@@ -1,8 +1,9 @@
-// 对端详情：完整指纹、地址历史、会话列表（可逐个关闭）、解除配对（本期 CLI 限定）。
+// 对端详情：完整指纹、别名、虚拟设备、地址历史、会话列表、解除配对。
 
 import { store } from '../store.js';
-import { el, icon, fmt, toast, sessionFlow } from '../ui.js';
+import { el, icon, fmt, toast, sessionFlow, confirmDialog } from '../ui.js';
 import { volumeText } from '../volume.js';
+import { peerDeviceRows, halReasonText, halDeviceOf, DEVICE_STATE_LABEL, isModeB } from '../mode.js';
 
 const DIR_LABEL = { send: '发送', recv: '接收' };
 
@@ -24,7 +25,7 @@ export function mount(root, ctx) {
   }
 
   const dot = el('span', { class: 'dot' });
-  const nameEl = el('h2', { class: 'detail-name' }, peer0.name || '未命名主机');
+  const nameEl = el('h2', { class: 'detail-name' }, peer0.display_name || peer0.name || '未命名主机');
   const onlineText = el('span', { class: 'detail-online', 'data-testid': 'detail-online' });
   const head = el('div', { class: 'detail-top' }, backBtn,
     el('div', { class: 'detail-title' }, dot, nameEl, onlineText));
@@ -52,6 +53,58 @@ export function mount(root, ctx) {
       el('div', { class: 'kv-row' }, el('span', { class: 'kv-k' }, '配对时间'), metaAdded),
       el('div', { class: 'kv-row' }, el('span', { class: 'kv-k' }, '公钥'), metaKey)));
 
+  // ---- 别名 ----
+  // 改名走「同 UID 就地更新」（spec-m5b §3.5）：AudioObjectID 不变、设备列表不变，
+  // 任何应用已记住的设备选择完全不受影响。这一点必须在界面上说出来，否则用户会
+  // 因为怕搞乱 Zoom 里的选择而不敢改名。
+  const aliasInput = el('input', {
+    class: 'input', 'data-testid': 'detail-alias-input', maxlength: '48',
+    placeholder: peer0.name || '对端主机名', autocomplete: 'off', spellcheck: 'false',
+  });
+  const aliasSave = el('button', { class: 'btn primary small', type: 'button', 'data-testid': 'detail-alias-save' }, '保存');
+  const aliasClear = el('button', { class: 'btn ghost small', type: 'button', 'data-testid': 'detail-alias-clear' }, '清除');
+  const aliasNote = el('p', { class: 'muted small', 'data-testid': 'detail-alias-note' });
+  const aliasCard = el('section', { class: 'card block', 'data-testid': 'detail-alias' },
+    el('h3', { class: 'block-title' }, '别名'),
+    el('div', { class: 'form-row' },
+      el('label', { class: 'field grow' },
+        el('span', { class: 'field-label' }, '显示名称'), aliasInput),
+      el('span', { class: 'field-btn' }, aliasSave, aliasClear)),
+    aliasNote);
+
+  let aliasBusy = false;
+  async function setAlias(value) {
+    if (aliasBusy) return;
+    aliasBusy = true;
+    aliasSave.disabled = true;
+    aliasClear.disabled = true;
+    try {
+      const res = await ctx.rpc('peers.set_alias', { peer: fp, alias: value });
+      toast(value ? `已改名为「${(res && res.display_name) || value}」` : '已恢复为对端主机名', 'ok');
+      await ctx.refreshPeers();
+    } catch (_) { /* rpc 已 toast */ } finally {
+      aliasBusy = false;
+      update(store.state);
+    }
+  }
+  aliasSave.addEventListener('click', () => {
+    const v = aliasInput.value.trim();
+    setAlias(v || null);
+  });
+  aliasClear.addEventListener('click', () => { aliasInput.value = ''; setAlias(null); });
+  aliasInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); aliasSave.click(); }
+  });
+
+  // ---- 虚拟设备 ----
+  const devRows = el('div', { class: 'dev-list' });
+  const devNote = el('p', { class: 'muted small', 'data-testid': 'detail-hal-note' });
+  const devMeta = el('code', { class: 'mono dim', 'data-testid': 'detail-hal-meta' }, '');
+  const devCard = el('section', { class: 'card block', 'data-testid': 'detail-hal-devices' },
+    el('div', { class: 'dev-inv-head' },
+      el('h3', { class: 'block-title' }, '虚拟设备'), devMeta),
+    devRows, devNote);
+
   const addrList = el('ul', { class: 'addr-list', 'data-testid': 'detail-addrs' });
   const addrCard = el('section', { class: 'card block' },
     el('h3', { class: 'block-title' }, '地址历史'),
@@ -72,20 +125,40 @@ export function mount(root, ctx) {
         tbody)),
     sessEmpty);
 
-  // M4a 的 IPC 没有解除配对方法：按钮直接禁用并给出 CLI 命令，
-  // 不再走「危险确认」再什么都不做的假流程。
-  const unpairBtn = el('button', {
-    class: 'btn danger looks-disabled', type: 'button', 'data-testid': 'detail-unpair', disabled: true,
-    title: '解除配对暂无 IPC 方法（M4a），本期请使用 CLI',
-  }, '解除配对');
+  const unpairBtn = el('button', { class: 'btn danger', type: 'button', 'data-testid': 'detail-unpair' }, '解除配对');
   const dangerCard = el('section', { class: 'card block danger-block' },
     el('h3', { class: 'block-title danger-title' }, '危险操作'),
-    el('p', { class: 'muted' }, '解除配对将移除双向信任与虚拟设备（如有）。当前版本（M4a）IPC 尚无该方法，界面上不可执行。'),
-    el('div', { class: 'field-btn' }, unpairBtn, el('span', { class: 'tag warn' }, '本期 CLI 限定')),
-    el('p', { class: 'cli-hint', 'data-testid': 'detail-unpair-hint' },
-      `本期请用 CLI：audiohub unpair --fingerprint ${fp}`));
+    el('p', { class: 'muted' },
+      '解除配对会撤销双向信任、立即关闭全部会话，并无条件从系统移除这台对端的虚拟设备。'
+      + '对端也会收到通知并移除本机的设备——它的系统列表里不会留下一对永远离线的幽灵设备。'),
+    el('div', { class: 'field-btn' }, unpairBtn),
+    el('p', { class: 'muted small' }, '若之后想再用这台主机，需要重新走一次配对流程。'));
 
-  root.append(head, infoCard, addrCard, sessCard, dangerCard);
+  unpairBtn.addEventListener('click', async () => {
+    const p = store.state.peers.find((x) => x.fingerprint === fp) || peer0;
+    const dev = p.hal_device;
+    const body = [
+      `将解除与「${p.display_name || p.name || fp}」的配对，并撤销双向信任。`,
+      dev
+        ? `解除配对会立即从系统移除「${dev.out_name}」与「${dev.in_name}」。`
+          + '若其中之一正是当前默认设备，系统会自动切换到其它设备。'
+        : '该对端当前没有虚拟设备，只会移除信任与已建立的会话。',
+    ];
+    if (!await confirmDialog({
+      title: '解除配对？', body, confirmText: '解除配对', danger: true, testid: 'confirm-unpair',
+    })) return;
+    unpairBtn.disabled = true;
+    try {
+      await ctx.rpc('peers.unpair', { peer: fp });
+      toast('已解除配对', 'ok');
+      await ctx.refreshPeers();
+      ctx.navigate('peers');
+    } catch (_) {
+      unpairBtn.disabled = false;
+    }
+  });
+
+  root.append(head, infoCard, aliasCard, devCard, addrCard, sessCard, dangerCard);
 
   // 只读回显：这张表每帧（1s）整体重建，放可拖动的滑块会在手指下被销毁重建。
   // 交互式音量控件在对端卡片上（spec-m4b §A3）；这里只如实显示同步到的值。
@@ -126,7 +199,7 @@ export function mount(root, ctx) {
     // 在这里逐秒显示只会显得卡住。
     const reconnecting = !p.online && !!p.reconnecting;
     dot.className = 'dot ' + (p.online ? 'online' : reconnecting ? 'connecting' : 'offline');
-    nameEl.textContent = p.name || '未命名主机';
+    nameEl.textContent = p.display_name || p.name || '未命名主机';
     onlineText.textContent = p.online ? '在线' : reconnecting ? '重连中…' : '离线';
     onlineText.className = 'detail-online ' + (p.online ? 'ok' : 'dim');
     metaPort.textContent = String(p.port ?? '—');
@@ -148,21 +221,39 @@ export function mount(root, ctx) {
       }
     }
 
+    // 别名：输入框只在用户没有在编辑时跟随 daemon，否则每秒一帧会把正在输入的字冲掉。
+    if (document.activeElement !== aliasInput) aliasInput.value = p.alias || '';
+    aliasSave.disabled = aliasBusy;
+    aliasClear.disabled = aliasBusy || !p.alias;
+    aliasNote.textContent = p.alias
+      ? `虚拟设备名称使用别名「${p.alias}」；清除后恢复为对端上报的主机名「${p.name || '—'}」。`
+      : '设置别名会改写这台对端在系统设备列表中的名字。改名是同 UID 就地进行的：'
+        + '设备身份不变，任何应用已记住的选择都不受影响。';
+
+    renderDevices(s, p);
+
     const sessions = s.sessions.filter((x) => x.peer_fingerprint === fp);
     sessEmpty.hidden = sessions.length > 0;
     tbody.innerHTML = '';
     for (const info of sessions) {
       const st = info.stats || {};
-      const closeBtn = el('button', {
-        class: 'btn ghost small', type: 'button', 'data-testid': `session-close-${info.id}`,
-      }, icon('close'), '关闭');
-      closeBtn.addEventListener('click', () => closeSession(info.id, closeBtn));
       const flow = sessionFlow(info);
+      // origin=hal 的会话是「某个应用选中了这台对端的虚拟设备」的结果。从背后把它
+      // 关掉，应用的设备选择还留在那儿——它会继续对着一台不再出声的设备播放，
+      // 而系统里没有任何地方能解释这件事。所以这里不给关闭入口，只说清楚怎么停。
+      const managed = info.origin === 'hal';
+      const action = managed
+        ? el('span', { class: 'dim small', 'data-testid': `session-managed-${info.id}` }, '由系统设备选择驱动')
+        : el('button', {
+          class: 'btn ghost small', type: 'button', 'data-testid': `session-close-${info.id}`,
+        }, icon('close'), '关闭');
+      if (!managed) action.addEventListener('click', () => closeSession(info.id, action));
       tbody.append(el('tr', { 'data-testid': `session-row-${info.id}`, class: flow.inbound ? 'inbound' : null },
         el('td', {}, el('code', { class: 'mono' }, `#${info.id}`)),
         el('td', { 'data-testid': `session-flow-${info.id}` },
           flow.label,
-          flow.inbound ? el('span', { class: 'tag warn' }, '对端发起') : null),
+          flow.inbound ? el('span', { class: 'tag warn' }, '对端发起') : null,
+          managed ? el('span', { class: 'tag accent', title: info.hal_device || '' }, '虚拟设备') : null),
         el('td', {}, DIR_LABEL[info.dir] || info.dir),
         el('td', {}, `${fmt.kbps(st.bitrate_kbps)} kbps`),
         el('td', {}, fmt.int(st.rung)),
@@ -170,8 +261,41 @@ export function mount(root, ctx) {
         el('td', {}, `${fmt.ms(st.jitter_ms)} ms`),
         el('td', { 'data-testid': `session-volume-${info.id}` }, volumeCell(info)),
         el('td', {}, verdictCell(st.verdict)),
-        el('td', {}, closeBtn)));
+        el('td', {}, action)));
     }
+  }
+
+  function renderDevices(s, p) {
+    const rows = peerDeviceRows(p, s.daemon);
+    const info = halDeviceOf(s.daemon, fp);
+    devRows.innerHTML = '';
+    devRows.hidden = rows.length === 0;
+    devMeta.textContent = info ? `槽位 ${info.slot} · 代号 ${info.generation}` : '';
+    if (!rows.length) {
+      devNote.textContent = isModeB(s)
+        ? halReasonText(p.hal_reason)
+        : '当前是模式 A：虚拟设备只在模式 B 下存在。在主面板顶部切换模式后，'
+          + '这台对端会作为一对设备出现在系统音频设备列表里。';
+      return;
+    }
+    const published = p.hal_device.state === 'bound' && p.hal_device.observed;
+    for (const r of rows) {
+      devRows.append(el('div', { class: 'dev-row', 'data-testid': `detail-device-${r.dir}` },
+        icon(r.icon, 'ico dev-ico'),
+        el('div', { class: 'dev-text' },
+          el('span', { class: 'dev-name' }, r.name || '—'),
+          el('code', { class: 'dev-uid mono' }, r.uid || '')),
+        el('span', { class: 'dev-frames mono' },
+          `${fmt.int(r.frames)} 帧` + (r.dropped ? ` · 丢 ${fmt.int(r.dropped)}` : '')),
+        el('span', { class: 'dev-state ' + (r.io ? 'live' : published ? 'idle' : 'pending') },
+          r.io ? '● 使用中' : published ? '○ 未使用' : '○ 等待系统发布')));
+    }
+    const stateText = DEVICE_STATE_LABEL[p.hal_device.state] || p.hal_device.state;
+    devNote.textContent = published
+      ? (p.online
+        ? '两台设备已在系统音频设备列表中，可被任意应用直接选用。'
+        : '⚠ 对端离线：设备仍在系统中可选，但不处理任何声音。')
+      : `驱动状态「${stateText}」，系统设备列表${p.hal_device.observed ? '已' : '尚未'}列出它们。`;
   }
 
   const unsub = store.subscribe(update);

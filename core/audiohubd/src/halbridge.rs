@@ -80,7 +80,7 @@
 
 #![allow(dead_code)] // wiring into engine/ipcserv lands with the main session
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -120,16 +120,40 @@ const fn ring_bytes(channels: u32) -> usize {
 pub const HAL_SPK_BYTES: usize = ring_bytes(HAL_SPK_CHANNELS);
 pub const HAL_MIC_BYTES: usize = ring_bytes(HAL_MIC_CHANNELS);
 
+/// One (out, in) ring pair per slot, `kAudioHubMaxSlots` in AudioHubBridge.h.
+/// The driver creates them all up front and never releases one, so binding a
+/// peer to a slot never has to interact with the realtime path (spec-m5b §1).
+pub const HAL_MAX_SLOTS: usize = 16;
+/// `kAudioHubMaxEndpoints`. A literal rather than `2 * HAL_MAX_SLOTS` because
+/// it is a frozen wire quantity — it sizes the reply's descriptor array on both
+/// sides — and the assertion below is what keeps the two facts consistent.
+pub const HAL_MAX_ENDPOINTS: usize = 32;
+const _: () = assert!(HAL_MAX_ENDPOINTS == 2 * HAL_MAX_SLOTS);
+
 const MSG_HELLO: i32 = 0x4148_0001; // daemon -> driver, carries our control port only
-const MSG_HELLO_REPLY: i32 = 0x4148_0002; // driver -> daemon, carries both memory entries
+const MSG_HELLO_REPLY: i32 = 0x4148_0002; // driver -> daemon, carries every memory entry
 const MSG_CONTROL: i32 = 0x4148_0003; // driver -> daemon, fire and forget
 const MSG_NOTIFY: i32 = 0x4148_0004; // daemon -> driver, fire and forget
+const MSG_BIND: i32 = 0x4148_0005; // daemon -> driver, fire and forget
 
 /// `kAudioHubProtocolVersion` in AudioHubBridge.h. The driver compares this for
 /// EQUALITY and answers `kAudioHubStatus_BadVersion` on anything else, so it is
 /// not a floor to be raised unilaterally — it changes only when that header
 /// changes. (It was briefly 2 here alone, which the driver could only refuse.)
-const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 is the per-peer device protocol (spec-m5b §4): the reply grew from 104 to
+/// 472 bytes and the control message from 48 to 56, so the two versions cannot
+/// be told apart by parsing — only by this number, before anything is parsed.
+/// An installed v1 driver therefore refuses this daemon outright, which is the
+/// intended loud failure; a shim that tried to speak both would be guessing at
+/// which layout it is holding.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// v1's `AudioHubHelloReply`: 24 header + 4 body + 2 descriptors + 52 payload.
+/// Kept ONLY so a reply of exactly this size can be named as "an old driver is
+/// installed" instead of being reported as an unrecognised message. Never parse
+/// a v1 reply — the two layouts are indistinguishable past the header.
+const HELLO_REPLY_V1_SIZE: usize = 104;
 
 const CTL_VOLUME: u32 = 1;
 const CTL_HEARTBEAT: u32 = 2;
@@ -140,52 +164,143 @@ const CTL_IO_STATE: u32 = 3;
 /// immediately, because an instant re-HELLO displaces whoever displaced us and
 /// the two daemons then trade the rings every few seconds forever.
 const CTL_SUPERSEDED: u32 = 4;
+/// The driver's account of one slot — `endpoint = slot*2`, `scalar_bits` a
+/// `SLOT_*` state, `generation` that slot's stamp. This is what establishes the
+/// generation every other control message is then filtered against, and what
+/// makes publication closed-loop rather than fire-and-hope (spec-m5b §4.6).
+const CTL_BIND_STATE: u32 = 5;
+
+/// Slot states carried in `CTL_BIND_STATE`'s `scalar_bits`.
+const SLOT_FREE: u32 = 0;
+const SLOT_BOUND: u32 = 1;
+const SLOT_DELISTED: u32 = 2;
 
 const NOTIFY_VOLUME: u32 = 1;
 const NOTIFY_PING: u32 = 2;
 
-const DEV_SPEAKER: u32 = 0;
-const DEV_MIC: u32 = 1;
+/// `hal.status_reason` for "a driver is installed but speaks another protocol".
+/// The UI keys its third driver state off this exact string (spec-m5b §6.2),
+/// and regression N14 asserts it, so it is a contract rather than a message.
+pub const REASON_PROTOCOL_MISMATCH: &str = "driver_protocol_mismatch";
+
+const BIND_CLEAR: u32 = 0;
+const BIND_SET: u32 = 1;
+
+/// The low bit of an endpoint. What used to be a one-bit device selector is now
+/// `slot * 2 + dir`, and the direction stayed the LOW bit so slot 0 keeps v1's
+/// numbering (`0` was the speaker, `1` the microphone).
+const DIR_OUT: u32 = 0;
+const DIR_IN: u32 = 1;
+
+/// `endpoint = slot*2 + dir`, the u32 that names one of the 32 virtual devices.
+const fn endpoint(slot: usize, dir: u32) -> u32 {
+    (slot as u32) * 2 + dir
+}
+const fn endpoint_slot(ep: u32) -> usize {
+    (ep / 2) as usize
+}
+const fn endpoint_dir(ep: u32) -> u32 {
+    ep & 1
+}
 
 const STATUS_OK: u32 = 0;
 const STATUS_BAD_VERSION: u32 = 1;
 const STATUS_NO_MEMORY: u32 = 2;
+/// The driver replaced the session this message quotes. Whoever sent it was
+/// superseded and does not know yet.
+const STATUS_STALE_SESSION: u32 = 3;
+const STATUS_BAD_REQUEST: u32 = 4;
 
 const FLAG_MUTED: u32 = 0x1;
 const FLAG_IO_RUNNING: u32 = 0x2;
+const FLAG_IS_INPUT: u32 = 0x4;
 
 // ---------------------------------------------------------------- public API
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HalDevice {
-    Speaker,
-    Microphone,
+/// One of the 32 virtual devices: which slot, and which direction of it.
+/// `slot` is a DAEMON-INTERNAL index — it names a pair of rings, never anything
+/// a user or an IPC client can select (spec-m5b §5.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct HalEndpoint {
+    pub slot: u8,
+    /// true = the virtual MICROPHONE (we write it), false = the virtual
+    /// SPEAKER (we read it).
+    pub input: bool,
 }
 
-impl HalDevice {
-    fn from_wire(v: u32) -> HalDevice {
-        if v == DEV_MIC {
-            HalDevice::Microphone
-        } else {
-            HalDevice::Speaker
-        }
+impl HalEndpoint {
+    pub fn out(slot: u8) -> HalEndpoint {
+        HalEndpoint { slot, input: false }
+    }
+    pub fn mic(slot: u8) -> HalEndpoint {
+        HalEndpoint { slot, input: true }
+    }
+    fn from_wire(v: u32) -> Option<HalEndpoint> {
+        let slot = endpoint_slot(v);
+        (slot < HAL_MAX_SLOTS).then(|| HalEndpoint {
+            slot: slot as u8,
+            input: endpoint_dir(v) == DIR_IN,
+        })
     }
     fn to_wire(self) -> u32 {
+        endpoint(self.slot as usize, if self.input { DIR_IN } else { DIR_OUT })
+    }
+}
+
+/// The driver's account of one slot, carried by `CTL_BIND_STATE`. This is the
+/// ONLY thing that establishes a slot's generation, and therefore the only
+/// thing that makes any other control message from that slot acceptable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalSlotState {
+    Free,
+    Bound,
+    Delisted,
+}
+
+impl HalSlotState {
+    fn from_wire(v: u32) -> Option<HalSlotState> {
+        match v {
+            SLOT_FREE => Some(HalSlotState::Free),
+            SLOT_BOUND => Some(HalSlotState::Bound),
+            SLOT_DELISTED => Some(HalSlotState::Delisted),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
         match self {
-            HalDevice::Speaker => DEV_SPEAKER,
-            HalDevice::Microphone => DEV_MIC,
+            HalSlotState::Free => "free",
+            HalSlotState::Bound => "bound",
+            HalSlotState::Delisted => "delisted",
         }
     }
 }
 
-/// What the driver tells us about its virtual devices (spec-round2 §B2).
+/// What the driver tells us about its virtual devices (spec-m5b §4.6).
+///
+/// Every variant that concerns a slot carries that slot's `generation`, and the
+/// receive path has ALREADY dropped anything whose stamp does not match the one
+/// the last `BindState` established — a late `StopIO` from the previous tenant
+/// of a slot must never light up the next peer's microphone.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HalControlEvent {
     /// The local user moved the virtual device's slider. The daemon must relay
     /// this to the peer's REAL device via the existing `VolumeSet` path.
-    Volume { device: HalDevice, scalar: f32, muted: bool },
-    /// An application started/stopped using the virtual device.
-    IoState { device: HalDevice, running: bool },
+    Volume { at: HalEndpoint, generation: u32, scalar: f32, muted: bool },
+    /// An application started/stopped using the virtual device. In mode B this
+    /// is the ONLY signal that opens a session (spec-m5b §5.6).
+    IoState { at: HalEndpoint, generation: u32, running: bool },
+    /// A slot changed state, or answered an idempotent `Bind`.
+    BindState { slot: u8, generation: u32, state: HalSlotState },
+    /// A handshake completed. Everything this daemon still intends must be
+    /// re-`Set` after this — the driver replays a slot's IO state and volume
+    /// only when an idempotent Set lands on it (spec-m5b §1, third trade-off),
+    /// so skipping the re-Set leaves an app that was mid-recording recording
+    /// silence with no error anywhere.
+    Attached { session_id: u64, slot_count: u8 },
+    /// The rings are gone (driver exited, superseded, went silent). Bindings
+    /// survive on the driver's side; sessions do not.
+    Detached,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,7 +347,17 @@ impl HalBridgeCfg {
     }
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+/// Per-slot traffic and state, summed into the three headline counters and
+/// reported per slot beside them (spec-m5b §6.1).
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct HalSlotCounters {
+    pub spk_frames: u64,
+    pub mic_frames: u64,
+    pub mic_dropped: u64,
+    pub generation: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct HalBridgeStatus {
     /// The driver's mach name resolves and we hold a send right on it. False
     /// means coreaudiod has not published it (plug-in absent, or coreaudiod
@@ -243,14 +368,23 @@ pub struct HalBridgeStatus {
     pub driver_found: bool,
     /// A HAL plug-in has completed the handshake and holds live rings.
     pub driver_connected: bool,
-    /// Speaker-direction frames handed to the media engine.
+    /// Speaker-direction frames handed to the media engine, summed over slots.
     pub spk_frames: u64,
-    /// Microphone-direction frames accepted by the ring.
+    /// Microphone-direction frames accepted by the rings, summed over slots.
     pub mic_frames: u64,
-    /// Microphone frames the ring had no room for (driver not draining).
+    /// Microphone frames the rings had no room for (driver not draining).
     pub mic_dropped: u64,
     /// Seconds since the last message from the driver, if it ever spoke.
     pub last_driver_msg_secs: Option<f64>,
+    /// How many slots the attached driver actually offers. 0 when detached.
+    pub slot_count: u8,
+    /// What the driver said it speaks, when it refused us for that reason.
+    pub driver_protocol_version: Option<u32>,
+    /// Why there is no live bridge, in words a UI can show. `None` while
+    /// connected.
+    pub status_reason: Option<String>,
+    /// Per-slot detail, indexed by slot.
+    pub slots: Vec<HalSlotCounters>,
 }
 
 pub struct HalBridge {
@@ -270,19 +404,45 @@ impl HalBridge {
     pub fn status(&self) -> HalBridgeStatus {
         let s = &self.shared;
         let last = *lk(&s.last_driver_msg);
+        let n = s.slot_count.load(Ordering::Relaxed) as usize;
+        let slots: Vec<HalSlotCounters> = (0..n.min(HAL_MAX_SLOTS))
+            .map(|i| s.slots[i].snapshot())
+            .collect();
         HalBridgeStatus {
             driver_found: s.driver_found.load(Ordering::Relaxed),
             driver_connected: s.driver_connected.load(Ordering::Relaxed),
-            spk_frames: s.spk_frames.load(Ordering::Relaxed),
-            mic_frames: s.mic_frames.load(Ordering::Relaxed),
-            mic_dropped: s.mic_dropped.load(Ordering::Relaxed),
+            spk_frames: slots.iter().map(|c| c.spk_frames).sum(),
+            mic_frames: slots.iter().map(|c| c.mic_frames).sum(),
+            mic_dropped: slots.iter().map(|c| c.mic_dropped).sum(),
             last_driver_msg_secs: last.map(|t| t.elapsed().as_secs_f64()),
+            slot_count: n as u8,
+            driver_protocol_version: match s.driver_protocol.load(Ordering::Relaxed) {
+                0 => None,
+                v => Some(v),
+            },
+            status_reason: lk(&s.status_reason).clone(),
+            slots,
         }
     }
 
-    /// APPENDS one 10ms mono frame of whatever an app played into "AudioHub
-    /// Speaker", padding with silence so exactly `HAL_FRAME_48K` samples are
-    /// added: a missing or idle driver produces silence, never a stall or a
+    /// How many slots the attached driver offers, 0 when detached. This is the
+    /// capacity a peer past the end gets `hal_reason: "capacity"` against — the
+    /// DRIVER's number, not this build's `HAL_MAX_SLOTS`, so a driver built
+    /// with a smaller pool is a visible capacity limit rather than a refused
+    /// handshake.
+    pub fn slot_count(&self) -> usize {
+        (self.shared.slot_count.load(Ordering::Relaxed) as usize).min(HAL_MAX_SLOTS)
+    }
+
+    /// Bumped on every completed handshake. A coordinator that sees this move
+    /// must re-`Set` every binding it still intends (see `Attached`).
+    pub fn attach_epoch(&self) -> u64 {
+        self.shared.attach_epoch.load(Ordering::Acquire)
+    }
+
+    /// APPENDS one 10ms mono frame of whatever an app played into this slot's
+    /// virtual speaker, padding with silence so exactly `HAL_FRAME_48K` samples
+    /// are added: a missing or idle driver produces silence, never a stall or a
     /// short frame. Returns how many of those samples were real.
     ///
     /// The name says `append` because the previous one (`read_spk_frame`) read
@@ -290,16 +450,16 @@ impl HalBridge {
     /// must replace, the engine truncated the over-long frame back to its first
     /// 480 samples, and the peer received the silence captured before any app
     /// had played anything, forever, with every counter and probe still green.
-    pub fn append_spk_frame(&self, out: &mut Vec<f32>) -> usize {
-        self.shared.append_spk_frame(out)
+    pub fn append_spk_frame(&self, slot: u8, out: &mut Vec<f32>) -> usize {
+        self.shared.append_spk_frame(slot, out)
     }
 
     /// Appends up to `max_frames` mono samples; returns how many were real.
-    pub fn read_spk_mono(&self, out: &mut Vec<f32>, max_frames: usize) -> usize {
+    pub fn read_spk_mono(&self, slot: u8, out: &mut Vec<f32>, max_frames: usize) -> usize {
         let mut done = 0;
         while done < max_frames {
             let want = (max_frames - done).min(HAL_FRAME_48K);
-            let got = self.shared.read_spk_chunk(out, want);
+            let got = self.shared.read_spk_chunk(slot, out, want);
             done += got;
             if got < want {
                 break;
@@ -308,15 +468,41 @@ impl HalBridge {
         done
     }
 
-    /// Peer microphone audio for "AudioHub Microphone". Returns the number of
-    /// samples the ring accepted; the remainder is dropped rather than queued,
-    /// because a driver that is not draining is a driver nobody is listening to.
-    pub fn write_mic_mono(&self, mono: &[f32]) -> usize {
-        self.shared.write_mic(mono)
+    /// Peer microphone audio for one slot's virtual microphone. Returns the
+    /// number of samples the ring accepted; the remainder is dropped rather
+    /// than queued, because a driver that is not draining is a driver nobody is
+    /// listening to.
+    pub fn write_mic_mono(&self, slot: u8, mono: &[f32]) -> usize {
+        self.shared.write_mic(slot, mono)
     }
 
-    /// Volume/mute and IO-state changes the driver has reported since the last
-    /// call. Never blocks.
+    /// Drops whatever is queued in the speaker rings of every PUBLISHED slot
+    /// that has no consumer, so an idle virtual speaker cannot fill up and make
+    /// the driver's census report "audiohubd has stopped draining it"
+    /// (spec-m5b §5.4). MUST be called from the tx thread and nowhere else:
+    /// only a ring's consumer may move `read_idx`.
+    ///
+    /// `busy` is the mask of slots that DO have a live source this tick; those
+    /// are left alone.
+    pub fn drain_idle_speakers(&self, busy: u16) {
+        let published = self.shared.published.load(Ordering::Relaxed);
+        let idle = published & !busy;
+        for slot in 0..HAL_MAX_SLOTS {
+            if idle & (1 << slot) != 0 {
+                self.shared.take_flush(slot as u8); // consumed here, not lost
+                self.shared.rings.flush_spk_consumer(slot);
+            }
+        }
+    }
+
+    /// The set of slots the daemon has bound, as a bitmask. Set by the device
+    /// coordinator, read by the tx loop.
+    pub fn set_published(&self, mask: u16) {
+        self.shared.published.store(mask, Ordering::Relaxed);
+    }
+
+    /// Volume/mute, IO-state and slot-state changes the driver has reported
+    /// since the last call. Never blocks.
     pub fn drain_events(&self) -> Vec<HalControlEvent> {
         let mut q = lk(&self.shared.events);
         std::mem::take(&mut *q)
@@ -325,13 +511,50 @@ impl HalBridge {
     /// Reverse direction of plan §7.2: the peer's real device reported a new
     /// volume, so the virtual control must show it. Best effort — a driver that
     /// is not attached simply misses it and re-reads on its next handshake.
-    pub fn notify_volume(&self, device: HalDevice, scalar: f32, muted: bool) {
-        self.shared.notify_volume(device, scalar, muted);
+    ///
+    /// `generation` is the slot's current stamp; the driver drops anything that
+    /// does not match, which is what keeps a volume meant for the previous
+    /// tenant of a slot off the new one's control.
+    pub fn notify_volume(&self, at: HalEndpoint, generation: u32, scalar: f32, muted: bool) {
+        self.shared.notify_volume(at, generation, scalar, muted);
+    }
+
+    /// Binds `slot` to a peer, or re-states an existing binding. IDEMPOTENT by
+    /// contract: same slot + same UIDs is a no-op on the driver's side except
+    /// for the state replay, so this is what a daemon restart sends instead of
+    /// Clear-then-Set (which would destroy the user's chosen default output on
+    /// every restart, silently — spec-m5b §1 third trade-off).
+    pub fn bind_set(&self, req: &HalBindRequest) -> bool {
+        platform::send_bind_set(&self.shared, req)
+    }
+
+    /// Retires `slot`. `generation` is what this daemon believes the slot's
+    /// stamp to be; the driver ignores a mismatch, so a Clear delayed past a
+    /// re-bind cannot cut down the binding that replaced it.
+    pub fn bind_clear(&self, slot: u8, generation: u32) -> bool {
+        platform::send_bind_clear(&self.shared, slot, generation)
     }
 
     pub fn shutdown(&self) {
         self.shared.stop.store(true, Ordering::SeqCst);
     }
+}
+
+/// One `Bind Set`. The driver owns no naming or disambiguation logic at all
+/// (it runs in coreaudiod's sandbox and can read neither the computer name nor
+/// a localisation), so the daemon hands it the finished strings — spec-m5b §3.5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HalBindRequest {
+    pub slot: u8,
+    /// Peer fingerprint, for the driver's logs and its idempotency compare.
+    pub peer_key: String,
+    pub out_uid: String,
+    pub in_uid: String,
+    pub out_name: String,
+    pub in_name: String,
+    /// bit0 of the wire `flags`: the peer is connected. Logging only on the
+    /// driver's side — a device is published either way (plan §7.3).
+    pub online: bool,
 }
 
 impl Drop for HalBridge {
@@ -348,13 +571,18 @@ impl Drop for HalBridge {
 /// group does not own.
 pub struct HalSpeakerSource {
     bridge: Arc<Shared>,
+    slot: u8,
     dbg_peak: f32,
     dbg_frames: u32,
 }
 
 impl HalSpeakerSource {
-    pub fn new(bridge: &HalBridge) -> HalSpeakerSource {
-        HalSpeakerSource { bridge: bridge.shared.clone(), dbg_peak: 0.0, dbg_frames: 0 }
+    /// One source per SLOT. The tx engine dedups sources by `SourceSpec`, and
+    /// `HalSpeaker { slot }` makes two slots two distinct keys — which is what
+    /// keeps each speaker ring to exactly one consumer and the SPSC contract
+    /// literally true (spec-m5b §5.4).
+    pub fn new(bridge: &HalBridge, slot: u8) -> HalSpeakerSource {
+        HalSpeakerSource { bridge: bridge.shared.clone(), slot, dbg_peak: 0.0, dbg_frames: 0 }
     }
 }
 
@@ -367,7 +595,7 @@ impl audiohub_net::media::FrameSource for HalSpeakerSource {
         // anything. The ring counters, the peak probe and the packet counts all
         // looked healthy while the peer received that initial silence, forever.
         out.clear();
-        self.bridge.append_spk_frame(out);
+        self.bridge.append_spk_frame(self.slot, out);
         // AUDIOHUB_HAL_DEBUG=1 prints the peak of what actually came out of the
         // ring once a second. Frame COUNTS advancing only proves the ring header
         // is shared; they say nothing about the sample area, and a silent stream
@@ -394,19 +622,69 @@ impl audiohub_net::media::FrameSource for HalSpeakerSource {
 
 // ---------------------------------------------------------------- shared state
 
+/// Everything that is per-slot rather than per-bridge. One record per ring
+/// pair, allocated once and never moved.
+struct SlotShared {
+    spk_frames: AtomicU64,
+    mic_frames: AtomicU64,
+    mic_dropped: AtomicU64,
+    /// The slot's stamp, as last reported by `CTL_BIND_STATE`. 0 = "we know
+    /// nothing about this slot", and everything the driver sends about it is
+    /// dropped until a BindState says otherwise.
+    generation: AtomicU32,
+}
+
+impl SlotShared {
+    fn new() -> SlotShared {
+        SlotShared {
+            spk_frames: AtomicU64::new(0),
+            mic_frames: AtomicU64::new(0),
+            mic_dropped: AtomicU64::new(0),
+            generation: AtomicU32::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> HalSlotCounters {
+        HalSlotCounters {
+            spk_frames: self.spk_frames.load(Ordering::Relaxed),
+            mic_frames: self.mic_frames.load(Ordering::Relaxed),
+            mic_dropped: self.mic_dropped.load(Ordering::Relaxed),
+            generation: self.generation.load(Ordering::Relaxed),
+        }
+    }
+}
+
 struct Shared {
     stop: AtomicBool,
     driver_found: AtomicBool,
     driver_connected: AtomicBool,
-    spk_frames: AtomicU64,
-    mic_frames: AtomicU64,
-    mic_dropped: AtomicU64,
+    slots: [SlotShared; HAL_MAX_SLOTS],
     last_driver_msg: Mutex<Option<Instant>>,
     events: Mutex<Vec<HalControlEvent>>,
-    /// Set by the service thread on every handshake; consumed by whichever
-    /// daemon thread reads spk next. Only the consumer may move `read_idx`, so
-    /// the flush has to happen here rather than on the service thread.
-    spk_flush: AtomicBool,
+    /// One bit per slot, set by the service thread on every handshake and
+    /// whenever a slot's generation changes; consumed by whichever daemon
+    /// thread reads that slot's speaker ring next. Only the consumer may move
+    /// `read_idx`, so the flush has to happen there rather than here.
+    ///
+    /// A BITMASK rather than a flag because a generation change is per slot: a
+    /// single flag would either flush all sixteen consumers (dropping live
+    /// audio on fifteen innocent slots) or none.
+    spk_flush: AtomicU16,
+    /// Slots the device coordinator has bound. The tx loop drains the idle ones
+    /// so their rings cannot fill up (spec-m5b §5.4).
+    published: AtomicU16,
+    /// The driver's session id from the last handshake. Every `Bind` quotes it;
+    /// the driver answers `StaleSession` to anything else.
+    session_id: AtomicU64,
+    /// Bumped on every completed handshake, so the coordinator can tell "still
+    /// the same rings" from "re-attached, re-Set everything".
+    attach_epoch: AtomicU64,
+    /// Slots this driver actually offers (`slot_count` from the reply).
+    slot_count: AtomicU32,
+    /// What the driver said it speaks when it refused us over version skew.
+    driver_protocol: AtomicU32,
+    /// Why there is no bridge right now, for `daemon.status`.
+    status_reason: Mutex<Option<String>>,
     rings: platform::Rings,
     /// Send right on the driver's service port, 0 when no driver is attached.
     /// A mutex rather than an atomic because two threads send on it (the
@@ -431,8 +709,28 @@ impl Shared {
         q.push(ev);
     }
 
-    fn append_spk_frame(&self, out: &mut Vec<f32>) -> usize {
-        let got = self.read_spk_chunk(out, HAL_FRAME_48K);
+    /// Arms the flush for one slot. Called when that slot's generation moves:
+    /// the driver resets a ring only while it is unpublished, so the daemon's
+    /// own `read_idx` is what would otherwise compute `avail = 0 - 24000` and
+    /// replay a full half second of the PREVIOUS peer's audio to the next one
+    /// (spec-m5b §4.6).
+    fn arm_flush(&self, slot: u8) {
+        if (slot as usize) < HAL_MAX_SLOTS {
+            self.spk_flush.fetch_or(1 << slot, Ordering::AcqRel);
+        }
+    }
+
+    /// Takes the flush bit for one slot, if set.
+    fn take_flush(&self, slot: u8) -> bool {
+        if slot as usize >= HAL_MAX_SLOTS {
+            return false;
+        }
+        let bit = 1u16 << slot;
+        self.spk_flush.fetch_and(!bit, Ordering::AcqRel) & bit != 0
+    }
+
+    fn append_spk_frame(&self, slot: u8, out: &mut Vec<f32>) -> usize {
+        let got = self.read_spk_chunk(slot, out, HAL_FRAME_48K);
         if got < HAL_FRAME_48K {
             out.resize(out.len() + (HAL_FRAME_48K - got), 0.0);
         }
@@ -440,42 +738,50 @@ impl Shared {
     }
 
     /// Appends at most `frames` (<= HAL_FRAME_48K) mono samples.
-    fn read_spk_chunk(&self, out: &mut Vec<f32>, frames: usize) -> usize {
+    fn read_spk_chunk(&self, slot: u8, out: &mut Vec<f32>, frames: usize) -> usize {
         let frames = frames.min(HAL_FRAME_48K);
-        if self.spk_flush.swap(false, Ordering::AcqRel) {
-            self.rings.flush_spk_consumer();
+        if self.take_flush(slot) {
+            self.rings.flush_spk_consumer(slot as usize);
         }
         let mut scratch = [0.0f32; HAL_FRAME_48K * (HAL_SPK_CHANNELS as usize)];
-        let got = self.rings.read_spk(&mut scratch[..frames * HAL_SPK_CHANNELS as usize], frames);
+        let got = self.rings.read_spk(
+            slot as usize,
+            &mut scratch[..frames * HAL_SPK_CHANNELS as usize],
+            frames,
+        );
         for f in 0..got {
             let l = scratch[f * 2];
             let r = scratch[f * 2 + 1];
             out.push((l + r) * 0.5);
         }
         if got > 0 {
-            self.spk_frames.fetch_add(got as u64, Ordering::Relaxed);
+            if let Some(c) = self.slots.get(slot as usize) {
+                c.spk_frames.fetch_add(got as u64, Ordering::Relaxed);
+            }
         }
         got
     }
 
-    fn write_mic(&self, mono: &[f32]) -> usize {
+    fn write_mic(&self, slot: u8, mono: &[f32]) -> usize {
         // `None` is "no driver attached, so there is no ring": nothing was
         // accepted, but nothing was DROPPED either. mic_dropped means "the
         // driver is not draining", and counting an absent driver into it would
         // bury the only reading of that number that diagnoses anything.
-        let Some(wrote) = self.rings.write_mic(mono) else {
+        let Some(wrote) = self.rings.write_mic(slot as usize, mono) else {
             return 0;
         };
-        self.mic_frames.fetch_add(wrote as u64, Ordering::Relaxed);
-        if wrote < mono.len() {
-            self.mic_dropped
-                .fetch_add((mono.len() - wrote) as u64, Ordering::Relaxed);
+        if let Some(c) = self.slots.get(slot as usize) {
+            c.mic_frames.fetch_add(wrote as u64, Ordering::Relaxed);
+            if wrote < mono.len() {
+                c.mic_dropped
+                    .fetch_add((mono.len() - wrote) as u64, Ordering::Relaxed);
+            }
         }
         wrote
     }
 
-    fn notify_volume(&self, device: HalDevice, scalar: f32, muted: bool) {
-        platform::send_notify(self, device, scalar, muted);
+    fn notify_volume(&self, at: HalEndpoint, generation: u32, scalar: f32, muted: bool) {
+        platform::send_notify(self, at, generation, scalar, muted);
     }
 }
 
@@ -539,28 +845,37 @@ mod platform {
 
     /// driver -> daemon, `AudioHubHelloReply`, on the send-once reply port.
     ///
-    /// Complex with exactly two port descriptors ONLY when `status` is OK; on
-    /// any other status it is a PLAIN message whose descriptor words are zero.
-    /// So `spk_entry`/`mic_entry` are meaningless until both the COMPLEX bit
-    /// and `status` have been tested — reading them first would hand
+    /// Complex with exactly `2 * slot_count` port descriptors ONLY when
+    /// `status` is OK; on any other status it is a PLAIN message whose
+    /// descriptor words are zero. So `entries` is meaningless until both the
+    /// COMPLEX bit and `status` have been tested — reading it first would hand
     /// `mach_vm_map` a port name that was never received.
+    ///
+    /// `entries[2*s]` is slot s's out ring and `entries[2*s+1]` its in ring:
+    /// the array is indexed by the same endpoint number the control plane uses.
+    /// One reply carrying all 32 is measured rather than assumed — see
+    /// `a_single_reply_can_carry_thirty_two_memory_entries` below.
     #[repr(C)]
-    #[derive(Clone, Copy, Default)]
+    #[derive(Clone, Copy)]
     struct HelloReply {
         header: MsgHeader,
         body: MsgBody,
-        spk_entry: PortDescriptor, // driver writes, daemon reads
-        mic_entry: PortDescriptor, // daemon writes, driver reads
+        entries: [PortDescriptor; HAL_MAX_ENDPOINTS],
         status: u32,
         protocol_version: u32,
+        slot_count: u32,
         data_offset: u32,
         spk_capacity_frames: u32,
         spk_channels: u32,
-        spk_sample_rate: u32,
         mic_capacity_frames: u32,
         mic_channels: u32,
-        mic_sample_rate: u32,
-        // nine u32 from offset 52 land the u64 pair on 88 with no padding
+        sample_rate: u32,
+        // The descriptor array ends at 412, which is 4 mod 8, so an ODD number
+        // of u32 must follow before the first u64 or the compiler inserts four
+        // bytes of padding here and the two ends read the ring geometry four
+        // bytes apart — with neither side's build failing on its own. Nine of
+        // them; the offset asserts below are what keeps that true.
+        session_id: u64,
         spk_bytes: u64,
         mic_bytes: u64,
     }
@@ -570,25 +885,75 @@ mod platform {
     struct ControlMsg {
         header: MsgHeader,
         op: u32,
-        device: u32,
+        endpoint: u32,
         scalar_bits: u32,
         flags: u32,
+        /// The slot's stamp when this message was produced; 0 means "concerns
+        /// no slot" (Heartbeat / Superseded / Ping). Anything whose stamp is
+        /// not the one the receiver currently holds for that slot is dropped,
+        /// which is what stops a late StopIO from lighting up the NEXT peer's
+        /// microphone after the slot has been reused (spec-m5b §4.6).
+        generation: u32,
+        reserved: u32,
         seq: u64,
     }
 
-    // Mirrors the _Static_asserts in AudioHubBridge.h one for one. A drift here
-    // is a struct read at the wrong offsets on the far side of a mach message,
-    // so it has to fail the build, not the audio.
+    /// daemon -> driver, `AudioHubBindMsg`. Binds one slot to a peer or retires
+    /// it; the driver answers on the control port with a `CTL_BIND_STATE`, so
+    /// the outcome comes back through the same closed loop as every other slot
+    /// transition rather than from mach's send status.
+    ///
+    /// The strings are fixed-size and the RECEIVER terminates them — neither
+    /// end trusts the sender's terminator.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct BindMsg {
+        header: MsgHeader,
+        op: u32,
+        slot: u32,
+        flags: u32,
+        generation: u32,
+        session_id: u64,
+        peer_key: [u8; 40],
+        out_uid: [u8; 64],
+        in_uid: [u8; 64],
+        out_name: [u8; 128],
+        in_name: [u8; 128],
+    }
+
+    // Mirrors the _Static_asserts in AudioHubBridge.h one for one, OFFSETS
+    // included: a size that happens to match while a field moved is exactly the
+    // drift these exist to catch. A break here is a struct read at the wrong
+    // offsets on the far side of a mach message, so it has to fail the build,
+    // not the audio.
     const _: () = {
         assert!(std::mem::size_of::<MsgHeader>() == 24);
+        assert!(std::mem::size_of::<MsgBody>() == 4);
         assert!(std::mem::size_of::<PortDescriptor>() == 12);
+        assert!(std::mem::offset_of!(HelloRequest, control_port) == 28);
         assert!(std::mem::offset_of!(HelloRequest, protocol_version) == 40);
         assert!(std::mem::size_of::<HelloRequest>() == 48);
-        assert!(std::mem::offset_of!(HelloReply, status) == 52);
-        assert!(std::mem::offset_of!(HelloReply, spk_bytes) == 88);
-        assert!(std::mem::size_of::<HelloReply>() == 104);
-        assert!(std::mem::offset_of!(ControlMsg, seq) == 40);
-        assert!(std::mem::size_of::<ControlMsg>() == 48);
+
+        assert!(std::mem::offset_of!(HelloReply, entries) == 28);
+        assert!(std::mem::offset_of!(HelloReply, status) == 412);
+        assert!(std::mem::offset_of!(HelloReply, session_id) == 448);
+        assert!(std::mem::offset_of!(HelloReply, spk_bytes) == 456);
+        assert!(std::mem::offset_of!(HelloReply, mic_bytes) == 464);
+        assert!(std::mem::size_of::<HelloReply>() == 472);
+
+        assert!(std::mem::offset_of!(ControlMsg, endpoint) == 28);
+        assert!(std::mem::offset_of!(ControlMsg, generation) == 40);
+        assert!(std::mem::offset_of!(ControlMsg, seq) == 48);
+        assert!(std::mem::size_of::<ControlMsg>() == 56);
+
+        assert!(std::mem::offset_of!(BindMsg, session_id) == 40);
+        assert!(std::mem::offset_of!(BindMsg, peer_key) == 48);
+        assert!(std::mem::offset_of!(BindMsg, out_uid) == 88);
+        assert!(std::mem::offset_of!(BindMsg, in_uid) == 152);
+        assert!(std::mem::offset_of!(BindMsg, out_name) == 216);
+        assert!(std::mem::offset_of!(BindMsg, in_name) == 344);
+        assert!(std::mem::size_of::<BindMsg>() == 472);
+
         assert!(std::mem::size_of::<RingHeader>() == 40);
         assert!(std::mem::offset_of!(RingHeader, write_idx) == 24);
         assert!(std::mem::offset_of!(RingHeader, read_idx) == 32);
@@ -986,7 +1351,12 @@ mod platform {
         mic: RingMem,
     }
 
-    /// The two mappings, present only while a driver is attached.
+    /// EVERY slot's mappings, present only while a driver is attached.
+    ///
+    /// Still a single `Option`, so attach and detach stay whole-set atomic: a
+    /// handshake either installs all `slot_count` pairs or none, and a detach
+    /// takes them all away at once. A per-slot `Option` would let a caller read
+    /// slot 3 of the previous driver while slot 4 belongs to the new one.
     ///
     /// The lock is NOT what makes the rings safe to use concurrently — the
     /// free-running SPSC indices do that, and both audio callers take it shared.
@@ -994,8 +1364,13 @@ mod platform {
     /// for the tx engine and the mixer to be out of the pages before
     /// `mach_vm_deallocate` runs, or a reconnect during playback is a segfault.
     /// The driver has no such lock and needs none; it never unmaps.
+    ///
+    /// A boxed SLICE rather than `[RingPair; HAL_MAX_SLOTS]`: a driver built
+    /// with a smaller pool reports a smaller `slot_count` and hands over
+    /// exactly that many pairs, and indexing a fixed array would then read
+    /// mappings that were never made.
     pub struct Rings {
-        inner: std::sync::RwLock<Option<RingPair>>,
+        inner: std::sync::RwLock<Option<Box<[RingPair]>>>,
     }
 
     // The pointers are into mappings owned by `RingPair` and live exactly as
@@ -1009,10 +1384,10 @@ mod platform {
             Rings { inner: std::sync::RwLock::new(None) }
         }
 
-        /// 0 with no driver attached: the caller zero-fills, so a missing
-        /// driver is silence rather than a stall.
-        pub fn read_spk(&self, dst: &mut [f32], frames: usize) -> usize {
-            match rd(&self.inner).as_ref() {
+        /// 0 with no driver attached (or a slot this driver does not have):
+        /// the caller zero-fills, so a missing driver is silence, never a stall.
+        pub fn read_spk(&self, slot: usize, dst: &mut [f32], frames: usize) -> usize {
+            match rd(&self.inner).as_ref().and_then(|p| p.get(slot)) {
                 Some(p) => p.spk.read(dst, frames),
                 None => 0,
             }
@@ -1021,20 +1396,23 @@ mod platform {
         /// `None` distinguishes "no ring at all" from "the ring was full",
         /// which are the same number of frames accepted but very different
         /// diagnoses. See `Shared::write_mic`.
-        pub fn write_mic(&self, mono: &[f32]) -> Option<usize> {
-            rd(&self.inner).as_ref().map(|p| p.mic.write(mono, mono.len()))
+        pub fn write_mic(&self, slot: usize, mono: &[f32]) -> Option<usize> {
+            rd(&self.inner)
+                .as_ref()
+                .and_then(|p| p.get(slot))
+                .map(|p| p.mic.write(mono, mono.len()))
         }
 
-        pub fn flush_spk_consumer(&self) {
-            if let Some(p) = rd(&self.inner).as_ref() {
+        pub fn flush_spk_consumer(&self, slot: usize) {
+            if let Some(p) = rd(&self.inner).as_ref().and_then(|p| p.get(slot)) {
                 p.spk.flush_consumer();
             }
         }
 
-        /// Installs a freshly handshaked pair. Dropping whatever was there
+        /// Installs a freshly handshaked set. Dropping whatever was there
         /// unmaps it, and the write lock is what makes that safe.
-        fn attach(&self, spk: RingMem, mic: RingMem) {
-            *wr(&self.inner) = Some(RingPair { spk, mic });
+        fn attach(&self, pairs: Vec<RingPair>) {
+            *wr(&self.inner) = Some(pairs.into_boxed_slice());
         }
 
         fn detach(&self) {
@@ -1107,12 +1485,16 @@ mod platform {
             stop: AtomicBool::new(false),
             driver_found: AtomicBool::new(first_port.is_some()),
             driver_connected: AtomicBool::new(false),
-            spk_frames: AtomicU64::new(0),
-            mic_frames: AtomicU64::new(0),
-            mic_dropped: AtomicU64::new(0),
+            slots: std::array::from_fn(|_| SlotShared::new()),
             last_driver_msg: Mutex::new(None),
             events: Mutex::new(Vec::new()),
-            spk_flush: AtomicBool::new(false),
+            spk_flush: AtomicU16::new(0),
+            published: AtomicU16::new(0),
+            session_id: AtomicU64::new(0),
+            attach_epoch: AtomicU64::new(0),
+            slot_count: AtomicU32::new(0),
+            driver_protocol: AtomicU32::new(0),
+            status_reason: Mutex::new(Some("no driver attached yet".to_string())),
             rings: Rings::new(),
             driver_port: Mutex::new(MACH_PORT_NULL),
             superseded: AtomicBool::new(false),
@@ -1170,10 +1552,20 @@ mod platform {
     }
 
     /// Receive buffer sized for the largest message plus the largest trailer.
-    /// Aligned to 8 because `ControlMsg` carries a u64 at offset 40 and reading
+    /// Aligned to 8 because `ControlMsg` carries a u64 at offset 48 and reading
     /// it out of a 1-aligned `[u8; N]` would be undefined behaviour.
+    ///
+    /// v2 SIZING, MEASURED. The reply this buffer has to hold went from 104 to
+    /// 472 bytes. `a_reply_that_does_not_fit_is_destroyed_rather_than_queued`
+    /// walks the receive size up one byte at a time against a real 472-byte
+    /// 32-descriptor message and finds the kernel refuses everything below 480
+    /// (472 + an 8-byte format-0 trailer) — and, because `MACH_RCV_LARGE` is
+    /// deliberately not requested, DESTROYS the message rather than leaving it
+    /// queued. The old 256 would therefore not have truncated a handshake, it
+    /// would have made every handshake time out with no diagnostic at either
+    /// end. 640 is 540 (472 + `MAX_TRAILER`) rounded up.
     const MAX_TRAILER: usize = 68;
-    const RCV_BUF: usize = 256;
+    const RCV_BUF: usize = 640;
 
     #[repr(C, align(8))]
     struct MsgBuf([u8; RCV_BUF]);
@@ -1236,9 +1628,12 @@ mod platform {
         let mut buf = MsgBuf::new();
         // The two things that ever land in this buffer. A message that does not
         // fit is discarded by the kernel (no MACH_RCV_LARGE), which would turn
-        // a handshake into a silent timeout.
+        // a handshake into a silent timeout. `BindMsg` is the same 472 bytes as
+        // the reply but travels the other way, so it is the DRIVER's buffer
+        // that has to hold it (AudioHubBridge.c's BridgeRcvBuf).
         const _: () = assert!(RCV_BUF >= std::mem::size_of::<HelloReply>() + MAX_TRAILER);
         const _: () = assert!(RCV_BUF >= std::mem::size_of::<ControlMsg>() + MAX_TRAILER);
+        const _: () = assert!(RCV_BUF >= std::mem::size_of::<HelloRequest>() + MAX_TRAILER);
         // Held between the look-up and the handshake so a failed handshake does
         // not throw away a perfectly good send right.
         let mut pending = first_port;
@@ -1288,7 +1683,7 @@ mod platform {
             if shared.driver_connected.load(Ordering::Relaxed) {
                 if now >= next_ping {
                     next_ping = now + PING_EVERY;
-                    let (kr, port) = send_to_driver(&shared, NOTIFY_PING, 0, 0.0, 0);
+                    let (kr, port) = send_to_driver(&shared, NOTIFY_PING, 0, 0.0, 0, 0);
                     match kr {
                         MACH_MSG_SUCCESS => send_timeouts = 0,
                         MACH_SEND_TIMED_OUT => {
@@ -1400,11 +1795,24 @@ mod platform {
                 *g = MACH_PORT_NULL;
             }
         }
-        // Outside the lock: detach unmaps both rings and blocks until the tx
+        // Outside the lock: detach unmaps every ring and blocks until the tx
         // engine and the mixer are out of them, and it must not do that while
         // holding a lock the sending threads also take. From here read_spk
         // yields silence and write_mic reports "no ring" — driverless behaviour.
         shared.rings.detach();
+        shared.slot_count.store(0, Ordering::Relaxed);
+        shared.published.store(0, Ordering::Relaxed);
+        // The BINDINGS survive on the driver's side (spec-m5b §4.4: disconnect
+        // unpublishes the rings and keeps every binding), so the devices stay
+        // in the system list and go silent. What does NOT survive is our right
+        // to speak about a slot: the generations are re-established by the
+        // BindState answers to the full re-Set the coordinator sends after the
+        // next handshake.
+        for c in shared.slots.iter() {
+            c.generation.store(0, Ordering::Relaxed);
+        }
+        *lk(&shared.status_reason) = Some(format!("driver_gone: {why}"));
+        shared.push_event(HalControlEvent::Detached);
         dlog!("[audiohubd] HAL driver gone ({why}); virtual devices are on their own");
     }
 
@@ -1481,7 +1889,30 @@ mod platform {
         let size = unsafe { (*hdr).size } as usize;
         if id != MSG_HELLO_REPLY || size < std::mem::size_of::<HelloReply>() {
             unsafe { mach_msg_destroy(hdr) };
-            anyhow::bail!("unexpected reply id {id:#x} size {size}");
+            // A v1 driver answers with the RIGHT id and the OLD size, so the
+            // size check fires before anything reads `protocol_version` and the
+            // careful "it speaks v1, we speak v2" message below is unreachable.
+            // Left generic, this prints `unexpected reply id 0x41480002 size
+            // 104` — accurate, and useless: it is the same shape as the
+            // `0x47 size 24` line that once cost hours. An installed driver
+            // that predates the protocol is the ONE cause a user can act on,
+            // so it gets named here rather than diagnosed later.
+            if id == MSG_HELLO_REPLY && size == HELLO_REPLY_V1_SIZE {
+                // The UI's three-state driver hint keys off this exact string
+                // (spec-m5b §6.2): "installed but talking a protocol this
+                // daemon cannot parse" is a reinstall, not a transient.
+                *lk(&shared.status_reason) = Some(REASON_PROTOCOL_MISMATCH.to_string());
+                shared.driver_protocol.store(1, Ordering::Relaxed);
+                anyhow::bail!(
+                    "the installed HAL driver speaks protocol v1, this daemon speaks \
+                     v{PROTOCOL_VERSION} — reinstall the driver \
+                     (drivers/macos-hal/install.sh), the virtual devices stay silent until you do"
+                );
+            }
+            anyhow::bail!(
+                "unexpected reply id {id:#x} size {size} (expected id {MSG_HELLO_REPLY:#x} size {})",
+                std::mem::size_of::<HelloReply>()
+            );
         }
         // SAFETY: shape checked above; MsgBuf is 8-aligned.
         let rep = unsafe { *(hdr as *const HelloReply) };
@@ -1494,69 +1925,132 @@ mod platform {
         // and it is a no-op on a plain message.
         if rep.status != STATUS_OK {
             unsafe { mach_msg_destroy(hdr) };
+            shared.driver_protocol.store(rep.protocol_version, Ordering::Relaxed);
             let why = match rep.status {
-                STATUS_BAD_VERSION => format!(
-                    "protocol mismatch: it speaks v{}, we speak v{PROTOCOL_VERSION}",
-                    rep.protocol_version
-                ),
-                STATUS_NO_MEMORY => "it could not create the shared rings".to_string(),
-                s => format!("status {s}"),
+                STATUS_BAD_VERSION => {
+                    *lk(&shared.status_reason) = Some(REASON_PROTOCOL_MISMATCH.to_string());
+                    format!(
+                        "protocol mismatch: it speaks v{}, we speak v{PROTOCOL_VERSION}",
+                        rep.protocol_version
+                    )
+                }
+                STATUS_NO_MEMORY => {
+                    *lk(&shared.status_reason) =
+                        Some("driver_out_of_memory".to_string());
+                    "it could not create the shared rings".to_string()
+                }
+                s => {
+                    *lk(&shared.status_reason) = Some(format!("driver_refused_{s}"));
+                    format!("status {s}")
+                }
             };
             anyhow::bail!("driver refused the handshake: {why}");
         }
-        if !complex || rep.body.descriptor_count != 2 {
+        // `slot_count` is checked BEFORE the descriptor count it predicts, so a
+        // driver that claims sixteen slots and sends two descriptors is named
+        // as such instead of being read as a two-slot driver. The reply is
+        // fixed-length whatever the count: only `2 * slot_count` of the 32
+        // descriptor words are populated and the rest are zero, so attaching
+        // more than that would hand `mach_vm_map` a null name.
+        if rep.slot_count == 0 || rep.slot_count as usize > HAL_MAX_SLOTS {
             unsafe { mach_msg_destroy(hdr) };
             anyhow::bail!(
-                "driver reported OK but sent {} descriptors (complex={complex}); expected the two ring entries",
-                rep.body.descriptor_count
+                "driver reported OK with slot_count {} (this daemon supports 1..={HAL_MAX_SLOTS})",
+                rep.slot_count
+            );
+        }
+        if !complex || rep.body.descriptor_count != 2 * rep.slot_count {
+            unsafe { mach_msg_destroy(hdr) };
+            anyhow::bail!(
+                "driver reported OK with slot_count {} but sent {} descriptors (complex={complex}); \
+                 expected {}",
+                rep.slot_count,
+                rep.body.descriptor_count,
+                2 * rep.slot_count
             );
         }
 
-        // From here the two entry names are ours, so disposal moves from
-        // mach_msg_destroy to the RingMem that owns each one.
-        let spk = RingMem::attach(
-            rep.spk_entry.name,
-            RingGeom {
-                channels: rep.spk_channels,
-                sample_rate: rep.spk_sample_rate,
-                capacity_frames: rep.spk_capacity_frames,
-                data_offset: rep.data_offset,
-                bytes: rep.spk_bytes,
-            },
-            HAL_SPK_CHANNELS,
-            "speaker",
-        );
-        let mic = RingMem::attach(
-            rep.mic_entry.name,
-            RingGeom {
-                channels: rep.mic_channels,
-                sample_rate: rep.mic_sample_rate,
-                capacity_frames: rep.mic_capacity_frames,
-                data_offset: rep.data_offset,
-                bytes: rep.mic_bytes,
-            },
-            HAL_MIC_CHANNELS,
-            "microphone",
-        );
-        // Both attaches are ATTEMPTED before either error propagates: taking
-        // ownership of one entry and returning early on the other would leak a
-        // mach port every time a mismatched driver retried.
-        let spk = spk?;
-        let mic = mic?;
+        // From here every entry name is ours, so disposal moves from
+        // mach_msg_destroy to the RingMem that owns each one. EVERY attach is
+        // ATTEMPTED before any error propagates: taking ownership of thirty
+        // entries and returning early on the thirty-first would leak thirty
+        // mach ports every time a mismatched driver retried, and the port name
+        // space is the one resource coreaudiod cannot be restarted to reclaim.
+        let n = rep.slot_count as usize;
+        let mut attached: Vec<Result<RingPair>> = Vec::with_capacity(n);
+        for slot in 0..n {
+            let spk = RingMem::attach(
+                rep.entries[endpoint(slot, DIR_OUT) as usize].name,
+                RingGeom {
+                    channels: rep.spk_channels,
+                    sample_rate: rep.sample_rate,
+                    capacity_frames: rep.spk_capacity_frames,
+                    data_offset: rep.data_offset,
+                    bytes: rep.spk_bytes,
+                },
+                HAL_SPK_CHANNELS,
+                "speaker",
+            );
+            let mic = RingMem::attach(
+                rep.entries[endpoint(slot, DIR_IN) as usize].name,
+                RingGeom {
+                    channels: rep.mic_channels,
+                    sample_rate: rep.sample_rate,
+                    capacity_frames: rep.mic_capacity_frames,
+                    data_offset: rep.data_offset,
+                    bytes: rep.mic_bytes,
+                },
+                HAL_MIC_CHANNELS,
+                "microphone",
+            );
+            attached.push(match (spk, mic) {
+                (Ok(spk), Ok(mic)) => Ok(RingPair { spk, mic }),
+                (Err(e), _) | (Ok(_), Err(e)) => {
+                    Err(e.context(format!("slot {slot}")))
+                }
+            });
+        }
+        let mut pairs = Vec::with_capacity(n);
+        let mut first_err: Option<anyhow::Error> = None;
+        for r in attached {
+            match r {
+                Ok(p) => pairs.push(p),
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            // `pairs` unmaps here: a partial attach is not a bridge, and
+            // leaving half a driver mapped would make the next handshake's
+            // rings disagree with the slots the coordinator then binds.
+            return Err(e);
+        }
 
-        // The driver rewound both rings before it replied and publishes them
+        // The driver rewound every ring before it replied and publishes them
         // only after, so nothing stale can be in there. The flush is still
         // armed for the gap between here and the tx engine's first read, which
         // is unbounded — a session opened a minute later must start at live
         // audio, not half a second behind it. Only the consumer may move
         // read_idx, hence a flag for the reading thread rather than a call.
         // Attach BEFORE arming the flush. The other order has a window in which
-        // a tx tick swaps the flag to false and flushes a ring that is still
-        // None — the flag is consumed, the backlog is never dropped, and the
-        // session keeps the extra latency the flush exists to remove. This way
-        // at worst one tick reads before the flush and the next one performs it.
-        shared.rings.attach(spk, mic);
-        shared.spk_flush.store(true, Ordering::Release);
+        // a tx tick clears the bit and flushes a ring that is still None — the
+        // bit is consumed, the backlog is never dropped, and the session keeps
+        // the extra latency the flush exists to remove. This way at worst one
+        // tick reads before the flush and the next one performs it.
+        shared.rings.attach(pairs);
+        shared.spk_flush.store(u16::MAX, Ordering::Release);
+        shared.slot_count.store(rep.slot_count, Ordering::Relaxed);
+        shared.session_id.store(rep.session_id, Ordering::Relaxed);
+        shared.driver_protocol.store(rep.protocol_version, Ordering::Relaxed);
+        *lk(&shared.status_reason) = None;
+        // Bumped LAST: a coordinator that sees the new epoch must find a
+        // session id and rings it can actually use in the same instant.
+        shared.attach_epoch.fetch_add(1, Ordering::AcqRel);
+        shared.push_event(HalControlEvent::Attached {
+            session_id: rep.session_id,
+            slot_count: rep.slot_count as u8,
+        });
         *lk(&shared.last_driver_msg) = None;
         Ok(())
     }
@@ -1582,21 +2076,71 @@ mod platform {
         }
         *lk(&shared.last_driver_msg) = Some(Instant::now());
         match msg.op {
-            CTL_VOLUME => {
-                let scalar = f32::from_bits(msg.scalar_bits);
-                if !scalar.is_finite() {
+            // BindState is the ONE message that is not generation-filtered:
+            // it is what ESTABLISHES the generation everything else is then
+            // filtered against (spec-m5b §4.6).
+            CTL_BIND_STATE => {
+                let slot = endpoint_slot(msg.endpoint);
+                let Some(state) = HalSlotState::from_wire(msg.scalar_bits) else {
+                    dlog!(
+                        "[audiohubd] hal: slot {slot} reported unknown state {}",
+                        msg.scalar_bits
+                    );
                     return;
+                };
+                let Some(c) = shared.slots.get(slot) else { return };
+                let prev = c.generation.swap(msg.generation, Ordering::AcqRel);
+                if prev != msg.generation {
+                    // The slot was reused (or first bound). The driver resets a
+                    // ring only while it is unpublished and cannot know where
+                    // OUR read_idx stands, so a consumer that does not jump to
+                    // write_idx here computes a half-second backlog out of a
+                    // wrapping subtraction and replays the PREVIOUS peer's
+                    // audio to the new one (spec-m5b §4.6, regression N16).
+                    shared.arm_flush(slot as u8);
                 }
-                shared.push_event(HalControlEvent::Volume {
-                    device: HalDevice::from_wire(msg.device),
-                    scalar: scalar.clamp(0.0, 1.0),
-                    muted: msg.flags & FLAG_MUTED != 0,
+                shared.push_event(HalControlEvent::BindState {
+                    slot: slot as u8,
+                    generation: msg.generation,
+                    state,
                 });
             }
-            CTL_IO_STATE => shared.push_event(HalControlEvent::IoState {
-                device: HalDevice::from_wire(msg.device),
-                running: msg.flags & FLAG_IO_RUNNING != 0,
-            }),
+            CTL_VOLUME | CTL_IO_STATE => {
+                let Some(at) = HalEndpoint::from_wire(msg.endpoint) else { return };
+                let Some(c) = shared.slots.get(at.slot as usize) else { return };
+                let want = c.generation.load(Ordering::Acquire);
+                if want == 0 || msg.generation != want {
+                    // A late StopIO from the slot's previous tenant, or a
+                    // volume event that crossed a re-bind. Applying it would
+                    // light up the NEXT peer's microphone indicator out of
+                    // nowhere, or move a stranger's volume.
+                    dlog!(
+                        "[audiohubd] hal: dropping op {} for slot {} at generation {} (current {want})",
+                        msg.op,
+                        at.slot,
+                        msg.generation
+                    );
+                    return;
+                }
+                if msg.op == CTL_VOLUME {
+                    let scalar = f32::from_bits(msg.scalar_bits);
+                    if !scalar.is_finite() {
+                        return;
+                    }
+                    shared.push_event(HalControlEvent::Volume {
+                        at,
+                        generation: msg.generation,
+                        scalar: scalar.clamp(0.0, 1.0),
+                        muted: msg.flags & FLAG_MUTED != 0,
+                    });
+                } else {
+                    shared.push_event(HalControlEvent::IoState {
+                        at,
+                        generation: msg.generation,
+                        running: msg.flags & FLAG_IO_RUNNING != 0,
+                    });
+                }
+            }
             CTL_HEARTBEAT => {}
             _ => {}
         }
@@ -1608,9 +2152,10 @@ mod platform {
     fn send_to_driver(
         shared: &Shared,
         op: u32,
-        device: u32,
+        endpoint: u32,
         scalar: f32,
         flags: u32,
+        generation: u32,
     ) -> (KernReturn, MachPort) {
         let g = lk(&shared.driver_port);
         if *g == MACH_PORT_NULL {
@@ -1627,9 +2172,14 @@ mod platform {
                 id: MSG_NOTIFY,
             },
             op,
-            device,
+            endpoint,
             scalar_bits: scalar.to_bits(),
             flags,
+            // 0 is the wire's "concerns no slot", which is what a Ping is; a
+            // Volume notify carries the slot's current stamp so the driver can
+            // refuse one that crossed a re-bind (spec-m5b §4.6).
+            generation,
+            reserved: 0,
             seq: 0,
         };
         let kr = unsafe {
@@ -1647,19 +2197,118 @@ mod platform {
         (kr, port)
     }
 
-    pub fn send_notify(shared: &Shared, device: HalDevice, scalar: f32, muted: bool) {
+    pub fn send_notify(
+        shared: &Shared,
+        at: HalEndpoint,
+        generation: u32,
+        scalar: f32,
+        muted: bool,
+    ) {
         let (kr, port) = send_to_driver(
             shared,
             NOTIFY_VOLUME,
-            device.to_wire(),
+            at.to_wire(),
             scalar.clamp(0.0, 1.0),
             if muted { FLAG_MUTED } else { 0 },
+            generation,
         );
         // A dead port is definitive; a full queue is not. Only the former ends
         // the session, and the service loop then goes back to looking up.
         if kr != MACH_MSG_SUCCESS && kr != MACH_SEND_TIMED_OUT {
             disconnect_port(shared, port, "volume relay found its port dead");
         }
+    }
+
+    /// Copies `s` into a fixed `char[N]` and guarantees the NUL. The driver
+    /// terminates what it receives too (spec-m5b §4.5: neither end trusts the
+    /// sender's terminator) — this is the sending half of the same rule, and it
+    /// truncates on a CHARACTER boundary so a multi-byte name can never arrive
+    /// as invalid UTF-8, which the driver rejects the whole message over.
+    fn fixed_cstr<const N: usize>(s: &str) -> [u8; N] {
+        let mut out = [0u8; N];
+        let mut end = s.len().min(N - 1);
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        out[..end].copy_from_slice(&s.as_bytes()[..end]);
+        out
+    }
+
+    fn send_bind(shared: &Shared, mut msg: BindMsg) -> bool {
+        let g = lk(&shared.driver_port);
+        if *g == MACH_PORT_NULL {
+            return false;
+        }
+        let port = *g;
+        msg.header = MsgHeader {
+            bits: msgh_bits(MACH_MSG_TYPE_COPY_SEND, 0),
+            size: std::mem::size_of::<BindMsg>() as u32,
+            remote: port,
+            local: MACH_PORT_NULL,
+            voucher: MACH_PORT_NULL,
+            id: MSG_BIND,
+        };
+        msg.session_id = shared.session_id.load(Ordering::Relaxed);
+        let kr = unsafe {
+            mach_msg(
+                &mut msg.header,
+                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                std::mem::size_of::<BindMsg>() as u32,
+                0,
+                MACH_PORT_NULL,
+                SEND_TIMEOUT_MS,
+                MACH_PORT_NULL,
+            )
+        };
+        drop(g);
+        if kr != MACH_MSG_SUCCESS && kr != MACH_SEND_TIMED_OUT {
+            disconnect_port(shared, port, "bind found its port dead");
+            return false;
+        }
+        // A full queue is NOT success: the coordinator is closed-loop and will
+        // re-send on its next tick, which is exactly the recovery a dropped
+        // Bind needs.
+        kr == MACH_MSG_SUCCESS
+    }
+
+    pub fn send_bind_set(shared: &Shared, req: &HalBindRequest) -> bool {
+        send_bind(
+            shared,
+            BindMsg {
+                header: MsgHeader::default(),
+                op: BIND_SET,
+                slot: req.slot as u32,
+                flags: if req.online { 1 } else { 0 },
+                // Set carries 0: the DRIVER allocates the generation and
+                // reports it back in the BindState this message provokes.
+                generation: 0,
+                session_id: 0, // stamped by send_bind under the port lock
+                peer_key: fixed_cstr(&req.peer_key),
+                out_uid: fixed_cstr(&req.out_uid),
+                in_uid: fixed_cstr(&req.in_uid),
+                out_name: fixed_cstr(&req.out_name),
+                in_name: fixed_cstr(&req.in_name),
+            },
+        )
+    }
+
+    pub fn send_bind_clear(shared: &Shared, slot: u8, generation: u32) -> bool {
+        send_bind(
+            shared,
+            BindMsg {
+                header: MsgHeader::default(),
+                op: BIND_CLEAR,
+                slot: slot as u32,
+                flags: 0,
+                generation,
+                session_id: 0,
+                peer_key: [0; 40],
+                out_uid: [0; 64],
+                in_uid: [0; 64],
+                out_name: [0; 128],
+                in_name: [0; 128],
+            },
+        )
     }
 
     // Every expectation below is the OBSERVED output of the C implementation in
@@ -1769,7 +2418,12 @@ mod platform {
             let ds = FakeDriverRing::new(HAL_SPK_CHANNELS, HAL_SPK_BYTES);
             let dm = FakeDriverRing::new(HAL_MIC_CHANNELS, HAL_MIC_BYTES);
             let r = Rings::new();
-            r.attach(attach_ring(&ds, HAL_SPK_CHANNELS), attach_ring(&dm, HAL_MIC_CHANNELS));
+            // A one-slot set: every per-slot assertion below is about slot 0,
+            // and the multi-slot fan-out is `rings_route_each_slot_to_its_own_pair`.
+            r.attach(vec![RingPair {
+                spk: attach_ring(&ds, HAL_SPK_CHANNELS),
+                mic: attach_ring(&dm, HAL_MIC_CHANNELS),
+            }]);
             (ds, dm, r)
         }
 
@@ -1785,6 +2439,280 @@ mod platform {
             assert_eq!(HAL_RING_FRAMES, 24_000);
             assert_eq!(HAL_RING_DATA_OFFSET, 64);
             assert_eq!(std::mem::size_of::<RingHeader>(), 40);
+
+            // v2 message sizes (spec-m5b §4.2). The `const _` block beside the
+            // struct definitions asserts these at compile time; restating them
+            // here is what makes a deliberate contract change show up as a
+            // NAMED test failure rather than as a wall of const-eval errors.
+            assert_eq!(PROTOCOL_VERSION, 2);
+            assert_eq!(std::mem::size_of::<HelloRequest>(), 48);
+            assert_eq!(std::mem::size_of::<HelloReply>(), 472);
+            assert_eq!(std::mem::size_of::<ControlMsg>(), 56);
+            assert_eq!(std::mem::size_of::<BindMsg>(), 472);
+            assert_eq!(HAL_MAX_SLOTS, 16);
+            assert_eq!(HAL_MAX_ENDPOINTS, 32);
+        }
+
+        // ---- v2 wire round trips ------------------------------------------
+        //
+        // One round trip per message shape (spec-m5b §7 step 2). Each one does
+        // TWO things, and the second is the one that matters: it reads every
+        // field back at the ABSOLUTE byte offset AudioHubBridge.h names for it.
+        // A pure encode/decode round trip only proves this file agrees with
+        // itself — a struct with a padding word the C side does not have would
+        // pass it and still put `session_id` four bytes off, which is a
+        // disagreement neither side's build can see alone. Every field also
+        // gets a distinct sentinel, so two swapped fields of the same width are
+        // a failure rather than a coincidence.
+
+        /// A message as `mach_msg` leaves it in a receive buffer: an 8-aligned
+        /// byte blob with no Rust type over it.
+        struct Wire(Vec<u64>);
+
+        impl Wire {
+            fn of<T: Copy>(v: &T) -> Wire {
+                let mut w = Wire(vec![0u64; std::mem::size_of::<T>().div_ceil(8)]);
+                // SAFETY: the destination is 8-aligned and at least
+                // size_of::<T>() bytes; T is Copy and repr(C), so these are the
+                // bytes the kernel would carry.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        v as *const T as *const u8,
+                        w.0.as_mut_ptr() as *mut u8,
+                        std::mem::size_of::<T>(),
+                    );
+                }
+                w
+            }
+            /// The same pointer cast `handshake` and `handle_control` use.
+            fn back<T: Copy>(&self) -> T {
+                unsafe { *(self.0.as_ptr() as *const T) }
+            }
+            fn at(&self, off: usize) -> *const u8 {
+                unsafe { (self.0.as_ptr() as *const u8).add(off) }
+            }
+            fn u32_at(&self, off: usize) -> u32 {
+                unsafe { *(self.at(off) as *const u32) }
+            }
+            fn u64_at(&self, off: usize) -> u64 {
+                unsafe { *(self.at(off) as *const u64) }
+            }
+            fn bytes_at(&self, off: usize, len: usize) -> &[u8] {
+                unsafe { std::slice::from_raw_parts(self.at(off), len) }
+            }
+        }
+
+        /// A `char[N]` field: copied in, NOT terminated by us. Both ends
+        /// terminate what they receive themselves (spec-m5b §4.5), so a test
+        /// helper that quietly guaranteed a NUL would be testing a promise the
+        /// wire does not make.
+        fn fixed<const N: usize>(s: &str) -> [u8; N] {
+            let mut out = [0u8; N];
+            let n = s.len().min(N);
+            out[..n].copy_from_slice(&s.as_bytes()[..n]);
+            out
+        }
+
+        #[test]
+        fn a_hello_reply_round_trips_at_the_offsets_the_header_names() {
+            let mut sent = HelloReply {
+                header: MsgHeader {
+                    bits: msgh_bits(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX,
+                    size: std::mem::size_of::<HelloReply>() as u32,
+                    remote: 0x0101,
+                    local: MACH_PORT_NULL,
+                    voucher: MACH_PORT_NULL,
+                    id: MSG_HELLO_REPLY,
+                },
+                body: MsgBody { descriptor_count: HAL_MAX_ENDPOINTS as u32 },
+                entries: [PortDescriptor::default(); HAL_MAX_ENDPOINTS],
+                status: STATUS_OK,
+                protocol_version: PROTOCOL_VERSION,
+                slot_count: HAL_MAX_SLOTS as u32,
+                data_offset: HAL_RING_DATA_OFFSET as u32,
+                spk_capacity_frames: HAL_RING_FRAMES,
+                spk_channels: HAL_SPK_CHANNELS,
+                mic_capacity_frames: HAL_RING_FRAMES,
+                mic_channels: HAL_MIC_CHANNELS,
+                sample_rate: HAL_SAMPLE_RATE,
+                session_id: 0x0102_0304_0506_0708,
+                spk_bytes: HAL_SPK_BYTES as u64,
+                mic_bytes: HAL_MIC_BYTES as u64,
+            };
+            // A distinct name per endpoint: an array that arrived reordered, or
+            // collapsed onto one descriptor, has to be visible here. 0x2000+i
+            // rather than i so a zeroed slot cannot pass as slot 0.
+            for (i, e) in sent.entries.iter_mut().enumerate() {
+                *e = PortDescriptor {
+                    name: 0x2000 + i as u32,
+                    pad1: 0,
+                    pad2: 0,
+                    disposition: MACH_MSG_TYPE_COPY_SEND as u8,
+                    dtype: MACH_MSG_PORT_DESCRIPTOR,
+                };
+            }
+
+            let wire = Wire::of(&sent);
+            let got: HelloReply = wire.back();
+
+            assert_eq!(got.header.bits, sent.header.bits);
+            assert_eq!(got.header.size, 472);
+            assert_eq!(got.header.remote, sent.header.remote);
+            assert_eq!(got.header.id, MSG_HELLO_REPLY);
+            assert_eq!(got.body.descriptor_count, 32);
+            for i in 0..HAL_MAX_ENDPOINTS {
+                assert_eq!(got.entries[i].name, 0x2000 + i as u32, "entry {i} moved");
+                assert_eq!(got.entries[i].disposition, MACH_MSG_TYPE_COPY_SEND as u8);
+                assert_eq!(got.entries[i].dtype, MACH_MSG_PORT_DESCRIPTOR);
+            }
+            assert_eq!(got.status, STATUS_OK);
+            assert_eq!(got.protocol_version, 2);
+            assert_eq!(got.slot_count, 16);
+            assert_eq!(got.data_offset, 64);
+            assert_eq!(got.spk_capacity_frames, HAL_RING_FRAMES);
+            assert_eq!(got.spk_channels, HAL_SPK_CHANNELS);
+            assert_eq!(got.mic_capacity_frames, HAL_RING_FRAMES);
+            assert_eq!(got.mic_channels, HAL_MIC_CHANNELS);
+            assert_eq!(got.sample_rate, HAL_SAMPLE_RATE);
+            assert_eq!(got.session_id, 0x0102_0304_0506_0708);
+            assert_eq!(got.spk_bytes, HAL_SPK_BYTES as u64);
+            assert_eq!(got.mic_bytes, HAL_MIC_BYTES as u64);
+
+            // AudioHubBridge.h's _Static_asserts, read off the wire.
+            assert_eq!(wire.u32_at(24), 32, "body.descriptor_count @24");
+            assert_eq!(wire.u32_at(28), 0x2000, "entries @28");
+            assert_eq!(wire.u32_at(28 + 31 * 12), 0x2000 + 31, "the last entry ends at 412");
+            assert_eq!(wire.u32_at(412), STATUS_OK, "status @412");
+            assert_eq!(wire.u32_at(416), 2, "protocol_version @416");
+            assert_eq!(wire.u32_at(420), 16, "slot_count @420");
+            assert_eq!(wire.u32_at(424), 64, "data_offset @424");
+            assert_eq!(wire.u32_at(444), HAL_SAMPLE_RATE, "sample_rate @444");
+            // The padding trap: nine u32 from 412 land session_id on 448. Ten
+            // or eight would put four bytes of compiler padding here and every
+            // number below would be read from the wrong place.
+            assert_eq!(wire.u64_at(448), 0x0102_0304_0506_0708, "session_id @448");
+            assert_eq!(wire.u64_at(456), HAL_SPK_BYTES as u64, "spk_bytes @456");
+            assert_eq!(wire.u64_at(464), HAL_MIC_BYTES as u64, "mic_bytes @464");
+        }
+
+        #[test]
+        fn a_control_message_round_trips_at_the_offsets_the_header_names() {
+            // The driver->daemon direction (Control) and the daemon->driver one
+            // (Notify) are the SAME 56 bytes with a different msgh_id, so both
+            // ids go through the identical layout check here.
+            for (id, op) in [(MSG_CONTROL, CTL_IO_STATE), (MSG_NOTIFY, NOTIFY_VOLUME)] {
+                let sent = ControlMsg {
+                    header: MsgHeader {
+                        bits: msgh_bits(MACH_MSG_TYPE_COPY_SEND, 0),
+                        size: std::mem::size_of::<ControlMsg>() as u32,
+                        remote: 0x0303,
+                        local: MACH_PORT_NULL,
+                        voucher: MACH_PORT_NULL,
+                        id,
+                    },
+                    op,
+                    // Slot 7's input, i.e. 15 — a value that is neither 0 nor 1,
+                    // so a receiver still reading a one-bit device selector
+                    // cannot accidentally agree with us.
+                    endpoint: endpoint(7, DIR_IN),
+                    scalar_bits: 0.75f32.to_bits(),
+                    flags: FLAG_MUTED | FLAG_IO_RUNNING | FLAG_IS_INPUT,
+                    generation: 0xABCD_1234,
+                    reserved: 0,
+                    seq: 0x1122_3344_5566_7788,
+                };
+
+                let wire = Wire::of(&sent);
+                let got: ControlMsg = wire.back();
+
+                assert_eq!(got.header.id, id);
+                assert_eq!(got.header.size, 56);
+                assert_eq!(got.op, op);
+                assert_eq!(got.endpoint, 15);
+                assert_eq!(endpoint_slot(got.endpoint), 7);
+                assert_eq!(endpoint_dir(got.endpoint), DIR_IN);
+                assert_eq!(f32::from_bits(got.scalar_bits), 0.75);
+                assert_eq!(got.flags, 0x7);
+                assert_eq!(got.generation, 0xABCD_1234);
+                assert_eq!(got.reserved, 0);
+                assert_eq!(got.seq, 0x1122_3344_5566_7788);
+
+                assert_eq!(wire.u32_at(24), op, "op @24");
+                assert_eq!(wire.u32_at(28), 15, "endpoint @28");
+                assert_eq!(wire.u32_at(32), 0.75f32.to_bits(), "scalar_bits @32");
+                assert_eq!(wire.u32_at(36), 0x7, "flags @36");
+                assert_eq!(wire.u32_at(40), 0xABCD_1234, "generation @40");
+                assert_eq!(wire.u32_at(44), 0, "reserved @44 must be MBZ");
+                // v1 read `seq` at 40. Two new u32 moved it to 48, and this is
+                // the assertion that says so out loud.
+                assert_eq!(wire.u64_at(48), 0x1122_3344_5566_7788, "seq @48");
+            }
+        }
+
+        #[test]
+        fn a_bind_message_round_trips_at_the_offsets_the_header_names() {
+            let sent = BindMsg {
+                header: MsgHeader {
+                    bits: msgh_bits(MACH_MSG_TYPE_COPY_SEND, 0),
+                    size: std::mem::size_of::<BindMsg>() as u32,
+                    remote: 0x0404,
+                    local: MACH_PORT_NULL,
+                    voucher: MACH_PORT_NULL,
+                    id: MSG_BIND,
+                },
+                op: BIND_SET,
+                slot: 9,
+                flags: 0x1,
+                generation: 0,
+                session_id: 0x0A0B_0C0D_0E0F_1011,
+                peer_key: fixed("fp-0123456789abcdef"),
+                out_uid: fixed("AudioHub:fp-0123456789abcdef:out"),
+                in_uid: fixed("AudioHub:fp-0123456789abcdef:in"),
+                out_name: fixed("Living Room Mac Speaker"),
+                in_name: fixed("Living Room Mac Microphone"),
+            };
+
+            let wire = Wire::of(&sent);
+            let got: BindMsg = wire.back();
+
+            assert_eq!(got.header.id, MSG_BIND);
+            assert_eq!(got.header.size, 472);
+            assert_eq!(got.op, BIND_SET);
+            assert_eq!(got.slot, 9);
+            assert_eq!(got.flags, 0x1);
+            assert_eq!(got.generation, 0);
+            assert_eq!(got.session_id, 0x0A0B_0C0D_0E0F_1011);
+            assert_eq!(got.peer_key, sent.peer_key);
+            assert_eq!(got.out_uid, sent.out_uid);
+            assert_eq!(got.in_uid, sent.in_uid);
+            assert_eq!(got.out_name, sent.out_name);
+            assert_eq!(got.in_name, sent.in_name);
+
+            assert_eq!(wire.u32_at(24), BIND_SET, "op @24");
+            assert_eq!(wire.u32_at(28), 9, "slot @28");
+            assert_eq!(wire.u32_at(32), 0x1, "flags @32");
+            assert_eq!(wire.u32_at(36), 0, "generation @36");
+            assert_eq!(wire.u64_at(40), 0x0A0B_0C0D_0E0F_1011, "session_id @40");
+            // The five char arrays, each read at its own offset: a size that is
+            // right while two of them are transposed is exactly the drift the
+            // absolute offsets exist to catch, and the uids are the field the
+            // driver turns into a system device UID.
+            assert_eq!(wire.bytes_at(48, 40), &sent.peer_key[..], "peer_key @48");
+            assert_eq!(wire.bytes_at(88, 64), &sent.out_uid[..], "out_uid @88");
+            assert_eq!(wire.bytes_at(152, 64), &sent.in_uid[..], "in_uid @152");
+            assert_eq!(wire.bytes_at(216, 128), &sent.out_name[..], "out_name @216");
+            assert_eq!(wire.bytes_at(344, 128), &sent.in_name[..], "in_name @344");
+            assert_eq!(
+                std::mem::size_of::<BindMsg>(),
+                344 + 128,
+                "in_name is the last field; anything after it is padding the C side lacks"
+            );
+
+            // Unterminated on purpose: `out_uid` fills 32 of 64 bytes here, and
+            // a sender that filled all 64 would arrive without a NUL at all.
+            // That is why the receiving side terminates rather than trusting.
+            assert_eq!(&got.out_uid[..32], b"AudioHub:fp-0123456789abcdef:out");
+            assert_eq!(got.out_uid[32], 0);
         }
 
         #[test]
@@ -1925,7 +2853,7 @@ mod platform {
             assert_eq!(spk.write(&stereo, 3), 3);
             let shared = test_shared(rings);
             let mut out = Vec::new();
-            assert_eq!(shared.append_spk_frame(&mut out), 3);
+            assert_eq!(shared.append_spk_frame(0, &mut out), 3);
             assert_eq!(out.len(), HAL_FRAME_48K);
             assert_eq!(&out[..3], &[0.5, 0.5, 0.5]);
             assert!(out[3..].iter().all(|s| *s == 0.0), "underrun must be silence");
@@ -1938,9 +2866,9 @@ mod platform {
             dm.hdr().read_idx.store(0, Ordering::Relaxed);
             let shared = test_shared(rings);
             let mono: Vec<f32> = (1..=10).map(|i| i as f32).collect();
-            assert_eq!(shared.write_mic(&mono), 3);
-            assert_eq!(shared.mic_frames.load(Ordering::Relaxed), 3);
-            assert_eq!(shared.mic_dropped.load(Ordering::Relaxed), 7);
+            assert_eq!(shared.write_mic(0, &mono), 3);
+            assert_eq!(shared.slots[0].mic_frames.load(Ordering::Relaxed), 3);
+            assert_eq!(shared.slots[0].mic_dropped.load(Ordering::Relaxed), 7);
         }
 
         /// With no driver there is no ring, and that is NOT a drop: mic_dropped
@@ -1950,12 +2878,16 @@ mod platform {
         fn a_detached_bridge_is_silent_and_counts_nothing() {
             let shared = test_shared(Rings::new());
             let mut out = Vec::new();
-            assert_eq!(shared.append_spk_frame(&mut out), 0);
+            assert_eq!(shared.append_spk_frame(0, &mut out), 0);
             assert_eq!(out.len(), HAL_FRAME_48K);
             assert!(out.iter().all(|s| *s == 0.0));
-            assert_eq!(shared.write_mic(&[0.5; 64]), 0);
-            assert_eq!(shared.mic_frames.load(Ordering::Relaxed), 0);
-            assert_eq!(shared.mic_dropped.load(Ordering::Relaxed), 0, "no ring is not a drop");
+            assert_eq!(shared.write_mic(0, &[0.5; 64]), 0);
+            assert_eq!(shared.slots[0].mic_frames.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                shared.slots[0].mic_dropped.load(Ordering::Relaxed),
+                0,
+                "no ring is not a drop"
+            );
         }
 
         fn test_shared(rings: Rings) -> Shared {
@@ -1963,14 +2895,19 @@ mod platform {
                 stop: AtomicBool::new(false),
                 driver_found: AtomicBool::new(false),
                 driver_connected: AtomicBool::new(false),
-                spk_frames: AtomicU64::new(0),
-                mic_frames: AtomicU64::new(0),
-                mic_dropped: AtomicU64::new(0),
+                slots: std::array::from_fn(|_| SlotShared::new()),
                 last_driver_msg: Mutex::new(None),
                 events: Mutex::new(Vec::new()),
-                spk_flush: AtomicBool::new(false),
+                spk_flush: AtomicU16::new(0),
+                published: AtomicU16::new(0),
+                session_id: AtomicU64::new(0),
+                attach_epoch: AtomicU64::new(0),
+                slot_count: AtomicU32::new(0),
+                driver_protocol: AtomicU32::new(0),
+                status_reason: Mutex::new(None),
                 rings,
                 driver_port: Mutex::new(MACH_PORT_NULL),
+                superseded: AtomicBool::new(false),
             }
         }
 
@@ -2009,6 +2946,97 @@ mod platform {
             }
         }
 
+        /// The routing property the whole per-peer design rests on: slot N's
+        /// audio goes to slot N's ring and nowhere else, in BOTH directions.
+        ///
+        /// An implementation that collapsed the set back to one pair would pass
+        /// every "did the audio arrive" test there is, and the only symptom
+        /// would be one peer hearing another's audio (regressions N1/N2).
+        #[test]
+        fn rings_route_each_slot_to_its_own_pair() {
+            const N: usize = 3;
+            let drivers: Vec<(FakeDriverRing, FakeDriverRing)> = (0..N)
+                .map(|_| {
+                    (
+                        FakeDriverRing::new(HAL_SPK_CHANNELS, HAL_SPK_BYTES),
+                        FakeDriverRing::new(HAL_MIC_CHANNELS, HAL_MIC_BYTES),
+                    )
+                })
+                .collect();
+            let rings = Rings::new();
+            rings.attach(
+                drivers
+                    .iter()
+                    .map(|(ds, dm)| RingPair {
+                        spk: attach_ring(ds, HAL_SPK_CHANNELS),
+                        mic: attach_ring(dm, HAL_MIC_CHANNELS),
+                    })
+                    .collect(),
+            );
+
+            // Each "driver" plays a distinct value into ITS speaker ring.
+            for (slot, (ds, _)) in drivers.iter().enumerate() {
+                let v = (slot + 1) as f32;
+                assert_eq!(attach_ring(ds, HAL_SPK_CHANNELS).write(&[v, v, v, v], 2), 2);
+            }
+            for slot in 0..N {
+                let mut out = [0.0f32; 4];
+                assert_eq!(rings.read_spk(slot, &mut out, 2), 2);
+                assert_eq!(
+                    out[0],
+                    (slot + 1) as f32,
+                    "slot {slot} read another slot's speaker audio"
+                );
+                // ...and reading it consumed nothing but its own: every slot
+                // still ahead of us in this loop must be untouched.
+                for other in (slot + 1)..N {
+                    assert_eq!(
+                        drivers[other].0.hdr().read_idx.load(Ordering::Relaxed),
+                        0,
+                        "reading slot {slot} moved slot {other}'s consumer index"
+                    );
+                }
+            }
+
+            // Microphone direction: what the daemon writes for one peer must
+            // reach that peer's ring only.
+            assert_eq!(rings.write_mic(1, &[0.5; 8]), Some(8));
+            for slot in 0..N {
+                let want = if slot == 1 { 8 } else { 0 };
+                assert_eq!(
+                    drivers[slot].1.hdr().write_idx.load(Ordering::Relaxed),
+                    want,
+                    "slot {slot} received microphone audio meant for slot 1"
+                );
+            }
+
+            // A slot beyond what this driver offers is silence and "no ring",
+            // never a panic and never somebody else's ring.
+            let mut out = [0.0f32; 4];
+            assert_eq!(rings.read_spk(N, &mut out, 2), 0);
+            assert_eq!(rings.write_mic(N, &[0.5; 8]), None);
+        }
+
+        /// The per-slot flush mask. A generation change on one slot must drop
+        /// THAT slot's backlog and leave every other consumer where it is —
+        /// a single flag would either flush all sixteen (dropping live audio on
+        /// fifteen innocent slots) or none (replaying the previous tenant's
+        /// half second to the new peer, spec-m5b §4.6).
+        #[test]
+        fn the_flush_mask_is_per_slot() {
+            let shared = test_shared(Rings::new());
+            shared.arm_flush(2);
+            shared.arm_flush(5);
+            assert!(!shared.take_flush(0));
+            assert!(shared.take_flush(2));
+            assert!(!shared.take_flush(2), "taking it consumes it");
+            assert!(shared.take_flush(5));
+            // Out of range is a no-op rather than a wrapped bit that would
+            // flush an unrelated slot.
+            shared.arm_flush(200);
+            assert_eq!(shared.spk_flush.load(Ordering::Relaxed), 0);
+        }
+
         /// A driver restart is a detach followed by an attach, any number of
         /// times. What this pins down is that the SECOND session reads the
         /// second driver's audio — a stale mapping surviving a detach would
@@ -2021,7 +3049,10 @@ mod platform {
             for gen in 1..=3u32 {
                 let ds = FakeDriverRing::new(HAL_SPK_CHANNELS, HAL_SPK_BYTES);
                 let dm = FakeDriverRing::new(HAL_MIC_CHANNELS, HAL_MIC_BYTES);
-                rings.attach(attach_ring(&ds, HAL_SPK_CHANNELS), attach_ring(&dm, HAL_MIC_CHANNELS));
+                rings.attach(vec![RingPair {
+                    spk: attach_ring(&ds, HAL_SPK_CHANNELS),
+                    mic: attach_ring(&dm, HAL_MIC_CHANNELS),
+                }]);
                 assert!(rings.attached());
 
                 // this generation's "driver" plays a tone the daemon must hear
@@ -2029,10 +3060,10 @@ mod platform {
                 let v = gen as f32;
                 assert_eq!(spk.write(&[v, v, v, v], 2), 2);
                 let mut out = [0.0f32; 4];
-                assert_eq!(rings.read_spk(&mut out, 2), 2);
+                assert_eq!(rings.read_spk(0, &mut out, 2), 2);
                 heard.push(out[0]);
                 // ...and the daemon's mic writes reach this generation's driver
-                assert_eq!(rings.write_mic(&[v; 8]), Some(8));
+                assert_eq!(rings.write_mic(0, &[v; 8]), Some(8));
                 let mut got = [0.0f32; 8];
                 assert_eq!(dm.hdr().write_idx.load(Ordering::Relaxed), 8);
                 assert_eq!(attach_ring(&dm, HAL_MIC_CHANNELS).read(&mut got, 8), 8);
@@ -2040,10 +3071,556 @@ mod platform {
 
                 rings.detach();
                 assert!(!rings.attached());
-                assert_eq!(rings.read_spk(&mut out, 2), 0, "a detached ring is silence");
-                assert_eq!(rings.write_mic(&[0.5; 8]), None, "not 'full' — absent");
+                assert_eq!(rings.read_spk(0, &mut out, 2), 0, "a detached ring is silence");
+                assert_eq!(rings.write_mic(0, &[0.5; 8]), None, "not 'full' — absent");
             }
             assert_eq!(heard, vec![1.0, 2.0, 3.0], "each session heard its own driver");
+        }
+
+        // ------------------------------ one reply, thirty-two memory entries
+        //
+        // The per-peer redesign (one virtual device PAIR per paired peer, 16
+        // slots) would turn today's two-entry `HelloReply` into a reply
+        // carrying 32 memory entries. Everything downstream of that plan rests
+        // on two things: that ONE mach message can carry them, and that the
+        // receive buffer can be sized by arithmetic. The second is only safe
+        // because NEITHER end asks for MACH_RCV_LARGE — a reply that does not
+        // fit is DESTROYED by the kernel, so an undersized buffer degrades the
+        // handshake to a silent timeout instead of wedging the port forever
+        // (AudioHubBridge.c's BridgeRcvBuf comment makes the same trade on its
+        // side). Both halves are measured here against the real kernel rather
+        // than reasoned about, because getting either wrong is discovered as
+        // "the driver never attaches" long after the protocol is frozen.
+
+        /// `MACH_RCV_TOO_LARGE`. Only the tests need to name it: the service
+        /// loop lumps every non-success, non-timeout receive into one backoff
+        /// arm, which is precisely why what the kernel DID with the message has
+        /// to be pinned down somewhere.
+        const MACH_RCV_TOO_LARGE: KernReturn = 0x1000_4004u32 as i32;
+
+        /// The shape the redesign wants: one reply, `N` memory entries, where
+        /// `HelloReply` carries exactly two. Field order mirrors `HelloReply`
+        /// so the sizes measured here are the sizes an equivalent C struct in
+        /// AudioHubBridge.h would produce.
+        ///
+        /// The count of trailing `u32` is not arbitrary. Header + body is 28
+        /// bytes, so for any EVEN descriptor count the payload starts at
+        /// `28 + 12N` ≡ 4 (mod 8) and the closing `u64` pair only lands without
+        /// compiler-inserted padding when an ODD number of `u32` precedes it.
+        /// The shipped `HelloReply` solves this with nine `u32` and three
+        /// `u64`; this probe uses eleven and two. Both are odd, both total 472
+        /// at N=32, and that is the point — the arithmetic, not the field list,
+        /// is what has to hold. This struct is deliberately NOT the contract:
+        /// it is generic over N so the same code can measure 64 and 128, which
+        /// no real message will ever be. `WIRE == size_of::<HelloReply>()`
+        /// below is what keeps the measurement about the message we actually
+        /// send.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct MultiEntryReply<const N: usize> {
+            header: MsgHeader,
+            body: MsgBody,
+            entries: [PortDescriptor; N],
+            status: u32,
+            protocol_version: u32,
+            data_offset: u32,
+            slot_count: u32,
+            active_slots: u32,
+            spk_capacity_frames: u32,
+            spk_channels: u32,
+            spk_sample_rate: u32,
+            mic_capacity_frames: u32,
+            mic_channels: u32,
+            mic_sample_rate: u32,
+            spk_bytes: u64,
+            mic_bytes: u64,
+        }
+
+        impl<const N: usize> MultiEntryReply<N> {
+            /// Bytes on the wire — what `msgh_size` must say and what the
+            /// receiver has to budget for before adding a trailer.
+            const WIRE: usize = std::mem::size_of::<Self>();
+            /// Where the descriptor array starts, for both ends.
+            const DESCRIPTORS_AT: usize =
+                std::mem::size_of::<MsgHeader>() + std::mem::size_of::<MsgBody>();
+
+            /// `MAKE_SEND` on the destination manufactures a send right out of
+            /// the receive right we hold, which is how a task sends to its own
+            /// port without minting a second name — the same disposition the
+            /// real `handshake` uses for its control-port descriptor.
+            /// `COPY_SEND` on each entry is what the driver's reply does, and
+            /// it leaves the sender's own right intact.
+            fn build(entries: &[MachPort], dest: MachPort) -> MultiEntryReply<N> {
+                assert_eq!(entries.len(), N);
+                let mut m = MultiEntryReply::<N> {
+                    header: MsgHeader {
+                        bits: msgh_bits(MACH_MSG_TYPE_MAKE_SEND, 0) | MACH_MSGH_BITS_COMPLEX,
+                        size: Self::WIRE as u32,
+                        remote: dest,
+                        local: MACH_PORT_NULL,
+                        voucher: MACH_PORT_NULL,
+                        id: MSG_HELLO_REPLY,
+                    },
+                    body: MsgBody { descriptor_count: N as u32 },
+                    entries: [PortDescriptor::default(); N],
+                    status: STATUS_OK,
+                    protocol_version: PROTOCOL_VERSION,
+                    data_offset: HAL_RING_DATA_OFFSET as u32,
+                    slot_count: (N / 2) as u32,
+                    active_slots: u32::MAX,
+                    spk_capacity_frames: HAL_RING_FRAMES,
+                    spk_channels: HAL_SPK_CHANNELS,
+                    spk_sample_rate: HAL_SAMPLE_RATE,
+                    mic_capacity_frames: HAL_RING_FRAMES,
+                    mic_channels: HAL_MIC_CHANNELS,
+                    mic_sample_rate: HAL_SAMPLE_RATE,
+                    spk_bytes: HAL_SPK_BYTES as u64,
+                    mic_bytes: HAL_MIC_BYTES as u64,
+                };
+                for (i, e) in entries.iter().enumerate() {
+                    m.entries[i] = PortDescriptor {
+                        name: *e,
+                        pad1: 0,
+                        pad2: 0,
+                        disposition: MACH_MSG_TYPE_COPY_SEND as u8,
+                        dtype: MACH_MSG_PORT_DESCRIPTOR,
+                    };
+                }
+                m
+            }
+        }
+
+        /// Sends one `N`-descriptor reply to `dest` from ANOTHER thread and
+        /// waits for that thread to finish, so the message is provably queued
+        /// before anything tries to receive it. Two threads, one task: mach
+        /// rights are task-wide, so this is the same kernel path the driver
+        /// takes, minus the process boundary.
+        fn send_reply_from_thread<const N: usize>(entries: &[MachPort], dest: MachPort) -> KernReturn {
+            let msg = MultiEntryReply::<N>::build(entries, dest);
+            std::thread::spawn(move || {
+                let mut msg = msg;
+                unsafe {
+                    mach_msg(
+                        &mut msg.header,
+                        MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                        MultiEntryReply::<N>::WIRE as u32,
+                        0,
+                        MACH_PORT_NULL,
+                        SEND_TIMEOUT_MS,
+                        MACH_PORT_NULL,
+                    )
+                }
+            })
+            .join()
+            .expect("the sending thread must not panic")
+        }
+
+        struct Received {
+            kr: KernReturn,
+            /// `msgh_size` as the kernel copied it out. Port descriptors are
+            /// 12 bytes in both directions on 64-bit, so this should equal what
+            /// was sent — an inequality would mean the wire size cannot be
+            /// computed from the struct, which is how the buffer gets sized.
+            size: u32,
+            descriptors: u32,
+            /// What the kernel actually appended. With no MACH_RCV_TRAILER_*
+            /// bits requested this is the minimum format-0 trailer, and it is
+            /// the number that decides how much slack `RCV_BUF` really needs.
+            trailer: u32,
+            names: Vec<MachPort>,
+        }
+
+        /// Receives into EXACTLY `rcv_size` bytes. A `Vec<u64>` rather than the
+        /// production `MsgBuf`, for the same 8-alignment but a size chosen at
+        /// runtime — finding where the kernel starts refusing is the point.
+        fn receive_into(port: MachPort, rcv_size: usize, timeout_ms: u32) -> Received {
+            let mut buf = vec![0u64; rcv_size.div_ceil(8).max(4)];
+            let base = buf.as_mut_ptr() as *mut u8;
+            let kr = unsafe {
+                mach_msg(
+                    base as *mut MsgHeader,
+                    MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                    0,
+                    rcv_size as u32,
+                    port,
+                    timeout_ms,
+                    MACH_PORT_NULL,
+                )
+            };
+            if kr != MACH_MSG_SUCCESS {
+                return Received { kr, size: 0, descriptors: 0, trailer: 0, names: Vec::new() };
+            }
+            // SAFETY: every offset below is 4-aligned against an 8-aligned
+            // allocation, and a successful receive guarantees the kernel wrote
+            // `size` bytes of message plus a trailer inside `rcv_size`.
+            let hdr = base as *const MsgHeader;
+            let size = unsafe { (*hdr).size };
+            let complex = unsafe { (*hdr).bits } & MACH_MSGH_BITS_COMPLEX != 0;
+            let descriptors = if complex {
+                unsafe { *(base.add(std::mem::size_of::<MsgHeader>()) as *const u32) }
+            } else {
+                0
+            };
+            let trailer = unsafe { *(base.add(size as usize + 4) as *const u32) };
+            let at = std::mem::size_of::<MsgHeader>() + std::mem::size_of::<MsgBody>();
+            let names = (0..descriptors as usize)
+                .map(|i| unsafe {
+                    (*(base.add(at + i * std::mem::size_of::<PortDescriptor>())
+                        as *const PortDescriptor))
+                        .name
+                })
+                .collect();
+            Received { kr, size, descriptors, trailer, names }
+        }
+
+        /// Received send rights are OURS. Dropping them by hand is the whole
+        /// reason this file can assert about port leaks at all.
+        fn release_names(names: &[MachPort]) {
+            for n in names {
+                let kr = unsafe { mach_port_deallocate(task_self(), *n) };
+                assert_eq!(kr, KERN_SUCCESS, "received name {n:#x} must be a live send right");
+            }
+        }
+
+        /// THE question. 32 memory entries in ONE reply, received into a buffer
+        /// sized by arithmetic, every one of them attached through the REAL
+        /// `RingMem::attach` and proven to share pages in both directions.
+        ///
+        /// A failure here is not a bug in this test: it means the 32-descriptor
+        /// single-reply design is not viable and the redesign has to fall back
+        /// to per-slot attach messages.
+        #[test]
+        fn a_single_reply_can_carry_thirty_two_memory_entries() {
+            const N: usize = 32;
+            const WIRE: usize = MultiEntryReply::<N>::WIRE;
+            // 24 header + 4 body + 32*12 descriptors + 44 payload + 16 = 472.
+            const _: () = assert!(WIRE == 472);
+            // ...which is the size of the message this actually stands in for.
+            // If `HelloReply` ever changes size, this measurement stops being
+            // about it and has to be re-taken.
+            const _: () = assert!(WIRE == std::mem::size_of::<HelloReply>());
+            const _: () = assert!(MultiEntryReply::<N>::DESCRIPTORS_AT == 28);
+            // The padding trap the doc comment warns about: if the eleven u32
+            // were ten, the u64 pair would sit four bytes further along than a
+            // hand-written wire layout says.
+            const _: () = assert!(std::mem::offset_of!(MultiEntryReply<N>, spk_bytes) == 456);
+
+            let rings: Vec<FakeDriverRing> = (0..N)
+                .map(|i| {
+                    let d = FakeDriverRing::new(HAL_MIC_CHANNELS, HAL_MIC_BYTES);
+                    // A per-slot stamp so a mapping can be traced back to the
+                    // descriptor index it arrived in: 32 entries that all
+                    // shared ONE object would pass a naive "is it shared?"
+                    // check and silently cross-wire every peer's audio.
+                    d.hdr().write_idx.store(0x1000 + i as u64, Ordering::Release);
+                    d
+                })
+                .collect();
+            let entries: Vec<MachPort> = rings.iter().map(|d| d.entry).collect();
+
+            let port = alloc_recv_port().expect("a receive port for the reply");
+            let _guard = PortGuard(port);
+
+            assert_eq!(
+                send_reply_from_thread::<N>(&entries, port),
+                MACH_MSG_SUCCESS,
+                "the kernel refused to SEND a {N}-descriptor message; \
+                 the 32-descriptor single-reply design is not viable — \
+                 fall back to per-slot attach messages"
+            );
+            let got = receive_into(port, WIRE + MAX_TRAILER, HELLO_TIMEOUT_MS);
+            assert_eq!(
+                got.kr, MACH_MSG_SUCCESS,
+                "a {N}-descriptor reply did not survive receive into {} bytes (kr {:#x}); \
+                 the 32-descriptor single-reply design is not viable — \
+                 fall back to per-slot attach messages",
+                WIRE + MAX_TRAILER,
+                got.kr
+            );
+            println!(
+                "[32-entry reply] wire={WIRE}B received={}B descriptors={} trailer={}B \
+                 buffer={}B (today's HelloReply={}B, RCV_BUF={RCV_BUF}B)",
+                got.size,
+                got.descriptors,
+                got.trailer,
+                WIRE + MAX_TRAILER,
+                std::mem::size_of::<HelloReply>(),
+            );
+            assert_eq!(got.size as usize, WIRE, "the wire size must be computable from the struct");
+            assert_eq!(got.descriptors as usize, N, "every descriptor must arrive");
+            assert_eq!(got.names.len(), N);
+
+            // Distinct names. In one task the received name for an entry we
+            // also created is the SAME name with one more user reference (mach
+            // names are per-task), so what this proves is that 32 distinct
+            // kernel objects stayed 32 distinct objects across the message —
+            // which is the property the design needs. Across a real process
+            // boundary the names would differ; the ref-counting below is
+            // identical either way.
+            let unique: std::collections::HashSet<MachPort> = got.names.iter().copied().collect();
+            assert_eq!(unique.len(), N, "the kernel collapsed distinct memory entries onto one name");
+            assert!(!got.names.contains(&MACH_PORT_NULL), "a null name is a descriptor that never arrived");
+
+            // Every entry through the PRODUCTION attach path, then a two-way
+            // sharing check per slot. Anything less would prove the message
+            // arrived without proving the memory behind it is usable.
+            let mapped: Vec<RingMem> = got
+                .names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    RingMem::attach(*name, rings[i].geom(HAL_MIC_CHANNELS), HAL_MIC_CHANNELS, "slot")
+                        .unwrap_or_else(|e| panic!("slot {i} of {N} would not map ({e:#}); \
+                             the 32-descriptor single-reply design is not viable — \
+                             fall back to per-slot attach messages"))
+                })
+                .collect();
+            for (i, m) in mapped.iter().enumerate() {
+                assert_eq!(
+                    m.hdr().write_idx.load(Ordering::Acquire),
+                    0x1000 + i as u64,
+                    "slot {i} mapped the wrong object: descriptors do not keep their order, \
+                     or the entry is a copy rather than the driver's pages"
+                );
+                m.hdr().read_idx.store(0x2000 + i as u64, Ordering::Release);
+            }
+            for (i, d) in rings.iter().enumerate() {
+                assert_eq!(
+                    d.hdr().read_idx.load(Ordering::Acquire),
+                    0x2000 + i as u64,
+                    "slot {i}: the daemon's write never reached the driver's mapping"
+                );
+            }
+            // `RingMem::drop` unmaps and releases each received right, so the
+            // 32 rings below go back to exactly the one reference they were
+            // created with.
+            drop(mapped);
+        }
+
+        /// How much headroom is there above 32? The redesign is sized for 16
+        /// slots today, and knowing whether the ceiling is 33 or thousands is
+        /// the difference between "room to grow" and "one more device pair
+        /// silently breaks the handshake".
+        ///
+        /// One-page entries here rather than full rings: the question is the
+        /// DESCRIPTOR count, and 128 real rings would map 24MB to prove nothing
+        /// extra. They go through the same `map_entry` the production attach
+        /// uses, just without the geometry validator (which would reject a
+        /// 16KB object claiming 24000 frames).
+        #[test]
+        fn descriptor_counts_well_past_thirty_two_still_fit_one_message() {
+            /// Reports the measured line for `N` so the caller can print it:
+            /// wire size, the size the kernel copied out, and the trailer.
+            fn probe<const N: usize>() -> (usize, usize, u32, u32) {
+                const PAGE: usize = 16_384;
+                let rings: Vec<FakeDriverRing> = (0..N)
+                    .map(|i| {
+                        let d = FakeDriverRing::new(HAL_MIC_CHANNELS, PAGE);
+                        d.hdr().write_idx.store(0x5000 + i as u64, Ordering::Release);
+                        d
+                    })
+                    .collect();
+                let entries: Vec<MachPort> = rings.iter().map(|d| d.entry).collect();
+                let port = alloc_recv_port().expect("a receive port");
+                let _guard = PortGuard(port);
+
+                let wire = MultiEntryReply::<N>::WIRE;
+                assert_eq!(
+                    send_reply_from_thread::<N>(&entries, port),
+                    MACH_MSG_SUCCESS,
+                    "the kernel refused to send {N} descriptors"
+                );
+                let got = receive_into(port, wire + MAX_TRAILER, HELLO_TIMEOUT_MS);
+                assert_eq!(got.kr, MACH_MSG_SUCCESS, "{N} descriptors failed to arrive: {:#x}", got.kr);
+                assert_eq!(got.descriptors as usize, N);
+                // Spot-check that the pages are real this far up, not just the
+                // descriptor array: a per-message limit could plausibly deliver
+                // names that no longer map.
+                const W_IDX: usize = std::mem::offset_of!(RingHeader, write_idx);
+                for (i, name) in got.names.iter().enumerate() {
+                    let addr = map_entry(*name, PAGE).expect("a delivered entry must map");
+                    let w = unsafe { &*((addr as usize + W_IDX) as *const AtomicU64) };
+                    assert_eq!(
+                        w.load(Ordering::Acquire),
+                        0x5000 + i as u64,
+                        "entry {i} of {N} does not point at slot {i}'s pages"
+                    );
+                    unsafe { mach_vm_deallocate(task_self(), addr, PAGE as u64) };
+                }
+                release_names(&got.names);
+                (N, wire, got.size, got.trailer)
+            }
+
+            for (n, wire, size, trailer) in [probe::<32>(), probe::<64>(), probe::<128>()] {
+                println!(
+                    "[descriptor scaling] N={n:<4} wire={wire:<5}B received={size:<5}B \
+                     trailer={trailer}B buffer_needed={}B",
+                    wire + MAX_TRAILER
+                );
+                assert_eq!(size as usize, wire);
+            }
+        }
+
+        /// The assumption the no-`MACH_RCV_LARGE` decision rests on, and the
+        /// only one of these that can be got wrong silently: a message that
+        /// does not fit must be DESTROYED, not left queued for a second,
+        /// bigger receive. If it were queued, an undersized buffer would wedge
+        /// the port permanently instead of costing one handshake.
+        ///
+        /// It also measures the true minimum receive size, which is what the
+        /// redesign has to budget: `RCV_BUF >= size_of::<Reply>() + MAX_TRAILER`
+        /// is correct but conservative, and knowing by how much is the
+        /// difference between an informed constant and a lucky one.
+        #[test]
+        fn a_reply_that_does_not_fit_is_destroyed_rather_than_queued() {
+            const N: usize = 32;
+            const WIRE: usize = MultiEntryReply::<N>::WIRE;
+            const PAGE: usize = 16_384;
+
+            let rings: Vec<FakeDriverRing> =
+                (0..N).map(|_| FakeDriverRing::new(HAL_MIC_CHANNELS, PAGE)).collect();
+            let entries: Vec<MachPort> = rings.iter().map(|d| d.entry).collect();
+            let port = alloc_recv_port().expect("a receive port");
+            let _guard = PortGuard(port);
+
+            // Walk up from "exactly the message, no trailer room" until the
+            // kernel accepts it. Every rejected pass also proves the queue is
+            // empty again: if rejected messages accumulated, the port's default
+            // queue limit would make the sends below start timing out.
+            let mut minimum = None;
+            for extra in 0..=MAX_TRAILER {
+                let rcv = WIRE + extra;
+                assert_eq!(send_reply_from_thread::<N>(&entries, port), MACH_MSG_SUCCESS,
+                    "send failed at probe {rcv} — earlier rejects were queued, not destroyed");
+                let got = receive_into(port, rcv, HELLO_TIMEOUT_MS);
+                if got.kr == MACH_MSG_SUCCESS {
+                    assert_eq!(got.descriptors as usize, N);
+                    release_names(&got.names);
+                    minimum = Some(rcv);
+                    break;
+                }
+                assert_eq!(
+                    got.kr, MACH_RCV_TOO_LARGE,
+                    "an undersized receive ({rcv}B for a {WIRE}B message) must report \
+                     MACH_RCV_TOO_LARGE, got {:#x}",
+                    got.kr
+                );
+            }
+            let minimum = minimum.expect("some size in [WIRE, WIRE+MAX_TRAILER] must be accepted");
+
+            println!(
+                "[undersized receive] wire={WIRE}B minimum_rcv={minimum}B \
+                 (= wire + {}B trailer); production budget wire+MAX_TRAILER={}B, \
+                 slack={}B",
+                minimum - WIRE,
+                WIRE + MAX_TRAILER,
+                WIRE + MAX_TRAILER - minimum
+            );
+            assert!(minimum >= WIRE, "the kernel cannot have delivered a truncated message");
+            assert!(
+                minimum <= WIRE + MAX_TRAILER,
+                "sizing a buffer as message + MAX_TRAILER is NOT sufficient; every \
+                 const assert in this file that uses that rule is wrong"
+            );
+
+            // The trap this test was written to find, kept as a live control
+            // now that v2 has walked out of it. 256 was `RCV_BUF` while the
+            // reply was 104 bytes; the v2 reply is 472, and growing the
+            // descriptor count without growing the buffer does not produce a
+            // short read or a truncated reply — it produces a handshake that
+            // times out with no diagnostic anywhere, forever. Naming the old
+            // value as a literal keeps that demonstration honest instead of
+            // asserting something about the current constant that stopped being
+            // true the moment the constant was fixed.
+            const PRE_V2_RCV_BUF: usize = 256;
+            assert!(PRE_V2_RCV_BUF < minimum);
+            assert_eq!(send_reply_from_thread::<N>(&entries, port), MACH_MSG_SUCCESS);
+            let with_the_old_buffer = receive_into(port, PRE_V2_RCV_BUF, HELLO_TIMEOUT_MS);
+            assert_eq!(
+                with_the_old_buffer.kr, MACH_RCV_TOO_LARGE,
+                "a {WIRE}B reply into the pre-v2 {PRE_V2_RCV_BUF}B buffer must be refused outright"
+            );
+            // ...and the positive form: the constant this daemon ships MUST be
+            // able to receive the reply it is about to start asking for. This is
+            // the assertion that now guards the handshake.
+            assert!(
+                RCV_BUF >= minimum,
+                "RCV_BUF is {RCV_BUF}B; a {WIRE}B HelloReply needs at least {minimum}B or the \
+                 kernel destroys it and the handshake times out with no diagnostic"
+            );
+            assert_eq!(send_reply_from_thread::<N>(&entries, port), MACH_MSG_SUCCESS);
+            let with_todays_buffer = receive_into(port, RCV_BUF, HELLO_TIMEOUT_MS);
+            assert_eq!(
+                with_todays_buffer.kr, MACH_MSG_SUCCESS,
+                "a {WIRE}B reply must fit today's RCV_BUF={RCV_BUF}B"
+            );
+            assert_eq!(with_todays_buffer.descriptors as usize, N);
+            release_names(&with_todays_buffer.names);
+            println!(
+                "[undersized receive] a {WIRE}B reply into the pre-v2 {PRE_V2_RCV_BUF}B buffer -> \
+                 MACH_RCV_TOO_LARGE; into v2's RCV_BUF={RCV_BUF}B -> delivered with {N} descriptors"
+            );
+
+            // ONE byte too small, then a full-size retry with a real timeout.
+            // A timeout is the proof: the message is gone, not waiting.
+            assert_eq!(send_reply_from_thread::<N>(&entries, port), MACH_MSG_SUCCESS);
+            let short = receive_into(port, minimum - 1, HELLO_TIMEOUT_MS);
+            assert_eq!(
+                short.kr, MACH_RCV_TOO_LARGE,
+                "one byte under the minimum must be refused outright, got {:#x}",
+                short.kr
+            );
+            let retry = receive_into(port, WIRE + MAX_TRAILER, RECV_TIMEOUT_MS);
+            assert_eq!(
+                retry.kr, MACH_RCV_TIMED_OUT,
+                "the refused message was still QUEUED (kr {:#x}, {} descriptors). Without \
+                 MACH_RCV_LARGE the kernel is supposed to destroy it; if it does not, an \
+                 undersized buffer wedges the port instead of costing one handshake, and \
+                 both ends' buffer-sizing comments are wrong",
+                retry.kr,
+                retry.descriptors
+            );
+            println!(
+                "[undersized receive] {}B (minimum-1) -> MACH_RCV_TOO_LARGE, \
+                 re-receive at {}B -> MACH_RCV_TIMED_OUT: destroyed, not queued",
+                minimum - 1,
+                WIRE + MAX_TRAILER
+            );
+
+            // ...and destroying it gave the rights back. This test has by now
+            // sent each entry through ~11 messages, all but one of them
+            // destroyed by the kernel, so if a destroyed message dropped its
+            // COPY_SEND references on the floor the entries would be carrying
+            // ten surplus user references each. That matters more to the
+            // redesign than to today's code: a driver that retries a reply the
+            // daemon's buffer is too small for would bleed 32 rights per
+            // attempt, and the port name space is the one resource coreaudiod
+            // cannot be restarted to reclaim.
+            //
+            // Counting is by subtraction, since nothing here can read a uref
+            // count directly: one `mod_refs(-1)` must succeed (the creator's
+            // own reference) and the next must NOT, which is only true if the
+            // count was exactly one.
+            for (i, d) in rings.iter().enumerate() {
+                let first = unsafe {
+                    mach_port_mod_refs(task_self(), d.entry, MACH_PORT_RIGHT_SEND, -1)
+                };
+                assert_eq!(first, KERN_SUCCESS, "entry {i} lost the creator's own reference");
+                let second = unsafe {
+                    mach_port_mod_refs(task_self(), d.entry, MACH_PORT_RIGHT_SEND, -1)
+                };
+                assert_ne!(
+                    second, KERN_SUCCESS,
+                    "entry {i} still holds a send right after every message carrying it was \
+                     destroyed: the kernel leaks descriptor rights on MACH_RCV_TOO_LARGE, so a \
+                     retried oversized reply bleeds one right per entry per attempt"
+                );
+            }
+            // The names are gone now, so `FakeDriverRing::drop`'s deallocate is
+            // a no-op; its `mach_vm_deallocate` still has work to do, because a
+            // mapping holds its own reference to the VM object.
+            println!("[undersized receive] all {N} entries back to a single user reference: \
+                      a destroyed message returns the rights it carried");
         }
 
         // --------------------------------------------- connect/retry ladder
@@ -2123,7 +3700,7 @@ mod platform {
         fn a_send_with_no_driver_reports_a_dead_destination_and_never_panics() {
             let shared = test_shared(Rings::new());
             assert_eq!(*lk(&shared.driver_port), MACH_PORT_NULL);
-            let (kr, port) = send_to_driver(&shared, NOTIFY_PING, 0, 0.0, 0);
+            let (kr, port) = send_to_driver(&shared, NOTIFY_PING, 0, 0.0, 0, 0);
             assert_eq!(kr, MACH_SEND_INVALID_DEST);
             assert_eq!(port, MACH_PORT_NULL);
             // ...and a failure on a port that is not the live one is ignored:
@@ -2136,7 +3713,7 @@ mod platform {
             shared.driver_connected.store(false, Ordering::Relaxed);
             // The public path swallows it: a peer volume change with no driver
             // attached is a no-op, not an error the daemon has to handle.
-            shared.notify_volume(HalDevice::Speaker, 0.5, false);
+            shared.notify_volume(HalEndpoint::out(0), 1, 0.5, false);
             assert!(!shared.driver_connected.load(Ordering::Relaxed));
         }
 
@@ -2183,15 +3760,19 @@ mod platform {
 
             // The audio path works with no driver: a full frame of silence.
             let mut out = Vec::new();
-            assert_eq!(b.append_spk_frame(&mut out), 0);
+            assert_eq!(b.append_spk_frame(0, &mut out), 0);
             assert_eq!(out.len(), HAL_FRAME_48K);
             assert!(out.iter().all(|s| *s == 0.0));
             // ...and mic writes are swallowed without an error and without
             // running the drop counter up: there is no ring to be full.
-            assert_eq!(b.write_mic_mono(&[0.25; 64]), 0);
+            assert_eq!(b.write_mic_mono(0, &[0.25; 64]), 0);
             assert_eq!(b.status().mic_dropped, 0);
             assert!(b.drain_events().is_empty());
-            b.notify_volume(HalDevice::Speaker, 0.4, false); // no driver: a no-op
+            b.notify_volume(HalEndpoint::out(0), 1, 0.4, false); // no driver: a no-op
+            // ...as are Binds: nothing to send them to, and the coordinator
+            // simply retries on its next pass.
+            assert!(!b.bind_clear(0, 1));
+            assert_eq!(b.slot_count(), 0, "a bridge with no driver has no capacity");
 
             let t = Instant::now();
             drop(b); // shutdown + join
@@ -2223,14 +3804,14 @@ mod platform {
         pub fn new() -> Rings {
             Rings
         }
-        pub fn read_spk(&self, _dst: &mut [f32], _frames: usize) -> usize {
+        pub fn read_spk(&self, _slot: usize, _dst: &mut [f32], _frames: usize) -> usize {
             0
         }
         /// Permanently "no driver attached" — see the macOS one.
-        pub fn write_mic(&self, _mono: &[f32]) -> Option<usize> {
+        pub fn write_mic(&self, _slot: usize, _mono: &[f32]) -> Option<usize> {
             None
         }
-        pub fn flush_spk_consumer(&self) {}
+        pub fn flush_spk_consumer(&self, _slot: usize) {}
     }
 
     pub fn start(cfg: HalBridgeCfg) -> Result<Option<HalBridge>> {
@@ -2240,5 +3821,20 @@ mod platform {
         Ok(None)
     }
 
-    pub fn send_notify(_shared: &Shared, _device: HalDevice, _scalar: f32, _muted: bool) {}
+    pub fn send_notify(
+        _shared: &Shared,
+        _at: HalEndpoint,
+        _generation: u32,
+        _scalar: f32,
+        _muted: bool,
+    ) {
+    }
+
+    pub fn send_bind_set(_shared: &Shared, _req: &HalBindRequest) -> bool {
+        false
+    }
+
+    pub fn send_bind_clear(_shared: &Shared, _slot: u8, _generation: u32) -> bool {
+        false
+    }
 }

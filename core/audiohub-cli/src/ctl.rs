@@ -66,8 +66,10 @@ pub enum CtlSource {
     Mic,
     /// mirror what the source machine is playing (spec-m4b §B2)
     Sysaudio,
-    /// what an app played into the macOS virtual device "AudioHub Speaker"
-    /// (spec-round2 §B2); needs the HAL bridge
+    /// what an app played into THIS peer's virtual speaker on macOS
+    /// (spec-m5b §5.4); needs the HAL bridge. The device is named after the
+    /// peer and there is one per peer — the daemon resolves which ring to read
+    /// from the fingerprint, so this source never names a slot or a device.
     Halspk,
 }
 
@@ -132,10 +134,14 @@ pub enum CtlCmd {
         /// (a virtual card, so any app can select it as an input)
         #[arg(long)]
         bridge: Option<String>,
-        /// mic: ALSO feed the peer's audio to the macOS virtual device
-        /// "AudioHub Microphone" through the HAL bridge (spec-round2 §B2)
+        /// mic: ALSO feed the peer's audio to the virtual microphone this
+        /// peer owns, through the HAL bridge (spec-m5b §5.4)
         #[arg(long)]
         hal: bool,
+        /// open the session even in mode B, where sessions are otherwise
+        /// driven by the system's device selection (probe/diagnostic use)
+        #[arg(long = "override")]
+        override_mode: bool,
         /// receiver-side tone verification frequency (probe)
         #[arg(long, default_value_t = 1000.0)]
         verify_freq: f32,
@@ -172,6 +178,45 @@ pub enum CtlCmd {
         /// which default device to pretend changed
         #[arg(long, value_parser = ["input", "output"])]
         kind: String,
+    },
+    /// read the daemon's settings, or change them
+    ///
+    /// With no flags this is a plain read. `--consumer-mode b` is what turns
+    /// the per-peer virtual devices on; the daemon owns this setting, so it
+    /// survives a restart and every client sees the same value.
+    Settings {
+        /// "a" (driverless system capture) or "b" (per-peer virtual devices)
+        #[arg(long, value_parser = ["a", "b"])]
+        consumer_mode: Option<String>,
+        /// remove a peer's virtual devices while it is disconnected
+        #[arg(long)]
+        remove_virtual_on_disconnect: Option<bool>,
+        /// append "（离线）" to a disconnected peer's device names
+        #[arg(long)]
+        mark_offline_devices: Option<bool>,
+    },
+    /// pair with a peer that has pairing mode enabled
+    Pair {
+        /// host or host:port
+        #[arg(long)]
+        addr: String,
+        /// the 6-digit PIN the other side is showing
+        #[arg(long)]
+        pin: String,
+    },
+    /// remove a pairing, its sessions and its virtual devices (both sides)
+    Unpair {
+        /// fingerprint or a unique prefix of one
+        #[arg(long)]
+        peer: String,
+    },
+    /// give a peer a local name; its virtual devices are renamed in place
+    Alias {
+        #[arg(long)]
+        peer: String,
+        /// omit to clear the alias and fall back to the peer's computer name
+        #[arg(long)]
+        alias: Option<String>,
     },
     /// stop the daemon
     Shutdown,
@@ -289,7 +334,11 @@ fn cmd_ctl(cmd: CtlCmd, json: bool) -> Result<i32> {
     // read timeout must outlast daemon-side blocking work (discover browse, connect+handshake)
     let read_timeout = match &cmd {
         CtlCmd::Discover { secs } => Duration::from_secs_f32(secs + 20.0),
-        CtlCmd::Connect { .. } | CtlCmd::Open { .. } => Duration::from_secs(30),
+        // A pair is a full SPAKE2 exchange against another machine; it needs
+        // the same room a connect does.
+        CtlCmd::Connect { .. } | CtlCmd::Open { .. } | CtlCmd::Pair { .. } => {
+            Duration::from_secs(30)
+        }
         _ => Duration::from_secs(15),
     };
     let mut client = match IpcClient::connect(read_timeout) {
@@ -360,6 +409,7 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             monitor,
             bridge,
             hal,
+            override_mode,
             verify_freq,
             loss,
             volume_sync,
@@ -397,6 +447,10 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
                 volume_sync: *volume_sync,
                 bridge: bridge.clone(),
                 hal: *hal,
+                // NOT defaulted to true: `ctl` is a UI too, and in mode B a
+                // session opened by peer instead of by device selection is the
+                // thing mode B exists to remove. Probes ask for it explicitly.
+                override_mode: *override_mode,
             };
             (methods::SESSION_OPEN, serde_json::to_value(params)?)
         }
@@ -417,6 +471,41 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
         CtlCmd::SimulateDeviceChange { kind } => (
             methods::DAEMON_SIMULATE_DEVICE_CHANGE,
             json!({ "kind": kind }),
+        ),
+        CtlCmd::Settings {
+            consumer_mode,
+            remove_virtual_on_disconnect,
+            mark_offline_devices,
+        } => {
+            let mut p = serde_json::Map::new();
+            if let Some(m) = consumer_mode {
+                p.insert("consumer_mode".into(), json!(m));
+            }
+            if let Some(v) = remove_virtual_on_disconnect {
+                p.insert("remove_virtual_on_disconnect".into(), json!(v));
+            }
+            if let Some(v) = mark_offline_devices {
+                p.insert("mark_offline_devices".into(), json!(v));
+            }
+            // A read and a write are the same call with no fields to change,
+            // so `settings` with no flags cannot accidentally write anything.
+            let method = if p.is_empty() {
+                methods::SETTINGS_GET
+            } else {
+                methods::SETTINGS_SET
+            };
+            (method, Value::Object(p))
+        }
+        CtlCmd::Pair { addr, pin } => {
+            (methods::PEERS_PAIR, json!({ "addr": addr, "pin": pin }))
+        }
+        CtlCmd::Unpair { peer } => (methods::PEERS_UNPAIR, json!({ "peer": peer })),
+        CtlCmd::Alias { peer, alias } => (
+            methods::PEERS_SET_ALIAS,
+            match alias {
+                Some(a) => json!({ "peer": peer, "alias": a }),
+                None => json!({ "peer": peer, "alias": null }),
+            },
         ),
         CtlCmd::Shutdown => (methods::DAEMON_SHUTDOWN, json!({})),
     })
@@ -677,6 +766,35 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
         CtlCmd::SimulateDeviceChange { kind } => info(&format!(
             "simulated default-{kind} device change (epoch {})",
             v.get("epoch").and_then(|e| e.as_u64()).unwrap_or(0)
+        )),
+        CtlCmd::Settings { .. } => {
+            info(&format!(
+                "consumer_mode={} effective_mode={} remove_virtual_on_disconnect={} \
+                 mark_offline_devices={} virtual devices {}/{}",
+                val_str(v, "consumer_mode"),
+                val_str(v, "effective_mode"),
+                val_bool(v, "remove_virtual_on_disconnect"),
+                val_bool(v, "mark_offline_devices"),
+                val_u64(v, "hal_used"),
+                val_u64(v, "hal_capacity"),
+            ));
+            if val_str(v, "consumer_mode") == "b" && val_str(v, "effective_mode") != "b" {
+                info("  (mode B is not in force: no HAL bridge on this daemon)");
+            }
+        }
+        CtlCmd::Pair { addr, .. } => info(&format!(
+            "paired with {} at {addr} ({})",
+            val_str(v, "display_name"),
+            val_str(v, "fingerprint")
+        )),
+        CtlCmd::Unpair { .. } => info(&format!(
+            "unpaired {}; its virtual devices are being removed",
+            val_str(v, "fingerprint")
+        )),
+        CtlCmd::Alias { .. } => info(&format!(
+            "{} is now shown as {:?}",
+            val_str(v, "fingerprint"),
+            val_str(v, "display_name")
         )),
         CtlCmd::Shutdown => info("daemon shutdown requested"),
     }

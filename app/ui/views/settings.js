@@ -1,43 +1,17 @@
-// 设置：端口只读、延迟/质量档与虚拟设备开关（M4b 占位）、配置目录展示。
+// 设置：模式镜像、端口只读、延迟/质量档、虚拟设备开关与设备清单、配置目录展示。
+//
+// 模式**选择器本身**不在这一页（plan §7.1：它决定整个主面板的含义，藏进设置页
+// 等于把「那排开关为什么没了」的答案藏起来）。这里只放一面只读的镜子 + 去主面板
+// 的入口，避免同一个全局状态出现两个可点的控件、两处 pending 态。
 
 import { store } from '../store.js';
-import { el, icon, switchBtn, setSwitch, extLink, toast, openExternal } from '../ui.js';
+import { el, icon, switchBtn, setSwitch, setPending, extLink, toast, openExternal, segmented, fmt } from '../ui.js';
 import { bridgeCatalog, vendors } from '../bridge.js';
 import { actionOf } from '../permissions.js';
 import { permissionRow } from './onboarding.js';
+import { halState, requestedMode, effectiveMode, isModeB, modeDowngraded, DEVICE_STATE_LABEL } from '../mode.js';
 
-// options[].disabled 是**每次 sync 都重新求值**的谓词，不是建控件时的一次性快照：
-// 模式 B 的可用性取决于 daemon 有没有连上 HAL 驱动，而那要等第一个 status 回包才
-// 知道，装/卸驱动后还会再变。wrap.sync 因此挂在元素上，供 update() 复位。
-function segmented(testid, options, get, set) {
-  const wrap = el('div', { class: 'segmented', role: 'radiogroup', 'data-testid': testid });
-  const btns = options.map((o) => {
-    const b = el('button', { class: 'seg', type: 'button', role: 'radio', 'data-value': o.value }, o.label);
-    b.addEventListener('click', () => {
-      if (b.disabled) return;
-      set(o.value);
-      sync();
-    });
-    return b;
-  });
-  function sync() {
-    const v = get();
-    for (let i = 0; i < btns.length; i += 1) {
-      const b = btns[i];
-      const off = typeof options[i].disabled === 'function' && options[i].disabled();
-      b.disabled = off;
-      b.classList.toggle('off', off);
-      b.title = off ? (options[i].why || '') : '';
-      const on = !off && b.dataset.value === v;
-      b.classList.toggle('on', on);
-      b.setAttribute('aria-checked', String(on));
-    }
-  }
-  wrap.append(...btns);
-  wrap.sync = sync;
-  sync();
-  return wrap;
-}
+const MODE_LABEL = { a: 'A · 免驱动', b: 'B · 虚拟设备' };
 
 function settingRow(title, desc, control, badge) {
   return el('div', { class: 'setting-row' },
@@ -114,33 +88,45 @@ function permissionsCard(ctx) {
 export function mount(root, ctx) {
   const s = store.state;
 
-  // 使用端模式（plan §7.1）：A/B 并列、独立选择，B 在驱动不可用时置灰。
-  // 判据取 daemon.status 的 hal.driver_connected——注册了名字但没连上（驱动装了、
-  // coreaudiod 还没加载完，或插件版本对不上）同样用不了 B，所以只认 connected。
-  const halOk = () => !!(store.state.daemon && store.state.daemon.hal
-    && store.state.daemon.hal.driver_connected);
-  const modeSeg = segmented('settings-consumer-mode',
-    [
-      { value: 'a', label: 'A · 免驱动' },
-      {
-        value: 'b',
-        label: 'B · 虚拟设备',
-        disabled: () => !halOk(),
-        why: '未检测到 AudioHub 驱动，无法使用模式 B',
-      },
-    ],
-    // 存过 'b' 不等于现在能用 B（换机器、卸了驱动都会变），生效模式因此在这里回落。
-    () => (store.state.settings.consumerMode === 'b' && halOk() ? 'b' : 'a'),
-    (v) => { store.update((x) => { x.settings.consumerMode = v; }); store.saveSettings(); });
+  // daemon 的值优先，拿不到才回落到本地缓存——反过来会让界面显示一个 daemon
+  // 根本不认的档位。
+  function settingValue(key, dft) {
+    const d = store.state.daemonSettings;
+    if (d && typeof d[key] === 'string' && d[key]) return d[key];
+    const local = store.state.settings[key];
+    return typeof local === 'string' && local ? local : dft;
+  }
+
+  // 全部写操作走同一条路：回包就是新的权威值，不做乐观翻转——开关先翻过去、
+  // 请求再失败的话，界面显示的是一个 daemon 从没接受过的设置。
+  let writing = 0;
+  async function pushSetting(patch, sw) {
+    writing += 1;
+    if (sw) setPending(sw, true);
+    try {
+      await ctx.applySettings(patch);
+    } catch (_) { /* rpc 已 toast */ } finally {
+      writing -= 1;
+      if (sw) setPending(sw, false);
+      update(store.state); // 成功按回包重画，失败按旧值复位
+    }
+  }
+
+  // 只读镜子：值取 daemon 的 effective_mode，切换入口在主面板。
+  const modeCur = el('span', { class: 'mode-mirror', 'data-testid': 'settings-mode-current' }, '—');
+  const modeGoto = el('button', { class: 'btn small', type: 'button', 'data-testid': 'settings-mode-goto' },
+    '前往主面板切换');
+  modeGoto.addEventListener('click', () => ctx.navigate('peers'));
   const modeNote = el('p', { class: 'muted small', 'data-testid': 'settings-mode-note' });
   const modeCard = el('section', { class: 'card block', 'data-testid': 'settings-mode' },
     el('h3', { class: 'block-title' }, '使用端模式'),
-    settingRow('模式',
+    settingRow('当前模式',
       'A：不装驱动，捕获本机系统音频送到对端播放——本机与对端同时发声；'
       + '取用对端麦克风需借助已安装的第三方虚拟声卡（见下方「虚拟声卡桥接」）。'
-      + 'B：由 AudioHub 驱动在系统音频设备列表中注入一对虚拟设备，任意应用直接选用，'
-      + '调节虚拟设备音量即调节对端真实设备。',
-      modeSeg, null),
+      + 'B：每台已配对主机作为一对设备出现在系统音频设备列表中，任意应用直接选用，'
+      + '调节该设备音量即调节对端真实设备。'
+      + '模式是全局设置，由本机服务持有；切换入口在主面板顶部。',
+      el('div', { class: 'field-btn' }, modeCur, modeGoto), null),
     modeNote);
 
   const portVal = el('code', { class: 'mono', 'data-testid': 'settings-port' }, '—');
@@ -152,38 +138,57 @@ export function mount(root, ctx) {
     settingRow('IPC 端口', '本机回环 WebSocket 端口，随 daemon 启动随机分配，写入 ipc.json。',
       ipcVal, null));
 
+  // 延迟/质量：**真的下发并落盘**（settings.json），但媒体面还没读它——两者都还
+  // 由 AUTO 阶梯决定。角标写「已保存 · 暂未生效」而不是隐藏：藏起来会让下一版
+  // 接上时用户以为是新功能，而这里保存的值那时会突然开始起作用。
   const latencySeg = segmented('settings-latency',
-    [{ value: 'lowest', label: '最低延迟' }, { value: 'auto', label: 'AUTO' }],
-    () => store.state.settings.latency,
-    (v) => { store.update((x) => { x.settings.latency = v; }); store.saveSettings(); });
+    [{ value: 'min', label: '最低延迟' }, { value: 'auto', label: 'AUTO' }],
+    () => settingValue('latency', 'min'),
+    (v) => pushSetting({ latency: v }));
   const qualitySeg = segmented('settings-quality',
     [{ value: 'pcm', label: 'PCM' }, { value: 'auto', label: 'AUTO' }],
-    () => store.state.settings.quality,
-    (v) => { store.update((x) => { x.settings.quality = v; }); store.saveSettings(); });
+    () => settingValue('quality', 'auto'),
+    (v) => pushSetting({ quality: v }));
 
   const transportCard = el('section', { class: 'card block' },
     el('h3', { class: 'block-title' }, '传输'),
     settingRow('延迟档', '最低：固定最小缓冲，追求最低听感延迟；AUTO：按网络质量自适应加深缓冲。推荐保持最低。',
-      latencySeg, '即将生效于 M4b'),
+      latencySeg, '已保存 · 暂未生效'),
     settingRow('质量档', 'PCM：无损 PCM_S16LE 固定码率；AUTO：按丢包与带宽在质量阶梯（rung）上自动升降。',
-      qualitySeg, '即将生效于 M4b'),
-    el('p', { class: 'muted small' }, '以上选择当前仅保存于本机 UI，IPC 尚无 settings.* 方法，不会下发到 daemon。'));
+      qualitySeg, '已保存 · 暂未生效'),
+    el('p', { class: 'muted small' },
+      '两档已随 settings.set 下发并由本机服务持久化，但媒体面尚未读取它们：'
+      + '当前编解码与缓冲深度仍由 AUTO 阶梯自行决定。'));
 
   const removeSw = switchBtn({
     testid: 'settings-remove-virtual',
     label: '断开后移除虚拟设备',
     checked: s.settings.removeVirtual,
-    onToggle(want, b) {
-      store.update((x) => { x.settings.removeVirtual = want; });
-      store.saveSettings();
-      setSwitch(b, want);
-    },
+    onToggle: (want, b) => pushSetting({ remove_virtual_on_disconnect: want }, b),
   });
-  const deviceCard = el('section', { class: 'card block' },
+  const offlineSw = switchBtn({
+    testid: 'settings-mark-offline',
+    label: '离线时在设备名后标注（离线）',
+    onToggle: (want, b) => pushSetting({ mark_offline_devices: want }, b),
+  });
+
+  const devCount = el('span', { class: 'dev-count', 'data-testid': 'settings-hal-count' }, '—');
+  const devList = el('div', { class: 'dev-inventory', 'data-testid': 'settings-hal-devices' });
+  const devNote = el('p', { class: 'muted small', 'data-testid': 'settings-hal-note' });
+
+  const deviceCard = el('section', { class: 'card block', 'data-testid': 'settings-devices' },
     el('h3', { class: 'block-title' }, '虚拟设备'),
     settingRow('断开后移除虚拟设备',
-      '关闭时：断开仅显示离线，虚拟设备保留在系统设备列表；开启时：断开即移除。解除配对总是无条件移除。',
-      removeSw, '即将生效于 M4b'));
+      '关闭时：断开仅显示离线，虚拟设备保留在系统设备列表；开启时：断开即移除，重连后以相同 UID 恢复。'
+      + '解除配对总是无条件移除。',
+      removeSw, null),
+    settingRow('离线时标注设备名',
+      '开启时，对端断开期间设备名后追加「（离线）」——同一 UID 就地改名，'
+      + '不影响任何应用已记住的设备选择。关闭则名字恒定，代价是「没声音」在系统里无从分辨。',
+      offlineSw, null),
+    el('div', { class: 'dev-inventory-head' },
+      el('span', { class: 'dev-inventory-title' }, '设备清单'), devCount),
+    devList, devNote);
 
   // 虚拟声卡桥接（spec-m4c §B / plan §7.1）：这里只报「检测到了什么」并给官网链接，
   // 真正的选择在主面板的对端卡片上——桥接目标是**按对端**决定的。
@@ -244,28 +249,96 @@ export function mount(root, ctx) {
     }
   }
 
-  function renderModeNote(st) {
-    modeSeg.sync();
+  function renderMode(st) {
+    const eff = effectiveMode(st);
+    modeCur.textContent = MODE_LABEL[eff] || eff;
+    modeCur.className = 'mode-mirror mode-' + eff;
+    const hs = halState(st.daemon);
+    modeNote.textContent = modeDowngraded(st)
+      ? `你选择的是「${MODE_LABEL[requestedMode(st)]}」，但当前不可用，已临时按模式 A 运行。${hs.text}`
+      : hs.text;
+    modeNote.className = `muted small tone-${hs.tone}`;
+  }
+
+  let devKey = null;
+
+  function renderDevices(st) {
+    const ds = st.daemonSettings;
     const hal = st.daemon ? st.daemon.hal : null;
-    if (!st.daemon) {
-      modeNote.textContent = '服务未连接，暂时无法判断驱动是否可用。';
-      return;
+    const list = hal && Array.isArray(hal.devices) ? hal.devices : [];
+    const cap = ds ? ds.hal_capacity : (hal ? 16 : 0);
+    const used = ds ? ds.hal_used : list.length;
+    devCount.textContent = cap ? `已用 ${used} / ${cap}` : '不可用';
+
+    const key = JSON.stringify([list, used, cap, isModeB(st)]);
+    if (key === devKey) return;
+    devKey = key;
+
+    devList.innerHTML = '';
+    for (const d of list) {
+      const peer = st.peers.find((p) => p.fingerprint === d.fingerprint);
+      const owner = (peer && (peer.display_name || peer.name)) || d.fingerprint.slice(0, 12);
+      // state 与 observed 是两件事：前者是驱动应答了我们，后者是系统真的列出了它。
+      // 只报前者，就会把「发过 Bind 但设备没出现」显示成一切正常——这恰恰是本轮
+      // 引入闭环观测要抓的那种故障。
+      const published = d.state === 'bound' && d.observed;
+      const tag = published
+        ? el('span', { class: 'tag ok' }, '已发布')
+        : d.state === 'bound'
+          ? el('span', { class: 'tag warn' }, '未出现在系统中')
+          : el('span', { class: 'tag' }, DEVICE_STATE_LABEL[d.state] || d.state);
+
+      const rows = [
+        { dir: 'out', ico: 'spk', name: d.out_name, uid: d.out_uid, io: d.io_out, frames: d.spk_frames, drop: null },
+        { dir: 'in', ico: 'mic', name: d.in_name, uid: d.in_uid, io: d.io_in, frames: d.mic_frames, drop: d.mic_dropped },
+      ].map((r) => el('div', { class: 'dev-inv-row', 'data-testid': `settings-hal-${r.dir}-${d.fingerprint}` },
+        icon(r.ico, 'ico dev-ico'),
+        el('div', { class: 'dev-text' },
+          el('span', { class: 'dev-name' }, r.name || '—'),
+          el('code', { class: 'dev-uid mono' }, r.uid || '')),
+        el('span', { class: 'dev-frames mono' },
+          `${fmt.int(r.frames)} 帧` + (r.drop ? ` · 丢 ${fmt.int(r.drop)}` : '')),
+        el('span', { class: 'dev-state ' + (r.io ? 'live' : 'idle') }, r.io ? '● 使用中' : '○ 未使用')));
+
+      devList.append(el('div', { class: 'dev-inv-card', 'data-testid': `settings-hal-device-${d.fingerprint}` },
+        el('div', { class: 'dev-inv-head' },
+          el('strong', {}, owner),
+          el('code', { class: 'mono dim' }, `槽位 ${d.slot} · 代号 ${d.generation}`),
+          d.peer_connected ? el('span', { class: 'tag ok' }, '在线') : el('span', { class: 'tag' }, '离线'),
+          tag),
+        rows));
     }
-    if (hal && hal.driver_connected) {
-      modeNote.textContent = '已连接 AudioHub 驱动，模式 B 可用。';
-      return;
-    }
-    // 装了但没连上和压根没装，用户要做的事不一样，不能合并成一句话。
-    modeNote.textContent = hal && hal.registered
-      ? '检测到驱动已注册但尚未连接：请稍候，或重启 AudioHub 服务后重试。'
-      : '未检测到 AudioHub 驱动，模式 B 不可用；安装驱动后重启本应用即可选择。';
+
+    devList.hidden = list.length === 0;
+    devNote.textContent = list.length
+      ? '「已发布」= 驱动确认绑定且系统的设备列表里确实能查到这两个 UID。'
+      : !hal
+        ? '本机未安装 AudioHub 驱动（或服务未加载桥接），没有虚拟设备。'
+        : isModeB(st)
+          ? '当前没有任何虚拟设备：配对一台对端后，它会立刻出现在系统音频设备列表里。'
+          : '当前是模式 A：虚拟设备只在模式 B 下存在。';
   }
 
   function update(st) {
     portVal.textContent = st.daemon ? String(st.daemon.control_port) : '—';
     ipcVal.textContent = st.endpoint ? String(st.endpoint.port) : '—';
-    setSwitch(removeSw, st.settings.removeVirtual);
-    renderModeNote(st);
+    const ds = st.daemonSettings;
+    setSwitch(removeSw, ds ? ds.remove_virtual_on_disconnect : st.settings.removeVirtual);
+    setSwitch(offlineSw, ds ? ds.mark_offline_devices : true);
+    // 没有 settings.* 的旧服务：开关点了也不会有任何效果，禁用比假装能用诚实。
+    // 正在写的时候不碰 disabled——那是 setPending 的地盘，抢过来会让 pending 态
+    // 在第一次 store.emit 时就被清掉。
+    if (!writing) {
+      const noSettings = st.settingsSupported === false;
+      for (const b of [removeSw, offlineSw]) b.disabled = noSettings;
+    }
+    latencySeg.sync();
+    qualitySeg.sync();
+    renderMode(st);
+    renderDevices(st);
+    // 第三方虚拟声卡与「AudioHub – X 麦克风」做的是同一件事：模式 B 下整张卡下线，
+    // 否则用户会以为还得再装一张卡才能用对端麦克风。
+    bridgeCard.hidden = isModeB(st);
     renderBridgeStatus(st);
     perms.render(st);
   }

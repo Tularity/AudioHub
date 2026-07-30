@@ -124,6 +124,17 @@ pub enum SessionMsg {
     Pong {
         t_us: u64,
     },
+    /// "I have unpaired from you." Sent immediately before `Bye` when the local
+    /// user removes a pairing while the channel is up (plan §7.1, ruled in
+    /// 2026-07-31).
+    ///
+    /// The refusal at the next verify (`ControlMsg::Unpaired`) covers the peer
+    /// that dials US; this covers the peer that never does, which would
+    /// otherwise never find out and would keep a pair of virtual devices in our
+    /// name in its system list forever. A peer that predates this variant fails
+    /// to parse it and drops the channel — the same thing the `Bye` a
+    /// microsecond later would have done.
+    Unpaired {},
     Bye {},
 }
 

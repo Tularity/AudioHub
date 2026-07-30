@@ -47,11 +47,16 @@ pub(crate) enum SourceSpec {
     /// What this machine is playing (spec-m4b §B2). The backend id is part of
     /// the dedup key: two streams naming different backends are two captures.
     SysAudio { backend: String },
-    /// What an application played into the macOS virtual device "AudioHub
-    /// Speaker" (spec-round2 §B2). One ring, one consumer: every stream on this
-    /// source shares the single entry this key produces, which is also what
-    /// keeps the halbridge SPSC rule (exactly one reader) true.
-    HalSpeaker,
+    /// What an application played into ONE peer's virtual speaker (spec-m5b
+    /// §5.4). The slot is part of the dedup key, so each speaker ring gets
+    /// exactly one consumer entry — which is what keeps the halbridge SPSC rule
+    /// (exactly one reader per ring) literally true with sixteen of them.
+    ///
+    /// Collapsing this back to a slot-less variant is the single most dangerous
+    /// simplification available here: every peer's audio would come out of one
+    /// ring, every positive test would still pass, and the only symptom would
+    /// be one peer hearing another's audio.
+    HalSpeaker { slot: u8 },
 }
 
 impl SourceSpec {
@@ -64,7 +69,7 @@ impl SourceSpec {
             SourceSpec::Tone { freq_bits } => format!("tone {}Hz", f32::from_bits(*freq_bits)),
             SourceSpec::Mic => "mic".to_string(),
             SourceSpec::SysAudio { backend } => format!("sysaudio '{backend}'"),
-            SourceSpec::HalSpeaker => "hal speaker".to_string(),
+            SourceSpec::HalSpeaker { slot } => format!("hal speaker slot {slot}"),
         }
     }
 }
@@ -336,7 +341,7 @@ fn build_source(inner: &DaemonInner, spec: &SourceSpec) -> Result<Src> {
         // same way an unresolvable sysaudio backend does. A bridge that IS
         // there but has no driver attached is a different thing entirely and
         // succeeds: halbridge answers silence, one full frame per tick.
-        SourceSpec::HalSpeaker => {
+        SourceSpec::HalSpeaker { slot } => {
             let hal = inner.hal().ok_or_else(|| {
                 anyhow!(
                     "the macOS HAL bridge is not available (no LaunchDaemon holding \
@@ -352,15 +357,16 @@ fn build_source(inner: &DaemonInner, spec: &SourceSpec) -> Result<Src> {
             // Same reasoning (and the same 500ms) as the driver's own flush of
             // mic_ring at handshake.
             let mut stale = Vec::with_capacity(crate::halbridge::HAL_RING_FRAMES as usize);
-            let dropped = hal.read_spk_mono(&mut stale, crate::halbridge::HAL_RING_FRAMES as usize);
+            let dropped =
+                hal.read_spk_mono(*slot, &mut stale, crate::halbridge::HAL_RING_FRAMES as usize);
             if dropped > 0 {
                 dlog!(
-                    "[audiohubd] hal speaker: dropped {}ms of audio played before this stream \
-                     opened",
+                    "[audiohubd] hal speaker slot {slot}: dropped {}ms of audio played before \
+                     this stream opened",
                     dropped / (crate::halbridge::HAL_SAMPLE_RATE as usize / 1000)
                 );
             }
-            Src::Frame(Box::new(crate::halbridge::HalSpeakerSource::new(&hal)))
+            Src::Frame(Box::new(crate::halbridge::HalSpeakerSource::new(&hal, *slot)))
         }
     })
 }
@@ -493,6 +499,10 @@ fn rebuild_mic_source(inner: &DaemonInner, sources: &mut HashMap<SourceSpec, Sou
 pub(crate) fn tx_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<TxCmd>) {
     let mut streams: HashMap<u32, TxStream> = HashMap::new();
     let mut sources: HashMap<SourceSpec, SourceEnt> = HashMap::new();
+    // Lifted out of the daemon mutex once, here, so the tick itself never
+    // touches that lock; the bridge is installed before any thread starts and
+    // is never replaced.
+    let hal = inner.hal();
     let mut dev_epoch = inner.dev_in_epoch.load(Ordering::Relaxed);
     let start = Instant::now();
     let mut tick: u64 = 0;
@@ -528,6 +538,22 @@ pub(crate) fn tx_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<TxCmd>) {
         }
         while let Ok(cmd) = cmds.try_recv() {
             apply_txcmd(&inner, cmd, &mut streams, &mut sources);
+        }
+        // spec-m5b §5.4: a PUBLISHED speaker ring with no session behind it
+        // still receives whatever the app that selected it played. Nobody would
+        // ever move its read_idx, the ring fills, and the driver's census
+        // starts logging "audiohubd has stopped draining it" at error level.
+        // Only a ring's consumer may move read_idx, and on this side that is
+        // THIS thread — so the drain belongs here, above the idle short-circuit
+        // below, because "no streams at all" is exactly the case it exists for.
+        if let Some(h) = hal.as_ref() {
+            let mut busy = 0u16;
+            for spec in sources.keys() {
+                if let SourceSpec::HalSpeaker { slot } = spec {
+                    busy |= 1u16 << (*slot).min(15);
+                }
+            }
+            h.drain_idle_speakers(busy);
         }
         if streams.is_empty() {
             match cmds.recv_timeout(Duration::from_millis(200)) {
@@ -880,11 +906,20 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
     let mut mix = [0.0f32; F48];
     let mut mon = [0.0f32; F48];
     let mut frame = [0.0f32; F48];
-    // spec-round2 §B2 microphone direction. Lifted out of the daemon mutex
-    // once, here, so the tick itself never touches that lock; the bridge is
-    // installed before any thread starts and is never replaced.
+    // spec-m5b §5.4 microphone direction. Lifted out of the daemon mutex once,
+    // here, so the tick itself never touches that lock; the bridge is installed
+    // before any thread starts and is never replaced.
     let hal = inner.hal();
-    let mut hal_buf = [0.0f32; F48];
+    // ONE BUCKET PER SLOT, not one shared buffer.
+    //
+    // The version this replaces summed every `hal` stream into a single `hal_buf`
+    // and wrote it into the one mic ring. With two peers bound that is a mixer,
+    // not a router: whoever recorded peer A's virtual microphone got peer B's
+    // audio too — and every positive test still passed, because A's audio was
+    // in there as well. `dirty` keeps the clearing cost proportional to the
+    // buckets actually used rather than to 16 * 480 floats per 10ms tick.
+    let mut hal_bufs = vec![[0.0f32; F48]; crate::haldev::HAL_MAX_SLOTS];
+    let mut hal_dirty: u16 = 0;
     loop {
         if inner.shutdown.load(Ordering::SeqCst) {
             return;
@@ -934,13 +969,17 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
         }
         mix.fill(0.0);
         mon.fill(0.0);
-        hal_buf.fill(0.0);
+        for slot in 0..crate::haldev::HAL_MAX_SLOTS {
+            if hal_dirty & (1 << slot) != 0 {
+                hal_bufs[slot].fill(0.0);
+            }
+        }
+        hal_dirty = 0;
         for b in bridges.values_mut() {
             b.buf.fill(0.0);
         }
         let mut any_spk = false;
         let mut any_mon = false;
-        let mut any_hal = false;
         for s in &streams {
             let popped = lk(&s.jbs).jb.pop();
             lk(&s.post).advance(popped, &mut frame);
@@ -963,13 +1002,9 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
             }
             // ...and the virtual microphone is a fourth one: monitor, bridge
             // and hal are independent destinations for the SAME decode
-            // (spec-round2 §B2).
-            if s.hal {
-                any_hal = true;
-                for i in 0..F48 {
-                    hal_buf[i] += frame[i];
-                }
-            }
+            // (spec-m5b §5.4). The bucket is chosen by the PEER's slot, so two
+            // peers' audio can never meet.
+            add_to_hal_bucket(s.hal_slot, &frame, &mut hal_bufs, &mut hal_dirty);
             if s.is_spk {
                 any_spk = true;
                 for i in 0..F48 {
@@ -986,17 +1021,25 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
             let out: Vec<f32> = b.buf.iter().map(|&v| soft_clip(v)).collect();
             b.tx.push(&out);
         }
-        // Exactly 480 mono samples per 10ms tick = the ring's 48k rate. Only
-        // while a session asked for it: writing into a ring nobody drains would
-        // do nothing but run mic_dropped up. The write is a lock-free SPSC
+        // Exactly 480 mono samples per 10ms tick per slot = each ring's 48k
+        // rate. Only into slots a session asked for AND an application is
+        // actually reading: writing into a ring nobody drains would do nothing
+        // but run that slot's mic_dropped up. The write is a lock-free SPSC
         // index bump, safe to do on this loop.
-        if any_hal && inner.hal_mic_io.load(Ordering::Relaxed) {
+        if hal_dirty != 0 {
             if let Some(h) = hal.as_ref() {
                 let mut out = [0.0f32; F48];
-                for i in 0..F48 {
-                    out[i] = soft_clip(hal_buf[i]);
+                for slot in 0..crate::haldev::HAL_MAX_SLOTS {
+                    if hal_dirty & (1 << slot) == 0
+                        || !inner.hal_mic_io[slot].load(Ordering::Relaxed)
+                    {
+                        continue;
+                    }
+                    for i in 0..F48 {
+                        out[i] = soft_clip(hal_bufs[slot][i]);
+                    }
+                    h.write_mic_mono(slot as u8, &out);
                 }
-                h.write_mic_mono(&out);
             }
         }
         if any_spk {
@@ -1026,6 +1069,30 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
             }
         }
         tick += 1;
+    }
+}
+
+/// Routes ONE decoded frame into the bucket of the peer that owns it.
+///
+/// Extracted so the rule can be tested without a driver, because it is the rule
+/// the previous implementation did not have: every `hal` stream was summed into
+/// a single buffer and written to a single ring, so with two peers bound,
+/// whoever recorded peer A's virtual microphone also got peer B. Every positive
+/// test still passed — A's audio WAS in there.
+fn add_to_hal_bucket(
+    hal_slot: Option<u8>,
+    frame: &[f32; F48],
+    bufs: &mut [[f32; F48]],
+    dirty: &mut u16,
+) {
+    let Some(slot) = hal_slot else { return };
+    let slot = slot as usize;
+    if slot >= bufs.len() {
+        return;
+    }
+    *dirty |= 1 << slot;
+    for i in 0..F48 {
+        bufs[slot][i] += frame[i];
     }
 }
 
@@ -1078,5 +1145,77 @@ pub(crate) fn mix_tone_verdict(samples: &[f32], rate: u32, freq: f32) -> ToneVer
         // tone well above this floor while silence/noise stays far below
         detected: p_med > 1e-4,
         samples_analyzed: analyzed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two peers' virtual microphones are two rings, and one decoded frame
+    /// belongs to exactly one of them.
+    ///
+    /// This is regression N2 in miniature: with a single shared buffer (what
+    /// this code did before spec-m5b §5.4), capturing peer A's virtual
+    /// microphone yielded A's audio AND B's — inaudible as a bug in any test
+    /// that only checks "did A arrive", and a privacy defect in the field.
+    #[test]
+    fn each_peers_audio_lands_only_in_its_own_bucket() {
+        let n = crate::haldev::HAL_MAX_SLOTS;
+        let mut bufs = vec![[0.0f32; F48]; n];
+        let mut dirty = 0u16;
+
+        add_to_hal_bucket(Some(0), &[0.25; F48], &mut bufs, &mut dirty);
+        add_to_hal_bucket(Some(3), &[0.75; F48], &mut bufs, &mut dirty);
+
+        assert_eq!(dirty, 0b1001, "exactly the two slots written are dirty");
+        assert!(bufs[0].iter().all(|&v| v == 0.25), "slot 0 must carry only its own peer");
+        assert!(bufs[3].iter().all(|&v| v == 0.75), "slot 3 must carry only its own peer");
+        for (i, b) in bufs.iter().enumerate() {
+            if i != 0 && i != 3 {
+                assert!(b.iter().all(|&v| v == 0.0), "slot {i} was written to by nobody");
+            }
+        }
+    }
+
+    #[test]
+    fn two_streams_on_the_same_slot_still_mix() {
+        // The bucket is per DEVICE, not per stream: two sessions feeding one
+        // peer's virtual microphone are a mix, which is the provider-side
+        // fan-in plan §1 asks for.
+        let mut bufs = vec![[0.0f32; F48]; 4];
+        let mut dirty = 0u16;
+        add_to_hal_bucket(Some(1), &[0.25; F48], &mut bufs, &mut dirty);
+        add_to_hal_bucket(Some(1), &[0.25; F48], &mut bufs, &mut dirty);
+        assert!(bufs[1].iter().all(|&v| v == 0.5));
+        assert_eq!(dirty, 0b10);
+    }
+
+    #[test]
+    fn a_stream_bound_to_no_device_touches_nothing() {
+        let mut bufs = vec![[0.0f32; F48]; 4];
+        let mut dirty = 0u16;
+        add_to_hal_bucket(None, &[1.0; F48], &mut bufs, &mut dirty);
+        // ...and neither does one naming a slot this driver does not have.
+        add_to_hal_bucket(Some(200), &[1.0; F48], &mut bufs, &mut dirty);
+        assert_eq!(dirty, 0);
+        assert!(bufs.iter().all(|b| b.iter().all(|&v| v == 0.0)));
+    }
+
+    /// The tx engine dedups sources by `SourceSpec`. If the slot were not part
+    /// of the key, every peer's speaker session would share ONE entry — one
+    /// ring, read once, fanned out to everybody — which is the same collapse
+    /// from the other direction.
+    #[test]
+    fn each_slots_speaker_is_its_own_source_key() {
+        let mut m: HashMap<SourceSpec, u32> = HashMap::new();
+        m.insert(SourceSpec::HalSpeaker { slot: 0 }, 10);
+        m.insert(SourceSpec::HalSpeaker { slot: 1 }, 11);
+        assert_eq!(m.len(), 2, "two slots must be two sources, not one shared ring");
+        // ...and the same slot twice is one source with two references, which
+        // is what keeps the ring to a single consumer (halbridge SPSC rule).
+        m.insert(SourceSpec::HalSpeaker { slot: 0 }, 12);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[&SourceSpec::HalSpeaker { slot: 0 }], 12);
     }
 }

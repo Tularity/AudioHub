@@ -3,10 +3,11 @@
 const SETTINGS_KEY = 'audiohub.ui.settings';
 
 function loadSettings() {
-  // consumerMode 缺省是 'a'（plan §7.1）：模式 B 依赖驱动，而驱动可能被卸载、
-  // 或换台机器就没有——存过的 'b' 因此不能被当作「现在能用 B」，settings 视图
-  // 每次都按 daemon 上报的驱动状态重新判定可用性。
-  const dft = { latency: 'lowest', quality: 'auto', removeVirtual: false, consumerMode: 'a' };
+  // **这份只是缓存**（spec-m5b §6.1）：设置的真身在 daemon 里（settings.get/set，
+  // 落盘 <config>/settings.json）。留着它只为两件事：首帧还没拿到回包时不闪，
+  // 以及 daemon 版本较旧、没有 settings.* 时仍有个本地值可显示。
+  // 任何时候 daemon 的值都覆盖它——见 mode.js 的 requestedMode/effectiveMode。
+  const dft = { latency: 'min', quality: 'auto', removeVirtual: false, consumerMode: 'a' };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (raw) return { ...dft, ...JSON.parse(raw) };
@@ -42,6 +43,11 @@ const state = {
     busy: null,                  // 正在请求的权限 id（'*' = 全部授权进行中）
   },
   settings: loadSettings(),
+  // daemon 拥有的全局设置（settings.get）。null = 还没拿到 / 这版服务没有该方法。
+  // 有它的时候，它就是唯一事实：consumer_mode、effective_mode、两个虚拟设备开关、
+  // 槽位容量全部只认这里。
+  daemonSettings: null,
+  settingsSupported: null,       // false = daemon 不认识 settings.*（版本较旧）
   route: { view: 'peers', peerFp: null },
 };
 
@@ -179,6 +185,30 @@ export const store = {
 
   saveSettings() {
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (_) { /* ignore */ }
+  },
+
+  // settings.get / settings.set 的回包。本地缓存跟着写一份，纯粹为了下次启动的首帧
+  // ——绝不反过来覆盖 daemon。
+  setDaemonSettings(d) {
+    if (!d || typeof d !== 'object') return;
+    this.update((s) => {
+      s.daemonSettings = d;
+      s.settingsSupported = true;
+      if (d.consumer_mode === 'a' || d.consumer_mode === 'b') s.settings.consumerMode = d.consumer_mode;
+      if (typeof d.remove_virtual_on_disconnect === 'boolean') s.settings.removeVirtual = d.remove_virtual_on_disconnect;
+      if (typeof d.latency === 'string') s.settings.latency = d.latency;
+      if (typeof d.quality === 'string') s.settings.quality = d.quality;
+    });
+    this.saveSettings();
+  },
+
+  // 「查不到」≠「是 A」：只记下这版服务没有 settings.*，模式判定回落到本地缓存 +
+  // 驱动状态（mode.js），而不是把界面钉死在某个模式上。
+  setSettingsUnsupported() {
+    this.update((s) => {
+      s.settingsSupported = false;
+      s.daemonSettings = null;
+    });
   },
 };
 

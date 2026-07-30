@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 
-use audiohub_core::audio::{default_devices_report, play_samples_blocking, LiveCapture, LivePlayback};
+use audiohub_core::audio::{
+    default_devices_report, device_name_for_uid, play_samples_blocking, watch_device_list,
+    DeviceEvent, DeviceKind, LiveCapture, LivePlayback,
+};
 use audiohub_core::{dsp, sysaudio};
 use audiohub_net::echo::{run_echo_client, run_echo_server_for, EchoCfg};
 use audiohub_net::media::{FrameSource, SysAudioSource, ToneSource};
@@ -50,7 +53,24 @@ enum Source {
 
 #[derive(Subcommand)]
 enum ProbeCmd {
-    Devices,
+    /// List every audio device with its UID and AudioObjectID, or (--watch)
+    /// stream device add/remove events.
+    ///
+    /// --json prints exactly ONE object either way: the listing, or — once the
+    /// --watch window has closed — {"secs":N,"count":K,"events":[...]} with the
+    /// events oldest first. Each event carries `kind` ("added"/"removed"),
+    /// `t_ms` (monotonic ms since the watch started), `unix_ms`, `uid`, `name`
+    /// and `id`. An empty `events` array is a successful run: it is the proof
+    /// that nothing appeared or disappeared during the window.
+    Devices {
+        /// watch kAudioHardwarePropertyDevices for add/remove events instead of
+        /// listing; self-terminates after --secs (macOS only)
+        #[arg(long)]
+        watch: bool,
+        /// how long --watch observes before it exits
+        #[arg(long, default_value_t = 10.0)]
+        secs: f32,
+    },
     Tone {
         #[arg(long, default_value_t = 440.0)]
         freq: f32,
@@ -62,6 +82,10 @@ enum ProbeCmd {
         /// the equivalent of picking that device inside an app
         #[arg(long)]
         device: Option<String>,
+        /// same, addressed by the device's UID (exact, case-sensitive).
+        /// Mutually exclusive with --device. macOS only.
+        #[arg(long)]
+        device_uid: Option<String>,
     },
     Loopback {
         #[arg(long, default_value_t = 5.0)]
@@ -73,7 +97,12 @@ enum ProbeCmd {
     Capture {
         /// input device name (exact, or a case-insensitive prefix)
         #[arg(long)]
-        device: String,
+        device: Option<String>,
+        /// input device UID (exact, case-sensitive) — the stable handle for a
+        /// device whose NAME is generated at runtime. Mutually exclusive with
+        /// --device; exactly one of the two is required. macOS only.
+        #[arg(long)]
+        device_uid: Option<String>,
         #[arg(long, default_value_t = 5.0)]
         secs: f32,
         /// assert this frequency IS present in the capture
@@ -182,60 +211,42 @@ fn main() {
 
 fn dispatch(cmd: ProbeCmd, json: bool) -> Result<i32> {
     match cmd {
-        ProbeCmd::Devices => {
+        ProbeCmd::Devices { watch, secs } => {
+            if watch {
+                return cmd_devices_watch(secs, json);
+            }
             let report = default_devices_report()?;
             info(&format!("{report:?}"));
             emit_json(json, &report);
             Ok(0)
         }
-        ProbeCmd::Tone { freq, secs, amp, device } => {
-            let samples = dsp::gen_sine(freq, 48000, (48000.0 * secs) as usize, amp);
-            match device.as_deref() {
-                Some(name) => {
-                    info(&format!("playing {freq} Hz for {secs}s (amp {amp}) into '{name}'"));
-                    // Feed the named device in real time: LivePlayback::start_on
-                    // resolves the name (no silent fallback to the default) and
-                    // owns the stream, so the tone lands where it was asked to.
-                    let (guard, mut tx) = LivePlayback::start_on(name, 48000)?;
-                    // Pace against an ABSOLUTE clock with a lead, never against a
-                    // fixed sleep: `sleep(10ms)` always overshoots, so pushing one
-                    // 10ms frame per sleep feeds slower than 48k is consumed and
-                    // the stream underruns into near-silence (measured: a 1200 Hz
-                    // tone came out at -5 dB SNR, indistinguishable from a broken
-                    // audio path — which is exactly what it was mistaken for).
-                    const LEAD: usize = 4800; // 100ms of slack in the ring
-                    let mut sent = 0usize;
-                    let start = Instant::now();
-                    while sent < samples.len() {
-                        let due = (start.elapsed().as_secs_f64() * 48000.0) as usize + LEAD;
-                        while sent < samples.len() && sent < due {
-                            let end = (sent + 480).min(samples.len());
-                            tx.push(&samples[sent..end]);
-                            sent = end;
-                        }
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    // the ring still holds up to LEAD samples the device has not played
-                    std::thread::sleep(Duration::from_millis(300));
-                    drop(guard);
-                }
-                None => {
-                    info(&format!("playing {freq} Hz tone for {secs}s (amp {amp})"));
-                    play_samples_blocking(&samples, 48000)?;
-                }
-            }
-            emit_json(
-                json,
-                &serde_json::json!({"ok": true, "freq": freq, "secs": secs, "device": device}),
-            );
-            Ok(0)
-        }
+        ProbeCmd::Tone {
+            freq,
+            secs,
+            amp,
+            device,
+            device_uid,
+        } => cmd_tone(
+            freq,
+            secs,
+            amp,
+            device.as_deref(),
+            device_uid.as_deref(),
+            json,
+        ),
         ProbeCmd::Loopback { secs } => cmd_loopback(secs, json),
         ProbeCmd::Capture {
             device,
+            device_uid,
             secs,
             verify_freq,
-        } => cmd_capture(&device, secs, verify_freq, json),
+        } => cmd_capture(
+            device.as_deref(),
+            device_uid.as_deref(),
+            secs,
+            verify_freq,
+            json,
+        ),
         ProbeCmd::Selftest => cmd_selftest(json),
         ProbeCmd::Tx {
             to,
@@ -306,6 +317,127 @@ fn dispatch(cmd: ProbeCmd, json: bool) -> Result<i32> {
     }
 }
 
+/// How a probe was told to address a device.
+enum DeviceSel<'a> {
+    Default,
+    Name(&'a str),
+    Uid(&'a str),
+}
+
+/// `--device` and `--device-uid` are mutually exclusive. The conflict is
+/// rejected here rather than by clap so that a usage mistake exits EXIT_ERROR:
+/// clap would exit 2, which in this CLI already means "the measurement ran and
+/// the check failed" — a regression script must not confuse the two.
+fn device_sel<'a>(name: Option<&'a str>, uid: Option<&'a str>) -> Result<DeviceSel<'a>> {
+    match (name, uid) {
+        (Some(_), Some(_)) => Err(anyhow!("--device and --device-uid are mutually exclusive")),
+        (Some(n), None) => Ok(DeviceSel::Name(n)),
+        (None, Some(u)) => Ok(DeviceSel::Uid(u)),
+        (None, None) => Ok(DeviceSel::Default),
+    }
+}
+
+/// probe devices --watch. Registers a listener on the system device list and
+/// reports every add/remove inside the window. This exists to prove a NEGATIVE
+/// — that e.g. a daemon restart causes ZERO device churn — which polling
+/// structurally cannot do: a device that comes and goes between two samples
+/// leaves no trace. An empty event list is therefore a result, not a failure.
+fn cmd_devices_watch(secs: f32, json: bool) -> Result<i32> {
+    info(&format!("watching the audio device list for {secs}s"));
+    let events = watch_device_list(
+        secs,
+        Box::new(|e: &DeviceEvent| {
+            info(&format!(
+                "t={}ms {} name={:?} uid={:?} id={:?} in={} out={}",
+                e.t_ms, e.kind, e.name, e.uid, e.id, e.is_input, e.is_output
+            ));
+        }),
+    )?;
+    info(&format!("{} device change event(s) in {secs}s", events.len()));
+    emit_json(
+        json,
+        &serde_json::json!({"secs": secs, "count": events.len(), "events": events}),
+    );
+    Ok(0)
+}
+
+/// probe tone. `--device`/`--device-uid` pick a specific card the way an app
+/// would; without either, the system default plays.
+fn cmd_tone(
+    freq: f32,
+    secs: f32,
+    amp: f32,
+    device: Option<&str>,
+    device_uid: Option<&str>,
+    json: bool,
+) -> Result<i32> {
+    let sel = device_sel(device, device_uid)?;
+    let samples = dsp::gen_sine(freq, 48000, (48000.0 * secs) as usize, amp);
+    // The name behind a UID, resolved up front purely so the run can REPORT
+    // which device it actually addressed — with runtime-generated names that is
+    // not knowable in advance, and the name is the only part a human can check.
+    let mut resolved: Option<String> = None;
+    let opened = match sel {
+        DeviceSel::Default => None,
+        DeviceSel::Name(name) => {
+            info(&format!("playing {freq} Hz for {secs}s (amp {amp}) into '{name}'"));
+            // Feed the named device in real time: LivePlayback::start_on
+            // resolves the name (no silent fallback to the default) and
+            // owns the stream, so the tone lands where it was asked to.
+            Some(LivePlayback::start_on(name, 48000)?)
+        }
+        DeviceSel::Uid(uid) => {
+            let name = device_name_for_uid(DeviceKind::Output, uid)?;
+            info(&format!(
+                "playing {freq} Hz for {secs}s (amp {amp}) into UID '{uid}' ({name})"
+            ));
+            resolved = Some(name);
+            Some(LivePlayback::start_on_uid(uid, 48000)?)
+        }
+    };
+    match opened {
+        Some((guard, mut tx)) => {
+            // Pace against an ABSOLUTE clock with a lead, never against a
+            // fixed sleep: `sleep(10ms)` always overshoots, so pushing one
+            // 10ms frame per sleep feeds slower than 48k is consumed and
+            // the stream underruns into near-silence (measured: a 1200 Hz
+            // tone came out at -5 dB SNR, indistinguishable from a broken
+            // audio path — which is exactly what it was mistaken for).
+            const LEAD: usize = 4800; // 100ms of slack in the ring
+            let mut sent = 0usize;
+            let start = Instant::now();
+            while sent < samples.len() {
+                let due = (start.elapsed().as_secs_f64() * 48000.0) as usize + LEAD;
+                while sent < samples.len() && sent < due {
+                    let end = (sent + 480).min(samples.len());
+                    tx.push(&samples[sent..end]);
+                    sent = end;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // the ring still holds up to LEAD samples the device has not played
+            std::thread::sleep(Duration::from_millis(300));
+            drop(guard);
+        }
+        None => {
+            info(&format!("playing {freq} Hz tone for {secs}s (amp {amp})"));
+            play_samples_blocking(&samples, 48000)?;
+        }
+    }
+    emit_json(
+        json,
+        &serde_json::json!({
+            "ok": true,
+            "freq": freq,
+            "secs": secs,
+            "device": device,
+            "device_uid": device_uid,
+            "resolved_name": resolved,
+        }),
+    );
+    Ok(0)
+}
+
 fn cmd_loopback(secs: f32, json: bool) -> Result<i32> {
     info("starting mic->speaker loopback; macOS may show a microphone permission (TCC) prompt");
     let (capture, mut rx, capture_rate) = LiveCapture::start()?;
@@ -331,11 +463,39 @@ fn cmd_loopback(secs: f32, json: bool) -> Result<i32> {
 /// probe capture (spec-m4c §B4). Reads a NAMED input device — typically the
 /// input end of the virtual card a mic session bridges into — and reports a
 /// ToneVerdict for it. Never touches the system default device.
-fn cmd_capture(device: &str, secs: f32, verify_freq: Option<f32>, json: bool) -> Result<i32> {
-    info(&format!(
-        "capturing from '{device}' for {secs}s; macOS may show a microphone permission (TCC) prompt"
-    ));
-    let (capture, mut rx, rate) = LiveCapture::start_on(device)?;
+fn cmd_capture(
+    device: Option<&str>,
+    device_uid: Option<&str>,
+    secs: f32,
+    verify_freq: Option<f32>,
+    json: bool,
+) -> Result<i32> {
+    let sel = device_sel(device, device_uid)?;
+    // See cmd_tone: resolved up front only so the run can report which device
+    // the UID actually addressed.
+    let mut resolved: Option<String> = None;
+    let (capture, mut rx, rate) = match sel {
+        // No default-device fallback, by design: capture exists to read ONE
+        // specific card, and reading the machine's microphone instead would
+        // produce a plausible-looking measurement of the wrong thing.
+        DeviceSel::Default => {
+            return Err(anyhow!("capture requires --device or --device-uid"));
+        }
+        DeviceSel::Name(name) => {
+            info(&format!(
+                "capturing from '{name}' for {secs}s; macOS may show a microphone permission (TCC) prompt"
+            ));
+            LiveCapture::start_on(name)?
+        }
+        DeviceSel::Uid(uid) => {
+            let name = device_name_for_uid(DeviceKind::Input, uid)?;
+            info(&format!(
+                "capturing from UID '{uid}' ({name}) for {secs}s; macOS may show a microphone permission (TCC) prompt"
+            ));
+            resolved = Some(name);
+            LiveCapture::start_on_uid(uid)?
+        }
+    };
     // one extra second of slack so the tail of the window is never clipped
     let cap = (rate as f32 * secs.max(0.0)) as usize + rate as usize;
     let mut accum: Vec<f32> = Vec::new();
@@ -372,6 +532,8 @@ fn cmd_capture(device: &str, secs: f32, verify_freq: Option<f32>, json: bool) ->
         json,
         &serde_json::json!({
             "device": device,
+            "device_uid": device_uid,
+            "resolved_name": resolved,
             "capture_rate": rate,
             "secs": secs,
             "samples": accum.len(),

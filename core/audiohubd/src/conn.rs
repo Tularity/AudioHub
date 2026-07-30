@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -21,13 +21,17 @@ use audiohub_ipc::{
 };
 use audiohub_net::control::{write_frame, ControlMsg, CONTROL_MAX_FRAME};
 use audiohub_net::identity::{PairedPeer, PeerStore};
-use audiohub_net::pairing::{pair_responder, verify_initiator, verify_responder};
+use audiohub_net::pairing::{
+    pair_initiator, pair_responder, verify_initiator, verify_responder, was_self_connection,
+    was_unpaired_by_peer, UnpairedByPeer,
+};
 use audiohub_net::secure::{SecureChannel, SessionMsg};
 
 use crate::engine::{self, SourceSpec, TxCmd};
 use crate::{
-    build_session_info, dlog, gen_media_salt, lk, rd, reconnect, wr, ConnShared, DaemonInner,
-    DaemonState, RxStream, SessionEntry, TxShared, VolumeCell, DIR_RECV, DIR_SEND, MEDIA_SALT_LEN,
+    build_session_info, dlog, gen_media_salt, haldev, lk, rd, reconnect, wr, ConnShared,
+    DaemonInner, DaemonState, RxStream, SessionEntry, SessionOrigin, TxShared, VolumeCell,
+    DIR_RECV, DIR_SEND, MEDIA_SALT_LEN,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -56,6 +60,9 @@ const MAX_PREAUTH_CONNS: usize = 32;
 /// simultaneous connect and resolved by the frozen tie-break; a later one is an
 /// ordinary reconnect and replaces whatever is there (self-heal on a dead path).
 const SIMULTANEOUS_WINDOW: Duration = Duration::from_secs(10);
+/// The frozen default control port, mirrored from the CLI's `DEFAULT_PORT`.
+/// `peers.pair` accepts a bare host and has to complete it with something.
+const DEFAULT_CONTROL_PORT: u16 = 47810;
 
 // ---------------------------------------------------------------- server
 
@@ -137,7 +144,14 @@ fn handle_inbound(
     match peek_first(&stream)? {
         ControlMsg::VerifyHello { .. } => {
             let store = PeerStore::load_at(Some(&inner.cfg_dir))?;
-            let peer = verify_responder(&mut stream, &inner.id, &store)?;
+            let mut peer = verify_responder(&mut stream, &inner.id, &store)?;
+            // The peer just told us its computer name (spec-m5b §5.3). Both
+            // verify paths refresh it, so a peer that renames its Mac is
+            // renamed on ITS virtual devices here at the next connection —
+            // whichever side dialled. The address is worth keeping too: it is
+            // where a reconnect would have to look.
+            peer.last_addr = Some(addr.ip().to_string());
+            persist_peer(inner, peer.clone())?;
             let chan = SecureChannel::establish_responder(stream, &inner.id, &peer)?;
             // we are the responder, so the peer is the initiator of this TCP
             let initiator_fp = chan.peer().fingerprint.clone();
@@ -161,6 +175,25 @@ fn handle_inbound(
             release_pairing_pin(inner, &pin, outcome.is_ok());
             let mut outcome = outcome?;
             outcome.peer.last_addr = Some(addr.ip().to_string());
+            // `PairInit.listen_port` is an ADVERTISEMENT, and the standalone
+            // CLI has no listener at all, so it advertises the frozen default
+            // (`m3.rs` cmd_pair). Paired over loopback to a daemon that owns
+            // that very port, the record produced by believing it points the
+            // peer at OUR socket — measured on 2026-07-31, and the reason the
+            // session coordinator dialled this daemon itself. Nobody else can
+            // be listening where we are listening, so this advertisement is
+            // provably false: record 0 = "no port we can believe". The peer
+            // stays fully usable — it dials us, and the media port is learned
+            // from its keepalives — it just never gets dialled on a lie.
+            let advertised = SocketAddr::new(addr.ip(), outcome.peer.port);
+            if is_self_endpoint(inner, advertised) {
+                dlog!(
+                    "[audiohubd] {} advertised {advertised}, which is our own control endpoint; \
+                     recording no port for it",
+                    outcome.peer.fingerprint
+                );
+                outcome.peer.port = 0;
+            }
             persist_peer(inner, outcome.peer)?; // persist before final Ok (M3 rule)
             write_frame(&mut stream, &ControlMsg::Ok {})?;
             Ok(())
@@ -468,6 +501,20 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
             let _ = conn.send_msg(&SessionMsg::Pong { t_us });
         }
         SessionMsg::Pong { .. } => {}
+        SessionMsg::Unpaired {} => {
+            // The peer removed us. Its virtual devices here are now a pair of
+            // ghosts — permanently offline, permanently silent, redialling a
+            // machine that has blacklisted us — so they go with the pairing.
+            dlog!("[audiohubd] peer {} unpaired from us; removing it here too", conn.fp);
+            let fp = conn.fp.clone();
+            let i = inner.clone();
+            // Off-thread: forget_peer tears this very connection down, and
+            // doing that from inside its own reader is a re-entrant teardown.
+            let _ = std::thread::Builder::new()
+                .name("ahb-unpair".into())
+                .spawn(move || forget_peer(&i, &fp));
+            return true;
+        }
         SessionMsg::Bye {} => return true,
     }
     false
@@ -686,8 +733,8 @@ fn handle_remote_open(
                 verify_freq,
                 kind == KIND_SPK, // spk-recv joins the mixer
                 false,
-                None,  // bridging is the local consumer's choice, never the peer's
-                false, // ...and so is the virtual microphone (spec-round2 §B2)
+                None, // bridging is the local consumer's choice, never the peer's
+                None, // ...and so is the virtual microphone (spec-m5b §5.4)
                 conn.media_dest,
             ));
             wr(&inner.rx_table).insert(stream_id, rx.clone());
@@ -703,13 +750,17 @@ fn handle_remote_open(
                     // we play this stream out of our own default output, so we
                     // are the provider the peer's slider drives
                     volume: Arc::new(VolumeCell::new(volume_sync && kind == KIND_SPK)),
-                    origin: None, // the opener re-opens it after a reconnect
+                    replay: None, // the opener re-opens it after a reconnect
+                    origin: SessionOrigin::Peer,
                 },
             );
         }
         // opener receives -> we are the media source (provider side)
         DIR_RECV => {
-            let spec = source_spec(source, freq, backend)?;
+            // A peer asking us for `halspk` is asking for OUR virtual speaker
+            // for IT — which is the slot we bound in its name.
+            let slot = lk(&inner.haldev).slot_of(&conn.fp);
+            let spec = source_spec(source, freq, backend, slot)?;
             let shared = Arc::new(TxShared::new());
             start_tx_stream(
                 inner,
@@ -733,7 +784,8 @@ fn handle_remote_open(
                     // mic provider: the opener consumes OUR source, no output
                     // device of ours is involved
                     volume: Arc::new(VolumeCell::new(false)),
-                    origin: None,
+                    replay: None,
+                    origin: SessionOrigin::Peer,
                 },
             );
         }
@@ -742,7 +794,16 @@ fn handle_remote_open(
     Ok(())
 }
 
-fn source_spec(source: Option<&str>, freq: Option<f32>, backend: Option<&str>) -> Result<SourceSpec> {
+/// `peer_slot` is the slot whose virtual devices belong to the peer at the
+/// other end of this stream, when it has any. Only `halspk` uses it, and it is
+/// resolved by the daemon from the peer's FINGERPRINT — a slot is never named
+/// on the wire or in the IPC contract (spec-m5b §5.6).
+fn source_spec(
+    source: Option<&str>,
+    freq: Option<f32>,
+    backend: Option<&str>,
+    peer_slot: Option<u8>,
+) -> Result<SourceSpec> {
     match source {
         Some(SOURCE_TONE) => Ok(SourceSpec::tone(freq.unwrap_or(1000.0))),
         Some(SOURCE_MIC) | None => Ok(SourceSpec::Mic),
@@ -756,10 +817,21 @@ fn source_spec(source: Option<&str>, freq: Option<f32>, backend: Option<&str>) -
             let info = sysaudio::resolve_backend(want)?;
             Ok(SourceSpec::SysAudio { backend: info.id })
         }
-        // spec-round2 §B2: whatever an app played into "AudioHub Speaker". The
-        // bridge check belongs to build_source (it is the thread that owns the
-        // ring), and a missing bridge fails the open there with its reason.
-        Some(SOURCE_HAL_SPEAKER) => Ok(SourceSpec::HalSpeaker),
+        // spec-m5b §5.4: whatever an app played into THIS PEER's virtual
+        // speaker. The bridge check belongs to build_source (it is the thread
+        // that owns the ring), and a missing bridge fails the open there with
+        // its reason. A peer with no slot is refused here instead: the ring
+        // that would carry this stream does not exist, and accepting it would
+        // produce a session that is silent forever with nothing saying why.
+        Some(SOURCE_HAL_SPEAKER) => {
+            let slot = peer_slot.ok_or_else(|| {
+                anyhow!(
+                    "this peer has no virtual devices, so there is no speaker ring to read \
+                     (mode B is not in force, the driver is absent, or the slot pool is full)"
+                )
+            })?;
+            Ok(SourceSpec::HalSpeaker { slot })
+        }
         Some(other) => bail!("unknown source {other}"),
     }
 }
@@ -796,7 +868,7 @@ fn teardown_conn(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
             .iter()
             .filter(|(_, e)| Arc::ptr_eq(&e.conn, conn))
             .map(|(id, e)| {
-                if let Some(o) = &e.origin {
+                if let Some(o) = &e.replay {
                     mine.push((*id, (**o).clone()));
                 }
                 *id
@@ -876,7 +948,7 @@ pub(crate) fn drop_conn(inner: &Arc<DaemonInner>, fp: &str, why: &str) {
 
 /// Fingerprint prefix lookup across live conns, retry entries and the peer
 /// store: `peers.disconnect` must still work for a peer that was just unpaired.
-fn resolve_fingerprint(inner: &DaemonInner, selector: &str) -> Result<String> {
+pub(crate) fn resolve_fingerprint(inner: &DaemonInner, selector: &str) -> Result<String> {
     let mut cands: Vec<String> = lk(&inner.state).conns.keys().cloned().collect();
     cands.extend(lk(&inner.recon).keys().cloned());
     if let Ok(s) = PeerStore::load_at(Some(&inner.cfg_dir)) {
@@ -899,7 +971,85 @@ pub(crate) fn disconnect_peer(inner: &Arc<DaemonInner>, selector: &str) -> Resul
     Ok(fp)
 }
 
+/// `peers.pair`: the INITIATOR half of M3 pairing, run by the daemon.
+///
+/// It used to live in the CLI, which meant a pairing was a foreign process
+/// writing `paired_peers.json` behind the daemon's back — fine when a pairing
+/// only changed a list, wrong now that it has to make a pair of audio devices
+/// appear. Doing it here means the device coordinator sees the new peer on its
+/// very next pass.
+///
+/// `addr` is `host` or `host:port`; the bare form uses the frozen default port.
+pub(crate) fn pair_with(inner: &Arc<DaemonInner>, addr: &str, pin: &str) -> Result<String> {
+    let target = if addr.contains(':') {
+        addr.to_string()
+    } else {
+        format!("{addr}:{DEFAULT_CONTROL_PORT}")
+    };
+    let sa = target
+        .to_socket_addrs()
+        .with_context(|| format!("resolve {target}"))?
+        .next()
+        .ok_or_else(|| anyhow!("no address for {target}"))?;
+    // Same guard as connect_peer, one layer earlier: pairing with ourselves
+    // would write a store record for our own fingerprint, which every later
+    // dial and every verify would then have to treat as a stranger.
+    if is_self_endpoint(inner, sa) {
+        bail!("refusing to pair with {sa}: that is this daemon's own control endpoint");
+    }
+    let mut stream = TcpStream::connect_timeout(&sa, CONNECT_TIMEOUT)
+        .with_context(|| format!("connect {sa}"))?;
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    // We advertise the port WE listen on, which for a daemon is its real one —
+    // the CLI had to guess the default here because it has no listener at all.
+    let mut outcome = pair_initiator(&mut stream, pin, &inner.id, inner.control_port)?;
+    outcome.peer.last_addr = Some(sa.ip().to_string());
+    outcome.peer.port = sa.port();
+    let fp = outcome.peer.fingerprint.clone();
+    persist_peer(inner, outcome.peer)?;
+    dlog!("[audiohubd] paired with {fp} at {sa}");
+    Ok(fp)
+}
+
 // ---------------------------------------------------------------- outbound
+
+/// True when `ip` names an interface of THIS host.
+///
+/// Asks the routing table rather than pattern-matching the text: a
+/// `127.0.0.1` compare would miss `::1`, `localhost`, the machine's own LAN
+/// address and a NAT hairpin, all of which land back here just as squarely.
+/// The UDP socket sends nothing — `connect` on a datagram socket only picks the
+/// route — and if the source address the kernel would use IS the target, the
+/// target is one of ours.
+fn ip_is_ours(ip: IpAddr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    let bind: SocketAddr = if ip.is_ipv4() {
+        ([0, 0, 0, 0], 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    UdpSocket::bind(bind)
+        .and_then(|s| {
+            s.connect(SocketAddr::new(ip, 9))?; // discard port; no datagram is sent
+            s.local_addr()
+        })
+        .map_or(false, |local| local.ip() == ip)
+}
+
+/// True when `addr` is this daemon's own control endpoint.
+///
+/// The cheap half of the self-dial guard (`SelfConnection` from the handshake
+/// is the authoritative half): it costs no TCP connection and catches the case
+/// that actually occurred — a peer record whose address and port resolved to
+/// the very socket we accept on, so the session coordinator dialled us, we
+/// answered our own `VerifyHello` with `Unpaired`, and we deleted the pairing
+/// on our own say-so.
+fn is_self_endpoint(inner: &DaemonInner, addr: SocketAddr) -> bool {
+    addr.port() == inner.control_port && ip_is_ours(addr.ip())
+}
 
 fn resolve_peer(store: &PeerStore, selector: &str) -> Result<PairedPeer> {
     let matches: Vec<&PairedPeer> = store
@@ -922,6 +1072,18 @@ fn target_addr(peer: &PairedPeer, addr_override: Option<&str>) -> Result<SocketA
             let ip = peer.last_addr.as_deref().ok_or_else(|| {
                 anyhow!("no known address for {} (pass addr)", peer.fingerprint)
             })?;
+            // Port 0 is how the store records "this peer never told us a port we
+            // could believe" (see the PairInit arm of handle_inbound). Dialling
+            // it is meaningless, and the message has to say so: the peer is
+            // still perfectly usable — it just has to be the one to dial, or be
+            // given an explicit address.
+            if peer.port == 0 {
+                bail!(
+                    "no reachable port recorded for {} (it paired without advertising one); \
+                     pass addr as host:port, or let it connect to us",
+                    peer.fingerprint
+                );
+            }
             format!("{}:{}", ip, peer.port)
         }
     };
@@ -970,12 +1132,76 @@ pub(crate) fn connect_peer(
         }
     }
     let addr = target_addr(&peer, addr_override)?;
+    // Never dial ourselves. Measured on 2026-07-31: a peer whose record pointed
+    // at this daemon's own control endpoint made the session coordinator open a
+    // TCP to us, we answered our own VerifyHello with `Unpaired` (our own
+    // fingerprint is not in our own store, and never can be) and the initiator
+    // half then deleted the pairing — the daemon told itself the trust was dead
+    // and destroyed it. Refused before the connect so no handshake, no
+    // reconnect rung and no store write can come of it.
+    if is_self_endpoint(inner, addr) {
+        bail!(
+            "refusing to dial {addr} for {}: that is this daemon's own control endpoint (the \
+             peer's recorded address is wrong — it must dial us, or be given the right one)",
+            peer.fingerprint
+        );
+    }
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .with_context(|| format!("connect {addr}"))?;
     let _ = stream.set_nodelay(true);
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-    let verified = verify_initiator(&mut stream, &inner.id, &store)?;
+    let verified = match verify_initiator(&mut stream, &inner.id, &store) {
+        Ok(v) => v,
+        Err(e) => {
+            // The peer has removed us. Keeping the pairing would leave a pair
+            // of virtual devices in this machine's system list bearing that
+            // peer's name — permanently offline, permanently silent — plus a
+            // reconnect loop dialling a machine that has blacklisted us
+            // (spec-m5b OPEN QUESTION 5).
+            //
+            // Two things must hold before a trust relationship is deleted over
+            // a frame that arrives before any key exchange. `verify_initiator`
+            // checked the first: the refusal is signed by the key we have on
+            // file for the fingerprint that signed it. This checks the second:
+            // that fingerprint is the peer we set out to reach. Without it a
+            // refusal legitimately signed by peer X, replayed or misdirected on
+            // the connection we opened toward peer Y, would delete Y.
+            let signed_by = e.downcast_ref::<UnpairedByPeer>().map(|u| u.fingerprint.clone());
+            match signed_by {
+                Some(fp) if fp == peer.fingerprint => {
+                    dlog!(
+                        "[audiohubd] peer {} has unpaired from us (signed refusal); dropping our \
+                         side too",
+                        peer.fingerprint
+                    );
+                    forget_peer(inner, &peer.fingerprint);
+                }
+                Some(fp) => dlog!(
+                    "[audiohubd] {addr} refused us as unpaired signed by {fp}, but we dialled {}; \
+                     keeping the pairing",
+                    peer.fingerprint
+                ),
+                // Unsigned, or signed by a key we cannot tie to that peer. The
+                // refusal proves nothing, so this is just a failed connection.
+                None if was_unpaired_by_peer(&e) => dlog!(
+                    "[audiohubd] {addr} refused us as unpaired without proof; keeping the pairing \
+                     with {}",
+                    peer.fingerprint
+                ),
+                // The handshake came back with our own key: whatever the
+                // address said, this connection is a loop. Never a pairing's
+                // fault, so nothing is touched.
+                None if was_self_connection(&e) => dlog!(
+                    "[audiohubd] refusing the connection to {addr} for {}: it came back to this \
+                     daemon ({e:#})",
+                    peer.fingerprint
+                ),
+                None => {}
+            }
+            return Err(e);
+        }
+    };
     if verified.fingerprint != peer.fingerprint {
         bail!(
             "peer at {addr} is {} (expected {})",
@@ -1037,9 +1263,19 @@ fn alloc_stream_id(inner: &DaemonInner) -> u32 {
     }
 }
 
+/// IPC and CLI entry point. Everything opened this way is a USER session: the
+/// device coordinator may never close one (spec-m5b §5.6).
 pub(crate) fn open_session(
     inner: &Arc<DaemonInner>,
     params: &OpenSessionParams,
+) -> Result<SessionInfo> {
+    open_session_from(inner, params, SessionOrigin::User)
+}
+
+pub(crate) fn open_session_from(
+    inner: &Arc<DaemonInner>,
+    params: &OpenSessionParams,
+    origin: SessionOrigin,
 ) -> Result<SessionInfo> {
     if params.kind != KIND_MIC && params.kind != KIND_SPK {
         bail!("kind must be '{KIND_MIC}' or '{KIND_SPK}'");
@@ -1071,13 +1307,26 @@ pub(crate) fn open_session(
     // Refused up front rather than accepted-and-silent: an operator who asked
     // for the virtual microphone and got a session that feeds nothing has no
     // way to tell from the session list.
-    if params.hal && inner.hal().is_none() {
+    //
+    // BEFORE the slot lookup below, and deliberately: "there is no bridge on
+    // this machine" and "this peer has no device" are different problems with
+    // different fixes, and a host with no driver at all must be told the first
+    // one — the slot could never exist there whatever the peer or the mode.
+    let wants_hal =
+        params.hal || params.source.as_deref() == Some(audiohub_ipc::SOURCE_HAL_SPEAKER);
+    if wants_hal && inner.hal().is_none() {
         bail!(
             "the macOS HAL bridge is not available (no LaunchDaemon holding '{}', or \
              AUDIOHUB_HAL_BRIDGE=off)",
             crate::halbridge::HAL_SERVICE_NAME
         );
     }
+    // auto-connect if offline; a locally opened session is by definition one we
+    // originated, so the peer joins the retry set
+    let peer = connect_peer(inner, &params.peer, None, ConnectOrigin::User)?;
+    // Resolved from the FINGERPRINT, after the selector has been resolved to a
+    // real peer: `hal` and `halspk` name a peer, never a slot (spec-m5b §5.6).
+    let peer_slot = lk(&inner.haldev).slot_of(&peer.fingerprint);
     let spec = if consuming {
         None
     } else {
@@ -1086,11 +1335,20 @@ pub(crate) fn open_session(
             params.source.as_deref(),
             params.freq,
             params.backend.as_deref(),
+            peer_slot,
         )?)
     };
-    // auto-connect if offline; a locally opened session is by definition one we
-    // originated, so the peer joins the retry set
-    let peer = connect_peer(inner, &params.peer, None, ConnectOrigin::User)?;
+    let hal_slot = if params.hal {
+        Some(peer_slot.ok_or_else(|| {
+            anyhow!(
+                "no virtual microphone is bound to {} (mode B is not in force, the driver is \
+                 absent, or the slot pool is full)",
+                peer.fingerprint
+            )
+        })?)
+    } else {
+        None
+    };
     let conn = lk(&inner.state)
         .conns
         .get(&peer.fingerprint)
@@ -1129,7 +1387,7 @@ pub(crate) fn open_session(
             false,
             params.monitor,
             bridge.clone(),
-            params.hal,
+            hal_slot,
             conn.media_dest,
         ));
         wr(&inner.rx_table).insert(stream_id, rx.clone());
@@ -1179,7 +1437,7 @@ pub(crate) fn open_session(
 
     // exactly what a reconnect replays; the fresh stream id and media salt are
     // minted by this function, not carried here (spec-m4c §C)
-    let origin = Some(Arc::new(params.clone()));
+    let replay = Some(Arc::new(params.clone()));
     let entry = if consuming {
         SessionEntry {
             id: stream_id,
@@ -1189,6 +1447,7 @@ pub(crate) fn open_session(
             rx: rx_arc,
             tx: None,
             volume: Arc::new(VolumeCell::new(false)), // mic: no remote output
+            replay,
             origin,
         }
     } else {
@@ -1218,6 +1477,7 @@ pub(crate) fn open_session(
             tx: Some(shared),
             // consumer of a spk stream: our slider drives the PEER's output
             volume: Arc::new(VolumeCell::new(vol_sync)),
+            replay,
             origin,
         }
     };
@@ -1246,7 +1506,32 @@ pub(crate) fn open_session(
             conn.fp
         );
     }
-    Ok(build_session_info(&entry, &[], None))
+    Ok(build_session_info(&entry, &[], None, None))
+}
+
+/// Removes every trace of a peer this daemon is no longer paired with: the
+/// store entry, the retry loop, the live control channel, its sessions and its
+/// virtual devices.
+///
+/// Order matters. The connection goes LAST, because dropping it re-arms the
+/// retry loop from `teardown_conn` unless the entry is already gone.
+pub(crate) fn forget_peer(inner: &Arc<DaemonInner>, fp: &str) {
+    {
+        let _g = lk(&inner.store_lock);
+        if let Ok(mut s) = PeerStore::load_at(Some(&inner.cfg_dir)) {
+            if s.remove_by_fingerprint(fp) {
+                let _ = s.save();
+            }
+        }
+    }
+    reconnect::disarm(inner, fp);
+    haldev::release_peer(inner, fp);
+    // Tell it, if we still can: the peer that never dials us would otherwise
+    // never learn, and its copy of our devices would outlive the pairing.
+    if let Some(c) = lk(&inner.state).conns.get(fp).cloned() {
+        let _ = c.send_msg(&SessionMsg::Unpaired {});
+    }
+    drop_conn(inner, fp, "unpaired");
 }
 
 pub(crate) fn close_session(inner: &Arc<DaemonInner>, id: u32) -> Result<()> {

@@ -154,9 +154,18 @@ else
     print -u2 -- "[audiohub] FAIL: $INSTALLED_BUNDLE did not install"
     rc=1
 fi
-print -- "[audiohub] coreaudiod needs a moment; then 'AudioHub Speaker' and"
-print -- "[audiohub] 'AudioHub Microphone' should appear in Audio MIDI Setup."
+# The v1 driver published one fixed, peer-less device pair the moment it loaded,
+# so the old message told the user to look for those two names. v2 publishes
+# NOTHING until audiohubd binds a slot to a paired peer, and each peer
+# then appears under its own name. Telling a user to look for two devices that
+# will never exist would make a correct install look broken.
+print -- "[audiohub] coreaudiod needs a moment. EXPECT NO AudioHub DEVICES YET:"
+print -- "[audiohub] the driver publishes one pair per PAIRED PEER, named after that"
+print -- "[audiohub] peer's host, and only once audiohubd binds them. Zero devices with"
+print -- "[audiohub] no peer paired is the correct state, not a failure."
 print -- "[audiohub] the plug-in registers $DRIVER_SERVICE once coreaudiod loads it;"
 print -- "[audiohub] start audiohubd normally (user session, no sudo) and it will attach."
+print -- "[audiohub] its log is in the plug-in's OWN host process, not coreaudiod:"
+print -- "[audiohub]   log stream --level debug --process \"\$(pgrep -f 'AudioHubDriver.driver' | head -1)\""
 print -- "[audiohub] undo everything with: zsh uninstall.sh --yes"
 exit $rc

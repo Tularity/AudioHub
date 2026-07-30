@@ -13,11 +13,12 @@ use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::{HandshakeError, Message, WebSocket};
 
 use audiohub_ipc::{
-    methods, DaemonInfo, OpenSessionParams, PeerState, PermissionKind, IPC_VERSION,
+    methods, DaemonInfo, DaemonSettings, OpenSessionParams, PeerState, PermissionKind, IPC_VERSION,
+    MODE_A, MODE_B,
 };
 use audiohub_net::identity::{random_pin, PeerStore};
 
-use crate::{conn, dlog, lk, DaemonInner, PairingMode};
+use crate::{conn, dlog, haldev, lk, DaemonInner, PairingMode};
 
 pub(crate) fn accept_loop(inner: Arc<DaemonInner>, listener: TcpListener) {
     loop {
@@ -316,31 +317,7 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 }
                 serde_json::to_value(state)?
             }
-            methods::PEERS_LIST => {
-                let store = PeerStore::load_at(Some(&inner.cfg_dir))?;
-                let recon = crate::reconnect::snapshot(inner);
-                let list: Vec<PeerState> = {
-                    let st = lk(&inner.state);
-                    store
-                        .list()
-                        .iter()
-                        .map(|p| {
-                            let (reconnecting, retry_in_s) =
-                                recon.get(&p.fingerprint).copied().unwrap_or((false, None));
-                            PeerState {
-                                peer: p.clone(),
-                                online: st
-                                    .conns
-                                    .get(&p.fingerprint)
-                                    .map_or(false, |c| c.alive.load(Ordering::SeqCst)),
-                                reconnecting,
-                                retry_in_s,
-                            }
-                        })
-                        .collect()
-                };
-                serde_json::to_value(list)?
-            }
+            methods::PEERS_LIST => serde_json::to_value(peer_states(inner)?)?,
             methods::PEERS_CONNECT => {
                 let sel = params
                     .get("peer")
@@ -348,12 +325,21 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     .ok_or_else(|| anyhow::anyhow!("missing 'peer'"))?;
                 let addr = params.get("addr").and_then(Value::as_str);
                 let peer = conn::connect_peer(inner, sel, addr, conn::ConnectOrigin::User)?;
-                serde_json::to_value(PeerState {
-                    peer,
-                    online: true,
-                    reconnecting: false,
-                    retry_in_s: None,
-                })?
+                let fp = peer.fingerprint.clone();
+                serde_json::to_value(
+                    peer_states(inner)?
+                        .into_iter()
+                        .find(|p| p.peer.fingerprint == fp)
+                        .unwrap_or(PeerState {
+                            peer,
+                            online: true,
+                            reconnecting: false,
+                            retry_in_s: None,
+                            hal_device: None,
+                            hal_reason: None,
+                            display_name: String::new(),
+                        }),
+                )?
             }
             methods::PEERS_DISCONNECT => {
                 let sel = params
@@ -399,6 +385,15 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
             }
             methods::SESSION_OPEN => {
                 let p: OpenSessionParams = serde_json::from_value(params.clone())?;
+                // The structural half of mode B (spec-m5b §6.1): in mode B the
+                // SYSTEM's device selection is what opens sessions. A UI that
+                // could also open one by peer would have put the peer picker
+                // back, and every mode-B property would quietly stop holding.
+                if let Some(why) =
+                    haldev::refuse_ui_session(haldev::effective_mode(inner), p.override_mode)
+                {
+                    anyhow::bail!("{why}");
+                }
                 serde_json::to_value(conn::open_session(inner, &p)?)?
             }
             methods::SESSION_CLOSE => {
@@ -429,10 +424,168 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 conn::set_session_volume(inner, id, scalar, muted)?;
                 json!({})
             }
+            methods::SETTINGS_GET => serde_json::to_value(settings_view(inner))?,
+            methods::SETTINGS_SET => {
+                let mut changed = false;
+                {
+                    let mut s = lk(&inner.settings);
+                    if let Some(m) = params.get("consumer_mode").and_then(Value::as_str) {
+                        if m != MODE_A && m != MODE_B {
+                            anyhow::bail!("consumer_mode must be '{MODE_A}' or '{MODE_B}'");
+                        }
+                        changed |= s.consumer_mode != m;
+                        s.consumer_mode = m.to_string();
+                    }
+                    for (key, field) in [
+                        ("remove_virtual_on_disconnect", 0u8),
+                        ("mark_offline_devices", 1u8),
+                    ] {
+                        if let Some(v) = params.get(key).and_then(Value::as_bool) {
+                            let slot = match field {
+                                0 => &mut s.remove_virtual_on_disconnect,
+                                _ => &mut s.mark_offline_devices,
+                            };
+                            changed |= *slot != v;
+                            *slot = v;
+                        }
+                    }
+                    for (key, field) in [("latency", 0u8), ("quality", 1u8)] {
+                        if let Some(v) = params.get(key).and_then(Value::as_str) {
+                            let slot = match field {
+                                0 => &mut s.latency,
+                                _ => &mut s.quality,
+                            };
+                            changed |= slot.as_str() != v;
+                            *slot = v.to_string();
+                        }
+                    }
+                    if changed {
+                        // Persisted before it is answered: a UI that reads back
+                        // what it just wrote must never see the old value, and
+                        // a daemon killed a moment later must come back in the
+                        // mode the user chose.
+                        s.save(&inner.cfg_dir)?;
+                    }
+                }
+                if changed {
+                    dlog!("[audiohubd] settings changed; the device coordinator will reconcile");
+                }
+                serde_json::to_value(settings_view(inner))?
+            }
+            // The initiator half of M3 pairing, moved out of the CLI: a pairing
+            // done in another process wrote paired_peers.json behind the
+            // daemon's back, and the device coordinator only noticed on its
+            // next re-read. Pairing here makes the devices appear at once.
+            methods::PEERS_PAIR => {
+                let addr = params
+                    .get("addr")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing 'addr'"))?;
+                let pin = params
+                    .get("pin")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing 'pin'"))?;
+                let fp = conn::pair_with(inner, addr, pin)?;
+                serde_json::to_value(
+                    peer_states(inner)?
+                        .into_iter()
+                        .find(|p| p.peer.fingerprint == fp)
+                        .ok_or_else(|| anyhow::anyhow!("paired peer {fp} vanished from the store"))?,
+                )?
+            }
+            methods::PEERS_UNPAIR => {
+                let sel = params
+                    .get("peer")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing 'peer'"))?;
+                let fp = conn::resolve_fingerprint(inner, sel)?;
+                conn::forget_peer(inner, &fp);
+                json!({ "fingerprint": fp })
+            }
+            methods::PEERS_SET_ALIAS => {
+                let sel = params
+                    .get("peer")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing 'peer'"))?;
+                let fp = conn::resolve_fingerprint(inner, sel)?;
+                let alias = params
+                    .get("alias")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                {
+                    let _g = lk(&inner.store_lock);
+                    let mut store = PeerStore::load_at(Some(&inner.cfg_dir))?;
+                    if !store.set_alias(&fp, alias) {
+                        anyhow::bail!("no paired peer {fp}");
+                    }
+                    store.save()?;
+                }
+                // The coordinator turns this into an in-place rename at the same
+                // UID on its next pass — no new AudioObjectID, no device-list
+                // change, so an application's remembered selection survives it.
+                let display = peer_states(inner)?
+                    .into_iter()
+                    .find(|p| p.peer.fingerprint == fp)
+                    .map(|p| p.display_name)
+                    .unwrap_or_default();
+                json!({ "fingerprint": fp, "display_name": display })
+            }
             other => anyhow::bail!("unknown method '{other}'"),
         })
     })();
     r.map_err(|e| format!("{e:#}"))
+}
+
+/// `DaemonSettings` = what is stored plus what is derived. `effective_mode`,
+/// `hal_capacity` and `hal_used` are computed here every time rather than
+/// persisted, so the two ends cannot drift apart about which mode is live.
+fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
+    let s = lk(&inner.settings).clone();
+    let (capacity, used) = {
+        let st = lk(&inner.haldev);
+        (st.capacity, st.table.used())
+    };
+    DaemonSettings {
+        consumer_mode: s.consumer_mode.clone(),
+        effective_mode: haldev::effective_mode(inner).to_string(),
+        remove_virtual_on_disconnect: s.remove_virtual_on_disconnect,
+        mark_offline_devices: s.mark_offline_devices,
+        latency: s.latency,
+        quality: s.quality,
+        hal_capacity: capacity as u8,
+        hal_used: used as u8,
+    }
+}
+
+fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
+    let store = PeerStore::load_at(Some(&inner.cfg_dir))?;
+    let recon = crate::reconnect::snapshot(inner);
+    let hal = lk(&inner.haldev);
+    let st = lk(&inner.state);
+    Ok(store
+        .list()
+        .iter()
+        .map(|p| {
+            let (reconnecting, retry_in_s) =
+                recon.get(&p.fingerprint).copied().unwrap_or((false, None));
+            PeerState {
+                online: st
+                    .conns
+                    .get(&p.fingerprint)
+                    .map_or(false, |c| c.alive.load(Ordering::SeqCst)),
+                reconnecting,
+                retry_in_s,
+                hal_device: hal.peer_device(&p.fingerprint),
+                hal_reason: hal.reasons.get(&p.fingerprint).cloned(),
+                display_name: hal
+                    .display
+                    .get(&p.fingerprint)
+                    .cloned()
+                    .unwrap_or_else(|| haldev::base_name(p)),
+                peer: p.clone(),
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]

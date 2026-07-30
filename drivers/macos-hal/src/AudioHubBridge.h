@@ -213,12 +213,43 @@ static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t 
 //   Control     driver -> the daemon port handed over in Hello.control_port
 //   Notify      daemon -> driver's registered service port (it already has a
 //               send right on it from bootstrap_look_up)
+//   Bind        daemon -> the same service port, fire and forget: binds or
+//               clears one slot's peer metadata (spec-m5b §4.2)
 #define kAudioHubMsg_Hello       0x41480001 // daemon -> driver, expects a reply
-#define kAudioHubMsg_HelloReply  0x41480002 // driver -> daemon, carries the two memory entries
+#define kAudioHubMsg_HelloReply  0x41480002 // driver -> daemon, carries every memory entry
 #define kAudioHubMsg_Control     0x41480003 // driver -> daemon, fire and forget
 #define kAudioHubMsg_Notify      0x41480004 // daemon -> driver, fire and forget
+#define kAudioHubMsg_Bind        0x41480005 // daemon -> driver, fire and forget
 
-#define kAudioHubProtocolVersion 1u
+// v2: per-peer virtual devices (spec-m5b §4). Compared for EQUALITY by the
+// driver, in both directions, and a mismatch is a refusal with zero descriptors
+// — never a partial mix. A v2 driver publishes NO devices until a daemon binds
+// a slot, so version skew presents as "zero AudioHub devices in the system"
+// plus a named reason in the daemon, which is a loud failure a user can act on.
+// A v1-shaped negotiation cannot be reconstructed from a v2 message: the reply
+// grew 104 -> 472 bytes and the control message 48 -> 56, so a compatibility
+// shim would have to guess which layout it is holding. There is deliberately
+// none.
+#define kAudioHubProtocolVersion 2u
+
+// One (spk, mic) ring pair per slot, all created up front and never released;
+// binding a peer to a slot is a metadata operation, so the realtime path never
+// has to reason about a ring that might be going away (spec-m5b §1).
+#define kAudioHubMaxSlots        16u
+#define kAudioHubMaxEndpoints    (2u * kAudioHubMaxSlots)
+
+// ENDPOINT ENCODING. What used to be a 1-bit device selector is now
+// `slot * 2 + dir`, so one u32 names any of the 32 virtual devices. The
+// direction bit stays the low bit precisely so the old fixed pair keeps its
+// numbering: slot 0 out == 0, slot 0 in == 1, which is what v1's
+// kAudioHubDevice_Speaker / _Mic were. Both of those names are gone: leaving
+// them would let a caller pass a plain "1" meaning "the microphone" and have it
+// silently addressed to slot 0 of a sixteen-slot pool.
+#define kAudioHubDir_Out         0u // driver writes, daemon reads (virtual speaker)
+#define kAudioHubDir_In          1u // daemon writes, driver reads (virtual microphone)
+#define AUDIOHUB_ENDPOINT(slot, dir) (((slot) * 2u) + (dir))
+#define AUDIOHUB_ENDPOINT_SLOT(ep)   ((ep) / 2u)
+#define AUDIOHUB_ENDPOINT_DIR(ep)    ((ep) & 1u)
 
 // Control ops (driver -> daemon)
 #define kAudioHubCtl_Volume      1u // volume/mute of a virtual device changed locally
@@ -228,9 +259,9 @@ static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t 
 // OUTGOING daemon's control port as the last message on it, immediately before
 // the driver deallocates that port; the send is best-effort (one bounded
 // mach_msg, a wedged daemon simply misses it).
-//   payload: device = kAudioHubDevice_Speaker, scalar_bits = 0, flags = 0,
-//            seq = the usual monotonic control sequence.
-//   the daemon MUST, on receipt: treat the session as already over — unmap both
+//   payload: endpoint = 0, generation = 0 (it concerns no single slot),
+//            scalar_bits = 0, flags = 0, seq = the usual monotonic sequence.
+//   the daemon MUST, on receipt: treat the session as already over — unmap all
 //   rings, drop its send right on the driver port, and stop producing/consuming
 //   at once. It must NOT count this as liveness and must not re-Hello on the
 //   strength of it (an immediate reconnect just displaces the daemon that
@@ -244,19 +275,35 @@ static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t 
 // An older daemon that does not know this op ignores it (its control dispatch
 // has a catch-all), so sending it is always safe.
 #define kAudioHubCtl_Superseded  4u
+// The driver's account of one slot: endpoint = slot*2, scalar_bits carries a
+// kAudioHubSlot_* state, generation carries that slot's current stamp. It is
+// what establishes the generation the daemon then filters every other control
+// message against, and what makes publication CLOSED-LOOP: "I sent a Bind and
+// mach returned OK" is not evidence a device exists (spec-m5b §4.6).
+#define kAudioHubCtl_BindState   5u
+
+// Slot states carried in kAudioHubCtl_BindState's scalar_bits.
+#define kAudioHubSlot_Free       0u
+#define kAudioHubSlot_Bound      1u
+#define kAudioHubSlot_Delisted   2u // off the device list, still answering the HAL
 
 // Notify ops (daemon -> driver)
 #define kAudioHubNotify_Volume   1u // peer's real device reported a new volume: update the control's value
 #define kAudioHubNotify_Ping     2u
 
-// Device selectors, shared by both directions.
-#define kAudioHubDevice_Speaker  0u
-#define kAudioHubDevice_Mic      1u
+// Bind ops (daemon -> driver), in AudioHubBindMsg.op
+#define kAudioHubBind_Clear      0u // retire the slot; generation must match the current one
+#define kAudioHubBind_Set        1u // bind (or idempotently re-bind) the slot to a peer
 
 // Reply status codes
 #define kAudioHubStatus_OK              0u
 #define kAudioHubStatus_BadVersion      1u
 #define kAudioHubStatus_NoMemory        2u
+// A Bind that names a session the driver has since replaced. Whoever sent it
+// was superseded and does not know yet; acting on it would let a departed
+// daemon's queued Binds retire a live daemon's slots.
+#define kAudioHubStatus_StaleSession    3u
+#define kAudioHubStatus_BadRequest      4u
 
 // Handshake request, sent BY THE DAEMON to the driver's registered service port.
 // msgh_local_port must be a send-once reply port. control_port hands the driver
@@ -273,27 +320,46 @@ typedef struct AudioHubHelloRequest
     uint32_t                   client_pid;
 } AudioHubHelloRequest;
 
-// Reply, sent BY THE DRIVER. Complex with exactly two port descriptors when
-// status == kAudioHubStatus_OK; on any other status it is a PLAIN message with
-// msgh_descriptor_count 0 and both descriptors zeroed, so the daemon must test
-// MACH_MSGH_BITS_COMPLEX and status before touching spk_entry/mic_entry.
+// Reply, sent BY THE DRIVER. Complex with exactly kAudioHubMaxEndpoints port
+// descriptors when status == kAudioHubStatus_OK; on any other status it is a
+// PLAIN message with msgh_descriptor_count 0 and the whole array zeroed, so the
+// daemon must test MACH_MSGH_BITS_COMPLEX and status before touching entries[].
+//
+// ONE reply carries all 32 entries rather than 16 follow-up RPCs, and that is
+// measured rather than assumed: core/audiohubd/src/halbridge.rs's
+// `a_single_reply_can_carry_thirty_two_memory_entries` sends this exact shape
+// through the kernel, maps every entry, and proves the 32 objects stay 32
+// distinct objects; `descriptor_counts_well_past_thirty_two_still_fit_one_message`
+// shows 128 works too, so 32 is nowhere near a ceiling.
+//
+// GEOMETRY IS ONE SET OF SCALARS FOR ALL SLOTS. Every out ring is 48k/2ch and
+// every in ring 48k/1ch (risk 8: capability mirroring would need another
+// version bump), so the reply describes them once instead of 32 times. What is
+// per-slot is only the entry port.
 typedef struct AudioHubHelloReply
 {
     mach_msg_header_t          header;
     mach_msg_body_t            body;
-    mach_msg_port_descriptor_t spk_entry; // driver writes, daemon reads
-    mach_msg_port_descriptor_t mic_entry; // daemon writes, driver reads
+    // entries[2*s]   = slot s's out ring (driver writes, daemon reads)
+    // entries[2*s+1] = slot s's in ring  (daemon writes, driver reads)
+    // i.e. indexed by the same endpoint number the control plane uses.
+    mach_msg_port_descriptor_t entries[kAudioHubMaxEndpoints];
     uint32_t                   status;
     uint32_t                   protocol_version;
+    uint32_t                   slot_count; // how many of entries[] are populated, as PAIRS
     uint32_t                   data_offset;
     uint32_t                   spk_capacity_frames;
     uint32_t                   spk_channels;
-    uint32_t                   spk_sample_rate;
     uint32_t                   mic_capacity_frames;
     uint32_t                   mic_channels;
-    uint32_t                   mic_sample_rate;
-    // nine u32 above land the u64 pair on offset 88 with no implicit padding;
-    // the asserts below are what keeps that true after any edit
+    uint32_t                   sample_rate; // shared by every ring in both directions
+    // The descriptor array ends at 412, which is 4 mod 8 — so an ODD number of
+    // u32 has to follow before the first u64 or the compiler inserts four bytes
+    // of padding that a hand-written wire layout does not know about, and the
+    // two ends read the ring geometry four bytes apart with neither side's
+    // build failing. Nine of them, and the offset asserts below are what keeps
+    // that true after any edit.
+    uint64_t                   session_id; // bumped on every accepted Hello
     uint64_t                   spk_bytes;
     uint64_t                   mic_bytes;
 } AudioHubHelloReply;
@@ -303,24 +369,78 @@ typedef struct AudioHubControlMsg
 {
     mach_msg_header_t header;
     uint32_t          op;
-    uint32_t          device;
-    uint32_t          scalar_bits; // IEEE-754 f32 bits, 0..1 scalar
-    uint32_t          flags;       // bit0 = muted, bit1 = io running
+    uint32_t          endpoint;    // slot*2 + dir; ops that concern no slot send 0
+    uint32_t          scalar_bits; // IEEE-754 f32 bits, 0..1 scalar; a kAudioHubSlot_* state in BindState
+    uint32_t          flags;       // bit0 = muted, bit1 = io running, bit2 = endpoint is an input
+    // The slot's stamp at the moment this message was produced. 0 means "no
+    // slot" (Heartbeat / Superseded / Ping). The receiver drops anything whose
+    // stamp is not the one it currently holds for that slot, which is what
+    // stops a late StopIO from lighting up the NEXT peer's microphone
+    // indicator after the slot has been reused (spec-m5b §4.6).
+    uint32_t          generation;
+    uint32_t          reserved; // MBZ
     uint64_t          seq;
 } AudioHubControlMsg;
 
+// daemon -> driver. Binds one slot to a peer, or retires it. Fire and forget:
+// the driver's answer is a kAudioHubCtl_BindState on the control port, so the
+// daemon learns the outcome (and the new generation) from the same closed loop
+// that reports every other slot transition, not from mach's send status.
+//
+// The strings are FIXED-SIZE and the receiver terminates them itself — it never
+// trusts the sender's terminator. They are sized to the longest thing each can
+// legitimately hold: peer_key for a fingerprint, the uids for "AudioHub:<fp>:out",
+// and the names for a peer's computer name plus a disambiguating suffix.
+typedef struct AudioHubBindMsg
+{
+    mach_msg_header_t header;
+    uint32_t          op;         // kAudioHubBind_Set | kAudioHubBind_Clear
+    uint32_t          slot;       // 0..slot_count-1
+    uint32_t          flags;      // bit0 = peer is online (logging only)
+    uint32_t          generation; // Clear: the stamp the daemon believes is current. Set: 0, the driver assigns
+    uint64_t          session_id; // the HelloReply's; a mismatch is kAudioHubStatus_StaleSession
+    char              peer_key[40];
+    char              out_uid[64];
+    char              in_uid[64];
+    char              out_name[128];
+    char              in_name[128];
+} AudioHubBindMsg;
+
 _Static_assert(sizeof(mach_msg_header_t) == 24, "mach header ABI drift");
+_Static_assert(sizeof(mach_msg_body_t) == 4, "mach body ABI drift");
 _Static_assert(sizeof(mach_msg_port_descriptor_t) == 12, "port descriptor ABI drift");
+_Static_assert(offsetof(AudioHubHelloRequest, control_port) == 28, "hello ABI drift");
 _Static_assert(offsetof(AudioHubHelloRequest, protocol_version) == 40, "hello ABI drift");
 _Static_assert(sizeof(AudioHubHelloRequest) == 48, "hello ABI drift");
-_Static_assert(offsetof(AudioHubHelloReply, status) == 52, "hello reply ABI drift");
-_Static_assert(offsetof(AudioHubHelloReply, spk_bytes) == 88, "hello reply ABI drift");
-_Static_assert(sizeof(AudioHubHelloReply) == 104, "hello reply ABI drift");
-_Static_assert(offsetof(AudioHubControlMsg, seq) == 40, "control ABI drift");
-_Static_assert(sizeof(AudioHubControlMsg) == 48, "control ABI drift");
+
+// The v2 wire sizes below are literals on purpose: they are what the daemon's
+// receive buffer, its own mirrored structs and test/tests/halwire.rs are all
+// sized against, so a slot-count edit must be a deliberate, visible change to
+// every one of them rather than something that silently reshapes the message.
+_Static_assert(kAudioHubMaxSlots == 16u, "the frozen v2 message sizes below assume 16 slots");
+_Static_assert(offsetof(AudioHubHelloReply, entries) == 28, "hello reply ABI drift");
+_Static_assert(offsetof(AudioHubHelloReply, status) == 412, "hello reply ABI drift");
+_Static_assert(offsetof(AudioHubHelloReply, session_id) == 448, "hello reply ABI drift");
+_Static_assert(offsetof(AudioHubHelloReply, spk_bytes) == 456, "hello reply ABI drift");
+_Static_assert(offsetof(AudioHubHelloReply, mic_bytes) == 464, "hello reply ABI drift");
+_Static_assert(sizeof(AudioHubHelloReply) == 472, "hello reply ABI drift");
+
+_Static_assert(offsetof(AudioHubControlMsg, endpoint) == 28, "control ABI drift");
+_Static_assert(offsetof(AudioHubControlMsg, generation) == 40, "control ABI drift");
+_Static_assert(offsetof(AudioHubControlMsg, seq) == 48, "control ABI drift");
+_Static_assert(sizeof(AudioHubControlMsg) == 56, "control ABI drift");
+
+_Static_assert(offsetof(AudioHubBindMsg, session_id) == 40, "bind ABI drift");
+_Static_assert(offsetof(AudioHubBindMsg, peer_key) == 48, "bind ABI drift");
+_Static_assert(offsetof(AudioHubBindMsg, out_uid) == 88, "bind ABI drift");
+_Static_assert(offsetof(AudioHubBindMsg, in_uid) == 152, "bind ABI drift");
+_Static_assert(offsetof(AudioHubBindMsg, out_name) == 216, "bind ABI drift");
+_Static_assert(offsetof(AudioHubBindMsg, in_name) == 344, "bind ABI drift");
+_Static_assert(sizeof(AudioHubBindMsg) == 472, "bind ABI drift");
 
 #define kAudioHubFlag_Muted     0x1u
 #define kAudioHubFlag_IORunning 0x2u
+#define kAudioHubFlag_IsInput   0x4u
 
 // ---------------------------------------------------------------- driver API
 //
@@ -330,23 +450,102 @@ _Static_assert(sizeof(AudioHubControlMsg) == 48, "control ABI drift");
 // mach. Everything expensive (bootstrap_check_in, mach_msg, ring allocation and
 // mapping) happens on the private service thread started by
 // AudioHubBridge_Start().
+//
+// WHERE THE LINE IS. This file is transport — the mach service, the rings, the
+// handshake, the control sends. AudioHubDriver.c owns the slot pool, the device
+// records and everything coreaudiod can see. Nothing here includes CoreAudio and
+// nothing there touches mach, which is not tidiness for its own sake: it is what
+// lets the slot state machine (bind, two-phase retirement, object-ID allocation)
+// be exercised in a plain test binary with these entry points stubbed out, on a
+// machine where installing a HAL plug-in costs sudo and every app's audio.
 
-// Applied by the driver when the daemon reports the peer's real device volume.
-// Runs on the bridge thread; must not call back into AudioHubBridge_PostVolume
-// or the two sides ping-pong forever.
-typedef void (*AudioHubBridge_NotifyProc)(uint32_t inDevice, float inScalar, int inMuted);
+// One (spk, mic) ring pair per slot, all created before the first Hello can be
+// answered and never released (spec-m5b §1) — so an IOProc can never race an
+// unmap and the realtime path needs no reclamation scheme at all.
+//
+// OPAQUE ON PURPOSE. The driver stores the pointer its device was bound to and
+// hands it straight back, so "which device feeds which ring" is DATA in the
+// device record rather than a function of the device's identity. A helper that
+// mapped a device onto a ring instead is the exact shape in which sixteen
+// devices silently share one ring while every positive test still passes.
+typedef struct BridgeRing BridgeRing;
 
-void AudioHubBridge_Start(AudioHubBridge_NotifyProc inNotifyProc);
+// The ring backing one endpoint (slot*2 + dir), constant for the life of the
+// process. NULL only before the service thread has built them, which is strictly
+// before any Bind can be dispatched, so a bind handler never sees NULL.
+BridgeRing* AudioHubBridge_RingForEndpoint(uint32_t inEndpoint);
 
-// IOProc-safe. Speaker direction: frames an app played into "AudioHub Speaker".
-void AudioHubBridge_WriteSpeaker(const float* inFrames, uint32_t inFrameCount, uint32_t inChannelCount);
+// IOProc-safe. Out direction: frames an app played into a peer's virtual
+// speaker. A ring nobody is attached to discards them (plan §7.3).
+void AudioHubBridge_WriteRing(BridgeRing* inRing, const float* inFrames, uint32_t inFrameCount, uint32_t inChannelCount);
 
-// IOProc-safe. Microphone direction: fills outFrames, zero-padding whatever the
-// daemon has not supplied (including "no daemon at all").
-void AudioHubBridge_ReadMicrophone(float* outFrames, uint32_t inFrameCount, uint32_t inChannelCount);
+// IOProc-safe. In direction: fills outFrames, zero-padding whatever the daemon
+// has not supplied (including "no daemon at all").
+void AudioHubBridge_ReadRing(BridgeRing* inRing, float* outFrames, uint32_t inFrameCount, uint32_t inChannelCount);
 
-// Non-blocking mailbox posts, safe from a property-set call.
-void AudioHubBridge_PostVolume(uint32_t inDevice, float inScalar, int inMuted);
-void AudioHubBridge_PostIOState(uint32_t inDevice, int inRunning);
+// Service thread only. Unpublish returns with no IOProc inside the ring, so the
+// three below it are safe to call immediately afterwards.
+void AudioHubBridge_PublishRing(BridgeRing* inRing);
+void AudioHubBridge_UnpublishRing(BridgeRing* inRing);
+// Re-stamps the header AND zeroes both indices: only legal on a ring that is
+// unpublished AND that no daemon is looking at, i.e. slot retirement and slot
+// binding. Zeroing write_idx under a live reader makes its next read compute a
+// 2^64 backlog, clamp to capacity and replay 500ms of the previous peer's audio
+// (spec-m5b §4.6) — the reason this is not called on disconnect any more.
+void AudioHubBridge_ResetRing(BridgeRing* inRing);
+// Consumer-side only (the driver consumes the IN rings): drops whatever is
+// queued by snapping read_idx up to write_idx. Used when a new daemon attaches,
+// so the first frames a virtual microphone renders are not the previous
+// session's. Unpublished rings only.
+void AudioHubBridge_FlushRingConsumer(BridgeRing* inRing);
+
+// Non-zero while a daemon is attached. Only the service thread may ask: it is
+// the only thread that can act on the answer without it going stale.
+int AudioHubBridge_SessionActive(void);
+
+// What one control send did. "Retry" is a full queue — the message was NOT
+// delivered, so the caller must leave its sent marker alone and try again;
+// "Dead" means the session is over and the caller should stop sending. The
+// distinction is not cosmetic: collapsing Retry into OK silently threw away
+// volume changes, and collapsing it into Dead disconnected a daemon that was
+// merely busy.
+#define kAudioHubSend_OK    0u
+#define kAudioHubSend_Retry 1u
+#define kAudioHubSend_Dead  2u
+uint32_t AudioHubBridge_SendControl(uint32_t inOp, uint32_t inEndpoint, uint32_t inGeneration, uint64_t inWord);
+
+// Everything the transport calls back into the driver for. All of these run on
+// the bridge service thread, one at a time, and none of them may block: this is
+// the thread that also answers the heartbeat, and a daemon that stops hearing it
+// for five seconds re-Hellos and re-binds every slot.
+typedef struct AudioHubBridgeHooks
+{
+    // A daemon completed a handshake and holds every entry port. The driver
+    // republishes the rings of the slots it still has bound (bindings survive a
+    // daemon restart — spec-m5b §5.7) and drops anything stale in the IN rings.
+    void (*attached)(void);
+    // The daemon went away or was superseded. Every ring is already unpublished;
+    // the bindings stay, so the devices remain listed and simply run silent.
+    void (*detached)(void);
+    // One Bind, already checked for shape, sender identity and session id. The
+    // driver validates slot number and strings, since those need CoreFoundation.
+    void (*bind)(const AudioHubBindMsg* inMsg);
+    // The peer's real device reported a new volume. Must NOT post a volume back
+    // or the two sides ping-pong forever.
+    void (*notify_volume)(uint32_t inEndpoint, uint32_t inGeneration, float inScalar, int inMuted);
+    // Drain the per-device outboxes. Returns non-zero while the daemon is alive.
+    int (*flush)(void);
+    // End of one service pass: retire whatever is due and announce a device-list
+    // change at most once, however many binds the pass carried.
+    void (*tick)(void);
+    // Bit `endpoint` set while that endpoint has IO running. Debug census only
+    // (kBridgeRingLogEnv), so it may answer from cached state.
+    uint32_t (*io_running_mask)(void);
+} AudioHubBridgeHooks;
+
+// inHooks must outlive the process (a static in the driver); it is read from the
+// service thread without further synchronisation, which is sound because it is
+// installed before the thread exists.
+void AudioHubBridge_Start(const AudioHubBridgeHooks* inHooks);
 
 #endif // AUDIOHUB_BRIDGE_H

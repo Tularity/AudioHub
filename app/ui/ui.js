@@ -59,6 +59,8 @@ const ICONS = {
   cable: '<rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><path d="M17.5 10v3.5a3 3 0 0 1-3 3H10"/><path d="M12 14.5l-2 2 2 2"/>',
   link: '<path d="M14 4h6v6"/><path d="M20 4l-8.5 8.5"/><path d="M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/>',
   shield: '<path d="M12 3l7 3v5.5c0 4.4-2.9 7.6-7 8.5-4.1-.9-7-4.1-7-8.5V6l7-3z"/><path d="M9 12l2 2 4-4"/>',
+  device: '<rect x="5" y="3" width="14" height="18" rx="2.5"/><circle cx="12" cy="14" r="3.2"/><circle cx="12" cy="7" r="1"/>',
+  tagname: '<path d="M3 12V5a2 2 0 0 1 2-2h7l9 9-9 9-9-9z"/><circle cx="8" cy="8" r="1.3"/>',
 };
 
 export function icon(name, cls = 'ico') {
@@ -181,6 +183,110 @@ export function setPending(b, on) {
   b.classList.toggle('pending', !!on);
   b.setAttribute('aria-busy', String(!!on));
   b.disabled = !!on;
+}
+
+// ---- 分段选择器 ----
+
+/**
+ * options[].disabled 是**每次 sync 都重新求值**的谓词，不是建控件时的一次性快照：
+ * 模式 B 的可用性取决于 daemon 有没有 HAL 桥，而那要等第一个 status 回包才知道，
+ * 装/卸驱动后还会再变。`wrap.sync` 因此挂在元素上，供各视图的 update() 复位。
+ *
+ * set() 可返回 Promise：写 daemon 的选择器在飞行期间必须整体禁用，否则连点两下
+ * 会发出两次 settings.set，第二次的回包可能比第一次先到，界面停在错的档上。
+ */
+export function segmented(testid, options, get, set) {
+  const wrap = el('div', { class: 'segmented', role: 'radiogroup', 'data-testid': testid });
+  let busy = false;
+  const btns = options.map((o) => {
+    const b = el('button', {
+      class: 'seg', type: 'button', role: 'radio', 'data-value': o.value,
+      'data-testid': `${testid}-${o.value}`,
+    }, o.label);
+    b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (b.disabled || busy) return;
+      const r = set(o.value);
+      if (r && typeof r.then === 'function') {
+        busy = true;
+        wrap.classList.add('busy');
+        sync();
+        try { await r; } catch (_) { /* 调用方已提示 */ } finally {
+          busy = false;
+          wrap.classList.remove('busy');
+        }
+      }
+      sync();
+    });
+    return b;
+  });
+  function sync() {
+    const v = get();
+    for (let i = 0; i < btns.length; i += 1) {
+      const b = btns[i];
+      const off = typeof options[i].disabled === 'function' && options[i].disabled();
+      b.disabled = off || busy;
+      b.classList.toggle('off', off);
+      // why 允许是函数：置灰的**原因**和置灰本身一样是随 status 变的
+      // （没装驱动 / 装了没连上 / 版本不匹配，下一步动作各不相同）。
+      const why = typeof options[i].why === 'function' ? options[i].why() : options[i].why;
+      b.title = off ? (why || '') : '';
+      const on = !off && b.dataset.value === v;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-checked', String(on));
+    }
+  }
+  wrap.append(...btns);
+  wrap.sync = sync;
+  sync();
+  return wrap;
+}
+
+// ---- 确认框 ----
+
+let confirmOpen = null;
+
+/**
+ * 应用内确认框。刻意不用 window.confirm：Tauri 的 webview 对它的支持随平台变化，
+ * 而且原生弹窗没法带 data-testid、没法排版长文案——而这里最需要说清楚的恰恰是
+ * 「按下去之后系统里会发生什么」。
+ *
+ * @returns {Promise<boolean>}
+ */
+export function confirmDialog({ title, body, confirmText = '确定', cancelText = '取消', danger = false, testid = 'confirm' }) {
+  if (confirmOpen) return Promise.resolve(false); // 同时只允许一个，避免叠层
+  return new Promise((resolve) => {
+    const ok = el('button', {
+      class: 'btn ' + (danger ? 'danger' : 'primary'), type: 'button', 'data-testid': `${testid}-ok`,
+    }, confirmText);
+    const cancel = el('button', { class: 'btn', type: 'button', 'data-testid': `${testid}-cancel` }, cancelText);
+    const lines = (Array.isArray(body) ? body : [body]).filter(Boolean);
+    const card = el('div', { class: 'confirm-card', role: 'alertdialog', 'aria-modal': 'true' },
+      el('h2', { class: 'confirm-title' }, title),
+      lines.map((t) => el('p', { class: 'confirm-body' }, t)),
+      el('div', { class: 'confirm-actions' }, cancel, ok));
+    const host = el('div', { class: 'confirm-mask', 'data-testid': testid }, card);
+
+    function done(v) {
+      if (!confirmOpen) return;
+      confirmOpen = null;
+      document.removeEventListener('keydown', onKey, true);
+      host.remove();
+      resolve(v);
+    }
+    function onKey(e) {
+      if (e.key === 'Escape') { e.preventDefault(); done(false); }
+    }
+    ok.addEventListener('click', () => done(true));
+    cancel.addEventListener('click', () => done(false));
+    // 点遮罩 = 取消。点卡片内部不能穿透过去（危险操作误关掉是小事，误确认才是大事）。
+    host.addEventListener('click', (e) => { if (e.target === host) done(false); });
+    document.addEventListener('keydown', onKey, true);
+
+    confirmOpen = host;
+    document.body.append(host);
+    ok.focus();
+  });
 }
 
 // ---- 电平表：requestAnimationFrame 插值逼近最近 stats 值 ----

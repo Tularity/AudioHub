@@ -157,6 +157,7 @@ function afterConnect() {
   refreshStatus();
   refreshPeers();
   refreshSessions();
+  refreshSettings();
   refreshPermissions({ force: true });
   rpc('stats.subscribe', { interval_ms: 1000 }, { silent: true }).catch(() => {});
   clearInterval(statusTimer);
@@ -177,6 +178,34 @@ async function refreshStatus() {
       s.lastStatusAt = Date.now();
     });
   } catch (_) { /* 断线由 close 处理 */ }
+  // 模式是 daemon 拥有的全局状态，而 CLI（audiohub ctl settings --set）与另一个
+  // UI 窗口都能改它。不跟着轮询，界面就会长期显示一个早已不成立的模式，而模式
+  // 决定了整个主面板长什么样——这不是「稍后刷新」能糊过去的偏差。
+  refreshSettings();
+}
+
+// 这一版 daemon 可能根本没有 settings.*：那就退回本地缓存 + 驱动状态判定，
+// 而不是把「查不到」当成「模式 A」。
+async function refreshSettings() {
+  if (!client.connected) return;
+  try {
+    store.setDaemonSettings(await client.request('settings.get', {}));
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (/unknown method/i.test(msg)) store.setSettingsUnsupported();
+  }
+}
+
+/**
+ * 写设置。回包就是新的权威值，直接落库——不做乐观翻转：模式切换在 daemon 侧要
+ * 增删虚拟设备，失败时界面若已经翻过去，用户会以为设备该出现却没出现。
+ */
+async function applySettings(patch) {
+  const res = await rpc('settings.set', patch);
+  store.setDaemonSettings(res);
+  refreshPeers();   // 模式变了，每个对端的 hal_device 跟着变
+  refreshStatus();
+  return res;
 }
 
 async function refreshPeers() {
@@ -251,7 +280,10 @@ client.on('event:stats', (data) => store.pushStats(data));
 
 // ---- 路由 ----
 
-const ctx = { rpc, navigate, isTauri, ensureDaemon, refreshPeers, refreshSessions, refreshPermissions };
+const ctx = {
+  rpc, navigate, isTauri, ensureDaemon,
+  refreshPeers, refreshSessions, refreshPermissions, refreshSettings, applySettings,
+};
 let currentCleanup = null;
 
 function navigate(view, peerFp = null) {

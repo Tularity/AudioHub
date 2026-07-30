@@ -14,11 +14,82 @@ const IDENT_RESPONDER: &[u8] = b"audiohub-responder";
 const CONFIRM_LABEL_A: &[u8] = b"audiohub-confirm-A";
 const CONFIRM_LABEL_B: &[u8] = b"audiohub-confirm-B";
 const VERIFY_LABEL: &[u8] = b"audiohub-verify";
+/// Domain separator for the refusal signature in `ControlMsg::Unpaired`. It has
+/// to be distinct from every other label here — a signature that could be
+/// lifted out of the verify exchange and replayed as a refusal would authorise
+/// exactly the trust deletion this signature exists to gate. Not a prefix of
+/// `VERIFY_LABEL` and not prefixed by it, so the two preimages can never
+/// coincide whatever nonce and fingerprints follow.
+const UNPAIRED_LABEL: &[u8] = b"audiohub-unpaired";
 
 type HmacSha256 = Hmac<Sha256>;
 
 pub struct PairOutcome {
     pub peer: PairedPeer,
+}
+
+/// The peer answered our verify with `ControlMsg::Unpaired` AND proved it was
+/// the peer: it has removed us from its store, so we must remove it from ours —
+/// and with it the pair of virtual devices we publish in its name, which would
+/// otherwise stay in the system list forever, permanently offline, while a
+/// reconnect loop redialled a machine that has already said no.
+///
+/// Only ever raised for a refusal whose signature verified against the key this
+/// store already holds for `fingerprint`; an unsigned or unverifiable refusal
+/// is an ordinary connection failure and leaves the pairing alone. Callers must
+/// still check that `fingerprint` is the peer they meant to reach — this type
+/// says who signed, not who was dialled.
+///
+/// A distinct type rather than a message string so the caller can `downcast_ref`
+/// it out of an `anyhow` chain: acting on a substring match would make an error
+/// message part of the contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpairedByPeer {
+    pub fingerprint: String,
+}
+
+impl std::fmt::Display for UnpairedByPeer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the peer has unpaired from us")
+    }
+}
+
+impl std::error::Error for UnpairedByPeer {}
+
+/// True when this error chain reports that the peer unpaired from us.
+pub fn was_unpaired_by_peer(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<UnpairedByPeer>().is_some())
+}
+
+/// The machine at the other end of this connection is US: the handshake came
+/// back carrying our own public key.
+///
+/// The honest self-dial check, and the reason it lives here: an address compare
+/// only knows the endpoint we aimed at, while the handshake learns the identity
+/// that actually answered — through a NAT hairpin, a forwarder or a stale peer
+/// record it is the only one that can tell. Measured on 2026-07-31: a peer
+/// record whose address resolved to this daemon's own control port made the
+/// session coordinator dial the daemon itself, which then answered its own
+/// `VerifyHello` with `Unpaired` (our fingerprint is not in our own store) and
+/// deleted the pairing on the strength of it.
+///
+/// Never a reason to touch a pairing. Nothing was learned about the peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfConnection {
+    pub fingerprint: String,
+}
+
+impl std::fmt::Display for SelfConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "this connection came back to ourselves ({})", self.fingerprint)
+    }
+}
+
+impl std::error::Error for SelfConnection {}
+
+/// True when this error chain reports that we connected to ourselves.
+pub fn was_self_connection(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<SelfConnection>().is_some())
 }
 
 fn now_unix() -> u64 {
@@ -139,6 +210,7 @@ pub fn pair_initiator(
             last_addr: None,
             port: target_port,
             added_unix: now_unix(),
+            alias: None,
         },
     })
 }
@@ -198,8 +270,64 @@ pub fn pair_responder(s: &mut TcpStream, pin: &str, id: &LocalIdentity) -> Resul
             last_addr: None,
             port: listen_port,
             added_unix: now_unix(),
+            alias: None,
         },
     })
+}
+
+/// What a responder signs to prove that IT is the machine refusing us.
+///
+/// Binds the initiator's fresh nonce (so the refusal cannot be replayed onto a
+/// later connection), the responder's own fingerprint (so a refusal signed by
+/// one peer cannot be presented as another's) and the fingerprint the initiator
+/// claimed in its `VerifyHello` (so a refusal collected while A was dialling
+/// cannot be replayed at B). Under its own label, so it is not a verify
+/// signature and no verify signature is one of these.
+fn unpaired_preimage(nonce_i: &[u8], fp_responder: &str, fp_initiator: &str) -> Vec<u8> {
+    let mut m = Vec::with_capacity(UNPAIRED_LABEL.len() + nonce_i.len() + 32);
+    m.extend_from_slice(UNPAIRED_LABEL);
+    m.extend_from_slice(nonce_i);
+    m.extend_from_slice(fp_responder.as_bytes());
+    m.extend_from_slice(fp_initiator.as_bytes());
+    m
+}
+
+/// Decides what an `Unpaired` frame is worth. `Ok(fp)` = a peer we have on file
+/// proved it is refusing us, and the caller may drop that pairing; every `Err`
+/// is an ordinary connection failure that must leave the store untouched.
+///
+/// The signature is checked against the key in OUR store, never the one on the
+/// wire — a key that verifies its own signature proves nothing. The wire key is
+/// used only to look the record up.
+fn authenticate_unpaired(
+    sig_b64: &str,
+    public_key_b64: &str,
+    nonce_i: &[u8],
+    id: &LocalIdentity,
+    store: &PeerStore,
+) -> Result<String> {
+    if sig_b64.is_empty() || public_key_b64.is_empty() {
+        bail!(
+            "the peer refused us as unpaired but did not sign the refusal (a responder from \
+             before the signature existed, or something else answering on its address); keeping \
+             the pairing"
+        );
+    }
+    let fp_r = fingerprint_of(&pub_arr(public_key_b64)?);
+    // Checked before the store lookup: our own fingerprint can never BE in our
+    // own store, so leaving this to `find` would report the self-dial as an
+    // impostor and bury the thing the operator actually has to fix.
+    if fp_r == id.fingerprint {
+        return Err(anyhow::Error::new(SelfConnection { fingerprint: fp_r }));
+    }
+    let peer = store
+        .find(&fp_r)
+        .ok_or_else(|| anyhow!("a machine we are not paired with ({fp_r}) refused us as unpaired"))?;
+    let m = unpaired_preimage(nonce_i, &fp_r, &id.fingerprint);
+    if !verify_sig(&peer.public_key_b64, &m, &b64d(sig_b64)?) {
+        bail!("the refusal from {fp_r} is not signed by that peer's key; keeping the pairing");
+    }
+    Ok(fp_r)
 }
 
 fn verify_preimage(nonce: &[u8], fp_first: &str, fp_second: &str) -> Vec<u8> {
@@ -233,18 +361,34 @@ pub fn verify_initiator(
     )?;
     let nonce_r = match read_frame(s)? {
         ControlMsg::VerifyChallenge { nonce_b64 } => b64d(&nonce_b64)?,
+        // The responder says it does not know us any more. Reported as a typed
+        // error so the daemon can drop its own half of the pairing (and the
+        // peer's virtual devices) instead of retrying forever — but ONLY once
+        // the refusal is proved to come from that peer. Everything else here is
+        // a failed connection, and a failed connection never edits the store.
+        ControlMsg::Unpaired { sig_b64, public_key_b64 } => {
+            let fingerprint = authenticate_unpaired(&sig_b64, &public_key_b64, &nonce_i, id, store)?;
+            return Err(anyhow::Error::new(UnpairedByPeer { fingerprint }));
+        }
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     };
-    let (sig_r, pub_r_b64) = match read_frame(s)? {
-        ControlMsg::VerifyResponse { sig_b64, public_key_b64, name: _ } => {
-            (b64d(&sig_b64)?, public_key_b64)
+    let (sig_r, pub_r_b64, name_r) = match read_frame(s)? {
+        ControlMsg::VerifyResponse { sig_b64, public_key_b64, name } => {
+            (b64d(&sig_b64)?, public_key_b64, name)
         }
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     };
     let fp_r = fingerprint_of(&pub_arr(&pub_r_b64)?);
-    let peer = store
+    // The other end is this very daemon. Only reachable if our own fingerprint
+    // somehow reached our own store, but reported the same way as on the
+    // refusal path so a self-dial always ends in one recognisable error rather
+    // than "unknown peer" — which reads as a stranger and hides the loop.
+    if fp_r == id.fingerprint {
+        return Err(anyhow::Error::new(SelfConnection { fingerprint: fp_r }));
+    }
+    let mut peer = store
         .find(&fp_r)
         .ok_or_else(|| anyhow!("unknown peer"))?
         .clone();
@@ -271,7 +415,28 @@ pub fn verify_initiator(
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     }
+    // Only AFTER the signature check: the name is unauthenticated text from the
+    // wire, and adopting it before the peer has proved who it is would let
+    // anyone who can reach this port relabel a device in our system list.
+    // The caller persists it (spec-m5b §5.3 — this used to be discarded here,
+    // which is why a renamed peer stayed under its old name forever).
+    adopt_name(&mut peer, name_r);
     Ok(peer)
+}
+
+/// A peer's self-reported computer name, taken only when it is usable. Bounded
+/// because it becomes a device name inside a fixed-size wire field, and a peer
+/// that sends 64 KB of name must not be able to truncate the rest of it.
+fn adopt_name(peer: &mut PairedPeer, name: String) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    let mut end = name.len().min(96);
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    peer.name = name[..end].to_string();
 }
 
 pub fn verify_responder(
@@ -286,10 +451,29 @@ pub fn verify_responder(
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     };
-    let peer = match store.find(&fp_i) {
+    let mut peer = match store.find(&fp_i) {
         Some(p) => p.clone(),
         None => {
-            let _ = write_frame(s, &ControlMsg::Error { message: "unknown peer".into() });
+            // Not the generic error any more: to a peer that WAS paired with us
+            // this is the only signal that its copy of the pairing is dead, and
+            // without it the pair of virtual devices bearing our name sits in
+            // its system list forever (spec-m5b OPEN QUESTION 5). It carries no
+            // more information than the refusal it replaces — an unknown
+            // fingerprint is refused either way.
+            //
+            // Signed, because the initiator deletes a pairing over it. We no
+            // longer know who `fp_i` is, but we do still know our own key, and
+            // that is exactly what the initiator needs: proof that the refusal
+            // came from the machine it dialled rather than from whatever else
+            // reached that address first.
+            let m = unpaired_preimage(&nonce_i, &id.fingerprint, &fp_i);
+            let _ = write_frame(
+                s,
+                &ControlMsg::Unpaired {
+                    sig_b64: BASE64_STANDARD.encode(id.sign(&m)),
+                    public_key_b64: id.public_key_b64(),
+                },
+            );
             bail!("unknown peer");
         }
     };
@@ -310,8 +494,10 @@ pub fn verify_responder(
             name: id.name.clone(),
         },
     )?;
-    let sig_i = match read_frame(s)? {
-        ControlMsg::VerifyResponse { sig_b64, public_key_b64: _, name: _ } => b64d(&sig_b64)?,
+    let (sig_i, name_i) = match read_frame(s)? {
+        ControlMsg::VerifyResponse { sig_b64, public_key_b64: _, name } => {
+            (b64d(&sig_b64)?, name)
+        }
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     };
@@ -324,5 +510,7 @@ pub fn verify_responder(
         bail!("signature verification failed");
     }
     write_frame(s, &ControlMsg::Ok {})?;
+    // Same rule as the initiator side: adopted only once the signature holds.
+    adopt_name(&mut peer, name_i);
     Ok(peer)
 }

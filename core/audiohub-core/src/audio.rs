@@ -8,12 +8,49 @@ use cpal::{SampleFormat, SupportedStreamConfig};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
+/// One system audio device as this process sees it.
+///
+/// `uid` (kAudioDevicePropertyDeviceUID) is the opaque, stable handle a device
+/// keeps across renames and reboots; `id` (AudioObjectID) is only meaningful
+/// inside this process' lifetime and is never recycled by our own driver, so a
+/// change of `id` under an unchanged `uid` is a genuine re-creation. Devices
+/// whose NAME is generated at runtime — one pair per paired peer — can only be
+/// addressed by `uid`, which is why it is reported at all.
+///
+/// Both are `None` off macOS: WASAPI endpoints have identifiers of their own,
+/// but nothing addresses devices by them yet and inventing one from the
+/// friendly name would be a lie a script could not detect.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DeviceEntry {
+    pub name: String,
+    pub uid: Option<String>,
+    pub id: Option<u32>,
+    pub is_input: bool,
+    pub is_output: bool,
+}
+
+// Gated with the watcher that is its only caller: only macOS observes the
+// device list today, and an ungated copy would just be dead code elsewhere.
+#[cfg(target_os = "macos")]
+impl DeviceEntry {
+    /// Identity for diffing two snapshots. Deliberately excludes the name: a
+    /// rename is an in-place update of one device, not a removal plus an
+    /// addition, and reporting it as churn would make the watcher's whole
+    /// "zero events across a daemon restart" assertion meaningless.
+    fn same_device(&self, other: &DeviceEntry) -> bool {
+        self.id == other.id && self.uid == other.uid
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct DevicesReport {
     pub default_output: Option<String>,
     pub default_input: Option<String>,
     pub output_config: Option<String>,
     pub input_config: Option<String>,
+    /// Appended AFTER the four keys above, which regression scripts parse: the
+    /// existing fields serialize byte-for-byte as before.
+    pub devices: Vec<DeviceEntry>,
 }
 
 fn describe(cfg: &SupportedStreamConfig) -> String {
@@ -45,6 +82,8 @@ pub fn default_devices_report() -> Result<DevicesReport> {
         default_input,
         output_config,
         input_config,
+        // Property reads only — same permission-free contract as the names.
+        devices: list_devices_detailed(),
     })
 }
 
@@ -75,6 +114,21 @@ pub fn list_output_devices() -> Vec<String> {
 /// order. Listing never opens a device, so it never trips a permission prompt.
 pub fn list_input_devices() -> Vec<String> {
     list_names(DeviceKind::Input)
+}
+
+/// Every device with its UID and AudioObjectID, raw enumeration order,
+/// duplicates kept. Like the name listings this only reads properties, so it
+/// never opens a unit and never trips a permission prompt.
+pub fn list_devices_detailed() -> Vec<DeviceEntry> {
+    devices::list_detailed()
+}
+
+/// The name behind a UID, without opening anything. Exists so a probe can
+/// report WHICH device a UID actually addressed: the name is the only part a
+/// human can check, and with runtime-generated names it is not knowable in
+/// advance.
+pub fn device_name_for_uid(kind: DeviceKind, uid: &str) -> Result<String> {
+    devices::name_for_uid(kind, uid)
 }
 
 /// THE DUPLICATE-NAME RULE: presentation deduplicates, resolution does not.
@@ -152,6 +206,15 @@ fn find_device(kind: DeviceKind, query: &str) -> Result<(cpal::Device, String)> 
     Ok((dev, resolved))
 }
 
+/// Same contract as `find_device` but keyed on the device UID, matched EXACTLY
+/// and case-sensitively: a UID is an opaque identifier, not a display string,
+/// so the prefix and case leniency that makes names typeable would here only
+/// invent matches that the system itself would not make. No fallback to the
+/// default device either — a mistyped UID must say so.
+fn find_device_by_uid(kind: DeviceKind, uid: &str) -> Result<(cpal::Device, String)> {
+    devices::find_by_uid(kind, uid)
+}
+
 /// macOS listing goes straight to CoreAudio properties. cpal's own
 /// `input_devices()` filter builds an *input* AudioUnit per device, which is
 /// what blocks behind the microphone TCC machinery — the same reason
@@ -159,7 +222,8 @@ fn find_device(kind: DeviceKind, query: &str) -> Result<(cpal::Device, String)> 
 /// permission-free.
 #[cfg(target_os = "macos")]
 mod devices {
-    use super::DeviceKind;
+    use super::{DeviceEntry, DeviceKind};
+    use anyhow::{bail, Result};
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::ptr::{addr_of, null, null_mut};
@@ -197,6 +261,7 @@ mod devices {
     const SEL_DEVICES: u32 = fourcc(b"dev#"); // kAudioHardwarePropertyDevices
     const SEL_STREAM_CONFIG: u32 = fourcc(b"slay"); // kAudioDevicePropertyStreamConfiguration
     const SEL_NAME: u32 = fourcc(b"lnam"); // kAudioDevicePropertyDeviceNameCFString
+    const SEL_UID: u32 = fourcc(b"uid "); // kAudioDevicePropertyDeviceUID
     const SCOPE_GLOBAL: u32 = fourcc(b"glob");
     const SCOPE_INPUT: u32 = fourcc(b"inpt");
     const SCOPE_OUTPUT: u32 = fourcc(b"outp");
@@ -355,14 +420,140 @@ mod devices {
         String::from_utf8(buf).ok()
     }
 
+    /// The device UID (kAudioDevicePropertyDeviceUID). Same ownership rule as
+    /// `device_name`: a "get" of a CF object hands the caller a +1 reference,
+    /// so it is released here.
+    fn device_uid(dev: AudioObjectID) -> Option<String> {
+        let a = at(SEL_UID, SCOPE_GLOBAL);
+        let mut cf: *const c_void = null_mut();
+        let mut io = size_of::<*const c_void>() as u32;
+        let st = unsafe {
+            AudioObjectGetPropertyData(
+                dev,
+                &a,
+                0,
+                null(),
+                &mut io,
+                &mut cf as *mut *const c_void as *mut c_void,
+            )
+        };
+        if st != 0 || cf.is_null() {
+            return None;
+        }
+        let s = unsafe { cf_to_string(cf) };
+        unsafe { CFRelease(cf) };
+        s.filter(|s| !s.is_empty())
+    }
+
+    fn scope_of(kind: DeviceKind) -> u32 {
+        match kind {
+            DeviceKind::Input => SCOPE_INPUT,
+            DeviceKind::Output => SCOPE_OUTPUT,
+        }
+    }
+
+    /// Every device, in raw enumeration order. Unlike `list_all` this keeps
+    /// devices that have no usable name (they are still addressable by UID) and
+    /// devices that do neither direction (both flags false) — a listing that
+    /// hid them would be lying about what the system contains.
+    pub fn list_detailed() -> Vec<DeviceEntry> {
+        device_ids()
+            .into_iter()
+            .map(|id| DeviceEntry {
+                name: device_name(id).unwrap_or_default(),
+                uid: device_uid(id),
+                id: Some(id),
+                // "has streams in that scope" is exactly how cpal decides the
+                // same question, so the two views cannot disagree.
+                is_input: scope_channels(id, SCOPE_INPUT) > 0,
+                is_output: scope_channels(id, SCOPE_OUTPUT) > 0,
+            })
+            .collect()
+    }
+
+    /// Finds `uid` inside an already-taken snapshot and returns its INDEX plus
+    /// the device name. The index is what lets `find_by_uid` reach the matching
+    /// cpal handle; taking the snapshot outside is what lets it prove the
+    /// snapshot did not move underneath.
+    fn locate_uid(ids: &[AudioObjectID], kind: DeviceKind, uid: &str) -> Result<(usize, String)> {
+        let scope = scope_of(kind);
+        let Some(i) = ids.iter().position(|&d| device_uid(d).as_deref() == Some(uid)) else {
+            bail!(
+                "no {} device matches UID {uid:?}; available: [{}]",
+                kind.word(),
+                uid_catalog(ids, scope)
+            );
+        };
+        let name = device_name(ids[i]).unwrap_or_default();
+        if scope_channels(ids[i], scope) == 0 {
+            bail!(
+                "device with UID {uid:?} ({name:?}) has no {} streams",
+                kind.word()
+            );
+        }
+        Ok((i, name))
+    }
+
+    /// What a mistyped UID gets told. Names ride along because a UID alone is
+    /// unrecognisable to a human trying to spot their own typo.
+    fn uid_catalog(ids: &[AudioObjectID], scope: u32) -> String {
+        ids.iter()
+            .filter(|&&d| scope_channels(d, scope) > 0)
+            .map(|&d| match (device_uid(d), device_name(d)) {
+                (Some(u), Some(n)) => format!("{u} ({n})"),
+                (Some(u), None) => u,
+                (None, Some(n)) => format!("<no uid> ({n})"),
+                (None, None) => "<no uid>".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub fn name_for_uid(kind: DeviceKind, uid: &str) -> Result<String> {
+        let ids = device_ids();
+        locate_uid(&ids, kind, uid).map(|(_, name)| name)
+    }
+
+    /// cpal's coreaudio `Devices` iterator is an unfiltered, order-preserving
+    /// map of the very kAudioHardwarePropertyDevices array `device_ids()`
+    /// reads, so index i of one is index i of the other — but only within a
+    /// consistent snapshot. Hence the re-read: if the device list moved while
+    /// we were enumerating, the whole attempt is thrown away rather than
+    /// indexing into a shifted list. The name cross-check is the belt to that
+    /// braces; opening the WRONG card is the single outcome a UID lookup must
+    /// never produce, and with per-peer devices it would mean audio landing on
+    /// somebody else's machine.
+    pub fn find_by_uid(kind: DeviceKind, uid: &str) -> Result<(cpal::Device, String)> {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let host = cpal::default_host();
+        for _ in 0..3 {
+            let ids = device_ids();
+            let mut handles: Vec<cpal::Device> = match host.devices() {
+                Ok(it) => it.collect(),
+                Err(e) => bail!("enumerate audio devices: {e}"),
+            };
+            if handles.len() != ids.len() || device_ids() != ids {
+                continue; // the list changed mid-read; indices are meaningless
+            }
+            let (i, name) = locate_uid(&ids, kind, uid)?;
+            let got = handles[i].name().unwrap_or_default();
+            if got != name {
+                bail!(
+                    "UID {uid:?} is AudioObjectID {} ({name:?}) but cpal's device #{i} is {got:?}; \
+                     refusing to open a device that may not be the one asked for",
+                    ids[i]
+                );
+            }
+            return Ok((handles.swap_remove(i), name));
+        }
+        bail!("the audio device list kept changing while resolving UID {uid:?}")
+    }
+
     /// Raw enumeration order, duplicates kept: an unnamed device can never be
     /// typed so it is dropped, but two cards with the same name must both stay
     /// visible to the ambiguity check.
     pub fn list_all(kind: DeviceKind) -> Vec<String> {
-        let scope = match kind {
-            DeviceKind::Input => SCOPE_INPUT,
-            DeviceKind::Output => SCOPE_OUTPUT,
-        };
+        let scope = scope_of(kind);
         device_ids()
             .into_iter()
             .filter(|&d| scope_channels(d, scope) > 0)
@@ -387,8 +578,39 @@ mod devices {
 /// no device is opened and no permission is involved.
 #[cfg(not(target_os = "macos"))]
 mod devices {
-    use super::DeviceKind;
+    use super::{DeviceEntry, DeviceKind};
+    use anyhow::{bail, Result};
     use cpal::traits::{DeviceTrait, HostTrait};
+
+    /// A WASAPI render endpoint and a capture endpoint are two different
+    /// objects even when they share one friendly name, so they are listed as
+    /// two entries rather than merged into one duplex device. `uid`/`id` stay
+    /// absent: see `DeviceEntry`.
+    pub fn list_detailed() -> Vec<DeviceEntry> {
+        let mut out = Vec::new();
+        for (kind, is_input) in [(DeviceKind::Input, true), (DeviceKind::Output, false)] {
+            for name in list_all(kind) {
+                out.push(DeviceEntry {
+                    name,
+                    uid: None,
+                    id: None,
+                    is_input,
+                    is_output: !is_input,
+                });
+            }
+        }
+        out
+    }
+
+    /// Refuses rather than silently ignoring the request: a script that asked
+    /// for one specific device must not be handed a different one.
+    pub fn name_for_uid(_kind: DeviceKind, _uid: &str) -> Result<String> {
+        bail!("addressing an audio device by UID is only supported on macOS");
+    }
+
+    pub fn find_by_uid(_kind: DeviceKind, _uid: &str) -> Result<(cpal::Device, String)> {
+        bail!("addressing an audio device by UID is only supported on macOS");
+    }
 
     /// Raw enumeration order, duplicates kept: two WASAPI endpoints can carry
     /// the same friendly name and both must stay visible to the ambiguity
@@ -685,6 +907,15 @@ impl LivePlayback {
             .with_context(|| format!("open output device {resolved:?}"))
     }
 
+    /// Plays to the output device carrying this UID. The name-based sibling
+    /// cannot address a device whose name is generated at runtime, nor tell two
+    /// identically named cards apart; the UID can do both.
+    pub fn start_on_uid(uid: &str, src_rate: u32) -> Result<(LivePlayback, AudioTx)> {
+        let (device, resolved) = find_device_by_uid(DeviceKind::Output, uid)?;
+        LivePlayback::on_device(&device, src_rate)
+            .with_context(|| format!("open output device {resolved:?} (UID {uid:?})"))
+    }
+
     fn on_device(device: &cpal::Device, src_rate: u32) -> Result<(LivePlayback, AudioTx)> {
         let supported = device
             .default_output_config()
@@ -777,6 +1008,15 @@ impl LiveCapture {
     pub fn start_on(device_name: &str) -> Result<(LiveCapture, AudioRx, u32)> {
         let (device, resolved) = find_device(DeviceKind::Input, device_name)?;
         LiveCapture::on_device(&device).with_context(|| format!("open input device {resolved:?}"))
+    }
+
+    /// Captures from the input device carrying this UID — the only stable way
+    /// to name a per-peer virtual microphone, whose display name changes with
+    /// the peer it belongs to.
+    pub fn start_on_uid(uid: &str) -> Result<(LiveCapture, AudioRx, u32)> {
+        let (device, resolved) = find_device_by_uid(DeviceKind::Input, uid)?;
+        LiveCapture::on_device(&device)
+            .with_context(|| format!("open input device {resolved:?} (UID {uid:?})"))
     }
 
     fn on_device(device: &cpal::Device) -> Result<(LiveCapture, AudioRx, u32)> {
@@ -978,55 +1218,70 @@ impl Drop for DeviceChangeWatcher {
     }
 }
 
+/// The AudioObject property-listener ABI, declared exactly once. Two modules
+/// register listeners (default-device selectors, and the device list) and each
+/// declaring its own `PropAddr` would make the two `ListenerProc` types
+/// distinct — which the clashing-extern-declarations lint reports and which
+/// would become a real hazard the moment somebody edited one copy.
+#[cfg(target_os = "macos")]
+mod ca_listener {
+    use std::ffi::c_void;
+
+    pub type OSStatus = i32;
+    pub type AudioObjectID = u32;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct PropAddr {
+        pub selector: u32,
+        pub scope: u32,
+        pub element: u32,
+    }
+
+    pub const SYSTEM_OBJECT: AudioObjectID = 1;
+    pub const ELEM_MAIN: u32 = 0;
+
+    pub const fn fourcc(s: &[u8; 4]) -> u32 {
+        u32::from_be_bytes(*s)
+    }
+    pub const SCOPE_GLOBAL: u32 = fourcc(b"glob");
+
+    pub type ListenerProc =
+        unsafe extern "C" fn(AudioObjectID, u32, *const PropAddr, *mut c_void) -> OSStatus;
+
+    #[link(name = "CoreAudio", kind = "framework")]
+    extern "C" {
+        pub fn AudioObjectAddPropertyListener(
+            id: AudioObjectID,
+            addr: *const PropAddr,
+            listener: ListenerProc,
+            data: *mut c_void,
+        ) -> OSStatus;
+        pub fn AudioObjectRemovePropertyListener(
+            id: AudioObjectID,
+            addr: *const PropAddr,
+            listener: ListenerProc,
+            data: *mut c_void,
+        ) -> OSStatus;
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod watch_imp {
     //! AudioObjectAddPropertyListener on the system object's
     //! kAudioHardwarePropertyDefaultInput/OutputDevice.
 
+    use super::ca_listener::{
+        fourcc, AudioObjectAddPropertyListener, AudioObjectID, AudioObjectRemovePropertyListener,
+        OSStatus, PropAddr, ELEM_MAIN, SCOPE_GLOBAL, SYSTEM_OBJECT,
+    };
     use super::{DeviceKind, Fanout};
     use anyhow::{bail, Result};
     use std::ffi::c_void;
     use std::sync::Arc;
 
-    type OSStatus = i32;
-    type AudioObjectID = u32;
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct PropAddr {
-        selector: u32,
-        scope: u32,
-        element: u32,
-    }
-
-    const SYSTEM_OBJECT: AudioObjectID = 1;
-    const ELEM_MAIN: u32 = 0;
-
-    const fn fourcc(s: &[u8; 4]) -> u32 {
-        u32::from_be_bytes(*s)
-    }
     const SEL_DEFAULT_INPUT: u32 = fourcc(b"dIn "); // kAudioHardwarePropertyDefaultInputDevice
     const SEL_DEFAULT_OUTPUT: u32 = fourcc(b"dOut"); // kAudioHardwarePropertyDefaultOutputDevice
-    const SCOPE_GLOBAL: u32 = fourcc(b"glob");
-
-    type ListenerProc =
-        unsafe extern "C" fn(AudioObjectID, u32, *const PropAddr, *mut c_void) -> OSStatus;
-
-    #[link(name = "CoreAudio", kind = "framework")]
-    extern "C" {
-        fn AudioObjectAddPropertyListener(
-            id: AudioObjectID,
-            addr: *const PropAddr,
-            listener: ListenerProc,
-            data: *mut c_void,
-        ) -> OSStatus;
-        fn AudioObjectRemovePropertyListener(
-            id: AudioObjectID,
-            addr: *const PropAddr,
-            listener: ListenerProc,
-            data: *mut c_void,
-        ) -> OSStatus;
-    }
 
     /// Raw pointer inside: created and consumed on the watcher thread only.
     pub struct Registration {
@@ -1391,6 +1646,219 @@ mod watch_imp {
     pub fn unregister(_reg: Registration) {}
 }
 
+// ------------------------------------------------ device list event stream
+
+/// One appearance or disappearance of a system audio device.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeviceEvent {
+    /// `"added"` or `"removed"`.
+    pub kind: &'static str,
+    /// Milliseconds since the watch started, from a monotonic clock: this is
+    /// the number that says whether two events fell inside the same restart
+    /// window, and a wall clock that steps cannot corrupt it.
+    pub t_ms: u64,
+    /// The same instant on the wall clock, only so events can be lined up
+    /// against `log show` output.
+    pub unix_ms: u64,
+    pub name: String,
+    pub uid: Option<String>,
+    pub id: Option<u32>,
+    pub is_input: bool,
+    pub is_output: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn unix_ms_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Everything the notification callback and the caller share. Behind a Mutex
+/// because the diff runs on the HAL's notification thread.
+#[cfg(target_os = "macos")]
+struct WatchState {
+    known: Vec<DeviceEntry>,
+    events: Vec<DeviceEvent>,
+    cb: Box<dyn FnMut(&DeviceEvent) + Send>,
+    start: Instant,
+}
+
+#[cfg(target_os = "macos")]
+impl WatchState {
+    /// Re-enumerates and diffs against the last snapshot. This runs INSIDE the
+    /// property listener, not on a poll loop, and that is the entire point: a
+    /// device that appears and disappears between two polls is invisible to a
+    /// sampler, so a sampler can never establish "nothing changed" — it can
+    /// only establish "nothing was changed at the instants I happened to look".
+    ///
+    /// Re-entering the HAL from a listener is the documented way to service one
+    /// (the callback carries no payload; the whole notification means "re-query
+    /// me"), and notifications for one object are dispatched serially, so this
+    /// lock cannot be taken twice on the same thread.
+    fn diff(&mut self) {
+        self.diff_against(list_devices_detailed());
+    }
+
+    /// The diff itself, split out so it can be tested against a synthetic
+    /// snapshot instead of whatever cards the test machine happens to have.
+    fn diff_against(&mut self, now: Vec<DeviceEntry>) {
+        let t_ms = self.start.elapsed().as_millis() as u64;
+        let unix_ms = unix_ms_now();
+        let mk = |kind: &'static str, d: &DeviceEntry| DeviceEvent {
+            kind,
+            t_ms,
+            unix_ms,
+            name: d.name.clone(),
+            uid: d.uid.clone(),
+            id: d.id,
+            is_input: d.is_input,
+            is_output: d.is_output,
+        };
+        // Removals first, so a slot re-created under one notification reads as
+        // "removed then added" rather than two bare additions.
+        let mut fresh: Vec<DeviceEvent> = self
+            .known
+            .iter()
+            .filter(|old| !now.iter().any(|n| n.same_device(old)))
+            .map(|old| mk("removed", old))
+            .collect();
+        fresh.extend(
+            now.iter()
+                .filter(|n| !self.known.iter().any(|old| old.same_device(n)))
+                .map(|n| mk("added", n)),
+        );
+        self.known = now;
+        for e in fresh {
+            (self.cb)(&e);
+            self.events.push(e);
+        }
+    }
+}
+
+/// Watches the system device list for `secs` and returns every add/remove seen,
+/// oldest first. Terminates on its own, deregisters the listener before
+/// returning, and treats an unchanged window as a successful run with an empty
+/// result — proving that nothing happened is exactly what this is for.
+///
+/// `on_event` fires on the HAL notification thread as each change lands.
+#[cfg(target_os = "macos")]
+pub fn watch_device_list(
+    secs: f32,
+    on_event: Box<dyn FnMut(&DeviceEvent) + Send + 'static>,
+) -> Result<Vec<DeviceEvent>> {
+    let state = Arc::new(Mutex::new(WatchState {
+        known: list_devices_detailed(),
+        events: Vec::new(),
+        cb: on_event,
+        start: Instant::now(),
+    }));
+    let reg = devlist_imp::register(Arc::clone(&state))?;
+    std::thread::sleep(Duration::from_secs_f32(secs.max(0.0)));
+    let released = devlist_imp::unregister(reg);
+    let events = {
+        let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+        // One last diff once the listener is gone: a change that landed in the
+        // final milliseconds is still a change inside the window, and rounding
+        // it away would be the one kind of miss this tool must not have.
+        g.diff();
+        std::mem::take(&mut g.events)
+    };
+    if !released {
+        // Deregistration failed, so the HAL may still call us: leaking the
+        // state keeps that pointer valid instead of dangling.
+        std::mem::forget(state);
+    }
+    Ok(events)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn watch_device_list(
+    _secs: f32,
+    _on_event: Box<dyn FnMut(&DeviceEvent) + Send + 'static>,
+) -> Result<Vec<DeviceEvent>> {
+    bail!("watching the audio device list is only implemented on macOS");
+}
+
+#[cfg(target_os = "macos")]
+mod devlist_imp {
+    //! AudioObjectAddPropertyListener on the system object's
+    //! kAudioHardwarePropertyDevices — the property that changes when a device
+    //! is published or withdrawn.
+
+    use super::ca_listener::{
+        fourcc, AudioObjectAddPropertyListener, AudioObjectID, AudioObjectRemovePropertyListener,
+        OSStatus, PropAddr, ELEM_MAIN, SCOPE_GLOBAL, SYSTEM_OBJECT,
+    };
+    use super::WatchState;
+    use anyhow::{bail, Result};
+    use std::ffi::c_void;
+    use std::sync::{Arc, Mutex};
+
+    const SEL_DEVICES: u32 = fourcc(b"dev#"); // kAudioHardwarePropertyDevices
+
+    pub struct Registration {
+        addr: PropAddr,
+        ctx: *const Mutex<WatchState>,
+    }
+
+    unsafe extern "C" fn on_devices_changed(
+        _id: AudioObjectID,
+        _n: u32,
+        _addrs: *const PropAddr,
+        data: *mut c_void,
+    ) -> OSStatus {
+        if !data.is_null() {
+            let st = &*(data as *const Mutex<WatchState>);
+            st.lock().unwrap_or_else(|e| e.into_inner()).diff();
+        }
+        0
+    }
+
+    pub fn register(state: Arc<Mutex<WatchState>>) -> Result<Registration> {
+        let addr = PropAddr { selector: SEL_DEVICES, scope: SCOPE_GLOBAL, element: ELEM_MAIN };
+        // The HAL keeps this pointer until the listener is removed, so the Arc
+        // strong count has to stay raised for exactly that long.
+        let ctx = Arc::into_raw(state);
+        let st = unsafe {
+            AudioObjectAddPropertyListener(
+                SYSTEM_OBJECT,
+                &addr,
+                on_devices_changed,
+                ctx as *mut c_void,
+            )
+        };
+        if st != 0 {
+            unsafe { drop(Arc::from_raw(ctx)) };
+            bail!("AudioObjectAddPropertyListener(dev#) failed: OSStatus {st}");
+        }
+        Ok(Registration { addr, ctx })
+    }
+
+    /// `true` when the HAL provably let go of the context pointer.
+    pub fn unregister(reg: Registration) -> bool {
+        let st = unsafe {
+            AudioObjectRemovePropertyListener(
+                SYSTEM_OBJECT,
+                &reg.addr,
+                on_devices_changed,
+                reg.ctx as *mut c_void,
+            )
+        };
+        if st == 0 {
+            unsafe { drop(Arc::from_raw(reg.ctx)) };
+            true
+        } else {
+            eprintln!(
+                "[audiohub] AudioObjectRemovePropertyListener(dev#) failed: OSStatus {st}"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 impl DeviceChangeWatcher {
     /// Does exactly what the platform listener does, so a test can prove the
@@ -1647,6 +2115,186 @@ mod tests {
     }
 
     // ---- watcher
+
+    // ---- device inventory (uid / AudioObjectID)
+
+    fn entry(id: u32, uid: &str, name: &str) -> DeviceEntry {
+        DeviceEntry {
+            name: name.to_string(),
+            uid: Some(uid.to_string()),
+            id: Some(id),
+            is_input: false,
+            is_output: true,
+        }
+    }
+
+    #[test]
+    fn detailed_listing_agrees_with_the_name_listings() {
+        let all = list_devices_detailed();
+        assert!(!all.is_empty(), "no audio devices at all");
+        for (kind, names) in [
+            (DeviceKind::Output, list_output_devices()),
+            (DeviceKind::Input, list_input_devices()),
+        ] {
+            for n in names {
+                let hit = all.iter().find(|d| d.name == n);
+                let d = hit.unwrap_or_else(|| panic!("{kind:?} {n:?} missing from the detailed listing"));
+                match kind {
+                    DeviceKind::Output => assert!(d.is_output, "{n:?} listed as output but is_output=false"),
+                    DeviceKind::Input => assert!(d.is_input, "{n:?} listed as input but is_input=false"),
+                }
+            }
+        }
+    }
+
+    /// The whole point of reporting a UID is that it identifies ONE device.
+    #[test]
+    fn uids_are_unique_across_the_machine() {
+        let all = list_devices_detailed();
+        let mut seen: Vec<&String> = Vec::new();
+        for uid in all.iter().filter_map(|d| d.uid.as_ref()) {
+            assert!(!seen.contains(&uid), "two devices share the UID {uid:?}");
+            seen.push(uid);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_uid_resolves_back_to_its_own_device() {
+        for d in list_devices_detailed() {
+            let Some(uid) = d.uid.as_deref() else { continue };
+            for (kind, applies) in [
+                (DeviceKind::Output, d.is_output),
+                (DeviceKind::Input, d.is_input),
+            ] {
+                if !applies {
+                    // asking the wrong direction must be refused, never coerced
+                    assert!(device_name_for_uid(kind, uid).is_err(), "{uid:?} {kind:?}");
+                    continue;
+                }
+                assert_eq!(device_name_for_uid(kind, uid).unwrap(), d.name, "{uid:?}");
+                let (_, resolved) = find_device_by_uid(kind, uid)
+                    .unwrap_or_else(|e| panic!("{uid:?} {kind:?} not findable: {e:#}"));
+                assert_eq!(resolved, d.name, "{uid:?}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unknown_uid_errors_and_lists_the_real_ones() {
+        let e = err_of(find_device_by_uid(DeviceKind::Output, "NoSuchUID"));
+        assert!(e.contains("no output device matches UID"), "{e}");
+        // the message has to be usable for spotting a typo
+        if let Some(real) = list_devices_detailed()
+            .into_iter()
+            .find(|d| d.is_output && d.uid.is_some())
+        {
+            assert!(e.contains(real.uid.as_deref().unwrap()), "{e}");
+        }
+        assert!(err_of(LivePlayback::start_on_uid("NoSuchUID", 48000))
+            .contains("no output device matches UID"));
+        assert!(err_of(LiveCapture::start_on_uid("NoSuchUID"))
+            .contains("no input device matches UID"));
+    }
+
+    /// A UID is an opaque identifier, not a display string: the case-insensitive
+    /// prefix leniency that makes NAMES typeable would here invent matches the
+    /// system itself would never make.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uid_matching_is_exact_and_case_sensitive() {
+        let Some(d) = list_devices_detailed().into_iter().find(|d| {
+            d.is_output && d.uid.as_deref().map_or(false, |u| u.chars().any(|c| c.is_alphabetic()))
+        }) else {
+            eprintln!("[audiohub] skip: no output device with an alphabetic UID");
+            return;
+        };
+        let uid = d.uid.unwrap();
+        assert_eq!(device_name_for_uid(DeviceKind::Output, &uid).unwrap(), d.name);
+        for bad in [uid.to_uppercase(), uid.to_lowercase()] {
+            if bad == uid {
+                continue;
+            }
+            assert!(device_name_for_uid(DeviceKind::Output, &bad).is_err(), "{bad:?}");
+        }
+        // a prefix is not a match either
+        assert!(device_name_for_uid(DeviceKind::Output, &uid[..uid.len() - 1]).is_err());
+    }
+
+    // ---- device list event stream
+
+    #[cfg(target_os = "macos")]
+    fn watch_state(known: Vec<DeviceEntry>) -> (WatchState, mpsc::Receiver<DeviceEvent>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            WatchState {
+                known,
+                events: Vec::new(),
+                cb: Box::new(move |e: &DeviceEvent| {
+                    let _ = tx.send(e.clone());
+                }),
+                start: Instant::now(),
+            },
+            rx,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn diff_reports_additions_and_removals_once_each() {
+        let (mut st, rx) = watch_state(vec![entry(40, "A", "Card A"), entry(41, "B", "Card B")]);
+        st.diff_against(vec![entry(41, "B", "Card B"), entry(42, "C", "Card C")]);
+        let kinds: Vec<(&str, Option<String>)> =
+            st.events.iter().map(|e| (e.kind, e.uid.clone())).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("removed", Some("A".into())),
+                ("added", Some("C".into()))
+            ]
+        );
+        // the live callback saw exactly the same events
+        assert_eq!(rx.try_iter().count(), 2);
+
+        // a second diff over an unchanged list must add nothing: an event is
+        // reported once, when it happens, not on every notification after it
+        st.diff_against(vec![entry(41, "B", "Card B"), entry(42, "C", "Card C")]);
+        assert_eq!(st.events.len(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_rename_is_not_churn_but_a_new_object_id_is() {
+        let (mut st, _rx) = watch_state(vec![entry(40, "A", "Living Room Mac")]);
+        st.diff_against(vec![entry(40, "A", "Living Room Mac (offline)")]);
+        assert!(st.events.is_empty(), "a rename must not read as add/remove");
+
+        // same UID, new AudioObjectID = the device really was re-created
+        st.diff_against(vec![entry(77, "A", "Living Room Mac")]);
+        let kinds: Vec<&str> = st.events.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, vec!["removed", "added"]);
+        assert_eq!(st.events[0].id, Some(40));
+        assert_eq!(st.events[1].id, Some(77));
+    }
+
+    /// Proving a NEGATIVE is the whole job: a window in which nothing happens
+    /// must succeed with zero events, and must leave no listener behind.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn watching_an_unchanged_window_yields_no_events() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        let events = watch_device_list(
+            0.3,
+            Box::new(move |_: &DeviceEvent| {
+                h.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
+        .expect("registering the device-list listener");
+        assert!(events.is_empty(), "unexpected device churn: {events:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn fanout_coalesces_and_stops() {

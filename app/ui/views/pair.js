@@ -103,25 +103,59 @@ export function mount(root, ctx) {
     placeholder: '对方 PIN', inputmode: 'numeric', maxlength: '8', autocomplete: 'off',
   });
   const goBtn = el('button', {
-    class: 'btn primary looks-disabled', type: 'button',
-    'data-testid': 'manual-pair-btn',
-    title: '发起端配对暂无 IPC 方法（M4a），本期请使用 CLI',
+    class: 'btn primary', type: 'button', 'data-testid': 'manual-pair-btn',
   }, '发起配对');
   const cliHint = el('p', { class: 'cli-hint', 'data-testid': 'pair-cli-hint', hidden: true });
 
-  goBtn.addEventListener('click', async () => {
-    if (ctx.isTauri()) {
-      try { await ctx.ensureDaemon(); } catch (_) { /* 提示为主，失败不阻断 */ }
-    }
-    const addr = addrIn.value.trim() || '<addr>';
-    const pin = pinIn.value.trim() || '<pin>';
-    cliHint.hidden = false;
-    cliHint.textContent = `发起端配对暂无 IPC 方法（M4a）。当前版本请用 CLI：audiohub pair --to ${addr} --pin ${pin}`;
-  });
-
   const steps = ['建立连接', '校验 PIN', '交换密钥', '完成配对'];
-  const progress = el('ol', { class: 'pair-steps', 'data-testid': 'pair-progress' },
-    steps.map((t) => el('li', {}, el('span', { class: 'step-dot' }), t)));
+  const stepEls = steps.map((t) => el('li', {}, el('span', { class: 'step-dot' }), t));
+  const progress = el('ol', { class: 'pair-steps', 'data-testid': 'pair-progress' }, stepEls);
+
+  // 进度是**诚实的粗粒度**：daemon 的 peers.pair 是一次同步 RPC，中间没有事件，
+  // 所以只标「进行中 / 全部完成 / 失败」，绝不假装能看见握手的每一步。
+  function markSteps(state) {
+    for (const li of stepEls) li.classList.remove('doing', 'done', 'failed');
+    if (state === 'running') stepEls.forEach((li) => li.classList.add('doing'));
+    else if (state === 'done') stepEls.forEach((li) => li.classList.add('done'));
+    else if (state === 'failed') stepEls.forEach((li) => li.classList.add('failed'));
+  }
+
+  let pairing = false;
+  goBtn.addEventListener('click', async () => {
+    if (pairing) return;
+    const addr = addrIn.value.trim();
+    const pin = pinIn.value.trim();
+    if (!addr) { toast('请填写对方地址（IP 或 IP:端口）', 'warn'); addrIn.focus(); return; }
+    if (!pin) { toast('请填写对方界面上显示的 PIN', 'warn'); pinIn.focus(); return; }
+    if (ctx.isTauri()) {
+      try { await ctx.ensureDaemon(); } catch (_) { /* 连接失败会在下一步报出来 */ }
+    }
+    pairing = true;
+    goBtn.disabled = true;
+    goBtn.textContent = '配对中…';
+    cliHint.hidden = true;
+    markSteps('running');
+    try {
+      // 配对成功后 daemon 会立刻为这台对端分配槽位并下发虚拟设备（模式 B），
+      // 所以这里必须刷新对端列表——设备清单与卡片都靠它。
+      const peer = await ctx.rpc('peers.pair', { addr, pin });
+      markSteps('done');
+      const name = (peer && (peer.display_name || peer.name)) || addr;
+      toast(`已与「${name}」完成配对`, 'ok');
+      pinIn.value = '';
+      await ctx.refreshPeers();
+      ctx.navigate('peers');
+    } catch (e) {
+      markSteps('failed');
+      cliHint.hidden = false;
+      cliHint.textContent = `配对失败：${String((e && e.message) || e)}。`
+        + `确认对方已开启配对模式、PIN 未过期、地址可达；也可用 CLI 复现：audiohub pair --to ${addr} --pin ${pin}`;
+    } finally {
+      pairing = false;
+      goBtn.disabled = false;
+      goBtn.textContent = '发起配对';
+    }
+  });
 
   const rightCard = el('section', { class: 'card block pair-col' },
     el('h3', { class: 'block-title' }, '我要连别人'),
@@ -132,10 +166,12 @@ export function mount(root, ctx) {
       el('div', { class: 'form-row' },
         el('label', { class: 'field grow' }, el('span', { class: 'field-label' }, '对方地址'), addrIn),
         el('label', { class: 'field' }, el('span', { class: 'field-label' }, 'PIN'), pinIn),
-        el('span', { class: 'field-btn' }, goBtn, el('span', { class: 'tag warn' }, '本期 CLI 限定'))),
+        el('span', { class: 'field-btn' }, goBtn)),
       cliHint,
       progress,
-      el('p', { class: 'muted small' }, '配对进度为占位展示，待发起端 IPC（M4b）接入后启用。')));
+      el('p', { class: 'muted small' },
+        '经 peers.pair 由本机服务发起：配对成功后双向信任立即生效，'
+        + '模式 B 下对方主机会同时作为一对音频设备出现在「系统设置 › 声音」里。')));
 
   root.append(el('div', { class: 'pair-grid' }, leftCard, rightCard));
 

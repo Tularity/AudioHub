@@ -50,6 +50,12 @@ pub enum M3Cmd {
         to: String,
         #[arg(long)]
         pin: String,
+        /// port the daemon for THIS config dir will listen on, advertised to
+        /// the peer so it can dial back. Defaults to 47810, which is a guess:
+        /// this command has no listener of its own. Pass the real one when the
+        /// daemon here will not use the default, or 0 to advertise nothing.
+        #[arg(long, default_value_t = DEFAULT_PORT)]
+        listen_port: u16,
     },
     /// list paired peers
     Peers,
@@ -86,7 +92,7 @@ pub fn dispatch(cmd: M3Cmd, json: bool) -> Result<i32> {
             pin,
             announce,
         } => cmd_pair_listen(port, secs, pin, announce, json),
-        M3Cmd::Pair { to, pin } => cmd_pair(&to, &pin, json),
+        M3Cmd::Pair { to, pin, listen_port } => cmd_pair(&to, &pin, listen_port, json),
         M3Cmd::Peers => cmd_peers(json),
         M3Cmd::Unpair { fingerprint, all } => cmd_unpair(fingerprint, all, json),
         M3Cmd::VerifyListen { port, secs } => cmd_verify_listen(port, secs, json),
@@ -261,7 +267,7 @@ fn cmd_pair_listen(
     }
 }
 
-fn cmd_pair(to: &str, pin: &str, json: bool) -> Result<i32> {
+fn cmd_pair(to: &str, pin: &str, listen_port: u16, json: bool) -> Result<i32> {
     validate_pin(pin)?;
     let target = parse_target(to)?;
     let id = LocalIdentity::load_or_create()?;
@@ -279,8 +285,14 @@ fn cmd_pair(to: &str, pin: &str, json: bool) -> Result<i32> {
     };
     stream.set_read_timeout(Some(TCP_READ_TIMEOUT))?;
 
-    // initiator advertises the port it would itself listen on (spec default)
-    match pair_initiator(&mut stream, pin, &id, DEFAULT_PORT) {
+    // The initiator advertises the port a daemon for this config dir WOULD
+    // listen on. This process has no listener, so the default is a guess, and a
+    // wrong guess is not harmless: the responder records it as the address to
+    // dial us back on, and when this pairing is over loopback to a daemon that
+    // owns the default port the guess names that daemon's own socket. Hence
+    // --listen-port, and hence the responder's refusal to record an
+    // advertisement that points at itself.
+    match pair_initiator(&mut stream, pin, &id, listen_port) {
         Ok(mut outcome) => {
             outcome.peer.last_addr = Some(target.ip().to_string());
             outcome.peer.port = target.port();

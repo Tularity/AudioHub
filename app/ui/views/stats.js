@@ -3,6 +3,12 @@
 import { store } from '../store.js';
 import { el, fmt, drawSpark, icon, sessionFlow } from '../ui.js';
 import { volumeText } from '../volume.js';
+import { isModeB } from '../mode.js';
+
+const ORIGIN_TAG = {
+  hal: { cls: 'tag accent', text: '虚拟设备', title: '由某个应用选中这台对端的 AudioHub 设备而自动建立' },
+  peer: { cls: 'tag warn', text: '对端发起', title: '由对端主动建立' },
+};
 
 const DIR_LABEL = { send: '发送', recv: '接收' };
 
@@ -24,10 +30,13 @@ export function mount(root) {
     el('div', { class: 'card tile' }, el('div', { class: 'tile-label' }, '活跃会话'), cntEl));
 
   const list = el('div', { class: 'session-list' });
+  // 空态文案要按模式分开：模式 B 下「去打开卡片上的开关」是一句错误的指引——
+  // 那排开关根本不存在，会话由系统的设备选择创建。
+  const emptyHint = el('p', { 'data-testid': 'stats-empty-hint' });
   const empty = el('div', { class: 'empty card', 'data-testid': 'stats-empty' },
     icon('stats', 'empty-ico'),
     el('h3', {}, '暂无活跃会话'),
-    el('p', {}, '在主面板打开对端卡片上的通路开关，或用 CLI 发起会话后，这里会实时出现指标。'));
+    emptyHint);
 
   root.append(tiles, list, empty);
 
@@ -62,22 +71,35 @@ export function mount(root) {
     }, volIco, volLabel, el('div', { class: 'vol-bar' }, volFill), volVal, volTag);
 
     const flow = sessionFlow(info);
+    const origin = ORIGIN_TAG[info.origin];
+    // origin=hal 的会话必须写出是**哪一台**虚拟设备触发的：模式 B 下这是用户唯一
+    // 能把「统计页这一行」和「我刚在系统里选的那台设备」对上的线索。
+    const originTag = origin
+      ? el('span', {
+        class: origin.cls, title: info.hal_device || origin.title,
+        'data-testid': `session-origin-${info.id}`,
+      }, origin.text)
+      : null;
+    const devName = el('span', { class: 'sess-device', 'data-testid': `session-device-${info.id}`, hidden: true });
     const card = el('article', { class: 'card session-card', 'data-testid': `session-row-${info.id}` },
       el('header', { class: 'session-head' },
         el('strong', {}, `会话 #${info.id}`),
         el('span', { class: 'tag accent', title: flow.label, 'data-testid': `session-flow-${info.id}` }, flow.short),
         el('span', { class: 'tag' }, DIR_LABEL[info.dir] || info.dir),
-        flow.inbound ? el('span', { class: 'tag warn' }, '对端发起') : null,
+        originTag || (flow.inbound ? el('span', { class: 'tag warn' }, '对端发起') : null),
+        devName,
         headMeta),
       el('div', { class: 'metrics' }, blocks),
       volRow,
       extra);
-    return { card, metricRefs, headMeta, extra, vol: { row: volRow, label: volLabel, fill: volFill, val: volVal, tag: volTag } };
+    return { card, metricRefs, headMeta, extra, devName, vol: { row: volRow, label: volLabel, fill: volFill, val: volVal, tag: volTag } };
   }
 
   function updateRow(refs, info, hist) {
     const st = info.stats || {};
     refs.headMeta.textContent = `${info.peer_name || info.peer_fingerprint.slice(0, 8)} · ${info.sample_rate} Hz · ${info.channels} 声道`;
+    refs.devName.hidden = !info.hal_device;
+    if (info.hal_device) refs.devName.textContent = info.hal_device;
     for (const m of METRICS) {
       const r = refs.metricRefs[m.key];
       const v = m.val(st);
@@ -125,6 +147,9 @@ export function mount(root) {
     updateUptime(s);
     cntEl.textContent = String(s.sessions.length);
     empty.hidden = s.sessions.length > 0;
+    emptyHint.textContent = isModeB(s)
+      ? '在「系统设置 › 声音」或任意应用里选择某台对端的 AudioHub 设备后，这里会出现对应的实时指标。'
+      : '在主面板打开对端卡片上的通路开关，或用 CLI 发起会话后，这里会实时出现指标。';
 
     const alive = new Set();
     for (const info of s.sessions) {

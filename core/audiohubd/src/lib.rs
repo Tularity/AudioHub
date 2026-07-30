@@ -3,9 +3,11 @@
 
 mod conn;
 mod engine;
+pub mod haldev;
 pub mod halbridge;
 mod ipcserv;
 pub mod reconnect;
+mod settings;
 
 /// Public for the deviceless test that pins the "one device = one bridge
 /// refcount" rule: a raw selector and its resolved name must key the same
@@ -28,7 +30,8 @@ use audiohub_core::dsp::{self, LinearResampler};
 use audiohub_core::sysaudio::{self, VirtualCard};
 use audiohub_core::volume::{self, VolumeState, VolumeSync};
 use audiohub_ipc::{
-    IpcEndpoint, OpenSessionParams, SessionInfo, SessionStats, IPC_VERSION, KIND_SPK,
+    IpcEndpoint, OpenSessionParams, SessionInfo, SessionStats, IPC_VERSION, KIND_SPK, ORIGIN_HAL,
+    ORIGIN_PEER, ORIGIN_USER,
 };
 use audiohub_net::discovery::{self, AnnounceGuard};
 use audiohub_net::identity::{LocalIdentity, PairedPeer};
@@ -241,15 +244,16 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     if let Some(mode) = cfg.hal_bridge {
         hal_cfg.mode = mode;
     }
+    // Named before it is moved: the line used to print the DEFAULT service name
+    // whatever `AUDIOHUB_HAL_SERVICE` said, which makes it useless for the one
+    // thing it is read for — checking that the daemon is looking for the driver
+    // you just installed.
+    let hal_name = hal_cfg.service_name.clone();
     let hal_bridge = match halbridge::HalBridge::start(hal_cfg) {
         Ok(b) => {
             if let Some(br) = &b {
                 let st = br.status();
-                dlog!(
-                    "hal bridge: driver_found={} name={}",
-                    st.driver_found,
-                    halbridge::HAL_SERVICE_NAME
-                );
+                dlog!("hal bridge: driver_found={} name={hal_name}", st.driver_found);
             }
             b.map(Arc::new)
         }
@@ -270,6 +274,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
 
     let (tx_send, tx_recv) = mpsc::channel::<engine::TxCmd>();
     let (mix_send, mix_recv) = mpsc::channel::<engine::MixCmd>();
+    let cfg_dir_for_state = cfg_dir.clone();
     let inner = Arc::new(DaemonInner {
         id: id.clone(),
         cfg_dir,
@@ -292,8 +297,12 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         cleanup: Once::new(),
         announce_guard: Mutex::new(announce_guard),
         halbridge: Mutex::new(hal_bridge),
-        hal_vol: Mutex::new(None),
-        hal_mic_io: AtomicBool::new(true),
+        settings: Mutex::new(settings::StoredSettings::load(&cfg_dir_for_state)),
+        haldev: Mutex::new(haldev::HalDevState::new(haldev::SlotTable::load(
+            &cfg_dir_for_state,
+        ))),
+        hal_sess: Mutex::new(None),
+        hal_mic_io: std::array::from_fn(|_| AtomicBool::new(true)),
         preauth: AtomicUsize::new(0),
         recon: Mutex::new(HashMap::new()),
         dev_in_epoch: AtomicU64::new(0),
@@ -358,6 +367,22 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         let i = inner.clone();
         threads.push(spawn("ahb-ticker", Box::new(move || ticker_loop(i)))?);
     }
+    // Only where there IS a bridge: on every other host these two threads would
+    // wake 5 times a second to find nothing, forever.
+    if inner.hal().is_some() {
+        let (sess_tx, sess_rx) = mpsc::channel::<haldev::SessCmd>();
+        *lk(&inner.hal_sess) = Some(sess_tx.clone());
+        let i = inner.clone();
+        threads.push(spawn(
+            "ahb-haldev",
+            Box::new(move || haldev::coordinator_loop(i, sess_tx)),
+        )?);
+        let i = inner.clone();
+        threads.push(spawn(
+            "ahb-halsess",
+            Box::new(move || haldev::session_worker(i, sess_rx)),
+        )?);
+    }
     {
         install_signal_handlers();
         let i = inner.clone();
@@ -419,23 +444,28 @@ pub(crate) struct DaemonInner {
     /// Behind an `Arc` so the 10ms loops can lift a handle out with one short
     /// lock instead of holding this mutex across a tick.
     pub halbridge: Mutex<Option<Arc<halbridge::HalBridge>>>,
-    /// Last (scalar, muted) this daemon pushed INTO the driver's controls with
-    /// `notify_volume`. Two jobs: it suppresses the mach send when the peer
-    /// merely re-reports an unchanged value (the provider refreshes every 5
-    /// ticks), and it lets the event drain recognise a driver report that is
-    /// only our own value coming back, which is what would otherwise close a
-    /// driver -> peer -> driver volume loop.
-    pub hal_vol: Mutex<Option<(f32, bool)>>,
-    /// Is an application actually reading "AudioHub Microphone"? Driven by the
-    /// driver's IoState reports (which it re-posts on every reconnect, so this
-    /// re-syncs by itself). It gates the mixer's ring writes for a latency
-    /// reason, not a correctness one: only the ring's CONSUMER may move
-    /// read_idx, so a ring we fill while nobody drains it stays full, and the
-    /// app that eventually starts recording would then read 500ms behind us —
-    /// permanently. Starts `true` because "not told yet" must never mean
-    /// silence: writes made before the driver attaches are dropped by the
+    /// Daemon-owned settings (spec-m5b §6.1). The consumer mode in particular
+    /// is a property of this MACHINE, so it cannot live in a UI's localStorage
+    /// where two windows can disagree and the daemon is never told.
+    pub settings: Mutex<settings::StoredSettings>,
+    /// Which peer owns which pair of virtual devices, plus everything the
+    /// device/session coordinator tracks per slot (spec-m5b §5.1).
+    pub haldev: Mutex<haldev::HalDevState>,
+    /// Command queue to the session worker. `None` where there is no bridge.
+    pub hal_sess: Mutex<Option<mpsc::Sender<haldev::SessCmd>>>,
+    /// Is an application actually reading slot N's virtual microphone? Driven
+    /// by the driver's IoState reports (which it replays on every idempotent
+    /// re-Set, so this re-syncs by itself). It gates the mixer's ring writes
+    /// for a latency reason, not a correctness one: only the ring's CONSUMER
+    /// may move read_idx, so a ring we fill while nobody drains it stays full,
+    /// and the app that eventually starts recording would then read 500ms
+    /// behind us — permanently. Starts `true` because "not told yet" must never
+    /// mean silence: writes made before the driver attaches are dropped by the
     /// handshake flush on its side anyway.
-    pub hal_mic_io: AtomicBool,
+    ///
+    /// PER SLOT: one flag would let an app recording peer A's microphone open
+    /// the write path for every other peer's ring as well.
+    pub hal_mic_io: [AtomicBool; haldev::HAL_MAX_SLOTS],
     /// Control connections past the first frame but not yet verified; bounds
     /// the number of unauthenticated handshake threads an attacker can pin.
     pub preauth: AtomicUsize,
@@ -545,135 +575,13 @@ impl DaemonInner {
     }
 }
 
-/// Volume values this close are the same value: the driver stores a float the
-/// user dragged, the peer's device snaps to its own step grid, and neither is
-/// allowed to look like a change and start another round trip.
-const HAL_VOL_EPS: f32 = 1.0 / 512.0;
-
-fn hal_vol_same(a: (f32, bool), b: (f32, bool)) -> bool {
-    (a.0 - b.0).abs() < HAL_VOL_EPS && a.1 == b.1
-}
-
-/// spec-round2 §B2 reverse direction: the peer's real output reported a new
-/// state (a `VolumeState` the consumer cell holds), so the virtual speaker's
-/// control must show it. Sending only on a genuine change is what keeps this
-/// off the provider's every-5-tick refresh, and what stops a driver that
-/// echoes its own controls from looping.
-///
-/// Runs on the ticker, not on the control reader that received the report: a
-/// mach send can sit for its full 500ms timeout, and the reader must stay free
-/// to keep draining the peer's channel.
-fn hal_push_peer_volume(inner: &DaemonInner, hal: &halbridge::HalBridge) {
-    // The consumer end of a volume_sync'd spk stream: its cell is the peer's
-    // real device, filled from VolumeState (and from the optimistic local echo
-    // set_session_volume writes, which is the same value by construction).
-    // Snapshot first — every other reader of a session's volume cell takes it
-    // with the state lock already released, and this one must not be the
-    // exception that introduces a lock order.
-    let state = snapshot_sessions(inner) // sorted by id: one pair this round
-        .iter()
-        .find(|e| e.kind == KIND_SPK && e.dir == DIR_SEND && e.volume.enabled)
-        .and_then(|e| *lk(&e.volume.state));
-    let Some(v) = state else { return };
-    if !v.scalar.is_finite() {
-        return;
-    }
-    let now = (v.scalar.clamp(0.0, 1.0), v.muted);
-    {
-        let mut last = lk(&inner.hal_vol);
-        if last.map_or(false, |l| hal_vol_same(l, now)) {
-            return;
-        }
-        *last = Some(now);
-    }
-    hal.notify_volume(halbridge::HalDevice::Speaker, now.0, now.1);
-}
-
-/// Both halves of spec-round2 §B2's volume sync, once per 200ms sub-tick.
-/// Never on a media loop: this writes the control TCP socket and sends mach
-/// messages, either of which can block for as long as its own timeout.
-fn hal_tick(inner: &Arc<DaemonInner>) {
-    let Some(hal) = inner.hal() else { return };
-    // Order matters: the driver's own change is dispatched (and recorded as
-    // "the control already reads this") BEFORE the peer's state is pushed back,
-    // so a slider move never bounces off its own round trip.
-    drain_hal_events(inner, &hal);
-    hal_push_peer_volume(inner, &hal);
-}
-
-/// spec-round2 §B2 forward direction: the local user moved the VIRTUAL
-/// speaker's slider, so the peer's REAL device must follow. Reuses the one
-/// VolumeSet emitter (`conn::set_session_volume`) rather than inventing a
-/// second path, so the admission rules, the SRC_LOCAL tagging and the
-/// optimistic local echo are the ones already under test. The IoState reports
-/// arrive on the same queue and are drained here too.
-fn drain_hal_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
-    let events = hal.drain_events();
-    if events.is_empty() {
-        return;
-    }
-    // A slider drag posts a burst; only where it ENDED is worth a round trip.
-    let mut latest: Option<(f32, bool)> = None;
-    for ev in events {
-        match ev {
-            halbridge::HalControlEvent::Volume { device, scalar, muted } => match device {
-                halbridge::HalDevice::Speaker => latest = Some((scalar, muted)),
-                // The virtual microphone's own gain is a local control over a
-                // stream we WRITE; there is no peer device it could drive.
-                halbridge::HalDevice::Microphone => dlog!(
-                    "[audiohubd] hal: virtual microphone volume {scalar:.3} muted={muted} \
-                     (nothing to sync: the peer owns its own capture gain)"
-                ),
-            },
-            halbridge::HalControlEvent::IoState { device, running } => {
-                let dev = match device {
-                    halbridge::HalDevice::Speaker => "speaker",
-                    halbridge::HalDevice::Microphone => {
-                        inner.hal_mic_io.store(running, Ordering::Relaxed);
-                        "microphone"
-                    }
-                };
-                dlog!(
-                    "[audiohubd] hal: virtual {dev} io {}",
-                    if running { "started" } else { "stopped" }
-                );
-            }
-        }
-    }
-    let Some((scalar, muted)) = latest else { return };
-    // Our own notify_volume coming back around: applying it would send the
-    // peer what the peer just told us.
-    {
-        let mut last = lk(&inner.hal_vol);
-        if last.map_or(false, |l| hal_vol_same(l, (scalar, muted))) {
-            return;
-        }
-        // The driver's control IS at this value now — recording it here is what
-        // keeps the push-back below from sending it straight back.
-        *last = Some((scalar, muted));
-    }
-    // Only a spk session THIS side drives can carry it (the same gate
-    // set_session_volume enforces); with §B2's single fixed device pair there
-    // is normally exactly one.
-    let targets: Vec<u32> = lk(&inner.state)
-        .sessions
-        .values()
-        .filter(|e| e.kind == KIND_SPK && e.dir == DIR_SEND && e.volume.enabled)
-        .map(|e| e.id)
-        .collect();
-    if targets.is_empty() {
-        dlog!(
-            "[audiohubd] hal: virtual speaker volume {scalar:.3} muted={muted} ignored: no \
-             volume_sync'd spk session to carry it"
-        );
-        return;
-    }
-    for id in targets {
-        if let Err(e) = conn::set_session_volume(inner, id, scalar, Some(muted)) {
-            dlog!("[audiohubd] hal: volume {scalar:.3} -> session {id}: {e:#}");
-        }
-    }
-}
+// The single-pair volume relay that used to live here (`hal_tick`,
+// `drain_hal_events`, `hal_push_peer_volume` and the one global `hal_vol`
+// cell) is gone: every one of them assumed exactly one virtual device pair.
+// The per-slot versions are in haldev.rs, on the coordinator's own thread —
+// the forward relay now filters by the peer that OWNS the slot, which the old
+// fan-out did not do at all (it drove every volume_sync'd spk session, so with
+// two peers bound, one slider moved both machines).
 
 /// Bridge health for `daemon.status`. `None` (serialised as null) is the
 /// normal answer: no macOS HAL bridge on this host.
@@ -686,10 +594,17 @@ pub(crate) fn hal_status(inner: &DaemonInner) -> Option<audiohub_ipc::HalStatus>
             // "the driver's mach name is registered and we found it".
             registered: s.driver_found,
             driver_connected: s.driver_connected,
+            // The three headline counters are the SUMS of the per-slot ones in
+            // `devices`, so a client that only reads them sees what it always
+            // did while a client that wants per-device detail has it.
             spk_frames: s.spk_frames,
             mic_frames: s.mic_frames,
             mic_dropped: s.mic_dropped,
             last_driver_msg_secs: s.last_driver_msg_secs,
+            protocol_version: halbridge::PROTOCOL_VERSION,
+            driver_protocol_version: s.driver_protocol_version,
+            status_reason: s.status_reason.clone(),
+            devices: lk(&inner.haldev).device_infos(&s.slots),
         }
     })
 }
@@ -759,6 +674,41 @@ impl ConnShared {
     }
 }
 
+/// WHO asked for this session (spec-m5b §5.6).
+///
+/// The distinction is load-bearing: the device coordinator closes a `Hal`
+/// session when the application stops using the virtual device, and it must
+/// never close a `User` one — a CLI or UI session belongs to whoever opened it,
+/// and a device selection somewhere else on the machine is not consent to end
+/// it. It runs the other way too: a `Hal` session exists because an application
+/// selected a device, so the UI does not offer to close it either.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SessionOrigin {
+    /// IPC (`session.open`), from the UI or the CLI.
+    User,
+    /// A virtual device started doing IO. `slot` is diagnostics only.
+    Hal { slot: u8 },
+    /// The peer opened it; we are the provider.
+    Peer,
+}
+
+impl SessionOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            SessionOrigin::User => ORIGIN_USER,
+            SessionOrigin::Hal { .. } => ORIGIN_HAL,
+            SessionOrigin::Peer => ORIGIN_PEER,
+        }
+    }
+
+    pub(crate) fn slot(self) -> Option<u8> {
+        match self {
+            SessionOrigin::Hal { slot } => Some(slot),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SessionEntry {
     pub id: u32,
@@ -771,7 +721,8 @@ pub(crate) struct SessionEntry {
     /// `Some` = WE opened this session, and these are the exact params to
     /// replay after a reconnect (spec-m4c §C). A peer-originated session is
     /// `None`: the peer re-opens it.
-    pub origin: Option<Arc<OpenSessionParams>>,
+    pub replay: Option<Arc<OpenSessionParams>>,
+    pub origin: SessionOrigin,
 }
 
 /// Per-session volume sync state (spec-m4b §A2). Shared behind an Arc because
@@ -908,10 +859,13 @@ pub(crate) struct RxStream {
     pub monitor: bool,
     /// Named output device this stream is ALSO rendered into (spec-m4c §B).
     pub bridge: Option<String>,
-    /// This stream is ALSO written into the HAL bridge's mic ring, so
-    /// "AudioHub Microphone" carries it (spec-round2 §B2). A third
+    /// This stream is ALSO written into ONE slot's mic ring, so the virtual
+    /// microphone that belongs to this peer carries it (spec-m5b §5.4). A third
     /// destination, not an alternative to `monitor` or `bridge`.
-    pub hal: bool,
+    ///
+    /// The SLOT, not a bare flag: the mixer routes by it, and a boolean here
+    /// is what let every peer's audio end up in one ring.
+    pub hal_slot: Option<u8>,
     pub ka_dest: SocketAddr,
     pub jbs: Mutex<JbState>,
     pub post: Mutex<PostMix>,
@@ -932,7 +886,7 @@ impl RxStream {
         is_spk: bool,
         monitor: bool,
         bridge: Option<String>,
-        hal: bool,
+        hal_slot: Option<u8>,
         ka_dest: SocketAddr,
     ) -> RxStream {
         RxStream {
@@ -943,7 +897,7 @@ impl RxStream {
             is_spk,
             monitor,
             bridge,
-            hal,
+            hal_slot,
             ka_dest,
             jbs: Mutex::new(JbState {
                 jb: JitterBuffer::new(2),
@@ -1050,9 +1004,33 @@ pub(crate) fn build_session_infos(inner: &DaemonInner) -> Vec<SessionInfo> {
     } else {
         Some(lk(&inner.mix_ring).iter().copied().collect())
     };
+    // One lock for the whole batch: `session.list` is on the stats event path
+    // and takes this every second per subscriber.
+    let names: HashMap<u8, (String, String)> = {
+        let st = lk(&inner.haldev);
+        st.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.fingerprint.is_empty())
+            .map(|(s, r)| (s as u8, (r.sent_out_name.clone(), r.sent_in_name.clone())))
+            .collect()
+    };
     entries
         .iter()
-        .map(|e| build_session_info(e, &mix_freqs, mix_snap.as_deref()))
+        .map(|e| {
+            // The DEVICE this session exists for: a spk session carries what an
+            // app played into the virtual speaker, a mic session feeds the
+            // virtual microphone. Reporting one name for both would put the
+            // wrong device on half the stats page.
+            let dev = e.origin.slot().and_then(|s| names.get(&s)).map(|(o, i)| {
+                if e.kind == KIND_SPK {
+                    o.as_str()
+                } else {
+                    i.as_str()
+                }
+            });
+            build_session_info(e, &mix_freqs, mix_snap.as_deref(), dev)
+        })
         .collect()
 }
 
@@ -1060,6 +1038,7 @@ pub(crate) fn build_session_info(
     e: &SessionEntry,
     mix_freqs: &[f32],
     mix_snap: Option<&[f32]>,
+    hal_device: Option<&str>,
 ) -> SessionInfo {
     let mut s = SessionStats {
         received: 0,
@@ -1134,6 +1113,9 @@ pub(crate) fn build_session_info(
         sample_rate: 48000,
         channels: 1,
         stats: s,
+        origin: e.origin.label().to_string(),
+        hal_slot: e.origin.slot(),
+        hal_device: hal_device.map(str::to_string),
     }
 }
 
@@ -1153,10 +1135,10 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(200));
-            // On the sub-tick, not the 1s one: a slider must not feel like it
-            // lags a second behind the hand. Never on a media loop — this
-            // writes the control socket and sends mach messages (§B2).
-            hal_tick(&inner);
+            // The HAL half of the sub-tick moved to haldev's own thread: the
+            // device reconcile, the volume relay and the session coordinator
+            // share one 200ms cadence there, and none of them may run on a
+            // thread that also has 1s work to do.
         }
         // spec-m4c §D: the output device the consumer's slider drives is a
         // different device now, so every volume_sync'd spk session must be told

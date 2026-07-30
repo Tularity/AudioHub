@@ -1,0 +1,42 @@
+[package]
+name = "audiohub-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cpal = "0.16"
+ringbuf = "0.4"
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+
+# mac-catap (spec-round2 §A1). Every crate here is already in the lock via
+# cpal; only extra *features* are new, so the resolved graph is unchanged.
+# Kept target-gated so no other host (least of all x86_64-pc-windows-gnu) can
+# see them. default-features stays off: the defaults would pull block2/libc,
+# and the IOProc is registered with a plain C function pointer, not a block.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSDictionary",
+    "NSObject",
+    "NSProcessInfo",
+    "NSString",
+    "NSValue",
+] }
+objc2-core-audio = { version = "0.3", default-features = false, features = [
+    "std",
+    "AudioHardware",
+    "objc2",
+    "objc2-core-audio-types",
+    "objc2-foundation",
+] }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = [
+    "std",
+    "CoreAudioBaseTypes",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFDictionary",
+] }

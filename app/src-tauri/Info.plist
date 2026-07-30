@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into AudioHub.app/Contents/Info.plist by tauri-cli (it picks up
+  src-tauri/Info.plist and hands it to the bundler, whose own keys it overrides).
+
+  These usage strings must live in the APP's plist, not the daemon's: TCC
+  attributes a request to the *responsible process*, and the daemon is spawned
+  as a child of AudioHub.app, so a microphone session opened by that daemon is
+  refused outright unless NSMicrophoneUsageDescription is present here.
+-->
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>AudioHub 需要使用麦克风，才能把本机的麦克风声音共享给已配对的另一台设备（例如让 Windows 电脑使用这台 Mac 的麦克风）。仅在你主动开启共享时采集，音频只在局域网内点对点加密传输。</string>
+
+  <!-- Core Audio process taps (mac-catap, core/audiohub-core/src/sysaudio.rs) are
+       gated by kTCCServiceAudioCapture ("system audio recording"), a category
+       distinct from the microphone. Its usage-description key is
+       NSAudioCaptureUsageDescription — verified against this machine's
+       /System/Library/PrivateFrameworks/TCC.framework/Support/tccd on macOS 26.5.2.
+       Without it a CATap attempt is denied outright rather than prompted, which is
+       indistinguishable from a broken backend.
+
+       Note there is deliberately no NSScreenCaptureUsageDescription here: no such
+       key exists (tccd knows kTCCServiceScreenCapture but no usage string for it),
+       so mac-sck's screen-recording consent is system-worded and settings-only. -->
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>AudioHub 需要录制本机的系统音频，才能把这台 Mac 正在播放的声音共享给已配对的另一台设备（例如让 Windows 电脑播放这台 Mac 的音乐）。仅在你主动开启共享时采集，音频只在局域网内点对点加密传输。</string>
+
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>AudioHub 需要访问本地网络，才能通过 mDNS 发现同一局域网内的其他 AudioHub 设备，并与已配对的设备直接传输音频。音频不会上传到互联网。</string>
+
+  <!-- macOS 15+ pairs the local-network prompt with the Bonjour service types
+       actually browsed; audiohub_net::discovery::SERVICE_TYPE. -->
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_audiohub._udp</string>
+  </array>
+</dict>
+</plist>

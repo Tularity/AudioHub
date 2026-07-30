@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AudioHub</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='%2331c8b0'%20stroke-width='1.8'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M3%2012h2l2-5%203%2010%203-14%203%2012%202-3h3'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <!-- macOS titleBarStyle=Overlay：红绿灯浮在内容上，这块空区既是安全区也是拖拽把手 -->
+    <div class="titlebar-space" data-tauri-drag-region></div>
+    <div class="brand" data-tauri-drag-region>
+      <span class="brand-logo">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h2l2-5 3 10 3-14 3 12 2-3h3"/></svg>
+      </span>
+      <div class="brand-text">
+        <strong>AudioHub</strong>
+        <span>网络音频共享</span>
+      </div>
+    </div>
+    <nav id="nav">
+      <button class="nav-item active" type="button" data-view="peers" data-testid="nav-peers">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/></svg>
+        主面板
+      </button>
+      <button class="nav-item" type="button" data-view="pair" data-testid="nav-pair">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 15l6-6"/><path d="M10.5 6.5L12 5a4 4 0 0 1 5.7 5.7l-1.5 1.5"/><path d="M13.5 17.5L12 19a4 4 0 0 1-5.7-5.7l1.5-1.5"/></svg>
+        配对向导
+      </button>
+      <button class="nav-item" type="button" data-view="stats" data-testid="nav-stats">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5v14h16"/><path d="M8 15l3-4 3 2 4-6"/></svg>
+        统计诊断
+      </button>
+      <button class="nav-item" type="button" data-view="settings" data-testid="nav-settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 7h14"/><circle cx="9" cy="7" r="2"/><path d="M5 17h14"/><circle cx="15" cy="17" r="2"/></svg>
+        设置
+      </button>
+    </nav>
+    <div class="sidebar-foot" id="conn-hint" data-testid="conn-mode"></div>
+  </aside>
+  <div id="main">
+    <header id="topbar" data-tauri-drag-region>
+      <h1 id="view-title">主面板</h1>
+      <div id="daemon-badge" class="daemon-badge offline" data-testid="daemon-badge"></div>
+    </header>
+    <main id="view-root"></main>
+  </div>
+</div>
+
+<!-- 首启授权门：盖住整个应用，但排在 #overlay 之下——服务都没连上时，
+     先说服务的事，权限页此刻也查不出任何东西。 -->
+<div id="gate" data-testid="gate" hidden></div>
+
+<div id="overlay" data-testid="daemon-overlay" hidden>
+  <div class="overlay-card">
+    <span class="overlay-ico" id="overlay-ico">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6v4m6-4v4"/><path d="M7 10h10v2a5 5 0 0 1-10 0v-2z"/><path d="M12 17v4"/></svg>
+    </span>
+    <div class="overlay-wave" id="overlay-wave" hidden aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+    <h2 id="overlay-title">正在启动 AudioHub 服务…</h2>
+    <p id="overlay-desc"></p>
+    <div class="overlay-actions" id="overlay-actions">
+      <button id="overlay-retry" class="btn primary" type="button" data-testid="overlay-retry">重试</button>
+    </div>
+    <p class="overlay-hint" id="overlay-hint"></p>
+  </div>
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

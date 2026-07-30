@@ -1,0 +1,19 @@
+[package]
+name = "audiohub-app"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone crate: keep the tauri dependency tree out of the main workspace.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# tray-icon: menu bar residency (spec-app §3). The tray glyph is fed to
+# Image::new as raw RGBA, so no image-png feature (and no `image` crate) is
+# needed — see icons/make-icons.py.
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

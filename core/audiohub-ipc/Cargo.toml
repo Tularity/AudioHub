@@ -1,0 +1,9 @@
+[package]
+name = "audiohub-ipc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+audiohub-core = { path = "../audiohub-core" }
+audiohub-net = { path = "../audiohub-net" }
+serde = { version = "1", features = ["derive"] }

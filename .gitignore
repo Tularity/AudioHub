@@ -1,0 +1,3 @@
+/target
+/app/src-tauri/target
+/drivers/macos-hal/build

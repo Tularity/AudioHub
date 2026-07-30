@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AudioHub",
+  "version": "0.1.0",
+  "identifier": "com.audiohub.app",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "AudioHub",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 860,
+        "minHeight": 600,
+        "titleBarStyle": "Overlay"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:*; object-src 'none'; base-uri 'self'; frame-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "category": "Music",
+    "shortDescription": "跨主机网络音频共享",
+    "icon": ["icons/icon.png", "icons/icon.icns"],
+    "externalBin": ["binaries/audiohub"],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}

@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- This is OUR OWN service name, not the daemon's, and that inversion is
+	     the whole mechanism. coreaudiod lives in the GLOBAL bootstrap
+	     namespace; declaring a name here is what lets the plug-in
+	     bootstrap_check_in() it from inside coreaudiod, so the name is
+	     registered globally. Bootstrap visibility is one-way — a user-session
+	     process can look up a global name, but coreaudiod can never resolve a
+	     gui/<uid> one — so audiohubd stays an ordinary user-session process
+	     (normal TCC identity, full local-network access, no sudo) and does the
+	     bootstrap_look_up. Rogue Amoeba's ARK ships exactly this shape: its
+	     bundle declares "com.rogueamoeba.ARK.driver", the driver's own name.
+	     Declaring the DAEMON's name instead was built and measured twice, and
+	     fails both ways: as a user LaunchAgent coreaudiod cannot see the name at
+	     all, and as a system LaunchDaemon the bridge connects but the daemon has
+	     no user session and therefore no local-network consent (EHOSTUNREACH on
+	     every outbound LAN connect).
+	     Must match kAudioHubDriverMachServiceName in src/AudioHubBridge.h. -->
+	<key>AudioServerPlugIn_MachServices</key>
+	<array>
+		<string>com.audiohub.driver</string>
+	</array>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>AudioHubDriver</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.audiohub.driver</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>AudioHub Driver</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>CFPlugInDynamicRegisterFunction</key>
+	<string></string>
+	<key>CFPlugInDynamicRegistration</key>
+	<string>NO</string>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<!-- must match kAudioHubDriver_FactoryUUIDString in src/AudioHubDriver.c -->
+		<key>E216324F-6D1C-4B60-9847-A1C501BB479B</key>
+		<string>AudioHubDriver_Create</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<!-- kAudioServerPlugInTypeUUID -->
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>E216324F-6D1C-4B60-9847-A1C501BB479B</string>
+		</array>
+	</dict>
+	<key>CFPlugInUnloadFunction</key>
+	<string></string>
+</dict>
+</plist>

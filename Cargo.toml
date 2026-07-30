@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "core/audiohub-core",
+    "core/audiohub-net",
+    "core/audiohub-ipc",
+    "core/audiohub-cli",
+    "core/audiohubd",
+]
+exclude = ["test"]
+
+[profile.release]
+opt-level = 3

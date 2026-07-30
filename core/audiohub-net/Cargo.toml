@@ -1,0 +1,29 @@
+[package]
+name = "audiohub-net"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+audiohub-core = { path = "../audiohub-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+mdns-sd = "0.13"
+spake2 = "0.4"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+# no default features / no derive: keeps zeroize dependency-free (no syn, and
+# nothing that could drag raw-dylib windows-sys in on the gnu toolchain).
+zeroize = { version = "1", default-features = false }
+# NOTE: no `dirs` — dirs-sys pulls windows-sys 0.61 (raw-dylib, unlinkable on
+# our gnu toolchain); config_dir is hand-rolled in identity.rs instead.
+# mio pinned to 1.0.x for the same reason (mdns-sd -> mio 1.2 -> windows-sys 0.61).
+mio = "=1.0.2"
+# gethostname 1.x also drags raw-dylib windows deps — hand-rolled in identity.rs

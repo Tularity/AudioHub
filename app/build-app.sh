@@ -73,6 +73,22 @@ BUNDLE="$TAURI_DIR/target/release/bundle/macos/AudioHub.app"
 [[ -d "$BUNDLE" ]] || die "bundle not found at $BUNDLE"
 
 # ------------------------------------------------------------------ 5) verify
+# Sign with the STABLE dev identity before verifying. An ad-hoc signature's
+# identity is derived from the file's own bytes, so every build produced a new
+# code identity — and macOS records Local Network consent against that identity,
+# so each rebuild silently revoked a permission the user had already granted.
+# Measured: after a rebuild the bundled daemon got `No route to host (os error
+# 65)` on every LAN connect while `nc` from a shell reached the same host:port.
+# Skipped with a warning when the identity does not exist, so a fresh clone
+# still builds.
+if security find-identity -p codesigning 2>/dev/null | grep -q '"AudioHub Dev"'; then
+  zsh "$APP_DIR/../scripts/sign-dev.sh" || die "signing failed"
+else
+  print -u2 -- "[audiohub] WARNING: no 'AudioHub Dev' identity — bundle stays ad-hoc,"
+  print -u2 -- "[audiohub]          and macOS will drop its Local Network consent on"
+  print -u2 -- "[audiohub]          every rebuild. See scripts/sign-dev.sh."
+fi
+
 step "5/5 verify bundle"
 # The app executable is named after the crate's bin (audiohub-app), NOT after
 # productName — and the volume is case-insensitive, so a naive

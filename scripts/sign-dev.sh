@@ -49,6 +49,27 @@ signed=0
 sign_one "$ROOT/target/release/audiohubd" com.audiohub.daemon && (( signed++ )) || true
 sign_one "$ROOT/target/release/audiohub"  com.audiohub.cli    && (( signed++ )) || true
 
+# The BUNDLE too, and its embedded daemon in particular. macOS records Local
+# Network consent against a code identity, and an ad-hoc signature's identity is
+# derived from the file's own contents — so every `build-app.sh` produced a
+# brand-new identity and silently dropped a consent the user had already given.
+# Measured: after a rebuild the bundled daemon got `No route to host (os error
+# 65)` on every LAN connect while `nc` from a shell reached the same host and
+# port fine. Inner binaries first, then the bundle: codesign seals what it
+# contains, so signing the wrapper before its contents invalidates it.
+BUNDLE="$ROOT/app/src-tauri/target/release/bundle/macos/AudioHub.app"
+if [[ -d "$BUNDLE" ]]; then
+  sign_one "$BUNDLE/Contents/MacOS/audiohub"     com.audiohub.daemon && (( signed++ )) || true
+  sign_one "$BUNDLE/Contents/MacOS/audiohub-app" com.audiohub.app    && (( signed++ )) || true
+  if codesign --force --sign "$IDENTITY" --identifier com.audiohub.app "$BUNDLE" 2>/dev/null; then
+    print -- "[audiohub] signed $BUNDLE"
+    print -- "[audiohub]   $(codesign -d -r- "$BUNDLE" 2>&1 | grep -o 'designated =>.*')"
+    (( signed++ ))
+  else
+    print -u2 -- "[audiohub] WARNING: could not sign $BUNDLE"
+  fi
+fi
+
 if (( signed == 0 )); then
   print -u2 -- "[audiohub] nothing to sign; run cargo build --release first"
   exit 1

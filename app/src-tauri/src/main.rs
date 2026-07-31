@@ -392,6 +392,35 @@ fn show_main_window(app: AppHandle) {
     show_main(&app);
 }
 
+/// Drag the window, driven explicitly from a `mousedown` in the frontend
+/// (`app/frontend/src/lib/drag.ts`) instead of `-webkit-app-region: drag`.
+///
+/// The CSS drag region was reported twice as "draggable right after launch,
+/// dead for the rest of the session once you click anything else or drag any
+/// text". The previously-suspected cause — a text selection poisoning the
+/// region — was already guarded against in CSS (`user-select: none` on the
+/// region, `no-drag` on its children) and the symptom survived that guard, so
+/// the region itself is what cannot be relied on. This is the same call Tauri's
+/// own `data-tauri-drag-region` makes internally; routing it through an app
+/// command keeps it working without a capabilities file, since app commands
+/// registered in `invoke_handler` are not subject to the plugin ACL.
+#[tauri::command]
+fn start_window_drag(window: tauri::Window) -> Result<(), String> {
+    window.start_dragging().map_err(|e| e.to_string())
+}
+
+/// Double-click on the title area. macOS toggles zoom there, and
+/// `start_dragging` on mousedown would otherwise swallow it — so the frontend
+/// routes `detail >= 2` here instead. `performWindowDragWithEvent:` does not
+/// consume the follow-up click when the pointer has not moved, which is why the
+/// second mousedown still arrives; Tauri's own drag region splits on exactly
+/// the same signal.
+#[tauri::command]
+fn toggle_window_zoom(window: tauri::Window) -> Result<(), String> {
+    let zoomed = window.is_maximized().map_err(|e| e.to_string())?;
+    if zoomed { window.unmaximize() } else { window.maximize() }.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn set_tray_status(app: AppHandle, online: bool, port: Option<u16>) {
     if let Some(s) = app.try_state::<TrayStatus>() {
@@ -513,6 +542,8 @@ fn main() {
             ensure_daemon,
             set_tray_status,
             show_main_window,
+            start_window_drag,
+            toggle_window_zoom,
             quit_ui,
             stop_daemon_and_quit,
             webui::get_webui_status,

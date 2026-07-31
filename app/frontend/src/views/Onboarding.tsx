@@ -12,6 +12,7 @@ import { Icon } from '../components/Icon';
 import { PermissionRow } from '../components/PermissionRow';
 import { toast } from '../components/Toasts';
 import { openExternal } from '../lib/external';
+import { chromeMouseDown } from '../lib/drag';
 import { t, listFormat } from '../i18n';
 import { actions, getState, useStore } from '../state/store';
 import { actionOf, isBlocking, requestQueue } from '../state/permissions';
@@ -100,8 +101,9 @@ export function OnboardingGate() {
   return (
     <>
       {/* 门盖住了整个窗口，连带盖掉了外壳里那块拖拽把手：macOS 的
-          titleBarStyle=Overlay 下没有系统标题栏，不补一条用户就搬不动这个窗口。 */}
-      <div className="gate-drag" data-tauri-drag-region />
+          titleBarStyle=Overlay 下没有系统标题栏，不补一条用户就搬不动这个窗口。
+          与外壳共用同一个显式 startDragging 处理器（lib/drag.ts）。 */}
+      <div className="gate-drag" onMouseDown={chromeMouseDown} />
       <section className="view onboarding" data-testid="view-onboarding">
         <div className="gate-head">
           <span className="gate-logo"><Icon name="shield" /></span>

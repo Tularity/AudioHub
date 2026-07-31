@@ -1,4 +1,16 @@
-/* AudioHub UI — 深色现代面板风。调色板/圆角/动画规格见 docs/spec-ui.md §3。 */
+/* AudioHub UI — 深色 Liquid Glass（macOS 26 / iOS 26 口径）。规格见 docs/spec-ui.md §3。
+ *
+ * 这一版的核心不是「加毛玻璃」，而是 Apple 的**分层**主张：控件层浮在内容层之上。
+ * 于是只有导航胶囊、状态徽标、模态浮层是玻璃，**卡片一律不透明**——Apple 的原话是
+ * "Don't use Liquid Glass in the content layer"，而且 CSS 侧还有一条硬理由：
+ * backdrop-filter 只采样到最近的 backdrop root，玻璃套玻璃采到的是两层之间那一丝
+ * 空隙，结果是**看起来更平**，不是更透。两条约束指向同一个做法，所以不给自己留余地。
+ *
+ * 真正的折射（lensing）在这里做不到：feDisplacementMap 喂给 backdrop-filter 是
+ * Chromium 独有的非标准扩展，而 Tauri 在 mac 上跑的是 WKWebView。因此本实现用
+ * 「低饱和度提升 + 顶缘强高光 + 细环」去接近那种「边缘在弯光」的读感，而不是
+ * 靠把模糊开大——后者恰好是 2020 年那套 glassmorphism 的做法，也正是廉价感的来源。
+ */
 
 :root {
   --bg: #0f1115;
@@ -12,8 +24,45 @@
   --warn: #e0a83f;
   --line: #ffffff0d;
   --line-strong: #ffffff14;
-  --radius: 10px;
-  --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px rgba(0, 0, 0, .22);
+
+  /* 圆角走 macOS 26 的**同心**规则：内半径 = 外半径 − 内边距。卡片 16 / 内边距 6
+     → 内部行 10；内部行 10 / 内边距 2 → 8。胶囊半径 = 高度的一半（Apple 的公式）。 */
+  --radius: 16px;
+  --radius-sm: 10px;
+  --radius-xs: 8px;
+  --pill: 999px;
+
+  /* 内容层：不透明。抬升只靠投影，不靠透明度。 */
+  --shadow: 0 1px 2px rgba(0, 0, 0, .34), 0 10px 28px -6px rgba(0, 0, 0, .3);
+  --shadow-lift: 0 2px 6px rgba(0, 0, 0, .34), 0 18px 44px -10px rgba(0, 0, 0, .44);
+
+  /* 控件层：Liquid Glass。三段结构缺一不可——
+       ① 顶部径向渐变 = 光从上方打下来的落差（不是平铺的白色蒙版）
+       ② rgba 底色**偏高**（.72）而不是教科书里的 .12：Apple 自己在 beta 3 把透明度
+          收回去过一轮，可读性下限比通透感重要
+       ③ backdrop-filter 的 saturate 补回模糊吃掉的彩度 */
+  --glass-fill:
+    radial-gradient(130% 150% at 50% 0%,
+      rgba(255, 255, 255, .10) 0%, rgba(255, 255, 255, .038) 46%, rgba(255, 255, 255, .012) 100%),
+    rgba(23, 27, 35, .72);
+  --glass-blur: blur(20px) saturate(180%);
+  /* 高光：顶缘约为底缘的 4 倍，模拟单一上方光源；最后一条 .5px 细环勾出轮廓。 */
+  --glass-edge:
+    inset 0 1px 0 rgba(255, 255, 255, .22),
+    inset 0 -1px 0 rgba(255, 255, 255, .05),
+    inset 0 0 0 .5px rgba(255, 255, 255, .07);
+  --glass-shadow: 0 2px 6px rgba(0, 0, 0, .3), 0 18px 44px -12px rgba(0, 0, 0, .58);
+
+  /* 动作短而有回弹。--ease-spring 带一点过冲，用在「出现」；--ease-out 用在状态过渡。 */
+  --ease-spring: cubic-bezier(.34, 1.42, .5, 1);
+  --ease-out: cubic-bezier(.22, 1, .36, 1);
+  --dur: .22s;
+
+  /* 浮动头部。--traffic-w 是 macOS 红绿灯安全区：Windows 上没有红绿灯，但
+     **双平台布局必须逐像素一致**（CLAUDE.md 冻结项），所以两边都照样留出来。 */
+  --chrome-h: 64px;
+  --traffic-w: 88px;
+
   --font: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
@@ -49,106 +98,214 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 
 /* ---- 布局 ---- */
 
+/* 左侧竖导航已移除（见 docs/spec-ui.md §2）：导航改为**浮在内容之上**的居中玻璃
+   胶囊，内容从它下面穿过去滚动。整块侧栏宽度（216px）归还给内容。 */
 #app {
-  display: grid;
-  grid-template-columns: 216px 1fr;
+  display: flex;
+  flex-direction: column;
   height: 100vh;
 }
 
-#sidebar {
-  background: var(--bg-1);
-  border-right: 1px solid var(--line);
-  display: flex;
-  flex-direction: column;
-  padding: 16px 12px;
-  gap: 16px;
+/* min-height:0 是承重的，不是整洁。flex 子项默认 min-height:auto，拒绝收缩到内容
+   高度以下——于是 `flex:1; overflow-y:auto` 永远拿不到一个受限高度，列被撑长而不是
+   开始滚动。症状是**整个应用里滚轮都不起作用**，两个平台都一样。
+   侧栏拆掉后原来那个 #main 容器没有了，这条规则必须原样搬到 #view-root 自己身上。 */
+#view-root {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  /* 上内边距让内容起点落在胶囊下方；滚动时内容从胶囊底下穿过去。 */
+  padding: calc(var(--chrome-h) + 20px) 28px 32px;
 }
 
-/* macOS titleBarStyle=Overlay：红绿灯浮在侧栏左上角，必须留出 28px 安全区，
-   否则品牌区被三颗按钮压住。浏览器测试挂钩里没有标题栏，这块不占位。 */
-.titlebar-space { display: none; }
-body.is-tauri .titlebar-space { display: block; height: 12px; flex: none; }
-/* A drag region must also refuse text selection. On macOS WKWebView, once a
-   selection or a text drag has happened anywhere, -webkit-app-region:drag stops
-   responding for the rest of the session — which is exactly the reported
-   "draggable right after launch, dead once you click or drag any text".
-   The children opt back into selection where it makes sense (the fingerprint
-   is meant to be copyable). */
-body.is-tauri #topbar {
-  -webkit-app-region: drag;
+/* ---- 浮动头部（控件层） ---- */
+
+/* 不是一条 chrome 带：#topbar 自身完全透明，只承载三个浮起来的元素 +
+   一条 scroll edge effect。它铺满顶部并接收指针事件，因为它同时是窗口拖拽把手
+   ——这与真实 macOS 工具栏一致（工具栏区域本就不把滚轮透传给内容）。 */
+#topbar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: var(--chrome-h);
+  z-index: 30;
   -webkit-user-select: none;
   user-select: none;
   cursor: default;
 }
-body.is-tauri #topbar > * {
-  -webkit-app-region: no-drag;
-  -webkit-user-select: text;
-  user-select: text;
+
+/* Scroll edge effect。Apple 在 macOS 上用的是 "hard" 一档：接近不透明的线性边界，
+   而不是 iOS 的柔和渐隐。这里用「渐变底色 + 轻背景模糊 + 底缘遮罩淡出」实现，
+   目的只有一个：从下面穿过去的内容在触到胶囊之前就已经溶进背景，胶囊因此被
+   视觉抬起。它是功能性的，不是装饰——Apple 明说「每个视图只用一条」。 */
+#topbar::before {
+  content: "";
+  position: absolute; inset: 0; z-index: -1;
+  pointer-events: none;
+  background: linear-gradient(180deg,
+    rgba(15, 17, 21, .94) 0%, rgba(15, 17, 21, .78) 52%, rgba(15, 17, 21, 0) 100%);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  -webkit-mask-image: linear-gradient(180deg, #000 0%, #000 56%, transparent 100%);
+  mask-image: linear-gradient(180deg, #000 0%, #000 56%, transparent 100%);
 }
 
-.brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px; }
+/* 三个分区都绝对定位：导航胶囊必须相对**窗口**居中，而不是相对「剩下的那点空间」
+   居中——否则左右两侧内容一变宽，居中的胶囊就跟着漂。用 left:0/right:0 + margin
+   auto 做居中，不用 transform：transform 在 WKWebView 上与 backdrop-filter 组合
+   有历史包袱，能不引入就不引入。 */
+.brand {
+  position: absolute;
+  left: var(--traffic-w); top: 50%;
+  margin-top: -17px;
+  display: flex; align-items: center; gap: 10px;
+}
 .brand-logo {
-  width: 34px; height: 34px; flex: none;
+  width: 30px; height: 30px; flex: none;
   display: grid; place-items: center;
   color: var(--accent);
   background: #31c8b01a;
-  border: 1px solid #31c8b033;
-  border-radius: var(--radius);
+  border: 1px solid #31c8b038;
+  border-radius: 9px;
 }
-.brand-logo svg { width: 20px; height: 20px; }
-.brand-text { display: flex; flex-direction: column; line-height: 1.25; }
-.brand-text strong { font-size: 15px; letter-spacing: .01em; }
-.brand-text span { font-size: 11px; color: var(--text-dim); }
+.brand-logo svg { width: 18px; height: 18px; }
+.brand-text { display: flex; flex-direction: column; line-height: 1.2; }
+.brand-text strong { font-size: 13.5px; font-weight: 650; letter-spacing: .01em; }
+.brand-text span { font-size: 10.5px; color: var(--text-dim); }
+/* 窄窗时字标先走，图标留下：胶囊居中，绝不让两边把它挤偏。 */
+@media (max-width: 960px) { .brand-text { display: none; } }
 
-#nav { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+/* ---- 导航胶囊（Liquid Glass 本体） ---- */
+
+#nav {
+  position: absolute;
+  top: 11px; left: 0; right: 0;
+  width: fit-content;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: repeat(var(--nav-count, 4), minmax(0, 1fr));
+  gap: 0;
+  padding: 5px;
+  border-radius: var(--pill);
+  background: var(--glass-fill);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid rgba(255, 255, 255, .10);
+  box-shadow: var(--glass-shadow), var(--glass-edge);
+  transition: top var(--dur) var(--ease-out), padding var(--dur) var(--ease-out);
+}
+/* 滚动后收拢一档。Apple 的 minimize 行为在 macOS 上没有先例（那是 iPhone 限定），
+   所以这里只做很轻的一档：抬高 3px、内边距收 1px。够读出「它让位了」，不至于
+   让导航在滚动时跳来跳去。prefers-reduced-motion 下由 JS 直接不加这个类。 */
+#nav.contracted { top: 8px; padding: 4px; }
+
+/* 活动指示块。**不是玻璃**——玻璃套玻璃在 Apple 那边是明令禁止，在 CSS 这边又
+   会因为 backdrop root 规则采样失败。Apple 给玻璃之上的元素开的方子就是填充 +
+   透明度，这里照做。它随选中项滑动而不是硬切，这就是 Liquid Glass 的 morph 读感。 */
+.nav-marker {
+  position: absolute;
+  top: 5px; bottom: 5px; left: 5px;
+  width: calc((100% - 10px) / var(--nav-count, 4));
+  border-radius: var(--pill);
+  background: linear-gradient(180deg, #31c8b02e, #31c8b01a);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .16),
+    inset 0 0 0 1px #31c8b040;
+  transform: translateX(calc(var(--nav-index, 0) * 100%));
+  transition: transform .34s var(--ease-spring);
+  pointer-events: none;
+}
+#nav.contracted .nav-marker { top: 4px; bottom: 4px; left: 4px; width: calc((100% - 8px) / var(--nav-count, 4)); }
 
 .nav-item {
-  display: flex; align-items: center; gap: 10px;
-  width: 100%; padding: 9px 12px;
-  border: none; border-radius: var(--radius);
+  position: relative;
+  display: flex; align-items: center; justify-content: center; gap: 7px;
+  padding: 8px 16px;
+  border: none; border-radius: var(--pill);
   background: transparent; color: var(--text-dim);
-  font-size: 13px; text-align: left; cursor: pointer;
-  transition: background .15s ease-out, color .15s ease-out;
+  font-size: 13px; font-family: inherit; white-space: nowrap;
+  cursor: pointer;
+  transition: color var(--dur) var(--ease-out), transform .12s var(--ease-out);
 }
-.nav-item svg { width: 17px; height: 17px; flex: none; }
-.nav-item:hover { background: #ffffff08; color: var(--text); }
-.nav-item.active { background: #31c8b01a; color: var(--accent); }
+.nav-item svg { width: 16px; height: 16px; flex: none; }
+.nav-item:hover { color: var(--text); }
+.nav-item.active { color: var(--accent); font-weight: 600; }
+/* 按下时轻微下压 = Apple 说的 gel-like flexibility。 */
+.nav-item:active { transform: scale(.96); }
+#nav.contracted .nav-item { padding: 7px 15px; }
 
-.sidebar-foot { font-size: 11px; color: var(--text-dim); padding: 8px; border-top: 1px solid var(--line); }
-
-/* min-height:0 is load-bearing, not tidiness. A flex item defaults to
-   min-height:auto, which refuses to shrink below its content — so #view-root's
-   `flex:1; overflow-y:auto` never receives a constrained height and the column
-   grows instead of scrolling. Symptom: the wheel does nothing ANYWHERE in the
-   app, on both platforms. Same reason min-width:0 is already here. */
-#main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-
-#topbar {
-  height: 56px; flex: none;
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 0 24px;
-  border-bottom: 1px solid var(--line);
-  background: rgba(23, 26, 33, .65);
-  backdrop-filter: blur(8px);
+/* 视图标题不再占一条 chrome 带（胶囊已经在说「你在哪一页」）。留在 DOM 里给读屏
+   与测试，视觉上收起来。 */
+#view-title {
+  position: absolute; width: 1px; height: 1px;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap;
 }
-#view-title { font-size: 16px; font-weight: 650; letter-spacing: .01em; }
 
-#view-root { flex: 1; overflow-y: auto; padding: 24px; }
+/* 运行形态脚注：原来在侧栏底部，侧栏没了就落到左下角当一条安静的注脚。
+   它浮在可滚动内容之上，所以**必须自带底**——裸文字压在卡片上会两边都读不清，
+   这正是「按对比度下限设计，而不是按平均值」那条规矩要挡的情况。给一层很浅的
+   玻璃即可：尺寸小、饱和度不动，不会跟顶部胶囊抢注意力。
+   pointer-events:none —— 它永远不该吃掉指向内容的点击。 */
+#conn-hint {
+  position: fixed;
+  left: 20px; bottom: 14px;
+  z-index: 20;
+  padding: 4px 11px;
+  border-radius: var(--pill);
+  background: rgba(15, 17, 21, .72);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, .06);
+  font-size: 11px; color: var(--text-dim);
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
 
-.view { display: flex; flex-direction: column; gap: 16px; max-width: 1080px; animation: viewIn .22s ease-out; }
+.view {
+  display: flex; flex-direction: column; gap: 16px;
+  max-width: 1120px; margin: 0 auto;
+  animation: viewIn .3s var(--ease-out);
+}
+/* Apple 的原则是「玻璃靠调制折射量出现，而不是靠淡入」。纯 CSS 折射不可得，
+   所以退一步：位移比透明度走得更远，读感上更接近「材质到位」而不是「图层淡入」。 */
 @keyframes viewIn {
-  from { opacity: 0; transform: translateY(8px); }
+  from { opacity: 0; transform: translateY(10px) scale(.994); }
   to { opacity: 1; transform: none; }
 }
 
 /* ---- daemon 徽标 ---- */
 
+/* 第二块玻璃，但**刻意比胶囊轻**：Apple 反复说「少用」，一屏上两块同等重量的
+   玻璃会互相打架。所以这里模糊更浅、底色更淡、没有强投影。 */
 .daemon-badge {
+  position: absolute;
+  right: 20px; top: 50%;
+  margin-top: -14px;
   display: inline-flex; align-items: center; gap: 8px;
-  padding: 6px 12px; border-radius: 999px;
-  background: var(--bg-2); border: 1px solid var(--line);
+  padding: 5px 13px; border-radius: var(--pill);
+  background: rgba(23, 27, 35, .6);
+  backdrop-filter: blur(16px) saturate(170%);
+  -webkit-backdrop-filter: blur(16px) saturate(170%);
+  border: 1px solid rgba(255, 255, 255, .09);
+  box-shadow:
+    0 6px 18px -6px rgba(0, 0, 0, .5),
+    inset 0 1px 0 rgba(255, 255, 255, .16),
+    inset 0 -1px 0 rgba(255, 255, 255, .04);
   font-size: 12px; color: var(--text-dim);
+  /* 指纹是要能选中复制的，头部整体禁用了选择，这里单独放开。 */
+  -webkit-user-select: text;
+  user-select: text;
 }
+/* 胶囊是相对窗口居中的，两侧元素**不能**把它挤走——只能自己让位。窗口最小宽度是
+   860（tauri.macos.conf.json），那时胶囊占 222–638，徽标从 640 起，刚好擦过；
+   低于 900 就把指纹与端口收掉，只留状态点和字，给足余量。 */
+@media (max-width: 900px) {
+  .daemon-badge .badge-sep,
+  .daemon-badge .badge-fp,
+  .daemon-badge .badge-port { display: none; }
+}
+
 .daemon-badge .badge-status { font-weight: 600; }
 .daemon-badge.online .badge-status { color: var(--ok); }
 .daemon-badge.offline .badge-status { color: var(--danger); }
@@ -172,12 +329,15 @@ body.is-tauri #topbar > * {
 
 /* ---- 卡片 ---- */
 
+/* 内容层：**不透明**，这是 Apple 的硬规矩（"Don't use Liquid Glass in the content
+   layer"）。现代化只体现在更大的圆角、更细的顶缘高光和更软的投影上，不体现在透明度。
+   顶缘那条 inset 白线让卡片看起来有厚度，是玻璃语汇里唯一能安全借到内容层的一笔。 */
 .card {
   background: var(--bg-1);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  padding: 16px;
+  box-shadow: var(--shadow), inset 0 1px 0 rgba(255, 255, 255, .045);
+  padding: 18px;
 }
 
 .block { display: flex; flex-direction: column; gap: 12px; padding: 20px; }
@@ -188,17 +348,25 @@ body.is-tauri #topbar > * {
 
 /* ---- 按钮 ---- */
 
+/* 胶囊按钮：macOS 26 把 Large 档控件全部改成了 capsule，与顶部导航胶囊同源。
+   顶缘 inset 高光让它们和玻璃语汇对齐，而不必真的变成玻璃。 */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  padding: 8px 14px; border-radius: var(--radius);
+  padding: 8px 16px; border-radius: var(--pill);
   background: var(--bg-2); color: var(--text);
   border: 1px solid var(--line-strong);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06);
   font-size: 13px; cursor: pointer; white-space: nowrap;
-  transition: filter .15s ease-out, transform .15s ease-out, background .15s ease-out, border-color .15s ease-out;
+  transition: filter var(--dur) var(--ease-out), transform .12s var(--ease-out),
+    background var(--dur) var(--ease-out), border-color var(--dur) var(--ease-out);
 }
 .btn:hover { filter: brightness(1.18); }
-.btn:active { transform: translateY(1px); }
-.btn.primary { background: var(--accent); color: #04211c; border-color: transparent; font-weight: 650; }
+.btn:active { transform: scale(.96); }
+.btn.primary {
+  background: linear-gradient(180deg, #3ad6bd, var(--accent));
+  color: #04211c; border-color: transparent; font-weight: 650;
+  box-shadow: 0 4px 14px -4px #31c8b066, inset 0 1px 0 rgba(255, 255, 255, .3);
+}
 .btn.danger { background: transparent; color: var(--danger); border-color: #e5484d55; }
 .btn.danger:hover { background: #e5484d1a; filter: none; }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--text-dim); }
@@ -215,11 +383,12 @@ body.is-tauri #topbar > * {
 /* ---- 输入 ---- */
 
 .input {
-  padding: 8px 12px; border-radius: var(--radius);
+  padding: 8px 13px; border-radius: var(--radius-sm);
   background: var(--bg); color: var(--text);
   border: 1px solid var(--line-strong);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, .28);
   font-size: 13px; font-family: inherit; min-width: 0;
-  transition: border-color .15s ease-out, box-shadow .15s ease-out;
+  transition: border-color var(--dur) var(--ease-out), box-shadow var(--dur) var(--ease-out);
 }
 .input::placeholder { color: #5f6979; }
 .input:focus { outline: none; border-color: #31c8b080; box-shadow: 0 0 0 3px #31c8b022; }
@@ -308,7 +477,7 @@ body.is-tauri #topbar > * {
 }
 .peer-card:hover {
   transform: translateY(-2px);
-  box-shadow: 0 4px 8px rgba(0, 0, 0, .35), 0 14px 36px rgba(0, 0, 0, .3);
+  box-shadow: var(--shadow-lift), inset 0 1px 0 rgba(255, 255, 255, .07);
   border-color: var(--line-strong);
 }
 
@@ -322,7 +491,7 @@ body.is-tauri #topbar > * {
   display: flex; align-items: center; gap: 8px;
   font-size: 12px; color: var(--warn);
   background: #e0a83f12; border: 1px solid #e0a83f33;
-  border-radius: var(--radius); padding: 6px 10px;
+  border-radius: var(--radius-sm); padding: 6px 10px;
 }
 .peer-inbound .ico svg { width: 14px; height: 14px; }
 .peer-inbound .dot.live { background: var(--warn); animation: breathe-warn 1.6s ease-in-out infinite; }
@@ -337,7 +506,7 @@ body.is-tauri #topbar > * {
   display: flex; align-items: center; gap: 8px;
   font-size: 12px; color: var(--accent);
   background: #31c8b010; border: 1px solid #31c8b02e;
-  border-radius: var(--radius); padding: 6px 10px;
+  border-radius: var(--radius-sm); padding: 6px 10px;
   animation: reconnectIn .2s ease-out;
 }
 .reconnect-text { flex: 1; min-width: 0; font-variant-numeric: tabular-nums; }
@@ -376,7 +545,7 @@ body.is-tauri #topbar > * {
   display: flex; flex-direction: column; gap: 6px;
   padding: 8px 10px;
   background: var(--bg-2); border: 1px solid var(--line);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   animation: volIn .2s ease-out;
 }
 @keyframes volIn {
@@ -397,7 +566,7 @@ body.is-tauri #topbar > * {
   display: flex; flex-direction: column; gap: 6px;
   padding: 8px 10px;
   background: var(--bg-2); border: 1px solid var(--line);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   transition: border-color .15s ease-out;
 }
 /* 没检测到卡：整块压暗，但链接必须保持完全可读——那是唯一的出路 */
@@ -425,7 +594,7 @@ body.is-tauri #topbar > * {
 .bridge-status-row {
   display: flex; align-items: center; gap: 10px;
   font-size: 13px; color: var(--text-dim);
-  padding: 6px 10px; border-radius: var(--radius);
+  padding: 6px 10px; border-radius: var(--radius-sm);
   background: var(--bg); border: 1px solid var(--line);
 }
 .bridge-status-row.on { color: var(--text); }
@@ -538,7 +707,7 @@ body.is-tauri #topbar > * {
 
 .fp-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .fp-full {
-  padding: 8px 12px; border-radius: var(--radius);
+  padding: 8px 12px; border-radius: var(--radius-sm);
   background: var(--bg); border: 1px solid var(--line);
   color: var(--accent); font-size: 12px; word-break: break-all;
 }
@@ -582,7 +751,7 @@ body.is-tauri #topbar > * {
   font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums;
   color: var(--accent);
   background: var(--bg-2); border: 1px solid var(--line-strong);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   box-shadow: inset 0 -14px 22px rgba(0, 0, 0, .28);
   animation: digitFlip .35s ease-out backwards;
   animation-delay: calc(var(--i) * 70ms);
@@ -630,7 +799,7 @@ body.is-tauri #topbar > * {
 .cli-hint {
   font-size: 12px; color: var(--warn);
   background: #e0a83f12; border: 1px solid #e0a83f33;
-  border-radius: var(--radius); padding: 10px 12px;
+  border-radius: var(--radius-sm); padding: 10px 12px;
   font-family: var(--mono); word-break: break-all;
 }
 
@@ -654,18 +823,26 @@ body.is-tauri #topbar > * {
 .setting-desc { font-size: 12px; color: var(--text-dim); margin-top: 3px; max-width: 520px; }
 .setting-ctl { flex: none; display: flex; align-items: center; }
 
+/* 同心圆角：外壳 999px 胶囊 → 内部小块也走胶囊（capsule 半径 = 高度一半，
+   与外壳共心）。这是 macOS 26 分段控件的现在形态。 */
 .segmented {
   display: inline-flex; gap: 3px; padding: 3px;
   background: var(--bg); border: 1px solid var(--line-strong);
-  border-radius: var(--radius);
+  border-radius: var(--pill);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, .32);
 }
 .seg {
   border: none; background: transparent; color: var(--text-dim);
-  padding: 6px 14px; font-size: 12px; border-radius: 7px; cursor: pointer;
-  transition: background .15s ease-out, color .15s ease-out;
+  padding: 6px 16px; font-size: 12px; border-radius: var(--pill); cursor: pointer;
+  font-family: inherit;
+  transition: background var(--dur) var(--ease-out), color var(--dur) var(--ease-out);
 }
 .seg:hover { color: var(--text); }
-.seg.on { background: var(--bg-2); color: var(--accent); box-shadow: 0 1px 2px rgba(0, 0, 0, .4); }
+.seg.on {
+  background: linear-gradient(180deg, #31c8b02e, #31c8b016);
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px #31c8b040, inset 0 1px 0 rgba(255, 255, 255, .14);
+}
 /* 置灰仍然可见、可聚焦读屏，只是点不动——用户得能看到「有这么个模式」，
    否则驱动没装时 B 直接消失，反而不知道自己缺什么。title 说明原因。 */
 .seg.off { opacity: .38; cursor: not-allowed; }
@@ -704,7 +881,7 @@ body.is-tauri #topbar > * {
 /* 无鉴权的界面被放上局域网，是这一页唯一真正危险的开关：用危险色实心块，
    而不是又一行灰色小字——那种提示的存在感等于没有。 */
 .web-warn {
-  margin-top: 14px; padding: 12px 14px; border-radius: var(--radius);
+  margin-top: 14px; padding: 12px 14px; border-radius: var(--radius-sm);
   background: #e5484d12; border: 1px solid #e5484d40;
   display: flex; flex-direction: column; gap: 6px;
 }
@@ -719,7 +896,7 @@ body.is-tauri #topbar > * {
 
 .peer-devices {
   display: flex; flex-direction: column; gap: 10px;
-  padding: 12px; border-radius: var(--radius);
+  padding: 12px; border-radius: var(--radius-sm);
   background: var(--bg-2); border: 1px solid var(--line);
   animation: viewIn .18s ease-out;
 }
@@ -763,7 +940,7 @@ body.is-tauri #topbar > * {
 .dev-inventory { display: flex; flex-direction: column; gap: 10px; }
 .dev-inv-card {
   display: flex; flex-direction: column; gap: 8px;
-  padding: 12px; border-radius: var(--radius);
+  padding: 12px; border-radius: var(--radius-sm);
   background: var(--bg-2); border: 1px solid var(--line);
 }
 .dev-inv-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -793,14 +970,22 @@ body.is-tauri #topbar > * {
   backdrop-filter: blur(6px);
   animation: fadeIn .18s ease-out;
 }
+/* 模态卡片属于控件层，玻璃在这里是正当的。注意它的祖先 .confirm-mask 自己带
+   backdrop-filter，按 backdrop root 规则这张卡采样到的只是遮罩之后的结果——所以
+   这里**不再叠一层 backdrop-filter**（叠了也只会更平），改用带高光的实心面。 */
 .confirm-card {
   width: 440px; max-width: 100%;
-  padding: 24px;
-  background: var(--bg-1); border: 1px solid var(--line-strong);
-  border-radius: 14px;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, .5);
+  padding: 26px;
+  background: var(--glass-fill);
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: 20px;
+  box-shadow: 0 32px 80px -16px rgba(0, 0, 0, .68), var(--glass-edge);
   display: flex; flex-direction: column; gap: 12px;
-  animation: viewIn .2s ease-out;
+  animation: sheetIn .32s var(--ease-spring);
+}
+@keyframes sheetIn {
+  from { opacity: 0; transform: translateY(14px) scale(.97); }
+  to { opacity: 1; transform: none; }
 }
 .confirm-title { font-size: 16px; font-weight: 650; }
 .confirm-body { font-size: 13px; color: var(--text-dim); line-height: 1.65; }
@@ -828,7 +1013,7 @@ body.is-tauri #topbar > * {
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(192px, 1fr)); gap: 12px; }
 .metric {
   background: var(--bg-2); border: 1px solid var(--line);
-  border-radius: var(--radius); padding: 12px 14px;
+  border-radius: var(--radius-sm); padding: 12px 14px;
   display: flex; flex-direction: column; gap: 6px;
 }
 .metric-label { font-size: 11px; color: var(--text-dim); letter-spacing: .06em; }
@@ -858,18 +1043,28 @@ canvas.spark { width: 160px; height: 36px; display: block; }
 }
 #gate[hidden] { display: none !important; }
 
-/* 只在 Tauri 里存在：浏览器测试挂钩没有无边框标题栏，不需要这块把手 */
+/* 授权门盖住整个应用，连同顶部那条拖拽把手一起盖掉——所以门自己要补一条，
+   否则首启时窗口挪不动。只在 Tauri 里存在：浏览器态没有无边框标题栏。
+   拖拽由 lib/drag.ts 的显式 startDragging 驱动，不再依赖 -webkit-app-region。 */
 .gate-drag { display: none; }
-body.is-tauri .gate-drag { display: block; position: fixed; top: 0; left: 0; right: 0; height: 28px; }
+body.is-tauri .gate-drag {
+  display: block;
+  position: fixed; top: 0; left: 0; right: 0;
+  height: var(--chrome-h);
+  -webkit-user-select: none;
+  user-select: none;
+}
 
 .onboarding {
   width: 620px; max-width: 100%;
   margin: auto;
-  padding: 28px;
-  background: var(--bg-1); border: 1px solid var(--line);
-  border-radius: 14px;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, .5);
+  padding: 30px;
+  background: var(--glass-fill);
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: 22px;
+  box-shadow: 0 32px 80px -16px rgba(0, 0, 0, .68), var(--glass-edge);
   gap: 20px;
+  animation: sheetIn .34s var(--ease-spring);
 }
 
 .gate-head { display: flex; gap: 14px; align-items: flex-start; }
@@ -878,7 +1073,7 @@ body.is-tauri .gate-drag { display: block; position: fixed; top: 0; left: 0; rig
   display: grid; place-items: center;
   color: var(--accent);
   background: #31c8b01a; border: 1px solid #31c8b033;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
 }
 .gate-logo svg { width: 22px; height: 22px; }
 .gate-title { font-size: 17px; font-weight: 650; }
@@ -890,7 +1085,7 @@ body.is-tauri .gate-drag { display: block; position: fixed; top: 0; left: 0; rig
   display: flex; align-items: flex-start; gap: 12px;
   padding: 14px;
   background: var(--bg-2); border: 1px solid var(--line);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   transition: border-color .18s ease-out, background .18s ease-out;
 }
 .perm-row.granted { border-color: #46c46b2e; }
@@ -937,12 +1132,14 @@ body.is-tauri .gate-drag { display: block; position: fixed; top: 0; left: 0; rig
 
 .overlay-card {
   width: 400px; max-width: calc(100vw - 48px);
-  padding: 32px;
-  background: var(--bg-1); border: 1px solid var(--line);
-  border-radius: 14px;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, .5);
+  padding: 34px;
+  background: var(--glass-fill);
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: 22px;
+  box-shadow: 0 32px 80px -16px rgba(0, 0, 0, .68), var(--glass-edge);
   text-align: center;
   display: flex; flex-direction: column; gap: 12px; align-items: center;
+  animation: sheetIn .34s var(--ease-spring);
 }
 .overlay-ico { color: #3a4353; }
 .overlay-ico svg { width: 40px; height: 40px; }
@@ -978,13 +1175,17 @@ body.is-tauri .gate-drag { display: block; position: fixed; top: 0; left: 0; rig
   display: flex; flex-direction: column; gap: 8px; align-items: flex-end;
   pointer-events: none;
 }
+/* toast 浮在所有内容之上 = 控件层，玻璃在这里成立。 */
 .toast {
-  padding: 10px 16px; border-radius: var(--radius);
-  background: var(--bg-2); border: 1px solid var(--line-strong);
-  box-shadow: var(--shadow);
+  padding: 11px 18px; border-radius: var(--radius);
+  background: var(--glass-fill);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid rgba(255, 255, 255, .1);
+  box-shadow: var(--glass-shadow), var(--glass-edge);
   font-size: 13px; max-width: 380px;
-  animation: toastIn .2s ease-out;
-  transition: opacity .3s ease-out, transform .3s ease-out;
+  animation: toastIn .3s var(--ease-spring);
+  transition: opacity .3s var(--ease-out), transform .3s var(--ease-out);
 }
 .toast.ok { border-color: #46c46b55; color: var(--ok); }
 .toast.error { border-color: #e5484d55; color: var(--danger); }

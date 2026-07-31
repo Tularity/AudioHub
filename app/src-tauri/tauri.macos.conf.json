@@ -2,7 +2,13 @@
   "app": {
     "windows": [
       {
-        "titleBarStyle": "Overlay"
+        "title": "AudioHub",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 860,
+        "minHeight": 600,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ]
   }

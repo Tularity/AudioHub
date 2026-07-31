@@ -1,7 +1,10 @@
-// 应用外壳：侧栏导航、顶栏徽标、断线覆盖层。原本这些是 index.html 里的静态 DOM +
-// app.js 里一大段 renderChrome()（带手写的 chromeKey 缓存）；React 下它们就是普通
-// 组件，缓存键随之消失。
+// 应用外壳：浮动导航胶囊、daemon 徽标、断线覆盖层。
+//
+// 左侧竖导航已经拆掉（docs/spec-ui.md §2）。导航现在是**浮在内容之上**的一枚居中
+// 玻璃胶囊：内容从它下面穿过去滚动，胶囊本身不占布局宽度。testid 全部原样保留，
+// `nav-*` 四个只是换了宿主元素。
 
+import { useEffect, useState } from 'react';
 import { RawIcon } from './Icon';
 import { useStore } from '../state/store';
 import type { AppState, ViewName } from '../state/store';
@@ -27,12 +30,78 @@ export const VIEW_TITLE: Record<ViewName, MsgKey> = {
   stats: 'nav.stats',
 };
 
-export function Sidebar({ onNavigate }: { onNavigate: (v: ViewName) => void }) {
+/**
+ * 内容滚下去之后胶囊收拢一档。**动画被关掉时直接不收拢**：收拢本身就是一个动作，
+ * 全局的 prefers-reduced-motion 规则会把过渡掐掉，留下的就只剩一次生硬的跳变
+ * ——那比不收拢更糟。所以这里在 JS 里就判掉，而不是指望 CSS 去兜。
+ */
+function useContracted(): boolean {
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const root = document.getElementById('view-root');
+    if (!root) return;
+    const onScroll = () => setOn(root.scrollTop > 12);
+    onScroll();
+    root.addEventListener('scroll', onScroll, { passive: true });
+    return () => root.removeEventListener('scroll', onScroll);
+  }, []);
+  return on;
+}
+
+export function Brand() {
+  return (
+    <div className="brand">
+      <span className="brand-logo"><RawIcon name="wave" /></span>
+      <div className="brand-text">
+        <strong>{t('app.name')}</strong>
+        <span>{t('app.tagline')}</span>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 居中浮动的导航胶囊。等宽栅格不是偷懒：活动指示块靠 `translateX(index * 100%)`
+ * 滑动，等宽才让这条位移算式成立，也才有 macOS 26 那种「指示块在胶囊里滑过去」
+ * 而不是「高亮硬切」的读感。
+ */
+export function NavPill({ onNavigate }: { onNavigate: (v: ViewName) => void }) {
   const view = useStore((s) => s.route.view);
+  const active = NAV_OF[view] || view;
+  const index = Math.max(0, NAV.findIndex((n) => n.view === active));
+  const contracted = useContracted();
+
+  return (
+    <nav
+      id="nav"
+      className={contracted ? 'contracted' : undefined}
+      style={{ '--nav-count': NAV.length, '--nav-index': index } as React.CSSProperties}
+    >
+      <span className="nav-marker" aria-hidden="true" />
+      {NAV.map((n) => (
+        <button
+          key={n.view}
+          className={`nav-item${active === n.view ? ' active' : ''}`}
+          type="button"
+          data-view={n.view}
+          data-testid={`nav-${n.view}`}
+          aria-current={active === n.view ? 'page' : undefined}
+          onClick={() => onNavigate(n.view)}
+        >
+          <RawIcon name={n.icon} />
+          {t(n.labelKey)}
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+/** 运行形态注脚。原来在侧栏底部，侧栏没了就落到窗口左下角当一条安静的说明。 */
+export function ConnFoot() {
   const mode = useStore((s) => s.mode);
   const conn = useStore((s) => s.conn);
   const port = useStore((s) => s.endpoint?.port ?? null);
-  const active = NAV_OF[view] || view;
 
   // 「浏览器模式」是测试挂钩的自我说明，只在浏览器里出现，绝不进入 App 的文案。
   let foot: string;
@@ -45,35 +114,7 @@ export function Sidebar({ onNavigate }: { onNavigate: (v: ViewName) => void }) {
     foot = port ? t('foot.browser', { port }) : t('foot.browserNoPort');
   }
 
-  return (
-    <aside id="sidebar">
-      {/* macOS titleBarStyle=Overlay：红绿灯浮在内容上，这块空区既是安全区也是拖拽把手 */}
-      <div className="titlebar-space" data-tauri-drag-region />
-      <div className="brand" data-tauri-drag-region>
-        <span className="brand-logo"><RawIcon name="wave" /></span>
-        <div className="brand-text">
-          <strong>{t('app.name')}</strong>
-          <span>{t('app.tagline')}</span>
-        </div>
-      </div>
-      <nav id="nav">
-        {NAV.map((n) => (
-          <button
-            key={n.view}
-            className={`nav-item${active === n.view ? ' active' : ''}`}
-            type="button"
-            data-view={n.view}
-            data-testid={`nav-${n.view}`}
-            onClick={() => onNavigate(n.view)}
-          >
-            <RawIcon name={n.icon} />
-            {t(n.labelKey)}
-          </button>
-        ))}
-      </nav>
-      <div className="sidebar-foot" id="conn-hint" data-testid="conn-mode">{foot}</div>
-    </aside>
-  );
+  return <div id="conn-hint" data-testid="conn-mode">{foot}</div>;
 }
 
 export function DaemonBadge() {

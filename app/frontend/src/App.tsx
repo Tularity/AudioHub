@@ -1,5 +1,6 @@
 import { useEffect, useSyncExternalStore } from 'react';
-import { Sidebar, DaemonBadge, Overlay, VIEW_TITLE } from './components/Chrome';
+import { Brand, NavPill, ConnFoot, DaemonBadge, Overlay, VIEW_TITLE } from './components/Chrome';
+import { chromeMouseDown } from './lib/drag';
 import { Toasts } from './components/Toasts';
 import { ConfirmHost } from './components/ConfirmDialog';
 import { PeersView } from './views/Peers';
@@ -40,19 +41,25 @@ export function App() {
   return (
     <>
       <div id="app">
-        <Sidebar onNavigate={(v) => actions.navigate(v)} />
-        <div id="main">
-          <header id="topbar" data-tauri-drag-region>
-            <h1 id="view-title">{t(VIEW_TITLE[view])}</h1>
-            <DaemonBadge />
-          </header>
-          <main id="view-root">
-            {/* key 让视图切换重新挂载，从而复现旧实现里那段淡入 + 8px 上移的动画 */}
-            <section className="view" data-testid={`view-${view}`} key={view}>
-              <View />
-            </section>
-          </main>
-        </div>
+        <main id="view-root">
+          {/* key 让视图切换重新挂载，从而复现那段淡入 + 上移的动画 */}
+          <section className="view" data-testid={`view-${view}`} key={view}>
+            <View />
+          </section>
+        </main>
+
+        {/* 浮动控件层，**排在内容之后**：它盖在内容上，靠 position:fixed 脱离布局，
+            所以内容能从它下面穿过去滚动。macOS 的红绿灯（titleBarStyle=Overlay）也
+            浮在这条带子的左上角——`--traffic-w` 给它们留了位置，而三颗按钮本身由
+            系统在 webview 之上绘制，永远先拿到点击，不会被这里挡掉。
+            onMouseDown 是窗口拖拽：控件与可选文本由 lib/drag.ts 自己排除。 */}
+        <header id="topbar" onMouseDown={chromeMouseDown}>
+          <h1 id="view-title">{t(VIEW_TITLE[view])}</h1>
+          <Brand />
+          <NavPill onNavigate={(v) => actions.navigate(v)} />
+          <DaemonBadge />
+        </header>
+        <ConnFoot />
       </div>
 
       {/* 首启授权门：盖住整个应用，但排在覆盖层之下——服务都没连上时，

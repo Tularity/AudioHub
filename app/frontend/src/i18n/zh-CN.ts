@@ -32,6 +32,9 @@ export const zhCN = {
   'nav.settings': '设置',
   'nav.detail': '对端详情',
 
+  // 窗口拖不动时的唯一线索。静默失败正是这个 bug 之前难以定位的原因，所以宁可吵。
+  'chrome.dragFailed': '窗口拖拽不可用：{message}。请重启 AudioHub；若持续如此，说明界面与应用外壳版本不一致。',
+
   'badge.online': '在线',
   'badge.starting': '启动中',
   'badge.connecting': '连接中',

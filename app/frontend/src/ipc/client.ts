@@ -7,6 +7,7 @@
 // 它不该知道有没有框架——换 UI 框架时唯一不必重写的就是它。
 
 import type { DaemonInfo } from './types';
+import { t } from '../i18n';
 
 // 必须与 audiohub_ipc::IPC_VERSION 一致。
 export const IPC_VERSION = 1;
@@ -38,7 +39,7 @@ export class VersionMismatchError extends Error {
   actual: number | string;
 
   constructor(actual: number | string) {
-    super(`daemon 协议版本不匹配（期望 ${IPC_VERSION}，实际 ${actual}）`);
+    super(t('error.versionMismatch', { expected: IPC_VERSION, actual }));
     this.name = 'VersionMismatchError';
     this.expected = IPC_VERSION;
     this.actual = actual;
@@ -104,7 +105,7 @@ export class IpcClient {
       }
       this.ws = ws;
 
-      authTimer = setTimeout(() => fail(new Error('daemon 认证握手超时')), AUTH_TIMEOUT_MS);
+      authTimer = setTimeout(() => fail(new Error(t('error.authTimeout'))), AUTH_TIMEOUT_MS);
 
       ws.addEventListener('open', () => {
         try { ws.send(JSON.stringify({ auth: token })); } catch { /* close 事件兜底 */ }
@@ -119,13 +120,13 @@ export class IpcClient {
           if (msg && msg.ok === true && daemon) {
             const v = Number(daemon.ipc_version);
             if (v !== IPC_VERSION) {
-              fail(new VersionMismatchError(Number.isFinite(v) ? v : '未知'));
+              fail(new VersionMismatchError(Number.isFinite(v) ? v : t('error.unknownVersion')));
               return;
             }
             this.authed = true;
             finish(resolve, daemon);
           } else {
-            fail(new Error(String((msg && msg.error) || '认证失败')));
+            fail(new Error(String((msg && msg.error) || t('error.authFailed'))));
           }
           return;
         }
@@ -135,7 +136,7 @@ export class IpcClient {
           this.pending.delete(id);
           clearTimeout(p.timer);
           if (msg.ok) p.resolve(msg.result);
-          else p.reject(new Error(String(msg.error || '请求失败')));
+          else p.reject(new Error(String(msg.error || t('error.requestFailed'))));
           return;
         }
         if (msg && msg.event) this.emit('event:' + String(msg.event), msg.data);
@@ -145,8 +146,8 @@ export class IpcClient {
         if (ws.__abandoned) return;
         const wasAuthed = this.authed;
         this.authed = false;
-        this.failAll('连接已断开');
-        finish(reject, new Error('无法连接 daemon'));
+        this.failAll(t('error.disconnected'));
+        finish(reject, new Error(t('error.cannotConnect')));
         if (this.ws === ws) this.ws = null;
         this.emit('close', wasAuthed);
       });
@@ -156,7 +157,7 @@ export class IpcClient {
   }
 
   request<T = unknown>(method: string, params: unknown = {}, timeoutMs?: number): Promise<T> {
-    if (!this.connected) return Promise.reject(new Error('IPC 未连接'));
+    if (!this.connected) return Promise.reject(new Error(t('error.ipcNotConnected')));
     const ms = Number.isFinite(timeoutMs) && (timeoutMs as number) > 0
       ? (timeoutMs as number)
       : methodTimeout(method);
@@ -165,7 +166,7 @@ export class IpcClient {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`请求超时：${method}`));
+        reject(new Error(t('error.requestTimeout', { method })));
       }, ms);
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
       try {
@@ -190,7 +191,7 @@ export class IpcClient {
     const ws = this.ws as (WebSocket & { __abandoned?: boolean }) | null;
     this.ws = null;
     this.authed = false;
-    this.failAll('连接已关闭');
+    this.failAll(t('error.connectionClosed'));
     if (ws) {
       ws.__abandoned = true;
       try { ws.close(); } catch { /* ignore */ }

@@ -10,6 +10,7 @@
 // 悄悄连到另一个实例上去）。三者都不成立时才报「缺少连接参数」。
 
 import type { IpcEndpoint } from './types';
+import { t } from '../i18n';
 
 export type EndpointSource = 'tauri' | 'query' | 'origin';
 
@@ -33,9 +34,9 @@ export function isTauri(): boolean {
 }
 
 export function tauriInvoke<T = unknown>(cmd: string, args?: unknown): Promise<T> {
-  const t = window.__TAURI__ || {};
-  const inv = (t.core && t.core.invoke) || t.invoke;
-  if (!inv) return Promise.reject(new Error('非 Tauri 环境'));
+  const tauri = window.__TAURI__ || {};
+  const inv = (tauri.core && tauri.core.invoke) || tauri.invoke;
+  if (!inv) return Promise.reject(new Error(t('error.notTauri')));
   return inv(cmd, args) as Promise<T>;
 }
 

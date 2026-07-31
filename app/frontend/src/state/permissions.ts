@@ -178,7 +178,12 @@ export function normalizeOne(raw: unknown, fallbackId: string | null): Permissio
   const src = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
   // name 只有在它本身就是一个认得出的 id 时才拿来当 id 用（有的实现把 id 塞在 name 里）。
   const named = src.name && BY_ID.has(normId(src.name)) ? src.name : null;
-  const id = normId(str(src.id) || str(named) || fallbackId || '');
+  // `kind` 是 daemon 实际用的字段名（core/audiohub-core/src/permissions.rs 的
+  // PermissionState，由 ipcserv.rs 的 permissions_serialize_to_the_documented_shape
+  // 测试钉死）。迁移前这里只认 id/name，于是 daemon 每次回来的三行**全部**因为算不出
+  // id 被丢掉：授权门永远不挂、设置页永远停在「正在探测系统权限…」，而 daemon 一直在
+  // 如实作答。这正是本次重构要消灭的那类偏差，所以照契约补上。
+  const id = normId(str(src.id) || str(src.kind) || str(named) || fallbackId || '');
   const meta = (BY_ID.get(id) || {}) as Partial<CatalogEntry>;
   const status = pickStatus(raw);
   const queryable = bool(src.queryable) ?? meta.queryable ?? true;

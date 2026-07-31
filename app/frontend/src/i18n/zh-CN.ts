@@ -449,6 +449,25 @@ export const zhCN = {
   'perm.unknown.name': '未知权限',
   'perm.unknown.why': '该权限由本机服务上报，界面暂无对应说明。',
 
+  // ---------------------------------------------------------------- 错误
+  // 这些是 Error.message。它们不只写进 console：rpc() 会把 message 直接 toast 出去，
+  // 离线覆盖层也会把它插进「与本机服务的连接已断开（{reason}）」。所以它们同样是
+  // 面向用户的文案，必须走语料。
+  'error.versionMismatch': 'daemon 协议版本不匹配（期望 {expected}，实际 {actual}）',
+  'error.unknownVersion': '未知',
+  'error.authTimeout': 'daemon 认证握手超时',
+  'error.authFailed': '认证失败',
+  'error.requestFailed': '请求失败',
+  'error.requestTimeout': '请求超时：{method}',
+  'error.disconnected': '连接已断开',
+  'error.connectionClosed': '连接已关闭',
+  'error.cannotConnect': '无法连接 daemon',
+  'error.ipcNotConnected': 'IPC 未连接',
+  'error.notTauri': '非 Tauri 环境',
+  'error.startFailed': '启动服务失败',
+  'error.noEndpoint': '未提供连接参数',
+  'error.connectTimeout': '连接服务超时',
+
   // ---------------------------------------------------------------- 外链 / 时间
   'vendor.blackhole': 'BlackHole（macOS）',
   'vendor.vbcable': 'VB-Cable（Windows）',

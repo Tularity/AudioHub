@@ -12,6 +12,7 @@ import { actions, getState, setState } from './store';
 import type { ConnError } from './store';
 import { normalizeList, normalizeOne, gateNeeded } from './permissions';
 import { toast } from '../components/Toasts';
+import { t } from '../i18n';
 
 export { IPC_VERSION };
 
@@ -61,7 +62,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, msg: string): Promise<T
 // Rust 的 DaemonError（{kind,message,detail}）越过 invoke 后是普通对象，不是 Error。
 function startFailure(err: unknown): Error & { __kind?: string; __detail?: string | null } {
   const raw = err as { message?: string; kind?: string; detail?: string } | undefined;
-  const e = new Error(String(raw?.message || err || '启动服务失败')) as Error & {
+  const e = new Error(String(raw?.message || err || t('error.startFailed'))) as Error & {
     __kind?: string; __detail?: string | null;
   };
   e.__kind = raw?.kind || 'start-failed';
@@ -96,7 +97,7 @@ async function attemptConnect(): Promise<DaemonInfo> {
       if (!isTauri()) throw e;
     }
   } else if (!isTauri()) {
-    const e = new Error('未提供连接参数') as Error & { __kind?: string };
+    const e = new Error(t('error.noEndpoint')) as Error & { __kind?: string };
     e.__kind = 'no-endpoint';
     throw e;
   }
@@ -124,7 +125,7 @@ export async function connectDaemon(): Promise<void> {
   if (retryTimer) clearTimeout(retryTimer);
   setState({ conn: 'connecting', connError: null });
   try {
-    const daemon = await withTimeout(attemptConnect(), CONNECT_ATTEMPT_TIMEOUT_MS, '连接服务超时');
+    const daemon = await withTimeout(attemptConnect(), CONNECT_ATTEMPT_TIMEOUT_MS, t('error.connectTimeout'));
     setState({ conn: 'online', daemon, connError: null, lastStatusAt: Date.now() });
     afterConnect();
   } catch (e) {

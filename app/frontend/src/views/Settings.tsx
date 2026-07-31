@@ -4,7 +4,7 @@
 // 等于把「那排开关为什么没了」的答案藏起来）。这里只放一面只读的镜子 + 去主面板
 // 的入口，避免同一个全局状态出现两个可点的控件、两处 pending 态。
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Icon } from '../components/Icon';
 import { ExtLink, Segmented, Switch } from '../components/Controls';
@@ -13,6 +13,11 @@ import { toast } from '../components/Toasts';
 import { openExternal } from '../lib/external';
 import { bridgeCatalog, vendors } from '../lib/bridge';
 import { fmt, IS_MAC } from '../lib/fmt';
+import {
+  getWebUiStatus, inferredStatus, setWebUiSettings, webPortValid, webUiSupported,
+  WEB_PORT_MAX, WEB_PORT_MIN,
+} from '../lib/webui';
+import type { WebUiPatch, WebUiStatus } from '../lib/webui';
 import { t, joinPhrases } from '../i18n';
 import type { MsgKey } from '../i18n';
 import { actions, useStore } from '../state/store';
@@ -251,6 +256,200 @@ function BridgeCard() {
   );
 }
 
+// 网页访问（plan §7.5）。三个选项落在 **App 自己的** <config>/webui.json：daemon
+// 是音频与网络引擎，不该为「App 要不要开个网页端口」长一个字段。
+//
+// 这一块的重点是那条警告。「仅允许本机」关掉之后发生的事不是抽象的「安全风险」，
+// 而是：整个局域网都能打开这套界面并完整操作本机音频，且 /ipc-endpoint 会把 IPC
+// 令牌明文交出去——所以文案逐条说出来，而不是写一句「请注意安全」。
+function WebAccessCard() {
+  // 浏览器态没有 Tauri 桥，也就没有调用面：三个选项只读。这不是退让——否则局域网
+  // 上任何访客都能顺手把 local_only 关掉。
+  const editable = webUiSupported();
+  const [status, setStatus] = useState<WebUiStatus | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [portDraft, setPortDraft] = useState('');
+
+  useEffect(() => {
+    if (!editable) {
+      setStatus(inferredStatus());
+      setPortDraft(String(inferredStatus().port));
+      setLoaded(true);
+      return;
+    }
+    let alive = true;
+    getWebUiStatus()
+      .then((s) => {
+        if (!alive) return;
+        setStatus(s);
+        setPortDraft(String(s.port));
+      })
+      .catch((e) => { if (alive) toast(String(e), 'warn'); })
+      .finally(() => { if (alive) setLoaded(true); });
+    return () => { alive = false; };
+  }, [editable]);
+
+  // 不做乐观翻转：回包才是权威。端口占用时开关必须停在「没开起来」，而不是显示成
+  // 已启用——后者会让用户对着一个根本连不上的地址找问题。
+  async function push(patch: WebUiPatch): Promise<void> {
+    if (!editable || busy) return;
+    setBusy(true);
+    try {
+      const next = await setWebUiSettings(patch);
+      setStatus(next);
+      setPortDraft(String(next.port));
+      if (next.enabled && !next.running && next.error) {
+        toast(t('settings.web.error', { message: next.error }), 'warn');
+      }
+    } catch (e) {
+      toast(String(e), 'warn');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function commitPort(): void {
+    const n = Number(portDraft.trim());
+    if (!webPortValid(n)) {
+      toast(t('settings.web.portInvalid'), 'warn');
+      return;
+    }
+    if (status && n === status.port) return;
+    void push({ port: n });
+  }
+
+  const st = status;
+  const running = !!st && st.running;
+  const localOnly = st ? st.local_only : true;
+  // 拿不到状态时按「锁死」呈现：还没问出结果就先把开关画成能点的，是最坏的一种默认。
+  const locked = st ? st.local_only_locked : true;
+  const disabled = !editable || !loaded || busy;
+
+  return (
+    <section className="card block" data-testid="settings-web">
+      <h3 className="block-title">{t('settings.web.title')}</h3>
+      <p className="muted">{t('settings.web.desc')}</p>
+
+      <SettingRow
+        title={t('settings.web.enabledTitle')}
+        desc={t('settings.web.enabledDesc')}
+        control={(
+          <Switch
+            testid="settings-web-enabled"
+            label={t('settings.web.enabledTitle')}
+            checked={!!st && st.enabled}
+            pending={busy}
+            disabled={disabled}
+            onToggle={(want) => void push({ enabled: want })}
+          />
+        )}
+      />
+
+      <SettingRow
+        title={t('settings.web.portTitle')}
+        desc={t('settings.web.portDesc')}
+        control={(
+          <div className="field-btn">
+            <input
+              className="input web-port"
+              data-testid="settings-web-port"
+              inputMode="numeric"
+              size={6}
+              value={portDraft}
+              disabled={disabled}
+              min={WEB_PORT_MIN}
+              max={WEB_PORT_MAX}
+              onChange={(e) => setPortDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') commitPort(); }}
+            />
+            <button
+              className="btn small"
+              type="button"
+              data-testid="settings-web-port-apply"
+              disabled={disabled}
+              onClick={commitPort}
+            >
+              {t('settings.web.portApply')}
+            </button>
+          </div>
+        )}
+      />
+
+      {/* 「仅允许本机」当前锁死（plan §7.5 用户裁定）：判据 local_only_locked 来自
+          服务端，前端不自己写死——解锁那天只改 webui.rs 一处。 */}
+      <SettingRow
+        title={t('settings.web.localOnlyTitle')}
+        desc={t('settings.web.localOnlyDesc')}
+        badge={locked ? t('settings.web.localOnlyBadge') : undefined}
+        control={(
+          <Switch
+            testid="settings-web-local-only"
+            label={t('settings.web.localOnlyTitle')}
+            checked={localOnly}
+            pending={busy}
+            disabled={disabled || locked}
+            onToggle={(want) => void push({ local_only: want })}
+          />
+        )}
+      />
+      <p className="muted small" data-testid="settings-web-local-only-note" hidden={!locked}>
+        {t('settings.web.localOnlyLocked')}
+      </p>
+
+      {/* 关掉「仅允许本机」= 把一个无鉴权的控制界面连同 IPC 令牌一起交给局域网。
+          plan §7.5 要求这条警告存在，且该选项永不为默认值。 */}
+      <div className="web-warn" data-testid="settings-web-warning" hidden={localOnly}>
+        <strong className="web-warn-title">{t('settings.web.warnTitle')}</strong>
+        <p className="web-warn-body">{t('settings.web.warnBody')}</p>
+      </div>
+
+      <div className="web-urls" data-testid="settings-web-url">
+        {!loaded ? (
+          <p className="muted small">{t('settings.web.starting')}</p>
+        ) : !running ? (
+          <p className="muted small">{t('settings.web.off')}</p>
+        ) : (
+          <>
+            <p className="muted small mono">{t('settings.web.urlLocal', { url: st?.url || '' })}</p>
+            {!localOnly ? (
+              <>
+                {st?.lan_url
+                  ? <p className="muted small mono">{t('settings.web.urlLan', { url: st.lan_url })}</p>
+                  : <p className="muted small">{t('settings.web.urlLanUnknown')}</p>}
+                {/* 实测（本机 ↔ 30-win）：页面与令牌都能过局域网，但 daemon 的 IPC
+                    只监听回环，所以远端页面连不上服务。不写出来，用户只会看到一个
+                    永远停在「连接中」的界面，而怀疑的是自己的网络。 */}
+                <p className="muted small" data-testid="settings-web-lan-note">{t('settings.web.lanIpcNote')}</p>
+              </>
+            ) : null}
+            {editable && st?.url ? <ExtLink text={st.url} url={st.url} testid="settings-web-open" /> : null}
+          </>
+        )}
+      </div>
+
+      <p
+        className="muted small tone-danger"
+        data-testid="settings-web-error"
+        hidden={!st || !st.error}
+      >
+        {st && st.error
+          ? joinPhrases([t('settings.web.error', { message: st.error }), t('settings.web.errorHint')])
+          : ''}
+      </p>
+
+      <p className="muted small" data-testid="settings-web-note">
+        {joinPhrases([
+          editable ? null : t('settings.web.browserOnly'),
+          running && st?.source === 'disk' ? t('settings.web.sourceDisk', { root: st.root || '' }) : null,
+          running && st?.source === 'embedded' ? t('settings.web.sourceEmbedded') : null,
+          t('settings.web.quitNote'),
+        ])}
+      </p>
+    </section>
+  );
+}
+
 export function SettingsView() {
   const s = useStore();
   const [writing, setWriting] = useState(0);
@@ -308,6 +507,8 @@ export function SettingsView() {
           )}
         />
       </section>
+
+      <WebAccessCard />
 
       {/* 延迟/质量：**真的下发并落盘**（settings.json），但媒体面还没读它。角标写
           「已保存 · 暂未生效」而不是隐藏：藏起来会让下一版接上时用户以为是新功能。 */}

@@ -10,11 +10,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, WindowEvent};
-// macOS only: the dock's reopen event. The variant does not exist in the
-// Windows build of tauri, so even importing it there is a warning.
-#[cfg(target_os = "macos")]
-use tauri::RunEvent;
+use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
+
+mod webui;
 
 /// Must match audiohub_ipc::IPC_VERSION (contract: core/audiohub-ipc/src/lib.rs).
 const IPC_VERSION: u32 = 1;
@@ -516,10 +514,14 @@ fn main() {
             set_tray_status,
             show_main_window,
             quit_ui,
-            stop_daemon_and_quit
+            stop_daemon_and_quit,
+            webui::get_webui_status,
+            webui::set_webui_settings
         ])
         .setup(|app| {
             build_tray(app.handle())?;
+            // 网页访问（plan §7.5）：设置里开着才会真的开监听端口，默认关闭。
+            webui::init(app.handle());
             Ok(())
         })
         // Closing the window hides to the menu bar; only the tray quit items
@@ -535,6 +537,11 @@ fn main() {
         .expect("error while building tauri application");
 
     app.run(|_app, _event| {
+        // 退出前把网页服务的监听端口交回系统。进程退出时内核也会回收，但显式停一下
+        // 才能保证「退出界面」后端口立刻可被下一次启动重新绑定。
+        if let RunEvent::Exit = _event {
+            webui::shutdown();
+        }
         // Dock click with every window hidden must bring the UI back. macOS
         // only: `RunEvent::Reopen` is the dock's own event and the variant does
         // not exist in the Windows build of tauri, so referring to it at all is

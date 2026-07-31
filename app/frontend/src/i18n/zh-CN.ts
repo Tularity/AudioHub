@@ -314,6 +314,39 @@ export const zhCN = {
   'settings.net.ipcPort': 'IPC 端口',
   'settings.net.ipcPortDesc': '本机回环 WebSocket 端口，随 daemon 启动随机分配，写入 ipc.json。',
 
+  // 网页访问（plan §7.5）。文案有两条硬要求：一是必须说清「仅允许本机」关掉之后
+  // **实际会发生什么**（无鉴权 + 令牌明文），二是不得把它写成一句泛泛的「请注意
+  // 安全」——那种话没人会当真。
+  'settings.web.title': '网页访问',
+  'settings.web.desc': '由本应用在一个独立端口上提供这套界面，用浏览器打开即可操作——手机、平板、另一台电脑都行，不必安装任何东西。它与对外控制端口无关，也不影响音频。',
+  'settings.web.enabledTitle': '启用网页访问',
+  'settings.web.enabledDesc': '默认关闭：没开启时这个端口根本不会被监听。开启后本应用开始服这套界面，页面自己向本机服务取连接参数（同源 GET /ipc-endpoint），网址里不带任何令牌。',
+  'settings.web.portTitle': '端口',
+  'settings.web.portDesc': '本应用自己的网页端口（默认 47800），与 daemon 的对外控制端口、IPC 端口都不是一回事。范围 1024–65535，改完按回车或点「应用」立即重新监听。',
+  'settings.web.portApply': '应用',
+  'settings.web.portInvalid': '端口需在 1024–65535 之间。',
+  'settings.web.localOnlyTitle': '仅允许本机',
+  'settings.web.localOnlyDesc': '开启时只监听 127.0.0.1——不是「监听所有网卡再按来源过滤」，而是根本不在对外地址上监听，局域网里连不上这个端口。',
+  'settings.web.localOnlyBadge': '尚不可用',
+  // 「为什么不可用」必须说到底：只写「暂不支持」，下一个读到的人（包括半年后的自己）
+  // 只会以为是没做完的开关，而不是一个有确定前提条件的设计裁定。
+  'settings.web.localOnlyLocked': '这个开关暂时不能关：关掉它并不会换来一个能用的远程界面。实测（本机 ↔ 另一台主机）对方能收到页面，也能从 /ipc-endpoint 拿到本机服务的 IPC 令牌，但连不上服务——本机服务的 IPC 只监听回环，远端够不到；即使在本机改用局域网地址打开，浏览器也会按「私有网络访问」规则拦掉从局域网页面指向回环的连接。也就是说，关掉它的净效果只剩「把令牌发出去」。要真正可用，需要本应用再提供一条把 IPC 转发出去的通路；而那条通路一旦存在，「暂不做鉴权」就不能同时成立——远程可操作与无鉴权只能二选一。在此之前，配置文件里即使写成 false，也一律按仅本机处理（启动日志会记一行）。',
+  'settings.web.urlLabel': '访问地址',
+  'settings.web.urlLocal': '本机：{url}',
+  'settings.web.urlLan': '局域网：{url}',
+  'settings.web.urlLanUnknown': '局域网：用本机在该网段的 IP 加同一端口访问（未能自动探测到出口地址）。',
+  'settings.web.off': '未启用。开启后这里会显示可直接打开的网址。',
+  'settings.web.starting': '正在读取当前状态…',
+  'settings.web.error': '没能开始监听：{message}',
+  'settings.web.errorHint': '设置已保存，但端口没能绑定——最常见的原因是这个端口被别的程序占着。换一个端口再试。',
+  'settings.web.warnTitle': '这个开关关掉之后，本机服务的令牌会明文发给任何来访者',
+  'settings.web.warnBody': '「仅允许本机」已关闭：同一局域网内任何人只要知道这台机器的 IP 和端口，就能打开这套界面，而且页面取连接参数的那个接口（/ipc-endpoint）会把本机服务的 IPC 令牌**明文**交给他——本应用目前没有任何鉴权。这个令牌等同于本机音频服务的完全控制凭据：谁拿着它又能够到本机回环（例如这台机器上的另一个登录会话、或本机上任何一个能发请求的程序），谁就能配对、开关音频通路、解除配对。只在你信得过的网络里临时开启，用完请开回来。',
+  'settings.web.lanIpcNote': '实测：用局域网地址打开时页面能显示，但连不上本机服务——服务的 IPC 只监听回环，别的机器根本够不到；即使在本机用局域网地址打开，浏览器也会按「私有网络访问」规则拦掉从局域网页面指向回环的连接。所以这个开关目前只是把页面和连接参数放了出去，界面在远端还不能真正操作；要让它可用，需要再加一条把 IPC 转发出去的通路（尚未实现）。',
+  'settings.web.sourceDisk': '页面文件来自磁盘目录 {root}。',
+  'settings.web.sourceEmbedded': '页面文件来自应用内嵌资源，与窗口里显示的是同一份。',
+  'settings.web.quitNote': '网页入口由本应用提供：从托盘选「退出界面（音频服务继续运行）」后它随之消失，音频不受影响；重新打开本应用即可恢复。',
+  'settings.web.browserOnly': '你正在用网页端查看本页面。这三个选项只能在应用窗口里修改——否则一次误触就能把你自己正在用的这个入口关掉。此处显示的是按当前访问地址推断出的状态。',
+
   'settings.transport.title': '传输',
   'settings.transport.latency': '延迟档',
   'settings.transport.latencyDesc': '最低：固定最小缓冲，追求最低听感延迟；AUTO：按网络质量自适应加深缓冲。推荐保持最低。',

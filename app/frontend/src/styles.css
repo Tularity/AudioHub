@@ -280,6 +280,10 @@ body.is-tauri #topbar > * {
   animation: switch-pending 1.1s ease-in-out infinite;
 }
 .switch.pending .knob { background: var(--accent); }
+/* 真禁用必须看得出来：网页端只读、旧服务没有 settings.* 时这些开关点了不会有任何
+   反应，而在此之前它们和能点的开关长得一模一样——用户只会以为是坏的。
+   pending 除外：请求在飞不是"不可用"，它有自己的呼吸动画。 */
+.switch:disabled:not(.pending) { opacity: .45; cursor: not-allowed; }
 @keyframes switch-pending { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
 
 /* ---- 主面板 ---- */
@@ -692,6 +696,24 @@ body.is-tauri #topbar > * {
   background: var(--bg-2); border: 1px solid var(--line-strong);
 }
 .mode-mirror.mode-b { color: var(--accent); border-color: #31c8b03d; }
+
+/* ---- 网页访问（plan §7.5） ---- */
+
+.web-port { width: 88px; text-align: center; font-family: var(--mono); }
+
+/* 无鉴权的界面被放上局域网，是这一页唯一真正危险的开关：用危险色实心块，
+   而不是又一行灰色小字——那种提示的存在感等于没有。 */
+.web-warn {
+  margin-top: 14px; padding: 12px 14px; border-radius: var(--radius);
+  background: #e5484d12; border: 1px solid #e5484d40;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.web-warn[hidden] { display: none; }
+.web-warn-title { font-size: 13px; color: var(--danger); }
+.web-warn-body { font-size: 12px; color: var(--text); line-height: 1.7; }
+
+.web-urls { display: flex; flex-direction: column; gap: 4px; margin-top: 14px; }
+.web-urls .mono { font-family: var(--mono); word-break: break-all; }
 
 /* ---- 虚拟设备（对端卡片 / 详情 / 设置页共用） ---- */
 

@@ -2,6 +2,11 @@
 //   首帧 {"auth":token} → {"ok":true,"daemon":DaemonInfo}
 //   请求 {"id":n,"method":..,"params":..} → {"id":n,"ok":..,"result"/"error":..}
 //   事件 {"event":"stats","data":Vec<SessionInfo>}
+//
+// 迁移说明：这一层与 React 无关，逐字照搬自旧 app/ui/ws.js（仅补类型）。
+// 它不该知道有没有框架——换 UI 框架时唯一不必重写的就是它。
+
+import type { DaemonInfo } from './types';
 
 // 必须与 audiohub_ipc::IPC_VERSION 一致。
 export const IPC_VERSION = 1;
@@ -18,18 +23,21 @@ const AUTH_TIMEOUT_MS = 5000;
 // 改动那几个常量时，这里要跟着抬。
 // daemon.request_permission 的「最坏耗时」是**人**：TCC 弹窗停在屏幕上多久，
 // 这个请求就挂多久。按默认 10s 去卡它，等于用户还在读弹窗时界面就报了超时。
-const METHOD_TIMEOUT_MS = {
+const METHOD_TIMEOUT_MS: Record<string, number> = {
   'peers.connect': 30000,
   'session.open': 45000,
   'daemon.request_permission': 180000,
 };
 
-export function methodTimeout(method) {
+export function methodTimeout(method: string): number {
   return METHOD_TIMEOUT_MS[method] ?? DEFAULT_TIMEOUT_MS;
 }
 
 export class VersionMismatchError extends Error {
-  constructor(actual) {
+  expected: number;
+  actual: number | string;
+
+  constructor(actual: number | string) {
     super(`daemon 协议版本不匹配（期望 ${IPC_VERSION}，实际 ${actual}）`);
     this.name = 'VersionMismatchError';
     this.expected = IPC_VERSION;
@@ -37,55 +45,61 @@ export class VersionMismatchError extends Error {
   }
 }
 
+interface Pending {
+  resolve: (v: unknown) => void;
+  reject: (e: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+type Listener = (data: unknown) => void;
+
 export class IpcClient {
-  constructor() {
-    this.ws = null;
-    this.nextId = 1;
-    this.pending = new Map();
-    this.listeners = new Map();
-    this.authed = false;
-  }
+  private ws: WebSocket | null = null;
+  private nextId = 1;
+  private pending = new Map<number, Pending>();
+  private listeners = new Map<string, Set<Listener>>();
+  private authed = false;
 
-  on(name, fn) {
+  on(name: string, fn: Listener): () => void {
     if (!this.listeners.has(name)) this.listeners.set(name, new Set());
-    this.listeners.get(name).add(fn);
-    return () => this.listeners.get(name)?.delete(fn);
+    this.listeners.get(name)!.add(fn);
+    return () => { this.listeners.get(name)?.delete(fn); };
   }
 
-  _emit(name, data) {
+  private emit(name: string, data: unknown): void {
     for (const fn of [...(this.listeners.get(name) || [])]) {
       try { fn(data); } catch (e) { console.error(e); }
     }
   }
 
-  get connected() {
+  get connected(): boolean {
     return this.authed && !!this.ws && this.ws.readyState === WebSocket.OPEN;
   }
 
-  connect(port, token) {
+  connect(port: number, token: string): Promise<DaemonInfo> {
     this.close();
-    return new Promise((resolve, reject) => {
+    return new Promise<DaemonInfo>((resolve, reject) => {
       let settled = false;
-      let authTimer = null;
-      let ws;
+      let authTimer: ReturnType<typeof setTimeout> | null = null;
+      let ws: WebSocket & { __abandoned?: boolean };
 
-      const finish = (fn, arg) => {
-        clearTimeout(authTimer);
+      const finish = <T>(fn: (arg: T) => void, arg: T) => {
+        if (authTimer) clearTimeout(authTimer);
         authTimer = null;
         if (settled) return;
         settled = true;
         fn(arg);
       };
       // 握手失败/超时一律关掉 socket：close 事件会把 conn 推向 offline 并触发重试。
-      const fail = (err) => {
+      const fail = (err: Error) => {
         finish(reject, err);
-        try { ws.close(); } catch (_) { /* ignore */ }
+        try { ws.close(); } catch { /* ignore */ }
       };
 
       try {
         ws = new WebSocket(`ws://127.0.0.1:${port}`);
       } catch (e) {
-        reject(e);
+        reject(e as Error);
         return;
       }
       this.ws = ws;
@@ -93,74 +107,78 @@ export class IpcClient {
       authTimer = setTimeout(() => fail(new Error('daemon 认证握手超时')), AUTH_TIMEOUT_MS);
 
       ws.addEventListener('open', () => {
-        try { ws.send(JSON.stringify({ auth: token })); } catch (_) { /* close 事件兜底 */ }
+        try { ws.send(JSON.stringify({ auth: token })); } catch { /* close 事件兜底 */ }
       });
 
-      ws.addEventListener('message', (ev) => {
+      ws.addEventListener('message', (ev: MessageEvent) => {
         if (ws.__abandoned) return;
-        let msg;
-        try { msg = JSON.parse(ev.data); } catch (_) { return; }
+        let msg: Record<string, unknown>;
+        try { msg = JSON.parse(String(ev.data)); } catch { return; }
         if (!this.authed) {
-          if (msg && msg.ok === true && msg.daemon) {
-            const v = Number(msg.daemon.ipc_version);
+          const daemon = msg && (msg.daemon as DaemonInfo | undefined);
+          if (msg && msg.ok === true && daemon) {
+            const v = Number(daemon.ipc_version);
             if (v !== IPC_VERSION) {
               fail(new VersionMismatchError(Number.isFinite(v) ? v : '未知'));
               return;
             }
             this.authed = true;
-            finish(resolve, msg.daemon);
+            finish(resolve, daemon);
           } else {
-            fail(new Error((msg && msg.error) || '认证失败'));
+            fail(new Error(String((msg && msg.error) || '认证失败')));
           }
           return;
         }
-        if (msg && msg.id != null && this.pending.has(msg.id)) {
-          const p = this.pending.get(msg.id);
-          this.pending.delete(msg.id);
+        const id = msg && (msg.id as number | undefined);
+        if (id != null && this.pending.has(id)) {
+          const p = this.pending.get(id)!;
+          this.pending.delete(id);
           clearTimeout(p.timer);
           if (msg.ok) p.resolve(msg.result);
-          else p.reject(new Error(msg.error || '请求失败'));
+          else p.reject(new Error(String(msg.error || '请求失败')));
           return;
         }
-        if (msg && msg.event) this._emit('event:' + msg.event, msg.data);
+        if (msg && msg.event) this.emit('event:' + String(msg.event), msg.data);
       });
 
       ws.addEventListener('close', () => {
         if (ws.__abandoned) return;
         const wasAuthed = this.authed;
         this.authed = false;
-        this._failAll('连接已断开');
+        this.failAll('连接已断开');
         finish(reject, new Error('无法连接 daemon'));
         if (this.ws === ws) this.ws = null;
-        this._emit('close', wasAuthed);
+        this.emit('close', wasAuthed);
       });
 
       ws.addEventListener('error', () => { /* close 事件兜底 */ });
     });
   }
 
-  request(method, params = {}, timeoutMs) {
+  request<T = unknown>(method: string, params: unknown = {}, timeoutMs?: number): Promise<T> {
     if (!this.connected) return Promise.reject(new Error('IPC 未连接'));
-    const ms = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : methodTimeout(method);
+    const ms = Number.isFinite(timeoutMs) && (timeoutMs as number) > 0
+      ? (timeoutMs as number)
+      : methodTimeout(method);
     const id = this.nextId++;
     const frame = JSON.stringify({ id, method, params });
-    return new Promise((resolve, reject) => {
+    return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`请求超时：${method}`));
       }, ms);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
       try {
-        this.ws.send(frame);
+        this.ws!.send(frame);
       } catch (e) {
         clearTimeout(timer);
         this.pending.delete(id);
-        reject(e);
+        reject(e as Error);
       }
     });
   }
 
-  _failAll(reason) {
+  private failAll(reason: string): void {
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
       p.reject(new Error(reason));
@@ -168,14 +186,14 @@ export class IpcClient {
     this.pending.clear();
   }
 
-  close() {
-    const ws = this.ws;
+  close(): void {
+    const ws = this.ws as (WebSocket & { __abandoned?: boolean }) | null;
     this.ws = null;
     this.authed = false;
-    this._failAll('连接已关闭');
+    this.failAll('连接已关闭');
     if (ws) {
       ws.__abandoned = true;
-      try { ws.close(); } catch (_) { /* ignore */ }
+      try { ws.close(); } catch { /* ignore */ }
     }
   }
 }

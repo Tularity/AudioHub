@@ -139,6 +139,7 @@ fn handle_inbound(
     let _ = stream.set_nodelay(true);
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+
     // dispatch on a peeked copy: verify_responder / pair_responder each read
     // the first frame themselves
     match peek_first(&stream)? {

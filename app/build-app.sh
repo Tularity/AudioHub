@@ -1,5 +1,6 @@
 #!/bin/zsh
 # Build the distributable macOS AudioHub.app (spec-app.md §2).
+#   0) npm install + vite build  (app/frontend -> app/ui, what Tauri embeds)
 #   1) cargo build --release -p audiohub-cli      (the daemon that ships inside)
 #   2) icons: make-icons.py -> sips/iconutil -> icon.icns   (system tools only)
 #   3) stage the daemon as a Tauri externalBin sidecar
@@ -25,6 +26,26 @@ die()  { print -ru2 -- "[audiohub] ERROR: $*"; exit 1; }
 
 TRIPLE="$(rustc -vV | awk '/^host: /{print $2}')"
 [[ -n "$TRIPLE" ]] || die "could not determine host triple from rustc -vV"
+
+# ---------------------------------------------------------------- 0) frontend
+# The UI is Vite + React (source: app/frontend, output: app/ui). It is built
+# FIRST and explicitly, not left to Tauri's beforeBuildCommand, for two reasons:
+#   · a type error should fail the build in 10 seconds, not after cargo has
+#     spent two minutes linking the shell;
+#   · `frontendDist` is a plain directory, so a stale or empty app/ui would be
+#     bundled silently — the app would ship whatever was there last time.
+# beforeBuildCommand in tauri.conf.json runs it a second time (cheap, ~1s) so a
+# bare `cargo tauri build` is safe too.
+FRONTEND="$APP_DIR/frontend"
+step "0/5 frontend (npm + vite build -> app/ui)"
+command -v npm >/dev/null 2>&1 || die "npm not found — the UI is a Vite/React build now; install Node 18+"
+if [[ ! -d "$FRONTEND/node_modules" ]]; then
+  print -ru2 -- "[audiohub] node_modules missing; running npm install"
+  ( cd "$FRONTEND" && npm install --no-audit --no-fund )
+fi
+( cd "$FRONTEND" && npm run build )
+[[ -f "$APP_DIR/ui/index.html" ]] || die "vite produced no app/ui/index.html"
+print -ru2 -- "[audiohub] frontend: $(ls "$APP_DIR/ui/assets" | tr '\n' ' ')"
 
 # ------------------------------------------------------------------ 1) daemon
 step "1/5 build daemon (cargo build --release -p audiohub-cli)"

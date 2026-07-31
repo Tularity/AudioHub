@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.audiohub.app",
   "build": {
-    "frontendDist": "../ui"
+    "frontendDist": "../ui",
+    "beforeBuildCommand": "npm --prefix frontend run build",
+    "beforeDevCommand": "npm --prefix frontend run build"
   },
   "app": {
     "withGlobalTauri": true,

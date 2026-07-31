@@ -425,6 +425,9 @@ pub(crate) struct DaemonInner {
     pub id: LocalIdentity,
     pub cfg_dir: PathBuf,
     pub control_port: u16,
+    /// Written to ipc.json so clients can find us; nothing in the daemon reads
+    /// it back. It was briefly live while the daemon served the web UI itself —
+    /// that moved to the App (plan §7.5), so the allow is correct again.
     #[allow(dead_code)]
     pub ipc_port: u16,
     pub token: String,

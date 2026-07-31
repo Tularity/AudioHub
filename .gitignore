@@ -1,3 +1,9 @@
 /target
 /app/src-tauri/target
 /drivers/macos-hal/build
+
+# 前端：源码在 app/frontend/，构建产物落在 app/ui/。
+# app/ui 之所以就是 outDir 而不是另起一个 dist：tauri.conf.json 的 frontendDist
+# 与 regress/r4_app.sh 的静态服务器都直接指着它，换路径会当场打断回归。
+/app/frontend/node_modules
+/app/ui

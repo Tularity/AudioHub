@@ -1,0 +1,542 @@
+// 主面板：全局模式栏 + 对端卡片列表 + 手动添加对端。
+//
+// 模式栏放在这里而不是设置页，是 plan §7.1 的直接后果：模式决定了下面每张卡片的
+// 含义（模式 A 在卡片上选对端，模式 B 在系统声音设置里选设备），把它藏进设置页
+// 就等于把「这些开关为什么消失了」的答案藏起来。
+
+import { useCallback, useRef, useState } from 'react';
+import { Icon } from '../components/Icon';
+import { Meter, Segmented, Switch } from '../components/Controls';
+import { VolumeControl } from '../components/VolumeControl';
+import { BridgeControl } from '../components/BridgeControl';
+import { toast } from '../components/Toasts';
+import { bridgeTargets } from '../lib/bridge';
+import { fmt } from '../lib/fmt';
+import { createBusySet, useTick } from '../lib/hooks';
+import { t, joinPhrases } from '../i18n';
+import { actions, getState, useStore } from '../state/store';
+import type { AppState } from '../state/store';
+import {
+  MODE_A, MODE_B, halState, requestedMode, effectiveMode, isModeB,
+  modeDowngraded, peerDeviceRows, halReasonText,
+} from '../state/mode';
+import type { ConsumerMode } from '../state/mode';
+import { applySettings, refreshPeers, refreshSessions, rpc } from '../state/connection';
+import type { PeerState, SessionInfo } from '../ipc/types';
+
+// 进行中的通路操作（`${fp}:mic` / `${fp}:spk`），也是开关 pending 态的唯一判据。
+const busy = createBusySet();
+
+// mic / monitor / bridge 操作的是同一条 mic 通路，必须共用一把锁，否则会互相关掉
+// 对方刚开的会话。
+function busyKey(fp: string, kind: string): string {
+  return `${fp}:${kind === 'monitor' || kind === 'bridge' ? 'mic' : kind}`;
+}
+
+// 本机取用对端麦克风的开启参数。monitor（本机监听）与 bridge（写入虚拟声卡）是
+// 同一条通路上的两个去向，daemon 允许同时开，所以两者都从偏好里读当前值。
+function micParams(fp: string): Record<string, unknown> {
+  const s = getState();
+  const p: Record<string, unknown> = { peer: fp, kind: 'mic', monitor: !!s.monitorPref[fp] };
+  const b = s.bridgePref[fp];
+  // 只在选了卡、且这张卡此刻确实可写时才带 bridge：OpenSessionParams.bridge 是
+  // Option<String>，空串或已消失的设备名都会被当成设备名去找，daemon 找不到就直接
+  // 开会话失败（规格明确禁止静默回落）。偏好本身保留：卡装回来就照旧生效。
+  if (b) {
+    if (bridgeTargets(s.daemon).some((c) => c.name === b)) p.bridge = b;
+    else toast(t('peers.bridgeUnavailable', { name: b }), 'warn');
+  }
+  return p;
+}
+
+// 重连倒计时：peers.list 10s 一轮，retry_in_s 只在那一刻是准的，中间自己往下走。
+// 每当 daemon 报来一个新值就重新对时，绝不在本地凭空续命。
+const retryAnchor = new Map<string, { value: number | undefined; at: number }>();
+
+function reconnectLabel(fp: string, reported: number | undefined): string {
+  const cur = retryAnchor.get(fp);
+  if (!cur || cur.value !== reported) retryAnchor.set(fp, { value: reported, at: Date.now() });
+  const a = retryAnchor.get(fp)!;
+  if (typeof a.value !== 'number' || !isFinite(a.value)) return t('peers.card.reconnecting');
+  const remain = a.value - (Date.now() - a.at) / 1000;
+  // 走到 0 说明这一拨已经在飞，而下一次的间隔还没报回来：显示「0s 后重试」会像卡死。
+  return remain >= 1 ? t('peers.card.reconnectingIn', { s: Math.ceil(remain) }) : t('peers.card.reconnecting');
+}
+
+// 本机发起的会话：mic = 取对方麦克风（媒体 对方→我，dir recv）；spk = 送对方扬声器（dir send）。
+// 必须 (kind,dir) 联合过滤：daemon 存的 kind 是发起方视角，对端发起的 mic 会话 dir 是 send
+// （= 对方在取用本机麦克风），只按 kind 匹配会把它误当成本机的通路。
+function matching(state: AppState, fp: string, kind: string): SessionInfo[] {
+  const dir = kind === 'mic' ? 'recv' : 'send';
+  return state.sessions.filter((x) => x.peer_fingerprint === fp && x.kind === kind && x.dir === dir);
+}
+
+// ---------------------------------------------------------------- 通路操作
+
+async function settle(key: string): Promise<void> {
+  busy.delete(key);
+  try { await refreshSessions(); } catch { /* ignore */ }
+}
+
+// session.open 在 daemon 侧最坏要 30s：期间开关停在可见的 pending 态、busy 键一直
+// 握着，结束后一律用 daemon 的会话列表对账，绝不乐观翻转——否则超时报错时会话其实
+// 已经建立，开关就跟真实状态脱节了。
+async function toggleSession(fp: string, kind: 'mic' | 'spk', want: boolean): Promise<void> {
+  const key = busyKey(fp, kind);
+  if (busy.has(key)) return;
+  busy.add(key);
+  try {
+    if (want) {
+      // spk 一律带 volume_sync（spec-m4b §A3-4）：daemon 只对开了它的会话
+      // 接受 session.set_volume，不带就等于卡片上的滑块必然报错。
+      const params = kind === 'mic'
+        ? micParams(fp)
+        : { peer: fp, kind: 'spk', source: 'mic', volume_sync: true };
+      actions.upsertSession(await rpc<SessionInfo>('session.open', params));
+    } else {
+      for (const sess of matching(getState(), fp, kind)) {
+        await rpc('session.close', { id: sess.id });
+        actions.removeSession(sess.id);
+      }
+    }
+  } catch { /* rpc 已 toast */ } finally {
+    await settle(key);
+  }
+}
+
+// 切换监听 / 换桥接目标 = 换一条 mic 会话。先开新的、成功后才关旧的：反过来
+// 一旦重开失败，音频就断了而且界面上一条会话都不剩。
+async function reopenMic(fp: string, kind: string, rollback: () => void): Promise<void> {
+  const key = busyKey(fp, kind);
+  if (busy.has(key)) return; // mic 通路正忙，偏好也先别动
+  const active = matching(getState(), fp, 'mic');
+  if (!active.length) return; // 只记偏好，下次打开 mic 通路时生效
+  busy.add(key);
+  try {
+    const info = await rpc<SessionInfo>('session.open', micParams(fp));
+    actions.upsertSession(info);
+    for (const sess of active) {
+      if (sess.id === info.id) continue;
+      try {
+        await rpc('session.close', { id: sess.id }, { silent: true });
+        actions.removeSession(sess.id);
+      } catch {
+        toast(t('peers.reopenFailed', { id: sess.id }), 'warn');
+      }
+    }
+  } catch {
+    rollback(); // 新会话没开起来，偏好回滚
+  } finally {
+    await settle(key);
+  }
+}
+
+function toggleMonitor(fp: string, want: boolean): void {
+  if (busy.has(busyKey(fp, 'monitor'))) return;
+  const prev = !!getState().monitorPref[fp];
+  actions.setMonitorPref(fp, want);
+  void reopenMic(fp, 'monitor', () => actions.setMonitorPref(fp, prev));
+}
+
+// 桥接目标：'' = 不桥接。未检测到虚拟声卡时控件本身是禁用的，走不到这里。
+function setBridge(fp: string, want: string): void {
+  if (busy.has(busyKey(fp, 'bridge'))) return;
+  const prev = getState().bridgePref[fp] || '';
+  if (want === prev) return;
+  actions.setBridgePref(fp, want);
+  void reopenMic(fp, 'bridge', () => actions.setBridgePref(fp, prev));
+}
+
+// ---------------------------------------------------------------- 模式栏
+
+function ModeBanner() {
+  const daemon = useStore((s) => s.daemon);
+  const mode = useStore(effectiveMode);
+  const downgraded = useStore(modeDowngraded);
+  const st = halState(daemon);
+
+  const setMode = useCallback(async (v: ConsumerMode) => {
+    if (v === requestedMode(getState())) return;
+    try {
+      await applySettings({ consumer_mode: v });
+      toast(v === MODE_B ? t('mode.switched.toB') : t('mode.switched.toA'), 'ok');
+    } catch { /* rpc 已 toast */ }
+  }, []);
+
+  return (
+    <section className="card block mode-bar" data-testid="consumer-mode">
+      <div className="mode-head">
+        <div className="mode-title-wrap">
+          <h3 className="block-title">{t('mode.title')}</h3>
+          <p className="mode-sub">{t('mode.sub')}</p>
+        </div>
+        {/* testid 沿用旧名 `settings-consumer-mode`（回归已依赖），外层另给别名 */}
+        <Segmented<ConsumerMode>
+          testid="settings-consumer-mode"
+          value={mode}
+          onSelect={setMode}
+          options={[
+            { value: MODE_A, label: t('mode.a.label') },
+            {
+              value: MODE_B,
+              label: t('mode.b.label'),
+              // 置灰必须是**真禁用**（点击不改变任何状态），判据见 state/mode.ts halState()。
+              disabled: !st.available,
+              why: st.why || '',
+            },
+          ]}
+        />
+      </div>
+      <p className="mode-desc" data-testid="consumer-mode-desc">
+        {mode === MODE_B ? t('mode.b.desc') : t('mode.a.desc')}
+      </p>
+      <p className={`mode-note tone-${st.tone}`} data-testid="settings-mode-note">{st.text}</p>
+      {/* 用户存的是 B、daemon 只能给 A：这是**降级**，不是「他选了 A」。 */}
+      <p className="mode-warn" data-testid="consumer-mode-downgraded" hidden={!downgraded}>
+        {t('mode.downgraded')}
+      </p>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------- 对端卡片
+
+function StreamRow({ fp, kind, label, sess }: {
+  fp: string; kind: 'mic' | 'spk'; label: string; sess: SessionInfo | null;
+}) {
+  const kbps = sess && sess.stats ? sess.stats.bitrate_kbps : 0;
+  return (
+    <div className={`stream${sess ? ' active' : ''}`} data-testid={`stream-${kind}-${fp}`}>
+      <span className="stream-label">{label}</span>
+      <Meter testid={`level-${kind}-${fp}`} value={(kbps || 0) / 900} />
+      <span className="stream-rate">
+        {sess ? t('peers.card.kbps', { v: fmt.kbps(kbps) }) : t('peers.card.idle')}
+      </span>
+    </div>
+  );
+}
+
+// 模式 B 的对端卡片主体：这台对端的两台系统设备 + 它们此刻的状态。
+// 这里**没有任何选择器**——选哪台对端 = 在系统里选哪台设备（plan §7.1 冻结）。
+function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
+  const daemon = useStore((s) => s.daemon);
+  const fp = peer.fingerprint;
+  const devs = peerDeviceRows(peer, daemon);
+  const has = devs.length > 0;
+  const dev = peer.hal_device;
+  const published = !!dev && dev.state === 'bound' && !!dev.observed;
+
+  let note = '';
+  let noteWarn = false;
+  if (!has) {
+    note = halReasonText(peer.hal_reason);
+    noteWarn = true;
+  } else if (!peer.online) {
+    // 对端离线时设备仍在系统里可选，只是不处理声音——这是 plan §7.3 的既定语义，
+    // 必须在卡片上说出来，否则「没声音」在系统里完全不可观测。
+    note = t('peers.devices.offline');
+    noteWarn = true;
+  } else if (!published) {
+    note = t('peers.devices.settling');
+  }
+
+  return (
+    <div
+      className="peer-devices"
+      data-testid={`peer-devices-${fp}`}
+      hidden={hidden}
+      // 卡片整体可点（进入详情）；设备区里的文本要能选中复制 UID。
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="dev-head"><Icon name="device" /><span>{t('peers.devices.title')}</span></div>
+      <div className="dev-list" hidden={!has}>
+        {(['out', 'in'] as const).map((dir) => {
+          const d = devs.find((x) => x.dir === dir);
+          // 三层状态，含义各不相同：正在被应用使用 / 已发布但没人用 / 还没真正出现在系统里。
+          const io = !!d && d.io;
+          const state = io ? 'live' : published ? 'idle' : 'pending';
+          const text = io ? t('device.inUse') : published ? t('device.idle') : t('device.awaiting');
+          return (
+            <div
+              key={dir}
+              className={`dev-row${io ? ' active' : ''}`}
+              data-testid={`peer-device-${dir}-${fp}`}
+            >
+              <Icon name={dir === 'out' ? 'spk' : 'mic'} cls="ico dev-ico" />
+              <div className="dev-text">
+                <span className="dev-name" title={d?.name || ''}>{d?.name || t('common.dash')}</span>
+                <code className="dev-uid mono" title={d?.uid || ''}>{d?.uid || ''}</code>
+              </div>
+              <span className={`dev-state ${state}`}>{text}</span>
+            </div>
+          );
+        })}
+      </div>
+      <p className={`dev-note${noteWarn ? ' warn' : ''}`} data-testid={`peer-devices-note-${fp}`} hidden={!note}>
+        {note}
+      </p>
+      <p className="dev-foot" hidden={!has}>{t('peers.devices.foot')}</p>
+    </div>
+  );
+}
+
+function PeerCard({ peer, modeB }: { peer: PeerState; modeB: boolean }) {
+  const fp = peer.fingerprint;
+  const daemon = useStore((s) => s.daemon);
+  const sessions = useStore((s) => s.sessions);
+  const monitorPref = useStore((s) => !!s.monitorPref[fp]);
+  const bridgePref = useStore((s) => s.bridgePref[fp] || '');
+  busy.use(); // 订阅进行中的操作，pending 态跟着翻
+
+  const reconnecting = !peer.online && !!peer.reconnecting;
+  useTick(1000, reconnecting);
+
+  const micS = sessions.find((x) => x.peer_fingerprint === fp && x.kind === 'mic' && x.dir === 'recv') || null;
+  const spkS = sessions.find((x) => x.peer_fingerprint === fp && x.kind === 'spk' && x.dir === 'send') || null;
+  // 对端发起、正在取用本机麦克风的会话（kind=mic + dir=send）。隐私相关，必须显式可见。
+  const inbound = sessions.filter((x) => x.peer_fingerprint === fp && x.kind === 'mic' && x.dir === 'send');
+
+  const micBusy = busy.has(busyKey(fp, 'mic'));
+  // 重连中不是「离线」：给和「连接中」同一种呼吸点，别让用户以为已经放弃了。
+  const dotCls = peer.online ? 'online' : reconnecting ? 'connecting' : 'offline';
+  if (!reconnecting) retryAnchor.delete(fp);
+
+  const displayName = peer.display_name || peer.name || t('peers.card.unnamed');
+  const nav = () => actions.navigate('detail', fp);
+
+  return (
+    <article
+      className="card peer-card"
+      data-testid={`peer-card-${fp}`}
+      tabIndex={0}
+      role="button"
+      aria-label={t('peers.card.viewDetail', { name: peer.name || fp })}
+      onClick={nav}
+      onKeyDown={(e) => { if (e.key === 'Enter' && e.target === e.currentTarget) nav(); }}
+    >
+      <header className="peer-head">
+        <span className={`dot ${dotCls}`} />
+        <h3 className="peer-name">{displayName}</h3>
+        <span className="peer-alias" data-testid={`peer-alias-${fp}`} hidden={!peer.alias}>
+          {peer.alias ? t('peers.card.alias', { name: peer.name || fp }) : ''}
+        </span>
+        <code className="peer-fp" title={fp}>{fmt.fp(fp, 16)}</code>
+      </header>
+
+      {/* 「最近地址 x · 默认端口 y」是两条并列短语，不是一个句子：分隔符与各自的
+          语序都交给语料，不在这里用 + 拼。 */}
+      <div className="peer-meta">
+        {joinPhrases([
+          peer.last_addr ? t('peers.card.lastAddr', { addr: peer.last_addr }) : t('peers.card.noAddr'),
+          t('peers.card.defaultPort', { port: String(peer.port ?? '') }),
+        ])}
+      </div>
+
+      {/* 控制通道断了但没被解除配对：daemon 正在按退避重拨，界面必须说出来，
+          否则「离线」看着就像放弃了。 */}
+      <div className="peer-reconnect" data-testid={`reconnecting-${fp}`} hidden={!reconnecting} role="status">
+        <span className="spinner tiny" />
+        <span className="reconnect-text">{reconnecting ? reconnectLabel(fp, peer.retry_in_s) : ''}</span>
+      </div>
+
+      <div className="peer-inbound" data-testid={`inbound-mic-${fp}`} hidden={inbound.length === 0} role="status">
+        <span className="dot live" />
+        <Icon name="mic" />
+        <span className="inbound-text">
+          {inbound.length > 1
+            ? t('peers.card.inboundMicN', { n: inbound.length })
+            : t('peers.card.inboundMic')}
+        </span>
+      </div>
+
+      {/* 模式 A 专属的一整排通路控件。模式 B 下它们全部**下线**（不是变灰）：
+          取谁的麦克风、送谁的扬声器由 App 在系统里选设备决定，这些开关既不反映那个
+          选择、也无法表达它；留着只会让用户以为自己在这里做了什么。
+          monitorPref / bridgePref 在模式 B 下**不读不写**（数据保留，切回 A 复用）。 */}
+      <div className="peer-toggles" data-testid={`peer-toggles-${fp}`} hidden={modeB}>
+        <div className="toggle-row">
+          <Icon name="mic" /><span className="toggle-label">{t('peers.card.takeMic')}</span>
+          <Switch
+            testid={`toggle-mic-${fp}`} label={t('peers.card.takeMic')} checked={!!micS} pending={micBusy}
+            onToggle={(w) => void toggleSession(fp, 'mic', w)}
+          />
+        </div>
+        <div className="toggle-row">
+          <Icon name="spk" /><span className="toggle-label">{t('peers.card.sendSpk')}</span>
+          <Switch
+            testid={`toggle-spk-${fp}`} label={t('peers.card.sendSpk')} checked={!!spkS}
+            pending={busy.has(busyKey(fp, 'spk'))}
+            onToggle={(w) => void toggleSession(fp, 'spk', w)}
+          />
+        </div>
+        {/* 「送对方扬声器」下方的音量同步控件：会话激活后出现，值来自 stats.volume。 */}
+        <VolumeControl
+          volumeTestid={`volume-${fp}`}
+          muteTestid={`mute-${fp}`}
+          label={t('peers.card.volumeLabel', { name: peer.name || fp })}
+          sess={modeB ? null : spkS}
+          // silent：拖动会连发，失败提示由控件自己在框内给一条，不刷 toast。
+          onSet={(id, params) => rpc('session.set_volume', { id, ...params }, { silent: true })}
+        />
+        <div className="toggle-row">
+          <Icon name="monitor" /><span className="toggle-label">{t('peers.card.monitor')}</span>
+          <Switch
+            testid={`toggle-monitor-${fp}`} label={t('peers.card.monitor')} checked={monitorPref} pending={micBusy}
+            onToggle={(w) => toggleMonitor(fp, w)}
+          />
+        </div>
+        {/* 「取对方麦克风」的第二个去向（plan §7.1）：写入第三方虚拟声卡的播放端。 */}
+        <BridgeControl
+          testid={`bridge-${fp}`}
+          daemon={daemon}
+          value={bridgePref}
+          pending={micBusy}
+          onChange={(v) => setBridge(fp, v)}
+        />
+      </div>
+
+      <PeerDevices peer={peer} hidden={!modeB} />
+
+      {/* 电平条两种模式都要：模式 B 的会话由系统的设备选择创建，那条流一样是这台
+          对端在收发，藏起来只会让「选了设备但没声音」少一个可看的地方。 */}
+      <div className="peer-streams">
+        <StreamRow fp={fp} kind="mic" label={t('peers.card.streamIn')} sess={micS} />
+        <StreamRow fp={fp} kind="spk" label={t('peers.card.streamOut')} sess={spkS} />
+      </div>
+    </article>
+  );
+}
+
+// ---------------------------------------------------------------- 手动添加
+
+function AddPeerForm({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const peers = useStore((s) => s.peers);
+  const peerRef = useRef<HTMLInputElement>(null);
+  const [addr, setAddr] = useState('');
+  const [peerVal, setPeerVal] = useState('');
+  const [pending, setPending] = useState(false);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const peer = peerVal.trim();
+    const a = addr.trim();
+    if (!peer) {
+      toast(t('peers.form.needFingerprint'), 'warn');
+      peerRef.current?.focus();
+      return;
+    }
+    setPending(true);
+    try {
+      // 超时由 ipc/client.ts 的方法级表给出（daemon 最坏 TCP 5s + 握手 10s）。
+      await rpc('peers.connect', a ? { peer, addr: a } : { peer });
+      toast(t('peers.form.done'), 'ok');
+      setAddr('');
+      onClose();
+      void refreshPeers();
+    } catch { /* rpc 已 toast */ } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <form className="card add-peer-form" hidden={!open} data-testid="add-peer-form" onSubmit={submit}>
+      <div className="form-row">
+        <label className="field">
+          <span className="field-label">{t('peers.form.fingerprint')}</span>
+          <input
+            ref={peerRef}
+            className="input"
+            data-testid="add-peer-peer"
+            list="ah-peer-fps"
+            placeholder={t('peers.form.fingerprintPlaceholder')}
+            autoComplete="off"
+            spellCheck="false"
+            value={peerVal}
+            onChange={(e) => setPeerVal(e.currentTarget.value)}
+          />
+          <datalist id="ah-peer-fps">
+            {peers.map((p) => <option key={p.fingerprint} value={p.fingerprint}>{p.name || ''}</option>)}
+          </datalist>
+        </label>
+        <label className="field grow">
+          <span className="field-label">{t('peers.form.addr')}</span>
+          <input
+            className="input"
+            data-testid="add-peer-input"
+            placeholder={t('peers.form.addrPlaceholder')}
+            autoComplete="off"
+            spellCheck="false"
+            value={addr}
+            onChange={(e) => setAddr(e.currentTarget.value)}
+          />
+        </label>
+        <button className="btn primary" type="submit" data-testid="add-peer-connect" disabled={pending}>
+          {pending ? t('common.connecting') : t('common.connect')}
+        </button>
+      </div>
+      <p className="form-note">{t('peers.form.note')}</p>
+    </form>
+  );
+}
+
+// ---------------------------------------------------------------- 视图
+
+export function PeersView() {
+  const peers = useStore((s) => s.peers);
+  const modeB = useStore(isModeB);
+  const [formOpen, setFormOpen] = useState(false);
+
+  const online = peers.filter((p) => p.online).length;
+  const retrying = peers.filter((p) => !p.online && p.reconnecting).length;
+  const published = modeB ? peers.filter((p) => p.hal_device).length : 0;
+  // 摘要是**并列短语**，不是一句话：每段自己完整，分隔符由语料给。
+  const summary = peers.length
+    ? joinPhrases([
+      t('peers.summary.paired', { n: peers.length }),
+      t('peers.summary.online', { n: online }),
+      retrying ? t('peers.summary.retrying', { n: retrying }) : null,
+      modeB ? t('peers.summary.devices', { n: published * 2 }) : null,
+    ])
+    : t('peers.summary.none');
+
+  return (
+    <>
+      <ModeBanner />
+      <div className="toolbar">
+        <div className="toolbar-note" data-testid="peers-summary">{summary}</div>
+        <button
+          className="btn primary" type="button" data-testid="add-peer-btn"
+          onClick={() => setFormOpen((v) => !v)}
+        >
+          <Icon name="plus" />{t('peers.addManual')}
+        </button>
+      </div>
+      <AddPeerForm open={formOpen} onClose={() => setFormOpen(false)} />
+
+      <div className={`peer-grid${modeB ? ' mode-b' : ''}`}>
+        {peers.map((p) => <PeerCard key={p.fingerprint} peer={p} modeB={modeB} />)}
+      </div>
+
+      {/* 首次启动的空态：不能是一片空白，必须把「两台设备先配对」这件事说清楚。 */}
+      <div className="empty card" data-testid="peers-empty" hidden={peers.length > 0}>
+        <Icon name="pair" cls="empty-ico" />
+        <h3>{t('peers.empty.title')}</h3>
+        <p>{t('peers.empty.desc')}</p>
+        <ol className="empty-steps">
+          <li>{t('peers.empty.step1')}</li>
+          <li>{t('peers.empty.step2')}</li>
+          <li>{t('peers.empty.step3')}</li>
+        </ol>
+        <p className="empty-mode-b" data-testid="peers-empty-mode-b" hidden={!modeB}>
+          {t('peers.empty.modeB')}
+        </p>
+        <button
+          className="btn primary" type="button" data-testid="peers-empty-pair"
+          onClick={() => actions.navigate('pair')}
+        >
+          <Icon name="pair" />{t('peers.empty.openPair')}
+        </button>
+      </div>
+    </>
+  );
+}

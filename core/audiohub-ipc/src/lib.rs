@@ -22,6 +22,16 @@ pub use audiohub_core::sysaudio::VirtualCard;
 pub use audiohub_core::volume::VolumeState;
 pub use audiohub_net::identity::PairedPeer;
 
+/// Where a page served by the daemon's own web UI asks for the endpoint below.
+///
+/// The daemon serves the UI over HTTP on its CONTROL port, loopback only
+/// (`audiohubd::webui`). A page loaded from there has no `?port&token` in its
+/// URL and no Tauri bridge to ask, so it `fetch`es this path on its own origin
+/// and gets `{"ipc_version","port","token"}` — the same three values
+/// `ipc.json` carries, minus `pid`, which is a liveness detail for whoever owns
+/// the file and means nothing to a client that just reached the owner.
+pub const IPC_ENDPOINT_PATH: &str = "/ipc-endpoint";
+
 /// Written to `<config_dir>/ipc.json` (0600) by the daemon on startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcEndpoint {

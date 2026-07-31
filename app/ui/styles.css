@@ -68,8 +68,23 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
    否则品牌区被三颗按钮压住。浏览器测试挂钩里没有标题栏，这块不占位。 */
 .titlebar-space { display: none; }
 body.is-tauri .titlebar-space { display: block; height: 12px; flex: none; }
-body.is-tauri #topbar { -webkit-app-region: drag; }
-body.is-tauri #topbar > * { -webkit-app-region: no-drag; }
+/* A drag region must also refuse text selection. On macOS WKWebView, once a
+   selection or a text drag has happened anywhere, -webkit-app-region:drag stops
+   responding for the rest of the session — which is exactly the reported
+   "draggable right after launch, dead once you click or drag any text".
+   The children opt back into selection where it makes sense (the fingerprint
+   is meant to be copyable). */
+body.is-tauri #topbar {
+  -webkit-app-region: drag;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+body.is-tauri #topbar > * {
+  -webkit-app-region: no-drag;
+  -webkit-user-select: text;
+  user-select: text;
+}
 
 .brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px; }
 .brand-logo {
@@ -101,7 +116,12 @@ body.is-tauri #topbar > * { -webkit-app-region: no-drag; }
 
 .sidebar-foot { font-size: 11px; color: var(--text-dim); padding: 8px; border-top: 1px solid var(--line); }
 
-#main { display: flex; flex-direction: column; min-width: 0; }
+/* min-height:0 is load-bearing, not tidiness. A flex item defaults to
+   min-height:auto, which refuses to shrink below its content — so #view-root's
+   `flex:1; overflow-y:auto` never receives a constrained height and the column
+   grows instead of scrolling. Symptom: the wheel does nothing ANYWHERE in the
+   app, on both platforms. Same reason min-width:0 is already here. */
+#main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
 #topbar {
   height: 56px; flex: none;

@@ -81,7 +81,17 @@ fn origin_allowed(origin: &str) -> bool {
         _ => return false,
     };
     let host = rest.split(':').next().unwrap_or("");
-    host == "127.0.0.1" || host == "localhost" || host == "[::1]"
+    // `tauri.localhost` is the WINDOWS webview's origin. Tauri only uses the
+    // `tauri://` scheme on macOS/Linux; on Windows WebView2 serves the app from
+    // `http://tauri.localhost`, so an allowlist written on a Mac silently locks
+    // the Windows app out of its own daemon. Measured on the peer: the window
+    // and the whole UI rendered, then sat on 「正在连接 AudioHub 服务…」 forever
+    // while the daemon answered every handshake with 403.
+    //
+    // It is not a loopback LITERAL, but it is not routable either: WebView2
+    // reserves the name internally and no DNS lookup happens, so a real site
+    // cannot obtain this origin.
+    host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "tauri.localhost"
 }
 
 fn reject_browser_origin(req: &Request, resp: Response) -> Result<Response, ErrorResponse> {

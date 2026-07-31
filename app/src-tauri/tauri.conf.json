@@ -14,8 +14,7 @@
         "width": 1000,
         "height": 700,
         "minWidth": 860,
-        "minHeight": 600,
-        "titleBarStyle": "Overlay"
+        "minHeight": 600
       }
     ],
     "security": {
@@ -24,11 +23,18 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
+    "targets": [
+      "app"
+    ],
     "category": "Music",
     "shortDescription": "跨主机网络音频共享",
-    "icon": ["icons/icon.png", "icons/icon.icns"],
-    "externalBin": ["binaries/audiohub"],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.icns"
+    ],
+    "externalBin": [
+      "binaries/audiohub"
+    ],
     "macOS": {
       "minimumSystemVersion": "11.0"
     }

@@ -10,7 +10,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
+use tauri::{AppHandle, Manager, WindowEvent};
+// macOS only: the dock's reopen event. The variant does not exist in the
+// Windows build of tauri, so even importing it there is a warning.
+#[cfg(target_os = "macos")]
+use tauri::RunEvent;
 
 /// Must match audiohub_ipc::IPC_VERSION (contract: core/audiohub-ipc/src/lib.rs).
 const IPC_VERSION: u32 = 1;
@@ -110,8 +114,71 @@ fn endpoint_alive(ep: &IpcEndpointJson) -> bool {
     port_alive(ep.port)
 }
 
-fn daemon_binary() -> Option<PathBuf> {
+/// True when `bin` is the standalone daemon rather than the CLI that carries it
+/// as a subcommand.
+/// The CLI specifically (`audiohub`), for the `ctl ...` subcommands the daemon
+/// binary does not have. Same search order as `daemon_binary`, one name.
+fn cli_binary() -> Option<PathBuf> {
     let name = if cfg!(windows) { "audiohub.exe" } else { "audiohub" };
+    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(PathBuf::from));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = &exe_dir {
+        candidates.push(dir.join(name));
+    }
+    if let Some(p) = std::env::var_os("AUDIOHUB_BIN") {
+        if !p.is_empty() {
+            candidates.push(PathBuf::from(p));
+        }
+    }
+    #[cfg(debug_assertions)]
+    if let Some(dir) = &exe_dir {
+        candidates.push(dir.join("../../../../target/release").join(name));
+    }
+    candidates.into_iter().find_map(|p| {
+        let abs = std::fs::canonicalize(&p).ok()?;
+        (abs.is_file() && abs.is_absolute()).then_some(abs)
+    })
+}
+
+fn is_daemon_binary(bin: &std::path::Path) -> bool {
+    bin.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("audiohubd"))
+        .unwrap_or(false)
+}
+
+/// Keep the daemon out of the user's face on Windows.
+///
+/// `audiohubd` is a CONSOLE-subsystem binary and this app is a GUI one, so
+/// Windows hands the child a brand-new console window unless told otherwise —
+/// measured on the peer: a cmd window sat on the desktop for as long as the
+/// daemon ran, which is what made a correctly-working install look like someone
+/// had shipped a bare script. CREATE_NO_WINDOW suppresses it while keeping the
+/// process a normal child (the app still reaps it, and it still outlives the
+/// window on purpose — see the tray's 「退出界面（音频服务继续运行）」).
+fn spawn_without_console(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
+fn daemon_binary() -> Option<PathBuf> {
+    // `audiohubd` FIRST. Both binaries run the same daemon (`audiohub daemon`
+    // is the CLI subcommand that calls into it), but the process a user finds
+    // in Activity Monitor / Task Manager should be named for what it is. A peer
+    // that only ever showed `audiohub` reads as "they shipped me a CLI", which
+    // is exactly the impression this app exists to correct. The CLI stays as
+    // the fallback because that is what the macOS bundle ships as its sidecar.
+    let names: [&str; 2] = if cfg!(windows) {
+        ["audiohubd.exe", "audiohub.exe"]
+    } else {
+        ["audiohubd", "audiohub"]
+    };
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(PathBuf::from));
@@ -120,7 +187,9 @@ fn daemon_binary() -> Option<PathBuf> {
     // First priority, so a bundled .app copied anywhere self-bootstraps from
     // the daemon shipped next to this executable (Contents/MacOS/audiohub).
     if let Some(dir) = &exe_dir {
-        candidates.push(dir.join(name));
+        for n in names {
+            candidates.push(dir.join(n));
+        }
     }
     if let Some(p) = std::env::var_os("AUDIOHUB_BIN") {
         if !p.is_empty() {
@@ -134,7 +203,9 @@ fn daemon_binary() -> Option<PathBuf> {
     // directory decide which binary we spawn.
     #[cfg(debug_assertions)]
     if let Some(dir) = &exe_dir {
-        candidates.push(dir.join("../../../../target/release").join(name));
+        for n in names {
+            candidates.push(dir.join("../../../../target/release").join(n));
+        }
     }
     candidates.into_iter().find_map(|p| {
         let abs = std::fs::canonicalize(&p).ok()?;
@@ -238,8 +309,15 @@ fn ensure_daemon_blocking() -> Result<IpcEndpointJson, DaemonError> {
         ),
     };
 
-    let mut child = Command::new(&bin)
-        .arg("daemon")
+    let mut cmd = Command::new(&bin);
+    // `audiohubd` IS the daemon; `audiohub` needs the subcommand. Passing
+    // "daemon" to audiohubd makes it exit on an unknown argument, which would
+    // present as "the app starts and nothing ever comes up".
+    if !is_daemon_binary(&bin) {
+        cmd.arg("daemon");
+    }
+    spawn_without_console(&mut cmd);
+    let mut child = cmd
         .stdin(Stdio::null())
         // The daemon's one stdout JSON line only appears with --json, which is
         // not passed here; stderr is its log and goes to a file, never a pipe.
@@ -338,12 +416,17 @@ fn quit_ui(app: AppHandle) {
 /// Best effort `daemon.shutdown` over IPC (that is exactly what `ctl shutdown`
 /// sends), then quit. A failure here must not trap the user in the app.
 fn shutdown_daemon_blocking() {
-    let Some(bin) = daemon_binary() else {
-        warn("stop-daemon: no audiohub binary found; quitting anyway");
+    // `ctl shutdown` is a CLI subcommand: audiohubd does not have it. Since
+    // daemon_binary() now prefers audiohubd, pick the CLI explicitly here — the
+    // two sit side by side in every layout that ships them.
+    let Some(bin) = cli_binary() else {
+        warn("stop-daemon: no audiohub CLI found; quitting anyway");
         return;
     };
-    match Command::new(&bin)
-        .args(["ctl", "shutdown", "--json"])
+    let mut cmd = Command::new(&bin);
+    cmd.args(["ctl", "shutdown", "--json"]);
+    spawn_without_console(&mut cmd);
+    match cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -451,11 +534,16 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(|app, event| {
-        // Dock click with every window hidden must bring the UI back.
-        if let RunEvent::Reopen { has_visible_windows, .. } = event {
+    app.run(|_app, _event| {
+        // Dock click with every window hidden must bring the UI back. macOS
+        // only: `RunEvent::Reopen` is the dock's own event and the variant does
+        // not exist in the Windows build of tauri, so referring to it at all is
+        // a compile error there. Windows has no dock — the tray icon is the way
+        // back, and that path is platform-independent.
+        #[cfg(target_os = "macos")]
+        if let RunEvent::Reopen { has_visible_windows, .. } = _event {
             if !has_visible_windows {
-                show_main(app);
+                show_main(_app);
             }
         }
     });

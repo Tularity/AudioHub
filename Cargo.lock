@@ -74,6 +74,7 @@ dependencies = [
  "objc2-foundation",
  "ringbuf",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

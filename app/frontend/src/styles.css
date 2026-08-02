@@ -115,7 +115,8 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  /* 上内边距让内容起点落在胶囊下方；滚动时内容从胶囊底下穿过去。 */
+  /* 上内边距让内容起点落在胶囊下方；滚动时内容从胶囊底下穿过去。
+     左下角那枚固定注脚（#conn-hint）已删，下内边距不必再为它多留 24px 避让。 */
   padding: calc(var(--chrome-h) + 20px) 28px 32px;
 }
 
@@ -241,26 +242,8 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   overflow: hidden; clip-path: inset(50%); white-space: nowrap;
 }
 
-/* 运行形态脚注：原来在侧栏底部，侧栏没了就落到左下角当一条安静的注脚。
-   它浮在可滚动内容之上，所以**必须自带底**——裸文字压在卡片上会两边都读不清，
-   这正是「按对比度下限设计，而不是按平均值」那条规矩要挡的情况。给一层很浅的
-   玻璃即可：尺寸小、饱和度不动，不会跟顶部胶囊抢注意力。
-   pointer-events:none —— 它永远不该吃掉指向内容的点击。 */
-#conn-hint {
-  position: fixed;
-  left: 20px; bottom: 14px;
-  z-index: 20;
-  padding: 4px 11px;
-  border-radius: var(--pill);
-  background: rgba(15, 17, 21, .72);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  border: 1px solid rgba(255, 255, 255, .06);
-  font-size: 11px; color: var(--text-dim);
-  pointer-events: none;
-  -webkit-user-select: none;
-  user-select: none;
-}
+/* 左下角的运行形态脚注（#conn-hint）已随 ConnFoot 一起删除（规格 §2.4、§5）：
+   它的四种连接状态与右上徽标逐一重合，端口在设置页。 */
 
 .view {
   display: flex; flex-direction: column; gap: 16px;
@@ -297,13 +280,26 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   -webkit-user-select: text;
   user-select: text;
 }
+/* 指纹与控制端口**悬停才展开**（plan §7.6 补充裁定）：平时右上角只有「● 在线」。
+   用 max-width 而不是 display:none 收起来，是为了让它保持在 DOM 与无障碍树里——
+   自动化与读屏仍读得到，只是不占视觉带宽。常驻落点在设置页「本机身份」。 */
+.badge-ident {
+  display: inline-flex; align-items: center; gap: 8px;
+  max-width: 0; opacity: 0; overflow: hidden; white-space: nowrap;
+  transition: max-width var(--dur) var(--ease-out), opacity var(--dur) var(--ease-out),
+    margin-left var(--dur) var(--ease-out);
+  margin-left: -8px; /* 抵消父级 gap，收起时不留空档 */
+}
+/* 只有 hover 一条路：徽标里没有任何可聚焦元素，写 :focus-within 是条死规则，而给
+   一枚纯状态徽标插一个 tab 停靠点只会让键盘序里多一个不可操作的空位。键盘 / 触摸屏
+   / 截图排障的落点是设置页的「本机身份」区块（plan §7.6 补充裁定就是这么安排的）。 */
+.daemon-badge:hover .badge-ident { max-width: 200px; opacity: 1; margin-left: 0; }
+
 /* 胶囊是相对窗口居中的，两侧元素**不能**把它挤走——只能自己让位。窗口最小宽度是
    860（tauri.macos.conf.json），那时胶囊占 222–638，徽标从 640 起，刚好擦过；
-   低于 900 就把指纹与端口收掉，只留状态点和字，给足余量。 */
+   低于 900 连悬停展开也不给，避免展开时把胶囊顶掉。 */
 @media (max-width: 900px) {
-  .daemon-badge .badge-sep,
-  .daemon-badge .badge-fp,
-  .daemon-badge .badge-port { display: none; }
+  .daemon-badge:hover .badge-ident { max-width: 0; opacity: 0; margin-left: -8px; }
 }
 
 .daemon-badge .badge-status { font-weight: 600; }
@@ -458,7 +454,20 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 /* ---- 主面板 ---- */
 
 .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+/* 汇总条现在会整条隐藏，而控件**不能**跟着从右边跳到左边：位置比信息更该稳定。
+   （统计页的工具条只剩一个分段选择器，同理靠右。） */
+.toolbar > .btn,
+.toolbar > .segmented { margin-left: auto; }
 .toolbar-note { font-size: 13px; color: var(--text-dim); }
+/* 汇总条只在异常时出现，所以它出现时就该有异常的颜色——否则和过去那条谁也不读的
+   「已配对 N 台」长得一样，等于白改。 */
+.toolbar-note.warn { color: var(--warn); }
+/* 正文里的行内跳转（模式描述的「了解更多」）：是链接的语义，按钮的可达性。 */
+.link-btn {
+  background: none; border: 0; padding: 0; margin-left: 6px;
+  color: var(--accent); font-size: inherit; font-family: inherit; cursor: pointer;
+}
+.link-btn:hover { text-decoration: underline; }
 
 .peer-grid {
   display: grid;
@@ -483,13 +492,181 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 
 .peer-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .peer-name { font-size: 15px; font-weight: 650; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.peer-fp { font-size: 11px; color: var(--text-dim); }
-.peer-meta { font-size: 12px; color: var(--text-dim); }
+/* 指纹**保留**（plan §7.6 裁定 2：配对校验场景有安全意义），但做克制呈现——
+   更小、更淡、常规字重，悬停才回到正常对比度。它在扫视时应当是背景，不是内容。 */
+.peer-fp {
+  font-size: 10px; font-weight: 400; color: var(--text-dim);
+  opacity: .5; letter-spacing: .02em; flex: none;
+  transition: opacity var(--dur) var(--ease-out);
+}
+.peer-card:hover .peer-fp { opacity: .85; }
+/* 整张卡片一直是 role="button"，却对视觉用户没有任何线索——这枚 `⟩` 就是那条线索。 */
+.peer-chev { color: var(--text-dim); opacity: .45; flex: none; transition: transform var(--dur) var(--ease-out), opacity var(--dur) var(--ease-out); }
+.peer-chev svg { width: 16px; height: 16px; }
+.peer-card:hover .peer-chev { opacity: .9; transform: translateX(2px); }
 
-/* 对端正在取用本机麦克风：隐私相关，卡片上必须显眼 */
+/* ---- 一级指标：延迟 / 音质（spec-telemetry-ia §2.2） ---- */
+
+/* min-height 是承重的：无会话时 ②③ 塌成一行，但**卡片高度必须不变**。否则一排卡片
+   里只有开了通路的那几张变高，扫一眼像排版坏了。88px = 有会话时的实测高度
+   （指标行 + 色带 + 数字行 + 两处 gap + 内边距 + 边框），两态因此严格等高。 */
+.peer-metrics {
+  display: flex; flex-direction: column; gap: 8px;
+  min-height: 88px;
+  padding: 10px 12px; border-radius: var(--radius-sm);
+  background: var(--bg-2); border: 1px solid var(--line);
+}
+.peer-metrics.idle { justify-content: center; }
+
+/* 不换行：一旦指标行折成两行，「两态等高」当场失效。窄卡片上让两格自己收缩、
+   等级文字省略号截断，而不是把行挤到下面去。 */
+/* gap 收到 10px（原 18）：在 1000×700 默认窗口的实际列宽（464px）下，18px 会把两个
+   等级词全部挤成省略号——而「可用于对话 / 良好」恰是这两个指标里唯一面向用户的那一半，
+   数字只是它的依据。留白让位给文案。 */
+.metric-line { display: flex; align-items: center; gap: 10px; overflow: hidden; }
+/* 指标格本身是按钮（点开就地展开明细）：按钮外观全部清掉，只留下光标与焦点环。 */
+.metric-cell {
+  display: flex; align-items: baseline; gap: 6px;
+  background: none; border: 0; padding: 0; margin: 0;
+  color: inherit; text-align: left; cursor: pointer;
+  flex: 1 1 auto; min-width: 0;
+}
+.metric-cap { font-size: 11px; color: var(--text-dim); letter-spacing: .06em; flex: none; white-space: nowrap; }
+/* 22px + tabular-nums：与统计页的 .tile-num / .metric-num 同级，数字跳动时不抖宽度。
+   nowrap 是必须的：「≥186 ms」中间那个空格在窄卡片上会断行，指标行一旦变成两行，
+   「有会话 / 无会话两态等高」当场失效。 */
+.metric-val {
+  font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.1;
+  white-space: nowrap; flex: none;
+}
+.metric-val.unknown { color: var(--text-dim); font-weight: 500; }
+.metric-val.tone-ok { color: var(--ok); }
+.metric-val.tone-accent { color: var(--accent); }
+.metric-val.tone-warn { color: var(--warn); }
+.metric-val.tone-danger { color: var(--danger); }
+.metric-grade {
+  font-size: 11.5px; color: var(--text-dim);
+  flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 「测量中…」占的是等级词的位置，但它不是一个等级——用斜体把它和「优/良好/一般/差」
+   在一眼之内分开，否则它读起来像第五档。 */
+.metric-grade.measuring { font-style: italic; opacity: .8; }
+/* 范围标记「未含对方主机」。用 warn 色而不是 dim：它是一句**警告**（你看到的不是
+   端到端），不是一句补充说明；夹在 22px 的数字旁边，dim 会被整个略过。 */
+.metric-scope {
+  font-size: 11px; color: var(--warn); flex: 0 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.metric-sep { font-size: 12px; color: var(--text-dim); opacity: .5; }
+.metric-idle { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.metric-idle .metric-val { font-size: 16px; }
+.metric-idle-text { font-size: 12px; color: var(--text-dim); }
+
+.metric-chev {
+  width: 0; height: 0; flex: none; align-self: center;
+  border-left: 4px solid currentColor;
+  border-top: 3.5px solid transparent; border-bottom: 3.5px solid transparent;
+  color: var(--text-dim); opacity: .55;
+  transition: transform var(--dur) var(--ease-out);
+}
+.metric-chev.open { transform: rotate(90deg); }
+
+/* 分段色带。四段的宽度由 flex-grow 承载，所以数字行用同一组 grow 值就能与色带对齐。
+   过渡 .4s 而不是逐帧动画：刷新沿用现有 1Hz 的 stats 事件，逐帧只会抖。 */
+.metric-band { display: flex; gap: 2px; height: 8px; }
+.band-seg {
+  border-radius: 2px; min-width: 2px;
+  flex-basis: 0; flex-shrink: 1;
+  transition: flex-grow .4s var(--ease-out);
+}
+.band-network { background: #6ea8fe; }
+.band-capture { background: var(--accent); }
+.band-buffer { background: var(--warn); }
+.band-playback { background: #b48ef0; }
+/* 读不到时四段等宽且几乎透明：那是「还没测到」的形状，不是「四段一样长」的结论。 */
+.metric-band[data-empty] .band-seg { background: #ffffff14; }
+
+.metric-segs { display: flex; gap: 8px; }
+/* flex-basis 取 auto 而不是 0：网络那一段常常只有 0.3 ms，按比例分宽度会把「网络 0.3」
+   这四个字整段挤没。宁可让数字与色带的对齐差几像素，也不能让一段读数消失——
+   它恰恰是「延迟不在网络上」这个结论的证据。 */
+.seg-item {
+  display: flex; align-items: baseline; gap: 4px;
+  flex-basis: auto; flex-shrink: 1; min-width: 0; overflow: hidden; white-space: nowrap;
+  transition: flex-grow .4s var(--ease-out);
+}
+.seg-name { font-size: 10.5px; color: var(--text-dim); }
+.seg-num { font-size: 11px; color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* 就地展开的逐级明细：排障时要边听边看数字变，跳页会打断这个循环。 */
+.metric-detail {
+  display: flex; flex-direction: column; gap: 2px;
+  border-top: 1px solid var(--line); padding-top: 8px;
+  animation: viewIn .18s ease-out;
+}
+/* 一级 = 两行：第一行 名称/主机/ms，第二行是可换行的事实标签。
+   改版前四条事实全挤在一个 nowrap + ellipsis 的 .stage-note 里，第一条说明就把整行
+   占满，饱和 / 丢弃量 / 漂移在实际渲染里从未被看见过——字段接上了但看不到，
+   与没接上是同一个结果。 */
+.stage-item { display: flex; flex-direction: column; gap: 2px; padding: 1px 0; }
+.stage-row { display: flex; align-items: baseline; gap: 8px; }
+.stage-facts { display: flex; flex-wrap: wrap; gap: 4px; padding-left: 2px; }
+/* 事实标签：短文字 + title 里的长解释。四条并排要能全看见，所以只做背景不做边框
+   （12 行 × 4 条边框在小尺寸下会糊成一片网格）。 */
+.stage-chip {
+  font-size: 10px; line-height: 1.6; color: var(--text-dim);
+  background: #ffffff0f; border-radius: 4px; padding: 0 5px;
+  font-variant-numeric: tabular-nums; cursor: help;
+}
+.stage-chip.warn { color: var(--warn); background: #e0a83f22; }
+.stage-name { font-size: 12px; }
+.stage-host {
+  font-size: 10px; color: var(--text-dim);
+  border: 1px solid var(--line-strong); border-radius: 999px; padding: 0 6px; flex: none;
+}
+.stage-note { font-size: 10.5px; color: var(--warn); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* margin-left:auto 在两种情形下都对：note 可见时它是 flex:1，自由空间被吃光，auto
+   解析为 0；note 被 hidden（display:none）时自由空间还在，auto 把数字推到右边。
+   写成 `.stage-note + .stage-ms { margin-left: 0 }` 反而会错——相邻选择器对
+   display:none 的兄弟照样命中。 */
+.stage-ms { font-size: 11.5px; margin-left: auto; flex: none; font-variant-numeric: tabular-nums; }
+.stage-ms.unknown { color: var(--text-dim); }
+.metric-foot { font-size: 10.5px; color: var(--text-dim); line-height: 1.5; margin-top: 4px; }
+
+/* 音质的「●●●○」：点数由等级定，空点保持在位，避免整行随质量变化左右抖。
+   空点画成**空心环**而不是灰实心——四颗灰实心点在小尺寸下读起来像「四颗都亮着」。 */
+.quality-dots { display: inline-flex; align-items: center; gap: 3px; flex: none; }
+.qdot { width: 7px; height: 7px; border-radius: 50%; background: none; box-shadow: inset 0 0 0 1px #ffffff2e; }
+.qdot.on { box-shadow: none; }
+.qdot.on.tone-ok { background: var(--ok); }
+.qdot.on.tone-accent { background: var(--accent); }
+.qdot.on.tone-warn { background: var(--warn); }
+.qdot.on.tone-danger { background: var(--danger); }
+/* 「还没测出来」的四颗点必须与「差」的一颗点分得开。等级不成立时点数是 0，而
+   「四颗空心」和「一颗亮 + 三颗空心」在 7px 尺寸下几乎是同一个形状——用户于是把
+   「不知道」读成「测出来很差」。呼吸动画给它一个「在进行」的读感；
+   prefers-reduced-motion 下动画被全局关掉，靠 opacity 仍然静态可辨。 */
+.quality-dots[data-state='measuring'] .qdot {
+  opacity: .45;
+  animation: qdot-breathe 1.6s ease-in-out infinite;
+}
+.quality-dots[data-state='measuring'] .qdot:nth-child(2) { animation-delay: .2s; }
+.quality-dots[data-state='measuring'] .qdot:nth-child(3) { animation-delay: .4s; }
+.quality-dots[data-state='measuring'] .qdot:nth-child(4) { animation-delay: .6s; }
+@keyframes qdot-breathe {
+  0%, 100% { opacity: .25; }
+  50% { opacity: .8; }
+}
+
+/* 从每张卡片上收拢来的常驻脚注：整份列表只说一次。 */
+.peer-list-foot { display: flex; flex-direction: column; gap: 4px; padding: 0 4px; }
+.foot-line { font-size: 11px; color: var(--text-dim); line-height: 1.55; }
+
+/* 对端正在取用本机麦克风：隐私相关，卡片上必须显眼。字号从 12 提到 13——它现在
+   紧贴指标区，是这张卡上唯一不该被略过的一行。 */
 .peer-inbound {
   display: flex; align-items: center; gap: 8px;
-  font-size: 12px; color: var(--warn);
+  font-size: 13px; color: var(--warn);
   background: #e0a83f12; border: 1px solid #e0a83f33;
   border-radius: var(--radius-sm); padding: 6px 10px;
 }
@@ -521,11 +698,17 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 .toggle-row .ico { color: var(--text-dim); }
 .toggle-label { flex: 1; font-size: 13px; }
 
+/* 收 / 发并成一行（规格 §2.3 ⑤）：省 20px，而且左右并置比上下堆叠更容易做对比。
+   窄卡片上仍会自动折回两行——不为并行牺牲可读性。 */
 .peer-streams {
-  display: flex; flex-direction: column; gap: 8px;
+  display: flex; flex-wrap: wrap; gap: 8px 16px;
   border-top: 1px solid var(--line); padding-top: 12px;
 }
-.stream { display: flex; align-items: center; gap: 10px; opacity: .45; transition: opacity .2s ease-out; }
+.stream {
+  display: flex; align-items: center; gap: 10px; opacity: .45;
+  flex: 1 1 140px; min-width: 0;
+  transition: opacity .2s ease-out;
+}
 .stream.active { opacity: 1; }
 .stream-label { font-size: 11px; color: var(--text-dim); width: 32px; flex: none; }
 .stream-rate { font-size: 11px; color: var(--text-dim); width: 72px; text-align: right; flex: none; font-variant-numeric: tabular-nums; }
@@ -559,6 +742,34 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   text-align: right; flex: none; font-variant-numeric: tabular-nums;
 }
 .vol-note { font-size: 11px; color: var(--warn); }
+
+/* ---- 共享来源 + 捕获后端（plan §7.1 模式 A 的 spk 方向 / §6 多后端） ---- */
+
+.share-box {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 10px;
+  background: var(--bg-2); border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  transition: border-color .15s ease-out;
+}
+/* 一个可用后端都没有：压暗，但说明文字反而要更醒目——它是唯一的出路 */
+.share-box.unavailable { border-style: dashed; }
+.share-box.unavailable .share-label { color: var(--text-dim); }
+.share-box.unavailable .share-note { color: var(--warn); }
+.share-row { display: flex; align-items: center; gap: 10px; cursor: default; }
+.share-row .ico { color: var(--text-dim); }
+/* 二级行（捕获后端）缩进对齐一级图标之后，读起来就是「属于上面那一条」 */
+.share-row.sub { padding-left: 26px; }
+.share-label { flex: 1; font-size: 13px; }
+.share-note { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
+.share-perm {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; line-height: 1.5; color: var(--text-dim);
+}
+.share-perm .ico { color: var(--warn); flex: none; }
+.share-perm .ico svg { width: 13px; height: 13px; }
+.share-perm-text { flex: 1; }
+.share-fault { font-size: 11px; color: var(--warn); line-height: 1.5; }
 
 /* ---- 虚拟声卡桥接（spec-m4c §B / plan §7.1） ---- */
 
@@ -900,11 +1111,8 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   background: var(--bg-2); border: 1px solid var(--line);
   animation: viewIn .18s ease-out;
 }
-.dev-head {
-  display: flex; align-items: center; gap: 8px;
-  font-size: 11px; color: var(--text-dim); letter-spacing: .06em;
-}
-.dev-head .ico { color: var(--accent); }
+/* `.dev-head`（「系统设备」标题行）已随 DOM 一起删除：两行带 🔊/🎤 图标的设备名
+   本来就自明，标题只是又一个不承载信息的方框。 */
 .dev-list { display: flex; flex-direction: column; gap: 8px; }
 .dev-row {
   display: flex; align-items: center; gap: 10px;
@@ -925,13 +1133,11 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 .dev-state.pending { color: var(--warn); }
 .dev-note { font-size: 11.5px; color: var(--text-dim); line-height: 1.55; }
 .dev-note.warn { color: var(--warn); }
-.dev-foot { font-size: 11px; color: var(--text-dim); line-height: 1.55; border-top: 1px solid var(--line); padding-top: 8px; }
+/* 原 `.dev-foot`（每张卡片各印一遍的长脚注）已随 DOM 一起删除：那句话现在只在
+   卡片列表底部出现一次，样式见 `.peer-list-foot / .foot-line`。 */
 
-.peer-alias {
-  font-size: 10.5px; color: var(--accent);
-  background: #31c8b014; border: 1px solid #31c8b033;
-  border-radius: 999px; padding: 1px 8px; flex: none;
-}
+/* `.peer-alias`（别名徽章）已随 DOM 一起删除：原主机名走卡片标题的 title，
+   详情页另有一张 AliasCard。 */
 
 /* 设置页设备清单 */
 .dev-inventory-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
@@ -1027,6 +1233,41 @@ canvas.spark { width: 160px; height: 36px; display: block; }
   border-top: 1px solid var(--line); padding-top: 12px;
   font-variant-numeric: tabular-nums;
 }
+
+/* ---- 延迟构成瀑布（spec-telemetry-ia §2.5） ---- */
+
+/* 每通路一条 stacked bar，横轴 ms。卡片给「现在多少」，这里给「大头一直在哪一段」。 */
+.waterfall { display: flex; flex-direction: column; gap: 8px; }
+.wf-row { display: flex; align-items: center; gap: 12px; }
+.wf-label {
+  font-size: 12px; color: var(--text-dim);
+  width: 240px; flex: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wf-bar {
+  flex: 1; min-width: 0; height: 12px; display: flex; gap: 2px;
+  border-radius: 3px; background: #ffffff08;
+}
+.wf-seg { flex-basis: 0; border-radius: 2px; transition: flex-grow .4s var(--ease-out); }
+.wf-network { background: #6ea8fe; }
+.wf-capture { background: var(--accent); }
+.wf-buffer { background: var(--warn); }
+.wf-playback { background: #b48ef0; }
+.wf-residual { background: #5a6372; }
+/* 分项全未知：**不画任何比例**——随手给一组比例等于宣称测到了它们。 */
+.wf-bar[data-empty] .wf-seg { flex-grow: 0; }
+.wf-total { font-size: 12px; color: var(--text-dim); width: 76px; text-align: right; flex: none; font-variant-numeric: tabular-nums; }
+
+/* ---- 按对端聚合（spec-telemetry-ia §2.5） ---- */
+
+.peer-group { display: flex; flex-direction: column; gap: 10px; }
+.peer-group-head {
+  display: flex; align-items: center; gap: 10px;
+  background: none; border: 0; padding: 0 4px; margin: 0;
+  color: inherit; text-align: left; cursor: pointer;
+}
+.peer-group-name { font-size: 14px; }
+.peer-group-count { font-size: 12px; color: var(--text-dim); }
+.peer-group-body { display: flex; flex-direction: column; gap: 12px; }
 
 /* ---- 首启授权门 ---- */
 

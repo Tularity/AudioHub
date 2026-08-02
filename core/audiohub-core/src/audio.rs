@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -859,20 +859,102 @@ pub struct AudioTx {
     prod: HeapProd<f32>,
     resampler: Option<Resampler>,
     staging: Vec<f32>,
+    /// 环的容量与消费者速率，都是**设备**速率。播放环的 cap 恰好 = dev_rate
+    /// = 1.000 秒，所以拿 48000 硬算 44.1k 设备会把 1 秒报成 918 ms
+    /// （规格 §3.5 点名的 −8.8% 偏差）。
+    dev_rate: u32,
+    /// 写不进去而被丢掉的样本数（累计）。
+    ///
+    /// 这里的丢弃方向是 **`DropMode::Newest`**：`push_slice` 满了就短写，
+    /// 新采样根本没进环。深度读数与「丢最旧」的源侧 FIFO 完全简并，听感却是
+    /// 「迟到 + 周期性断续」而不是「恒定迟到但连续」（规格 §0.2）。
+    ///
+    /// 在此之前这里是全链路唯一**完全无遥测**的丢弃点：`let _ = push_slice(..)`
+    /// 静默丢尾、零计数、零日志。丢弃**行为本身没有任何改变**，只是现在数得出来。
+    dropped: Arc<AtomicU64>,
 }
 
 impl AudioTx {
     pub fn push(&mut self, mono_samples: &[f32]) {
         match self.resampler.as_mut() {
             None => {
-                let _ = self.prod.push_slice(mono_samples);
+                let wrote = self.prod.push_slice(mono_samples);
+                self.note_short_write(mono_samples.len(), wrote);
             }
             Some(rs) => {
                 self.staging.clear();
                 rs.process(mono_samples, &mut self.staging);
-                let _ = self.prod.push_slice(&self.staging);
+                let wrote = self.prod.push_slice(&self.staging);
+                self.note_short_write(self.staging.len(), wrote);
             }
         }
+    }
+
+    fn note_short_write(&self, wanted: usize, wrote: usize) {
+        if wrote < wanted {
+            self.dropped
+                .fetch_add((wanted - wrote) as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// 此刻环里排队等着送进声卡的样本数（规格 §3.2 的级 8 `play_ring`）。
+    /// 整数样本计数，单机单时钟内读取，**无任何估计成分**。
+    pub fn queued(&self) -> u32 {
+        self.prod.occupied_len() as u32
+    }
+
+    /// 环容量（样本）。播放环恰好 = 1 秒设备速率。
+    pub fn capacity(&self) -> u32 {
+        self.prod.capacity().get() as u32
+    }
+
+    /// 消费者（声卡）的标称速率。换算 ms 必须用它，不能用 48000。
+    pub fn dev_rate(&self) -> u32 {
+        self.dev_rate
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// **测试用**：不开设备，造一个与 `LivePlayback::on_device` 同构的播放环
+    /// （同一个 `HeapRb`、同样 = `dev_rate` 的 1 秒容量、同一个短写丢弃计数），
+    /// 外加一个替代声卡回调的消费端。
+    ///
+    /// `#[doc(hidden)] pub` 而不是 `#[cfg(test)]`：`publish_play_ring` 在
+    /// **另一个 crate**（audiohubd），`cfg(test)` 只对本 crate 自己的测试生效，
+    /// 到不了那里。没有这个口子，「播放环那一级的速率/深度/丢弃到底接对没有」
+    /// 就只能靠断言手写字面量——那正是这套遥测要消灭的失败形态。
+    #[doc(hidden)]
+    pub fn detached_for_test(dev_rate: u32) -> (AudioTx, PlayRingSink) {
+        // 与 `on_device` 逐字相同的一行：>= 500ms required; use 1s of device-rate samples
+        let rb = HeapRb::<f32>::new(dev_rate.max(8000) as usize);
+        let (prod, cons) = rb.split();
+        (
+            AudioTx {
+                prod,
+                resampler: None,
+                staging: Vec::new(),
+                dev_rate,
+                dropped: Arc::new(AtomicU64::new(0)),
+            },
+            PlayRingSink { cons },
+        )
+    }
+}
+
+/// 测试用的播放环消费端，站在声卡输出回调的位置上。见
+/// [`AudioTx::detached_for_test`]。
+#[doc(hidden)]
+pub struct PlayRingSink {
+    cons: HeapCons<f32>,
+}
+
+impl PlayRingSink {
+    /// 像输出回调那样取走最多 `n` 个样本，返回真正取到的数量。
+    pub fn drain(&mut self, n: usize) -> usize {
+        let mut buf = vec![0.0f32; n];
+        self.cons.pop_slice(&mut buf)
     }
 }
 
@@ -953,6 +1035,8 @@ impl LivePlayback {
                 prod,
                 resampler,
                 staging: Vec::new(),
+                dev_rate,
+                dropped: Arc::new(AtomicU64::new(0)),
             },
         ))
     }
@@ -965,6 +1049,16 @@ pub struct LiveCapture {
 
 pub struct AudioRx {
     cons: HeapCons<f32>,
+    /// 采集设备的速率。环是 `rate * 2`（2 秒），换算必须用它。
+    rate: u32,
+    /// 采集回调写不进去而丢掉的样本数（累计）。方向同样是
+    /// **`DropMode::Newest`**（`push_slice` 短写）。
+    ///
+    /// 规格 §0.4：`pop` 每次调用**全量排空**，所以这个环的稳态驻留只有一个
+    /// tick 加回调突发（10–20 ms 量级），**不是延迟嫌疑**。但它溢出时丢的是
+    /// 真实音频，那是**音质**指标的输入——所以计数必须有，只是不该被当成
+    /// 延迟证据。丢弃行为本身未改。
+    dropped: Arc<AtomicU64>,
 }
 
 impl AudioRx {
@@ -978,6 +1072,62 @@ impl AudioRx {
         let got = self.cons.pop_slice(&mut out[start..]);
         out.truncate(start + got);
         got
+    }
+
+    /// 此刻环里积压的样本数（规格 §3.2 的级 1 `cap_ring`）。
+    pub fn queued(&self) -> u32 {
+        self.cons.occupied_len() as u32
+    }
+
+    /// 环容量（样本）。注意是 **2 秒**，不是 1 秒（规格 §0.4 的修正四）。
+    pub fn capacity(&self) -> u32 {
+        self.cons.capacity().get() as u32
+    }
+
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// **测试用**：不开设备，造一个与 `LiveCapture::on_device` 同构的 **2 秒**
+    /// 采集环（规格 §0.4 的修正四：这个环是 2 秒不是 1 秒），外加一个替代采集
+    /// 回调的写入端。
+    ///
+    /// `#[doc(hidden)] pub` 而不是 `#[cfg(test)]`：`MicSource` 在另一个 crate
+    /// （audiohub-net），`cfg(test)` 到不了那里。
+    #[doc(hidden)]
+    pub fn detached_for_test(rate: u32) -> (AudioRx, CaptureFeed) {
+        let rb = HeapRb::<f32>::new((rate as usize) * 2); // 2s，与 on_device 同一行
+        let (prod, cons) = rb.split();
+        let dropped = Arc::new(AtomicU64::new(0));
+        (
+            AudioRx { cons, rate, dropped: Arc::clone(&dropped) },
+            CaptureFeed { prod, dropped },
+        )
+    }
+}
+
+/// 测试用的采集环写入端，站在 cpal 采集回调的位置上。见
+/// [`AudioRx::detached_for_test`]。
+#[doc(hidden)]
+pub struct CaptureFeed {
+    prod: HeapProd<f32>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl CaptureFeed {
+    /// 与采集回调最后那两行**逐字相同**的写入语义：环满就短写，丢的是**新**
+    /// 样本（`DropMode::Newest`），并把短掉的数量记进同一个计数器。
+    pub fn write(&mut self, mono: &[f32]) -> usize {
+        let wrote = self.prod.push_slice(mono);
+        if wrote < mono.len() {
+            self.dropped
+                .fetch_add((mono.len() - wrote) as u64, Ordering::Relaxed);
+        }
+        wrote
     }
 }
 
@@ -1030,6 +1180,11 @@ impl LiveCapture {
         let rb = HeapRb::<f32>::new((rate as usize) * 2); // 2s
         let (mut prod, cons) = rb.split();
 
+        // 采集回调与 AudioRx 各持一份：回调是唯一的写入方，AudioRx 是唯一的
+        // 读取方。回调里只有一次 `fetch_add`，且仅在真的短写时才执行。
+        let dropped = Arc::new(AtomicU64::new(0));
+        let cb_dropped = Arc::clone(&dropped);
+
         let health = StreamHealth::new();
         let mut mono: Vec<f32> = Vec::new();
         let stream = match supported.sample_format() {
@@ -1041,7 +1196,10 @@ impl LiveCapture {
                         let sum: f32 = frame.iter().map(|&v| v as f32 / 32768.0).sum();
                         mono.push(sum / channels as f32);
                     }
-                    let _ = prod.push_slice(&mono);
+                    let wrote = prod.push_slice(&mono);
+                    if wrote < mono.len() {
+                        cb_dropped.fetch_add((mono.len() - wrote) as u64, Ordering::Relaxed);
+                    }
                 },
                 err_sink(Arc::clone(&health), "input"),
                 None,
@@ -1054,14 +1212,21 @@ impl LiveCapture {
                         let sum: f32 = frame.iter().sum();
                         mono.push(sum / channels as f32);
                     }
-                    let _ = prod.push_slice(&mono);
+                    let wrote = prod.push_slice(&mono);
+                    if wrote < mono.len() {
+                        cb_dropped.fetch_add((mono.len() - wrote) as u64, Ordering::Relaxed);
+                    }
                 },
                 err_sink(Arc::clone(&health), "input"),
                 None,
             )?,
         };
         stream.play()?;
-        Ok((LiveCapture { _stream: stream, health }, AudioRx { cons }, rate))
+        Ok((
+            LiveCapture { _stream: stream, health },
+            AudioRx { cons, rate, dropped },
+            rate,
+        ))
     }
 }
 

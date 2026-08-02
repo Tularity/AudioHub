@@ -22,6 +22,7 @@ import type {
 } from '../ipc/types';
 import type { EndpointSource } from '../ipc/endpoint';
 import type { PermissionState } from './permissions';
+import { readLatency, readQuality } from '../lib/metrics';
 
 const SETTINGS_KEY = 'audiohub.ui.settings';
 
@@ -48,6 +49,10 @@ export interface MetricHistory {
   jitter: number[];
   bitrate: number[];
   rung: number[];
+  /** 系统链路延迟 ms（规格 §2.5）。S1 恒无数据 ⇒ 数组保持空，折线不画。 */
+  latency: number[];
+  /** 完整度 %（100 − 加权隐藏率）。同上。 */
+  intact: number[];
 }
 
 export interface AddrSeen { addr: string; seenAt: number }
@@ -81,6 +86,18 @@ export interface AppState {
   discover: { running: boolean; results: DiscoverResult[] };
   monitorPref: Record<string, boolean>;
   bridgePref: Record<string, string>;
+  /** 模式 A「送对方扬声器」的共享来源（'sysaudio' | 'mic'），按对端记。 */
+  spkSourcePref: Record<string, string>;
+  /** 同上的系统音频捕获后端 id，'' / 'auto' = 交给 daemon 自动选。 */
+  spkBackendPref: Record<string, string>;
+  /**
+   * 上一次 spk 会话开启失败的原因（daemon 原话）。
+   *
+   * 存进 store 而不是只弹一条 toast：系统音频捕获在某台机器上不可用时，toast 三秒
+   * 就没了，用户看到的只是一个自己弹回去的开关——那正是 plan §6 不许出现的「静默
+   * 失败」。这条文字必须留在控件上，直到下一次开启成功或用户换了来源。
+   */
+  spkFault: Record<string, string>;
   permissions: PermissionsSlice;
   settings: LocalSettings;
   daemonSettings: DaemonSettings | null;
@@ -118,6 +135,9 @@ const initial: AppState = {
   discover: { running: false, results: [] },
   monitorPref: {},
   bridgePref: {},
+  spkSourcePref: {},
+  spkBackendPref: {},
+  spkFault: {},
   // 系统权限。**全部只活在内存里**：授权门要在每次启动时重新探测，落盘任何
   // 「已看过」标记都会在用户撤销授权后把门永久藏起来。
   permissions: {
@@ -148,6 +168,15 @@ function num(v: unknown): number {
   return typeof v === 'number' && isFinite(v) ? v : 0;
 }
 
+/**
+ * 只在真的有读数时才追加一点。延迟 / 完整度**不能**像丢包率那样把缺失记成 0：
+ * 0 ms 延迟是一个具体且极好的读数，而「读不到」是没有读数——两者画在同一条折线上
+ * 无法分辨（规格 §3.3 的红线：绝不用 0 填补缺失分项）。缺失时序列原地不动。
+ */
+function pushMaybe(arr: number[], v: number | undefined): number[] {
+  return typeof v === 'number' && isFinite(v) ? push60(arr, v) : arr;
+}
+
 function persist(settings: LocalSettings): void {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* ignore */ }
 }
@@ -160,7 +189,7 @@ export const actions = {
       // 按指纹存的旁路状态跟着对端一起消失。不清就是无限增长，而且同一指纹重新
       // 配对时，上一次的桥接目标/监听开关会悄悄套回去。只在拿到权威列表（真的是
       // 一个数组）时修剪：peers.list 回来一坨垃圾不该顺手把用户偏好抹掉。
-      let { monitorPref, bridgePref, addrHistory } = s;
+      let { monitorPref, bridgePref, spkSourcePref, spkBackendPref, spkFault, addrHistory } = s;
       if (authoritative) {
         const alive = new Set(peers.map((p) => p && p.fingerprint).filter(Boolean));
         const prune = <T,>(map: Record<string, T>): Record<string, T> => {
@@ -172,6 +201,9 @@ export const actions = {
         };
         monitorPref = prune(monitorPref);
         bridgePref = prune(bridgePref);
+        spkSourcePref = prune(spkSourcePref);
+        spkBackendPref = prune(spkBackendPref);
+        spkFault = prune(spkFault);
         addrHistory = prune(addrHistory);
       }
       const nextAddr: Record<string, AddrSeen[]> = { ...addrHistory };
@@ -183,7 +215,10 @@ export const actions = {
         else arr.push({ addr: p.last_addr, seenAt: Date.now() });
         nextAddr[p.fingerprint] = arr;
       }
-      return { peers, monitorPref, bridgePref, addrHistory: nextAddr };
+      return {
+        peers, monitorPref, bridgePref, spkSourcePref, spkBackendPref, spkFault,
+        addrHistory: nextAddr,
+      };
     });
   },
 
@@ -213,13 +248,18 @@ export const actions = {
       const history: Record<string, MetricHistory> = {};
       for (const info of sessions) {
         const key = String(info.id);
-        const prev = s.history[key] || { loss: [], jitter: [], bitrate: [], rung: [] };
+        const prev = s.history[key]
+          || { loss: [], jitter: [], bitrate: [], rung: [], latency: [], intact: [] };
         const st = info.stats || {};
+        const q = readQuality(info);
+        const conceal = q && typeof q.concealPct === 'number' ? q.concealPct : undefined;
         history[key] = {
           loss: push60(prev.loss, num(st.loss_pct)),
           jitter: push60(prev.jitter, num(st.jitter_ms)),
           bitrate: push60(prev.bitrate, num(st.bitrate_kbps)),
           rung: push60(prev.rung, num(st.rung)),
+          latency: pushMaybe(prev.latency, readLatency(info)?.totalMs),
+          intact: pushMaybe(prev.intact, conceal == null ? undefined : 100 - conceal),
         };
       }
       return { sessions, history };
@@ -293,6 +333,27 @@ export const actions = {
 
   setBridgePref(fp: string, value: string): void {
     setState((s) => ({ bridgePref: { ...s.bridgePref, [fp]: value } }));
+  },
+
+  setSpkSourcePref(fp: string, value: string): void {
+    setState((s) => ({ spkSourcePref: { ...s.spkSourcePref, [fp]: value } }));
+  },
+
+  setSpkBackendPref(fp: string, value: string): void {
+    setState((s) => ({ spkBackendPref: { ...s.spkBackendPref, [fp]: value } }));
+  },
+
+  /** reason 传 null = 清除（开启成功、或用户换了来源重试）。 */
+  setSpkFault(fp: string, reason: string | null): void {
+    setState((s) => {
+      if (!reason) {
+        if (!(fp in s.spkFault)) return {};
+        const next = { ...s.spkFault };
+        delete next[fp];
+        return { spkFault: next };
+      }
+      return { spkFault: { ...s.spkFault, [fp]: reason } };
+    });
   },
 
   setPairing(p: PairingState | null): void {

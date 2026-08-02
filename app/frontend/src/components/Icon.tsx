@@ -23,6 +23,7 @@ const ICONS = {
   settings: '<path d="M5 7h14"/><circle cx="9" cy="7" r="2"/><path d="M5 17h14"/><circle cx="15" cy="17" r="2"/>',
   wave: '<path d="M3 12h2l2-5 3 10 3-14 3 12 2-3h3"/>',
   back: '<path d="M15 5l-7 7 7 7"/>',
+  chev: '<path d="M9 5l7 7-7 7"/>',
   copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
   close: '<path d="M6 6l12 12M18 6L6 18"/>',
   scan: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 12l6.4-6.4"/>',

@@ -16,6 +16,8 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
+use audiohub_core::latency::{DevLatency, DropMode};
+
 use crate::control::{read_frame, write_frame, ControlMsg, CONTROL_MAX_FRAME};
 use crate::identity::{verify_sig, LocalIdentity, PairedPeer};
 
@@ -39,6 +41,45 @@ pub fn decode_media_salt(media_salt_b64: &str) -> Result<[u8; MEDIA_SALT_LEN]> {
     let raw = b64d(media_salt_b64).context("media_salt_b64")?;
     raw.try_into()
         .map_err(|_| anyhow!("media_salt_b64 must decode to {MEDIA_SALT_LEN} bytes"))
+}
+
+/// 对端管线上**一级**缓冲的瞬时读数（`StageReport` 的载荷单元，规格 §3.5）。
+///
+/// 与 IPC 的 `PipelineStage` 是两个类型，故意的：`audiohub-ipc` 依赖本 crate，
+/// 反向依赖不成立；而且这两层要回答的问题不同——IPC 那层是「给 UI 看什么」，
+/// 这一层是「给对端**足够重算一遍**的原始量」。
+///
+/// ## 为什么线上没有 `ms`
+///
+/// `ms = samples * 1000 / rate` 由**接收方**自己算，不收对端算好的数。
+/// 规则只有一条真值：`rate == 0` ⇒ 这一级读不到 ⇒ `None`（绝不当 0）。若把 `ms`
+/// 放上线，一个 `{rate: 0, ms: 0.0}` 的报文就能把「测不到」伪装成「没有延迟」，
+/// 而那正是整套遥测明令禁止的 0 填补。少一个字段就少一个说谎面。
+///
+/// `drop_mode` **没有** serde default：缺了它整条 `StageReport` 反序列化失败、
+/// 被 `recv_timeout` 跳过、`confidence` 停在 `LocalOnly`——这是安全的方向。
+/// 规格 §0.2 已证明四个 1 秒 FIFO 饱和时的深度读数完全简并，只能靠这个标签区分，
+/// 给它编一个默认值等于替对端瞎猜听感。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageReading {
+    /// 稳定级 id（`audiohub_core::latency::StageId::as_str()` 的取值）。
+    /// 收到本版本不认识的 id 是**正常的**（对端更新）：照样展示、照样按串联
+    /// 计入总数，保守方向。
+    pub id: String,
+    pub samples: u32,
+    /// 该级容量；0 = 无界 / 不适用。
+    #[serde(default)]
+    pub capacity: u32,
+    /// 该级**消费者**的标称速率(Hz)。`0` = 这一级读不到。
+    pub rate: u32,
+    /// 会话累计丢弃样本数。`None` = 对端观测不到这一级的丢弃，**不是没丢过**。
+    #[serde(default)]
+    pub dropped: Option<u64>,
+    pub drop_mode: DropMode,
+    #[serde(default)]
+    pub saturated: bool,
+    #[serde(default)]
+    pub drift_sps: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,8 +162,70 @@ pub enum SessionMsg {
     Ping {
         t_us: u64,
     },
+    /// `t_us` 原样回抄发起方的 `Ping.t_us`（**发起方时基**，只被发起方读）。
+    ///
+    /// `peer_t_us` 是**应答方自己**收到那条 Ping 的时刻（应答方时基）。有了它，
+    /// 发起方就能按 NTP 的四时戳法估时钟偏移（规格 §3.3 P1）：
+    ///
+    /// ```text
+    /// t1 = 发起方发出 Ping        (发起方时基)
+    /// t2 = 应答方收到 Ping        (应答方时基)  ← 就是这个字段
+    /// t4 = 发起方收到 Pong        (发起方时基)
+    /// θ  = (t1 + t4)/2 − t2       「把对端时戳 + θ 就换算成本机时基」
+    /// ```
+    ///
+    /// 这里省掉了 NTP 的 t3（应答方发出 Pong 的时刻）：`Ping` 在读取线程里被
+    /// 同步应答，t3 − t2 是几微秒，而下面的 min-RTT 滤波本来就靠挑最干净的那个
+    /// 样本把这一项吃掉。多一个字段换不来精度，只多一处可以说谎的地方。
+    ///
+    /// ## 为什么是 `Option<u64>` 而不是规格草案写的 `#[serde(default)] u64`
+    ///
+    /// `u64` 的默认值是 **0**，与「对端真的报了 0」逐位相同。P1 之前的对端不发
+    /// 这个字段，于是 θ 会被算成 (t1+t4)/2，一个纯粹的垃圾值——而它长得完全像
+    /// 个正常读数。这正是全规格反复禁止的 0 填补。`None` 让「没有这个字段」在
+    /// 类型上就无法被当成一个测量值。
     Pong {
         t_us: u64,
+        #[serde(default)]
+        peer_t_us: Option<u64>,
+    },
+    /// 双向：把**本侧**这条流的逐级缓冲读数回传给对端（P0b，规格 §3.3）。
+    ///
+    /// 没有它，任何一端都只知道自己这一半：`sum_ms` 无从合成，`confidence` 只能
+    /// 停在 `LocalOnly`。本次故障（mac→win 端到端约 1 秒，发送侧只解释了约
+    /// 188 ms）缺的正是对端那一半。
+    ///
+    /// ## 按流，一条流一份，**永不合并**（规格 §7.2 R8）
+    ///
+    /// 扇出时一个源被 N 条流引用，物理队列只有一份，于是 N 条流报的
+    /// `src_fifo` 是**同一个数**——这是正确的物理事实。由此得出的硬约束是：
+    /// 分项只能按流合成，跨流求和会得到 N 倍假延迟。`stream_id` 在这里不是
+    /// 路由细节，是那条约束的载体：收方按它落到**那一条**会话的格子里。
+    ///
+    /// ## 新增变体不需要升协议版本
+    ///
+    /// 老对端认证通过、反序列化失败，于是被 `recv_timeout` 跳过并计入
+    /// `bad_session_msgs`，连接照常存活（见本文件 `Unpaired` 上那段说明与
+    /// `recv_timeout` 的实现）。它只是永远停在 `LocalOnly`，不掉线。
+    StageReport {
+        stream_id: u32,
+        /// 发送方本侧各级，按数据流顺序。空列表 = 这条流本侧一级都读不到。
+        stages: Vec<StageReading>,
+        /// 发送方自己算的本侧 Σ。**收方不拿它当权威**——收方用同一份 `stages`
+        /// 按自己的规则重算（并行尾级取 max、`rate==0` 判缺项），只把这个值当
+        /// 交叉校验：两端求和口径若分了岔，这里会对不上。
+        #[serde(default)]
+        local_ms: Option<f64>,
+        /// 发送方声卡固有延迟。P0 恒为 `Unavailable`（平台查询是 P1 的活）。
+        #[serde(default)]
+        dev: Option<DevLatency>,
+        /// 采样时刻，**发送方时基**（µs since its daemon start）。
+        ///
+        /// ⚠ 只允许与**同一个发送方**的其它 `seq_us` 比较（去重、判乱序）。
+        /// 拿它和本机的时钟相减是跨时基运算，得到的是两个 daemon 启动时刻之差
+        /// ——一个长得很像「年龄」的垃圾数。读数年龄一律用**本机**收到它的
+        /// `Instant` 量（见 `PeerLatCell`）。
+        seq_us: u64,
     },
     /// "I have unpaired from you." Sent immediately before `Bye` when the local
     /// user removes a pairing while the channel is up (plan §7.1, ruled in
@@ -131,9 +234,20 @@ pub enum SessionMsg {
     /// The refusal at the next verify (`ControlMsg::Unpaired`) covers the peer
     /// that dials US; this covers the peer that never does, which would
     /// otherwise never find out and would keep a pair of virtual devices in our
-    /// name in its system list forever. A peer that predates this variant fails
-    /// to parse it and drops the channel — the same thing the `Bye` a
-    /// microsecond later would have done.
+    /// name in its system list forever.
+    ///
+    /// 老版本对端**不会**因为这个变体断连：它认证通过、反序列化失败，于是被
+    /// `recv_timeout` 跳过并计入 `bad_session_msgs`，连接照常存活（见本文件
+    /// `recv_timeout` 里 `Ok(sm) => ... , Err(_) => { bad_session_msgs += 1; continue }`
+    /// 那一段）。它只是不知道自己被解除配对了，随后那条 `Bye` 才关掉通道。
+    ///
+    /// 这条实现给出的兼容性保证，值得写死在这里：**往 `SessionMsg` 里新增变体
+    /// 不需要升协议版本**。老对端遇到不认识的变体会跳过它继续跑，不会掉线、
+    /// 不会把整条控制通道判死；只有解密失败和分帧错误才允许拆连接。所有
+    /// 「新增遥测消息可以单端先上线、混合版本自动降级」的结论都押在这一点上。
+    ///
+    /// （此处原有注释写的是「老对端解析失败会丢弃通道」，与实现相反。若将来
+    /// 有人照那句话把行为改回断连，上面这条保证会静默失效。）
     Unpaired {},
     Bye {},
 }
@@ -504,6 +618,148 @@ impl SecureChannel {
 
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+}
+
+#[cfg(test)]
+mod wire_compat_tests {
+    use super::*;
+
+    /// `SessionMsg` 在 P0b / P1 之前的形状。整套「新增变体 / 新增字段不必升协议
+    /// 版本」的结论就押在这个类型上——所以它必须真的存在于测试里，而不是活在
+    /// 注释里。
+    ///
+    /// 只列到这次改动碰过的两个变体（`Pong` 与「没有 `StageReport`」），其余
+    /// 变体在 `control.rs` 的同名测试里已有同构覆盖。
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum LegacySessionMsg {
+        Ping { t_us: u64 },
+        /// 老版本的 `Pong`：只有 `t_us`。
+        Pong { t_us: u64 },
+        Bye {},
+    }
+
+    fn reading() -> StageReading {
+        StageReading {
+            id: "src_fifo".into(),
+            samples: 48_000,
+            capacity: 48_000,
+            rate: 48_000,
+            dropped: Some(7),
+            drop_mode: DropMode::Oldest,
+            saturated: true,
+            drift_sps: Some(0.0),
+        }
+    }
+
+    /// **老对端收到新 `Pong`**：多出来的 `peer_t_us` 被 serde 忽略，照常解析。
+    /// 若谁给 `SessionMsg` 加了 `deny_unknown_fields`，这条会立刻变红。
+    #[test]
+    fn a_peer_that_predates_peer_t_us_still_parses_our_pong() {
+        let json = serde_json::to_string(&SessionMsg::Pong {
+            t_us: 123,
+            peer_t_us: Some(456),
+        })
+        .unwrap();
+        match serde_json::from_str::<LegacySessionMsg>(&json).expect("老对端必须解析得动") {
+            LegacySessionMsg::Pong { t_us } => assert_eq!(t_us, 123),
+            other => panic!("解析成了 {other:?}"),
+        }
+    }
+
+    /// **新端收到老 `Pong`**：缺字段 ⇒ `None`，**不是 `Some(0)`**。
+    ///
+    /// 这条是 0 填补禁令在协议层的执行点。把字段改回规格草案里的
+    /// `#[serde(default)] peer_t_us: u64` 会让它变成 0，而 0 是一个完全合法的
+    /// 时戳取值——θ 会被算成 (t1+t4)/2，一个长得像正常读数的垃圾。
+    #[test]
+    fn an_old_pong_yields_none_not_a_zero_timestamp() {
+        let legacy = serde_json::to_string(&LegacySessionMsg::Pong { t_us: 99 }).unwrap();
+        match serde_json::from_str::<SessionMsg>(&legacy).expect("新端必须解析得动老报文") {
+            SessionMsg::Pong { t_us, peer_t_us } => {
+                assert_eq!(t_us, 99);
+                assert!(
+                    peer_t_us.is_none(),
+                    "老对端没有这个字段 ⇒ 必须是 None，绝不能落成一个可用的 0"
+                );
+            }
+            other => panic!("解析成了 {other:?}"),
+        }
+    }
+
+    /// **老对端收到 `StageReport`**：解析失败。这正是我们要的——`recv_timeout`
+    /// 把它计入 `bad_session_msgs` 并跳过，连接存活，对端永远停在 `LocalOnly`。
+    ///
+    /// 断言的是「失败」而不是「成功」：若它意外解析成了别的变体（比如有人把
+    /// `SessionMsg` 改成 `#[serde(untagged)]`），老对端会拿一条遥测报文当成
+    /// 别的指令执行。
+    #[test]
+    fn a_peer_that_predates_stage_report_rejects_it_and_that_is_the_safe_outcome() {
+        let json = serde_json::to_string(&SessionMsg::StageReport {
+            stream_id: 5,
+            stages: vec![reading()],
+            local_ms: Some(1005.0),
+            dev: None,
+            seq_us: 1_000_000,
+        })
+        .unwrap();
+        assert!(
+            serde_json::from_str::<LegacySessionMsg>(&json).is_err(),
+            "老对端必须认不出它（随后被跳过），而不是错认成另一个变体"
+        );
+    }
+
+    /// `StageReport` 自己往返一趟，字段不掉。
+    #[test]
+    fn a_stage_report_round_trips() {
+        let msg = SessionMsg::StageReport {
+            stream_id: 7,
+            stages: vec![reading()],
+            local_ms: Some(1005.0),
+            dev: Some(DevLatency::unavailable()),
+            seq_us: 42,
+        };
+        let back: SessionMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        match back {
+            SessionMsg::StageReport { stream_id, stages, local_ms, seq_us, .. } => {
+                assert_eq!(stream_id, 7);
+                assert_eq!(seq_us, 42);
+                assert_eq!(local_ms, Some(1005.0));
+                assert_eq!(stages.len(), 1);
+                assert_eq!(stages[0].id, "src_fifo");
+                assert_eq!(stages[0].samples, 48_000);
+                assert_eq!(stages[0].rate, 48_000);
+                assert_eq!(stages[0].dropped, Some(7));
+                assert!(matches!(stages[0].drop_mode, DropMode::Oldest));
+            }
+            other => panic!("解析成了 {other:?}"),
+        }
+    }
+
+    /// `drop_mode` 缺席 ⇒ 整条报文解析失败 ⇒ 被跳过 ⇒ 停在 `LocalOnly`。
+    ///
+    /// 规格 §0.2：四个 1 秒 FIFO 饱和时的深度读数完全简并，只有丢弃方向能区分
+    /// 「恒定迟到但连续」与「迟到 + 断续」。给它编个默认值 = 替对端瞎猜听感，
+    /// 所以这个字段故意**没有** serde default。
+    #[test]
+    fn a_stage_without_a_drop_mode_is_refused_rather_than_guessed() {
+        let json = r#"{"type":"stage_report","stream_id":1,"seq_us":1,"stages":[
+            {"id":"src_fifo","samples":48000,"rate":48000}]}"#;
+        assert!(serde_json::from_str::<SessionMsg>(json).is_err());
+    }
+
+    /// 线上**没有** `ms` 字段：`ms` 只能由收方从 `samples`/`rate` 重算。
+    ///
+    /// 若谁把它加回去，`{"rate":0,"ms":0.0}` 这种报文就能把「这一级读不到」
+    /// 伪装成「这一级没有延迟」——蓝牙耳机那 150~250 ms 就是这么消失的。
+    #[test]
+    fn the_wire_carries_no_precomputed_ms() {
+        let json = serde_json::to_string(&reading()).unwrap();
+        assert!(
+            !json.contains("\"ms\""),
+            "分项的 ms 必须由收方自己算，线上不许带：{json}"
+        );
     }
 }
 

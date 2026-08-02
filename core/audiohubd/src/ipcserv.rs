@@ -60,6 +60,9 @@ fn daemon_info(inner: &DaemonInner) -> DaemonInfo {
         uptime_s: inner.start.elapsed().as_secs_f64(),
         output_devices,
         virtual_cards,
+        // 站点级混音健康（规格 §3.5）。求和之后的量，归不到任何一条会话头上，
+        // 所以走 daemon.status 而不是 SessionStats。
+        mix_health: crate::build_mix_health(inner),
     }
 }
 

@@ -11,10 +11,24 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const IPC_VERSION: u32 = 1;
+/// 2 起：daemon 保证 `SessionStats.pipeline` / `.quality` 两个字段**存在**
+/// （值可以是 `null`）。这是能力标记，不是不兼容变更——字段全部 `#[serde(default)]`
+/// 纯追加，v1 客户端读 v2 的回包没有任何问题。
+///
+/// 升它的唯一理由（规格 §3.6 / R2）：让 UI 分得清「**daemon 支持但暂无数据**」
+/// 与「**daemon 不支持**」。前者显示「测量中」，后者显示「daemon 版本较旧」，
+/// 是两个不同的用户动作。
+///
+/// ⚠ **必须同步改的两处**（不在本 crate，改这里就得改它们，否则 App 拒连）：
+///   - `app/src-tauri/src/main.rs` 的 `const IPC_VERSION: u32`
+///   - `app/frontend/src/ipc/client.ts` 的 `export const IPC_VERSION`
+/// 两处都做**严格相等**校验（`main.rs` 的 `port_alive` 分支会直接报版本不符），
+/// 所以它们与本常量是一个原子的三件套。
+pub const IPC_VERSION: u32 = 2;
 
 pub use audiohub_core::audio::DevicesReport;
 pub use audiohub_core::dsp::ToneVerdict;
+pub use audiohub_core::latency::{DevLatency, DropMode, LatSource};
 pub use audiohub_core::permissions::{
     PermissionKind, PermissionState, KIND_LOCAL_NETWORK, KIND_MICROPHONE, KIND_SYSTEM_AUDIO,
 };
@@ -55,6 +69,11 @@ pub struct DaemonInfo {
     /// bridge selector is selectable or greyed out (spec-m4b §C / m4c §B).
     #[serde(default)]
     pub virtual_cards: Vec<VirtualCard>,
+    /// 站点级混音健康（规格 §3.5 / §4.6）。挂在这里而不是 `SessionStats` 上，
+    /// 是因为它是**求和之后**的量：削顶发生在 N 路相加以后，归不到任何一条
+    /// 会话头上。`None` = 本窗口内混音器没有输出过。
+    #[serde(default)]
+    pub mix_health: Option<MixHealth>,
 }
 
 /// `kind` from the CALLER's perspective:
@@ -225,6 +244,237 @@ pub struct HalStatus {
     pub devices: Vec<HalDeviceInfo>,
 }
 
+// ------------------------------------------------------- 逐级延迟会计 (P0a)
+
+/// 管线上一级缓冲的瞬时读数（规格 §3.2 / §3.5）。
+///
+/// `id` 的取值与前端 `app/frontend/src/lib/metrics.ts` 的 `LATENCY_STAGES[].id`
+/// **逐字一致**（snake_case，不做大小写转写）：
+/// `cap_ring` | `cap_dev` | `src_fifo` | `hal_spk` | `send_pace` | `network`
+/// | `jitter_buf` | `post_mix` | `play_ring` | `play_dev` | `residual`
+///
+/// 中间不留映射表——映射表漏一条就是那一级静默显示「未知」，而「静默缺项」
+/// 正是本规格反复点名要消灭的失败形态。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineStage {
+    pub id: String,
+    pub samples: u32,
+    /// 该级容量；0 = 无界 / 不适用。
+    pub capacity: u32,
+    /// 该级**消费者**的标称速率(Hz)。播放环走**设备**速率（可能 44.1k），
+    /// 混用 48000 会引入 −8.8% 的系统性偏差。`rate == 0` 即判该级读数无效。
+    pub rate: u32,
+    /// `samples * 1000 / rate`，daemon 算好直接给。
+    ///
+    /// 冗余但值得：UI 自己除一遍就多一个用错 rate 的机会，而那个错误
+    /// （拿 48000 除 44.1k 设备的读数）恰好是 −8.8%，小到不会有人发现。
+    /// `None` = 这一级读不到，**不是 0 ms**。
+    #[serde(default)]
+    pub ms: Option<f64>,
+    /// 会话累计丢弃样本数。**`None` = 本进程观测不到这一级的丢弃，不是没丢过。**
+    /// 典型是 `hal_spk`：环满时写不进去的是驱动侧的 IOProc，计数在它那里。
+    #[serde(default)]
+    pub dropped: Option<u64>,
+    /// 满时丢哪一头。**必填**：规格 §0.2 已证明四个 1 秒 FIFO 的丢弃方向不同，
+    /// 而它们**饱和时的深度读数完全简并**——三个源侧 FIFO 丢最旧（听感「恒定
+    /// 迟到但连续」），播放环与采集环丢最新（听感「迟到 + 断续」）。少了这个
+    /// 标签，遥测只能说「有一秒卡在某处」，说不出那一秒是怎么卡的。
+    pub drop_mode: DropMode,
+    /// 深度贴着容量上限（≥95%）。
+    pub saturated: bool,
+    /// 30 s 窗口深度斜率，样本/秒（规格 §3.3）。`None` = 样本点不足以判趋势
+    /// （<3 点或跨度 <5 s）——**不是 0**：「测到了，就是不漂」与「还没测出来」
+    /// 是两个不同的结论，而它们对应完全不同的修法：
+    ///   - ≈0 + 饱和 + `dropped` 冻结  ⇒ 曾被一次卡顿灌满，之后收支平衡但永远迟到
+    ///   - ≈0 + 饱和 + `dropped` 增长  ⇒ 稳态产销速率失配
+    ///   - 持续同号且未饱和          ⇒ 正在走向饱和
+    #[serde(default)]
+    pub drift_sps: Option<f64>,
+}
+
+/// 这个延迟读数**能信到什么程度**。
+///
+/// 序列化取值与前端 `metrics.ts` 的
+/// `LatencyConfidence = 'full' | 'lowerBound' | 'converging' | 'localOnly' | 'unavailable'`
+/// **逐字一致**（故意用 camelCase 而非 Rust 习惯的 snake_case：全部字符串枚举
+/// 都直穿前端，一张映射表都不留）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LatConfidence {
+    /// 各分项齐全，e2e 与 Σ 闭合。
+    Full,
+    /// 缺声卡缓冲项，读数是下限。UI 加「≥」。
+    LowerBound,
+    /// 时钟偏移 θ 尚未收敛。UI 显示「测量中」。
+    Converging,
+    /// 对端未上报分项（旧 daemon，或 P0a 这种单端部署）。只显示本机段。
+    LocalOnly,
+    /// 无法测量。
+    Unavailable,
+}
+
+/// 一条会话的逐级延迟会计（规格 §3.5）。
+///
+/// **P0a 阶段的取值**：`stages` 只有本侧的级，`peer_stages` 为空，
+/// `confidence = LocalOnly`，`sum_ms = None`（对端分项缺失），`local_ms` 是本侧
+/// Σ——那是这一期唯一能显示的数字。`net_ms` / `e2e_ms` / `residual_ms` /
+/// `clock_offset_us` 全部 `None`，它们是 P0b / P1 的活。
+///
+/// **绝不用 0 填补缺失分项**：任一已声明存在的分项测不到 ⇒ 相应的和为 `None`。
+/// 用 0 填补会让蓝牙耳机（真实 +150~250 ms）看起来和模拟输出一样好。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineLatency {
+    /// "send" | "recv"：本侧在这条流里是发送端还是接收端，决定 `stages` 里
+    /// 会出现哪几级。
+    pub side: String,
+    /// 本侧各级，按数据流顺序。
+    pub stages: Vec<PipelineStage>,
+    /// 本侧 Σ。任一本侧级 `rate == 0` ⇒ `None`。
+    #[serde(default)]
+    pub local_ms: Option<f64>,
+    /// 本侧声卡固有延迟。P0 恒为 `Unavailable`（平台查询是 P1 的活）——
+    /// 保留字段是为了让「缺项 ⇒ 带『≥』」这条链路现在就成立。
+    #[serde(default)]
+    pub dev: Option<DevLatency>,
+
+    /// 对端分项（控制面回传，P0b 起）。P0a 恒为空。
+    #[serde(default)]
+    pub peer_stages: Vec<PipelineStage>,
+    #[serde(default)]
+    pub peer_local_ms: Option<f64>,
+    #[serde(default)]
+    pub peer_dev: Option<DevLatency>,
+    /// 对端读数的年龄（秒）。>3 即视为陈旧，UI 标注。
+    #[serde(default)]
+    pub peer_age_s: Option<f64>,
+
+    /// 单向网络 = 控制面 min-RTT / 2。**只作一段，绝不作总数。**
+    ///
+    /// 红线（规格 §3.1）：实测 RTT 0.58 ms vs 感知 ~1000 ms，比值 1700 倍，
+    /// 两者之间不存在任何单调关系。任何情况下不得用 RTT 冒充或填补总延迟。
+    #[serde(default)]
+    pub net_ms: Option<f64>,
+    /// 交叉校验：|net_ms − rtt/2|。超过 5 ms 或超过读数 10% ⇒ UI 降级为「约」。
+    #[serde(default)]
+    pub rtt_cross_check_ms: Option<f64>,
+
+    /// Σ 各级（含对端）。任一已声明分项缺失即 `None`。
+    #[serde(default)]
+    pub sum_ms: Option<f64>,
+    /// P1：真实采样年龄。
+    #[serde(default)]
+    pub e2e_ms: Option<f64>,
+    /// P1：`e2e_ms − sum_ms`。|residual| > 20 ms 即存在未建模的缓冲级。
+    #[serde(default)]
+    pub residual_ms: Option<f64>,
+
+    #[serde(default)]
+    pub clock_offset_us: Option<i64>,
+    #[serde(default)]
+    pub clock_unc_us: Option<u32>,
+    pub confidence: LatConfidence,
+}
+
+// ------------------------------------------------------------ 音质 (P0q)
+
+/// 一条会话的音质三分量（规格 §4）。
+///
+/// **音质 = 保真度**：最终送进扬声器的样本流，相对于对端采集到的原始波形被
+/// 损坏了多少。测点在 JitterBuffer pop 之后、送进播放环之前。
+///
+/// 明确拒绝用丢包率当音质：丢包 2% 在 PLC 修得住时几乎不可闻，丢包 0% 时两路
+/// 重复流相加照样把声音削烂。丢包率是**网口上的量**，音质是**扬声器上的量**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityStats {
+    /// 实际统计窗口秒数（滚动窗口的真实跨度，不是标称的 10）。
+    pub window_s: f64,
+    /// Q1：`(plc + 3*silence) / total`，[0,1]。
+    ///
+    /// silence 权重 3 的依据：PLC 是「上一帧 ×0.7 重复」，仍有能量、仍连续；
+    /// silence 是彻底的真空。ITU-T G.113 附录 I 对帧擦除给出有隐藏 / 无隐藏
+    /// 两条 Ie 曲线，同一丢失率下无隐藏的损伤值约为有隐藏的 2.5~3 倍。
+    pub conceal_ratio: f64,
+    pub plc_ticks: u64,
+    pub silence_ticks: u64,
+    pub popped_ticks: u64,
+    /// 二级证据，**不参与定级**：它们解释等级为何低，不定义等级。
+    pub underruns: u64,
+    pub jb_dropped: u64,
+    /// Q2：本流送进混音前 |v| > 0.8 的采样占比。
+    ///
+    /// **`None` = 本窗口还没攒够一整页，这一分量「还没测」。** 它与
+    /// `Some(0.0)`（「测了，确实一个越界样本都没有」）是两个完全不同的结论，
+    /// 而这里曾经用 `f64` 承载、缺席时填 0——于是流开头约 10~20 秒里，一条正在
+    /// 爆音的流会拿到 `grade_clip(0.0) = Excellent`，而 min 合成下一个被钉成
+    /// Excellent 的分量**永远拉不低总分**，整条流报「良好」。
+    /// 这与 Q1「窗口不够就整体 None」的口径也自相矛盾（同一个函数上下两行）。
+    #[serde(default)]
+    pub clip_ratio: Option<f64>,
+    /// `20*log10(pre_clip_peak / 0.8)`，负值表示根本没碰到削顶阈值。
+    /// `None` 的含义同 `clip_ratio`。
+    #[serde(default)]
+    pub clip_excess_db: Option<f64>,
+    /// Q3：`rung_rate / 2`（Nyquist）。
+    pub bandwidth_hz: u32,
+    /// "excellent" | "good" | "fair" | "poor" | "unknown"
+    ///
+    /// **三分量取 min（木桶），不是加权平均**：三家损伤在感知上不可互相补偿。
+    /// 加权平均会把「两路重复流把声音削烂」（Q2=差、Q1=优、Q3=优）稀释成
+    /// 「良」，恰好掩盖用户要抓的那个 bug。
+    ///
+    /// **`"unknown"` = 等级不成立**，不是「一般般」也不是「没有会话」。分量缺席
+    /// 时在场分量的 min 只是**上界**，真实等级落在 `[差, 上界]` 这个区间里，
+    /// 而区间不是等级。UI 必须把它渲染成「测量中」一类的措辞，**绝不可回退到
+    /// 某个具体等级**——那正是这个字段此前的失败形态：`min(q1, Excellent, q3)`
+    /// 与 `min(q1, q3)` 逐值相同，于是缺席被静默读作「良好」。
+    /// 唯一的例外由 daemon 侧判掉：上界已经贴着地板时等级确定，照常给出 "poor"。
+    pub grade: String,
+    /// "continuity" | "level" | "bandwidth" | "none"：argmin，拖后腿的那一项。
+    ///
+    /// **缺席的分量不会出现在这里**：`clip_ratio == None` 时 `worst` 永远不是
+    /// "level"，因为那一项根本还没被测量，说不上它拖没拖后腿。
+    /// `grade == "unknown"` 时恒为 "none"（等级都没定，谈不上谁拖后腿）。
+    pub worst: String,
+    /// 本次合成是不是**少了至少一块板**（目前只可能是 Q2 的削顶页没攒满）。
+    ///
+    /// 与 `grade` 的关系：`partial` 为真时 `grade` 通常是 `"unknown"`，
+    /// **但两者不是同义词**——上界已经触底（"poor"）时等级确定而 `partial`
+    /// 仍为真。UI 若想说明「这个结论是在缺一项的情况下得出的」，读这个字段；
+    /// 若只是决定要不要显示等级，读 `grade == "unknown"` 就够。
+    #[serde(default)]
+    pub partial: bool,
+}
+
+/// 站点级混音健康（规格 §3.5）。**求和之后**的量，不可归属到单条会话，
+/// 所以挂在 `DaemonInfo` 上而不是 `SessionStats` 上。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MixHealth {
+    pub window_s: f64,
+    /// 求和后、`soft_clip` 之前 |v| > 0.8 的采样占比。
+    ///
+    /// **`None` = 削顶页还没攒满，「还没测」**——与 `Some(0.0)`（「测了，没有一个
+    /// 样本越界」）是两个不同的结论。这里曾经 `unwrap_or(0.0)`，把启动后头 10 秒
+    /// 的空窗报成「混音正常」。
+    #[serde(default)]
+    pub clip_ratio: Option<f64>,
+    /// `20*log10(pre_clip_peak / 0.8)`。`None` 的含义同 `clip_ratio`。
+    #[serde(default)]
+    pub clip_excess_db: Option<f64>,
+    /// 本窗口内单 tick 参与求和的最大流数。
+    pub max_contrib: u32,
+    /// 前两路参与求和的帧在零延迟上的归一化互相关峰值。
+    /// `None` = 本窗口内就没有过两路同时求和，无从相关。
+    #[serde(default)]
+    pub corr_peak: Option<f64>,
+    /// `corr_peak > 0.98` 且窗口内占比 > 90%。
+    ///
+    /// 这条判据之所以严谨，恰恰因为它**对阈值不敏感**：正常素材峰值 −3 dBFS 时
+    /// 越过 0.8 的采样占比是 1e-4 量级，而两路相同信号相加等于整段波形 ×2，
+    /// 正常电平的音乐立刻有百分之几十的采样越界。两者之间隔着 3 个数量级的
+    /// 真空，阈值放在这个空隙里的任何位置结论都一样。
+    pub duplicate_suspect: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStats {
     pub received: u64,
@@ -244,6 +494,47 @@ pub struct SessionStats {
     /// means the session does not sync volume (or nothing arrived yet).
     #[serde(default)]
     pub volume: Option<VolumeState>,
+
+    // ---- 以下为 P0a / P0q 追加。**纯追加**：既有 12 个字段的顺序与语义未动。
+    //
+    // 兼容性（规格 §0.1，已对 secure.rs:422-437 核对）：认证成功但无法反序列化
+    // 的 SessionMsg 会被跳过且连接存活，故媒体面/控制面新增变体无需升协议版本。
+    // IPC 侧同理——全部 #[serde(default)]，v1 客户端读 v2 回包毫无问题。
+    // `IPC_VERSION` 1→2 只是能力标记，见该常量的注释。
+    /// 逐级延迟会计。`None` = 本端未采集（非媒体会话，或该会话尚无可读的级）。
+    #[serde(default)]
+    pub pipeline: Option<PipelineLatency>,
+    /// 音质三分量。`None` = 窗口还不够长 / 这条流没有接收侧（发送会话没有
+    /// 「送进扬声器的样本」可言）。**不是 0 分**。
+    #[serde(default)]
+    pub quality: Option<QualityStats>,
+
+    // JitterBuffer 内部早已存在却从未导出的五个计数器（media.rs:115-119），
+    // 零成本补齐。这些是 **lifetime 累计值**，窗口化由 `quality` 承担——
+    // 用 lifetime 算隐藏率会让一次早期抖动永远压着等级，那与 `take_interval`
+    // 已经吸取过的教训是同一条。
+    #[serde(default)]
+    pub jb_popped: u64,
+    #[serde(default)]
+    pub jb_underruns: u64,
+    #[serde(default)]
+    pub jb_dropped: u64,
+    #[serde(default)]
+    pub jb_plc: u64,
+    #[serde(default)]
+    pub jb_silence: u64,
+    #[serde(default)]
+    pub jb_target_frames: u32,
+    #[serde(default)]
+    pub jb_prebuffering: bool,
+    /// 从 `next_seq` 起**连续**的帧数（规格 §7.2 R10）。
+    ///
+    /// 与 `jb_depth_frames` 的区别不是精度而是含义：后者是 `BTreeMap` 的条目数，
+    /// 乱序到达时把「洞之后的帧」也算了进去。next_seq 缺失而 {n+1,n+2,n+3} 已
+    /// 到达时，`jb_depth_frames = 3`（谎报 30 ms 排队），`jb_contiguous_frames = 0`
+    /// ——而下一个 tick 一定 underrun。**延迟分项用的是这个数。**
+    #[serde(default)]
+    pub jb_contiguous_frames: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,4 +671,64 @@ pub mod methods {
     pub const PEERS_PAIR: &str = "peers.pair";
     pub const PEERS_UNPAIR: &str = "peers.unpair";
     pub const PEERS_SET_ALIAS: &str = "peers.set_alias";
+}
+
+#[cfg(test)]
+mod version_contract_tests {
+    use super::IPC_VERSION;
+
+    /// 读仓库里另一处（非本 crate）的源文件。读不到就 panic —— 绝不 skip：
+    /// 一条「文件没了就悄悄通过」的守卫，正好在文件被改名的那一刻失效。
+    fn read_sibling(rel: &str) -> String {
+        let path = format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "读不到 {rel}（{e}）。文件被改名/挪走了就把这条测试一起更新，\
+                 不要让它退化成一条恒真断言"
+            )
+        })
+    }
+
+    /// 取 `needle` 之后紧跟的十进制整数，并要求 `needle` 在全文**恰好出现一次**。
+    ///
+    /// 唯一性不是洁癖：常量名出现在注释里非常常见（这两个文件里都有），
+    /// 「匹配第一个」会让守卫在别人加一行注释时开始读错地方，而且照样是绿的。
+    fn sole_int_after(src: &str, rel: &str, needle: &str) -> u32 {
+        let hits = src.matches(needle).count();
+        assert_eq!(hits, 1, "{rel} 里 `{needle}` 出现了 {hits} 次，期望恰好 1 次");
+        let tail = &src[src.find(needle).unwrap() + needle.len()..];
+        let digits: String = tail
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("{rel} 的 `{needle}` 后面没有跟十进制整数"))
+    }
+
+    /// `IPC_VERSION` 的三处声明必须相等 —— 见该常量上方的契约注释。
+    ///
+    /// 为什么这条守卫非有不可：`app/src-tauri` **不是根 workspace 的成员**
+    /// （根 Cargo.toml 的 members 里没有它），前端更不经过 cargo。于是
+    /// `cargo build --release`、`cargo test --workspace`、`tsc --noEmit`、
+    /// `npm run build` **四样全绿**，而三处声明可以互不相同 —— 没有任何本地信号。
+    ///
+    /// 2026-08-01 部署实测到的后果：daemon 报 v2、配对在线、音频零丢包一切正常，
+    /// 两端 UI 却被「AudioHub 服务版本不兼容」的模态整个挡死。两处校验都是
+    /// **严格相等**（`main.rs` 的 `port_alive` 分支、`client.ts` 的 `v !== IPC_VERSION`），
+    /// 所以落后一版不是「少显示一点数据」，是拒连。
+    #[test]
+    fn the_three_ipc_version_declarations_agree() {
+        const RS: &str = "app/src-tauri/src/main.rs";
+        const TS: &str = "app/frontend/src/ipc/client.ts";
+        let shell = sole_int_after(&read_sibling(RS), RS, "const IPC_VERSION: u32 =");
+        let front = sole_int_after(&read_sibling(TS), TS, "export const IPC_VERSION =");
+        assert_eq!(
+            (shell, front),
+            (IPC_VERSION, IPC_VERSION),
+            "三处 IPC_VERSION 不一致（本 crate={IPC_VERSION}、{RS}={shell}、{TS}={front}）。\
+             App 会以「服务版本不兼容」拒连：音频照跑，界面全死。"
+        );
+    }
 }

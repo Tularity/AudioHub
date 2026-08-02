@@ -14,6 +14,7 @@ use anyhow::{anyhow, Context, Result};
 
 use audiohub_core::audio::{self, AudioTx, LivePlayback};
 use audiohub_core::dsp::{self, LinearResampler, ToneVerdict};
+use audiohub_core::latency::{DropMode, SourceDepths, StageDepth, StageId, StageSlot, NO_DEPTHS};
 use audiohub_core::sysaudio::{self, SysAudioCapture};
 use audiohub_net::media::{rung_rate, FrameSource, LossInjector, MediaCrypto, MicSource, ToneSource};
 use audiohub_net::packet::{Codec, Header, Kind};
@@ -24,6 +25,56 @@ const FRAME_MS: u64 = 10;
 const F48: usize = 480; // 48k @ 10ms
 const RING_CAP: usize = 96000; // 2s @ 48k
 const TONE_AMP: f32 = 0.5;
+
+/// `TxShared::stages` 的最后一槽，专给级 4 `send_pace`。
+///
+/// 前两槽由 `SourceDepths` 广播（源自己能观测到的排队），第三槽是**调度器自己**
+/// 那一级：`tx_loop` 每 10 ms 一次性取走 480 个样本，而生产者跑在设备时钟上，
+/// 把连续到达量化到打包边界的那半个 tick 是这个循环造成的，不是任何一个源造成的
+/// ——所以它由这里发射，不由 `depths()` 发射。
+const SEND_PACE_SLOT: usize = 2;
+
+/// 清空一条发送流的全部分项槽。
+///
+/// **不是「顺手清一下」**：`TxShared` 的生命周期比 `tx_loop` 里的 `TxStream`
+/// 长（会话表还持有它，报告线程还在读），源被收尸之后若不清，UI 会继续显示一段
+/// 早已不存在的排队，而且**没有任何字段说它是陈的**。
+fn clear_send_stages(st: &TxStream) {
+    for slot in st.shared.stages.iter() {
+        slot.store(None);
+    }
+}
+
+/// 本源这一 tick 该不该报级 4 `send_pace`（常数 5 ms）。
+///
+/// 判据：**这个源有没有真实排队**。这 5 ms 是把连续到达量化到 10 ms 打包边界的
+/// 期望等待，成立的前提是到达相位相对 tick 均匀分布——那要求生产者跑在**另一个
+/// 时钟**上（设备回调 / 驱动 IOProc），而「有队列」正是这件事的同义词。
+/// `ToneSource` 是在 tick 里现合成的，样本诞生的时刻就是被取走的时刻，等待恒为
+/// 0；给它记 5 ms 是凭空捏造。驱动没附着时 `HalSpeakerSource` 报 `NO_DEPTHS`，
+/// 那一级连同节拍一起不存在。
+fn send_pace_for(depths: &SourceDepths) -> Option<StageDepth> {
+    depths
+        .iter()
+        .any(|d| d.is_some())
+        .then(StageDepth::send_pace)
+}
+
+/// 把一个源本 tick 的各级深度发布到一条发送流的槽里（含级 4 `send_pace`）。
+///
+/// 与 `publish_play_ring` 同一条理由拆出来：这三行是**接线**——哪一级进哪个槽、
+/// 空槽清不清、节拍这一级由谁发射。`tx_loop` 里要一个真实设备、一条 UDP socket
+/// 和一整张源表才走得到它，于是接线本身没法被断言，而漏掉的从来是接线不是逻辑
+/// （`send_pace` 就曾经在枚举里声明、在规格里编号、**全仓库零发布点**）。
+///
+/// 每 tick 都写，包括 `None`：源换过之后（默认输入设备变化触发 `MicSource`
+/// 重建）若不清槽，报告线程会一直读到已经不存在的那一级。
+pub(crate) fn publish_send_stages(stages: &[StageSlot; 3], depths: &SourceDepths) {
+    for (slot, d) in stages.iter().zip(depths.iter()) {
+        slot.store(*d);
+    }
+    stages[SEND_PACE_SLOT].store(send_pace_for(depths));
+}
 
 fn poll_tick(kind: ErrorKind) -> bool {
     // see audiohub-net session.rs: Windows latches ICMP unreachable as
@@ -206,6 +257,9 @@ struct SourceEnt {
     src: Src,
     refs: usize,
     frame: Vec<f32>, // one 48k frame per tick, broadcast to all attached streams
+    /// 本 tick 读到的各级深度，随 `frame` 一起广播给挂在这个源上的每条流。
+    /// 读一次、发 N 份：物理队列只有一份（规格 §7.2 R8）。
+    depths: SourceDepths,
 }
 
 /// A media source plus the one thing `FrameSource` cannot express: a system
@@ -220,6 +274,15 @@ impl Src {
         match self {
             Src::Frame(f) => f.next_frame(out),
             Src::Sys(s) => s.next_frame(out),
+        }
+    }
+
+    /// 本源在交给发送调度器之前压着的各级排队（规格 §3.2 的级 1 / 3 / 3′）。
+    /// 无分配、常数次 `len()`，可以在 10 ms 节拍上调用。
+    fn depths(&self) -> SourceDepths {
+        match self {
+            Src::Frame(f) => f.depths(),
+            Src::Sys(s) => s.depths(),
         }
     }
 
@@ -244,6 +307,8 @@ struct SysAudioFrames {
     fifo: VecDeque<f32>,
     raw: Vec<f32>,
     staged: Vec<f32>,
+    /// FIFO 满时丢掉的样本数。方向是 `DropMode::Oldest`（`pop_front`）。
+    dropped: u64,
 }
 
 impl SysAudioFrames {
@@ -260,7 +325,24 @@ impl SysAudioFrames {
             fifo: VecDeque::new(),
             raw: Vec::new(),
             staged: Vec::new(),
+            dropped: 0,
         }
+    }
+
+    /// 只有发送 FIFO 一级：后端自己的内部缓冲从这里读不到，**所以不报**，
+    /// 而不是报 0（规格 §7.2 R11 记着这条口径缺口）。
+    fn depths(&self) -> SourceDepths {
+        [
+            Some(StageDepth {
+                id: StageId::SrcFifo,
+                samples: self.fifo.len() as u32,
+                capacity: Self::FIFO_CAP as u32,
+                rate: 48_000,
+                dropped: Some(self.dropped),
+                drop_mode: DropMode::Oldest,
+            }),
+            None,
+        ]
     }
 
     fn next_frame(&mut self, out: &mut Vec<f32>) -> bool {
@@ -276,6 +358,7 @@ impl SysAudioFrames {
         }
         while self.fifo.len() > Self::FIFO_CAP {
             self.fifo.pop_front();
+            self.dropped += 1; // 丢弃行为未改，只是现在数得出来
         }
         out.clear();
         if self.fifo.len() >= F48 {
@@ -396,7 +479,12 @@ fn apply_txcmd(
                 }
                 Entry::Vacant(v) => match build_source(inner, &spec) {
                     Ok(src) => {
-                        v.insert(SourceEnt { src, refs: 1, frame: Vec::new() });
+                        v.insert(SourceEnt {
+                            src,
+                            refs: 1,
+                            frame: Vec::new(),
+                            depths: NO_DEPTHS,
+                        });
                         Ok(())
                     }
                     Err(e) => {
@@ -431,6 +519,9 @@ fn apply_txcmd(
         }
         TxCmd::Remove { stream_id } => {
             if let Some(st) = streams.remove(&stream_id) {
+                // 这条流从此不再被 tick 到，槽再也不会被覆盖 —— 但 `TxShared`
+                // 还活着且还在被报告线程读。不清就是把最后一次读数永久钉住。
+                clear_send_stages(&st);
                 if let Some(ent) = sources.get_mut(&st.spec) {
                     ent.refs = ent.refs.saturating_sub(1);
                     if ent.refs == 0 {
@@ -470,7 +561,15 @@ fn reap_dead_sources(
             crate::conn::teardown_stream(inner, id, true);
         }
         // drop the corpse now: the queued Remove would only reach it next tick
-        streams.retain(|_, s| s.spec != spec);
+        streams.retain(|_, s| {
+            let keep = s.spec != spec;
+            if !keep {
+                // 同 TxCmd::Remove：走了就得清槽，否则一段死掉的排队会永远
+                // 留在 UI 上，且不带任何「这是陈的」标记。
+                clear_send_stages(s);
+            }
+            keep
+        });
         sources.remove(&spec);
     }
 }
@@ -568,11 +667,23 @@ pub(crate) fn tx_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<TxCmd>) {
         let slow_tick = tick % 100 == 0; // ~1s
         for ent in sources.values_mut() {
             if ent.refs == 0 {
+                // 没被取过音频的源，它的深度读数这一 tick 就不成立（`depths()`
+                // 的语义是「刚被取走一帧之后还剩多少」）。清掉而不是留着上一轮
+                // 的值——留着就是把陈旧读数交给下一条挂上来的流。
+                ent.depths = NO_DEPTHS;
                 continue;
             }
             if !ent.src.next_frame(&mut ent.frame) {
                 ent.frame.clear();
             }
+            // 取完这一 tick 的音频之后立刻读深度：这才是「刚被取走 480 个样本
+            // 之后还剩多少」的稳态读数，也就是「此刻进来的样本前面排着几个」。
+            // 放在 next_frame 之前读会系统性地多出一帧（10 ms）。
+            //
+            // 接收侧的播放环必须取**同一个相位**：那边是在 `push` 之**前**读
+            // （见 `ring_depth_before_push`）。一边谷值一边峰值，差的那一帧会
+            // 恒定挂在总数上，而且看起来完全像一个真实缓冲。
+            ent.depths = ent.src.depths();
             if ent.frame.len() != F48 {
                 // An OVER-long frame means the source appended instead of
                 // replacing, and the resize below then re-sends whatever its
@@ -606,7 +717,25 @@ pub(crate) fn tx_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<TxCmd>) {
         reap_dead_sources(&inner, &mut streams, &mut sources);
         let ts_us = start.elapsed().as_micros() as u64;
         for st in streams.values_mut() {
-            let Some(ent) = sources.get(&st.spec) else { continue };
+            let Some(ent) = sources.get(&st.spec) else {
+                // 源已经不在表里了（`reap_dead_sources` 收了尸，或 Remove 把
+                // refs 减到 0），而这条流的 `TxShared` 还活着并且仍在被报告线程
+                // 读。**这里必须清槽再走**：早先的 `continue` 会把最后一次读数
+                // 留在槽里，于是 UI 继续显示一段早已不存在的排队——这正是下面
+                // 那句注释要消灭的「静默缺项」，而缺项本身就是从这条捷径漏出去的。
+                clear_send_stages(st);
+                continue;
+            };
+            // 发布本流的发送侧分项。只有原子 store，没有除法、没有锁、没有
+            // 分配（规格附录约束 3：否则测量会改变被测对象）。
+            //
+            // 每 tick 都写，包括 `None`：源换过之后（如默认输入设备变化触发的
+            // MicSource 重建）若不清槽，报告线程会一直读到已经不存在的那一级。
+            // 级 4 `send_pace`（规格 §3.2）：常数 5 ms，由 `publish_send_stages`
+            // 一并发射。判据见 `send_pace_for`。这一级此前**在枚举里声明了、在
+            // 规格里编了号，却一个发布点都没有** ⇒ 发送侧的 local_ms 系统性短
+            // 5 ms，而且没有任何字段标出它缺席。
+            publish_send_stages(&st.shared.stages, &ent.depths);
             let want = st.shared.rung.load(Ordering::Relaxed).min(3);
             if want != st.rung {
                 st.rung = want;
@@ -738,6 +867,10 @@ fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
                 st.jb.push(h.seq, frame);
                 st.last_dropped = 0;
                 st.late_streak = 0;
+                // 五个 lifetime 计数器随新 JB 归零，这是一次真实的不连续：
+                // 旧采样点不能再参与差分，否则窗口值会被 saturating_sub 压成 0，
+                // 让一次 resync 看起来像「这 10 秒完美无瑕」。
+                st.conceal.reset();
                 dlog!("[audiohubd] jb resync on stream {}", h.stream_id);
             }
             st.jit_win.push(jit_ms);
@@ -745,6 +878,12 @@ fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
                 st.jit_win.remove(0);
             }
             st.pushes += 1;
+            // Q1 窗口的细分辨率采样点（规格 §4.6：每 10 次 push 一点，≈100 ms）。
+            // ticker 每秒还会补一点——那一路才是断流时唯一还在走的，因为**断流
+            // 时这里根本不执行**，而断流正是 Q1 最该报警的时候。
+            if st.pushes % 10 == 0 {
+                st.sample_conceal();
+            }
             if st.pushes % 100 == 0 && !st.jit_win.is_empty() {
                 let mut v = st.jit_win.clone();
                 v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -830,6 +969,45 @@ fn push_mix(inner: &DaemonInner, samples: &[f32]) {
     }
 }
 
+/// 一个 `AudioTx` 播放环此刻的深度（级 8 `play_ring` / 级 8′ `bridge_ring`）。
+///
+/// ## ⚠ 采样相位：必须在 `push()` **之前**调用
+///
+/// 被测量是「此刻交进这一级的样本还要排多久」。`push` 之前的 `queued()` 恰好是
+/// **排在这一帧前面**的样本数，也就是这一帧的驻留时间。`push` 之后读到的是它
+/// **+ 480**，恒定多算一整帧 ≈ 10 ms —— 刚推进去的 480 个样本不用等自己。
+///
+/// 这也是与源侧的相位对齐：源侧三级都在 `next_frame()` **之后**读，读到的同样是
+/// 「此刻进来的样本前面排着几个」。一边取谷值、一边取峰值，差的那 10 ms 会一直
+/// 挂在总数上，而且因为它恒定，看起来完全像一个真实的缓冲。
+///
+/// 速率与容量都取自 `AudioTx` 自己的**设备**速率，不是 48000：环容量恰好等于
+/// `dev_rate`（1.000 秒），拿 48000 去除一个 44.1k 设备的读数会静默偏 −8.8%。
+///
+/// 丢弃方向是 `Newest`——`push_slice` 满了就短写，新采样根本没进环。这与三个
+/// 源侧 FIFO 的「丢最旧」在深度上完全简并，只有这个标签能把它们分开
+/// （规格 §0.2）。
+pub(crate) fn ring_depth_before_push(id: StageId, tx: &AudioTx) -> StageDepth {
+    StageDepth {
+        id,
+        samples: tx.queued(),
+        capacity: tx.capacity(),
+        rate: tx.dev_rate(),
+        dropped: Some(tx.dropped()),
+        drop_mode: DropMode::Newest,
+    }
+}
+
+/// 发布播放环深度（规格 §3.2 的级 8 `play_ring`）。
+///
+/// 取 `&StageSlot` 而不是 `&DaemonInner`：这一级的全部接线决策（哪个 getter
+/// 进哪个字段、丢弃方向标什么）都在这几行里，而 `DaemonInner` 要一个 UDP
+/// socket、一堆线程通道和一个真实设备才造得出来——那会把它们永久挡在测试
+/// 之外。调用方传 `&inner.play_ring`。
+pub(crate) fn publish_play_ring(slot: &StageSlot, tx: &AudioTx) {
+    slot.store(Some(ring_depth_before_push(StageId::PlayRing, tx)));
+}
+
 /// Drops the mix history when nothing feeds the mixer. The ring is a rolling
 /// window read by mix_verdicts, and the idle path advances it far slower than
 /// real time, so rolling silence through it would keep a stopped tone testing
@@ -849,6 +1027,13 @@ struct BridgeOut {
     tx: AudioTx,
     refs: usize,
     buf: [f32; F48],
+    /// 本 tick **推之前**读到的环深度（级 8′ `bridge_ring`）。
+    ///
+    /// 存在这里而不是当场发布，是因为发布要按**流**做（一个桥可被多条流引用），
+    /// 而深度是按**桥**读的一份。先在推的循环里读好、再在第二趟里广播给引用它
+    /// 的每条流——顺序反过来就只能在推之后读，那恒定多算一整帧（见
+    /// `ring_depth_before_push`）。
+    depth: Option<StageDepth>,
 }
 
 fn apply_mixcmd(cmd: MixCmd, bridges: &mut HashMap<String, BridgeOut>) {
@@ -861,7 +1046,9 @@ fn apply_mixcmd(cmd: MixCmd, bridges: &mut HashMap<String, BridgeOut>) {
                 Ok(None) // already open: this is only a new reference
             } else {
                 LivePlayback::start_on(&device, 48000)
-                    .map(|(pb, tx)| Some(BridgeOut { _pb: pb, tx, refs: 0, buf: [0.0; F48] }))
+                    .map(|(pb, tx)| {
+                        Some(BridgeOut { _pb: pb, tx, refs: 0, buf: [0.0; F48], depth: None })
+                    })
                     .map_err(|e| format!("open bridge device '{device}': {e:#}"))
             };
             let r = match opened {
@@ -920,6 +1107,10 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
     // buckets actually used rather than to 16 * 480 floats per 10ms tick.
     let mut hal_bufs = vec![[0.0f32; F48]; crate::haldev::HAL_MAX_SLOTS];
     let mut hal_dirty: u16 = 0;
+    // 重复流判据（规格 §4.6）：把**第一个**送进本机输出的 frame 拷进暂存，
+    // 与**第二个**做零延迟归一化互相关。零延迟即可——重复流是同一份解码结果
+    // 分两条会话进来，样本级已经对齐。480 点点积 ≈ 1.4k flops / 10 ms。
+    let mut corr_a = [0.0f32; F48];
     loop {
         if inner.shutdown.load(Ordering::SeqCst) {
             return;
@@ -960,9 +1151,13 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
             for b in bridges.values_mut() {
                 b.buf.fill(0.0);
                 let silence = b.buf;
+                b.depth = Some(ring_depth_before_push(StageId::BridgeRing, &b.tx));
                 b.tx.push(&silence);
             }
             clear_mix(inner.as_ref()); // never serve stale mix audio
+            // 没有任何流 = 没有这一级。清槽，否则报告线程会一直读到最后一次的
+            // 陈旧深度——那是「静默缺项」的另一种形态。
+            inner.play_ring.store(None);
             std::thread::sleep(Duration::from_millis(20));
             tick = start.elapsed().as_millis() as u64 / FRAME_MS + 1;
             continue;
@@ -980,9 +1175,17 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
         }
         let mut any_spk = false;
         let mut any_mon = false;
+        // 本 tick 有多少路真的落到本机输出上，以及前两路的相关度。
+        let now_ms = inner.start.elapsed().as_millis() as u64;
+        let mut contrib: u32 = 0;
+        let mut corr: Option<f64> = None;
         for s in &streams {
             let popped = lk(&s.jbs).jb.pop();
             lk(&s.post).advance(popped, &mut frame);
+            // Q2 的可归属那一半（规格 §4.6）：测点在 advance 之后、加进任何
+            // 目的地之前。这回答的是「我这一路送进来多响」，是**求和前**的量，
+            // 与站点级的求和后削顶是两个不同的问题。
+            s.clip.feed(now_ms, &frame);
             if let Some(ring) = s.ring.as_ref() {
                 let mut r = lk(ring);
                 r.extend(frame.iter().copied());
@@ -1005,6 +1208,16 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
             // (spec-m5b §5.4). The bucket is chosen by the PEER's slot, so two
             // peers' audio can never meet.
             add_to_hal_bucket(s.hal_slot, &frame, &mut hal_bufs, &mut hal_dirty);
+            if s.is_spk || s.monitor {
+                // 送本机真实输出的那一集合：`out = soft_clip(mix + mon)`。
+                // 站点级削顶正是在这里发生的，所以重复流判据也只看这一集合。
+                contrib += 1;
+                if contrib == 1 {
+                    corr_a.copy_from_slice(&frame);
+                } else if contrib == 2 {
+                    corr = crate::quality::correlation(&corr_a, &frame);
+                }
+            }
             if s.is_spk {
                 any_spk = true;
                 for i in 0..F48 {
@@ -1017,8 +1230,16 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
                 }
             }
         }
+        inner.mix_meter.feed(now_ms, contrib, corr);
         for b in bridges.values_mut() {
+            // 站点级削顶计入点 1/3：桥接到第三方虚拟声卡（规格 §4.6）。
+            // 喂的是**削顶之前**的 buf——削顶之后再量就永远量不到越界。
+            inner.mix_clip.feed(now_ms, &b.buf);
             let out: Vec<f32> = b.buf.iter().map(|&v| soft_clip(v)).collect();
+            // 级 8′ `bridge_ring`：桥接流的尾级。**推之前**读（见
+            // `ring_depth_before_push`）。这一整秒的环此前完全没有建模——桥接流
+            // 的 `local_ms` 只有 jitter_buf + post_mix，静默漏掉它。
+            b.depth = Some(ring_depth_before_push(StageId::BridgeRing, &b.tx));
             b.tx.push(&out);
         }
         // Exactly 480 mono samples per 10ms tick per slot = each ring's 48k
@@ -1026,6 +1247,11 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
         // actually reading: writing into a ring nobody drains would do nothing
         // but run that slot's mic_dropped up. The write is a lock-free SPSC
         // index bump, safe to do on this loop.
+        // 级 8″ `hal_mic` 的本 tick 读数，按槽存一份（一个槽可被多条流写，
+        // 深度只有一份 —— 与 `bridge_ring` 同理）。全 `None` 起手：没写的槽
+        // 这一 tick 就没有这一级。
+        let mut hal_mic_depth: [Option<StageDepth>; crate::haldev::HAL_MAX_SLOTS] =
+            [None; crate::haldev::HAL_MAX_SLOTS];
         if hal_dirty != 0 {
             if let Some(h) = hal.as_ref() {
                 let mut out = [0.0f32; F48];
@@ -1035,19 +1261,32 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
                     {
                         continue;
                     }
+                    // 站点级削顶计入点 2/3：写进某个对端的虚拟麦克风。
+                    inner.mix_clip.feed(now_ms, &hal_bufs[slot]);
                     for i in 0..F48 {
                         out[i] = soft_clip(hal_bufs[slot][i]);
                     }
+                    // 级 8″：模式 B 虚拟麦克风环（500 ms）。同样**写之前**读——
+                    // 读到的是「驱动还没取走的积压」，正是这一帧要等的排队量。
+                    // 这一级此前也完全没有建模：模式 B 的接收流上报的
+                    // `local_ms` 只有 jitter_buf + post_mix。
+                    hal_mic_depth[slot] = h.mic_depth(slot as u8);
                     h.write_mic_mono(slot as u8, &out);
                 }
             }
         }
         if any_spk {
+            // ⚠ 这个 soft_clip **不计入**站点级削顶统计（规格 §0.6）：
+            // `mix_ring` 是 probe 的旁路 tap，不在送扬声器的路径上。把它算进去
+            // 会让每一路 spk 流的削顶被重复计数一次，凭空虚增一倍。
             let clipped: Vec<f32> = mix.iter().map(|&v| soft_clip(v)).collect();
             push_mix(inner.as_ref(), &clipped);
         } else {
             clear_mix(inner.as_ref());
         }
+        // 本 tick 到底有没有一个活的播放环。没有就得清槽（设备打不开、或压根
+        // 没有流送本机输出），不能留着上一次的读数。
+        let mut have_play_ring = false;
         if any_spk || any_mon {
             if playback.is_none()
                 && pb_fail_at.map_or(true, |t| t.elapsed() > Duration::from_secs(10))
@@ -1063,10 +1302,42 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
             if let Some((_, tx)) = playback.as_mut() {
                 let mut out = [0.0f32; F48];
                 for i in 0..F48 {
-                    out[i] = soft_clip(mix[i] + mon[i]);
+                    out[i] = mix[i] + mon[i];
                 }
+                // 站点级削顶计入点 3/3：真实默认输出。这是最重要的一个——
+                // 「两路重复流相加」的破音就出现在这里。同样喂削顶**之前**的和。
+                inner.mix_clip.feed(now_ms, &out);
+                for o in out.iter_mut() {
+                    *o = soft_clip(*o);
+                }
+                // 播放环深度（规格 §3.2 的级 8）。**`push` 之前**读：读到的是
+                // 排在这一帧前面的样本数，也就是这一帧的驻留时间。之前这里是
+                // push 之后读，恒定多算一整帧 ≈ 10 ms（刚推进去的 480 个样本
+                // 不用等自己），而且因为恒定，看起来完全像一个真实的缓冲。
+                publish_play_ring(&inner.play_ring, tx);
                 tx.push(&out);
+                have_play_ring = true;
             }
+        }
+        if !have_play_ring {
+            inner.play_ring.store(None);
+        }
+        // 每条流的两条**并行**尾级（桥接虚拟声卡 / 虚拟麦克风）。每 tick 都写，
+        // 包括 `None`：桥关掉、槽解绑之后若不清槽，报告线程会一直读到最后一次的
+        // 陈旧深度 —— 与发送侧同一条纪律。
+        //
+        // 并行而非串联：一帧解码结果会被**同时**送进真实输出 / 桥 / 虚拟麦克风，
+        // 求和会报出双倍延迟，所以 `sum_stage_ms` 对尾级取 max（见
+        // `StageId::is_output_tail`）。
+        for s in &streams {
+            s.bridge_ring.store(
+                s.bridge
+                    .as_ref()
+                    .and_then(|n| bridges.get(n))
+                    .and_then(|b| b.depth),
+            );
+            s.hal_mic
+                .store(s.hal_slot.and_then(|slot| hal_mic_depth.get(slot as usize).copied().flatten()));
         }
         tick += 1;
     }
@@ -1200,6 +1471,378 @@ mod tests {
         add_to_hal_bucket(Some(200), &[1.0; F48], &mut bufs, &mut dirty);
         assert_eq!(dirty, 0);
         assert!(bufs.iter().all(|b| b.iter().all(|&v| v == 0.0)));
+    }
+
+    // ------------------------------------------- SysAudioFrames::depths()
+    //
+    // 这个源的 `depths()` 此前零覆盖。它是三个「1 秒源侧 FIFO」之一，而三个
+    // FIFO 的丢弃方向（`Oldest`）与播放环的（`Newest`）在深度读数上完全简并
+    // ——标错标签，遥测就只能说「有一秒卡在某处」，说不出那一秒是怎么卡的
+    // （规格 §0.2）。所以下面真的跑 `next_frame()` 把 FIFO 灌到饱和，再断言
+    // `depths()` 报出来的东西。
+
+    /// 站在系统音频后端的位置上：按固定块交出**单调递增**的样本，好让「剩下的
+    /// 是早的还是晚的」——也就是丢弃方向——看得出来。
+    struct FakeSysCap {
+        rate: u32,
+        chunk: usize,
+        n: u32,
+    }
+
+    impl SysAudioCapture for FakeSysCap {
+        fn read(&mut self, out: &mut Vec<f32>) -> usize {
+            for _ in 0..self.chunk {
+                self.n += 1;
+                out.push(self.n as f32);
+            }
+            self.chunk
+        }
+        fn sample_rate(&self) -> u32 {
+            self.rate
+        }
+    }
+
+    fn sys_frames(rate: u32, chunk: usize) -> SysAudioFrames {
+        SysAudioFrames::new(
+            Box::new(FakeSysCap { rate, chunk, n: 0 }),
+            "fake".to_string(),
+            true,
+        )
+    }
+
+    /// 空 FIFO 也要报这一级：0 样本 ≠ 「这一级不存在」。后者是 `None`
+    /// （`ToneSource` 那种即时合成的源），两者在 UI 上是两句不同的话。
+    #[test]
+    fn a_sysaudio_source_reports_one_send_fifo_stage_even_when_empty() {
+        let src = sys_frames(48_000, 480);
+        let [first, second] = src.depths();
+        let d = first.expect("发送 FIFO 这一级必须存在");
+        assert_eq!(d.id, StageId::SrcFifo);
+        assert_eq!(d.samples, 0);
+        assert_eq!(d.capacity, 48_000, "1 秒 @48k");
+        assert_eq!(d.rate, 48_000, "FIFO 在重采样之后，恒为 48k");
+        assert_eq!(d.dropped, Some(0), "本进程数得出来，0 是真读数");
+        assert_eq!(d.drop_mode, DropMode::Oldest);
+        assert_eq!(d.ms(), Some(0.0));
+        assert!(
+            second.is_none(),
+            "后端自己的内部缓冲从这里读不到 —— 不报，而不是报 0（规格 §7.2 R11）"
+        );
+    }
+
+    /// 灌爆 1 秒上限：深度贴顶、丢弃方向是**最旧**、计数对得上、ms 按 48k 换算。
+    #[test]
+    fn a_sysaudio_send_fifo_saturates_at_one_second_and_drops_the_oldest() {
+        let mut src = sys_frames(48_000, 5_000); // 每 tick 收 5000、放 480
+        let mut out = Vec::new();
+        for _ in 0..20 {
+            src.next_frame(&mut out);
+        }
+        let d = src.depths()[0].expect("发送 FIFO 这一级");
+        // 修剪到 CAP=48000 后本 tick 又被取走 480。
+        assert_eq!(d.samples, 47_520);
+        assert!(d.saturated());
+        assert_eq!(d.ms(), Some(990.0), "1 秒 FIFO 灌满 ≈ 990 ms 驻留");
+        assert_eq!(d.drop_mode, DropMode::Oldest);
+        assert_eq!(
+            d.dropped,
+            Some(20 * 5_000 - 20 * 480 - 47_520),
+            "收进来的 − 放出去的 − 还压着的 = 丢掉的"
+        );
+        // 丢的确实是最旧的：源交的是 1,2,3,…，留在 FIFO 里的必须是尾部。
+        src.next_frame(&mut out);
+        assert!(
+            out[0] > 50_000.0,
+            "留下的必须是晚到的样本，got {} —— 丢弃方向反了",
+            out[0]
+        );
+    }
+
+    // ------------------------------------------------------------- 注入 B
+    //
+    // 规格 §6.3 注入 B：**稳态速率失配**（生产者比消费者快 1%）。
+    //
+    // 这是 §0.7 两种病理里的第二种：`tx_loop` 按 `Instant` 固定节拍每 tick 取走
+    // 恰好 480 个样本，而生产者跑在**设备时钟**上。两个时钟只要有稳态速率差，
+    // 这一级就**必然**单调涨到饱和，之后永远丢下去。它与「一次卡顿灌满」的深度
+    // 读数完全相同（都贴着容量），修法却完全不同——所以必须靠 `drift_sps`
+    // （饱和之前）与 `dropped` 是否还在增长（饱和之后）区分。
+    //
+    // 用真的 `SysAudioFrames`（真 FIFO、真重采样器、真 `next_frame`）跑完整整
+    // 96 秒的模拟时间，喂真的 `DriftTracker`，不造任何字面量。
+    #[test]
+    fn injection_b_a_steady_rate_mismatch_climbs_then_keeps_dropping() {
+        use audiohub_core::latency::DriftTracker;
+
+        // 每 tick 交 485、取走 480 ⇒ +5 样本/tick = **+500 样本/秒**（约 1%）。
+        let mut src = sys_frames(48_000, 485);
+        let mut out = Vec::new();
+        let mut drift = DriftTracker::new();
+
+        // ---- 阶段一：还没饱和，斜率必须把「正在走向饱和」说出来 ----
+        // 30 秒 = 3000 tick ⇒ 深度约 15000 样本（312 ms），离 48000 还远。
+        for sec in 0..=30 {
+            for _ in 0..100 {
+                src.next_frame(&mut out);
+            }
+            let d = src.depths()[0].expect("这一级一直在");
+            drift.push(sec as f32, d.id, d.samples);
+        }
+        let mid = src.depths()[0].unwrap();
+        assert!(!mid.saturated(), "此刻还没饱和, got {} 样本", mid.samples);
+        assert_eq!(mid.dropped, Some(0), "还没开始丢 —— 深度在涨，但一个样本都没丢");
+        let slope = drift.slope(StageId::SrcFifo).expect("30 秒 31 个点，够算斜率");
+        assert!(
+            (slope - 500.0).abs() < 5.0,
+            "1% 失配 = +500 样本/秒，遥测必须在**饱和之前**就说出来, got {slope}"
+        );
+        assert!(
+            mid.ms().unwrap() > 250.0,
+            "已经积到 250 ms 以上了, got {:?}",
+            mid.ms()
+        );
+
+        // ---- 阶段二：跑到饱和之后，丢弃**持续增长** ----
+        //
+        // 深度 48000 / 500 每秒 ⇒ 第 96 秒才真正装满。注意 `saturated()` 的判据
+        // 是 ≥95% 容量，也就是第 91 秒就为真，**而那时一个样本都还没丢**
+        // ——「贴顶」与「开始丢」不是同一件事，差着 5 秒。所以取样窗口开在
+        // 第 120 秒之后，那里已经是纯稳态。
+        let mut dropped_seen = Vec::new();
+        for sec in 31..=180 {
+            for _ in 0..100 {
+                src.next_frame(&mut out);
+            }
+            let d = src.depths()[0].unwrap();
+            drift.push(sec as f32, d.id, d.samples);
+            if sec >= 120 {
+                dropped_seen.push(d.dropped.expect("源侧 FIFO 的丢弃是可观测的"));
+            }
+        }
+        let d = src.depths()[0].unwrap();
+        assert!(d.saturated(), "1% 失配跑够久必然贴顶, got {} 样本", d.samples);
+        assert_eq!(d.samples, 47_520, "修剪到 48000 后本 tick 又被取走一帧");
+        assert_eq!(d.ms(), Some(990.0), "这就是用户听到的那将近一秒");
+        assert_eq!(d.drop_mode, DropMode::Oldest, "丢最旧 ⇒ 恒定迟到但**连续**，不断续");
+        assert!(dropped_seen.len() >= 10, "饱和后采到了足够多的点");
+        assert!(
+            dropped_seen.windows(2).all(|w| w[1] > w[0]),
+            "**丢弃必须一直在涨** —— 这是「稳态速率失配」区别于「被一次卡顿灌满」的唯一判据（规格 §3.3）"
+        );
+        // 每秒丢掉的正是那 1%：500 样本/秒。
+        let per_sec = (dropped_seen.last().unwrap() - dropped_seen.first().unwrap()) as f64
+            / (dropped_seen.len() - 1) as f64;
+        assert!(
+            (per_sec - 500.0).abs() < 5.0,
+            "稳态每秒丢掉的样本数应等于失配量 500, got {per_sec}"
+        );
+        // 饱和之后深度不再动 ⇒ 斜率归零。**只看斜率会以为一切正常**，
+        // 必须与 `dropped` 一起读才能得出「正在持续丢」的结论。
+        let late = drift.slope(StageId::SrcFifo).expect("有斜率");
+        assert!(
+            late.abs() < 1.0,
+            "饱和后深度封顶，斜率必然回到 0, got {late} —— 这正是 dropped 不可或缺的理由"
+        );
+    }
+
+    /// 后端跑 44.1k 时这一级**仍然**按 48000 换算（它在重采样之后）。
+    /// 与采集环那一级（走设备速率）恰好相反，写反任一个都静默偏 ±8.8%。
+    #[test]
+    fn a_sysaudio_send_fifo_converts_at_48k_whatever_the_backend_rate() {
+        let mut src = sys_frames(44_100, 4_410); // 100 ms @44.1k / tick
+        let mut out = Vec::new();
+        src.next_frame(&mut out);
+        let d = src.depths()[0].expect("发送 FIFO 这一级");
+        assert_eq!(d.rate, 48_000);
+        let ms = d.ms().expect("rate 非 0");
+        assert!((ms - 90.0).abs() < 2.0, "100 ms 进、10 ms 出 ⇒ 约 90 ms，got {ms:.2}");
+    }
+
+    // ------------------------------------------------- 站点级削顶的计入点
+    //
+    // 三个计入点（bridge / 虚拟麦克风 / 真实输出）都在 `mixer_loop` 的 10 ms
+    // 循环里，而那个循环要一个完整的 `DaemonInner`（UDP socket + 三条线程通道
+    // + 真实设备）才跑得起来，单元测试构造不出来。所以这一条退到源码层面清点
+    // 调用点——它仍然会在**多一个** feed 出现的那一刻变红，而那正是规格 §0.6
+    // 唯一要防的事。
+
+    /// probe 的 `mix_ring` tap **不计入**站点级削顶（规格 §0.6）。
+    ///
+    /// 它是旁路 tap，不在送扬声器的路径上；把它算进去会让每一路 spk 流的削顶被
+    /// 重复计一次，`clip_ratio` 凭空翻倍，而「两路重复流把声音削烂」正是靠这个
+    /// 比率抓的——虚增一倍就等于把判据本身毁掉。
+    #[test]
+    fn the_probe_tap_is_not_counted_in_site_clipping() {
+        // 拆开写，免得这条断言自己被自己数进去。
+        let needle = concat!("mix_clip", ".feed(");
+        let src = include_str!("engine.rs");
+        let n = src.matches(needle).count();
+        assert_eq!(
+            n, 3,
+            "站点级削顶恰好三个计入点：bridge / 虚拟麦克风 / 真实输出。\
+             多出来的那个八成是 push_mix 那条 probe 旁路（规格 §0.6 明确排除）"
+        );
+        // ...而且那三个都不在 `any_spk` 的 probe 分支里。
+        let probe = src
+            .split("if any_spk {")
+            .nth(1)
+            .expect("mixer_loop 里的 probe 分支");
+        let probe = probe.split("clear_mix(").next().unwrap();
+        assert!(
+            probe.contains("push_mix("),
+            "定位到的应该是 push_mix 那个分支"
+        );
+        assert!(
+            !probe.contains(needle),
+            "probe 旁路里出现了站点级削顶计入 —— 每一路 spk 流会被重复计一次"
+        );
+    }
+
+    /// 上一条守的是「不能多喂一次」，这一条说明**为什么**：同一帧喂两次，
+    /// 站点级窗口的分母和越界数一起翻倍，`clip_ratio` 却纹丝不动——所以光看
+    /// 比率发现不了，只能靠计入点本身守住。而峰值与样本总数是会变的。
+    #[test]
+    fn feeding_one_frame_twice_doubles_the_site_window() {
+        let once = crate::quality::ClipMeter::new();
+        let twice = crate::quality::ClipMeter::new();
+        let loud = [0.9f32; F48]; // 0.9 > 0.8 阈值 ⇒ 每个样本都算越界
+        for t in 0..10u64 {
+            let ms = 1_000 + t * 1_000;
+            once.feed(ms, &loud);
+            twice.feed(ms, &loud);
+            twice.feed(ms, &loud); // 多喂的那一次
+        }
+        // 空帧只推时间、不加样本，用它干净地把两边各翻一页。
+        once.feed(11_500, &[]);
+        twice.feed(11_500, &[]);
+
+        let a = once.window().expect("整页可读");
+        let b = twice.window().expect("整页可读");
+        assert_eq!(b.samples, a.samples * 2, "分母被凭空放大一倍");
+        assert_eq!(b.over, a.over * 2);
+        assert!(
+            (b.ratio() - a.ratio()).abs() < 1e-12,
+            "而**比率一模一样** —— 所以光盯着 clip_ratio 是发现不了重复计数的，\
+             只能靠计入点本身守住"
+        );
+    }
+
+    // ------------------------------------------------- 级 4 `send_pace`
+
+    /// 有排队的源必须报节拍那一级；即时合成的源必须**不**报。
+    ///
+    /// 这一级过去在 `StageId` 里声明、在规格 §3.2 里编号，**全仓库零发布点**：
+    /// 发送侧 `local_ms` 因此系统性短 5 ms，且没有任何字段说它缺席。
+    #[test]
+    fn send_pace_is_emitted_for_queued_sources_only() {
+        let fifo = StageDepth::new(StageId::SrcFifo, 480, 48_000, 48_000, DropMode::Oldest);
+        let p = send_pace_for(&[Some(fifo), None]).expect("有队列的源必须报节拍");
+        assert_eq!(p.id, StageId::SendPace);
+        assert_eq!(p.ms(), Some(5.0), "半个 tick 的期望值");
+
+        // 采集环 + 发送 FIFO 两级齐全时也只加**一次** 5 ms：节拍是调度器的一级，
+        // 不是每个队列各来一份。
+        let cap = StageDepth::new(StageId::CapRing, 960, 96_000, 48_000, DropMode::Newest);
+        assert_eq!(send_pace_for(&[Some(cap), Some(fifo)]), Some(StageDepth::send_pace()));
+
+        // ToneSource / 驱动未附着的 HalSpeakerSource：样本在 tick 里现产现取，
+        // 等待恒为 0，记 5 ms 是凭空捏造。
+        assert_eq!(send_pace_for(&NO_DEPTHS), None);
+    }
+
+    /// **采样相位**：播放环深度必须在 `tx.push()` **之前**读。
+    ///
+    /// 推之后读到的是「这一帧 + 排在它前面的」，恒定多算一整帧 ≈ 10 ms——刚推
+    /// 进去的 480 个样本不用等自己——而且因为它恒定，看起来完全像一个真实缓冲，
+    /// 不会有人怀疑。源侧三级都在 `next_frame()` 之后读（同样是「新样本前面的
+    /// 存量」），两边必须同相。
+    ///
+    /// `AudioTx` 要一台真设备才造得出来，所以这条守在源码顺序上——它会在有人
+    /// 把两行调回去的那一刻变红，而那正是唯一要防的事。
+    #[test]
+    fn the_play_ring_is_sampled_before_the_push_not_after() {
+        let src = include_str!("engine.rs");
+        let body = src
+            .split("if let Some((_, tx)) = playback.as_mut() {")
+            .nth(1)
+            .expect("mixer_loop 里的真实输出分支");
+        let publish = body.find("publish_play_ring(").expect("发布点");
+        let push = body.find("tx.push(").expect("推送点");
+        assert!(
+            publish < push,
+            "publish_play_ring 必须在 tx.push 之前 —— 之后读恒定多算一整帧 10 ms"
+        );
+        // 桥接环同理：`ring_depth_before_push` 的名字本身就是契约。读数那一行
+        // 之后的**三行以内**必须出现它守着的那次 push。
+        // 拆开写，免得这条断言自己被自己匹配到（同 `the_probe_tap_...`）。
+        let needle = concat!("ring_depth_before_push(StageId::", "BridgeRing");
+        for b in src.split(needle).skip(1) {
+            let seg: String = b.lines().take(3).collect::<Vec<_>>().join("\n");
+            assert!(
+                seg.contains("tx.push("),
+                "桥接环的读数之后必须紧跟着那次 push，否则相位对不上；\n{seg}"
+            );
+        }
+    }
+
+    // ------------------------------------------- 源消失时必须清槽
+
+    fn tx_stream_for(shared: &Arc<TxShared>) -> TxStream {
+        TxStream {
+            id: 7,
+            crypto: MediaCrypto::new_for_stream(&[0u8; 32], 7, &[0u8; 16]),
+            dest: "127.0.0.1:1".parse().unwrap(),
+            spec: SourceSpec::Mic,
+            loss: LossInjector::new(7, 0.0),
+            seq: 0,
+            rung: 0,
+            rs: None,
+            rs_last: 0.0,
+            staged: Vec::new(),
+            shared: shared.clone(),
+        }
+    }
+
+    /// 源没了 ⇒ 槽必须清空，而不是把最后一次读数永久钉在那里。
+    ///
+    /// `TxShared` 的寿命比 `tx_loop` 里的 `TxStream` 长（会话表还持有它，报告
+    /// 线程还在读）。`reap_dead_sources` 收尸、或 `TxCmd::Remove` 把 refs 减到
+    /// 0 之后，tick 里的 `sources.get(&st.spec)` 拿不到东西——早先那条
+    /// `else { continue }` 直接跳过了下面的发布，于是一段**早已不存在的排队**
+    /// 会一直显示下去，而且不带任何「这是陈的」标记。
+    #[test]
+    fn a_vanished_source_clears_its_stage_slots() {
+        let shared = Arc::new(TxShared::new());
+        let st = tx_stream_for(&shared);
+        // 上一 tick 报过的读数
+        shared.stages[0].store(Some(StageDepth::new(
+            StageId::SrcFifo,
+            48_000,
+            48_000,
+            48_000,
+            DropMode::Oldest,
+        )));
+        shared.stages[SEND_PACE_SLOT].store(Some(StageDepth::send_pace()));
+        assert!(shared.stages[0].load().is_some());
+
+        clear_send_stages(&st);
+        for (i, slot) in shared.stages.iter().enumerate() {
+            assert!(slot.load().is_none(), "槽 {i} 还留着一段死掉的排队");
+        }
+    }
+
+    /// 三条清槽路径必须都在：tick 里源查不到、`TxCmd::Remove`、收尸。
+    /// 少任何一条，那条流的槽就再也不会被覆盖。
+    #[test]
+    fn every_stream_teardown_path_clears_the_slots() {
+        let needle = concat!("clear_send", "_stages(");
+        let src = include_str!("engine.rs");
+        // 定义 1 处 + 调用 3 处（tick / Remove / reap），测试里的 1 处另计
+        let calls = src.matches(needle).count();
+        assert!(
+            calls >= 4,
+            "清槽调用点少了：tick 里源查不到、TxCmd::Remove、reap_dead_sources 三条都要，got {calls}"
+        );
     }
 
     /// The tx engine dedups sources by `SourceSpec`. If the slot were not part

@@ -1,5 +1,5 @@
 import { useEffect, useSyncExternalStore } from 'react';
-import { Brand, NavPill, ConnFoot, DaemonBadge, Overlay, VIEW_TITLE } from './components/Chrome';
+import { Brand, NavPill, DaemonBadge, Overlay, VIEW_TITLE } from './components/Chrome';
 import { chromeMouseDown } from './lib/drag';
 import { Toasts } from './components/Toasts';
 import { ConfirmHost } from './components/ConfirmDialog';
@@ -59,7 +59,6 @@ export function App() {
           <NavPill onNavigate={(v) => actions.navigate(v)} />
           <DaemonBadge />
         </header>
-        <ConnFoot />
       </div>
 
       {/* 首启授权门：盖住整个应用，但排在覆盖层之下——服务都没连上时，

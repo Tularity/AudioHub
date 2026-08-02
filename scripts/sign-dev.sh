@@ -21,6 +21,17 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+BUNDLE="$ROOT/app/src-tauri/target/release/bundle/macos/AudioHub.app"
+
+# 防线：绝不重签一个**正在运行**的映像。
+# 2026-08-01 事故就是这么来的 —— 重签正在运行的 AudioHub.app，替换了运行中进程的
+# 磁盘映像与代码身份，其「本地网络」TCC 授权随即失配，daemon 从此连不上对端，
+# 日志却只刷 `No route to host`（macOS 用伪造的 EHOSTUNREACH 掩盖权限拒绝）。
+# 必须早于第一次 codesign —— codesign 是就地改写，写下去就晚了。
+# 检测细节与覆盖开关见 scripts/guard-running-image.sh。
+sh "$(dirname "$0")/guard-running-image.sh" \
+  "$BUNDLE" "$ROOT/target/release/audiohubd" "$ROOT/target/release/audiohub" || exit 1
+
 IDENTITY="${AUDIOHUB_SIGN_IDENTITY:-AudioHub Dev}"
 
 # Two explicit calls, no data structure: an associative array silently iterated
@@ -57,7 +68,7 @@ sign_one "$ROOT/target/release/audiohub"  com.audiohub.cli    && (( signed++ )) 
 # 65)` on every LAN connect while `nc` from a shell reached the same host and
 # port fine. Inner binaries first, then the bundle: codesign seals what it
 # contains, so signing the wrapper before its contents invalidates it.
-BUNDLE="$ROOT/app/src-tauri/target/release/bundle/macos/AudioHub.app"
+# ($BUNDLE 已在文件开头定义 —— 那里的运行中检测要用到它。)
 if [[ -d "$BUNDLE" ]]; then
   sign_one "$BUNDLE/Contents/MacOS/audiohub"     com.audiohub.daemon && (( signed++ )) || true
   sign_one "$BUNDLE/Contents/MacOS/audiohub-app" com.audiohub.app    && (( signed++ )) || true

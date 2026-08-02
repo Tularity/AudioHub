@@ -98,6 +98,45 @@ function PermissionsCard() {
   );
 }
 
+// 本机身份。右上徽标改成悬停才显示指纹与端口之后（plan §7.6 补充裁定），这里是它
+// 唯一的常驻落点——触摸屏没有 hover，截图排障也拿不到 hover 态，那两个场景都得有
+// 一个「一直在那儿」的地方能读到并复制完整指纹。
+function IdentityCard() {
+  const daemon = useStore((s) => s.daemon);
+  const fp = daemon?.fingerprint || '';
+
+  return (
+    <section className="card block" data-testid="settings-identity">
+      <h3 className="block-title">{t('settings.identity.title')}</h3>
+      <div className="kv">
+        <div className="kv-row">
+          <span className="kv-k">{t('settings.identity.name')}</span>
+          <span data-testid="settings-identity-name">{daemon?.name || t('common.dash')}</span>
+        </div>
+      </div>
+      <div className="fp-row">
+        <span className="kv-k">{t('settings.identity.fingerprint')}</span>
+        <code className="fp-full" data-testid="settings-identity-fp">{fp || t('common.dash')}</code>
+        <button
+          className="btn ghost small" type="button" data-testid="settings-identity-copy"
+          disabled={!fp}
+          onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(fp);
+              toast(t('settings.identity.copied'), 'ok');
+            } catch {
+              toast(t('common.copyFailed'), 'warn');
+            }
+          }}
+        >
+          <Icon name="copy" />{t('common.copy')}
+        </button>
+      </div>
+      <p className="muted small">{t('settings.identity.note')}</p>
+    </section>
+  );
+}
+
 function ModeMirrorCard() {
   const s = useStore();
   const eff = effectiveMode(s);
@@ -484,6 +523,7 @@ export function SettingsView() {
     <>
       <PermissionsCard />
       <ModeMirrorCard />
+      <IdentityCard />
 
       <section className="card block">
         <h3 className="block-title">{t('settings.net.title')}</h3>

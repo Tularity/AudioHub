@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Icon } from '../components/Icon';
 import { toast } from '../components/Toasts';
 import { fmt, sleep } from '../lib/fmt';
-import { t } from '../i18n';
+import { t, joinPhrases } from '../i18n';
 import type { MsgKey } from '../i18n';
 import { useTick } from '../lib/hooks';
 import { actions, getState, useStore } from '../state/store';
@@ -218,7 +218,8 @@ function ConnectOthers() {
                   ? <span className="tag ok">{t('pair.right.paired')}</span>
                   : <span className="tag">{t('pair.right.unpaired')}</span>}
               </div>
-              <div className="disc-sub">{a + (d.fingerprint ? ` · ${fmt.fp(d.fingerprint, 12)}` : '')}</div>
+              {/* 地址与指纹是两条并列短语，分隔符由语料给（原来这里硬编码着 ` · `）。 */}
+              <div className="disc-sub">{joinPhrases([a, d.fingerprint ? fmt.fp(d.fingerprint, 12) : null])}</div>
             </button>
           );
         })}

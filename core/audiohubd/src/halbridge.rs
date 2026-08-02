@@ -454,6 +454,47 @@ impl HalBridge {
         self.shared.append_spk_frame(slot, out)
     }
 
+    /// 这个槽的扬声器环此刻积着多少帧，以及环有多大（规格 §3.2 的级 3′
+    /// `hal_spk`）。**只读，不移动 `read_idx`。**
+    ///
+    /// 规格 §0.3 的修正二：`HAL_RING_FRAMES = 24000` = 500 ms，而
+    /// `engine.rs` 只在开流那一刻冲掉积压，之后**没有任何机制收敛驻留深度**。
+    /// 「写入与读出严格相等」只证明速率相等，证明不了驻留深度小——一个恒定
+    /// 存着 400 ms 的 FIFO，进出速率同样严格相等。这个读数就是用来把那个
+    /// 结构上无法证伪的场景变成一个可以直接看的数。
+    pub fn spk_depth(&self, slot: u8) -> Option<(u32, u32)> {
+        self.shared.rings.spk_readable(slot as usize)
+    }
+
+    /// 这个槽的**麦克风**环此刻积着多少（规格 §3.2 之外新建模的级 8″
+    /// `hal_mic`）。**只读，不动任何下标。**
+    ///
+    /// 与 `spk_depth` 严格对称，只是方向相反：扬声器环是驱动写、我们读，
+    /// 麦克风环是我们写、驱动读。模式 B 的接收流把对端麦克风音频写进这里，
+    /// 选了这个虚拟麦克风的 App 从驱动那一侧取走——**它在送音频的路径上**，
+    /// 少一级就是 `local_ms` 少一段，且没有任何字段标出它缺席。
+    ///
+    /// 丢弃方向 `Newest`（`write` 满了短写），且**在我们这一侧**，所以
+    /// 与 `hal_spk` 不同：这一级的 `dropped` 是真读数，不是 `None`。
+    pub fn mic_depth(&self, slot: u8) -> Option<audiohub_core::latency::StageDepth> {
+        use audiohub_core::latency::{DropMode, StageDepth, StageId};
+        let (samples, capacity) = self.shared.rings.mic_occupied(slot as usize)?;
+        Some(StageDepth {
+            id: StageId::HalMic,
+            samples,
+            capacity,
+            rate: HAL_SAMPLE_RATE,
+            dropped: Some(
+                self.shared
+                    .slots
+                    .get(slot as usize)
+                    .map(|c| c.mic_dropped.load(Ordering::Relaxed))
+                    .unwrap_or(0),
+            ),
+            drop_mode: DropMode::Newest,
+        })
+    }
+
     /// Appends up to `max_frames` mono samples; returns how many were real.
     pub fn read_spk_mono(&self, slot: u8, out: &mut Vec<f32>, max_frames: usize) -> usize {
         let mut done = 0;
@@ -615,6 +656,29 @@ impl audiohub_net::media::FrameSource for HalSpeakerSource {
         }
         true // silence when idle: the virtual device is alive even with no app on it
     }
+    /// 只有虚拟扬声器环一级。`None` = 驱动没附着，那一级**不存在**（不是 0 ms）。
+    fn depths(&self) -> audiohub_core::latency::SourceDepths {
+        use audiohub_core::latency::{DropMode, StageDepth, StageId};
+        let Some((samples, capacity)) = self.bridge.rings.spk_readable(self.slot as usize) else {
+            return audiohub_core::latency::NO_DEPTHS;
+        };
+        [
+            Some(StageDepth {
+                id: StageId::HalSpk,
+                samples,
+                capacity,
+                rate: HAL_SAMPLE_RATE,
+                // 环满时写不进去的是生产者（驱动的 IOProc），丢的是新样本；
+                // 我们这一侧只做消费，从不 pop_front，所以绝不是 Oldest。
+                // 丢弃计数在驱动那一侧，本进程只有两个下标 —— 观测不到就报
+                // None，不报 0（报 0 是「这一级很健康」的假保证）。
+                dropped: None,
+                drop_mode: DropMode::Newest,
+            }),
+            None,
+        ]
+    }
+
     fn sample_rate(&self) -> u32 {
         HAL_SAMPLE_RATE
     }
@@ -1321,6 +1385,19 @@ mod platform {
             count
         }
 
+        /// 此刻环里占着的帧数。与 `read()` 里的 `avail` / `write()` 里的 `used`
+        /// 用同一个式子（含同样的 `min(cap)` 封顶与 wrapping 语义），但
+        /// **不移动任何下标**。
+        ///
+        /// 两个方向都用它：对扬声器环（驱动写、我们读）这是「可读」，对麦克风环
+        /// （我们写、驱动读）这是「驱动还没取走的积压」。数值定义相同，物理含义
+        /// 由调用方的方向决定 —— 见 `Rings::spk_readable` / `Rings::mic_occupied`。
+        fn readable(&self) -> u32 {
+            let r = self.r_idx().load(Ordering::Relaxed);
+            let w = self.w_idx().load(Ordering::Acquire);
+            (w.wrapping_sub(r) as usize).min(self.capacity as usize) as u32
+        }
+
         /// Consumer-side backlog drop; only ever called on the ring this
         /// process consumes.
         fn flush_consumer(&self) {
@@ -1407,6 +1484,33 @@ mod platform {
             if let Some(p) = rd(&self.inner).as_ref().and_then(|p| p.get(slot)) {
                 p.spk.flush_consumer();
             }
+        }
+
+        /// `(可读帧数, 容量帧数)`，**只读**：不动 `read_idx`，所以从这个方法
+        /// 观测不会改变被测对象（规格 §0.3 点名的那条纪律——HAL 环是唯一一个
+        /// 恒定驻留上限恰好 500 ms 的级，误把观测写成消费就会自己把它清零）。
+        ///
+        /// `None` = 没有驱动附着 / 没有这个槽 ⇒ 这一级不存在，不是 0 ms。
+        pub fn spk_readable(&self, slot: usize) -> Option<(u32, u32)> {
+            rd(&self.inner)
+                .as_ref()
+                .and_then(|p| p.get(slot))
+                .map(|p| (p.spk.readable(), p.spk.capacity))
+        }
+
+        /// `(已占用帧数, 容量帧数)` of the MIC ring, **read-only**.
+        ///
+        /// 同一个 `w - r` 表达式在两个方向上含义不同：扬声器环我们是消费者，
+        /// 它叫「可读」；麦克风环我们是生产者，同一个数是「驱动还没取走的积压」
+        /// ——也正是我们此刻写进去的那一帧要等的排队量。所以方法名叫
+        /// `occupied` 而不是 `readable`。
+        ///
+        /// `None` = 没有驱动附着 / 没有这个槽 ⇒ 这一级不存在，不是 0 ms。
+        pub fn mic_occupied(&self, slot: usize) -> Option<(u32, u32)> {
+            rd(&self.inner)
+                .as_ref()
+                .and_then(|p| p.get(slot))
+                .map(|p| (p.mic.readable(), p.mic.capacity))
         }
 
         /// Installs a freshly handshaked set. Dropping whatever was there
@@ -2890,6 +2994,178 @@ mod platform {
             );
         }
 
+        // ------------------------------------ HalSpeakerSource::depths()
+        //
+        // 规格 §3.2 的级 3′。此前零覆盖，而它恰恰是全链路**唯一恒定驻留上限
+        // 正好 500 ms** 的级，也是 §0.3「修正二」点名未被洗清嫌疑的那一个：
+        // 父任务的证据（90.25 s 内驱动写入 = tx_loop 读出，均 9025 帧）只证明
+        // 速率相等，**结构上无法证伪**「恒定存着 400 ms」这个形态。
+        // 下面这条就把那个形态造出来，断言新遥测直接把它显示成 400 ms。
+
+        use audiohub_core::latency::{DropMode, StageId};
+
+        fn attached_spk(frames_written: usize) -> (FakeDriverRing, FakeDriverRing, Arc<Shared>) {
+            let ds = FakeDriverRing::new(HAL_SPK_CHANNELS, HAL_SPK_BYTES);
+            let dm = FakeDriverRing::new(HAL_MIC_CHANNELS, HAL_MIC_BYTES);
+            let rings = Rings::new();
+            rings.attach(vec![RingPair {
+                spk: attach_ring(&ds, HAL_SPK_CHANNELS),
+                mic: attach_ring(&dm, HAL_MIC_CHANNELS),
+            }]);
+            if frames_written > 0 {
+                // 「驱动」把应用播的音频写进它自己的那份映射。
+                let ch = HAL_SPK_CHANNELS as usize;
+                let buf = vec![0.5f32; frames_written * ch];
+                let wrote = attach_ring(&ds, HAL_SPK_CHANNELS).write(&buf, frames_written);
+                assert_eq!(wrote, frames_written, "环装得下这些帧");
+            }
+            (ds, dm, Arc::new(test_shared(rings)))
+        }
+
+        fn spk_source(shared: &Arc<Shared>, slot: u8) -> HalSpeakerSource {
+            HalSpeakerSource {
+                bridge: shared.clone(),
+                slot,
+                dbg_peak: 0.0,
+                dbg_frames: 0,
+            }
+        }
+
+        /// 环里恒定压着 400 ms —— 不饱和（80%）、不丢弃、进出速率可以严格相等，
+        /// 但每一个样本都要迟到 400 ms 才出得来。旧证据对这个场景完全无感。
+        #[test]
+        fn a_hal_speaker_source_reports_the_ring_backlog_in_frames_at_48k() {
+            use audiohub_net::media::FrameSource;
+            let (_ds, _dm, shared) = attached_spk(19_200); // 400 ms @48k
+            let src = spk_source(&shared, 0);
+
+            let [first, second] = src.depths();
+            let d = first.expect("附着着驱动，这一级必须存在");
+            assert_eq!(d.id, StageId::HalSpk);
+            assert_eq!(d.samples, 19_200);
+            assert_eq!(d.capacity, HAL_RING_FRAMES, "500 ms 上限");
+            assert_eq!(d.rate, HAL_SAMPLE_RATE, "环恒为 48k");
+            assert_eq!(d.ms(), Some(400.0), "19200 / 48000 = 400 ms");
+            assert!(
+                !d.saturated(),
+                "80% 不算饱和 —— 靠『是否饱和』判断这一级健不健康，恰好会漏掉它"
+            );
+            assert_eq!(
+                d.dropped, None,
+                "环满时写不进去的是驱动的 IOProc，计数在它那一侧 —— 观测不到就报 None，不报 0"
+            );
+            assert_eq!(d.drop_mode, DropMode::Newest, "我们只消费，从不 pop_front");
+            assert!(second.is_none(), "这个源只有一级");
+        }
+
+        /// **观测不得改变被测对象**：读深度绝不能移动 `read_idx`，否则一读就把
+        /// 那 400 ms 自己清零，遥测会永远报 0（规格 §0.3 点名的纪律）。
+        #[test]
+        fn reading_the_hal_depth_does_not_consume_the_ring() {
+            use audiohub_net::media::FrameSource;
+            let (_ds, _dm, shared) = attached_spk(19_200);
+            let mut src = spk_source(&shared, 0);
+
+            for _ in 0..5 {
+                assert_eq!(src.depths()[0].unwrap().samples, 19_200, "读一次就少一点？");
+            }
+            // 真的取走一帧之后才准下降，且恰好降 480。
+            let mut out = Vec::new();
+            src.next_frame(&mut out);
+            assert_eq!(out.len(), HAL_FRAME_48K);
+            assert_eq!(src.depths()[0].unwrap().samples, 19_200 - 480);
+        }
+
+        /// 没有驱动 = 这一级**不存在**，不是 0 ms。空数组与「0 样本」在 UI 上是
+        /// 两句不同的话，用 0 冒充会给出「这一级很健康」的假保证。
+        #[test]
+        fn a_detached_hal_speaker_source_reports_no_stage_at_all() {
+            use audiohub_net::media::FrameSource;
+            let shared = Arc::new(test_shared(Rings::new()));
+            let src = spk_source(&shared, 0);
+            assert!(src.depths().iter().all(|s| s.is_none()));
+            // ...驱动没给出的槽同理。
+            let (_ds, _dm, attached) = attached_spk(0);
+            assert!(spk_source(&attached, 3).depths().iter().all(|s| s.is_none()));
+            // 而附着着的槽 0 即使空环也**要**报这一级（0 样本是真读数）。
+            let d = spk_source(&attached, 0).depths()[0].expect("槽 0 有环");
+            assert_eq!(d.samples, 0);
+            assert_eq!(d.ms(), Some(0.0));
+        }
+
+        /// 规格 §6.3 **注入 C 的满载形态**：把这条 500 ms 的环彻底灌满。
+        ///
+        /// 任务点名要求：分别灌满四个 1.000 秒 FIFO 与这条 500 ms 的 HAL 环，
+        /// 确认遥测报出 ~1000 / ~500 ms **而不是沉默**。这一条负责后者。
+        ///
+        /// 注意它与 400 ms 那条的区别：400 ms 时 `saturated()` 是 **false**
+        /// （80% < 95%），此刻才是 true。也就是说「靠是否饱和判断这一级健不
+        /// 健康」在 400 ms 上会漏掉，在满载上才报警——所以真正可依赖的是
+        /// `ms()` 这个读数本身，不是那个布尔。
+        #[test]
+        fn a_completely_full_hal_speaker_ring_reads_five_hundred_milliseconds() {
+            use audiohub_net::media::FrameSource;
+            let (_ds, _dm, shared) = attached_spk(HAL_RING_FRAMES as usize);
+            let d = spk_source(&shared, 0).depths()[0].expect("这一级必须存在");
+            assert_eq!(d.samples, HAL_RING_FRAMES, "环装满 = 24000 帧");
+            assert_eq!(d.capacity, HAL_RING_FRAMES);
+            assert_eq!(
+                d.ms(),
+                Some(500.0),
+                "满载的虚拟扬声器环 = 500 ms —— 这一级要是不报，用户的半秒就没人说"
+            );
+            assert!(d.saturated());
+            assert_eq!(d.dropped, None, "丢弃发生在驱动那一侧，观测不到就报 None");
+            assert_eq!(d.drop_mode, DropMode::Newest);
+        }
+
+        /// 模式 B 的虚拟麦克风环（500 ms）同样要能被灌满并报出来。与 spk 环
+        /// 严格对称、只是方向相反：**丢弃发生在我们这一侧**（`write` 满了短写），
+        /// 所以这一级的 `dropped` 是可观测的 `Some`，与 spk 的 `None` 构成对照。
+        ///
+        /// 走的是生产写入路径 `Shared::write_mic` 与生产读数路径
+        /// `HalBridge::mic_depth`，不手写任何 `StageDepth`。
+        #[test]
+        fn a_completely_full_hal_mic_ring_reads_five_hundred_milliseconds() {
+            let (_ds, _dm, rings) = attached_rings();
+            let bridge = HalBridge {
+                shared: Arc::new(test_shared(rings)),
+                thread: Mutex::new(None),
+            };
+
+            // 空环：这一级**存在**且是 0 ms（0 ≠ 不存在）。
+            let d = bridge.mic_depth(0).expect("附着着，这一级必须存在");
+            assert_eq!(d.samples, 0);
+            assert_eq!(d.ms(), Some(0.0));
+            assert_eq!(d.capacity, HAL_RING_FRAMES);
+
+            // 灌满：正好 24000 帧写得进去，第 24001 帧起短写。
+            let mono = vec![0.5f32; HAL_RING_FRAMES as usize + 5_000];
+            let wrote = bridge.shared.write_mic(0, &mono);
+            assert_eq!(wrote, HAL_RING_FRAMES as usize, "环只装得下 24000 帧");
+
+            let d = bridge.mic_depth(0).expect("这一级必须存在");
+            assert_eq!(d.samples, HAL_RING_FRAMES);
+            assert_eq!(d.ms(), Some(500.0), "满载的虚拟麦克风环 = 500 ms");
+            assert!(d.saturated());
+            assert_eq!(d.drop_mode, DropMode::Newest, "写满了短写：丢的是新样本");
+            assert_eq!(
+                d.dropped,
+                Some(5_000),
+                "**这一侧的丢弃数得出来** —— 与 hal_spk 的 None 正好构成对照"
+            );
+        }
+
+        /// 驱动没附着时这一级不存在（`None`），而不是「0 ms 的健康读数」。
+        #[test]
+        fn a_detached_hal_mic_ring_reports_no_stage_at_all() {
+            let bridge = HalBridge {
+                shared: Arc::new(test_shared(Rings::new())),
+                thread: Mutex::new(None),
+            };
+            assert!(bridge.mic_depth(0).is_none());
+        }
+
         fn test_shared(rings: Rings) -> Shared {
             Shared {
                 stop: AtomicBool::new(false),
@@ -3812,6 +4088,15 @@ mod platform {
             None
         }
         pub fn flush_spk_consumer(&self, _slot: usize) {}
+        /// 没有环就没有深度。`None` 是「这一级不存在」，**不是 0 ms**
+        /// （规格附录约束 1：绝不用 0 填补缺失分项）。
+        pub fn spk_readable(&self, _slot: usize) -> Option<(u32, u32)> {
+            None
+        }
+        /// 同上：没有环就没有这一级。
+        pub fn mic_occupied(&self, _slot: usize) -> Option<(u32, u32)> {
+            None
+        }
     }
 
     pub fn start(cfg: HalBridgeCfg) -> Result<Option<HalBridge>> {

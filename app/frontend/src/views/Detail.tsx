@@ -263,7 +263,7 @@ export function DetailView() {
                 await navigator.clipboard.writeText(fp);
                 toast(t('detail.fpCopied'), 'ok');
               } catch {
-                toast(t('detail.fpCopyFailed'), 'warn');
+                toast(t('common.copyFailed'), 'warn');
               }
             }}
           >

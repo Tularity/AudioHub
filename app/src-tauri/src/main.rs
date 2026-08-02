@@ -15,7 +15,13 @@ use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 mod webui;
 
 /// Must match audiohub_ipc::IPC_VERSION (contract: core/audiohub-ipc/src/lib.rs).
-const IPC_VERSION: u32 = 1;
+///
+/// 这个 crate 不在根 workspace 的 members 里，所以 `cargo test --workspace` **不编译
+/// 它** —— 该常量落后于 audiohub-ipc 时没有任何本地信号，只有装机之后 UI 弹
+/// 「服务版本不兼容」才暴露（2026-08-01 实测：daemon v2 起来了、音频正常，两端
+/// 界面同时被这个模态挡死）。守卫因此写在 audiohub-ipc 里，见那里的
+/// `the_three_ipc_version_declarations_agree`。
+const IPC_VERSION: u32 = 2;
 
 /// How long a freshly spawned daemon gets to publish a connectable ipc.json.
 const READY_TIMEOUT: Duration = Duration::from_secs(8);

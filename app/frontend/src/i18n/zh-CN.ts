@@ -6,7 +6,11 @@
 
 export const zhCN = {
   // ---------------------------------------------------------------- 通用
+  // 并列短语的**连接符**：两侧的留白是它契约的一部分，joinPhrases() 用的就是它。
   'common.phraseSep': ' · ',
+  // 独立展示用的间隔点。与 phraseSep 不是一回事——那是连接符，不能 trim 出来当字形用：
+  // 某个语种把 phraseSep 设成「，」时，被 trim 的结果会变成一个悬空的逗号。
+  'common.bullet': '·',
   'common.listSep': '、',
   'common.dash': '—',
   'common.ok': '确定',
@@ -15,6 +19,8 @@ export const zhCN = {
   'common.clear': '清除',
   'common.close': '关闭',
   'common.copy': '复制',
+  // 复制失败在详情页与设置页是同一件事，一条键服务两处——分成两条早晚会各自漂移。
+  'common.copyFailed': '复制失败，请手动选择文本',
   'common.retry': '重试',
   'common.connect': '连接',
   'common.connecting': '连接中…',
@@ -40,13 +46,9 @@ export const zhCN = {
   'badge.connecting': '连接中',
   'badge.offline': '离线',
 
-  'foot.tauri.online': 'AudioHub · 已连接 · 端口 {port}',
-  'foot.tauri.onlineNoPort': 'AudioHub · 已连接',
-  'foot.tauri.starting': 'AudioHub · 正在启动服务…',
-  'foot.tauri.connecting': 'AudioHub · 正在连接…',
-  'foot.tauri.offline': 'AudioHub · 服务未连接',
-  'foot.browser': '浏览器模式 · IPC 端口 {port}',
-  'foot.browserNoPort': '浏览器模式',
+  // foot.* 七条已删（规格 §2.4）：左下角那条注脚说的四种状态与上面四条 badge.* 逐一
+  // 重合，端口在设置页「网络 › IPC 端口」，「你正在用网页端查看」由 settings.web.browserOnly
+  // 常驻说明。
 
   // ---------------------------------------------------------------- 覆盖层
   'overlay.starting.title': '正在启动 AudioHub 服务…',
@@ -84,8 +86,12 @@ export const zhCN = {
   'mode.sub': '全局设置：决定本机怎么使用别人的音频设备，对全部对端一起生效。',
   'mode.a.label': 'A · 免驱动',
   'mode.b.label': 'B · 虚拟设备',
-  'mode.a.desc': '捕获本机系统音频送到对端播放（两端同时发声）；取用对端麦克风需借助已安装的第三方虚拟声卡。用哪一台对端，在下方各张卡片上选择。',
-  'mode.b.desc': '每台已配对的主机都会作为一对设备出现在系统音频设备列表里。用哪一台主机，就在「系统设置 › 声音」或任意应用里选它的设备——本界面不再提供对端选择。调节该设备的音量即调节对端真实设备的音量。',
+  // 一级界面只留一句**结果句**：读完这一行就知道「现在选谁、在哪里选」，剩下的由
+  // 「了解更多」带到设置页——那里的 settings.mode.rowDesc 本来就是同一段话的完整版，
+  // 原先主面板上的 mode.a.desc / mode.b.desc 与它逐句重复，已随本次重整一并删除。
+  'mode.a.result': '在下方卡片上选对端；本机与对端会同时发声。',
+  'mode.b.result': '在「系统设置 › 声音」或任意应用里选对端的设备即可使用。',
+  'mode.learnMore': '了解更多',
   'mode.downgraded': '你选择的是模式 B，但当前不可用，已临时按模式 A 运行。',
   'mode.switched.toB': '已切换到模式 B：已配对主机将作为音频设备出现在系统里。',
   'mode.switched.toA': '已切换到模式 A：全部 AudioHub 虚拟设备已从系统移除。',
@@ -119,12 +125,166 @@ export const zhCN = {
   'device.speaker': '扬声器',
   'device.microphone': '麦克风',
 
+  // ---------------------------------------------------------------- 一级指标：延迟
+  // 一级界面只回答三个问题：这台主机在不在 / 我在用它做什么 / 用起来好不好。
+  // 「延迟」与「音质」补的是第三个（spec-telemetry-ia §2.1）。
+  'metric.latency.label': '延迟',
+  'metric.latency.value': '{ms} ms',
+  // 「≥」不是修辞：声卡自身的缓冲读不到，Σ 各级必然是下限（plan §7.6 补充裁定）。
+  'metric.latency.valueLower': '≥{ms} ms',
+  'metric.latency.none': '—',
+  'metric.latency.measuring': '测量中…',
+  'metric.latency.unsupported': '对端版本较旧，无法测量',
+  'metric.latency.grade.imperceptible': '几乎无感',
+  'metric.latency.grade.conversational': '可用于对话',
+  'metric.latency.grade.noticeable': '明显延迟',
+  'metric.latency.grade.unusable': '不适合互动',
+  'metric.latency.footnote': '系统链路延迟，不含蓝牙 / HDMI 等外部音频链路的额外缓冲。',
+  'metric.latency.lowerBoundWhy': '未含声卡固有缓冲，实际略高于此值。',
+  'metric.latency.expand': '查看分段',
+  'metric.latency.collapse': '收起分段',
+  // 范围标记：读数只覆盖本机这一侧时挂在等级词的位置上。
+  // 为什么要单独一条而不是复用「≥」：「≥」说的是「还要再多一点」，而这里缺的是
+  // **对方整整一半管线**，量级无上界。只给「≥474 ms」而不说缺了谁，用户会把它
+  // 读成端到端总延迟——那正是这次要消灭的误读。文案直说缺的是什么，不说黑话。
+  'metric.latency.scopeLocal': '未含对方主机',
+  'metric.latency.scopeLocalWhy': '这个数只算了本机这一侧的排队时长。对方主机上的分段还没上报，端到端的真实延迟比它高，高多少现在说不了。',
+
+  // 一级四段：面向用户的说法，不出现 FIFO / JitterBuffer 这类内部词。
+  // 没有第五段「设备」：色带是按音频流向排的时间轴，而两个声卡固有延迟分别落在
+  // 链路的两端，一个在轴上出现两次的集合占不了一个连续色块（详见 lib/metrics.ts
+  // 的 LATENCY_SEGMENTS 注释）。它们并进「采集」与「播放」，在明细里各占一行。
+  'latency.seg.network': '网络',
+  'latency.seg.capture': '采集',
+  'latency.seg.buffer': '缓冲',
+  'latency.seg.playback': '播放',
+
+  // 就地展开的逐级明细：这里才出现内部级名，并各带一句说明。
+  //
+  // ⚠ 这些说明一律**不写「本机 / 对方」**，主机由每行的 stage-host 标签给。
+  // 原文把主机烤进了句子里（「对方声卡把声音交给…」「本机等待送进声卡的音频」），
+  // 那是照着 recv 会话写的：延迟的物理定义是「从对方声卡采到、到本机声卡送出」。
+  // 可 **send 会话上两边正好互换**——本机才是提供方。于是一条 send 会话会渲染成
+  // 「本机」标签配「对方声卡……」的说明，两者当场打架，而排障时指错机器比不说
+  // 更糟。主机只在一个地方说，就不会有第二个地方说错。
+  'latency.stage.capRing.name': '声卡采集缓冲',
+  'latency.stage.capRing.desc': '声卡把声音交给 AudioHub 之前的排队。',
+  'latency.stage.capDev.name': '声卡采集延迟',
+  'latency.stage.capDev.desc': '声卡从收到声音到交出采样之间的固有延迟。',
+  'latency.stage.srcFifo.name': '发送队列',
+  'latency.stage.srcFifo.desc': '采集侧等待打包发出的音频。',
+  'latency.stage.halSpk.name': '虚拟扬声器环',
+  'latency.stage.halSpk.desc': '应用写进虚拟扬声器、尚未被 AudioHub 取走的音频。',
+  'latency.stage.sendPace.name': '打包节拍',
+  'latency.stage.sendPace.desc': '发送侧每 10 毫秒打包一次，一个采样平均要等半个节拍。',
+  'latency.stage.network.name': '网络单程',
+  'latency.stage.network.desc': '数据包在两台主机之间传输的时间。',
+  'latency.stage.jitterBuf.name': '抖动缓冲',
+  'latency.stage.jitterBuf.desc': '为抵消网络抖动而刻意保留的余量。',
+  'latency.stage.postMix.name': '混音对齐缓冲',
+  'latency.stage.postMix.desc': '把不等长的解码结果对齐成整帧的小缓冲。',
+  'latency.stage.playRing.name': '播放队列',
+  'latency.stage.playRing.desc': '等待送进声卡的音频。',
+  'latency.stage.bridgeRing.name': '虚拟声卡队列',
+  'latency.stage.bridgeRing.desc': '等待送进桥接虚拟声卡的音频。与播放队列并行，不叠加。',
+  'latency.stage.halMic.name': '虚拟麦克风环',
+  'latency.stage.halMic.desc': '写进虚拟麦克风、尚未被应用取走的音频。与播放队列并行，不叠加。',
+  'latency.stage.playDev.name': '声卡播放缓冲',
+  'latency.stage.playDev.desc': '声卡收到音频到真正发声之间的固有延迟。',
+  'latency.stage.residual.name': '未归属',
+  'latency.stage.residual.desc': '实测总延迟减去各分段之和。持续偏大说明链路上还有未被统计的缓冲。',
+  'latency.stage.ms': '{ms} ms',
+  'latency.stage.unknown': '未知',
+  'latency.stage.onPeer': '对方主机',
+  'latency.stage.onLocal': '本机',
+
+  // —— 逐级明细的事实标签（排障用）。每条都是**短标签 + 长 title**：
+  // 一行里要并排放四条事实，长句会被省略号吃掉后面的（这正是改版前的实际形态：
+  // 「满时丢弃最早的音频（听感：…）」一条就把整行占满，饱和/丢弃/漂移全被截掉）。
+  //
+  // 规格 §0.2：深度读数在丢头 / 丢尾两种语义下**完全简并**——两者饱和时都恰好等于
+  // cap/rate，只有 drop_mode + dropped 的组合能把它们分开。所以这几条不是装饰。
+  'latency.stage.dropOldestShort': '丢最早',
+  'latency.stage.dropNewestShort': '丢最新',
+  'latency.stage.dropNoneShort': '不丢弃',
+  'latency.stage.dropOldest': '满时丢弃最早的音频（听感：恒定迟到但连续）',
+  'latency.stage.dropNewest': '满时丢弃最新的音频（听感：迟到并伴随断续）',
+  'latency.stage.dropNone': '这一级不会丢弃音频（有界但从不饱和，或根本没有队列）。',
+  'latency.stage.droppedN': '已丢弃 {n} 个样本',
+  'latency.stage.droppedNone': '未丢弃',
+  'latency.stage.droppedWhy': '本条会话的累计值。数字冻结说明只是曾被灌满一次；持续增长说明产销速率长期失配。',
+  // `dropped: null` 与 `0` 是两个结论，界面必须分开讲——混为一谈就等于替驱动
+  // 宣布「它一个样本都没丢」，而我们根本数不到那一侧。
+  'latency.stage.droppedUnknown': '丢弃数不可见',
+  'latency.stage.droppedUnknownWhy': '这一级的丢弃发生在另一侧（音频驱动或对方进程）里，本机数不到。**不等于没丢过。**',
+  'latency.stage.fill': '{pct}% 满',
+  'latency.stage.fullAt': '已满（{pct}%）',
+  'latency.stage.fillWhy': '{n} / {cap} 个样本。到 95% 才算「已满」。',
+  'latency.stage.driftUp': '每分钟涨 {ms} ms',
+  'latency.stage.driftDown': '每分钟降 {ms} ms',
+  'latency.stage.driftFlat': '深度稳定',
+  'latency.stage.driftWhy': '最近 30 秒的深度斜率（{sps} 样本/秒）。持续上涨说明这一级迟早会被灌满。',
+  'latency.stage.driftUnknown': '趋势未知',
+  'latency.stage.driftUnknownWhy': '样本点还不够判趋势（不足 3 点或跨度不到 5 秒）。**不等于不漂移。**',
+
+  'latency.conf.full': '各分段完整',
+  'latency.conf.lowerBound': '下限（缺声卡缓冲）',
+  'latency.conf.converging': '时钟对齐中，约 {s} 秒后可用',
+  // 说人话版：原文「仅本机分段，对端未上报」是照着字段名写的，用户读不出后果。
+  'latency.conf.localOnly': '以上只有本机这一侧的分段。对方主机还没上报它那一半，所以这不是端到端的总延迟。',
+  'latency.conf.deviceUnreliable': '输出设备（蓝牙 / HDMI）的延迟系统少报，实际更高',
+  'latency.conf.peerStale': '对方主机的分段是 {s} 秒前的读数',
+  'latency.detail.e2e': '实测采样年龄 {ms} ms（与各分段之和的差记入「未归属」）',
+
+  // ---------------------------------------------------------------- 一级指标：音质
+  'metric.quality.label': '音质',
+  'metric.quality.none': '—',
+  'metric.quality.bandwidth': '{khz} kHz',
+  'metric.quality.grade.excellent': '优',
+  'metric.quality.grade.good': '良好',
+  'metric.quality.grade.fair': '一般',
+  'metric.quality.grade.poor': '差',
+  'metric.quality.worst.continuity': '受限于断续',
+  'metric.quality.worst.level': '受限于破音',
+  'metric.quality.worst.bandwidth': '受限于带宽',
+  'metric.quality.expand': '查看构成',
+  'metric.quality.collapse': '收起构成',
+  // daemon 报 `grade: "unknown"`（某个分量还没攒够窗口）时的等级位文案。
+  //
+  // 没有它的时候，这个状态在界面上长成「有 kHz 数、没有等级词、四颗点全空」——
+  // 而「四颗点全空」在视觉上与「一颗点 = 差」几乎分不开，用户只能读成**测出来很差**。
+  // 一个还没测出结论的通路被读成质量最差，是这套遥测最不该犯的错：它把「不知道」
+  // 伪装成了一个具体且悲观的结论，方向虽反，性质与用 0 填补缺失分项完全相同。
+  'metric.quality.measuring': '测量中…',
+  'metric.quality.measuringWhy': '还有分量没攒够统计窗口（通常是通路刚建立后的十几秒）。此时把在场分量取最小只是个上界，不是等级，所以先不给。',
+  // grade 成立、但仍缺一块板：等级已经触底，缺席改不了结论，两件事都要说。
+  'metric.quality.partial': '这一档是在还缺一个分量的情况下定的，补齐后只会更低、不会更高。',
+
+  'quality.part.continuity.name': '连续性',
+  'quality.part.continuity.desc': '输出中不是由对方原始采样构成的时长占比（补偿帧与静音）。',
+  'quality.part.continuity.value': '{pct}% 被补偿',
+  'quality.part.level.name': '电平',
+  'quality.part.level.desc': '波形被削顶压缩的采样占比与压缩深度。',
+  'quality.part.level.value': '{pct}% 削顶，超出 {db} dB',
+  'quality.part.bandwidth.name': '带宽',
+  'quality.part.bandwidth.desc': '还保留了多少高频成分。网络变差时会自动降档。',
+  'quality.part.bandwidth.value': '{khz} kHz',
+  'quality.part.window': '统计窗口：最近 {s} 秒',
+
+  // 站点级混音健康（求和后，不可归属到单条会话，所以不进 SessionStats）。
+  // **S1 尚无渲染面**：这五条是按规格 §2.7 预登记的，P0q 接上 MixHealth 时直接可用。
+  // 之所以现在就写进目录而不是那时再加，是为了让「两路重复流把声音削烂」这个判据的
+  // 文案与阈值在同一次评审里定死——它是 duplicate_suspect 一票否决的唯一出口。
+  'mix.health.title': '本机混音',
+  'mix.health.clip': '{pct}% 的采样被削顶',
+  'mix.health.contrib': '同时混入 {n} 路',
+  'mix.health.duplicate': '检测到两路内容几乎相同的音频叠加（相关度 {r}），这会使音量翻倍并削顶。',
+  'mix.health.ok': '正常',
+
   // ---------------------------------------------------------------- 主面板
-  'peers.summary.paired': '已配对 {n} 台',
-  'peers.summary.online': '在线 {n} 台',
+  // 汇总条只在**异常**时出现：正常态下「已配对 N 台 · 在线 N 台」是一句谁都不会读的话。
+  'peers.summary.offline': '离线 {n} 台',
   'peers.summary.retrying': '重连中 {n} 台',
-  'peers.summary.devices': '系统设备 {n} 台',
-  'peers.summary.none': '暂无已配对对端',
   'peers.addManual': '添加手动对端',
   'peers.form.fingerprint': '对端指纹',
   'peers.form.fingerprintPlaceholder': '对端指纹（可输前缀）',
@@ -136,10 +296,9 @@ export const zhCN = {
 
   'peers.card.unnamed': '未命名主机',
   'peers.card.viewDetail': '查看 {name} 详情',
-  'peers.card.alias': '别名 · {name}',
-  'peers.card.lastAddr': '最近地址 {addr}',
-  'peers.card.noAddr': '暂无地址记录',
-  'peers.card.defaultPort': '默认端口 {port}',
+  // peers.card.alias 已删（规格 §2.3 ①）：改名后原主机名走卡片标题的 title，
+  // 详情页另有一张 AliasCard；徽章只是把同一条信息又印一遍。
+  'peers.card.noSession': '未建立通路',
   'peers.card.reconnecting': '重连中…',
   'peers.card.reconnectingIn': '重连中…（{s}s 后重试）',
   'peers.card.inboundMic': '对方正在取用本机麦克风',
@@ -153,8 +312,8 @@ export const zhCN = {
   'peers.card.idle': '空闲',
   'peers.card.kbps': '{v} kbps',
 
-  'peers.devices.title': '系统设备',
-  'peers.devices.foot': '在「系统设置 › 声音」或任意应用的音频设备菜单里选中它即可使用；音量在系统里调节，会同步到这台主机的真实设备。',
+  // 原来每张卡片各印一遍（同一句话在 N 张卡上重复 N 次）：现在只在卡片列表底部渲染一次。
+  'peers.devices.footOnce': '在「系统设置 › 声音」或任意应用的音频设备菜单里选中它即可使用；音量在系统里调节，会同步到这台主机的真实设备。',
   'peers.devices.offline': '⚠ 对端离线：设备仍在系统中可选，但不处理任何声音。',
   'peers.devices.settling': '设备已下发，正在等待系统的设备列表刷新（最多 1 秒）。',
 
@@ -196,6 +355,38 @@ export const zhCN = {
   'bridge.selected': '对端麦克风将写入「{name}」的播放端；任意应用选择它的输入端即可当作对端麦克风使用。',
   'bridge.pick': '选择一张虚拟声卡后，对端麦克风会写入它的播放端，供其他应用当作输入设备使用。',
 
+  // ---------------------------------------------------------------- 共享来源（模式 A 的 spk 方向）
+  // plan §7.1：模式 A 的「送对方扬声器」= 捕获本机系统音频送对方默认输出播放。
+  // 麦克风是可选来源，不是默认值。文案里绝不出现「把系统输出切到某某设备」（plan §6 红线）。
+  'share.label': '共享来源',
+  'share.source.sysaudio': '系统音频',
+  'share.source.mic': '麦克风',
+  'share.mic.note': '送出的是本机默认麦克风。若想让对端听到本机正在播放的声音，请选「系统音频」。',
+  'share.sys.none': '本机没有可用的系统音频捕获后端，只能共享麦克风。AudioHub 不会要求你改动系统的输出设备。',
+  'share.backend.label': '捕获后端',
+  'share.backend.autoOption': '自动',
+  'share.backend.auto': '由服务按优先级自动挑选可用的捕获后端。捕获是旁路读取，本机的输出设备与音量保持原样。',
+  'share.backend.selected': '已指定「{name}」：{note}',
+  'share.backend.unknown': '当前服务未上报可用后端清单，是否支持要到真正开启时才知道；开不起来会明确说明原因，不会静默失败。',
+  'share.backend.stale': '当前服务不认识后端「{id}」：开启时会直接报错。请改回「自动」或另选一个。',
+  'share.backend.staleOption': '{id}（当前服务未提供）',
+  'share.backend.optionUnavailable': '{name}（本机不可用）',
+  'share.perm.hint': '共享系统音频需要「系统音频录制」授权：macOS 无法预先查询，首次开启时系统会询问；若此前被拒绝过，需到系统设置里手动打开。',
+  'share.perm.goto': '前往授权',
+  'share.fault': '⚠ 上次开启失败：{reason}',
+  'share.fault.unknown': '服务未说明原因',
+
+  // 后端目录。id 必须与 core/audiohub-core/src/sysaudio.rs 的 BACKEND_* 常量一致。
+  // 服务上报了自己的 note 时优先用它（它带本机实际版本号 / 上次被拒绝的事实）。
+  'sysaudio.backend.winProcExclude.label': 'Windows 进程环回（排除自身）',
+  'sysaudio.backend.winProcExclude.note': '天然排除 AudioHub 自己播放的声音，不会把对端音频再送回去。需要 Windows 10 2004 及以上。',
+  'sysaudio.backend.winDeviceLoopback.label': 'Windows 设备环回',
+  'sysaudio.backend.winDeviceLoopback.note': '兜底方案，兼容更老的系统；它会一并录到 AudioHub 自己播放的声音，与对端互送时可能形成回授。',
+  'sysaudio.backend.macCatap.label': 'macOS 音频进程 Tap',
+  'sysaudio.backend.macCatap.note': '首选：纯音频接口，权限归「系统音频录制」而非屏幕录制，且排除本 App 自身的播放。需要 macOS 14.2 及以上。',
+  'sysaudio.backend.macSck.label': 'macOS 屏幕捕获音频流',
+  'sysaudio.backend.macSck.note': '备选路线，权限归「屏幕录制」类别。',
+
   // ---------------------------------------------------------------- 会话
   'session.flow.micRecv': '取对方麦克风',
   'session.flow.micSend': '对方取用本机麦克风',
@@ -222,7 +413,7 @@ export const zhCN = {
   'detail.pairedAt': '配对时间',
   'detail.publicKey': '公钥',
   'detail.fpCopied': '已复制完整指纹',
-  'detail.fpCopyFailed': '复制失败，请手动选择文本',
+  // 失败提示改走 common.copyFailed（设置页「本机身份」也复制指纹，两处必须同一条）。
 
   'detail.alias.title': '别名',
   'detail.alias.field': '显示名称',
@@ -306,9 +497,17 @@ export const zhCN = {
   // ---------------------------------------------------------------- 设置
   'settings.mode.title': '使用端模式',
   'settings.mode.rowTitle': '当前模式',
-  'settings.mode.rowDesc': 'A：不装驱动，捕获本机系统音频送到对端播放——本机与对端同时发声；取用对端麦克风需借助已安装的第三方虚拟声卡（见下方「虚拟声卡桥接」）。B：每台已配对主机作为一对设备出现在系统音频设备列表中，任意应用直接选用，调节该设备音量即调节对端真实设备。模式是全局设置，由本机服务持有；切换入口在主面板顶部。',
+  'settings.mode.rowDesc': 'A：不装驱动，默认捕获本机系统音频送到对端播放——本机与对端同时发声，捕获是旁路读取，本机的输出设备不需要做任何改动；每张对端卡片上的「共享来源」可改送本机麦克风，也可指定捕获后端。取用对端麦克风需借助已安装的第三方虚拟声卡（见下方「虚拟声卡桥接」）。B：每台已配对主机作为一对设备出现在系统音频设备列表中，任意应用直接选用，调节该设备音量即调节对端真实设备。模式是全局设置，由本机服务持有；切换入口在主面板顶部。',
   'settings.mode.goto': '前往主面板切换',
   'settings.mode.downgraded': '你选择的是「{mode}」，但当前不可用，已临时按模式 A 运行。{hint}',
+
+  // 本机指纹在右上徽标里改成了**悬停才显示**（plan §7.6 补充裁定）。悬停在触摸屏上
+  // 不存在、在截图排障时也拿不到，所以必须有一个常驻落点——就是这一块。
+  'settings.identity.title': '本机身份',
+  'settings.identity.fingerprint': '本机指纹',
+  'settings.identity.name': '本机名称',
+  'settings.identity.copied': '已复制本机指纹',
+  'settings.identity.note': '对方在配对时核对的就是这串指纹。',
 
   'settings.net.title': '网络',
   'settings.net.controlPort': '控制端口',
@@ -406,10 +605,18 @@ export const zhCN = {
   'stats.empty.hintModeB': '在「系统设置 › 声音」或任意应用里选择某台对端的 AudioHub 设备后，这里会出现对应的实时指标。',
   'stats.empty.hintModeA': '在主面板打开对端卡片上的通路开关，或用 CLI 发起会话后，这里会实时出现指标。',
   'stats.session': '会话 #{id}',
+  // 诊断页从「会话导向」改为「先按对端聚合、再按会话展开」（spec §2.5）。
+  'stats.groupBy.peer': '按对端',
+  'stats.groupBy.session': '按会话',
+  'stats.group.sessions': '{n} 条通路',
+  'stats.waterfall.title': '延迟构成',
+  'stats.waterfall.empty': '暂无活跃通路',
   'stats.metric.loss': '丢包率',
   'stats.metric.jitter': '抖动',
   'stats.metric.bitrate': '码率',
   'stats.metric.rung': '质量阶梯',
+  'stats.metric.latency': '延迟',
+  'stats.metric.intact': '完整度',
   'stats.unit.pct': '%',
   'stats.unit.ms': 'ms',
   'stats.unit.kbps': 'kbps',

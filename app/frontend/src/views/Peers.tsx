@@ -9,8 +9,11 @@ import { Icon } from '../components/Icon';
 import { Meter, Segmented, Switch } from '../components/Controls';
 import { VolumeControl } from '../components/VolumeControl';
 import { BridgeControl } from '../components/BridgeControl';
+import { ShareSourceControl } from '../components/ShareSourceControl';
+import { PeerMetrics } from '../components/PeerMetrics';
 import { toast } from '../components/Toasts';
 import { bridgeTargets } from '../lib/bridge';
+import { backendParam, normalizeSource, SOURCE_SYSAUDIO } from '../lib/sysaudio';
 import { fmt } from '../lib/fmt';
 import { createBusySet, useTick } from '../lib/hooks';
 import { t, joinPhrases } from '../i18n';
@@ -28,9 +31,11 @@ import type { PeerState, SessionInfo } from '../ipc/types';
 const busy = createBusySet();
 
 // mic / monitor / bridge 操作的是同一条 mic 通路，必须共用一把锁，否则会互相关掉
-// 对方刚开的会话。
+// 对方刚开的会话。spk / source / backend 同理，共用 spk 那一把。
 function busyKey(fp: string, kind: string): string {
-  return `${fp}:${kind === 'monitor' || kind === 'bridge' ? 'mic' : kind}`;
+  if (kind === 'monitor' || kind === 'bridge') return `${fp}:mic`;
+  if (kind === 'source' || kind === 'backend') return `${fp}:spk`;
+  return `${fp}:${kind}`;
 }
 
 // 本机取用对端麦克风的开启参数。monitor（本机监听）与 bridge（写入虚拟声卡）是
@@ -45,6 +50,27 @@ function micParams(fp: string): Record<string, unknown> {
   if (b) {
     if (bridgeTargets(s.daemon).some((c) => c.name === b)) p.bridge = b;
     else toast(t('peers.bridgeUnavailable', { name: b }), 'warn');
+  }
+  return p;
+}
+
+// 本机送对端扬声器的开启参数（plan §7.1 模式 A 的扬声器方向）。
+//
+// **默认 source 是 'sysaudio'，不是 'mic'**：plan §7.1 定义模式 A 的这条通路就是
+// 「捕获本机系统默认音频送对方默认输出播放」，本机与对端同时发声。此前这里写死了
+// 'mic'，送过去的是本机麦克风——与产品语义、与设置页自己的文案都对不上。麦克风保留
+// 为可选来源，由卡片上的「共享来源」显式选择。
+//
+// backend 只在选了具体后端时才带：缺席 = daemon 的 'auto'，由它按优先级挑第一个可用的。
+// volume_sync 一律带（spec-m4b §A3-4）：daemon 只对开了它的会话接受 session.set_volume，
+// 不带就等于卡片上的音量滑块必然报错。
+function spkParams(fp: string): Record<string, unknown> {
+  const s = getState();
+  const source = normalizeSource(s.spkSourcePref[fp]);
+  const p: Record<string, unknown> = { peer: fp, kind: 'spk', source, volume_sync: true };
+  if (source === SOURCE_SYSAUDIO) {
+    const b = backendParam(s.spkBackendPref[fp]);
+    if (b) p.backend = b;
   }
   return p;
 }
@@ -87,21 +113,77 @@ async function toggleSession(fp: string, kind: 'mic' | 'spk', want: boolean): Pr
   busy.add(key);
   try {
     if (want) {
-      // spk 一律带 volume_sync（spec-m4b §A3-4）：daemon 只对开了它的会话
-      // 接受 session.set_volume，不带就等于卡片上的滑块必然报错。
-      const params = kind === 'mic'
-        ? micParams(fp)
-        : { peer: fp, kind: 'spk', source: 'mic', volume_sync: true };
+      const params = kind === 'mic' ? micParams(fp) : spkParams(fp);
       actions.upsertSession(await rpc<SessionInfo>('session.open', params));
+      if (kind === 'spk') actions.setSpkFault(fp, null);
     } else {
       for (const sess of matching(getState(), fp, kind)) {
         await rpc('session.close', { id: sess.id });
         actions.removeSession(sess.id);
       }
+      if (kind === 'spk') actions.setSpkFault(fp, null);
     }
-  } catch { /* rpc 已 toast */ } finally {
+  } catch (e) {
+    // rpc 已 toast，但 toast 会消失。系统音频捕获不可用是**必须留在界面上**的那一类
+    // 失败：否则用户看到的只是一个自己弹回去的开关，没有任何地方说得出为什么。
+    if (kind === 'spk' && want) actions.setSpkFault(fp, faultText(e));
+  } finally {
     await settle(key);
   }
+}
+
+function faultText(e: unknown): string {
+  const msg = String((e as Error)?.message || e || '').trim();
+  return msg || t('share.fault.unknown');
+}
+
+// 换共享来源 / 换捕获后端 = 换一条 spk 会话。与 reopenMic 同样先开新的、成功后才关
+// 旧的：反过来一旦重开失败，对端就直接没声音了，而界面上一条会话都不剩。
+// 代价是切换的一瞬间对端可能同时听到两路（daemon 不拒绝重复 spk 流），比断音可接受。
+async function reopenSpk(fp: string, rollback: () => void): Promise<void> {
+  const key = busyKey(fp, 'spk');
+  if (busy.has(key)) return; // spk 通路正忙，偏好也先别动
+  const active = matching(getState(), fp, 'spk');
+  if (!active.length) {
+    actions.setSpkFault(fp, null); // 只记偏好，下次打开时生效；旧的失败原因作废
+    return;
+  }
+  busy.add(key);
+  try {
+    const info = await rpc<SessionInfo>('session.open', spkParams(fp));
+    actions.upsertSession(info);
+    actions.setSpkFault(fp, null);
+    for (const sess of active) {
+      if (sess.id === info.id) continue;
+      try {
+        await rpc('session.close', { id: sess.id }, { silent: true });
+        actions.removeSession(sess.id);
+      } catch {
+        toast(t('peers.reopenFailed', { id: sess.id }), 'warn');
+      }
+    }
+  } catch (e) {
+    actions.setSpkFault(fp, faultText(e));
+    rollback(); // 新会话没开起来，偏好回滚：界面上显示的仍是此刻真正在送的那一路
+  } finally {
+    await settle(key);
+  }
+}
+
+function setSpkSource(fp: string, want: string): void {
+  if (busy.has(busyKey(fp, 'source'))) return;
+  const prev = normalizeSource(getState().spkSourcePref[fp]);
+  if (want === prev) return;
+  actions.setSpkSourcePref(fp, want);
+  void reopenSpk(fp, () => actions.setSpkSourcePref(fp, prev));
+}
+
+function setSpkBackend(fp: string, want: string): void {
+  if (busy.has(busyKey(fp, 'backend'))) return;
+  const prev = getState().spkBackendPref[fp] || '';
+  if (want === prev) return;
+  actions.setSpkBackendPref(fp, want);
+  void reopenSpk(fp, () => actions.setSpkBackendPref(fp, prev));
 }
 
 // 切换监听 / 换桥接目标 = 换一条 mic 会话。先开新的、成功后才关旧的：反过来
@@ -187,10 +269,25 @@ function ModeBanner() {
           ]}
         />
       </div>
+      {/* 长文（mode.a.desc / mode.b.desc）下沉到设置页——那里本来就有一份更完整的。
+          一级只留一句结果句：读完就知道「现在去哪里选对端」。 */}
       <p className="mode-desc" data-testid="consumer-mode-desc">
-        {mode === MODE_B ? t('mode.b.desc') : t('mode.a.desc')}
+        {mode === MODE_B ? t('mode.b.result') : t('mode.a.result')}
+        <button
+          className="link-btn" type="button" data-testid="consumer-mode-more"
+          onClick={() => actions.navigate('settings')}
+        >
+          {t('mode.learnMore')}
+        </button>
       </p>
-      <p className={`mode-note tone-${st.tone}`} data-testid="settings-mode-note">{st.text}</p>
+      {/* 「驱动就绪」是常态，不是消息：只有出问题时这行才值得占一行。 */}
+      <p
+        className={`mode-note tone-${st.tone}`}
+        data-testid="settings-mode-note"
+        hidden={st.tone === 'ok'}
+      >
+        {st.text}
+      </p>
       {/* 用户存的是 B、daemon 只能给 A：这是**降级**，不是「他选了 A」。 */}
       <p className="mode-warn" data-testid="consumer-mode-downgraded" hidden={!downgraded}>
         {t('mode.downgraded')}
@@ -248,7 +345,8 @@ function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
       // 卡片整体可点（进入详情）；设备区里的文本要能选中复制 UID。
       onClick={(e) => e.stopPropagation()}
     >
-      <div className="dev-head"><Icon name="device" /><span>{t('peers.devices.title')}</span></div>
+      {/* 「系统设备」标题行已删（规格 §2.3）：下面两行各带 🔊/🎤 图标 + 设备全名，
+          已经自明，标题只是又一个不承载信息的方框。 */}
       <div className="dev-list" hidden={!has}>
         {(['out', 'in'] as const).map((dir) => {
           const d = devs.find((x) => x.dir === dir);
@@ -263,19 +361,21 @@ function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
               data-testid={`peer-device-${dir}-${fp}`}
             >
               <Icon name={dir === 'out' ? 'spk' : 'mic'} cls="ico dev-ico" />
+              {/* 设备 UID（`AudioHub:<fp>:out`）整行下沉到详情页 DevicesCard：
+                  用户点名它是「不必要的编号」，而它在一级界面既不可执行也无人核对。 */}
               <div className="dev-text">
                 <span className="dev-name" title={d?.name || ''}>{d?.name || t('common.dash')}</span>
-                <code className="dev-uid mono" title={d?.uid || ''}>{d?.uid || ''}</code>
               </div>
               <span className={`dev-state ${state}`}>{text}</span>
             </div>
           );
         })}
       </div>
+      {/* 长脚注（peers.devices.footOnce）已移到卡片列表底部渲染一次：它对每张卡片
+          说的是同一句话，印 N 遍不会更有用。 */}
       <p className={`dev-note${noteWarn ? ' warn' : ''}`} data-testid={`peer-devices-note-${fp}`} hidden={!note}>
         {note}
       </p>
-      <p className="dev-foot" hidden={!has}>{t('peers.devices.foot')}</p>
     </div>
   );
 }
@@ -286,6 +386,12 @@ function PeerCard({ peer, modeB }: { peer: PeerState; modeB: boolean }) {
   const sessions = useStore((s) => s.sessions);
   const monitorPref = useStore((s) => !!s.monitorPref[fp]);
   const bridgePref = useStore((s) => s.bridgePref[fp] || '');
+  const spkSource = useStore((s) => normalizeSource(s.spkSourcePref[fp]));
+  const spkBackend = useStore((s) => s.spkBackendPref[fp] || '');
+  const spkFault = useStore((s) => s.spkFault[fp] || '');
+  // 系统音频录制授权。取不到（还没探测 / daemon 不报这一项）就传 null，控件不提示——
+  // 「不知道」不能渲染成「你还没授权」。
+  const sysPerm = useStore((s) => s.permissions.list.find((p) => p.id === 'system_audio') || null);
   busy.use(); // 订阅进行中的操作，pending 态跟着翻
 
   const reconnecting = !peer.online && !!peer.reconnecting;
@@ -314,31 +420,24 @@ function PeerCard({ peer, modeB }: { peer: PeerState; modeB: boolean }) {
       onClick={nav}
       onKeyDown={(e) => { if (e.key === 'Enter' && e.target === e.currentTarget) nav(); }}
     >
+      {/* 头部只回答「这台主机是谁、在不在」。指纹**保留**（plan §7.6 裁定 2：它在配对
+          校验场景有安全意义），但做克制呈现——弱字重、弱色阶，不与主机名争注意力。
+          `⟩` 是新增的可点提示：整张卡此前已经 role="button"，却对视觉用户毫无线索。
+          别名徽章已删（规格 §2.3 ①）：改名后原主机名走 `.peer-name` 的 title，详情页
+          还有一张 AliasCard。留着它等于同一条信息印两遍，而它是 flex:none——一旦对端
+          设了别名，被挤掉的恰恰是主机名本身。 */}
       <header className="peer-head">
         <span className={`dot ${dotCls}`} />
-        <h3 className="peer-name">{displayName}</h3>
-        <span className="peer-alias" data-testid={`peer-alias-${fp}`} hidden={!peer.alias}>
-          {peer.alias ? t('peers.card.alias', { name: peer.name || fp }) : ''}
-        </span>
-        <code className="peer-fp" title={fp}>{fmt.fp(fp, 16)}</code>
+        <h3 className="peer-name" title={peer.name || fp}>{displayName}</h3>
+        <code className="peer-fp" data-testid={`peer-fp-${fp}`} title={fp}>{fmt.fp(fp, 16)}</code>
+        <Icon name="chev" cls="ico peer-chev" />
       </header>
 
-      {/* 「最近地址 x · 默认端口 y」是两条并列短语，不是一个句子：分隔符与各自的
-          语序都交给语料，不在这里用 + 拼。 */}
-      <div className="peer-meta">
-        {joinPhrases([
-          peer.last_addr ? t('peers.card.lastAddr', { addr: peer.last_addr }) : t('peers.card.noAddr'),
-          t('peers.card.defaultPort', { port: String(peer.port ?? '') }),
-        ])}
-      </div>
+      {/* ②③ 一级指标：这一屏唯一新增的一级信息（规格 §2.1）。 */}
+      <PeerMetrics fp={fp} sess={micS || spkS} />
 
-      {/* 控制通道断了但没被解除配对：daemon 正在按退避重拨，界面必须说出来，
-          否则「离线」看着就像放弃了。 */}
-      <div className="peer-reconnect" data-testid={`reconnecting-${fp}`} hidden={!reconnecting} role="status">
-        <span className="spinner tiny" />
-        <span className="reconnect-text">{reconnecting ? reconnectLabel(fp, peer.retry_in_s) : ''}</span>
-      </div>
-
+      {/* ④ 隐私条紧贴指标区：原位夹在重连提示与开关之间，视觉权重低到会被略过，
+          而「对方正在取用本机麦克风」是这张卡上唯一不该被略过的一行。 */}
       <div className="peer-inbound" data-testid={`inbound-mic-${fp}`} hidden={inbound.length === 0} role="status">
         <span className="dot live" />
         <Icon name="mic" />
@@ -347,6 +446,13 @@ function PeerCard({ peer, modeB }: { peer: PeerState; modeB: boolean }) {
             ? t('peers.card.inboundMicN', { n: inbound.length })
             : t('peers.card.inboundMic')}
         </span>
+      </div>
+
+      {/* 控制通道断了但没被解除配对：daemon 正在按退避重拨，界面必须说出来，
+          否则「离线」看着就像放弃了。 */}
+      <div className="peer-reconnect" data-testid={`reconnecting-${fp}`} hidden={!reconnecting} role="status">
+        <span className="spinner tiny" />
+        <span className="reconnect-text">{reconnecting ? reconnectLabel(fp, peer.retry_in_s) : ''}</span>
       </div>
 
       {/* 模式 A 专属的一整排通路控件。模式 B 下它们全部**下线**（不是变灰）：
@@ -369,6 +475,20 @@ function PeerCard({ peer, modeB }: { peer: PeerState; modeB: boolean }) {
             onToggle={(w) => void toggleSession(fp, 'spk', w)}
           />
         </div>
+        {/* 「送对方扬声器」送的是什么（plan §7.1：默认本机系统音频）+ 用哪个捕获后端
+            （plan §6）。这是模式 A 的核心特性，此前整个界面上没有任何入口。 */}
+        <ShareSourceControl
+          testid={`share-source-${fp}`}
+          daemon={daemon}
+          source={spkSource}
+          backend={spkBackend}
+          pending={busy.has(busyKey(fp, 'spk'))}
+          perm={sysPerm}
+          fault={spkFault}
+          onSource={(v) => setSpkSource(fp, v)}
+          onBackend={(v) => setSpkBackend(fp, v)}
+          onGrant={() => actions.navigate('settings')}
+        />
         {/* 「送对方扬声器」下方的音量同步控件：会话激活后出现，值来自 stats.volume。 */}
         <VolumeControl
           volumeTestid={`volume-${fp}`}
@@ -397,8 +517,9 @@ function PeerCard({ peer, modeB }: { peer: PeerState; modeB: boolean }) {
 
       <PeerDevices peer={peer} hidden={!modeB} />
 
-      {/* 电平条两种模式都要：模式 B 的会话由系统的设备选择创建，那条流一样是这台
-          对端在收发，藏起来只会让「选了设备但没声音」少一个可看的地方。 */}
+      {/* ⑤ 电平条两种模式都要：模式 B 的会话由系统的设备选择创建，那条流一样是这台
+          对端在收发，藏起来只会让「选了设备但没声音」少一个可看的地方。
+          收/发并成一行：省 20px，而且左右并置本来就比上下堆叠更容易做对比。 */}
       <div className="peer-streams">
         <StreamRow fp={fp} kind="mic" label={t('peers.card.streamIn')} sess={micS} />
         <StreamRow fp={fp} kind="spk" label={t('peers.card.streamOut')} sess={spkS} />
@@ -486,24 +607,21 @@ export function PeersView() {
   const modeB = useStore(isModeB);
   const [formOpen, setFormOpen] = useState(false);
 
-  const online = peers.filter((p) => p.online).length;
   const retrying = peers.filter((p) => !p.online && p.reconnecting).length;
-  const published = modeB ? peers.filter((p) => p.hal_device).length : 0;
-  // 摘要是**并列短语**，不是一句话：每段自己完整，分隔符由语料给。
-  const summary = peers.length
-    ? joinPhrases([
-      t('peers.summary.paired', { n: peers.length }),
-      t('peers.summary.online', { n: online }),
-      retrying ? t('peers.summary.retrying', { n: retrying }) : null,
-      modeB ? t('peers.summary.devices', { n: published * 2 }) : null,
-    ])
-    : t('peers.summary.none');
+  const offline = peers.filter((p) => !p.online && !p.reconnecting).length;
+  // 汇总条**只在异常时出现**（规格 §2.4）：「已配对 3 台 · 在线 3 台」这类正常态陈述
+  // 每张卡片上都自带一颗状态点，重复一遍只是占掉一行。摘要仍是并列短语，不是句子。
+  const summary = joinPhrases([
+    offline ? t('peers.summary.offline', { n: offline }) : null,
+    retrying ? t('peers.summary.retrying', { n: retrying }) : null,
+  ]);
+  const hasDevices = modeB && peers.some((p) => p.hal_device);
 
   return (
     <>
       <ModeBanner />
       <div className="toolbar">
-        <div className="toolbar-note" data-testid="peers-summary">{summary}</div>
+        <div className="toolbar-note warn" data-testid="peers-summary" hidden={!summary}>{summary}</div>
         <button
           className="btn primary" type="button" data-testid="add-peer-btn"
           onClick={() => setFormOpen((v) => !v)}
@@ -515,6 +633,15 @@ export function PeersView() {
 
       <div className={`peer-grid${modeB ? ' mode-b' : ''}`}>
         {peers.map((p) => <PeerCard key={p.fingerprint} peer={p} modeB={modeB} />)}
+      </div>
+
+      {/* 从每张卡片上收拢来的两条常驻脚注：一句怎么用虚拟设备（只在模式 B 有意义），
+          一句延迟数字的口径。它们对整份列表说的是同一件事，所以只说一次。 */}
+      <div className="peer-list-foot" data-testid="peers-foot" hidden={peers.length === 0}>
+        <p className="foot-line" data-testid="peers-devices-foot" hidden={!hasDevices}>
+          {t('peers.devices.footOnce')}
+        </p>
+        <p className="foot-line" data-testid="peers-latency-foot">{t('metric.latency.footnote')}</p>
       </div>
 
       {/* 首次启动的空态：不能是一片空白，必须把「两台设备先配对」这件事说清楚。 */}

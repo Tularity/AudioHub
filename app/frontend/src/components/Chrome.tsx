@@ -97,25 +97,10 @@ export function NavPill({ onNavigate }: { onNavigate: (v: ViewName) => void }) {
   );
 }
 
-/** 运行形态注脚。原来在侧栏底部，侧栏没了就落到窗口左下角当一条安静的说明。 */
-export function ConnFoot() {
-  const mode = useStore((s) => s.mode);
-  const conn = useStore((s) => s.conn);
-  const port = useStore((s) => s.endpoint?.port ?? null);
-
-  // 「浏览器模式」是测试挂钩的自我说明，只在浏览器里出现，绝不进入 App 的文案。
-  let foot: string;
-  if (mode === 'tauri') {
-    if (conn === 'online') foot = port ? t('foot.tauri.online', { port }) : t('foot.tauri.onlineNoPort');
-    else if (conn === 'starting') foot = t('foot.tauri.starting');
-    else if (conn === 'connecting') foot = t('foot.tauri.connecting');
-    else foot = t('foot.tauri.offline');
-  } else {
-    foot = port ? t('foot.browser', { port }) : t('foot.browserNoPort');
-  }
-
-  return <div id="conn-hint" data-testid="conn-mode">{foot}</div>;
-}
+// 左下角那条固定注脚（#conn-hint / ConnFoot）已删（规格 §2.4、§5）：它说的四种连接
+// 状态与右上徽标逐一重合，IPC 端口在设置页「网络 › IPC 端口」，「你正在用网页端查看」
+// 也已经由设置页的 settings.web.browserOnly 常驻说明。留着它的代价是整页下内边距要
+// 多留 24px 去避让一枚重复信息的浮层——那恰好压住主面板新加的两条常驻脚注。
 
 export function DaemonBadge() {
   const conn = useStore((s) => s.conn);
@@ -127,16 +112,22 @@ export function DaemonBadge() {
     : conn === 'starting' ? t('badge.starting')
       : conn === 'connecting' ? t('badge.connecting') : t('badge.offline');
 
+  // 本机指纹与控制端口**悬停才展开**（plan §7.6 补充裁定）：它们的使用场景是多实例
+  // 调试，不是配对校验——常驻显示只会在每一屏的右上角挂两串谁也不看的十六进制。
+  // 但悬停在触摸屏上不存在、截图排障也拿不到，所以设置页有一个常驻的「本机身份」区块。
+  // 这里保持元素**始终在 DOM 里**（只做视觉折叠），自动化仍能读到值。
   return (
     <div id="daemon-badge" className={`daemon-badge ${cls}`} data-testid="daemon-badge">
       <span className={`dot ${cls}`} />
       <span className="badge-status">{label}</span>
       {fp ? (
-        <>
-          <span className="badge-sep">·</span>
+        <span className="badge-ident" data-testid="daemon-badge-ident">
+          {/* 独立展示的间隔点走 common.bullet，不是把连接符 phraseSep trim 出来用：
+              后者两侧的留白是它的契约，某个语种把它设成「，」这里就会冒出一个悬空逗号。 */}
+          <span className="badge-sep">{t('common.bullet')}</span>
           <code className="badge-fp" title={fp}>{fp.slice(0, 8)}</code>
           <span className="badge-port">{`:${ctlPort ?? t('common.dash')}`}</span>
-        </>
+        </span>
       ) : null}
     </div>
   );

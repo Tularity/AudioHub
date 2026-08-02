@@ -29,9 +29,9 @@ use audiohub_net::secure::{SecureChannel, SessionMsg};
 
 use crate::engine::{self, SourceSpec, TxCmd};
 use crate::{
-    build_session_info, dlog, gen_media_salt, haldev, lk, rd, reconnect, wr, ConnShared,
-    DaemonInner, DaemonState, RxStream, SessionEntry, SessionOrigin, TxShared, VolumeCell,
-    DIR_RECV, DIR_SEND, MEDIA_SALT_LEN,
+    build_session_info, dlog, gen_media_salt, haldev, lk, rd, reconnect, wr, ClockFilter,
+    ConnShared, DaemonInner, DaemonState, PeerLatCell, RxStream, SessionEntry, SessionOrigin,
+    TxShared, VolumeCell, DIR_RECV, DIR_SEND, MEDIA_SALT_LEN,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -322,6 +322,8 @@ fn register_conn(
         pending: Mutex::new(HashMap::new()),
         alive: AtomicBool::new(true),
         last_rx_ms: AtomicU64::new(0), // measured from `created`
+        clock: Mutex::new(ClockFilter::new()),
+        clock_warned: AtomicBool::new(false),
     });
     let mut st = lk(&inner.state);
     let keep_existing = st.conns.get(&conn.fp).map_or(false, |old| {
@@ -499,9 +501,61 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
             }
         }
         SessionMsg::Ping { t_us } => {
-            let _ = conn.send_msg(&SessionMsg::Pong { t_us });
+            // `t_us` 原样回抄（对端时基，我们不解释它）；`peer_t_us` 是**我们**
+            // 收到这条 Ping 的时刻，本机时基。两个时基在这条报文里并排放着，
+            // 谁也不减谁——换算是发起方的事（`ClockFilter::note_pong`）。
+            //
+            // 同步应答，就在读取线程里：NTP 的 t3 因此约等于 t2，这正是只发
+            // 一个时戳而不是两个的前提（见 `SessionMsg::Pong` 的文档）。
+            let _ = conn.send_msg(&SessionMsg::Pong {
+                t_us,
+                peer_t_us: Some(inner.start.elapsed().as_micros() as u64),
+            });
         }
-        SessionMsg::Pong { .. } => {}
+        SessionMsg::Pong { t_us, peer_t_us } => {
+            // P1：t1 = 我们发 Ping 的时刻（对端原样回抄），t4 = 现在。
+            // **两者都取自 `inner.start`，同一个时基** —— RTT 因此是纯本机量，
+            // 对端做什么都改变不了它的基准。t2（对端时基）只进 θ，而 θ 的定义
+            // 就是「两个时基之差」。全daemon只有这一处允许两个时基相遇，并且
+            // 只做差、不做商（做商就会混进两个基准的相对速率——上一轮 143 ppm
+            // 系统误差底的来历）。
+            let t4 = inner.start.elapsed().as_micros() as u64;
+            let outcome = lk(&conn.clock).note_pong(t_us, t4, peer_t_us);
+            match outcome {
+                crate::PongOutcome::Ok => {}
+                crate::PongOutcome::Stepped => dlog!(
+                    "[audiohubd] peer {}: clock offset stepped (peer daemon restart or sleep?), \
+                     restarting the min-RTT window",
+                    conn.fp
+                ),
+                // 静默丢弃会让 confidence 永远挂在「测量中」而没人说得出为什么。
+                // 一次就够：Pong 是对端发的，刷屏的可能性归它掌握。
+                crate::PongOutcome::Implausible => {
+                    if conn.first_clock_warning() {
+                        dlog!(
+                            "[audiohubd] peer {}: ignoring a Pong that echoes a timestamp we \
+                             cannot have sent (t_us={t_us}, now={t4}); latency stays 'measuring'",
+                            conn.fp
+                        );
+                    }
+                }
+            }
+        }
+        // P0b：对端把它那一侧的分项回传过来了。
+        //
+        // `owned_session` 是这里的安全边界：stream id 在媒体头里是明文，任何
+        // 另一个已配对的对端都可以对它喊话。分项决定用户看到的那个延迟数字，
+        // 不属于这条连接的流一律不收。
+        SessionMsg::StageReport { stream_id, stages, local_ms, dev, seq_us } => {
+            if let Some(e) = owned_session(inner, conn, stream_id, "stage_report") {
+                let ipc: Vec<_> = stages.iter().map(crate::from_wire_stage).collect();
+                // 落在**这一条流**的格子里（`SessionEntry::peer_lat`），不是一张
+                // 按连接的表——见 `PeerLatCell` 上的 R8 说明。
+                if let Some(why) = e.peer_lat.accept(seq_us, ipc, local_ms, dev) {
+                    dlog!("[audiohubd] stream {stream_id} ({}): {why}", conn.fp);
+                }
+            }
+        }
         SessionMsg::Unpaired {} => {
             // The peer removed us. Its virtual devices here are now a pair of
             // ghosts — permanently offline, permanently silent, redialling a
@@ -753,6 +807,7 @@ fn handle_remote_open(
                     volume: Arc::new(VolumeCell::new(volume_sync && kind == KIND_SPK)),
                     replay: None, // the opener re-opens it after a reconnect
                     origin: SessionOrigin::Peer,
+                    peer_lat: Arc::new(PeerLatCell::new()),
                 },
             );
         }
@@ -787,6 +842,7 @@ fn handle_remote_open(
                     volume: Arc::new(VolumeCell::new(false)),
                     replay: None,
                     origin: SessionOrigin::Peer,
+                    peer_lat: Arc::new(PeerLatCell::new()),
                 },
             );
         }
@@ -861,8 +917,13 @@ fn teardown_conn(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
     }
     // capture what WE opened before the entries are dropped: that list is the
     // recovery plan (spec-m4c §C); peer-originated streams carry no origin and
-    // are the peer's to re-open
-    let mut mine: Vec<(u32, OpenSessionParams)> = Vec::new();
+    // are the peer's to re-open.
+    //
+    // `replay` 有值只说明「这是本机开的会话、这是它的参数」，**不等于**「该由
+    // 通用重放机制救回来」：模式 B 的 `Hal` 会话归设备协调器管，它自己就会重开。
+    // 两套机制都开一路 = 同一个 spec 的两条流、逐字节相同的载荷、对端 +6 dB 削顶。
+    // 这个判断是 `reconnect::recoverable_by_replay`，理由写在那里。
+    let mut mine: Vec<(u32, reconnect::PlannedSession)> = Vec::new();
     let ids: Vec<u32> = {
         let st = lk(&inner.state);
         st.sessions
@@ -870,7 +931,15 @@ fn teardown_conn(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
             .filter(|(_, e)| Arc::ptr_eq(&e.conn, conn))
             .map(|(id, e)| {
                 if let Some(o) = &e.replay {
-                    mine.push((*id, (**o).clone()));
+                    if reconnect::recoverable_by_replay(e.origin) {
+                        mine.push((
+                            *id,
+                            reconnect::PlannedSession {
+                                params: (**o).clone(),
+                                origin: e.origin,
+                            },
+                        ));
+                    }
                 }
                 *id
             })
@@ -890,7 +959,7 @@ fn teardown_conn(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
             .map_or(false, |c| c.alive.load(Ordering::SeqCst))
     };
     mine.sort_by_key(|(id, _)| *id); // deterministic replay order
-    let mine: Vec<OpenSessionParams> = mine.into_iter().map(|(_, p)| p).collect();
+    let mine: Vec<reconnect::PlannedSession> = mine.into_iter().map(|(_, p)| p).collect();
     if replaced {
         // The CONNECTION was replaced, the sessions were not: they were torn
         // down just now and nothing else re-opens them (register_conn inserts
@@ -1450,6 +1519,7 @@ pub(crate) fn open_session_from(
             volume: Arc::new(VolumeCell::new(false)), // mic: no remote output
             replay,
             origin,
+            peer_lat: Arc::new(PeerLatCell::new()),
         }
     } else {
         let shared = Arc::new(TxShared::new());
@@ -1480,6 +1550,7 @@ pub(crate) fn open_session_from(
             volume: Arc::new(VolumeCell::new(vol_sync)),
             replay,
             origin,
+            peer_lat: Arc::new(PeerLatCell::new()),
         }
     };
     // Liveness is re-checked under the SAME lock that inserts. A peer that
@@ -1507,7 +1578,7 @@ pub(crate) fn open_session_from(
             conn.fp
         );
     }
-    Ok(build_session_info(&entry, &[], None, None))
+    Ok(build_session_info(inner, &entry, &[], None, None))
 }
 
 /// Removes every trace of a peer this daemon is no longer paired with: the

@@ -1,0 +1,30 @@
+<!--
+  Directory.Build.props - wire the WDK / Windows SDK NuGet packages into every
+  project in this tree.
+
+  $(AudioHubNuGetRoot) / $(AudioHubWdkVersion) / $(AudioHubSdkCppVersion) are
+  passed in by build.ps1 (or restore-wdk.ps1); the Condition-guarded defaults
+  below keep the tree loadable in an IDE that has not gone through build.ps1.
+
+  Import order is copied from the upstream Windows-driver-samples
+  Directory.Build.props: WDK first, then SDK.CPP.<arch>, then SDK.CPP. The last
+  one deliberately re-points $(WindowsSdkDir) at the SDK package (the WDK
+  package only sets it when empty), which is what the km/um include split
+  expects.
+-->
+<Project>
+  <PropertyGroup>
+    <AudioHubNuGetRoot Condition="'$(AudioHubNuGetRoot)' == ''">$(UserProfile)\.nuget\packages</AudioHubNuGetRoot>
+    <AudioHubWdkVersion Condition="'$(AudioHubWdkVersion)' == ''">10.0.26100.6584</AudioHubWdkVersion>
+    <AudioHubSdkCppVersion Condition="'$(AudioHubSdkCppVersion)' == ''">10.0.26100.1</AudioHubSdkCppVersion>
+  </PropertyGroup>
+
+  <Import Project="$(AudioHubNuGetRoot)\microsoft.windows.wdk.x64\$(AudioHubWdkVersion)\build\native\Microsoft.Windows.WDK.x64.props"
+          Condition="'$(Platform)' == 'x64' and Exists('$(AudioHubNuGetRoot)\microsoft.windows.wdk.x64\$(AudioHubWdkVersion)\build\native\Microsoft.Windows.WDK.x64.props')" />
+
+  <Import Project="$(AudioHubNuGetRoot)\microsoft.windows.sdk.cpp.x64\$(AudioHubSdkCppVersion)\build\native\Microsoft.Windows.SDK.cpp.x64.props"
+          Condition="'$(Platform)' == 'x64' and Exists('$(AudioHubNuGetRoot)\microsoft.windows.sdk.cpp.x64\$(AudioHubSdkCppVersion)\build\native\Microsoft.Windows.SDK.cpp.x64.props')" />
+
+  <Import Project="$(AudioHubNuGetRoot)\microsoft.windows.sdk.cpp\$(AudioHubSdkCppVersion)\build\native\Microsoft.Windows.SDK.cpp.props"
+          Condition="Exists('$(AudioHubNuGetRoot)\microsoft.windows.sdk.cpp\$(AudioHubSdkCppVersion)\build\native\Microsoft.Windows.SDK.cpp.props')" />
+</Project>

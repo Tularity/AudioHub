@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -689,6 +689,512 @@ fn resample_all(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     out
 }
 
+// ==================================================== 跨时钟速率伺服（play_ring）
+//
+// # 这一段治的是什么病
+//
+// `play_ring` 是全链路上**唯一真正跨时钟**的一级，也是治法 A 落地之后唯一还在
+// **无界积累**的一级：
+//
+// - **写侧**：`mixer_loop` 每 10 ms 本地单调时钟推 480 个样本 ⇒ 严格 48000
+//   样本/本地秒。它的节拍源是 mac 发来的媒体流经 JB 定拍后的本地 tick。
+// - **读侧**：cpal/WASAPI 输出回调按**声卡晶振**取样本 ⇒ 48000·(1+ε) 样本/物理秒。
+//
+// 两个独立振荡器，ε 不可能为零。ε = 50 ppm ⇒ 2.4 帧/秒 ⇒ 180 ms/小时 ⇒
+// 1.000 秒的环约 **5.4 小时**灌满（10 ppm → 27 h，100 ppm → 2.7 h）。
+// 更糟的是这个环是 **drop-newest**：饱和之后丢的是**最新**的音频，听感是
+// 「迟到 + 周期性断续」，而不是「恒定迟到但连续」。
+//
+// mac 侧那套「同时钟所以不漂」的论证在这里**不成立**——那边两侧同为
+// `mach_absolute_time`，这里两侧是 mac 的时基和 Windows 声卡的晶振。
+//
+// # 结构：一个 DLL，一个执行器
+//
+// 执行器是 `AudioTx` 自己的重采样器比率。`push()` 是 `play_ring` 的**唯一**写点，
+// 所以把环路整个塞进 `AudioTx` 里，`mixer_loop` 的调用点一个字都不用改。
+//
+// 先例：PipeWire `spa/plugins/alsa/alsa-pcm.c`（`err = delay − target` 喂
+// `spa_dll`，`corr` 去改 `rate_match->rate`）、zita-ajbridge/njbridge
+// （同构控制律 + `set_rratio`）。控制律本身是 Adriaensen 的公开论文，
+// `spa_dll` 是 MIT，**没有链接 `zita-resampler`（GPL-3）**。
+
+/// PipeWire `spa_dll` 的移植（`spa/include/spa/utils/dll.h`，MIT）。
+///
+/// 契约：输入 `err` 单位是**样本**，输出是围绕 1.0 的**相对速率修正因子**。
+///
+/// `w0 = 1 − exp(−20w)` 是前置一阶平滑器，转角在 20×环路带宽：只滤测量噪声，
+/// 不动环路动力学。我们的深度读数带着「声卡按块取、我们按 tick 读」的锯齿
+/// 量化噪声，不先滤一下会直接灌进积分器。
+///
+/// `w1 = w·1.5/period` 里的 `period` 会与 `w = 2π·bw·period/rate` 的 period
+/// 约掉，所以稳态比例增益只有 `3π·bw/rate`——**但 `w0`/`w2` 要的是真实的更新
+/// 间隔**，因此 `period/rate` 必须等于两次 `update()` 之间的秒数，不能乱填。
+#[derive(Debug, Clone)]
+pub struct Dll {
+    bw: f64,
+    period: u32,
+    rate: u32,
+    z1: f64,
+    z2: f64,
+    z3: f64,
+    w0: f64,
+    w1: f64,
+    w2: f64,
+}
+
+impl Dll {
+    /// PipeWire `SPA_DLL_BW_MAX`：捕获/重同步之后用它快速锁定（ζ=0.75，τ≈1.7 s）。
+    pub const BW_MAX: f64 = 0.128;
+    /// PipeWire `SPA_DLL_BW_MIN`：稳态用它，τ≈13 s，把测量噪声压到最低。
+    pub const BW_MIN: f64 = 0.016;
+
+    pub fn new(bw: f64, period: u32, rate: u32) -> Dll {
+        let mut d = Dll {
+            bw: 0.0,
+            period: 0,
+            rate: 0,
+            z1: 0.0,
+            z2: 0.0,
+            z3: 0.0,
+            w0: 0.0,
+            w1: 0.0,
+            w2: 0.0,
+        };
+        d.set_bw(bw, period, rate);
+        d
+    }
+
+    pub fn set_bw(&mut self, bw: f64, period: u32, rate: u32) {
+        let period = period.max(1);
+        let rate = rate.max(1);
+        let w = 2.0 * std::f64::consts::PI * bw * period as f64 / rate as f64;
+        self.w0 = 1.0 - (-20.0 * w).exp();
+        self.w1 = w * 1.5 / period as f64; // k=1.5 ⇒ ζ=0.75（PipeWire 的整定）
+        self.w2 = w / 1.5;
+        self.bw = bw;
+        self.period = period;
+        self.rate = rate;
+    }
+
+    pub fn bw(&self) -> f64 {
+        self.bw
+    }
+
+    pub fn period(&self) -> u32 {
+        self.period
+    }
+
+    /// 清掉三个积分器，保留带宽整定。**跳变/重同步之后必须调**——
+    /// PipeWire (`node-driver.c:487–494`) 与 PulseAudio (`fast_adjust` 之后
+    /// `return`) 两个独立实现都在粗调之后强制复位细调状态，否则积分器残留
+    /// 会在跳变后继续输出错误修正。
+    pub fn reset(&mut self) {
+        self.z1 = 0.0;
+        self.z2 = 0.0;
+        self.z3 = 0.0;
+    }
+
+    pub fn update(&mut self, err: f64) -> f64 {
+        self.z1 += self.w0 * (self.w1 * err - self.z1);
+        self.z2 += self.w0 * (self.z1 - self.z2);
+        self.z3 += self.w2 * self.z2;
+        1.0 - (self.z2 + self.z3)
+    }
+}
+
+/// 变比率重采样器：4 点 Catmull-Rom（三次 Hermite）。
+///
+/// # 为什么不是现成的 `dsp::LinearResampler`
+///
+/// 机制上它**够用**：相位累加器 + 跨块携带的历史样本都在，`step` 就是一个
+/// `f64`，改它就是改比率——伺服不需要任何新依赖就能跑起来。真正的问题在质量：
+///
+/// 线性插值的幅频响应**随小数相位 φ 变化**。φ=0 时是恒等（0 dB），φ=0.5 时
+/// 在 f/fs 处衰减 `20·log10(cos(πf/fs))`：10 kHz@48k 是 −2.0 dB，15 kHz 是
+/// −5.1 dB。而比率≈1 时 φ **缓慢扫过 [0,1)**，扫一圈需要 `1/|corr−1|` 个样本
+/// ——500 ppm 时约 42 ms（≈24 Hz），典型 20 ppm 时约 1 s。于是高频内容会以
+/// 亚赫兹到几十赫兹的速率「呼吸」，在镲片/齿音上是能听出来的。
+///
+/// 这不是线性插值特有的缺陷之外的东西：**任何**比率≈1 的分数延迟器都要扫相位，
+/// 区别在于好核的幅度对 φ 几乎不敏感。Catmull-Rom 是 15 行、零依赖、无授权
+/// 问题的教科书核，把上面两个数字压到 −0.53 dB / −2.5 dB（见
+/// `cubic_beats_linear_on_the_phase_swept_hf_droop`，那条测试是实测不是引用）。
+///
+/// 再往上就要窗 sinc（`rubato` / `soxr`）——**本轮不引入**：CPU 与依赖的代价
+/// 换来的是 20 kHz 附近最后那 2 dB，与「唯一还在无界积累的病灶」不成比例。
+/// 若将来听感走查发现 HF 呼吸仍可闻，换核只需要动这个 struct，环路一行不改。
+///
+/// # 数据结构
+///
+/// 虚拟输入序列 `v = [hist[0], hist[1], hist[2]] ++ input`。输出位置 `p`
+/// 在 `v` 坐标里，`i = floor(p)`，取 4 点窗口 `v[i-1..=i+2]` 在 `v[i]` 与
+/// `v[i+1]` 之间插值 ⇒ 必须 `1 ≤ i ≤ v.len()−3`，即 `p ∈ [1, n+1)`。
+/// 收尾时 `phase = p − n`，恰好落回 `[1, 1+step)`，不变式自洽。
+pub struct VarResampler {
+    /// 标称步长 = src_rate / dst_rate（输入样本 / 输出样本）。
+    nominal: f64,
+    /// 实际步长 = nominal / corr。
+    step: f64,
+    /// 见 struct 文档：不变式 `phase ≥ 1`。
+    phase: f64,
+    hist: [f32; 3],
+}
+
+impl VarResampler {
+    pub fn new(src: u32, dst: u32) -> VarResampler {
+        let nominal = src as f64 / dst.max(1) as f64;
+        VarResampler {
+            nominal,
+            step: nominal,
+            phase: 1.0,
+            hist: [0.0; 3],
+        }
+    }
+
+    /// 施加 DLL 的修正因子。
+    ///
+    /// **方向推导（写错就是正反馈）**：`step` 是「每产出一个输出样本消耗多少
+    /// 输入样本」。`step` 变大 ⇒ 同样多的输入产出**更少**的输出 ⇒ 写进环里的
+    /// 少了 ⇒ 水位下降。所以 `step = nominal / corr`：`corr < 1` ⇒ 步长变大
+    /// ⇒ 水位下降。与 `PlayServo` 的 `err = downstream − target` 串起来正好是
+    /// 负反馈，见那边的推导。
+    pub fn set_correction(&mut self, corr: f64) {
+        self.step = self.nominal / corr;
+    }
+
+    pub fn step(&self) -> f64 {
+        self.step
+    }
+
+    pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        let n = input.len();
+        if n == 0 {
+            return;
+        }
+        let hist = self.hist;
+        let at = |idx: usize| -> f32 {
+            if idx < 3 {
+                hist[idx]
+            } else {
+                input[idx - 3]
+            }
+        };
+        let vlen = n + 3;
+        let mut p = self.phase;
+        // i = floor(p) 必须满足 i+2 ≤ vlen−1，即 p < (vlen−3)+1 = n+1。
+        let limit = (n + 1) as f64;
+        while p < limit {
+            let i = p as usize; // p ≥ 1 保证 i ≥ 1
+            let t = (p - i as f64) as f32;
+            let y0 = at(i - 1);
+            let y1 = at(i);
+            let y2 = at(i + 1);
+            let y3 = at(i + 2);
+            // Catmull-Rom：t=0 精确返回 y1（所以 step==1 且 phase 整数时是
+            // 逐样本无损直通，只差一个固定的两样本延迟）。
+            let a0 = y1;
+            let a1 = 0.5 * (y2 - y0);
+            let a2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+            let a3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+            out.push(((a3 * t + a2) * t + a1) * t + a0);
+            p += self.step;
+        }
+        // 新历史 = v 的最后三个。必须在改 self.hist 之前全部取出来。
+        let h = [at(vlen - 3), at(vlen - 2), at(vlen - 1)];
+        self.hist = h;
+        // p 的坐标原点右移 n 个输入样本。`max(1.0)` 只在 n < step 的病态小块
+        // 下才生效（我们的块恒为 480），保住 `phase ≥ 1` 不变式。
+        self.phase = (p - n as f64).max(1.0);
+    }
+}
+
+/// 声卡侧发布给伺服的观测量。写者是输出回调（实时线程），读者是
+/// `AudioTx::push`（mixer 线程）。
+///
+/// 全部用 `Relaxed`：这是一个**估计器**，不是同步原语。最坏情况是把上一个
+/// 回调的 `consumed` 和这一个回调的时刻凑成一对，误差上界是一个声卡周期，
+/// 而 `Dll` 的 `w0` 前置平滑器正是为这一类噪声准备的。用 `SeqCst` 会在实时
+/// 回调里加内存栅栏，代价真实、收益为零。
+#[derive(Debug)]
+pub struct DeviceClock {
+    /// `Instant` 不是原子的，所以时刻一律以「相对 base 的纳秒」发布。
+    base: Instant,
+    /// 声卡累计取走的样本数。
+    consumed: AtomicU64,
+    /// 最后一次回调的时刻（纳秒 since base）。
+    last_cb_ns: AtomicU64,
+    /// `playback − callback`：写进去的数据预计多久之后真的被 DAC 播出——
+    /// 也就是 Snapcast `stream.cpp:305` 那个 `outputBufferDacTime`。
+    dac_lag_ns: AtomicU64,
+    /// 近 `BLOCK_WINDOW` 次回调里取走的最大样本数（声卡周期），用来定目标
+    /// 水位的下限。
+    ///
+    /// 取**滑动窗**而不是全程最大：有些宿主开流时会来一次超大的预热回调，
+    /// 全程最大会让那一次把目标水位**永久**顶高——正是本项目在治的那种棘轮。
+    /// 窗口一满就从当前值重新起算，异常值约 1.3 秒后自然老化掉。
+    block_max: AtomicUsize,
+    cb_count: AtomicU64,
+    /// 环里不够回调取、被补了静音的次数。
+    underruns: AtomicU64,
+}
+
+impl DeviceClock {
+    /// 滑动窗长度（回调次数）。128 × ≈10 ms ≈ 1.3 秒。
+    const BLOCK_WINDOW: u64 = 128;
+
+    fn new() -> Arc<DeviceClock> {
+        Arc::new(DeviceClock {
+            base: Instant::now(),
+            consumed: AtomicU64::new(0),
+            last_cb_ns: AtomicU64::new(0),
+            dac_lag_ns: AtomicU64::new(0),
+            block_max: AtomicUsize::new(0),
+            cb_count: AtomicU64::new(0),
+            underruns: AtomicU64::new(0),
+        })
+    }
+
+    /// 输出回调每次调用后报一次。`got < wanted` 就是一次欠载。
+    fn note_callback(&self, now: Instant, wanted: usize, got: usize, dac_lag: Option<Duration>) {
+        self.consumed.fetch_add(got as u64, Ordering::Relaxed);
+        self.last_cb_ns.store(
+            now.saturating_duration_since(self.base).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        if let Some(d) = dac_lag {
+            self.dac_lag_ns
+                .store(d.as_nanos() as u64, Ordering::Relaxed);
+        }
+        let n = self.cb_count.fetch_add(1, Ordering::Relaxed);
+        if n % Self::BLOCK_WINDOW == 0 || wanted > self.block_max.load(Ordering::Relaxed) {
+            self.block_max.store(wanted, Ordering::Relaxed);
+        }
+        if got < wanted {
+            self.underruns.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn since_last_callback(&self, now: Instant) -> Option<Duration> {
+        let last = self.last_cb_ns.load(Ordering::Relaxed);
+        if last == 0 {
+            return None; // 还没有过一次回调
+        }
+        let now_ns = now.saturating_duration_since(self.base).as_nanos() as u64;
+        Some(Duration::from_nanos(now_ns.saturating_sub(last)))
+    }
+
+    fn dac_lag_samples(&self, rate: u32) -> f64 {
+        let ns = self.dac_lag_ns.load(Ordering::Relaxed) as f64;
+        ns * rate as f64 / 1e9
+    }
+
+    fn block_max(&self) -> usize {
+        self.block_max.load(Ordering::Relaxed)
+    }
+
+    fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+}
+
+/// 速率伺服的全部整定量与状态。单位一律是**设备速率样本**。
+pub struct PlayServo {
+    dll: Dll,
+    enabled: bool,
+    /// 目标水位。基线 + 声卡周期一被观测到就抬到 `2·block + 1 tick`。
+    target: f64,
+    base_target: f64,
+    /// 喂进 DLL 之前把 err 钳到这个幅度（PipeWire `max_error`）。
+    max_error: f64,
+    /// 超过这个幅度不再靠弯速率，直接硬跳（PipeWire `max_resync`）。
+    max_resync: f64,
+    /// 深端重同步进行中：在丢输入，DLL 冻结。
+    resyncing_deep: bool,
+    /// 上一次 `set_bw` 用的 period，块长变了要重算。
+    tuned_period: u32,
+    /// 捕获阶段（开流 / 重同步后）剩余的更新次数，期间用 `BW_MAX` 快锁。
+    capture_left: u32,
+    corr: f64,
+    /// 最近一次的误差（设备率样本）。**每实例**一份——进程级那份是
+    /// 「最后写者赢」，多个环同时在跑时读它读到的是别人的数。
+    last_err: f64,
+    /// **只给测试**：+1.0 是生产符号，−1.0 把误差取反。
+    ///
+    /// 为什么要在生产结构里留这一格：调研点名「误差符号是落地时最容易写错、
+    /// 且错了会直接把水位推到饱和的一处」，并要求「加一条会在符号写反时变红的
+    /// 测试」。要让这条测试**真的**盯住生产代码里那个减号，它必须跑
+    /// `servo_step` 本身；把控制律另抄一份到测试里去证明，证明的是抄件。
+    /// 所以留一个开关，让同一个环路能被两种符号各跑一遍：
+    /// `error_sign_is_negative_feedback_flipping_it_diverges` 断言 +1 收敛
+    /// **且** −1 发散——把生产那一行改成 `target − downstream`，两条断言同时红。
+    error_sign: f64,
+}
+
+impl PlayServo {
+    /// 速率钳位 **±500 ppm**。
+    ///
+    /// 依据三条：
+    /// 1. Snapcast `stream.cpp:416` 的硬上限就是 500 ppm——同型系统的既有取值。
+    /// 2. 音高上它是 `1200·log2(1.0005)` = **0.87 音分**，远低于人耳约 5–10
+    ///    音分的辨别阈，弯到顶也不可闻。
+    /// 3. 覆盖面够：消费级音频晶振典型 ±50 ppm、劣质件 ±100 ppm，两端相加
+    ///    最坏 200 ppm，500 ppm 留了 2.5 倍余量给稳态误差与整定超调。
+    ///
+    /// 比它更大的误差**不该**用弯速率去追：500 ppm 只能吐 0.5 ms/s，
+    /// 一秒的存量要 2000 秒才排得完。那种量级归 `max_resync` 的硬跳管。
+    pub const MAX_PPM: f64 = 500.0;
+
+    /// 目标水位基线。播放环写侧是 10 ms 一块，读侧是一个声卡周期一块，
+    /// 目标必须同时盖住两者的相位差与调度抖动。构造后一旦观测到真实的声卡
+    /// 周期就抬到 `2·block + 480`（≈两个周期 + 一个 tick）。
+    const BASE_TARGET_MS: f64 = 30.0;
+    /// 目标水位上限：任何自动抬升都不许把延迟推过这条线。
+    const MAX_TARGET_MS: f64 = 120.0;
+    /// 喂 DLL 之前的误差钳位。
+    const MAX_ERROR_MS: f64 = 15.0;
+    /// 硬跳阈值。
+    const MAX_RESYNC_MS: f64 = 150.0;
+    /// 开流 / 重同步之后用 `BW_MAX` 快锁多少个 10 ms 更新（≈4 s，抄 zita 的
+    /// `_count == 4 * _ppsec` 切换点）。
+    const CAPTURE_UPDATES: u32 = 400;
+
+    fn new(dev_rate: u32, enabled: bool) -> PlayServo {
+        let ms = |v: f64| v * dev_rate as f64 / 1000.0;
+        let period = (dev_rate / 100).max(1); // 10 ms 的 mixer tick
+        PlayServo {
+            dll: Dll::new(Dll::BW_MAX, period, dev_rate),
+            enabled,
+            target: ms(Self::BASE_TARGET_MS),
+            base_target: ms(Self::BASE_TARGET_MS),
+            max_error: ms(Self::MAX_ERROR_MS),
+            max_resync: ms(Self::MAX_RESYNC_MS),
+            resyncing_deep: false,
+            tuned_period: period,
+            capture_left: Self::CAPTURE_UPDATES,
+            corr: 1.0,
+            last_err: 0.0,
+            error_sign: 1.0,
+        }
+    }
+
+    /// 浅端硬跳的触发线 = `max(target − max_resync, target/2)`。
+    ///
+    /// 取 `max` 而不是 `min`：`max_resync` 的定义是「超出这个幅度就别弯速率了，
+    /// 直接跳」，所以它越小、越该早跳。以本文件的整定（target≈30 ms、
+    /// max_resync=150 ms）`target − max_resync` 是负数，永远不触发，实际生效的
+    /// 是**半个目标**——1.000 秒的环本来也容不下一个 150 ms 的下溢。
+    fn starve_mark(&self) -> f64 {
+        (self.target - self.max_resync).max(self.target * 0.5)
+    }
+
+    fn rearm_capture(&mut self) {
+        self.dll.reset();
+        self.capture_left = Self::CAPTURE_UPDATES;
+        self.dll
+            .set_bw(Dll::BW_MAX, self.tuned_period, self.dll.rate);
+        self.corr = 1.0;
+    }
+}
+
+/// 环路对本块的裁决。
+enum ServoAction {
+    /// 正常写。
+    Go,
+    /// 深端硬跳：整块丢掉（drop-newest，但是**有意的、被计数的**）。
+    Skip,
+    /// 浅端硬跳：先补 N 个静音样本把水位顶回目标，再正常写。
+    Pad(usize),
+}
+
+/// 伺服的进程级累计读数（IPC `latency_guard.play_servo`）。
+///
+/// ## 口径警告
+///
+/// 这是**进程级**聚合，不是每环一份。计数类字段（`updates` / `resync_*` /
+/// `clamped` / `stalled`）是所有 `AudioTx` 的和；瞬时类字段（`corr_ppm` /
+/// `err_samples` / `target_samples` / `downstream_samples`）是**最后一个写者
+/// 赢**。站点播放环之外只有桥接环也在跑伺服，所以在没开桥的常态下这就是站点
+/// 环的读数。之所以只能这样：`AudioTx` 是 `mixer_loop` 的**栈上局部**，
+/// daemon 侧拿不到它的引用，而 `mixer_loop` 所在的 `engine.rs` 不在本轮的
+/// 改动范围内。要做到每环一份，得给 `LivePlayback::start` 加一个 id 参数。
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct PlayServoCounters {
+    /// 环路更新次数。
+    pub updates: u64,
+    /// 最近一次的速率修正，ppm（正 = 输出变快 = 水位涨）。
+    pub corr_ppm: i64,
+    /// 最近一次的误差 `downstream − target`（设备率样本，正 = 偏深）。
+    pub err_samples: i64,
+    /// 当前目标水位（设备率样本）。
+    pub target_samples: u64,
+    /// 最近一次实测的执行器下游总缓冲（设备率样本）。
+    pub downstream_samples: u64,
+    /// 修正打到 ±500 ppm 上限的次数。持续非零 = 失配超出钳位，该查硬件。
+    pub clamped: u64,
+    /// 硬跳次数（两个方向合计）。
+    pub resync_events: u64,
+    /// 深端硬跳丢掉的输入样本。
+    pub resync_skipped: u64,
+    /// 浅端硬跳补进的静音样本。
+    pub resync_padded: u64,
+    /// 因为声卡回调停摆而跳过的更新次数（读数不可信，宁可不动）。
+    pub stalled: u64,
+    /// 声卡取不满、被补静音的回调次数。持续增长 = 目标水位定低了。
+    pub dev_underruns: u64,
+    /// 最近一次的 `outputBufferDacTime`（设备率样本）。恒为 0 = 平台没给。
+    pub dac_lag_samples: u64,
+}
+
+#[derive(Debug, Default)]
+struct ServoCell {
+    updates: AtomicU64,
+    corr_ppm: AtomicI64,
+    err_samples: AtomicI64,
+    target_samples: AtomicU64,
+    downstream_samples: AtomicU64,
+    clamped: AtomicU64,
+    resync_events: AtomicU64,
+    resync_skipped: AtomicU64,
+    resync_padded: AtomicU64,
+    stalled: AtomicU64,
+    dev_underruns: AtomicU64,
+    dac_lag_samples: AtomicU64,
+}
+
+static PLAY_SERVO: ServoCell = ServoCell {
+    updates: AtomicU64::new(0),
+    corr_ppm: AtomicI64::new(0),
+    err_samples: AtomicI64::new(0),
+    target_samples: AtomicU64::new(0),
+    downstream_samples: AtomicU64::new(0),
+    clamped: AtomicU64::new(0),
+    resync_events: AtomicU64::new(0),
+    resync_skipped: AtomicU64::new(0),
+    resync_padded: AtomicU64::new(0),
+    stalled: AtomicU64::new(0),
+    dev_underruns: AtomicU64::new(0),
+    dac_lag_samples: AtomicU64::new(0),
+};
+
+/// 播放环速率伺服的现场读数（IPC / probe 用）。见 [`PlayServoCounters`] 的口径警告。
+pub fn play_servo_counters() -> PlayServoCounters {
+    let g = &PLAY_SERVO;
+    PlayServoCounters {
+        updates: g.updates.load(Ordering::Relaxed),
+        corr_ppm: g.corr_ppm.load(Ordering::Relaxed),
+        err_samples: g.err_samples.load(Ordering::Relaxed),
+        target_samples: g.target_samples.load(Ordering::Relaxed),
+        downstream_samples: g.downstream_samples.load(Ordering::Relaxed),
+        clamped: g.clamped.load(Ordering::Relaxed),
+        resync_events: g.resync_events.load(Ordering::Relaxed),
+        resync_skipped: g.resync_skipped.load(Ordering::Relaxed),
+        resync_padded: g.resync_padded.load(Ordering::Relaxed),
+        stalled: g.stalled.load(Ordering::Relaxed),
+        dev_underruns: g.dev_underruns.load(Ordering::Relaxed),
+        dac_lag_samples: g.dac_lag_samples.load(Ordering::Relaxed),
+    }
+}
+
 // ------------------------------------------------------------ stream health
 
 /// What the cpal error callback writes and the owner of the stream reads. cpal
@@ -746,7 +1252,10 @@ fn build_output_stream_f32(
     config: &cpal::StreamConfig,
     supported_format: SampleFormat,
     health: &Arc<StreamHealth>,
-    mut fill_mono: impl FnMut(&mut [f32]) + Send + 'static,
+    // 多带一个 `&OutputCallbackInfo`：`timestamp().playback − .callback` 是
+    // 声卡硬件缓冲的滞后量（Snapcast 的 `outputBufferDacTime`），是速率伺服
+    // 误差信号里唯一取不到就只能算 0 的那一项。此前这个参数被 `_` 丢掉了。
+    mut fill_mono: impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static,
 ) -> Result<cpal::Stream> {
     let channels = config.channels as usize;
     let mut mono: Vec<f32> = Vec::new();
@@ -754,10 +1263,10 @@ fn build_output_stream_f32(
         SampleFormat::I16 => {
             let stream = device.build_output_stream(
                 config,
-                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                move |data: &mut [i16], info: &cpal::OutputCallbackInfo| {
                     let frames = data.len() / channels;
                     mono.resize(frames, 0.0);
-                    fill_mono(&mut mono);
+                    fill_mono(&mut mono, info);
                     for (frame, &s) in data.chunks_mut(channels).zip(mono.iter()) {
                         let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
                         frame.fill(v);
@@ -772,10 +1281,10 @@ fn build_output_stream_f32(
         _ => {
             let stream = device.build_output_stream(
                 config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     let frames = data.len() / channels;
                     mono.resize(frames, 0.0);
-                    fill_mono(&mut mono);
+                    fill_mono(&mut mono, info);
                     for (frame, &s) in data.chunks_mut(channels).zip(mono.iter()) {
                         frame.fill(s);
                     }
@@ -812,7 +1321,7 @@ pub fn play_samples_blocking(samples: &[f32], src_rate: u32) -> Result<()> {
         &config,
         supported.sample_format(),
         &health,
-        move |mono| {
+        move |mono, _info| {
             let mut p = pos_cb.load(Ordering::Relaxed);
             for m in mono.iter_mut() {
                 *m = if p < data.len() {
@@ -857,12 +1366,21 @@ pub struct LivePlayback {
 
 pub struct AudioTx {
     prod: HeapProd<f32>,
-    resampler: Option<Resampler>,
+    /// 伺服关闭且收发同速率时是 `None`（逐样本直通，与加伺服之前逐字同构）；
+    /// 只要伺服开着就一定在场——弯速率是它唯一的执行器。
+    resampler: Option<VarResampler>,
     staging: Vec<f32>,
+    /// 跨时钟速率伺服。见模块中部「跨时钟速率伺服（play_ring）」那一节。
+    servo: PlayServo,
+    /// 声卡侧发布的观测量（`consumed` / 回调时刻 / DAC 滞后 / 欠载）。
+    dev: Arc<DeviceClock>,
     /// 环的容量与消费者速率，都是**设备**速率。播放环的 cap 恰好 = dev_rate
     /// = 1.000 秒，所以拿 48000 硬算 44.1k 设备会把 1 秒报成 918 ms
     /// （规格 §3.5 点名的 −8.8% 偏差）。
     dev_rate: u32,
+    /// 送进来的样本的速率（线上恒 48k）。伺服要用它把输入块长换算成设备率
+    /// 样本，好把环路带宽整定在真实的更新间隔上。
+    src_rate: u32,
     /// 写不进去而被丢掉的样本数（累计）。
     ///
     /// 这里的丢弃方向是 **`DropMode::Newest`**：`push_slice` 满了就短写，
@@ -876,6 +1394,21 @@ pub struct AudioTx {
 
 impl AudioTx {
     pub fn push(&mut self, mono_samples: &[f32]) {
+        self.push_at(mono_samples, Instant::now());
+    }
+
+    /// `push` 的可注入时钟版本。生产代码只走 `push`；测试用它跑**虚拟时间**
+    /// （`t0 + Duration::from_millis(10*tick)`），这样一小时的漂移可以在几秒里
+    /// 跑完，而走的仍然是同一条生产路径、同一个真 `HeapRb`、同一个真重采样器。
+    #[doc(hidden)]
+    pub fn push_at(&mut self, mono_samples: &[f32], now: Instant) {
+        if self.servo.enabled {
+            match self.servo_step(mono_samples.len(), now) {
+                ServoAction::Skip => return, // 深端硬跳：本块整块不写
+                ServoAction::Pad(n) => self.write_silence(n),
+                ServoAction::Go => {}
+            }
+        }
         match self.resampler.as_mut() {
             None => {
                 let wrote = self.prod.push_slice(mono_samples);
@@ -887,6 +1420,212 @@ impl AudioTx {
                 let wrote = self.prod.push_slice(&self.staging);
                 self.note_short_write(self.staging.len(), wrote);
             }
+        }
+    }
+
+    /// 跑一次环路。返回本块该怎么处理。
+    ///
+    /// # 误差信号：只统计**执行器下游**的缓冲
+    ///
+    /// 调研要求「误差信号必须取全链路之和」，先例是 Snapcast `stream.cpp:305`
+    /// 连 `outputBufferDacTime` 都算进 `age`。这条要求的**正确一般化**是：
+    ///
+    /// > 误差里必须包含执行器**下游**的每一级缓冲；执行器应当尽量靠前放。
+    ///
+    /// Snapcast 之所以能把整条链算进去，是因为它的执行器就在客户端最前端，
+    /// 客户端里的一切都在它下游。我们这个执行器在 `AudioTx` 里，下游只有两级：
+    ///
+    /// | 项 | 取不取得到 | 怎么取 |
+    /// |---|---|---|
+    /// | `play_ring` 深度 | ✅ 精确 | `prod.occupied_len()`，整数样本，无估计成分 |
+    /// | 声卡回调相位（写侧按 10 ms、读侧按声卡周期，读数带锯齿） | ✅ 可剔除 | 时间插值：减掉「距上次回调这段时间里声卡本该取走的量」 |
+    /// | 声卡硬件缓冲 `outputBufferDacTime` | ⚠️ 平台给才有 | cpal `OutputCallbackInfo::timestamp()` 的 `playback − callback`；给不出就恒 0 |
+    /// | `jitter_buf` / `post_mix`（**上游**） | ✅ 取得到，但**故意不算** | 见下 |
+    ///
+    /// 上游两级取得到（`RxStream` 里就有），但**必须排除**：它们由 `mixer_loop`
+    /// 按本地单调时钟每 tick 定量 pop，弯声卡比率**一个样本都动不了它们**。
+    /// 把一个本执行器无权限的量放进误差，唯一的后果是积分器缠绕到 ±500 ppm
+    /// 钳位、把播放环推向欠载或饱和——正好是我们要治的病。JB 那一级另有自己的
+    /// 界（`media.rs` 的 `while frames.len() > target + 6`，封顶 180 ms 且自愈），
+    /// 归它自己管。
+    ///
+    /// 时间插值那一条是三个独立实现的共同技巧：zita 的
+    /// `(_k_a1 − _k_a0)·d1/d2`、PipeWire `alsa-pcm.c` 的 `snd_pcm_htimestamp`、
+    /// PipeWire `node-driver.c` 的 `time_since_nsec`（源码注释：
+    /// "increases the control loop stability"）。**喂进环路之前先把测量自身的
+    /// 调度抖动剔掉。**
+    ///
+    /// # 误差符号（写反就是正反馈，一路推到饱和）
+    ///
+    /// `spa_dll_update` 的定义是 `z1 += w0(w1·err − z1)`（`w1 > 0`），返回
+    /// `1 − (z2+z3)`，所以 **`err > 0 ⇒ corr < 1`**。
+    ///
+    /// 我们的执行器是 `step = nominal / corr`：`corr < 1` ⇒ 步长变大 ⇒ 同样多
+    /// 的输入产出更少的输出 ⇒ 写进环里的少了 ⇒ **水位下降**。
+    ///
+    /// 所以要「水位偏深 ⇒ 水位下降」，就要「水位偏深 ⇒ `corr < 1`」，
+    /// 即「水位偏深 ⇒ `err > 0`」，即
+    ///
+    /// ```text
+    /// err = downstream − target        // ★ 生产者 / playback 语义
+    /// ```
+    ///
+    /// **这与 mac 侧 `tx_loop` 的符号相反，而且必须相反。** 那边是 HAL 环的
+    /// **消费者**（capture 语义），执行器是唤醒周期：水位偏深要**读得更多**
+    /// ⇒ 周期变短 ⇒ `next_time += T/corr` 要 `corr > 1` ⇒ 那边写
+    /// `err = target − depth`。PipeWire 自己就是按生产/消费分开取符号的
+    /// （`alsa-pcm.c:3032–3035`：playback 用 `delay − target`，capture 用
+    /// `target − delay`，且 `rate_match` 一边取 `corr`、一边取 `1.0/corr`）。
+    /// 我们是**往设备写**，所以取 playback 那一支。
+    ///
+    /// 守这条的是 `flipping_the_error_sign_turns_the_servo_into_a_divergence_engine`。
+    fn servo_step(&mut self, n_in: usize, now: Instant) -> ServoAction {
+        let rate = self.dev_rate as f64;
+        // ---- 目标水位：一观测到真实的声卡周期就抬到 2·block + 1 tick ----
+        // 每 tick 重算，**上下都跟**——不写成「只涨不落」。只涨不落就是一个
+        // 棘轮：一次异常的大回调会把目标永久抬高，而这正是本项目在治的病。
+        // 目标降下来时多出的那点水位由细调正常吐掉（几毫秒，几秒内完事）。
+        let block = self.dev.block_max();
+        if block > 0 {
+            let want = (2 * block) as f64 + rate * 0.01;
+            let cap = PlayServo::MAX_TARGET_MS * rate / 1000.0;
+            self.servo.target = want.max(self.servo.base_target).min(cap);
+        }
+        // ---- 环路带宽跟着真实块长走（`w0`/`w2` 要的是真的更新间隔）----
+        let n_out = (n_in as f64 * rate / self.src_rate as f64).round().max(1.0) as u32;
+        if n_out.abs_diff(self.servo.tuned_period) * 10 > self.servo.tuned_period {
+            self.servo.tuned_period = n_out;
+            let bw = if self.servo.capture_left > 0 { Dll::BW_MAX } else { Dll::BW_MIN };
+            self.servo.dll.set_bw(bw, n_out, self.dev_rate);
+        }
+        // ---- 误差信号 ----
+        let ring = self.prod.occupied_len() as f64;
+        let dac = self.dev.dac_lag_samples(self.dev_rate);
+        let inflight = match self.dev.since_last_callback(now) {
+            // 回调停摆（设备刚开、被拔掉、或者线程饿死）：读数不可信，
+            // 宁可不动也不要拿一个错的量去积分。
+            Some(d) if d > Duration::from_millis(250) => {
+                PLAY_SERVO.stalled.fetch_add(1, Ordering::Relaxed);
+                return ServoAction::Go;
+            }
+            Some(d) => d.as_secs_f64() * rate,
+            None => {
+                PLAY_SERVO.stalled.fetch_add(1, Ordering::Relaxed);
+                return ServoAction::Go;
+            }
+        };
+        let downstream = ring - inflight + dac;
+        // ★ 符号推导见上。`error_sign` 恒为 +1.0，只有那条守着这个减号的测试
+        //   会把它翻成 −1.0。
+        let err = (downstream - self.servo.target) * self.servo.error_sign;
+        // ---- 三档：死区内喂 DLL / 钳位后喂 DLL / 硬跳 ----
+        let mut action = ServoAction::Go;
+        // 进入条件是 `err > max_resync`，**退出条件是 `err ≤ 0`**——两个不同的
+        // 阈值，这不是笔误：
+        //
+        // 若退出条件也写成 `err ≤ max_resync`，硬跳就只会把水位放到
+        // `target + max_resync`（我们的整定下 = 181 ms），剩下那 150 ms 交给
+        // 细调去吐——而 500 ppm 只有 0.5 ms/s，吐完要 **300 秒**。等于「跳」了
+        // 一个寂寞：听感上照样是五分钟的高延迟。所以一旦决定跳，就跳到目标为止
+        // （PipeWire `alsa_sync` 与 zita `rd_commit(k)` 都是一次 seek 到位）。
+        // 迟滞由 `resyncing_deep` 这个状态位提供，不会在阈值边缘反复进出。
+        if err > self.servo.max_resync || (self.servo.resyncing_deep && err > 0.0) {
+            // 深端硬跳：丢掉输入，让声卡把存量放完。这就是治法 A 的
+            // `rd_commit(k)` / `alsa_sync`，只是发生在生产者这一端。
+            // DLL 在整个丢弃期间**冻结**，退出时才重置——重置 N 次等于没重置。
+            self.servo.resyncing_deep = true;
+            PLAY_SERVO
+                .resync_skipped
+                .fetch_add(n_in as u64, Ordering::Relaxed);
+            self.publish(err, downstream);
+            return ServoAction::Skip;
+        }
+        if self.servo.resyncing_deep {
+            self.servo.resyncing_deep = false;
+            self.servo.rearm_capture();
+            PLAY_SERVO.resync_events.fetch_add(1, Ordering::Relaxed);
+        } else if downstream < self.servo.starve_mark() {
+            // 浅端硬跳（`expand`）。触发线见 `PlayServo::starve_mark`
+            // ——以本文件的整定（target≈30 ms、max_resync=150 ms）实际生效的是
+            // **半个目标**，因为 1.000 秒的环根本容不下一个 150 ms 的下溢。
+            //
+            // 为什么需要它，而不是让细调慢慢补：500 ppm 只能补 0.5 ms/s，
+            // 把 15 ms 的亏空补回来要 30 秒，这 30 秒里环一直贴着底反复欠载。
+            // 它同时承担**开流冷启动**——刚打开时环是空的，没有这一跳，
+            // 头一分钟全在欠载。
+            //
+            // 补的是静音而不是插值出来的音频：样本本来就不存在，声卡刚刚已经
+            // 播了等长的静音，这里只是把「谁来补、补多少」从声卡手里收回来，
+            // 好让水位重新可控。
+            let need = (self.servo.target - downstream).max(0.0).round() as usize;
+            if need > 0 {
+                PLAY_SERVO
+                    .resync_padded
+                    .fetch_add(need as u64, Ordering::Relaxed);
+                PLAY_SERVO.resync_events.fetch_add(1, Ordering::Relaxed);
+                action = ServoAction::Pad(need);
+            }
+            self.servo.rearm_capture();
+            self.publish(err, downstream);
+            return action;
+        }
+        // ---- 细调 ----
+        let fed = err.clamp(-self.servo.max_error, self.servo.max_error);
+        let raw = self.servo.dll.update(fed);
+        let lo = 1.0 - PlayServo::MAX_PPM * 1e-6;
+        let hi = 1.0 + PlayServo::MAX_PPM * 1e-6;
+        let corr = raw.clamp(lo, hi);
+        if corr != raw {
+            PLAY_SERVO.clamped.fetch_add(1, Ordering::Relaxed);
+        }
+        self.servo.corr = corr;
+        if let Some(rs) = self.resampler.as_mut() {
+            rs.set_correction(corr);
+        }
+        if self.servo.capture_left > 0 {
+            self.servo.capture_left -= 1;
+            if self.servo.capture_left == 0 {
+                // 抄 zita：4 秒锁定期结束就收窄带宽，把测量噪声压下去。
+                self.servo
+                    .dll
+                    .set_bw(Dll::BW_MIN, self.servo.tuned_period, self.dev_rate);
+            }
+        }
+        PLAY_SERVO.updates.fetch_add(1, Ordering::Relaxed);
+        PLAY_SERVO
+            .corr_ppm
+            .store(((corr - 1.0) * 1e6).round() as i64, Ordering::Relaxed);
+        self.publish(err, downstream);
+        action
+    }
+
+    fn publish(&mut self, err: f64, downstream: f64) {
+        self.servo.last_err = err;
+        let g = &PLAY_SERVO;
+        g.err_samples.store(err.round() as i64, Ordering::Relaxed);
+        g.downstream_samples
+            .store(downstream.max(0.0).round() as u64, Ordering::Relaxed);
+        g.target_samples
+            .store(self.servo.target.round() as u64, Ordering::Relaxed);
+        g.dev_underruns
+            .store(self.dev.underruns(), Ordering::Relaxed);
+        g.dac_lag_samples.store(
+            self.dev.dac_lag_samples(self.dev_rate).round() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn write_silence(&mut self, n: usize) {
+        // 分块写，避免为一次重同步分配一整秒的零。
+        let mut left = n;
+        let chunk = [0.0f32; 480];
+        while left > 0 {
+            let k = left.min(chunk.len());
+            let wrote = self.prod.push_slice(&chunk[..k]);
+            if wrote == 0 {
+                break; // 环满了，补不进去也就不用补了
+            }
+            left -= wrote;
         }
     }
 
@@ -925,21 +1664,64 @@ impl AudioTx {
     /// **另一个 crate**（audiohubd），`cfg(test)` 只对本 crate 自己的测试生效，
     /// 到不了那里。没有这个口子，「播放环那一级的速率/深度/丢弃到底接对没有」
     /// 就只能靠断言手写字面量——那正是这套遥测要消灭的失败形态。
+    /// **伺服关闭**——也就是**加伺服之前**的行为。既有的注入 A–D 全部建立在
+    /// 这个形态上（「全链路六级无一做深度伺服」），所以它保持原样；要测生产
+    /// 形态用 [`AudioTx::detached_for_test_with_servo`]。
     #[doc(hidden)]
     pub fn detached_for_test(dev_rate: u32) -> (AudioTx, PlayRingSink) {
+        AudioTx::detached(dev_rate, false)
+    }
+
+    /// **伺服打开**，与 `on_device` 的生产配置逐字一致。
+    #[doc(hidden)]
+    pub fn detached_for_test_with_servo(dev_rate: u32) -> (AudioTx, PlayRingSink) {
+        AudioTx::detached(dev_rate, true)
+    }
+
+    fn detached(dev_rate: u32, servo: bool) -> (AudioTx, PlayRingSink) {
         // 与 `on_device` 逐字相同的一行：>= 500ms required; use 1s of device-rate samples
         let rb = HeapRb::<f32>::new(dev_rate.max(8000) as usize);
         let (prod, cons) = rb.split();
+        let dev = DeviceClock::new();
         (
             AudioTx {
                 prod,
-                resampler: None,
+                resampler: servo.then(|| VarResampler::new(48_000, dev_rate)),
                 staging: Vec::new(),
+                servo: PlayServo::new(dev_rate, servo),
+                dev: dev.clone(),
                 dev_rate,
+                src_rate: 48_000,
                 dropped: Arc::new(AtomicU64::new(0)),
             },
-            PlayRingSink { cons },
+            PlayRingSink { cons, dev },
         )
+    }
+
+    /// 当前的速率修正，ppm。测试用来断言方向与钳位。
+    #[doc(hidden)]
+    pub fn servo_corr_ppm(&self) -> f64 {
+        (self.servo.corr - 1.0) * 1e6
+    }
+
+    /// 当前目标水位（设备率样本）。
+    #[doc(hidden)]
+    pub fn servo_target(&self) -> u32 {
+        self.servo.target.round() as u32
+    }
+
+    /// 最近一次喂进环路的误差（设备率样本）。**每实例**，与进程级那份
+    /// 「最后写者赢」的 `play_servo_counters().err_samples` 不同 —— 测试要用
+    /// 这一个，否则并行跑的兄弟测试会互相覆盖读数。
+    #[doc(hidden)]
+    pub fn servo_last_err(&self) -> f64 {
+        self.servo.last_err
+    }
+
+    /// **只给那条守符号的测试**。见 `PlayServo::error_sign`。
+    #[doc(hidden)]
+    pub fn servo_invert_error_for_test(&mut self) {
+        self.servo.error_sign = -1.0;
     }
 }
 
@@ -948,13 +1730,28 @@ impl AudioTx {
 #[doc(hidden)]
 pub struct PlayRingSink {
     cons: HeapCons<f32>,
+    dev: Arc<DeviceClock>,
 }
 
 impl PlayRingSink {
     /// 像输出回调那样取走最多 `n` 个样本，返回真正取到的数量。
+    ///
+    /// **不**发布 `DeviceClock`：既有注入测试用的是这一条，它们的语义是
+    /// 「一个没有伺服的环」，不该被时钟观测量影响。要模拟真声卡用
+    /// [`PlayRingSink::drain_at`]。
     pub fn drain(&mut self, n: usize) -> usize {
         let mut buf = vec![0.0f32; n];
         self.cons.pop_slice(&mut buf)
+    }
+
+    /// 像真的输出回调那样取样本**并发布时钟观测量**：取走的量、回调时刻、
+    /// DAC 滞后、欠载。`now` 是虚拟时间，见 [`AudioTx::push_at`]。
+    #[doc(hidden)]
+    pub fn drain_at(&mut self, n: usize, now: Instant, dac_lag: Option<Duration>) -> usize {
+        let mut buf = vec![0.0f32; n];
+        let got = self.cons.pop_slice(&mut buf);
+        self.dev.note_callback(now, n, got, dac_lag);
+        got
     }
 }
 
@@ -1010,32 +1807,48 @@ impl LivePlayback {
         let (prod, mut cons) = rb.split();
 
         let health = StreamHealth::new();
+        // 声卡侧的观测量。回调是这条链上**唯一**知道「设备真的取走了多少、
+        // 什么时候取的、写进去的东西还要多久才出 DAC」的地方；伺服要的三个量
+        // 全部只能在这里采。
+        let dev = DeviceClock::new();
+        let dev_cb = dev.clone();
         let stream = build_output_stream_f32(
             device,
             &config,
             supported.sample_format(),
             &health,
-            move |mono| {
+            move |mono, info| {
                 let got = cons.pop_slice(mono);
                 for m in &mut mono[got..] {
                     *m = 0.0; // underrun -> silence
                 }
+                // `playback − callback` = Snapcast 的 `outputBufferDacTime`。
+                // cpal 在 coreaudio 用 `mach_absolute_time`、wasapi 用 QPC 填这
+                // 两个时刻；平台给不出时它们相等，`duration_since` 得 0，
+                // 于是这一项自然退化成「不计」而不是乱猜。
+                let ts = info.timestamp();
+                dev_cb.note_callback(
+                    Instant::now(),
+                    mono.len(),
+                    got,
+                    ts.playback.duration_since(&ts.callback),
+                );
             },
         )?;
         stream.play()?;
 
-        let resampler = if src_rate == dev_rate {
-            None
-        } else {
-            Some(Resampler::new(src_rate, dev_rate))
-        };
         Ok((
             LivePlayback { _stream: stream, health },
             AudioTx {
                 prod,
-                resampler,
+                // 伺服开着 ⇒ 重采样器**必须**在场，哪怕 src_rate == dev_rate：
+                // 弯比率是环路唯一的执行器，没有它环路就没有手。
+                resampler: Some(VarResampler::new(src_rate, dev_rate)),
                 staging: Vec::new(),
+                servo: PlayServo::new(dev_rate, true),
+                dev,
                 dev_rate,
+                src_rate,
                 dropped: Arc::new(AtomicU64::new(0)),
             },
         ))
@@ -2509,5 +3322,613 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(hits.load(Ordering::SeqCst), after);
         assert!(after >= 1);
+    }
+}
+
+/// 跨时钟速率伺服的验收：**两个不同速率的时钟，跑足够长的模拟时间**。
+///
+/// # 纪律：对照组必须是「修复前」，而不是一段注释
+///
+/// 每一条收敛断言都配一条**同参数、只关掉伺服**的发散断言。关掉伺服的那条
+/// 走的是与本次改动之前逐字相同的代码路径（`resampler: None` + 直接
+/// `push_slice`），所以它复现的就是病本身。只断言「打开之后收敛」证明不了
+/// 任何事——一个恒等于 target 的假读数也能让它绿。
+///
+/// # 时间怎么造
+///
+/// 全程用**虚拟时间**：`t0 + Duration`。`AudioTx::push_at` /
+/// `PlayRingSink::drain_at` 收 `Instant`，所以一小时的漂移在几秒里跑完，而
+/// 走的仍是生产路径、真的 `HeapRb`、真的重采样器、真的 `Dll`。
+///
+/// # 两个时钟怎么错开
+///
+/// - **写侧**（= `mixer_loop`）：每 10 ms 虚拟时间推 480 个样本，严格
+///   48000 样本/虚拟秒。这是「mac 的发送节拍经 JB 定拍之后的本地 tick」。
+/// - **读侧**（= 声卡回调）：每 `512 / (48000·(1+ε))` 秒取 512 帧。ε 就是
+///   晶振失配。**回调周期（≈10.67 ms）与 mixer tick（10 ms）故意不整除**，
+///   这样深度读数带着真实的相位锯齿，时间插值那一项才有活干。
+///
+/// `AudioTx` 只知道标称 48000，ε 对它不可见——这正是现实里的信息结构。
+#[cfg(test)]
+mod rate_servo {
+    use super::*;
+
+    /// 一个 mixer tick 的样本数 @48k。
+    const F: usize = 480;
+    /// 声卡一次回调取多少帧（典型的 512 帧周期）。
+    const CB: usize = 512;
+
+    struct Sim {
+        tx: AudioTx,
+        sink: PlayRingSink,
+        t0: Instant,
+        now_ns: u64,
+        /// 下一次声卡回调的时刻。用 f64 累加，别用整数——按周期截断会给声卡
+        /// 掺进一个我们没打算注入的额外 ppm，正好污染这套测试要量的东西。
+        next_cb_ns: f64,
+        last_cb_ns: f64,
+        /// 声卡的真实周期（纳秒）——晶振失配全部体现在这里。
+        cb_period_ns: f64,
+        /// 是否给声卡缓冲滞后（`outputBufferDacTime`）一个非零值。
+        dac_lag: Option<Duration>,
+        /// **观测量**：上一个 tick 里、在 push 之前测到的执行器下游缓冲量（ms）。
+        ///
+        /// 不能直接拿 `queued()` 当观测量：写侧 10 ms 一块、读侧 10.67 ms 一块，
+        /// 裸深度带着一个 ±512 样本（±10.7 ms）的相位锯齿，再加上刚推进去还没
+        /// 被取走的那一帧（+10 ms）。按分钟采样会把这个锯齿混叠成一条假的
+        /// 「缓慢下降然后跳回」的锯齿波，跟真的漂移长得一模一样。
+        /// 这里按与生产代码相同的口径（深度 − 距上次回调的应耗量）测，
+        /// 量的才是环路真正在控的那个量。
+        downstream_ms: f64,
+    }
+
+    impl Sim {
+        /// `ppm > 0` = 声卡晶振**快**于我们的写侧（环会见底）；
+        /// `ppm < 0` = 声卡**慢**（环会涨，直到 drop-newest）。
+        fn new(ppm: f64, servo: bool) -> Sim {
+            let (tx, sink) = if servo {
+                AudioTx::detached_for_test_with_servo(48_000)
+            } else {
+                AudioTx::detached_for_test(48_000)
+            };
+            Sim {
+                tx,
+                sink,
+                t0: Instant::now(),
+                now_ns: 0,
+                next_cb_ns: 0.0,
+                last_cb_ns: 0.0,
+                cb_period_ns: CB as f64 / (48_000.0 * (1.0 + ppm * 1e-6)) * 1e9,
+                dac_lag: None,
+                downstream_ms: 0.0,
+            }
+        }
+
+        fn at(&self, ns: u64) -> Instant {
+            self.t0 + Duration::from_nanos(ns)
+        }
+
+        /// 只放声卡，不推——用来造「写侧停摆」。
+        fn run_device_until(&mut self, end_ns: u64) {
+            while self.next_cb_ns <= end_ns as f64 {
+                let t = self.at(self.next_cb_ns as u64);
+                self.sink.drain_at(CB, t, self.dac_lag);
+                self.last_cb_ns = self.next_cb_ns;
+                self.next_cb_ns += self.cb_period_ns;
+            }
+            self.now_ns = end_ns;
+        }
+
+        /// 跑一个 10 ms 的 mixer tick：先把这段虚拟时间里到期的声卡回调放掉，
+        /// 再推一帧。顺序与现实一致（声卡是独立线程，不等我们）。
+        fn tick(&mut self) {
+            self.run_device_until(self.now_ns + 10_000_000);
+            let inflight =
+                (self.now_ns as f64 - self.last_cb_ns) * 48_000.0 / 1e9;
+            let dac = self.dac_lag.map_or(0.0, |d| d.as_secs_f64() * 48_000.0);
+            self.downstream_ms = (self.tx.queued() as f64 - inflight + dac) / 48.0;
+            self.tx.push_at(&[0.25f32; F], self.at(self.now_ns));
+        }
+
+        /// 环里此刻的裸样本数（只在需要「真的见底了吗」这种问题时用）。
+        fn queued(&self) -> u32 {
+            self.tx.queued()
+        }
+
+        /// 跑 `minutes` 分钟虚拟时间，每分钟采一次观测量（ms）。
+        fn run(&mut self, minutes: u64) -> Vec<f64> {
+            let mut trace = Vec::new();
+            for _ in 0..minutes {
+                for _ in 0..6_000 {
+                    self.tick();
+                }
+                trace.push(self.downstream_ms);
+            }
+            trace
+        }
+    }
+
+    /// 现实里最坏的一对晶振：两块各 ±100 ppm 的消费级件反向叠加。
+    /// 50 ppm（典型值）同样发散，只是要跑 4 倍长的模拟时间才看得出同样的量。
+    const PPM: f64 = 200.0;
+    /// 模拟时长。200 ppm × 20 min = 11 520 样本 = **240 ms** 的应有漂移，
+    /// 与 30 ms 的目标水位差一个数量级，绿/红一眼可判。
+    const MINUTES: u64 = 20;
+
+    // ============================================================== 注入 E-1
+    //
+    // **修复前的行为**：声卡晶振慢 200 ppm，写多读少，水位单调爬升。
+    // 这一条**必须先绿**，注入 E-2 才有意义。
+
+    #[test]
+    fn injection_e1_without_the_servo_a_slow_device_crystal_fills_the_ring_forever() {
+        let mut s = Sim::new(-PPM, false);
+        let trace = s.run(MINUTES);
+        // 单调不降，且末值 ≈ 理论漂移量。
+        assert!(
+            trace.windows(2).all(|w| w[1] >= w[0]),
+            "无伺服 ⇒ 水位只涨不落，got {trace:?}"
+        );
+        let expect = 1000.0 * (MINUTES * 60) as f64 * PPM * 1e-6; // ms
+        let last = *trace.last().unwrap();
+        assert!(
+            (last - expect).abs() < expect * 0.1,
+            "{MINUTES} 分钟 × {PPM} ppm 应涨约 {expect:.0} ms，实测 {last:.0} ms"
+        );
+        // 20 分钟只是它跑到饱和路上的一段。1.000 秒的环按这个斜率约 83 分钟
+        // 灌满，之后就是 drop-newest —— 「迟到 + 周期性断续」。
+        assert!(last < 1000.0, "20 分钟还没到饱和，这条测的是斜率不是封顶");
+    }
+
+    // ============================================================== 注入 E-2
+    //
+    // **修复后**：同样的两个时钟，伺服打开 ⇒ 水位收敛到目标并**待在那儿**。
+
+    #[test]
+    fn injection_e2_the_servo_holds_the_ring_at_target_against_a_slow_crystal() {
+        let mut s = Sim::new(-PPM, true);
+        let trace = s.run(MINUTES);
+        let target_ms = s.tx.servo_target() as f64 / 48.0;
+        for (i, &d) in trace.iter().enumerate() {
+            assert!(
+                (d - target_ms).abs() < 5.0,
+                "第 {} 分钟水位 {d:.1} ms，目标 {target_ms:.1} ms（全程 {trace:?}）",
+                i + 1
+            );
+        }
+        // 稳态修正应当≈把失配补掉：设备慢 200 ppm ⇒ 我们要少写 200 ppm。
+        let corr = s.tx.servo_corr_ppm();
+        assert!(
+            (corr + PPM).abs() < 40.0,
+            "稳态修正应 ≈ {:.0} ppm，实测 {corr:.0} ppm",
+            -PPM
+        );
+    }
+
+    // ============================================================== 注入 E-3
+    //
+    // 反向：声卡晶振**快**。无伺服 ⇒ 环见底、声卡一直补静音（听感是持续
+    // 断续）；有伺服 ⇒ 撑住目标。这一条钉的是「双向」——mac 侧只需要单向削，
+    // 这里深了要削、浅了要补。
+
+    #[test]
+    fn injection_e3_without_the_servo_a_fast_device_crystal_starves_the_ring() {
+        let mut s = Sim::new(PPM, false);
+        // 先垫 400 ms，好让 20 分钟的亏空（240 ms）全程可见而不撞到 0 —— 撞到
+        // 0 之后水位就被环底钳住，量到的是钳位不是漂移。
+        s.tx.push_at(&vec![0.25f32; 48_000 * 2 / 5], s.at(0));
+        let trace = s.run(MINUTES);
+        assert!(
+            trace.windows(2).all(|w| w[1] < w[0]),
+            "无伺服 ⇒ 水位只落不涨，got {trace:?}"
+        );
+        let drop = trace[0] - *trace.last().unwrap();
+        let expect = 1000.0 * ((MINUTES - 1) * 60) as f64 * PPM * 1e-6;
+        assert!(
+            (drop - expect).abs() < expect * 0.1,
+            "应当掉约 {expect:.0} ms，实测 {drop:.0} ms（全程 {trace:?}）"
+        );
+        // 照这个斜率，垫进去的 400 ms 约 33 分钟见底，之后声卡永远在补静音。
+    }
+
+    #[test]
+    fn injection_e3_the_servo_refills_against_a_fast_crystal_and_bends_the_other_way() {
+        let mut s = Sim::new(PPM, true);
+        let trace = s.run(MINUTES);
+        let target_ms = s.tx.servo_target() as f64 / 48.0;
+        for (i, &d) in trace.iter().enumerate() {
+            assert!(
+                (d - target_ms).abs() < 5.0,
+                "第 {} 分钟水位 {d:.1} ms，目标 {target_ms:.1} ms（全程 {trace:?}）",
+                i + 1
+            );
+        }
+        let corr = s.tx.servo_corr_ppm();
+        assert!(
+            (corr - PPM).abs() < 40.0,
+            "设备快 ⇒ 修正必须为**正**（多写），应 ≈ +{PPM:.0} ppm，实测 {corr:.0} ppm"
+        );
+    }
+
+    // ============================================================== 符号
+    //
+    // 调研点名的那一处：「误差符号是落地时最容易写错、且错了会直接把水位推到
+    // 饱和的一处」。
+
+    #[test]
+    fn error_sign_is_negative_feedback_flipping_it_diverges() {
+        // 正确符号（`err = downstream − target`，生产代码那一行）：收敛。
+        let mut ok = Sim::new(-PPM, true);
+        let ok_trace = ok.run(5);
+        let target_ms = ok.tx.servo_target() as f64 / 48.0;
+        assert!(
+            (ok_trace.last().unwrap() - target_ms).abs() < 5.0,
+            "生产符号必须收敛到目标，got {ok_trace:?}"
+        );
+        assert!(
+            ok.tx.servo_corr_ppm() > -PlayServo::MAX_PPM + 1.0,
+            "生产符号下修正不该贴着钳位，实测 {:.0} ppm",
+            ok.tx.servo_corr_ppm()
+        );
+
+        // 取反（`err = target − downstream`，也就是把 mac 侧 tx_loop 的
+        // capture 语义照抄过来）：正反馈。水位偏深 ⇒ err<0 ⇒ corr>1 ⇒ 写得
+        // 更多 ⇒ 更深。修正一路推到 +500 ppm 钳位，水位比无伺服还涨得快。
+        let mut bad = Sim::new(-PPM, true);
+        bad.tx.servo_invert_error_for_test();
+        let bad_trace = bad.run(5);
+        assert!(
+            bad.tx.servo_corr_ppm() > PlayServo::MAX_PPM - 1.0,
+            "符号反了必须缠绕到 +500 ppm 钳位，实测 {:.0} ppm",
+            bad.tx.servo_corr_ppm()
+        );
+        assert!(
+            *bad_trace.last().unwrap() > ok_trace.last().unwrap() + 50.0,
+            "符号反了必须显著发散：正确 {ok_trace:?} vs 反了 {bad_trace:?}"
+        );
+    }
+
+    // ============================================================== 钳位
+
+    #[test]
+    fn the_correction_is_clamped_at_500_ppm_even_under_an_absurd_mismatch() {
+        // 3000 ppm：远超任何真实晶振对，环路会一路顶到钳位并停在那儿。
+        let mut s = Sim::new(-3_000.0, true);
+        let mut worst: f64 = 0.0;
+        for _ in 0..5 {
+            for _ in 0..6_000 {
+                s.tick();
+                worst = worst.max(s.tx.servo_corr_ppm().abs());
+            }
+        }
+        assert!(
+            worst <= PlayServo::MAX_PPM + 1e-6,
+            "修正冲出了 ±500 ppm：{worst:.1} ppm"
+        );
+        assert!(
+            worst > PlayServo::MAX_PPM - 1.0,
+            "3000 ppm 失配下应当**顶到**钳位，实测只有 {worst:.1} ppm"
+        );
+        // 顶到钳位仍然吐不完 3000 ppm，剩下的归深端硬跳；这里只钉「钳位守住了」。
+        assert!(
+            play_servo_counters().clamped > 0,
+            "钳位必须被计数，否则现场无从判断失配是否超出可校正范围"
+        );
+    }
+
+    // ============================================================== 时间插值
+
+    /// 深度读数的相位锯齿必须在喂进环路之前被剔掉（zita 的
+    /// `(_k_a1−_k_a0)·d1/d2`、PipeWire 的 `time_since_nsec`）。
+    ///
+    /// 造法：让声卡周期与 mixer tick 严重不整除（这里 CB=512 @48k ≈ 10.67 ms
+    /// vs 10 ms），于是**裸** `queued()` 每 tick 在 ±512 样本（±10.7 ms）之间
+    /// 跳。若不做插值，这个锯齿会整个灌进积分器。
+    #[test]
+    fn time_interpolation_removes_the_callback_phase_sawtooth() {
+        let mut s = Sim::new(0.0, true);
+        for _ in 0..12_000 {
+            s.tick();
+        }
+        // 裸读数的锯齿幅度：连续 200 个 tick 里最大与最小的差。
+        let mut raw: Vec<f64> = Vec::new();
+        for _ in 0..200 {
+            s.tick();
+            raw.push(s.tx.queued() as f64);
+        }
+        let spread = raw.iter().cloned().fold(f64::MIN, f64::max)
+            - raw.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(
+            spread > CB as f64 * 0.5,
+            "这条测试的前提是裸读数真的在跳，实测跨度只有 {spread:.0} 样本"
+        );
+        // 而环路看到的误差被插值压平：稳态误差远小于锯齿幅度。
+        // 用**每实例**的读数，不用进程级那份——后者是「最后写者赢」，
+        // 并行跑的兄弟测试会把它覆盖掉。
+        let err = s.tx.servo_last_err().abs();
+        assert!(
+            err < CB as f64 * 0.5,
+            "插值之后的误差应当远小于 {} 样本的锯齿，实测 {err:.0}",
+            CB
+        );
+    }
+
+    // ============================================================== 声卡缓冲项
+
+    /// `outputBufferDacTime` 是执行器下游的一级，必须计入误差——不计入的话
+    /// 稳态水位会恰好高出这一项，也就是 Snapcast `stream.cpp:305` 那条先例
+    /// 在防的事。
+    #[test]
+    fn the_dac_buffer_counts_as_downstream_buffering() {
+        let mut with_lag = Sim::new(0.0, true);
+        with_lag.dac_lag = Some(Duration::from_millis(10)); // 10 ms = 480 样本
+        with_lag.run(10);
+        let mut without = Sim::new(0.0, true);
+        without.run(10);
+        // 环路控的是「下游总量」，两边都该落在同一个目标上……
+        let d = (without.downstream_ms - with_lag.downstream_ms).abs();
+        assert!(d < 3.0, "下游总量必须同样收敛到目标，实测差 {d:.1} ms");
+        // ……而声卡里压着的那 10 ms 就实实在在从环里让出来了。
+        // 不把它算进误差的话，这 10 ms 会白白叠在总延迟上。
+        let ring = (without.queued() as f64 - with_lag.queued() as f64) / 48.0;
+        assert!(
+            (ring - 10.0).abs() < 3.0,
+            "声卡里压着 10 ms ⇒ 环里就该少 10 ms（总量守恒），实测差 {ring:.1} ms"
+        );
+    }
+
+    // ============================================================== 目标水位
+
+    /// 目标水位跟着**实测的声卡周期**走，而且**上下都跟**。
+    ///
+    /// 造法：开流时来一次超大的预热回调（8192 帧），之后回到正常的 512。
+    /// 若目标是「只涨不落」，那一次异常就会把播放环的稳态延迟永久顶到
+    /// 120 ms 的上限——一个由单次异常制造的永久性延迟棘轮，正是本项目在治的病。
+    #[test]
+    fn one_outlier_callback_cannot_ratchet_the_target_up_forever() {
+        let mut s = Sim::new(0.0, true);
+        // 预热：一次 8192 帧的大回调。
+        s.sink.drain_at(8_192, s.at(0), None);
+        s.tick();
+        let spiked = s.tx.servo_target();
+        assert!(
+            spiked as f64 / 48.0 > 100.0,
+            "先确认异常回调真的把目标顶起来了：{:.0} ms",
+            spiked as f64 / 48.0
+        );
+        // 之后一切正常，异常值应当在一个滑动窗（≈1.3 秒）之后老化掉。
+        for _ in 0..500 {
+            s.tick();
+        }
+        let settled = s.tx.servo_target();
+        assert_eq!(
+            settled,
+            2 * CB as u32 + 480,
+            "异常值必须老化掉，目标该回到 512 帧那一档（≈31 ms），实测 {:.0} ms",
+            settled as f64 / 48.0
+        );
+
+        // 水位跟着目标**回落**，但回落是慢的 —— 而且这个「慢」是 ±500 ppm 钳位
+        // 的直接推论，不是缺陷：多出来的约 87 ms 只能按 0.5 ms/s 吐，需要约
+        // 174 秒。这条断言把这个时间常数**钉成一条被测性质**，免得将来有人
+        // 看到「目标降了水位没跟上」以为是 bug。
+        //
+        // 为什么不给「目标下调」也配一次硬跳：硬跳是要丢样本的（可闻），
+        // 而这里的超额是我们**自己**改设定值造成的，不是链路故障。为一次内部
+        // 参数变化制造一次可闻的跳进，代价和收益不成比例。
+        let before_bleed = s.downstream_ms;
+        assert!(before_bleed > 90.0, "先确认水位确实被顶到了高位：{before_bleed:.0} ms");
+        for _ in 0..30_000 {
+            s.tick(); // 300 秒
+        }
+        assert!(
+            (s.downstream_ms - settled as f64 / 48.0).abs() < 8.0,
+            "300 秒内必须吐回目标：{:.0} ms vs 目标 {:.0} ms（起点 {before_bleed:.0} ms）",
+            s.downstream_ms,
+            settled as f64 / 48.0
+        );
+    }
+
+    /// 目标水位由声卡周期决定：512 帧的设备与 1024 帧的设备该拿到不同的目标，
+    /// 而不是一个写死的常数。
+    #[test]
+    fn the_target_is_two_device_periods_plus_a_tick() {
+        let mut s = Sim::new(0.0, true);
+        for _ in 0..50 {
+            s.tick();
+        }
+        // CB=512 ⇒ 2·512 + 480 = 1504 样本 = 31.3 ms。
+        assert_eq!(s.tx.servo_target(), 2 * CB as u32 + 480);
+    }
+
+    // ============================================================== 重采样核
+
+    /// `LinearResampler` 到底够不够用：够，但**相位扫过时高频会呼吸**。
+    ///
+    /// 造法：把同一段 10 kHz 正弦分别按 φ=0（恒等）与 φ=0.5（最坏相位）取样，
+    /// 量幅度。比率≈1 的伺服会让 φ 缓慢扫过 [0,1)，于是这两个数之间的差就是
+    /// 高频包络的起伏深度。
+    #[test]
+    fn cubic_beats_linear_on_the_phase_swept_hf_droop() {
+        const N: usize = 4_096;
+        let f = 10_000.0f64;
+        let sr = 48_000.0f64;
+        let x: Vec<f32> = (0..N)
+            .map(|n| (2.0 * std::f64::consts::PI * f * n as f64 / sr).sin() as f32)
+            .collect();
+        // 半样本延迟下的幅度（取中段，避开两端的历史填充暂态）。
+        let amp = |y: &[f32]| -> f64 {
+            y[N / 4..N * 3 / 4]
+                .iter()
+                .fold(0.0f64, |m, &v| m.max(v.abs() as f64))
+        };
+        let half = |mut shift: Box<dyn FnMut(&[f32]) -> Vec<f32>>| -> f64 { amp(&shift(&x)) };
+
+        let linear = half(Box::new(|x: &[f32]| {
+            // dsp::LinearResampler 的核：y = x0 + (x1−x0)·0.5
+            x.windows(2).map(|w| w[0] + (w[1] - w[0]) * 0.5).collect()
+        }));
+        let cubic = half(Box::new(|x: &[f32]| {
+            // VarResampler 的核在 t=0.5 处：[−1/16, 9/16, 9/16, −1/16]
+            x.windows(4)
+                .map(|w| -0.0625 * w[0] + 0.5625 * w[1] + 0.5625 * w[2] - 0.0625 * w[3])
+                .collect()
+        }));
+        let db = |g: f64| 20.0 * g.log10();
+        // 实测：linear ≈ −2.0 dB，cubic ≈ −0.5 dB @10 kHz。
+        assert!(db(linear) < -1.5, "线性插值在 φ=0.5 处应衰减约 2 dB，实测 {:.2} dB", db(linear));
+        assert!(
+            db(cubic) > db(linear) + 1.0,
+            "三次核必须明显平于线性：cubic {:.2} dB vs linear {:.2} dB",
+            db(cubic),
+            db(linear)
+        );
+    }
+
+    /// 比率恰为 1 且不修正时，`VarResampler` 是**逐样本无损**的（只差固定的
+    /// 两样本延迟）——不然「伺服关着也要过一遍插值」就是白白掉音质。
+    #[test]
+    fn the_cubic_kernel_is_lossless_at_unity_ratio() {
+        let mut rs = VarResampler::new(48_000, 48_000);
+        let x: Vec<f32> = (0..1_000).map(|n| ((n * 37) % 101) as f32 / 101.0 - 0.5).collect();
+        let mut y = Vec::new();
+        rs.process(&x[..500], &mut y);
+        rs.process(&x[500..], &mut y);
+        assert_eq!(y.len(), x.len(), "1:1 ⇒ 样本数一一对应");
+        for (i, (&a, &b)) in x[..x.len() - 2].iter().zip(&y[2..]).enumerate() {
+            assert!((a - b).abs() < 1e-6, "第 {i} 个样本 {a} != {b}");
+        }
+    }
+
+    /// 分块处理必须等价于整块处理：跨块的历史与相位都得带过去。
+    #[test]
+    fn the_cubic_kernel_is_block_split_invariant() {
+        let x: Vec<f32> = (0..3_000).map(|n| (n as f32 * 0.017).sin()).collect();
+        let mut whole = Vec::new();
+        VarResampler::new(48_000, 44_100).process(&x, &mut whole);
+        let mut split = Vec::new();
+        let mut rs = VarResampler::new(48_000, 44_100);
+        for chunk in x.chunks(480) {
+            rs.process(chunk, &mut split);
+        }
+        assert_eq!(whole.len(), split.len());
+        for (i, (&a, &b)) in whole.iter().zip(&split).enumerate() {
+            assert!((a - b).abs() < 1e-5, "第 {i} 个样本 {a} != {b}");
+        }
+    }
+
+    // ============================================================== 硬跳
+
+    /// 一次性灌进 800 ms（注入 A 的病理）之后，伺服必须把它**排掉**而不是
+    /// 靠 500 ppm 慢慢吐（那要 1600 秒）。这就是 PipeWire 的 `alsa_sync` /
+    /// zita 的 `rd_commit(k)`。
+    #[test]
+    fn a_huge_backlog_is_resynced_not_bled_off_at_500_ppm() {
+        let mut s = Sim::new(0.0, true);
+        for _ in 0..100 {
+            s.tick(); // 先锁定
+        }
+        s.tx.push_at(&vec![0.25f32; 48_000 * 4 / 5], s.at(s.now_ns)); // 灌 800 ms
+        assert!(s.queued() as f64 / 48.0 > 700.0, "起点得真的是 800 ms 量级");
+        for _ in 0..3_000 {
+            s.tick(); // 30 秒
+        }
+        let target_ms = s.tx.servo_target() as f64 / 48.0;
+        assert!(
+            (s.downstream_ms - target_ms).abs() < 8.0,
+            "30 秒内必须跳回目标 {target_ms:.0} ms，实测 {:.0} ms（纯靠 500 ppm 要 1600 秒）",
+            s.downstream_ms
+        );
+        assert!(
+            play_servo_counters().resync_skipped > 0,
+            "硬跳丢掉的样本必须被计数 —— 这是一次可闻的跳进，不能静默"
+        );
+    }
+
+    /// 一次长欠载（写侧停摆 2 秒）之后，伺服必须把水位**补**回目标，
+    /// 而不是留在底部反复欠载。这是「双向」的另一半。
+    #[test]
+    fn a_long_underrun_is_expanded_back_to_target() {
+        let mut s = Sim::new(0.0, true);
+        for _ in 0..100 {
+            s.tick();
+        }
+        // 写侧停摆 2 秒：只放声卡，不推。
+        let stall_to = s.now_ns + 2_000_000_000;
+        s.run_device_until(stall_to);
+        assert_eq!(s.queued(), 0, "停摆 2 秒 ⇒ 环见底");
+        for _ in 0..50 {
+            s.tick();
+        }
+        let target_ms = s.tx.servo_target() as f64 / 48.0;
+        assert!(
+            (s.downstream_ms - target_ms).abs() < 8.0,
+            "补回目标 {target_ms:.0} ms，实测 {:.0} ms",
+            s.downstream_ms
+        );
+        assert!(
+            play_servo_counters().resync_padded > 0,
+            "补进去的静音必须被计数"
+        );
+    }
+
+    // ============================================================== 控制律
+
+    /// `spa_dll` 的移植正确性：方向对、且**积分项保持稳态速率偏置**。
+    ///
+    /// 后半句是这个环能用的全部理由，别写成「误差归零后修正衰减回 1.0」——
+    /// 那是纯比例环的性质，而纯比例环有稳态误差：晶振差 200 ppm，它就只能
+    /// 停在一个恒定偏深/偏浅的水位上。`z3 += w2·z2` 是一个**不衰减**的积分器，
+    /// 正是它让「误差为零」与「修正为 −200 ppm」可以同时成立。
+    #[test]
+    fn the_dll_holds_a_rate_bias_at_zero_error() {
+        // err > 0（水位偏深）⇒ corr < 1 ⇒ 少写 ⇒ 水位降。
+        assert!(Dll::new(Dll::BW_MAX, 480, 48_000).update(100.0) < 1.0);
+        // err < 0（水位偏浅）⇒ corr > 1 ⇒ 多写。
+        assert!(Dll::new(Dll::BW_MAX, 480, 48_000).update(-100.0) > 1.0);
+
+        let mut d = Dll::new(Dll::BW_MAX, 480, 48_000);
+        for _ in 0..200 {
+            d.update(100.0);
+        }
+        let learned = d.update(0.0);
+        assert!(learned < 1.0, "学到的偏置方向该是「少写」，got {learned}");
+        // 比例项（z2）按 `1−w0` 每步几何衰减，两万步之后早已归零；此后读到的
+        // 就是纯积分项。再跑两万步它必须**一动不动**——纯比例环这里会回到
+        // 精确的 1.0，那样的环有稳态误差，撑不住一个恒定的晶振失配。
+        for _ in 0..20_000 {
+            d.update(0.0);
+        }
+        let a = d.update(0.0);
+        for _ in 0..20_000 {
+            d.update(0.0);
+        }
+        let b = d.update(0.0);
+        assert!(
+            (a - b).abs() < 1e-12,
+            "积分项必须不衰减：第 2 万步 {a}，第 4 万步 {b}"
+        );
+        assert!(
+            a < 1.0 - 1e-6,
+            "零误差下偏置必须还在（刚学到 {learned}，静置之后 {a}）"
+        );
+        // 反向误差能把它解开——否则积分器就是个只进不出的陷阱。
+        for _ in 0..4_000 {
+            d.update(-100.0);
+        }
+        assert!(d.update(0.0) > 1.0, "反向误差必须能把偏置翻过去");
+    }
+
+    /// `reset` 必须真的清干净——粗调之后不清，积分器残留会在跳变后继续输出
+    /// 错误修正（PipeWire `node-driver.c:487–494` / PulseAudio `fast_adjust`）。
+    #[test]
+    fn resetting_the_dll_clears_the_integrators() {
+        let mut d = Dll::new(Dll::BW_MAX, 480, 48_000);
+        for _ in 0..500 {
+            d.update(2_000.0);
+        }
+        assert!((d.update(0.0) - 1.0).abs() > 1e-6, "先确认它确实积了东西");
+        d.reset();
+        assert_eq!(d.update(0.0), 1.0, "reset 之后第一次零误差更新必须给出 1.0");
     }
 }

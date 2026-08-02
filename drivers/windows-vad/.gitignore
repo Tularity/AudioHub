@@ -1,0 +1,13 @@
+# Build outputs. The driver package (.sys/.inf/.cat), the private VCTargetsPath
+# shim and the exported test certificate are all reproducible from build.ps1 +
+# sign-test.ps1, and the .pfx must never be committed.
+_build/
+x64/
+ARM64/
+Debug/
+Release/
+Source/*/x64/
+Source/*/ARM64/
+*.user
+*.suo
+.vs/

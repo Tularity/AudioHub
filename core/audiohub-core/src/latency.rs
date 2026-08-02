@@ -24,6 +24,7 @@
 //! 断续」。标量读数在这里完全简并，只能靠 `drop_mode` + `dropped` 的增长区分。
 //! 少了这个标签，遥测就只能告诉你「有一秒卡在某处」，没法告诉你那一秒是怎么卡的。
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -390,17 +391,373 @@ pub const NO_DEPTHS: SourceDepths = [None, None];
 
 // ---------------------------------------------------------------- 漂移
 
-/// 30 s 窗口的深度斜率（样本/秒），对 `samples` 做最小二乘线性回归。
+/// 置信区间取几倍标准误。3σ ≈ 正态下 99.7%。
+///
+/// 取 3 而不是常见的 2，是因为这个字段的读者是**诊断判据**而不是统计报告：
+/// 一个假阳性会把「稳态但永远迟到」误判成「正在走向饱和」，而这两种病理的
+/// 修法完全不同（规格 §3.3）。
+pub const DRIFT_T: f64 = 3.0;
+
+/// 这个窗口要算「分辨得出漂移」，3σ 半宽必须紧到这个值以内（样本/秒）。
+///
+/// ## 这个数是怎么定的（2026-08-02 重新标定）
+///
+/// 它不是「小到不用管」的经验值，是**这一级真实病灶的大小**：实测 `hal_spk`
+/// 9 小时的平均涨速是 **+0.34 样本/秒**（≈7 ppm @48k），9 小时积出 253 ms。
+/// 「测到了，就是不漂」这句话若要成立，就必须**排除得掉 0.34 样本/秒**——
+/// 半宽比它还宽时，「不漂」与「正在走向饱和」在这份数据里根本不可分，
+/// 唯一诚实的输出是 `None`。所以门槛必须 ≤ 0.34，取 **0.3**（≈6.3 ppm）。
+///
+/// ## 为什么此前是 1.0，现在能收紧
+///
+/// 1.0 是照着**未剔除量化噪声**的读数定的：那时 `hal_spk` 的 3σ 半宽是
+/// 6.7 样本/秒，门槛定在 0.3 会让**所有**级都报 `None`，等于关掉这个指标。
+/// `DepthInterp` 把写块量化（±384 样本）从读数里减掉之后，噪声底降了一到两个
+/// 数量级，0.3 这个门槛才有东西够得着——**先降噪声底，再收门槛**，顺序反了
+/// 就只是把指标关掉。
+///
+/// ⚠ 收紧对**没有**插值的级同样生效，这是有意的：一条 3σ 半宽 0.5 样本/秒的
+/// 序列在旧门槛下会报「≈0」，而它其实排除不掉 +0.34 的真实病灶——那句「不漂」
+/// 是假保证。宁可报 `None`。
+pub const DRIFT_RESOLUTION_SPS: f64 = 0.3;
+
+/// 修正量的绝对上限（样本）。100 ms @48k。
+///
+/// 快照坏掉（时间戳陈旧、速率字段没填、时钟回跳）时，`since_* × rate` 会算出
+/// 一个天文数字，而它会被当成真读数直接进回归窗口——**一个错的修正比不修正更坏**。
+/// PipeWire 在同一位置也钳：`alsa-pcm.c` 用 `snd_pcm_htimestamp` 精修 delay 时，
+/// 只在 `SPA_ABS(diff) < threshold*3` 时采纳，且修正量钳在 ±threshold。
+///
+/// 取 100 ms 是因为这个修正项的物理含义是「一个整块里还没写出来的那一截」，
+/// 而没有任何音频设备的一次 IO 块有 100 ms 那么长（典型 5–21 ms）。
+const INTERP_CLAMP_SAMPLES: f64 = 4_800.0;
+
+/// 一次深度读数的**量化修正项**：把两侧的整块阶梯插值回连续位置。
+///
+/// # 这不是滤波，是把测量自身的量化减掉
+///
+/// 一级缓冲的深度 = 生产侧累计写入 − 消费侧累计读出，而**两侧都是阶梯**：
+/// 驱动一次 `DoIOOperation` 写整块 B 个样本，`tx_loop` 一次读整块 480 个样本。
+/// 于是任意时刻读到的深度是
+///
+/// ```text
+/// D_obs(t) = D_连续(t) − (生产侧本块还没写出来的那一截)
+///                      + (消费侧本块还没读走的那一截)
+/// ```
+///
+/// 那两截各自在 `[0, 一个块)` 里随时间锯齿状滑动。实测 `hal_spk` 上它就是
+/// ±384 样本（`docs/investigate-hal-residency.md` §1.2 的 86 个小步，σ≈111），
+/// 而要探测的真实漂移只有 +0.34 样本/秒——**噪声底比效应大 20 倍**。
+///
+/// 此前把这归因为「窗口太短」，提议把 30 s 拉到 5–10 分钟。**那个归因是错的**：
+/// 拉长窗口只能按 √N 压它（要压 20 倍得 400 倍的点，即 3 小时以上），而它根本
+/// 不是随机噪声，是**确定性的量化**——知道「上一次整块发生在多久以前」就能
+/// 直接把它减掉，一步到位、不需要更长的窗口。
+///
+/// 三个独立实现都这么做（`docs/research-latency-prior-art.md` 附录 C-DLL §C.4.3、
+/// 附录 D §D.2-③c）：
+/// - zita-ajbridge：`err = k + (_k_a1 - _k_a0) * d1 / d2 + ...`
+///   —— 用两个带时间戳的计数快照对当前周期做线性插值；
+/// - PipeWire `alsa-pcm.c`：用 `snd_pcm_htimestamp` 精修 delay；
+/// - PipeWire `node-driver.c:414-419`，注释原文：
+///   *"time_since_nsec estimates the delay, and subtracts that estimation, …
+///   which increases the control loop stability."*
+///
+/// # ⚠ 符号推导（写反了噪声会翻倍，不是减半）
+///
+/// 记生产侧连续位置 `W_c(t) = r_w · t`，阶梯位置 `W(t) = B·floor(t·r_w/B)`。
+/// 最近一次写块发生在 `t_w ≤ t`，于是
+/// `W_c(t) − W(t) = r_w · (t − t_w)` —— **阶梯永远落后于连续线**。
+/// 深度 = W − R，所以
+///
+/// ```text
+/// D_连续 = D_obs + r_w·(t − t_w) − r_r·(t − t_r)
+///                 ^^^^^^^^^^^^^^   ^^^^^^^^^^^^^^
+///                 生产侧：加       消费侧：减
+/// ```
+///
+/// 记住方向就一句话：**「生产侧欠着的补上去，消费侧欠着的扣回来」**。
+/// 两项都写成加，噪声不但不消，还会变成原来的两倍——
+/// `interpolating_with_the_wrong_sign_makes_it_worse` 这条测试就是钉这个的。
+///
+/// # 只填得出一侧怎么办
+///
+/// 填一侧、另一侧留 0 即可（`producer()` / `consumer()`），少减掉一截量化总比
+/// 减错方向好。字段非有限值 / 负值 / 速率为 0 一律当 0 处理——**缺项不许用
+/// 猜出来的数填补**，与文件头约束 1 同一条纪律。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DepthInterp {
+    /// 读数时刻 − 生产侧最近一次整块写入的时刻（秒，≥0）。
+    pub since_write_s: f32,
+    /// 生产侧实测写入速率（样本/秒）。零 / 非有限 ⇒ 本项不参与修正。
+    pub writer_sps: f32,
+    /// 读数时刻 − 消费侧最近一次整块读出的时刻（秒，≥0）。
+    pub since_read_s: f32,
+    /// 消费侧实测读出速率（样本/秒）。零 / 非有限 ⇒ 本项不参与修正。
+    pub reader_sps: f32,
+}
+
+impl DepthInterp {
+    /// 拿不到任何时间快照：退回旧行为（读数原样进窗口）。
+    pub const NONE: DepthInterp =
+        DepthInterp { since_write_s: 0.0, writer_sps: 0.0, since_read_s: 0.0, reader_sps: 0.0 };
+
+    /// 只知道生产侧的写块时刻（`hal_spk` / `play_ring` 这类**我们读、别人写**的级）。
+    pub fn producer(since_write_s: f32, writer_sps: f32) -> DepthInterp {
+        DepthInterp { since_write_s, writer_sps, ..DepthInterp::NONE }
+    }
+
+    /// 只知道消费侧的读块时刻（`hal_mic` / `bridge_ring` 这类**我们写、别人读**的级）。
+    pub fn consumer(since_read_s: f32, reader_sps: f32) -> DepthInterp {
+        DepthInterp { since_read_s, reader_sps, ..DepthInterp::NONE }
+    }
+
+    /// 补上另一侧。两侧都填才可能把量化减到 0。
+    pub fn with_consumer(mut self, since_read_s: f32, reader_sps: f32) -> DepthInterp {
+        self.since_read_s = since_read_s;
+        self.reader_sps = reader_sps;
+        self
+    }
+
+    /// 这份快照一个可用项都没有吗？用来把「插值过的读数」与「原始读数」分开
+    /// （见 `DriftFit::interpolated`）。
+    pub fn is_none(&self) -> bool {
+        self.term(self.since_write_s, self.writer_sps) == 0.0
+            && self.term(self.since_read_s, self.reader_sps) == 0.0
+    }
+
+    /// 加到读数上的修正量（样本，可正可负）。符号推导见结构体文档。
+    pub fn correction_samples(&self) -> f64 {
+        self.term(self.since_write_s, self.writer_sps)
+            - self.term(self.since_read_s, self.reader_sps)
+    }
+
+    /// 单侧的「欠着没走完的那一截」。非法输入一律 0，且钳在
+    /// `INTERP_CLAMP_SAMPLES` 以内。
+    fn term(&self, dt_s: f32, rate_sps: f32) -> f64 {
+        if !dt_s.is_finite() || !rate_sps.is_finite() || dt_s <= 0.0 || rate_sps <= 0.0 {
+            return 0.0;
+        }
+        (dt_s as f64 * rate_sps as f64).min(INTERP_CLAMP_SAMPLES)
+    }
+}
+
+/// 一次回归的完整结果。`slope_sps` 单独拿出去是危险的——必须与
+/// `stderr_sps` 一起看才知道那个数字是不是噪声。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DriftFit {
+    /// 最小二乘斜率，样本/秒。
+    pub slope_sps: f64,
+    /// 斜率的标准误，样本/秒。`0.0` = 完美拟合（残差为 0）。
+    pub stderr_sps: f64,
+    /// 参与拟合的点数。
+    pub n: usize,
+    /// 首末点的时间跨度（秒）。
+    pub span_s: f32,
+    /// 窗口里的点**是否全部**做过量化修正（见 `DepthInterp`）。
+    ///
+    /// 它不参与任何判据，只回答「这条读数的噪声底是被剔除过的，还是原始的」。
+    /// 混着来（换源、快照中途失效）时为 `false`——半段修正过、半段没修过的
+    /// 序列会在接缝处凭空多出一个台阶，把它当「插值过」汇报是误导。
+    pub interpolated: bool,
+}
+
+impl DriftFit {
+    /// 这个窗口对漂移的分辨力：3σ 置信半宽（样本/秒）。越小越有话语权。
+    pub fn resolution_sps(&self) -> f64 {
+        DRIFT_T * self.stderr_sps
+    }
+
+    /// 这个读数说得出话吗？三分，不是两分——**「测了，不漂」与「没测出来」
+    /// 是两个不同的结论**，合并它们正是这次要修的那个错。
+    ///
+    /// 1. 斜率越过自己的 3σ 界 ⇒ 测到了漂移，报这个数。
+    /// 2. 没越界，但**界本身很紧**（≤ `DRIFT_RESOLUTION_SPS`）⇒ 测到了
+    ///    「不漂」，报 ≈0。一条只抖 ±1 个样本的稳态队列属此。
+    /// 3. 没越界且**界很松** ⇒ 这个窗口分辨不出来，`slope()` 报 `None`。
+    ///
+    /// 情形 3 的实例（实测，`docs/investigate-hal-residency.md` §2.3）：mac 的
+    /// `hal_spk` 在 30 s 窗口 + 1 Hz 采样下 N≈31，叠着 ±192 samples 的写块相位
+    /// 噪声（σ≈111）⇒ `stderr ≈ 111/49.8 ≈ 2.2`，3σ 半宽 ≈ **6.7 样本/秒**；
+    /// 而要探测的真实涨速只有 **+0.34 样本/秒**。噪声底比效应大 20 倍，
+    /// 此时报出去的 −2.07…+3.10 连符号都是随机的。
+    ///
+    /// ⚠ 情形 3 是**可以被治好的**，而不是这一级的宿命：那 ±192 是写块量化，
+    /// 喂点时带上 `DepthInterp` 就能直接减掉，同一条序列会从情形 3 落回情形 1/2。
+    /// 拉长窗口只能按 √N 压它，是当初那条错误归因的产物。
+    pub fn resolved(&self) -> bool {
+        self.slope_sps.abs() >= self.resolution_sps()
+            || self.resolution_sps() <= DRIFT_RESOLUTION_SPS
+    }
+}
+
+// ------------------------------------------------- 阶跃累积检测（跳变才是病因）
+
+/// 鲁棒噪声尺度用最近多少个 `|Δ|` 估计。
+///
+/// 用**中位数**而不是均值。被判为阶跃的那些 `Δ` 本来就不进这个窗口，所以要防的
+/// 不是它们，而是**大而没越线**的那一批：现实里就是接近但未越过 100 ms 那条线的
+/// 卡顿（`engine.rs` 的门限），以及设备重配一类的中等位移。它们合法地进了窗口，
+/// 均值会被少数几个这样的值拽高一大截，门限跟着抬起来，于是**下一次真正越线的
+/// 跳变反而被自己的噪声底盖住**。中位数对少于一半的污染免疫，均值不免疫。
+const SCALE_WIN: usize = 64;
+
+/// 预热：尺度窗口攒够这么多个 `|Δ|` 之前**一律不判阶跃**。
+///
+/// 这不是保守，是必需的——少了它检测器会自锁：第一个 `Δ` 因为「尺度还是 0」
+/// 被判成阶跃，而阶跃不进尺度窗口，于是尺度永远是 0，于是**每一个** `Δ` 都是
+/// 阶跃。一条等速上涨 600 样本/秒的曲线会被报成「每秒跳变一次、净注入 59400」，
+/// 而它恰恰是斜率该管、这里不该管的那一种。
+const SCALE_MIN: usize = 8;
+
+/// 判为阶跃需要超过鲁棒尺度的倍数。
+///
+/// 高斯噪声下 `median|Δ| ≈ 0.95σ`，5 倍即 ≈4.8σ ⇒ 单点假阳率 ~2e-6。
+/// 同时它天然把**连续漂移**排除在外：等速上涨时每个 `Δ` 都相等，
+/// 尺度就等于 `Δ` 本身，`|Δ| > 5·Δ` 永假。这正是要的判别——
+/// 连续漂移归斜率管，离散跳变归这里管。
+const STEP_K: f64 = 5.0;
+
+/// 阶跃的绝对下限（样本）：一个 10 ms 帧 @48k。
+///
+/// 没有它，一条纹丝不动的序列（尺度 = 0）会把任何 ±1 样本的抖动都算成阶跃。
+/// 取一帧是因为生产侧/消费侧的漏拍都以帧为单位，小于一帧的位移不是「卡顿」。
+const STEP_FLOOR: f64 = 480.0;
+
+/// 「正在累积」的读数：**离散事件的积分**，不是连续斜率。
+///
+/// # 为什么这一级需要它
+///
+/// `hal_spk` 的病理（`docs/investigate-hal-residency.md` §2.1）是：
+/// 驻留量在两次卡顿之间**纹丝不动**，只在 `tx_loop` 落后 >100 ms 时
+/// 一次性阶跃注入。规格 §3.3 的三态判据（drift / saturated / dropped）
+/// 在这一级上三个输入**全部失效**——drift 是噪声（见 `DriftFit::significant`）、
+/// `saturated` 只在 100% 才为真、`dropped` 因丢弃发生在驱动侧而结构性为 `None`。
+///
+/// 于是唯一还看得见这个病的量是**跳变本身**：检测阶跃，把它们的净和攒起来。
+/// 一次没有被吐回来的上跳就是一次永久注入，这是判据的全部内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StepAccum {
+    /// 上跳次数（消费侧卡顿 ⇒ 积压被永久注入）。
+    pub steps_up: u32,
+    /// 下跳次数（生产侧漏写 ⇒ 积压被永久排出）。
+    pub steps_down: u32,
+    /// 阶跃净和（样本）。正 = 这一级净积累了多少积压。
+    ///
+    /// **不含**小步噪声：只有被判为阶跃的那几个 `Δ` 计入，所以它是
+    /// 「历史上被灌进去、至今没出来」的量，而不是当前水位。
+    ///
+    /// ⚠ 它仍然带着**跳变发生那一刻的相位噪声**：测到的 `Δ` 是
+    /// 「真实阶跃 + (本次噪声 − 上次噪声)」，两次跳变就带两份。所以它是
+    /// 「≈4736，误差一个噪声带宽」而不是「精确 4736」，判据必须留出这个余量
+    /// （见 `is_accumulating`）。
+    pub net_samples: i64,
+}
+
+impl StepAccum {
+    /// 这一级在累积吗？
+    ///
+    /// 判据 = 至少发生过一次上跳，**且**净注入超过一个 10 ms 帧。
+    ///
+    /// - 「一次就算」是刻意的：这一级的病理正是**一次卡顿永久注入**
+    ///   （`engine.rs` 的 `tick = behind` 把跳过的帧留在环里），没有任何机制
+    ///   把它拿回来。等到「多次」才报警，等的是第二次事故。
+    /// - 「超过一帧」也是刻意的：`net_samples` 带着跳变时刻的相位噪声，
+    ///   一次上跳 + 一次等量下跳的净和是 0 ± 一个噪声带宽。拿 `> 0` 当判据，
+    ///   那种「灌进去又吐回来」的健康情形会因为几百个样本的噪声残渣被报成
+    ///   「正在累积」。低于一帧的净位移不是延迟注入。
+    pub fn is_accumulating(&self) -> bool {
+        self.steps_up > 0 && self.net_samples > STEP_FLOOR as i64
+    }
+}
+
+/// 一级的阶跃检测状态。跟着 `DriftTracker` 走，但**不受 30 s 窗口约束**：
+/// 累积量是会话生命周期的积分，窗口只服务于斜率。
+#[derive(Default)]
+struct StepState {
+    last: Option<f32>,
+    /// 最近 `SCALE_WIN` 个 `|Δ|`，用来出鲁棒尺度（中位数）。
+    scale_win: VecDeque<f64>,
+    acc: StepAccum,
+}
+
+impl StepState {
+    fn push(&mut self, v: f32) {
+        let Some(prev) = self.last.replace(v) else { return };
+        let d = (v - prev) as f64;
+        let mag = d.abs();
+        // 尺度先用**旧**窗口判，再把本次 |Δ| 收进去：否则一次大跳变会先把
+        // 自己的门限抬起来，然后自己判自己不显著。预热期（见 `SCALE_MIN`）
+        // 只喂窗口、不判阶跃。
+        let thr = (STEP_K * self.scale()).max(STEP_FLOOR);
+        if self.scale_win.len() >= SCALE_MIN && mag > thr {
+            if d > 0.0 {
+                self.acc.steps_up += 1;
+            } else {
+                self.acc.steps_down += 1;
+            }
+            self.acc.net_samples += d as i64;
+            // 阶跃**不进**尺度窗口：它不是噪声的样本，收进去只会污染门限。
+            return;
+        }
+        if self.scale_win.len() == SCALE_WIN {
+            self.scale_win.pop_front();
+        }
+        self.scale_win.push_back(mag);
+    }
+
+    /// `|Δ|` 的中位数。窗口空时返回 0 ⇒ 门限退到 `STEP_FLOOR`
+    /// （但预热期本来就不判阶跃，见 `SCALE_MIN`）。
+    fn scale(&self) -> f64 {
+        if self.scale_win.is_empty() {
+            return 0.0;
+        }
+        let mut v: Vec<f64> = self.scale_win.iter().copied().collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = v.len();
+        if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            (v[n / 2 - 1] + v[n / 2]) / 2.0
+        }
+    }
+}
+
+/// 30 s 窗口的深度斜率（样本/秒）+ 生命周期的阶跃累积。
 ///
 /// 用途（规格 §3.3，三种病理靠它区分）：
 /// - `drift ≈ 0` + 饱和 + `dropped` 冻结 ⇒ 曾被一次卡顿灌满，之后收支平衡但**永远迟到**。
 /// - `drift ≈ 0` + 饱和 + `dropped` 持续增长 ⇒ **稳态产销速率失配**（`Instant` 节拍 vs 设备时钟）。
 /// - `drift` 持续同号且未饱和 ⇒ 正在走向饱和，尚未到达。
 ///
+/// ⚠ **上面这套判据在 `hal_spk` 上三个输入全部失效**（实测见
+/// `docs/investigate-hal-residency.md` §2.3）。所以本结构同时维护
+/// `StepAccum`：那一级的「正在累积」只能靠**检测跳变**看见，拟合斜率看不见。
+///
 /// **不在节拍上跑**：由 1 s 的 ticker 喂点，报告线程读斜率。
+/// 窗口里的一个采样点。
+///
+/// `interp` 跟着**点**走而不是跟着级走，是为了免掉一处状态同步：级一级的
+/// 「插值过没有」若单独存一份，就得在 `clear` / `retain_only` / 窗口滑出
+/// 三个地方各清一次，漏一处就是一条陈旧的 `interpolated=true`。挂在点上，
+/// 它的生命周期与那个点完全一致，三处全部自动正确。
+#[derive(Debug, Clone, Copy)]
+struct Pt {
+    t_s: f32,
+    /// **修正后**的深度（样本）。带小数：修正量是连续量，取整会把刚减掉的
+    /// 量化噪声又量化回去一部分。
+    v: f32,
+    /// 这个点带过 `DepthInterp` 吗。
+    interp: bool,
+}
+
 pub struct DriftTracker {
-    /// 每级一个 (秒, 样本数) 序列，按 StageId 判别码索引。
-    win: Vec<Vec<(f32, f32)>>,
+    /// 每级一个采样点序列，按 StageId 判别码索引。
+    win: Vec<Vec<Pt>>,
+    /// 每级一份阶跃累积，同样按判别码索引。与 `win` 同生共死
+    /// （`clear` / `retain_only` 一并清）：一条新流继承上一条流的累积量，
+    /// 与继承它的斜率是同一个错误。
+    steps: Vec<StepState>,
 }
 
 impl Default for DriftTracker {
@@ -414,24 +771,51 @@ impl DriftTracker {
     pub const WINDOW_S: f32 = 30.0;
 
     pub fn new() -> DriftTracker {
-        DriftTracker { win: (0..StageId::COUNT).map(|_| Vec::new()).collect() }
+        DriftTracker {
+            win: (0..StageId::COUNT).map(|_| Vec::new()).collect(),
+            steps: (0..StageId::COUNT).map(|_| StepState::default()).collect(),
+        }
     }
 
-    /// 喂一个采样点。`now_s` 是任意单调时基下的秒数（只用差值，所以常偏无所谓）。
+    /// 喂一个采样点（**没有**时间快照，读数原样进窗口）。
+    ///
+    /// `now_s` 是任意单调时基下的秒数（只用差值，所以常偏无所谓）。
+    ///
+    /// ⚠ 这条路径上写块量化会原样进回归窗口。拿得到生产/消费侧的整块时刻时
+    /// **一律走 `push_interp`**——那 ±384 样本是这个指标最大的噪声源，
+    /// 而它是可以直接减掉的，不是必须忍受的本底。
     pub fn push(&mut self, now_s: f32, id: StageId, samples: u32) {
+        self.push_interp(now_s, id, samples, DepthInterp::NONE);
+    }
+
+    /// 喂一个**做过量化修正**的采样点。见 `DepthInterp`（含符号推导）。
+    ///
+    /// 只修正**读数**，不动**时刻**：`now_s` 本来就是真实的读数时刻，最小二乘
+    /// 对非均匀 x 是精确的。把 x 强行插到「统一时间栅格」上反而是往里注入误差
+    /// ——那等于用一个估计出来的斜率去搬点，而斜率正是要估的东西。所以
+    /// 「统一时间栅格」这件事在这里的正确落地是：**把两侧阶梯都插值到同一个
+    /// 时刻（读数时刻）**，而不是把读数搬到整秒上。
+    pub fn push_interp(&mut self, now_s: f32, id: StageId, samples: u32, interp: DepthInterp) {
+        let v = (samples as f64 + interp.correction_samples()) as f32;
+        // 阶跃检测吃的是**全部**采样点，不受 30 s 窗口约束：跳变的累积量是
+        // 会话生命周期的积分，被窗口滑掉的那几次跳变照样还压在环里。
+        // 它同样吃修正后的值——量化噪声被剔掉，鲁棒尺度收紧，检测器只会更灵。
+        self.steps[id.index()].push(v);
         let w = &mut self.win[id.index()];
-        w.push((now_s, samples as f32));
+        w.push(Pt { t_s: now_s, v, interp: !interp.is_none() });
         // 窗口外的点直接丢：一次早期抖动不该永远压着斜率。
         let cutoff = now_s - Self::WINDOW_S;
-        let keep = w.iter().position(|&(t, _)| t >= cutoff).unwrap_or(w.len());
+        let keep = w.iter().position(|p| p.t_s >= cutoff).unwrap_or(w.len());
         if keep > 0 {
             w.drain(..keep);
         }
     }
 
-    /// 该级不再存在时清掉它的历史，避免下一条同名会话继承上一条的斜率。
+    /// 该级不再存在时清掉它的历史，避免下一条同名会话继承上一条的斜率
+    /// **与阶跃累积**。
     pub fn clear(&mut self, id: StageId) {
         self.win[id.index()].clear();
+        self.steps[id.index()] = StepState::default();
     }
 
     /// 只保留 `present` 这几级的历史，其余全清。
@@ -451,41 +835,91 @@ impl DriftTracker {
     /// 调用方手上本来就是一排 `StageSlot::load()` 的结果，让它先过滤一遍只会多
     /// 一次分配、多一个写错的机会。
     pub fn retain_only(&mut self, present: &[Option<StageId>]) {
-        for (i, w) in self.win.iter_mut().enumerate() {
-            if w.is_empty() {
+        for i in 0..self.win.len() {
+            if self.win[i].is_empty() && self.steps[i].last.is_none() {
                 continue;
             }
             if !present.iter().flatten().any(|id| id.index() == i) {
-                w.clear();
+                self.win[i].clear();
+                self.steps[i] = StepState::default();
             }
         }
     }
 
-    /// 最小二乘斜率，样本/秒。点数 < 3 或时间跨度 < 5 s ⇒ `None`
-    /// （两点连线在这里不是趋势，是噪声；**绝不用 0 冒充「没有漂移」**）。
+    /// 最小二乘斜率，样本/秒。**分辨力不足时返回 `None`**。
+    ///
+    /// 三种情形都报 `None`，且三种都不是「没有漂移」：
+    /// - 点数 < 3 或跨度 < 5 s：两点连线不是趋势。
+    /// - 时间全同（分母退化）。
+    /// - **斜率落在噪声底以内，且噪声底本身宽到没有话语权**（见
+    ///   `DriftFit::resolved`）。
+    ///
+    /// 最后一条是这次补上的。此前这个函数把 `hal_spk` 上纯粹由写块相位噪声
+    /// 产生的 −2.07…+3.10 样本/秒原样报了出去，而同一时段真实涨速是
+    /// +0.34 样本/秒——报出去的数字连符号都是随机的，读者却会拿它去套规格
+    /// §3.3 的三态判据。**报 `None`（「这个窗口分辨不出来」）是唯一诚实的输出**；
+    /// 那一级真正的病要用 `steps()` 看。
+    ///
+    /// ⚠ 注意 `None` **没有**吞掉「测了，就是不漂」：一条低噪声的稳态队列
+    /// 3σ 半宽很紧，照报 `Some(≈0)`（`DriftFit::resolved` 的情形 2）。
     pub fn slope(&self, id: StageId) -> Option<f64> {
+        self.fit(id).filter(DriftFit::resolved).map(|f| f.slope_sps)
+    }
+
+    /// 回归本身：斜率 + 斜率标准误 + 点数 + 跨度。
+    ///
+    /// 拆出来是为了让「这个读数为什么被判成噪声」可查、可测：`slope()` 只给
+    /// 一个 `None`，说不出它是点不够、跨度不够，还是信噪比不够。
+    pub fn fit(&self, id: StageId) -> Option<DriftFit> {
         let w = &self.win[id.index()];
         if w.len() < 3 {
             return None;
         }
-        let span = w[w.len() - 1].0 - w[0].0;
-        if span < 5.0 {
+        let span_s = w[w.len() - 1].t_s - w[0].t_s;
+        if span_s < 5.0 {
             return None;
         }
         let n = w.len() as f64;
         let (mut sx, mut sy, mut sxx, mut sxy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        for &(t, v) in w {
-            let (x, y) = (t as f64, v as f64);
+        for p in w {
+            let (x, y) = (p.t_s as f64, p.v as f64);
             sx += x;
             sy += y;
             sxx += x * x;
             sxy += x * y;
         }
-        let denom = n * sxx - sx * sx;
+        let denom = n * sxx - sx * sx; // = n · Sxx（中心化后的平方和 × n）
         if denom.abs() < 1e-9 {
             return None;
         }
-        Some((n * sxy - sx * sy) / denom)
+        let slope_sps = (n * sxy - sx * sy) / denom;
+        let intercept = (sy - slope_sps * sx) / n;
+        // 残差平方和 ⇒ 残差标准差 ⇒ 斜率标准误 = s / √Sxx。
+        let sse: f64 = w
+            .iter()
+            .map(|p| {
+                let r = p.v as f64 - (slope_sps * p.t_s as f64 + intercept);
+                r * r
+            })
+            .sum();
+        let resid_sd = (sse / (n - 2.0)).sqrt();
+        let sxx_centered = denom / n;
+        let stderr_sps = if sxx_centered <= 0.0 { 0.0 } else { resid_sd / sxx_centered.sqrt() };
+        Some(DriftFit {
+            slope_sps,
+            stderr_sps,
+            n: w.len(),
+            span_s,
+            interpolated: w.iter().all(|p| p.interp),
+        })
+    }
+
+    /// 这一级到目前为止累积了多少**阶跃**注入。见 `StepAccum`。
+    ///
+    /// 与 `slope()` 的分工是硬的：斜率答「它在以什么速率连续变化」，
+    /// 这里答「它被一次性灌进去过几次、净灌了多少」。`hal_spk` 只有后者说得清。
+    pub fn steps(&self, id: StageId) -> StepAccum {
+        self.steps[id.index()].acc
     }
 }
 
@@ -682,6 +1116,574 @@ mod tests {
         t.retain_only(&[Some(StageId::HalSpk), None, Some(StageId::SendPace)]);
         assert_eq!(t.slope(StageId::SrcFifo), None);
         assert_eq!(t.slope(StageId::CapRing), None);
+    }
+
+    // ------------------------------------------- 信噪比：噪声不许冒充漂移
+
+    /// 确定性的伪随机噪声源（不引 rand 依赖，且每次跑出来的序列一模一样——
+    /// 一条会随机翻绿翻红的统计断言比没有断言更糟）。
+    ///
+    /// 参数照抄实测：`hal_spk` 的写块相位噪声在 ±192 samples 之间滑动，
+    /// σ ≈ 111（`docs/investigate-hal-residency.md` §1.2 的 86 个小步）。
+    struct Lcg(u64);
+    impl Lcg {
+        fn new() -> Lcg {
+            Lcg(0x2545_F491_4F6C_DD1D)
+        }
+        /// 均匀分布在 [-amp, amp] 的整数。
+        fn noise(&mut self, amp: i64) -> i64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (((self.0 >> 33) as i64) % (2 * amp + 1)) - amp
+        }
+    }
+
+    /// **噪声不许被报成漂移。**
+    ///
+    /// 实测（`docs/investigate-hal-residency.md` §2.3）：`hal_spk` 在 30 s 窗口 +
+    /// 1 Hz 采样下 N≈31，噪声底让斜率标准误达 ≈2.3 样本/秒，而要探测的真实涨速
+    /// 只有 +0.34 样本/秒——**噪声底比效应大 7 倍**。此前这个函数把 −2.07…+3.10
+    /// 的噪声原样报出去，读者拿它去套规格 §3.3 的三态判据，得到的是随机结论。
+    #[test]
+    fn pure_phase_noise_reports_no_drift_at_all_instead_of_a_random_number() {
+        let mut rng = Lcg::new();
+        let mut t = DriftTracker::new();
+        // 水位钉死在 8672（实测那一刻的值），只叠 ±192 的写块相位噪声。
+        for i in 0..=30 {
+            let v = (8_672 + rng.noise(192)) as u32;
+            t.push(i as f32, StageId::HalSpk, v);
+        }
+        let f = t.fit(StageId::HalSpk).expect("点数与跨度都够");
+        assert!(
+            f.stderr_sps > 1.0,
+            "前提：这段序列的噪声底就该是 2 样本/秒量级，实得 SE={}",
+            f.stderr_sps
+        );
+        assert!(
+            f.slope_sps.abs() < DRIFT_T * f.stderr_sps,
+            "前提：拟合斜率落在噪声底以内，slope={} SE={}",
+            f.slope_sps,
+            f.stderr_sps
+        );
+        assert_eq!(
+            t.slope(StageId::HalSpk),
+            None,
+            "信噪比不足 ⇒ 必须报 None（『这个窗口分辨不出来』），\
+             不许把 {} 样本/秒这个方向都随机的数字当成漂移报出去",
+            f.slope_sps
+        );
+    }
+
+    /// **「测了，就是不漂」不许被这道门槛一起滤掉。**
+    ///
+    /// 上一条要的是「噪声 ⇒ None」。若判据只写成 `|slope| ≥ 3·SE`，那么**任何**
+    /// 带一点噪声的稳态队列都会报 `None`——0 永远够不着 3σ 界。于是
+    /// 「测到了，就是不漂」（规格 §3.3 三态判据的第一、二态都要它）就永久消失了，
+    /// 而那与「没测出来」是两个不同的结论。
+    ///
+    /// 分界不是「有没有噪声」，是**噪声底宽不宽**（`DriftFit::resolved` 的
+    /// 情形 2 vs 情形 3）：这里的两条序列同样稳态、同样有噪声，只差噪声幅度。
+    #[test]
+    fn a_steady_stage_with_tiny_noise_still_reports_measured_and_not_drifting() {
+        // ±1 个样本的抖动：3σ 半宽 ≈0.16 样本/秒，紧得足以说「它没在漂」。
+        let mut tight = DriftTracker::new();
+        for i in 0..=30u32 {
+            tight.push(i as f32, StageId::PostMix, 4_800 + (i % 2));
+        }
+        let f = tight.fit(StageId::PostMix).unwrap();
+        assert!(f.stderr_sps > 0.0, "前提：确实有残差，不是完美拟合（SE={}）", f.stderr_sps);
+        assert!(
+            f.resolution_sps() <= DRIFT_RESOLUTION_SPS,
+            "前提：噪声底很紧，实得 3σ 半宽 {}",
+            f.resolution_sps()
+        );
+        let s = tight
+            .slope(StageId::PostMix)
+            .expect("低噪声稳态必须报『测到了，≈0』，不是 None");
+        assert!(s.abs() < 0.1, "实得 {s}");
+
+        // 对照：同样稳态，噪声抬到 ±192（hal_spk 的写块相位噪声）⇒ 半宽 ≈6.7，
+        // 这个窗口就没有话语权了。
+        let mut rng = Lcg::new();
+        let mut loose = DriftTracker::new();
+        for i in 0..=30 {
+            loose.push(i as f32, StageId::PostMix, (4_800 + rng.noise(192)) as u32);
+        }
+        assert!(loose.fit(StageId::PostMix).unwrap().resolution_sps() > DRIFT_RESOLUTION_SPS);
+        assert_eq!(
+            loose.slope(StageId::PostMix),
+            None,
+            "同样是稳态，噪声底一宽就分辨不出来了 —— 这一条必须报 None"
+        );
+    }
+
+    /// ……但**真的**漂移必须照报，门槛不能高到把病也滤掉。
+    ///
+    /// 1% 速率失配 = 480 样本/秒，即使叠上同一份 ±192 的噪声也必须显著。
+    #[test]
+    fn a_real_rate_mismatch_still_gets_through_the_significance_gate() {
+        let mut rng = Lcg::new();
+        let mut t = DriftTracker::new();
+        for i in 0..=30 {
+            let v = (1_000 + 480 * i + rng.noise(192)) as u32;
+            t.push(i as f32, StageId::SrcFifo, v);
+        }
+        let s = t.slope(StageId::SrcFifo).expect("480 样本/秒远在噪声底之上");
+        assert!((s - 480.0).abs() < 10.0, "斜率仍要准，实得 {s}");
+    }
+
+    // ------------------------------------ 时间插值：写块量化是可以直接减掉的
+
+    /// 一段**物理上成立**的环深度轨迹发生器（照着 `hal_spk` 建模）。
+    ///
+    /// - 生产侧：驱动的 IOProc，一次 `DoIOOperation` 写整块 `block` 个样本，
+    ///   速率 `writer_sps`；
+    /// - 消费侧：`tx_loop`，每 10 ms 读整块 480 个，速率恰好 48000。
+    ///
+    /// 深度 = 两条阶梯之差。**真实漂移 = `writer_sps − 48000`，别的什么都没有**
+    /// ——所以任何非零残差都是量化，不是物理。
+    struct RingSim {
+        block: f64,
+        writer_sps: f64,
+        read_chunk: f64,
+        read_period_s: f64,
+        base: f64,
+    }
+
+    impl RingSim {
+        /// 实测那一级的参数：块 768（±384 的来源）、真实涨速 +0.34 样本/秒
+        /// （9 小时 253 ms），起始水位 8672（`investigate-hal-residency.md` §0）。
+        fn hal_spk() -> RingSim {
+            RingSim {
+                block: 768.0,
+                writer_sps: 48_000.34,
+                read_chunk: 480.0,
+                read_period_s: 0.01,
+                base: 8_672.0,
+            }
+        }
+
+        /// `t` 时刻**能观测到**的深度：两条阶梯之差，带着全部量化。
+        fn observed(&self, t: f64) -> u32 {
+            let w = (t * self.writer_sps / self.block).floor() * self.block;
+            let r = (t / self.read_period_s).floor() * self.read_chunk;
+            (self.base + w - r) as u32
+        }
+
+        /// `t` 时刻生产侧最近一次写块距今多久（秒）。
+        fn since_write_s(&self, t: f64) -> f64 {
+            t - (t * self.writer_sps / self.block).floor() * self.block / self.writer_sps
+        }
+
+        /// `t` 时刻消费侧最近一次读块距今多久（秒）。
+        fn since_read_s(&self, t: f64) -> f64 {
+            t - (t / self.read_period_s).floor() * self.read_period_s
+        }
+
+        fn reader_sps(&self) -> f64 {
+            self.read_chunk / self.read_period_s
+        }
+
+        /// 两侧都填的正确快照。
+        fn interp(&self, t: f64) -> DepthInterp {
+            DepthInterp::producer(self.since_write_s(t) as f32, self.writer_sps as f32)
+                .with_consumer(self.since_read_s(t) as f32, self.reader_sps() as f32)
+        }
+
+        /// **写反了**的快照：生产侧的量填进消费侧的槽，反之亦然。
+        /// 这正是符号搞反时会写出来的东西，修正量恰好取负。
+        fn interp_swapped(&self, t: f64) -> DepthInterp {
+            DepthInterp::producer(self.since_read_s(t) as f32, self.reader_sps() as f32)
+                .with_consumer(self.since_write_s(t) as f32, self.writer_sps as f32)
+        }
+
+        /// 真实的连续深度（无量化）。
+        fn truth(&self, t: f64) -> f64 {
+            self.base + (self.writer_sps - self.reader_sps()) * t
+        }
+    }
+
+    /// 1 Hz 心跳的真实开火时刻：整秒 ± 10 ms 的调度抖动。
+    fn tick_times(rng: &mut Lcg) -> Vec<f64> {
+        (0..=30).map(|k| k as f64 + rng.noise(10) as f64 / 1000.0).collect()
+    }
+
+    /// **喂入带量化噪声的理想斜率：插值前后的斜率标准误必须显著下降。**
+    ///
+    /// 这条是本轮的验收点。同一条物理轨迹喂两遍：
+    /// - 原样喂 ⇒ ±384 的写块量化 + ±240 的读块量化原封不动进回归窗口，
+    ///   标准误落在**样本/秒量级**，比要探测的 +0.34 大一个数量级 ⇒ 报 `None`；
+    /// - 带 `DepthInterp` 喂 ⇒ 两条阶梯都被插值回连续位置，残差只剩 f32 的
+    ///   舍入 ⇒ 标准误掉到 1e-5 量级，斜率精确落在 0.34。
+    ///
+    /// 实测（确定性，跑多少次都一样）：
+    ///
+    /// | | 斜率 | 标准误 | 3σ 半宽 | `slope()` |
+    /// |---|---|---|---|---|
+    /// | 原样喂 | **+3.79**（真值 0.34，连量级都不对） | 4.58 | 13.7 | `None` |
+    /// | 带 `DepthInterp` 喂 | **+0.3400004** | 5.6e-6 | 1.7e-5 | `Some(0.34)` |
+    ///
+    /// 注意这**不是**把噪声按 √N 压下去（那要 400 倍的点、3 小时以上的窗口），
+    /// 是把它整个减掉——窗口一秒都没变长。此前把 `drift_sps` 测不出漂移归因为
+    /// 「窗口太短」是错的，归因错了就会去改窗口而不是改误差项。
+    #[test]
+    fn time_interpolation_removes_the_write_block_quantization() {
+        let sim = RingSim::hal_spk();
+        let mut rng = Lcg::new();
+        let ts = tick_times(&mut rng);
+
+        let mut raw = DriftTracker::new();
+        let mut fixed = DriftTracker::new();
+        for &t in &ts {
+            let d = sim.observed(t);
+            // 逐点先钉死机制本身：**读数 + 修正 = 无量化的真值**。
+            // 这一条比下面的统计量强 —— 统计量只能说「噪声小了」，它说的是
+            // 「量化被精确减掉了」。修正若只是碰巧朝对的方向偏一点，这里就红。
+            let restored = d as f64 + sim.interp(t).correction_samples();
+            assert!(
+                (restored - sim.truth(t)).abs() < 0.05,
+                "t={t}: 观测 {d} + 修正 = {restored}，真值 {}",
+                sim.truth(t)
+            );
+            // 而未修正的读数与真值差着整整一个块的量级——那就是要减掉的东西。
+            raw.push(t as f32, StageId::HalSpk, d);
+            fixed.push_interp(t as f32, StageId::HalSpk, d, sim.interp(t));
+        }
+        assert!(
+            ts.iter().any(|&t| (sim.observed(t) as f64 - sim.truth(t)).abs() > 100.0),
+            "前提：未修正时至少有点偏出 100 样本，否则这条轨迹根本没有量化可减"
+        );
+
+        let fr = raw.fit(StageId::HalSpk).expect("点数与跨度都够");
+        let ff = fixed.fit(StageId::HalSpk).expect("点数与跨度都够");
+
+        // 前提：这条轨迹的原始噪声底确实压过了要探测的效应。
+        assert!(
+            fr.stderr_sps > 1.0,
+            "前提：未插值时噪声底该是样本/秒量级，实得 SE={}",
+            fr.stderr_sps
+        );
+        // 验收：标准误至少降两个数量级（实得 4.58 → 5.6e-6，降了 80 万倍）。
+        assert!(
+            ff.stderr_sps * 100.0 < fr.stderr_sps,
+            "插值后标准误必须显著下降：raw SE={} → interp SE={}",
+            fr.stderr_sps,
+            ff.stderr_sps
+        );
+        // 再钉一条绝对上限：相对判据在「两边一起变差」时是绿的，绝对判据不是。
+        // 1e-3 比实得的 5.6e-6 松 180 倍，只拦住量级级别的退化。
+        assert!(ff.stderr_sps < 1e-3, "插值后的标准误不该有物理噪声，实得 {}", ff.stderr_sps);
+        assert!(!fr.interpolated && ff.interpolated, "两条读数的来源必须自报家门");
+
+        // 而且不只是「更平滑」——插值后的斜率要**对**。
+        assert!(
+            (ff.slope_sps - 0.34).abs() < 0.01,
+            "插值后必须还原出真实涨速 +0.34 样本/秒，实得 {}",
+            ff.slope_sps
+        );
+        assert_eq!(raw.slope(StageId::HalSpk), None, "原始读数分辨不出 0.34，只能报 None");
+        let got = fixed.slope(StageId::HalSpk).expect("插值后这一级终于说得出话");
+        assert!((got - 0.34).abs() < 0.01, "实得 {got}");
+    }
+
+    /// **符号写反了必须变红。**
+    ///
+    /// 修正项是 `+生产侧欠的 − 消费侧欠的`。把两侧对调（最容易写出来的那个错）
+    /// 修正量恰好取负，于是 `观测 + (−修正) = 真值 − 2×量化`——噪声不但没消，
+    /// **正好翻倍**。所以判据是硬的：写反时标准误必须比**不插值**还差，
+    /// 而不只是「比正确插值差」。
+    #[test]
+    fn interpolating_with_the_wrong_sign_makes_it_worse_not_better() {
+        let sim = RingSim::hal_spk();
+        let mut rng = Lcg::new();
+        let ts = tick_times(&mut rng);
+
+        let mut raw = DriftTracker::new();
+        let mut flipped = DriftTracker::new();
+        for &t in &ts {
+            let d = sim.observed(t);
+            raw.push(t as f32, StageId::HalSpk, d);
+            flipped.push_interp(t as f32, StageId::HalSpk, d, sim.interp_swapped(t));
+        }
+        let fr = raw.fit(StageId::HalSpk).unwrap().stderr_sps;
+        let fl = flipped.fit(StageId::HalSpk).unwrap().stderr_sps;
+        assert!(
+            fl > 1.8 * fr,
+            "符号反了残差就该精确翻倍（raw SE={fr} → flipped SE={fl}）。\
+             这条断言若变绿说明 `DepthInterp::correction_samples` 的两项符号\
+             不再是『生产侧加、消费侧减』"
+        );
+        assert_eq!(flipped.slope(StageId::HalSpk), None, "噪声翻倍后更不可能分辨出 0.34");
+    }
+
+    /// 修正量本身的符号与量纲，直接钉在 `correction_samples()` 上。
+    ///
+    /// 上一条测的是「反了会更差」，这一条测的是「正着是多少」——两条都在，
+    /// 才能把「符号对」和「大小对」分开定位。
+    #[test]
+    fn the_correction_adds_what_the_producer_owes_and_subtracts_what_the_consumer_owes() {
+        // 生产侧欠着 5 ms @48k = 240 个样本还没写出来 ⇒ 连续深度比读数**大** 240。
+        // 容差 1e-3 而不是 1e-6：`0.005f32` 本来就不是精确的 5 ms（差 5e-9 s），
+        // 乘 48000 就是 2.6e-4 个样本。写 1e-6 是在断言一件 f32 做不到的事。
+        let p = DepthInterp::producer(0.005, 48_000.0);
+        assert!((p.correction_samples() - 240.0).abs() < 1e-3, "{}", p.correction_samples());
+        // 消费侧欠着 5 ms 没读走 ⇒ 连续深度比读数**小** 240。
+        let c = DepthInterp::consumer(0.005, 48_000.0);
+        assert!((c.correction_samples() + 240.0).abs() < 1e-3, "{}", c.correction_samples());
+        // 两侧欠得一样多 ⇒ 互相抵消，读数本来就在连续位置上。
+        assert!(p.with_consumer(0.005, 48_000.0).correction_samples().abs() < 1e-9);
+        assert!(DepthInterp::NONE.is_none() && DepthInterp::default().is_none());
+        assert!(!p.is_none());
+    }
+
+    /// **坏快照必须被忽略，不许被采信。**
+    ///
+    /// 时钟回跳、速率字段没填、时间戳陈旧——这些在真机上都会发生，而一个错的
+    /// 修正比不修正更坏：它是直接加在读数上的，会被当成真深度进回归窗口。
+    /// PipeWire 在同一位置也钳（`alsa-pcm.c` 只在 `|diff| < threshold*3` 时采纳
+    /// 且修正量钳在 ±threshold）。
+    #[test]
+    fn a_broken_snapshot_is_ignored_rather_than_believed() {
+        for bad in [
+            DepthInterp::producer(f32::NAN, 48_000.0),
+            DepthInterp::producer(0.005, f32::NAN),
+            DepthInterp::producer(f32::INFINITY, 48_000.0),
+            DepthInterp::producer(-0.005, 48_000.0), // 时钟回跳
+            DepthInterp::producer(0.005, 0.0),       // 速率没填
+            DepthInterp::producer(0.005, -48_000.0),
+        ] {
+            assert_eq!(bad.correction_samples(), 0.0, "坏快照必须退化成不修正：{bad:?}");
+            assert!(bad.is_none(), "坏快照不算『插值过』：{bad:?}");
+        }
+        // 陈旧快照（一整秒没写块了）钳在 100 ms 等效量以内，而不是加进去 48000。
+        let stale = DepthInterp::producer(1.0, 48_000.0);
+        assert_eq!(stale.correction_samples(), INTERP_CLAMP_SAMPLES);
+
+        // 钳住之后的读数仍然进得去窗口，只是不会把水位炸到天上。
+        let mut t = DriftTracker::new();
+        for i in 0..=10 {
+            t.push_interp(i as f32, StageId::HalSpk, 8_672, stale);
+        }
+        let f = t.fit(StageId::HalSpk).unwrap();
+        assert!(f.slope_sps.abs() < 1e-3, "恒定的修正量不产生斜率，实得 {}", f.slope_sps);
+    }
+
+    /// 半段插值过、半段没插过的窗口**不许**自称插值过：接缝处会凭空多出一个
+    /// 台阶（一整个块），把它当「噪声已剔除」汇报是误导。
+    #[test]
+    fn a_window_that_only_partly_had_snapshots_does_not_claim_to_be_interpolated() {
+        let mut t = DriftTracker::new();
+        for i in 0..=5 {
+            t.push(i as f32, StageId::HalSpk, 8_672);
+        }
+        for i in 6..=12 {
+            t.push_interp(i as f32, StageId::HalSpk, 8_672, DepthInterp::producer(0.005, 48_000.0));
+        }
+        assert!(!t.fit(StageId::HalSpk).unwrap().interpolated, "混着来 ⇒ false");
+        // 旧点滑出 30 s 窗口之后，剩下的全是插值点，这时才该为 true。
+        for i in 40..=60 {
+            t.push_interp(i as f32, StageId::HalSpk, 8_672, DepthInterp::producer(0.005, 48_000.0));
+        }
+        assert!(t.fit(StageId::HalSpk).unwrap().interpolated);
+    }
+
+    /// **门槛是照着真实病灶标定的，不是照着噪声底标定的。**
+    ///
+    /// 「测了，就是不漂」这句话若要成立，就必须排除得掉实测的 +0.34 样本/秒
+    /// （9 小时 253 ms）。门槛一旦松过它，那句「不漂」就是假保证。
+    /// 这条断言把这个推导钉死——将来谁为了「让 UI 少报 None」把它调松，这里会红。
+    #[test]
+    fn the_resolution_bar_is_tight_enough_to_exclude_the_measured_hal_spk_drift() {
+        const MEASURED_HAL_SPK_DRIFT_SPS: f64 = 0.34;
+        assert!(
+            DRIFT_RESOLUTION_SPS < MEASURED_HAL_SPK_DRIFT_SPS,
+            "门槛 {DRIFT_RESOLUTION_SPS} 必须紧过实测涨速 {MEASURED_HAL_SPK_DRIFT_SPS}，\
+             否则『测到了，不漂』这个结论排除不掉那个正在把环推向饱和的真实漂移"
+        );
+        // 反过来也要有下限意识：门槛紧到 0 就等于永远不许说「不漂」。
+        assert!(DRIFT_RESOLUTION_SPS > 0.0);
+        // 一条被插值救活的序列必须真的够得着这个门槛（否则收紧就是关掉指标）。
+        let sim = RingSim::hal_spk();
+        let mut rng = Lcg::new();
+        let mut t = DriftTracker::new();
+        for tk in tick_times(&mut rng) {
+            t.push_interp(tk as f32, StageId::HalSpk, sim.observed(tk), sim.interp(tk));
+        }
+        assert!(
+            t.fit(StageId::HalSpk).unwrap().resolution_sps() < DRIFT_RESOLUTION_SPS,
+            "插值后的 3σ 半宽必须落在门槛以内，否则这个门槛没有任何序列够得着"
+        );
+    }
+
+    // ------------------------------------------- 阶跃：这一级真正看得见的量
+
+    /// **斜率看不见的病，阶跃检测器看得见。**
+    ///
+    /// 复刻实测轨迹（`docs/investigate-hal-residency.md` §1.2）：水位在两次卡顿
+    /// 之间纹丝不动（只有 ±192 的写块相位噪声），偶尔被一次 >100 ms 的消费侧
+    /// 卡顿一次性抬高 2368 samples（`engine.rs` 的 `tick = behind` 把跳过的帧
+    /// 永久留在环里）。9 小时涨 253 ms 就是这么来的。
+    ///
+    /// 两条断言合起来才是这条测试的全部内容：
+    /// - 30 s 窗口的斜率**报不出来**（跳变早就滑出窗口，窗口里只剩噪声）；
+    /// - 阶跃累积**报得出来**，而且净和精确等于两次跳变之和。
+    #[test]
+    fn a_staircase_is_invisible_to_the_slope_and_obvious_to_the_step_detector() {
+        let mut rng = Lcg::new();
+        let mut t = DriftTracker::new();
+        let mut level: i64 = 8_672;
+        let mut clock = 0.0f32;
+        let quiet = |t: &mut DriftTracker, rng: &mut Lcg, clock: &mut f32, level: i64, n: u32| {
+            for _ in 0..n {
+                t.push(*clock, StageId::HalSpk, (level + rng.noise(192)) as u32);
+                *clock += 1.0;
+            }
+        };
+        quiet(&mut t, &mut rng, &mut clock, level, 40);
+        for _ in 0..2 {
+            level += 2_368; // 一次 >100 ms 的消费侧卡顿
+            quiet(&mut t, &mut rng, &mut clock, level, 40);
+        }
+
+        assert_eq!(
+            t.slope(StageId::HalSpk),
+            None,
+            "窗口里只剩最后 30 s 的噪声 —— 斜率对这个病是瞎的，这正是要点"
+        );
+
+        let acc = t.steps(StageId::HalSpk);
+        assert_eq!(acc.steps_up, 2, "两次跳变都要被抓到，实得 {acc:?}");
+        assert_eq!(acc.steps_down, 0);
+        // 净注入 ≈ 2×2368。不写成精确相等是因为测到的 `Δ` 必然带着跳变那一刻的
+        // 相位噪声（`真实阶跃 + 本次噪声 − 上次噪声`），两次跳变带两份，
+        // 上界 2×2×192 = 768。写成 `assert_eq!(4736)` 是在断言一件物理上做不到
+        // 的事，那种断言只会逼后来的人去调噪声幅度而不是去看检测器。
+        assert!(
+            (acc.net_samples - 4_736).abs() < 768,
+            "净注入必须落在 2×2368 ± 一个噪声带宽内，实得 {acc:?}"
+        );
+        assert!(acc.is_accumulating(), "有净注入且从未吐回 ⇒ 正在累积");
+        // 对照：驻留量本身（最后的水位 ≈ 8672+4736）远高于起点，
+        // 而这一点**没有任何一个规格 §3.3 的输入看得见**——drift 是 None、
+        // 环远未饱和、dropped 在驱动侧。只有上面这个 `acc` 说得出来。
+    }
+
+    /// **纯噪声不许产生任何阶跃。** 否则这个检测器只是换了个地方生成随机数。
+    #[test]
+    fn pure_noise_produces_no_steps() {
+        let mut rng = Lcg::new();
+        let mut t = DriftTracker::new();
+        for i in 0..300 {
+            t.push(i as f32, StageId::HalSpk, (8_672 + rng.noise(192)) as u32);
+        }
+        let acc = t.steps(StageId::HalSpk);
+        assert_eq!(acc, StepAccum::default(), "300 个噪声点，一次阶跃都不许有：{acc:?}");
+        assert!(!acc.is_accumulating());
+    }
+
+    /// **连续等速漂移不是阶跃。**
+    ///
+    /// 门限用 `|Δ|` 的中位数标定 ⇒ 等速上涨时门限恰好等于 5×Δ，永远够不着。
+    /// 这条分工是硬的：连续漂移归 `slope()`，离散跳变归 `steps()`，
+    /// 两个量不许互相冒充。
+    #[test]
+    fn a_smooth_ramp_is_drift_not_steps() {
+        let mut t = DriftTracker::new();
+        for i in 0..100u32 {
+            t.push(i as f32, StageId::PlayRing, 1_000 + 600 * i); // 600 样本/秒
+        }
+        assert_eq!(t.steps(StageId::PlayRing), StepAccum::default(), "等速上涨没有阶跃");
+        let s = t.slope(StageId::PlayRing).expect("这才是斜率该报的东西");
+        assert!((s - 600.0).abs() < 1e-6, "实得 {s}");
+    }
+
+    /// 生产侧漏写把积压排出去 ⇒ 下跳，净和抵消。累积判据必须跟着变假。
+    #[test]
+    fn a_jump_that_drains_back_out_is_not_accumulation() {
+        let mut rng = Lcg::new();
+        let mut t = DriftTracker::new();
+        let mut clock = 0.0f32;
+        let mut level: i64 = 8_672;
+        let quiet = |t: &mut DriftTracker, rng: &mut Lcg, clock: &mut f32, level: i64| {
+            for _ in 0..40 {
+                t.push(*clock, StageId::HalSpk, (level + rng.noise(192)) as u32);
+                *clock += 1.0;
+            }
+        };
+        quiet(&mut t, &mut rng, &mut clock, level);
+        level += 2_368; // 消费侧卡顿
+        quiet(&mut t, &mut rng, &mut clock, level);
+        level -= 2_368; // 生产侧漏写，原样吐回来
+        quiet(&mut t, &mut rng, &mut clock, level);
+        let acc = t.steps(StageId::HalSpk);
+        assert_eq!((acc.steps_up, acc.steps_down), (1, 1), "{acc:?}");
+        assert!(
+            acc.net_samples.abs() < 768,
+            "灌进去多少吐回来多少 ⇒ 净和 ≈ 0（余下的是跳变时刻的相位噪声），实得 {acc:?}"
+        );
+        assert!(
+            !acc.is_accumulating(),
+            "净位移不足一帧就不是累积 —— 判据若写成 `net > 0`，这里的 {} 个噪声残渣\
+             就会把一次健康的『灌进去又吐回来』报成正在累积",
+            acc.net_samples
+        );
+    }
+
+    /// **门限的尺度必须是中位数，不能是均值。**
+    ///
+    /// 少数几个「大而没越线」的 `Δ`（现实里就是接近但未越过 100 ms 那条线的
+    /// 卡顿）会合法地进入尺度窗口。均值被它们拽高一大截，门限跟着抬起来，
+    /// 于是**下一次真正越线的跳变被自己的噪声底盖住**——检测器越是刚经历过
+    /// 一串抖动，就越是看不见随后那次真事故，与要它做的事正好相反。
+    ///
+    /// 构造：每 6 拍里 4 个 ±200、2 个 ±900 ⇒ 中位数 200（门限 1000）、
+    /// 均值 ≈430（门限 ≈2150）。那次 1500 的真跳变恰好落在两者之间。
+    #[test]
+    fn the_step_threshold_uses_a_median_so_a_few_big_wiggles_cannot_hide_the_next_jump() {
+        let mut t = DriftTracker::new();
+        let mut clock = 0.0f32;
+        let mut level: i64 = 8_000;
+        for _ in 0..14 {
+            for d in [200, -200, 200, -200, 900, -900] {
+                level += d;
+                t.push(clock, StageId::HalSpk, level as u32);
+                clock += 1.0;
+            }
+        }
+        assert_eq!(
+            t.steps(StageId::HalSpk),
+            StepAccum::default(),
+            "前提：这些抖动一个都没越门限，它们只是**进了尺度窗口**"
+        );
+
+        level += 1_500; // 真跳变：> 5×中位数(1000)，< 5×均值(≈2150)
+        t.push(clock, StageId::HalSpk, level as u32);
+        let acc = t.steps(StageId::HalSpk);
+        assert_eq!(
+            acc.steps_up, 1,
+            "中位数门限看得见这次跳变；把 `scale()` 换成均值就看不见了，实得 {acc:?}"
+        );
+        assert_eq!(acc.net_samples, 1_500);
+    }
+
+    /// 源被换掉之后，新源不许继承旧源的**阶跃累积**——与不许继承斜率同一条纪律。
+    #[test]
+    fn a_replaced_source_does_not_inherit_the_previous_step_accumulation() {
+        let mut t = DriftTracker::new();
+        for i in 0..10 {
+            t.push(i as f32, StageId::HalSpk, 1_000);
+        }
+        for i in 10..20 {
+            t.push(i as f32, StageId::HalSpk, 20_000); // 一次巨跳
+        }
+        assert!(t.steps(StageId::HalSpk).is_accumulating(), "前提：旧源确实累积过");
+        t.retain_only(&[None, None, None]);
+        assert_eq!(
+            t.steps(StageId::HalSpk),
+            StepAccum::default(),
+            "换源必须断历史 —— 否则一条刚开的干净流一上来就报『正在累积』"
+        );
+        t.clear(StageId::HalSpk); // 幂等
+        assert_eq!(t.steps(StageId::HalSpk), StepAccum::default());
     }
 
     /// 在场的级**不能**被顺手清掉——否则每秒清一次，`drift_sps` 永远是 `None`，

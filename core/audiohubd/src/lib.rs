@@ -650,8 +650,63 @@ pub(crate) fn status_with_hal(
     let mut v = serde_json::to_value(info)?;
     if let Some(obj) = v.as_object_mut() {
         obj.insert("hal".to_string(), serde_json::to_value(hal_status(inner))?);
+        obj.insert("latency_guard".to_string(), latency_guard_status(inner)?);
     }
     Ok(v)
+}
+
+/// 棘轮治理（治法 A + B）的现场读数。**必须经 IPC 暴露**：这一整类病的特征就是
+/// 「除了水位读数本身没有一个数字会动」，上一轮花了整轮调查才把它挖出来。埋点留在
+/// 进程里不导出，等于下一次复发时又得重来一遍。
+///
+/// `hal` 里那份 `audiohub_ipc::HalStatus` 是**发布过的**结构，它的字段被
+/// `test/tests/hal_wiring.rs` 冻结；trim/underrun/skip 是新量，挂在自己的键下，
+/// 一个字段都不动老结构。
+fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
+    let hal = inner.hal().map(|h| {
+        let s = h.status();
+        serde_json::json!({
+            "trim": s.trim,
+            "underrun": s.underrun,
+            "skip_drained_frames": s.skip_drained_frames,
+        })
+    });
+    Ok(serde_json::json!({
+        "skip": {
+            "tx": engine::tx_skip_counters(),
+            "mixer": engine::mixer_skip_counters(),
+        },
+        // 发送侧：`tx_loop` 唤醒周期的二阶 DLL（`halbridge::dll`）。它是
+        // `hal_spk` 水位的**常规执行器**，`trim` 只是它够不着那一档的兜底。
+        //
+        // 现场怎么读这四个数：
+        // - `corr_ppm` 长期贴在 +500 或 −500 ⇒ 要么真有一大笔存量在被斜坡排空
+        //   （几分钟内应当回落），要么**误差符号写反了**（永不回落，且 `hal_spk`
+        //   同向发散）。这两种情形靠「`corr_ppm` 是否随时间回到 0 附近」区分。
+        // - 稳态下 `clamped` 仍在涨 ⇒ 观测噪声已经超出 ±0.8 ms 的线性区，
+        //   环路一直工作在压摆率限制段。
+        // - `resyncs` 涨得快 ⇒ 跳 tick / 驱动重附着在反复发生，病不在环路里。
+        // - `bw_hz` 应当在开流约 4 s 后从 0.5 落到 0.05；一直停在 0.5 说明
+        //   `resync` 被反复触发（与 `resyncs` 互相印证）。
+        //
+        // 没有这一项就没法判断环路到底在不在工作——`hal_spk.ms` 平稳既可能是
+        // 环路在起作用，也可能是这段时间恰好没有扰动。
+        "dll": engine::tx_dll_counters(),
+        "hal_spk": hal,
+        // 接收侧：`play_ring` 的跨时钟速率伺服。这一级是全链路上**唯一真正
+        // 跨时钟**的一段（mac 的发送节拍 vs Windows 声卡晶振，两个独立振荡器），
+        // 也是治法 A 落地之后唯一还在无界积累的病灶。
+        //
+        // 现场怎么读这三个数：
+        // - `corr_ppm` 稳态值 ≈ **两端晶振的实际失配**。它本身就是一个硬件读数。
+        // - `clamped` 持续增长 ⇒ 失配超出 ±500 ppm 可校正范围，该查设备而不是调参。
+        // - `resync_events` / `dev_underruns` 持续增长 ⇒ 目标水位定低了，
+        //   或者上游（JB / mixer）在周期性卡顿，环路只是在替它们收拾。
+        //
+        // 口径警告（进程级聚合、瞬时字段最后写者赢）见
+        // `audiohub_core::audio::PlayServoCounters` 的文档。
+        "play_servo": audio::play_servo_counters(),
+    }))
 }
 
 /// One verified + encrypted control connection to a peer.
@@ -1471,9 +1526,22 @@ pub(crate) fn build_session_infos(inner: &DaemonInner) -> Vec<SessionInfo> {
             .map(|(s, r)| (s as u8, (r.sent_out_name.clone(), r.sent_in_name.clone())))
             .collect()
     };
+    // 逐级延迟会计**全部**在装配层一次算完（见 `assemble_pipelines`）：
+    // N 条流进，N 条读数出，第 i 条只由第 i 条流自己的队列决定。
+    let pipelines = assemble_pipelines(
+        &inner.play_ring,
+        &inner.play_drift,
+        entries.iter().map(StreamLat::of).collect(),
+    );
+    // ⚠ 两个 `into_iter()` 都不是风格选择，是 R8 在这一层的封口：`entries` 与
+    // `pipelines` 双双被**移进**迭代器，于是闭包里的
+    // `entries.iter().filter_map(..).sum()` / `pipelines.iter().sum()`
+    // 根本编译不过。这一层此前握着一整个 `&[SessionEntry]`，跨流求和随手可写
+    // 而 253 条测试全绿——`compose_sum_ms` 只收标量封住的是合成函数，不是这里。
     entries
-        .iter()
-        .map(|e| {
+        .into_iter()
+        .zip(pipelines)
+        .map(|(e, pipeline)| {
             // The DEVICE this session exists for: a spk session carries what an
             // app played into the virtual speaker, a mic session feeds the
             // virtual microphone. Reporting one name for both would put the
@@ -1485,7 +1553,73 @@ pub(crate) fn build_session_infos(inner: &DaemonInner) -> Vec<SessionInfo> {
                     i.as_str()
                 }
             });
-            build_session_info(inner, e, &mix_freqs, mix_snap.as_deref(), dev)
+            build_session_info_with(inner, &e, &mix_freqs, mix_snap.as_deref(), dev, pipeline)
+        })
+        .collect()
+}
+
+/// 一条流里**与延迟有关的全部东西**——装配层看得见的唯一投影。
+///
+/// 刻意不含 `conn`、不含 `SessionEntry`：见 `assemble_pipelines` 的文档。
+/// 这也是这一层能被测试驱动的原因——`SessionEntry.conn` 要一条真 TCP 与一次
+/// 完整握手才造得出来，收它当参数就等于把装配层永久挡在测试之外。
+pub(crate) struct StreamLat<'a> {
+    is_send: bool,
+    tx: Option<&'a TxShared>,
+    rx: Option<&'a RxStream>,
+    /// **这一条流**的对端分项（R8：格子按流走，见 `PeerLatCell`）。
+    peer: Option<PeerLatSnapshot>,
+    /// 这条流所在**连接**的时钟估计。队列属于流，时钟属于主机。
+    clock: Option<ClockEstimate>,
+}
+
+impl<'a> StreamLat<'a> {
+    fn of(e: &'a SessionEntry) -> StreamLat<'a> {
+        StreamLat {
+            is_send: e.dir == DIR_SEND,
+            tx: e.tx.as_deref(),
+            rx: e.rx.as_deref(),
+            peer: e.peer_lat.snapshot(),
+            clock: lk(&e.conn.clock).estimate(),
+        }
+    }
+}
+
+/// 装配层：**N 条流进，N 条读数出，第 i 条只由第 i 条流的队列决定。**
+///
+/// # 这一层为什么必须单独存在（R8 的最后一处缺口）
+///
+/// 规格 §7.2 R8 说分项「只能按流合成，跨流求和会得到 N 倍假延迟」，而此前这条
+/// 约束的全部执行力只有两处：格子挂在 `SessionEntry` 上（没有可以 `values()`
+/// 求和的表），以及 `compose_sum_ms` 只收标量。两者封住的都是**合成函数**。
+/// 真正把 N 条流的读数摆在一起的是**装配循环**，而它手上握着整个
+/// `&[SessionEntry]`——`entries.iter().filter_map(|e| …local_ms).sum()` 写进去，
+/// 253 条测试没有一条会红，因为它们全都直接调 `build_pipeline_from`，绕过了这里。
+///
+/// 所以这一层收 `Vec<StreamLat>` 并 `into_iter()`：**`streams` 被移进迭代器**，
+/// 闭包里再写 `streams.iter()…sum()` 编译不过。加上
+/// `the_assembly_layer_gives_each_stream_its_own_depth_never_the_fleet_sum`
+/// 那条走这条真路径的测试，「按流一份」这次才既是结构性的、又是被测的。
+///
+/// # 为什么连 `attach_peer_and_net` 也在这里
+///
+/// 一条流的读数由三块拼成：本侧逐级 + 输出尾级 + 对端分项/网络段。三块若散在
+/// 三个调用点，「装配层」就不是一个可以被指着说「跨流求和只可能写在这里」的
+/// 地方。全部收进来之后，这一个函数就是全部的答案。
+fn assemble_pipelines(
+    play_ring: &StageSlot,
+    play_drift: &Mutex<DriftTracker>,
+    streams: Vec<StreamLat<'_>>,
+) -> Vec<Option<PipelineLatency>> {
+    streams
+        .into_iter()
+        .map(|s| {
+            let mut p = build_pipeline_from(s.is_send, s.tx, s.rx)?;
+            if let Some(rx) = s.rx {
+                attach_output_tails(play_ring, play_drift, rx, &mut p);
+            }
+            attach_peer_and_net(&mut p, s.peer, s.clock);
+            Some(p)
         })
         .collect()
 }
@@ -1995,12 +2129,35 @@ pub(crate) fn build_mix_health(inner: &DaemonInner) -> Option<MixHealth> {
     })
 }
 
+/// 单条会话的读数（`conn.rs` 的 `session.opened` 事件走这条路径）。
+///
+/// 它**也**走装配层，只是流的条数是 1：两个入口若各拼各的，事件里的读数与
+/// UI 上显示的就会不是同一个东西，而这种分歧只在两处截图并排放时才被发现。
 pub(crate) fn build_session_info(
     inner: &DaemonInner,
     e: &SessionEntry,
     mix_freqs: &[f32],
     mix_snap: Option<&[f32]>,
     hal_device: Option<&str>,
+) -> SessionInfo {
+    let pipeline = assemble_pipelines(&inner.play_ring, &inner.play_drift, vec![StreamLat::of(e)])
+        .pop()
+        .flatten();
+    build_session_info_with(inner, e, mix_freqs, mix_snap, hal_device, pipeline)
+}
+
+/// `build_session_info` 的全部内容，只是**逐级延迟会计由调用方给**。
+///
+/// 拆开的理由与本文件其它遥测函数同一条：让「谁算的这条读数」变成签名上的
+/// 事实。这一层收的是一条**已经算完**的 `PipelineLatency`，它没有任何机会
+/// 去看别的流——装配循环因此只剩搬运，不再做延迟算术。
+fn build_session_info_with(
+    inner: &DaemonInner,
+    e: &SessionEntry,
+    mix_freqs: &[f32],
+    mix_snap: Option<&[f32]>,
+    hal_device: Option<&str>,
+    pipeline: Option<PipelineLatency>,
 ) -> SessionInfo {
     let mut s = SessionStats {
         received: 0,
@@ -2091,16 +2248,10 @@ pub(crate) fn build_session_info(
     }
     // ---- P0a：逐级延迟会计（本侧）+ P0b/P1：对端分项与网络单程 ----
     //
-    // 输出尾级由 `local_pipeline` 负责：站点播放环只属于**真的把音频送到本机
-    // 扬声器**的流；桥接流走的是另一个 `AudioTx`（每个桥一个，同样 1 秒），
-    // 只写虚拟麦克风的流走的是 HAL mic ring（500 ms）——它们**也在送音频的路径
-    // 上**。三条尾级并行，`sum_stage_ms` 取 max，不相加。
-    s.pipeline = local_pipeline(inner, e).map(|mut p| {
-        // 对端分项按**流**取（`e.peer_lat`，规格 §7.2 R8），时钟/网络按**连接**
-        // 取（`e.conn.clock`）：队列属于流，时钟属于主机。
-        attach_peer_and_net(&mut p, e.peer_lat.snapshot(), lk(&e.conn.clock).estimate());
-        p
-    });
+    // 已经由装配层（`assemble_pipelines`）按流算完，这里只是原样装进去。
+    // **这一行不许出现任何算术**：一旦它开始加工延迟数字，加工的对象就可能
+    // 来自别的流，而 R8 说那是 N 倍假延迟。
+    s.pipeline = pipeline;
     // ---- P0q：音质三分量 ----
     if let Some(rx) = &e.rx {
         // 站点级重复流嫌疑只对**真的进了混音求和**的流成立。一条只喂虚拟麦克风
@@ -3431,6 +3582,82 @@ mod telemetry_tests {
         assert_eq!(p.confidence, LatConfidence::Unavailable);
     }
 
+    /// **本侧有一级读不到 ⇒ 总和 `None`，绝不按 0 计入。**
+    ///
+    /// 这条与 `an_unreadable_peer_stage_is_never_filled_with_zero` 严格对称，
+    /// 补的是同一条纪律在**本侧**的那一半。此前
+    /// `compose_sum_ms(local_ms?, net_ms?, peer_local_ms?)` 三个入参里只有
+    /// `peer_local_ms` 和 `net_ms` 有专门用例：把 `local_ms?` 改成
+    /// `local_ms.unwrap_or(0.0)` 全绿——一条「本侧测不到」的流会报出
+    /// 「总延迟 = 网络 + 对端」这个漂亮而错误的数，而且它比真值小得多，
+    /// 正好是这套遥测要消灭的那种失败形态。
+    ///
+    /// 今天难触发（`rate` 全来自真实设备）不是不测的理由：纪律的强度由它**最弱
+    /// 的那个入口**决定，而三个入口里有两个被测、一个没有，与它自称的
+    /// 「三项缺一即 None」不是一回事。
+    #[test]
+    fn an_unreadable_local_stage_is_never_filled_with_zero() {
+        let tx = TxShared::new();
+        tx.stages[0].store(Some(StageDepth::new(
+            StageId::SrcFifo,
+            9_600,
+            48_000,
+            48_000,
+            DropMode::Oldest,
+        )));
+        // 采集环读不到（`rate == 0`：设备速率还没协商出来 / 源刚被换掉）。
+        tx.stages[1].store(Some(StageDepth::new(
+            StageId::CapRing,
+            4_800,
+            96_000,
+            0,
+            DropMode::Newest,
+        )));
+        tx.stages[2].store(Some(StageDepth::send_pace()));
+
+        let mut p = build_pipeline_from(true, Some(&tx), None).expect("有分项");
+        assert!(p.local_ms.is_none(), "前提：本侧 Σ 里有洞");
+        assert!(!p.stages.is_empty(), "分项本身照样展示给排障看");
+
+        let cell = cell_reporting(&[180.0]);
+        attach_peer_and_net(&mut p, cell.snapshot(), Some(clock(580)));
+        assert_eq!(p.peer_local_ms, Some(180.0), "对端那一半自己是成立的");
+        assert_eq!(p.net_ms, Some(0.29), "网络段也是");
+        assert!(p.sum_ms.is_none(), "本侧缺一项 ⇒ 整体 None");
+        assert_ne!(p.sum_ms, Some(180.29), "更不许把本侧当 0 加进去");
+        assert_eq!(
+            p.confidence,
+            LatConfidence::Unavailable,
+            "对端**回传了**、网络段**有了**，只是本机测不出来 —— 这与「对端没回传」\
+             对应的是两个不同的用户动作，不能共用 LocalOnly"
+        );
+    }
+
+    /// **三个入参一视同仁**：任意一个缺席都必须让总和 `None`。
+    ///
+    /// 上面三条测试各自走一条真路径，这一条是它们的判据表：把
+    /// 「绝不用 0 填补」写成一个对称的、一眼可查的断言，谁给任何一个入参加上
+    /// `unwrap_or(0.0)`，这里当场红。
+    #[test]
+    fn every_one_of_the_three_terms_can_veto_the_total() {
+        let (l, n, pe) = (Some(205.0), Some(0.29), Some(180.0));
+        assert!(
+            (compose_sum_ms(l, n, pe).unwrap() - 385.29).abs() < 1e-9,
+            "三项齐了才有总和"
+        );
+        for (name, got, if_zeroed) in [
+            ("local_ms", compose_sum_ms(None, n, pe), 180.29),
+            ("net_ms", compose_sum_ms(l, None, pe), 385.0),
+            ("peer_local_ms", compose_sum_ms(l, n, None), 205.29),
+        ] {
+            assert_eq!(
+                got, None,
+                "{name} 缺席 ⇒ 总和必须 None；按 0 填补会给出 {if_zeroed} ms —— \
+                 一个比真值小得多、看起来却完全正常的数字"
+            );
+        }
+    }
+
     /// min-RTT 窗口还没收敛（约 8 s）⇒ `Converging`，UI 显示「测量中」。
     #[test]
     fn a_peer_report_without_a_converged_network_segment_reads_as_measuring() {
@@ -3562,6 +3789,172 @@ mod telemetry_tests {
         assert_eq!(n_fold, 2010.0);
         for p in [&pa, &pb] {
             assert_ne!(p.local_ms, Some(n_fold), "分项不可跨流求和");
+        }
+    }
+
+    // ------------------------------------------- R8：装配层（不是合成函数）
+
+    /// 一条只有 `src_fifo` 的发送流，深度由调用方给。
+    fn tx_with_fifo(samples: u32) -> TxShared {
+        let tx = TxShared::new();
+        tx.stages[0].store(Some(StageDepth::new(
+            StageId::SrcFifo,
+            samples,
+            48_000,
+            48_000,
+            DropMode::Oldest,
+        )));
+        tx.stages[2].store(Some(StageDepth::send_pace()));
+        tx
+    }
+
+    fn send_lat<'a>(tx: &'a TxShared, peer: Option<PeerLatSnapshot>, clock: Option<ClockEstimate>) -> StreamLat<'a> {
+        StreamLat { is_send: true, tx: Some(tx), rx: None, peer, clock }
+    }
+
+    /// **装配层：N 条流进，N 条读数出，谁的深度都不许流进别人的读数。**
+    ///
+    /// 上面那条 `fan_out_streams_…` 走的是 `build_pipeline_from`——一次一条流，
+    /// 手上根本没有第二条流可加，所以它证明不了这件事。真正把 N 条流的读数摆在
+    /// 一起的是**装配层**，而它此前零覆盖：在 `build_session_infos` 的循环里写
+    /// `entries.iter().filter_map(|e| …local_ms).sum()` 再把结果塞进每条会话，
+    /// 253 条测试没有一条会红。`compose_sum_ms` 只收标量封住的是合成函数，
+    /// 不是这里。
+    ///
+    /// 这条测试走的是那条**真路径**：`assemble_pipelines` 是生产代码里唯一算
+    /// 逐级延迟的地方，`build_session_infos`（N 条）与 `build_session_info`
+    /// （1 条，`conn.rs` 的 `session.opened` 事件）都只经它。
+    ///
+    /// 三条流深度**各不相同**是刻意的：全用同一个深度时，「每条报自己的」与
+    /// 「每条报平均值」给出同一个数，断言就分辨不出来了。
+    #[test]
+    fn the_assembly_layer_gives_each_stream_its_own_depth_never_the_fleet_sum() {
+        // 扇出：a、b 共用一个源（物理队列只有一份 ⇒ 报同一个数是**正确的**）。
+        let shared: audiohub_core::latency::SourceDepths = [
+            Some(StageDepth::new(StageId::SrcFifo, 48_000, 48_000, 48_000, DropMode::Oldest)),
+            None,
+        ];
+        let a = TxShared::new();
+        let b = TxShared::new();
+        engine::publish_send_stages(&a.stages, &shared);
+        engine::publish_send_stages(&b.stages, &shared);
+        a.stages[2].store(Some(StageDepth::send_pace()));
+        b.stages[2].store(Some(StageDepth::send_pace()));
+        // 第三条流是**另一个**源，深度差一个数量级。
+        let c = tx_with_fifo(4_800);
+
+        let play_ring = StageSlot::new();
+        let play_drift = Mutex::new(DriftTracker::new());
+        let out = assemble_pipelines(
+            &play_ring,
+            &play_drift,
+            vec![send_lat(&a, None, None), send_lat(&b, None, None), send_lat(&c, None, None)],
+        );
+
+        assert_eq!(out.len(), 3, "N 条流进，必须 N 条读数出，一一对应");
+        let ms: Vec<Option<f64>> = out.iter().map(|p| p.as_ref().and_then(|p| p.local_ms)).collect();
+        assert_eq!(
+            ms,
+            vec![Some(1005.0), Some(1005.0), Some(105.0)],
+            "每条流只报**自己**那一份：a/b 共用队列所以相同（R7/R8 的物理事实），\
+             c 是另一个源所以不同"
+        );
+
+        // 跨流求和会得到这些数，它们不该出现在任何一条流的读数里。
+        let fleet_sum = 1005.0 + 1005.0 + 105.0; // 2115
+        let fleet_avg = fleet_sum / 3.0; // 705
+        for (i, m) in ms.iter().enumerate() {
+            assert_ne!(*m, Some(fleet_sum), "第 {i} 条流报出了全站总和 —— 三倍假延迟");
+            assert_ne!(*m, Some(fleet_avg), "第 {i} 条流报出了全站均值 —— 同一类错误的平均版");
+        }
+    }
+
+    /// 对端分项也**按流落位**：一条流的对端读数不许渗进邻居的总和。
+    ///
+    /// 与上一条同一层、同一条路径，钉的是另一半——`attach_peer_and_net` 也在
+    /// 装配层里，所以「谁的对端」同样是这一层的责任。
+    #[test]
+    fn a_peer_report_on_one_stream_does_not_leak_into_its_neighbours() {
+        let a = tx_with_fifo(9_600); // 200 + 5 = 205 ms
+        let b = tx_with_fifo(9_600);
+        let cell = cell_reporting(&[180.0]);
+        let play_ring = StageSlot::new();
+        let play_drift = Mutex::new(DriftTracker::new());
+
+        let out = assemble_pipelines(
+            &play_ring,
+            &play_drift,
+            vec![
+                send_lat(&a, cell.snapshot(), Some(clock(580))), // 只有 a 收到了对端上报
+                send_lat(&b, None, Some(clock(580))),
+            ],
+        );
+        let (pa, pb) = (out[0].as_ref().unwrap(), out[1].as_ref().unwrap());
+        assert!((pa.sum_ms.unwrap() - 385.29).abs() < 1e-9, "a：205 + 0.29 + 180");
+        assert_eq!(pa.confidence, LatConfidence::LowerBound);
+        assert!(pb.sum_ms.is_none(), "b 没有对端上报 ⇒ 总和 None，不许借用邻居的");
+        assert!(pb.peer_local_ms.is_none());
+        assert_eq!(pb.confidence, LatConfidence::LocalOnly);
+        assert_eq!(pb.local_ms, Some(205.0), "b 自己那一半照样成立");
+    }
+
+    /// 站点级播放环（规格 §7.2 R7）：多条流报**同一个**读数是物理事实，
+    /// 而把它按流数乘出去是那个 N 倍错误的另一种写法。
+    ///
+    /// 走装配层，因为「同一个 `StageSlot` 被 N 条流读」这件事只在这一层发生。
+    #[test]
+    fn the_site_play_ring_is_reported_once_per_stream_never_multiplied() {
+        let (mut tx, mut sink) = audio::AudioTx::detached_for_test(48_000);
+        let play_ring = StageSlot::new();
+        let play_drift = Mutex::new(DriftTracker::new());
+        // 环里压 4800 个样本 = 100 ms（推之前发布，见 `ring_depth_before_push`）。
+        tx.push(&vec![0.25f32; 4_800]);
+        engine::publish_play_ring(&play_ring, &tx);
+        sink.drain(0);
+
+        let mk = || {
+            RxStream::new(
+                1,
+                &[0u8; 32],
+                &[0u8; 12],
+                None,
+                true,  // is_spk：真的往本机默认输出送
+                false, // monitor
+                None,
+                None,
+                "127.0.0.1:1".parse().unwrap(),
+            )
+        };
+        let (r1, r2) = (mk(), mk());
+        let out = assemble_pipelines(
+            &play_ring,
+            &play_drift,
+            vec![
+                StreamLat { is_send: false, tx: None, rx: Some(&r1), peer: None, clock: None },
+                StreamLat { is_send: false, tx: None, rx: Some(&r2), peer: None, clock: None },
+            ],
+        );
+        let ring_ms = |p: &Option<PipelineLatency>| {
+            p.as_ref()
+                .unwrap()
+                .stages
+                .iter()
+                .find(|s| s.id == "play_ring")
+                .expect("送本机输出的流必须有 play_ring 这一级")
+                .ms
+        };
+        assert_eq!(ring_ms(&out[0]), Some(100.0));
+        assert_eq!(
+            ring_ms(&out[1]),
+            ring_ms(&out[0]),
+            "同一个环，两条流读到同一个数 —— 这是对的"
+        );
+        for p in &out {
+            assert_eq!(
+                p.as_ref().unwrap().local_ms,
+                Some(100.0),
+                "……但每条流的 Σ 里它只能算**一份**（JB/PostMix 此刻都是 0）"
+            );
         }
     }
 
@@ -4130,6 +4523,106 @@ mod fault_injection {
             !p.stages.iter().any(|s| s.id == "play_ring"),
             "纯桥接流不经过站点播放环，不该凭空多一级"
         );
+    }
+
+    // ================================================================ 注入 E
+    //
+    // **跨时钟速率失配** —— 治法 A 落地之后全链路上唯一还在无界积累的病灶。
+    //
+    // 与注入 B 的区别：B 那条是「产销速率失配」在**同一台机器内部**的形态，
+    // 靠治法 A 收敛。E 是**真跨时钟**：写侧是 mac 的发送节拍经 JB 定拍之后的
+    // 本地 tick（严格 48000 样本/本地秒），读侧是 Windows 声卡的**晶振**
+    // （48000·(1+ε) 样本/物理秒）。两个独立振荡器，ε 不可能为零，而 `play_ring`
+    // 是 **drop-newest** —— 饱和之后丢的是最新的音频，听感是「迟到 + 周期性
+    // 断续」而不是「恒定迟到但连续」。
+    //
+    // 50 ppm ⇒ 180 ms/小时 ⇒ 1.000 秒的环约 5.4 小时灌满。
+    //
+    // 控制律与收敛性由 `audiohub-core` 的 `audio::rate_servo` 那一组测试钉死
+    // （那里有真的两个时钟与二十分钟虚拟时间）。**这里钉的是另一件事**：
+    // 病理与治法在**这条生产遥测链路**（`publish_play_ring` →
+    // `attach_output_tails` → `sum_stage_ms`）上报出来的是什么。
+
+    /// 一个 10 ms tick 的跨时钟播放：声卡按自己的晶振取，mixer 按本地时钟推。
+    /// `ppm > 0` = 声卡快。走的是 `push_at` / `drain_at`，即生产路径 + 虚拟时间。
+    fn drift_tick(
+        sink: &mut PlayRingSink,
+        tx: &mut AudioTx,
+        slot: &StageSlot,
+        t0: Instant,
+        tick: u64,
+        cb_period_ns: &mut f64,
+        next_cb_ns: &mut f64,
+    ) {
+        let end_ns = (tick + 1) * 10_000_000;
+        while *next_cb_ns <= end_ns as f64 {
+            sink.drain_at(512, t0 + Duration::from_nanos(*next_cb_ns as u64), None);
+            *next_cb_ns += *cb_period_ns;
+        }
+        let now = t0 + Duration::from_nanos(end_ns);
+        engine::publish_play_ring(slot, tx);
+        tx.push_at(&vec![0.25f32; F], now);
+    }
+
+    /// 跑 `secs` 秒虚拟时间，返回这条流每 30 秒上报一次的 `play_ring.ms`。
+    fn drift_trace(ppm: f64, servo: bool, secs: u64) -> Vec<f64> {
+        let (mut tx, mut sink) = if servo {
+            AudioTx::detached_for_test_with_servo(48_000)
+        } else {
+            AudioTx::detached_for_test(48_000)
+        };
+        let slot = StageSlot::new();
+        let drift = Mutex::new(DriftTracker::new());
+        let rx = spk_stream();
+        seed_upstream_50ms(&rx);
+        let t0 = Instant::now();
+        let mut cb = 512.0 / (48_000.0 * (1.0 + ppm * 1e-6)) * 1e9;
+        let mut next = 0.0f64;
+        let mut out = Vec::new();
+        for tick in 0..secs * 100 {
+            drift_tick(&mut sink, &mut tx, &slot, t0, tick, &mut cb, &mut next);
+            if (tick + 1) % 3_000 == 0 {
+                out.push(stage_of(&report(&slot, &drift, &rx), "play_ring").ms.expect("有读数"));
+            }
+        }
+        out
+    }
+
+    /// **修复前**：声卡晶振慢 200 ppm，遥测报出的 `play_ring` 单调爬升，
+    /// 而全链路其余五级纹丝不动 —— 这正是「除了水位读数本身没有一个数字会动」
+    /// 那一类病的签名。
+    #[test]
+    fn injection_e_without_the_servo_the_reported_play_ring_climbs_forever() {
+        let trace = drift_trace(-200.0, false, 600); // 10 分钟
+        assert!(
+            trace.windows(2).all(|w| w[1] > w[0]),
+            "无伺服 ⇒ 上报的 play_ring 只涨不落，got {trace:?}"
+        );
+        let climb = trace.last().unwrap() - trace[0];
+        // 9.5 分钟 × 200 ppm = 114 ms。留 ±25% 给相位锯齿（读侧 512 帧一块、
+        // 写侧 480 一块，裸深度带 ±10.7 ms 的抖动）。
+        assert!(
+            (climb - 114.0).abs() < 30.0,
+            "应当涨约 114 ms，实测 {climb:.0} ms（全程 {trace:?}）"
+        );
+    }
+
+    /// **修复后**：同样两个时钟，上报的 `play_ring` 稳在目标附近不再爬。
+    #[test]
+    fn injection_e_the_servo_pins_the_reported_play_ring_at_its_target() {
+        let trace = drift_trace(-200.0, true, 600);
+        let span = trace.iter().cloned().fold(f64::MIN, f64::max)
+            - trace.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(
+            span < 25.0,
+            "十分钟内上报读数的跨度必须收在相位锯齿量级，实测 {span:.0} ms（{trace:?}）"
+        );
+        for &ms in &trace {
+            assert!(
+                (10.0..80.0).contains(&ms),
+                "上报的 play_ring 应当停在几十毫秒的目标附近，实测 {ms:.0} ms（{trace:?}）"
+            );
+        }
     }
 
     /// 模式 B 的虚拟麦克风环（500 ms）。同样是一条不碰站点播放环的流。

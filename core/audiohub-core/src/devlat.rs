@@ -44,12 +44,40 @@
 //! 并且对**采集**端点还会触发 Win10+ 的麦克风隐私门（既可能弹窗，也可能直接
 //! `E_ACCESSDENIED`）。
 //!
-//! 所以 Windows 侧报的是**一个设备周期**，标 `Assumed`，并且它是**下限**：
-//! 共享模式的实际路径至少还有引擎自己那一档周期，加上端点硬件那一截——两者都在
-//! `GetStreamLatency` 里、都不在 `GetDevicePeriod` 里。把 2× 周期硬写进来同样是
-//! 编造，所以这里只报读到的那一份，靠 `Assumed` 把「这是模型不是真值」说出去。
-//! 要变成真值只有两条路：P2 的水印探针（规格 §3.1），或者用户明确授权后在第二轮
-//! 里做一次 `Initialize`+`GetStreamLatency` 的一次性标定。
+//! 所以 Windows 侧报的是**一个设备周期**，并且它是**下限**：共享模式的实际路径
+//! 至少还有引擎自己那一档周期，加上端点硬件那一截——两者都不在 `GetDevicePeriod` 里。
+//! 把 2× 周期硬写进来同样是编造，所以这里只报读到的那一份。
+//!
+//! ### 这个下限**低报 4.2 倍**（2026-08-04 于 30-win 实测，`Assumed` → `Unreliable`）
+//!
+//! 本模块此前把它标 `Assumed`（「按模型算的，可能偏几毫秒」）。实测否掉了那个量级：
+//!
+//! ```text
+//! GetDevicePeriod 的 default              =  480 帧 = 10.00 ms   ← 本模块报的
+//! written − IAudioClock::GetPosition()    = 2012 帧 = 41.92 ms   ← 写进去到播出来
+//!   其中 padding@event (=bufferSize−period) = 576 帧 = 12.00 ms
+//!   其中 引擎 + KS 传输 + 驱动 + 设备 `K`   = 1436 帧 = 29.92 ms
+//! ```
+//!
+//! `K` 用「把端点缓冲撑到 4.5 倍」验证死：1056 / 2400 / 4800 帧三档下 `K` 分别是
+//! 1436 / 1435 / 1435 帧——**纹丝不动**，所以 41.9 不是记账伪影。换一条完全不同的
+//! 硬件通路（NVIDIA HDMI 端点）`K = 1498 帧 = 31.2 ms`，只差 1.3 ms ⇒ 这 30 ms
+//! **不是设备特性，是 Windows 共享引擎 + KS 传输**。
+//! 全部证据：`docs/spec-playdev-measurement.md` §3。
+//!
+//! 按本模块 `worse()` 的定义，「API 答了，而且已知差着一个数量级」正是 `Unreliable`
+//! 而不是 `Assumed`。所以 Windows 的 `base_source` 改标 **`Unreliable`**：数照报
+//! （它是真下限，比没有强），但**永远带「≥」，永远不许把总和升级成精确值**。
+//!
+//! ⚠ 两条**不要再试**的路（都已实测证伪，别浪费下一轮）：
+//! - `GetStreamLatency`：这两个端点上**恒返回 0 hns**。`Initialize` 前后、事件驱动
+//!   与否、四种 client properties 组合，全是 0。这个 API 在盒内 USB/HDMI 类驱动上是废的。
+//! - 端点属性存储：73 条逐条 dump，**没有任何一条是延迟**。
+//!
+//! 要把它变成真值只剩一条路：开一条**共享模式静音流**，按
+//! `written − IAudioClock::GetPosition()` 做一次性标定（`GetPosition` 的 `qpcPosition`
+//! 实测陈旧度 ≈0，读数新鲜）。那违反纪律 2（要建流），属第二轮、需用户明确授权。
+//! 在那之前，`Unreliable` + 「≥」是唯一诚实的形态。
 //!
 //! WASAPI 也没有 macOS 那个直白的传输方式属性，所以「这是不是蓝牙/HDMI」要从端点
 //! 属性库里的 `PKEY_AudioEndpoint_FormFactor` + `PKEY_Device_EnumeratorName` 拼出来
@@ -60,6 +88,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::DeviceKind;
 use crate::latency::{DevLatency, LatSource};
+
+/// Windows 侧 `IAudioClient::GetDevicePeriod` 那个读数的可信度标签。
+///
+/// **故意抽成一个不带 `cfg` 的常量，而不是写死在 `#[cfg(windows)] mod imp` 里。**
+/// 理由是可测性：这个判定的依据是一次 30-win 实测，而**改坏它的人多半坐在 macOS 前**
+/// （本项目的主开发机）。写在 `imp` 里，改回 `Assumed` 在 mac 上一条测试都不会红，
+/// 要等到 Windows 那边跑测试才发现——而 Windows 侧的音频测试本来就跑得少。
+/// 抽出来之后 `a_windows_device_period_is_a_floor_not_a_truth` 在 mac 上就能盯住它。
+///
+/// 为什么是 `Unreliable` 而不是 `Assumed`：见文件头「这个下限低报 4.2 倍」。
+/// 一句话——`GetDevicePeriod` 报 10.00 ms，同一端点写到播实测 41.92 ms。
+/// `Assumed` 的语义是「按模型算的，可能偏几毫秒」，这里偏了 31.9 ms。
+pub const WINDOWS_DEVICE_PERIOD_SOURCE: LatSource = LatSource::Unreliable;
 
 /// 设备的物理连接方式。**只用来给读数定性**，不参与换算。
 ///
@@ -663,9 +704,10 @@ mod imp {
     //! vtable 布局是 mmdeviceapi.h / audioclient.h 的冻结 ABI；用不到的槽声明成
     //! `usize`，这样谁也没法从它们身上误调出去——与 `volume.rs` 同一套写法。
 
+    // `LatSource` 不再直接用：可信度标签走 `super::WINDOWS_DEVICE_PERIOD_SOURCE`
+    // 那个常量，好让 macOS 上的测试也能盯住它（见该常量的文档）。
     use super::{DevLatencyParts, DevTarget, Transport};
     use crate::audio::DeviceKind;
-    use crate::latency::LatSource;
     use std::ffi::c_void;
     use std::ptr;
 
@@ -1186,8 +1228,16 @@ mod imp {
             transport_code,
             device: name,
             // 读到的是引擎周期，不是这条路径的固有延迟：共享模式下引擎自己那一档
-            // 周期与端点硬件那一截都不在这个数里。故 Assumed，且是下限。
-            base_source: LatSource::Assumed,
+            // 周期、KS 传输、驱动队列、设备 FIFO 都不在这个数里。
+            //
+            // **`Unreliable` 不是 `Assumed`**：30-win 实测 `GetDevicePeriod` 报
+            // 10.00 ms，而同一端点写到播实测 41.92 ms —— 低报 4.2 倍，不是
+            // 「模型偏几毫秒」，是「API 答了且已知差着一个数量级」。
+            // 见文件头「这个下限低报 4.2 倍」与 `docs/spec-playdev-measurement.md` §3。
+            //
+            // 后果（必须保住）：`LatSource::is_exact()` 为假 ⇒ UI 永远带「≥」，
+            // 总和永远不许升级成 `LatConfidence::Full`。
+            base_source: super::WINDOWS_DEVICE_PERIOD_SOURCE,
             error: (rate == 0).then(|| "GetMixFormat failed; no engine sample rate".to_string()),
         }
     }
@@ -1446,8 +1496,64 @@ mod tests {
         assert_eq!(member.total().source, LatSource::Api);
     }
 
-    /// Windows 的 `Assumed` 不能被有线传输「洗白」成 `Api`，蓝牙也不能把
-    /// `Assumed` 洗成比 `Unreliable` 更好看的东西：取更不可信的那个。
+    /// **Windows 的 `device_period` 永远不许被当成真值。**
+    ///
+    /// 30-win 实测（`docs/spec-playdev-measurement.md` §3）：
+    /// `GetDevicePeriod` 报 480 帧 = 10.00 ms，而同一端点
+    /// `written − IAudioClock::GetPosition()` = 2012 帧 = **41.92 ms**。
+    /// 低报 4.2 倍——不是「模型偏几毫秒」（那是 `Assumed` 的语义），
+    /// 而是「API 答了且已知差着一个数量级」（`Unreliable` 的语义）。
+    ///
+    /// 这条与传输方式**无关**：ADAM D3V 是 USB、Odyssey G8 是 HDMI，
+    /// 两条毫无共同硬件的通路，`K` 只差 1.3 ms ⇒ 这 30 ms 是 Windows 共享引擎
+    /// 加 KS 传输，不是链路特性。所以哪怕传输方式是最「干净」的 `BuiltIn`，
+    /// 这个读数也必须带「≥」。
+    ///
+    /// 注入对照（**在 macOS 上就能红**，这是把标签抽成
+    /// [`WINDOWS_DEVICE_PERIOD_SOURCE`] 的全部理由）：
+    /// 把那个常量改回 `LatSource::Assumed` 或 `Api` ⇒ 本条红。
+    #[test]
+    fn a_windows_device_period_is_a_floor_not_a_truth() {
+        assert_eq!(
+            WINDOWS_DEVICE_PERIOD_SOURCE,
+            LatSource::Unreliable,
+            "实测低报 4.2 倍（10.00 vs 41.92 ms）⇒ 不是 Assumed 那个量级的偏差"
+        );
+        let mut win = parts(&[("device_period", 480)], 48_000);
+        win.base_source = WINDOWS_DEVICE_PERIOD_SOURCE;
+        for t in [Transport::BuiltIn, Transport::Usb, Transport::Hdmi, Transport::Bluetooth] {
+            win.transport = t;
+            let total = win.total();
+            assert_eq!(total.ms(), Some(10.0), "{t:?}：读数本身照报，它是个真下限");
+            assert!(
+                !total.source.is_exact(),
+                "{t:?}：10.00 ms 对着实测的 41.92 ms —— 绝不许清掉「≥」"
+            );
+        }
+    }
+
+    /// Windows 后端**自己**报的标签必须是 `Unreliable`。
+    ///
+    /// 上一条测的是「拿到 `Unreliable` 之后不会被洗白」，这一条测的是
+    /// 「后端确实给了 `Unreliable`」。两条缺一条，改坏了都不会红。
+    /// 在 macOS 上编译掉——`cargo check --target x86_64-pc-windows-gnu --tests` 覆盖它。
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_backend_disowns_its_own_number() {
+        for p in [default_output(), default_input()] {
+            if p.parts.is_empty() {
+                continue; // 没有默认设备的机器：本条无从判定，交给冒烟测试
+            }
+            assert_eq!(
+                p.base_source, WINDOWS_DEVICE_PERIOD_SOURCE,
+                "后端绕过了那个常量，mac 上的测试就盯不住它了: {p:?}"
+            );
+            assert!(!p.total().source.is_exact());
+        }
+    }
+
+    /// `Assumed` 不能被有线传输「洗白」成 `Api`，蓝牙也不能把 `Assumed` 洗成比
+    /// `Unreliable` 更好看的东西：取更不可信的那个。
     #[test]
     fn the_less_trustworthy_label_wins() {
         assert_eq!(worse(LatSource::Api, LatSource::Assumed), LatSource::Assumed);

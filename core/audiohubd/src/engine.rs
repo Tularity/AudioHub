@@ -160,15 +160,69 @@ static MIX_SKIP: SkipCell = SkipCell::new();
 // 网络抖动统计量（RFC 3550 一阶差分 EWMA，实测 p95 = 0.18 ms）**看不见这件事**：
 // EWMA 把 1600 个包里的一个尖峰平均掉了。判据和被判的量不是一回事。
 //
+// # 两条循环量的**不是同一个东西**（2026-08-04 实测后修正）
+//
+// 同一个 `LateCell` 类型，两个测点，两套语义。混为一谈会读出相反的结论：
+//
+// | | `TX_LATE`（`tx_loop`） | `MIX_LATE`（`mixer_loop`） |
+// |---|---|---|
+// | 测点 | 循环顶部，**等待之前** | `sleep` **之后**（`sleep_until`） |
+// | 量的是 | 「这一 tick 相对计划整体推迟了多久」= 上一 tick 的活 + 抢占 − 一个 tick | 「醒来时刻比计划晚了多久」= 纯唤醒过冲 |
+// | 服务于 | `jitter_buf` 深度（对端 JB 净排空 Δ/10 帧，语义就是整 tick） | `play_ring` 目标水位里那 5 ms `margin` |
+// | 死区 | **一整个 tick（10 ms）** —— 这正是它要的 | **无** |
+// | 典型量级 | mac 现场 6.3 h：max 126.7 ms、均值 4.7 ms/tick | 30-win 探针：p50 0.45 / p99.9 1.21 / max 1.67 ms |
+//
+// ## `MIX_LATE` 此前的测点错在哪：**一个 10 ms 的死区，恰好盖住了要量的东西**
+//
+// 它曾经也在等待之前测。`tick` 在循环末尾 +1，所以那个位置量到的是
+//
+// ```text
+// max(0, 上一 tick 的唤醒过冲 + 上一 tick 的活 − 10 ms)
+// ```
+//
+// —— **一个带 10 ms 死区的「超支」指标**，只在上一 tick 的活撑破了整个 tick 时才动。
+//
+// ⚠ **不要把它说成「恒等于 0」**：mac 现场跑 6.3 h 的真实读数是
+// `mixer.max_us = 64737`（64.7 ms），它记的是真实发生过的**卡顿**。
+// 30-win 探针那 27000 个 tick 之所以**全是 0**，是因为探针的 tick 里**没有活**
+// （`docs/spec-playdev-measurement.md` §4.4）。
+//
+// 真正的缺陷是**量程错位**：`margin` 关心的是唤醒过冲，实测量级 0.02–1.67 ms，
+// **整个落在那 10 ms 死区里面**，所以旧测点在原理上就看不见它。
+// 判据是「回调那一刻环里够不够 `block`」——回调迟到多少就吃掉多少余量，
+// 与「整 tick 有没有超支」无关。
+//
+// 后果是**双向**的误读，两边都错：
+// - 读到 `max_us = 0`（空闲机）⇒「margin 白留了」——实测需要 2×1.665 = 3.33 ms，现有 5 ms 是对的；
+// - 读到 `max_us = 64737`（mac 现场）⇒「margin 差着 13 倍，赶紧加」——那 64.7 ms 是一次卡顿，
+//   卡顿由 `MIX_SKIP` 和 JB 自愈接管，不是 `margin` 该覆盖的量。
+//
+// 新测点在唤醒之后，**死区没了**，两种量都还在：卡顿时 `sleep_until` 立刻返回全额迟到，
+// 准时时返回亚毫秒过冲。⚠ 因此 `late_us_sum / ticks` 的含义变了
+// （旧：平均超支，稳态≈0；新：平均唤醒过冲，≈0.45 ms）——**新旧读数不可并列比较**。
+//
+// `TX_LATE` 的测点**保持不变**：那一处的 10 ms 死区正是对端 JB 要的语义
+// （停顿 Δ ⇒ JB 净排空 Δ/10 帧），见其代码处注释。
+//
 // # 为什么它不违反「测量不许改变被测对象」
 //
-// 每 tick 的成本是：一次 `saturating_duration_since`（那个 `Instant::now()`
-// **两条循环本来就要取**，直接复用，没有新增取时钟）、一次至多 11 步的常量
-// 数组比较、两次 relaxed 原子加、一次 `fetch_max`。零分配、零锁、零系统调用。
+// 每 tick 的成本是：一次 `saturating_duration_since`、一次至多 11 步的常量数组比较、
+// 两次 relaxed 原子加、一次 `fetch_max`。零分配、零锁、零系统调用。
+// `tx_loop` 复用循环本来就要取的那个 `Instant::now()`，不新增取时钟；
+// `mixer_loop` 在**准时**的那条路径上多取一次时钟（睡醒后必须重新读，否则测的还是睡前），
+// 迟到那条路径不多取。`Instant::now()` 是 `mach_absolute_time` / `QueryPerformanceCounter`，
+// 数十纳秒，占 10 ms 节拍的 1e-5 —— 如实写在这里，不假装是零。
 
 /// 直方图的桶上界，**毫秒**。边界不是随手取的：`10/20/30/40/50` 正好是
 /// JB 深度 1/2/3/4/5 帧所能扛住的停顿长度，所以「累计尾 ≥ 40 ms 的比例」
 /// 可以直接读成「`min_target = 4` 时的欠载率上界」。
+///
+/// ⚠ **这套边界是照 `TX_LATE` 的量程定的。** `MIX_LATE` 量的是唤醒过冲，
+/// 30-win 实测全分布落在 0.02–1.67 ms —— 也就是几乎全部挤在第 0 桶（`<1 ms`）。
+/// 读 `mixer` 那一条时**桶没有分辨率，要看 `max_us` 与 `late_us_sum / ticks`**
+/// （微秒精度，`play_ring` 的 `margin` 判据要的正是 `max_us`）。
+/// 不为它单独加一套更细的边界：那要么给 `LateCounters` 加一个变体、要么让两条
+/// 循环的 `edges_ms` 不同——前者是类型分叉，后者会让并排读数的人误以为同刻度。
 const LATE_EDGES_MS: [u64; 11] = [1, 2, 5, 10, 15, 20, 30, 40, 50, 70, 100];
 /// 桶数 = 边界数 + 1（最后一个是 `>100 ms`，与 `SkipCell` 的判据接壤）。
 const LATE_BUCKETS: usize = LATE_EDGES_MS.len() + 1;
@@ -253,14 +307,52 @@ pub fn tx_late_counters() -> LateCounters {
     TX_LATE.snapshot()
 }
 
-/// `mixer_loop` 的调度迟到分布（IPC / probe 用）。
+/// `mixer_loop` 的**唤醒过冲**分布（IPC / probe 用）。
 ///
 /// 这一条在 **Windows** 上尤其要紧：`play_ring` 的目标水位 `dac + block + margin`
-/// 里那 5 ms 的 `margin` 就是留给这条循环迟到的，而它此前从未被测过。
-/// 把目标从 25 ms 降到 20 ms 会把环内谷值从 6.4 ms 压到 1.4 ms ——
-/// **在这条尾被测出来之前，那一步是在赌每一个回调。**
+/// 里那 5 ms 的 `margin` 就是留给这条循环迟到的。
+///
+/// # 怎么读它（2026-08-04 起）
+///
+/// 看 **`max_us`**，不要看桶——见 [`LATE_EDGES_MS`]。判据是 2× 超订：
+/// `需要的 margin = 2 × max`。30-win 独立探针（9000 tick × 3 臂交错）实测
+/// max = 1.665 ms ⇒ 需要 3.33 ms，**现有 5 ms 是对的，可削空间只有 1.7 ms**
+/// （占 `sum_ms` 的 1.5%），`docs/spec-latency-floor.md` §2.5.3 已据此判定不削。
+///
+/// # 它此前带一个 10 ms 死区，恰好盖住了要量的东西
+///
+/// 测点在 `sleep` **之前**，量到的是「上一 tick 的活 + 过冲 − 一个 tick」并钳零
+/// —— 一个**带 10 ms 死区的超支指标**。而唤醒过冲实测 0.02–1.67 ms，
+/// **整个落在死区里**，所以它在原理上量不到 `margin` 关心的东西。
+///
+/// 现测点在 [`sleep_until`] 内、唤醒之后，死区没了。⚠ **新旧读数不可并列比较**：
+/// `late_us_sum / ticks` 的含义从「平均超支（稳态≈0）」变成「平均唤醒过冲（≈0.45 ms）」。
+/// 判定与证据见 `docs/spec-playdev-measurement.md` §4.4 与 [`LateCell`] 上方的对照。
 pub fn mixer_late_counters() -> LateCounters {
     MIX_LATE.snapshot()
+}
+
+/// 睡到 `deadline`，返回**唤醒之后实测**的迟到量（早到不可能，见下）。
+///
+/// 存在的唯一理由是把「等待」和「量迟到」绑成一个不可拆开的动作。
+/// 拆开写过一次，测点落在了 `sleep` 之前 —— 那等于给指标加了一个 10 ms 死区，
+/// 而要量的唤醒过冲（0.02–1.67 ms）整个在死区里面
+/// （`docs/spec-playdev-measurement.md` §4.4，以及 [`LateCell`] 上方的对照）。
+///
+/// 两条路径的取时钟次数不同，这是刻意的：
+/// - **已经迟到**（`now >= deadline`）：不睡，`now − deadline` 就是答案，不再取第二次；
+/// - **准时**：睡到 `deadline`，**再取一次**。`std::thread::sleep` 的契约是「至少睡
+///   这么久」，所以醒来时刻严格 ≥ `deadline`，返回值恒 > 0（实测 0.02–1.67 ms）。
+///   这一次多出来的时钟读数是这个测点的全部成本，数十纳秒 / 10 ms 节拍。
+///
+/// `saturating_duration_since` 只是防御性写法：按上面两条，两个分支都不可能为负。
+fn sleep_until(deadline: Instant) -> Duration {
+    let now = Instant::now();
+    if now >= deadline {
+        return now.saturating_duration_since(deadline);
+    }
+    std::thread::sleep(deadline - now);
+    Instant::now().saturating_duration_since(deadline)
 }
 
 /// 发送调度器跳过了多少 tick（IPC / probe 用）。
@@ -1197,9 +1289,15 @@ pub(crate) fn tx_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<TxCmd>) {
         // 的丢弃。`corr ≡ 1` 时下式与旧的 `start.elapsed()/FRAME_MS` **逐位相等**
         //（`next_time = start + tick×10ms` ⇒ `tick + (elapsed − tick×10)/10`）。
         let late = Instant::now().saturating_duration_since(next_time);
-        // 调度迟到直方图。**位置就是这里**：`next_time` 是本 tick 的计划时刻，
-        // 差值即「上一 tick 的活 + 任何抢占」把我们推迟了多久。放到下面等待循环
-        // 之后再量就恒等于 0（那时我们刚好等到了 deadline），量了个寂寞。
+        // 调度迟到直方图。**位置就是这里，且与 `MIX_LATE` 刻意不同**：
+        // `next_time` 是本 tick 的计划时刻，差值即「上一 tick 的活 + 任何抢占」
+        // 把我们推迟了多久。这一条服务于对端 `jitter_buf` —— 发送端停顿 Δ ⇒
+        // 对端 JB 在 Δ 里净排空 Δ/10 帧，**整 tick 正是要的语义**。
+        //
+        // 挪到下面等待循环之后，量到的就变成纯唤醒过冲（亚毫秒），
+        // 那是 `play_ring` 的 `margin` 关心的量、不是这一条关心的量。
+        // `mixer_loop` 需要的恰好是后者，所以它走 `sleep_until`；
+        // 两个测点量的不是同一个东西，见 [`LateCell`] 上方的对照表。
         TX_LATE.record(late);
         let late_ms = late.as_millis() as u64;
         let behind = tick + late_ms / FRAME_MS;
@@ -1844,13 +1942,9 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
             tick = behind;
         }
         let deadline = start + Duration::from_millis(tick * FRAME_MS);
-        let now = Instant::now();
-        // 调度迟到直方图（见 [`LateCell`]）。这个 `Instant::now()` 本来就要取，
-        // 直接复用；`saturating_duration_since` 让「早到」记 0 而不是回绕。
-        MIX_LATE.record(now.saturating_duration_since(deadline));
-        if now < deadline {
-            std::thread::sleep(deadline - now);
-        }
+        // 唤醒过冲直方图（见 [`LateCell`] 与 [`sleep_until`]）。**测点必须在等待
+        // 之后**：`margin` 买的是「醒来晚了多少」，不是「整 tick 丢没丢」。
+        MIX_LATE.record(sleep_until(deadline));
         let streams: Vec<Arc<RxStream>> = rd(&inner.rx_table).values().cloned().collect();
         if streams.is_empty() {
             // an open bridge keeps being written to even before its stream's
@@ -2178,6 +2272,67 @@ mod tests {
             s.late_us_sum,
             probes_us.iter().sum::<u64>(),
             "迟到总量漏掉了某些样本"
+        );
+    }
+
+    /// **`sleep_until` 必须在唤醒之后量，不能在睡之前量。**
+    ///
+    /// 这条守的是 `docs/spec-playdev-measurement.md` §4.4 记下的那个缺陷：
+    /// 测点落在 `sleep` 之前，量到的是 `max(0, 上一 tick 的活 + 过冲 − 一个 tick)`
+    /// —— **一个带 10 ms 死区的超支指标**。而 `play_ring` 的 `margin` 关心的
+    /// 唤醒过冲实测 0.02–1.67 ms，**整个落在死区里面**，原理上就量不到。
+    /// 30-win 探针（tick 内无活）27000 次全记 0，正是这个死区的极端形态。
+    ///
+    /// 注入对照：把 `sleep_until` 改回「先量后睡」（即在 `now < deadline` 时
+    /// 返回 `now.saturating_duration_since(deadline)` == 0），本条**必红**。
+    #[test]
+    fn sleeping_until_a_deadline_measures_the_overshoot_after_waking() {
+        for i in 0..5 {
+            let deadline = Instant::now() + Duration::from_millis(2);
+            let late = sleep_until(deadline);
+            let after = Instant::now();
+            // 关键断言：睡前量的版本在这条路径上恒等于 0。
+            // `std::thread::sleep` 的契约是「至少睡这么久」⇒ 醒来严格晚于
+            // deadline ⇒ 过冲严格 > 0。实测量级 0.02–1.67 ms，不是 1 ns 级的擦边。
+            assert!(
+                late > Duration::ZERO,
+                "第 {i} 次：唤醒过冲记成了 0 —— 测点回到了 sleep 之前"
+            );
+            // 返回值必须是「唤醒时刻 − deadline」，那一刻不晚于现在。
+            assert!(
+                late <= after.saturating_duration_since(deadline),
+                "第 {i} 次：返回值 {late:?} 超过了到现在为止的全部经过时间"
+            );
+            // 而且真的等到了 deadline（没有提前返回）。
+            assert!(after >= deadline, "第 {i} 次：还没到 deadline 就返回了");
+        }
+    }
+
+    /// **已经错过的 deadline：如实报出全部迟到量，且不再睡。**
+    ///
+    /// 注入对照：
+    /// - 无条件 `sleep(deadline − now)` 之类的写法在这里会下溢 / panic 或睡满，
+    ///   `elapsed < 5 ms` 那一条会红；
+    /// - 把返回值钳成 0（「迟到当没发生」）会让第一条红。
+    ///
+    /// 这一支才是 `LateCell` 尾部桶（≥10 ms）的来源；准时那一支只喂第 0 桶。
+    #[test]
+    fn a_deadline_already_missed_reports_the_whole_lateness_without_sleeping() {
+        let deadline = Instant::now() - Duration::from_millis(30);
+        let t0 = Instant::now();
+        let late = sleep_until(deadline);
+        let elapsed = t0.elapsed();
+        assert!(
+            late >= Duration::from_millis(29),
+            "迟到 30 ms 却只报了 {late:?}"
+        );
+        assert!(
+            late < Duration::from_millis(60),
+            "迟到量 {late:?} 远超实际，基准点取错了"
+        );
+        assert!(
+            elapsed < Duration::from_millis(5),
+            "已经迟到还睡了 {elapsed:?} —— 迟到会被自己放大"
         );
     }
 

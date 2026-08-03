@@ -64,6 +64,31 @@ pub enum LatSource {
     Unavailable,
 }
 
+impl LatSource {
+    /// 这个读数够不够格把总和从「≥ N ms」升级成一个**精确**的端到端物理量？
+    ///
+    /// **只有 `Api`。** 另外三个都不行，而且理由各不相同：
+    ///
+    /// | 取值 | 为什么仍是下限 |
+    /// |---|---|
+    /// | `Assumed` | 按模型算的，不是读来的 |
+    /// | `Unreliable` | API 答了，但已知差着一个数量级。**Windows 上实测低报 4.2 倍**：`GetDevicePeriod` 报 10.00 ms，同一端点写到播 41.92 ms（`docs/spec-playdev-measurement.md` §3） |
+    /// | `Unavailable` | 根本没有数，`ms()` 已经是 `None` |
+    ///
+    /// 存在的理由是它**将来会被误用**。`audiohubd` 那边接设备固有延迟的说明里
+    /// 曾写着「设备项齐全后它不再是下限」——照字面做就会把 Windows 那 10 ms
+    /// 当真值加进去，报出「121 ms」而真值 153 ms，且不带「≥」。
+    /// 那正是 `plan.md` §7.6 第 6 条（不许拿不完整的量冒充端到端物理量）
+    /// 要杀死的形态。把判据写成一个有名字的谓词，比写在注释里更难绕过。
+    ///
+    /// ⚠ 它是**必要条件不是充分条件**：即使两侧都 `Api`，还得先让求和真的把
+    /// 设备项加进去（今天的 `compose_sum_ms` 没加）。少做那一步就升级，
+    /// 是同一个谎的另一种拼法。
+    pub fn is_exact(self) -> bool {
+        matches!(self, LatSource::Api)
+    }
+}
+
 /// 声卡自身的固有延迟。P0 阶段恒为 `Unavailable`（平台查询是 P1 的活），
 /// 保留类型是为了让「缺项 ⇒ 总和 None ⇒ UI 带『≥』」这条链路现在就成立，
 /// 而不是等 P1 再回来补一遍判空。
@@ -1855,5 +1880,37 @@ mod tests {
         assert_eq!(j(&DropMode::None), "\"none\"");
         assert_eq!(serde_json::to_string(&LatSource::Unreliable).unwrap(), "\"unreliable\"");
         assert_eq!(serde_json::to_string(&LatSource::Unavailable).unwrap(), "\"unavailable\"");
+    }
+
+    /// **「有值」和「是真值」是两件事，只有后者能清掉「≥」。**
+    ///
+    /// 这条守 [`LatSource::is_exact`]。它防的是一个具体的、已经写进文档过的错误
+    /// 判据：「设备固有延迟项**齐全**后总和就不再是下限」。
+    /// 30-win 实测把这个判据打穿了 —— Windows 的 `GetDevicePeriod` 报 10.00 ms
+    /// （齐全、非 `Unavailable`、`ms()` 有值），而同一端点写到播实测 41.92 ms。
+    /// 照「齐全就升级」做，用户会看到一个不带「≥」的 121 ms，真值 153 ms。
+    ///
+    /// 注入对照：
+    /// - `is_exact` 放宽成 `!matches!(self, Unavailable)`（即「有值就算数」）⇒ 本条红；
+    /// - 放宽成 `matches!(self, Api | Assumed)`（即「只排除已知少报的」）⇒ 本条红。
+    #[test]
+    fn having_a_number_is_not_the_same_as_having_a_true_number() {
+        // Windows 形态：读到了 480 帧 = 10 ms，非 Unavailable，`ms()` 有值……
+        let win = DevLatency { frames: 480, rate: 48_000, source: LatSource::Unreliable };
+        assert_eq!(win.ms(), Some(10.0), "它确实有值 —— 所以「齐全了吗」这个判据答『是』");
+        assert!(
+            !win.source.is_exact(),
+            "……但实测真值 41.92 ms，低报 4.2 倍：它永远只能当下限"
+        );
+
+        // 四个取值的完整真值表，一个都不许漏。
+        assert!(LatSource::Api.is_exact());
+        assert!(!LatSource::Assumed.is_exact());
+        assert!(!LatSource::Unreliable.is_exact());
+        assert!(!LatSource::Unavailable.is_exact());
+
+        // `Unavailable` 那一格双重设防：既不 exact，也根本没有毫秒值。
+        assert_eq!(DevLatency::unavailable().ms(), None);
+        assert!(!DevLatency::unavailable().source.is_exact());
     }
 }

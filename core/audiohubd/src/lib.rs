@@ -738,18 +738,41 @@ fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
         // ⇒ 对端 JB 在 Δ ms 里净排空 Δ/10 帧（对端 `mixer_loop` 照常每 10 ms
         // pop 一次）⇒ **不欠载的充要条件是 JB 深度 ≥ Δ**。
         //
-        // 现场怎么读：把 `buckets` 从尾部往前累加，除以 `ticks`，就得到
-        // 「P(迟到 > 边界)」。`edges_ms` 里的 10/20/30/40/50 正好对应 JB
-        // 深度 1/2/3/4/5 帧，所以 `P(迟到 > 40 ms)` 可以直接读成
+        // ⚠ **`tx` 和 `mixer` 量的不是同一个东西，读法也不同**（对照表见
+        // `engine.rs` 的 `LateCell` 上方）：`tx` 在等待**之前**量，是整 tick 的
+        // 推迟量；`mixer` 在唤醒**之后**量，是纯唤醒过冲。
+        //
+        // ## `tx`：看桶
+        //
+        // 把 `buckets` 从尾部往前累加，除以 `ticks`，就得到「P(迟到 > 边界)」。
+        // `edges_ms` 里的 10/20/30/40/50 正好对应 JB 深度 1/2/3/4/5 帧，
+        // 所以 `P(迟到 > 40 ms)` 可以直接读成
         // 「`min_target = 4` 时由发送端调度造成的欠载率上界」。
         //
-        // - `tx.max_us` 远大于 `tx.late_us_sum / tx.ticks` ⇒ 尾很陡，
-        //   那是**事件尺寸分布**（被抢占 / 阻塞的系统调用），不是恒定速率失配。
-        //   恒定失配给的是线性关系，陡尾不是——这条区别决定了该去修调度还是
-        //   去修重采样。
-        // - `mixer` 这一条在 Windows 上是 `play_ring` 那 5 ms `margin` 的判据：
-        //   目标从 25 降到 20 ms 会把环内谷值从 6.4 压到 1.4 ms，
-        //   **在 `mixer.max_us` 被测出来之前那一步是在赌每一个回调**。
+        // `tx.max_us` 远大于 `tx.late_us_sum / tx.ticks` ⇒ 尾很陡，
+        // 那是**事件尺寸分布**（被抢占 / 阻塞的系统调用），不是恒定速率失配。
+        // 恒定失配给的是线性关系，陡尾不是——这条区别决定了该去修调度还是
+        // 去修重采样。
+        //
+        // ## `mixer`：看 `max_us`，**不要看桶**
+        //
+        // 它是 Windows 上 `play_ring` 那 5 ms `margin` 的判据，判据是 2× 超订：
+        // `需要的 margin = 2 × max`。30-win 独立探针实测 max = 1.665 ms
+        // ⇒ 需要 3.33 ms，现有 5 ms 是对的，可削空间只有 1.7 ms（占 `sum_ms`
+        // 的 1.5%），`docs/spec-latency-floor.md` §2.5.3 已据此判定**不削**。
+        //
+        // 桶在这一条上没有分辨率：唤醒过冲实测全分布落在 0.02–1.67 ms，
+        // 几乎全部挤在第 0 桶（`<1 ms`）。要精度就看 `max_us` 与
+        // `late_us_sum / ticks`（微秒）。
+        //
+        // ⚠ 2026-08-04 之前 `mixer` 的测点在 `sleep` **之前**，那等于给它加了
+        // **一个 10 ms 死区**（量的是「上一 tick 的活 + 过冲 − 一个 tick」），
+        // 而唤醒过冲 0.02–1.67 ms **整个落在死区里面**。
+        // 那时读到的 `mixer.max_us` 是**卡顿**读数（mac 现场 6.3 h 报 64.7 ms），
+        // 不是 margin 读数 —— 两个方向都会被误读：空闲机读到 0 ⇒「margin 白留了」，
+        // 现场读到 64.7 ⇒「margin 差 13 倍」，**两个结论都是错的**。
+        // 测点已挪到唤醒之后（`engine.rs` 的 `sleep_until`），死区没了。
+        // **旧读数不可与新读数并列比较**：`late_us_sum / ticks` 的含义变了。
         "sched_late": {
             "tx": engine::tx_late_counters(),
             "mixer": engine::mixer_late_counters(),
@@ -2085,11 +2108,20 @@ fn compose_sum_ms(
 ///
 /// ⚠ **接上设备固有延迟时必须同时改三处**，少改一处就是一个静默的谎：
 /// 1. `compose_sum_ms`：把 `dev` / `peer_dev` 的 ms 加进总数；
-/// 2. 这里的 `LowerBound`：设备项齐全后它不再是下限；
+/// 2. 这里的 `LowerBound`：**只有当两侧 dev 都 `LatSource::is_exact()`（即都是
+///    `Api`）时**才谈得上不再是下限；
 /// 3. `the_total_is_both_sides_plus_exactly_one_network_segment` 那条测试。
 ///
 /// 第 3 条里有一句 `assert!(p.dev…ms().is_none())`，它就是这个前提的看门狗：
 /// 设备项一旦真有值，那条测试会先红，把改动逼到该改的两个地方去。
+///
+/// ⚠⚠ **第 2 条此前写的是「设备项齐全后它不再是下限」，那句话会直接制造一个谎。**
+/// 2026-08-04 于 30-win 实测：Windows 侧 `devlat` 报的 `GetDevicePeriod`
+/// = 10.00 ms，而同一端点「写进去到播出来」实测 **41.92 ms**（低报 4.2 倍，
+/// `docs/spec-playdev-measurement.md` §3）。照原话做 ⇒ 报出「121 ms」且不带「≥」，
+/// 而真值 ≈153 ms。所以 `devlat` 的 Windows 路径已改标 `Unreliable`，
+/// 而**判据必须落在 `is_exact()` 上，不是落在「有没有值」上**：
+/// 「有值」和「是真值」是两件事，这一整套遥测的存在理由就是把它们分开。
 ///
 /// θ 未收敛**不**单独降级：本期显示的 `sum_ms` 里没有 θ 的份（它只服务于 P1
 /// 的 `e2e_ms`）。拿一个与显示值无关的量去把读数标成「测量中」，是另一种形式
@@ -3923,6 +3955,18 @@ mod telemetry_tests {
             "设备固有延迟已经有值了 ⇒ 必须同时改 compose_sum_ms（把它加进总数）\
              与 attach_peer_and_net 的 confidence 梯子；见后者的文档"
         );
+        // 而「有值」**不等于**可以清掉「≥」。看门狗被触发时，正确的下一步判据是
+        // `is_exact()` 而不是 `is_some()`：Windows 的 `GetDevicePeriod` 有值
+        // （10 ms）却实测低报 4.2 倍（真值 41.92 ms，
+        // `docs/spec-playdev-measurement.md` §3），标 `Unreliable`。
+        // 按「有值就升级」做，用户会看到一个不带「≥」的 121 ms 而真值 153 ms。
+        for d in [p.dev, p.peer_dev].into_iter().flatten() {
+            assert!(
+                !d.source.is_exact() || d.ms().is_none(),
+                "出现了一个自称真值的设备读数 ⇒ 先确认 compose_sum_ms 真把它加进去了，\
+                 再谈 confidence 升级；两步只做一步就是一个静默少算的总数"
+            );
+        }
         assert_eq!(
             p.confidence,
             LatConfidence::LowerBound,

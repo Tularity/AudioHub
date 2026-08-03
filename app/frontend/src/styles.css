@@ -678,6 +678,20 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   50% { box-shadow: 0 0 0 5px rgba(224, 168, 63, 0); }
 }
 
+/* 对端处于使用端模式、无法被本机调取（plan §13 推论 1）。
+   用 danger 而不是 warn：这不是「暂时不好」而是「现在做不到」，而且要改的开关
+   在**对面那台机器**上——徽章负责一眼可见，下面那行负责说清去哪儿改。 */
+.peer-unusable-badge {
+  flex: none; font-size: 11px; font-weight: 650; letter-spacing: .02em;
+  color: var(--danger); background: #e0574f14; border: 1px solid #e0574f33;
+  border-radius: 999px; padding: 2px 8px; white-space: nowrap;
+}
+.peer-unusable {
+  font-size: 12px; color: var(--danger); line-height: 1.6;
+  background: #e0574f0d; border: 1px solid #e0574f26;
+  border-radius: var(--radius-sm); padding: 6px 10px;
+}
+
 /* 重连中：与「离线」区分开，配 connecting 那颗呼吸点 */
 .peer-reconnect {
   display: flex; align-items: center; gap: 8px;
@@ -1084,6 +1098,14 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   background: var(--bg-2); border: 1px solid var(--line-strong);
 }
 .mode-mirror.mode-b { color: var(--accent); border-color: #31c8b03d; }
+.mode-mirror.mode-share { color: var(--ok); border-color: #4fbf7d3d; }
+
+/* 互斥提示（plan §13）：常驻一行，说明「选了这个，另一件事本机就不做了」。
+   刻意比 .mode-desc 弱一档——它是约束的注脚，不该跟结果句抢注意力。 */
+.mode-exclusive {
+  font-size: 12px; color: var(--text-dim); line-height: 1.6; max-width: 720px;
+  padding-left: 10px; border-left: 2px solid var(--line-strong);
+}
 
 /* ---- 网页访问（plan §7.5） ---- */
 

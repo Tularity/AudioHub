@@ -181,13 +181,20 @@ pub enum CtlCmd {
     },
     /// read the daemon's settings, or change them
     ///
-    /// With no flags this is a plain read. `--consumer-mode b` is what turns
-    /// the per-peer virtual devices on; the daemon owns this setting, so it
+    /// With no flags this is a plain read. `--mode b` is what turns the
+    /// per-peer virtual devices on; the daemon owns this setting, so it
     /// survives a restart and every client sees the same value.
+    ///
+    /// The three modes are mutually exclusive (plan §13): `share` is the only
+    /// one in which OTHER machines may use this one, and `a`/`b` are the two
+    /// ways this machine uses others. Switching away from `share` closes
+    /// whatever peers had open on us and tells them; switching to `share` or
+    /// `a` removes every virtual device.
     Settings {
-        /// "a" (driverless system capture) or "b" (per-peer virtual devices)
-        #[arg(long, value_parser = ["a", "b"])]
-        consumer_mode: Option<String>,
+        /// "share" (be used by others), "a" (driverless system capture) or
+        /// "b" (per-peer virtual devices)
+        #[arg(long, value_parser = ["share", "a", "b"])]
+        mode: Option<String>,
         /// remove a peer's virtual devices while it is disconnected
         #[arg(long)]
         remove_virtual_on_disconnect: Option<bool>,
@@ -473,13 +480,13 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             json!({ "kind": kind }),
         ),
         CtlCmd::Settings {
-            consumer_mode,
+            mode,
             remove_virtual_on_disconnect,
             mark_offline_devices,
         } => {
             let mut p = serde_json::Map::new();
-            if let Some(m) = consumer_mode {
-                p.insert("consumer_mode".into(), json!(m));
+            if let Some(m) = mode {
+                p.insert("mode".into(), json!(m));
             }
             if let Some(v) = remove_virtual_on_disconnect {
                 p.insert("remove_virtual_on_disconnect".into(), json!(v));
@@ -769,17 +776,23 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
         )),
         CtlCmd::Settings { .. } => {
             info(&format!(
-                "consumer_mode={} effective_mode={} remove_virtual_on_disconnect={} \
+                "mode={} effective_mode={} remove_virtual_on_disconnect={} \
                  mark_offline_devices={} virtual devices {}/{}",
-                val_str(v, "consumer_mode"),
+                val_str(v, "mode"),
                 val_str(v, "effective_mode"),
                 val_bool(v, "remove_virtual_on_disconnect"),
                 val_bool(v, "mark_offline_devices"),
                 val_u64(v, "hal_used"),
                 val_u64(v, "hal_capacity"),
             ));
-            if val_str(v, "consumer_mode") == "b" && val_str(v, "effective_mode") != "b" {
+            if val_str(v, "mode") == "b" && val_str(v, "effective_mode") != "b" {
                 info("  (mode B is not in force: no HAL bridge on this daemon)");
+            }
+            // The one fact a `share`-mode reader most needs and cannot infer
+            // from the line above: this machine will refuse `ctl open`.
+            if val_str(v, "effective_mode") == "share" {
+                info("  (share mode: this machine serves peers and does not open sessions of \
+                      its own — plan §13)");
             }
         }
         CtlCmd::Pair { addr, .. } => info(&format!(

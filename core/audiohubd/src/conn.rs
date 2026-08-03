@@ -16,7 +16,7 @@ use base64::prelude::*;
 use audiohub_core::sysaudio;
 use audiohub_core::volume::{self, SetAction, VolumeState};
 use audiohub_ipc::{
-    OpenSessionParams, SessionInfo, KIND_MIC, KIND_SPK, SOURCE_HAL_SPEAKER, SOURCE_MIC,
+    Mode, OpenSessionParams, SessionInfo, KIND_MIC, KIND_SPK, SOURCE_HAL_SPEAKER, SOURCE_MIC,
     SOURCE_SYSAUDIO, SOURCE_TONE,
 };
 use audiohub_net::control::{write_frame, ControlMsg, CONTROL_MAX_FRAME};
@@ -324,6 +324,7 @@ fn register_conn(
         last_rx_ms: AtomicU64::new(0), // measured from `created`
         clock: Mutex::new(ClockFilter::new()),
         clock_warned: AtomicBool::new(false),
+        peer_mode: Mutex::new(crate::PeerModeCell::Unheard),
     });
     let mut st = lk(&inner.state);
     let keep_existing = st.conns.get(&conn.fp).map_or(false, |old| {
@@ -345,7 +346,83 @@ fn register_conn(
     if let Some(o) = old {
         o.alive.store(false, Ordering::SeqCst);
     }
+    // plan §13 推论 1, and the single place it is wired: every control channel
+    // is born here, whichever side dialled, so putting the advertisement
+    // anywhere else would cover one direction and quietly miss the other.
+    //
+    // Sent before the reader starts, so it is the first thing on the channel:
+    // the peer's list is right from its first paint rather than after a
+    // round-trip. A failure is not fatal — `send_msg` has already marked the
+    // conn dead, and the reader will notice on its next pass.
+    let _ = conn.send_msg(&SessionMsg::ModeState {
+        mode: haldev::effective_mode(inner).as_str().to_string(),
+    });
     Some(conn)
+}
+
+/// Tell every live peer what mode we are in now, and stop whatever the new mode
+/// no longer permits (plan §13 推论 2).
+///
+/// Called on every mode change. The transition is "disconnect and tell", not
+/// "refuse to switch": plan §7.1 freezes mode switching as needing no
+/// confirmation, and a switch that could be vetoed by somebody else's session
+/// would be a confirmation dialog worn by a peer.
+///
+/// The two halves are symmetric and both are necessary:
+///   - leaving share ⇒ close what PEERS opened on us; they lose their devices,
+///     which is the announced consequence, and `teardown_stream(notify=true)`
+///     sends each one a `CloseStream` so nothing is left dangling.
+///   - entering share ⇒ close what WE opened on them; a share-mode machine does
+///     not consume. Without this half, sessions opened in mode A keep running
+///     after the switch and the machine is a provider AND a consumer — exactly
+///     the state §13 exists to make unreachable, reached by the very control
+///     that was supposed to leave it.
+///
+/// The control channels stay up. Dropping them would take the other direction
+/// with them, trigger the reconnect backoff, and — worst — remove the channel
+/// the explanation travels on.
+pub(crate) fn announce_mode(inner: &Arc<DaemonInner>, mode: Mode) {
+    let conns: Vec<Arc<ConnShared>> = lk(&inner.state)
+        .conns
+        .values()
+        .filter(|c| c.alive.load(Ordering::SeqCst))
+        .cloned()
+        .collect();
+
+    let doomed: Vec<u32> = {
+        let st = lk(&inner.state);
+        st.sessions
+            .values()
+            .filter(|e| {
+                let theirs = e.origin == SessionOrigin::Peer;
+                // A session survives only if the new mode still allows the side
+                // that opened it. Written from `mode`'s own answers rather than
+                // from a `match` on the variants, so a fourth mode cannot slip
+                // through with its sessions intact.
+                if theirs {
+                    !mode.serves_peers()
+                } else {
+                    !mode.consumes_peers()
+                }
+            })
+            .map(|e| e.id)
+            .collect()
+    };
+    for id in &doomed {
+        teardown_stream(inner, *id, true);
+    }
+    if !doomed.is_empty() {
+        dlog!(
+            "[audiohubd] mode is now {mode}: closed {} session(s) the new mode does not permit",
+            doomed.len()
+        );
+    }
+
+    // After the teardown, so a peer that reads both in order sees the closes
+    // explained rather than announced in advance and then contradicted.
+    for c in conns {
+        let _ = c.send_msg(&SessionMsg::ModeState { mode: mode.as_str().to_string() });
+    }
 }
 
 /// Reads this connection until it closes, then ALWAYS tears it down. The
@@ -556,6 +633,34 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 }
             }
         }
+        SessionMsg::ModeState { mode } => {
+            let cell = match Mode::parse(&mode) {
+                Some(m) => crate::PeerModeCell::Known(m),
+                None => {
+                    // Unreachable from any build of ours (the protocol version
+                    // is equality-checked at verify), so it is worth a line
+                    // rather than a silent shrug — and the peer is treated as
+                    // unusable, because "it named something we cannot read" is
+                    // not a reason to offer it.
+                    dlog!(
+                        "[audiohubd] peer {} advertised a mode this build does not know; \
+                         treating it as unusable",
+                        conn.fp
+                    );
+                    crate::PeerModeCell::Unrecognised
+                }
+            };
+            let prev = std::mem::replace(&mut *lk(&conn.peer_mode), cell);
+            if prev != cell {
+                dlog!("[audiohubd] peer {} is now in mode {mode}", conn.fp);
+            }
+            // A peer that stopped serving takes its own sessions down and tells
+            // us with CloseStream; we do not tear anything down from here. The
+            // asymmetry is deliberate: acting on a peer's claim would let a
+            // misbehaving peer close streams it does not own, and everything
+            // that actually has to stop is already stopped by the machine that
+            // owns the devices.
+        }
         SessionMsg::Unpaired {} => {
             // The peer removed us. Its virtual devices here are now a pair of
             // ghosts — permanently offline, permanently silent, redialling a
@@ -757,7 +862,19 @@ fn start_tx_stream(
 }
 
 /// Auto-accept policy (spec §2): the peer is paired+verified by construction, so
-/// any well-formed OpenStream within the stream caps is accepted.
+/// any well-formed OpenStream within the stream caps is accepted — **provided
+/// this machine is in a mode that may be used at all** (plan §13).
+///
+/// That mode check is the enforcement half of the whole §13 change. Both
+/// directions of an inbound `OpenStream` are "a peer using this machine":
+/// `dir == send` means the peer plays into our default output, `dir == recv`
+/// means the peer consumes our microphone / system audio / virtual speaker.
+/// Neither is allowed while we are ourselves a consumer, because our "default
+/// device" may then BE another machine's device, and handing it out makes us a
+/// relay — and a cycle, if that machine is using us back.
+///
+/// Refused before `claim_stream_id`, so a refusal leaves no state behind and a
+/// peer that keeps retrying cannot exhaust the stream-id table.
 #[allow(clippy::too_many_arguments)]
 fn handle_remote_open(
     inner: &Arc<DaemonInner>,
@@ -773,6 +890,9 @@ fn handle_remote_open(
     loss: Option<f32>,
     volume_sync: bool,
 ) -> Result<()> {
+    if let Some(why) = haldev::refuse_being_used(haldev::effective_mode(inner)) {
+        bail!("{why}");
+    }
     if kind != KIND_MIC && kind != KIND_SPK {
         bail!("unknown kind {kind}");
     }

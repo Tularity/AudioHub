@@ -97,6 +97,21 @@ export interface PeerState {
   public_key_b64?: string;
   hal_device?: PeerHalDevice | null;
   hal_reason?: string | null;
+  /**
+   * 对端上报的模式（plan §13 推论 1）。
+   *
+   * **缺席 / null = 不知道**，界面必须什么都不说——既不是「可用」也不是
+   * 「不可用」。对端离线时恒为 null（记忆里的模式是关于过去的陈述，而这个字段
+   * 只用来决定此刻能不能用它）。
+   */
+  peer_mode?: 'share' | 'a' | 'b' | string | null;
+  /**
+   * 对端明确告诉我们它现在不能被使用。与 `peer_mode` 分开由 daemon 给，是因为
+   * `peer_mode == null` 有两种成因、需要相反的处理：还没上报（什么都别说）vs
+   * 上报了一个本版本不认识的模式（别提供它）。详见 `audiohub-ipc` 的
+   * `PeerState::peer_unusable` 上那张表。
+   */
+  peer_unusable?: boolean;
 }
 
 export interface VolumeState {
@@ -281,8 +296,12 @@ export interface SessionInfo {
 
 /** settings.get / settings.set 的回包（daemon 拥有的全局设置）。 */
 export interface DaemonSettings {
-  consumer_mode?: 'a' | 'b' | string;
-  effective_mode?: 'a' | 'b' | string;
+  /**
+   * 用户请求的模式（plan §13）。IPC v3 前叫 `consumer_mode`——加进 `share` 之后
+   * 那个名字与自己的取值相矛盾，故改名。
+   */
+  mode?: 'share' | 'a' | 'b' | string;
+  effective_mode?: 'share' | 'a' | 'b' | string;
   latency?: string;
   quality?: string;
   remove_virtual_on_disconnect?: boolean;

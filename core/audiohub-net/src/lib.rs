@@ -3,6 +3,7 @@ pub mod discovery;
 pub mod echo;
 pub mod identity;
 pub mod media;
+pub mod mode;
 pub mod packet;
 pub mod pairing;
 pub mod secure;

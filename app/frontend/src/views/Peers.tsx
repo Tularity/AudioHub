@@ -17,13 +17,14 @@ import { backendParam, normalizeSource, SOURCE_SYSAUDIO } from '../lib/sysaudio'
 import { fmt } from '../lib/fmt';
 import { createBusySet, useTick } from '../lib/hooks';
 import { t, joinPhrases } from '../i18n';
+import type { MsgKey } from '../i18n';
 import { actions, getState, useStore } from '../state/store';
 import type { AppState } from '../state/store';
 import {
-  MODE_A, MODE_B, halState, requestedMode, effectiveMode, isModeB,
-  modeDowngraded, peerDeviceRows, halReasonText,
+  MODE_SHARE, MODE_A, MODE_B, halState, requestedMode, effectiveMode, isModeB,
+  isShareMode, modeDowngraded, peerDeviceRows, halReasonText, peerUnusableText,
 } from '../state/mode';
-import type { ConsumerMode } from '../state/mode';
+import type { AppMode } from '../state/mode';
 import { applySettings, refreshPeers, refreshSessions, rpc } from '../state/connection';
 import type { PeerState, SessionInfo } from '../ipc/types';
 
@@ -231,17 +232,31 @@ function setBridge(fp: string, want: string): void {
 
 // ---------------------------------------------------------------- 模式栏
 
+// 切换后的提示语。三档各一条：模式切换会**真的关掉正在跑的会话**（plan §13
+// 推论 2），用户必须从这句话里读到发生了什么，而不是从「对端怎么突然没声了」。
+const SWITCHED_KEY: Record<AppMode, MsgKey> = {
+  share: 'mode.switched.toShare',
+  a: 'mode.switched.toA',
+  b: 'mode.switched.toB',
+};
+
+const RESULT_KEY: Record<AppMode, MsgKey> = {
+  share: 'mode.share.result',
+  a: 'mode.a.result',
+  b: 'mode.b.result',
+};
+
 function ModeBanner() {
   const daemon = useStore((s) => s.daemon);
   const mode = useStore(effectiveMode);
   const downgraded = useStore(modeDowngraded);
   const st = halState(daemon);
 
-  const setMode = useCallback(async (v: ConsumerMode) => {
+  const setMode = useCallback(async (v: AppMode) => {
     if (v === requestedMode(getState())) return;
     try {
-      await applySettings({ consumer_mode: v });
-      toast(v === MODE_B ? t('mode.switched.toB') : t('mode.switched.toA'), 'ok');
+      await applySettings({ mode: v });
+      toast(t(SWITCHED_KEY[v]), 'ok');
     } catch { /* rpc 已 toast */ }
   }, []);
 
@@ -253,11 +268,13 @@ function ModeBanner() {
           <p className="mode-sub">{t('mode.sub')}</p>
         </div>
         {/* testid 沿用旧名 `settings-consumer-mode`（回归已依赖），外层另给别名 */}
-        <Segmented<ConsumerMode>
+        <Segmented<AppMode>
           testid="settings-consumer-mode"
           value={mode}
           onSelect={setMode}
           options={[
+            // 共享模式排第一：它是默认值，也是「本机被别人使用」这条唯一的路。
+            { value: MODE_SHARE, label: t('mode.share.label') },
             { value: MODE_A, label: t('mode.a.label') },
             {
               value: MODE_B,
@@ -272,13 +289,18 @@ function ModeBanner() {
       {/* 长文（mode.a.desc / mode.b.desc）下沉到设置页——那里本来就有一份更完整的。
           一级只留一句结果句：读完就知道「现在去哪里选对端」。 */}
       <p className="mode-desc" data-testid="consumer-mode-desc">
-        {mode === MODE_B ? t('mode.b.result') : t('mode.a.result')}
+        {t(RESULT_KEY[mode])}
         <button
           className="link-btn" type="button" data-testid="consumer-mode-more"
           onClick={() => actions.navigate('settings')}
         >
           {t('mode.learnMore')}
         </button>
+      </p>
+      {/* 互斥是这次改动的**全部意义**，必须常驻一行：用户在切换前就该知道
+          「选了这个，另一件事本机就不做了」。两句互为反面，各自只在对应侧出现。 */}
+      <p className="mode-exclusive" data-testid="mode-exclusive">
+        {mode === MODE_SHARE ? t('mode.exclusive.share') : t('mode.exclusive.consumer')}
       </p>
       {/* 「驱动就绪」是常态，不是消息：只有出问题时这行才值得占一行。 */}
       <p
@@ -380,7 +402,7 @@ function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
   );
 }
 
-function PeerCard({ peer, modeB }: { peer: PeerState; modeB: boolean }) {
+function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; share: boolean }) {
   const fp = peer.fingerprint;
   const daemon = useStore((s) => s.daemon);
   const sessions = useStore((s) => s.sessions);
@@ -410,6 +432,14 @@ function PeerCard({ peer, modeB }: { peer: PeerState; modeB: boolean }) {
   const displayName = peer.display_name || peer.name || t('peers.card.unnamed');
   const nav = () => actions.navigate('detail', fp);
 
+  // plan §13 推论 1：对端处于使用端模式时本机用不了它。空串 = 不知道（离线 /
+  // 还没收到通告），此时**什么都不说**——把「不知道」画成「不可用」会让一台刚
+  // 连上的正常主机看起来是坏的。
+  //
+  // 只在本机是使用端时才显示：共享模式下本机根本不打算用它，这行提示对当下的
+  // 操作没有任何意义，只是噪声。
+  const unusable = share ? '' : peerUnusableText(peer);
+
   return (
     <article
       className="card peer-card"
@@ -429,9 +459,18 @@ function PeerCard({ peer, modeB }: { peer: PeerState; modeB: boolean }) {
       <header className="peer-head">
         <span className={`dot ${dotCls}`} />
         <h3 className="peer-name" title={peer.name || fp}>{displayName}</h3>
+        <span className="peer-unusable-badge" data-testid={`peer-unusable-badge-${fp}`} hidden={!unusable}>
+          {t('peers.unusable.badge')}
+        </span>
         <code className="peer-fp" data-testid={`peer-fp-${fp}`} title={fp}>{fmt.fp(fp, 16)}</code>
         <Icon name="chev" cls="ico peer-chev" />
       </header>
+
+      {/* 徽章只说「不可用」，这一行说「为什么、去哪里改」——两者缺一不可：光有
+          徽章会让用户在本机翻遍设置也找不到开关，因为要改的是**对面那台**。 */}
+      <p className="peer-unusable" data-testid={`peer-unusable-${fp}`} hidden={!unusable} role="status">
+        {unusable}
+      </p>
 
       {/* ②③ 一级指标：这一屏唯一新增的一级信息（规格 §2.1）。 */}
       <PeerMetrics fp={fp} sess={micS || spkS} />
@@ -458,8 +497,12 @@ function PeerCard({ peer, modeB }: { peer: PeerState; modeB: boolean }) {
       {/* 模式 A 专属的一整排通路控件。模式 B 下它们全部**下线**（不是变灰）：
           取谁的麦克风、送谁的扬声器由 App 在系统里选设备决定，这些开关既不反映那个
           选择、也无法表达它；留着只会让用户以为自己在这里做了什么。
-          monitorPref / bridgePref 在模式 B 下**不读不写**（数据保留，切回 A 复用）。 */}
-      <div className="peer-toggles" data-testid={`peer-toggles-${fp}`} hidden={modeB}>
+          monitorPref / bridgePref 在模式 B 下**不读不写**（数据保留，切回 A 复用）。
+
+          共享模式下同样全部下线，理由更硬（plan §13）：本机在这个模式里**根本不
+          使用**别的主机，daemon 会直接拒掉 `session.open`。留着它们等于摆一排必然
+          报错的开关。 */}
+      <div className="peer-toggles" data-testid={`peer-toggles-${fp}`} hidden={modeB || share}>
         <div className="toggle-row">
           <Icon name="mic" /><span className="toggle-label">{t('peers.card.takeMic')}</span>
           <Switch
@@ -605,6 +648,7 @@ function AddPeerForm({ open, onClose }: { open: boolean; onClose: () => void }) 
 export function PeersView() {
   const peers = useStore((s) => s.peers);
   const modeB = useStore(isModeB);
+  const share = useStore(isShareMode);
   const [formOpen, setFormOpen] = useState(false);
 
   const retrying = peers.filter((p) => !p.online && p.reconnecting).length;
@@ -632,7 +676,9 @@ export function PeersView() {
       <AddPeerForm open={formOpen} onClose={() => setFormOpen(false)} />
 
       <div className={`peer-grid${modeB ? ' mode-b' : ''}`}>
-        {peers.map((p) => <PeerCard key={p.fingerprint} peer={p} modeB={modeB} />)}
+        {peers.map((p) => (
+          <PeerCard key={p.fingerprint} peer={p} modeB={modeB} share={share} />
+        ))}
       </div>
 
       {/* 从每张卡片上收拢来的两条常驻脚注：一句怎么用虚拟设备（只在模式 B 有意义），

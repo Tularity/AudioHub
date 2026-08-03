@@ -22,6 +22,10 @@ import type {
 } from '../ipc/types';
 import type { EndpointSource } from '../ipc/endpoint';
 import type { PermissionState } from './permissions';
+// 运行时导入。反向那条（mode.ts → store.ts）是 `import type`，编译后被抹掉，
+// 所以两者之间没有运行时环。
+import { parseMode } from './mode';
+import type { AppMode } from './mode';
 import { readLatency, readQuality } from '../lib/metrics';
 
 const SETTINGS_KEY = 'audiohub.ui.settings';
@@ -41,7 +45,8 @@ export interface LocalSettings {
   latency: string;
   quality: string;
   removeVirtual: boolean;
-  consumerMode: 'a' | 'b';
+  /** plan §13：`consumerMode` 改名为 `mode`，取值多了 `share`。 */
+  mode: AppMode;
 }
 
 export interface MetricHistory {
@@ -110,10 +115,18 @@ function loadSettings(): LocalSettings {
   // 落盘 <config>/settings.json）。留着它只为两件事：首帧还没拿到回包时不闪，
   // 以及 daemon 版本较旧、没有 settings.* 时仍有个本地值可显示。
   // 任何时候 daemon 的值都覆盖它——见 state/mode.ts 的 requestedMode/effectiveMode。
-  const dft: LocalSettings = { latency: 'min', quality: 'auto', removeVirtual: false, consumerMode: 'a' };
+  // 默认与 daemon 的 `StoredSettings::default` 一致（plan §13：共享模式）。这只是
+  // 首帧兜底，daemon 的回包一到就被覆盖。
+  const dft: LocalSettings = { latency: 'min', quality: 'auto', removeVirtual: false, mode: 'share' };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return { ...dft, ...(JSON.parse(raw) as Partial<LocalSettings>) };
+    if (raw) {
+      const got = JSON.parse(raw) as Partial<LocalSettings>;
+      // 模式单独过一遍 parseMode：localStorage 里躺着的很可能是 §13 之前存的
+      // `consumerMode`，或者一个这版认不出的字符串。展开赋值会把它原样塞进
+      // `mode`，于是首帧按一个不存在的模式渲染。
+      return { ...dft, ...got, mode: parseMode(got.mode) ?? dft.mode };
+    }
   } catch { /* ignore */ }
   return dft;
 }
@@ -307,7 +320,8 @@ export const actions = {
     let saved: LocalSettings | null = null;
     setState((s) => {
       const settings = { ...s.settings };
-      if (d.consumer_mode === 'a' || d.consumer_mode === 'b') settings.consumerMode = d.consumer_mode;
+      const m = parseMode(d.mode);
+      if (m) settings.mode = m;
       if (typeof d.remove_virtual_on_disconnect === 'boolean') settings.removeVirtual = d.remove_virtual_on_disconnect;
       if (typeof d.latency === 'string') settings.latency = d.latency;
       if (typeof d.quality === 'string') settings.quality = d.quality;

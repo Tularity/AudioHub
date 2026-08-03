@@ -39,8 +39,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use audiohub_ipc::{
-    HalDeviceInfo, OpenSessionParams, PeerHalDevice, KIND_MIC, KIND_SPK, MODE_A, MODE_B,
-    SOURCE_HAL_SPEAKER,
+    HalDeviceInfo, Mode, OpenSessionParams, PeerHalDevice, KIND_MIC, KIND_SPK, SOURCE_HAL_SPEAKER,
 };
 use audiohub_net::identity::{PairedPeer, PeerStore};
 
@@ -627,35 +626,114 @@ pub(crate) enum SessCmd {
 
 /// What mode is actually in force.
 ///
-/// Deliberately keyed on "this daemon HAS a HAL bridge", not on "a driver is
-/// attached this instant". coreaudiod restarts; the bridge reconnects within
-/// seconds and the bindings survive it (plan §7.3 keeps the devices through an
-/// outage). A mode that flapped to A on every such blip would tear down every
-/// virtual device and hand the UI's session controls back for a few seconds,
-/// which is precisely the churn this design exists to avoid.
-pub(crate) fn effective_mode(inner: &DaemonInner) -> &'static str {
-    if lk(&inner.settings).wants_mode_b() && inner.hal().is_some() {
-        MODE_B
-    } else {
-        MODE_A
+/// The only mode that can be requested but not delivered is `B`, and it falls
+/// back to `A` rather than to `Share`: the user asked to *use* other machines,
+/// and only the driver-specific half of that is unavailable. Falling back to
+/// `Share` would flip which side of the §13 exclusion the machine is on — a far
+/// larger change than the one the missing driver actually forces, and one that
+/// would silently stop the machine consuming while the UI still showed a
+/// consumer mode selected.
+///
+/// The `B` availability test is deliberately keyed on "this daemon HAS a HAL
+/// bridge", not on "a driver is attached this instant". coreaudiod restarts;
+/// the bridge reconnects within seconds and the bindings survive it (plan §7.3
+/// keeps the devices through an outage). A mode that flapped on every such blip
+/// would tear down every virtual device and hand the UI's session controls back
+/// for a few seconds, which is precisely the churn this design exists to avoid.
+pub(crate) fn effective_mode(inner: &DaemonInner) -> Mode {
+    let want = lk(&inner.settings).mode;
+    match want {
+        Mode::Share => Mode::Share,
+        Mode::A => Mode::A,
+        Mode::B if inner.hal().is_some() => Mode::B,
+        Mode::B => Mode::A,
     }
 }
 
-/// Whether a UI-originated `session.open` is allowed right now.
+/// Whether a locally-originated `session.open` is allowed right now — i.e.
+/// whether this machine may reach out and use another one.
 ///
-/// In mode B the system's device selection is the session control: an app
-/// selects "AudioHub – X 扬声器" and the daemon opens the stream behind it. A
-/// UI that could also open sessions by peer would be mode A wearing mode B's
-/// labels, and every mode-B property (one device = one peer, the selection
-/// living in the system) would quietly stop holding. `override` exists for the
-/// CLI and the probes, which have to be able to drive the daemon directly.
-pub(crate) fn refuse_ui_session(mode: &str, override_mode: bool) -> Option<String> {
-    (mode == MODE_B && !override_mode).then(|| {
-        "mode B: sessions are driven by the system device selection — select \
-         the peer's AudioHub device in 系统设置 › 声音 or in the application \
-         (pass override:true to force one anyway)"
-            .to_string()
-    })
+/// Two modes refuse, for unrelated reasons that must not be collapsed into one
+/// message, because the user's next action differs:
+///
+///   - `Share` (plan §13): this machine is the one being used. Nothing about
+///     the peer or the device selection will change that; the fix is to pick a
+///     consumer mode, which is a decision, not a retry.
+///   - `B` (spec-m5b §6.1): the system's device selection is the session
+///     control. An app selects "AudioHub – X 扬声器" and the daemon opens the
+///     stream behind it. A UI that could also open sessions by peer would be
+///     mode A wearing mode B's labels, and every mode-B property (one device =
+///     one peer, the selection living in the system) would quietly stop
+///     holding. The fix is to go and select the device.
+///
+/// `override` exists for the CLI and the probes, which have to drive their own
+/// daemon directly. It cannot defeat the peer's half of the exclusion — see
+/// `refuse_being_used`, which runs on the other machine.
+pub(crate) fn refuse_using_others(mode: Mode, override_mode: bool) -> Option<String> {
+    if override_mode {
+        return None;
+    }
+    match mode {
+        Mode::A => None,
+        Mode::Share => Some(
+            "share mode: this machine shares its own audio devices and does not use other \
+             machines' (plan §13 — the three modes are mutually exclusive). Switch to mode A or \
+             mode B to use a peer, or pass override:true to force one anyway"
+                .to_string(),
+        ),
+        Mode::B => Some(
+            "mode B: sessions are driven by the system device selection — select \
+             the peer's AudioHub device in 系统设置 › 声音 or in the application \
+             (pass override:true to force one anyway)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Whether a PEER may open a stream on us — the enforcement half of plan §13.
+///
+/// This is the guard that actually prevents the relay: X sharing its "default
+/// microphone" while X is a mode-B consumer would hand out **Z's** microphone,
+/// and if Z is using X the graph closes into a cycle whose latency grows
+/// without bound. Refusing here is what makes that unreachable, and it is
+/// checked against OUR OWN mode only — never against anything the peer claimed,
+/// which is why a peer that lies or never advertises changes nothing.
+///
+/// There is deliberately **no override**. The probe flag on `session.open` is
+/// about driving one's own daemon; nothing should be able to talk another
+/// machine out of this.
+/// Why a peer has no virtual devices, when the reason is the mode itself.
+/// `None` in mode B — that is the mode where devices are supposed to exist.
+///
+/// plan §13 推论 3 rides on this being a *refusal to desire* rather than a
+/// "keep but silence": leaving share mode's peers out of the desired set makes
+/// the ordinary reconcile diff remove their devices unconditionally, exactly as
+/// unpairing does. "Kept but silent" is only the rule for a peer going offline
+/// (§7.3), and applying it here would leave a machine that is no longer a
+/// consumer still publishing consumer devices.
+///
+/// Share and A are separate strings because the user's next step differs, and
+/// because a shared "not mode B" reason would label every card on a
+/// share-mode machine with mode A's explanation. The frontend switches on these
+/// exact values — see `reasons_the_frontend_can_explain`, which reads the
+/// frontend and fails if either side drifts.
+pub(crate) fn no_device_reason(mode: Mode) -> Option<&'static str> {
+    match mode {
+        Mode::B => None,
+        Mode::Share => Some("mode_share"),
+        Mode::A => Some("mode_a"),
+    }
+}
+
+pub(crate) fn refuse_being_used(mode: Mode) -> Option<String> {
+    if mode.serves_peers() {
+        return None;
+    }
+    Some(format!(
+        "this machine is in mode {mode} and cannot be used as an audio device right now \
+         (plan §13: the machine that shares must not also consume, or it becomes an \
+         unwitting relay). It has to be switched to share mode to serve you"
+    ))
 }
 
 // ---------------------------------------------------------------- reconcile
@@ -678,17 +756,28 @@ fn observe() -> Option<HashSet<String>> {
     )
 }
 
-struct PassInputs {
-    desired: Vec<DesiredDevice>,
+pub(crate) struct PassInputs {
+    pub(crate) desired: Vec<DesiredDevice>,
     display: HashMap<String, String>,
-    reasons: HashMap<String, String>,
+    pub(crate) reasons: HashMap<String, String>,
     paired: HashSet<String>,
 }
 
 /// Everything the reconcile needs from the peer store and the settings, with
 /// the naming pass already applied.
-fn compute_desired(inner: &DaemonInner, capacity: usize, table: &mut SlotTable) -> PassInputs {
-    let mode_b = effective_mode(inner) == MODE_B;
+///
+/// `pub(crate)` for the §13 tests in `mode_tests`: `capacity` is a parameter, so
+/// they can ask "what WOULD the coordinator want, if a driver with N slots were
+/// attached" on a host that has no driver — which is every CI host and every
+/// machine running the suite. Testing the mode branch through the real function
+/// is the point; a test that re-implemented the branch would pass while
+/// `compute_desired` ignored the mode entirely.
+pub(crate) fn compute_desired(
+    inner: &DaemonInner,
+    capacity: usize,
+    table: &mut SlotTable,
+) -> PassInputs {
+    let mode = effective_mode(inner);
     let (remove_offline, mark_offline) = {
         let s = lk(&inner.settings);
         (s.remove_virtual_on_disconnect, s.mark_offline_devices)
@@ -725,8 +814,8 @@ fn compute_desired(inner: &DaemonInner, capacity: usize, table: &mut SlotTable) 
     for p in &peers {
         let fp = &p.fingerprint;
         let online = connected.contains(fp);
-        if !mode_b {
-            reasons.insert(fp.clone(), "mode_a".to_string());
+        if let Some(why) = no_device_reason(mode) {
+            reasons.insert(fp.clone(), why.to_string());
             continue;
         }
         if capacity == 0 {
@@ -1099,7 +1188,7 @@ fn push_peer_volumes(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
 /// or closes a mode-B session: `CTL_IO_STATE` says an application started using
 /// a virtual device, and a session appears behind it.
 fn coordinate_sessions(inner: &Arc<DaemonInner>, tx: &mpsc::Sender<SessCmd>) {
-    let mode_b = effective_mode(inner) == MODE_B;
+    let mode_b = effective_mode(inner) == Mode::B;
     let live: HashSet<u32> = lk(&inner.state).sessions.keys().copied().collect();
     let now = Instant::now();
     let mut cmds = Vec::new();
@@ -1711,11 +1800,111 @@ mod tests {
         // labels: in mode B the SYSTEM's device selection opens sessions, so a
         // UI that could open one by peer would have reintroduced exactly the
         // peer picker mode B exists to remove (plan §7.1).
-        let refusal = refuse_ui_session(MODE_B, false).expect("mode B must refuse");
+        let refusal = refuse_using_others(Mode::B, false).expect("mode B must refuse");
         assert!(refusal.contains("mode B"), "{refusal}");
         // CLI and probes must still be able to drive the daemon directly.
-        assert!(refuse_ui_session(MODE_B, true).is_none());
+        assert!(refuse_using_others(Mode::B, true).is_none());
         // ...and mode A is untouched: every existing session flow keeps working.
-        assert!(refuse_ui_session(MODE_A, false).is_none());
+        assert!(refuse_using_others(Mode::A, false).is_none());
+    }
+
+    /// plan §13: share mode does not use other machines, so the outbound half
+    /// is refused too — and with a DIFFERENT message from mode B's, because the
+    /// user's next action differs (pick another mode vs. go select a device).
+    #[test]
+    fn share_mode_refuses_to_use_other_machines() {
+        let refusal = refuse_using_others(Mode::Share, false).expect("share mode must refuse");
+        assert!(refusal.contains("share mode"), "{refusal}");
+        assert_ne!(
+            refusal,
+            refuse_using_others(Mode::B, false).unwrap(),
+            "share and mode B refuse for unrelated reasons; one message for both would send \
+             half the users to look for a device selection that does not apply to them"
+        );
+        assert!(refuse_using_others(Mode::Share, true).is_none(), "probes still drive us");
+    }
+
+    /// The enforcement half of plan §13, and the one that actually prevents the
+    /// relay. Exactly one mode may be used by others.
+    #[test]
+    fn only_share_mode_lets_a_peer_open_a_stream_on_us() {
+        assert!(
+            refuse_being_used(Mode::Share).is_none(),
+            "share mode is the whole point: it must serve"
+        );
+        for m in [Mode::A, Mode::B] {
+            let why = refuse_being_used(m)
+                .unwrap_or_else(|| panic!("{m} is a consumer mode and must refuse to be used"));
+            assert!(why.contains(m.as_str()), "the refusal must name the mode: {why}");
+        }
+    }
+
+    /// There is no override on the inbound guard, and there must not be: the
+    /// override flag is about driving one's OWN daemon. This is a signature
+    /// assertion — it goes red if somebody gives `refuse_being_used` an escape
+    /// hatch, which is the shape the relay would come back in.
+    #[test]
+    fn the_inbound_guard_takes_nothing_but_our_own_mode() {
+        // Deliberately written as a call with exactly one argument. If a second
+        // parameter is added this stops compiling, which is the point.
+        let f: fn(Mode) -> Option<String> = refuse_being_used;
+        assert!(f(Mode::Share).is_none());
+    }
+
+    /// plan §13 推论 3: virtual devices are desired ONLY in mode B.
+    ///
+    /// This is the branch `compute_desired` takes for every paired peer, so a
+    /// `Some` here is what makes the reconcile diff delete that peer's devices.
+    /// If share mode ever returned `None`, a machine that had just stopped
+    /// being a consumer would keep publishing consumer devices.
+    #[test]
+    fn only_mode_b_desires_virtual_devices() {
+        assert_eq!(no_device_reason(Mode::B), None, "mode B is where devices live");
+        let share = no_device_reason(Mode::Share).expect("share mode must not desire devices");
+        let a = no_device_reason(Mode::A).expect("mode A must not desire devices");
+        assert_ne!(
+            share, a,
+            "a shared 'not mode B' reason would compile, reconcile correctly, and then label \
+             every card on a share-mode machine with mode A's explanation"
+        );
+    }
+
+    /// Every reason this daemon can emit has to be a reason the frontend can
+    /// put into words, and the two live in different languages with no compiler
+    /// between them.
+    ///
+    /// Read out of the frontend source, in the style of `audiohub-ipc`'s
+    /// `the_three_ipc_version_declarations_agree` — and for the same reason:
+    /// `cargo test`, `tsc --noEmit` and `npm run build` are all perfectly green
+    /// while a `hal_reason` the UI has never heard of falls through to a
+    /// generic "暂无虚拟设备（mode_share）". Missing the file is a panic, never
+    /// a skip: a guard that goes quiet when its subject is renamed is not a
+    /// guard.
+    #[test]
+    fn reasons_the_frontend_can_explain() {
+        const TS: &str = "app/frontend/src/state/mode.ts";
+        let path = format!("{}/../../{TS}", env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "读不到 {TS}（{e}）。文件被改名/挪走了就把这条测试一起更新，\
+                 不要让它退化成一条恒真断言"
+            )
+        });
+        // Every mode-derived reason, plus the ones the reconcile emits for
+        // non-mode causes. All of them reach `halReasonText`.
+        let emitted = [
+            no_device_reason(Mode::Share).unwrap(),
+            no_device_reason(Mode::A).unwrap(),
+            "no_driver",
+            "removed_while_offline",
+            "capacity",
+        ];
+        for reason in emitted {
+            assert!(
+                src.contains(&format!("case '{reason}':")),
+                "{TS} has no branch for hal_reason '{reason}': the card would fall through to \
+                 the generic text and show the user a machine-readable token"
+            );
+        }
     }
 }

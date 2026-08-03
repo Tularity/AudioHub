@@ -13,7 +13,7 @@ import { t } from '../i18n';
 // 校验是**严格相等**（见下面 connect() 里的 `v !== IPC_VERSION`），所以这里落后一个
 // 版本不是「少显示一点数据」而是**整个界面拒连**。守卫在 Rust 侧：
 // core/audiohub-ipc 的 `the_three_ipc_version_declarations_agree` 直接读本文件。
-export const IPC_VERSION = 2;
+export const IPC_VERSION = 3;
 
 const DEFAULT_TIMEOUT_MS = 10000;
 

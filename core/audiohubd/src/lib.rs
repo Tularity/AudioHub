@@ -10,6 +10,9 @@ pub mod halbridge;
 /// developed on, not only on the target.
 pub mod halbridge_win;
 mod ipcserv;
+/// plan §13 三模式互斥的接线测试（两台真 daemon 跑回环）。
+#[cfg(test)]
+mod mode_tests;
 mod quality;
 pub mod reconnect;
 mod settings;
@@ -242,6 +245,13 @@ impl DaemonHandle {
     /// deviceless tests pin, because "no bridge" must change nothing.
     pub fn hal_status(&self) -> Option<audiohub_ipc::HalStatus> {
         hal_status(&self.inner)
+    }
+
+    /// The daemon's own state, for in-crate tests that need to drive the IPC
+    /// dispatcher without standing up a WebSocket client.
+    #[cfg(test)]
+    pub(crate) fn inner_for_test(&self) -> &Arc<DaemonInner> {
+        &self.inner
     }
 }
 
@@ -759,6 +769,56 @@ pub(crate) struct ConnShared {
     pub(crate) clock: Mutex<ClockFilter>,
     /// One stderr line per connection for Pongs we could not have caused.
     clock_warned: AtomicBool,
+    /// What the peer last said its mode is (plan §13 推论 1), from
+    /// `SessionMsg::ModeState`.
+    ///
+    /// Lives on the CONNECTION, not on the peer record, and is therefore gone
+    /// the moment the channel is: a mode remembered across a disconnect is a
+    /// claim about the past, and this value is only ever used to decide what to
+    /// offer the user *now*. Persisting it would produce the one failure this
+    /// field exists to prevent, just delayed — an entry that says "usable"
+    /// about a machine that has since become a consumer.
+    pub(crate) peer_mode: Mutex<PeerModeCell>,
+}
+
+/// The peer's advertised mode, with "unknown" and "unrecognised" kept apart.
+///
+/// They are different answers to different questions and they need opposite
+/// treatment in the UI: nothing advertised yet ⇒ say nothing; a mode we cannot
+/// name ⇒ do not offer the peer. Collapsing them into `Option<Mode>` would force
+/// one of the two to be wrong, and the wrong one would be silent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum PeerModeCell {
+    /// No `ModeState` has arrived on this channel yet.
+    #[default]
+    Unheard,
+    Known(audiohub_ipc::Mode),
+    /// The peer named a mode this build does not define. Only reachable from a
+    /// hand-built frame — the protocol version is equality-checked, so a peer
+    /// that got this far runs this build — but it is still represented rather
+    /// than folded into `Unheard`, because "it told us something we could not
+    /// read" argues for caution and "it has not spoken yet" does not.
+    Unrecognised,
+}
+
+impl PeerModeCell {
+    pub(crate) fn mode(self) -> Option<audiohub_ipc::Mode> {
+        match self {
+            PeerModeCell::Known(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// True only when the peer has actually told us it cannot serve. `Unheard`
+    /// is NOT unusable: an offline peer, or one whose first advertisement is
+    /// still in flight, must not be painted as refusing.
+    pub(crate) fn unusable(self) -> bool {
+        match self {
+            PeerModeCell::Known(m) => !m.serves_peers(),
+            PeerModeCell::Unrecognised => true,
+            PeerModeCell::Unheard => false,
+        }
+    }
 }
 
 impl ConnShared {

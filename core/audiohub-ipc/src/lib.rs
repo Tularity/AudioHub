@@ -19,12 +19,18 @@ use serde::{Deserialize, Serialize};
 /// 与「**daemon 不支持**」。前者显示「测量中」，后者显示「daemon 版本较旧」，
 /// 是两个不同的用户动作。
 ///
+/// **3（plan §13 三模式互斥）：这一次是真正的不兼容变更。**
+/// `DaemonSettings.consumer_mode` 改名为 `mode` 并新增取值 `share`；
+/// `PeerState` 新增 `peer_mode`。旧客户端读新 daemon 会看不到 `consumer_mode`，
+/// 于是把模式渲染成默认值 —— 一个「显示 A、实际 Share」的界面比拒连坏得多，
+/// 所以照既有的**严格相等**语义拒连（见下方三处同步要求）。
+///
 /// ⚠ **必须同步改的两处**（不在本 crate，改这里就得改它们，否则 App 拒连）：
 ///   - `app/src-tauri/src/main.rs` 的 `const IPC_VERSION: u32`
 ///   - `app/frontend/src/ipc/client.ts` 的 `export const IPC_VERSION`
 /// 两处都做**严格相等**校验（`main.rs` 的 `port_alive` 分支会直接报版本不符），
 /// 所以它们与本常量是一个原子的三件套。
-pub const IPC_VERSION: u32 = 2;
+pub const IPC_VERSION: u32 = 3;
 
 pub use audiohub_core::audio::DevicesReport;
 pub use audiohub_core::dsp::ToneVerdict;
@@ -35,6 +41,10 @@ pub use audiohub_core::permissions::{
 pub use audiohub_core::sysaudio::VirtualCard;
 pub use audiohub_core::volume::VolumeState;
 pub use audiohub_net::identity::PairedPeer;
+/// The machine-wide mode (plan §13). Defined in `audiohub-net` because it is
+/// also a wire type (`SessionMsg::ModeState`) and that crate cannot depend on
+/// this one; re-exported here so IPC clients have a single import.
+pub use audiohub_net::mode::{Mode, MODE_A, MODE_B, MODE_SHARE};
 
 /// Where a page served by the daemon's own web UI asks for the endpoint below.
 ///
@@ -133,27 +143,40 @@ pub struct OpenSessionParams {
     /// IPC client may name (spec-m5b §5.6).
     #[serde(default)]
     pub hal: bool,
-    /// Open this session even though mode B owns the session lifecycle
-    /// (spec-m5b §6.1). CLI/probe only: in mode B the daemon refuses a plain
-    /// `session.open`, because a UI that could open its own sessions would have
-    /// turned mode B back into mode A with different labels.
+    /// Open this session even though the current mode does not allow the UI to
+    /// open one. CLI/probe only. Two modes refuse a plain `session.open`, for
+    /// unrelated reasons:
+    ///   - `B` (spec-m5b §6.1): the SYSTEM's device selection opens sessions. A
+    ///     UI that could also open one by peer would have turned mode B back
+    ///     into mode A with different labels.
+    ///   - `Share` (plan §13): this machine does not use other machines at all
+    ///     while it is the one being used.
+    ///
+    /// It does NOT override the other half of the exclusion: a peer's
+    /// `OpenStream` is refused by the peer's own daemon whenever that peer is
+    /// not in `Share`, and no flag on this side can reach that decision. That
+    /// asymmetry is deliberate — the probes need to drive their own daemon, and
+    /// nothing needs to defeat somebody else's.
     #[serde(default, rename = "override")]
     pub override_mode: bool,
 }
 
-/// Global consumer mode (plan §7.1, frozen): it is a property of THIS machine,
-/// not of a peer, so it lives in the daemon and the UI's copy is a cache.
-pub const MODE_A: &str = "a";
-pub const MODE_B: &str = "b";
-
 /// Daemon-owned settings, `settings.get` / `settings.set` (spec-m5b §6.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonSettings {
-    /// What the user asked for: `MODE_A` | `MODE_B`.
-    pub consumer_mode: String,
-    /// What is actually in force. `MODE_B` only when the driver is usable, so
-    /// the two ends can no longer disagree for long about which mode is live.
-    pub effective_mode: String,
+    /// What the user asked for (plan §13): `Share` | `A` | `B`.
+    ///
+    /// Called `consumer_mode` until IPC v3. The rename is not cosmetic: with
+    /// `Share` in the set the field no longer names a *consumer* choice, it
+    /// names which side of the exclusion this machine is on. A field whose name
+    /// contradicts one of its own values is exactly the "identifier drifting
+    /// from its referent" failure this project has paid for repeatedly.
+    pub mode: Mode,
+    /// What is actually in force. `B` only when the driver is usable, so the
+    /// two ends can no longer disagree for long about which mode is live.
+    /// `Share` is always available — it needs neither driver nor capture
+    /// permission, which is why it is also the default.
+    pub effective_mode: Mode,
     /// plan §7.3: remove a peer's virtual devices while it is disconnected.
     pub remove_virtual_on_disconnect: bool,
     /// Append `（离线）` to a disconnected peer's device names, so "no sound"
@@ -613,6 +636,37 @@ pub struct PeerState {
     /// would otherwise be indistinguishable (spec-m5b §5.3).
     #[serde(default)]
     pub display_name: String,
+    /// The mode this peer last told us it is in (plan §13 推论 1), from
+    /// `SessionMsg::ModeState` on the live control channel.
+    ///
+    /// **`None` = we do not know**, and the UI must render that as nothing at
+    /// all — never as "usable" and never as "unusable". It is `None` while the
+    /// peer is offline (a mode remembered from a previous connection is a
+    /// statement about the past, and this field is used to decide what to
+    /// offer *now*), and for the few milliseconds between a channel coming up
+    /// and its first advertisement landing.
+    ///
+    /// Deliberately not persisted with the peer record for the same reason.
+    #[serde(default)]
+    pub peer_mode: Option<Mode>,
+    /// This peer has told us it is in a mode that cannot serve us.
+    ///
+    /// Carried rather than derived by the UI from `peer_mode`, because the two
+    /// reasons `peer_mode` can be `None` need opposite treatment and only the
+    /// daemon can tell them apart:
+    ///
+    /// | `peer_mode` | `peer_unusable` | meaning |
+    /// |---|---|---|
+    /// | `Some(Share)` | `false` | usable |
+    /// | `Some(A)` / `Some(B)` | `true`  | it is a consumer right now |
+    /// | `None` | `false` | offline, or nothing advertised yet — say nothing |
+    /// | `None` | `true`  | it advertised a mode this build cannot name |
+    ///
+    /// That last row is why the flag exists: an unrecognised mode must fall to
+    /// "do not offer it", and a UI deriving usability from `peer_mode` alone
+    /// would have to read `None` as "fine" to keep the offline case quiet.
+    #[serde(default)]
+    pub peer_unusable: bool,
 }
 
 /// Method names (params -> result):
@@ -660,12 +714,15 @@ pub struct PeerState {
 ///       never resolved to a default, which would unmute a muted machine)
 /// - "stats.subscribe"   {interval_ms?}        -> {} (then "stats" events with Vec<SessionInfo>)
 /// - "settings.get"      {}                    -> DaemonSettings
-/// - "settings.set"      {consumer_mode?, remove_virtual_on_disconnect?,
+/// - "settings.set"      {mode?, remove_virtual_on_disconnect?,
 ///                        mark_offline_devices?, latency?, quality?}
 ///                                             -> DaemonSettings
-///       The mode is DAEMON-owned global state (plan §7.1): switching to
-///       mode A removes every virtual device, switching to B recreates them
-///       under the same UIDs.
+///       The mode is DAEMON-owned global state (plan §7.1/§13) and the three
+///       modes are mutually exclusive, so setting it is never only a display
+///       change. Switching AWAY from `share` closes every session a peer opened
+///       on us and tells those peers why; switching TO `share`, or to `a`,
+///       removes every virtual device; switching to `b` recreates them under
+///       the same UIDs. No confirmation dialog (plan §7.1, frozen).
 /// - "peers.pair"        {addr, pin}           -> PeerState
 ///       The initiator half of M3 pairing, moved out of the CLI so a pairing
 ///       done anywhere is visible to the device coordinator immediately.

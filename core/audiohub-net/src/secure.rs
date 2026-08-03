@@ -227,6 +227,43 @@ pub enum SessionMsg {
         /// `Instant` 量（见 `PeerLatCell`）。
         seq_us: u64,
     },
+    /// "This is the mode I am in right now" (plan §13 推论 1).
+    ///
+    /// Sent by BOTH sides immediately after the secure channel is established,
+    /// and again on every mode change for as long as the channel lives. Without
+    /// it a peer lists a machine sitting in mode A/B as a usable audio device
+    /// and only discovers otherwise when its `OpenStream` comes back rejected —
+    /// an error at the moment of use, where the interface had promised one.
+    ///
+    /// ## Why it is *advertised* and not *trusted*
+    ///
+    /// This message is a UI affordance, not a safety boundary. The exclusion is
+    /// enforced by the machine being asked, in `handle_remote_open`, which does
+    /// not consult anything the peer said. A peer that lies about its mode gets
+    /// exactly what an honest one gets: its own machine still refuses to serve
+    /// while it is a consumer, and ours still refuses while we are. Treating
+    /// the advertisement as authority would put the relay guard on the wrong
+    /// side of the wire.
+    ///
+    /// ## Why this variant did need a protocol version bump
+    ///
+    /// Every other variant here is pure addition: an old peer cannot decode it,
+    /// `recv_timeout` skips it, the connection survives, and the only loss is
+    /// telemetry (see `Unpaired` below, where that guarantee is written down).
+    /// Mode is different in kind — the *absence* of this message is not "no
+    /// data", it is a peer that predates the exclusion and therefore both
+    /// serves and consumes. Degrading silently would leave the §13 relay leg
+    /// open with nothing on either screen to say so, so `control.rs` bumped
+    /// `PROTOCOL_VERSION` and refuses the handshake instead. This variant is
+    /// consequently only ever seen by a peer that understands it.
+    ModeState {
+        /// `mode::Mode` spelled on the wire (`"share" | "a" | "b"`). Carried as
+        /// a string rather than the enum so a mode this build does not know
+        /// arrives as itself: an unknown mode must be reported as unknown, and
+        /// deserialising into `Mode` would fail the whole frame and make the
+        /// peer look like it never advertised at all.
+        mode: String,
+    },
     /// "I have unpaired from you." Sent immediately before `Bye` when the local
     /// user removes a pairing while the channel is up (plan §7.1, ruled in
     /// 2026-07-31).

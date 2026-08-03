@@ -5,6 +5,38 @@ use std::net::TcpStream;
 
 pub const CONTROL_MAX_FRAME: usize = 65536;
 
+/// Peer-to-peer control protocol version, compared for **strict equality** on
+/// every verify (see `pairing::check_protocol`). A mismatch refuses the
+/// connection; it never edits the peer store.
+///
+/// ## Why equality, and why this exists at all now
+///
+/// Until plan §13 there was no peer version negotiation whatsoever — the
+/// `Hello` variant below carries a `version` field that nothing has ever sent
+/// or read. Adding message *variants* did not need one: `secure.rs` skips a
+/// `SessionMsg` it cannot decode and keeps the connection, so new telemetry
+/// degrades to "the peer never tells us" (that guarantee is documented on
+/// `SessionMsg::Unpaired` and still holds).
+///
+/// **Mode advertisement is not that shape.** A build that predates §13 is
+/// simultaneously a provider and a consumer, and it has no field in which to
+/// say so. It would therefore list a machine sitting in mode A/B as usable,
+/// open streams that get refused, and — the part that is not merely cosmetic —
+/// it can still be the relay leg of the §13 cycle, because *its* half of the
+/// exclusion does not exist. Skipping an unparseable `ModeState` would leave
+/// that gap open and silent. Refusing the connection makes it loud, and the
+/// fix (upgrade both ends) is the same either way.
+///
+/// Version 1 = the unversioned pre-§13 protocol. Peers of that vintage send no
+/// `version` field at all, which `serde(default)` reads as [`VERSION_ABSENT`]
+/// so the refusal can name the problem instead of failing as a parse error.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// What a missing `version` field decodes to: a peer old enough to have no
+/// version at all. Distinct from any real version so the refusal message can
+/// say "upgrade it" rather than quoting a number the peer never sent.
+pub const VERSION_ABSENT: u32 = 0;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMsg {
@@ -30,12 +62,23 @@ pub enum ControlMsg {
         mac_b64: String,
         public_key_b64: String,
     },
+    /// The initiator's opening frame, and the first place it can state its
+    /// protocol version. `serde(default)` so a pre-§13 peer decodes as
+    /// [`VERSION_ABSENT`] and gets a refusal that names the problem, instead of
+    /// a bare "parse control message" that names nothing.
     VerifyHello {
         fingerprint: String,
         nonce_b64: String,
+        #[serde(default)]
+        version: u32,
     },
+    /// The responder's first frame, and the mirror of the version above: both
+    /// ends have to learn the other's, and this is the earliest frame in which
+    /// the responder speaks.
     VerifyChallenge {
         nonce_b64: String,
+        #[serde(default)]
+        version: u32,
     },
     VerifyResponse {
         sig_b64: String,

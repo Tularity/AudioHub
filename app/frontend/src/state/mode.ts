@@ -1,4 +1,4 @@
-// 使用端模式（plan §7.1，冻结）——**全局**设置，不是每个对端各自的开关。
+// 运行模式（plan §7.1 + §13，冻结）——**全局**设置，不是每个对端各自的开关。
 //
 // 这个模块是整套 UI 里关于「现在是哪种模式」「模式 B 能不能用」的唯一判据来源：
 // 三个视图各自判一次的话，迟早会出现主面板按 A 渲染、设置页按 B 渲染的分裂。
@@ -6,7 +6,11 @@
 // 迁移后这条规矩比以前更硬：这里全是**纯函数选择器**，组件只能经
 // `useStore(selectXxx)` 读，不许在组件内就地重算。谁想改判据，只能改这个文件。
 //
-// 两条冻结语义直接决定了各视图的形状：
+// **三模式互斥（plan §13）**：共享模式能被别人用、不能用别人；模式 A / B 反过来。
+// 于是「本机是共享端」这件事从一个恒真的背景条件，变成了一个和 A/B 并列的选项，
+// 而界面上每一处「取对方麦克风 / 送对方扬声器」的控件都只在 A/B 下才有意义。
+//
+// 另两条冻结语义仍然决定各视图的形状：
 //   · 模式 B 下「用哪个对端」由用户在系统声音设置里选设备决定，**UI 不提供对端
 //     选择器**——这正是模式 B 存在的理由（以系统最原生的体验为核心目标）；
 //   · 只有模式 A 才在 UI 里决定音频送往哪个对端。
@@ -15,9 +19,15 @@ import type { DaemonInfo, HalDeviceInfo, PeerState } from '../ipc/types';
 import { t } from '../i18n';
 import type { AppState } from './store';
 
+export const MODE_SHARE = 'share';
 export const MODE_A = 'a';
 export const MODE_B = 'b';
-export type ConsumerMode = 'a' | 'b';
+export type AppMode = 'share' | 'a' | 'b';
+
+/** daemon 给的模式字符串 → 本模块的类型。认不出就 null，**绝不猜**。 */
+export function parseMode(v: unknown): AppMode | null {
+  return v === MODE_SHARE || v === MODE_A || v === MODE_B ? v : null;
+}
 
 export type HalKind = 'unknown' | 'absent' | 'mismatch' | 'detached' | 'ready';
 
@@ -83,25 +93,33 @@ export function halState(daemon: DaemonInfo | null | undefined): HalState {
 }
 
 /** 用户请求的模式：daemon 说了算，没拿到回包前用本地缓存兜住首帧。 */
-export function requestedMode(s: AppState): ConsumerMode {
-  const d = s.daemonSettings;
-  if (d && (d.consumer_mode === MODE_A || d.consumer_mode === MODE_B)) return d.consumer_mode;
-  return s.settings.consumerMode === MODE_B ? MODE_B : MODE_A;
+export function requestedMode(s: AppState): AppMode {
+  return parseMode(s.daemonSettings?.mode) ?? parseMode(s.settings.mode) ?? MODE_SHARE;
 }
 
 /**
  * 真正生效的模式。daemon 的 `effective_mode` 优先——它才知道自己有没有 HAL 桥。
- * 拿不到时（旧服务、还没回包）自己按 halState 回落一次，绝不把存过的 'b' 当成
+ * 拿不到时（还没回包）自己按 halState 回落一次，绝不把存过的 'b' 当成
  * 「现在能用 B」。
+ *
+ * 回落方向与 daemon 的 `haldev::effective_mode` 逐条一致：**只有 B 会落空，
+ * 而且落到 A**。落到共享模式会把本机换到互斥关系的另一侧——一个比缺个驱动
+ * 大得多的变化，而且界面上还选中着一个使用端模式。
  */
-export function effectiveMode(s: AppState): ConsumerMode {
-  const d = s.daemonSettings;
-  if (d && (d.effective_mode === MODE_A || d.effective_mode === MODE_B)) return d.effective_mode;
-  return requestedMode(s) === MODE_B && halState(s.daemon).available ? MODE_B : MODE_A;
+export function effectiveMode(s: AppState): AppMode {
+  const d = parseMode(s.daemonSettings?.effective_mode);
+  if (d) return d;
+  const want = requestedMode(s);
+  return want === MODE_B && !halState(s.daemon).available ? MODE_A : want;
 }
 
 export function isModeB(s: AppState): boolean {
   return effectiveMode(s) === MODE_B;
+}
+
+/** 共享模式：本机被别人使用，卡片上那排「使用对端」的控件全部无意义。 */
+export function isShareMode(s: AppState): boolean {
+  return effectiveMode(s) === MODE_SHARE;
 }
 
 /** 用户选了 B、daemon 却只能给 A：必须说出来，否则界面在无声地降级。 */
@@ -109,10 +127,40 @@ export function modeDowngraded(s: AppState): boolean {
   return requestedMode(s) === MODE_B && effectiveMode(s) === MODE_A;
 }
 
+/**
+ * 这台对端此刻能不能被本机使用（plan §13 推论 1）。
+ *
+ * 三态，**不可压成布尔**：
+ *   · 'yes'     —— 它在共享模式，可用；
+ *   · 'no'      —— 它明确说了自己是使用端，或报了个本版本不认识的模式；
+ *   · 'unknown' —— 离线，或刚连上还没收到通告。什么都别说。
+ *
+ * 判据取 daemon 给的 `peer_unusable`，而不是自己从 `peer_mode` 推：`peer_mode`
+ * 为空有两种成因（没上报 / 认不出），只有 daemon 分得清，见 types.ts 的说明。
+ */
+export type PeerUsable = 'yes' | 'no' | 'unknown';
+
+export function peerUsable(p: PeerState | null | undefined): PeerUsable {
+  if (!p || !p.online) return 'unknown';
+  if (p.peer_unusable) return 'no';
+  return parseMode(p.peer_mode) ? 'yes' : 'unknown';
+}
+
+/** 对端不可用时该显示的那句话。'yes' / 'unknown' 一律空串（什么都不说）。 */
+export function peerUnusableText(p: PeerState | null | undefined): string {
+  if (peerUsable(p) !== 'no') return '';
+  const m = parseMode(p?.peer_mode);
+  if (m === MODE_A) return t('peers.unusable.modeA');
+  if (m === MODE_B) return t('peers.unusable.modeB');
+  // 认不出的模式（协议版本相等比较之下本不该出现）：说得含糊但不说错。
+  return t('peers.unusable.unknownMode');
+}
+
 /** 组件用的选择器（引用稳定的对象请勿在此处新建——halState 每次返回新对象，
  *  所以取用它的组件应当只订阅需要的字段，或接受一次浅比较）。 */
-export const selectEffectiveMode = (s: AppState): ConsumerMode => effectiveMode(s);
+export const selectEffectiveMode = (s: AppState): AppMode => effectiveMode(s);
 export const selectIsModeB = (s: AppState): boolean => isModeB(s);
+export const selectIsShareMode = (s: AppState): boolean => isShareMode(s);
 export const selectModeDowngraded = (s: AppState): boolean => modeDowngraded(s);
 export const selectHalKind = (s: AppState): HalKind => halState(s.daemon).kind;
 export const selectHalAvailable = (s: AppState): boolean => halState(s.daemon).available;
@@ -194,6 +242,10 @@ export function halReasonText(reason: string | null | undefined): string {
     case 'no_driver': return t('halReason.noDriver');
     case 'removed_while_offline': return t('halReason.removedWhileOffline');
     case 'mode_a': return t('halReason.modeA');
+    // plan §13 推论 3：切到共享模式即无条件移除，与模式 A 不是同一件事，
+    // 用户的下一步也不同。daemon 侧的 `haldev::no_device_reason` 有一条测试
+    // 会读这个文件，确认每个它能发出的 reason 在这里都有分支。
+    case 'mode_share': return t('halReason.modeShare');
     default: return reason ? t('halReason.other', { reason }) : t('halReason.none');
   }
 }

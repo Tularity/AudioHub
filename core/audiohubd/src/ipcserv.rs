@@ -13,8 +13,8 @@ use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::{HandshakeError, Message, WebSocket};
 
 use audiohub_ipc::{
-    methods, DaemonInfo, DaemonSettings, OpenSessionParams, PeerState, PermissionKind, IPC_VERSION,
-    MODE_A, MODE_B,
+    methods, DaemonInfo, DaemonSettings, Mode, OpenSessionParams, PeerState, PermissionKind,
+    IPC_VERSION, MODE_A, MODE_B, MODE_SHARE,
 };
 use audiohub_net::identity::{random_pin, PeerStore};
 
@@ -265,6 +265,19 @@ fn client_thread(inner: Arc<DaemonInner>, stream: TcpStream) {
     }
 }
 
+/// The whole IPC surface, minus the WebSocket. Tests drive this directly so an
+/// assertion exercises the SAME dispatcher a real client reaches — a test that
+/// called `conn::open_session` by hand would skip the mode gate that lives here
+/// and pass while the product refused nothing.
+#[cfg(test)]
+pub(crate) fn dispatch_for_test(
+    inner: &Arc<DaemonInner>,
+    method: &str,
+    params: &Value,
+) -> Result<Value, String> {
+    dispatch(inner, method, params)
+}
+
 fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Value, String> {
     let r: anyhow::Result<Value> = (|| {
         Ok(match method {
@@ -351,6 +364,12 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                             hal_device: None,
                             hal_reason: None,
                             display_name: String::new(),
+                            // This arm only runs when the peer vanished from
+                            // the store between connecting and listing, so
+                            // there is no channel to have heard a mode on.
+                            // "Unknown", never "usable".
+                            peer_mode: None,
+                            peer_unusable: false,
                         }),
                 )?
             }
@@ -403,7 +422,7 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 // could also open one by peer would have put the peer picker
                 // back, and every mode-B property would quietly stop holding.
                 if let Some(why) =
-                    haldev::refuse_ui_session(haldev::effective_mode(inner), p.override_mode)
+                    haldev::refuse_using_others(haldev::effective_mode(inner), p.override_mode)
                 {
                     anyhow::bail!("{why}");
                 }
@@ -440,14 +459,21 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
             methods::SETTINGS_GET => serde_json::to_value(settings_view(inner))?,
             methods::SETTINGS_SET => {
                 let mut changed = false;
+                // Set only when the MODE moved, which is what drives the §13
+                // transition below. Any other setting changing must not close
+                // anybody's sessions.
+                let mut mode_changed = false;
                 {
                     let mut s = lk(&inner.settings);
-                    if let Some(m) = params.get("consumer_mode").and_then(Value::as_str) {
-                        if m != MODE_A && m != MODE_B {
-                            anyhow::bail!("consumer_mode must be '{MODE_A}' or '{MODE_B}'");
-                        }
-                        changed |= s.consumer_mode != m;
-                        s.consumer_mode = m.to_string();
+                    if let Some(m) = params.get("mode").and_then(Value::as_str) {
+                        let m = Mode::parse(m).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "mode must be '{MODE_SHARE}', '{MODE_A}' or '{MODE_B}'"
+                            )
+                        })?;
+                        mode_changed = s.mode != m;
+                        changed |= mode_changed;
+                        s.mode = m;
                     }
                     for (key, field) in [
                         ("remove_virtual_on_disconnect", 0u8),
@@ -482,6 +508,19 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 }
                 if changed {
                     dlog!("[audiohubd] settings changed; the device coordinator will reconcile");
+                }
+                if mode_changed {
+                    // plan §13 推论 2/3, run BEFORE the reply so a client that
+                    // reads back `settings.get` (or `peers.list`) right after
+                    // this call cannot observe the old sessions still open.
+                    //
+                    // `effective_mode` and not the requested one: a machine
+                    // that asked for B without a driver is running A, and it is
+                    // A's permissions that the sessions have to satisfy.
+                    // Virtual devices are removed by the ordinary reconcile —
+                    // `compute_desired` stops desiring them the moment the mode
+                    // is no longer B (see `haldev::no_device_reason`).
+                    conn::announce_mode(inner, haldev::effective_mode(inner));
                 }
                 serde_json::to_value(settings_view(inner))?
             }
@@ -559,8 +598,8 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         (st.capacity, st.table.used())
     };
     DaemonSettings {
-        consumer_mode: s.consumer_mode.clone(),
-        effective_mode: haldev::effective_mode(inner).to_string(),
+        mode: s.mode,
+        effective_mode: haldev::effective_mode(inner),
         remove_virtual_on_disconnect: s.remove_virtual_on_disconnect,
         mark_offline_devices: s.mark_offline_devices,
         latency: s.latency,
@@ -581,11 +620,20 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
         .map(|p| {
             let (reconnecting, retry_in_s) =
                 recon.get(&p.fingerprint).copied().unwrap_or((false, None));
+            // Only from a LIVE channel (plan §13 推论 1). A dead conn's cell
+            // still holds whatever the peer last said, and reporting that would
+            // put a stale "usable"/"unusable" badge on an offline machine.
+            let live = st
+                .conns
+                .get(&p.fingerprint)
+                .filter(|c| c.alive.load(Ordering::SeqCst));
+            let cell = live
+                .map(|c| *crate::lk(&c.peer_mode))
+                .unwrap_or(crate::PeerModeCell::Unheard);
             PeerState {
-                online: st
-                    .conns
-                    .get(&p.fingerprint)
-                    .map_or(false, |c| c.alive.load(Ordering::SeqCst)),
+                online: live.is_some(),
+                peer_mode: cell.mode(),
+                peer_unusable: cell.unusable(),
                 reconnecting,
                 retry_in_s,
                 hal_device: hal.peer_device(&p.fingerprint),

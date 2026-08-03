@@ -12,7 +12,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use audiohub_ipc::{MODE_A, MODE_B};
+use audiohub_ipc::Mode;
+
+/// Bumped to 2 by plan §13: `consumer_mode` became `mode` and gained `share`.
+///
+/// Nothing migrates. A v1 file simply fails to provide `mode`, so the whole
+/// record falls back to [`StoredSettings::default`] — which is exactly the
+/// intent, because the pre-§13 value cannot be translated: every v1 machine was
+/// a provider AND a consumer at once, so both `"a"` and `"b"` are half of the
+/// answer and neither is the whole one. Choosing for the user here would
+/// silently decide which half of their setup keeps working.
+pub(crate) const SETTINGS_VERSION: u32 = 2;
 
 /// Exactly the fields this daemon owns. `effective_mode`, `hal_capacity` and
 /// `hal_used` are NOT here: they are derived at read time from what the driver
@@ -21,7 +31,7 @@ use audiohub_ipc::{MODE_A, MODE_B};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct StoredSettings {
     pub version: u32,
-    pub consumer_mode: String,
+    pub mode: Mode,
     pub remove_virtual_on_disconnect: bool,
     pub mark_offline_devices: bool,
     pub latency: String,
@@ -31,11 +41,27 @@ pub(crate) struct StoredSettings {
 impl Default for StoredSettings {
     fn default() -> Self {
         StoredSettings {
-            version: 1,
-            // Mode A is the default because it is the mode that works with no
-            // driver installed: a fresh machine must never start in a mode
-            // whose devices cannot exist.
-            consumer_mode: MODE_A.to_string(),
+            version: SETTINGS_VERSION,
+            // Share is the default (plan §13). Three reasons, in order of
+            // weight:
+            //
+            //  1. It is the only mode that needs NOTHING — no driver, no
+            //     system-audio TCC grant. The old comment here made that
+            //     argument for mode A ("a fresh machine must never start in a
+            //     mode whose devices cannot exist"); Share satisfies it
+            //     strictly better, since mode A's own job needs a capture
+            //     permission that a fresh machine has not granted either.
+            //  2. It is what every pre-§13 machine already was. The provider
+            //     side was unconditionally on for everyone; the consumer side
+            //     was a choice most installs never exercised. Defaulting to
+            //     Share removes a capability nobody had asked for rather than
+            //     one they were using.
+            //  3. Two fresh machines that both default to Share are inert but
+            //     coherent: nothing happens until the user names a consumer.
+            //     Two that both defaulted to a consumer mode would refuse each
+            //     other, and every attempt would fail with the interface
+            //     insisting both ends were fine.
+            mode: Mode::Share,
             // plan §7.3 freezes this default: frequent device churn breaks the
             // system's and applications' remembered device selections.
             remove_virtual_on_disconnect: false,
@@ -65,21 +91,38 @@ impl StoredSettings {
         match serde_json::from_slice::<StoredSettings>(&bytes) {
             Ok(s) => s.normalized(),
             Err(e) => {
+                // Includes every pre-§13 file: `mode` is absent there, so serde
+                // fails and the whole record becomes the defaults. Logged as a
+                // plain reason rather than a migration notice, because it is
+                // not one — see SETTINGS_VERSION for why nothing is carried
+                // across.
                 crate::dlog!(
-                    "[audiohubd] {} is not readable ({e}); using default settings",
-                    path.display()
+                    "[audiohubd] {} is not readable ({e}); using default settings \
+                     (mode={})",
+                    path.display(),
+                    Mode::Share
                 );
                 StoredSettings::default()
             }
         }
     }
 
-    /// An unknown mode string is mode A, not an error: whatever wrote it, the
-    /// safe reading of "I do not understand this" is the mode that needs no
-    /// driver.
+    /// A file from the future — a `version` this build does not know — is read
+    /// for whatever fields it does have, but its MODE is not trusted: a mode
+    /// written by a newer build may have a meaning this one cannot honour, and
+    /// the failure would be silent on exactly the axis §13 exists to police
+    /// ("can this machine be used"). Falling back to the default is loud in the
+    /// only way that matters — the user sees the mode they did not choose.
     fn normalized(mut self) -> StoredSettings {
-        if self.consumer_mode != MODE_A && self.consumer_mode != MODE_B {
-            self.consumer_mode = MODE_A.to_string();
+        if self.version != SETTINGS_VERSION {
+            crate::dlog!(
+                "[audiohubd] settings.json is version {} (this build writes {SETTINGS_VERSION}); \
+                 keeping the file's other fields but resetting mode to {}",
+                self.version,
+                Mode::Share
+            );
+            self.mode = Mode::Share;
+            self.version = SETTINGS_VERSION;
         }
         self
     }
@@ -94,9 +137,6 @@ impl StoredSettings {
         Ok(())
     }
 
-    pub(crate) fn wants_mode_b(&self) -> bool {
-        self.consumer_mode == MODE_B
-    }
 }
 
 #[cfg(test)]
@@ -114,9 +154,20 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_the_no_driver_safe_ones() {
+    fn the_default_mode_is_the_one_that_needs_nothing_installed() {
         let d = StoredSettings::default();
-        assert_eq!(d.consumer_mode, MODE_A, "a fresh machine must not start in a mode whose devices cannot exist");
+        assert_eq!(
+            d.mode,
+            Mode::Share,
+            "a fresh machine must start in the only mode that needs neither a driver nor a \
+             capture permission"
+        );
+        assert!(
+            d.mode.serves_peers() && !d.mode.consumes_peers(),
+            "the default must be the provider side: it is what every pre-§13 machine already \
+             was, and two fresh machines that both default to a consumer mode would refuse \
+             each other"
+        );
         assert!(!d.remove_virtual_on_disconnect, "plan §7.3 freezes 'keep'");
         assert!(d.mark_offline_devices);
     }
@@ -126,13 +177,21 @@ mod tests {
         let dir = tmp("roundtrip");
         assert_eq!(StoredSettings::load(&dir), StoredSettings::default());
         let want = StoredSettings {
-            consumer_mode: MODE_B.to_string(),
+            mode: Mode::B,
             remove_virtual_on_disconnect: true,
             mark_offline_devices: false,
             ..StoredSettings::default()
         };
         want.save(&dir).expect("save");
         assert_eq!(StoredSettings::load(&dir), want);
+        // ...and every mode survives the trip, not just the one above: a mode
+        // that round-trips as some *other* mode is the failure this whole
+        // change exists to prevent.
+        for m in [Mode::Share, Mode::A, Mode::B] {
+            let s = StoredSettings { mode: m, ..StoredSettings::default() };
+            s.save(&dir).expect("save");
+            assert_eq!(StoredSettings::load(&dir).mode, m, "{m} did not survive the file");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -141,15 +200,68 @@ mod tests {
         let dir = tmp("corrupt");
         std::fs::write(dir.join("settings.json"), b"{not json").expect("write");
         assert_eq!(StoredSettings::load(&dir), StoredSettings::default());
-        // ...and so does a file whose mode is a string nobody defined: the safe
-        // reading of an unknown mode is the one that needs no driver.
+        // A mode string nobody defined does NOT get guessed into a neighbour:
+        // serde refuses the record and the whole file reads as the defaults.
         std::fs::write(
             dir.join("settings.json"),
-            br#"{"version":1,"consumer_mode":"c","remove_virtual_on_disconnect":false,
+            br#"{"version":2,"mode":"c","remove_virtual_on_disconnect":false,
                  "mark_offline_devices":true,"latency":"min","quality":"auto"}"#,
         )
         .expect("write");
-        assert_eq!(StoredSettings::load(&dir).consumer_mode, MODE_A);
+        assert_eq!(StoredSettings::load(&dir), StoredSettings::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A settings.json written before plan §13 has `consumer_mode`, no `mode`,
+    /// and version 1. It must land on the DEFAULT, not on a translation of the
+    /// old value — see `SETTINGS_VERSION` for why translating is wrong.
+    ///
+    /// The assertion is deliberately on `Share` and not merely on "not `b`":
+    /// the interesting failure is a future `#[serde(alias = "consumer_mode")]`
+    /// added "to be helpful", which would resurrect `"b"` on a machine the user
+    /// has to consciously re-choose.
+    #[test]
+    fn a_pre_s13_file_lands_on_the_default_rather_than_a_translation() {
+        let dir = tmp("legacy");
+        for old in ["a", "b"] {
+            std::fs::write(
+                dir.join("settings.json"),
+                format!(
+                    r#"{{"version":1,"consumer_mode":"{old}","remove_virtual_on_disconnect":true,
+                       "mark_offline_devices":false,"latency":"min","quality":"auto"}}"#
+                ),
+            )
+            .expect("write");
+            let got = StoredSettings::load(&dir);
+            assert_eq!(
+                got.mode,
+                Mode::Share,
+                "consumer_mode={old} must not be carried into the new field"
+            );
+            assert_eq!(got, StoredSettings::default(), "the whole record resets, not just mode");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file from a FUTURE build parses (the fields happen to line up) but its
+    /// mode is not honoured: a newer build's mode may mean something this one
+    /// cannot do, and "can this machine be used by others" is not a question to
+    /// get silently wrong.
+    #[test]
+    fn a_newer_version_keeps_its_other_fields_but_not_its_mode() {
+        let dir = tmp("future");
+        std::fs::write(
+            dir.join("settings.json"),
+            br#"{"version":99,"mode":"b","remove_virtual_on_disconnect":true,
+                 "mark_offline_devices":false,"latency":"min","quality":"auto"}"#,
+        )
+        .expect("write");
+        let got = StoredSettings::load(&dir);
+        assert_eq!(got.mode, Mode::Share, "a mode from an unknown version is not trusted");
+        assert!(got.remove_virtual_on_disconnect, "...but the ordinary preferences are kept");
+        assert!(!got.mark_offline_devices);
+        assert_eq!(got.version, SETTINGS_VERSION, "and it is rewritten as ours");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

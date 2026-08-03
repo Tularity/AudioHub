@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use audiohub_ipc::OpenSessionParams;
+use audiohub_ipc::{Mode, OpenSessionParams};
 use audiohub_net::identity::PeerStore;
 
 use crate::conn::{self, ConnectOrigin};
@@ -145,22 +145,27 @@ pub(crate) enum ReplayAction {
 ///
 /// 三道关，缺一不可：
 /// 1. 去重——保证同一个 `(对端, spec, 方向)` 不会因为重连多出第二路；
-/// 2. 模式闸门——`haldev::refuse_ui_session`，和 IPC 路径 (`ipcserv.rs` 的
+/// 2. 模式闸门——`haldev::refuse_using_others`，和 IPC 路径 (`ipcserv.rs` 的
 ///    `SESSION_OPEN`) 调的是同一个函数。重放过去完全绕过它：模式 B 明令禁止
 ///    UI 开会话，一条模式 A 时期开的用户会话却能靠一次断线在模式 B 下复活。
+///    plan §13 之后这道关同时挡住共享模式——重放的全是**本机开的**会话，
+///    也就是「本机使用别人」，而共享模式下这件事根本不该发生。少了它，
+///    切到共享模式时被 `announce_mode` 关掉的会话会在下一次断线重连时原样复活，
+///    本机重新变回「既共享又使用」。
 ///    `Hal` 会话不过这道关——它本身就是模式 B 的路径（协调器传 `override_mode:
-///    true` 也是这个道理）；
+///    true` 也是这个道理）；模式一旦不是 B，虚拟设备已被移除，也就不会再有
+///    `Hal` 计划产生。
 /// 3. 身份——把原来的 origin 原样带出去。
 pub(crate) fn plan_replay(
     planned: &PlannedSession,
     live: &[OpenSessionParams],
-    mode: &str,
+    mode: Mode,
 ) -> ReplayAction {
     if live.iter().any(|l| same_media_intent(l, &planned.params)) {
         return ReplayAction::SkipDuplicate;
     }
     if !matches!(planned.origin, SessionOrigin::Hal { .. }) {
-        if let Some(why) = haldev::refuse_ui_session(mode, planned.params.override_mode) {
+        if let Some(why) = haldev::refuse_using_others(mode, planned.params.override_mode) {
             return ReplayAction::SkipMode(why);
         }
     }
@@ -462,7 +467,7 @@ fn attempt(inner: &Arc<DaemonInner>, fp: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audiohub_ipc::{MODE_A, MODE_B, SOURCE_HAL_SPEAKER, SOURCE_TONE};
+    use audiohub_ipc::{Mode, SOURCE_HAL_SPEAKER, SOURCE_TONE};
 
     fn base(kind: &str) -> OpenSessionParams {
         OpenSessionParams {
@@ -542,7 +547,7 @@ mod tests {
         }
 
         /// reconnect.rs `replay_sessions`：逐条决策，每条都重新读一次现场。
-        fn replay_pass(&mut self, plan: &[PlannedSession], mode: &str) {
+        fn replay_pass(&mut self, plan: &[PlannedSession], mode: Mode) {
             for p in plan {
                 let live = self.intents();
                 if let ReplayAction::Open(origin) = plan_replay(p, &live, mode) {
@@ -580,9 +585,9 @@ mod tests {
             let mut live = Live::default();
             if coordinator_first {
                 live.coordinator_pass(0, &spk);
-                live.replay_pass(&plan, MODE_B);
+                live.replay_pass(&plan, Mode::B);
             } else {
-                live.replay_pass(&plan, MODE_B);
+                live.replay_pass(&plan, Mode::B);
                 live.coordinator_pass(0, &spk);
             }
             let same = live.matching(&spk);
@@ -611,7 +616,7 @@ mod tests {
 
         let mut live = Live::default();
         live.coordinator_pass(2, &mic);
-        live.replay_pass(&plan, MODE_B);
+        live.replay_pass(&plan, Mode::B);
         assert_eq!(live.matching(&mic).len(), 1);
         assert_eq!(live.0[0].origin, SessionOrigin::Hal { slot: 2 });
     }
@@ -624,12 +629,12 @@ mod tests {
         let planned = PlannedSession { params: spk.clone(), origin: SessionOrigin::Hal { slot: 0 } };
 
         assert_eq!(
-            plan_replay(&planned, &[spk.clone()], MODE_B),
+            plan_replay(&planned, &[spk.clone()], Mode::B),
             ReplayAction::SkipDuplicate,
             "协调器已经恢复了这条链路，重放不能再开第二条"
         );
         assert_eq!(
-            plan_replay(&planned, &[], MODE_B),
+            plan_replay(&planned, &[], Mode::B),
             ReplayAction::Open(SessionOrigin::Hal { slot: 0 }),
             "没人恢复过就该开——而且用原来的身份，不是硬编码的 User"
         );
@@ -642,12 +647,12 @@ mod tests {
     fn the_replay_path_goes_through_the_same_mode_gate() {
         let ui = PlannedSession { params: user_tone(), origin: SessionOrigin::User };
         assert_eq!(
-            plan_replay(&ui, &[], MODE_A),
+            plan_replay(&ui, &[], Mode::A),
             ReplayAction::Open(SessionOrigin::User),
             "模式 A 下用户会话照常恢复"
         );
         assert!(
-            matches!(plan_replay(&ui, &[], MODE_B), ReplayAction::SkipMode(_)),
+            matches!(plan_replay(&ui, &[], Mode::B), ReplayAction::SkipMode(_)),
             "模式 B 不允许 UI 开会话，一次断线也不该成为后门"
         );
 
@@ -656,7 +661,7 @@ mod tests {
             params: OpenSessionParams { override_mode: true, ..user_tone() },
             origin: SessionOrigin::User,
         };
-        assert_eq!(plan_replay(&cli, &[], MODE_B), ReplayAction::Open(SessionOrigin::User));
+        assert_eq!(plan_replay(&cli, &[], Mode::B), ReplayAction::Open(SessionOrigin::User));
     }
 
     /// 修复不能把正常的重连恢复弄坏：UI/CLI 开的会话没有别的主人，断线后必须
@@ -670,7 +675,7 @@ mod tests {
         let plan = live.drop_connection();
         assert_eq!(plan.len(), 1, "用户会话必须进入恢复计划——重放是它唯一的救生索");
 
-        live.replay_pass(&plan, MODE_A);
+        live.replay_pass(&plan, Mode::A);
         let same = live.matching(&tone);
         assert_eq!(same.len(), 1, "恢复一条，不多不少");
         assert_eq!(same[0].origin, SessionOrigin::User);
@@ -695,7 +700,7 @@ mod tests {
             origin: SessionOrigin::User,
         }];
         live.coordinator_pass(0, &spk);
-        live.replay_pass(&plan, MODE_B);
+        live.replay_pass(&plan, Mode::B);
 
         assert_eq!(live.matching(&spk).len(), 1);
         assert_eq!(live.matching(&tone).len(), 1);

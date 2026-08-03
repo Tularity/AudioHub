@@ -1,4 +1,4 @@
-use crate::control::{read_frame, write_frame, ControlMsg};
+use crate::control::{read_frame, write_frame, ControlMsg, PROTOCOL_VERSION, VERSION_ABSENT};
 use crate::identity::{fingerprint_of, verify_sig, LocalIdentity, PairedPeer, PeerStore};
 use anyhow::{anyhow, bail, Result};
 use base64::prelude::*;
@@ -330,6 +330,60 @@ fn authenticate_unpaired(
     Ok(fp_r)
 }
 
+/// The peer speaks a different control protocol version than we do.
+///
+/// A distinct type, like [`UnpairedByPeer`], so callers can recognise it out of
+/// an `anyhow` chain without matching on message text. Unlike `UnpairedByPeer`
+/// it must **never** edit the peer store: a version mismatch is a connection
+/// failure between two machines that are still perfectly well paired, and the
+/// user's fix is to redeploy the older end, not to pair again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolMismatch {
+    pub ours: u32,
+    pub theirs: u32,
+}
+
+impl std::fmt::Display for ProtocolMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.theirs == VERSION_ABSENT {
+            write!(
+                f,
+                "the peer speaks a control protocol from before mode advertisement existed \
+                 (we speak v{}); both machines have to run this build",
+                self.ours
+            )
+        } else {
+            write!(
+                f,
+                "control protocol mismatch: we speak v{}, the peer speaks v{}; both machines \
+                 have to run the same build",
+                self.ours, self.theirs
+            )
+        }
+    }
+}
+
+impl std::error::Error for ProtocolMismatch {}
+
+/// True when this error chain reports a control protocol version mismatch.
+pub fn was_protocol_mismatch(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<ProtocolMismatch>().is_some())
+}
+
+/// Strict equality (plan §13). Deliberately not `theirs >= ours` or any other
+/// ordering: mode advertisement changes what a peer is *allowed to do*, not
+/// just what it can say, so "close enough" has no safe reading. The Windows
+/// driver handshake already uses this exact posture for the same reason.
+pub fn check_protocol(theirs: u32) -> Result<()> {
+    if theirs == PROTOCOL_VERSION {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(ProtocolMismatch {
+        ours: PROTOCOL_VERSION,
+        theirs,
+    }))
+}
+
 fn verify_preimage(nonce: &[u8], fp_first: &str, fp_second: &str) -> Vec<u8> {
     let mut m = Vec::with_capacity(VERIFY_LABEL.len() + nonce.len() + 32);
     m.extend_from_slice(VERIFY_LABEL);
@@ -357,10 +411,17 @@ pub fn verify_initiator(
         &ControlMsg::VerifyHello {
             fingerprint: id.fingerprint.clone(),
             nonce_b64: BASE64_STANDARD.encode(nonce_i),
+            version: PROTOCOL_VERSION,
         },
     )?;
     let nonce_r = match read_frame(s)? {
-        ControlMsg::VerifyChallenge { nonce_b64 } => b64d(&nonce_b64)?,
+        ControlMsg::VerifyChallenge { nonce_b64, version } => {
+            // Before anything is signed or stored. A refused version leaves the
+            // pairing alone — the two machines are still paired, one of them is
+            // just running a build that cannot state its mode.
+            check_protocol(version)?;
+            b64d(&nonce_b64)?
+        }
         // The responder says it does not know us any more. Reported as a typed
         // error so the daemon can drop its own half of the pairing (and the
         // peer's virtual devices) instead of retrying forever — but ONLY once
@@ -447,7 +508,18 @@ pub fn verify_responder(
     let _ = s.set_nodelay(true);
 
     let (fp_i, nonce_i) = match read_frame(s)? {
-        ControlMsg::VerifyHello { fingerprint, nonce_b64 } => (fingerprint, b64d(&nonce_b64)?),
+        ControlMsg::VerifyHello { fingerprint, nonce_b64, version } => {
+            // Checked BEFORE the store lookup, so a version-mismatched peer is
+            // told about the version rather than about its fingerprint — and,
+            // more importantly, so it can never reach the `Unpaired` branch
+            // below. That branch makes the initiator DELETE a pairing, and a
+            // build we cannot speak to must not be able to trigger it.
+            if let Err(e) = check_protocol(version) {
+                let _ = write_frame(s, &ControlMsg::Error { message: e.to_string() });
+                return Err(e);
+            }
+            (fingerprint, b64d(&nonce_b64)?)
+        }
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     };
@@ -483,6 +555,7 @@ pub fn verify_responder(
         s,
         &ControlMsg::VerifyChallenge {
             nonce_b64: BASE64_STANDARD.encode(nonce_r),
+            version: PROTOCOL_VERSION,
         },
     )?;
     let m_r = verify_preimage(&nonce_i, &id.fingerprint, &fp_i);
@@ -513,4 +586,197 @@ pub fn verify_responder(
     // Same rule as the initiator side: adopted only once the signature holds.
     adopt_name(&mut peer, name_i);
     Ok(peer)
+}
+
+#[cfg(test)]
+mod protocol_version_tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("ahb-pair-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).expect("mkdir");
+        p
+    }
+
+    struct Party {
+        id: LocalIdentity,
+        dir: PathBuf,
+    }
+
+    impl Party {
+        fn new(tag: &str) -> Party {
+            let dir = tmp(tag);
+            let id = LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
+            Party { id, dir }
+        }
+
+        fn trust(&self, other: &Party) {
+            let mut s = PeerStore::load_at(Some(&self.dir)).expect("store");
+            s.upsert(PairedPeer {
+                name: other.id.name.clone(),
+                fingerprint: other.id.fingerprint.clone(),
+                public_key_b64: other.id.public_key_b64(),
+                last_addr: Some("127.0.0.1".into()),
+                port: 47810,
+                added_unix: 0,
+                alias: None,
+            });
+            s.save().expect("save store");
+        }
+    }
+
+    /// Serves ONE `verify_responder` on loopback, out of `dir`'s identity and
+    /// store. Returns the listening address and the join handle.
+    ///
+    /// The responder is the PRODUCTION function — the whole point of these
+    /// tests is that the shipped code refuses, not that a hand-written check
+    /// would.
+    fn serve(dir: &PathBuf) -> (std::net::SocketAddr, std::thread::JoinHandle<Result<PairedPeer>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let dir = dir.clone();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let id = LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
+            let store = PeerStore::load_at(Some(&dir)).expect("store");
+            verify_responder(&mut s, &id, &store)
+        });
+        (addr, h)
+    }
+
+    /// One real verify exchange, with the initiator's `VerifyHello.version`
+    /// overridden. Returns what the responder concluded and what it replied.
+    fn exchange(
+        fingerprint: &str,
+        hello_version: u32,
+        dir: &PathBuf,
+    ) -> (Result<PairedPeer>, Result<ControlMsg>) {
+        let (addr, h) = serve(dir);
+        let mut c = TcpStream::connect(addr).expect("connect");
+        let mut nonce_i = [0u8; 16];
+        OsRng.fill_bytes(&mut nonce_i);
+        write_frame(
+            &mut c,
+            &ControlMsg::VerifyHello {
+                fingerprint: fingerprint.to_string(),
+                nonce_b64: BASE64_STANDARD.encode(nonce_i),
+                version: hello_version,
+            },
+        )
+        .expect("write hello");
+        // Read the reply so the responder is never blocked on its own write.
+        let reply = read_frame(&mut c);
+        drop(c);
+        (h.join().expect("responder thread"), reply)
+    }
+
+    fn pair_of(tag: &str) -> (Party, Party) {
+        let a = Party::new(&format!("{tag}-init"));
+        let b = Party::new(&format!("{tag}-resp"));
+        a.trust(&b);
+        b.trust(&a);
+        (a, b)
+    }
+
+    fn cleanup(parties: [&Party; 2]) {
+        for p in parties {
+            let _ = std::fs::remove_dir_all(&p.dir);
+        }
+    }
+
+    /// The control case. Without it every assertion below would pass just as
+    /// well against a responder that refuses everything — which is exactly the
+    /// shape of "green test, dead feature" this project keeps paying for.
+    #[test]
+    fn a_matching_version_clears_the_gate() {
+        let (a, b) = pair_of("match");
+        let (out, _) = exchange(&a.id.fingerprint, PROTOCOL_VERSION, &b.dir);
+        // The exchange still fails afterwards — our stub initiator never signs
+        // — but it must NOT fail as a version mismatch.
+        let e = out.expect_err("the stub initiator cannot complete the exchange");
+        assert!(
+            !was_protocol_mismatch(&e),
+            "a peer speaking our version must clear the version gate, got: {e:#}"
+        );
+        cleanup([&a, &b]);
+    }
+
+    /// A peer one version behind is refused by the real responder, before any
+    /// signature is exchanged.
+    #[test]
+    fn a_stale_version_is_refused_by_the_real_responder() {
+        let (a, b) = pair_of("stale");
+        let (out, reply) = exchange(&a.id.fingerprint, PROTOCOL_VERSION - 1, &b.dir);
+        let e = out.expect_err("must be refused");
+        assert!(was_protocol_mismatch(&e), "expected a version mismatch, got: {e:#}");
+        assert!(
+            matches!(reply, Ok(ControlMsg::Error { .. })),
+            "the initiator has to be TOLD, not just dropped: {reply:?}"
+        );
+        cleanup([&a, &b]);
+    }
+
+    /// A peer that predates versioning entirely sends no `version` field at
+    /// all, which decodes as `VERSION_ABSENT`. It is refused, and the message
+    /// names the actual problem rather than quoting a v0 it never sent.
+    ///
+    /// This is the case that matters: plan §13 mode advertisement is not
+    /// additive, so a build that cannot state its mode must not be talked to.
+    /// Before this change such a peer connected happily and was listed as
+    /// usable while it was simultaneously a provider and a consumer.
+    #[test]
+    fn a_peer_from_before_versioning_is_refused_and_told_why() {
+        let (a, b) = pair_of("absent");
+        let (out, _) = exchange(&a.id.fingerprint, VERSION_ABSENT, &b.dir);
+        let e = out.expect_err("must be refused");
+        assert!(was_protocol_mismatch(&e), "expected a version mismatch, got: {e:#}");
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("before mode advertisement"),
+            "the message must name the real problem, not quote a version nobody sent: {text}"
+        );
+        cleanup([&a, &b]);
+    }
+
+    /// The version check has to sit AHEAD of the store lookup, because the
+    /// lookup's miss path answers `Unpaired` — a frame the initiator acts on by
+    /// DELETING a pairing. A build we cannot speak to must not be able to reach
+    /// it.
+    ///
+    /// Pinned with a fingerprint the responder has never heard of: a responder
+    /// that looked up first would answer `Unpaired` here instead of refusing on
+    /// the version, and this test would catch exactly that reordering.
+    #[test]
+    fn a_version_mismatch_is_decided_before_the_peer_is_looked_up() {
+        let b = Party::new("order-resp");
+        let (out, reply) = exchange("ffffffffffffffff", VERSION_ABSENT, &b.dir);
+        let e = out.expect_err("must be refused");
+        assert!(was_protocol_mismatch(&e), "expected a version mismatch, got: {e:#}");
+        match reply {
+            Ok(ControlMsg::Error { .. }) => {}
+            Ok(ControlMsg::Unpaired { .. }) => panic!(
+                "the responder answered Unpaired to a version-mismatched stranger: acting on \
+                 that frame deletes a pairing, and a peer we refuse to speak to must not be \
+                 able to trigger it"
+            ),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    /// Strict equality in BOTH directions. "Newer is fine" is the reading that
+    /// quietly reopens the gap: a newer peer may define a mode whose exclusion
+    /// rules this build cannot honour, and we would list it as usable.
+    #[test]
+    fn the_gate_is_equality_not_a_minimum() {
+        assert!(check_protocol(PROTOCOL_VERSION).is_ok());
+        assert!(check_protocol(PROTOCOL_VERSION + 1).is_err(), "a newer peer is refused too");
+        assert!(check_protocol(PROTOCOL_VERSION - 1).is_err());
+    }
 }

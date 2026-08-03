@@ -27,9 +27,16 @@ import type { PermissionState } from '../state/permissions';
 import {
   halState, requestedMode, effectiveMode, isModeB, modeDowngraded, deviceStateLabel,
 } from '../state/mode';
+import type { AppMode } from '../state/mode';
 import { applySettings, refreshPermissions, rpc } from '../state/connection';
 
-const MODE_LABEL_KEY: Record<string, MsgKey> = { a: 'mode.a.label', b: 'mode.b.label' };
+// plan §13：三档。`Record<AppMode, MsgKey>` 而不是 `Record<string, MsgKey>`——
+// 后者会让漏掉一档在编译期毫无声响，运行期变成一次 `t(undefined)`。
+export const MODE_LABEL_KEY: Record<AppMode, MsgKey> = {
+  share: 'mode.share.label',
+  a: 'mode.a.label',
+  b: 'mode.b.label',
+};
 
 function SettingRow({ title, desc, control, badge }: {
   title: string; desc: string; control: ReactNode; badge?: string;

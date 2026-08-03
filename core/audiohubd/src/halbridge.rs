@@ -428,6 +428,22 @@ pub struct HalBridgeStatus {
     /// Why there is no live bridge, in words a UI can show. `None` while
     /// connected.
     pub status_reason: Option<String>,
+    /// Binds the driver refused, or performed only halfway. Monotonic.
+    pub bind_failures: u64,
+    /// The most recent of those, in words. `None` once a bind succeeds again.
+    ///
+    /// A connected driver that will not publish an endpoint is otherwise
+    /// INVISIBLE from here: `driver_connected` is true and the counters keep
+    /// moving. This pair is the only place that state is representable.
+    pub last_bind_error: Option<String>,
+    /// Binds that SUCCEEDED but published the peer's devices under the generic
+    /// direction names instead of the peer's own (Windows only). Monotonic.
+    ///
+    /// Separate from `bind_failures` because it is not one: the devices exist
+    /// and work. It is counted at all because with two peers paired it means
+    /// two identically labelled speakers, and "the devices are there but you
+    /// cannot tell them apart" needs somewhere to be said.
+    pub pin_name_fallbacks: u64,
     /// 主动水位削减，跨槽汇总。计数是**和**，三个读数（target/drawdown/tokens）
     /// 取**最大**——它们是水位而不是流量，相加没有物理含义。
     pub trim: HalTrimCounters,
@@ -510,6 +526,9 @@ impl HalBridge {
                 v => Some(v),
             },
             status_reason: lk(&s.status_reason).clone(),
+            bind_failures: s.bind_failures.load(Ordering::Relaxed),
+            last_bind_error: lk(&s.last_bind_error).clone(),
+            pin_name_fallbacks: s.pin_name_fallbacks.load(Ordering::Relaxed),
             trim: HalTrimCounters {
                 events: slots.iter().map(|c| c.trim.events).sum(),
                 frames: slots.iter().map(|c| c.trim.frames).sum(),
@@ -799,12 +818,24 @@ impl HalBridge {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HalBindRequest {
     pub slot: u8,
-    /// Peer fingerprint, for the driver's logs and its idempotency compare.
+    /// Peer fingerprint. On macOS this is only the driver's log line and its
+    /// idempotency compare; on WINDOWS it is additionally the device-interface
+    /// reference string, i.e. the endpoint's identity, so the driver validates
+    /// it against a `[0-9a-f]{16}` whitelist.
     pub peer_key: String,
     pub out_uid: String,
     pub in_uid: String,
     pub out_name: String,
     pub in_name: String,
+    /// The peer's disambiguated display name with NO direction suffix —
+    /// "AudioHub – WIN-30", where `out_name` would be "AudioHub – WIN-30 扬声器".
+    ///
+    /// macOS ignores this and uses `out_name`/`in_name`, which are the complete
+    /// device names. Windows uses ONLY this, because it composes the string the
+    /// user sees itself: the endpoint name is `"<pin name> (<filter
+    /// FriendlyName>)"`, and the driver controls only the half in brackets.
+    /// Sending `out_name` there would produce "扬声器 (AudioHub – WIN-30 扬声器)".
+    pub display: String,
     /// bit0 of the wire `flags`: the peer is connected. Logging only on the
     /// driver's side — a device is published either way (plan §7.3).
     pub online: bool,
@@ -3603,6 +3634,18 @@ struct Shared {
     driver_protocol: AtomicU32,
     /// Why there is no bridge right now, for `daemon.status`.
     status_reason: Mutex<Option<String>>,
+    /// How many binds/unbinds the driver has refused or half-performed, and
+    /// what the most recent one said.
+    ///
+    /// SURFACED OVER IPC, not merely logged. A driver that fails to publish an
+    /// endpoint while still answering every message is invisible to every
+    /// other field here — `driver_connected` stays true, `state` stays
+    /// `bound` — so the daemon has to carry the failure itself or nothing
+    /// upstream can ever show it. That gap is precisely how "the speaker is
+    /// gone" became something only a human could notice.
+    bind_failures: AtomicU64,
+    last_bind_error: Mutex<Option<String>>,
+    pin_name_fallbacks: AtomicU64,
     rings: platform::Rings,
     /// Send right on the driver's service port, 0 when no driver is attached.
     /// A mutex rather than an atomic because two threads send on it (the
@@ -4550,6 +4593,9 @@ mod platform {
             slot_count: AtomicU32::new(0),
             driver_protocol: AtomicU32::new(0),
             status_reason: Mutex::new(Some("no driver attached yet".to_string())),
+            bind_failures: AtomicU64::new(0),
+            last_bind_error: Mutex::new(None),
+            pin_name_fallbacks: AtomicU64::new(0),
             rings: Rings::new(),
             driver_port: Mutex::new(MACH_PORT_NULL),
             superseded: AtomicBool::new(false),
@@ -7034,6 +7080,9 @@ mod platform {
                 slot_count: AtomicU32::new(0),
                 driver_protocol: AtomicU32::new(0),
                 status_reason: Mutex::new(None),
+                bind_failures: AtomicU64::new(0),
+                last_bind_error: Mutex::new(None),
+                pin_name_fallbacks: AtomicU64::new(0),
                 rings,
                 driver_port: Mutex::new(MACH_PORT_NULL),
                 superseded: AtomicBool::new(false),
@@ -7926,13 +7975,27 @@ mod platform {
 mod platform {
     use super::*;
 
-    /// There is no HAL to bridge to; the type exists so the rest of the module
-    /// compiles unchanged on Windows.
-    pub struct Rings;
+    /// The platform's private state bag, held by `Shared`.
+    ///
+    /// The name is inherited from the macOS side, where this really is the
+    /// shared-memory rings. On Windows there is no data plane yet — M6-2 is
+    /// control-plane only — so every ring method below is a no-op and the
+    /// struct's actual job is to hold the driver session.
+    ///
+    /// Putting the session HERE rather than adding a field to `Shared` is what
+    /// keeps `Shared` free of `cfg`: it is already the one member declared as
+    /// `platform::…`.
+    pub struct Rings {
+        #[cfg(windows)]
+        session: Mutex<Option<crate::halbridge_win::session::Session>>,
+    }
 
     impl Rings {
         pub fn new() -> Rings {
-            Rings
+            Rings {
+                #[cfg(windows)]
+                session: Mutex::new(None),
+            }
         }
         pub fn read_spk(&self, _slot: usize, _dst: &mut [f32], _frames: usize) -> usize {
             0
@@ -7966,13 +8029,17 @@ mod platform {
         }
     }
 
+    // ------------------------------------------------------------ no driver
+
+    #[cfg(not(windows))]
     pub fn start(cfg: HalBridgeCfg) -> Result<Option<HalBridge>> {
         if cfg.mode == HalBridgeMode::Require {
-            anyhow::bail!("the HAL bridge is macOS-only");
+            anyhow::bail!("the HAL bridge needs macOS or Windows");
         }
         Ok(None)
     }
 
+    #[cfg(not(windows))]
     pub fn send_notify(
         _shared: &Shared,
         _at: HalEndpoint,
@@ -7982,11 +8049,315 @@ mod platform {
     ) {
     }
 
+    #[cfg(not(windows))]
     pub fn send_bind_set(_shared: &Shared, _req: &HalBindRequest) -> bool {
         false
     }
 
+    #[cfg(not(windows))]
     pub fn send_bind_clear(_shared: &Shared, _slot: u8, _generation: u32) -> bool {
         false
+    }
+
+    // ------------------------------------------------------------- windows
+
+    #[cfg(windows)]
+    use crate::halbridge_win::{session::Session, wire};
+
+    /// How often the service thread retries a missing driver and drains the
+    /// inverted call. The macOS side is woken by mach; here there is nothing to
+    /// block on until the data plane exists, so it polls.
+    #[cfg(windows)]
+    const SERVICE_TICK: Duration = Duration::from_millis(500);
+
+    #[cfg(windows)]
+    pub fn start(cfg: HalBridgeCfg) -> Result<Option<HalBridge>> {
+        if cfg.mode == HalBridgeMode::Off {
+            return Ok(None);
+        }
+
+        // The gate for `Auto`: can we open the control device right now? A
+        // machine without the driver is the ordinary case (every CI box, every
+        // Windows machine before installation) and must stay silent.
+        let first = match Session::open() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                if cfg.mode != HalBridgeMode::Require {
+                    return Ok(None);
+                }
+                dlog!("[audiohubd] HAL bridge: {} ; will keep looking", e.text());
+                None
+            }
+        };
+
+        let shared = Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            driver_found: AtomicBool::new(first.is_some()),
+            driver_connected: AtomicBool::new(false),
+            slots: std::array::from_fn(|_| SlotShared::new()),
+            last_driver_msg: Mutex::new(None),
+            events: Mutex::new(Vec::new()),
+            spk_flush: AtomicU16::new(0),
+            published: AtomicU16::new(0),
+            session_id: AtomicU64::new(0),
+            attach_epoch: AtomicU64::new(0),
+            slot_count: AtomicU32::new(0),
+            driver_protocol: AtomicU32::new(0),
+            status_reason: Mutex::new(Some("no driver attached yet".to_string())),
+            bind_failures: AtomicU64::new(0),
+            last_bind_error: Mutex::new(None),
+            pin_name_fallbacks: AtomicU64::new(0),
+            rings: Rings::new(),
+            driver_port: Mutex::new(0),
+            superseded: AtomicBool::new(false),
+            tick_punctual: AtomicBool::new(true),
+        });
+
+        if let Some(s) = first {
+            attach(&shared, s);
+        }
+
+        let s = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("ahb-halbridge".to_string())
+            .spawn(move || service_loop(s))?;
+
+        Ok(Some(HalBridge { shared, thread: Mutex::new(Some(thread)) }))
+    }
+
+    /// Publishes a freshly handshaken session. Bumping `attach_epoch` is what
+    /// makes the device coordinator re-`Set` every binding it still intends —
+    /// the driver keeps its bindings across a daemon restart, but none of them
+    /// are acknowledged to THIS daemon any more.
+    #[cfg(windows)]
+    fn attach(shared: &Arc<Shared>, s: Session) {
+        let (id, slots, protocol, check) =
+            (s.session_id, s.slot_count, s.driver_protocol, s.client_check);
+
+        if s.identity_check_degraded() {
+            // Loud on purpose. A caller-identity check that silently degraded
+            // to "the ACL let you in" is indistinguishable from no check, and
+            // the whole point of reporting the level is that the weaker one is
+            // visible rather than assumed.
+            dlog!(
+                "[audiohubd] hal: the driver is enforcing client_check={check} (ACL only). \
+                 Set AudioHubDaemonImage in the device software key to pin the daemon's \
+                 image path."
+            );
+        }
+
+        *lk(&shared.rings.session) = Some(s);
+        shared.session_id.store(id, Ordering::SeqCst);
+        shared.slot_count.store(slots as u32, Ordering::SeqCst);
+        shared.driver_protocol.store(protocol, Ordering::Relaxed);
+        shared.driver_found.store(true, Ordering::Relaxed);
+        shared.driver_connected.store(true, Ordering::Relaxed);
+        *lk(&shared.status_reason) = None;
+        *lk(&shared.last_driver_msg) = Some(Instant::now());
+        shared.attach_epoch.fetch_add(1, Ordering::AcqRel);
+        shared.push_event(HalControlEvent::Attached { session_id: id, slot_count: slots });
+        dlog!("[audiohubd] hal: attached, session {id}, {slots} slots, client_check {check}");
+    }
+
+    /// Drops the session. The DRIVER's bindings survive this — a daemon that
+    /// died is not a peer that was unpaired, and plan §7.3 keeps a paired
+    /// peer's devices in the system list either way.
+    #[cfg(windows)]
+    fn detach(shared: &Shared, why: &str) {
+        if lk(&shared.rings.session).take().is_none() {
+            return;
+        }
+        shared.driver_connected.store(false, Ordering::Relaxed);
+        shared.slot_count.store(0, Ordering::SeqCst);
+        shared.session_id.store(0, Ordering::SeqCst);
+        *lk(&shared.status_reason) = Some(why.to_string());
+        shared.push_event(HalControlEvent::Detached);
+        dlog!("[audiohubd] hal: detached ({why})");
+    }
+
+    #[cfg(windows)]
+    fn service_loop(shared: Arc<Shared>) {
+        while !shared.stop.load(Ordering::SeqCst) {
+            let connected = lk(&shared.rings.session).is_some();
+
+            if !connected {
+                match Session::open() {
+                    Ok(s) => attach(&shared, s),
+                    Err(e) => {
+                        shared.driver_found.store(e.driver_present(), Ordering::Relaxed);
+                        shared
+                            .driver_protocol
+                            .store(e.driver_protocol().unwrap_or(0), Ordering::Relaxed);
+                        *lk(&shared.status_reason) = Some(e.text());
+                    }
+                }
+            } else {
+                // Drain whatever the driver pushed. Empty through M6-2 — there
+                // is no volume node and no data plane — but the loop is here so
+                // that adding either is a driver-side change only.
+                let events = {
+                    let mut g = lk(&shared.rings.session);
+                    g.as_mut().map(|s| s.poll_events()).unwrap_or_default()
+                };
+                if !events.is_empty() {
+                    *lk(&shared.last_driver_msg) = Some(Instant::now());
+                }
+                for ev in events {
+                    if let Some(mapped) = map_event(&shared, ev) {
+                        shared.push_event(mapped);
+                    }
+                }
+            }
+
+            std::thread::sleep(SERVICE_TICK);
+        }
+
+        detach(&shared, "daemon shutting down");
+    }
+
+    /// Wire event -> bridge event, dropping anything about a slot the driver
+    /// cannot legitimately be talking about.
+    #[cfg(windows)]
+    fn map_event(shared: &Shared, ev: wire::ControlEvent) -> Option<HalControlEvent> {
+        let slot = u8::try_from(ev.slot).ok()?;
+        if slot as usize >= HAL_MAX_SLOTS {
+            return None;
+        }
+        let at = if ev.input() { HalEndpoint::mic(slot) } else { HalEndpoint::out(slot) };
+        match ev.kind {
+            wire::EVENT_VOLUME => Some(HalControlEvent::Volume {
+                at,
+                generation: ev.generation,
+                scalar: ev.scalar(),
+                muted: ev.muted(),
+            }),
+            wire::EVENT_IOSTATE => {
+                Some(HalControlEvent::IoState { at, generation: ev.generation, running: ev.running() })
+            }
+            wire::EVENT_SLOT => {
+                let state = match ev.state {
+                    wire::SLOT_FREE => HalSlotState::Free,
+                    wire::SLOT_BOUND => HalSlotState::Bound,
+                    wire::SLOT_DELISTED => HalSlotState::Delisted,
+                    _ => return None,
+                };
+                shared.arm_flush(slot);
+                Some(HalControlEvent::BindState { slot, generation: ev.generation, state })
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn send_notify(
+        _shared: &Shared,
+        _at: HalEndpoint,
+        _generation: u32,
+        _scalar: f32,
+        _muted: bool,
+    ) {
+        // Nothing to notify yet: the Windows driver grows its volume topology
+        // node in M6-4. Deliberately a silent no-op rather than an error — the
+        // daemon relays a local slider move here, and there is no local slider
+        // on a device that has no volume node.
+    }
+
+    #[cfg(windows)]
+    pub fn send_bind_set(shared: &Shared, req: &HalBindRequest) -> bool {
+        // `display`, not `out_name`/`in_name`: those two already carry the
+        // direction suffix, which on Windows is the driver's to append.
+        //
+        // And `display` goes across UNMODIFIED. The prefix is composed inside
+        // wire::encode_bind_request, through the same haldev helper the macOS
+        // names are built with. Composing it here instead is what M6-2 did —
+        // by leaving it out — and the result was every endpoint labelled with
+        // a bare host name. There is deliberately nothing at this call site
+        // left to get wrong.
+        bind_call(shared, req.slot, true, |s| {
+            s.bind_set(req.slot, &req.peer_key, &req.display, req.online)
+        })
+    }
+
+    #[cfg(windows)]
+    pub fn send_bind_clear(shared: &Shared, slot: u8, generation: u32) -> bool {
+        bind_call(shared, slot, false, |s| s.bind_clear(slot, generation))
+    }
+
+    /// Runs one bind IOCTL and turns the reply into the same `BindState` the
+    /// macOS driver pushes asynchronously.
+    ///
+    /// "The IOCTL succeeded" is NOT "the device appeared" — that distinction is
+    /// carried by the reply's own status field, and a non-OK status is reported
+    /// as failure so the coordinator retries on its next pass.
+    ///
+    /// `is_set` splits the two operations because their success invariants are
+    /// different and BOTH are checked here: a SET that returns OK must have
+    /// published `PUB_BOTH`, a CLEAR that returns OK must have published
+    /// nothing. The driver checks the same thing; this side checks it again
+    /// because the whole class of defect being guarded against is "the driver
+    /// said OK and it was not true", and a guard that lives only inside the
+    /// thing it is guarding cannot catch that.
+    #[cfg(windows)]
+    fn bind_call<F>(shared: &Shared, slot: u8, is_set: bool, f: F) -> bool
+    where
+        F: FnOnce(&Session) -> Result<wire::BindReply>,
+    {
+        let guard = lk(&shared.rings.session);
+        let Some(s) = guard.as_ref() else { return false };
+
+        let reply = match f(s) {
+            Ok(r) => r,
+            Err(e) => {
+                // A failed IOCTL means the handle is no longer usable in any
+                // way we can distinguish, so the session goes. Dropping it
+                // inside the guard, then reporting, keeps the two consistent.
+                drop(guard);
+                detach(shared, &format!("the driver stopped answering: {e:#}"));
+                return false;
+            }
+        };
+        drop(guard);
+
+        if let Err(what) = wire::bind_outcome(is_set, &reply) {
+            let op = if is_set { "bind" } else { "unbind" };
+            dlog!("[audiohubd] hal: slot {slot} {op} failed: {what}");
+            shared.bind_failures.fetch_add(1, Ordering::Relaxed);
+            *lk(&shared.last_bind_error) = Some(format!("slot {slot}: {op} failed: {what}"));
+            return false;
+        }
+        *lk(&shared.last_bind_error) = None;
+
+        if reply.pin_name_fell_back() {
+            // Not a failure: the devices are published and usable. But with
+            // more than one peer paired it means two speakers with the same
+            // label, so it is counted and logged rather than absorbed — the
+            // whole point of the v2/v3 reply fields is that the driver never
+            // gets to answer OK and leave part of the truth out.
+            shared.pin_name_fallbacks.fetch_add(1, Ordering::Relaxed);
+            dlog!(
+                "[audiohubd] hal: slot {slot} bound, but the per-peer device name could \
+                 not be applied; the endpoints carry the generic direction names"
+            );
+        }
+
+        let state = match reply.state {
+            wire::SLOT_BOUND => HalSlotState::Bound,
+            wire::SLOT_DELISTED => HalSlotState::Delisted,
+            _ => HalSlotState::Free,
+        };
+        if state != HalSlotState::Bound {
+            // A retired slot may go to another peer, and the daemon's own read
+            // index into that slot's ring would otherwise replay the previous
+            // tenant's audio to the next one. Harmless while there is no data
+            // plane; wrong the moment there is.
+            shared.arm_flush(slot);
+        }
+        shared.push_event(HalControlEvent::BindState {
+            slot,
+            generation: reply.generation,
+            state,
+        });
+        *lk(&shared.last_driver_msg) = Some(Instant::now());
+        true
     }
 }

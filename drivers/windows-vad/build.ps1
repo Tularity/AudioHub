@@ -59,6 +59,20 @@ if (-not (Test-Path $msbuild)) { throw "64-bit MSBuild not found at $msbuild (it
 
 $target = if ($Clean) { 'Rebuild' } else { 'Build' }
 
+# DriverVer date, in UTC, deliberately NOT "today on this machine".
+#
+# stampinf's default (%(Inf.TimeStamp) = "*") writes the builder's LOCAL date,
+# while inf2cat rejects a DriverVer it considers postdated against UTC. 30-win
+# runs at UTC+10, so every build started before 10:00 local time produced a
+# driver that compiled and linked and then failed packaging with
+#
+#   22.9.7: DriverVer set to a date in the future (postdated DriverVer not allowed)
+#
+# i.e. the build was reproducible only after mid-morning. One day back from the
+# UTC date is unambiguously in the past for any timezone on earth, which makes
+# the packaging step independent of when and where it runs.
+$driverVerDate = [DateTime]::UtcNow.AddDays(-1).ToString('MM/dd/yyyy')
+
 $msbuildArgs = @(
     $sln,
     "/t:$target",
@@ -69,6 +83,7 @@ $msbuildArgs = @(
     "/p:AudioHubWdkVersion=$WdkVersion",
     "/p:AudioHubSdkCppVersion=$SdkCppVersion",
     '/p:SignMode=Off',
+    "/p:AudioHubDriverVerDate=$driverVerDate",
     '/m',
     # /nr:false is not optional here. With node reuse on (the default) MSBuild
     # leaves worker processes alive after the build, and those workers keep a

@@ -71,29 +71,6 @@ PHYSICALCONNECTIONTABLE SpeakerTopologyPhysicalConnections[] =
     }
 };
 
-static
-ENDPOINT_MINIPAIR SpeakerMiniports =
-{
-    eSpeakerDevice,
-    L"TopologySpeaker",                                     // make sure this or the template name matches with KSNAME_TopologySpeaker in the inf's [Strings] section 
-    NULL,                                                   // optional template name
-    CreateMiniportTopologySimpleAudioSample,
-    &SpeakerTopoMiniportFilterDescriptor,
-    0, NULL,                                                // Interface properties
-    L"WaveSpeaker",                                         // make sure this or the template name matches with KSNAME_WaveSpeaker in the inf's [Strings] section
-    NULL,                                                   // optional template name
-    CreateMiniportWaveRTSimpleAudioSample,
-    &SpeakerWaveMiniportFilterDescriptor,
-    0,                                                      // Interface properties
-    NULL,
-    SPEAKER_DEVICE_MAX_CHANNELS,
-    SpeakerPinDeviceFormatsAndModes,
-    SIZEOF_ARRAY(SpeakerPinDeviceFormatsAndModes),
-    SpeakerTopologyPhysicalConnections,
-    SIZEOF_ARRAY(SpeakerTopologyPhysicalConnections),
-    ENDPOINT_NO_FLAGS,
-};
-
 //
 // Capture miniports.
 //
@@ -118,60 +95,38 @@ PHYSICALCONNECTIONTABLE MicArray1TopologyPhysicalConnections[] =
     }
 };
 
-static
-ENDPOINT_MINIPAIR MicArray1Miniports =
-{
-    eMicArrayDevice1,
-    L"TopologyMicArray1",                   // make sure this or the template name matches with KSNAME_TopologyMicArray1 in the inf's [Strings] section 
-    NULL,                                   // optional template name
-    CreateMicArrayMiniportTopology,
-    &MicArray1TopoMiniportFilterDescriptor,
-    0, NULL,                                // Interface properties
-    L"WaveMicArray1",                       // make sure this or the tempalte name matches with KSNAME_WaveMicArray1 in the inf's [Strings] section
-    NULL,                                   // optional template name
-    CreateMiniportWaveRTSimpleAudioSample,
-    &MicArrayWaveMiniportFilterDescriptor,
-    0,                                      // Interface properties
-    NULL,
-    MICARRAY_DEVICE_MAX_CHANNELS,
-    MicArrayPinDeviceFormatsAndModes,
-    SIZEOF_ARRAY(MicArrayPinDeviceFormatsAndModes),
-    MicArray1TopologyPhysicalConnections,
-    SIZEOF_ARRAY(MicArray1TopologyPhysicalConnections),
-    ENDPOINT_NO_FLAGS,
-};
-
+//
+// The static ENDPOINT_MINIPAIRs the sample declared here are GONE.
+//
+// A minipair now belongs to a SLOT, not to the driver image: perpeer.cpp fills
+// one per direction per paired peer, pointing at the shared descriptors and
+// tables above and at that slot's own reference strings and FriendlyName.
+//
+// The descriptors and the pin/format tables stay shared. sysvad deep-copies
+// them per endpoint only because its Bluetooth path rewrites each endpoint's
+// pin Category at runtime; nothing here varies per peer, so copying them would
+// buy nothing and add a lifetime to get wrong.
+//
 
 //=============================================================================
 //
-// Render miniport pairs. NOTE: the split of render and capture is arbitrary and
-// unnessary, this array could contain capture endpoints.
+// AudioHub publishes one pair of endpoints PER PAIRED PEER, at runtime, so each
+// peer costs 4 miniports: render topology + render wave + capture topology +
+// capture wave.
 //
-static
-PENDPOINT_MINIPAIR  g_RenderEndpoints[] = 
-{
-    &SpeakerMiniports,
-};
+// This number reaches PcAddAdapterDevice ONCE, from AddDevice, and cannot be
+// raised afterwards -- "This count sets the upper limit to the total number of
+// miniport objects that the adapter driver can instantiate."
+//
+// AUDIOHUB_WIN_MAX_SLOTS must equal HAL_MAX_SLOTS in halbridge.rs. The C_ASSERT
+// is here so that changing either side has to be deliberate, instead of showing
+// up as PcRegisterSubdevice failing on the second peer with an error code that
+// says nothing about peers.
+//
+#include "AudioHubIoctl.h"
 
-#define g_cRenderEndpoints  (SIZEOF_ARRAY(g_RenderEndpoints))
-
-//=============================================================================
-//
-// Capture miniport pairs. NOTE: the split of render and capture is arbitrary and
-// unnessary, this array could contain render endpoints.
-//
-static
-PENDPOINT_MINIPAIR  g_CaptureEndpoints[] =
-{
-    &MicArray1Miniports,
-};
-
-#define g_cCaptureEndpoints (SIZEOF_ARRAY(g_CaptureEndpoints))
-
-//=============================================================================
-//
-// Total miniports = # endpoints * 2 (topology + wave).
-//
-#define g_MaxMiniports  ((g_cRenderEndpoints + g_cCaptureEndpoints) * 2)
+#define AUDIOHUB_MINIPORTS_PER_PEER 4
+#define g_MaxAudioHubMiniports      (AUDIOHUB_MINIPORTS_PER_PEER * AUDIOHUB_WIN_MAX_SLOTS)
+C_ASSERT(g_MaxAudioHubMiniports == 64);
 
 #endif // _SIMPLEAUDIOSAMPLE_MINIPAIRS_H_

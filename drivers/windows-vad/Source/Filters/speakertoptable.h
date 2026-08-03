@@ -14,6 +14,30 @@ Abstract:
 #ifndef _SIMPLEAUDIOSAMPLE_SPEAKERTOPTABLE_H_
 #define _SIMPLEAUDIOSAMPLE_SPEAKERTOPTABLE_H_
 
+//
+// Pin name for the render bridge pin. KS resolves KsPinDescriptor.Name BEFORE
+// KsPinDescriptor.Category, and since Windows 10 1809 looks in the device's
+// software key first -- which is where the inf's
+// HKR,MediaCategories\%GUID.AhPinOut%,Name puts the string.
+//
+// This GUID is the STATIC one, and it now has two jobs beyond naming:
+//
+//   * it is the FALLBACK: an endpoint whose peer name could not be written
+//     keeps it and comes out named with the plain direction word;
+//   * it is the MARKER perpeer.cpp searches this table for. AhCloneTopoFilter
+//     copies the pin array per slot and repoints whichever pin carries this
+//     GUID at that peer's derived GUID. Matching on the value rather than on a
+//     pin index keeps the fact in ONE place -- an index here would rename the
+//     wrong pin, silently, if this table were ever reordered.
+//
+// Category stays KSNODETYPE_SPEAKER: it is what drives the endpoint's form
+// factor, its icon and its rank in the audio endpoint builder's default-device
+// ordering, none of which we want to change.
+//
+// {B1D9F2C7-4A63-4C8E-9A11-3F2C6E5D8071} -- must equal %GUID.AhPinOut% in the inf.
+DEFINE_GUID(AH_PIN_NAME_OUT,
+    0xb1d9f2c7, 0x4a63, 0x4c8e, 0x9a, 0x11, 0x3f, 0x2c, 0x6e, 0x5d, 0x80, 0x71);
+
 //=============================================================================
 static
 KSDATARANGE SpeakerTopoPinDataRangesBridge[] =
@@ -76,7 +100,7 @@ PCPIN_DESCRIPTOR SpeakerTopoMiniportPins[] =
       KSPIN_DATAFLOW_OUT,                               // DataFlow
       KSPIN_COMMUNICATION_NONE,                         // Communication
       &KSNODETYPE_SPEAKER,                              // Category
-      NULL,                                             // Name
+      &AH_PIN_NAME_OUT,                                 // Name
       0                                                 // Reserved
     }
   }

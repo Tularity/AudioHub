@@ -1,7 +1,17 @@
 # AudioHubVad —— Windows 虚拟声卡驱动构建说明
 
-对应里程碑 **M6-1**：让一个名为 AudioHub 的音频设备出现在 Windows 系统音频设备列表里。
-本目录只负责**编译 + 测试签名**，不负责安装（安装是下一阶段的事）。
+本目录只负责**编译 + 测试签名**，不负责安装。
+
+里程碑现状：
+
+- **M6-1（已完成）**：一个编译期写死的静态设备 `AudioHub Virtual Audio` 出现在系统音频设备列表里。
+- **M6-2（本轮，代码已落地、尚未装机）**：静态设备**已被删除**，改为
+  **每台已配对对端各自一对系统音频设备**，由 daemon 经 IOCTL 在运行时增删。
+
+⚠️ **M6-1 的验收判据在 M6-2 之后不再成立**：没有配对对端时，
+系统里**一个 AudioHub 端点都没有**（`Get-PnpDevice -Class AudioEndpoint` 计数为 0 才是正确的）。
+任何断言「驱动装好就应看到 AudioHub 端点」的脚本都是在测上一版架构
+（本项目已三次栽在「判据来自旧架构」上，见 `docs/progress.md`）。
 
 ---
 
@@ -14,30 +24,75 @@ M6-1 阶段**只改名字与标识，不动任何音频逻辑**（`.cpp` / `.h` 
 
 上游 commit：`ef7c3074748ab05726c3a9161d3256118efd76e2`，上游 README 保留为 `README.upstream.md`。
 
-与上游相比改动的文件（**全部只是命名**）：
+与上游相比改动的文件：
 
-| 文件 | 改动 |
-|---|---|
-| `Source/Main/AudioHubVad.inx` | 原 `SimpleAudioSample.inx`。硬件 ID `ROOT\SimpleAudioSample` → `ROOT\AudioHubVad`；服务名、`CatalogFile`、`.sys` 文件名同步改；`[Strings]` 里的设备描述/端点友好名改成 AudioHub 命名 |
-| `Source/Main/AudioHubVad.rc` | 原 `SimpleAudioSample.rc`。版本资源里的文件名与描述 |
-| `Source/Main/Main.vcxproj` | `TargetName` → `AudioHubVad`，`ResourceCompile Include` 指向新 rc |
-| `Source/Main/Main.vcxproj.Filters` | 同上，纯 IDE 显示 |
-| `AudioHubVad.sln` | 原 `SimpleAudioSample.sln`，仅文件名 |
+| 文件 | 改动 | 阶段 |
+|---|---|---|
+| `Source/Main/AudioHubVad.inx` | 硬件 ID `ROOT\SimpleAudioSample` → `ROOT\AudioHubVad`；服务名、`CatalogFile`、`.sys` 文件名同步改 | M6-1（命名） |
+| `Source/Main/AudioHubVad.rc` | 版本资源里的文件名与描述 | M6-1（命名） |
+| `Source/Main/Main.vcxproj` / `.Filters` | `TargetName`、`ResourceCompile Include` | M6-1（命名） |
+| `AudioHubVad.sln` | 仅文件名 | M6-1（命名） |
+| **`Source/Inc/AudioHubIoctl.h`** | **新增**。与 daemon 的冻结控制面契约（IOCTL 码、结构体、布局断言） | M6-2 |
+| **`Source/Inc/perpeer.h` / `Source/Main/perpeer.cpp`** | **新增**。每对端一对端点的槽位表与运行时增删 | M6-2 |
+| **`Source/Inc/ctldevice.h` / `Source/Main/ctldevice.cpp`** | **新增**。`\\.\AudioHubVadCtl` 控制设备、IOCTL 派发、调用方身份校验 | M6-2 |
+| `Source/Main/adapter.cpp` | `MaxObjects` 4 → 64；删掉 `StartDevice` 里的静态端点安装；`DriverEntry`/`DriverUnload`/`PnpHandler` 挂钩控制设备 | M6-2 |
+| `Source/Filters/minipairs.h` | 删掉静态 `ENDPOINT_MINIPAIR`；新增 `g_MaxAudioHubMiniports` 及其 `C_ASSERT` | M6-2 |
+| `Source/Filters/speakertoptable.h` / `micarray1toptable.h` | bridge pin 的 `KsPinDescriptor.Name` 指向自定义 GUID | M6-2 |
+| `Source/Main/AudioHubVad.inx` | 四个接口段由**实体端点**降级为**模板**；新增 `MediaCategories` pin 名 | M6-2 |
+| `Source/Main/common.cpp` | `ConnectTopologies` 之后**重新武装**两个 KS 接口；`InstallEndpointFilters` / `RemoveEndpointFilters` / `DisconnectTopologies` 如实报告部分失败 | M6-2 D3 |
+| `Source/Inc/AudioHubIoctl.h` | 协议 2→**3**：`AH_BIND_REPLY.reserved` 变 `flags`，新增 `AH_STAGE_PINNAME` / `AH_BINDFLAG_FAIL_PIN_NAME` / `AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK` | M6-2 D2 |
+| `Source/Inc/perpeer.h` / `Source/Main/perpeer.cpp` | **每对端设备名**：由指纹派生 pin 名 GUID，绑定时写 `MediaCategories\{guid}\Name`，解绑时清除；topology filter 描述符与 pin 数组改为**每槽位一份** | M6-2 D2 |
+
+音频逻辑（`minwavert` / `minwavertstream` / `mintopo` / `basetopo`）**至今一行未改**。
 
 新增的构建基础设施：`Directory.Build.props`、`build.ps1`、`sign-test.ps1`、`tools/`、`BUILD.md`、`.gitignore`。
 
-对外标识（下一阶段安装/验收要用的判据）：
+对外标识（安装/验收要用的判据）：
 
 ```
 硬件 ID       ROOT\AudioHubVad
 服务名        AudioHubVad          (Win32_SystemDriver 里的 Name)
 驱动文件      audiohubvad.sys
 INF / CAT     AudioHubVad.inf / AudioHubVad.cat
-设备描述      AudioHub Virtual Audio
-渲染端点      AudioHub Speaker
-采集端点      AudioHub Microphone
+设备描述      AudioHub Virtual Audio      (devnode，不是端点)
+控制设备      \\.\AudioHubVadCtl          (daemon 用 CreateFileW 打开)
 Class         MEDIA {4d36e96c-e325-11ce-bfc1-08002be10318}
+
+端点          未配对时为 0 个。
+              每配对一台对端 +2 个，接口引用串是
+                  AhWaveOut-<16位指纹> / AhTopoOut-<16位指纹>
+                  AhWaveIn -<16位指纹> / AhTopoIn -<16位指纹>
+              用户看到的名字由系统合成为「<pin 名> (<devnode FriendlyName>)」，
+              即「AudioHub – <对端主机名> 扬声器 (AudioHub Virtual Audio)」。
+              括号前那一整段与 macOS 的「AudioHub – <主机名> 扬声器」逐字相同。
 ```
+
+> **引用串用对端指纹而不是槽位号**，这是本阶段最重要的正确性决定：
+> 引用串决定 endpoint ID，而 endpoint ID 是 Windows 挂载「系统默认设备选择 /
+> 每应用设备指派 / 端点音量 / 用户改过的名字」的地方。用槽位号会让槽位被回收后
+> 分给的**新对端静默继承旧对端的这些状态**——不报错、不蓝屏，只是「新配的机器
+> 莫名其妙成了默认输出」，而系统里没有任何地方能解释原因。
+
+> **端点名的两半各自来自哪里（M6-2 实测纠正了 spec 的判断）**：
+> 括号里那半来自 **devnode 的 FriendlyName**，不是 KS 接口的
+> `DEVPKEY_DeviceInterface_FriendlyName`——决定性实验是直接改
+> `HKLM\...\Enum\ROOT\MEDIA\0000` 的 `FriendlyName`，两个端点的括号内容立刻跟着变；
+> 而给 KS 接口写同一属性，注册表里逐字读得到、端点名毫无变化。
+> devnode 只有一个、被所有对端共享，所以**括号那半永远无法表达每对端不同的名字**。
+>
+> 能表达的是**括号前那半 = pin 名**（per-filter）。因此每个槽位分到一个
+> **由对端指纹确定性派生**的 pin 名 GUID（形如
+> `{9F3C7A21-6B48-4D00-<指纹前 4 位>-<指纹后 12 位>}`，第三段末位 0=渲染 1=采集），
+> 驱动在绑定时把 `AudioHub – <主机名> 扬声器` 写进
+> `MediaCategories\{该 GUID}\Name`，解绑时删除。
+> 「扬声器 / 麦克风」这两个词**不写死在 .cpp 里**，而是驱动启动时从 INF 装好的那两条
+> 静态 `MediaCategories` 项里**读回来**——本地化字符串只留 INF 一份，且 `.cpp` 保持纯 ASCII
+> （非 ASCII 源码字面量会被 MSVC 按构建机的 ANSI 代码页解码）。
+>
+> 写不进去时**回退**为 INF 的静态 GUID（名字变成通用的「扬声器 (AudioHub Virtual Audio)」），
+> 并在 `AH_BIND_REPLY.flags` 里置 `AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK`
+> 一路上报到 `daemon.status` 的 `hal.pin_name_fallbacks`。
+> 回退不算失败（设备可用），但绝不静默——两台对端同时配对时它意味着两个同名扬声器。
 
 ---
 
@@ -169,6 +224,23 @@ worker 进程，那些进程持有 `_build\vctargets\v170\Microsoft.Build.CPPTas
 的文件锁，**下一次**构建刷新私有 VCTargets 时就会死在
 `Access to the path 'Microsoft.Build.CPPTasks.Common.dll' is denied`。
 `wdk-vs-shim.ps1` 另有一层防御：默认复用已存在的副本而不是先删再拷，只有 `-Force` 才整棵重建。
+
+### DriverVer 的日期必须按 UTC 给，不能用 stampinf 的默认值
+
+stampinf 默认（`%(Inf.TimeStamp)` = `*`）写的是**构建机本地日期**，而 inf2cat 拿 **UTC**
+判「是不是未来日期」。30-win 在 UTC+10，于是**本地时间 10:00 之前发起的每一次构建**
+都会编译链接全过、卡在打包这一步：
+
+```
+22.9.7: DriverVer set to a date in the future (postdated DriverVer not allowed)
+error MSB6006: "inf2cat.exe" exited with code -2.
+```
+
+即构建的可重复性取决于一天里的钟点。`build.ps1` 因此显式算一个
+`[DateTime]::UtcNow.AddDays(-1)` 的日期，经 `/p:AudioHubDriverVerDate=` 传给
+`Main.vcxproj` 里 `Inf` 项的 `DateStamp` 元数据（**不是** `TimeStamp`——那是 `-v`
+版本号，填日期进去会得到 `Invalid version '08/01/2026.0.0.0'`）。
+往回退一天对地球上任何时区都必定是过去，于是打包不再依赖构建发生在何时何地。
 
 ---
 

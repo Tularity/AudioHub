@@ -72,15 +72,36 @@ pub fn uid_in(fingerprint: &str) -> String {
     format!("{UID_PREFIX}{fingerprint}:in")
 }
 
+/// The part BOTH of a peer's device names share: "AudioHub – WIN-30", i.e. the
+/// disambiguated display name with the frozen plan §7.1 prefix and no
+/// direction suffix.
+///
+/// (Not to be confused with [`base_name`] below, which is the peer's own label
+/// — alias or host name — before any of this is put around it.)
+///
+/// The single spelling of the prefix, and both platforms go through it: macOS
+/// via [`device_names`], which appends " 扬声器" / " 麦克风" here, and Windows
+/// via `halbridge_win::wire::encode_bind_request`, which sends this and lets
+/// the driver append the direction word it read from the INF.
+///
+/// It is a function rather than a `pub const` so the two callers cannot end up
+/// composing it two slightly different ways — which is exactly what happened:
+/// the Windows path sent the bare peer name and every endpoint came out
+/// labelled `WIN-IR01HVEFU7G`, with no AudioHub anywhere in it.
+pub fn device_name_stem(display: &str) -> String {
+    format!("{NAME_PREFIX}{display}")
+}
+
 /// The two device names for one peer. The daemon builds the whole string
 /// because the driver runs inside coreaudiod's sandbox: it can read neither the
 /// computer name nor any localisation, and putting half the naming logic there
 /// would mean two places to disambiguate (spec-m5b §3.5).
 pub fn device_names(display: &str, offline: bool) -> (String, String) {
     let mark = if offline { NAME_OFFLINE } else { "" };
+    let stem = device_name_stem(display);
     (
-        clamp_utf8(&format!("{NAME_PREFIX}{display}{NAME_OUT}{mark}"), MAX_NAME_BYTES),
-        clamp_utf8(&format!("{NAME_PREFIX}{display}{NAME_IN}{mark}"), MAX_NAME_BYTES),
+        clamp_utf8(&format!("{stem}{NAME_OUT}{mark}"), MAX_NAME_BYTES),
+        clamp_utf8(&format!("{stem}{NAME_IN}{mark}"), MAX_NAME_BYTES),
     )
 }
 
@@ -301,6 +322,16 @@ pub struct DesiredDevice {
     pub in_uid: String,
     pub out_name: String,
     pub in_name: String,
+    /// The disambiguated display name WITHOUT a direction suffix — what
+    /// `display_names` produced, before `device_names` appended " 扬声器" /
+    /// " 麦克风". macOS ignores it; Windows uses only it, because there the
+    /// system composes the endpoint name as "<pin name> (<this>)".
+    ///
+    /// Carried as a plain extra field rather than behind a platform
+    /// conditional: this file has none at all, and keeping it that way is worth
+    /// more than saving one `String` per slot. `halwire_win.rs` asserts the
+    /// count stays zero.
+    pub display: String,
     pub online: bool,
 }
 
@@ -313,6 +344,7 @@ impl DesiredDevice {
             in_uid: self.in_uid.clone(),
             out_name: self.out_name.clone(),
             in_name: self.in_name.clone(),
+            display: self.display.clone(),
             online: self.online,
         }
     }
@@ -718,6 +750,7 @@ fn compute_desired(inner: &DaemonInner, capacity: usize, table: &mut SlotTable) 
             in_uid: uid_in(fp),
             out_name,
             in_name,
+            display: name,
             online,
         });
     }
@@ -1325,6 +1358,7 @@ mod tests {
             in_uid: uid_in(fp),
             out_name,
             in_name,
+            display: name.to_string(),
             online: true,
         }
     }

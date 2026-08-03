@@ -392,7 +392,13 @@ DECLARE_INTERFACE_(IAdapterCommon, IUnknown)
         _In_            REFGUID                                     PortInterfaceId,
         _Out_opt_       PUNKNOWN                                  * OutPortInterface,
         _Out_opt_       PUNKNOWN                                  * OutPortUnknown,
-        _Out_opt_       PUNKNOWN                                  * OutMiniportUnknown
+        _Out_opt_       PUNKNOWN                                  * OutMiniportUnknown,
+        //
+        // The interface's symbolic link, allocated by IoRegisterDeviceInterface
+        // and OWNED BY THE CALLER, which must RtlFreeUnicodeString it. Needed
+        // to re-arm the interface after the endpoint is fully wired.
+        //
+        _Out_opt_       PUNICODE_STRING                             OutSymbolicLink
     );    
 
     STDMETHOD_(NTSTATUS,        UnregisterSubdevice)
@@ -416,7 +422,8 @@ DECLARE_INTERFACE_(IAdapterCommon, IUnknown)
         _In_ PUNKNOWN                   UnknownTopology,
         _In_ PUNKNOWN                   UnknownWave,
         _In_ PHYSICALCONNECTIONTABLE*   PhysicalConnections,
-        _In_ ULONG                      PhysicalConnectionCount
+        _In_ ULONG                      PhysicalConnectionCount,
+        _In_ ULONG                      DebugFlags
     );
 
     STDMETHOD_(NTSTATUS,        InstallEndpointFilters)
@@ -431,12 +438,21 @@ DECLARE_INTERFACE_(IAdapterCommon, IUnknown)
         _Out_opt_   PUNKNOWN *          UnknownMiniportWave
     );
 
+    //
+    // Returns the FIRST failure it hit, not STATUS_SUCCESS-no-matter-what.
+    // `FailStage` (optional) names which step that was, as AH_STAGE_*.
+    //
+    // DebugFlags carries AH_BINDFLAG_LEGACY_UNBIND for the fault-injection
+    // path; production callers pass 0.
+    //
     STDMETHOD_(NTSTATUS,        RemoveEndpointFilters)
     (
         THIS_
         _In_        PENDPOINT_MINIPAIR  MiniportPair,
         _In_opt_    PUNKNOWN            UnknownTopology,
-        _In_opt_    PUNKNOWN            UnknownWave
+        _In_opt_    PUNKNOWN            UnknownWave,
+        _In_        ULONG               DebugFlags,
+        _Out_opt_   PULONG              FailStage
     );
 
     STDMETHOD_(NTSTATUS,        GetFilters)

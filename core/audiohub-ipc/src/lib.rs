@@ -238,6 +238,32 @@ pub struct HalStatus {
     /// `driver_protocol_mismatch`. `None` while connected.
     #[serde(default)]
     pub status_reason: Option<String>,
+    /// How many `Bind Set` / `Bind Clear` the driver refused, or performed
+    /// only halfway. Monotonic for the life of the daemon.
+    ///
+    /// This exists because a driver can be perfectly connected and still fail
+    /// to publish a device: `driver_connected` stays true, the frame counters
+    /// keep moving, and `devices[].state` reports whatever the daemon last
+    /// intended. Windows M6-2 shipped exactly that shape — `state: "bound"`,
+    /// `driver_connected: true`, and an empty system speaker list. Nothing in
+    /// this contract could express it, so nothing upstream could show it.
+    #[serde(default)]
+    pub bind_failures: u64,
+    /// The most recent bind failure in words, including the driver's own
+    /// failure stage and NTSTATUS. `None` once a bind succeeds again.
+    #[serde(default)]
+    pub last_bind_error: Option<String>,
+    /// How many binds SUCCEEDED but had to fall back to the generic direction
+    /// names because the peer's own name could not be applied (Windows only).
+    /// Monotonic for the life of the daemon.
+    ///
+    /// Deliberately not folded into `bind_failures`: these devices exist and
+    /// work, so calling them failures would make a naming problem look like an
+    /// outage. Deliberately not omitted either — every peer's devices then read
+    /// alike, and a user with two machines paired has no way to tell which
+    /// speaker is which and nowhere that says why.
+    #[serde(default)]
+    pub pin_name_fallbacks: u64,
     /// Per-peer virtual devices. The three counters above are the sums of the
     /// per-slot ones here (spec-m5b §6.1).
     #[serde(default)]

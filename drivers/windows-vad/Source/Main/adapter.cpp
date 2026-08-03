@@ -22,6 +22,8 @@ Abstract:
 #include "definitions.h"
 #include "endpoints.h"
 #include "minipairs.h"
+#include "perpeer.h"
+#include "ctldevice.h"
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
@@ -103,7 +105,14 @@ Environment:
     {
         goto Done;
     }
-    
+
+    //
+    // Take the control device down before PortCls unhooks itself: our dispatch
+    // routines chain into the entries PortCls installed, so they must not
+    // outlive it.
+    //
+    AhCtlDeleteDevice(DriverObject);
+
     //
     // Invoke first the port unload.
     //
@@ -347,6 +356,27 @@ Return Value:
     DriverObject->DriverUnload = DriverUnload;
 
     //
+    // Per-peer endpoint table. Must come before the control device, which can
+    // start taking Bind IOCTLs the moment its symbolic link exists.
+    //
+    AhPerPeerDriverInit();
+
+    //
+    // Control plane. A failure here is NOT fatal: a driver that loads without
+    // it publishes nothing and is harmless, while a driver that refuses to load
+    // takes the devnode down and has to be recovered by hand on a test machine
+    // that only answers over SSH.
+    //
+    {
+        NTSTATUS ctlStatus = AhCtlCreateDevice(DriverObject);
+        if (!NT_SUCCESS(ctlStatus))
+        {
+            DPF(D_ERROR, ("AhCtlCreateDevice failed 0x%x; driver loads without a control plane",
+                          ctlStatus));
+        }
+    }
+
+    //
     // All done.
     //
     ntStatus = STATUS_SUCCESS;
@@ -411,7 +441,17 @@ Return Value:
 
     DPF(D_TERSE, ("[AddDevice]"));
 
-    maxObjects = g_MaxMiniports;
+    //
+    // THE ONE-SHOT BUDGET. PcAddAdapterDevice's MaxObjects "sets the upper
+    // limit to the total number of miniport objects that the adapter driver can
+    // instantiate", it is passed exactly once, and it cannot be raised later.
+    //
+    // 4 miniports per peer (render topology + render wave + capture topology +
+    // capture wave) times AUDIOHUB_WIN_MAX_SLOTS. The sample's g_MaxMiniports
+    // is 4 -- enough for ONE peer -- and the failure when it runs out surfaces
+    // inside PcRegisterSubdevice as an error that says nothing about peers.
+    //
+    maxObjects = g_MaxAudioHubMiniports;
 
     // Tell the class driver to add the device.
     //
@@ -453,220 +493,17 @@ PowerControlCallback
     return STATUS_NOT_IMPLEMENTED;
 }
 
-#pragma code_seg("PAGE")
-NTSTATUS 
-InstallEndpointRenderFilters(
-    _In_ PDEVICE_OBJECT     _pDeviceObject, 
-    _In_ PIRP               _pIrp, 
-    _In_ PADAPTERCOMMON     _pAdapterCommon,
-    _In_ PENDPOINT_MINIPAIR _pAeMiniports
-    )
-{
-    NTSTATUS                    ntStatus                = STATUS_SUCCESS;
-    PUNKNOWN                    unknownTopology         = NULL;
-    PUNKNOWN                    unknownWave             = NULL;
-    PPORTCLSETWHELPER           pPortClsEtwHelper       = NULL;
-#ifdef _USE_IPortClsRuntimePower
-    PPORTCLSRUNTIMEPOWER        pPortClsRuntimePower    = NULL;
-#endif // _USE_IPortClsRuntimePower
-    PPORTCLSStreamResourceManager pPortClsResMgr        = NULL;
-    PPORTCLSStreamResourceManager2 pPortClsResMgr2      = NULL;
-
-    PAGED_CODE();
-    
-    UNREFERENCED_PARAMETER(_pDeviceObject);
-
-    ntStatus = _pAdapterCommon->InstallEndpointFilters(
-        _pIrp,
-        _pAeMiniports,
-        NULL,
-        &unknownTopology,
-        &unknownWave,
-        NULL, NULL);
-
-    if (unknownWave) // IID_IPortClsEtwHelper and IID_IPortClsRuntimePower interfaces are only exposed on the WaveRT port.
-    {
-        ntStatus = unknownWave->QueryInterface (IID_IPortClsEtwHelper, (PVOID *)&pPortClsEtwHelper);
-        if (NT_SUCCESS(ntStatus))
-        {
-            _pAdapterCommon->SetEtwHelper(pPortClsEtwHelper);
-            ASSERT(pPortClsEtwHelper != NULL);
-            pPortClsEtwHelper->Release();
-        }
-
-#ifdef _USE_IPortClsRuntimePower
-        // Let's get the runtime power interface on PortCls.  
-        ntStatus = unknownWave->QueryInterface(IID_IPortClsRuntimePower, (PVOID *)&pPortClsRuntimePower);
-        if (NT_SUCCESS(ntStatus))
-        {
-            // This interface would typically be stashed away for later use.  Instead,
-            // let's just send an empty control with GUID_NULL.
-            NTSTATUS ntStatusTest =
-                pPortClsRuntimePower->SendPowerControl
-                (
-                    _pDeviceObject,
-                    &GUID_NULL,
-                    NULL,
-                    0,
-                    NULL,
-                    0,
-                    NULL
-                );
-
-            if (NT_SUCCESS(ntStatusTest) || STATUS_NOT_IMPLEMENTED == ntStatusTest || STATUS_NOT_SUPPORTED == ntStatusTest)
-            {
-                ntStatus = pPortClsRuntimePower->RegisterPowerControlCallback(_pDeviceObject, &PowerControlCallback, NULL);
-                if (NT_SUCCESS(ntStatus))
-                {
-                    ntStatus = pPortClsRuntimePower->UnregisterPowerControlCallback(_pDeviceObject);
-                }
-            }
-            else
-            {
-                ntStatus = ntStatusTest;
-            }
-
-            pPortClsRuntimePower->Release();
-        }
-#endif // _USE_IPortClsRuntimePower
-
-        //
-        // Test: add and remove current thread as streaming audio resource.  
-        // In a real driver you should only add interrupts and driver-owned threads 
-        // (i.e., do NOT add the current thread as streaming resource).
-        //
-        // testing IPortClsStreamResourceManager:
-        ntStatus = unknownWave->QueryInterface(IID_IPortClsStreamResourceManager, (PVOID *)&pPortClsResMgr);
-        if (NT_SUCCESS(ntStatus))
-        {
-            PCSTREAMRESOURCE_DESCRIPTOR res;
-            PCSTREAMRESOURCE hRes = NULL;
-            PDEVICE_OBJECT pdo = NULL;
-
-            PcGetPhysicalDeviceObject(_pDeviceObject, &pdo);
-            PCSTREAMRESOURCE_DESCRIPTOR_INIT(&res);
-            res.Pdo = pdo;
-            res.Type = ePcStreamResourceThread;
-            res.Resource.Thread = PsGetCurrentThread();
-            
-            NTSTATUS ntStatusTest = pPortClsResMgr->AddStreamResource(NULL, &res, &hRes);
-            if (NT_SUCCESS(ntStatusTest))
-            {
-                pPortClsResMgr->RemoveStreamResource(hRes);
-                hRes = NULL;
-            }
-
-            pPortClsResMgr->Release();
-            pPortClsResMgr = NULL;
-        }
-        
-        // testing IPortClsStreamResourceManager2:
-        ntStatus = unknownWave->QueryInterface(IID_IPortClsStreamResourceManager2, (PVOID *)&pPortClsResMgr2);
-        if (NT_SUCCESS(ntStatus))
-        {
-            PCSTREAMRESOURCE_DESCRIPTOR res;
-            PCSTREAMRESOURCE hRes = NULL;
-            PDEVICE_OBJECT pdo = NULL;
-
-            PcGetPhysicalDeviceObject(_pDeviceObject, &pdo);
-            PCSTREAMRESOURCE_DESCRIPTOR_INIT(&res);
-            res.Pdo = pdo;
-            res.Type = ePcStreamResourceThread;
-            res.Resource.Thread = PsGetCurrentThread();
-            
-            NTSTATUS ntStatusTest = pPortClsResMgr2->AddStreamResource2(pdo, NULL, &res, &hRes);
-            if (NT_SUCCESS(ntStatusTest))
-            {
-                pPortClsResMgr2->RemoveStreamResource(hRes);
-                hRes = NULL;
-            }
-
-            pPortClsResMgr2->Release();
-            pPortClsResMgr2 = NULL;
-        }
-    }
-
-    SAFE_RELEASE(unknownTopology);
-    SAFE_RELEASE(unknownWave);
-
-    return ntStatus;
-}
-
-#pragma code_seg("PAGE")
-NTSTATUS 
-InstallAllRenderFilters(
-    _In_ PDEVICE_OBJECT _pDeviceObject, 
-    _In_ PIRP           _pIrp, 
-    _In_ PADAPTERCOMMON _pAdapterCommon
-    )
-{
-    NTSTATUS            ntStatus;
-    PENDPOINT_MINIPAIR* ppAeMiniports   = g_RenderEndpoints;
-    
-    PAGED_CODE();
-
-    for(ULONG i = 0; i < g_cRenderEndpoints; ++i, ++ppAeMiniports)
-    {
-        ntStatus = InstallEndpointRenderFilters(_pDeviceObject, _pIrp, _pAdapterCommon, *ppAeMiniports);
-        IF_FAILED_JUMP(ntStatus, Exit);
-    }
-    
-    ntStatus = STATUS_SUCCESS;
-
-Exit:
-    return ntStatus;
-}
-
-#pragma code_seg("PAGE")
-NTSTATUS
-InstallEndpointCaptureFilters(
-    _In_ PDEVICE_OBJECT     _pDeviceObject,
-    _In_ PIRP               _pIrp,
-    _In_ PADAPTERCOMMON     _pAdapterCommon,
-    _In_ PENDPOINT_MINIPAIR _pAeMiniports
-)
-{
-    NTSTATUS    ntStatus = STATUS_SUCCESS;
-
-    PAGED_CODE();
-
-    UNREFERENCED_PARAMETER(_pDeviceObject);
-
-    ntStatus = _pAdapterCommon->InstallEndpointFilters(
-        _pIrp,
-        _pAeMiniports,
-        NULL,
-        NULL,
-        NULL,
-        NULL, NULL);
-
-    return ntStatus;
-}
-
-#pragma code_seg("PAGE")
-NTSTATUS
-InstallAllCaptureFilters(
-    _In_ PDEVICE_OBJECT _pDeviceObject,
-    _In_ PIRP           _pIrp,
-    _In_ PADAPTERCOMMON _pAdapterCommon
-)
-{
-    NTSTATUS            ntStatus;
-    PENDPOINT_MINIPAIR* ppAeMiniports = g_CaptureEndpoints;
-
-    PAGED_CODE();
-
-    for (ULONG i = 0; i < g_cCaptureEndpoints; ++i, ++ppAeMiniports)
-    {
-        ntStatus = InstallEndpointCaptureFilters(_pDeviceObject, _pIrp, _pAdapterCommon, *ppAeMiniports);
-        IF_FAILED_JUMP(ntStatus, Exit);
-    }
-
-    ntStatus = STATUS_SUCCESS;
-
-Exit:
-    return ntStatus;
-}
+//
+// The static endpoint installation the sample did here is GONE.
+//
+// simpleaudiosample published one fixed speaker and one fixed microphone at
+// StartDevice. AudioHub publishes one pair PER PAIRED PEER, created and
+// destroyed at runtime from perpeer.cpp, so with nothing paired the system
+// audio device list correctly contains no AudioHub endpoint at all.
+//
+// Anything asserting "AudioHub endpoints exist as soon as the driver loads"
+// is testing the previous architecture.
+//
 
 //=============================================================================
 #pragma code_seg("PAGE")
@@ -702,6 +539,12 @@ Return Value:
 
 --*/
     UNREFERENCED_PARAMETER(ResourceList);
+    //
+    // Unused since the static endpoints went away. The runtime installs pass
+    // NULL for the IRP, which is what sysvad's own dynamic (Bluetooth) path
+    // does -- IPort::Init tolerates it precisely for dynamic subdevices.
+    //
+    UNREFERENCED_PARAMETER(Irp);
 
     PAGED_CODE();
 
@@ -740,15 +583,27 @@ Return Value:
     IF_FAILED_JUMP(ntStatus, Exit);
 
     //
-    // Install wave+topology filters for render devices
+    // Caller-identity policy lives in the DEVICE software key, which only an
+    // administrator can write, so it can only be read once we have a PDO.
     //
-    ntStatus = InstallAllRenderFilters(DeviceObject, Irp, pAdapterCommon);
-    IF_FAILED_JUMP(ntStatus, Exit);
+    {
+        PDEVICE_OBJECT pdo = NULL;
+        PcGetPhysicalDeviceObject(DeviceObject, &pdo);
+        if (pdo != NULL)
+        {
+            AhCtlLoadPolicy(pdo);
+        }
+        else
+        {
+            DPF(D_ERROR, ("[StartDevice] no PDO; caller-identity check stays ACL-only"));
+        }
+    }
 
     //
-    // Install wave+topology filters for capture devices
+    // NO endpoints are installed here. They appear one pair at a time, as
+    // peers are paired, via IOCTL_AUDIOHUB_BIND_SET (perpeer.cpp).
     //
-    ntStatus = InstallAllCaptureFilters(DeviceObject, Irp, pAdapterCommon);
+    ntStatus = AhPerPeerAttachAdapter(DeviceObject, pAdapterCommon);
     IF_FAILED_JUMP(ntStatus, Exit);
 
 Exit:
@@ -822,6 +677,14 @@ Return Value:
     case IRP_MN_SURPRISE_REMOVAL:
     case IRP_MN_STOP_DEVICE:
         ext = static_cast<PortClassDeviceContext*>(_DeviceObject->DeviceExtension);
+
+        //
+        // Every published endpoint goes FIRST, while the adapter that owns the
+        // port objects is still alive. A slot still holding port pointers after
+        // Cleanup()/Release() is a dangling reference, and the bugcheck it
+        // produces names none of the code that caused it.
+        //
+        AhPerPeerDetachAdapter();
 
         if (ext->m_pCommon != NULL)
         {

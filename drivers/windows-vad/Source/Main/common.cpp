@@ -18,6 +18,12 @@ Abstract:
 #include "hw.h"
 #include "savedata.h"
 #include "endpoints.h"
+//
+// For AH_STAGE_* and AH_BINDFLAG_LEGACY_UNBIND: the endpoint install/remove
+// paths report WHERE they failed in the same vocabulary the IOCTL reply uses,
+// so the daemon does not have to translate one enum into another.
+//
+#include "AudioHubIoctl.h"
 
 //-----------------------------------------------------------------------------
 // CSaveData statics
@@ -171,7 +177,8 @@ class CAdapterCommon :
             _In_            REFGUID                                     PortInterfaceId,
             _Out_opt_       PUNKNOWN                                  * OutPortInterface,
             _Out_opt_       PUNKNOWN                                  * OutPortUnknown,
-            _Out_opt_       PUNKNOWN                                  * OutMiniportUnknown
+            _Out_opt_       PUNKNOWN                                  * OutMiniportUnknown,
+            _Out_opt_       PUNICODE_STRING                             OutSymbolicLink
         );
         
         STDMETHODIMP_(NTSTATUS) UnregisterSubdevice
@@ -192,7 +199,8 @@ class CAdapterCommon :
             _In_ PUNKNOWN                   UnknownTopology,
             _In_ PUNKNOWN                   UnknownWave,
             _In_ PHYSICALCONNECTIONTABLE*   PhysicalConnections,
-            _In_ ULONG                      PhysicalConnectionCount
+            _In_ ULONG                      PhysicalConnectionCount,
+            _In_ ULONG                      DebugFlags
         );
         
         STDMETHODIMP_(NTSTATUS) InstallEndpointFilters
@@ -210,7 +218,9 @@ class CAdapterCommon :
         (
             _In_        PENDPOINT_MINIPAIR  MiniportPair,
             _In_opt_    PUNKNOWN            UnknownTopology,
-            _In_opt_    PUNKNOWN            UnknownWave
+            _In_opt_    PUNKNOWN            UnknownWave,
+            _In_        ULONG               DebugFlags,
+            _Out_opt_   PULONG              FailStage
         );
 
         STDMETHODIMP_(NTSTATUS) GetFilters
@@ -1511,7 +1521,8 @@ CAdapterCommon::InstallSubdevice
     _In_            REFGUID                                 PortInterfaceId,
     _Out_opt_       PUNKNOWN                              * OutPortInterface,
     _Out_opt_       PUNKNOWN                              * OutPortUnknown,
-    _Out_opt_       PUNKNOWN                              * OutMiniportUnknown
+    _Out_opt_       PUNKNOWN                              * OutMiniportUnknown,
+    _Out_opt_       PUNICODE_STRING                         OutSymbolicLink
 )
 {
 /*++
@@ -1571,12 +1582,14 @@ Return Value:
 
     adapterCommon = PADAPTERCOMMON(this);
 
+    if (OutSymbolicLink != NULL)
+    {
+        RtlZeroMemory(OutSymbolicLink, sizeof(*OutSymbolicLink));
+    }
+
     ntStatus = CreateAudioInterfaceWithProperties(Name, TemplateName, cPropertyCount, pProperties, &symbolicLink);
     if (NT_SUCCESS(ntStatus))
     {
-        // Currently have no use for the symbolic link
-        RtlFreeUnicodeString(&symbolicLink);
-
         // Create the port driver object
         //
         ntStatus = PcNewPort(&port, PortClassId);
@@ -1691,6 +1704,18 @@ Return Value:
     {
         miniport->Release();
     }
+
+    //
+    // The caller needs the symbolic link to RE-ARM the interface once the
+    // endpoint is completely built (see InstallEndpointFilters). Handing it
+    // back rather than freeing it here is the only change to this routine.
+    //
+    if (NT_SUCCESS(ntStatus) && OutSymbolicLink != NULL)
+    {
+        *OutSymbolicLink = symbolicLink;
+        RtlZeroMemory(&symbolicLink, sizeof(symbolicLink));
+    }
+    RtlFreeUnicodeString(&symbolicLink);
 
     return ntStatus;
 } // InstallSubDevice
@@ -1837,7 +1862,7 @@ Return Value:
     {
         // disconnect all connections on error, ignore error code because not all
         // connections may have been made
-        DisconnectTopologies(UnknownTopology, UnknownWave, PhysicalConnections, PhysicalConnectionCount);
+        DisconnectTopologies(UnknownTopology, UnknownWave, PhysicalConnections, PhysicalConnectionCount, 0);
     }
 
     return ntStatus;
@@ -1851,7 +1876,8 @@ CAdapterCommon::DisconnectTopologies
     _In_ PUNKNOWN                   UnknownTopology,
     _In_ PUNKNOWN                   UnknownWave,
     _In_ PHYSICALCONNECTIONTABLE*   PhysicalConnections,
-    _In_ ULONG                      PhysicalConnectionCount
+    _In_ ULONG                      PhysicalConnectionCount,
+    _In_ ULONG                      DebugFlags
 )
 /*++
 
@@ -1859,81 +1885,107 @@ Routine Description:
 
   Disconnects the bridge pins between the wave and mixer topologies.
 
+  THREE DEFECTS FIXED HERE, all inherited from the sample. Read this before
+  "simplifying" any of it back.
+
+  1. The IUnregisterPhysicalConnection interface is now queried from the port
+     that OWNS the connection -- the FROM side -- not from the topology port
+     unconditionally.
+
+     PortCls stores a physical connection so that "the port driver can
+     subsequently use the information to respond to
+     KSPROPERTY_PIN_PHYSICALCONNECTION property requests"
+     (PcRegisterPhysicalConnection, Remarks), and that responder is the filter
+     that owns the SOURCE pin -- FromUnknown. Our speaker pair is registered
+     with CONNECTIONTYPE_WAVE_OUTPUT, i.e. FROM the wave port; asking the
+     TOPOLOGY port to unregister it leaves the registration in place. The
+     microphone pair is CONNECTIONTYPE_TOPOLOGY_OUTPUT, so the sample happened
+     to be right for capture and wrong for render.
+
+     That asymmetry is exactly the shape of the observed failure: repeated
+     bind/unbind cycles lost the SPEAKER endpoint and never the microphone.
+
+  2. The CONNECTIONTYPE_WAVE_OUTPUT branch tested `ntStatus2` -- a variable
+     that is initialised to STATUS_SUCCESS and never assigned -- so a failure
+     on the render path could not even be logged. The status of the call it had
+     just made was in `ntStatus`.
+
+  3. "cache and return the first error" was written as
+     `if (NT_SUCCESS(ntStatus)) ntStatus = ntStatus2;`, which with (2) can only
+     ever overwrite a SUCCESS with a SUCCESS. The first error is now genuinely
+     latched in `firstError` and returned.
+
 Arguments:
+
+  DebugFlags - AH_BINDFLAG_LEGACY_UNBIND reproduces defect (1) on demand, so
+               the regression harness can show the failure returning and going
+               away again against ONE driver build. Production callers pass 0.
 
 Return Value:
 
-  NTSTATUS
+  NTSTATUS -- the FIRST failure, or STATUS_SUCCESS.
 
 --*/
 {
     PAGED_CODE();
     DPF_ENTER(("[CAdapterCommon::DisconnectTopologies]"));
-    
+
     ASSERT(m_pDeviceObject != NULL);
-    
-    NTSTATUS                        ntStatus                        = STATUS_SUCCESS;
-    NTSTATUS                        ntStatus2                       = STATUS_SUCCESS;
-    PUNREGISTERPHYSICALCONNECTION   unregisterPhysicalConnection    = NULL;
 
-    //
-    // Get the IUnregisterPhysicalConnection interface
-    //
-    ntStatus = UnknownTopology->QueryInterface( 
-        IID_IUnregisterPhysicalConnection,
-        (PVOID *)&unregisterPhysicalConnection);
-    
-    if (NT_SUCCESS(ntStatus))
-    { 
-        for (ULONG i = 0; i < PhysicalConnectionCount; i++)
+    NTSTATUS    firstError = STATUS_SUCCESS;
+    BOOLEAN     legacy     = (DebugFlags & AH_BINDFLAG_LEGACY_UNBIND) ? TRUE : FALSE;
+
+    for (ULONG i = 0; i < PhysicalConnectionCount; i++)
+    {
+        PUNKNOWN from = NULL;
+        ULONG    fromPin = 0;
+        PUNKNOWN to = NULL;
+        ULONG    toPin = 0;
+
+        switch (PhysicalConnections[i].eType)
         {
-            switch(PhysicalConnections[i].eType)
-            {
-                case CONNECTIONTYPE_TOPOLOGY_OUTPUT:
-                    ntStatus =
-                        unregisterPhysicalConnection->UnregisterPhysicalConnection(
-                            m_pDeviceObject,
-                            UnknownTopology,
-                            PhysicalConnections[i].ulTopology,
-                            UnknownWave,
-                            PhysicalConnections[i].ulWave
-                        );
+            case CONNECTIONTYPE_TOPOLOGY_OUTPUT:
+                from = UnknownTopology; fromPin = PhysicalConnections[i].ulTopology;
+                to   = UnknownWave;     toPin   = PhysicalConnections[i].ulWave;
+                break;
+            case CONNECTIONTYPE_WAVE_OUTPUT:
+                from = UnknownWave;     fromPin = PhysicalConnections[i].ulWave;
+                to   = UnknownTopology; toPin   = PhysicalConnections[i].ulTopology;
+                break;
+            default:
+                continue;
+        }
 
-                    if (!NT_SUCCESS(ntStatus))
-                    {
-                        DPF(D_TERSE, ("DisconnectTopologies: UnregisterPhysicalConnection(render) failed, 0x%x", ntStatus));
-                    }
-                    break;
-                case CONNECTIONTYPE_WAVE_OUTPUT:
-                    ntStatus =
-                        unregisterPhysicalConnection->UnregisterPhysicalConnection(
-                            m_pDeviceObject,
-                            UnknownWave,
-                            PhysicalConnections[i].ulWave,
-                            UnknownTopology,
-                            PhysicalConnections[i].ulTopology
-                        );
-                    if (!NT_SUCCESS(ntStatus2))
-                    {
-                        DPF(D_TERSE, ("DisconnectTopologies: UnregisterPhysicalConnection(capture) failed, 0x%x", ntStatus2));
-                    }
-                    break;
-            }
+        //
+        // The owner is the FROM port. `legacy` deliberately asks the wrong one,
+        // which is the whole point of the injection flag.
+        //
+        PUNKNOWN owner = legacy ? UnknownTopology : from;
 
-            // cache and return the first error encountered, as it's likely the most relevent
-            if (NT_SUCCESS(ntStatus))
-            {
-                ntStatus = ntStatus2;
-            }
-        }    
+        PUNREGISTERPHYSICALCONNECTION unreg = NULL;
+        NTSTATUS st = owner->QueryInterface(
+            IID_IUnregisterPhysicalConnection,
+            (PVOID *)&unreg);
+        if (!NT_SUCCESS(st))
+        {
+            DPF(D_ERROR, ("DisconnectTopologies: QueryInterface(IUnregisterPhysicalConnection) failed, 0x%x", st));
+            if (NT_SUCCESS(firstError)) { firstError = st; }
+            continue;
+        }
+
+        st = unreg->UnregisterPhysicalConnection(m_pDeviceObject, from, fromPin, to, toPin);
+        if (!NT_SUCCESS(st))
+        {
+            DPF(D_ERROR, ("DisconnectTopologies: UnregisterPhysicalConnection(type %u, pins %u->%u%s) failed, 0x%x",
+                          PhysicalConnections[i].eType, fromPin, toPin,
+                          legacy ? ", LEGACY owner" : "", st));
+            if (NT_SUCCESS(firstError)) { firstError = st; }
+        }
+
+        SAFE_RELEASE(unreg);
     }
-    
-    //
-    // Release the IUnregisterPhysicalConnection interface.
-    //
-    SAFE_RELEASE(unregisterPhysicalConnection);
 
-    return ntStatus;
+    return firstError;
 }
 
 //=============================================================================
@@ -2129,6 +2181,13 @@ CAdapterCommon::InstallEndpointFilters
     BOOL                bWaveCreated        = FALSE;
     PUNKNOWN            unknownMiniTopo     = NULL;
     PUNKNOWN            unknownMiniWave     = NULL;
+    //
+    // Kept so the interfaces can be RE-ARMED once the endpoint is complete.
+    // Empty when the subdevice came from the cache (nothing was registered on
+    // this pass, so there is nothing to re-arm).
+    //
+    UNICODE_STRING      topoLink            = { 0 };
+    UNICODE_STRING      waveLink            = { 0 };
 
     // Initialize output optional parameters if needed
     if (UnknownTopology)
@@ -2172,12 +2231,47 @@ CAdapterCommon::InstallEndpointFilters
                                     IID_IPortTopology,
                                     NULL,
                                     &unknownTopology,
-                                    &unknownMiniTopo
+                                    &unknownMiniTopo,
+                                    &topoLink
                                     );
         if (NT_SUCCESS(ntStatus))
         {
             ntStatus = CacheSubdevice(MiniportPair->TopoName, unknownTopology, unknownMiniTopo);
         }
+    }
+
+    //
+    // ---- THE LIE THIS BLOCK EXISTS TO STOP -------------------------------
+    //
+    // The next statement is `ntStatus = GetCachedSubdevice(WaveName, ...)`,
+    // which OVERWRITES whatever the topology install just returned. If the
+    // topology half failed, `unknownTopology` stays NULL, the ConnectTopologies
+    // block below is skipped because it is guarded on both pointers, and the
+    // function goes on to return the WAVE half's STATUS_SUCCESS.
+    //
+    // The caller is then told "endpoint installed" while what actually exists
+    // is a wave filter with no topology filter and no physical connection --
+    // which AudioEndpointBuilder cannot turn into an endpoint. Observed
+    // symptom: `state=bound generation=N driver_connected=true` in the daemon
+    // and an empty `output_devices`.
+    //
+    // Latching here rather than restructuring the whole routine keeps the
+    // sample's shape (and its diff against upstream) readable.
+    //
+    if (!NT_SUCCESS(ntStatus) || NULL == unknownTopology)
+    {
+        NTSTATUS topoStatus = NT_SUCCESS(ntStatus) ? STATUS_UNSUCCESSFUL : ntStatus;
+        DPF(D_ERROR, ("InstallEndpointFilters: topology '%S' failed 0x%x; refusing to report success",
+                      MiniportPair->TopoName, topoStatus));
+        if (bTopologyCreated && unknownTopology != NULL)
+        {
+            UnregisterSubdevice(unknownTopology);
+            RemoveCachedSubdevice(MiniportPair->TopoName);
+        }
+        RtlFreeUnicodeString(&topoLink);
+        SAFE_RELEASE(unknownMiniTopo);
+        SAFE_RELEASE(unknownTopology);
+        return topoStatus;
     }
 
     ntStatus = GetCachedSubdevice(MiniportPair->WaveName, &unknownWave, &unknownMiniWave);
@@ -2201,7 +2295,8 @@ CAdapterCommon::InstallEndpointFilters
                                     IID_IPortWaveRT,
                                     NULL, 
                                     &unknownWave,
-                                    &unknownMiniWave
+                                    &unknownMiniWave,
+                                    &waveLink
                                     );
 
         if (NT_SUCCESS(ntStatus))
@@ -2210,7 +2305,20 @@ CAdapterCommon::InstallEndpointFilters
         }
     }
 
-    if (unknownTopology && unknownWave)
+    //
+    // Same rule for the wave half: "the call returned SUCCESS" and "there is a
+    // port object" are different facts, and only the second one can be
+    // connected to anything. Without this, a NULL wave port would skip
+    // ConnectTopologies silently and still be reported as success.
+    //
+    if (NT_SUCCESS(ntStatus) && NULL == unknownWave)
+    {
+        ntStatus = STATUS_UNSUCCESSFUL;
+        DPF(D_ERROR, ("InstallEndpointFilters: wave '%S' reported success with no port object",
+                      MiniportPair->WaveName));
+    }
+
+    if (NT_SUCCESS(ntStatus) && unknownTopology && unknownWave)
     {
         //
         // register wave <=> topology connections
@@ -2222,6 +2330,59 @@ CAdapterCommon::InstallEndpointFilters
             unknownWave,
             MiniportPair->PhysicalConnections,
             MiniportPair->PhysicalConnectionCount);
+
+        //
+        // ---- RE-ARM ------------------------------------------------------
+        //
+        // PcRegisterSubdevice ENABLES the interface, and the AudioEndpointBuilder
+        // service "monitors the KSCATEGORY_AUDIO class for device interface
+        // arrivals" -- so by the time this line is reached the builder has
+        // ALREADY been told about both filters, and it was told BEFORE the
+        // physical connection between them existed. A build that starts in
+        // that window asks the bridge pin for
+        // KSPROPERTY_PIN_PHYSICALCONNECTION, gets nothing, and gives up. The
+        // service does not retry: it is edge-triggered on interface arrival.
+        //
+        // Measured on win-audio-debug: with both interfaces enabled, both
+        // filters present and the connection registered, the SPEAKER endpoint
+        // came back on roughly half of repeated bind/unbind cycles and the
+        // microphone on all of them -- the two differ only in which filter owns
+        // the physical connection, i.e. in who loses the race.
+        //
+        // Toggling the interface off and on again re-issues the arrival, this
+        // time with the topology already complete. It is deliberately done for
+        // BOTH filters and in the same order they were registered, so no
+        // direction is special-cased.
+        //
+        if (NT_SUCCESS(ntStatus))
+        {
+            if (topoLink.Buffer != NULL)
+            {
+                (VOID)IoSetDeviceInterfaceState(&topoLink, FALSE);
+            }
+            if (waveLink.Buffer != NULL)
+            {
+                (VOID)IoSetDeviceInterfaceState(&waveLink, FALSE);
+            }
+            if (topoLink.Buffer != NULL)
+            {
+                NTSTATUS st = IoSetDeviceInterfaceState(&topoLink, TRUE);
+                if (!NT_SUCCESS(st))
+                {
+                    DPF(D_ERROR, ("InstallEndpointFilters: re-arm(topology) failed 0x%x", st));
+                    ntStatus = st;
+                }
+            }
+            if (waveLink.Buffer != NULL)
+            {
+                NTSTATUS st = IoSetDeviceInterfaceState(&waveLink, TRUE);
+                if (!NT_SUCCESS(st))
+                {
+                    DPF(D_ERROR, ("InstallEndpointFilters: re-arm(wave) failed 0x%x", st));
+                    ntStatus = st;
+                }
+            }
+        }
     }
 
     if (NT_SUCCESS(ntStatus))
@@ -2268,6 +2429,9 @@ CAdapterCommon::InstallEndpointFilters
         }
     }
    
+    RtlFreeUnicodeString(&topoLink);
+    RtlFreeUnicodeString(&waveLink);
+
     SAFE_RELEASE(unknownMiniTopo);
     SAFE_RELEASE(unknownTopology);
     SAFE_RELEASE(unknownMiniWave);
@@ -2283,51 +2447,77 @@ CAdapterCommon::RemoveEndpointFilters
 (
     _In_        PENDPOINT_MINIPAIR  MiniportPair,
     _In_opt_    PUNKNOWN            UnknownTopology,
-    _In_opt_    PUNKNOWN            UnknownWave
+    _In_opt_    PUNKNOWN            UnknownWave,
+    _In_        ULONG               DebugFlags,
+    _Out_opt_   PULONG              FailStage
 )
+/*++
+
+Routine Description:
+
+  Tears one endpoint down: physical connections first, then the wave
+  subdevice, then the topology subdevice.
+
+  The step ORDER is the sample's and is correct -- "When deleting a subdevice
+  from an adapter's topology, the driver must unregister the subdevice's
+  physical connections to that portion of the topology. Failure to unregister
+  the subdevice's physical connections can cause memory leaks."
+  (Dynamic Audio Subdevices).
+
+  What changed is the RETURN. The sample ended with an unconditional
+  `ntStatus = STATUS_SUCCESS;`, so every failure above it was erased -- and the
+  caller had no way to learn that the endpoint it just "removed" is still half
+  registered. A remove that silently half-succeeds is the direct cause of a
+  later install that half-fails.
+
+--*/
 {
     PAGED_CODE();
     DPF_ENTER(("[CAdapterCommon::RemoveEndpointFilters]"));
-    
-    NTSTATUS    ntStatus   = STATUS_SUCCESS;
-    
+
+    NTSTATUS firstError = STATUS_SUCCESS;
+    ULONG    stage      = AH_STAGE_NONE;
+
     if (UnknownTopology != NULL && UnknownWave != NULL)
     {
-        ntStatus = DisconnectTopologies(
+        NTSTATUS st = DisconnectTopologies(
             UnknownTopology,
             UnknownWave,
             MiniportPair->PhysicalConnections,
-            MiniportPair->PhysicalConnectionCount);
+            MiniportPair->PhysicalConnectionCount,
+            DebugFlags);
 
-        if (!NT_SUCCESS(ntStatus))
+        if (!NT_SUCCESS(st))
         {
-            DPF(D_VERBOSE, ("RemoveEndpointFilters: DisconnectTopologies failed: 0x%x", ntStatus));
+            DPF(D_ERROR, ("RemoveEndpointFilters: DisconnectTopologies failed: 0x%x", st));
+            firstError = st;
+            stage = AH_STAGE_DISCONNECT;
         }
     }
 
-        
     RemoveCachedSubdevice(MiniportPair->WaveName);
 
-    ntStatus = UnregisterSubdevice(UnknownWave);
-    if (!NT_SUCCESS(ntStatus))
+    NTSTATUS stWave = UnregisterSubdevice(UnknownWave);
+    if (!NT_SUCCESS(stWave))
     {
-        DPF(D_VERBOSE, ("RemoveEndpointFilters: UnregisterSubdevice(wave) failed: 0x%x", ntStatus));
+        DPF(D_ERROR, ("RemoveEndpointFilters: UnregisterSubdevice(wave) failed: 0x%x", stWave));
+        if (NT_SUCCESS(firstError)) { firstError = stWave; stage = AH_STAGE_UNREGISTER; }
     }
 
     RemoveCachedSubdevice(MiniportPair->TopoName);
 
-    ntStatus = UnregisterSubdevice(UnknownTopology);
-    if (!NT_SUCCESS(ntStatus))
+    NTSTATUS stTopo = UnregisterSubdevice(UnknownTopology);
+    if (!NT_SUCCESS(stTopo))
     {
-        DPF(D_VERBOSE, ("RemoveEndpointFilters: UnregisterSubdevice(topology) failed: 0x%x", ntStatus));
+        DPF(D_ERROR, ("RemoveEndpointFilters: UnregisterSubdevice(topology) failed: 0x%x", stTopo));
+        if (NT_SUCCESS(firstError)) { firstError = stTopo; stage = AH_STAGE_UNREGISTER; }
     }
 
-    //
-    // All Done.
-    //
-    ntStatus = STATUS_SUCCESS;
-    
-    return ntStatus;
+    if (FailStage != NULL)
+    {
+        *FailStage = stage;
+    }
+    return firstError;
 }
 
 //=============================================================================

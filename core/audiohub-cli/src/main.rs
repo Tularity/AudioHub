@@ -1,5 +1,6 @@
 mod ctl;
 mod m3;
+mod winvad;
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
@@ -180,6 +181,12 @@ enum ProbeCmd {
         #[arg(long, default_value_t = 960)]
         size: usize,
     },
+    /// Drive the Windows virtual-audio driver's control device directly,
+    /// bypassing the daemon and the network. Windows only.
+    Winvad {
+        #[command(subcommand)]
+        cmd: winvad::WinvadCmd,
+    },
 }
 
 fn info(msg: &str) {
@@ -314,6 +321,7 @@ fn dispatch(cmd: ProbeCmd, json: bool) -> Result<i32> {
             emit_json(json, &summary);
             Ok(if summary.received == 0 { EXIT_NO_TRAFFIC } else { 0 })
         }
+        ProbeCmd::Winvad { cmd } => winvad::dispatch(cmd, json),
     }
 }
 

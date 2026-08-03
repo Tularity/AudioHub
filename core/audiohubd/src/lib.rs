@@ -5,6 +5,10 @@ mod conn;
 mod engine;
 pub mod haldev;
 pub mod halbridge;
+/// The Windows control-plane contract and transport. The `wire` half is
+/// compiled EVERYWHERE so its encoding is tested on the machine this is
+/// developed on, not only on the target.
+pub mod halbridge_win;
 mod ipcserv;
 mod quality;
 pub mod reconnect;
@@ -633,6 +637,9 @@ pub(crate) fn hal_status(inner: &DaemonInner) -> Option<audiohub_ipc::HalStatus>
             protocol_version: halbridge::PROTOCOL_VERSION,
             driver_protocol_version: s.driver_protocol_version,
             status_reason: s.status_reason.clone(),
+            bind_failures: s.bind_failures,
+            last_bind_error: s.last_bind_error.clone(),
+            pin_name_fallbacks: s.pin_name_fallbacks,
             devices: lk(&inner.haldev).device_infos(&s.slots),
         }
     })

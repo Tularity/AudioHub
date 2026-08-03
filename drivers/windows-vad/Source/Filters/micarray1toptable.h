@@ -16,8 +16,18 @@ Abstract:
 #define _SIMPLEAUDIOSAMPLE_MICARRAY1TOPTABLE_H_
 
 //
-// {6ae81ff4-203e-4fe1-88aa-f2d57775cd4a}
-DEFINE_GUID(MICARRAY1_CUSTOM_NAME,
+// Pin name for the capture bridge pin -- the counterpart of AH_PIN_NAME_OUT.
+// The inf registers the string under
+// HKR,MediaCategories\%GUID.AhPinIn%,Name in the device software key.
+//
+// Same two extra jobs as AH_PIN_NAME_OUT: the fallback name, and the marker
+// perpeer.cpp matches on when swapping in a peer's derived GUID.
+//
+// Category stays KSNODETYPE_MICROPHONE_ARRAY (form factor, icon, ranking);
+// only the NAME is ours.
+//
+// {6ae81ff4-203e-4fe1-88aa-f2d57775cd4a} -- must equal %GUID.AhPinIn% in the inf.
+DEFINE_GUID(AH_PIN_NAME_IN,
     0x6ae81ff4, 0x203e, 0x4fe1, 0x88, 0xaa, 0xf2, 0xd5, 0x77, 0x75, 0xcd, 0x4a);
 
 //=============================================================================
@@ -62,7 +72,7 @@ PCPIN_DESCRIPTOR MicArray1TopoMiniportPins[] =
         KSPIN_DATAFLOW_IN,                            // DataFlow
         KSPIN_COMMUNICATION_NONE,                     // Communication
         &KSNODETYPE_MICROPHONE_ARRAY,                 // Category
-        &MICARRAY1_CUSTOM_NAME,                       // Name
+        &AH_PIN_NAME_IN,                              // Name
         0                                             // Reserved
       }
     },

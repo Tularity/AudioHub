@@ -17,11 +17,13 @@ import {
   confidenceKey, coversWholeChain, isLowerBound, isQualityMeasuring, latencyGrade,
   latencyGradeKey, latencyTone, latencyValueKey, medianOf5, qualityDots,
   qualityGradeTextKey, qualityTone, qualityWorstKey,
-  readLatency, readQuality, stageHost,
+  readLatency, readPeerNet, readQuality, stageHost,
 } from '../lib/metrics';
-import type { LatencyReading, QualityReading, StageReading, StageSpec } from '../lib/metrics';
+import type {
+  LatencyReading, PeerNetReading, QualityReading, StageReading, StageSpec,
+} from '../lib/metrics';
 import { useStore } from '../state/store';
-import type { SessionInfo } from '../ipc/types';
+import type { PeerState, SessionInfo } from '../ipc/types';
 
 /** 对端分项超过这个岁数就当陈旧（daemon 侧同一口径，规格 §3.5）。 */
 const PEER_STALE_S = 3;
@@ -242,7 +244,11 @@ function QualityCell({ fp, q, open, onToggle }: {
   const measuring = isQualityMeasuring(q);
   const gradeKey = qualityGradeTextKey(q);
   const gradeText = gradeKey ? t(gradeKey) : '';
+  // 出处标记。**必须在数字旁边**，不能只进 title：本机在这条通路上是发送侧、
+  // 根本没有音质测点，不标就等于让这张卡宣称了一个它测不出来的结论。
+  const fromPeer = !!q?.fromPeer;
   const title = joinPhrases([
+    fromPeer ? t('metric.quality.fromPeerWhy') : null,
     measuring ? t('metric.quality.measuringWhy') : null,
     grade && q?.partial ? t('metric.quality.partial') : null,
   ]);
@@ -259,6 +265,8 @@ function QualityCell({ fp, q, open, onToggle }: {
         t('metric.quality.label'),
         value,
         gradeText || null,
+        // 出处进可访问名：对读屏用户来说「这个数是对面量的」和等级词一样要紧。
+        fromPeer ? t('metric.quality.fromPeer') : null,
         t(open ? 'metric.quality.collapse' : 'metric.quality.expand'),
       ])}
       title={title || undefined}
@@ -290,6 +298,16 @@ function QualityCell({ fp, q, open, onToggle }: {
         hidden={!gradeText}
       >
         {gradeText}
+      </span>
+      {/* 一枚克制的角标，与「未含对方主机」同一套视觉语言（小字 + 边框），但用
+          dim 而不是 warn：这不是警告——读数是真的，只是量它的人在对面。 */}
+      <span
+        className="metric-origin"
+        data-testid={`quality-frompeer-${fp}`}
+        title={t('metric.quality.fromPeerWhy')}
+        hidden={!fromPeer}
+      >
+        {fromPeer ? t('metric.quality.fromPeer') : ''}
       </span>
       <span className={`metric-chev${open ? ' open' : ''}`} aria-hidden="true" />
     </button>
@@ -327,6 +345,15 @@ function QualityDetail({ fp, q }: { fp: string; q: QualityReading | undefined })
           <span className={`stage-ms${q ? '' : ' unknown'}`}>{partValue(id)}</span>
         </div>
       ))}
+      {/* 出处整句。角标只有四个字（「对端测得」），展开明细的人要的是那句完整的
+          解释——为什么本机给不出这三个数字。 */}
+      <p
+        className="metric-foot"
+        data-testid={`quality-frompeer-note-${fp}`}
+        hidden={!q?.fromPeer}
+      >
+        {q?.fromPeer ? t('metric.quality.fromPeerWhy') : ''}
+      </p>
       {/* 等级已经触底时，缺一块板改不了结论——于是 grade 有值而 partial 仍为真。
           这两件事都要说：结论成立，但它是在缺一项的情况下得出的（只会更低）。
           等级根本不成立时这行不出，那个状态由格子里的「测量中…」承担。 */}
@@ -346,6 +373,53 @@ function QualityDetail({ fp, q }: { fp: string; q: QualityReading | undefined })
   );
 }
 
+// ------------------------------------------------- 连接级网络延迟（无会话时）
+
+/**
+ * 「连上了，但还没人在用」时唯一能给出的延迟读数。
+ *
+ * 这一格与有会话时那个 22px 的端到端总数是**两个量**，所以它在四个维度上都长得
+ * 不一样，任何一个维度单独被看到都不会误读：
+ *
+ *   1. 标签不是「延迟」而是「网络单程」；
+ *   2. 值自带「（仅网络）」后缀——被截图、被复制走时它跟着走；
+ *   3. 旁边一枚 warn 色标记「不是总延迟」（与「未含对方主机」同一套语言）；
+ *   4. 下面一行说清缺的是哪两段、以及为什么现在量不到。
+ *
+ * 缺一个都不行：只改标签，用户仍会把「0.6 ms」记成总延迟；只写进 title，鼠标不
+ * 悬停就永远读不到。而这个数与真实感知延迟差三个数量级（0.58 ms vs 约 1000 ms），
+ * 误读的代价不是「看起来好一点」，是完全相反的结论。
+ */
+function NetOnly({ fp, net }: { fp: string; net: PeerNetReading }) {
+  const ms = net.ms;
+  const known = typeof ms === 'number';
+  // 读不到时是「测量中…」而**不是 0 ms**：min-RTT 还在攒样本，不是这条链路快到 0。
+  const value = known
+    ? t('metric.latency.netOnlyValue', { ms: segNum(ms) })
+    : t('metric.latency.measuring');
+  const title = joinPhrases([
+    t('metric.latency.netOnlyWhy'),
+    known ? null : t('metric.latency.netOnlyMeasuringWhy'),
+    typeof net.rttMs === 'number'
+      ? t('metric.latency.netOnlyRtt', { ms: segNum(net.rttMs) })
+      : null,
+  ]);
+  return (
+    <span className="metric-netonly" data-testid={`peer-netonly-${fp}`} title={title}>
+      <span className="metric-cap">{t('metric.latency.netOnlyLabel')}</span>
+      {/* 不上色阶：色阶是「这个延迟好不好用」的判断，而在一段网络时间上做那个
+          判断本身就不成立——缓冲与声卡还一个数都没有。 */}
+      <span
+        className={`metric-val${known ? '' : ' unknown'}`}
+        data-testid={`peer-netonly-value-${fp}`}
+      >
+        {value}
+      </span>
+      <span className="metric-scope">{t('metric.latency.netOnlyScope')}</span>
+    </span>
+  );
+}
+
 // ---------------------------------------------------------------- 指标区
 
 /**
@@ -356,7 +430,9 @@ function QualityDetail({ fp, q }: { fp: string; q: QualityReading | undefined })
  * 无会话时整块塌成一行，但**卡片高度不变**（CSS 上有 min-height）：一排卡片里
  * 只有开了通路的那几张变高，扫一眼时像是排版坏了。
  */
-export function PeerMetrics({ fp, sess }: { fp: string; sess: SessionInfo | null }) {
+export function PeerMetrics({ fp, peer, sess }: {
+  fp: string; peer: PeerState | null; sess: SessionInfo | null;
+}) {
   const [open, setOpen] = useState<'latency' | 'quality' | null>(null);
   // 头条数字要平滑（规格 §2.6），而平滑要历史序列——store 里已经有一条 60 点的，
   // 由 pushStats 每秒推一点，缺读数时原地不动（所以序列里不会混进 0）。
@@ -371,12 +447,25 @@ export function PeerMetrics({ fp, sess }: { fp: string; sess: SessionInfo | null
   // 早就防住了同一类问题，指标区不能漏。
   const keep = (e: React.MouseEvent) => e.stopPropagation();
 
+  // 无会话时唯一还活着的延迟读数：控制面的网络单程。**离线即 undefined**——
+  // 记忆里的往返时间是关于过去的陈述，挂在一台离线主机上会被读成「它现在这么快」。
+  const net = sess ? undefined : readPeerNet(peer);
+
   if (!sess) {
     return (
       <div className="peer-metrics idle" data-testid={`peer-metrics-${fp}`} onClick={keep}>
         <div className="metric-idle">
-          <span className="metric-cap">{t('metric.latency.label')}</span>
-          <span className="metric-val unknown">{t('metric.latency.none')}</span>
+          {/* 连着的时候把这一格让给网络单程：此前这里恒是「延迟 —」，而「—」在
+              离线、刚连上、通路正常闲置三种情形下长得一模一样，用户从中读不出
+              「连接是通的、而且很快」这条已经实实在在测到了的事实。 */}
+          {net ? (
+            <NetOnly fp={fp} net={net} />
+          ) : (
+            <>
+              <span className="metric-cap">{t('metric.latency.label')}</span>
+              <span className="metric-val unknown">{t('metric.latency.none')}</span>
+            </>
+          )}
           <span className="metric-sep" aria-hidden="true">{sep}</span>
           <span className="metric-cap">{t('metric.quality.label')}</span>
           <span className="metric-val unknown">{t('metric.quality.none')}</span>
@@ -385,6 +474,11 @@ export function PeerMetrics({ fp, sess }: { fp: string; sess: SessionInfo | null
             {t('peers.card.noSession')}
           </span>
         </div>
+        {/* 缺的是哪两段、为什么现在量不到——这句必须**看得见**。只写进 title 的话，
+            不悬停鼠标的人拿到的仍然是一个孤零零的毫秒数。 */}
+        <p className="metric-foot" data-testid={`peer-netonly-note-${fp}`} hidden={!net}>
+          {net ? t('metric.latency.netOnlyNote') : ''}
+        </p>
       </div>
     );
   }

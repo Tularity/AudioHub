@@ -11,6 +11,13 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod transport;
+
+pub use transport::{
+    LatencyTarget, QualityStop, QualityTarget, LATENCY_AUTO, LATENCY_LEGACY_MIN, LATENCY_STOPS_MS,
+    QUALITY_AUTO, QUALITY_LEGACY_PCM,
+};
+
 /// 2 起：daemon 保证 `SessionStats.pipeline` / `.quality` 两个字段**存在**
 /// （值可以是 `null`）。这是能力标记，不是不兼容变更——字段全部 `#[serde(default)]`
 /// 纯追加，v1 客户端读 v2 的回包没有任何问题。
@@ -182,14 +189,49 @@ pub struct DaemonSettings {
     /// Append `（离线）` to a disconnected peer's device names, so "no sound"
     /// is visible in the system's own device list (spec-m5b OPEN QUESTION 1).
     pub mark_offline_devices: bool,
-    /// Persisted for the UI; not yet wired to the media plane (the AUTO ladder
-    /// still decides both). Kept here so the UI has one home for its settings
-    /// instead of localStorage.
+    /// 端到端**总延迟**的目标：`"auto"` 或 [`LATENCY_STOPS_MS`] 里的毫秒数。
+    ///
+    /// 曾经的注释写着「persisted for the UI; not yet wired to the media plane」。
+    /// 那句话是真的：这两个字段被收下、写盘、原样回显，**没有任何一行代码读它们**，
+    /// 重启也不生效。现在它们真的驱动媒体面（见 `audiohubd::transport`）。
     pub latency: String,
+    /// 质量档：`"auto"` 或某个**可用**档位 id（见 [`transport::quality_stops`]）。
     pub quality: String,
+    /// 延迟滑条的固定档（毫秒，升序）。**daemon 是唯一真值源**——前端不许自己
+    /// 写一份，否则两边的「有哪些档」会各自演化，而分歧不会有任何报错。
+    pub latency_stops_ms: Vec<u16>,
+    /// 质量滑条的完整档位表，**含不可用档**（UI 画成灰刻度）。
+    pub quality_stops: Vec<QualityStop>,
+    /// 媒体面**真的**在做什么。与上面两个字段是两回事：那是用户要的，这是拿到的。
+    pub transport_live: TransportLive,
     /// Virtual-device slots the attached driver offers, and how many are bound.
     pub hal_capacity: u8,
     pub hal_used: u8,
+}
+
+/// 传输档位的**实测**读数。
+///
+/// 存在的唯一理由是「够不到的时候要如实呈现」：目标 0 ms 而物理下限 90 ms 时，
+/// UI 必须显示 90 与「已达物理下限」，而不是把用户选的 0 回显成当前值。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TransportLive {
+    /// 实测端到端总延迟（ms）。`None` = 还没测出来（对端分项未到 / RTT 窗口未攒够）。
+    /// **绝不用目标值或上一次的值顶替。**
+    #[serde(default)]
+    pub achieved_ms: Option<f64>,
+    /// 目标够不到，已经贴在物理下限上。
+    #[serde(default)]
+    pub at_floor: bool,
+    /// 目标够不到，已经贴在物理上限上。
+    #[serde(default)]
+    pub at_ceiling: bool,
+    /// 当前实际线上采样率（Hz）。`None` = 没有流。
+    #[serde(default)]
+    pub rate: Option<u32>,
+    /// 正在被伺服的接收流数。`0` = 暂无会话，档位还没有作用对象——
+    /// UI 要说这句，否则用户会以为设置没生效。
+    #[serde(default)]
+    pub streams: u32,
 }
 
 /// One published (or intended) virtual device pair, `hal.devices`.
@@ -526,6 +568,21 @@ pub struct MixHealth {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStats {
+    /// 对端在**它那一侧**测到的音质（`SessionMsg::StageReport` 回传）。
+    ///
+    /// # 为什么非有不可
+    ///
+    /// 音质三分量全是**接收侧**概念：PLC、欠载、静音填充只在收端发生。于是
+    /// 一条纯发送的流，`quality` 恒为 `None`——实测 `[spk/send] quality = None`，
+    /// 界面上音质那一格**永远**空着，而链路其实好得很。
+    ///
+    /// 这与本项目栽过的 `jb_underruns = 0` 假象是同一个病：只看本机方向，
+    /// 就把「我这侧无从观测」误当成了「链路无损」。
+    ///
+    /// `quality` 与本字段**至多一个**非空（一条流不会两侧都是接收端）。
+    /// UI 取 `quality ?? peer_quality`，并标出这一格来自对端的测量。
+    #[serde(default)]
+    pub peer_quality: Option<QualityStats>,
     pub received: u64,
     pub lost: u64,
     pub loss_pct: f64,
@@ -655,6 +712,26 @@ pub struct PeerState {
     /// would otherwise be indistinguishable (spec-m5b §5.3).
     #[serde(default)]
     pub display_name: String,
+    /// 控制面 Ping/Pong 的**单向**网络延迟估计（min-RTT / 2，毫秒）。
+    ///
+    /// # 它与媒体会话无关，这正是它存在的理由
+    ///
+    /// `SessionStats.pipeline` 里的延迟是**按流**的，没有会话就整块没有，
+    /// 于是「已连上但还没人在用」时界面上一个数字都没有——用户看到的是一片空白，
+    /// 分不清「没连上」「连上了但坏了」「连上了只是闲着」。这个字段挂在
+    /// **连接**上（`ConnShared::clock`），配对连上就有。
+    ///
+    /// ⚠ **它不是端到端总延迟，UI 必须把这一点说出来。** 实测 RTT 0.58 ms 而
+    /// 感知延迟约 1000 ms，相差三个数量级（plan §7.6 严谨性红线：不得以网络
+    /// RTT 冒充音频延迟）。延迟的绝大部分在缓冲与设备侧。
+    ///
+    /// `None` = min-RTT 窗口还没攒够样本（约 8 拍）。**宁可 None 也不拿一个
+    /// 未滤波的 RTT 顶上。**
+    #[serde(default)]
+    pub net_ms: Option<f64>,
+    /// 最近一次 Pong 的 RTT（毫秒），交叉校验用。`None` 同上。
+    #[serde(default)]
+    pub rtt_ms: Option<f64>,
     /// The mode this peer last told us it is in (plan §13 推论 1), from
     /// `SessionMsg::ModeState` on the live control channel.
     ///

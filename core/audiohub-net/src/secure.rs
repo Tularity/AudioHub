@@ -82,6 +82,50 @@ pub struct StageReading {
     pub drift_sps: Option<f64>,
 }
 
+/// 对端在**它那一侧**测到的音质原料（`StageReport` 的可选载荷）。
+///
+/// # 为什么必须回传，而不是各看各的
+///
+/// 音质三分量（遮蔽率 Q1 / 削顶 Q2 / 带宽 Q3）本质上是**接收侧**的概念：
+/// PLC、欠载、静音填充只在收端发生。于是一台纯发送的机器对自己这条流的音质
+/// **没有定义**——`build_quality` 需要一个抖动缓冲，而发送侧没有。
+///
+/// 实测后果：`[spk/send] origin=hal quality = None`，界面上音质那一格永远空着。
+/// 这与本项目栽过的 `jb_underruns = 0` 假象**是同一个病**：只看本机方向，
+/// 就会把「我这侧无从观测」误当成「链路无损」。真正的音质在对端的接收会话上。
+///
+/// # 为什么送原料而不是送等级
+///
+/// 与 [`StageReading`] 同一条理由：**给对端足够重算一遍的量**，评级规则在收方
+/// 本机执行。等级是我们的口径，收方的 build 可能有不同的门限；把等级放上线，
+/// 两端就会对同一条流给出不同的字，而谁也说不清哪个对。
+///
+/// 缺席语义与本机侧逐字相同：`clip_ratio` 的 `None` 是「**还没测**」，
+/// 不是「测了，一个越界样本都没有」——这条红线在线上也必须活着，所以它是
+/// `Option` 而不是一个填了 0 的 `f64`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityReading {
+    /// 滚动窗口的真实跨度（秒）。
+    pub window_s: f64,
+    /// Q1 原料。
+    pub conceal_ratio: f64,
+    pub plc_ticks: u64,
+    pub silence_ticks: u64,
+    pub popped_ticks: u64,
+    pub underruns: u64,
+    pub jb_dropped: u64,
+    /// Q2 原料。`None` = 本窗口还没攒够一整页，**不是 0**。
+    #[serde(default)]
+    pub clip_ratio: Option<f64>,
+    #[serde(default)]
+    pub clip_excess_db: Option<f64>,
+    /// Q3 原料：对端实际收到的音频带宽（Hz，= 线上采样率 / 2）。
+    pub bandwidth_hz: u32,
+    /// 对端是否判定本流与另一路重复（站点级一票否决，规格 §4.4）。
+    #[serde(default)]
+    pub duplicate: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionMsg {
@@ -219,6 +263,16 @@ pub enum SessionMsg {
         /// 发送方声卡固有延迟。P0 恒为 `Unavailable`（平台查询是 P1 的活）。
         #[serde(default)]
         dev: Option<DevLatency>,
+        /// 发送方**接收侧**的音质原料。`None` 有两种成因，收方不区分：
+        /// 对端是不带这个字段的旧版本，或者这条流在对端也是纯发送方向
+        /// （于是它那侧同样没有抖动缓冲可测）。两种都只意味着「拿不到」，
+        /// 而拿不到必须显示成拿不到 —— 见 [`QualityReading`]。
+        ///
+        /// `#[serde(default)]` ⇒ 老对端发来的报文照样解析，只是这一格是空的；
+        /// 反之老对端收到带这个字段的报文时 serde 忽略未知字段，也不掉线。
+        /// 所以这条不需要升 P2P 协议版本。
+        #[serde(default)]
+        quality: Option<QualityReading>,
         /// 采样时刻，**发送方时基**（µs since its daemon start）。
         ///
         /// ⚠ 只允许与**同一个发送方**的其它 `seq_us` 比较（去重、判乱序）。
@@ -738,6 +792,7 @@ mod wire_compat_tests {
             stages: vec![reading()],
             local_ms: Some(1005.0),
             dev: None,
+            quality: None,
             seq_us: 1_000_000,
         })
         .unwrap();
@@ -755,6 +810,7 @@ mod wire_compat_tests {
             stages: vec![reading()],
             local_ms: Some(1005.0),
             dev: Some(DevLatency::unavailable()),
+            quality: None,
             seq_us: 42,
         };
         let back: SessionMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
@@ -772,6 +828,65 @@ mod wire_compat_tests {
             }
             other => panic!("解析成了 {other:?}"),
         }
+    }
+
+    /// **音质原料穿过线缆之后一个字段都不许掉**，尤其是两个 `Option`。
+    ///
+    /// `clip_ratio: None`（还没测）与 `Some(0.0)`（测了，一个越界样本都没有）
+    /// 在本项目里是两个结论，混同过一次、代价是一条正在爆音的流报「良好」。
+    /// 那条红线在**线上**也必须活着，所以这里逐个断言，不用 `..` 糊过去。
+    #[test]
+    fn a_quality_reading_survives_the_wire_including_the_difference_between_none_and_zero() {
+        for (clip, excess) in [(None, None), (Some(0.0), Some(-120.0)), (Some(0.031), Some(2.5))] {
+            let msg = SessionMsg::StageReport {
+                stream_id: 9,
+                stages: vec![],
+                local_ms: None,
+                dev: None,
+                quality: Some(QualityReading {
+                    window_s: 10.5,
+                    conceal_ratio: 0.012,
+                    plc_ticks: 3,
+                    silence_ticks: 1,
+                    popped_ticks: 1000,
+                    underruns: 2,
+                    jb_dropped: 4,
+                    clip_ratio: clip,
+                    clip_excess_db: excess,
+                    bandwidth_hz: 24_000,
+                    duplicate: true,
+                }),
+                seq_us: 7,
+            };
+            let back: SessionMsg =
+                serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+            let SessionMsg::StageReport { quality: Some(q), .. } = back else {
+                panic!("音质原料没活过线缆")
+            };
+            assert_eq!(q.window_s, 10.5);
+            assert_eq!(q.conceal_ratio, 0.012);
+            assert_eq!((q.plc_ticks, q.silence_ticks, q.popped_ticks), (3, 1, 1000));
+            assert_eq!((q.underruns, q.jb_dropped), (2, 4));
+            assert_eq!(q.bandwidth_hz, 24_000);
+            assert!(q.duplicate);
+            assert_eq!(q.clip_ratio, clip, "「还没测」与「测了是 0」被线缆混为一谈");
+            assert_eq!(q.clip_excess_db, excess);
+        }
+    }
+
+    /// 不带 `quality` 的老报文照常解析，那一格是 `None`。
+    /// 若哪天有人把 `#[serde(default)]` 拿掉，整条 `StageReport` 会解析失败、
+    /// 被 `recv_timeout` 跳过 —— 延迟分项也会跟着一起消失，而没人会想到是这里。
+    #[test]
+    fn a_stage_report_without_quality_still_parses() {
+        let json = r#"{"type":"stage_report","stream_id":1,"stages":[],
+                       "local_ms":null,"dev":null,"seq_us":5}"#;
+        let msg: SessionMsg = serde_json::from_str(json).expect("老报文必须照常解析");
+        let SessionMsg::StageReport { quality, stream_id, .. } = msg else {
+            panic!("解析成了别的变体")
+        };
+        assert_eq!(stream_id, 1);
+        assert!(quality.is_none(), "缺席就是缺席");
     }
 
     /// `drop_mode` 缺席 ⇒ 整条报文解析失败 ⇒ 被跳过 ⇒ 停在 `LocalOnly`。

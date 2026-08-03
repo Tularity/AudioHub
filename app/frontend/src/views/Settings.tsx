@@ -4,10 +4,12 @@
 // 等于把「那排开关为什么没了」的答案藏起来）。这里只放一面只读的镜子 + 去主面板
 // 的入口，避免同一个全局状态出现两个可点的控件、两处 pending 态。
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Icon } from '../components/Icon';
-import { ExtLink, Segmented, Switch } from '../components/Controls';
+import { ExtLink, Switch } from '../components/Controls';
+import { StopSlider } from '../components/StopSlider';
+import type { Stop } from '../components/StopSlider';
 import { PermissionRow } from '../components/PermissionRow';
 import { toast } from '../components/Toasts';
 import { openExternal } from '../lib/external';
@@ -18,6 +20,7 @@ import {
   WEB_PORT_MAX, WEB_PORT_MIN,
 } from '../lib/webui';
 import type { WebUiPatch, WebUiStatus } from '../lib/webui';
+import type { DaemonSettings, QualityStop } from '../ipc/types';
 import { t, joinPhrases } from '../i18n';
 import type { MsgKey } from '../i18n';
 import { actions, useStore } from '../state/store';
@@ -496,19 +499,196 @@ function WebAccessCard() {
   );
 }
 
+// ---- 传输：延迟档 / 质量档 ----
+
+// **daemon 才是档表的唯一真值源**：档位随物理能力与构建选项变，前端写死一份，早晚
+// 会画出一个它自己都送不下去的档。下面两张表只在旧服务什么都不上报时兜底——目的是
+// 让滑条还有档可选，不是替 daemon 声明它支持什么。
+const LATENCY_STOPS_FALLBACK = [0, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000];
+
+// 兜底表里三档 Opus 一律置为不可用：拿不到 daemon 的应答时，「不知道能不能用」只能
+// 按不能用画。反过来（默认可用）会让用户选中一个根本发不出去的档。
+const QUALITY_STOPS_FALLBACK: QualityStop[] = [
+  { id: 'auto', available: true },
+  { id: 'opus64', kbps: 64, available: false, blocked_by: 'opus' },
+  { id: 'opus128', kbps: 128, available: false, blocked_by: 'opus' },
+  { id: 'opus256', kbps: 256, available: false, blocked_by: 'opus' },
+  // kbps = rate × 16 bit（s16 单声道），与 daemon 的 quality_stops() 逐档对齐。
+  { id: 'pcm16k', kbps: 256, rate: 16000, available: true },
+  { id: 'pcm24k', kbps: 384, rate: 24000, available: true },
+  { id: 'pcm32k', kbps: 512, rate: 32000, available: true },
+  { id: 'pcm48k', kbps: 768, rate: 48000, available: true },
+];
+
+// `Record<string, MsgKey>` 而不是 `Record<QualityId, MsgKey>`：id 由 daemon 定义，
+// 它加一档而前端还没跟上时，缺的那条必须能在运行期被发现（见下面的 raw-id 回落），
+// 而不是让 TS 强迫我们把一个虚构的联合类型当成契约。
+const QUALITY_LABEL_KEY: Record<string, MsgKey> = {
+  auto: 'settings.transport.q.auto',
+  opus64: 'settings.transport.q.opus64',
+  opus128: 'settings.transport.q.opus128',
+  opus256: 'settings.transport.q.opus256',
+  pcm16k: 'settings.transport.q.pcm16k',
+  pcm24k: 'settings.transport.q.pcm24k',
+  pcm32k: 'settings.transport.q.pcm32k',
+  pcm48k: 'settings.transport.q.pcm48k',
+};
+
+/** 旧服务的 `'min'` 与新档表里的 `'0'` 是同一档。数值串统一过一遍 Number，免得
+ *  `'200.0'` 和 `'200'` 被当成两个不同的档而双双落空。认不出来就原样返回——
+ *  硬塞进某一档等于替 daemon 编造一个它没说过的选择。 */
+function normLatency(v: string): string {
+  if (v === 'auto') return 'auto';
+  const n = Number(v === 'min' ? '0' : v);
+  return Number.isFinite(n) ? String(n) : v;
+}
+
+/** 旧服务的 `'pcm'` 指的是全带宽那一档。 */
+function normQuality(v: string): string {
+  return v === 'pcm' ? 'pcm48k' : v;
+}
+
+/**
+ * 延迟读数。**只念实测值，绝不念目标值**——把用户刚选的档复述一遍的读数，正是这个
+ * 项目反复栽过的那种「报告成功、其实什么都没发生」。分支顺序即优先级：没有流可测
+ * 时连「正在测量」都不该说。
+ */
+function latencyReadout(ds: DaemonSettings | null): string {
+  const live = ds ? ds.transport_live : null;
+  if (!live) return t('settings.transport.liveNa');
+  if (live.streams === 0) return t('settings.transport.noStreams');
+  const ms = live.achieved_ms;
+  if (ms == null || !Number.isFinite(ms)) return t('settings.transport.measuring');
+  const n = Math.round(ms);
+  if (live.at_floor) return t('settings.transport.atFloor', { n });
+  if (live.at_ceiling) return t('settings.transport.atCeiling', { n });
+  return t('settings.transport.achieved', { n });
+}
+
+/**
+ * 采样率读数：同样是媒体面此刻真正在跑的值，不是所选档位的标称值。
+ *
+ * `streams === 0` 单独说一句，而不是笼统的「暂无读数」：契约里 `rate` 的
+ * `None` 恰恰有「没有流」这一种成因，含糊过去会让用户以为设置没生效。
+ */
+function qualityReadout(ds: DaemonSettings | null): string {
+  const live = ds ? ds.transport_live : null;
+  if (!live) return t('settings.transport.liveNa');
+  if (live.streams === 0) return t('settings.transport.noStreams');
+  const r = live.rate;
+  if (r == null || !Number.isFinite(r) || r <= 0) return t('settings.transport.measuring');
+  return t('settings.transport.qLive', { n: Math.round(r / 1000) });
+}
+
+function TransportCard() {
+  const ds = useStore((s) => s.daemonSettings);
+  // 没有 settings.* 的旧服务：拖了也不会有任何效果，禁用比假装能用诚实。
+  const noSettings = useStore((s) => s.settingsSupported === false);
+
+  const latencyStops = useMemo<Stop[]>(() => {
+    const raw = ds && Array.isArray(ds.latency_stops_ms) && ds.latency_stops_ms.length
+      ? ds.latency_stops_ms
+      : LATENCY_STOPS_FALLBACK;
+    const out: Stop[] = [{ value: 'auto', label: t('settings.transport.auto') }];
+    const seen = new Set<string>(['auto']);
+    for (const n of raw) {
+      if (typeof n !== 'number' || !Number.isFinite(n)) continue;
+      const value = String(n);
+      if (seen.has(value)) continue;   // 重复档会撞 React key，也没有任何意义
+      seen.add(value);
+      out.push({
+        value,
+        label: n === 0 ? t('settings.transport.latencyLowest') : t('settings.transport.ms', { n }),
+      });
+    }
+    return out;
+  }, [ds]);
+
+  const qualityStops = useMemo<Stop[]>(() => {
+    const raw = ds && Array.isArray(ds.quality_stops) && ds.quality_stops.length
+      ? ds.quality_stops
+      : QUALITY_STOPS_FALLBACK;
+    const out: Stop[] = [];
+    const seen = new Set<string>();
+    for (const q of raw) {
+      const id = q && typeof q.id === 'string' ? q.id : '';
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const key = QUALITY_LABEL_KEY[id];
+      const off = q.available === false;
+      out.push({
+        value: id,
+        // daemon 加了一档而语料还没跟上：把原始 id 画出来。悄悄跳过它，新档位就在
+        // 界面上凭空消失了，而没有任何人会收到通知。
+        label: key ? t(key) : id,
+        available: !off,
+        why: off
+          ? (q.blocked_by === 'opus'
+            ? t('settings.transport.qBlockedOpus')
+            : t('settings.transport.qBlocked'))
+          : undefined,
+      });
+    }
+    return out;
+  }, [ds]);
+
+  // 回包即权威：失败时不改任何本地状态，StopSlider 会把 thumb 退回 daemon 的值。
+  function push(patch: Partial<DaemonSettings>): Promise<unknown> {
+    return applySettings(patch).catch(() => { /* rpc 已 toast */ });
+  }
+
+  const latency = normLatency(ds && typeof ds.latency === 'string' ? ds.latency : 'auto');
+  const quality = normQuality(ds && typeof ds.quality === 'string' ? ds.quality : 'auto');
+
+  return (
+    <section className="card block" data-testid="settings-transport">
+      <h3 className="block-title">{t('settings.transport.title')}</h3>
+      <SettingRow
+        title={t('settings.transport.latency')}
+        desc={t('settings.transport.latencyDesc')}
+        control={(
+          <div className="transport-ctl">
+            <StopSlider
+              testid="settings-latency"
+              label={t('settings.transport.latency')}
+              stops={latencyStops}
+              value={latency}
+              disabled={noSettings}
+              onSelect={(v) => push({ latency: v })}
+            />
+            <p className="transport-live" data-testid="settings-latency-readout">
+              {latencyReadout(ds)}
+            </p>
+          </div>
+        )}
+      />
+      <SettingRow
+        title={t('settings.transport.quality')}
+        desc={t('settings.transport.qualityDesc')}
+        control={(
+          <div className="transport-ctl">
+            <StopSlider
+              testid="settings-quality"
+              label={t('settings.transport.quality')}
+              stops={qualityStops}
+              value={quality}
+              disabled={noSettings}
+              onSelect={(v) => push({ quality: v })}
+            />
+            <p className="transport-live" data-testid="settings-quality-readout">
+              {qualityReadout(ds)}
+            </p>
+          </div>
+        )}
+      />
+      <p className="muted small">{t('settings.transport.noteLive')}</p>
+    </section>
+  );
+}
+
 export function SettingsView() {
   const s = useStore();
   const [writing, setWriting] = useState(0);
-
-  // daemon 的值优先，拿不到才回落到本地缓存——反过来会让界面显示一个 daemon
-  // 根本不认的档位。
-  function settingValue(key: 'latency' | 'quality', dft: string): string {
-    const d = s.daemonSettings;
-    const fromDaemon = d && typeof d[key] === 'string' ? d[key] : '';
-    if (fromDaemon) return fromDaemon;
-    const local = s.settings[key];
-    return typeof local === 'string' && local ? local : dft;
-  }
 
   // 全部写操作走同一条路：回包就是新的权威值，不做乐观翻转——开关先翻过去、
   // 请求再失败的话，界面显示的是一个 daemon 从没接受过的设置。
@@ -557,44 +737,7 @@ export function SettingsView() {
 
       <WebAccessCard />
 
-      {/* 延迟/质量：**真的下发并落盘**（settings.json），但媒体面还没读它。角标写
-          「已保存 · 暂未生效」而不是隐藏：藏起来会让下一版接上时用户以为是新功能。 */}
-      <section className="card block">
-        <h3 className="block-title">{t('settings.transport.title')}</h3>
-        <SettingRow
-          title={t('settings.transport.latency')}
-          desc={t('settings.transport.latencyDesc')}
-          badge={t('settings.transport.savedBadge')}
-          control={(
-            <Segmented
-              testid="settings-latency"
-              value={settingValue('latency', 'min')}
-              onSelect={(v) => pushSetting({ latency: v })}
-              options={[
-                { value: 'min', label: t('settings.transport.latencyMin') },
-                { value: 'auto', label: t('settings.transport.auto') },
-              ]}
-            />
-          )}
-        />
-        <SettingRow
-          title={t('settings.transport.quality')}
-          desc={t('settings.transport.qualityDesc')}
-          badge={t('settings.transport.savedBadge')}
-          control={(
-            <Segmented
-              testid="settings-quality"
-              value={settingValue('quality', 'auto')}
-              onSelect={(v) => pushSetting({ quality: v })}
-              options={[
-                { value: 'pcm', label: t('settings.transport.qualityPcm') },
-                { value: 'auto', label: t('settings.transport.auto') },
-              ]}
-            />
-          )}
-        />
-        <p className="muted small">{t('settings.transport.note')}</p>
-      </section>
+      <TransportCard />
 
       <BridgeCard />
 

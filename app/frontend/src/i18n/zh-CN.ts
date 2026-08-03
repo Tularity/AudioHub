@@ -160,6 +160,21 @@ export const zhCN = {
   'metric.latency.scopeLocal': '未含对方主机',
   'metric.latency.scopeLocalWhy': '这个数只算了本机这一侧的排队时长。对方主机上的分段还没上报，端到端的真实延迟比它高，高多少现在说不了。',
 
+  // 无会话、只连着控制通道时的读数（PeerState.net_ms = 控制面 min-RTT / 2）。
+  //
+  // 它与上面那个「延迟」**不是同一个量**，所以标签、字号、措辞全部另起一套：
+  // 实测网络单程 0.58 ms，而同一条链路上的感知延迟约 1000 ms——相差三个数量级。
+  // 占大头的是缓冲与声卡，而那两段**要等真的有音频在流动时才量得到**。
+  // 因此这里的值自带「仅网络」后缀，旁边再挂一枚 warn 色标记：任何一处单独被看到、
+  // 被截图、被复制走，都不能被读成端到端总延迟。
+  'metric.latency.netOnlyLabel': '网络单程',
+  'metric.latency.netOnlyValue': '{ms} ms（仅此一段）',
+  'metric.latency.netOnlyScope': '不是总延迟',
+  'metric.latency.netOnlyNote': '不含缓冲与声卡，而那两段占大头——要等真的有音频在流动时才量得到。',
+  'metric.latency.netOnlyWhy': '这只是数据包在两台主机之间跑一趟的时间。占大头的缓冲与声卡还没有数——它们要等真的有音频在流动时才量得到。建立通路后，这里会换成端到端的总延迟。',
+  'metric.latency.netOnlyRtt': '最近一次往返 {ms} ms（交叉校验用）。',
+  'metric.latency.netOnlyMeasuringWhy': '还在攒最小往返时间的样本（约十几秒）。宁可先不给，也不拿一个没滤过的往返值顶上。',
+
   // 一级四段：面向用户的说法，不出现 FIFO / JitterBuffer 这类内部词。
   // 没有第五段「设备」：色带是按音频流向排的时间轴，而两个声卡固有延迟分别落在
   // 链路的两端，一个在轴上出现两次的集合占不了一个连续色块（详见 lib/metrics.ts
@@ -270,6 +285,15 @@ export const zhCN = {
   // grade 成立、但仍缺一块板：等级已经触底，缺席改不了结论，两件事都要说。
   'metric.quality.partial': '这一档是在还缺一个分量的情况下定的，补齐后只会更低、不会更高。',
 
+  // 这一格来自对端的测量（SessionStats.peer_quality）。
+  //
+  // 音质三分量（补偿、削顶、带宽）全是**接收侧**的量，所以一条纯发送的通路本机
+  // 恒无读数——「送对方扬声器」的音质格此前**永远**空着，而链路其实好得很。
+  // 现在由对端把它那侧测到的回传过来。必须标：数是真的，但量它的人在对面，
+  // 不标就等于让本机宣称了一个它没有测点的结论。
+  'metric.quality.fromPeer': '对端测得',
+  'metric.quality.fromPeerWhy': '这条通路是本机在发送，而音质（补偿、削顶、带宽）只有收端量得到，所以这一格是对端在它那侧测好后回传的。',
+
   'quality.part.continuity.name': '连续性',
   'quality.part.continuity.desc': '输出中不是由对方原始采样构成的时长占比（补偿帧与静音）。',
   'quality.part.continuity.value': '{pct}% 被补偿',
@@ -321,6 +345,16 @@ export const zhCN = {
   'peers.card.streamOut': '发送',
   'peers.card.idle': '空闲',
   'peers.card.kbps': '{v} kbps',
+
+  // 模式 B 下，虚拟麦克风已经真的出现在系统设备列表里、但还没有任何应用打开它。
+  //
+  // 「接收」那一行此前只显示「空闲」，与「对端离线」「驱动没起来」长得一模一样——
+  // 用户明明知道麦克风是通的，界面却什么都不肯说。这一行说的是**状态**，不是数据：
+  // 没有音频在流动时不存在码率、不存在电平，任何数字都会是编的。
+  // 只有 hal_device.observed 为真（设备确实在系统里）且对端在线时才敢这么说。
+  'peers.card.micReadyShort': '就绪',
+  'peers.card.micReady': '通路就绪 · 暂无应用在录音',
+  'peers.card.micReadyWhy': '虚拟麦克风已经出现在系统设备列表里，对端也在线。任意应用（会议、录音、浏览器）选中它的那一刻，音频就开始流动，这里随即显示实时码率。',
 
   // plan §13 推论 1：对端处于使用端模式时无法被本机调取。三条分开写，因为
   // 「它在模式 A」和「它在模式 B」对用户的意义不同（后者说明对面正把本机之外的
@@ -568,15 +602,40 @@ export const zhCN = {
   'settings.web.browserOnly': '你正在用网页端查看本页面。这三个选项只能在应用窗口里修改——否则一次误触就能把你自己正在用的这个入口关掉。此处显示的是按当前访问地址推断出的状态。',
 
   'settings.transport.title': '传输',
-  'settings.transport.latency': '延迟档',
-  'settings.transport.latencyDesc': '最低：固定最小缓冲，追求最低听感延迟；AUTO：按网络质量自适应加深缓冲。推荐保持最低。',
-  'settings.transport.latencyMin': '最低延迟',
   'settings.transport.auto': 'AUTO',
+
+  'settings.transport.latency': '延迟档',
+  // 「这是总延迟的目标，不是某一级缓冲的大小」必须写死在文案里：把它读成缓冲大小的
+  // 人，会以为调到 200 ms 就是「多缓冲 200 ms」，于是永远不明白为什么读数不听话。
+  'settings.transport.latencyDesc': '这里设的是端到端总延迟的目标值——从对方采集到本机放出声音的全程，与对方之间的网络延迟也算在内，不是某一级缓冲的大小。服务会在链路允许的范围内朝这个目标调节缓冲深度：目标低于物理下限就贴着下限跑，高于上限就贴着上限。「尽可能低」= 不设目标、一路压到最低；AUTO = 按实测网络质量自适应。',
+  'settings.transport.latencyLowest': '尽可能低',
+  'settings.transport.ms': '{n} ms',
+
   'settings.transport.quality': '质量档',
-  'settings.transport.qualityDesc': 'PCM：无损 PCM_S16LE 固定码率；AUTO：按丢包与带宽在质量阶梯（rung）上自动升降。',
-  'settings.transport.qualityPcm': 'PCM',
-  'settings.transport.savedBadge': '已保存 · 暂未生效',
-  'settings.transport.note': '两档已随 settings.set 下发并由本机服务持久化，但媒体面尚未读取它们：当前编解码与缓冲深度仍由 AUTO 阶梯自行决定。',
+  'settings.transport.qualityDesc': '本版本可调的是采样率，也就是能传过去的音频带宽（上限为采样率的一半）：16 kHz 够清晰说话，48 kHz 是全带宽。三档 Opus 尚未实现——照样画在滑条上但选不中，好让「本机为什么没有它」看得见。AUTO 按丢包与带宽在质量阶梯（rung）上自动升降。',
+  'settings.transport.q.auto': 'AUTO',
+  'settings.transport.q.opus64': 'Opus 64k',
+  'settings.transport.q.opus128': 'Opus 128k',
+  'settings.transport.q.opus256': 'Opus 256k',
+  'settings.transport.q.pcm16k': 'PCM 16 kHz',
+  'settings.transport.q.pcm24k': 'PCM 24 kHz',
+  'settings.transport.q.pcm32k': 'PCM 32 kHz',
+  'settings.transport.q.pcm48k': 'PCM 48 kHz',
+  'settings.transport.qBlocked': '本版本暂不支持这一档。',
+  'settings.transport.qBlockedOpus': '本次构建未链接 libopus，这一档不可用。',
+
+  // 下面五条是**实测**读数，绝不可以变成对所选档位的复述。
+  'settings.transport.achieved': '实测端到端 {n} ms。',
+  'settings.transport.atFloor': '实测端到端 {n} ms：已贴住链路的物理下限，目标再往下调也降不动了。',
+  'settings.transport.atCeiling': '实测端到端 {n} ms：已贴住链路的物理上限，目标再往上调也升不上去。',
+  // 两行读数共用它，所以措辞不能倒向其中一边（「正在测量延迟…」放在采样率那行就是错的）。
+  'settings.transport.measuring': '正在测量，暂无读数。',
+  'settings.transport.noStreams': '当前没有正在传输的音频流，无从测量；设定会在下一条流建立时生效。',
+  'settings.transport.qLive': '当前实际采样率 {n} kHz。',
+  // 旧服务不上报 transport_live。这时候显示「正在测量」是一句永远兑现不了的承诺，
+  // 所以单列一条说清楚是拿不到，而不是还没测出来。
+  'settings.transport.liveNa': '本机服务未上报实测读数（版本较旧）。设定仍会下发，只是这里读不到它的实际效果。',
+  'settings.transport.noteLive': '两档都直接作用于正在运行的本机服务，松手即生效：不需要重启服务，也不需要与对端重新连接。下方两行是实测读数，不是你设定的目标值——两者对不上恰恰是这里要让你看见的信息。',
 
   'settings.devices.title': '虚拟设备',
   'settings.devices.removeTitle': '断开后移除虚拟设备',

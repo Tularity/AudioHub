@@ -21,7 +21,10 @@ use audiohub_net::packet::{Codec, Header, Kind};
 
 use crate::{dlog, lk, rd, DaemonInner, RxStream, TxShared};
 
-const FRAME_MS: u64 = 10;
+/// 一帧的毫秒数。`pub(crate)` 是为了让 `servo.rs` 能断言它与伺服里那份常量
+/// 相等——同一个物理量在两处各写一份，漂了之后伺服每一步的换算都会偏，
+/// 而不会有任何一处报错。
+pub(crate) const FRAME_MS: u64 = 10;
 const F48: usize = 480; // 48k @ 10ms
 const RING_CAP: usize = 96000; // 2s @ 48k
 const TONE_AMP: f32 = 0.5;
@@ -130,6 +133,135 @@ impl SkipCell {
 /// `DaemonInner` 就要改 `lib.rs`（本次改动的边界之外）。
 static TX_SKIP: SkipCell = SkipCell::new();
 static MIX_SKIP: SkipCell = SkipCell::new();
+
+// -------------------------------------------------- 调度迟到直方图（100 ms 以下）
+//
+// **这是全链路上唯一决定 `jitter_buf` 深度的量，而它此前一个数字都没有。**
+//
+// `SkipCell` 的判据是 `behind > tick + 10`，即**只有超过 100 ms 的迟到才留痕**；
+// 以下的迟到走「背靠背补跑」路径，不写日志、不计数、任何遥测字段里都没有它。
+// 而 JB 的整定表（`media.rs` 的 `JbTuning::DEFAULT` 文档）说的正是 20–50 ms
+// 这一段：
+//
+// ```text
+// JB 深度 20 ms ⇒ 欠载 3.75 次/分     ⇒ 「>20 ms 的发送端停顿」≈ 1/16 s
+// JB 深度 50 ms ⇒ 欠载 0.18 次/分     ⇒ 「>50 ms 的发送端停顿」≈ 1/333 s
+// >100 ms 的停顿（SkipCell 实测）      ≈ 1/241 s
+// ```
+//
+// 三点连起来是一条单调下降的尾，但**中间两点是从欠载率反推的，不是测出来的**。
+// 反推依赖「一次停顿恰好换一次欠载」这个未经验证的假设。本直方图直接测那条尾。
+//
+// # 为什么必须先有它，才谈得上削 `jitter_buf`
+//
+// 发送端停顿 Δ 毫秒 ⇒ 接收端 JB 在 Δ 毫秒里净排空 Δ/10 帧（接收端 `mixer_loop`
+// 无论如何每 10 ms `pop()` 一次）。**不欠载的充要条件是 `JB 深度 ≥ Δ`**，
+// 单位是毫秒。所以 `min_target` 该取多少，等价于问「停顿尾的 p99.9 是多少」。
+// 网络抖动统计量（RFC 3550 一阶差分 EWMA，实测 p95 = 0.18 ms）**看不见这件事**：
+// EWMA 把 1600 个包里的一个尖峰平均掉了。判据和被判的量不是一回事。
+//
+// # 为什么它不违反「测量不许改变被测对象」
+//
+// 每 tick 的成本是：一次 `saturating_duration_since`（那个 `Instant::now()`
+// **两条循环本来就要取**，直接复用，没有新增取时钟）、一次至多 11 步的常量
+// 数组比较、两次 relaxed 原子加、一次 `fetch_max`。零分配、零锁、零系统调用。
+
+/// 直方图的桶上界，**毫秒**。边界不是随手取的：`10/20/30/40/50` 正好是
+/// JB 深度 1/2/3/4/5 帧所能扛住的停顿长度，所以「累计尾 ≥ 40 ms 的比例」
+/// 可以直接读成「`min_target = 4` 时的欠载率上界」。
+const LATE_EDGES_MS: [u64; 11] = [1, 2, 5, 10, 15, 20, 30, 40, 50, 70, 100];
+/// 桶数 = 边界数 + 1（最后一个是 `>100 ms`，与 `SkipCell` 的判据接壤）。
+const LATE_BUCKETS: usize = LATE_EDGES_MS.len() + 1;
+
+/// 一条循环的调度迟到分布。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct LateCounters {
+    /// 观测到的 tick 总数（分母）。
+    pub ticks: u64,
+    /// 迟到总量，微秒。`late_us_sum / ticks` = 平均迟到。
+    pub late_us_sum: u64,
+    /// 迄今最大单次迟到，微秒。
+    pub max_us: u64,
+    /// 每桶的 tick 数，上界见 [`LATE_EDGES_MS`]，最后一个桶是 `>100 ms`。
+    pub buckets: [u64; LATE_BUCKETS],
+    /// 桶上界的副本，让读的人不必去翻源码对齐语义。
+    pub edges_ms: [u64; 11],
+}
+
+#[derive(Debug)]
+struct LateCell {
+    ticks: AtomicU64,
+    late_us_sum: AtomicU64,
+    max_us: AtomicU64,
+    buckets: [AtomicU64; LATE_BUCKETS],
+}
+
+impl LateCell {
+    const fn new() -> LateCell {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const Z: AtomicU64 = AtomicU64::new(0);
+        LateCell {
+            ticks: AtomicU64::new(0),
+            late_us_sum: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+            buckets: [Z; LATE_BUCKETS],
+        }
+    }
+
+    /// 记一个 tick。`late` = 实际唤醒时刻 − 计划时刻（早到记 0）。
+    ///
+    /// 在 10 ms 音频线程上调用，**必须**保持零分配、零锁、零系统调用。
+    #[inline]
+    fn record(&self, late: Duration) {
+        let us = late.as_micros() as u64;
+        self.ticks.fetch_add(1, Ordering::Relaxed);
+        if us == 0 {
+            // 绝大多数 tick 走这条：早到或准时，一次原子加就够了。
+            self.buckets[0].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.late_us_sum.fetch_add(us, Ordering::Relaxed);
+        self.max_us.fetch_max(us, Ordering::Relaxed);
+        let ms = us / 1000;
+        let mut i = 0;
+        while i < LATE_EDGES_MS.len() && ms >= LATE_EDGES_MS[i] {
+            i += 1;
+        }
+        self.buckets[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LateCounters {
+        let mut buckets = [0u64; LATE_BUCKETS];
+        for (dst, src) in buckets.iter_mut().zip(self.buckets.iter()) {
+            *dst = src.load(Ordering::Relaxed);
+        }
+        LateCounters {
+            ticks: self.ticks.load(Ordering::Relaxed),
+            late_us_sum: self.late_us_sum.load(Ordering::Relaxed),
+            max_us: self.max_us.load(Ordering::Relaxed),
+            buckets,
+            edges_ms: LATE_EDGES_MS,
+        }
+    }
+}
+
+static TX_LATE: LateCell = LateCell::new();
+static MIX_LATE: LateCell = LateCell::new();
+
+/// `tx_loop` 的调度迟到分布（IPC / probe 用）。见 [`LateCell`] 的模块说明。
+pub fn tx_late_counters() -> LateCounters {
+    TX_LATE.snapshot()
+}
+
+/// `mixer_loop` 的调度迟到分布（IPC / probe 用）。
+///
+/// 这一条在 **Windows** 上尤其要紧：`play_ring` 的目标水位 `dac + block + margin`
+/// 里那 5 ms 的 `margin` 就是留给这条循环迟到的，而它此前从未被测过。
+/// 把目标从 25 ms 降到 20 ms 会把环内谷值从 6.4 ms 压到 1.4 ms ——
+/// **在这条尾被测出来之前，那一步是在赌每一个回调。**
+pub fn mixer_late_counters() -> LateCounters {
+    MIX_LATE.snapshot()
+}
 
 /// 发送调度器跳过了多少 tick（IPC / probe 用）。
 ///
@@ -687,6 +819,143 @@ fn seeded_resampler(src_rate: u32, dst_rate: u32, last: f32) -> LinearResampler 
     rs
 }
 
+/// 把 JB 的目标深度**精确**设到 `want` 帧，不重建、不分配。
+///
+/// # 为什么是 `update_target` 的逆运算而不是一个 setter
+///
+/// `JitterBuffer` 没有 `set_target`。它只有
+/// `update_target(jitter_p95_ms, frame_ms)`，公式是
+/// `target = clamp(ceil(p95 / frame) + 1, min, max)`。
+/// 代入 `p95 = (want − 1) × frame` 得 `ceil(want − 1) + 1 = want`——
+/// **精确相等，不是近似**（`want ≥ 1` 时 `(want−1)×frame` 恰是 frame 的整数倍，
+/// `ceil` 是恒等）。
+///
+/// 这条路是刻意选的：`core/audiohub-net/src/media.rs` 归另一条线在改，
+/// 本轮不动它。合并时若那边加了 `set_target_frames(u32)`，这里换过去即可，
+/// 语义完全一致——见文件末 `TODO(merge)`。
+///
+/// 越出包络时由 `update_target` 自己夹住，与伺服侧的夹逻辑同一个 `[min, max]`，
+/// 所以两边不会打架。
+fn steer_jitter_target(jb: &mut audiohub_net::media::JitterBuffer, want: u32) {
+    let frame_ms = FRAME_MS as f64;
+    let synthetic_p95 = want.max(1).saturating_sub(1) as f64 * frame_ms;
+    jb.update_target(synthetic_p95, frame_ms);
+}
+
+/// 重建 JB 以换一个**包络**（`min_target` / `max_target`）。
+///
+/// # 为什么非重建不可
+///
+/// 包络是 `JbTuning` 的字段，而 `JbTuning` 只在 `JitterBuffer::with_tuning` 的
+/// 构造点被读一次。默认包络是 4..12 帧（40..120 ms，`JbTuning::DEFAULT` 的实测
+/// 整定）。用户选 1000 ms 时，`target_effective()` 的 `clamp` 会把伺服的
+/// 102 帧直接砍成 12 —— 滑条右半边全部失效，而 UI 会一路显示「已达物理上限」，
+/// 那是**我们自己造的**上限，不是物理的。
+///
+/// # 代价与触发频率
+///
+/// 重建丢掉队列里的帧并重新预缓冲（几十毫秒，由 PLC 遮掉）。它**只在换代号
+/// 变化时**发生，也就是用户动了滑条那一下。稳态一次都不会发生。
+///
+/// AUTO 时恢复 `JbTuning::cached()` 那个实测默认——固定档期间放开的下限
+/// （`min_target = 1`）不许留给 AUTO，那会悄悄改掉 plan §5 里 AUTO 的整定。
+/// 目标 -> JB 应有的包络。**纯函数**，于是「哪个目标该配哪个包络」这条规则
+/// 可以被直接测，不必起一台 daemon。
+///
+/// `base` 由调用方给（生产是 `JbTuning::from_env()`，测试给一个已知的），
+/// 于是这条规则不依赖环境变量。
+pub(crate) fn envelope_for(
+    target: audiohub_ipc::LatencyTarget,
+    base: audiohub_net::media::JbTuning,
+) -> audiohub_net::media::JbTuning {
+    use audiohub_ipc::LatencyTarget;
+    match target {
+        // AUTO：一个字段都不改，回到 `JbTuning::DEFAULT` 的实测整定。
+        // 固定档期间放开的下限**不许**留给 AUTO——那会悄悄改掉 plan §5 里
+        // AUTO 的整定，而 AUTO 是默认档。
+        LatencyTarget::Auto => base,
+        LatencyTarget::TotalMs(ms) => {
+            // 目标全部交给 JB 时需要的帧数，是 JB 深度的**上界**
+            // （JB 驻留是端到端总延迟的真子集）。再给欠载惩罚留 2 帧余量。
+            let need = (ms as u32).div_ceil(FRAME_MS as u32);
+            let hi = need.saturating_add(2).max(base.max_target);
+            audiohub_net::media::JbTuning {
+                // 下界放开到 1：用户选 0 ms 就是「尽你所能地低」，
+                // 拿实测默认的 4 帧去挡他，等于替他否决了他的选择。
+                // 放开只是**允许**浅，不是强制——深度由伺服给。
+                min_target: 1,
+                max_target: hi,
+                // 内存上界必须跟着抬，否则 `pop()` 的修剪线会落在目标之下，
+                // 每一拍都在删刚到的真音频。`hard_slack` 是那条线与目标的距离。
+                max_frames: hi.saturating_add(base.hard_slack).saturating_add(6),
+                // `..base` 而不是逐字段列全：`JbTuning` 归另一条线在改，
+                // 加字段时这里不该编译不过，也不该悄悄用上一个过时的默认值。
+                ..base
+            }
+        }
+    }
+}
+
+/// 按当前**目标**重建 JB 的包络（`min_target` / `max_target` / `max_frames`）。
+///
+/// # 为什么按目标而不是按伺服的输出
+///
+/// 第一版按伺服输出算，于是有一个先有鸡还是先有蛋：伺服的输出被旧包络夹在
+/// 4 帧以上 ⇒ 永远算不出 1 ⇒ 包络永远不放开 ⇒ 伺服永远够不到低档。
+/// 实测下来那一版的效果是滑条左半边完全无效，而日志里一行异常都没有。
+/// 包络是**目标**的函数，与伺服此刻走到哪里无关。
+///
+/// # 为什么每拍都调而不是只在换档时调
+///
+/// 只在换代号变化时调，就得保证那一拍恰好在流已建好之后——第一版就是在流的
+/// 第一个包上锁死了包络。这里改成每秒调一次、**包络已经对了就立刻返回**，
+/// 于是「什么时候调」不再是正确性的一部分。
+///
+/// # 代价
+///
+/// 真正重建时丢掉队列里的帧并重新预缓冲（几十毫秒，由 PLC 遮掉），
+/// 同时把 JB 预置到目标对应的深度——用户刚动过滑条，这一跳是他要的那一跳。
+/// 稳态一次都不会发生。
+/// 返回 `true` = 这一拍真的重建了。
+///
+/// 调用方必须据此**跳过本拍的伺服执行**：伺服的输出是上一拍算的，那时包络
+/// 还是旧的（比如 4..12 帧），于是它被夹在 12 上。刚把 JB 预置到 50 帧，
+/// 转手就按 12 去执行，等于预置从未发生——实测下来的表现是深度先跳到 50、
+/// 同一拍掉回 12，然后以每秒一帧的限速慢慢爬 37 秒。
+fn reshape_jitter_envelope(
+    st: &mut crate::JbState,
+    target: audiohub_ipc::LatencyTarget,
+    stream_id: u32,
+) -> bool {
+    use audiohub_ipc::LatencyTarget;
+    use audiohub_net::media::{JbTuning, JitterBuffer};
+    let cfg = envelope_for(target, JbTuning::from_env());
+    let cur_cfg = st.jb.tuning();
+    if cfg.min_target == cur_cfg.min_target
+        && cfg.max_target == cur_cfg.max_target
+        && cfg.max_frames == cur_cfg.max_frames
+    {
+        return false; // 包络已经对了，不值得付一次重新预缓冲
+    }
+    // 预置深度：固定档直接落到「JB 独自承担全部目标」那个上界，闭环再往下收敛。
+    // 走一帧一拍地爬过去要几十秒，而用户刚刚才动过滑条。
+    let seed = match target {
+        LatencyTarget::Auto => st.jb.target(),
+        LatencyTarget::TotalMs(ms) => (ms as u32).div_ceil(FRAME_MS as u32).max(1),
+    };
+    st.jb = JitterBuffer::with_tuning(seed.clamp(cfg.min_target, cfg.max_target), cfg);
+    // 五个 lifetime 计数器随新 JB 归零 —— 与 `jb resync` 那条路同一个理由：
+    // 旧采样点不能再参与差分，否则窗口值会被 saturating_sub 压成 0，
+    // 让一次重建看起来像「这 10 秒完美无瑕」。
+    st.conceal.reset();
+    dlog!(
+        "[audiohubd] stream {stream_id}: jitter envelope -> {}..{} frames, seeded at {seed}",
+        cfg.min_target,
+        cfg.max_target
+    );
+    true
+}
+
 fn apply_txcmd(
     inner: &DaemonInner,
     cmd: TxCmd,
@@ -927,7 +1196,12 @@ pub(crate) fn tx_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<TxCmd>) {
         // 修正跑上 20 分钟就会被误判成一次 600 ms 的卡顿，凭空触发一次治法 A
         // 的丢弃。`corr ≡ 1` 时下式与旧的 `start.elapsed()/FRAME_MS` **逐位相等**
         //（`next_time = start + tick×10ms` ⇒ `tick + (elapsed − tick×10)/10`）。
-        let late_ms = Instant::now().saturating_duration_since(next_time).as_millis() as u64;
+        let late = Instant::now().saturating_duration_since(next_time);
+        // 调度迟到直方图。**位置就是这里**：`next_time` 是本 tick 的计划时刻，
+        // 差值即「上一 tick 的活 + 任何抢占」把我们推迟了多久。放到下面等待循环
+        // 之后再量就恒等于 0（那时我们刚好等到了 deadline），量了个寂寞。
+        TX_LATE.record(late);
+        let late_ms = late.as_millis() as u64;
         let behind = tick + late_ms / FRAME_MS;
         // 本 tick 准不准时。落后 ≤100 ms 时循环用背靠背的 tick 追平（自愈），
         // 那期间队列深度是**假高**——高是因为我们暂时没读，不是因为积压。水位
@@ -1269,11 +1543,37 @@ fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
             if st.pushes % 10 == 0 {
                 st.sample_conceal();
             }
-            if st.pushes % 100 == 0 && !st.jit_win.is_empty() {
-                let mut v = st.jit_win.clone();
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let p95 = v[(v.len() * 95 / 100).min(v.len() - 1)] as f64;
-                st.jb.update_target(p95, FRAME_MS as f64);
+            // ---- 谁来决定 JB 的目标深度：伺服，还是抖动公式 ----
+            //
+            // 固定延迟档下**必须**是伺服，而且抖动公式必须彻底闭嘴。两个都写，
+            // 就是两条回路抢同一个水位：用户选的 200 ms 会在每一次 p95 更新时
+            // 被改回抖动算出来的那个数，而界面照旧显示 200——「设置生效了」
+            // 的错觉，正是本项目栽过五次的形态。
+            let servo_want = inner.transport.servo_frames();
+            if st.pushes % 100 == 0 {
+                // 包络（min/max_target）只能在构造时给定。用户把目标从 100 ms
+                // 拖到 1000 ms 时，默认包络 4..12 帧 = 40..120 ms 根本够不着，
+                // 于是必须重建。每秒问一次、已经对了就立刻返回。
+                let reseeded =
+                    reshape_jitter_envelope(&mut st, inner.transport.latency_target(), h.stream_id);
+                match servo_want {
+                    // 刚重建过：`servo_want` 是上一拍在**旧包络**下算的，
+                    // 拿它执行会把刚落好的预置立刻推翻。让伺服下一拍重新算。
+                    Some(_) if reseeded => {}
+                    // 固定档：伺服说了算。
+                    Some(want) => steer_jitter_target(&mut st.jb, want),
+                    // AUTO（plan §5）：抖动 p95 驱动，与改动前逐字相同。
+                    None => {
+                        if !st.jit_win.is_empty() {
+                            let mut v = st.jit_win.clone();
+                            v.sort_by(|a, b| {
+                                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let p95 = v[(v.len() * 95 / 100).min(v.len() - 1)] as f64;
+                            st.jb.update_target(p95, FRAME_MS as f64);
+                        }
+                    }
+                }
             }
         }
         Kind::PullReq => {
@@ -1545,6 +1845,9 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
         }
         let deadline = start + Duration::from_millis(tick * FRAME_MS);
         let now = Instant::now();
+        // 调度迟到直方图（见 [`LateCell`]）。这个 `Instant::now()` 本来就要取，
+        // 直接复用；`saturating_duration_since` 让「早到」记 0 而不是回绕。
+        MIX_LATE.record(now.saturating_duration_since(deadline));
         if now < deadline {
             std::thread::sleep(deadline - now);
         }
@@ -1828,6 +2131,55 @@ pub(crate) fn mix_tone_verdict(samples: &[f32], rate: u32, freq: f32) -> ToneVer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **调度迟到直方图的分桶必须与 `LATE_EDGES_MS` 声明的语义一致。**
+    ///
+    /// 这条守 [`LateCell::record`]。分桶写错的后果特别隐蔽：直方图照样有数、
+    /// 照样单调、照样看起来合理，只是「P(迟到 > 40 ms)」答的是另一个问题——
+    /// 而那个数是 `min_target` 该取 3 还是 4 的**唯一**判据。一个差一错位
+    /// 就能让下一轮把 JB 削到听得见咔哒的深度，并且事后无从追查。
+    ///
+    /// 边界取**闭下开上**（`[lo, hi)`）：恰好 10.000 ms 的迟到算进 `10-15` 桶，
+    /// 因为 JB 深度 1 帧（10 ms）扛得住的是**严格小于** 10 ms 的停顿。
+    #[test]
+    fn the_lateness_histogram_buckets_match_their_declared_edges() {
+        let c = LateCell::new();
+        // 每个边界上下各打一发，外加 0 和一个远超上界的值
+        let probes_us: [u64; 16] = [
+            0, 999, 1_000, 1_999, 2_000, 4_999, 5_000, 9_999, 10_000, 14_999, 20_000, 29_999,
+            40_000, 50_000, 99_999, 250_000,
+        ];
+        for us in probes_us {
+            c.record(Duration::from_micros(us));
+        }
+        let s = c.snapshot();
+        assert_eq!(s.ticks, probes_us.len() as u64, "tick 总数（分母）不对");
+        assert_eq!(s.max_us, 250_000, "最大值没记对");
+        // 逐个探针独立复算它该落哪个桶，与实现的累计结果对账。
+        let mut want = [0u64; LATE_BUCKETS];
+        for us in probes_us {
+            let ms = us / 1000;
+            let mut i = 0;
+            while i < LATE_EDGES_MS.len() && ms >= LATE_EDGES_MS[i] {
+                i += 1;
+            }
+            want[i] += 1;
+        }
+        assert_eq!(s.buckets, want, "分桶与边界语义不一致");
+        // 关键的三条读法：把桶从尾部累加得到 P(迟到 ≥ 边界)。
+        let tail = |from: usize| -> u64 { s.buckets[from..].iter().sum() };
+        assert_eq!(tail(LATE_BUCKETS - 1), 1, ">100 ms 的桶应当只有 250 ms 那一发");
+        // `edges_ms[3] = 10`，所以第 4 个桶起就是「≥10 ms」。
+        assert_eq!(s.edges_ms[3], 10);
+        assert_eq!(tail(4), 8, "P(迟到 ≥ 10 ms) 的分子算错");
+        // 0 的那一发既不进 max 也不进 sum，但必须进分母和 0 号桶。
+        assert_eq!(s.buckets[0], 2, "0 和 999 µs 都该落在 0-1ms 桶");
+        assert_eq!(
+            s.late_us_sum,
+            probes_us.iter().sum::<u64>(),
+            "迟到总量漏掉了某些样本"
+        );
+    }
 
     /// Two peers' virtual microphones are two rings, and one decoded frame
     /// belongs to exactly one of them.

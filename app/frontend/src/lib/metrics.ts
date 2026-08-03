@@ -7,14 +7,16 @@
 // 算一个」——见 readQuality 的注释。
 //
 // 当前状态：
-//   - readQuality  已接上 `SessionStats.quality`（daemon 的 P0q）。
+//   - readQuality  已接上 `SessionStats.quality`（daemon 的 P0q），本机无测点时
+//     回退到对端回传的 `peer_quality` 并置 `fromPeer`——纯发送的流本机恒无音质读数。
+//   - readPeerNet  连接级的网络单程（`PeerState.net_ms`），**只是一段，不是总数**。
 //   - readLatency  已接上 `SessionStats.pipeline`（P0a 的本侧分项、P0b 的对端分项、
 //     P1 的 net/dev/e2e/residual）。**总数的取法见 readLatency 头部的表**：
 //     `sum_ms` 在场才是端到端；只有 `local_ms` 时读数不覆盖整条链路，
 //     `coversWholeChain()` 为假，界面据此撤掉等级词并标出「未含对方主机」。
 
 import type { MsgKey } from '../i18n';
-import type { DevLatency, PipelineStage, SessionInfo } from '../ipc/types';
+import type { DevLatency, PeerState, PipelineStage, SessionInfo } from '../ipc/types';
 
 // ---------------------------------------------------------------- 延迟
 
@@ -303,6 +305,14 @@ export interface QualityReading {
    * 读这个；只想决定要不要显示等级读 `grade` 就够。
    */
   partial?: boolean;
+  /**
+   * 这份读数来自**对端**（`SessionStats.peer_quality`），不是本机量的。
+   *
+   * 界面必须把它标出来。不标不是「省一个标签」，而是把对方主机的测量冒充成本机
+   * 的观测：同一条通路上，本机是发送侧、根本没有测点，凭什么给出一个音质结论？
+   * 标了之后这一格才说得通——数是真的，量它的人在对面。
+   */
+  fromPeer?: boolean;
 }
 
 const QUALITY_GRADE_LABEL: Record<QualityGrade, MsgKey> = {
@@ -573,6 +583,44 @@ export function readLatency(sess: SessionInfo | null | undefined): LatencyReadin
   };
 }
 
+// ------------------------------------------------- 连接级网络延迟（无会话时）
+
+/**
+ * 一条**连接**上的网络单程读数。它与 `LatencyReading` 是两个量，故意不共用类型：
+ * 前者是端到端总延迟（音频真正走完全程要多久），这里只是其中**一段**。
+ */
+export interface PeerNetReading {
+  /** min-RTT / 2，毫秒。**undefined = 还在攒样本**（界面「测量中…」），不是 0。 */
+  ms?: number;
+  /** 最近一次往返，交叉校验用。缺席即不显示。 */
+  rttMs?: number;
+}
+
+/**
+ * 连上了、但还没有任何会话时，这条连接唯一能给出的延迟读数（`PeerState.net_ms`）。
+ *
+ * 三态，两条红线各管一态：
+ *
+ * - **离线 ⇒ `undefined`**：整块不渲染。daemon 在离线时把两个字段都清成 null，
+ *   这里再兜一层——记忆里的往返时间是关于过去的陈述，挂在一台离线主机的卡片上
+ *   会被读成「它现在还这么快」。
+ * - **在线但 `net_ms` 为 null ⇒ `{ ms: undefined }`**：min-RTT 窗口还没攒够。
+ *   界面显示「测量中…」，**绝不落成 0 ms**。
+ * - 在线且有值 ⇒ `{ ms }`。
+ *
+ * ⚠ 调用方必须把「这只是网络那一段」标在**数字旁边**，不是藏进 title。缓冲与声卡
+ * 占了延迟的绝大部分（实测网络 0.58 ms vs 感知约 1000 ms），而它们要等真的有音频
+ * 在流动时才量得到。把这个数放进端到端总数的槽位就是撒谎。
+ */
+export function readPeerNet(peer: PeerState | null | undefined): PeerNetReading | undefined {
+  if (!peer || !peer.online) return undefined;
+  // 两个键**整个缺席** = 旧 daemon 根本不上报这一项 ⇒ 什么都不渲染，退回改版前的
+  // 「延迟 —」。这与 `null` 是两回事：`null` 是新 daemon 在说「我在测，还没攒够」，
+  // 而缺席时显示「测量中…」就是一句永远不会兑现的承诺（同 `transport_live` 那条）。
+  if (peer.net_ms === undefined && peer.rtt_ms === undefined) return undefined;
+  return { ms: num(peer.net_ms), rttMs: num(peer.rtt_ms) };
+}
+
 /** 有限数才算读数。`null` / `undefined` / `NaN` 一律是「没读到」，不是 0。 */
 function num(v: unknown): number | undefined {
   return typeof v === 'number' && isFinite(v) ? v : undefined;
@@ -603,10 +651,24 @@ const QUALITY_GRADES: readonly string[] = ['excellent', 'good', 'fair', 'poor'];
  *    量**，中间差一整条流水线（规格 §4.1）。丢包 2% 在 PLC 修得住时几乎不可闻；
  *    丢包 0% 时两路重复流相加照样把声音削烂。
  *
- * 没有 `quality` 字段（发送会话、旧 daemon、Q1 窗口还没攒够）⇒ `undefined` ⇒ 「—」。
+ * ## 第四条：本机没有测点时，用对端的读数，并**标明出处**
+ *
+ * 音质三分量全是接收侧概念，于是一条纯发送的流 `quality` **结构上恒为 null**——
+ * 不是链路不好，是本机压根量不到。此前这里只读 `quality`，「送对方扬声器」那条
+ * 通路的音质格因此**永远**是「—」，而它其实好得很。daemon 现在把对端在它那侧测到
+ * 的同一条流的音质经控制通道回传（`peer_quality`，与 `quality` 至多一个非空），
+ * 这里取 `quality ?? peer_quality` 并置 `fromPeer`，由界面把「谁量的」说出来。
+ *
+ * 兜底顺序**不能反**：本机有测点时本机的读数才是第一手的。
+ *
+ * 两者都没有（旧 daemon、Q1 窗口还没攒够、对端还没回传）⇒ `undefined` ⇒ 「—」。
  */
 export function readQuality(sess: SessionInfo | null | undefined): QualityReading | undefined {
-  const q = sess && sess.stats && sess.stats.quality;
+  const st = sess && sess.stats;
+  // 本机的读数优先；`|| undefined` 是把 daemon 的 JSON `null` 收敛成一个值，
+  // 好让下面那行的「有没有本机读数」只需判一次。
+  const own = (st && st.quality) || undefined;
+  const q = own || (st && st.peer_quality) || undefined;
   if (!q) return undefined;
 
   // 认不出的等级串（含 "unknown"，以及将来某个更新的 daemon 发来的新档）一律
@@ -632,5 +694,6 @@ export function readQuality(sess: SessionInfo | null | undefined): QualityReadin
     clipExcessDb: num(q.clip_excess_db),
     windowS: num(q.window_s),
     partial: q.partial === true,
+    fromPeer: !own,
   };
 }

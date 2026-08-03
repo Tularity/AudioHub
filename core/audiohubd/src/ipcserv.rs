@@ -13,8 +13,9 @@ use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::{HandshakeError, Message, WebSocket};
 
 use audiohub_ipc::{
-    methods, DaemonInfo, DaemonSettings, Mode, OpenSessionParams, PeerState, PermissionKind,
-    IPC_VERSION, MODE_A, MODE_B, MODE_SHARE,
+    methods, DaemonInfo, DaemonSettings, LatencyTarget, Mode, OpenSessionParams, PeerState,
+    PermissionKind, QualityTarget, IPC_VERSION, LATENCY_AUTO, LATENCY_STOPS_MS, MODE_A, MODE_B,
+    MODE_SHARE,
 };
 use audiohub_net::identity::{random_pin, PeerStore};
 
@@ -359,6 +360,11 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                         .unwrap_or(PeerState {
                             peer,
                             online: true,
+                            // 这条分支只在「刚连上就从 store 里消失了」时走到，
+                            // 那时既没有窗口也没有样本。`None` = 还没测出来，
+                            // 与「测出来是 0」是两回事。
+                            net_ms: None,
+                            rtt_ms: None,
                             reconnecting: false,
                             retry_in_s: None,
                             hal_device: None,
@@ -488,15 +494,40 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                             *slot = v;
                         }
                     }
-                    for (key, field) in [("latency", 0u8), ("quality", 1u8)] {
-                        if let Some(v) = params.get(key).and_then(Value::as_str) {
-                            let slot = match field {
-                                0 => &mut s.latency,
-                                _ => &mut s.quality,
-                            };
-                            changed |= slot.as_str() != v;
-                            *slot = v.to_string();
-                        }
+                    // 传输档位：**先校验再收下**。
+                    //
+                    // 改动前这里是「有字符串就存」，于是 `{"quality":"opus999"}`
+                    // 会被收下、写盘、原样回显 —— 界面显示切成功了，媒体面一个
+                    // 字节都没变。这正是本项目栽过五次的形态，而且这一次它是
+                    // 真实存在的：Opus 三档在滑条上可见，`parse` 必须拒绝它们。
+                    if let Some(v) = params.get("latency").and_then(Value::as_str) {
+                        let t = LatencyTarget::parse(v).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "latency 必须是 '{LATENCY_AUTO}' 或档位表里的毫秒数 {:?}，收到 '{v}'",
+                                LATENCY_STOPS_MS
+                            )
+                        })?;
+                        // 存规范拼写而不是用户给的原样：旧的 "min" 与新的 "0"
+                        // 是同一档，盘上留两种写法只会让下一个读者以为是两档。
+                        let w = t.as_wire();
+                        changed |= s.latency != w;
+                        s.latency = w;
+                    }
+                    if let Some(v) = params.get("quality").and_then(Value::as_str) {
+                        let t = QualityTarget::parse(v).ok_or_else(|| {
+                            let avail: Vec<String> = audiohub_ipc::transport::quality_stops()
+                                .into_iter()
+                                .filter(|q| q.available)
+                                .map(|q| q.id)
+                                .collect();
+                            anyhow::anyhow!(
+                                "quality '{v}' 本 build 给不了；可选 {avail:?}\
+                                 （Opus 三档在档位表里可见但尚未实现）"
+                            )
+                        })?;
+                        let w = t.as_wire();
+                        changed |= s.quality != w;
+                        s.quality = w;
                     }
                     if changed {
                         // Persisted before it is answered: a UI that reads back
@@ -507,6 +538,18 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     }
                 }
                 if changed {
+                    // **「修改即生效」的那一行。** 落盘之后立刻把两个档位推给
+                    // 音频线程的无锁镜像；`tx_loop` / rx 路径下一拍（10 ms）就
+                    // 读到新值。不重启、不重连、不等下一次会话。
+                    //
+                    // 在回复之前做：一个刚写完就 `settings.get` 的客户端，
+                    // 拿到的 `transport_live` 必须已经属于新档位。
+                    {
+                        let s = lk(&inner.settings);
+                        inner
+                            .transport
+                            .publish(s.latency_target(), s.quality_target());
+                    }
                     dlog!("[audiohubd] settings changed; the device coordinator will reconcile");
                 }
                 if mode_changed {
@@ -604,6 +647,21 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         mark_offline_devices: s.mark_offline_devices,
         latency: s.latency,
         quality: s.quality,
+        // 档位表随每次 `settings.get` 一起发：前端不许自己写一份。
+        // 两边各存一份表，分歧不会有任何报错——只会有一个选不中的档。
+        latency_stops_ms: LATENCY_STOPS_MS.to_vec(),
+        quality_stops: audiohub_ipc::transport::quality_stops(),
+        // 用户要的在上面两个字段里，**拿到的在这里**。
+        transport_live: {
+            let l = inner.transport.live();
+            audiohub_ipc::TransportLive {
+                achieved_ms: l.achieved_ms,
+                at_floor: l.at_floor,
+                at_ceiling: l.at_ceiling,
+                rate: l.rate,
+                streams: l.streams,
+            }
+        },
         hal_capacity: capacity as u8,
         hal_used: used as u8,
     }
@@ -630,7 +688,19 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
             let cell = live
                 .map(|c| *crate::lk(&c.peer_mode))
                 .unwrap_or(crate::PeerModeCell::Unheard);
+            // 网络单程估计**只在连接活着时**给：拿上一次的读数冒充现在，
+            // 与 `peer_mode` 那条规矩同源。
+            //
+            // ⚠ 这一句是**防御性**的，不是承重的，缺陷注入 I17 已经证明：
+            // `ClockFilter` 挂在 `ConnShared` 上、每条连接一个新的，于是重连
+            // 必然从空窗口起步，`estimate()` 恒为 `None`——陈旧值根本活不到
+            // 被读出来。留着它是因为这个前提是**别处**的实现细节：哪天有人把
+            // 时钟窗口提到 per-peer 复用，这一句就立刻从防御变成承重。
+            // 删掉它不会有任何测试变红，所以这段注释就是它的保险丝。
+            let clock = live.and_then(|c| crate::lk(&c.clock).estimate());
             PeerState {
+                net_ms: clock.map(|e| e.min_rtt_us as f64 / 2000.0),
+                rtt_ms: clock.map(|e| e.last_rtt_us as f64 / 1000.0),
                 online: live.is_some(),
                 peer_mode: cell.mode(),
                 peer_unusable: cell.unusable(),

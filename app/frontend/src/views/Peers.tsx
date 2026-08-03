@@ -320,16 +320,26 @@ function ModeBanner() {
 
 // ---------------------------------------------------------------- 对端卡片
 
-function StreamRow({ fp, kind, label, sess }: {
-  fp: string; kind: 'mic' | 'spk'; label: string; sess: SessionInfo | null;
+// `ready`（仅「接收」行会传真）= 通路真的通了、只是此刻没有应用在录音。它换掉的只是
+// 「空闲」那两个字，**电平条与码率一个数都不动**：没有音频在流动时不存在码率、不存在
+// 电平，随便填一个 0 上去就等于宣称「测过了，是 0」。这一行说的是状态，不是数据。
+function StreamRow({ fp, kind, label, sess, ready }: {
+  fp: string; kind: 'mic' | 'spk'; label: string; sess: SessionInfo | null; ready?: boolean;
 }) {
   const kbps = sess && sess.stats ? sess.stats.bitrate_kbps : 0;
+  const idleReady = !sess && !!ready;
   return (
-    <div className={`stream${sess ? ' active' : ''}`} data-testid={`stream-${kind}-${fp}`}>
+    <div
+      className={`stream${sess ? ' active' : ''}${idleReady ? ' ready' : ''}`}
+      data-testid={`stream-${kind}-${fp}`}
+      title={idleReady ? t('peers.card.micReadyWhy') : undefined}
+    >
       <span className="stream-label">{label}</span>
       <Meter testid={`level-${kind}-${fp}`} value={(kbps || 0) / 900} />
       <span className="stream-rate">
-        {sess ? t('peers.card.kbps', { v: fmt.kbps(kbps) }) : t('peers.card.idle')}
+        {sess
+          ? t('peers.card.kbps', { v: fmt.kbps(kbps) })
+          : idleReady ? t('peers.card.micReadyShort') : t('peers.card.idle')}
       </span>
     </div>
   );
@@ -424,6 +434,15 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
   // 对端发起、正在取用本机麦克风的会话（kind=mic + dir=send）。隐私相关，必须显式可见。
   const inbound = sessions.filter((x) => x.peer_fingerprint === fp && x.kind === 'mic' && x.dir === 'send');
 
+  // 「接收」这条通路已就绪、只是还没有应用在用它。三个条件缺一不可，每一条都对应
+  // 一种**不能**这么说的情形：
+  //   - 对端在线      —— 离线时虚拟设备仍在系统里可选，但没有任何声音会被处理；
+  //   - observed 为真 —— 设备真的出现在系统设备列表里了（daemon 从驱动侧确认过），
+  //     `state === 'bound'` 而未被观测到时只是「已下发」，还不能承诺可用；
+  //   - 没有 mic 方向的会话 —— 有会话时这一行显示的是实时码率，轮不到状态词。
+  // 任一条不满足就退回原样（「空闲」/ 空白）：宣称一个兜不住的就绪状态，比不说更糟。
+  const micReady = !micS && !!peer.online && peer.hal_device?.observed === true;
+
   const micBusy = busy.has(busyKey(fp, 'mic'));
   // 重连中不是「离线」：给和「连接中」同一种呼吸点，别让用户以为已经放弃了。
   const dotCls = peer.online ? 'online' : reconnecting ? 'connecting' : 'offline';
@@ -472,8 +491,11 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
         {unusable}
       </p>
 
-      {/* ②③ 一级指标：这一屏唯一新增的一级信息（规格 §2.1）。 */}
-      <PeerMetrics fp={fp} sess={micS || spkS} />
+      {/* ②③ 一级指标：这一屏唯一新增的一级信息（规格 §2.1）。
+          `peer` 是无会话时的兜底数据源：延迟按流统计，没有会话就整块没有，而控制面
+          的网络单程（`PeerState.net_ms`）配对连上就有——它是「连着但闲着」这一态下
+          唯一测得到的一段。 */}
+      <PeerMetrics fp={fp} peer={peer} sess={micS || spkS} />
 
       {/* ④ 隐私条紧贴指标区：原位夹在重连提示与开关之间，视觉权重低到会被略过，
           而「对方正在取用本机麦克风」是这张卡上唯一不该被略过的一行。 */}
@@ -564,8 +586,16 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
           对端在收发，藏起来只会让「选了设备但没声音」少一个可看的地方。
           收/发并成一行：省 20px，而且左右并置本来就比上下堆叠更容易做对比。 */}
       <div className="peer-streams">
-        <StreamRow fp={fp} kind="mic" label={t('peers.card.streamIn')} sess={micS} />
+        <StreamRow fp={fp} kind="mic" label={t('peers.card.streamIn')} sess={micS} ready={micReady} />
         <StreamRow fp={fp} kind="spk" label={t('peers.card.streamOut')} sess={spkS} />
+        {/* 「接收」为什么空着：模式 B 下这条流要等**某个应用真的打开那只虚拟麦克风**
+            才会建立，在此之前一个字节都不会流动。此前这里只有「空闲」两个字，而它与
+            「对端离线」「驱动没起来」长得完全一样——用户明明知道麦克风是通的，界面
+            却什么都不肯说。这一行把「通路本身没问题」讲出来，且只在设备确实出现在
+            系统列表里（observed）且对端在线时才敢讲。 */}
+        <p className="stream-ready" data-testid={`mic-idle-${fp}`} hidden={!micReady} title={t('peers.card.micReadyWhy')}>
+          {micReady ? t('peers.card.micReady') : ''}
+        </p>
       </div>
     </article>
   );

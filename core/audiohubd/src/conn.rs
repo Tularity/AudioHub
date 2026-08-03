@@ -623,12 +623,15 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
         // `owned_session` 是这里的安全边界：stream id 在媒体头里是明文，任何
         // 另一个已配对的对端都可以对它喊话。分项决定用户看到的那个延迟数字，
         // 不属于这条连接的流一律不收。
-        SessionMsg::StageReport { stream_id, stages, local_ms, dev, seq_us } => {
+        SessionMsg::StageReport { stream_id, stages, local_ms, dev, quality, seq_us } => {
             if let Some(e) = owned_session(inner, conn, stream_id, "stage_report") {
                 let ipc: Vec<_> = stages.iter().map(crate::from_wire_stage).collect();
                 // 落在**这一条流**的格子里（`SessionEntry::peer_lat`），不是一张
                 // 按连接的表——见 `PeerLatCell` 上的 R8 说明。
-                if let Some(why) = e.peer_lat.accept(seq_us, ipc, local_ms, dev) {
+                //
+                // `quality` 与分项走同一条报文、同一个安全边界：音质是「对端
+                // 那侧听到的东西」，同样只有这条连接自己的流才有资格更新它。
+                if let Some(why) = e.peer_lat.accept(seq_us, ipc, local_ms, dev, quality) {
                     dlog!("[audiohubd] stream {stream_id} ({}): {why}", conn.fp);
                 }
             }

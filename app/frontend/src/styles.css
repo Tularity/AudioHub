@@ -557,10 +557,23 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   font-size: 11px; color: var(--warn); flex: 0 1 auto; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* 出处角标「对端测得」。与 .metric-scope 同一套语言（小字、贴着数字），但用 dim 而
+   不是 warn：它不是警告——读数是真的，只是量它的人在对面。加一圈极淡的边框让它读起来
+   像一枚标签而不是又一段正文，否则它会被当成等级词的下半句。 */
+.metric-origin {
+  flex: none; font-size: 10px; color: var(--text-dim);
+  border: 1px solid var(--line); border-radius: 999px; padding: 1px 6px;
+  white-space: nowrap; align-self: center;
+}
+
 .metric-sep { font-size: 12px; color: var(--text-dim); opacity: .5; }
 .metric-idle { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .metric-idle .metric-val { font-size: 16px; }
 .metric-idle-text { font-size: 12px; color: var(--text-dim); }
+/* 无会话时的网络单程读数。**故意不长得像端到端总数**：16px（而不是 22px）、不上
+   色阶、值自带「（仅网络）」后缀，右边再跟一枚 warn 色的「不是总延迟」。这个数与真实
+   感知延迟能差三个数量级，长得像总数就是撒谎。 */
+.metric-netonly { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; }
 
 .metric-chev {
   width: 0; height: 0; flex: none; align-self: center;
@@ -724,6 +737,16 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   transition: opacity .2s ease-out;
 }
 .stream.active { opacity: 1; }
+/* 「通路就绪、只是没人在用」：介于 .45（空闲/不可用）与 1（正在跑）之间。三态在一眼
+   之内必须能分开——此前就绪与离线是同一个灰度，用户明知麦克风是通的却看不出来。 */
+.stream.ready { opacity: .75; }
+.stream.ready .stream-rate { color: var(--text); }
+/* 就绪那句话独占一行（flex-basis 100% 让它在 .peer-streams 里换行）。它是**状态**，
+   所以留在 dim 字号里——旁边的电平条与码率一个数都没变，不能让它看起来像数据。 */
+.stream-ready {
+  flex: 0 0 100%; width: 100%; margin: 0;
+  font-size: 11px; color: var(--text-dim); line-height: 1.5;
+}
 .stream-label { font-size: 11px; color: var(--text-dim); width: 32px; flex: none; }
 .stream-rate { font-size: 11px; color: var(--text-dim); width: 72px; text-align: right; flex: none; font-variant-numeric: tabular-nums; }
 
@@ -1072,6 +1095,82 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
    否则驱动没装时 B 直接消失，反而不知道自己缺什么。title 说明原因。 */
 .seg.off { opacity: .38; cursor: not-allowed; }
 .seg.off:hover { color: var(--text-dim); }
+
+/* ---- 离散档滑条（传输：延迟档 / 质量档） ----
+ *
+ * 视觉语言沿用 .vol-slider（同一套双引擎写法：-webkit- 为主，-moz- 兜浏览器形态），
+ * 差别只在多了一排刻度。--fill 由 JS 写成一个 calc()，而不是简单的百分比：轨道两端
+ * 各被 thumb 的一半占住，直接用百分比的话填充线和刻度都会与 thumb 中心差半个球。 */
+
+.transport-ctl { display: flex; flex-direction: column; align-items: stretch; gap: 6px; width: 268px; }
+.transport-live {
+  font-size: 12px; color: var(--text-dim);
+  font-variant-numeric: tabular-nums; text-align: right;
+}
+
+.stop-slider-box { display: flex; flex-direction: column; gap: 2px; }
+.stop-slider-row { position: relative; display: flex; align-items: center; }
+
+.stop-slider {
+  -webkit-appearance: none; appearance: none;
+  flex: 1; min-width: 0; height: 18px;
+  background: transparent; cursor: pointer;
+}
+.stop-slider::-webkit-slider-runnable-track {
+  height: 6px; border-radius: 3px;
+  background: linear-gradient(90deg, var(--accent) 0 var(--fill, 0px), #2a3140 var(--fill, 0px) 100%);
+}
+.stop-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 14px; height: 14px; margin-top: -4px;
+  border-radius: 50%; background: #e8eaf0; border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .5);
+  transition: transform .15s ease-out, box-shadow .15s ease-out, background .15s ease-out;
+}
+.stop-slider:hover:not(:disabled)::-webkit-slider-thumb { transform: scale(1.15); }
+.stop-slider:active:not(:disabled)::-webkit-slider-thumb { transform: scale(1.25); box-shadow: 0 0 0 4px #31c8b033; }
+.stop-slider:disabled { cursor: not-allowed; }
+.stop-slider:disabled::-webkit-slider-runnable-track { background: #2a3140; }
+.stop-slider:disabled::-webkit-slider-thumb { background: #5a6372; box-shadow: none; }
+/* 请求还在路上：thumb 先跟手，但要看得出「尚未落定」——旁边的值标签同时保持在
+   daemon 确认过的那一档上。 */
+.stop-slider[aria-busy="true"]::-webkit-slider-thumb { background: var(--accent); }
+.stop-slider[aria-busy="true"]::-moz-range-thumb { background: var(--accent); }
+/* Firefox（浏览器测试形态可能用到；Tauri 走 WebKit） */
+.stop-slider::-moz-range-track { height: 6px; border-radius: 3px; background: #2a3140; }
+.stop-slider::-moz-range-progress { height: 6px; border-radius: 3px; background: var(--accent); }
+.stop-slider::-moz-range-thumb {
+  width: 14px; height: 14px; border-radius: 50%;
+  background: #e8eaf0; border: none;
+  transition: transform .15s ease-out;
+}
+.stop-slider:disabled::-moz-range-progress { background: #2a3140; }
+.stop-slider:disabled::-moz-range-thumb { background: #5a6372; }
+
+/* 刻度浮在轨道下方，纯装饰（aria-hidden）：档位的语义由 aria-valuetext 承担。
+   pointer-events: none 是硬要求——否则刻度会挡住滑条本身的拖动。 */
+.stop-ticks {
+  position: absolute; left: 0; right: 0; bottom: 1px; height: 4px;
+  pointer-events: none;
+}
+.stop-tick {
+  position: absolute; top: 0; width: 2px; height: 4px;
+  margin-left: -1px; border-radius: 1px;
+  background: #3a4353;
+  transition: background .15s ease-out;
+}
+.stop-tick.on { background: var(--accent); }
+/* 不可用档照画不误，只是明显更暗：不画出来，用户就无从知道「本机缺了什么」。
+   title（由 JS 给）说明原因，但刻度不接指针事件，所以滑条本身也带一份 title。 */
+.stop-tick.off { background: #2a3140; height: 3px; top: 1px; }
+
+.stop-slider-val {
+  align-self: flex-end;
+  font-size: 12px; color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+/* 有请求在飞：显示的仍是 daemon 确认过的那一档，只是提示它可能马上要变。 */
+.stop-slider-val.pending { color: var(--text-dim); opacity: .7; }
 
 /* ---- 使用端模式栏（主面板通栏） ---- */
 

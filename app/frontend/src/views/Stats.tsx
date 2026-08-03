@@ -77,6 +77,15 @@ const METRICS: {
       const c = readQuality(info)?.concealPct;
       return typeof c === 'number' ? 100 - c : undefined;
     },
+    // 这一格现在也可能来自**对端**的测量（纯发送的流本机量不到音质，
+    // 见 `readQuality`）。数字本身是诚实的——连续性是「样本落地那一端」的
+    // 属性——但**谁量的**必须说出来，否则页面就在不声不响地换信源。
+    // 卡片上是一枚「对端测得」徽章，这里没有徽章的位置，就进 title。
+    titleOf: (info) => {
+      const q = readQuality(info);
+      const base = t('quality.part.continuity.desc');
+      return q?.fromPeer ? `${base}\n\n${t('metric.quality.fromPeerWhy')}` : base;
+    },
     fmt: (v) => fmt.pct(v),
   },
   { key: 'loss', labelKey: 'stats.metric.loss', unitKey: 'stats.unit.pct', val: (i) => i.stats?.loss_pct, fmt: (v) => fmt.pct(v) },

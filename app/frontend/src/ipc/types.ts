@@ -112,6 +112,25 @@ export interface PeerState {
    * `PeerState::peer_unusable` 上那张表。
    */
   peer_unusable?: boolean;
+  /**
+   * 控制面 Ping/Pong 的**单向**网络延迟估计（min-RTT / 2，毫秒）。
+   *
+   * 它挂在**连接**上，与有没有媒体会话无关——这正是它存在的理由：
+   * `SessionStats.pipeline` 的延迟是**按流**的，没有会话就整块没有，于是「已连上
+   * 但还没人在用」时界面上一个数字都没有，用户分不清「没连上」「连上了但坏了」
+   * 「连上了只是闲着」。
+   *
+   * ⚠ **它不是端到端总延迟，读取点必须把这一句说出来。** 实测网络 RTT 0.58 ms 而
+   * 感知延迟约 1000 ms，相差三个数量级：延迟的绝大部分在缓冲与声卡侧，而那两段
+   * 要等真的有音频在流动时才量得到。把它渲染进端到端总数那个槽位（同字号、同格式、
+   * 同标签），就是让用户把「1 ms」读成「总延迟 1 ms」。
+   *
+   * `null` = min-RTT 窗口还没攒够样本。对端离线时恒为 null（记忆里的读数是关于
+   * 过去的陈述，而这个字段只用来说明此刻这条连接有多快）。
+   */
+  net_ms?: number | null;
+  /** 最近一次 Pong 的往返（毫秒），交叉校验用。`null` 的含义同 `net_ms`。 */
+  rtt_ms?: number | null;
 }
 
 export interface VolumeState {
@@ -268,6 +287,20 @@ export interface SessionStats {
    * 接收会话在 Q1 的 10 s 窗口攒够之前也没有。**不是「音质为 0」。**
    */
   quality?: QualityStats | null;
+  /**
+   * 对端在**它那一侧**测到的音质，经控制通道回传。
+   *
+   * 音质三分量全是**接收侧**概念（PLC、欠载、静音填充只在收端发生），所以一条纯
+   * 发送的流 `quality` **结构上恒为 null**——不是这条链路不好，是本机压根量不到。
+   * 少了这个字段，「送对方扬声器」那条通路的音质格永远空着，而它其实好得很；
+   * 这与本项目栽过的 `jb_underruns = 0` 假象是同一个病：把「我这侧无从观测」误当
+   * 成了「链路无损」。
+   *
+   * 与 `quality` **至多一个**非空（一条流不会两端都是接收端）。UI 取
+   * `quality ?? peer_quality`，并**标出**这一格来自对端的测量——不标就等于把对端
+   * 的读数冒充成本机量到的。
+   */
+  peer_quality?: QualityStats | null;
 }
 
 export type SessionKind = 'mic' | 'spk' | string;
@@ -294,6 +327,43 @@ export interface SessionInfo {
   backend?: string | null;
 }
 
+/**
+ * 质量档滑条上的一档。**含不可用档**：不可用的也要发过来，UI 才画得出那条灰刻度。
+ * 把它们在服务端就滤掉，用户看到的是一条短滑条，而「本机缺 libopus」这件事无从得知。
+ */
+export interface QualityStop {
+  /** 'auto' | 'opus64' | 'opus128' | 'opus256' | 'pcm16k' | 'pcm24k' | 'pcm32k' | 'pcm48k' */
+  id: string;
+  /** 码率（kbps）。'auto' 没有。 */
+  kbps?: number | null;
+  /** 采样率（Hz）。Opus 档没有。 */
+  rate?: number | null;
+  /** false = 画出来但选不中。 */
+  available: boolean;
+  /** 'opus' = 需要 libopus，本次构建没有链接。 */
+  blocked_by?: string | null;
+}
+
+/**
+ * 伺服/媒体面**实际**在做的事——用来如实显示，**不是**回显用户的选择。
+ *
+ * 这个区分是这两行读数存在的全部理由：把目标值原样念一遍的读数，等于「报告成功、
+ * 其实什么都没发生」，而那正是这个项目反复栽过的地方。所以 `achieved_ms` 只能是实测
+ * 端到端延迟，`rate` 只能是当前真正在跑的采样率。
+ */
+export interface TransportLive {
+  /** 实测端到端总延迟（ms）。`null` = 还没测出来，**不是 0**。 */
+  achieved_ms?: number | null;
+  /** 目标够不到：已贴住链路物理下限。 */
+  at_floor?: boolean;
+  /** 目标够不到：已贴住链路物理上限。 */
+  at_ceiling?: boolean;
+  /** 当前实际采样率（Hz）。 */
+  rate?: number | null;
+  /** 正在被伺服的接收流数。0 = 暂无会话，此时任何延迟读数都无从谈起。 */
+  streams?: number;
+}
+
 /** settings.get / settings.set 的回包（daemon 拥有的全局设置）。 */
 export interface DaemonSettings {
   /**
@@ -302,12 +372,27 @@ export interface DaemonSettings {
    */
   mode?: 'share' | 'a' | 'b' | string;
   effective_mode?: 'share' | 'a' | 'b' | string;
+  /** `'auto'`，或 `latency_stops_ms` 中某一档的十进制毫秒串（`'0'`/`'200'`…）。 */
   latency?: string;
+  /** `'auto'`，或某个 `available` 的 `QualityStop.id`。 */
   quality?: string;
+  /**
+   * 延迟档滑条的固定档（毫秒，升序），`0` = 「尽可能低」。
+   * **daemon 是唯一真值源**：档表随物理能力变，前端写死一份就会给出它自己都
+   * 送不下去的档。缺席（旧服务）时前端回落到内置常量，见 Settings.tsx。
+   */
+  latency_stops_ms?: number[];
+  /** 质量档的档位表，含不可用档（用于画灰色刻度）。缺席时同样回落。 */
+  quality_stops?: QualityStop[];
   remove_virtual_on_disconnect?: boolean;
   mark_offline_devices?: boolean;
   hal_capacity?: number;
   hal_used?: number;
+  /**
+   * 媒体面此刻的实测读数。**缺席 = 旧服务不上报**，界面必须说「拿不到」，
+   * 而不是显示成「正在测量」——后者是一句永远不会兑现的承诺。
+   */
+  transport_live?: TransportLive;
 }
 
 export interface DiscoverResult {

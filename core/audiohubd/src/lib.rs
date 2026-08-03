@@ -15,7 +15,14 @@ mod ipcserv;
 mod mode_tests;
 mod quality;
 pub mod reconnect;
+/// 延迟目标的伺服回路（纯函数 + 一拍驱动）。
+mod servo;
 mod settings;
+/// 传输档位在 daemon 侧的活体状态：用户选了什么、媒体面真的在做什么。
+mod transport;
+/// 传输档位的接线测试（两台真 daemon，断言执行器而不是设置字段）。
+#[cfg(test)]
+mod transport_tests;
 
 /// Public for the deviceless test that pins the "one device = one bridge
 /// refcount" rule: a raw selector and its resolved name must key the same
@@ -332,6 +339,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         announce_guard: Mutex::new(announce_guard),
         halbridge: Mutex::new(hal_bridge),
         settings: Mutex::new(settings::StoredSettings::load(&cfg_dir_for_state)),
+        transport: transport::TransportControl::default(),
         haldev: Mutex::new(haldev::HalDevState::new(haldev::SlotTable::load(
             &cfg_dir_for_state,
         ))),
@@ -347,6 +355,14 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         mix_clip: quality::ClipMeter::new(),
         mix_meter: quality::MixMeter::new(),
     });
+
+    // 把盘上的档位推给音频线程。**开机就要做**：不做的话，一台设了固定档的机器
+    // 重启后会以 AUTO 跑，而 `settings.get` 照旧回显固定档 —— 界面与行为对不上，
+    // 且没有任何一处会报错。
+    {
+        let s = lk(&inner.settings);
+        inner.transport.publish(s.latency_target(), s.quality_target());
+    }
 
     let mut threads = Vec::new();
     let spawn = |name: &str, f: Box<dyn FnOnce() + Send>| -> Result<JoinHandle<()>> {
@@ -489,6 +505,13 @@ pub(crate) struct DaemonInner {
     /// is a property of this MACHINE, so it cannot live in a UI's localStorage
     /// where two windows can disagree and the daemon is never told.
     pub settings: Mutex<settings::StoredSettings>,
+    /// 两个传输档位的**无锁**镜像，外加伺服的输出与读数。
+    ///
+    /// 与 `settings` 是同一份事实的两种形态：`settings` 是权威且持久的，但它是
+    /// 一把 `Mutex`，10 ms 的音频线程不许碰（只允许常数时间原子操作）。
+    /// `settings.set` 落盘后立刻 `publish` 到这里，音频线程下一拍就读到——
+    /// 这就是「修改即生效」的全部机制。
+    pub transport: transport::TransportControl,
     /// Which peer owns which pair of virtual devices, plus everything the
     /// device/session coordinator tracks per slot (spec-m5b §5.1).
     pub haldev: Mutex<haldev::HalDevState>,
@@ -707,6 +730,29 @@ fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
         "skip": {
             "tx": engine::tx_skip_counters(),
             "mixer": engine::mixer_skip_counters(),
+        },
+        // 两条音频循环的**调度迟到分布**（100 ms 以下那一段）。
+        //
+        // `skip` 只记 >100 ms 的迟到；以下的走「背靠背补跑」，此前完全静默。
+        // 而决定 `jitter_buf` 深度的恰恰是 20–50 ms 那一段：发送端停顿 Δ ms
+        // ⇒ 对端 JB 在 Δ ms 里净排空 Δ/10 帧（对端 `mixer_loop` 照常每 10 ms
+        // pop 一次）⇒ **不欠载的充要条件是 JB 深度 ≥ Δ**。
+        //
+        // 现场怎么读：把 `buckets` 从尾部往前累加，除以 `ticks`，就得到
+        // 「P(迟到 > 边界)」。`edges_ms` 里的 10/20/30/40/50 正好对应 JB
+        // 深度 1/2/3/4/5 帧，所以 `P(迟到 > 40 ms)` 可以直接读成
+        // 「`min_target = 4` 时由发送端调度造成的欠载率上界」。
+        //
+        // - `tx.max_us` 远大于 `tx.late_us_sum / tx.ticks` ⇒ 尾很陡，
+        //   那是**事件尺寸分布**（被抢占 / 阻塞的系统调用），不是恒定速率失配。
+        //   恒定失配给的是线性关系，陡尾不是——这条区别决定了该去修调度还是
+        //   去修重采样。
+        // - `mixer` 这一条在 Windows 上是 `play_ring` 那 5 ms `margin` 的判据：
+        //   目标从 25 降到 20 ms 会把环内谷值从 6.4 压到 1.4 ms，
+        //   **在 `mixer.max_us` 被测出来之前那一步是在赌每一个回调**。
+        "sched_late": {
+            "tx": engine::tx_late_counters(),
+            "mixer": engine::mixer_late_counters(),
         },
         // 发送侧：`tx_loop` 唤醒周期的二阶 DLL（`halbridge::dll`）。它是
         // `hal_spk` 水位的**常规执行器**，`trim` 只是它够不着那一档的兜底。
@@ -1132,6 +1178,12 @@ struct PeerReport {
     /// 本机按 `sum_stage_ms` **重算**的对端 Σ（不是对端自报的那个）。
     local_ms: Option<f64>,
     dev: Option<DevLatency>,
+    /// 对端**接收侧**的音质原料。评级在本机做（见 `grade_peer_quality`）。
+    ///
+    /// 与 `local_ms` 一样**不做窗口中位数**：音质本身已经是一个 10 s 滚动窗口
+    /// 的统计量，再套一层窗口就是对同一段时间平滑两次，而代价是一次真实的
+    /// 劣化要拖两个窗口才显示得出来。
+    quality: Option<audiohub_net::secure::QualityReading>,
 }
 
 /// 取出去用的快照。
@@ -1141,6 +1193,8 @@ pub(crate) struct PeerLatSnapshot {
     pub local_ms: Option<f64>,
     pub dev: Option<DevLatency>,
     pub age_s: f64,
+    /// 对端接收侧的音质原料（最新一条，不做中位数——见 `PeerReport::quality`）。
+    pub quality: Option<audiohub_net::secure::QualityReading>,
 }
 
 /// 一条流的对端分项（P0b）。
@@ -1185,8 +1239,9 @@ impl PeerLatCell {
         stages: Vec<PipelineStage>,
         claimed_ms: Option<f64>,
         dev: Option<DevLatency>,
+        quality: Option<audiohub_net::secure::QualityReading>,
     ) -> Option<String> {
-        self.accept_at(Instant::now(), seq_us, stages, claimed_ms, dev)
+        self.accept_at(Instant::now(), seq_us, stages, claimed_ms, dev, quality)
     }
 
     /// `accept` 的全部内容，只是到达时刻由调用方给。
@@ -1202,6 +1257,7 @@ impl PeerLatCell {
         stages: Vec<PipelineStage>,
         claimed_ms: Option<f64>,
         dev: Option<DevLatency>,
+        quality: Option<audiohub_net::secure::QualityReading>,
     ) -> Option<String> {
         let local_ms = sum_stage_ms(&stages);
         let mut win = lk(&self.win);
@@ -1212,7 +1268,7 @@ impl PeerLatCell {
         if win.len() == PEER_REPORT_WINDOW {
             win.pop_front();
         }
-        win.push_back(PeerReport { at, seq_us, stages, local_ms, dev });
+        win.push_back(PeerReport { at, seq_us, stages, local_ms, dev, quality });
         drop(win);
 
         match (claimed_ms, local_ms) {
@@ -1245,6 +1301,7 @@ impl PeerLatCell {
             local_ms,
             dev: newest.dev,
             age_s: newest.at.elapsed().as_secs_f64(),
+            quality: newest.quality.clone(),
         })
     }
 }
@@ -2138,6 +2195,82 @@ fn from_wire_stage(w: &StageReading) -> PipelineStage {
 /// `rung` 由调用方给出（它已经从 `RxCell.last_rate` 或 `TxShared` 解析过一次）。
 /// `duplicate` 是站点级的一票否决：`MixHealth.duplicate_suspect` 为真时，此刻
 /// 的削顶不是素材响，是叠加 bug。
+/// 本侧**接收**方向的音质原料，装进 `StageReport` 回传给对端。
+///
+/// # 为什么这个函数必须存在
+///
+/// 音质三分量全是接收侧概念（PLC / 欠载 / 静音填充只在收端发生）。一台纯发送
+/// 的机器对自己这条流的音质**没有定义**，实测就是 `[spk/send] quality = None`，
+/// 界面上那一格永远空着。真正的音质在对端的接收会话上，而它此前不随
+/// `peer_stages` 回传——这与本项目栽过的 `jb_underruns = 0` 假象是同一个病：
+/// 只看本机方向，就会把「我这侧无从观测」误当成「链路无损」。
+///
+/// 送的是**原料**不是等级：评级门限属于收方的口径（见 [`QualityReading`] 的
+/// 文档）。`None` 表示这条流本侧也没有接收方向，收方原样理解为「拿不到」。
+fn peer_quality_payload(
+    inner: &DaemonInner,
+    e: &SessionEntry,
+) -> Option<audiohub_net::secure::QualityReading> {
+    let rx = e.rx.as_ref()?;
+    // 与 `build_session_info_with` 里那份**同一个判据**，故意重复取值而不是
+    // 抽一个共用变量：两处若分了岔，用户会在两台机器上看到同一条流两个等级。
+    let duplicate = (rx.is_spk || rx.monitor)
+        && build_mix_health(inner).map_or(false, |h| h.duplicate_suspect);
+    // 锁各拿各的、不嵌套（`sample_telemetry` 上的锁序说明）。`last_rate` 先取出来，
+    // 否则那把锁会在 `position` 的闭包里被反复拿放。
+    let last_rate = lk(&rx.stats).last_rate;
+    let rung = AUTO_RATES.iter().position(|&r| r == last_rate).unwrap_or(0) as u32;
+    let (window_s, d) = lk(&rx.jbs).conceal.window()?;
+    let conceal = quality::conceal_ratio(&d)?;
+    let clip = rx.clip.window();
+    Some(audiohub_net::secure::QualityReading {
+        window_s,
+        conceal_ratio: conceal,
+        plc_ticks: d.plc,
+        silence_ticks: d.silence,
+        popped_ticks: d.popped,
+        underruns: d.underruns,
+        jb_dropped: d.dropped,
+        // 缺席原样上线。填 0 会让「还没测」变成「测了，一个越界样本都没有」，
+        // 而 `grade_clip(0.0) = Excellent` 是拉不低总分的——一条正在爆音的流
+        // 会因此报「良好」。这个坑本机侧已经踩过一次。
+        clip_ratio: clip.map(|w| w.ratio()),
+        clip_excess_db: clip.map(|w| w.excess_db()),
+        bandwidth_hz: audiohub_net::media::rung_rate(rung) / 2,
+        duplicate,
+    })
+}
+
+/// 把对端回传的音质原料按**本机**的门限评成一份 `QualityStats`。
+///
+/// 与 [`build_quality`] 共用 `quality::grade_*` / `quality::compose`：两处若各写
+/// 一套门限，同一条流在两台机器上会显示不同的等级，而谁也说不出哪个对。
+fn grade_peer_quality(q: &audiohub_net::secure::QualityReading) -> QualityStats {
+    let q1 = quality::grade_conceal(q.conceal_ratio);
+    let q2 = if q.duplicate {
+        Some(quality::Grade::Poor)
+    } else {
+        q.clip_ratio.map(quality::grade_clip)
+    };
+    let q3 = quality::grade_bandwidth(q.bandwidth_hz);
+    let (grade, worst, partial) = quality::compose(q1, q2, q3);
+    QualityStats {
+        window_s: q.window_s,
+        conceal_ratio: q.conceal_ratio,
+        plc_ticks: q.plc_ticks,
+        silence_ticks: q.silence_ticks,
+        popped_ticks: q.popped_ticks,
+        underruns: q.underruns,
+        jb_dropped: q.jb_dropped,
+        clip_ratio: q.clip_ratio,
+        clip_excess_db: q.clip_excess_db,
+        bandwidth_hz: q.bandwidth_hz,
+        grade: grade.map_or("unknown", quality::Grade::as_str).to_string(),
+        worst: worst.to_string(),
+        partial,
+    }
+}
+
 fn build_quality(rx: &RxStream, rung: u32, duplicate: bool) -> Option<QualityStats> {
     // Q1：10 s 非消费型窗口的差分。窗口不够长 ⇒ 整个 QualityStats 为 None，
     // 而不是给一个分母只有几帧的随机比率。
@@ -2242,6 +2375,7 @@ fn build_session_info_with(
     pipeline: Option<PipelineLatency>,
 ) -> SessionInfo {
     let mut s = SessionStats {
+        peer_quality: None,
         received: 0,
         lost: 0,
         loss_pct: 0.0,
@@ -2350,6 +2484,11 @@ fn build_session_info_with(
             && build_mix_health(inner).map_or(false, |h| h.duplicate_suspect);
         s.quality = build_quality(rx, s.rung, duplicate);
     }
+    // 对端那一侧的音质。**与本侧至多一个非空**：一条流不会两端都是接收端。
+    // 这一格是纯发送流唯一可能的音质来源——没有它，`[spk/send]` 永远空着。
+    if let Some(pq) = e.peer_lat.snapshot().and_then(|p| p.quality) {
+        s.peer_quality = Some(grade_peer_quality(&pq));
+    }
     SessionInfo {
         id: e.id,
         peer_fingerprint: e.conn.peer.fingerprint.clone(),
@@ -2429,6 +2568,10 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                         stages: p.stages.iter().map(to_wire_stage).collect(),
                         local_ms: p.local_ms,
                         dev: p.dev,
+                        // 本侧**接收**方向的音质原料。纯发送的流这里是 `None`，
+                        // 因为那一侧没有抖动缓冲、音质无从定义——而对端的接收
+                        // 会话会把它那一份发过来，两个方向各补各的那一半。
+                        quality: peer_quality_payload(&inner, e),
                         // 本机时基。对端只拿它与我们之前发的 `seq_us` 相比
                         // （判乱序），绝不与它自己的时钟相减。
                         seq_us: inner.start.elapsed().as_micros() as u64,
@@ -2451,18 +2594,44 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                 }
             }
             if let Some(tx) = &e.tx {
-                let r = *lk(&tx.remote);
-                let cell = autos.entry(e.id).or_insert_with(|| AutoCell {
-                    ladder: AutoLadder::new(),
-                    last_seq: 0,
-                });
-                if r.seq > cell.last_seq {
-                    cell.last_seq = r.seq;
-                    if let Some(new_rung) = cell.ladder.feed_stats(r.iv_loss_pct, r.iv_jitter_ms) {
-                        tx.rung.store(new_rung, Ordering::Relaxed);
+                // 固定质量档：**阶梯停摆，格号由用户钉死。**
+                //
+                // `else` 而不是提前 return/continue：这个 `for` 的后面还有音量
+                // 轮询，跳过去会让固定质量档顺手把音量同步也关掉——一个只在
+                // 「选了固定档 + 开了音量同步」时才出现的组合失效。
+                if let Some(rate) = inner.transport.quality_rate() {
+                    if let Some(rung) = transport::rung_of_rate(rate) {
+                        tx.rung.store(rung, Ordering::Relaxed);
                     }
-                    tx.rung_changes
-                        .store(cell.ladder.rung_changes, Ordering::Relaxed);
+                    // 阶梯的历史状态也扔掉：切回 AUTO 时应当从当前格重新学，
+                    // 而不是接着用固定档期间那段没有意义的干净计数。
+                    autos.remove(&e.id);
+                } else {
+                    let r = *lk(&tx.remote);
+                    let cell = autos.entry(e.id).or_insert_with(|| {
+                        // 新建一个格子 = 这条流刚从固定档交还给阶梯（或者刚开）。
+                        //
+                        // **必须把线上的格号与阶梯的内部格号对齐。** `AutoLadder::new()`
+                        // 从 rung 0 起步，而线上可能被固定档钉在 1；不对齐的话阶梯
+                        // 以为自己在 0，而 `feed_stats` 只在 `rung > 0` 时升档 ⇒
+                        // 线上永远停在固定档那一格，界面却显示 AUTO。
+                        //
+                        // 对齐方向取 0（最好那一格）而不是把阶梯拨到线上那一格：
+                        // 阶梯的设计就是「升档保守、降档激进」（plan §5），
+                        // 从最好起步、链路一差就快速掉下来，正是它要的形状。
+                        tx.rung.store(0, Ordering::Relaxed);
+                        AutoCell { ladder: AutoLadder::new(), last_seq: 0 }
+                    });
+                    if r.seq > cell.last_seq {
+                        cell.last_seq = r.seq;
+                        if let Some(new_rung) =
+                            cell.ladder.feed_stats(r.iv_loss_pct, r.iv_jitter_ms)
+                        {
+                            tx.rung.store(new_rung, Ordering::Relaxed);
+                        }
+                        tx.rung_changes
+                            .store(cell.ladder.rung_changes, Ordering::Relaxed);
+                    }
                 }
             }
             // spk provider: our real output device is the thing the consumer's
@@ -2477,7 +2646,82 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                 poll_provider_volume(e, live, renegotiate);
             }
         }
+        // 延迟伺服一拍。放在整个 `for` 之后：它要看**全部**接收流才能给出
+        // 一个站点级读数，逐条流各写各的会让 UI 读到最后一条流的值。
+        servo_pass(&inner, &entries);
     }
+}
+
+/// 延迟伺服的一拍（1 s）。
+///
+/// # 为什么在这里而不是在音频线程上
+///
+/// 它要读 `sum_ms`，而那个数要合成本侧逐级 + 网络段 + 对端分项，
+/// 中间有锁、有中位数、有除法——10 ms 的路径上一样都不许有
+/// （遥测规格附录约束 3：测量不许改变被测对象）。所以伺服在 1 s 的 ticker 上
+/// 算，把结果拍成一个 `u32` 放进原子量，音频线程只读那个整数。
+///
+/// # 为什么走 `assemble_pipelines` 而不是自己算
+///
+/// **伺服必须盯着 UI 显示的那同一个数。** 两处各算一份，就会出现「界面说
+/// 186 ms，伺服认为已经达标」这种谁也查不出来的分歧。这里复用装配层，
+/// 于是按定义不可能分歧。
+fn servo_pass(inner: &Arc<DaemonInner>, entries: &[SessionEntry]) {
+    let target = inner.transport.latency_target();
+    let pipelines = assemble_pipelines(
+        &inner.play_ring,
+        &inner.play_drift,
+        entries.iter().map(StreamLat::of).collect(),
+    );
+
+    // 只有**接收**流手上有 jitter buffer，也只有它的深度是我们动得了的。
+    // 发送方向的缓冲在对端，改它要一条协议消息（见文件末尾的合并注记）。
+    let mut worst: Option<f64> = None;
+    let mut streams = 0u32;
+    let mut jb_frames: Option<u32> = None;
+    let mut lo = audiohub_net::media::JitterBuffer::MIN_TARGET;
+    let mut hi = audiohub_net::media::JitterBuffer::MAX_TARGET;
+    for (e, p) in entries.iter().zip(pipelines.iter()) {
+        let Some(rx) = e.rx.as_ref() else { continue };
+        streams += 1;
+        let (cur, tuning) = {
+            let st = lk(&rx.jbs);
+            (st.jb.target(), st.jb.tuning())
+        };
+        // 站点级读数取**最差**的一条：多条流时用平均会把一条卡住的流藏起来，
+        // 而用户听见的恰恰是那一条。
+        if let Some(sum) = p.as_ref().and_then(|p| p.sum_ms) {
+            worst = Some(worst.map_or(sum, |w: f64| w.max(sum)));
+        }
+        if jb_frames.is_none() {
+            jb_frames = Some(cur);
+            lo = tuning.min_target;
+            hi = tuning.max_target;
+        }
+    }
+
+    let out = servo::step(servo::ServoIn {
+        target,
+        sum_ms: worst,
+        jb_frames: jb_frames.unwrap_or(lo),
+        lo_frames: lo,
+        hi_frames: hi,
+    });
+    // AUTO 下**不许**写深度：那一档按 plan §5 归抖动公式管。
+    inner.transport.set_servo_frames(match target {
+        audiohub_ipc::LatencyTarget::Auto => None,
+        audiohub_ipc::LatencyTarget::TotalMs(_) => Some(out.want_frames.max(1)),
+    });
+    inner.transport.set_live(transport::TransportLive {
+        achieved_ms: worst,
+        at_floor: out.at_floor,
+        at_ceiling: out.at_ceiling,
+        rate: entries
+            .iter()
+            .find_map(|e| e.tx.as_ref().map(|t| t.rung.load(Ordering::Relaxed)))
+            .map(audiohub_net::media::rung_rate),
+        streams,
+    });
 }
 
 /// Ticks between unconditional VolumeState refreshes. Changes go out
@@ -3626,7 +3870,7 @@ mod telemetry_tests {
     fn cell_reporting(ms_values: &[f64]) -> PeerLatCell {
         let c = PeerLatCell::new();
         for (i, ms) in ms_values.iter().enumerate() {
-            c.accept(i as u64 + 1, peer_stage_ms(*ms), Some(*ms), None);
+            c.accept(i as u64 + 1, peer_stage_ms(*ms), Some(*ms), None, None);
         }
         c
     }
@@ -3698,7 +3942,7 @@ mod telemetry_tests {
         let cell = PeerLatCell::new();
         let mut stages = peer_stage_ms(180.0);
         stages.push(stage(StageId::PlayRing, 48_000, 0)); // rate=0 = 读不到
-        cell.accept(1, stages, None, None);
+        cell.accept(1, stages, None, None, None);
         attach_peer_and_net(&mut p, cell.snapshot(), Some(clock(580)));
         assert!(p.peer_local_ms.is_none(), "对端 Σ 里有洞 ⇒ None");
         assert!(!p.peer_stages.is_empty(), "分项本身照样展示给排障看");
@@ -3827,7 +4071,7 @@ mod telemetry_tests {
         let c = cell_reporting(&[100.0; 4]);
         let mut holed = peer_stage_ms(100.0);
         holed.push(stage(StageId::PlayRing, 4_800, 0));
-        c.accept(99, holed, None, None);
+        c.accept(99, holed, None, None, None);
         assert!(
             c.snapshot().unwrap().local_ms.is_none(),
             "对端此刻报不出深度，本机就不该报总和"
@@ -3844,12 +4088,12 @@ mod telemetry_tests {
         let now = Instant::now();
 
         let fresh = PeerLatCell::new();
-        fresh.accept_at(now - Duration::from_secs(4), 1, peer_stage_ms(180.0), None, None);
+        fresh.accept_at(now - Duration::from_secs(4), 1, peer_stage_ms(180.0), None, None, None);
         let s = fresh.snapshot().expect("4 秒前的读数仍可用");
         assert!(s.age_s > 3.0, "但要标成陈旧：age_s={}", s.age_s);
 
         let dead = PeerLatCell::new();
-        dead.accept_at(now - Duration::from_secs(20), 1, peer_stage_ms(180.0), None, None);
+        dead.accept_at(now - Duration::from_secs(20), 1, peer_stage_ms(180.0), None, None, None);
         assert!(dead.snapshot().is_none(), "20 秒前的读数不再是关于「现在」的证据");
 
         let mut p = send_pipeline(9_600);
@@ -3862,9 +4106,9 @@ mod telemetry_tests {
     #[test]
     fn an_out_of_order_peer_report_is_dropped() {
         let c = PeerLatCell::new();
-        c.accept(100, peer_stage_ms(100.0), None, None);
-        c.accept(50, peer_stage_ms(900.0), None, None); // 迟到的旧报文
-        c.accept(100, peer_stage_ms(900.0), None, None); // 重复
+        c.accept(100, peer_stage_ms(100.0), None, None, None);
+        c.accept(50, peer_stage_ms(900.0), None, None, None); // 迟到的旧报文
+        c.accept(100, peer_stage_ms(900.0), None, None, None); // 重复
         assert_eq!(c.snapshot().unwrap().local_ms, Some(100.0));
     }
 
@@ -4150,6 +4394,7 @@ mod telemetry_tests {
             stages: sender.stages.iter().map(to_wire_stage).collect(),
             local_ms: sender.local_ms,
             dev: sender.dev,
+            quality: None,
             seq_us: 1,
         };
         let back: SessionMsg =
@@ -4159,7 +4404,7 @@ mod telemetry_tests {
         };
 
         let cell = PeerLatCell::new();
-        let why = cell.accept(seq_us, stages.iter().map(from_wire_stage).collect(), local_ms, dev);
+        let why = cell.accept(seq_us, stages.iter().map(from_wire_stage).collect(), local_ms, dev, None);
         assert!(
             why.is_none(),
             "同一份分项走了一圈回来，两端求和口径必须一致，实得分歧：{why:?}"
@@ -4189,9 +4434,9 @@ mod telemetry_tests {
     fn a_peer_that_sums_differently_is_reported_once_and_never_believed() {
         let c = PeerLatCell::new();
         // 对端自称 0 ms，实际分项摆着 100 ms。
-        let why = c.accept(1, peer_stage_ms(100.0), Some(0.0), None);
+        let why = c.accept(1, peer_stage_ms(100.0), Some(0.0), None, None);
         assert!(why.is_some(), "口径对不上必须说出来");
-        assert!(c.accept(2, peer_stage_ms(100.0), Some(0.0), None).is_none(), "只说一次");
+        assert!(c.accept(2, peer_stage_ms(100.0), Some(0.0), None, None).is_none(), "只说一次");
         assert_eq!(
             c.snapshot().unwrap().local_ms,
             Some(100.0),

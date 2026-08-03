@@ -4,6 +4,9 @@
 #include "endpoints.h"
 #include "minwavert.h"
 #include "minwavertstream.h"
+#include "perpeer.h"
+#include "ahrings.h"
+#include "ctldevice.h"
 #define MINWAVERTSTREAM_POOLTAG 'SRWM'
 
 #pragma warning (disable : 4127)
@@ -269,6 +272,40 @@ Return Value:
     m_ulPin = Pin_;
     m_bCapture = Capture_;
     m_ulDmaMovementRate = pWfEx->nAvgBytesPerSec;
+
+    //
+    // AUDIOHUB DATA PLANE: which peer is this?
+    //
+    // Resolved once, from the endpoint context the miniport was created with.
+    // The RING is deliberately not resolved here -- see m_AhSlot's comment.
+    //
+    // The direction reported by the context is cross-checked against the
+    // stream's own m_bCapture rather than trusted. They come from completely
+    // different places (perpeer.cpp's slot setup vs PortCls's pin direction),
+    // and if they ever disagreed the audio would be written into the ring of
+    // the opposite direction -- an endpoint that silently plays what the
+    // microphone should have captured. Nothing else in the system would notice.
+    //
+    m_AhSlot        = AUDIOHUB_WIN_MAX_SLOTS;
+    m_AhFramesMoved = 0;
+    m_AhFramesShort = 0;
+    {
+        ULONG   ahSlot  = 0;
+        BOOLEAN ahInput = FALSE;
+        if (AhEpContextDecode(m_pMiniport->GetDeviceContext(), &ahSlot, &ahInput))
+        {
+            if ((ahInput ? TRUE : FALSE) == (m_bCapture ? TRUE : FALSE))
+            {
+                m_AhSlot = ahSlot;
+            }
+            else
+            {
+                DPF(D_ERROR, ("[CMiniportWaveRTStream::Init] slot %u direction mismatch: "
+                              "context says input=%u, stream says capture=%u; no data plane",
+                              ahSlot, (ULONG)ahInput, (ULONG)m_bCapture));
+            }
+        }
+    }
 
     m_pDpc = (PRKDPC)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(KDPC), MINWAVERTSTREAM_POOLTAG);
     if (!m_pDpc)
@@ -1271,6 +1308,37 @@ NTSTATUS CMiniportWaveRTStream::SetState
             break;
     }
 
+    //
+    // AUDIOHUB: TELL THE DAEMON AN APPLICATION STARTED OR STOPPED USING THIS
+    // VIRTUAL ENDPOINT.
+    //
+    // Read before the assignment below, because everything above this point
+    // still reads m_KsState as the PREVIOUS state.
+    //
+    // This is the link that makes mode B work at all. The endpoints appear on
+    // pairing and the rings carry audio, but nothing pulls that audio onward
+    // until the daemon opens a session -- and in mode B a session is opened by
+    // the SYSTEM's device selection, i.e. by an application starting IO here,
+    // not by anything the daemon can observe on its own. Without this call the
+    // whole path is built, reports healthy at every layer, and is silent:
+    // `ctl sessions` says "0 session(s)" while a tone plays into the device.
+    // (Measured -- that is exactly how M6-3 ended its first attempt.)
+    //
+    // Edge-triggered on the RUN boundary, not level-reported on every
+    // transition: STOP/ACQUIRE/PAUSE all mean "not running" and firing on each
+    // of them would send the daemon three identical events for one stop.
+    //
+    if (m_AhSlot < AUDIOHUB_WIN_MAX_SLOTS)
+    {
+        const BOOLEAN wasRunning = (m_KsState == KSSTATE_RUN) ? TRUE : FALSE;
+        const BOOLEAN nowRunning = (State_ == KSSTATE_RUN) ? TRUE : FALSE;
+
+        if (wasRunning != nowRunning)
+        {
+            AhCtlRaiseIoState(m_AhSlot, m_bCapture, nowRunning);
+        }
+    }
+
     m_KsState = State_;
 
     return ntStatus;
@@ -1332,8 +1400,11 @@ VOID CMiniportWaveRTStream::UpdatePosition
 
     if (m_bCapture)
     {
-        // Write sine wave to buffer.
-        WriteBytes(ByteDisplacement);
+        //
+        // Fill the WaveRT buffer from this peer's microphone ring. Replaces
+        // upstream's sine generator, which is now unreachable.
+        //
+        AhPullCapture(ByteDisplacement);
     }
     else
     {
@@ -1364,6 +1435,19 @@ VOID CMiniportWaveRTStream::UpdatePosition
             m_bLastBufferRendered = TRUE;
         }
 
+        //
+        // THE RENDER HOOK, and it is deliberately OUTSIDE the
+        // g_DoNotCreateDataFiles guard below.
+        //
+        // That guard defaults to ON (adapter.cpp), so upstream's ReadBytes has
+        // never once run on this driver -- the render path touched the WaveRT
+        // buffer zero times. Putting the ring write inside it would have
+        // produced a data plane that compiles, installs, reports every counter
+        // as healthy, and moves no audio at all, for a reason nothing in the
+        // audio stack would report.
+        //
+        AhPushRender(ByteDisplacement);
+
         if (!g_DoNotCreateDataFiles)
         {
             // Read from buffer and write to a file.
@@ -1385,6 +1469,260 @@ VOID CMiniportWaveRTStream::UpdatePosition
     // Update the DMA time stamp for the next call to GetPosition()
     //
     m_ullDmaTimeStamp = hnsCurrentTime;
+}
+
+//=============================================================================
+//
+// THE AUDIOHUB DATA PLANE. Both routines run at DISPATCH_LEVEL, inside
+// m_PositionSpinLock, from TimerNotifyRT and from the three position queries.
+//
+// The region both routines work on is [m_ullLinearPosition, +ByteDisplacement)
+// modulo the buffer size -- the same window upstream's WriteBytes/ReadBytes
+// used, and the caller advances m_ullLinearPosition past it afterwards.
+//
+// The two directions do NOT share a frame size: the render pin is 16-bit PCM
+// stereo (4 bytes/frame) and the capture pin is 32-bit PCM stereo (8), both
+// inherited from upstream. Publishing one common FLOAT format instead was
+// tried and REVERTED -- see the note at the top of speakerwavtable.h: the
+// endpoint builder silently declines to create an endpoint for it, which
+// presents as a driver that installs perfectly and produces no device.
+//
+//=============================================================================
+
+#define AH_RENDER_BLOCK_ALIGN   4u      // 2ch * int16
+#define AH_CAPTURE_BLOCK_ALIGN  8u      // 2ch * int32
+
+//
+// Frames converted per pass. The scratch lives on the DPC stack, which is
+// small; at the 1 ms timer period a pass moves 48 frames.
+//
+#define AH_CONV_FRAMES          256u
+
+//
+// XSTATE_MASK_LEGACY is declared in the user-mode headers, not in the ones
+// portcls.h pulls in (measured: error C2065 with the WDK 10.0.26100 kernel
+// include set). The value is architectural -- bit 0 is x87, bit 1 is SSE -- and
+// spelling it out is preferable to including a user-mode header into a driver
+// just for one constant.
+//
+#ifndef XSTATE_MASK_LEGACY
+#define XSTATE_MASK_LEGACY_FLOATING_POINT_  (1ui64 << 0)
+#define XSTATE_MASK_LEGACY_SSE_             (1ui64 << 1)
+#define XSTATE_MASK_LEGACY \
+    (XSTATE_MASK_LEGACY_FLOATING_POINT_ | XSTATE_MASK_LEGACY_SSE_)
+#endif
+
+//
+// FLOATING POINT AT DISPATCH_LEVEL.
+//
+// The ring carries float (it is shared with macOS, whose HAL speaks float) and
+// both pins carry integer PCM, so every pass has to convert. On x64 a
+// kernel-mode driver may not use the FPU/SSE at IRQL >= DISPATCH_LEVEL without
+// first saving the extended processor state -- and this runs in a DPC.
+// KeSaveExtendedProcessorState is the documented way to do exactly that and is
+// callable at IRQL <= DISPATCH_LEVEL.
+//
+// It brackets the WHOLE loop rather than each sample: the save is the
+// expensive part, and doing it per sample would cost far more than the
+// conversion it protects.
+//
+// A failed save is not fatal and not silent: the pass moves no audio and the
+// frames are counted short, the same accounting an empty ring gets. Using the
+// FPU anyway would corrupt some unrelated thread's register state -- a fault
+// that would surface far away from here and never be diagnosed as audio.
+//
+
+#pragma code_seg()
+VOID CMiniportWaveRTStream::AhPushRender
+(
+    _In_ ULONG ByteDisplacement
+)
+/*++
+
+Routine Description:
+
+    Copies what the audio engine just wrote into the WaveRT buffer out to this
+    peer's OUT ring, converting 16-bit PCM to float.
+
+    NO GAIN IS APPLIED, ever. plan 7.2's transmission invariant: the ring
+    carries full scale and the peer's REAL device does the attenuating. The
+    volume the user set on this virtual endpoint travels as a NUMBER over the
+    control plane, not as a multiplication here -- doing both is the double
+    attenuation this whole design exists to avoid, and neither end could see it.
+
+--*/
+{
+    PAUDIOHUB_RING_HEADER ring = AhRingsHeader(m_AhSlot, AUDIOHUB_DIR_OUT);
+
+    if (ring == NULL || m_pDmaBuffer == NULL || m_ulDmaBufferSize == 0)
+    {
+        return;
+    }
+
+    XSTATE_SAVE save;
+    NTSTATUS    st = KeSaveExtendedProcessorState(XSTATE_MASK_LEGACY, &save);
+    if (!NT_SUCCESS(st))
+    {
+        m_AhFramesShort += ByteDisplacement / AH_RENDER_BLOCK_ALIGN;
+        return;
+    }
+
+    ULONG bufferOffset = (ULONG)(m_ullLinearPosition % m_ulDmaBufferSize);
+
+    while (ByteDisplacement >= AH_RENDER_BLOCK_ALIGN)
+    {
+        ULONG run    = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
+        ULONG frames = run / AH_RENDER_BLOCK_ALIGN;
+
+        if (frames == 0)
+        {
+            //
+            // Cannot happen: m_ulDmaBufferSize and every displacement are
+            // multiples of nBlockAlign. Bailing rather than looping is what
+            // keeps a future format change from turning this into a DPC that
+            // never returns.
+            //
+            break;
+        }
+        if (frames > AH_CONV_FRAMES)
+        {
+            frames = AH_CONV_FRAMES;
+        }
+
+        float scratch[AH_CONV_FRAMES * AUDIOHUB_SPK_CHANNELS];
+        const SHORT *src = (const SHORT *)(m_pDmaBuffer + bufferOffset);
+
+        for (ULONG i = 0; i < frames * AUDIOHUB_SPK_CHANNELS; i++)
+        {
+            //
+            // 1/32768, not 1/32767: it makes the mapping exact for every
+            // representable input and puts full-scale negative at exactly
+            // -1.0f. The half-LSB of positive headroom that costs is
+            // inaudible; dividing by 32767 instead sends -32768 below -1.0 and
+            // clips on any downstream converter.
+            //
+            scratch[i] = (float)src[i] * (1.0f / 32768.0f);
+        }
+
+        ULONG wrote = AhRingWrite(
+            ring,
+            AUDIOHUB_RING_DATA_OFFSET,
+            AUDIOHUB_RING_FRAMES,
+            AUDIOHUB_SPK_CHANNELS,
+            scratch,
+            frames);
+
+        m_AhFramesMoved += wrote;
+        m_AhFramesShort += (frames - wrote);
+
+        ULONG consumed = frames * AH_RENDER_BLOCK_ALIGN;
+        bufferOffset = (bufferOffset + consumed) % m_ulDmaBufferSize;
+        ByteDisplacement -= consumed;
+    }
+
+    KeRestoreExtendedProcessorState(&save);
+    AhRingsSignal();
+}
+
+#pragma code_seg()
+VOID CMiniportWaveRTStream::AhPullCapture
+(
+    _In_ ULONG ByteDisplacement
+)
+/*++
+
+Routine Description:
+
+    Fills the WaveRT buffer from this peer's IN ring so an application
+    recording the virtual microphone hears the peer.
+
+    The ring is MONO (AUDIOHUB_MIC_CHANNELS, matching macOS) and the pin is
+    32-bit stereo, so each frame is converted once and written to both channels.
+
+    A short read becomes SILENCE, not stale audio: zeroing the remainder is
+    what makes an absent or lagging daemon sound like nothing rather than like
+    a loop of the last thing it said.
+
+--*/
+{
+    PAUDIOHUB_RING_HEADER ring = AhRingsHeader(m_AhSlot, AUDIOHUB_DIR_IN);
+
+    if (m_pDmaBuffer == NULL || m_ulDmaBufferSize == 0)
+    {
+        return;
+    }
+
+    XSTATE_SAVE save;
+    NTSTATUS    st = KeSaveExtendedProcessorState(XSTATE_MASK_LEGACY, &save);
+    if (!NT_SUCCESS(st))
+    {
+        m_AhFramesShort += ByteDisplacement / AH_CAPTURE_BLOCK_ALIGN;
+        return;
+    }
+
+    ULONG bufferOffset = (ULONG)(m_ullLinearPosition % m_ulDmaBufferSize);
+
+    while (ByteDisplacement >= AH_CAPTURE_BLOCK_ALIGN)
+    {
+        ULONG run    = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
+        ULONG frames = run / AH_CAPTURE_BLOCK_ALIGN;
+
+        if (frames == 0)
+        {
+            break;
+        }
+        if (frames > AH_CONV_FRAMES)
+        {
+            frames = AH_CONV_FRAMES;
+        }
+
+        float mono[AH_CONV_FRAMES];
+        ULONG got = 0;
+
+        if (ring != NULL)
+        {
+            got = AhRingRead(
+                ring,
+                AUDIOHUB_RING_DATA_OFFSET,
+                AUDIOHUB_RING_FRAMES,
+                AUDIOHUB_MIC_CHANNELS,
+                mono,
+                frames);
+        }
+
+        LONG *dst = (LONG *)(m_pDmaBuffer + bufferOffset);
+
+        for (ULONG f = 0; f < got; f++)
+        {
+            //
+            // Clamped BEFORE the cast. A float arriving even slightly outside
+            // [-1, 1) -- which a peer's mixer can legitimately produce -- would
+            // otherwise wrap to the opposite sign as an integer. That is not
+            // distortion, it is a full-scale click.
+            //
+            float v = mono[f];
+            if (v >  1.0f) { v =  1.0f; }
+            if (v < -1.0f) { v = -1.0f; }
+
+            LONG s = (LONG)(v * 2147483647.0f);
+            dst[2 * f]     = s;
+            dst[2 * f + 1] = s;
+        }
+        if (got < frames)
+        {
+            RtlZeroMemory(&dst[2 * got], (SIZE_T)(frames - got) * AH_CAPTURE_BLOCK_ALIGN);
+        }
+
+        m_AhFramesMoved += got;
+        m_AhFramesShort += (frames - got);
+
+        ULONG consumed = frames * AH_CAPTURE_BLOCK_ALIGN;
+        bufferOffset = (bufferOffset + consumed) % m_ulDmaBufferSize;
+        ByteDisplacement -= consumed;
+    }
+
+    KeRestoreExtendedProcessorState(&save);
+    AhRingsSignal();
 }
 
 //=============================================================================

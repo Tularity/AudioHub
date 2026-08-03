@@ -14,8 +14,25 @@ Abstract:
 #ifndef _SIMPLEAUDIOSAMPLE_SPEAKERWAVTABLE_H_
 #define _SIMPLEAUDIOSAMPLE_SPEAKERWAVTABLE_H_
 
-// To keep the code simple assume device supports only 48KHz, 16-bit, stereo (PCM and NON-PCM)
-
+//
+// 48 kHz, 16-bit PCM, stereo -- upstream's format, restored.
+//
+// THIS WAS BRIEFLY IEEE FLOAT AND THAT WAS WRONG. MEASURED, on
+// win-audio-debug: with KSDATAFORMAT_SUBTYPE_IEEE_FLOAT on the pins the driver
+// installed cleanly, the devnode came up OK, the KS interfaces registered in
+// all four categories, AhSlotBindSet reported AH_PUB_BOTH -- and the audio
+// endpoint builder created NO endpoint at all. `Get-PnpDevice -Class
+// AudioEndpoint` was empty while AudioEndpointBuilder and audiosrv were both
+// Running. Nothing failed; the endpoint simply never appeared.
+//
+// The float experiment existed to keep the ring copy free of a format
+// conversion, because that copy runs in the WaveRT timer DPC and on x64 a
+// driver may not touch the FPU at IRQL >= DISPATCH_LEVEL. That problem is real
+// but it has a supported answer -- KeSaveExtendedProcessorState, which is
+// documented callable at IRQL <= DISPATCH_LEVEL precisely for this -- and
+// minwavertstream.cpp now uses it. Publishing a format the endpoint builder
+// refuses is not a trade worth making to avoid one documented API call.
+//
 #define SPEAKER_DEVICE_MAX_CHANNELS                 2       // Max Channels.
 
 #define SPEAKER_HOST_MAX_CHANNELS                   2       // Max Channels.
@@ -23,6 +40,21 @@ Abstract:
 #define SPEAKER_HOST_MAX_BITS_PER_SAMPLE            16      // Max Bits Per Sample
 #define SPEAKER_HOST_MIN_SAMPLE_RATE                48000   // Min Sample Rate
 #define SPEAKER_HOST_MAX_SAMPLE_RATE                48000   // Max Sample Rate
+
+//
+// nBlockAlign and nAvgBytesPerSec, derived rather than typed twice. A stale
+// nAvgBytesPerSec is invisible in a device list and shows up as audio that
+// plays at the wrong speed: m_ulDmaMovementRate is taken straight from it
+// (minwavertstream.cpp Init), and every position the driver reports is
+// computed from that.
+//
+#define SPEAKER_HOST_BLOCK_ALIGN \
+    (SPEAKER_HOST_MAX_CHANNELS * (SPEAKER_HOST_MAX_BITS_PER_SAMPLE / 8))
+#define SPEAKER_HOST_AVG_BYTES_PER_SEC \
+    (SPEAKER_HOST_MAX_SAMPLE_RATE * SPEAKER_HOST_BLOCK_ALIGN)
+
+C_ASSERT(SPEAKER_HOST_BLOCK_ALIGN == 4);
+C_ASSERT(SPEAKER_HOST_AVG_BYTES_PER_SEC == 192000);
 
 //
 // Max # of pin instances.
@@ -47,14 +79,14 @@ KSDATAFORMAT_WAVEFORMATEXTENSIBLE SpeakerHostPinSupportedDeviceFormats[] =
         {
             {
                 WAVE_FORMAT_EXTENSIBLE,
-                2,
-                48000,
-                192000,
-                4,
-                16,
+                SPEAKER_HOST_MAX_CHANNELS,
+                SPEAKER_HOST_MAX_SAMPLE_RATE,
+                SPEAKER_HOST_AVG_BYTES_PER_SEC,
+                SPEAKER_HOST_BLOCK_ALIGN,
+                SPEAKER_HOST_MAX_BITS_PER_SAMPLE,
                 sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
             },
-            16,
+            SPEAKER_HOST_MAX_BITS_PER_SAMPLE,
             KSAUDIO_SPEAKER_STEREO,
             STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
         }
@@ -110,7 +142,7 @@ KSDATARANGE_AUDIO SpeakerPinDataRangesStream[] =
             STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
             STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
         },
-        SPEAKER_HOST_MAX_CHANNELS,           
+        SPEAKER_HOST_MAX_CHANNELS,
         SPEAKER_HOST_MIN_BITS_PER_SAMPLE,    
         SPEAKER_HOST_MAX_BITS_PER_SAMPLE,    
         SPEAKER_HOST_MIN_SAMPLE_RATE,            

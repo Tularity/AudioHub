@@ -104,7 +104,21 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 // "<speaker>". A version check is the only place that difference is
 // expressible, and it is an EQUALITY test, so the mismatch refuses to bind.
 //
-#define AUDIOHUB_WIN_PROTOCOL_VERSION   4u
+// v5: THE DATA PLANE AND THE VOLUME NODE (M6-3). Two new IOCTLs (MAP_RINGS,
+// NOTIFY); AH_HELLO_REPLY starts answering AH_CAP_DATAPLANE|AH_CAP_VOLUME with
+// real numbers in sample_rate/out_channels/in_channels.
+//
+// The bump is again about a SILENT bad pairing, and this one is the worst so
+// far. A v4 driver has no volume node, so the audio engine inserts a software
+// volume APO ahead of it -- every sample reaching the ring is ALREADY
+// attenuated by the user's slider. A v5 daemon then also reads that slider off
+// the control plane and asks the peer to attenuate its REAL device by the same
+// factor. Nothing errors, no device list looks wrong; the audio is simply
+// quieter than it should be by the SQUARE of the setting, and the only place
+// that shows is a level meter nobody is looking at. An equality check turns
+// that into "refuses to bind", which is loud.
+//
+#define AUDIOHUB_WIN_PROTOCOL_VERSION   5u
 
 //
 // Must equal HAL_MAX_SLOTS in core/audiohubd/src/halbridge.rs. The driver's
@@ -171,6 +185,8 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 #define IOCTL_AUDIOHUB_BIND_CLEAR   CTL_CODE(AH_DEVICE_TYPE, 0x802, METHOD_BUFFERED, AH_ACCESS)
 #define IOCTL_AUDIOHUB_QUERY_SLOTS  CTL_CODE(AH_DEVICE_TYPE, 0x803, METHOD_BUFFERED, AH_ACCESS)
 #define IOCTL_AUDIOHUB_CONTROL_PEND CTL_CODE(AH_DEVICE_TYPE, 0x804, METHOD_BUFFERED, AH_ACCESS)
+#define IOCTL_AUDIOHUB_MAP_RINGS    CTL_CODE(AH_DEVICE_TYPE, 0x805, METHOD_BUFFERED, AH_ACCESS)
+#define IOCTL_AUDIOHUB_NOTIFY       CTL_CODE(AH_DEVICE_TYPE, 0x806, METHOD_BUFFERED, AH_ACCESS)
 
 //=============================================================================
 // Status codes carried INSIDE the reply payload
@@ -275,7 +291,16 @@ typedef struct _AH_HELLO_REPLY {
     UINT32 client_check;        // AH_CLIENT_CHECK_* actually in force
 } AH_HELLO_REPLY;
 
-#define AH_CAP_DATAPLANE    0x1u    // audio rings exist (0 until M6-4)
+#define AH_CAP_DATAPLANE    0x1u    // IOCTL_AUDIOHUB_MAP_RINGS works and the
+                                    // sample_rate/out_channels/in_channels
+                                    // fields above are meaningful
+#define AH_CAP_VOLUME       0x2u    // every endpoint carries a KSNODETYPE_VOLUME
+                                    // node, so the audio engine does NOT insert
+                                    // a software volume APO ahead of the driver
+                                    // and the samples in the rings are FULL
+                                    // SCALE. A daemon that syncs volume to a
+                                    // peer while this bit is CLEAR is applying
+                                    // the user's setting twice.
 
 //=============================================================================
 // BIND
@@ -432,6 +457,123 @@ typedef struct _AH_CONTROL_EVENT {
 } AH_CONTROL_EVENT;
 
 //=============================================================================
+// MAP_RINGS -- the data plane's ONE system call.
+//
+// The driver owns 2 * slot_count rings, allocated non-paged at DriverEntry and
+// never freed; this call maps every one of them into the caller's address
+// space and hands back the user virtual addresses. After it, audio moves with
+// nothing but two memcpys and two 64-bit stores per tick -- no IOCTL, no
+// copy by the I/O manager, no system call at all.
+//
+// WHY NOT AN IOCTL PER FRAME. METHOD_BUFFERED makes the I/O manager copy every
+// transfer through a system buffer, and at 10 ms per frame across 32 endpoints
+// that is 3200 system calls per second whose only product is a memcpy we could
+// have done ourselves. METHOD_NEITHER is worse than slow, it is WRONG here:
+// "the buffer is only accessible from drivers that execute in the
+// application's thread context", and the ring is read and written from a timer
+// DPC, where there is no thread context at all.
+//
+// WHY THE DRIVER ALLOCATES AND THE DAEMON MAPS, rather than the other way
+// round. Three reasons, in order of how much trouble each one saves:
+//   1. it is what WaveRT itself does one layer up -- KSPROPERTY_RTAUDIO_BUFFER
+//      returns a "driver-allocated cyclic buffer" whose base address "the
+//      client can directly access";
+//   2. the driver is started by PnP and outlives every daemon; a daemon is the
+//      restartable party, and memory owned by the restartable party has to be
+//      re-established on every restart;
+//   3. it matches macOS, where the driver owns the mach memory entries, so
+//      halbridge.rs's RingMem does not have to branch on platform.
+//
+// LIFETIME. The mapping is torn down in IRP_MJ_CLEANUP, which runs in the
+// context of the process closing the handle -- the only context in which
+// MmUnmapLockedPages is safe ("if the context is incorrect, the unmapping
+// operation could delete the address range of a random process"). Closing the
+// handle therefore destroys the mapping deterministically, which is why this
+// protocol needs no equivalent of the macOS bridge's kAudioHubCtl_Superseded:
+// a superseded daemon on macOS keeps a LIVE mapping and goes on draining the
+// speaker ring, and that oscillation simply cannot be built here.
+//=============================================================================
+
+typedef struct _AH_MAP_REQUEST {
+    UINT64 session_id;      // != HelloReply => AH_STATUS_STALE_SESSION
+    UINT64 wake_event;      // OPTIONAL. A user-mode HANDLE to an auto- or
+                            // manual-reset event, or 0 for none. The driver
+                            // references it once here and signals it from the
+                            // DPC whenever it moved audio, so a daemon can
+                            // wait instead of poll. 0 is fully supported: the
+                            // daemon's mixer is driven by its own 10 ms tick,
+                            // and the event is an accelerator, never the
+                            // mechanism by which data becomes visible.
+    UINT32 protocol_version;// checked again here, for EQUALITY: an unversioned
+                            // second call is how a stale client would map the
+                            // rings of a driver it never handshook with
+    UINT32 flags;           // MBZ
+} AH_MAP_REQUEST;
+
+typedef struct _AH_MAP_REPLY {
+    UINT32 status;
+    UINT32 ring_count;      // == 2 * slot_count; va[] entries past this are 0
+    UINT32 data_offset;     // AUDIOHUB_RING_DATA_OFFSET
+    UINT32 capacity_frames; // AUDIOHUB_RING_FRAMES
+    UINT32 sample_rate;
+    UINT32 spk_channels;
+    UINT32 mic_channels;
+    UINT32 spk_bytes;       // mapped length of an OUT ring
+    UINT32 mic_bytes;       // mapped length of an IN ring
+    UINT32 reserved;        // MBZ; keeps va[] 8-byte aligned without a hole
+    //
+    // Indexed AUDIOHUB_RING_INDEX(slot, dir) = slot*2 + dir, the SAME encoding
+    // the macOS bridge uses for its 32 endpoints. Even entries are speakers
+    // (driver writes), odd are microphones (daemon writes).
+    //
+    UINT64 va[2 * AUDIOHUB_WIN_MAX_SLOTS];
+} AH_MAP_REPLY;
+
+//=============================================================================
+// NOTIFY -- daemon -> driver, the return leg of volume sync.
+//
+// The forward leg is an AH_CONTROL_EVENT of kind AH_EVENT_VOLUME, raised when
+// the USER moves the slider on a virtual endpoint. This is the other
+// direction: the far peer's real device changed and the virtual endpoint's
+// node must follow, so that the two sliders read the same number.
+//
+// It updates the node's stored level and raises KSEVENT_CONTROL_CHANGE so
+// that whoever is holding IAudioEndpointVolume sees it. It does NOT touch a
+// single sample: plan 7.2's transmission invariant says the rings carry full
+// scale and the far side does the attenuating.
+//
+// LOOP SUPPRESSION is the driver's job, not the daemon's: applying a value
+// that equals the stored one raises no event. Without that, every sync would
+// bounce -- daemon sets, driver events, daemon reads its own echo and sets
+// again -- and the two ends would ratchet against each other forever.
+//=============================================================================
+
+#define AH_NOTIFYFLAG_MUTED     0x1u
+#define AH_NOTIFYFLAG_INPUT     0x2u    // the virtual MICROPHONE, else speaker
+
+typedef struct _AH_NOTIFY_REQUEST {
+    UINT64 session_id;
+    UINT32 slot;
+    UINT32 generation;      // dropped if it does not match the slot's current
+                            // stamp -- a late notify for a slot's PREVIOUS
+                            // tenant must not move the next peer's slider
+    UINT32 flags;           // AH_NOTIFYFLAG_*
+    UINT32 scalar_q16;      // 16.16 fixed point, 0x10000 == 1.0 == full scale.
+                            // Fixed point rather than float because kernel
+                            // code must not use the FPU without saving state,
+                            // and this value is consumed at DISPATCH_LEVEL.
+} AH_NOTIFY_REQUEST;
+
+typedef struct _AH_NOTIFY_REPLY {
+    UINT32 status;
+    UINT32 applied;         // 1 when the stored level actually changed (and an
+                            // event was raised), 0 when it was already this
+                            // value. Observable on purpose: "the driver
+                            // suppressed my echo" and "the driver ignored me"
+                            // are otherwise the same silence.
+} AH_NOTIFY_REPLY;
+
+//=============================================================================
 // Layout assertions. These are the whole point of the file: the Rust mirror
 // asserts the same numbers, and test/tests/halwire_win.rs asserts both against
 // a third, independently transcribed copy.
@@ -444,6 +586,17 @@ C_ASSERT(sizeof(AH_BIND_REPLY) == 32);
 C_ASSERT(sizeof(AH_SLOT_INFO) == 52);
 C_ASSERT(sizeof(AH_QUERY_SLOTS_REPLY) == 848);
 C_ASSERT(sizeof(AH_CONTROL_EVENT) == 24);
+C_ASSERT(sizeof(AH_MAP_REQUEST) == 24);
+C_ASSERT(sizeof(AH_MAP_REPLY) == 296);
+C_ASSERT(sizeof(AH_NOTIFY_REQUEST) == 24);
+C_ASSERT(sizeof(AH_NOTIFY_REPLY) == 8);
+
+C_ASSERT(AH_FIELD_OFFSET(AH_MAP_REQUEST, wake_event) == 8);
+C_ASSERT(AH_FIELD_OFFSET(AH_MAP_REQUEST, protocol_version) == 16);
+C_ASSERT(AH_FIELD_OFFSET(AH_MAP_REPLY, spk_bytes) == 28);
+C_ASSERT(AH_FIELD_OFFSET(AH_MAP_REPLY, va) == 40);
+C_ASSERT(AH_FIELD_OFFSET(AH_NOTIFY_REQUEST, slot) == 8);
+C_ASSERT(AH_FIELD_OFFSET(AH_NOTIFY_REQUEST, scalar_q16) == 20);
 
 C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REPLY, stage) == 16);
 C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REPLY, nt_status) == 20);
@@ -473,5 +626,7 @@ C_ASSERT(IOCTL_AUDIOHUB_BIND_SET     == 0x0022E004);
 C_ASSERT(IOCTL_AUDIOHUB_BIND_CLEAR   == 0x0022E008);
 C_ASSERT(IOCTL_AUDIOHUB_QUERY_SLOTS  == 0x0022E00C);
 C_ASSERT(IOCTL_AUDIOHUB_CONTROL_PEND == 0x0022E010);
+C_ASSERT(IOCTL_AUDIOHUB_MAP_RINGS    == 0x0022E014);
+C_ASSERT(IOCTL_AUDIOHUB_NOTIFY       == 0x0022E018);
 
 #endif // _AUDIOHUB_IOCTL_H_

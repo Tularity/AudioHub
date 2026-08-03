@@ -78,7 +78,6 @@ Return Value:
     ASSERT(MiniportPair);
 
     UNREFERENCED_PARAMETER(UnknownAdapter);
-    UNREFERENCED_PARAMETER(DeviceContext);
 
     CMicArrayMiniportTopology* obj =
         new (PoolFlags, MINTOPORT_POOLTAG)
@@ -92,6 +91,15 @@ Return Value:
     }
 
     obj->AddRef();
+
+    //
+    // AUDIOHUB: same as the render side. Upstream discarded DeviceContext here
+    // (it was an UNREFERENCED_PARAMETER), which would have left every virtual
+    // microphone sharing one volume cell while every virtual speaker had its
+    // own -- an asymmetry with no reason behind it and no symptom but wrong
+    // levels.
+    //
+    obj->SetAhEndpointContext(DeviceContext);
 
     *Unknown = reinterpret_cast<IUnknown*>(obj);
 

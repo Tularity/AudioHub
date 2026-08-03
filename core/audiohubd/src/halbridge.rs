@@ -8464,25 +8464,78 @@ mod platform {
 
     /// The platform's private state bag, held by `Shared`.
     ///
-    /// The name is inherited from the macOS side, where this really is the
-    /// shared-memory rings. On Windows there is no data plane yet — M6-2 is
-    /// control-plane only — so every ring method below is a no-op and the
-    /// struct's actual job is to hold the driver session.
+    /// The name is inherited from the macOS side. On Windows it holds two
+    /// things: the driver session (control plane) and the mapped rings (data
+    /// plane), and they are deliberately separate. The session lives behind a
+    /// `Mutex` because an IOCTL is a blocking round trip; the rings live behind
+    /// their own `RwLock` because the audio path must never wait on a control
+    /// call to read a frame.
     ///
-    /// Putting the session HERE rather than adding a field to `Shared` is what
-    /// keeps `Shared` free of `cfg`: it is already the one member declared as
+    /// Putting both HERE rather than adding fields to `Shared` is what keeps
+    /// `Shared` free of `cfg`: it is already the one member declared as
     /// `platform::…`.
+    ///
+    /// On a third platform there is neither, and every method is a no-op that
+    /// reports absence.
     pub struct Rings {
         #[cfg(windows)]
         session: Mutex<Option<crate::halbridge_win::session::Session>>,
+        /// Moved out of the session at attach, so nothing on the audio path
+        /// ever takes the session mutex.
+        ///
+        /// Safe to declare AFTER `session` — i.e. to be dropped after the
+        /// control handle closes — only because `WinRings` has no `Drop` that
+        /// touches the pages; the driver unmaps them itself in
+        /// `IRP_MJ_CLEANUP`. Give it one and this order becomes a
+        /// use-after-free, and `detach` below is the place that already gets
+        /// the sequence right.
+        #[cfg(windows)]
+        rings: crate::halbridge_win::rings::WinRings,
     }
 
+    #[cfg(windows)]
     impl Rings {
         pub fn new() -> Rings {
             Rings {
-                #[cfg(windows)]
                 session: Mutex::new(None),
+                rings: crate::halbridge_win::rings::WinRings::new(),
             }
+        }
+        pub fn read_spk(&self, slot: usize, dst: &mut [f32], frames: usize) -> usize {
+            self.rings.read_spk(slot, dst, frames)
+        }
+        pub fn write_mic(&self, slot: usize, mono: &[f32]) -> Option<usize> {
+            self.rings.write_mic(slot, mono)
+        }
+        pub fn flush_spk_consumer(&self, slot: usize) {
+            self.rings.flush_spk_consumer(slot)
+        }
+        pub fn peek_spk(
+            &self,
+            slot: usize,
+            dst: &mut [f32],
+            frames: usize,
+        ) -> Option<(usize, u64)> {
+            self.rings.peek_spk(slot, dst, frames)
+        }
+        pub fn advance_spk(&self, slot: usize, base: u64, frames: usize) {
+            self.rings.advance_spk(slot, base, frames)
+        }
+        pub fn drop_spk(&self, slot: usize, frames: usize) -> usize {
+            self.rings.drop_spk(slot, frames)
+        }
+        pub fn spk_readable(&self, slot: usize) -> Option<(u32, u32)> {
+            self.rings.spk_readable(slot)
+        }
+        pub fn mic_occupied(&self, slot: usize) -> Option<(u32, u32)> {
+            self.rings.mic_occupied(slot)
+        }
+    }
+
+    #[cfg(not(windows))]
+    impl Rings {
+        pub fn new() -> Rings {
+            Rings {}
         }
         pub fn read_spk(&self, _slot: usize, _dst: &mut [f32], _frames: usize) -> usize {
             0
@@ -8633,6 +8686,30 @@ mod platform {
             );
         }
 
+        if let Some(why) = s.dataplane_off.as_deref() {
+            // Loud, and for the same reason the degraded identity check above
+            // is: a bridge that publishes devices which then carry no audio is
+            // indistinguishable from a peer that is simply not sending, and the
+            // difference is the whole diagnosis.
+            dlog!("[audiohubd] hal: NO DATA PLANE — {why}");
+        } else if !s.has_volume() {
+            // The squared-attenuation trap: with no hardware volume node the
+            // audio engine inserts a software volume APO ahead of the driver,
+            // so the samples in the rings are ALREADY attenuated by the user's
+            // slider. Relaying that same slider to the peer's real device
+            // applies it a second time, and the only place the difference shows
+            // is a level meter nobody is looking at.
+            dlog!(
+                "[audiohubd] hal: the driver has no volume node (AH_CAP_VOLUME is clear); \
+                 the samples in the rings are pre-attenuated, so volume must not be synced"
+            );
+        }
+
+        // The mapping moves out of the session and onto `Shared`, where the
+        // mixer and the tx engine reach it WITHOUT taking the session mutex —
+        // which an IOCTL can hold for its whole round trip.
+        s.rings.move_into(&shared.rings.rings);
+
         *lk(&shared.rings.session) = Some(s);
         shared.session_id.store(id, Ordering::SeqCst);
         shared.slot_count.store(slots as u32, Ordering::SeqCst);
@@ -8651,6 +8728,14 @@ mod platform {
     /// peer's devices in the system list either way.
     #[cfg(windows)]
     fn detach(shared: &Shared, why: &str) {
+        // THE RINGS GO FIRST, before anything can drop the session and with it
+        // the control handle. The mapping is torn down by the driver in
+        // IRP_MJ_CLEANUP — i.e. the instant `CloseHandle` runs — so the mixer
+        // and the tx engine have to be out of the pages by then. Taking
+        // `WinRings`'s write lock is exactly that wait. Reverse these two and
+        // a driver restart during playback is a segfault in whichever thread
+        // happened to be mid-memcpy.
+        shared.rings.rings.detach();
         if lk(&shared.rings.session).take().is_none() {
             return;
         }
@@ -8735,18 +8820,36 @@ mod platform {
         }
     }
 
+    /// Relays the far peer's real device level onto the virtual endpoint's
+    /// volume node, so the two sliders read the same number.
+    ///
+    /// A driver with `AH_CAP_VOLUME` CLEAR is skipped rather than told: it has
+    /// no node to move, and the audio engine has already applied the user's
+    /// setting in a software APO upstream of the ring. Sending anyway would be
+    /// asking for the setting to be applied twice.
+    ///
+    /// Failures are logged, never propagated. This is a best-effort follow of
+    /// somebody else's slider; it must not be able to tear down a session that
+    /// is otherwise carrying audio perfectly well.
     #[cfg(windows)]
     pub fn send_notify(
-        _shared: &Shared,
-        _at: HalEndpoint,
-        _generation: u32,
-        _scalar: f32,
-        _muted: bool,
+        shared: &Shared,
+        at: HalEndpoint,
+        generation: u32,
+        scalar: f32,
+        muted: bool,
     ) {
-        // Nothing to notify yet: the Windows driver grows its volume topology
-        // node in M6-4. Deliberately a silent no-op rather than an error — the
-        // daemon relays a local slider move here, and there is no local slider
-        // on a device that has no volume node.
+        let guard = lk(&shared.rings.session);
+        let Some(s) = guard.as_ref() else { return };
+        if !s.has_volume() {
+            return;
+        }
+        if let Err(e) = s.notify(at.slot, generation, at.input, muted, scalar) {
+            dlog!(
+                "[audiohubd] hal: slot {} volume notify failed: {e:#}",
+                at.slot
+            );
+        }
     }
 
     #[cfg(windows)]

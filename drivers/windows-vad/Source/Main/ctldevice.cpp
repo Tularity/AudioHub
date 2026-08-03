@@ -42,6 +42,7 @@ Abstract:
 #include "endpoints.h"
 #include "perpeer.h"
 #include "ctldevice.h"
+#include "ahrings.h"
 #include <wdmsec.h>
 
 //
@@ -99,6 +100,22 @@ static BOOLEAN          g_SessionGreeted = FALSE;
 //
 static KSPIN_LOCK       g_PendLock;
 static PIRP             g_PendIrp       = NULL;
+
+//
+// Events waiting for an IRP to carry them. See AhCtlRaiseEvent in ctldevice.h
+// for why this queue exists at all.
+//
+// 16 is deep enough that overflow means the daemon has stopped draining, not
+// that the driver got busy: the daemon re-arms immediately on every completion
+// and additionally polls, while the only producers are pin state changes and
+// volume moves -- both human-scale.
+//
+#define AH_EVENTQ_DEPTH 16u
+
+static AH_CONTROL_EVENT g_EventQ[AH_EVENTQ_DEPTH];
+static ULONG            g_EventHead     = 0;    // next to hand out
+static ULONG            g_EventCount    = 0;
+static ULONG64          g_EventsDropped = 0;
 
 //
 // Caller-identity policy, loaded from the device software key at StartDevice.
@@ -412,6 +429,124 @@ AhCtlDrainPend(
     }
 }
 
+//-----------------------------------------------------------------------------
+// Driver -> daemon events
+//-----------------------------------------------------------------------------
+
+#pragma code_seg()
+VOID
+AhCtlRaiseEvent(
+    _In_ ULONG Kind,
+    _In_ ULONG Slot,
+    _In_ ULONG Generation,
+    _In_ ULONG Flags,
+    _In_ ULONG ScalarQ16,
+    _In_ ULONG State
+    )
+{
+    KIRQL irql;
+    PIRP  irp = NULL;
+    AH_CONTROL_EVENT ev;
+
+    RtlZeroMemory(&ev, sizeof(ev));
+    ev.kind       = Kind;
+    ev.slot       = Slot;
+    ev.generation = Generation;
+    ev.flags      = Flags;
+    ev.scalar_q16 = ScalarQ16;
+    ev.state      = State;
+
+    KeAcquireSpinLock(&g_PendLock, &irql);
+
+    //
+    // No session, no events. Queuing them for a daemon that is not there would
+    // mean the FIRST thing a newly connected daemon receives is a burst of
+    // history describing a machine state that has since changed.
+    //
+    if (g_SessionFile == NULL || !g_SessionGreeted)
+    {
+        KeReleaseSpinLock(&g_PendLock, irql);
+        return;
+    }
+
+    if (g_PendIrp != NULL)
+    {
+        //
+        // An IRP is parked: hand the event straight to it. Nothing is queued,
+        // so the common case allocates and copies exactly once.
+        //
+        if (IoSetCancelRoutine(g_PendIrp, NULL) != NULL)
+        {
+            irp = g_PendIrp;
+        }
+        //
+        // NULL means the cancel routine already owns the IRP and will complete
+        // it; touching it here would be a double completion. The event then
+        // falls through to the queue below, which is exactly what should happen
+        // -- the daemon is about to re-arm.
+        //
+        g_PendIrp = NULL;
+    }
+
+    if (irp != NULL)
+    {
+        KeReleaseSpinLock(&g_PendLock, irql);
+
+        *(AH_CONTROL_EVENT *)irp->AssociatedIrp.SystemBuffer = ev;
+        irp->IoStatus.Status      = STATUS_SUCCESS;
+        irp->IoStatus.Information = sizeof(AH_CONTROL_EVENT);
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        return;
+    }
+
+    if (g_EventCount == AH_EVENTQ_DEPTH)
+    {
+        //
+        // Drop the OLDEST. For a state report the newest is the truth, and a
+        // queue that refused new events would preserve a stale one forever.
+        // Counted, never silent.
+        //
+        g_EventHead = (g_EventHead + 1) % AH_EVENTQ_DEPTH;
+        g_EventCount--;
+        g_EventsDropped++;
+    }
+
+    g_EventQ[(g_EventHead + g_EventCount) % AH_EVENTQ_DEPTH] = ev;
+    g_EventCount++;
+
+    KeReleaseSpinLock(&g_PendLock, irql);
+}
+
+#pragma code_seg()
+VOID
+AhCtlRaiseIoState(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input,
+    _In_ BOOLEAN Running
+    )
+{
+    ULONG flags = 0;
+
+    if (Input)   { flags |= AH_EVFLAG_INPUT; }
+    if (Running) { flags |= AH_EVFLAG_RUNNING; }
+
+    //
+    // The generation is read HERE rather than passed in, so a stream that has
+    // been running across a re-bind cannot report the stamp it was created
+    // with. The daemon drops any event whose generation does not match the
+    // slot's current one, and a stale stamp would present as an event that is
+    // silently ignored -- indistinguishable from one that was never sent.
+    //
+    AhCtlRaiseEvent(AH_EVENT_IOSTATE, Slot, AhSlotGeneration(Slot), flags, 0, 0);
+}
+
+#pragma code_seg()
+ULONG64
+AhCtlEventsDropped(VOID)
+{
+    return g_EventsDropped;
+}
+
 #pragma code_seg()
 static NTSTATUS
 AhCtlQueuePend(
@@ -426,6 +561,25 @@ AhCtlQueuePend(
     {
         KeReleaseSpinLock(&g_PendLock, irql);
         return STATUS_DEVICE_BUSY;
+    }
+
+    //
+    // A queued event outranks parking: hand it over now. This is the half of
+    // the queue that makes it work -- without it, events accumulate and are
+    // only ever delivered when a LATER event happens to find an IRP parked.
+    //
+    if (g_EventCount > 0)
+    {
+        AH_CONTROL_EVENT ev = g_EventQ[g_EventHead];
+        g_EventHead = (g_EventHead + 1) % AH_EVENTQ_DEPTH;
+        g_EventCount--;
+        KeReleaseSpinLock(&g_PendLock, irql);
+
+        *(AH_CONTROL_EVENT *)Irp->AssociatedIrp.SystemBuffer = ev;
+        Irp->IoStatus.Status      = STATUS_SUCCESS;
+        Irp->IoStatus.Information = sizeof(AH_CONTROL_EVENT);
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_SUCCESS;
     }
 
     IoSetCancelRoutine(Irp, AhCtlCancelPend);
@@ -568,7 +722,34 @@ Routine Description:
     {
         g_SessionGreeted = FALSE;
         AhCtlDrainPend(STATUS_CANCELLED);
-        DPF(D_TERSE, ("[AhCtlCleanup] control session closed; bindings kept"));
+
+        //
+        // Drop whatever this session never collected. The next daemon must not
+        // open with a burst of history describing a machine state that has
+        // since changed -- and IOSTATE in particular would tell it that streams
+        // are running which stopped while nobody was listening.
+        //
+        {
+            KIRQL irql;
+            KeAcquireSpinLock(&g_PendLock, &irql);
+            g_EventHead  = 0;
+            g_EventCount = 0;
+            KeReleaseSpinLock(&g_PendLock, irql);
+        }
+
+        //
+        // THE ONE PLACE the ring mapping may be torn down. MmUnmapLockedPages
+        // must run in the context of the process that owns the mapping, and
+        // cleanup is the only dispatch routine guaranteed to run there.
+        //
+        // This is also why this protocol needs no equivalent of the macOS
+        // bridge's kAudioHubCtl_Superseded: closing the handle destroys the
+        // mapping deterministically, so a displaced daemon cannot go on
+        // draining the speaker ring behind the new one's back.
+        //
+        AhRingsUnmap(stack->FileObject);
+
+        DPF(D_TERSE, ("[AhCtlCleanup] control session closed; rings unmapped, bindings kept"));
     }
 
     return AhCompleteIrp(Irp, STATUS_SUCCESS, 0);
@@ -624,10 +805,18 @@ AhCtlDeviceControl(
         RtlZeroMemory(rep, sizeof(*rep));
         rep->protocol_version = AUDIOHUB_WIN_PROTOCOL_VERSION;
         rep->slot_count       = AUDIOHUB_WIN_MAX_SLOTS;
-        rep->caps             = 0;      // no data plane yet
-        rep->sample_rate      = 0;
-        rep->out_channels     = 0;
-        rep->in_channels      = 0;
+        //
+        // AH_CAP_VOLUME is asserted unconditionally because the volume node is
+        // a COMPILE-TIME property of the topology descriptors (KSNODETYPE_VOLUME
+        // at node 0 in both directions), not a runtime one. If it were ever
+        // removed this bit would have to go with it: the daemon reads it as
+        // "the audio engine did not insert a software volume APO ahead of us,
+        // so the samples in the rings are full scale".
+        //
+        rep->caps             = AH_CAP_DATAPLANE | AH_CAP_VOLUME;
+        rep->sample_rate      = AUDIOHUB_RING_SAMPLE_RATE;
+        rep->out_channels     = AUDIOHUB_SPK_CHANNELS;
+        rep->in_channels      = AUDIOHUB_MIC_CHANNELS;
         rep->client_check     = g_ClientCheck;
 
         if (req.protocol_version != AUDIOHUB_WIN_PROTOCOL_VERSION)
@@ -766,16 +955,137 @@ AhCtlDeviceControl(
         }
 
         //
-        // M6-2 has nothing to report: no volume node, no data plane. The IRP is
-        // parked and completed on cleanup. Defining the call now is what stops
-        // M6-3/M6-4 from having to bump the protocol version.
+        // Three outcomes, and only two of them leave the IRP to us:
+        //   STATUS_PENDING  -- parked, will be completed by AhCtlRaiseEvent
+        //   STATUS_SUCCESS  -- an event was already queued; AhCtlQueuePend has
+        //                      ALREADY completed the IRP with it, so this
+        //                      routine must not touch it again
+        //   anything else   -- refused, complete it here
         //
         NTSTATUS status = AhCtlQueuePend(Irp);
-        if (status == STATUS_PENDING)
+        if (status == STATUS_PENDING || status == STATUS_SUCCESS)
         {
-            return STATUS_PENDING;
+            return status;
         }
         return AhCompleteIrp(Irp, status, 0);
+    }
+
+    case IOCTL_AUDIOHUB_MAP_RINGS:
+    {
+        if (inLen != sizeof(AH_MAP_REQUEST) || outLen != sizeof(AH_MAP_REPLY) || buffer == NULL)
+        {
+            return AhCompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
+        }
+        if (!g_SessionGreeted)
+        {
+            return AhCompleteIrp(Irp, STATUS_INVALID_DEVICE_STATE, 0);
+        }
+
+        //
+        // Same METHOD_BUFFERED aliasing rule as BIND: the reply is written into
+        // the request's buffer, so the request has to be copied out first.
+        //
+        AH_MAP_REQUEST req = *(AH_MAP_REQUEST *)buffer;
+        AH_MAP_REPLY  *rep = (AH_MAP_REPLY *)buffer;
+
+        RtlZeroMemory(rep, sizeof(*rep));
+
+        if (req.session_id != g_SessionId)
+        {
+            rep->status = AH_STATUS_STALE_SESSION;
+            return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+        }
+        if (req.protocol_version != AUDIOHUB_WIN_PROTOCOL_VERSION)
+        {
+            rep->status = AH_STATUS_BAD_VERSION;
+            return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+        }
+
+        //
+        // The mapping is made into the CALLING process. This dispatch routine
+        // runs in the caller's context (a METHOD_BUFFERED device control from
+        // user mode always does), which is the requirement
+        // MmMapLockedPagesSpecifyCache(UserMode) imposes and the reason the
+        // data plane cannot be established anywhere else -- not from a work
+        // item, not from a DPC, not from DriverEntry.
+        //
+        NTSTATUS mapStatus = AhRingsMap(stack->FileObject, (HANDLE)(ULONG_PTR)req.wake_event, rep);
+        if (!NT_SUCCESS(mapStatus))
+        {
+            RtlZeroMemory(rep, sizeof(*rep));
+            rep->status = (mapStatus == STATUS_DEVICE_BUSY) ? AH_STATUS_CAPACITY
+                                                            : AH_STATUS_INTERNAL;
+            DPF(D_ERROR, ("[AhCtl] MAP_RINGS failed 0x%x", mapStatus));
+        }
+        return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+    }
+
+    case IOCTL_AUDIOHUB_NOTIFY:
+    {
+        if (inLen != sizeof(AH_NOTIFY_REQUEST) || outLen != sizeof(AH_NOTIFY_REPLY) || buffer == NULL)
+        {
+            return AhCompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
+        }
+        if (!g_SessionGreeted)
+        {
+            return AhCompleteIrp(Irp, STATUS_INVALID_DEVICE_STATE, 0);
+        }
+
+        AH_NOTIFY_REQUEST req = *(AH_NOTIFY_REQUEST *)buffer;
+        AH_NOTIFY_REPLY  *rep = (AH_NOTIFY_REPLY *)buffer;
+
+        RtlZeroMemory(rep, sizeof(*rep));
+
+        if (req.session_id != g_SessionId)
+        {
+            rep->status = AH_STATUS_STALE_SESSION;
+            return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+        }
+        if (req.slot >= AUDIOHUB_WIN_MAX_SLOTS)
+        {
+            rep->status = AH_STATUS_BAD_ARGUMENT;
+            return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+        }
+
+        //
+        // Generation filter. A notify that quotes a stamp the slot no longer
+        // carries belongs to that slot's PREVIOUS tenant, and applying it would
+        // move the CURRENT peer's slider to a level the user set for somebody
+        // else. Dropped silently but not invisibly: `applied` comes back 0.
+        //
+        ULONG gen = AhSlotGeneration(req.slot);
+        if (gen == 0 || (req.generation != 0 && req.generation != gen))
+        {
+            rep->status  = AH_STATUS_NOT_BOUND;
+            rep->applied = 0;
+            return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+        }
+
+        BOOLEAN input   = (req.flags & AH_NOTIFYFLAG_INPUT) ? TRUE : FALSE;
+        BOOLEAN muted   = (req.flags & AH_NOTIFYFLAG_MUTED) ? TRUE : FALSE;
+        LONG    level   = AhScalarQ16ToKsVolume(req.scalar_q16);
+        BOOLEAN changed = FALSE;
+
+        for (ULONG ch = 0; ch < AH_VOLUME_MAX_CHANNELS; ch++)
+        {
+            if (AhSlotVolumeSet(req.slot, input, ch, level)) { changed = TRUE; }
+            if (AhSlotMuteSet(req.slot, input, ch, muted))   { changed = TRUE; }
+        }
+
+        //
+        // The event is raised ONLY when something moved. That suppression is
+        // what stops the two ends ratcheting: without it every push from the
+        // daemon would raise an event, the daemon would read its own echo and
+        // push again, forever.
+        //
+        if (changed)
+        {
+            AhTopoRaiseVolumeEvent(req.slot, input);
+        }
+
+        rep->status  = AH_STATUS_OK;
+        rep->applied = changed ? 1u : 0u;
+        return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
     }
 
     default:

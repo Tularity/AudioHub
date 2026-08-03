@@ -31,7 +31,37 @@ class CMiniportTopologySimpleAudioSample
     PPORTEVENTS                 m_PortEvents;           // Event interface.
     USHORT                      m_DeviceMaxChannels;    // Max device channels.
 
+    //
+    // WHICH PEER'S ENDPOINT THIS IS. Decoded from the AH_EP_CONTEXT the
+    // miniport was created with; AUDIOHUB_WIN_MAX_SLOTS means "not one of
+    // ours", which falls back to the sample's adapter-wide storage.
+    //
+    // This exists because the sample's volume storage cannot work here.
+    // Upstream keeps levels in CSimpleAudioSample::m_VolumeControls[], one
+    // array for the whole ADAPTER indexed by the topology NODE id -- and every
+    // slot's volume node is node 0, and there is one adapter. Sixteen peers and
+    // two directions therefore shared a single cell: moving peer A's speaker
+    // slider moved peer B's, with nothing in any device list or log to say so.
+    //
+    ULONG                       m_AhSlot;
+    BOOLEAN                     m_AhInput;
+
   public:
+    //
+    // Called immediately after construction by whichever Create* function made
+    // this object, with the DeviceContext PortCls threaded down from
+    // InstallEndpointFilters. Separate from the constructor because the two
+    // topology classes have different constructors and only one of them was
+    // passing DeviceContext through at all.
+    //
+    VOID                        SetAhEndpointContext(_In_opt_ PVOID DeviceContext);
+
+    //
+    // KSPROPERTY_AUDIO_VOLUMELEVEL / _MUTE against this slot's own storage.
+    // Public because AhTopoRaiseVolumeEvent (a free function) is its partner.
+    //
+    NTSTATUS                    AhPropertyHandlerSlotVolume(_In_ PPCPROPERTY_REQUEST PropertyRequest);
+
     CMiniportTopologySimpleAudioSample(
         _In_        PCFILTER_DESCRIPTOR    *FilterDesc,
         _In_        USHORT                  DeviceMaxChannels

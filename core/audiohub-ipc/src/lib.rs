@@ -584,6 +584,25 @@ pub struct SessionStats {
     /// ——而下一个 tick 一定 underrun。**延迟分项用的是这个数。**
     #[serde(default)]
     pub jb_contiguous_frames: u32,
+
+    // 水位控制的现场读数。没有它们就没法把「深度低」和「收敛机制在跑」分开：
+    // 一条从来没进过高水位的链路和一条被平滑吐回来的链路，深度读数完全一样。
+    /// 平滑收敛（两帧交叉淡化拼成一帧）的次数。
+    #[serde(default)]
+    pub jb_accel_events: u64,
+    /// 平滑收敛累计吃掉的帧数（每次 1 帧）。**已计入 `jb_dropped`**——
+    /// 那个字段的语义「late + catch-up drops」没变，这里回答的是
+    /// 「其中有多少走了交叉淡化那条平滑路径」。
+    #[serde(default)]
+    pub jb_accel_frames: u64,
+    /// 想收敛但因为素材会抵消而推迟的 tick 数。持续增长 = 对端在送一段恰好
+    /// 反相的稳态纯音，收敛降到死线节律（5 s 一次）。
+    #[serde(default)]
+    pub jb_accel_deferred: u64,
+    /// 欠载惩罚项（帧）。`jb_target_frames` 里含它。**非零 = 这条链路让我们
+    /// 付过代价，水位是它自己长上去的**，不是整定拍出来的。
+    #[serde(default)]
+    pub jb_underrun_penalty_frames: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

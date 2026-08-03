@@ -1001,9 +1001,20 @@ impl DeviceClock {
 pub struct PlayServo {
     dll: Dll,
     enabled: bool,
-    /// 目标水位。基线 + 声卡周期一被观测到就抬到 `2·block + 1 tick`。
+    /// 目标水位。基线 + 声卡周期一被观测到就换成 `dac + block + margin`。
     target: f64,
-    base_target: f64,
+    /// 目标水位里那一份**可调**余量（设备率样本），见 [`PlayServo::MARGIN_MS`]。
+    margin: f64,
+    /// 欠载惩罚（设备率样本）。`dev_underruns` 一涨就 +`underrun_step`，
+    /// 上界 `underrun_cap`，无欠载时每 `decay_period` 次更新退 1 ms。
+    underrun_extra: f64,
+    underrun_step: f64,
+    underrun_cap: f64,
+    decay_period: u32,
+    /// 惩罚项的基准：上一次记账时的 `dev.underruns()`。
+    underrun_seen: u64,
+    /// 距离下一次衰减还剩多少次更新。
+    decay_left: u32,
     /// 喂进 DLL 之前把 err 钳到这个幅度（PipeWire `max_error`）。
     max_error: f64,
     /// 超过这个幅度不再靠弯速率，直接硬跳（PipeWire `max_resync`）。
@@ -1044,10 +1055,52 @@ impl PlayServo {
     /// 一秒的存量要 2000 秒才排得完。那种量级归 `max_resync` 的硬跳管。
     pub const MAX_PPM: f64 = 500.0;
 
-    /// 目标水位基线。播放环写侧是 10 ms 一块，读侧是一个声卡周期一块，
-    /// 目标必须同时盖住两者的相位差与调度抖动。构造后一旦观测到真实的声卡
-    /// 周期就抬到 `2·block + 480`（≈两个周期 + 一个 tick）。
+    /// **冷启动**目标水位：还没有过一次输出回调时用它，因为那时 `block_max`
+    /// 和 `dac_lag` 都还是 0，导出式无从算起。观测到第一次回调就换成导出式。
     const BASE_TARGET_MS: f64 = 30.0;
+
+    /// 目标水位里那一份余量，**5 ms**。可用 `AUDIOHUB_PLAY_TARGET_MARGIN_MS` 覆盖。
+    ///
+    /// # 目标水位为什么是 `dac + block + margin`
+    ///
+    /// 误差信号是 `downstream = ring − inflight + dac`，其中
+    /// `inflight` 是「距上次回调这段时间里声卡本该取走的量」。所以
+    /// `L = ring − inflight` 是把回调锯齿剔掉之后的**连续**环位，而
+    /// `downstream = L + dac`。
+    ///
+    /// 欠载的判据是「回调那一刻 `ring < block`」。回调那一刻已经过了整整一个
+    /// 周期，`inflight ≈ block`，于是 `ring ≈ L + block`：
+    ///
+    /// ```text
+    /// ring ≥ block  ⟺  L ≥ 0  ⟺  downstream ≥ dac
+    /// ```
+    ///
+    /// **`dac` 是结构性的、不可削的**（WASAPI/CoreAudio 的硬件缓冲，实测 480
+    /// 样本 = 10 ms）；`block` 是「一个回调整块的储备」，`margin` 是留给生产侧
+    /// （`mixer_loop`）调度迟到的那一点。三项各有物理含义，**不是一个拍出来的
+    /// 30 ms**。
+    ///
+    /// 改动前写的是 `2·block + 1 tick`：`block ≤ 480` 时它恒等于 1440 = 30 ms，
+    /// 且**完全没用到实测的 `dac`**（尽管误差信号里有它）。代入实测
+    /// （`block = 480`、`dac = 480`）新式给 1200 = **25 ms**，即环内谷值从
+    /// 11.4 ms 降到 6.4 ms —— 仍高于半个回调块。
+    ///
+    /// 5 ms 的来历：实测 61.7 s（≈6 170 次回调）零 `dev_underruns`，只给出
+    /// 「生产侧迟到 < 11.4 ms」这一个上界，**不足以支撑更激进的削减**。所以取
+    /// 半个 tick 作余量，并把「再往下」交给下面那条惩罚项去实测。
+    const MARGIN_MS: f64 = 5.0;
+    /// 一次 `dev_underruns` 增长把目标抬高多少。
+    const UNDERRUN_STEP_MS: f64 = 5.0;
+    /// 惩罚项上界。`25 + 10 = 35 ms`，略高于改动前的 30 ms —— 真是我们削过头，
+    /// 它会自己长到比改动前还稳的地方去。
+    const UNDERRUN_MAX_MS: f64 = 10.0;
+    /// 惩罚项的衰减节律：无欠载满这么多秒，退 1 ms。
+    ///
+    /// **必须衰减**：`servo_step` 里那句「只涨不落就是一个棘轮：一次异常的大
+    /// 回调会把目标永久抬高，而这正是本项目在治的病」对惩罚项同样成立。
+    /// 120 s/ms ⇒ 从上界退回 0 要 20 分钟，比任何一次瞬态都长得多。
+    const UNDERRUN_DECAY_S: f64 = 120.0;
+
     /// 目标水位上限：任何自动抬升都不许把延迟推过这条线。
     const MAX_TARGET_MS: f64 = 120.0;
     /// 喂 DLL 之前的误差钳位。
@@ -1058,14 +1111,51 @@ impl PlayServo {
     /// `_count == 4 * _ppsec` 切换点）。
     const CAPTURE_UPDATES: u32 = 400;
 
+    /// `AUDIOHUB_PLAY_*_MS` / `_S` 覆盖。进程内只读一次。
+    ///
+    /// | 变量 | 默认 |
+    /// |---|---|
+    /// | `AUDIOHUB_PLAY_TARGET_MARGIN_MS` | 5 |
+    /// | `AUDIOHUB_PLAY_TARGET_BASE_MS` | 30（冷启动） |
+    /// | `AUDIOHUB_PLAY_UNDERRUN_STEP_MS` | 5 |
+    /// | `AUDIOHUB_PLAY_UNDERRUN_MAX_MS` | 10 |
+    /// | `AUDIOHUB_PLAY_UNDERRUN_DECAY_S` | 120 |
+    fn tuning() -> [f64; 5] {
+        static CACHE: std::sync::OnceLock<[f64; 5]> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| {
+            let v = |key: &str, d: f64, lo: f64| {
+                std::env::var(key)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .filter(|x| x.is_finite())
+                    .unwrap_or(d)
+                    .max(lo)
+            };
+            [
+                v("AUDIOHUB_PLAY_TARGET_MARGIN_MS", Self::MARGIN_MS, 0.0),
+                v("AUDIOHUB_PLAY_TARGET_BASE_MS", Self::BASE_TARGET_MS, 1.0),
+                v("AUDIOHUB_PLAY_UNDERRUN_STEP_MS", Self::UNDERRUN_STEP_MS, 0.0),
+                v("AUDIOHUB_PLAY_UNDERRUN_MAX_MS", Self::UNDERRUN_MAX_MS, 0.0),
+                v("AUDIOHUB_PLAY_UNDERRUN_DECAY_S", Self::UNDERRUN_DECAY_S, 1.0),
+            ]
+        })
+    }
+
     fn new(dev_rate: u32, enabled: bool) -> PlayServo {
         let ms = |v: f64| v * dev_rate as f64 / 1000.0;
         let period = (dev_rate / 100).max(1); // 10 ms 的 mixer tick
+        let [margin_ms, base_ms, step_ms, cap_ms, _decay_s] = Self::tuning();
         PlayServo {
             dll: Dll::new(Dll::BW_MAX, period, dev_rate),
             enabled,
-            target: ms(Self::BASE_TARGET_MS),
-            base_target: ms(Self::BASE_TARGET_MS),
+            target: ms(base_ms),
+            margin: ms(margin_ms),
+            underrun_extra: 0.0,
+            underrun_step: ms(step_ms),
+            underrun_cap: ms(cap_ms),
+            decay_period: Self::decay_updates(),
+            underrun_seen: 0,
+            decay_left: Self::decay_updates(),
             max_error: ms(Self::MAX_ERROR_MS),
             max_resync: ms(Self::MAX_RESYNC_MS),
             resyncing_deep: false,
@@ -1075,6 +1165,11 @@ impl PlayServo {
             last_err: 0.0,
             error_sign: 1.0,
         }
+    }
+
+    /// 衰减节律换算成更新次数（环路每 10 ms 更新一次）。
+    fn decay_updates() -> u32 {
+        (Self::tuning()[4] * 100.0).round().max(1.0) as u32
     }
 
     /// 浅端硬跳的触发线 = `max(target − max_resync, target/2)`。
@@ -1481,15 +1576,44 @@ impl AudioTx {
     /// 守这条的是 `flipping_the_error_sign_turns_the_servo_into_a_divergence_engine`。
     fn servo_step(&mut self, n_in: usize, now: Instant) -> ServoAction {
         let rate = self.dev_rate as f64;
-        // ---- 目标水位：一观测到真实的声卡周期就抬到 2·block + 1 tick ----
+        let dac = self.dev.dac_lag_samples(self.dev_rate);
+        // ---- 欠载惩罚：目标定低了会自己长回来（自动回退）----
+        //
+        // `play_ring` 是全链路里**唯一**「我们主动定低就会立刻可闻」的一级：
+        // `hal_spk` 定低会被 `MaxDrawdown` 自愈，抖动缓冲定低只是欠载率线性
+        // 上升，而这里定低是**每个回调都在赌** —— 取不满就补静音，听感是断续。
+        // 所以削它必须配一条自动回退，而不是靠事后有人去读计数器。
+        //
+        // 捕获期（开流后 ≈4 s、每次硬跳之后重新计时）**不记账**：那时环是空的，
+        // 欠载是冷启动的结构性产物（progress.md 2026-08-03 已确证根因是冷启动
+        // 空环而非排空过头），把它算成「目标定低了」会让目标一开机就被顶满。
+        let seen = self.dev.underruns();
+        if self.servo.capture_left > 0 {
+            self.servo.underrun_seen = seen;
+        } else if seen > self.servo.underrun_seen {
+            self.servo.underrun_seen = seen;
+            self.servo.underrun_extra =
+                (self.servo.underrun_extra + self.servo.underrun_step).min(self.servo.underrun_cap);
+            self.servo.decay_left = self.servo.decay_period;
+        } else {
+            self.servo.decay_left = self.servo.decay_left.saturating_sub(1);
+            if self.servo.decay_left == 0 {
+                self.servo.decay_left = self.servo.decay_period;
+                self.servo.underrun_extra = (self.servo.underrun_extra - rate / 1000.0).max(0.0);
+            }
+        }
+        // ---- 目标水位：由**实测**的 dac / block 导出，见 `PlayServo::MARGIN_MS` ----
         // 每 tick 重算，**上下都跟**——不写成「只涨不落」。只涨不落就是一个
         // 棘轮：一次异常的大回调会把目标永久抬高，而这正是本项目在治的病。
         // 目标降下来时多出的那点水位由细调正常吐掉（几毫秒，几秒内完事）。
         let block = self.dev.block_max();
         if block > 0 {
-            let want = (2 * block) as f64 + rate * 0.01;
+            // `dac + block` 是**结构下限**（谷值恰好为 0，每个回调刚好取满）；
+            // `margin` 是生产侧调度迟到的余量；`underrun_extra` 是实测回退。
+            let floor = dac + block as f64;
+            let want = floor + self.servo.margin + self.servo.underrun_extra;
             let cap = PlayServo::MAX_TARGET_MS * rate / 1000.0;
-            self.servo.target = want.max(self.servo.base_target).min(cap);
+            self.servo.target = want.max(floor).min(cap);
         }
         // ---- 环路带宽跟着真实块长走（`w0`/`w2` 要的是真的更新间隔）----
         let n_out = (n_in as f64 * rate / self.src_rate as f64).round().max(1.0) as u32;
@@ -1500,7 +1624,6 @@ impl AudioTx {
         }
         // ---- 误差信号 ----
         let ring = self.prod.occupied_len() as f64;
-        let dac = self.dev.dac_lag_samples(self.dev_rate);
         let inflight = match self.dev.since_last_callback(now) {
             // 回调停摆（设备刚开、被拔掉、或者线程饿死）：读数不可信，
             // 宁可不动也不要拿一个错的量去积分。
@@ -1702,6 +1825,30 @@ impl AudioTx {
     #[doc(hidden)]
     pub fn servo_corr_ppm(&self) -> f64 {
         (self.servo.corr - 1.0) * 1e6
+    }
+
+    /// **只给测试**：把欠载回退的三个整定量换成能在虚拟时间里跑完的值。
+    /// 生产值（5 ms / 10 ms / 120 s）意味着一次完整衰减要 20 分钟虚拟时间。
+    #[doc(hidden)]
+    pub fn set_underrun_rollback_for_test(&mut self, step_ms: f64, cap_ms: f64, decay_updates: u32) {
+        let ms = self.dev_rate as f64 / 1000.0;
+        self.servo.underrun_step = step_ms * ms;
+        self.servo.underrun_cap = cap_ms * ms;
+        self.servo.decay_period = decay_updates.max(1);
+        self.servo.decay_left = self.servo.decay_period;
+    }
+
+    /// **只给测试**：当前的欠载回退量（设备率样本）。
+    #[doc(hidden)]
+    pub fn servo_underrun_extra(&self) -> f64 {
+        self.servo.underrun_extra
+    }
+
+    /// **只给测试**：本环自己的声卡短读次数。进程级那份是「最后写者赢」，
+    /// 并行跑的兄弟测试会把它覆盖掉。
+    #[doc(hidden)]
+    pub fn dev_underruns(&self) -> u64 {
+        self.dev.underruns()
     }
 
     /// 当前目标水位（设备率样本）。
@@ -3655,9 +3802,23 @@ mod rate_servo {
 
     // ============================================================== 声卡缓冲项
 
-    /// `outputBufferDacTime` 是执行器下游的一级，必须计入误差——不计入的话
-    /// 稳态水位会恰好高出这一项，也就是 Snapcast `stream.cpp:305` 那条先例
-    /// 在防的事。
+    /// `outputBufferDacTime` 是执行器下游的一级，必须计入**误差**（Snapcast
+    /// `stream.cpp:305` 那条先例），但**不许从环的储备里扣**。
+    ///
+    /// # 这两件事以前是混在一起的
+    ///
+    /// 旧目标式 `2·block + 1 tick` 完全不含 `dac`，而误差信号含。净效果是
+    /// 「下游总量守恒」：声卡硬件缓冲越大，**环里就越浅**。听起来像省延迟，
+    /// 其实是拿欠载去换——欠载的判据是「回调那一刻 `ring < block`」，
+    /// 而 `dac` 在环的**下游**，一个样本都帮不上忙。
+    /// 极端一点就穿帮：`dac = 30 ms` 的设备上旧式会把环推到
+    /// `2·512 + 480 − 1440 = 64` 样本，每个回调都短读。
+    /// （下面 `a_large_hardware_buffer_must_not_starve_the_ring` 就是这条注入。）
+    ///
+    /// 新目标式 `dac + block + margin` 把两件事分开：`dac` 仍在误差里（环路控
+    /// 的仍是下游总量），但设定点同额补偿，于是**环的储备恒为 `block + margin`**，
+    /// 与硬件缓冲多大无关。总延迟因此确实随硬件缓冲增加——那是物理，不是我们
+    /// 能省掉的东西。
     #[test]
     fn the_dac_buffer_counts_as_downstream_buffering() {
         let mut with_lag = Sim::new(0.0, true);
@@ -3665,15 +3826,135 @@ mod rate_servo {
         with_lag.run(10);
         let mut without = Sim::new(0.0, true);
         without.run(10);
-        // 环路控的是「下游总量」，两边都该落在同一个目标上……
-        let d = (without.downstream_ms - with_lag.downstream_ms).abs();
-        assert!(d < 3.0, "下游总量必须同样收敛到目标，实测差 {d:.1} ms");
-        // ……而声卡里压着的那 10 ms 就实实在在从环里让出来了。
-        // 不把它算进误差的话，这 10 ms 会白白叠在总延迟上。
+        // `dac` 在误差信号里：两边各自收敛到**各自的**目标，而两个目标差 10 ms。
+        let dt = (with_lag.tx.servo_target() as f64 - without.tx.servo_target() as f64) / 48.0;
+        assert!(
+            (dt - 10.0).abs() < 0.5,
+            "目标必须为硬件缓冲同额补偿，实测差 {dt:.1} ms"
+        );
+        for s in [&with_lag, &without] {
+            let err = (s.downstream_ms - s.tx.servo_target() as f64 / 48.0).abs();
+            assert!(err < 3.0, "下游总量必须收敛到各自的目标，实测差 {err:.1} ms");
+        }
+        // 环的**储备**两边一样 —— 硬件缓冲不许从这里扣。
         let ring = (without.queued() as f64 - with_lag.queued() as f64) / 48.0;
         assert!(
-            (ring - 10.0).abs() < 3.0,
-            "声卡里压着 10 ms ⇒ 环里就该少 10 ms（总量守恒），实测差 {ring:.1} ms"
+            ring.abs() < 3.0,
+            "环的储备被硬件缓冲扣走了 {ring:.1} ms —— 那是拿欠载换延迟"
+        );
+    }
+
+    /// **自动回退：目标定低了会自己长回来，且不是棘轮。**
+    ///
+    /// `play_ring` 是全链路里唯一「我们主动定低就会立刻可闻」的一级
+    /// （`hal_spk` 定低会被 `MaxDrawdown` 自愈，抖动缓冲定低只是欠载率线性
+    /// 上升，而这里定低是每个回调都在赌）。所以本轮把它从 30 ms 削到
+    /// `dac + block + 5 ms` 的前提，就是这条回退**真的在跑**。
+    ///
+    /// 造法：稳态之后让写侧停摆若干毫秒，声卡照常取 —— 环见底、短读、
+    /// `dev_underruns` 涨。断言目标随之抬高、抬到上界为止、无欠载时又退回去。
+    #[test]
+    fn a_device_underrun_rolls_the_target_back_up_and_the_penalty_decays() {
+        let mut s = Sim::new(0.0, true);
+        // 生产整定（5/10/120 s）在虚拟时间里要跑 20 分钟才衰减完；
+        // 换成同结构的短整定，走的仍是同一条生产代码路径。
+        s.tx.set_underrun_rollback_for_test(5.0, 10.0, 200);
+        s.run(1); // 1 分钟，远过捕获期（4 s）
+        let base = s.tx.servo_target();
+        assert_eq!(s.tx.servo_underrun_extra(), 0.0, "干净跑完一分钟不该有惩罚");
+
+        // 三次写侧停摆，每次之间留 5 s 让捕获期过去（捕获期内按设计不记账：
+        // 那时的欠载是冷启动/重同步的结构性产物，不是「目标定低了」）。
+        for _ in 0..3 {
+            let end = s.now_ns + 60_000_000; // 60 ms 不写，只放声卡
+            s.run_device_until(end);
+            for _ in 0..600 {
+                s.tick(); // 6 s
+            }
+        }
+        let raised = s.tx.servo_target();
+        assert!(
+            raised >= base + 10 * 48,
+            "欠载没有把目标抬起来：{base} -> {raised} 样本"
+        );
+        assert!(
+            s.tx.servo_underrun_extra() <= 10.0 * 48.0 + 1.0,
+            "惩罚项越界：{} 样本（上界 10 ms）",
+            s.tx.servo_underrun_extra()
+        );
+
+        // 无欠载 ⇒ 每 200 次更新退 1 ms，最终**退回 0** —— 只涨不落就是棘轮，
+        // 而那正是本项目在治的病（见 `servo_step` 里目标水位那段注释）。
+        for _ in 0..4_000 {
+            s.tick();
+        }
+        assert_eq!(s.tx.servo_underrun_extra(), 0.0, "惩罚项不退 ⇒ 棘轮");
+        assert_eq!(s.tx.servo_target(), base, "退干净之后该回到导出值");
+    }
+
+    /// **注入：把回退关掉，同一段停摆就只剩欠载，目标纹丝不动。**
+    ///
+    /// 没有这一条，上面那条测试在「回退根本没接上、目标是被别的东西抬起来的」
+    /// 情况下也可能碰巧通过。
+    #[test]
+    fn without_the_rollback_the_same_stall_leaves_the_target_where_it_was() {
+        let mut s = Sim::new(0.0, true);
+        s.tx.set_underrun_rollback_for_test(0.0, 0.0, 200); // step = 0 ⇒ 等于关掉
+        s.run(1);
+        let base = s.tx.servo_target();
+        let u0 = s.tx.dev_underruns();
+        for _ in 0..3 {
+            let end = s.now_ns + 60_000_000;
+            s.run_device_until(end);
+            for _ in 0..600 {
+                s.tick();
+            }
+        }
+        assert!(
+            s.tx.dev_underruns() > u0,
+            "这段停摆本该造成欠载，否则上面那条测试测的是空气"
+        );
+        assert_eq!(
+            s.tx.servo_target(),
+            base,
+            "关掉回退之后目标居然还是动了 —— 说明抬高目标的不是这条回路"
+        );
+    }
+
+    /// **注入：把硬件缓冲放大到旧目标式会把环饿死的地步。**
+    ///
+    /// `dac = 30 ms` ⇒ 旧式 `2·512 + 480 = 1504` 样本的下游目标里，光 `dac`
+    /// 就占了 1440，留给环的只剩 64 个样本 —— 每个 512 帧的回调都短读。
+    /// 新式给 `1440 + 512 + 240 = 2192`，环里恒有 `512 + 240` 样本。
+    ///
+    /// 这一条同时是「削 `play_ring` 削过头会怎样」的直观演示：谷值一旦低于一个
+    /// 回调块，`dev_underruns` 立刻开始涨。
+    #[test]
+    fn a_large_hardware_buffer_must_not_starve_the_ring() {
+        let mut s = Sim::new(0.0, true);
+        s.dac_lag = Some(Duration::from_millis(30));
+        s.run(10);
+        let dac = 30.0 * 48.0;
+        assert!(
+            s.tx.servo_target() as f64 >= dac + CB as f64,
+            "目标 {} 低于结构下限 dac+block = {:.0} —— 环必然短读",
+            s.tx.servo_target(),
+            dac + CB as f64
+        );
+        assert!(
+            s.queued() as f64 >= CB as f64,
+            "环里只剩 {} 个样本（< 一个 {CB} 帧的回调）",
+            s.queued()
+        );
+        // ★ 判据的**承重**那一半：目标式必须**直接**给出正确水位，
+        //   而不是靠欠载回退事后补救。旧式（`2·block + 1 tick`，不含 dac）在这里
+        //   会先把环饿死、再由回退一步步把目标抬回来 —— 用户听到的是那段爬升期
+        //   的断续。回退是安全网，不是设计。
+        assert_eq!(
+            s.tx.servo_underrun_extra(),
+            0.0,
+            "目标式没算对结构下限：回退了 {} 个样本才把水位补上来",
+            s.tx.servo_underrun_extra()
         );
     }
 
@@ -3703,8 +3984,8 @@ mod rate_servo {
         let settled = s.tx.servo_target();
         assert_eq!(
             settled,
-            2 * CB as u32 + 480,
-            "异常值必须老化掉，目标该回到 512 帧那一档（≈31 ms），实测 {:.0} ms",
+            CB as u32 + 240,
+            "异常值必须老化掉，目标该回到 `block + margin` 那一档（≈15.7 ms），实测 {:.0} ms",
             settled as f64 / 48.0
         );
 
@@ -3729,16 +4010,19 @@ mod rate_servo {
         );
     }
 
-    /// 目标水位由声卡周期决定：512 帧的设备与 1024 帧的设备该拿到不同的目标，
-    /// 而不是一个写死的常数。
+    /// 目标水位由**实测量**导出：`dac + block + margin`，三项各有物理含义。
+    /// 512 帧的设备与 1024 帧的设备该拿到不同的目标，而不是一个写死的常数。
+    ///
+    /// 改动前是 `2·block + 1 tick`，`block ≤ 480` 时它恒等于 1440 = 30 ms，
+    /// 也就是说在实测设备上「公式没起作用，生效的是 30 ms 这个基线」。
     #[test]
-    fn the_target_is_two_device_periods_plus_a_tick() {
+    fn the_target_is_the_hardware_buffer_plus_one_block_plus_the_margin() {
         let mut s = Sim::new(0.0, true);
         for _ in 0..50 {
             s.tick();
         }
-        // CB=512 ⇒ 2·512 + 480 = 1504 样本 = 31.3 ms。
-        assert_eq!(s.tx.servo_target(), 2 * CB as u32 + 480);
+        // dac = 0（这个 Sim 没给），CB = 512，margin = 5 ms = 240 样本。
+        assert_eq!(s.tx.servo_target(), CB as u32 + 240);
     }
 
     // ============================================================== 重采样核

@@ -18,10 +18,31 @@ Abstract:-
 //
 // Mic array range.
 //
+//
+// 48 kHz, 32-bit IEEE FLOAT, 2 channels. See the note in speakerwavtable.h for
+// why float and not PCM: the ring<->WaveRT copy runs in a DPC and must not
+// convert.
+//
+// The CHANNEL COUNT stays at 2 even though the microphone ring is MONO
+// (AUDIOHUB_MIC_CHANNELS == 1, matching macOS). The mono sample is splatted to
+// both channels in the DPC, which is an integer copy of 4-byte units and so
+// still touches no FPU. Publishing a 1-channel endpoint instead would have
+// been tidier here and would have meant changing the mic-array GEOMETRY
+// descriptor, a property Windows reads and validates -- a bigger change, in a
+// direction (capture) that is not on the M6-3 critical path.
+//
 #define MICARRAY_RAW_CHANNELS                   2       // Channels for raw mode
 #define MICARRAY_DEVICE_MAX_CHANNELS            2       // Max channels overall
-#define MICARRAY_32_BITS_PER_SAMPLE_PCM         32      // 32 Bits Per Sample
+#define MICARRAY_32_BITS_PER_SAMPLE_PCM         32      // 32 Bits Per Sample (float)
 #define MICARRAY_RAW_SAMPLE_RATE                48000   // Raw sample rate
+
+#define MICARRAY_BLOCK_ALIGN \
+    (MICARRAY_RAW_CHANNELS * (MICARRAY_32_BITS_PER_SAMPLE_PCM / 8))
+#define MICARRAY_AVG_BYTES_PER_SEC \
+    (MICARRAY_RAW_SAMPLE_RATE * MICARRAY_BLOCK_ALIGN)
+
+C_ASSERT(MICARRAY_BLOCK_ALIGN == 8);
+C_ASSERT(MICARRAY_AVG_BYTES_PER_SEC == 384000);
 
 //
 // Max # of pin instances.
@@ -32,7 +53,7 @@ Abstract:-
 static
 KSDATAFORMAT_WAVEFORMATEXTENSIBLE MicArrayPinSupportedDeviceFormats[] =
 {
-    // 48 KHz 32-bit 2 channels
+    // 48 KHz 32-bit PCM, 2 channels
     {
         {
             sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
@@ -46,14 +67,14 @@ KSDATAFORMAT_WAVEFORMATEXTENSIBLE MicArrayPinSupportedDeviceFormats[] =
         {
             {
                 WAVE_FORMAT_EXTENSIBLE,
-                2,
-                48000,
-                384000,
-                8,
-                32,
+                MICARRAY_RAW_CHANNELS,
+                MICARRAY_RAW_SAMPLE_RATE,
+                MICARRAY_AVG_BYTES_PER_SEC,
+                MICARRAY_BLOCK_ALIGN,
+                MICARRAY_32_BITS_PER_SAMPLE_PCM,
                 sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
             },
-            32,
+            MICARRAY_32_BITS_PER_SAMPLE_PCM,
             KSAUDIO_SPEAKER_STEREO,
             STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
         }

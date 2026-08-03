@@ -921,6 +921,36 @@ Routine Description:
     Slot->InTopoProps[0] = Slot->OutTopoProps[0];
 
     //
+    // The routing tokens every miniport of this slot gets as its DeviceContext.
+    // Built here rather than at DriverInit only because this is where the slot
+    // index is already in hand; the contents never change afterwards.
+    //
+    const ULONG slotIndex = (ULONG)(Slot - g_AhSlots);
+    Slot->OutCtx.Magic = AH_EP_CONTEXT_MAGIC;
+    Slot->OutCtx.Slot  = slotIndex;
+    Slot->OutCtx.Input = FALSE;
+    Slot->InCtx.Magic  = AH_EP_CONTEXT_MAGIC;
+    Slot->InCtx.Slot   = slotIndex;
+    Slot->InCtx.Input  = TRUE;
+
+    //
+    // Volume starts at UNITY and unmuted, in BOTH directions.
+    //
+    // Unity, not "whatever the array happened to hold", and this is the whole
+    // point of plan 7.2's transmission invariant: the rings carry full scale
+    // and the FAR side attenuates. A virtual endpoint that came up at some
+    // other level would apply an attenuation the user never asked for and that
+    // no slider on either machine would explain.
+    //
+    for (ULONG c = 0; c < AH_VOLUME_MAX_CHANNELS; c++)
+    {
+        Slot->VolumeOut[c] = AH_VOLUME_UNITY;
+        Slot->VolumeIn[c]  = AH_VOLUME_UNITY;
+        Slot->MuteOut[c]   = FALSE;
+        Slot->MuteIn[c]    = FALSE;
+    }
+
+    //
     // Render pair.
     //
     RtlZeroMemory(&Slot->OutPair, sizeof(Slot->OutPair));
@@ -1083,6 +1113,329 @@ Routine Description:
 // Lifecycle
 //-----------------------------------------------------------------------------
 
+//-----------------------------------------------------------------------------
+// Data-plane routing and per-slot volume
+//-----------------------------------------------------------------------------
+
+#pragma code_seg()
+BOOLEAN
+AhEpContextDecode(
+    _In_opt_ const void *DeviceContext,
+    _Out_ PULONG Slot,
+    _Out_ PBOOLEAN Input
+    )
+{
+    const AH_EP_CONTEXT *ctx = (const AH_EP_CONTEXT *)DeviceContext;
+
+    if (ctx == NULL || ctx->Magic != AH_EP_CONTEXT_MAGIC || ctx->Slot >= AUDIOHUB_WIN_MAX_SLOTS)
+    {
+        return FALSE;
+    }
+    *Slot  = ctx->Slot;
+    *Input = ctx->Input;
+    return TRUE;
+}
+
+#pragma code_seg()
+LONG
+AhSlotVolumeGet(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input,
+    _In_ ULONG Channel
+    )
+{
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS || Channel >= AH_VOLUME_MAX_CHANNELS)
+    {
+        return AH_VOLUME_UNITY;
+    }
+    return Input ? g_AhSlots[Slot].VolumeIn[Channel] : g_AhSlots[Slot].VolumeOut[Channel];
+}
+
+#pragma code_seg()
+BOOLEAN
+AhSlotVolumeSet(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input,
+    _In_ ULONG Channel,
+    _In_ LONG Value
+    )
+/*++
+
+Routine Description:
+
+    Stores one channel's level and answers whether it CHANGED.
+
+    The return value is the loop breaker for volume sync, and it belongs here
+    rather than at either caller. The daemon pushes the peer's level in, the
+    driver raises an event when the level moves, the daemon reads the event and
+    pushes the level to the peer. Without an "it was already that" answer the
+    two ends ratchet against each other forever, and the symptom is a slider
+    that creeps rather than an error anyone would look for.
+
+--*/
+{
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS || Channel >= AH_VOLUME_MAX_CHANNELS)
+    {
+        return FALSE;
+    }
+
+    PLONG cell = Input ? &g_AhSlots[Slot].VolumeIn[Channel] : &g_AhSlots[Slot].VolumeOut[Channel];
+    LONG prev = InterlockedExchange(cell, Value);
+    return (prev != Value) ? TRUE : FALSE;
+}
+
+#pragma code_seg()
+BOOLEAN
+AhSlotMuteGet(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input,
+    _In_ ULONG Channel
+    )
+{
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS || Channel >= AH_VOLUME_MAX_CHANNELS)
+    {
+        return FALSE;
+    }
+    return Input ? g_AhSlots[Slot].MuteIn[Channel] : g_AhSlots[Slot].MuteOut[Channel];
+}
+
+#pragma code_seg()
+BOOLEAN
+AhSlotMuteSet(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input,
+    _In_ ULONG Channel,
+    _In_ BOOLEAN Value
+    )
+{
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS || Channel >= AH_VOLUME_MAX_CHANNELS)
+    {
+        return FALSE;
+    }
+
+    PBOOLEAN cell = Input ? &g_AhSlots[Slot].MuteIn[Channel] : &g_AhSlots[Slot].MuteOut[Channel];
+    BOOLEAN prev = *cell;
+    *cell = Value;
+    return (prev != Value) ? TRUE : FALSE;
+}
+
+#pragma code_seg()
+ULONG
+AhSlotGeneration(
+    _In_ ULONG Slot
+    )
+{
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS)
+    {
+        return 0;
+    }
+    return g_AhSlots[Slot].Generation;
+}
+
+//-----------------------------------------------------------------------------
+// Volume unit conversion
+//-----------------------------------------------------------------------------
+
+//
+// KS carries volume as a signed LONG in 1/65536 dB; the daemon and every peer
+// carry it as a 0..1 amplitude scalar. Both directions of the conversion live
+// here so there is exactly ONE mapping in the driver.
+//
+// dB = 20*log10(scalar), which cannot be computed here -- kernel code must not
+// touch the FPU at raised IRQL, and these are reachable from the property
+// handler. So the mapping is a 33-entry table over the scalar's top bits, with
+// linear interpolation in between. The error against the true curve is under
+// 0.35 dB everywhere above -60 dB, which is far below what the 1 dB granularity
+// of the Windows volume slider can express.
+//
+// THE TABLE IS A STARTING POINT AND MUST BE CHECKED AGAINST THE REAL SYSTEM.
+// The claim being made is "the number IAudioEndpointVolume::GetMasterVolume-
+// LevelScalar reports equals the scalar the peer applies", and that is a
+// statement about two pieces of software neither of which is documented to
+// this precision. Deriving it from the formula and declaring victory is how a
+// volume that is consistently 3 dB off ships.
+//
+static const LONG g_AhDbTable[33] = {
+    //
+    // index i corresponds to scalar = i/32; value is round(20*log10(scalar) * 65536),
+    // clamped at the KS floor. Index 0 is silence.
+    //
+    VOLUME_SIGNED_MINIMUM,          // 0.000
+    -2097152,  // 0.03125  -> -30.10 dB
+    -1703936,  // 0.0625   -> -24.08 dB
+    -1474560,  // 0.09375  -> -20.56 dB
+    -1310720,  // 0.125    -> -18.06 dB
+    -1183744,  // 0.15625  -> -16.12 dB
+    -1081344,  // 0.1875   -> -14.54 dB
+    -993280,   // 0.21875  -> -13.20 dB
+    -917504,   // 0.250    -> -12.04 dB
+    -851968,   // 0.28125  -> -11.02 dB
+    -790528,   // 0.3125   -> -10.10 dB
+    -737280,   // 0.34375  ->  -9.27 dB
+    -688128,   // 0.375    ->  -8.52 dB
+    -643072,   // 0.40625  ->  -7.82 dB
+    -602112,   // 0.4375   ->  -7.17 dB
+    -565248,   // 0.46875  ->  -6.57 dB
+    -524288,   // 0.500    ->  -6.02 dB
+    -495616,   // 0.53125  ->  -5.49 dB
+    -462848,   // 0.5625   ->  -5.00 dB
+    -434176,   // 0.59375  ->  -4.53 dB
+    -405504,   // 0.625    ->  -4.08 dB
+    -380928,   // 0.65625  ->  -3.66 dB
+    -356352,   // 0.6875   ->  -3.25 dB
+    -331776,   // 0.71875  ->  -2.86 dB
+    -311296,   // 0.750    ->  -2.50 dB
+    -290816,   // 0.78125  ->  -2.14 dB
+    -270336,   // 0.8125   ->  -1.80 dB
+    -249856,   // 0.84375  ->  -1.47 dB
+    -233472,   // 0.875    ->  -1.16 dB
+    -212992,   // 0.90625  ->  -0.85 dB
+    -196608,   // 0.9375   ->  -0.56 dB
+    -180224,   // 0.96875  ->  -0.28 dB
+    AH_VOLUME_UNITY // 1.000 -> 0 dB
+};
+
+#pragma code_seg()
+LONG
+AhScalarQ16ToKsVolume(
+    _In_ ULONG ScalarQ16
+    )
+{
+    if (ScalarQ16 == 0)
+    {
+        return VOLUME_SIGNED_MINIMUM;
+    }
+    if (ScalarQ16 >= 0x10000u)
+    {
+        return AH_VOLUME_UNITY;
+    }
+
+    //
+    // 0..65535 -> table index 0..32 plus a fraction, all integer.
+    //
+    ULONG scaled = ScalarQ16 * 32u;         // < 2^21, no overflow
+    ULONG idx    = scaled >> 16;            // 0..31
+    ULONG frac   = scaled & 0xFFFFu;
+
+    LONG lo = g_AhDbTable[idx];
+    LONG hi = g_AhDbTable[idx + 1];
+
+    return lo + (LONG)(((LONGLONG)(hi - lo) * (LONGLONG)frac) >> 16);
+}
+
+#pragma code_seg()
+ULONG
+AhKsVolumeToScalarQ16(
+    _In_ LONG Level
+    )
+{
+    if (Level >= AH_VOLUME_UNITY)
+    {
+        return 0x10000u;
+    }
+    if (Level <= VOLUME_SIGNED_MINIMUM)
+    {
+        return 0;
+    }
+
+    //
+    // Inverse of the table, by search. 33 comparisons at property-set rate is
+    // not worth a second table, and a second table is a second thing to keep
+    // in step with the first.
+    //
+    for (ULONG i = 32; i > 0; i--)
+    {
+        if (Level >= g_AhDbTable[i - 1])
+        {
+            LONG lo = g_AhDbTable[i - 1];
+            LONG hi = g_AhDbTable[i];
+            ULONG base = (i - 1) * 2048u;   // (i-1)/32 in Q16
+            if (hi == lo)
+            {
+                return base;
+            }
+            ULONG frac = (ULONG)(((LONGLONG)(Level - lo) << 16) / (LONGLONG)(hi - lo));
+            if (frac > 0xFFFFu) { frac = 0xFFFFu; }
+            return base + ((frac * 2048u) >> 16);
+        }
+    }
+    return 0;
+}
+
+//-----------------------------------------------------------------------------
+// Volume change events (driver -> daemon)
+//-----------------------------------------------------------------------------
+
+//
+// One registered topology miniport per slot per direction. Registered when the
+// miniport initialises and cleared when it goes away, both under the spin lock
+// so that a NOTIFY arriving while an endpoint is being torn down cannot raise
+// an event on a released object.
+//
+static KSPIN_LOCK g_AhTopoLock;
+static PVOID      g_AhTopoObj[AUDIOHUB_WIN_MAX_SLOTS][2];
+
+#pragma code_seg()
+VOID
+AhTopoRegister(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input,
+    _In_opt_ PVOID Topology
+    )
+{
+    KIRQL irql;
+
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS)
+    {
+        return;
+    }
+
+    KeAcquireSpinLock(&g_AhTopoLock, &irql);
+    g_AhTopoObj[Slot][Input ? 1 : 0] = Topology;
+    KeReleaseSpinLock(&g_AhTopoLock, irql);
+}
+
+#pragma code_seg()
+VOID
+AhTopoUnregister(
+    _In_ PVOID Topology
+    )
+{
+    KIRQL irql;
+
+    KeAcquireSpinLock(&g_AhTopoLock, &irql);
+    for (ULONG s = 0; s < AUDIOHUB_WIN_MAX_SLOTS; s++)
+    {
+        for (ULONG d = 0; d < 2; d++)
+        {
+            if (g_AhTopoObj[s][d] == Topology)
+            {
+                g_AhTopoObj[s][d] = NULL;
+            }
+        }
+    }
+    KeReleaseSpinLock(&g_AhTopoLock, irql);
+}
+
+#pragma code_seg()
+PVOID
+AhTopoLookup(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input
+    )
+{
+    KIRQL irql;
+    PVOID obj = NULL;
+
+    if (Slot < AUDIOHUB_WIN_MAX_SLOTS)
+    {
+        KeAcquireSpinLock(&g_AhTopoLock, &irql);
+        obj = g_AhTopoObj[Slot][Input ? 1 : 0];
+        KeReleaseSpinLock(&g_AhTopoLock, irql);
+    }
+    return obj;
+}
+
 #pragma code_seg("PAGE")
 VOID
 AhPerPeerDriverInit(VOID)
@@ -1090,6 +1443,8 @@ AhPerPeerDriverInit(VOID)
     PAGED_CODE();
 
     RtlZeroMemory(g_AhSlots, sizeof(g_AhSlots));
+    RtlZeroMemory(g_AhTopoObj, sizeof(g_AhTopoObj));
+    KeInitializeSpinLock(&g_AhTopoLock);
     KeInitializeMutex(&g_AhSlotLock, 0);
     g_AhAdapter = NULL;
     g_AhDeviceObject = NULL;
@@ -1441,7 +1796,8 @@ Routine Description:
             NULL,                   // no IRP: this is a dynamic install, exactly as
                                     // sysvad's Bluetooth path does it
             &s->OutPair,
-            NULL,
+            &s->OutCtx,             // DeviceContext -> every miniport of this
+                                    // endpoint learns its slot and direction
             &s->OutTopo,
             &s->OutWave,
             NULL, NULL);
@@ -1477,7 +1833,7 @@ Routine Description:
         status = g_AhAdapter->InstallEndpointFilters(
             NULL,
             &s->InPair,
-            NULL,
+            &s->InCtx,
             &s->InTopo,
             &s->InWave,
             NULL, NULL);

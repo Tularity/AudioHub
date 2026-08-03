@@ -24,6 +24,7 @@ Abstract:
 #include "minipairs.h"
 #include "perpeer.h"
 #include "ctldevice.h"
+#include "ahrings.h"
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
@@ -112,6 +113,14 @@ Environment:
     // outlive it.
     //
     AhCtlDeleteDevice(DriverObject);
+
+    //
+    // AFTER the control device: every mapping is torn down when its handle
+    // closes, and by this point every device object -- and therefore every
+    // stream and every timer DPC that could touch a ring -- is already gone.
+    // That is what makes freeing the rings safe here and nowhere earlier.
+    //
+    AhRingsDriverFree();
 
     //
     // Invoke first the port unload.
@@ -360,6 +369,13 @@ Return Value:
     // start taking Bind IOCTLs the moment its symbolic link exists.
     //
     AhPerPeerDriverInit();
+
+    //
+    // Data plane. Only initialises locks here -- the rings themselves are
+    // allocated on the first MAP_RINGS, so a machine with the driver installed
+    // and no daemon running carries no non-paged pool for them.
+    //
+    AhRingsDriverInit();
 
     //
     // Control plane. A failure here is NOT fatal: a driver that loads without

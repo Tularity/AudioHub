@@ -140,6 +140,33 @@ Abstract:
 #define AH_ENDPOINT_NAME_CHARS       (AH_DISPLAY_CHARS + AH_DIRWORD_CHARS + 2)
 
 //
+// Per-slot, per-direction volume storage width. Both endpoints are stereo at
+// the KS level (the microphone's mono ring is splatted to two channels in the
+// DPC), so two cells cover every channel either direction can present.
+//
+#define AH_VOLUME_MAX_CHANNELS  2
+
+//
+// What every miniport of a slot receives as its `DeviceContext`. See the note
+// on AhEpContextDecode below for why the routing goes through here rather than
+// through CONTAINING_RECORD on the minipair.
+//
+//
+// Unity gain in the KS volume unit (1/65536 dB), i.e. 0 dB. Spelled through
+// the sample's own constant so the two never drift apart.
+//
+#define AH_VOLUME_UNITY     VOLUME_SIGNED_MAXIMUM
+
+#define AH_EP_CONTEXT_MAGIC 0x41484550u  // 'AHEP'
+
+typedef struct _AH_EP_CONTEXT
+{
+    ULONG   Magic;      // AH_EP_CONTEXT_MAGIC
+    ULONG   Slot;
+    BOOLEAN Input;      // TRUE = the virtual MICROPHONE
+} AH_EP_CONTEXT, *PAH_EP_CONTEXT;
+
+//
 // A slot's four name buffers, its display name, its two ENDPOINT_MINIPAIRs and
 // its property arrays all live INSIDE this record, and the record lives in a
 // static array for the lifetime of the driver image.
@@ -187,6 +214,33 @@ typedef struct _AH_SLOT
     // direction names instead of the peer's. Reported to the daemon as
     // AH_BINDREPLY_FLAG_NAME_FALLBACK.
     BOOLEAN             NameFallback;
+
+    //
+    // PER-SLOT VOLUME AND MUTE, one set per direction.
+    //
+    // These exist because the sample's storage does NOT work here. Upstream
+    // keeps volume in CSimpleAudioSample::m_VolumeControls[MAX_TOPOLOGY_NODES]
+    // (hw.h), one array for the whole ADAPTER, indexed by the topology NODE id.
+    // Every slot's volume node is node 0, and there is one adapter, so all
+    // sixteen peers and both directions shared a single cell: moving the
+    // speaker slider on peer A moved it on peer B, and neither device list nor
+    // log said anything.
+    //
+    // Units are the KS unit throughout -- 1/65536 dB, with
+    // VOLUME_SIGNED_MAXIMUM/-VOLUME_SIGNED_MAXIMUM style extremes -- because
+    // that is what KSPROPERTY_AUDIO_VOLUMELEVEL carries and converting on
+    // storage would mean converting back on every read.
+    //
+    LONG                VolumeOut[AH_VOLUME_MAX_CHANNELS];
+    LONG                VolumeIn[AH_VOLUME_MAX_CHANNELS];
+    BOOLEAN             MuteOut[AH_VOLUME_MAX_CHANNELS];
+    BOOLEAN             MuteIn[AH_VOLUME_MAX_CHANNELS];
+
+    // Handed to every miniport of this slot as its DeviceContext. By value, so
+    // the address is stable for the life of the driver image -- PortCls holds
+    // it for as long as the miniport lives.
+    AH_EP_CONTEXT       OutCtx;
+    AH_EP_CONTEXT       InCtx;
 
     // NOTE: there are deliberately NO per-slot filter descriptors here. v3 kept
     // a private copy of each TOPOLOGY filter and its pin array so the bridge
@@ -297,5 +351,107 @@ VOID AhSlotQuery(_Out_ AH_QUERY_SLOTS_REPLY *Reply, _In_ ULONGLONG SessionId);
 // Validators, exported so the IOCTL layer and the tests use ONE implementation.
 //
 BOOLEAN AhIsValidPeerKey(_In_reads_(Length) const CHAR *Key, _In_ SIZE_T Length);
+
+//
+// DATA-PLANE ROUTING.
+//
+// Every miniport this driver creates -- wave and topology, render and capture
+// -- is handed the address of the AH_EP_CONTEXT belonging to its slot and
+// direction, through the `DeviceContext` parameter that PortCls already
+// threads from InstallEndpointFilters all the way to the miniport constructor
+// (common.h:434 -> common.cpp:2228 -> PFNCREATEMINIPORT). Upstream passes NULL
+// there and every miniport UNREFERENCED_PARAMETERs it, so the channel is free.
+//
+// This carries slot AND direction explicitly, which the alternatives do not:
+//   * CONTAINING_RECORD off ENDPOINT_MINIPAIR requires the caller to already
+//     know whether it is holding OutPair or InPair, and guessing wrong yields
+//     a plausible slot index that is off by the distance between the two
+//     members -- a wrong-peer bug with no symptom but wrong audio;
+//   * the topology miniports never see the minipair at all, so that route
+//     could not have served the volume node in any case.
+//
+// The record lives inside AH_SLOT, i.e. in a static array for the lifetime of
+// the driver image, so the pointer cannot dangle.
+//
+//
+// Decodes a DeviceContext. Returns FALSE (and leaves the outputs untouched)
+// for NULL or for anything whose magic does not match -- so a miniport created
+// by some future path that forgets to pass one degrades to "no data plane"
+// instead of indexing the slot table with whatever the pointer happened to
+// point at.
+//
+// Callable at DISPATCH_LEVEL: two loads, no locks.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN AhEpContextDecode(_In_opt_ const void *DeviceContext, _Out_ PULONG Slot, _Out_ PBOOLEAN Input);
+
+//
+// Per-slot, per-direction volume, in the KS unit (1/65536 dB, and
+// AH_VOLUME_SILENCE for muted-by-attenuation). Replaces the adapter-wide
+// hw.cpp array, which is indexed by NODE id and therefore had ONE cell shared
+// by every peer: moving one peer's slider moved all of them.
+//
+// Read and written from the topology property handler (PASSIVE) and from the
+// NOTIFY IOCTL (PASSIVE). Interlocked because those are different threads, not
+// because anything here is a hot path.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+LONG AhSlotVolumeGet(_In_ ULONG Slot, _In_ BOOLEAN Input, _In_ ULONG Channel);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN AhSlotVolumeSet(_In_ ULONG Slot, _In_ BOOLEAN Input, _In_ ULONG Channel, _In_ LONG Value);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN AhSlotMuteGet(_In_ ULONG Slot, _In_ BOOLEAN Input, _In_ ULONG Channel);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN AhSlotMuteSet(_In_ ULONG Slot, _In_ BOOLEAN Input, _In_ ULONG Channel, _In_ BOOLEAN Value);
+
+//
+// The slot's current generation, or 0 when it is free. Events carry it so a
+// late report about a slot's PREVIOUS tenant cannot be applied to the next.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG AhSlotGeneration(_In_ ULONG Slot);
+
+//
+// The ONE mapping between the KS volume unit (signed 1/65536 dB) and the 0..1
+// amplitude scalar the daemon and every peer speak. Integer-only: reachable
+// from the property handler, and kernel code must not use the FPU at raised
+// IRQL.
+//
+// The table behind these is an approximation of 20*log10 and IS EXPECTED TO BE
+// CALIBRATED AGAINST THE REAL SYSTEM rather than trusted. See the comment on
+// g_AhDbTable in perpeer.cpp.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+LONG  AhScalarQ16ToKsVolume(_In_ ULONG ScalarQ16);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG AhKsVolumeToScalarQ16(_In_ LONG Level);
+
+//
+// Registry of live topology miniports, so a volume change arriving over the
+// control plane can raise KSEVENT_CONTROL_CHANGE on the right endpoint.
+//
+// PVOID rather than the class type because perpeer.cpp must not depend on the
+// topology class's layout; basetopo.cpp casts it back.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID  AhTopoRegister(_In_ ULONG Slot, _In_ BOOLEAN Input, _In_opt_ PVOID Topology);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID  AhTopoUnregister(_In_ PVOID Topology);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PVOID AhTopoLookup(_In_ ULONG Slot, _In_ BOOLEAN Input);
+
+//
+// Implemented in basetopo.cpp (it is the only place that knows how to raise
+// one). A no-op when the endpoint has no live topology miniport, which is the
+// ordinary state for a paired-but-never-opened device.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+VOID  AhTopoRaiseVolumeEvent(_In_ ULONG Slot, _In_ BOOLEAN Input);
 
 #endif // _AUDIOHUB_PERPEER_H_

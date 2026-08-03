@@ -77,6 +77,14 @@ Return Value:
     }
     
     obj->AddRef();
+
+    //
+    // AUDIOHUB: teach the base class which peer and direction this endpoint is,
+    // so volume and mute come out of that slot's storage instead of the
+    // adapter-wide array every slot would otherwise share.
+    //
+    obj->SetAhEndpointContext(DeviceContext);
+
     *Unknown = reinterpret_cast<IUnknown*>(obj);
 
     return STATUS_SUCCESS;

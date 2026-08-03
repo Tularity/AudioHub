@@ -222,6 +222,14 @@ private:
     _Success_(return != 0)
     ULONG GetPinSupportedDeviceModes(_In_ ULONG PinId, _Outptr_opt_result_buffer_(return) _On_failure_(_Deref_post_null_) MODE_AND_DEFAULT_FORMAT **ppModes);
 
+    //
+    // The AH_EP_CONTEXT this endpoint was created with (perpeer.cpp passes
+    // &slot->OutCtx / &slot->InCtx). NULL for any miniport created some other
+    // way, which AhEpContextDecode renders as "no data plane" rather than as a
+    // slot index.
+    //
+    PVOID GetDeviceContext() { return m_DeviceContext; }
+
 #pragma code_seg()
 
 protected:

@@ -2264,6 +2264,10 @@ fn build_session_info_with(
         jb_target_frames: 0,
         jb_prebuffering: false,
         jb_contiguous_frames: 0,
+        jb_accel_events: 0,
+        jb_accel_frames: 0,
+        jb_accel_deferred: 0,
+        jb_underrun_penalty_frames: 0,
     };
     if let Some(rx) = &e.rx {
         {
@@ -2293,6 +2297,10 @@ fn build_session_info_with(
             s.jb_underruns = st.jb.underruns;
             s.jb_target_frames = st.jb.target();
             s.jb_prebuffering = st.jb.prebuffering();
+            s.jb_accel_events = st.jb.accel_events;
+            s.jb_accel_frames = st.jb.accel_frames;
+            s.jb_accel_deferred = st.jb.accel_deferred;
+            s.jb_underrun_penalty_frames = st.jb.underrun_penalty();
         }
         if let (Some(f), Some(ring)) = (rx.verify_freq, rx.ring.as_ref()) {
             let snap: Vec<f32> = lk(ring).iter().copied().collect();
@@ -2943,15 +2951,32 @@ mod telemetry_tests {
         let rx = rx_stream();
         {
             let mut st = lk(&rx.jbs);
-            // 起播：next_seq 落在 11。
-            st.jb.push(10, jb_frame());
-            st.jb.push(11, jb_frame());
+            // 起播需要攒够设定点那么多帧（`MIN_TARGET`，随实测整定走），
+            // 起播时硬钳到设定点、弹掉一帧 ⇒ 队首落在 `10 + 1`。
+            // **不写死 2**：写死会在 `min_target` 改动时让夹具本身失效
+            // （`pop()` 返回 None），红的是夹具不是判据。
+            let n = JitterBuffer::MIN_TARGET;
+            for i in 0..n {
+                st.jb.push(10 + i, jb_frame());
+            }
             assert!(st.jb.pop().is_some());
-            // 12 缺失，13/14 提前到达 ⇒ 表里 3 帧，连续的只有 11 那一帧。
-            st.jb.push(13, jb_frame());
-            st.jb.push(14, jb_frame());
-            assert_eq!(st.jb.depth(), 3, "BTreeMap 里确实有 3 帧");
-            assert_eq!(st.jb.contiguous(), 1, "但只有 1 帧真的排得上队");
+            // 队首之后紧跟着挖一个洞，再让两帧提前到达。
+            let head = 10 + 1; // 起播弹掉一帧后的 next_seq
+            let hole = head + (n - 1); // 连续段的末尾 +1 = 缺失的那个 seq
+            st.jb.push(hole + 1, jb_frame());
+            st.jb.push(hole + 2, jb_frame());
+            assert_eq!(
+                st.jb.depth(),
+                (n - 1) + 2,
+                "BTreeMap 里有连续段 {} 帧 + 洞后 2 帧",
+                n - 1
+            );
+            assert_eq!(
+                st.jb.contiguous(),
+                n - 1,
+                "但只有洞之前那 {} 帧真的排得上队",
+                n - 1
+            );
         }
 
         let p = build_pipeline_from(false, None, Some(&rx)).expect("接收侧必须有分项");
@@ -2962,18 +2987,25 @@ mod telemetry_tests {
             .expect("抖动缓冲这一级");
         assert_eq!(
             jb.samples,
-            1 * F48_PER_FRAME,
-            "1 帧连续 = 480 样本；用 depth() 会报 1440"
+            (JitterBuffer::MIN_TARGET - 1) * F48_PER_FRAME,
+            "连续 {} 帧；用 depth() 会多报洞后面那 2 帧",
+            JitterBuffer::MIN_TARGET - 1
         );
+        // 连续段 × 10 ms。用 depth() 会把洞后面那 2 帧也算进来，多报 20 ms。
+        let want_ms = (JitterBuffer::MIN_TARGET - 1) as f64 * 10.0;
         assert_eq!(
             jb.ms,
-            Some(10.0),
-            "10 ms。用 depth() 会谎报 30 ms —— 下一个 tick 其实一定 underrun"
+            Some(want_ms),
+            "{want_ms} ms。用 depth() 会谎报 {} ms —— 下一个 tick 其实一定 underrun",
+            want_ms + 20.0
         );
         assert_eq!(jb.rate, 48_000);
+        // 硬上限是 `target + 6` 帧（`pop` 里的应急修剪条件），不是某个固定常数。
+        // `target` 是**含惩罚的有效目标**，稳态下等于设定点，所以这里从
+        // `MIN_TARGET` 推——写死 2 会在设定点改动时假红。
         assert_eq!(
             jb.capacity,
-            (2 + 6) * F48_PER_FRAME,
+            (JitterBuffer::MIN_TARGET + 6) * F48_PER_FRAME,
             "硬上限是 target+6 帧（pop 里的修剪条件），不是某个固定常数"
         );
         assert_eq!(
@@ -3010,10 +3042,21 @@ mod telemetry_tests {
         let rx = rx_stream();
         {
             let mut st = lk(&rx.jbs);
-            for seq in 0..4 {
+            // ⚠ **起播深度是受控的**（`media.rs` 的 `start_playback`）：起播要先
+            // 攒够设定点那么多帧，然后硬钳到设定点、弹掉一帧。所以摆这个夹具得
+            // 「先起播、再补到 3 帧」，且补几帧**取决于设定点**——写死 2 会在
+            // `min_target` 改动时让夹具自己失效（`pop()` 返回 None）。
+            let mut seq = 0u32;
+            while seq < JitterBuffer::MIN_TARGET {
                 st.jb.push(seq, jb_frame());
+                seq += 1;
             }
-            assert!(st.jb.pop().is_some()); // 起播，放掉一帧 ⇒ 连续 3 帧 = 30 ms
+            assert!(st.jb.pop().is_some(), "起播：钳到设定点，放掉一帧");
+            while st.jb.contiguous() < 3 {
+                st.jb.push(seq, jb_frame());
+                seq += 1;
+            }
+            assert_eq!(st.jb.contiguous(), 3, "连续 3 帧 = 30 ms");
         }
         // PostMix 里压着 960 个样本 = 20 ms（灌 1440 进去、取走 480）。
         {
@@ -4212,10 +4255,21 @@ mod fault_injection {
     fn seed_upstream_50ms(rx: &RxStream) {
         {
             let mut st = lk(&rx.jbs);
-            for seq in 0..4 {
+            // ⚠ **起播深度是受控的**（`media.rs` 的 `start_playback`）：起播要先
+            // 攒够设定点那么多帧，然后硬钳到设定点、弹掉一帧。所以摆这个夹具得
+            // 「先起播、再补到 3 帧」，且补几帧**取决于设定点**——写死 2 会在
+            // `min_target` 改动时让夹具自己失效（`pop()` 返回 None）。
+            let mut seq = 0u32;
+            while seq < JitterBuffer::MIN_TARGET {
                 st.jb.push(seq, vec![0.1; F]);
+                seq += 1;
             }
-            assert!(st.jb.pop().is_some(), "起播，放掉一帧 ⇒ 连续 3 帧 = 30 ms");
+            assert!(st.jb.pop().is_some(), "起播：钳到设定点，放掉一帧");
+            while st.jb.contiguous() < 3 {
+                st.jb.push(seq, vec![0.1; F]);
+                seq += 1;
+            }
+            assert_eq!(st.jb.contiguous(), 3, "连续 3 帧 = 30 ms");
         }
         let mut out = [0.0f32; F];
         lk(&rx.post).advance(Some(vec![0.5; 1_440]), &mut out); // 1440 − 480 = 960 = 20 ms

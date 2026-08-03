@@ -129,4 +129,32 @@ PHYSICALCONNECTIONTABLE MicArray1TopologyPhysicalConnections[] =
 #define g_MaxAudioHubMiniports      (AUDIOHUB_MINIPORTS_PER_PEER * AUDIOHUB_WIN_MAX_SLOTS)
 C_ASSERT(g_MaxAudioHubMiniports == 64);
 
+//
+// THE FORMAT AGREEMENT BETWEEN THE PINS AND THE RING.
+//
+// This is the only translation unit that includes both wave tables AND the
+// ring header, so it is the only place these can be checked. The data-plane
+// copy in minwavertstream.cpp assumes all of them and inspects none of them at
+// runtime -- it is a straight RtlCopyMemory, which is the whole point.
+//
+// A disagreement here does not fail loudly. A wrong block alignment misaligns
+// every copy by a fraction of a frame and sounds like noise; a wrong sample
+// rate plays at the wrong speed; a wrong channel count swaps the stereo image
+// into a mono-shaped ring. None of those look like a bug in a device list.
+//
+#include "AudioHubRing.h"
+
+C_ASSERT(SPEAKER_HOST_MAX_SAMPLE_RATE == AUDIOHUB_RING_SAMPLE_RATE);
+C_ASSERT(MICARRAY_RAW_SAMPLE_RATE     == AUDIOHUB_RING_SAMPLE_RATE);
+C_ASSERT(SPEAKER_HOST_MAX_CHANNELS    == AUDIOHUB_SPK_CHANNELS);
+C_ASSERT(SPEAKER_HOST_BLOCK_ALIGN     == 4);
+C_ASSERT(MICARRAY_BLOCK_ALIGN         == 8);
+//
+// The two pins carry DIFFERENT integer widths, and the DPC converts each to and
+// from the ring's float. Asserted rather than assumed because the conversion
+// code picks its shift from these numbers.
+//
+C_ASSERT(SPEAKER_HOST_MAX_BITS_PER_SAMPLE == 16);
+C_ASSERT(MICARRAY_32_BITS_PER_SAMPLE_PCM  == 32);
+
 #endif // _SIMPLEAUDIOSAMPLE_MINIPAIRS_H_

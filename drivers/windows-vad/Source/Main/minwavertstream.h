@@ -117,6 +117,28 @@ protected:
     BOOLEAN                     m_bEoSReceived;
     BOOLEAN                     m_bLastBufferRendered;
     KSPIN_LOCK                  m_PositionSpinLock;
+
+    //
+    // AUDIOHUB DATA PLANE.
+    //
+    // Which peer's endpoint this stream belongs to, resolved ONCE in Init from
+    // the miniport's ENDPOINT_MINIPAIR. AUDIOHUB_WIN_MAX_SLOTS means "not an
+    // AudioHub endpoint", which is not a state that should occur but is
+    // rendered as silence rather than as a dereference of a slot index nobody
+    // computed.
+    //
+    // The RING pointer is deliberately NOT cached: it is fetched from
+    // AhRingsHeader() on every pass, because a daemon may attach after a stream
+    // is already running (a restart during playback is ordinary) and a cached
+    // NULL would make that stream mute for the rest of its life.
+    //
+    ULONG                       m_AhSlot;
+    // Counters, for the probe. Frames actually transferred vs frames the ring
+    // could not take / could not supply. The second number is the one that
+    // matters: "the ring was full" and "there was no daemon" both look like
+    // silence from outside, and only a count tells them apart.
+    ULONGLONG                   m_AhFramesMoved;
+    ULONGLONG                   m_AhFramesShort;
     // Member variable as config params for tone generator
     ULONG                       m_ulHostCaptureToneFrequency;
     // If abs(m_dwHostCaptureToneAmplitude) + abs(m_dwHostCaptureToneDCValue) > 100
@@ -152,8 +174,28 @@ public:
     {
         return m_SignalProcessingMode;
     }
-    
+
+    ULONG     GetAhSlot()         { return m_AhSlot; }
+    ULONGLONG GetAhFramesMoved()  { return m_AhFramesMoved; }
+    ULONGLONG GetAhFramesShort()  { return m_AhFramesShort; }
+
 private:
+
+    //
+    // AudioHub data plane. Both run at DISPATCH_LEVEL under
+    // m_PositionSpinLock, and both are pure RtlCopyMemory over the WaveRT
+    // buffer and the ring -- no allocation, no wait, no FPU.
+    //
+    // AhPushRender: the OS has written [linear, linear+bytes) of the WaveRT
+    // buffer; copy it into this slot's OUT ring for the daemon to send.
+    // AhPullCapture: fill [linear, linear+bytes) from this slot's IN ring so
+    // the OS can read it as microphone input; short reads become silence.
+    //
+#pragma code_seg()
+    VOID AhPushRender(_In_ ULONG ByteDisplacement);
+
+#pragma code_seg()
+    VOID AhPullCapture(_In_ ULONG ByteDisplacement);
 
     //
     // Helper functions.

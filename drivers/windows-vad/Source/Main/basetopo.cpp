@@ -17,6 +17,9 @@ Abstract:
 
 #include "definitions.h"
 #include "basetopo.h"
+#include "endpoints.h"
+#include "perpeer.h"
+#include "ctldevice.h"
 
 //=============================================================================
 #pragma code_seg("PAGE")
@@ -52,10 +55,213 @@ Return Value:
     ASSERT(FilterDesc != NULL);
     m_FilterDescriptor  = FilterDesc;
     m_PortEvents        = NULL;
-    
+
+    m_AhSlot            = AUDIOHUB_WIN_MAX_SLOTS;
+    m_AhInput           = FALSE;
+
     ASSERT(DeviceMaxChannels > 0);
     m_DeviceMaxChannels = DeviceMaxChannels;
 } // CMiniportTopologySimpleAudioSample
+
+//=============================================================================
+#pragma code_seg("PAGE")
+VOID
+CMiniportTopologySimpleAudioSample::SetAhEndpointContext
+(
+    _In_opt_ PVOID DeviceContext
+)
+{
+    PAGED_CODE();
+
+    ULONG   slot  = AUDIOHUB_WIN_MAX_SLOTS;
+    BOOLEAN input = FALSE;
+
+    if (AhEpContextDecode(DeviceContext, &slot, &input))
+    {
+        m_AhSlot  = slot;
+        m_AhInput = input;
+        //
+        // Registered as the BASE pointer, and looked up and cast back as the
+        // base pointer, because these classes multiply-inherit and `this`
+        // differs between subobjects.
+        //
+        AhTopoRegister(slot, input, (PVOID)this);
+    }
+}
+
+//=============================================================================
+#pragma code_seg("PAGE")
+NTSTATUS
+CMiniportTopologySimpleAudioSample::AhPropertyHandlerSlotVolume
+(
+    _In_ PPCPROPERTY_REQUEST PropertyRequest
+)
+/*++
+
+Routine Description:
+
+    KSPROPERTY_AUDIO_VOLUMELEVEL and KSPROPERTY_AUDIO_MUTE against this SLOT's
+    own storage.
+
+    NOTHING HERE APPLIES GAIN TO AUDIO, and that is the point of the whole
+    feature. The node exists so that the audio engine does NOT insert a
+    software volume APO of its own ahead of this driver; the value it stores
+    travels to the peer over the control plane and the peer's REAL device does
+    the attenuating. Applying it here as well is the double attenuation plan
+    7.2 forbids -- and it would be invisible, because each end would see
+    exactly the level the user asked for.
+
+    BASICSUPPORT is delegated to the sample's handlers: the range and stepping
+    are properties of the node type, not of the peer, and duplicating them here
+    would be a second copy to keep in step.
+
+--*/
+{
+    PAGED_CODE();
+
+    const ULONG id = PropertyRequest->PropertyItem->Id;
+    const BOOLEAN isVolume = (id == KSPROPERTY_AUDIO_VOLUMELEVEL);
+
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_BASICSUPPORT)
+    {
+        return isVolume
+            ? PropertyHandler_BasicSupportVolume(PropertyRequest, m_DeviceMaxChannels)
+            : PropertyHandler_BasicSupportMute(PropertyRequest, m_DeviceMaxChannels);
+    }
+
+    NTSTATUS ntStatus = ValidatePropertyParams(
+        PropertyRequest,
+        isVolume ? sizeof(LONG) : sizeof(BOOL),
+        sizeof(ULONG));         // instance is the channel number
+    if (!NT_SUCCESS(ntStatus))
+    {
+        return ntStatus;
+    }
+
+    const ULONG channel = *(PULONG(PropertyRequest->Instance));
+    const BOOLEAN all   = (channel == ALL_CHANNELS_ID);
+
+    if (!all && channel >= m_DeviceMaxChannels)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // ALL_CHANNELS_ID is 0xFFFFFFFF. The sample's own handler writes
+    // `for (i = 0; i < ulChannel; ++i)` with ulChannel STILL holding that
+    // sentinel -- four billion iterations, saved only by a bounds check deeper
+    // down. Iterating over the real channel count is not a style preference.
+    //
+    const ULONG first = all ? 0 : channel;
+    const ULONG last  = all ? m_DeviceMaxChannels : (channel + 1);
+
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_GET)
+    {
+        if (isVolume)
+        {
+            *(PLONG(PropertyRequest->Value)) = AhSlotVolumeGet(m_AhSlot, m_AhInput, first);
+            PropertyRequest->ValueSize = sizeof(LONG);
+        }
+        else
+        {
+            *(PBOOL(PropertyRequest->Value)) = AhSlotMuteGet(m_AhSlot, m_AhInput, first) ? TRUE : FALSE;
+            PropertyRequest->ValueSize = sizeof(BOOL);
+        }
+        return STATUS_SUCCESS;
+    }
+
+    if (PropertyRequest->Verb & KSPROPERTY_TYPE_SET)
+    {
+        BOOLEAN changed = FALSE;
+
+        for (ULONG ch = first; ch < last && ch < AH_VOLUME_MAX_CHANNELS; ch++)
+        {
+            if (isVolume)
+            {
+                LONG want = VOLUME_NORMALIZE_IN_RANGE(*(PLONG(PropertyRequest->Value)));
+                if (AhSlotVolumeSet(m_AhSlot, m_AhInput, ch, want)) { changed = TRUE; }
+            }
+            else
+            {
+                BOOLEAN want = *(PBOOL(PropertyRequest->Value)) ? TRUE : FALSE;
+                if (AhSlotMuteSet(m_AhSlot, m_AhInput, ch, want)) { changed = TRUE; }
+            }
+        }
+
+        //
+        // THE USER MOVED THIS ENDPOINT'S SLIDER. Tell the daemon so it can ask
+        // the peer to move its REAL device to the same level -- that relay is
+        // the whole of plan 7.2's volume sync, and it is also why no gain is
+        // applied to the samples here.
+        //
+        // No KS event is raised on this path: the party that would receive it
+        // is the party that just caused it. The KS event belongs to the
+        // opposite direction (AhTopoRaiseVolumeEvent, driven by NOTIFY).
+        //
+        // Only on an actual change, which is what breaks the sync loop: daemon
+        // pushes a level in, the store reports "already that", nothing is sent
+        // back, and the two ends settle instead of ratcheting.
+        //
+        if (changed)
+        {
+            ULONG flags = AH_EVFLAG_INPUT * (m_AhInput ? 1 : 0);
+            if (AhSlotMuteGet(m_AhSlot, m_AhInput, 0)) { flags |= AH_EVFLAG_MUTED; }
+
+            AhCtlRaiseEvent(
+                AH_EVENT_VOLUME,
+                m_AhSlot,
+                AhSlotGeneration(m_AhSlot),
+                flags,
+                AhKsVolumeToScalarQ16(AhSlotVolumeGet(m_AhSlot, m_AhInput, 0)),
+                0);
+        }
+        return STATUS_SUCCESS;
+    }
+
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+
+//=============================================================================
+#pragma code_seg("PAGE")
+VOID
+AhTopoRaiseVolumeEvent
+(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input
+)
+/*++
+
+Routine Description:
+
+    Tells whoever holds IAudioEndpointVolume on this endpoint that its level
+    moved. Called after the daemon pushed the far peer's level in, so that the
+    two sliders read the same number.
+
+    Silently does nothing when the endpoint has no live topology miniport --
+    which is the NORMAL state for a paired peer nobody has opened. plan 7.3
+    keeps a paired peer's devices published whether or not anything is using
+    them, so "no miniport" is the common case, not an error.
+
+--*/
+{
+    PAGED_CODE();
+
+    CMiniportTopologySimpleAudioSample *topo =
+        (CMiniportTopologySimpleAudioSample *)AhTopoLookup(Slot, Input);
+
+    if (topo == NULL)
+    {
+        return;
+    }
+
+    topo->GenerateEventList(
+        (GUID *)&KSEVENTSETID_AudioControlChange,
+        KSEVENT_CONTROL_CHANGE,
+        FALSE,                  // not a pin event
+        ULONG(-1),
+        TRUE,                   // a node event
+        KSNODE_TOPO_VOLUME);
+}
 
 CMiniportTopologySimpleAudioSample::~CMiniportTopologySimpleAudioSample
 (
@@ -78,6 +284,12 @@ Return Value:
     PAGED_CODE();
 
     DPF_ENTER(("[%s]",__FUNCTION__));
+
+    //
+    // Before the interfaces go: a NOTIFY arriving after this point must not
+    // find this object in the registry and raise an event on it.
+    //
+    AhTopoUnregister((PVOID)this);
 
     SAFE_RELEASE(m_AdapterCommon);
     SAFE_RELEASE(m_PortEvents);
@@ -271,6 +483,22 @@ Return Value:
     PAGED_CODE();
 
     NTSTATUS                    ntStatus = STATUS_INVALID_DEVICE_REQUEST;
+
+    //
+    // AUDIOHUB: volume and mute come out of THIS SLOT's storage, not the
+    // adapter-wide array the sample uses. See m_AhSlot in basetopo.h for why
+    // the sample's storage cannot work with more than one peer.
+    //
+    // Everything else still goes to the sample's handlers: jack descriptions,
+    // mic geometry and the rest are genuinely per-adapter or per-filter and
+    // have no per-peer meaning.
+    //
+    if (m_AhSlot < AUDIOHUB_WIN_MAX_SLOTS &&
+        (PropertyRequest->PropertyItem->Id == KSPROPERTY_AUDIO_VOLUMELEVEL ||
+         PropertyRequest->PropertyItem->Id == KSPROPERTY_AUDIO_MUTE))
+    {
+        return AhPropertyHandlerSlotVolume(PropertyRequest);
+    }
 
     switch (PropertyRequest->PropertyItem->Id)
     {

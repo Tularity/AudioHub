@@ -56,18 +56,25 @@ pub mod wire {
     /// exist — the belief that produced `state=bound` alongside an empty
     /// `output_devices`.
     ///
-    /// v3 is PER-PEER DEVICE NAMES. The driver derives a pin-name GUID from
-    /// the peer fingerprint and writes the composed label under
-    /// MediaCategories, so the name the user reads carries the peer's host
-    /// name; the reply's trailing word became `flags`.
+    /// v3 was PER-PEER DEVICE NAMES, first attempt: a pin-name GUID derived
+    /// from the peer fingerprint, with the composed label written under
+    /// MediaCategories. The reply's trailing word became `flags`.
     ///
-    /// A bump for the same reason again: a v2 driver under a v3 daemon
-    /// publishes every peer's devices under the SAME generic name while the
-    /// daemon believes each one is labelled with its peer. Nothing in a v2
-    /// reply can say otherwise, and the version test is an equality test, so
-    /// the mismatch refuses to bind instead of producing a device list the
-    /// user cannot read.
-    pub const PROTOCOL_VERSION: u32 = 3;
+    /// v4 is the same feature through a mechanism that works in BOTH
+    /// directions. v3's route names the microphone and cannot name the
+    /// speaker: the endpoint builder hardcodes the name of any endpoint whose
+    /// bridge pin carries `KSNODETYPE_SPEAKER`. v4 delivers the name as
+    /// `PKEY_Device_DeviceDesc` under the interface's `EP\0` key instead.
+    ///
+    /// A bump for the same reason every time: the bad pairing is SILENT. A v3
+    /// driver under a v4 daemon writes each speaker's name into a registry key
+    /// nothing reads, finds no error, and answers OK with the fallback bit
+    /// clear — so the daemon is told every device carries its peer's name
+    /// while every speaker in the list reads the same generic word. Nothing in
+    /// a v3 reply can say otherwise, and the version test is an equality test,
+    /// so the mismatch refuses to bind instead of producing a device list the
+    /// user cannot tell apart.
+    pub const PROTOCOL_VERSION: u32 = 4;
 
     /// `AudioHubIoctl.h:AUDIOHUB_WIN_MAX_SLOTS`, and equal to
     /// `halbridge::HAL_MAX_SLOTS`. The driver's `PcAddAdapterDevice` budget is
@@ -175,15 +182,15 @@ pub mod wire {
     /// M6-2 speaker-loss defect on demand.
     pub const BINDFLAG_LEGACY_UNBIND: u32 = 0x800;
     /// SET: fail the per-peer pin-name write, so the fallback path and
-    /// [`BINDREPLY_FLAG_PIN_NAME_FALLBACK`] can be observed without having to
+    /// [`BINDREPLY_FLAG_NAME_FALLBACK`] can be observed without having to
     /// break the registry by hand.
-    pub const BINDFLAG_FAIL_PIN_NAME: u32 = 0x1000;
+    pub const BINDFLAG_FAIL_ENDPOINT_NAME: u32 = 0x1000;
 
     pub const BINDFLAG_DEBUG_MASK: u32 = BINDFLAG_FAIL_RENDER
         | BINDFLAG_FAIL_CAPTURE
         | BINDFLAG_SKIP_ROLLBACK
         | BINDFLAG_LEGACY_UNBIND
-        | BINDFLAG_FAIL_PIN_NAME;
+        | BINDFLAG_FAIL_ENDPOINT_NAME;
 
     // -- bind reply flags ---------------------------------------------------
 
@@ -195,7 +202,7 @@ pub mod wire {
     /// is enormously better than no device. Not silent either — with two peers
     /// paired it means two identically named speakers, and the user needs
     /// somewhere that explains why.
-    pub const BINDREPLY_FLAG_PIN_NAME_FALLBACK: u32 = 0x1;
+    pub const BINDREPLY_FLAG_NAME_FALLBACK: u32 = 0x1;
 
     // -- failure stages -----------------------------------------------------
 
@@ -207,7 +214,7 @@ pub mod wire {
     pub const STAGE_ROLLBACK: u32 = 5;
     pub const STAGE_DISCONNECT: u32 = 6;
     pub const STAGE_UNREGISTER: u32 = 7;
-    pub const STAGE_PINNAME: u32 = 8;
+    pub const STAGE_ENDPOINT_NAME: u32 = 8;
 
     pub fn stage_label(v: u32) -> &'static str {
         match v {
@@ -219,7 +226,7 @@ pub mod wire {
             STAGE_ROLLBACK => "rolling a failed install back",
             STAGE_DISCONNECT => "unregistering the physical connection",
             STAGE_UNREGISTER => "unregistering the subdevice",
-            STAGE_PINNAME => "applying the per-peer device name",
+            STAGE_ENDPOINT_NAME => "applying the per-peer device name",
             _ => "unknown stage",
         }
     }
@@ -469,7 +476,7 @@ pub mod wire {
         pub nt_status: u32,
         /// [`PUB_RENDER`] | [`PUB_CAPTURE`] as they stand after the call.
         pub published: u32,
-        /// [`BINDREPLY_FLAG_PIN_NAME_FALLBACK`]. Degradations that leave the
+        /// [`BINDREPLY_FLAG_NAME_FALLBACK`]. Degradations that leave the
         /// call successful but not wholly true.
         pub flags: u32,
     }
@@ -485,8 +492,8 @@ pub mod wire {
 
         /// The bind worked, but the devices carry the INF's generic direction
         /// words rather than this peer's name.
-        pub fn pin_name_fell_back(&self) -> bool {
-            self.flags & BINDREPLY_FLAG_PIN_NAME_FALLBACK != 0
+        pub fn endpoint_name_fell_back(&self) -> bool {
+            self.flags & BINDREPLY_FLAG_NAME_FALLBACK != 0
         }
 
         /// One line a status view can show verbatim.
@@ -1346,7 +1353,7 @@ mod tests {
         assert_eq!(SLOT_INFO_BYTES, 52);
         assert_eq!(QUERY_SLOTS_REPLY_BYTES, 848);
         assert_eq!(CONTROL_EVENT_BYTES, 24);
-        assert_eq!(PROTOCOL_VERSION, 3, "the layout above IS version 3");
+        assert_eq!(PROTOCOL_VERSION, 4, "the layout above IS version 4");
     }
 
     /// Every added field is read from the offset the C header asserts, by
@@ -1402,15 +1409,15 @@ mod tests {
         assert!(bind_outcome(true, &ok_set).is_ok());
 
         // A naming fallback is NOT a failed bind: the devices exist. It is
-        // reported separately (`pin_name_fell_back`), never by turning a
+        // reported separately (`endpoint_name_fell_back`), never by turning a
         // working device pair into an error the coordinator would retry.
         let named_generically = BindReply {
-            flags: BINDREPLY_FLAG_PIN_NAME_FALLBACK,
+            flags: BINDREPLY_FLAG_NAME_FALLBACK,
             ..ok_set
         };
         assert!(bind_outcome(true, &named_generically).is_ok());
-        assert!(named_generically.pin_name_fell_back());
-        assert!(!ok_set.pin_name_fell_back());
+        assert!(named_generically.endpoint_name_fell_back());
+        assert!(!ok_set.endpoint_name_fell_back());
 
         // A SET with only the microphone: the defect under repair.
         let half = BindReply { published: PUB_CAPTURE, ..ok_set };
@@ -1488,7 +1495,7 @@ mod tests {
             BINDFLAG_FAIL_CAPTURE,
             BINDFLAG_SKIP_ROLLBACK,
             BINDFLAG_LEGACY_UNBIND,
-            BINDFLAG_FAIL_PIN_NAME,
+            BINDFLAG_FAIL_ENDPOINT_NAME,
         ];
         let mut seen = 0u32;
         for b in bits {

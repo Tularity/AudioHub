@@ -84,20 +84,27 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 // therefore keep believing "status == OK" means "both endpoints exist" -- which
 // is exactly the belief this version exists to destroy.
 //
-// v3: PER-PEER DEVICE NAMES. The driver now derives a pin-name GUID from the
-// peer fingerprint and writes the composed label ("AudioHub - <host> <speaker>")
-// under MediaCategories at bind time, so the name the user reads carries the
-// peer's host name. `reserved` became `flags`, carrying
-// AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK.
+// v3: PER-PEER DEVICE NAMES, first attempt. The driver derived a pin-name GUID
+// from the peer fingerprint and wrote the composed label under MediaCategories.
+// `reserved` became `flags`, carrying AH_BINDREPLY_FLAG_NAME_FALLBACK.
 //
-// This is a bump and not an append for the same reason v2 was. A v2 driver
-// under a v3 daemon publishes endpoints named "<speaker> (AudioHub Virtual
-// Audio)" -- IDENTICAL for every peer -- while the daemon believes each device
-// carries its peer's name. Nothing in a v2 reply can express the difference,
-// and the version check is an EQUALITY test, so the mismatch refuses to bind
-// instead of producing a device list nobody can read.
+// v4: THE SAME FEATURE, THROUGH A MECHANISM THAT WORKS IN BOTH DIRECTIONS.
+// v3's pin-name route names the microphone and CANNOT name the speaker: the
+// endpoint builder hardcodes the name of any endpoint whose bridge pin carries
+// KSNODETYPE_SPEAKER, ignoring both the pin's Name GUID and the Category entry
+// it would otherwise fall back to (measured; see perpeer.h). v4 delivers the
+// name as PKEY_Device_DeviceDesc under the device interface's EP\0 key
+// instead, which the endpoint builder applies to render and capture alike.
 //
-#define AUDIOHUB_WIN_PROTOCOL_VERSION   3u
+// The bump is what stops a v4 daemon from believing a v3 driver. That pairing
+// is the dangerous one and it is SILENT: v3 writes the speaker's name into a
+// registry key nothing reads, finds no error to report, and answers
+// AH_STATUS_OK with the fallback bit CLEAR -- so the daemon is told every
+// device carries its peer's name while every speaker in the list reads
+// "<speaker>". A version check is the only place that difference is
+// expressible, and it is an EQUALITY test, so the mismatch refuses to bind.
+//
+#define AUDIOHUB_WIN_PROTOCOL_VERSION   4u
 
 //
 // Must equal HAL_MAX_SLOTS in core/audiohubd/src/halbridge.rs. The driver's
@@ -209,12 +216,13 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 #define AH_STAGE_ROLLBACK           5u  // the undo of a failed Set failed too
 #define AH_STAGE_DISCONNECT         6u  // UnregisterPhysicalConnection
 #define AH_STAGE_UNREGISTER         7u  // UnregisterSubdevice
-#define AH_STAGE_PINNAME            8u  // writing MediaCategories\<per-peer GUID>
+#define AH_STAGE_ENDPOINT_NAME      8u  // writing PKEY_Device_DeviceDesc into
+                                        // the interface's EP\0 key
 
 //
-// Set alongside a SUCCESSFUL bind when the per-peer pin name could not be
-// written and the endpoints therefore carry the INF's generic direction names
-// ("<speaker>" / "<microphone>") instead of the peer's.
+// Set alongside a SUCCESSFUL bind when the per-peer endpoint name could not be
+// written and the endpoints therefore carry the system's generic direction
+// names ("<speaker>" / "<microphone>") instead of the peer's.
 //
 // Deliberately a warning bit on an OK reply rather than a failure: a device
 // with a generic name is enormously better than no device, and the daemon can
@@ -223,7 +231,7 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 // class protocol v2 was cut for, and a naming fallback nobody can observe is
 // the same shape of lie in a smaller size.
 //
-#define AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK 0x1u
+#define AH_BINDREPLY_FLAG_NAME_FALLBACK 0x1u
 
 //
 // One bit per half of a peer's device pair. The invariant a bound slot must
@@ -311,16 +319,26 @@ typedef struct _AH_HELLO_REPLY {
                                             // i.e. reproduce the M6-2 defect on
                                             // demand (see common.cpp
                                             // DisconnectTopologies)
-#define AH_BINDFLAG_FAIL_PIN_NAME  0x1000u  // SET: fail the per-peer pin-name
-                                            // write, so the fallback path and
-                                            // AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK
-                                            // can be observed without having to
-                                            // break the registry by hand
+#define AH_BINDFLAG_FAIL_ENDPOINT_NAME 0x1000u
+                                            // SET: skip the per-peer endpoint
+                                            // name write, so the fallback path
+                                            // and AH_BINDREPLY_FLAG_NAME_FALLBACK
+                                            // can be observed without breaking
+                                            // the registry by hand.
+                                            //
+                                            // This is also the NEGATIVE CONTROL
+                                            // for the naming test: the same
+                                            // assertion that must pass with the
+                                            // name written must FAIL with this
+                                            // bit set. Without it, a test can
+                                            // only prove that some string is
+                                            // present, not that this driver put
+                                            // it there.
 
 #define AH_BINDFLAG_DEBUG_MASK \
     (AH_BINDFLAG_FAIL_RENDER | AH_BINDFLAG_FAIL_CAPTURE | \
      AH_BINDFLAG_SKIP_ROLLBACK | AH_BINDFLAG_LEGACY_UNBIND | \
-     AH_BINDFLAG_FAIL_PIN_NAME)
+     AH_BINDFLAG_FAIL_ENDPOINT_NAME)
 
 typedef struct _AH_BIND_REQUEST {
     UINT32 op;                          // AH_BIND_SET | AH_BIND_CLEAR

@@ -60,7 +60,7 @@ pub enum WinvadCmd {
         /// fault injection: skip the per-peer pin-name write, so the fallback
         /// to the INF's generic direction names can be observed
         #[arg(long)]
-        fail_pin_name: bool,
+        fail_endpoint_name: bool,
     },
     /// One `BIND_CLEAR`. `--generation 0` means "whatever is there now".
     Clear {
@@ -127,7 +127,7 @@ pub fn dispatch(cmd: WinvadCmd, json: bool) -> Result<i32> {
             fail_render,
             fail_capture,
             skip_rollback,
-            fail_pin_name,
+            fail_endpoint_name,
         } => {
             let mut flags = 0u32;
             if fail_render {
@@ -139,8 +139,8 @@ pub fn dispatch(cmd: WinvadCmd, json: bool) -> Result<i32> {
             if skip_rollback {
                 flags |= wire::BINDFLAG_SKIP_ROLLBACK;
             }
-            if fail_pin_name {
-                flags |= wire::BINDFLAG_FAIL_PIN_NAME;
+            if fail_endpoint_name {
+                flags |= wire::BINDFLAG_FAIL_ENDPOINT_NAME;
             }
             let r = session.bind_set_with(slot, peer_key, display, online, flags)?;
             gate = Some(wire::bind_outcome(true, &r));
@@ -241,6 +241,6 @@ fn bind_reply_json(r: &audiohubd::halbridge_win::wire::BindReply) -> serde_json:
         // The one degradation that leaves `status` OK. Printed unconditionally
         // so a harness reads it as a field rather than having to notice its
         // absence.
-        "pin_name_fallback": r.pin_name_fell_back(),
+        "endpoint_name_fallback": r.endpoint_name_fell_back(),
     })
 }

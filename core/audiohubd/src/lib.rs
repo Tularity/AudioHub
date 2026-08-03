@@ -83,12 +83,27 @@ pub(crate) fn wr<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 /// therefore dropped on the floor, deliberately.
 ///
 /// Public so the binary in main.rs shares the one writer.
+///
+/// **每行带进程单调时间戳**（`[   1234.567]`，秒，原点 = 本进程第一次记日志）。
+/// 没有它，日志只剩下**顺序**而没有**时刻**：上一轮排查 `hal_spk` 欠载时，
+/// 33 条跳 tick 记录与 30 次欠载谁先谁后、隔了多久，在一份 21 小时的日志里
+/// 完全无法回答，只能从头再跑一遍。时间戳与 IPC 的 `uptime_s` 同一条时基
+/// （两者都是进程启动后的单调秒），所以日志行可以直接和外部采样对齐。
 pub fn logln(args: std::fmt::Arguments<'_>) {
     use std::io::Write;
     // one write per line: interleaved threads must not tear a line apart
-    let mut line = args.to_string();
+    let mut line = format!("[{:11.3}] ", log_uptime().as_secs_f64());
+    use std::fmt::Write as _;
+    let _ = line.write_fmt(args);
     line.push('\n');
     let _ = std::io::stderr().write_all(line.as_bytes());
+}
+
+/// 日志时间戳的原点。第一次记日志时钉住，之后只读——比 `Instant::now()` 每行
+/// 取一次系统时间便宜，也让「第 0 秒」在日志里有确定含义。
+fn log_uptime() -> std::time::Duration {
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed()
 }
 
 macro_rules! dlog {
@@ -639,7 +654,7 @@ pub(crate) fn hal_status(inner: &DaemonInner) -> Option<audiohub_ipc::HalStatus>
             status_reason: s.status_reason.clone(),
             bind_failures: s.bind_failures,
             last_bind_error: s.last_bind_error.clone(),
-            pin_name_fallbacks: s.pin_name_fallbacks,
+            endpoint_name_fallbacks: s.endpoint_name_fallbacks,
             devices: lk(&inner.haldev).device_infos(&s.slots),
         }
     })

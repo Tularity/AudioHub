@@ -109,6 +109,37 @@ pub const HAL_MIC_CHANNELS: u32 = 1;
 /// work in so nothing on this path has to allocate.
 pub const HAL_FRAME_48K: usize = 480;
 
+/// 进程单调微秒，**归因埋点共用的时基**。
+///
+/// 「欠载是我们排空过头造成的，还是生产侧本来就没数据」这个问题只能靠**时刻**
+/// 回答：孤立发生 ⇒ 生产侧；紧随一次排空 / trim / 重同步 ⇒ 我们的锅。所以
+/// `drain_spk`、`try_trim`、`Dll::resync` 各自留一个「上次发生在什么时候」的
+/// 戳，欠载那一行把它们的年龄一起打出来。
+///
+/// 只在**事件发生时**取（每次跳 tick / 每次 trim / 每段欠载的头尾），不在每
+/// tick 上取：`Instant::now()` 在 macOS 上是 `mach_absolute_time`，几十纳秒，
+/// 但音频路径上「便宜」不是不做的理由。
+///
+/// `0` 是保留值 = **从未发生过**，`age_ms` 因此要能区分「刚发生」与「没发生过」。
+pub(crate) fn mono_us() -> u64 {
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    // +1：保证返回值非零，于是 0 可以专门表示「从未发生过」。
+    T0.get_or_init(Instant::now).elapsed().as_micros() as u64 + 1
+}
+
+/// 一个「上次发生在什么时候」的戳距今多少毫秒。`None` = 从未发生过。
+pub(crate) fn age_ms(stamp_us: u64, now_us: u64) -> Option<f64> {
+    (stamp_us != 0).then(|| now_us.saturating_sub(stamp_us) as f64 / 1000.0)
+}
+
+/// 把 [`age_ms`] 排成日志里那一列。`—` = 本进程从未发生过这件事。
+pub(crate) fn age_str(stamp_us: u64, now_us: u64) -> String {
+    match age_ms(stamp_us, now_us) {
+        Some(ms) => format!("{ms:.0}ms前"),
+        None => "—".to_string(),
+    }
+}
+
 const fn page_align(n: usize) -> usize {
     (n + 16383) & !16383
 }
@@ -363,7 +394,19 @@ pub struct HalTrimCounters {
     /// 想削但被令牌 / 可行性 / 追平期挡下的 tick 数。
     pub deferred_ticks: u64,
     /// 当前目标水位 `D_target`。
+    ///
+    /// ⚠ **这是 trim 的目标，不是稳态水位。** `safety_net` 档下它被顶成固定的
+    /// 60 ms（`D_TARGET_SAFETY`）——那是**重同步的触发线**，不是环该停在哪。
+    /// 环真正会收敛到的是 [`Self::dll_target_ms`]。两者相差可达 30 ms，照这个
+    /// 数去读现场水位会得出「环长期低于目标 27 ms」这种完全错误的结论
+    /// （本项目排查欠载时真的踩过）。
     pub target_ms: f32,
+    /// **DLL 伺服的目标水位**（`Ctl::dll_target_frames`）——稳态水位就是它。
+    ///
+    /// `clamp(1.25 × MaxDrawdown_60s + 5 ms + 欠载惩罚, 15, 120)`。与
+    /// [`Self::drawdown_ms`] 一起读，可以直接答「现在离欠载边界还有多远」，
+    /// 这是判断「延迟被换成了欠载」的核心读数。
+    pub dll_target_ms: f32,
     /// 当前 `MaxDrawdown_60s`（低于它必欠载的实测边界）。
     pub drawdown_ms: f32,
     /// 令牌余额。
@@ -443,7 +486,7 @@ pub struct HalBridgeStatus {
     /// and work. It is counted at all because with two peers paired it means
     /// two identically labelled speakers, and "the devices are there but you
     /// cannot tell them apart" needs somewhere to be said.
-    pub pin_name_fallbacks: u64,
+    pub endpoint_name_fallbacks: u64,
     /// 主动水位削减，跨槽汇总。计数是**和**，三个读数（target/drawdown/tokens）
     /// 取**最大**——它们是水位而不是流量，相加没有物理含义。
     pub trim: HalTrimCounters,
@@ -528,7 +571,7 @@ impl HalBridge {
             status_reason: lk(&s.status_reason).clone(),
             bind_failures: s.bind_failures.load(Ordering::Relaxed),
             last_bind_error: lk(&s.last_bind_error).clone(),
-            pin_name_fallbacks: s.pin_name_fallbacks.load(Ordering::Relaxed),
+            endpoint_name_fallbacks: s.endpoint_name_fallbacks.load(Ordering::Relaxed),
             trim: HalTrimCounters {
                 events: slots.iter().map(|c| c.trim.events).sum(),
                 frames: slots.iter().map(|c| c.trim.frames).sum(),
@@ -537,6 +580,7 @@ impl HalBridge {
                 // 水位取最大而不是求和：把两个槽各自的 44 ms 目标加成 88 ms
                 // 是一句没有物理含义的话。
                 target_ms: slots.iter().map(|c| c.trim.target_ms).fold(0.0, f32::max),
+                dll_target_ms: slots.iter().map(|c| c.trim.dll_target_ms).fold(0.0, f32::max),
                 drawdown_ms: slots.iter().map(|c| c.trim.drawdown_ms).fold(0.0, f32::max),
                 tokens_ms: slots.iter().map(|c| c.trim.tokens_ms).fold(0.0, f32::max),
             },
@@ -746,6 +790,13 @@ impl HalBridge {
             if n > 0 {
                 c.skip_drained.fetch_add(n as u64, Ordering::Relaxed);
             }
+            // 归因埋点。**`n == 0` 时也要盖戳**：那正是「想排却排不动」的情形
+            // （生产者同时也停了），它是欠载最强的嫌疑人之一，不能因为没排掉
+            // 东西就从案发记录里消失。`left` 是这一刀之后环里还剩多少。
+            c.last_drain_us.store(mono_us(), Ordering::Relaxed);
+            c.last_drain_frames.store(n as u32, Ordering::Relaxed);
+            c.last_drain_left
+                .store(avail.saturating_sub(n) as u32, Ordering::Relaxed);
             // 排空之后「上一 tick 的读后残量」作废：`W_n = A_{n+1} − D_n` 只在
             // 两次读之间只有生产者动过时才成立。
             //
@@ -2693,6 +2744,8 @@ pub(crate) mod dll {
     //! 这条推导配了一条会在符号写反时变红的闭环仿真测试
     //! （`tests::inverting_the_error_sign_diverges`）。
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     /// 阻尼系数 `k`。等效二阶环路 `b = k·w`、`c = w²` ⇒ **ζ = k/2**。
     ///
     /// 三个独立实现：Adriaensen 论文 √2（ζ=0.707）、PipeWire `spa_dll` 1.5
@@ -2713,6 +2766,12 @@ pub(crate) mod dll {
     pub const BW_TRACK: f64 = 0.05;
     /// 捕获段的长度（tick）。4 s @ 10 ms。
     pub const CAPTURE_TICKS: u32 = 400;
+
+    /// 上一次 [`Dll::resync`] 的时刻（[`super::mono_us`]，0 = 从未）。
+    ///
+    /// 进程级：唤醒周期只有一条环路。欠载的归因行读它，用来回答「这一段欠载
+    /// 是不是落在重同步之后那段高增益窗口里」。
+    pub(crate) static LAST_RESYNC_US: AtomicU64 = AtomicU64::new(0);
 
     /// `corr` 的对称限幅：**±500 ppm**。
     ///
@@ -2819,6 +2878,11 @@ pub(crate) mod dll {
             self.capture_left = CAPTURE_TICKS;
             self.resyncs += 1;
             self.set_bw(BW_CAPTURE);
+            // 归因埋点。重同步是环路唯一一次「丢掉全部历史、回到捕获带宽」的
+            // 动作，紧随其后是环路增益最高、最可能过冲的一段。欠载若总落在这
+            // 一段里，嫌疑就从生产侧转到我们自己身上。进程级而非按槽：唤醒周
+            // 期只有一条，重同步作用于整条 `tx_loop`。
+            LAST_RESYNC_US.store(super::mono_us(), Ordering::Relaxed);
         }
 
         /// 喂一次误差，返回**已限幅**的 `corr`。
@@ -3200,6 +3264,21 @@ pub struct HalSpeakerSource {
     seen_disc: u64,
     /// 连续短读（欠载）的当前段长，帧。0 = 上一 tick 没短读。
     short_run: u32,
+    /// 冷启动预填的截止时刻（`now_us` 时基）。`None` = 已经在正常消费。
+    ///
+    /// `Some(t)` 期间每 tick 发整帧静音、不动 `read_idx`，直到环攒够
+    /// `D_TARGET_COLD` 或 `now_us >= t`。见 `tick()` 里那段说明。
+    prime_until_us: Option<u64>,
+    /// 欠载日志的令牌桶：`(窗口起点 μs, 本窗口已打印的段数)`。
+    ///
+    /// 存在的理由：`logln` 是一次**阻塞 write 系统调用**，而 `note_short` 跑在
+    /// 10 ms 音频节拍上。欠载稀疏时（现场是 21 小时 30 段）日志是纯收益；但
+    /// 「稀疏」正是这套埋点要去证实的假设，不能拿它当前提。环深度贴着 0 抖动时
+    /// 会出现「短读一 tick、好一 tick」的交替 ⇒ 每 20 ms 两行 ⇒ 日志本身变成
+    /// 欠载的成因。所以设上限，并在恢复打印时报出被压掉了多少段。
+    log_window_us: u64,
+    log_in_window: u32,
+    log_suppressed: u32,
     /// 预分配的 peek 暂存：交织立体声 + 下混单声道。**10 ms 节拍上零分配**。
     /// 只在 `mode != off` 时分配。
     peek_st: Vec<f32>,
@@ -3209,6 +3288,22 @@ pub struct HalSpeakerSource {
 impl HalSpeakerSource {
     /// peek 暂存的帧数上界：一帧 + 静音快速通道的最长一次 peek。
     const SCRATCH_FRAMES: usize = HAL_FRAME_48K + trim::PEEK_MAX; // 12 480 帧
+
+    /// 欠载日志的限流窗口（μs）与窗口内上限（段）。
+    ///
+    /// 10 段/10 s 远高于现场速率（21 小时 30 段 ≈ 0.004 段/秒），所以正常情况下
+    /// 限流永不生效；它挡的是「环深度贴着 0 抖动」那种病理，在那种情况下日志
+    /// 会以 50 段/秒的速度往 10 ms 音频线程上压阻塞 write 系统调用。
+    const LOG_WINDOW_US: u64 = 10_000_000;
+    const LOG_PER_WINDOW: u32 = 10;
+
+    /// 冷启动预填的最长等待（μs）。
+    ///
+    /// 兜底而非目标：环正常填到 `D_TARGET_COLD`（30 ms）只需要 30 ms，用不到
+    /// 这个数。它防的是「驱动附着了但 IO 还没起来」——那种情况下环永远填不满，
+    /// 无限等下去就是这条流永远不出声。200 ms 给足了 IO 启动的余量，又短到
+    /// 用户不会把它当成故障。
+    const PRIME_TIMEOUT_US: u64 = 200_000;
 
     /// One source per SLOT. The tx engine dedups sources by `SourceSpec`, and
     /// `HalSpeaker { slot }` makes two slots two distinct keys — which is what
@@ -3237,6 +3332,12 @@ impl HalSpeakerSource {
             seen_epoch,
             seen_disc,
             short_run: 0,
+            // 源一建出来就先预填一次：`build_source` 那里刚把积压削到
+            // `D_TARGET_COLD`，但环里本来不足那么多时它一帧都丢不掉。
+            prime_until_us: Some(Self::PRIME_TIMEOUT_US),
+            log_window_us: 0,
+            log_in_window: 0,
+            log_suppressed: 0,
             peek_st: vec![0.0; n * HAL_SPK_CHANNELS as usize],
             peek_mono: vec![0.0; n],
         }
@@ -3256,6 +3357,12 @@ impl HalSpeakerSource {
             .unwrap_or(0);
         let mut discontinuous = false;
         if epoch != self.seen_epoch || disc != self.seen_disc {
+            // 驱动**重新附着**：环是新映射的一段共享内存，里面什么都没有。
+            // 这与治法 A 的排空（只动 `disc_epoch`）性质不同——那一种排完仍留着
+            // 工作储备，接着读是对的；这一种从 0 开始读必然连续短读。
+            if epoch != self.seen_epoch {
+                self.prime_until_us = Some(now_us + Self::PRIME_TIMEOUT_US);
+            }
             self.seen_epoch = epoch;
             self.seen_disc = disc;
             self.ctl.on_discontinuity();
@@ -3267,14 +3374,55 @@ impl HalSpeakerSource {
             self.bridge.rings.flush_spk_consumer(slot);
             self.ctl.on_discontinuity();
             discontinuous = true;
+            // flush 把环清空了，和重新附着同一个处境。
+            self.prime_until_us = Some(now_us + Self::PRIME_TIMEOUT_US);
         }
 
         let Some((avail, cap)) = self.bridge.rings.spk_readable(slot) else {
             // 没有驱动附着 ⇒ 这一级根本不存在。整帧静音，且**不算欠载**：
             // 把「没有环」计进短读会把那个计数器唯一的诊断价值埋掉。
+            //
+            // 但**必须先把正在进行的那一段欠载收尾**。此前这里直接 `return`，
+            // 于是驱动在一段欠载中途脱离时 `short_run` 不会归零：重新附着后再
+            // 短读，`run_before != 0` ⇒ 不计新事件、长度继续往上累加。结果是
+            // `underrun.events` 少计，`worst_run_frames` 变成一个**跨越脱离
+            // 期**的合成数——它描述的时长里有一半根本没有环存在。
+            self.note_short(0, 0, now_us);
             self.bridge.append_spk_frame(self.slot, out);
             return;
         };
+
+        // ---- 冷启动预填（`engine.rs` 开流处那段注释的另一半） -----------------
+        //
+        // 开流那里把积压**削到** `D_TARGET_COLD`，并写明了理由：「排到 0 的代价
+        // 是真实的：此后每一个 `W_n < F` 的 tick 都要短读补静音，水位靠我们自己
+        // 的短读慢慢爬回写块抖动之上——那段爬升期是听得见的细碎断续。」
+        //
+        // 但削减只能**封顶**，不能**兜底**。环里本来就不足 30 ms 时（驱动刚重新
+        // 附着、代次 flush 之后，环是全新的、空的），那段代码 `want == 0`、一帧
+        // 都不丢，日志照打「留下 30ms 作为起始水位」，而实际起始水位是 **0**。
+        // 于是它警告过的那个后果原样发生。
+        //
+        // 现场实测（2026-08-03，21.7 h 的 daemon，10 Hz 采样）：驱动重新附着后
+        // 环深度从 0 起步，靠 DLL 以 500 ppm 上限爬升，**十几秒后仍只有 800 帧
+        // (17 ms)**，其间连续短读。同一窗口 `skip.tx` 一次没动——这批欠载既不是
+        // 排空过头也不是 coreaudiod 卡顿，就是这里。
+        //
+        // 治法与接收侧的 `jb_prebuffering` 同一条：**先等够再开始消费**。等待期
+        // 发整帧静音、不动 `read_idx`、不计欠载（这不是「该有数据却没有」，是我们
+        // 自己选择还不读），也不喂 DLL（水位还没进入工作区，那不是有效观测）。
+        //
+        // 代价 ≤ 30 ms 的开流静音——而那 30 ms 无论如何都是静音，区别只在于它是
+        // 干净的一段，还是几十秒的细碎断续外加 DLL 的长爬升。超时兜底防的是
+        // 「驱动附着了但 IO 还没起来」：那种情况下等下去就是永远不出声。
+        if let Some(deadline) = self.prime_until_us {
+            if (avail as usize) < trim::D_TARGET_COLD && now_us < deadline {
+                self.note_short(0, avail, now_us);
+                out.resize(out.len() + HAL_FRAME_48K, 0.0);
+                return;
+            }
+            self.prime_until_us = None;
+        }
 
         let punctual = self.bridge.tick_punctual.load(Ordering::Relaxed);
         let plan = self.ctl.begin_tick(now_us, punctual, avail, cap);
@@ -3289,9 +3437,9 @@ impl HalSpeakerSource {
         }
         if tau == 0 {
             let got = self.bridge.append_spk_frame(self.slot, out);
-            self.note_short((HAL_FRAME_48K - got) as u32, now_us);
+            self.note_short((HAL_FRAME_48K - got) as u32, avail, now_us);
         } else {
-            self.note_short(0, now_us);
+            self.note_short(0, avail, now_us);
         }
         let consumed = (HAL_FRAME_48K + tau) as u32;
         let d_after = avail.saturating_sub(consumed);
@@ -3376,6 +3524,9 @@ impl HalSpeakerSource {
             if d.forced {
                 s.trim_forced.fetch_add(1, Ordering::Relaxed);
             }
+            // 归因埋点：欠载那一行要能答「我前面刚被削过一刀吗」。
+            s.last_trim_us.store(mono_us(), Ordering::Relaxed);
+            s.last_trim_frames.store(d.tau as u32, Ordering::Relaxed);
         }
         d.tau
     }
@@ -3408,23 +3559,114 @@ impl HalSpeakerSource {
     /// 这是「trim 有没有削过头」的唯一直接证据：`append_spk_frame` 一直返回真实
     /// 样本数，此前这个返回值被丢掉了，补进去的静音原样发给对端而没有任何计数器
     /// 知道。
-    fn note_short(&mut self, short: u32, now_us: u64) {
+    ///
+    /// ## 为什么这里要记日志（而不只是计数）
+    ///
+    /// 计数器只能答「发生过几次」，答不了**性质**。同一个 `underrun.events++`
+    /// 有两种成因，处理方式正好相反：
+    ///
+    /// - **生产侧卡顿**（coreaudiod 的 IOProc 也被拖住）⇒ 环里本来就没数据，
+    ///   补静音是正确行为，不是缺陷，不该改任何参数；
+    /// - **排空过头**（治法 A 的储备不够 / trim 削狠了 / DLL 在限幅上排太久）
+    ///   ⇒ 数据是被我们自己削掉的，是缺陷。
+    ///
+    /// 区分它们只需要一件东西：**时刻**。孤立发生 ⇒ 前者；紧随一次排空 / trim /
+    /// 重同步 ⇒ 后者。所以段首那一行把三个「上次发生在什么时候」的年龄、当时的
+    /// 环深度、以及本 tick 准不准时一起打出来——一个能潜伏 21 小时的问题不该
+    /// 只留下一个孤零零的计数。
+    ///
+    /// `avail` 是**本次读之前**环里的帧数（读后残量恒为 0，没有信息量）。
+    fn note_short(&mut self, short: u32, avail: u32, now_us: u64) {
         let run_before = self.short_run;
         self.short_run = if short > 0 { run_before + short } else { 0 };
         let run_now = self.short_run;
-        if let Some(s) = self.bridge.slots.get(self.slot as usize) {
-            if short > 0 {
-                if run_before == 0 {
-                    s.underrun_events.fetch_add(1, Ordering::Relaxed);
-                }
-                s.underrun_frames.fetch_add(short as u64, Ordering::Relaxed);
-                s.underrun_worst_run.fetch_max(run_now, Ordering::Relaxed);
+        let Some(s) = self.bridge.slots.get(self.slot as usize) else {
+            return;
+        };
+        if short > 0 {
+            // 计数**永远**先记。日志可以被限流压掉，计数不行——计数器是这套
+            // 埋点的底线，日志只是它的注解。
+            s.underrun_frames.fetch_add(short as u64, Ordering::Relaxed);
+            s.underrun_worst_run.fetch_max(run_now, Ordering::Relaxed);
+            if run_before > 0 {
+                return; // 段中间，没有新信息
             }
+            s.underrun_events.fetch_add(1, Ordering::Relaxed);
+            let t = mono_us();
+            s.underrun_start_us.store(t, Ordering::Relaxed);
+            // 现场读数先落到局部量，`s` 的借用到此为止——下面的 `log_allow`
+            // 要 `&mut self`。
+            let drain = age_str(s.last_drain_us.load(Ordering::Relaxed), t);
+            let drain_n = s.last_drain_frames.load(Ordering::Relaxed);
+            let drain_left = s.last_drain_left.load(Ordering::Relaxed);
+            let trimmed = age_str(s.last_trim_us.load(Ordering::Relaxed), t);
+            let trim_n = s.last_trim_frames.load(Ordering::Relaxed);
+            let resync = age_str(dll::LAST_RESYNC_US.load(Ordering::Relaxed), t);
+            let punctual = self.bridge.tick_punctual.load(Ordering::Relaxed);
+            let target = self.ctl.d_target_frames() / trim::MSF as f32;
+            // 段首与段尾**成对**打印或**成对**压掉：只剩一半的日志比没有更难读。
+            if !self.log_allow(t) {
+                // 起点戳作废，段尾据此知道自己也该闭嘴。
+                if let Some(s) = self.bridge.slots.get(self.slot as usize) {
+                    s.underrun_start_us.store(0, Ordering::Relaxed);
+                }
+                return;
+            }
+            dlog!(
+                "[audiohubd] 欠载开始 slot {} 环里只有 {} 帧（{:.1}ms），本 tick 差 {} 帧；\
+                 上次排空 {drain}（排掉 {drain_n} 帧、剩 {drain_left} 帧）、\
+                 上次 trim {trimmed}（削 {trim_n} 帧）、上次 DLL 重同步 {resync}；\
+                 准时={punctual} 目标水位={target:.1}ms",
+                self.slot,
+                avail,
+                avail as f32 / trim::MSF as f32,
+                short,
+            );
+            return;
         }
-        if short == 0 && run_before > 0 {
+        if run_before > 0 {
+            let t = mono_us();
+            // `swap(0)` 兼作「段首那一行有没有打印」的标记：被限流压掉的段不写
+            // 起点戳，于是这里 `None` ⇒ 段尾也不打印，成对性由数据本身保证。
+            let start = s.underrun_start_us.swap(0, Ordering::Relaxed);
+            if start != 0 {
+                // 帧长度与墙钟长度**必须一起看**。两者相当 ⇒ 我们一直在按 10 ms
+                // 读、只是环里没东西（生产侧的病）；墙钟远长于帧长度 ⇒ 这段时间
+                // 我们自己也没在按时读（消费侧被抢占），欠载只是那次抢占的影子。
+                dlog!(
+                    "[audiohubd] 欠载结束 slot {} 连续补了 {} 帧（{:.1}ms），墙钟 {:.1}ms；\
+                     累计 {} 次 / {} 帧{}",
+                    self.slot,
+                    run_before,
+                    run_before as f32 / trim::MSF as f32,
+                    (t.saturating_sub(start)) as f64 / 1000.0,
+                    s.underrun_events.load(Ordering::Relaxed),
+                    s.underrun_frames.load(Ordering::Relaxed),
+                    match std::mem::take(&mut self.log_suppressed) {
+                        0 => String::new(),
+                        n => format!("（前面另有 {n} 段因限流未记录）"),
+                    },
+                );
+            }
             // §6.3 伺服：已经付出过的代价不许被 60 s 窗口滑出后遗忘。
             self.ctl.on_underrun(run_before, now_us);
         }
+    }
+
+    /// 欠载日志的令牌桶：每 [`Self::LOG_WINDOW_US`] 最多 [`Self::LOG_PER_WINDOW`]
+    /// 段。压掉的段计进 `log_suppressed`，下一条段尾行把它报出来——**被限流**与
+    /// **没发生**必须能分开，否则限流本身就成了新的观测盲区。
+    fn log_allow(&mut self, now_us: u64) -> bool {
+        if now_us.saturating_sub(self.log_window_us) >= Self::LOG_WINDOW_US {
+            self.log_window_us = now_us;
+            self.log_in_window = 0;
+        }
+        if self.log_in_window >= Self::LOG_PER_WINDOW {
+            self.log_suppressed = self.log_suppressed.saturating_add(1);
+            return false;
+        }
+        self.log_in_window += 1;
+        true
     }
 
     fn publish(&self) {
@@ -3434,6 +3676,8 @@ impl HalSpeakerSource {
         let ms = |frames: f32| frames / trim::MSF as f32;
         s.trim_target_ms
             .store(ms(self.ctl.d_target_frames()).to_bits(), Ordering::Relaxed);
+        s.dll_target_ms
+            .store(ms(self.ctl.dll_target_frames()).to_bits(), Ordering::Relaxed);
         s.trim_drawdown_ms.store(
             ms(self.ctl.drawdown_frames() as f32).to_bits(),
             Ordering::Relaxed,
@@ -3522,12 +3766,35 @@ struct SlotShared {
     trim_deferred: AtomicU64,
     /// 三个当前读数按 f32 的位模式存。存 ms 而不是帧：读它的人是 UI 和 probe。
     trim_target_ms: AtomicU32,
+    /// DLL 伺服真正在追的水位（`Ctl::dll_target_frames`）。与 `trim_target_ms`
+    /// 分开发布：后者在 `safety_net` 档是固定的重同步触发线，不是稳态水位。
+    dll_target_ms: AtomicU32,
     trim_drawdown_ms: AtomicU32,
     trim_tokens_ms: AtomicU32,
     underrun_frames: AtomicU64,
     underrun_events: AtomicU64,
     underrun_worst_run: AtomicU32,
     skip_drained: AtomicU64,
+
+    // ---- 归因埋点：「上一次 X 发生在什么时候」（[`mono_us`]，0 = 从未）。
+    //
+    // 存在的理由只有一条：欠载**只有计数没有时刻**时，「排空过头」与「生产侧
+    // 卡顿」这两个性质完全相反的解释在数据上无法分辨——一个能潜伏 21 小时的
+    // 问题不该只有一个孤零零的计数器。有了这三个戳，欠载那一行就能自答
+    // 「我是不是紧跟在一次排空后面」。
+    /// 上一次治法 A 排空（`drain_spk`）的时刻，以及它排掉了多少帧。
+    last_drain_us: AtomicU64,
+    last_drain_frames: AtomicU32,
+    /// 排空**之后**环里还剩多少帧。这是「排空过头」的直接证据：它若接近
+    /// `D_FLOOR_MIN`（720），说明那一刀贴着工作储备落下，紧随其后的欠载就是
+    /// 我们自己造成的；它若仍在目标水位附近，排空就洗清了嫌疑。
+    last_drain_left: AtomicU32,
+    /// 上一次 trim 削减（`try_trim`）的时刻与削掉的 τ。
+    last_trim_us: AtomicU64,
+    last_trim_frames: AtomicU32,
+    /// 上一段欠载**开始**的时刻。段结束时用它算段的墙钟长度——与帧数长度对照
+    /// 能直接看出「这段时间我们到底在不在按 10 ms 读」。
+    underrun_start_us: AtomicU64,
 
     /// **DLL 的相位误差观测**：`D_target − 读后残量`，帧，按 f32 的位模式存。
     ///
@@ -3566,6 +3833,7 @@ impl SlotShared {
             trim_forced: AtomicU64::new(0),
             trim_deferred: AtomicU64::new(0),
             trim_target_ms: AtomicU32::new(0),
+            dll_target_ms: AtomicU32::new(0),
             trim_drawdown_ms: AtomicU32::new(0),
             trim_tokens_ms: AtomicU32::new(0),
             underrun_frames: AtomicU64::new(0),
@@ -3575,6 +3843,12 @@ impl SlotShared {
             dll_err_frames: AtomicU32::new(0),
             dll_epoch: AtomicU64::new(0),
             disc_epoch: AtomicU64::new(0),
+            last_drain_us: AtomicU64::new(0),
+            last_drain_frames: AtomicU32::new(0),
+            last_drain_left: AtomicU32::new(0),
+            last_trim_us: AtomicU64::new(0),
+            last_trim_frames: AtomicU32::new(0),
+            underrun_start_us: AtomicU64::new(0),
         }
     }
 
@@ -3590,6 +3864,7 @@ impl SlotShared {
                 forced: self.trim_forced.load(Ordering::Relaxed),
                 deferred_ticks: self.trim_deferred.load(Ordering::Relaxed),
                 target_ms: f32::from_bits(self.trim_target_ms.load(Ordering::Relaxed)),
+                dll_target_ms: f32::from_bits(self.dll_target_ms.load(Ordering::Relaxed)),
                 drawdown_ms: f32::from_bits(self.trim_drawdown_ms.load(Ordering::Relaxed)),
                 tokens_ms: f32::from_bits(self.trim_tokens_ms.load(Ordering::Relaxed)),
             },
@@ -3645,7 +3920,7 @@ struct Shared {
     /// gone" became something only a human could notice.
     bind_failures: AtomicU64,
     last_bind_error: Mutex<Option<String>>,
-    pin_name_fallbacks: AtomicU64,
+    endpoint_name_fallbacks: AtomicU64,
     rings: platform::Rings,
     /// Send right on the driver's service port, 0 when no driver is attached.
     /// A mutex rather than an atomic because two threads send on it (the
@@ -4595,7 +4870,7 @@ mod platform {
             status_reason: Mutex::new(Some("no driver attached yet".to_string())),
             bind_failures: AtomicU64::new(0),
             last_bind_error: Mutex::new(None),
-            pin_name_fallbacks: AtomicU64::new(0),
+            endpoint_name_fallbacks: AtomicU64::new(0),
             rings: Rings::new(),
             driver_port: Mutex::new(MACH_PORT_NULL),
             superseded: AtomicBool::new(false),
@@ -6883,13 +7158,20 @@ mod platform {
 
         /// 欠载（短读 ⇒ 补静音）必须被数出来。这是「trim 有没有削过头」的唯一
         /// 直接证据，而 `append_spk_frame` 的返回值此前是被丢掉的。
+        ///
+        /// 时基从 `PRIME_TIMEOUT_US` 之后起步：这一条要测的是**稳态**下的短读
+        /// 记账，不是冷启动。冷启动那一段由
+        /// `a_cold_ring_is_primed_before_the_first_read` 单独管——在预填窗口里
+        /// 空环发静音是**设计行为**而不是欠载，两件事必须分开测，否则改动其中
+        /// 一件会莫名其妙地弄红另一件。
         #[test]
         fn an_underrun_is_counted_instead_of_silently_padded() {
             let rig = rig();
             let mut src = rig.source(trim::Mode::Off);
             let mut out = Vec::new();
+            let t0 = HalSpeakerSource::PRIME_TIMEOUT_US + 10_000;
             // 环是空的：整帧补静音。
-            src.tick(0, &mut out);
+            src.tick(t0, &mut out);
             assert_eq!(out.len(), HAL_FRAME_48K);
             assert!(out.iter().all(|s| *s == 0.0));
             let c = rig.counters();
@@ -6899,9 +7181,9 @@ mod platform {
 
             // 再连着短两个 tick ⇒ 还是**同一段**，段数不变、最长段变长。
             out.clear();
-            src.tick(10_000, &mut out);
+            src.tick(t0 + 10_000, &mut out);
             out.clear();
-            src.tick(20_000, &mut out);
+            src.tick(t0 + 20_000, &mut out);
             let c = rig.counters();
             assert_eq!(c.underrun.frames, 3 * HAL_FRAME_48K as u64);
             assert_eq!(c.underrun.events, 1, "连续短读是一段，不是三段");
@@ -6910,13 +7192,210 @@ mod platform {
             // 喂满一帧 ⇒ 段结束；下一次短读才是新的一段。
             rig.drive(&tone_frame());
             out.clear();
-            src.tick(30_000, &mut out);
+            src.tick(t0 + 30_000, &mut out);
             assert_eq!(rig.counters().underrun.events, 1);
             out.clear();
-            src.tick(40_000, &mut out);
+            src.tick(t0 + 40_000, &mut out);
             let c = rig.counters();
             assert_eq!(c.underrun.events, 2, "隔了一帧之后再短读是新的一段");
             assert_eq!(c.underrun.worst_run_frames, 3 * HAL_FRAME_48K as u32, "最长段是历史最大");
+        }
+
+        /// 冷启动/重新附着后**先把环填到 `D_TARGET_COLD` 再开始消费**。
+        ///
+        /// 现场捕获（2026-08-03，10 Hz 采样一台跑了 21.7 h 的 daemon）：驱动被
+        /// 另一个进程接管后重新附着，环从 0 起步，`engine.rs` 开流处那段「留下
+        /// 30ms 作为起始水位」一帧都没丢（`want = 0 − 1440` 饱和成 0），日志照打，
+        /// 实际起始水位是 0。随后十几秒环深度在 0–800 帧之间爬，其间连续短读；
+        /// 同一窗口 `skip.tx` **一次没动** —— 既不是排空过头也不是生产侧卡顿。
+        ///
+        /// 这条测的正是「削减只能封顶、不能兜底」这个缺口。
+        #[test]
+        fn a_cold_ring_is_primed_before_the_first_read() {
+            let rig = rig();
+            let mut src = rig.source(trim::Mode::Off);
+            let mut out = Vec::new();
+            let frame = tone_frame();
+
+            // 环是空的：预填期发整帧静音，**不计欠载**，也不动 read_idx。
+            for t in 0..2u64 {
+                src.tick(t * 10_000, &mut out);
+                assert_eq!(out.len(), HAL_FRAME_48K, "预填期仍然要输出整整一帧");
+                assert!(out.iter().all(|s| *s == 0.0), "预填期输出必须是静音");
+                out.clear();
+            }
+            assert_eq!(
+                rig.counters().underrun.frames,
+                0,
+                "预填不是欠载：是我们自己选择还不读，不是该有数据却没有"
+            );
+
+            // 攒到 20 ms（< D_TARGET_COLD 30 ms）：还不够，继续等，环不许被动。
+            for _ in 0..2 {
+                rig.drive(&frame);
+            }
+            let before = rig.readable();
+            src.tick(20_000, &mut out);
+            out.clear();
+            assert_eq!(rig.readable(), before, "预填期不许移动 read_idx");
+            assert_eq!(rig.counters().underrun.frames, 0);
+
+            // 攒够 30 ms ⇒ 开始正常消费，而且第一帧就是**满帧真实音频**。
+            for _ in 0..2 {
+                rig.drive(&frame);
+            }
+            src.tick(30_000, &mut out);
+            assert_eq!(out.len(), HAL_FRAME_48K);
+            assert!(out.iter().any(|s| *s != 0.0), "预填结束后第一帧必须有声音");
+            assert_eq!(
+                rig.counters().underrun.frames,
+                0,
+                "预填的全部意义就是让这第一帧不欠载"
+            );
+        }
+
+        /// 生产者始终不来时，预填必须**超时放行**，而不是让这条流永远不出声。
+        ///
+        /// 这一条守的是兜底而不是主路径：驱动附着了但 IO 还没起来时环永远填不满，
+        /// 无限等下去就把一个「30 ms 静音」换成了「永久静音」。
+        #[test]
+        fn priming_gives_up_after_the_timeout() {
+            let rig = rig();
+            let mut src = rig.source(trim::Mode::Off);
+            let mut out = Vec::new();
+            // 超时之前：静音，不计欠载。
+            src.tick(0, &mut out);
+            out.clear();
+            assert_eq!(rig.counters().underrun.frames, 0);
+            // 超时之后：回到正常路径，空环 ⇒ 如实计欠载。
+            src.tick(HalSpeakerSource::PRIME_TIMEOUT_US + 10_000, &mut out);
+            assert_eq!(out.len(), HAL_FRAME_48K);
+            assert_eq!(
+                rig.counters().underrun.frames,
+                HAL_FRAME_48K as u64,
+                "超时放行之后短读必须重新如实上报"
+            );
+        }
+
+        /// 治法 A 的排空**不得**触发预填。
+        ///
+        /// 两者性质不同：排空之后环里仍留着工作储备（`D_FLOOR_MIN`），接着读是
+        /// 对的；重新附着后环是空的，接着读必然连续短读。把两者混为一谈会让每
+        /// 一次跳 tick 都白搭上 30 ms 静音。
+        #[test]
+        fn a_treatment_a_drain_does_not_re_arm_priming() {
+            let rig = rig();
+            let frame = tone_frame();
+            for _ in 0..20 {
+                rig.drive(&frame); // 200 ms
+            }
+            let mut src = rig.source(trim::Mode::Off);
+            let mut out = Vec::new();
+            src.tick(0, &mut out); // 环够深 ⇒ 预填立刻结束
+            out.clear();
+
+            rig.bridge().drain_spk(0, 5 * HAL_FRAME_48K); // 治法 A：排 50 ms
+            rig.drive(&frame);
+            src.tick(10_000, &mut out);
+            assert!(
+                out.iter().any(|s| *s != 0.0),
+                "排空之后立刻又进了预填期：那 30 ms 静音是白搭的"
+            );
+        }
+
+        /// 驱动在一段欠载**中途**脱离时，那一段必须就地结束。
+        ///
+        /// 修的是一个**测量**缺陷，不是音频缺陷：`tick` 在「没有环」那条路径上
+        /// 直接 `return`，`note_short` 收不到归零信号 ⇒ `short_run` 一直挂着。
+        /// 重新附着后再短读，`run_before != 0` ⇒ **不计新事件**、长度**继续累加**。
+        /// 结果是 `underrun.events` 系统性少计，而 `worst_run_frames` 变成一个
+        /// 横跨脱离期的合成数——它声称的那段时长里有一半根本没有环存在。
+        ///
+        /// 现场证据：一份 21 小时的读数里 `worst_run_frames = 96096`（2.0 秒），
+        /// 而同期没有任何一次生产侧中断接近那个量级。
+        #[test]
+        fn a_driver_detach_closes_the_open_underrun_run() {
+            let rig = rig();
+            let mut src = rig.source(trim::Mode::Off);
+            let mut out = Vec::new();
+            // 时基跨过预填窗口：这一条测的是段的**边界**，不是冷启动。
+            let t0 = HalSpeakerSource::PRIME_TIMEOUT_US + 10_000;
+            // 环空 ⇒ 两个 tick 的短读，段还开着。
+            for t in 0..2u64 {
+                src.tick(t0 + t * 10_000, &mut out);
+                out.clear();
+            }
+            assert_eq!(rig.counters().underrun.events, 1);
+            assert_eq!(rig.counters().underrun.worst_run_frames, 2 * HAL_FRAME_48K as u32);
+
+            // 驱动脱离：这一级不存在了，段必须在这里收尾。
+            rig.shared.rings.detach();
+            src.tick(t0 + 20_000, &mut out);
+            out.clear();
+
+            // 重新附着后再短读 ⇒ **新的一段**，而不是接着上一段往上加。
+            // `attach_epoch` 必须跟着动：生产路径（`attach_reply`）在挂上 rings
+            // 之后**最后**才 bump 它，消费者正是靠它认出「环换了一段内存」。只
+            // 调 `rings.attach` 会造出一个现实中不存在的状态，测出来的行为也就
+            // 不是生产行为。重新附着同时重新武装预填，所以这里要越过超时。
+            rig.shared.rings.attach(vec![RingPair {
+                spk: attach_ring(&rig._ds, HAL_SPK_CHANNELS),
+                mic: attach_ring(&rig._dm, HAL_MIC_CHANNELS),
+            }]);
+            rig.shared.attach_epoch.fetch_add(1, Ordering::AcqRel);
+            let t1 = t0 + 30_000 + HalSpeakerSource::PRIME_TIMEOUT_US;
+            src.tick(t0 + 30_000, &mut out); // 这一拍重新武装预填
+            out.clear();
+            for t in 0..3u64 {
+                src.tick(t1 + t * 10_000, &mut out);
+                out.clear();
+            }
+            let c = rig.counters();
+            assert_eq!(c.underrun.events, 2, "脱离期把两段黏成了一段");
+            assert_eq!(
+                c.underrun.worst_run_frames,
+                3 * HAL_FRAME_48K as u32,
+                "最长段跨过了驱动脱离期：它描述的时长里有一段根本没有环"
+            );
+        }
+
+        /// 治法 A 的排空必须把「排完还剩多少」记下来。
+        ///
+        /// 这是「排空过头」与「生产侧卡顿」唯一的分辨依据：欠载紧随一次把水位
+        /// 削到工作储备（15 ms）的排空 ⇒ 是我们的锅；欠载发生时上一次排空还剩
+        /// 着正常水位 ⇒ 排空洗清嫌疑。此前这个数字根本没有被记下来过，于是那
+        /// 两种性质完全相反的解释在数据上无法分辨。
+        #[test]
+        fn a_drain_records_what_it_left_behind() {
+            let rig = rig();
+            let frame = tone_frame();
+            for _ in 0..10 {
+                rig.drive(&frame); // 100 ms 存量
+            }
+            let b = rig.bridge();
+            let before = rig.readable();
+            let n = b.drain_spk(0, 4 * HAL_FRAME_48K); // 排 40 ms
+            assert_eq!(n, 4 * HAL_FRAME_48K);
+            let s = &rig.shared.slots[0];
+            assert_ne!(s.last_drain_us.load(Ordering::Relaxed), 0, "排空没盖时间戳");
+            assert_eq!(s.last_drain_frames.load(Ordering::Relaxed), n as u32);
+            assert_eq!(
+                s.last_drain_left.load(Ordering::Relaxed),
+                before - n as u32,
+                "剩余水位记错了"
+            );
+
+            // 「想排却排不动」也必须留痕：那正是生产者同时停摆的情形，是欠载
+            // 最强的嫌疑人之一，不能因为没排掉东西就从案发记录里消失。
+            let t_before = s.last_drain_us.load(Ordering::Relaxed);
+            let left = rig.readable();
+            assert_eq!(b.drain_spk(0, 100 * HAL_FRAME_48K), left as usize - trim::D_FLOOR_MIN);
+            assert!(s.last_drain_us.load(Ordering::Relaxed) >= t_before);
+            assert_eq!(
+                s.last_drain_left.load(Ordering::Relaxed),
+                trim::D_FLOOR_MIN as u32,
+                "排到工作储备下沿时 left 必须等于 D_FLOOR_MIN"
+            );
         }
 
         /// 没有驱动附着时的整帧静音**不算欠载** —— 那一级根本不存在，
@@ -7013,9 +7492,17 @@ mod platform {
                 "flush 之后的差值被当成生产侧漏写了：回撤 {dd} → {dd2} ms，\
                  欠载边界会被这一下永久抬高"
             );
-            // 而 flush 造成的那一帧空读**照样**计欠载：它是真的补了静音发出去，
-            // 只不过原因不是 trim 削过头。计数器只说事实，不替人下结论。
-            assert_eq!(rig.counters().underrun.frames, HAL_FRAME_48K as u64);
+            // flush 之后那一帧仍然是发出去的静音，但它**不再计欠载**：flush 把环
+            // 清空是**设计动作**，紧接着的空环是它的必然结果，不是「该有数据却
+            // 没有」。这一拍进的是冷启动预填窗口（`prime_until_us`），语义是
+            // 「我们自己选择还不读」——与接收侧的 `jb_prebuffering` 同一件事。
+            //
+            // 计数器仍然只说事实，只是事实被分成了两类：`underrun` 专管
+            // 「想读而读不到」（trim/排空削过头，或生产侧真的断供），预填窗口
+            // 专管「主动等」。混在一起的代价是实测过的：现场 30 次欠载里混着
+            // 冷启动那一类，把「排空过头」与「生产侧卡顿」两个相反的结论都变得
+            // 无法证伪。
+            assert_eq!(rig.counters().underrun.frames, 0);
         }
 
         /// 模式 B 的虚拟麦克风环（500 ms）同样要能被灌满并报出来。与 spk 环
@@ -7082,7 +7569,7 @@ mod platform {
                 status_reason: Mutex::new(None),
                 bind_failures: AtomicU64::new(0),
                 last_bind_error: Mutex::new(None),
-                pin_name_fallbacks: AtomicU64::new(0),
+                endpoint_name_fallbacks: AtomicU64::new(0),
                 rings,
                 driver_port: Mutex::new(MACH_PORT_NULL),
                 superseded: AtomicBool::new(false),
@@ -8106,7 +8593,7 @@ mod platform {
             status_reason: Mutex::new(Some("no driver attached yet".to_string())),
             bind_failures: AtomicU64::new(0),
             last_bind_error: Mutex::new(None),
-            pin_name_fallbacks: AtomicU64::new(0),
+            endpoint_name_fallbacks: AtomicU64::new(0),
             rings: Rings::new(),
             driver_port: Mutex::new(0),
             superseded: AtomicBool::new(false),
@@ -8327,13 +8814,13 @@ mod platform {
         }
         *lk(&shared.last_bind_error) = None;
 
-        if reply.pin_name_fell_back() {
+        if reply.endpoint_name_fell_back() {
             // Not a failure: the devices are published and usable. But with
             // more than one peer paired it means two speakers with the same
             // label, so it is counted and logged rather than absorbed — the
             // whole point of the v2/v3 reply fields is that the driver never
             // gets to answer OK and leave part of the truth out.
-            shared.pin_name_fallbacks.fetch_add(1, Ordering::Relaxed);
+            shared.endpoint_name_fallbacks.fetch_add(1, Ordering::Relaxed);
             dlog!(
                 "[audiohubd] hal: slot {slot} bound, but the per-peer device name could \
                  not be applied; the endpoints carry the generic direction names"

@@ -32,9 +32,9 @@ static PDEVICE_OBJECT   g_AhDeviceObject = NULL;
 static BOOLEAN          g_AhInitialised = FALSE;
 
 //
-// The PDO, kept so the per-peer pin-name keys can be written into the device's
-// own software key -- the same key the INF's AddReg section wrote the static
-// entries into, which is the location proven to work on the target machine.
+// The PDO. Needed for two registry paths: reading the INF's static
+// MediaCategories entries out of the driver software key, and reaching each
+// per-peer device interface's own key to write the endpoint name into it.
 //
 static PDEVICE_OBJECT   g_AhPdo = NULL;
 
@@ -79,20 +79,24 @@ static const DEVPROPKEY AhDevpkeyInterfaceFriendlyName = {
 };
 
 //-----------------------------------------------------------------------------
-// Per-peer pin names
+// Per-peer endpoint names
 //
-// See the long comment on AH_DIRWORD_CHARS in perpeer.h for WHY the pin name is
-// the half of the endpoint name that can carry the peer's identity, and why the
-// bracketed half provably cannot.
+// See the long comment above AH_DIRWORD_CHARS in perpeer.h for WHY the name is
+// delivered as PKEY_Device_DeviceDesc under the interface's EP\0 key, and why
+// neither the pin name nor the interface FriendlyName can do it for a speaker.
+//
+// MediaCategories is still READ here -- it is where the INF keeps the
+// localizable direction words -- but it is no longer WRITTEN. Microsoft
+// documents the machine-wide key as "reserved for global definitions and
+// should not be modified by new drivers ... will not be supported in a future
+// OS release", and the per-peer software-key entries it used to hold turned
+// out to name only one of the two directions.
 //-----------------------------------------------------------------------------
 
 //
 // "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" == 38 characters + NUL.
 //
 #define AH_GUIDSTR_CHARS    39
-
-#define AH_PIN_DIR_OUT      0u
-#define AH_PIN_DIR_IN       1u
 
 //
 // The two registry locations KS consults for a pin-name GUID, in the order KS
@@ -101,18 +105,11 @@ static const DEVPROPKEY AhDevpkeyInterfaceFriendlyName = {
 //   0  the device's own software key -- "Starting with Windows 10 October 2018
 //      Update, version 1809, when searching the registry, KS first looks for an
 //      entry in the device's software key". This is where the INF's
-//      HKR,MediaCategories,... entries landed, and where the static direction
-//      names are ALREADY MEASURED to work on the target machine.
+//      HKR,MediaCategories,... entries landed.
 //   1  the machine-wide fallback KS drops to when the software key has no entry.
 //
-// Both are written, and it is worth being explicit that this is a hedge rather
-// than a belief: the software-key entry is proven for keys the INF created at
-// INSTALL time, and nothing observed so far proves KS re-reads that key for one
-// created at BIND time. Writing the machine-wide key as well costs one more
-// handle on a path that runs a few times per pairing, and both are removed
-// together, so the hedge leaves nothing behind. Which one actually served the
-// name is answerable at verification time by deleting one and re-reading the
-// endpoint name.
+// Read in that order so the direction words come from wherever KS would have
+// taken them, rather than from wherever we happened to look first.
 //
 #define AH_MEDIACAT_SOFTWAREKEY 0u
 #define AH_MEDIACAT_GLOBAL      1u
@@ -121,6 +118,18 @@ static const DEVPROPKEY AhDevpkeyInterfaceFriendlyName = {
 #define AH_MEDIACAT_SUBKEY_W    L"MediaCategories"
 #define AH_MEDIACAT_GLOBAL_W \
     L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\MediaCategories"
+
+//
+// PKEY_Device_DeviceDesc == {a45c254e-df1c-4efd-8020-67d146a850e0}, PID 2.
+//
+// Spelled as the literal value name because that is the form the endpoint
+// builder looks for: EP\0 values are named by their property key, not by a
+// DEVPROPKEY structure. The two halves of the endpoint name the user reads are
+// this property and the devnode's FriendlyName, in that order.
+//
+#define AH_EP_SUBKEY_EP_W       L"EP"
+#define AH_EP_SUBKEY_0_W        L"0"
+#define AH_EP_DEVICEDESC_W      L"{a45c254e-df1c-4efd-8020-67d146a850e0},2"
 
 #define AH_POOLTAG_PERPEER  'PphA'      // "AhpP"
 
@@ -154,70 +163,20 @@ Routine Description:
 }
 
 #pragma code_seg("PAGE")
-static VOID
-AhDerivePinNameGuid(
-    _In_z_ PCSTR   PeerKey,
-    _In_   ULONG   Direction,
-    _Out_  GUID   *Out
-    )
-/*++
-
-Routine Description:
-
-    The pin-name GUID for one peer and one direction, DERIVED from the
-    fingerprint. Never allocated, never random, never stored.
-
-    Layout:
-
-        {9F3C7A21-6B48-4D0d-hhhh-hhhhhhhhhhhh}
-         \______________/  |  \______________/
-          fixed namespace  |   the 16 hex digits of the peer fingerprint,
-                           |   verbatim
-                           direction: 0 render, 1 capture
-
-    Determinism is the point, and it is the same argument the reference string
-    makes: unpair and re-pair the same machine and it must land on the SAME
-    registry key. A random GUID would leave one dead MediaCategories entry per
-    pairing cycle, and each one is a string with somebody's host name in it.
-
-    Putting the fingerprint in verbatim also makes the key self-identifying:
-    reading MediaCategories in regedit tells you which peer each name belongs to
-    without any other lookup.
-
-    Caller has already validated PeerKey as exactly AH_PEERKEY_CHARS of
-    lowercase hex, so the parse below cannot fail.
-
---*/
-{
-    PAGED_CODE();
-
-    Out->Data1 = 0x9F3C7A21;
-    Out->Data2 = 0x6B48;
-    Out->Data3 = (USHORT)(0x4D00 | (Direction & 0xF));
-
-    for (ULONG i = 0; i < 8; i++)
-    {
-        CHAR hi = PeerKey[i * 2];
-        CHAR lo = PeerKey[i * 2 + 1];
-        UCHAR h = (UCHAR)((hi >= 'a') ? (hi - 'a' + 10) : (hi - '0'));
-        UCHAR l = (UCHAR)((lo >= 'a') ? (lo - 'a' + 10) : (lo - '0'));
-        Out->Data4[i] = (UCHAR)((h << 4) | l);
-    }
-}
-
-#pragma code_seg("PAGE")
 static NTSTATUS
 AhOpenMediaCategories(
     _In_  ULONG       Location,
     _In_  ACCESS_MASK Access,
-    _In_  BOOLEAN     Create,
     _Out_ PHANDLE     Key
     )
 /*++
 
 Routine Description:
 
-    Opens (or creates) the MediaCategories root at one of the two locations.
+    Opens the MediaCategories root at one of the two locations, READ ONLY.
+
+    Nothing writes MediaCategories any more. The only reason to come here is to
+    read back the direction words the INF installed.
 
     Every handle this returns is function-local at the call site ON PURPOSE.
     Bind IOCTLs run in the DAEMON'S process context, and IoOpenDeviceRegistryKey
@@ -247,13 +206,7 @@ Routine Description:
         // section is the DRIVER software key, and that is where the INF put the
         // static MediaCategories entries this has to sit beside.
         //
-        status = IoOpenDeviceRegistryKey(
-            g_AhPdo, PLUGPLAY_REGKEY_DRIVER,
-            Access | KEY_CREATE_SUB_KEY, &root);
-        //
-        // KEY_CREATE_SUB_KEY is added because the caller's Access says what it
-        // wants on MediaCategories itself, not on the driver key it hangs off.
-        //
+        status = IoOpenDeviceRegistryKey(g_AhPdo, PLUGPLAY_REGKEY_DRIVER, Access, &root);
         if (!NT_SUCCESS(status))
         {
             return status;
@@ -272,14 +225,7 @@ Routine Description:
                                    NULL, NULL);
     }
 
-    if (Create)
-    {
-        status = ZwCreateKey(Key, Access, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, NULL);
-    }
-    else
-    {
-        status = ZwOpenKey(Key, Access, &oa);
-    }
+    status = ZwOpenKey(Key, Access, &oa);
 
     if (root != NULL)
     {
@@ -316,7 +262,7 @@ Routine Description:
     for (ULONG loc = 0; loc < AH_MEDIACAT_COUNT; loc++)
     {
         HANDLE mediaCat = NULL;
-        NTSTATUS status = AhOpenMediaCategories(loc, KEY_READ, FALSE, &mediaCat);
+        NTSTATUS status = AhOpenMediaCategories(loc, KEY_READ, &mediaCat);
         if (!NT_SUCCESS(status))
         {
             continue;
@@ -384,117 +330,186 @@ Routine Description:
 
 #pragma code_seg("PAGE")
 static NTSTATUS
-AhWritePinNameAt(
-    _In_ ULONG        Location,
-    _In_ const GUID  *Guid,
-    _In_z_ PCWSTR     Label
+AhOpenOrCreateSubkey(
+    _In_   HANDLE  Parent,
+    _In_z_ PCWSTR  Name,
+    _In_   BOOLEAN Create,
+    _Out_  PHANDLE Key
     )
 {
     PAGED_CODE();
 
-    WCHAR guidStr[AH_GUIDSTR_CHARS];
-    AhFormatGuidKey(Guid, guidStr);
+    *Key = NULL;
 
-    //
-    // KEY_READ as well as KEY_WRITE: a child is opened THROUGH this handle, and
-    // KEY_WRITE alone carries no KEY_ENUMERATE_SUB_KEYS.
-    //
-    HANDLE   mediaCat = NULL;
-    NTSTATUS status   = AhOpenMediaCategories(Location, KEY_READ | KEY_WRITE, TRUE, &mediaCat);
+    UNICODE_STRING    name;
+    OBJECT_ATTRIBUTES oa;
+
+    RtlInitUnicodeString(&name, Name);
+    InitializeObjectAttributes(&oa, &name,
+                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+                               Parent, NULL);
+
+    if (Create)
+    {
+        return ZwCreateKey(Key, KEY_READ | KEY_WRITE, &oa, 0, NULL,
+                           REG_OPTION_NON_VOLATILE, NULL);
+    }
+    return ZwOpenKey(Key, KEY_READ | KEY_WRITE, &oa);
+}
+
+#pragma code_seg("PAGE")
+static NTSTATUS
+AhOpenEndpointParams(
+    _In_z_ PCWSTR  ReferenceString,
+    _In_   BOOLEAN Create,
+    _Out_  PHANDLE Key
+    )
+/*++
+
+Routine Description:
+
+    Opens the "EP\0" subkey under one device interface's Device Parameters --
+    the key the audio endpoint builder reads in step 5 of its algorithm, AFTER
+    it has already chosen a default name in step 3. That ordering is the whole
+    reason this works where the pin name does not.
+
+    The interface is registered first, purely to obtain its registry path.
+    IoRegisterDeviceInterface is idempotent -- it hands back the existing
+    symbolic link for a reference string it has already seen -- and
+    MigrateDeviceInterfaceTemplateParameters reaches the template's key exactly
+    this way, so this is the house pattern rather than a new trick.
+
+    Called BEFORE the filters are installed, which matters twice over. The
+    interface is not yet enabled, so the value is in place before any endpoint
+    can be built from it; and the later template migration adds the template's
+    own EP\0 values alongside ours rather than replacing them (measured -- a
+    value written here survived two subsequent binds).
+
+    Handles are function-local at every call site ON PURPOSE: bind IOCTLs run
+    in the DAEMON's process context, and a handle cached in one context and
+    closed from another is the kind of bug that only reproduces on somebody
+    else's machine.
+
+--*/
+{
+    PAGED_CODE();
+
+    *Key = NULL;
+
+    if (g_AhPdo == NULL)
+    {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    UNICODE_STRING refString;
+    UNICODE_STRING symlink;
+
+    RtlInitUnicodeString(&refString, ReferenceString);
+    RtlZeroMemory(&symlink, sizeof(symlink));
+
+    NTSTATUS status = IoRegisterDeviceInterface(
+        g_AhPdo, &KSCATEGORY_AUDIO, &refString, &symlink);
     if (!NT_SUCCESS(status))
     {
         return status;
     }
 
-    UNICODE_STRING    sub;
-    OBJECT_ATTRIBUTES oa;
-    HANDLE            key = NULL;
+    HANDLE params = NULL;
+    status = IoOpenDeviceInterfaceRegistryKey(&symlink, KEY_READ | KEY_WRITE, &params);
+    RtlFreeUnicodeString(&symlink);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
 
-    RtlInitUnicodeString(&sub, guidStr);
-    InitializeObjectAttributes(&oa, &sub,
-                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
-                               mediaCat, NULL);
-    status = ZwCreateKey(&key, KEY_SET_VALUE, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, NULL);
-    ZwClose(mediaCat);
+    //
+    // "EP\0" is two levels and ZwCreateKey creates only a leaf, so walk it.
+    //
+    HANDLE ep = NULL;
+    status = AhOpenOrCreateSubkey(params, AH_EP_SUBKEY_EP_W, Create, &ep);
+    ZwClose(params);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    status = AhOpenOrCreateSubkey(ep, AH_EP_SUBKEY_0_W, Create, Key);
+    ZwClose(ep);
+    return status;
+}
+
+#pragma code_seg("PAGE")
+static NTSTATUS
+AhWriteEndpointName(
+    _In_z_ PCWSTR ReferenceString,
+    _In_z_ PCWSTR Name
+    )
+{
+    PAGED_CODE();
+
+    HANDLE   ep     = NULL;
+    NTSTATUS status = AhOpenEndpointParams(ReferenceString, TRUE, &ep);
     if (!NT_SUCCESS(status))
     {
         return status;
     }
 
     SIZE_T chars = 0;
-    while (chars < AH_PINLABEL_CHARS && Label[chars] != L'\0')
+    while (chars < AH_ENDPOINT_NAME_CHARS - 1 && Name[chars] != L'\0')
     {
         chars++;
     }
 
     UNICODE_STRING valueName;
-    RtlInitUnicodeString(&valueName, L"Name");
-    status = ZwSetValueKey(key, &valueName, 0, REG_SZ,
-                           (PVOID)Label, (ULONG)((chars + 1) * sizeof(WCHAR)));
-
-    if (NT_SUCCESS(status))
-    {
-        //
-        // Mirrors the INF's `HKR,MediaCategories\<guid>,Display,1,00,00,00,00`
-        // for the static entries. Written the same way for the same reason it
-        // is written there at all: this key is meant to be indistinguishable
-        // from one the INF created.
-        //
-        UCHAR display[4] = { 0, 0, 0, 0 };
-        UNICODE_STRING displayName;
-        RtlInitUnicodeString(&displayName, L"Display");
-        (VOID)ZwSetValueKey(key, &displayName, 0, REG_BINARY, display, sizeof(display));
-    }
-
-    ZwClose(key);
+    RtlInitUnicodeString(&valueName, AH_EP_DEVICEDESC_W);
+    status = ZwSetValueKey(ep, &valueName, 0, REG_SZ,
+                           (PVOID)Name, (ULONG)((chars + 1) * sizeof(WCHAR)));
+    ZwClose(ep);
     return status;
 }
 
 #pragma code_seg("PAGE")
 static VOID
-AhDeletePinNameAt(
-    _In_ ULONG       Location,
-    _In_ const GUID *Guid
+AhClearEndpointName(
+    _In_z_ PCWSTR ReferenceString
     )
+/*++
+
+Routine Description:
+
+    Removes one interface's name value. Only the value: EP\0 also holds the
+    parameters the INF's template supplied, which belong to the interface and
+    not to any peer.
+
+    The interface REGISTRATION itself cannot be removed from kernel mode -- the
+    kernel has no IoUnregisterDeviceInterface -- so the key survives unpairing
+    either way. What must not survive is the string inside it, because that
+    string is somebody's computer name.
+
+--*/
 {
     PAGED_CODE();
 
-    WCHAR guidStr[AH_GUIDSTR_CHARS];
-    AhFormatGuidKey(Guid, guidStr);
-
-    HANDLE   mediaCat = NULL;
-    NTSTATUS status   = AhOpenMediaCategories(Location, KEY_READ, FALSE, &mediaCat);
+    HANDLE   ep     = NULL;
+    NTSTATUS status = AhOpenEndpointParams(ReferenceString, FALSE, &ep);
     if (!NT_SUCCESS(status))
     {
         return;
     }
 
-    UNICODE_STRING    sub;
-    OBJECT_ATTRIBUTES oa;
-    HANDLE            key = NULL;
-
-    RtlInitUnicodeString(&sub, guidStr);
-    InitializeObjectAttributes(&oa, &sub,
-                               OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
-                               mediaCat, NULL);
-    status = ZwOpenKey(&key, DELETE, &oa);
-    ZwClose(mediaCat);
-    if (!NT_SUCCESS(status))
+    UNICODE_STRING valueName;
+    RtlInitUnicodeString(&valueName, AH_EP_DEVICEDESC_W);
+    status = ZwDeleteValueKey(ep, &valueName);
+    if (!NT_SUCCESS(status) && status != STATUS_OBJECT_NAME_NOT_FOUND)
     {
-        return;
+        DPF(D_ERROR, ("[AhClearEndpointName] %S delete failed 0x%x", ReferenceString, status));
     }
-
-    status = ZwDeleteKey(key);
-    if (!NT_SUCCESS(status))
-    {
-        DPF(D_ERROR, ("[AhDeletePinNameAt] loc %u %S delete failed 0x%x", Location, guidStr, status));
-    }
-    ZwClose(key);
+    ZwClose(ep);
 }
 
 #pragma code_seg("PAGE")
 static NTSTATUS
-AhComposePinLabel(
+AhComposeEndpointName(
     _In_z_ PCWSTR Display,
     _In_z_ PCWSTR DirectionWord,
     _Out_writes_z_(Chars) PWSTR Out,
@@ -553,50 +568,92 @@ Routine Description:
     return STATUS_SUCCESS;
 }
 
+//
+// THE ONE PLACE A DIRECTION IS NAMED.
+//
+// Everything below this table treats the two directions as an array index.
+// That is deliberate and it is the actual fix, not decoration: the defect this
+// replaces was a naming mechanism that silently worked for the microphone and
+// not for the speaker, and what let it hide for a whole acceptance run was that
+// nothing in the code said the two were being handled differently -- they went
+// through separate statements that merely looked alike. A loop cannot drift.
+//
+// A test asserts that AhApplyEndpointNames and AhRemoveEndpointNames mention no
+// direction-specific identifier at all, so adding a step "just for the speaker"
+// is a build-time argument rather than a bug found on a target machine.
+//
+#define AH_NAME_DIRECTIONS  2u
+
+typedef struct _AH_NAME_TARGET
+{
+    PCWSTR  ReferenceString;    // the TOPOLOGY interface carrying this endpoint
+    PCWSTR  DirectionWord;      // from the INF, read back at attach
+    PWSTR   Name;               // where the composed name is kept
+} AH_NAME_TARGET;
+
 #pragma code_seg("PAGE")
 static VOID
-AhRemovePinNames(
+AhNameTargets(
+    _In_  PAH_SLOT Slot,
+    _Out_writes_(AH_NAME_DIRECTIONS) AH_NAME_TARGET *Targets
+    )
+{
+    PAGED_CODE();
+
+    Targets[0].ReferenceString = Slot->TopoNameOut;
+    Targets[0].DirectionWord   = g_AhDirWordOut;
+    Targets[0].Name            = Slot->NameOut;
+
+    Targets[1].ReferenceString = Slot->TopoNameIn;
+    Targets[1].DirectionWord   = g_AhDirWordIn;
+    Targets[1].Name            = Slot->NameIn;
+}
+
+#pragma code_seg("PAGE")
+static VOID
+AhRemoveEndpointNames(
     _Inout_ PAH_SLOT Slot
     )
 /*++
 
 Routine Description:
 
-    Removes both of a slot's MediaCategories entries, at every location they
-    could have been written to.
+    Removes every endpoint-name value this slot wrote.
 
-    Called from the ONE teardown routine rather than from each of its three call
-    sites, so "unpairing leaves no registry litter carrying somebody's host
-    name" cannot be true at two of them and false at the third.
+    Called from the ONE teardown routine rather than from each of its three
+    call sites, so "unpairing leaves no registry litter carrying somebody's
+    host name" cannot be true at two of them and false at the third.
 
 --*/
 {
     PAGED_CODE();
 
-    if (!Slot->PinNamesWritten)
+    if (!Slot->NamesWritten)
     {
         return;
     }
 
-    for (ULONG loc = 0; loc < AH_MEDIACAT_COUNT; loc++)
+    AH_NAME_TARGET targets[AH_NAME_DIRECTIONS];
+    AhNameTargets(Slot, targets);
+
+    for (ULONG i = 0; i < AH_NAME_DIRECTIONS; i++)
     {
-        AhDeletePinNameAt(loc, &Slot->PinGuidOut);
-        AhDeletePinNameAt(loc, &Slot->PinGuidIn);
+        AhClearEndpointName(targets[i].ReferenceString);
     }
 
-    Slot->PinNamesWritten = FALSE;
+    Slot->NamesWritten = FALSE;
     //
-    // PinNameFallback is deliberately NOT cleared here. AhApplyPinNames calls
+    // NameFallback is deliberately NOT cleared here. AhApplyEndpointNames calls
     // this routine ON its fallback path -- to take back a half-written pair --
     // and clearing the flag there would erase the decision that had just been
-    // made, leaving the pins pointed at GUIDs with no registry entry AND the
-    // reply claiming everything was fine. The flag's lifetime belongs to
-    // AhApplyPinNames, which resets it at the top of every attempt.
+    // made, leaving the reply claiming everything was fine. The flag's lifetime
+    // belongs to AhApplyEndpointNames, which resets it at the top of every
+    // attempt.
 }
 
 #pragma code_seg("PAGE")
 static VOID
-AhApplyPinNames(
+AhApplyEndpointNames(
     _Inout_ PAH_SLOT Slot,
     _In_    ULONG    Flags
     )
@@ -604,24 +661,24 @@ AhApplyPinNames(
 
 Routine Description:
 
-    Derives this slot's two pin-name GUIDs, composes the labels and writes them.
+    Composes this slot's endpoint names and writes each one into its own
+    TOPOLOGY interface's EP\0 key.
 
-    Sets Slot->PinNameFallback when the peer's name could NOT be made to appear,
-    in which case AhBuildMinipairs leaves the INF's static GUIDs in the pin
-    descriptors and the endpoints come out named with the plain direction words.
+    Sets Slot->NameFallback when the peer's name could NOT be made to appear, in
+    which case the endpoints come up under the system's generic direction names.
     That is a real degradation -- with two peers paired the user sees two
     identically named speakers -- so it travels back to the daemon as
-    AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK rather than being absorbed here.
+    AH_BINDREPLY_FLAG_NAME_FALLBACK rather than being absorbed here.
 
     Failing the whole bind instead was considered and rejected: a device with a
-    generic name is enormously more useful than no device, and the peer is
-    already paired by the time this runs.
+    generic name is far more useful than no device, and the peer is already
+    paired by the time this runs.
 
 --*/
 {
     PAGED_CODE();
 
-    Slot->PinNameFallback = FALSE;
+    Slot->NameFallback = FALSE;
 
     if (!g_AhDirWordsOk)
     {
@@ -631,65 +688,64 @@ Routine Description:
         // microphone under the SAME string -- strictly worse than generic
         // names, which at least still say which is which.
         //
-        DPF(D_ERROR, ("[AhApplyPinNames] no direction words; per-peer naming disabled"));
-        Slot->PinNameFallback = TRUE;
+        DPF(D_ERROR, ("[AhApplyEndpointNames] no direction words; per-peer naming disabled"));
+        Slot->NameFallback = TRUE;
         return;
     }
 
-    AhDerivePinNameGuid(Slot->PeerKey, AH_PIN_DIR_OUT, &Slot->PinGuidOut);
-    AhDerivePinNameGuid(Slot->PeerKey, AH_PIN_DIR_IN,  &Slot->PinGuidIn);
+    AH_NAME_TARGET targets[AH_NAME_DIRECTIONS];
+    AhNameTargets(Slot, targets);
 
-    NTSTATUS st1 = AhComposePinLabel(Slot->Display, g_AhDirWordOut,
-                                     Slot->PinLabelOut, AH_PINLABEL_CHARS);
-    NTSTATUS st2 = AhComposePinLabel(Slot->Display, g_AhDirWordIn,
-                                     Slot->PinLabelIn, AH_PINLABEL_CHARS);
-    if (!NT_SUCCESS(st1) || !NT_SUCCESS(st2))
+    for (ULONG i = 0; i < AH_NAME_DIRECTIONS; i++)
     {
-        DPF(D_ERROR, ("[AhApplyPinNames] compose failed 0x%x / 0x%x", st1, st2));
-        Slot->PinNameFallback = TRUE;
-        return;
-    }
-
-    //
-    // Written at BOTH locations, and a location counts as written only if BOTH
-    // directions land there. One direction named and the other not is the same
-    // half-published shape the whole of protocol v2 exists to make impossible.
-    //
-    ULONG written = 0;
-    for (ULONG loc = 0; loc < AH_MEDIACAT_COUNT && !(Flags & AH_BINDFLAG_FAIL_PIN_NAME); loc++)
-    {
-        NTSTATUS a = AhWritePinNameAt(loc, &Slot->PinGuidOut, Slot->PinLabelOut);
-        NTSTATUS b = AhWritePinNameAt(loc, &Slot->PinGuidIn,  Slot->PinLabelIn);
-        if (NT_SUCCESS(a) && NT_SUCCESS(b))
+        NTSTATUS st = AhComposeEndpointName(Slot->Display, targets[i].DirectionWord,
+                                            targets[i].Name, AH_ENDPOINT_NAME_CHARS);
+        if (!NT_SUCCESS(st))
         {
-            written++;
-        }
-        else
-        {
-            DPF(D_ERROR, ("[AhApplyPinNames] loc %u write failed 0x%x / 0x%x", loc, a, b));
+            DPF(D_ERROR, ("[AhApplyEndpointNames] compose %u failed 0x%x", i, st));
+            Slot->NameFallback = TRUE;
+            return;
         }
     }
 
-    //
-    // Anything written has to be removable, whether or not the naming worked.
-    //
-    Slot->PinNamesWritten = TRUE;
-
-    if (written == 0)
+    if (Flags & AH_BINDFLAG_FAIL_ENDPOINT_NAME)
     {
         //
-        // Take back anything a partly-successful write left behind FIRST, then
-        // record the decision: AhRemovePinNames must not be in a position to
-        // observe -- or undo -- a flag it does not own.
+        // Fault injection, and the negative control the naming test needs: with
+        // this bit set the assertion that must pass on the happy path has to
+        // FAIL. A naming test without it can only show that some string is
+        // present, not that this driver is what put it there.
         //
-        AhRemovePinNames(Slot);
-        Slot->PinNameFallback = TRUE;
-        DPF(D_ERROR, ("[AhApplyPinNames] slot pin names unwritable; falling back to generic names"));
+        Slot->NameFallback = TRUE;
         return;
     }
 
-    DPF(D_TERSE, ("[AhApplyPinNames] %S / %S (%u location(s))",
-                  Slot->PinLabelOut, Slot->PinLabelIn, written));
+    //
+    // Anything written has to be removable, so the flag goes up BEFORE the
+    // first write rather than after the last.
+    //
+    Slot->NamesWritten = TRUE;
+
+    for (ULONG i = 0; i < AH_NAME_DIRECTIONS; i++)
+    {
+        NTSTATUS st = AhWriteEndpointName(targets[i].ReferenceString, targets[i].Name);
+        if (!NT_SUCCESS(st))
+        {
+            //
+            // ALL OR NOTHING, for the same reason the install is: one direction
+            // named after the peer and the other not is a device pair that lies
+            // about what it is. Take back whatever landed FIRST, then record the
+            // decision -- AhRemoveEndpointNames must not be in a position to
+            // observe, or undo, a flag it does not own.
+            //
+            DPF(D_ERROR, ("[AhApplyEndpointNames] write %u failed 0x%x", i, st));
+            AhRemoveEndpointNames(Slot);
+            Slot->NameFallback = TRUE;
+            return;
+        }
+    }
+
+    DPF(D_TERSE, ("[AhApplyEndpointNames] %S / %S", Slot->NameOut, Slot->NameIn));
 }
 
 //-----------------------------------------------------------------------------
@@ -809,75 +865,6 @@ Routine Description:
     return STATUS_SUCCESS;
 }
 
-//
-// Both topology pin tables must fit the per-slot copy, and PortCls must be able
-// to walk the copy with the template's own stride.
-//
-C_ASSERT(SIZEOF_ARRAY(SpeakerTopoMiniportPins) <= AH_MAX_TOPO_PINS);
-C_ASSERT(SIZEOF_ARRAY(MicArray1TopoMiniportPins) <= AH_MAX_TOPO_PINS);
-
-#pragma code_seg("PAGE")
-static NTSTATUS
-AhCloneTopoFilter(
-    _In_  const PCFILTER_DESCRIPTOR *Template,
-    _In_  const GUID  *Marker,
-    _In_opt_ const GUID *Replacement,
-    _Out_writes_(AH_MAX_TOPO_PINS) PCPIN_DESCRIPTOR *Pins,
-    _Out_ PCFILTER_DESCRIPTOR *Out
-    )
-/*++
-
-Routine Description:
-
-    Copies a topology filter descriptor and its pin array into the slot, and
-    repoints the bridge pin's KsPinDescriptor.Name at this peer's GUID.
-
-    The pin is found by MATCHING the static Name GUID the INF registered, not by
-    index. An index would be a second, invisible copy of a fact that already
-    lives in the topology table, and reordering that table would silently rename
-    the wrong pin -- one of the few mistakes here that produces no error at all,
-    just a device whose name belongs to something else.
-
-    Replacement == NULL leaves the marker in place, which is exactly the
-    fallback behaviour: the endpoint keeps the INF's generic direction name.
-
---*/
-{
-    PAGED_CODE();
-
-    if (Template->PinCount > AH_MAX_TOPO_PINS ||
-        Template->PinSize != sizeof(PCPIN_DESCRIPTOR))
-    {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    RtlCopyMemory(Pins, Template->Pins, Template->PinCount * sizeof(PCPIN_DESCRIPTOR));
-    *Out = *Template;
-    Out->Pins = Pins;
-
-    if (Replacement == NULL)
-    {
-        return STATUS_SUCCESS;
-    }
-
-    for (ULONG i = 0; i < Template->PinCount; i++)
-    {
-        const GUID *name = Pins[i].KsPinDescriptor.Name;
-        if (name != NULL && RtlEqualMemory(name, Marker, sizeof(GUID)))
-        {
-            Pins[i].KsPinDescriptor.Name = Replacement;
-            return STATUS_SUCCESS;
-        }
-    }
-
-    //
-    // The table lost its marker. Reported rather than ignored: silently keeping
-    // the shared descriptor would publish every peer under one name and nothing
-    // would say why.
-    //
-    return STATUS_NOT_FOUND;
-}
-
 #pragma code_seg("PAGE")
 static NTSTATUS
 AhBuildMinipairs(
@@ -889,18 +876,18 @@ Routine Description:
 
     Fills the slot's two ENDPOINT_MINIPAIRs from the static templates.
 
-    The TOPOLOGY filter descriptors and their pin arrays are copied per slot,
-    because the bridge pin's Name GUID is this peer's (AhApplyPinNames). That is
-    the same reason sysvad's Bluetooth path deep-copies -- it rewrites each
-    endpoint's pin Category at runtime.
+    EVERY DESCRIPTOR IS SHARED -- filters, pin arrays, node tables, connection
+    tables, data ranges, automation tables and the format-and-modes tables.
+    Nothing in them varies per peer.
 
-    Everything else stays SHARED: node tables, connection tables, data ranges,
-    automation tables, the format-and-modes tables and both WAVE filters. None
-    of them varies per peer, and each one copied would be another lifetime to
-    get wrong for no gain.
+    v3 deep-copied the two TOPOLOGY filters and their pin arrays so that each
+    peer's bridge pin could point at a per-peer Name GUID. The name no longer
+    travels through the pin, so the copies are gone, and with them the one
+    per-slot lifetime that PortCls holds pointers into.
 
-    Both the FriendlyName property and the pin Name GUID point INTO the slot
-    record, which outlives every endpoint they can be attached to.
+    What still points INTO the slot record is the FriendlyName property buffer
+    and the four reference strings, all of which outlive every endpoint that
+    can be attached to them because the slot array is static.
 
 --*/
 {
@@ -934,30 +921,6 @@ Routine Description:
     Slot->InTopoProps[0] = Slot->OutTopoProps[0];
 
     //
-    // Per-slot topology descriptors. NULL replacement == keep the INF's static
-    // GUID == generic direction names, which is what the fallback path wants.
-    //
-    NTSTATUS nameStatus = AhCloneTopoFilter(
-        &SpeakerTopoMiniportFilterDescriptor,
-        &AH_PIN_NAME_OUT,
-        Slot->PinNameFallback ? NULL : &Slot->PinGuidOut,
-        Slot->OutTopoPins,
-        &Slot->OutTopoFilter);
-    if (NT_SUCCESS(nameStatus))
-    {
-        nameStatus = AhCloneTopoFilter(
-            &MicArray1TopoMiniportFilterDescriptor,
-            &AH_PIN_NAME_IN,
-            Slot->PinNameFallback ? NULL : &Slot->PinGuidIn,
-            Slot->InTopoPins,
-            &Slot->InTopoFilter);
-    }
-    if (!NT_SUCCESS(nameStatus))
-    {
-        return nameStatus;
-    }
-
-    //
     // Render pair.
     //
     RtlZeroMemory(&Slot->OutPair, sizeof(Slot->OutPair));
@@ -965,7 +928,7 @@ Routine Description:
     Slot->OutPair.TopoName                      = Slot->TopoNameOut;
     Slot->OutPair.TemplateTopoName              = (PWSTR)AH_TEMPLATE_TOPO_OUT;
     Slot->OutPair.TopoCreateCallback            = CreateMiniportTopologySimpleAudioSample;
-    Slot->OutPair.TopoDescriptor                = &Slot->OutTopoFilter;
+    Slot->OutPair.TopoDescriptor                = &SpeakerTopoMiniportFilterDescriptor;
     Slot->OutPair.TopoInterfacePropertyCount    = ARRAYSIZE(Slot->OutTopoProps);
     Slot->OutPair.TopoInterfaceProperties       = Slot->OutTopoProps;
     Slot->OutPair.WaveName                      = Slot->WaveNameOut;
@@ -989,7 +952,7 @@ Routine Description:
     Slot->InPair.TopoName                       = Slot->TopoNameIn;
     Slot->InPair.TemplateTopoName               = (PWSTR)AH_TEMPLATE_TOPO_IN;
     Slot->InPair.TopoCreateCallback             = CreateMicArrayMiniportTopology;
-    Slot->InPair.TopoDescriptor                 = &Slot->InTopoFilter;
+    Slot->InPair.TopoDescriptor                 = &MicArray1TopoMiniportFilterDescriptor;
     Slot->InPair.TopoInterfacePropertyCount     = ARRAYSIZE(Slot->InTopoProps);
     Slot->InPair.TopoInterfaceProperties        = Slot->InTopoProps;
     Slot->InPair.WaveName                       = Slot->WaveNameIn;
@@ -1058,7 +1021,7 @@ Routine Description:
     a failed unregister is a leak inside PortCls, and holding our reference on
     top of it would add a second, larger one.
 
-    The slot's MediaCategories entries go here too, and not at the three call
+    The slot's endpoint-name values go here too, and not at the three call
     sites: "unpairing leaves no registry litter carrying somebody's host name"
     must not be true at two of them and false at the third. They are removed
     AFTER the endpoints, because until the endpoints are gone the names are
@@ -1084,7 +1047,7 @@ Routine Description:
         // remove: they live under the PDO's software key and the machine-wide
         // key, neither of which the adapter owns.
         //
-        AhRemovePinNames(Slot);
+        AhRemoveEndpointNames(Slot);
         return STATUS_SUCCESS;
     }
 
@@ -1110,7 +1073,7 @@ Routine Description:
     SAFE_RELEASE(Slot->InTopo);
     SAFE_RELEASE(Slot->InWave);
 
-    AhRemovePinNames(Slot);
+    AhRemoveEndpointNames(Slot);
 
     if (FailStage != NULL) { *FailStage = stage; }
     return firstError;
@@ -1182,7 +1145,7 @@ AhPerPeerAttachAdapter(
         {
             //
             // NOT fatal, and NOT silent. Every bind from here on reports
-            // AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK, so the daemon can say that
+            // AH_BINDREPLY_FLAG_NAME_FALLBACK, so the daemon can say that
             // the devices are unnamed because the INF's own strings are
             // missing -- which is an install problem, not a pairing problem,
             // and the two are otherwise indistinguishable from the outside.
@@ -1369,9 +1332,9 @@ Routine Description:
                 // that appears once and then disappears is a warning nobody
                 // acts on.
                 //
-                if (s->PinNameFallback)
+                if (s->NameFallback)
                 {
-                    Result->Flags |= AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK;
+                    Result->Flags |= AH_BINDREPLY_FLAG_NAME_FALLBACK;
                 }
                 goto Done;
             }
@@ -1438,26 +1401,29 @@ Routine Description:
     }
 
     //
-    // BEFORE the filters exist. KS resolves KSPROPERTY_PIN_NAME when the audio
-    // endpoint builder asks -- which happens once PcRegisterSubdevice has
-    // enabled the interface -- so the key has to be in place by then. Writing
-    // it afterwards would be a race against the endpoint builder, and the
-    // losing side of that race is a device published under the wrong name with
-    // nothing to say so.
+    // AFTER the reference strings (the name is written into the interface those
+    // strings identify) and BEFORE the filters exist.
     //
-    AhApplyPinNames(s, Flags);
-    if (s->PinNameFallback)
+    // "Before" is load-bearing and not merely tidy. PcRegisterSubdevice is the
+    // step that ENABLES the interface, and the endpoint builder acts on the
+    // arrival edge; a name written afterwards is a race whose losing side is a
+    // device published under the wrong name with nothing to say so. Worse, the
+    // composed name is CACHED per endpoint id, so losing that race once is
+    // permanent for that peer rather than something the next bind repairs.
+    //
+    AhApplyEndpointNames(s, Flags);
+    if (s->NameFallback)
     {
-        Result->Flags |= AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK;
+        Result->Flags |= AH_BINDREPLY_FLAG_NAME_FALLBACK;
     }
 
     status = AhBuildMinipairs(s);
     if (!NT_SUCCESS(status))
     {
-        Result->Stage = AH_STAGE_PINNAME;
+        Result->Stage = AH_STAGE_ENDPOINT_NAME;
         Result->NtStatus = status;
         *AhStatus = AH_STATUS_INTERNAL;
-        AhRemovePinNames(s);
+        AhRemoveEndpointNames(s);
         goto Done;
     }
 
@@ -1558,7 +1524,7 @@ Routine Description:
     *AhStatus   = AH_STATUS_OK;
 
     DPF(D_TERSE, ("[AhSlotBindSet] slot %u -> '%S' gen %u published 0x%x flags 0x%x",
-                  Slot, s->PinNameFallback ? s->Display : s->PinLabelOut,
+                  Slot, s->NameFallback ? s->Display : s->NameOut,
                   s->Generation, Result->Published, Result->Flags));
     goto Done;
 

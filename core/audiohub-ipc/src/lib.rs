@@ -263,7 +263,7 @@ pub struct HalStatus {
     /// alike, and a user with two machines paired has no way to tell which
     /// speaker is which and nowhere that says why.
     #[serde(default)]
-    pub pin_name_fallbacks: u64,
+    pub endpoint_name_fallbacks: u64,
     /// Per-peer virtual devices. The three counters above are the sums of the
     /// per-slot ones here (spec-m5b §6.1).
     #[serde(default)]

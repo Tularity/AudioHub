@@ -45,32 +45,89 @@ Abstract:
 #define AH_REFSTRING_MAX        64
 
 //
-// PER-PEER PIN NAMES
-// ==================
+// PER-PEER ENDPOINT NAMES
+// =======================
 //
-// Windows composes what the user reads as "<pin name> (<devnode FriendlyName>)".
-// Measured on the target machine, the bracketed half comes from the DEVNODE's
-// FriendlyName -- there is one devnode shared by every peer, so that half can
-// never differ per peer. (Setting DEVPKEY_DeviceInterface_FriendlyName on the
-// KS interface, which the spec assumed supplied it, changed nothing: the value
-// lands in the registry verbatim and no endpoint name uses it.)
+// Windows composes what the user reads as "<DeviceDesc> (<devnode FriendlyName>)".
+// Two of the three obvious ways to supply the left half do NOT work, and both
+// were MEASURED here rather than reasoned about, because each looks correct in
+// the documentation:
 //
-// The half that IS per-filter is the pin name, and it is resolved through
-// KsPinDescriptor.Name -> HKR\MediaCategories\<GUID>\Name, a lookup already
-// proven to work here (the capture endpoint went from "Microphone Array" to
-// "Microphone" when the static GUID was introduced in M6-1 -> M6-2).
+//   1. DEVPKEY_DeviceInterface_FriendlyName on the KS interface. The value
+//      lands in the registry verbatim and no endpoint name uses it. (The
+//      bracketed half comes from the DEVNODE's FriendlyName, of which there is
+//      exactly one for all peers, so that half can never carry a peer name.)
 //
-// So each slot gets its OWN pin-name GUID, derived from the peer fingerprint,
-// and the driver writes that key at bind time. The result reads
+//   2. The pin name, KsPinDescriptor.Name -> MediaCategories\<GUID>\Name.
+//      This one works -- FOR CAPTURE ONLY. Step 3 of the audio endpoint
+//      builder's algorithm "sets the default properties for the endpoint ...
+//      the name, icon, and the form factor", and for a bridge pin whose
+//      category is KSNODETYPE_SPEAKER that name is hardcoded:
+//
+//          "in the case of speaker endpoints, the name has been hardcoded to
+//           'Speakers' and cannot be altered by your driver or a third-party
+//           application"
+//          -- learn.microsoft.com/.../audio/audio-endpoint-builder-algorithm
+//
+//      Measured on a FRESH peer key with the registry perturbed: renaming the
+//      render pin's Name GUID entry changed nothing, and renaming the
+//      MediaCategories entry for KSNODETYPE_SPEAKER ITSELF also changed
+//      nothing -- the speaker's name is not a registry lookup at all. The same
+//      perturbation renamed the capture endpoint both times.
+//
+//      This is why the defect outlived a full acceptance run: the localized
+//      string the hardcode produces is BYTE-IDENTICAL to the string our own
+//      INF installs for the render pin, so "the speaker endpoint is named
+//      <speaker>" was true whether or not anything we wrote was ever read.
+//
+// What DOES work, in both directions, is step 5 of the same algorithm:
+// "populates the endpoint PropertyStore with property information from the
+// registry keys of the audio device interface". Step 5 runs AFTER step 3, so a
+// PKEY_Device_DeviceDesc value under the interface's EP\0 key replaces the
+// hardcoded name. Measured: with the value in place before the interface is
+// enabled, BOTH endpoints came up under it.
+//
+// So the driver writes, per peer and per direction, into the TOPOLOGY
+// interface's own key:
+//
+//     ...\<AhTopoOut|AhTopoIn>-<fingerprint>\Device Parameters\EP\0
+//         "{a45c254e-df1c-4efd-8020-67d146a850e0},2" = "AudioHub - <host> <dir>"
+//
+// and the endpoint reads
 //
 //     AudioHub - WIN-IR01HVEFU7G <speaker> (AudioHub Virtual Audio)
 //
-// whose leading run is byte-identical to the macOS name that plan §7.1 froze.
+// whose leading run is byte-identical to the macOS name that plan 7.1 froze.
+//
+// WHY THIS IS THE SYMMETRIC FIX, and the pin name was not:
+//
+//   * one mechanism, one code path, one call per direction. Neither direction
+//     has a branch, a substitution or a fallback that the other lacks;
+//   * the pin CATEGORY is untouched, so KSNODETYPE_SPEAKER keeps supplying the
+//     form factor, the icon and the default-device rank. The alternative fix
+//     -- moving the render bridge pin off KSNODETYPE_SPEAKER to escape the
+//     hardcode -- would have been a change made to one direction only, to work
+//     around one direction's problem: exactly the small-print asymmetry that
+//     produced this bug in the first place;
+//   * it stops writing the machine-wide MediaCategories key altogether, which
+//     Microsoft documents as "reserved for global definitions and should not
+//     be modified by new drivers ... will not be supported in a future OS
+//     release".
+//
+// KNOWN LIMIT, shared with every other mechanism here: the composed name is
+// CACHED per endpoint id in the MMDevices property store. Rewriting EP\0 for
+// an endpoint id that already exists does not rename it. That matches the
+// deliberate "no renaming of live endpoints" rule (disabling an interface to
+// force a refresh puts the endpoint into DEVICE_STATE_NOTPRESENT and moves the
+// user's default-device choice), and it is why a naming test MUST use a peer
+// key it has never used before.
 //
 // The direction word is NOT hardcoded here: it is READ BACK from the INF's
 // static MediaCategories entries (AH_PIN_NAME_OUT / AH_PIN_NAME_IN) at attach
 // time, so the localizable strings stay in the INF's [Strings] section, which
-// is the only place that can ever grow a [Strings.0409].
+// is the only place that can ever grow a [Strings.0409]. Those entries keep
+// earning their place as the pin-name fallback; only the PER-PEER writes are
+// gone.
 //
 #define AH_DIRWORD_CHARS        32
 
@@ -80,14 +137,7 @@ Abstract:
 // direction word, because two devices distinguished only by a host name that
 // got cut off are worse than one whose host name is short.
 //
-#define AH_PINLABEL_CHARS       (AH_DISPLAY_CHARS + AH_DIRWORD_CHARS + 2)
-
-//
-// Both topology filters declare 2 pins today. The per-slot copy is sized with
-// headroom and perpeer.cpp C_ASSERTs the real tables against it, so growing a
-// table is a compile error rather than a silent overrun of a static array.
-//
-#define AH_MAX_TOPO_PINS        8
+#define AH_ENDPOINT_NAME_CHARS       (AH_DISPLAY_CHARS + AH_DIRWORD_CHARS + 2)
 
 //
 // A slot's four name buffers, its display name, its two ENDPOINT_MINIPAIRs and
@@ -122,45 +172,28 @@ typedef struct _AH_SLOT
     // prefix included, direction suffix excluded.
     WCHAR               Display[AH_DISPLAY_CHARS];
 
-    // Per-peer pin-name GUIDs, DERIVED from PeerKey (never allocated, never
-    // random). Determinism matters for the same reason the reference string
-    // carries the fingerprint: unpair and re-pair the same machine and it must
-    // land on the same registry key, so no garbage accumulates and the name is
-    // stable across the endpoint id that is itself stable.
-    GUID                PinGuidOut;
-    GUID                PinGuidIn;
+    // The composed per-peer endpoint names, "AudioHub - <host> <direction>".
+    // These are what goes into EP\0 as PKEY_Device_DeviceDesc, and they are
+    // also what a test asserts the system's device list contains, verbatim.
+    WCHAR               NameOut[AH_ENDPOINT_NAME_CHARS];
+    WCHAR               NameIn[AH_ENDPOINT_NAME_CHARS];
 
-    // What gets written to MediaCategories\<GUID>\Name.
-    WCHAR               PinLabelOut[AH_PINLABEL_CHARS];
-    WCHAR               PinLabelIn[AH_PINLABEL_CHARS];
+    // TRUE once the registry values exist, i.e. once there is something to
+    // clean up. Checked rather than inferred from State: a Set that failed
+    // after writing the names still has to remove them.
+    BOOLEAN             NamesWritten;
 
-    // TRUE once the registry keys exist, i.e. once there is something to clean
-    // up. Checked rather than inferred from State: a Set that failed after
-    // writing the names still has to remove them.
-    BOOLEAN             PinNamesWritten;
-
-    // TRUE when this slot's endpoints are published under the INF's generic
+    // TRUE when this slot's endpoints are published under the system's generic
     // direction names instead of the peer's. Reported to the daemon as
-    // AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK.
-    BOOLEAN             PinNameFallback;
+    // AH_BINDREPLY_FLAG_NAME_FALLBACK.
+    BOOLEAN             NameFallback;
 
-    // Per-slot copies of the two TOPOLOGY filter descriptors and their pin
-    // arrays.
-    //
-    // These are the ONLY descriptors that get copied. Everything else -- node
-    // tables, connection tables, data ranges, automation tables, and both WAVE
-    // filters -- stays shared, because nothing in them varies per peer. The
-    // topology pin array does: the bridge pin's KsPinDescriptor.Name has to
-    // point at THIS slot's GUID. sysvad's Bluetooth path deep-copies for the
-    // identical reason (it rewrites each endpoint's pin Category).
-    //
-    // Storage is inside the slot record, which lives for the driver image's
-    // lifetime, so there is no ordering to get wrong between freeing a
-    // descriptor and PortCls still holding the pointer.
-    PCPIN_DESCRIPTOR    OutTopoPins[AH_MAX_TOPO_PINS];
-    PCPIN_DESCRIPTOR    InTopoPins[AH_MAX_TOPO_PINS];
-    PCFILTER_DESCRIPTOR OutTopoFilter;
-    PCFILTER_DESCRIPTOR InTopoFilter;
+    // NOTE: there are deliberately NO per-slot filter descriptors here. v3 kept
+    // a private copy of each TOPOLOGY filter and its pin array so the bridge
+    // pin's KsPinDescriptor.Name could point at a per-peer GUID. The name no
+    // longer travels through the pin, so every descriptor is shared again --
+    // which also retires the lifetime hazard that copy created (PortCls holds
+    // these pointers for as long as the device object lives).
 
     SIMPLEAUDIOSAMPLE_DEVPROPERTY   OutTopoProps[1];
     SIMPLEAUDIOSAMPLE_DEVPROPERTY   InTopoProps[1];

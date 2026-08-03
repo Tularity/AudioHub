@@ -735,7 +735,7 @@ AhCtlDeviceControl(
         rep->published  = result.Published;
         //
         // Degradations that do not make the call a failure. Today that is only
-        // AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK, and it is relayed rather than
+        // AH_BINDREPLY_FLAG_NAME_FALLBACK, and it is relayed rather than
         // dropped for the same reason `published` exists at all: a driver that
         // answers OK owes the caller everything it knows about how far short of
         // "OK" the result actually fell.

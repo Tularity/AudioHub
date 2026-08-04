@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use anyhow::{anyhow, Result};
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -67,19 +67,41 @@ impl MediaCrypto {
     /// Builds the full datagram: 40B header (payload_len set to ciphertext
     /// length) followed by the ciphertext.
     pub fn seal(&self, header: &Header, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut datagram = Vec::with_capacity(HEADER_LEN + plaintext.len() + AEAD_TAG_LEN);
+        self.seal_into(header, plaintext, &mut datagram)?;
+        Ok(datagram)
+    }
+
+    /// [`MediaCrypto::seal`] 的**零分配**形态：清空 `out` 并就地封包。
+    ///
+    /// # 为什么需要它
+    ///
+    /// `tx_loop` 每 tick 每流封一个包。原来的 `seal` 每次做**两次**堆分配
+    /// （`Header::encode` 一次、AEAD 的 `encrypt` 一次），而那条线程上的每一次
+    /// `malloc` 都可能撞上分配器的 magazine refill 并陪它等一把锁
+    /// —— `docs/spec-latency-floor.md` §9.3 手段 J1 点名的第 3 项。
+    ///
+    /// # 线格式与 `seal` **逐字节相同**
+    ///
+    /// `Aead::encrypt` 产出的是 `密文 ‖ 标签`；`encrypt_in_place_detached` 就地
+    /// 产出同一段密文并把标签单独返回，接上去即得同一串字节。`tests` 里有一条
+    /// 直接对拍的断言 —— 这不是「看起来一样」，两份实现就是两份线格式。
+    pub fn seal_into(&self, header: &Header, plaintext: &[u8], out: &mut Vec<u8>) -> Result<()> {
         let mut h = header.clone();
         h.payload_len = (plaintext.len() + AEAD_TAG_LEN) as u32;
-        let mut datagram = h.encode(&[]);
+        out.clear();
+        out.reserve(HEADER_LEN + plaintext.len() + AEAD_TAG_LEN);
+        h.encode_into(plaintext, out);
         let nonce = media_nonce(h.stream_id, h.seq);
-        let ct = self
+        // AAD 是那 40 字节头，而它此刻就在 `out` 的前面 —— `split_at_mut` 让
+        // 「以头为 AAD 加密其后的载荷」不必再拷一份头出来。
+        let (aad, msg) = out.split_at_mut(HEADER_LEN);
+        let tag = self
             .cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload { msg: plaintext, aad: &datagram },
-            )
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce), aad, msg)
             .map_err(|_| anyhow!("media encrypt failed"))?;
-        datagram.extend_from_slice(&ct);
-        Ok(datagram)
+        out.extend_from_slice(&tag);
+        Ok(())
     }
 
     /// Parse + authenticate + decrypt one datagram into (header, plaintext).
@@ -261,6 +283,52 @@ impl JbTuning {
     /// 附带纠正一处口径错误：整定表那 3.75 次/分是 `min_target=2` 的实验值，
     /// 而**不能**再拿来反推停顿尾——反推依赖「一次停顿恰好换一次欠载」，
     /// 现在有了直接测量，反推该退休了。
+    ///
+    /// # 2026-08-04 第三轮：`min_target = 3` 上机跑过 36 min，**已回退**
+    ///
+    /// 上面所有推断都还是统计的。这一轮把它变成了**确定性**的：在 mac→30-win
+    /// 的真实会话上用 `SIGSTOP`/`SIGCONT` 给 `audiohubd` 注入精确时长的停顿，
+    /// 逐级抬高幅度，看对端 `jb_underruns` 什么时候动。
+    ///
+    /// ```text
+    /// Δ(ms)  20   30      40      50   60      70
+    /// mt=4   0/2  0/2     1/2 ✗   0/2  1/2 ✗   2/2 ✗      ← 阈值落在 40
+    /// mt=3   0/2  1/2 ✗                                    ← 阈值落到 30
+    /// ```
+    ///
+    /// 12 次注入全部落在同一条规律上（含惩罚项抬高目标之后的复核）：
+    ///
+    /// > **欠载 ⟺ 连续收不到帧的 tick 数 ≥ `target_effective()`**，
+    /// > 即发送端停顿 **Δ ≥ target × 10 ms**。
+    ///
+    /// 这条已钉成单测 [`water_level_tests::the_stall_tolerance_is_exactly_target_effective_frames`]。
+    /// 所以 `min_target` 省下的**每一帧都恰好是一次 10 ms 停顿的抗性**——
+    /// 同一个 30 ms 停顿在 `min_target = 4` 下是绿的、在 `min_target = 3` 下是红的。
+    ///
+    /// 随后按「只降一帧」把对端整定到 `min_target = 3` 跑了 36 min（其中 15.7 min
+    /// 满载编译负载），与 `min_target = 4` 的同链路基线对照：
+    ///
+    /// | | `mt=4` 基线 | `mt=3` | |
+    /// |---|---|---|---|
+    /// | `jitter_buf` 均值 | 34.3 ms | **29.7 ms** | −4.6 ms |
+    /// | `sum_ms` p50（对端自读） | 86.7 ms | **86.4 ms** | **−0.4 ms** |
+    /// | `jb_underruns` | 0.101/min | **0.167/min** | **×1.65** |
+    /// | `jb_plc` | 0.332/min | **0.667/min** | ×2.0 |
+    /// | `jb_silence` | 0.116/min | **1.334/min** | ×11.5 |
+    /// | `jitter_buf` 最大值 | 40 ms | **110 ms** | 惩罚项把尾拉长了 |
+    /// | `lost` | 0 | 0 | — |
+    ///
+    /// **收益进了 JB 那一级，却没有进 `sum_ms`**：省下的 4.6 ms 被下游
+    /// `play_ring` 与惩罚项爬升吃掉（`target` 分布 3:84.8% / 4:13.9% / 5:1.3%）。
+    /// 也就是说 `min_target` 一降，回路就靠**制造欠载**把水位学回去——省下的延迟
+    /// 是借来的，利息用断续付。**据此回退到 4，不再下调。**
+    ///
+    /// 顺带纠正 `docs/spec-latency-floor.md` §9.1 的一个工作点误读：那里写的
+    /// `jitter_buf = 50 ms` 是**惩罚项处于激活态**时的快照。链路干净、惩罚项
+    /// 归零时两侧同时实测（mac 中继 145 点 / 对端自读 249 点，同一窗口）都是
+    /// **p50 30 ms、均值 34.3 ms、只在 3↔4 帧之间摆**——上报的是弹出前深度，
+    /// 弹出后是它减一。所以 J1「50 → 15 = −35 ms」的前提里，有 20 ms 从一开始
+    /// 就不存在。
     pub const DEFAULT: JbTuning = JbTuning {
         min_target: 4,
         max_target: 12,
@@ -904,14 +972,20 @@ impl FrameSource for ToneSource {
 }
 
 /// Default-microphone source, resampled to 48k. Underruns emit silence so the
-/// send cadence never stalls. Create on the sending thread (cpal streams are
-/// not Send on all platforms).
+/// send cadence never stalls.
+///
+/// # 它**不**持有 cpal 流 —— 这一条是承重的
+///
+/// `LiveCapture` 里是一个 `cpal::Stream`，在 macOS 上 **`!Send`**。只要这个
+/// 结构体里有它，`MicSource` 就是 `!Send`，于是「开设备」这件事就只能发生在
+/// 最终消费它的那条线程上 —— 也就是 `tx_loop` 的 10 ms 截止期线程。
+/// 而开一次 CoreAudio 输入设备的量级与实测停顿直方图的 110–600 ms 正好对得上
+/// （`docs/spec-latency-floor.md` §9.3 手段 J1）。
+///
+/// 所以拆开：**开设备的线程持有 `LiveCapture`，音频线程只拿 `AudioRx`**
+/// （无锁环的消费端，`Send`）。[`MicSource::open`] 把两者一起返回，调用方必须
+/// 让那个 `LiveCapture` 活着——丢掉它 = 关掉采集流 = 这个源从此只出静音。
 pub struct MicSource {
-    /// 只为让 cpal 流活着而持有。`Option` 是给测试留的口子：`LiveCapture` 里
-    /// 是一个 `cpal::Stream`，没有真设备就造不出来，而 `depths()` 的接线
-    /// （哪个读数进哪个字段、丢弃方向标成什么）恰恰是必须被真调用一次才作数的
-    /// 那部分。`None` 只在单元测试里出现，运行时永远是 `Some`。
-    _cap: Option<LiveCapture>,
     rx: AudioRx,
     resampler: Option<LinearResampler>,
     fifo: VecDeque<f32>,
@@ -928,15 +1002,22 @@ impl MicSource {
     pub const OUT_RATE: u32 = 48000;
     const FIFO_CAP: usize = 48000; // 1s: bound added latency
 
-    pub fn new(frame_ms: u32) -> Result<Self> {
+    /// 开默认输入设备。**返回的 `LiveCapture` 必须被调用方保管好**（见类型
+    /// 文档）：它是 `!Send` 的 cpal 流，只能留在开它的这条线程上，而
+    /// `MicSource` 可以被送去任何线程消费。
+    pub fn open(frame_ms: u32) -> Result<(MicSource, LiveCapture)> {
         let (cap, rx, rate) = LiveCapture::start()?;
+        Ok((MicSource::from_rx(rx, rate, frame_ms), cap))
+    }
+
+    /// 从一个已经在跑的采集环造源。速率取自设备，不是假定 48k。
+    pub fn from_rx(rx: AudioRx, rate: u32, frame_ms: u32) -> MicSource {
         let resampler = if rate == Self::OUT_RATE {
             None
         } else {
             Some(LinearResampler::new(rate, Self::OUT_RATE))
         };
-        Ok(MicSource {
-            _cap: Some(cap),
+        MicSource {
             rx,
             resampler,
             fifo: VecDeque::new(),
@@ -944,7 +1025,7 @@ impl MicSource {
             staged: Vec::new(),
             frame_samples: (Self::OUT_RATE as u64 * frame_ms as u64 / 1000) as usize,
             dropped: 0,
-        })
+        }
     }
 
     pub fn fifo_len(&self) -> u32 {
@@ -1358,7 +1439,6 @@ mod telemetry_tests {
         // 设备速率故意取 44100：采集环那一级若被硬写成 48000，ms 会偏 −8.8%。
         let (rx, mut feed) = AudioRx::detached_for_test(44_100);
         let mut mic = MicSource {
-            _cap: None,
             rx,
             resampler: Some(LinearResampler::new(44_100, MicSource::OUT_RATE)),
             fifo: VecDeque::new(),
@@ -1417,7 +1497,6 @@ mod telemetry_tests {
     fn mic_source_capture_ring_overflow_is_counted_as_newest_dropped() {
         let (rx, mut feed) = AudioRx::detached_for_test(48_000);
         let mic = MicSource {
-            _cap: None,
             rx,
             resampler: None,
             fifo: VecDeque::new(),
@@ -1454,7 +1533,6 @@ mod telemetry_tests {
     fn a_brimming_send_fifo_reads_exactly_one_second_and_the_capture_ring_two() {
         let (rx, mut feed) = AudioRx::detached_for_test(48_000);
         let mut mic = MicSource {
-            _cap: None,
             rx,
             resampler: None,
             fifo: VecDeque::new(),
@@ -1787,6 +1865,52 @@ mod water_level_tests {
             sim.jb.accel_frames, sim.jb.accel_events,
             "一次收敛净吐一帧"
         );
+    }
+
+    /// **抗停顿深度 = `target_effective()` 帧，一帧不多一帧不少。**
+    ///
+    /// 这条不是从欠载率反推的，是 2026-08-04 在 mac→30-win **真实会话**上用
+    /// `SIGSTOP`/`SIGCONT` 精确注入发送端停顿量出来的（阶梯见 `JbTuning::DEFAULT`
+    /// 的文档）：发送端停顿 Δ ms ⇒ 对端连续 Δ/10 个 tick 一帧都收不到 ⇒
+    /// **恰好 `gap >= target_effective` 时欠载**，少一个 tick 都不欠。
+    /// 上机阶梯 12/12 命中，且同一个 Δ = 30 ms 在 `min_target = 4` 下是绿的、
+    /// 在 `min_target = 3` 下是红的。
+    ///
+    /// 之所以必须把它钉成单测：`min_target` 是全链路上唯一一个「改小就立刻省
+    /// 延迟」的常数，而它省下的**每一帧都恰好是一次 10 ms 停顿的抗性**。谁把
+    /// 这条不变量改松了（比如把重新预缓冲的判据从 `depth() < target` 改成 `<=`，
+    /// 或者让 `start_playback` 少钳一帧），延迟表会立刻变好看，代价却要到真实
+    /// 链路上、在别人机器有负载的时候才浮出来。
+    #[test]
+    fn the_stall_tolerance_is_exactly_target_effective_frames() {
+        for min_target in [2u32, 3, 4, 5] {
+            let cfg = cfg_min(min_target);
+            for gap in 1..=(min_target + 2) {
+                let mut sim = Sim::new(cfg, tone(1010.0), false);
+                sim.warm_up();
+                sim.run(50); // 进稳态
+                assert_eq!(
+                    sim.jb.target_effective(),
+                    min_target,
+                    "前提：稳态有效目标就是 min_target（惩罚项此刻必须是 0）"
+                );
+                let before = sim.jb.underruns;
+                for _ in 0..gap {
+                    sim.tick(0); // 一帧都不到 —— 这就是发送端停顿 gap × 10 ms
+                }
+                let starved = sim.jb.underruns > before;
+                assert_eq!(
+                    starved,
+                    gap >= min_target,
+                    "min_target={min_target}（保护 {} ms）遇到 {} ms 停顿：\
+                     期望{}欠载，实际{}欠载",
+                    min_target * 10,
+                    gap * 10,
+                    if gap >= min_target { "" } else { "不" },
+                    if starved { "" } else { "不" },
+                );
+            }
+        }
     }
 
     /// **限速：ρ ≤ 1 %。** 把应急线抬到够不着，只留软档，然后持续超供
@@ -2234,5 +2358,81 @@ mod water_level_tests {
         );
         let t = JbTuning::from_env();
         assert!(t.max_frames >= t.max_target + t.hard_slack + 1);
+    }
+}
+
+#[cfg(test)]
+mod zero_alloc_wire_tests {
+    //! `seal_into` / `encode_into` 是为了让 `tx_loop` 每 tick 不再 `malloc`
+    //! （`docs/spec-latency-floor.md` §9.3 手段 J1 的第 3 项）而加的。
+    //!
+    //! **两份实现就是两份线格式**，所以这里不测「看起来对」，只测两件事：
+    //! ① 与原实现逐字节相同；② 复用缓冲时真的不再重新分配。
+
+    use super::*;
+    use crate::packet::{Codec, Kind};
+
+    fn hdr(seq: u32, len: usize) -> Header {
+        Header {
+            kind: Kind::Media,
+            codec: Codec::PcmS16le,
+            channels: 1,
+            sample_rate: 48000,
+            session_id: 7,
+            stream_id: 7,
+            seq,
+            timestamp_us: 123_456,
+            payload_len: len as u32,
+        }
+    }
+
+    /// **逐字节相同**。注入对照：把 `seal_into` 里的 `out.extend_from_slice(&tag)`
+    /// 挪到 `encode_into` 之前（= 标签跑到密文前面），本条立刻变红。
+    #[test]
+    fn sealing_in_place_produces_the_very_same_datagram() {
+        let mc = MediaCrypto::new_for_stream(&[9u8; 32], 7, b"salt-16-bytes!!!");
+        let mut buf = Vec::new();
+        for seq in 0..4u32 {
+            let plain: Vec<u8> = (0..960u32).map(|i| (i.wrapping_mul(seq + 1)) as u8).collect();
+            let want = mc.seal(&hdr(seq, plain.len()), &plain).expect("seal");
+            mc.seal_into(&hdr(seq, plain.len()), &plain, &mut buf)
+                .expect("seal_into");
+            assert_eq!(buf, want, "seq {seq}：就地封包与原实现产出的字节不同");
+            // 而且它必须真的能被解开（对拍相同还不够：两边一起错也会相同）。
+            let (h, pt) = mc.open(&buf).expect("open");
+            assert_eq!(h.seq, seq);
+            assert_eq!(pt, plain);
+        }
+    }
+
+    /// **复用缓冲之后不再分配**：容量与首地址都不许变。
+    ///
+    /// 注入对照：把 `seal_into` 开头的 `out.clear()` 换成
+    /// `*out = Vec::new()`（= 每次重新分配），`ptr` 断言变红。
+    #[test]
+    fn a_reused_buffer_stops_reallocating_after_the_first_frame() {
+        let mc = MediaCrypto::new_for_stream(&[1u8; 32], 3, b"0123456789abcdef");
+        let plain = vec![0u8; 960];
+        let mut buf = Vec::new();
+        mc.seal_into(&hdr(0, plain.len()), &plain, &mut buf).unwrap();
+        let (cap, ptr) = (buf.capacity(), buf.as_ptr());
+        for seq in 1..64u32 {
+            mc.seal_into(&hdr(seq, plain.len()), &plain, &mut buf).unwrap();
+            assert_eq!(buf.capacity(), cap, "seq {seq}：缓冲被重新分配了");
+            assert_eq!(buf.as_ptr(), ptr, "seq {seq}：缓冲搬家了 = 一次 malloc");
+        }
+    }
+
+    /// `Header::encode_into` 与 `Header::encode` 逐字节相同（含载荷拼接）。
+    #[test]
+    fn encoding_a_header_in_place_matches_the_allocating_form() {
+        let payload = [1u8, 2, 3, 4, 5];
+        let h = hdr(11, payload.len());
+        let mut out = Vec::new();
+        h.encode_into(&payload, &mut out);
+        assert_eq!(out, h.encode(&payload));
+        // 复用：第二次写短载荷必须把上一次的尾巴清掉，不能残留。
+        h.encode_into(&[], &mut out);
+        assert_eq!(out, h.encode(&[]), "encode_into 没有清空 out");
     }
 }

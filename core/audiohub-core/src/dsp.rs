@@ -81,11 +81,26 @@ pub fn verify_tone(samples: &[f32], sample_rate: u32, freq_hz: f32) -> ToneVerdi
 
 pub fn f32_to_s16le(samples: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples.len() * 2);
+    f32_to_s16le_into(samples, &mut out);
+    out
+}
+
+/// [`f32_to_s16le`] 的**零分配**形态：清空 `out` 并就地写入。
+///
+/// 存在的理由只有一个：`tx_loop` 每 tick 每流调一次，而那条线程上的每一次
+/// `malloc` 都是一条尾巴（`docs/spec-latency-floor.md` §9.3 手段 J1）。
+/// 调用方持有一个长期复用的缓冲，容量在第一帧之后就不再变。
+///
+/// `reserve` 在容量够时是一次比较，不是一次分配；写成 `reserve` 而不是
+/// `debug_assert!(capacity >= …)` 是因为换档（rung）会改变帧长度，
+/// 少给一次容量就变成一次静默的截断。
+pub fn f32_to_s16le_into(samples: &[f32], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(samples.len() * 2);
     for &s in samples {
         let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
         out.extend_from_slice(&v.to_le_bytes());
     }
-    out
 }
 
 pub fn s16le_to_f32(bytes: &[u8]) -> Vec<f32> {
@@ -135,5 +150,33 @@ impl LinearResampler {
         }
         self.phase = p - len;
         self.last = *input.last().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod zero_alloc_tests {
+    use super::*;
+
+    /// `f32_to_s16le_into` 必须与 `f32_to_s16le` 逐字节相同，且复用时不再分配。
+    ///
+    /// 注入对照：把 `f32_to_s16le_into` 里的 `out.clear()` 删掉，第二轮的长度
+    /// 断言立刻变红（内容会累积）。
+    #[test]
+    fn converting_in_place_matches_the_allocating_form_and_reuses_the_buffer() {
+        let samples: Vec<f32> = (0..480).map(|i| (i as f32 / 480.0) * 2.0 - 1.0).collect();
+        let want = f32_to_s16le(&samples);
+        let mut out = Vec::new();
+        f32_to_s16le_into(&samples, &mut out);
+        assert_eq!(out, want);
+        let (cap, ptr) = (out.capacity(), out.as_ptr());
+        for _ in 0..32 {
+            f32_to_s16le_into(&samples, &mut out);
+            assert_eq!(out, want, "复用之后内容变了（多半是没清空）");
+            assert_eq!(out.capacity(), cap, "缓冲被重新分配了");
+            assert_eq!(out.as_ptr(), ptr, "缓冲搬家了 = 一次 malloc");
+        }
+        // 换档（rung）会把帧变短：短帧必须只有短帧的内容。
+        f32_to_s16le_into(&samples[..240], &mut out);
+        assert_eq!(out, f32_to_s16le(&samples[..240]));
     }
 }

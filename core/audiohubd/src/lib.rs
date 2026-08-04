@@ -15,6 +15,10 @@ mod ipcserv;
 mod mode_tests;
 mod quality;
 pub mod reconnect;
+/// 截止期线程的延迟落盘日志（阻塞 write + Stderr 全局锁不许上音频线程）。
+mod rtlog;
+/// 截止期线程用的无锁原语（定长槽 SPSC 环）。
+mod rtsafe;
 /// 延迟目标的伺服回路（纯函数 + 一拍驱动）。
 mod servo;
 mod settings;
@@ -99,10 +103,27 @@ pub(crate) fn wr<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 /// 33 条跳 tick 记录与 30 次欠载谁先谁后、隔了多久，在一份 21 小时的日志里
 /// 完全无法回答，只能从头再跑一遍。时间戳与 IPC 的 `uptime_s` 同一条时基
 /// （两者都是进程启动后的单调秒），所以日志行可以直接和外部采样对齐。
+/// **截止期线程（`tx_loop` / `mixer_loop`）上这里不写 stderr**，见
+/// [`rtlog`]：那两条线程调 [`rtlog::arm`] 之后，本函数把行**入队**，由
+/// `ahb-rtlog` 线程落盘。阻塞的 `write(2)` 加上 `Stderr` 的进程级锁是
+/// `docs/spec-latency-floor.md` §9.3 手段 J1 点名的两条尾之一，
+/// 而调用点有几十处、分散在 `halbridge` 里——所以分流做在**这里**，
+/// 不是让每个 `dlog!` 自己选。漏改一处就等于白做，这样就不存在漏改。
 pub fn logln(args: std::fmt::Arguments<'_>) {
+    let at = log_uptime();
+    if rtlog::try_defer(at, args) {
+        return;
+    }
+    logln_direct(at, args);
+}
+
+/// 真正落盘的那一半。`at` 是**行产生**的时刻，不是写下去的时刻——
+/// 延迟落盘之后两者不再相等，而上面那段文档说的「日志行可以直接和外部采样
+/// 对齐」依赖的是前者。
+pub(crate) fn logln_direct(at: std::time::Duration, args: std::fmt::Arguments<'_>) {
     use std::io::Write;
     // one write per line: interleaved threads must not tear a line apart
-    let mut line = format!("[{:11.3}] ", log_uptime().as_secs_f64());
+    let mut line = format!("[{:11.3}] ", at.as_secs_f64());
     use std::fmt::Write as _;
     let _ = line.write_fmt(args);
     line.push('\n');
@@ -111,7 +132,7 @@ pub fn logln(args: std::fmt::Arguments<'_>) {
 
 /// 日志时间戳的原点。第一次记日志时钉住，之后只读——比 `Instant::now()` 每行
 /// 取一次系统时间便宜，也让「第 0 秒」在日志里有确定含义。
-fn log_uptime() -> std::time::Duration {
+pub(crate) fn log_uptime() -> std::time::Duration {
     static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     T0.get_or_init(Instant::now).elapsed()
 }
@@ -315,6 +336,11 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
 
     let (tx_send, tx_recv) = mpsc::channel::<engine::TxCmd>();
     let (mix_send, mix_recv) = mpsc::channel::<engine::MixCmd>();
+    // 建源 / 收尸线程的两条通道。开一次 CoreAudio 输入设备是 110–600 ms 量级
+    // （`docs/spec-latency-floor.md` §1.4 的停顿直方图），那件事必须离开
+    // `tx_loop` 的 10 ms 截止期。
+    let (build_send, build_recv) = mpsc::channel::<engine::BuildReq>();
+    let (built_send, built_recv) = mpsc::channel::<engine::BuildDone>();
     let cfg_dir_for_state = cfg_dir.clone();
     let inner = Arc::new(DaemonInner {
         id: id.clone(),
@@ -323,6 +349,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         ipc_port,
         token: token.clone(),
         udp,
+        media_send: engine::UdpSender::new(),
         start: Instant::now(),
         state: Mutex::new(DaemonState {
             conns: HashMap::new(),
@@ -382,11 +409,34 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         let i = inner.clone();
         threads.push(spawn("ahb-media-rx", Box::new(move || engine::rx_loop(i)))?);
     }
+    // 日志写手**必须最先起**：`tx_loop` / `mixer_loop` 一进循环就开始往队列里
+    // 塞行，写手不在的话它们只会积到环满然后丢。
+    {
+        let i = inner.clone();
+        threads.push(spawn(
+            "ahb-rtlog",
+            Box::new(move || rtlog::writer_loop(|| i.shutdown.load(Ordering::SeqCst))),
+        )?);
+    }
+    {
+        let i = inner.clone();
+        threads.push(spawn(
+            "ahb-media-send",
+            Box::new(move || engine::udp_send_loop(i)),
+        )?);
+    }
+    {
+        let i = inner.clone();
+        threads.push(spawn(
+            "ahb-source-build",
+            Box::new(move || engine::source_builder_loop(i, build_recv, built_send)),
+        )?);
+    }
     {
         let i = inner.clone();
         threads.push(spawn(
             "ahb-media-tx",
-            Box::new(move || engine::tx_loop(i, tx_recv)),
+            Box::new(move || engine::tx_loop(i, tx_recv, build_send, built_recv)),
         )?);
     }
     {
@@ -486,6 +536,10 @@ pub(crate) struct DaemonInner {
     pub ipc_port: u16,
     pub token: String,
     pub udp: UdpSocket,
+    /// 媒体发送队列。`tx_loop` 入队、`engine::udp_send_loop` 出队并 `sendto`。
+    /// **`sendto` 不许回到 10 ms 截止期线程上** —— 它进内核网络栈，
+    /// 单次调用的耗时上界不可预知（`docs/spec-latency-floor.md` §9.3 手段 J1）。
+    pub media_send: engine::UdpSender,
     pub start: Instant,
     pub state: Mutex<DaemonState>,
     pub rx_table: RwLock<HashMap<u32, Arc<RxStream>>>,
@@ -776,6 +830,19 @@ fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
         "sched_late": {
             "tx": engine::tx_late_counters(),
             "mixer": engine::mixer_late_counters(),
+        },
+        // 媒体发送队列（`tx_loop` → `ahb-media-send`）。
+        //
+        // 怎么读：`queued` 稳态恒为 0 —— 非 0 就说明发送线程此刻正卡在
+        // `sendto` 里，而那正是把 `sendto` 搬出截止期线程要挡的那件事。
+        // `dropped` 是队列满时丢掉的数据报数：它涨了意味着发送线程卡的时间
+        // 已经**超过对端 JB 的深度**，对端在那段时间里必然欠载 —— 换句话说，
+        // 它是「发送侧长停顿」的直接证据，而不是一个新的丢包源。
+        // ⚠ 搬家之前同一类事件（`send_to` 返回 `Err`）是**完全静默**的。
+        "media_send_q": {
+            "queued": inner.media_send.queued(),
+            "capacity": inner.media_send.capacity(),
+            "dropped": inner.media_send.dropped(),
         },
         // 发送侧：`tx_loop` 唤醒周期的二阶 DLL（`halbridge::dll`）。它是
         // `hal_spk` 水位的**常规执行器**，`trim` 只是它够不着那一档的兜底。
@@ -1605,7 +1672,21 @@ pub(crate) struct TxShared {
     pub remote: Mutex<RemoteStats>,
     /// Receiver PORT learned from its keepalives; the IP always stays the
     /// control-TCP peer's (spec-m4a §3 freezes the destination IP).
+    ///
+    /// ⚠ **`tx_loop` 不许每 tick 拿这把锁。** 它由 `rx_loop`（普通优先级）
+    /// 持有，那条线程在临界区里被抢占，10 ms 音频线程就要陪等一个调度量子
+    /// —— 正是 `docs/spec-latency-floor.md` §9.3 手段 J1 在追的那条尾。
+    /// 读它之前先看 [`TxShared::dest_epoch`]。
     pub dest_override: Mutex<Option<SocketAddr>>,
+    /// `dest_override` 的**变更代号**，`rx_loop` 每次真的改了值就 +1。
+    ///
+    /// 存在的唯一理由是让 `tx_loop` 用一次 relaxed 原子读代替一次加锁：
+    /// 稳态下地址一辈子只学一次，于是这把锁在音频线程上的取用次数从
+    /// 「100 次/秒/流」降到「每条流一生一次」。
+    ///
+    /// 从 1 开始计（0 = `TxStream` 的「还没看过」），所以**在流建起来之前**
+    /// 就学到的地址不会被漏掉：那条流的第一 tick 会看到代号 ≠ 0 并去读一次。
+    pub dest_epoch: AtomicU64,
     /// 发送侧各级深度的发布槽，由 tx_loop 每 10 ms 写一次（只有原子 store）。
     ///
     /// 最多两级：`MicSource` 是采集环 + 发送 FIFO，`SysAudio` 只有发送 FIFO，
@@ -1638,6 +1719,7 @@ impl TxShared {
             created: Instant::now(),
             remote: Mutex::new(RemoteStats::default()),
             dest_override: Mutex::new(None),
+            dest_epoch: AtomicU64::new(0),
             stages: [StageSlot::new(), StageSlot::new(), StageSlot::new()],
             drift: Mutex::new(DriftTracker::new()),
         }

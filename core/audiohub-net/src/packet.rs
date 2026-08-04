@@ -76,6 +76,18 @@ pub enum PacketError {
 impl Header {
     pub fn encode(&self, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
+        self.encode_into(payload, &mut out);
+        out
+    }
+
+    /// [`Header::encode`] 的**零分配**形态：清空 `out` 并就地写入。
+    ///
+    /// `tx_loop` 每 tick 每流封一个包，那条线程上不许有 `malloc`
+    /// （`docs/spec-latency-floor.md` §9.3 手段 J1）。字节序与字段顺序必须与
+    /// `encode` 逐字相同 —— 两份实现就是两份线格式，所以 `encode` 改成调它。
+    pub fn encode_into(&self, payload: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        out.reserve(HEADER_LEN + payload.len());
         out.extend_from_slice(&MAGIC);
         out.push(VERSION);
         out.push(self.kind as u8);
@@ -88,7 +100,6 @@ impl Header {
         out.extend_from_slice(&self.timestamp_us.to_le_bytes());
         out.extend_from_slice(&self.payload_len.to_le_bytes());
         out.extend_from_slice(payload);
-        out
     }
 
     pub fn parse(datagram: &[u8]) -> Result<(Header, &[u8]), PacketError> {

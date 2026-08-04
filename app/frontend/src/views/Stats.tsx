@@ -168,6 +168,9 @@ function SessionCard({ info, hist }: { info: SessionInfo; hist: MetricHistory | 
   const flow = sessionFlow(info);
   const origin = info.origin ? ORIGIN_TAG[info.origin] : undefined;
   const vol = volumeText(st.volume);
+  // 抖动缓冲这一级的 ms，由 daemon 算好（`jitter_buf`）。用来给下面那格帧数配一个
+  // 与延迟档同量纲的读数；读不到就不配（不拿帧数 ×10 编一个）。
+  const jbMs = readLatency(info)?.stages?.jitter_buf?.ms;
 
   return (
     <article className="card session-card" data-testid={`session-row-${info.id}`}>
@@ -194,7 +197,12 @@ function SessionCard({ info, hist }: { info: SessionInfo; hist: MetricHistory | 
         <span className="sess-meta">
           {joinPhrases([
             peerLabel(info),
-            t('stats.meta.sampleRate', { v: fmt.count(info.sample_rate) }),
+            // `sample_rate` 现在是**线上**速率（随质量档变），不再是硬编码的
+            // 48000。0 = 两侧都报不出来 ⇒ 说「读不到」，**不显示 0 Hz、也不兜底
+            // 成 48000**——那个兜底正是这一格此前恒写 48000 的来路。
+            typeof info.sample_rate === 'number' && info.sample_rate > 0
+              ? t('stats.meta.sampleRate', { v: fmt.count(info.sample_rate) })
+              : t('stats.meta.sampleRateNone'),
             t('stats.meta.channels', { v: fmt.count(info.channels) }),
           ])}
         </span>
@@ -242,7 +250,17 @@ function SessionCard({ info, hist }: { info: SessionInfo; hist: MetricHistory | 
         <span>{t('stats.extra.received', { n: fmt.count(st.received) })}</span>
         <span>{t('stats.extra.lost', { n: fmt.count(st.lost) })}</span>
         <span>{t('stats.extra.sent', { n: fmt.count(st.sent_packets) })}</span>
-        <span>{t('stats.extra.jbDepth', { n: fmt.count(st.jb_depth_frames) })}</span>
+        {/* 缓冲深度**同时给帧与毫秒**，理由与音质那一格的「带宽（采样率 …）」逐字
+            相同：延迟档的设置单位是 ms，而这一格此前只有帧，用户设了 300 ms 之后
+            没有任何办法把「12 帧」与它对上。
+            ms **不由帧数 ×10 推**——那是把 FRAME_MS 这个后端常数刻一份在前端。
+            取的是 daemon 已经算好的 `jitter_buf` 级读数（同一条会话、同一拍）；
+            它拿不到时就只显示帧数，不编一个毫秒出来。 */}
+        <span>
+          {typeof jbMs === 'number'
+            ? t('stats.extra.jbDepthMs', { n: fmt.count(st.jb_depth_frames), ms: fmt.int(jbMs) })
+            : t('stats.extra.jbDepth', { n: fmt.count(st.jb_depth_frames) })}
+        </span>
         <span>{t('stats.extra.rungChanges', { n: fmt.count(st.rung_changes) })}</span>
         {st.verdict
           ? (st.verdict.detected

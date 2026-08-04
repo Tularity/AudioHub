@@ -170,6 +170,37 @@ impl Node {
             })
     }
 
+    /// **界面读到的**线上采样率：`session.list` 里 `SessionInfo.sample_rate`。
+    ///
+    /// 与 `tx_rung` 是两个东西，这一点是承重的：`tx_rung` 是执行器的内部序号，
+    /// 用户从没见过；`sample_rate` 是统计页上那个数。这个字段此前是**硬编码的
+    /// 48000**，于是「格号动了」与「界面上的数动了」之间没有任何联系——
+    /// 一条只断言格号的测试对 UI 层的谎言完全免疫。
+    fn session_wire_rate(&self) -> Option<u32> {
+        self.ok(methods::SESSION_LIST, json!({}))
+            .as_array()?
+            .iter()
+            .find_map(|s| s["sample_rate"].as_u64())
+            .map(|v| v as u32)
+    }
+
+    /// 音质那一格的两个数：`(wire_rate_hz, bandwidth_hz)`。
+    /// 一级界面显示前者（与设置同量纲），展开明细显示后者。
+    /// 本机侧 `quality` 优先，纯发送流回落到对端回传的 `peer_quality`。
+    fn session_quality_rate(&self) -> Option<(u32, u32)> {
+        self.ok(methods::SESSION_LIST, json!({}))
+            .as_array()?
+            .iter()
+            .find_map(|s| {
+                let st = &s["stats"];
+                let q = st["quality"].as_object().or_else(|| st["peer_quality"].as_object())?;
+                Some((
+                    q.get("wire_rate_hz")?.as_u64()? as u32,
+                    q.get("bandwidth_hz")?.as_u64()? as u32,
+                ))
+            })
+    }
+
     /// **接收侧执行器**：这条 daemon 上任意一条接收流的 JB 有效目标深度（帧）。
     fn jb_target(&self) -> Option<u32> {
         crate::snapshot_sessions(self.h.inner_for_test())
@@ -285,6 +316,61 @@ fn moving_the_quality_slider_really_changes_the_wire_rate() {
             a.tx_rung() == Some(want_rung)
         });
     }
+}
+
+/// **接线 ②：档位 id 里的那个数 == `session.list` 报出去的采样率。**
+///
+/// 上一条只证明格号跟着动，它证明不了**界面上那个数是对的**——格号是个内部序号
+/// （`pcm48k` ⇒ 0），用户从没见过它。用户见到的是 `SessionInfo.sample_rate` 与
+/// `QualityStats.wire_rate_hz`，而这两个此前都不可信：
+///
+///   - `sample_rate` 是**硬编码的 48000**，无论阶梯掉到哪一档都写 48000
+///     （统计页那格「采样率 48000 Hz」因此恒为真、恒不含信息）；
+///   - 一级界面那一格显示的是 `bandwidth_hz`（= 采样率/2），于是用户设 `pcm48k`
+///     却读到 24 kHz，2026-08-04 据此报「设置没生效」。
+///
+/// 所以这一条比的是**同一个数**：`pcmNNk` 里的 NN，与 IPC 报出去的 Hz/1000。
+/// 顺带钉死带宽恰是它的一半、且**两者不相等**——它们在界面上都写作 kHz。
+///
+/// 缺陷注入对照（都实跑过）：
+///   1. `sample_rate: wire_rate.unwrap_or(0)` 改回 `48000` ⇒ 三档红在「采样率」；
+///   2. `wire_rate_hz` 改成 `bandwidth_hz`（少乘 2）⇒ 四档全红；
+///   3. `bandwidth_hz: last_rate / 2` 改成 `last_rate` ⇒ 红在「带宽是一半」与
+///      「两者不相等」。
+#[test]
+fn the_number_in_the_quality_stop_id_is_the_number_ipc_reports() {
+    let (a, b) = linked("qunits");
+    let _id = tone_session(&a, &b);
+    eventually("a to have a sending stream", || a.tx_rung().is_some());
+
+    for (id, khz) in [("pcm16k", 16u32), ("pcm24k", 24), ("pcm32k", 32), ("pcm48k", 48)] {
+        a.set_transport(&b.fingerprint(), "send", "quality", id);
+        let want = khz * 1000;
+        eventually(&format!("session.list 的 sample_rate 变成 {want} （档 {id}）"), || {
+            a.session_wire_rate() == Some(want)
+        });
+        // 正向对照：上面那条 `eventually` 若因为**根本没有会话**而恒为 None，
+        // 它会超时而不是通过；这里再取一次并断言，好让失败信息带上实际值。
+        assert_eq!(
+            a.session_wire_rate(),
+            Some(want),
+            "档 {id} 的线上采样率不是 {want}——界面上那个数与用户设的那个数对不上",
+        );
+    }
+
+    // 音质原料那一份（一级界面读 `wire_rate_hz`、明细读 `bandwidth_hz`）。
+    // 它只在**接收**侧算得出来，所以看 b 那台：a 在发，b 在收。
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm32k");
+    eventually("b 侧音质原料里的采样率变成 32000", || {
+        b.session_quality_rate() == Some((32_000, 16_000))
+    });
+    let (rate, bw) = b.session_quality_rate().expect("b 侧应当有音质读数");
+    assert_eq!(rate, 32_000, "音质那一格的采样率与档位对不上");
+    assert_eq!(bw, rate / 2, "带宽必须恰是采样率的一半（奈奎斯特）");
+    assert_ne!(
+        rate, bw,
+        "采样率与带宽成了同一个数——两者在界面上都写作 kHz，混同即 2026-08-04 那次误读",
+    );
 }
 
 /// **固定档必须让 AUTO 阶梯闭嘴。**
@@ -781,6 +867,7 @@ fn a_peer_reading_without_a_clip_page_does_not_become_excellent() {
         clip_ratio: None,
         clip_excess_db: None,
         bandwidth_hz: 24_000, // Q3 满带宽
+        wire_rate_hz: 48_000, // 线上采样率：与带宽差 2 倍，是两个数
         duplicate: false,
     };
     let unmeasured = crate::grade_peer_quality(&base);

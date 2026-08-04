@@ -2436,10 +2436,15 @@ fn peer_quality_payload(
     // 抽一个共用变量：两处若分了岔，用户会在两台机器上看到同一条流两个等级。
     let duplicate = (rx.is_spk || rx.monitor)
         && build_mix_health(inner).map_or(false, |h| h.duplicate_suspect);
-    // 锁各拿各的、不嵌套（`sample_telemetry` 上的锁序说明）。`last_rate` 先取出来，
-    // 否则那把锁会在 `position` 的闭包里被反复拿放。
+    // 锁各拿各的、不嵌套（`sample_telemetry` 上的锁序说明）。
+    //
+    // `last_rate` 就是媒体包头里的 `sample_rate`（`engine.rs` 的
+    // `c.last_rate = h.sample_rate`）——**本机实际收到的线上采样率**。
+    // 带宽与它自己都直接由它导出，不再绕一趟阶梯格号：
+    // `AUTO_RATES.position(..).unwrap_or(0)` 会把任何**不在阶梯上**的速率
+    // 静默记成格号 0，于是 `rung_rate(0)/2 = 24 kHz`——一个我们从没收到过的
+    // 「满带宽、优」。除掉这一跳，off-ladder 的速率就照实报。
     let last_rate = lk(&rx.stats).last_rate;
-    let rung = AUTO_RATES.iter().position(|&r| r == last_rate).unwrap_or(0) as u32;
     let (window_s, d) = lk(&rx.jbs).conceal.window()?;
     let conceal = quality::conceal_ratio(&d)?;
     let clip = rx.clip.window();
@@ -2456,7 +2461,8 @@ fn peer_quality_payload(
         // 会因此报「良好」。这个坑本机侧已经踩过一次。
         clip_ratio: clip.map(|w| w.ratio()),
         clip_excess_db: clip.map(|w| w.excess_db()),
-        bandwidth_hz: audiohub_net::media::rung_rate(rung) / 2,
+        bandwidth_hz: last_rate / 2,
+        wire_rate_hz: last_rate,
         duplicate,
     })
 }
@@ -2485,13 +2491,38 @@ fn grade_peer_quality(q: &audiohub_net::secure::QualityReading) -> QualityStats 
         clip_ratio: q.clip_ratio,
         clip_excess_db: q.clip_excess_db,
         bandwidth_hz: q.bandwidth_hz,
+        // 旧对端不发 `wire_rate_hz`（字段是本轮新加的），线上给 0。
+        // **只有这一处**允许由带宽反推采样率，因为只有这一处能确定对面是旧版：
+        // 那个 build 里 `bandwidth_hz ≡ rung_rate/2` 是恒等式，反推是准确的。
+        // 新对端一律用它自己报的线上速率——见 `QualityReading::wire_rate_hz`。
+        wire_rate_hz: if q.wire_rate_hz > 0 {
+            q.wire_rate_hz
+        } else {
+            q.bandwidth_hz.saturating_mul(2)
+        },
         grade: grade.map_or("unknown", quality::Grade::as_str).to_string(),
         worst: worst.to_string(),
         partial,
     }
 }
 
-fn build_quality(rx: &RxStream, rung: u32, duplicate: bool) -> Option<QualityStats> {
+/// `wire_rate_hz` 是这条流**线上的采样率**（收方取媒体包头的 `h.sample_rate`）。
+/// Q3 的两个数都由它导出：带宽 = 它的一半，采样率 = 它自己。
+/// 参数从「阶梯格号」换成「速率」是有意的：格号要经
+/// `AUTO_RATES.position(..).unwrap_or(0)` 才拿得到，而那个 `unwrap_or` 会把任何
+/// 不在阶梯上的速率报成满带宽。速率是**观测到的量**，格号是对它的分类。
+fn build_quality(rx: &RxStream, wire_rate_hz: u32, duplicate: bool) -> Option<QualityStats> {
+    // 这个参数**曾经是阶梯格号**（0..3）。两者都是 u32，传错编译照过，而后果是
+    // 静默的：格号 0 会被当成 0 Hz ⇒ 带宽 0 ⇒ Q3 判「差」⇒ 整条流报「差」，
+    // 没有任何一处报错。改名挡住了大部分，这条 `debug_assert` 挡住剩下的。
+    //
+    // 门限取 8 kHz 而不是当前阶梯最低档 16 kHz：这是一条**合理性**下界（低于它
+    // 的取值不可能是任何音频采样率），不是阶梯的复述。将来阶梯加一档更低的速率
+    // 时它不该跟着变红——一条会因为正常演进而误报的断言活不过两次改动。
+    debug_assert!(
+        wire_rate_hz >= 8_000,
+        "build_quality 收到 {wire_rate_hz}——这看起来是阶梯格号，不是线上采样率",
+    );
     // Q1：10 s 非消费型窗口的差分。窗口不够长 ⇒ 整个 QualityStats 为 None，
     // 而不是给一个分母只有几帧的随机比率。
     let (window_s, d) = lk(&rx.jbs).conceal.window()?;
@@ -2513,7 +2544,7 @@ fn build_quality(rx: &RxStream, rung: u32, duplicate: bool) -> Option<QualitySta
     // （`compose` 返回 `Option<Grade>`，这里落成 `"unknown"`）。这与 Q1
     // 「窗口不够就整体 None」是同一个口径：测不出来就说测不出来。
     let clip = rx.clip.window();
-    let bandwidth_hz = audiohub_net::media::rung_rate(rung) / 2;
+    let bandwidth_hz = wire_rate_hz / 2;
 
     let q1 = quality::grade_conceal(conceal);
     let q2 = if duplicate {
@@ -2538,6 +2569,7 @@ fn build_quality(rx: &RxStream, rung: u32, duplicate: bool) -> Option<QualitySta
         clip_ratio: clip.map(|w| w.ratio()),
         clip_excess_db: clip.map(|w| w.excess_db()),
         bandwidth_hz,
+        wire_rate_hz,
         // 等级不成立时是 `"unknown"`，**不是在场分量的 min**。IPC 契约上
         // `grade` 早就把 "unknown" 列为合法取值，此前没有任何路径产生它——
         // 那个空位就是这个缺陷藏身的地方。
@@ -2644,6 +2676,13 @@ fn build_session_info_with(
             if e.origin == SessionOrigin::Peer { "peer" } else { "local" }.to_string(),
         );
     }
+    // 这条流**线上的采样率**（Hz）。收方取媒体包头，发方取自己阶梯格号对应的速率。
+    //
+    // `None` = 这条流两侧都没有（不该发生，但**不许兜底成 48000**）：
+    // `SessionInfo.sample_rate` 此前就是一个硬编码的 48000，于是统计页那格
+    // 「采样率 48000 Hz」在阶梯掉到 16 kHz 时照样写着 48000——一个永远为真、
+    // 因而永远不含信息的数字，正是本项目要消灭的那类「报告成功什么都没发生」。
+    let mut wire_rate: Option<u32> = None;
     if let Some(rx) = &e.rx {
         {
             let live = rx.transport.live();
@@ -2659,6 +2698,9 @@ fn build_session_info_with(
             s.loss_pct = sm.loss_pct;
             s.jitter_ms = sm.jitter_ms;
             s.bitrate_kbps = sm.bitrate_kbps;
+            // 速率与格号是**两件事**：速率是包头里观测到的量，格号是把它归进
+            // AUTO 阶梯的分类。归不进去时格号只能给 0，而速率照实报。
+            wire_rate = Some(c.last_rate);
             s.rung = AUTO_RATES
                 .iter()
                 .position(|&r| r == c.last_rate)
@@ -2701,6 +2743,9 @@ fn build_session_info_with(
         s.sent_packets = tx.sent_packets.load(Ordering::Relaxed);
         s.rung = tx.rung.load(Ordering::Relaxed);
         s.rung_changes = tx.rung_changes.load(Ordering::Relaxed);
+        // 发送侧的线上速率就是格号对应的那一档——`engine.rs` 的 tx_loop 用同一个
+        // `rung_rate(tx.rung)` 既建重采样器、又写进包头，所以这里没有第二个真值源。
+        wire_rate = Some(audiohub_net::media::rung_rate(s.rung));
         let r = *lk(&tx.remote);
         // lifetime totals for display; loss_pct is derived from them so the UI
         // still shows a session-wide figure while AUTO reacts to the last window
@@ -2728,7 +2773,9 @@ fn build_session_info_with(
         // 的会话没参与那次求和，不该替它背这口锅。
         let duplicate = (rx.is_spk || rx.monitor)
             && build_mix_health(inner).map_or(false, |h| h.duplicate_suspect);
-        s.quality = build_quality(rx, s.rung, duplicate);
+        // 喂的是**观测到的线上速率**，不是 `s.rung`：格号已经过了一次
+        // `unwrap_or(0)`，用它算带宽等于让一个不认识的速率报「满带宽、优」。
+        s.quality = build_quality(rx, lk(&rx.stats).last_rate, duplicate);
     }
     // 对端那一侧的音质。**与本侧至多一个非空**：一条流不会两端都是接收端。
     // 这一格是纯发送流唯一可能的音质来源——没有它，`[spk/send]` 永远空着。
@@ -2741,7 +2788,12 @@ fn build_session_info_with(
         peer_name: e.conn.peer.name.clone(),
         kind: e.kind.clone(),
         dir: e.dir.clone(),
-        sample_rate: 48000,
+        // **线上**采样率，与设置里的质量档同量纲（`pcm48k` ⇒ 48000）。
+        // 本机管线恒为 48 kHz（收端非 48k 必然重采样），那是另一个量；界面上
+        // 这一格的措辞必须说清是哪一个，否则又是一处 24/48 式的误读。
+        // `0` = 这条流没有任何一侧报得出速率——**宁可是 0 也不填 48000**：
+        // 那正是本字段修掉的那个硬编码。
+        sample_rate: wire_rate.unwrap_or(0),
         channels: 1,
         stats: s,
         origin: e.origin.label().to_string(),
@@ -3445,7 +3497,7 @@ mod telemetry_tests {
         // 削顶页还没攒满
         assert!(rx.clip.window().is_none(), "前提：这一页还没完成");
 
-        let q = build_quality(&rx, 0, false).expect("Q1/Q3 有读数 ⇒ 分量明细照给");
+        let q = build_quality(&rx, 48_000, false).expect("Q1/Q3 有读数 ⇒ 分量明细照给");
         assert_eq!(q.clip_ratio, None, "还没测 ⇒ None。填 0 会说成『测了，一点没削』");
         assert_eq!(q.clip_excess_db, None);
         assert!(q.partial, "木桶少了一块板，必须说出来");
@@ -3460,7 +3512,7 @@ mod telemetry_tests {
 
         // 同一条流，页攒满之后：Q2 立刻把等级拉到底，并指名是电平的问题。
         flip_a_loud_clip_page(&rx.clip);
-        let q = build_quality(&rx, 0, false).expect("三分量齐全");
+        let q = build_quality(&rx, 48_000, false).expect("三分量齐全");
         assert_eq!(q.clip_ratio, Some(1.0), "整页都在越界");
         assert!(!q.partial);
         assert_eq!(q.grade, "poor");
@@ -3479,7 +3531,7 @@ mod telemetry_tests {
         seed_conceal(&rx, 900, 100); // Q1 = 100/1000 = 10% -> Poor
         assert!(rx.clip.window().is_none(), "前提：削顶页仍未完成");
 
-        let q = build_quality(&rx, 0, false).expect("有结论");
+        let q = build_quality(&rx, 48_000, false).expect("有结论");
         assert_eq!(q.grade, "poor", "断续已经触底，削顶再差也压不下去");
         assert_eq!(q.worst, "continuity");
         assert!(q.partial, "等级确定，但木桶确实少了一块板 —— 两件事都要说");
@@ -3513,7 +3565,7 @@ mod telemetry_tests {
         let rx = rx_stream();
         seed_conceal(&rx, 1000, 0); // Q1 = 0 -> Excellent
         assert!(rx.clip.window().is_none());
-        let q = build_quality(&rx, 0, true).expect("有结论");
+        let q = build_quality(&rx, 48_000, true).expect("有结论");
         assert_eq!(q.grade, "poor", "两路重复流相加把整段波形 ×2");
         assert_eq!(q.worst, "level");
         assert!(!q.partial, "一票否决是实测结论，不是缺席");
@@ -3974,6 +4026,7 @@ mod telemetry_tests {
             clip_ratio: Some(0.31),
             clip_excess_db: Some(6.02),
             bandwidth_hz: 24_000,
+            wire_rate_hz: 48_000,
             grade: "poor".into(),
             worst: "level".into(),
             partial: false,
@@ -3982,6 +4035,11 @@ mod telemetry_tests {
         assert_eq!(v["grade"], "poor");
         assert_eq!(v["worst"], "level");
         assert_eq!(v["bandwidth_hz"], 24_000);
+        // 两个数一起上 IPC，且**不相等**。UI 的一级格读 `wire_rate_hz`（与设置
+        // 同量纲），明细读 `bandwidth_hz`；少了任何一个，那一格就只能在
+        // 「与设置对不上的数」和「丢掉诊断量」之间二选一。
+        assert_eq!(v["wire_rate_hz"], 48_000);
+        assert_ne!(v["wire_rate_hz"], v["bandwidth_hz"]);
         assert_eq!(v["window_s"], 10.0);
         assert_eq!(v["clip_ratio"], 0.31);
         assert_eq!(v["partial"], false);

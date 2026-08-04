@@ -288,8 +288,20 @@ export interface QualityReading {
   grade?: QualityGrade;
   /** argmin：拖后腿的那一项。`grade` 不成立时它也不成立。 */
   worst?: QualityPartId;
-  /** 有效带宽 kHz = rung_rate / 2（Nyquist）。 */
+  /**
+   * 有效带宽 kHz = 线上采样率 / 2（奈奎斯特上限）。**只进明细，不上一级界面。**
+   *
+   * 它与 `wireRateKhz` 差 2 倍且都以 kHz 呈现——一级界面上放它，用户会拿它和
+   * 自己刚设的「PCM 48 kHz」比，得出「设置没生效」（2026-08-04 实测报告）。
+   */
   bandwidthKhz?: number;
+  /**
+   * 线上采样率 kHz。**与设置里的质量档同量纲**（`pcm48k` ⇒ 48），所以它才是
+   * 一级界面该显示的那个数：用户设 48，界面写 48。
+   *
+   * 由 daemon 一等上报，**绝不由 `bandwidthKhz * 2` 推**（理由见 types.ts）。
+   */
+  wireRateKhz?: number;
   /** 加权隐藏率（%）。 */
   concealPct?: number;
   /** 削顶占比（%）与超出深度（dB）：占比说明多广，深度说明多狠。 */
@@ -794,11 +806,17 @@ export function readQuality(sess: SessionInfo | null | undefined): QualityReadin
       : undefined;
 
   const hz = num(q.bandwidth_hz);
+  // 线上采样率是**独立读取**的字段。这里一行 `* 2` 都不许出现：今天
+  // `bandwidth_hz ≡ wire_rate_hz / 2` 成立，所以推导现在算得对——正因为算得对，
+  // 它会一直躺在这里，直到 Q3 换成实测频谱（规格 §4.2 允许）的那天开始撒谎，
+  // 而那一天不会有任何一处报错。旧 daemon 不发这个字段 ⇒ undefined ⇒ 「—」。
+  const rateHz = num(q.wire_rate_hz);
   return {
     grade,
     worst,
     // Hz → kHz。0 Hz 不是带宽读数（rung 解析不出来才会是 0），照样算没读到。
     bandwidthKhz: hz !== undefined && hz > 0 ? hz / 1000 : undefined,
+    wireRateKhz: rateHz !== undefined && rateHz > 0 ? rateHz / 1000 : undefined,
     concealPct: pctOf(q.conceal_ratio),
     clipPct: pctOf(q.clip_ratio),
     clipExcessDb: num(q.clip_excess_db),

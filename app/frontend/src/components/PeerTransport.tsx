@@ -110,11 +110,27 @@ function liveLatency(list: SessionInfo[]): string {
   return t('detail.transport.liveMs', { n: fmt.int(ms) });
 }
 
+/**
+ * ## 全应用里单位混淆最刺眼的一处（2026-08-04 用户实测）
+ *
+ * 这一行紧贴在音质滑条**正下方**，而滑条的档位标签逐字写着「PCM 48 kHz」。
+ * 它此前读 `bandwidthKhz`，于是屏幕上相邻两行是：
+ *
+ *     [滑条]  PCM 48 kHz          ← 用户刚选的
+ *     线上 24 kHz                 ← 这一行
+ *
+ * 两个数都对（24 kHz 是 48 kHz 采样率的奈奎斯特带宽），但**没有任何一个字**说明
+ * 它们是两个量。任何人读到这两行的第一结论都是「我设了 48，实测只有 24，没生效」。
+ *
+ * 所以这里改读线上**采样率**：与正上方的滑条同量纲、同数字。这不是把读数换成
+ * 「复述目标值」——它取自会话的实测线上速率，AUTO 掉档时它会与滑条上的档不一致，
+ * 而那正是这一行存在的理由（见下面 `Cell` 的注释）。
+ */
 function liveQuality(list: SessionInfo[]): string {
   const s = pickWorst(list);
   if (!s) return t('detail.transport.noStream');
   const q = readQuality(s);
-  const khz = q && typeof q.bandwidthKhz === 'number' ? q.bandwidthKhz : null;
+  const khz = q && typeof q.wireRateKhz === 'number' ? q.wireRateKhz : null;
   if (khz == null) return t('detail.transport.measuring');
   return t('detail.transport.liveKhz', { n: fmt.int(khz) });
 }

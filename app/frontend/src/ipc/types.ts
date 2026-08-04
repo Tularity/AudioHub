@@ -177,8 +177,22 @@ export interface QualityStats {
   /** Q2：本流送进混音前 |v| > 0.8 的采样占比。`null` = 这一页还没攒满。 */
   clip_ratio?: number | null;
   clip_excess_db?: number | null;
-  /** Q3：`rung_rate / 2`（Nyquist）。 */
+  /**
+   * Q3：可用带宽（Hz）= **线上采样率的一半**（Nyquist 上限）。
+   *
+   * ⚠ 与 `wire_rate_hz` 差 2 倍，而两者在界面上都写成「kHz」。2026-08-04 用户
+   * 实测：设置里选 `PCM 48 kHz`、卡片显示 `24 kHz`（就是这个字段），据此判定
+   * 「设置没生效」——设置生效得好好的。呈现本字段的地方**必须**同时写明它是带宽。
+   */
   bandwidth_hz?: number;
+  /**
+   * 线上采样率（Hz）。**与设置里的质量档同量纲、同数字**：`pcm48k` ⇒ 48000。
+   *
+   * 面向用户的那一格（卡片一级、详情页滑条下的实测行）读它。
+   * `undefined` / `0` = 旧 daemon 或读不到 ⇒ 「—」，**不许 `bandwidth_hz * 2`**：
+   * 那会把奈奎斯特关系刻第二份在前端，Q3 将来换成实测频谱时会静默撒谎。
+   */
+  wire_rate_hz?: number;
   /**
    * "excellent" | "good" | "fair" | "poor" | **"unknown"**。
    *

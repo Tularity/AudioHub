@@ -269,7 +269,15 @@ export const zhCN = {
   // ---------------------------------------------------------------- 一级指标：音质
   'metric.quality.label': '音质',
   'metric.quality.none': '—',
-  'metric.quality.bandwidth': '{khz} kHz',
+  // 一级格显示的是**线上采样率**（`wire_rate_hz`），与详情页音质滑条的档位标签
+  // 「PCM 48 kHz」同量纲、同数字。
+  //
+  // 这里曾经是 `metric.quality.bandwidth`（奈奎斯特带宽 = 采样率/2）。2026-08-04
+  // 用户实测：设 `pcm48k`、卡片显示 24 kHz，判定「设置没生效」——两个数都对，
+  // 但同一个界面上**设置用采样率、显示用带宽，差 2 倍且都叫 kHz**。
+  // 带宽没有丢，它在展开明细里与采样率并排（quality.part.bandwidth.valueWithRate）。
+  'metric.quality.rate': '{khz} kHz',
+  'metric.quality.rateWhy': '线上采样率，与你在详情页设的音质档同一个数。可用带宽是它的一半（展开「音质构成」可以看到）。',
   'metric.quality.grade.excellent': '优',
   'metric.quality.grade.good': '良好',
   'metric.quality.grade.fair': '一般',
@@ -306,7 +314,14 @@ export const zhCN = {
   'quality.part.level.desc': '波形被削顶压缩的采样占比与压缩深度。',
   'quality.part.level.value': '{pct}% 削顶，超出 {db} dB',
   'quality.part.bandwidth.name': '带宽',
-  'quality.part.bandwidth.desc': '还保留了多少高频成分。网络变差时会自动降档。',
+  // desc 必须说清它是**由采样率推出来的标称上限**，不是对实际频谱内容的测量。
+  // 旧文案「还保留了多少高频成分」把它说成了一个实测量——而树里没有任何频谱
+  // 分析，这个数恒等于采样率的一半。把推导值说成测量值，比单位混淆更难查。
+  'quality.part.bandwidth.desc': '能传过去的最高音频频率，等于线上采样率的一半（奈奎斯特上限）。它由采样率推出，不是对实际频谱内容的测量。网络变差时采样率会自动降档，这个数跟着降。',
+  // 两个数并排：带宽是本分量本身，采样率是它的来源，也是用户在设置里设的那个数。
+  // 只写带宽 ⇒ 复现一级界面那次误读；只写采样率 ⇒ 丢掉 Q3 本身。
+  'quality.part.bandwidth.valueWithRate': '{khz} kHz（采样率 {rate} kHz）',
+  // 旧 daemon 不上报 wire_rate_hz 时的退路：只给带宽。**不许用 ×2 补一个采样率**。
   'quality.part.bandwidth.value': '{khz} kHz',
   'quality.part.window': '统计窗口：最近 {s} 秒',
 
@@ -661,7 +676,10 @@ export const zhCN = {
   'detail.transport.liveMs': '实测 {n} ms',
   'detail.transport.liveAtFloor': '实测 {n} ms · 已贴住物理下限',
   'detail.transport.liveAtCeiling': '实测 {n} ms · 已贴住物理上限',
-  'detail.transport.liveKhz': '线上 {n} kHz',
+  // 这一行紧贴在音质滑条**正下方**，而滑条档位标签写着「PCM 48 kHz」。
+  // 它此前显示奈奎斯特带宽（24），于是相邻两行是「PCM 48 kHz」与「线上 24 kHz」
+  // ——全应用里单位混淆最刺眼的一处。现在两行同量纲，且措辞点名是采样率。
+  'detail.transport.liveKhz': '线上采样率 {n} kHz',
 
   'settings.transport.title': '传输',
   'settings.transport.auto': 'AUTO',
@@ -674,11 +692,18 @@ export const zhCN = {
   'settings.transport.ms': '{n} ms',
 
   'settings.transport.quality': '质量档',
-  'settings.transport.qualityDesc': '本版本可调的是采样率，也就是能传过去的音频带宽（上限为采样率的一半）：16 kHz 够清晰说话，48 kHz 是全带宽。三档 Opus 尚未实现——照样画在滑条上但选不中，好让「本机为什么没有它」看得见。AUTO 按丢包与带宽在质量阶梯（rung）上自动升降。',
+  // ⚠ 这句话是「采样率 / 带宽」这一对的**权威解释**，措辞不能再把两者说成一回事。
+  // 旧版写「可调的是采样率，也就是能传过去的音频带宽（上限为采样率的一半）」——
+  // 一句里先说「就是」再说「一半」，正是界面上那次 48/24 误读的文字版。
+  'settings.transport.qualityDesc': '这里调的是**线上采样率**：16 kHz 够清晰说话，48 kHz 是全带宽。能传过去的最高音频频率是采样率的**一半**（48 kHz 采样率 ⇒ 24 kHz 带宽），所以卡片上的「音质」显示采样率、展开明细里才是带宽，两个数差一倍是正常的。三档 Opus 尚未实现——照样画在滑条上但选不中，好让「本机为什么没有它」看得见。AUTO 按丢包与抖动在质量阶梯（rung）上自动升降。',
   'settings.transport.q.auto': 'AUTO',
-  'settings.transport.q.opus64': 'Opus 64k',
-  'settings.transport.q.opus128': 'Opus 128k',
-  'settings.transport.q.opus256': 'Opus 256k',
+  // 「64k」→「64 kbps」：**同一条滑条上 Opus 档是码率、PCM 档是采样率**，两种量纲
+  // 并排。这是编解码器的惯例（Opus 按码率参数化、PCM 按采样率），改不了，但
+  // 「64k」与「48 kHz」摆在一起时，那个光秃秃的 k 邀请用户去比 64 和 48。
+  // 写全单位就比不起来了——一处零成本的消歧，与本轮 48/24 那处同源。
+  'settings.transport.q.opus64': 'Opus 64 kbps',
+  'settings.transport.q.opus128': 'Opus 128 kbps',
+  'settings.transport.q.opus256': 'Opus 256 kbps',
   'settings.transport.q.pcm16k': 'PCM 16 kHz',
   'settings.transport.q.pcm24k': 'PCM 24 kHz',
   'settings.transport.q.pcm32k': 'PCM 32 kHz',
@@ -758,7 +783,14 @@ export const zhCN = {
   'stats.unit.ms': 'ms',
   'stats.unit.kbps': 'kbps',
   'stats.unit.rung': 'RUNG',
-  'stats.meta.sampleRate': '{v} Hz',
+  // 「线上」二字是承重的：本机管线恒为 48 kHz（收端非 48k 必然重采样），而这一格
+  // 报的是**包头里的那个速率**，会随质量档变。不点名的话，一个 16000 会被读成
+  // 「本机在用 16k 播放」，而一个 48000 会被读成「质量档没生效」——后者正是这个
+  // 字段此前的实际形态：它是硬编码的 48000，无论阶梯掉到哪一档都写 48000。
+  'stats.meta.sampleRate': '线上 {v} Hz',
+  // 两侧都报不出速率（不该发生，但 daemon 此时发 0）。**不显示「0 Hz」，也不兜底
+  // 成 48000**：那个兜底就是被修掉的那个 bug。
+  'stats.meta.sampleRateNone': '线上采样率 —',
   'stats.meta.channels': '{v} 声道',
   'stats.origin.hal': '虚拟设备',
   'stats.origin.halTitle': '由某个应用选中这台对端的 AudioHub 设备而自动建立',
@@ -770,7 +802,10 @@ export const zhCN = {
   'stats.extra.received': '收包 {n}',
   'stats.extra.lost': '丢包 {n}',
   'stats.extra.sent': '发包 {n}',
+  // 帧是这一级的原生单位，ms 是**延迟档的单位**。只给帧，用户设了 300 ms 之后
+  // 对不上这一格；只给 ms，就丢了「12 帧」这个与 MIN/MAX_TARGET 直接可比的量。
   'stats.extra.jbDepth': '缓冲 {n} 帧',
+  'stats.extra.jbDepthMs': '缓冲 {n} 帧（{ms} ms）',
   'stats.extra.rungChanges': '档位变更 {n} 次',
   'stats.extra.verdictPass': '校验通过 {snr} dB',
   'stats.extra.verdictFail': '校验未通过',

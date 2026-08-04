@@ -228,12 +228,26 @@ function StageRow({ fp, dir, spec, r, side }: {
 
 // ---------------------------------------------------------------- 音质
 
+/**
+ * ## 这一格显示的是**采样率**，不是带宽（2026-08-04 用户实测报告）
+ *
+ * 曾经这里写 `bandwidthKhz`。用户在详情页把音质设成 `PCM 48 kHz`，卡片上这一格
+ * 显示 `24 kHz`，于是判定「设置没生效」——而设置生效得好好的：24 kHz 是 48 kHz
+ * 采样率对应的奈奎斯特带宽，两个数**差 2 倍且都写作 kHz**。
+ *
+ * 病灶不是哪个数算错了（都对），是**同一个界面上设置与显示用了不同量纲**。
+ * 一级界面这一格与设置那个滑条是用户唯一会去对照的一对，所以它必须与滑条同量纲：
+ * 设 48，这里就写 48。
+ *
+ * 带宽没有丢：它进了展开明细的 Q3 行，并且在那里**与采样率并排显示**
+ * （`quality.part.bandwidth.value`），2 倍关系是看得见的，不需要用户自己去推。
+ */
 function QualityCell({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading | undefined }) {
   const grade = q ? q.grade : undefined;
   const dots = qualityDots(grade);
-  const khz = q ? q.bandwidthKhz : undefined;
+  const khz = q ? q.wireRateKhz : undefined;
   const value = typeof khz === 'number'
-    ? t('metric.quality.bandwidth', { khz: fmt.int(khz) })
+    ? t('metric.quality.rate', { khz: fmt.int(khz) })
     : t('metric.quality.none');
 
   // 三态判定（有等级 / 有读数但等级不成立 / 什么都没有）在 lib/metrics 里，那样它
@@ -262,12 +276,15 @@ function QualityCell({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading |
           <span key={i} className={`qdot${i < dots ? ` on tone-${grade ? qualityTone(grade) : 'ok'}` : ''}`} />
         ))}
       </span>
-      {/* 与延迟那格同一条规矩：`.unknown` 的暗色只表示**读不到**。带宽在「测量中」
-          这一态里是**已经测出来的真读数**，把它调暗等于说它也没测到——而那正是
-          这次要修的那种「让不知道和坏消息长得一样」的呈现。 */}
+      {/* 与延迟那格同一条规矩：`.unknown` 的暗色只表示**读不到**。采样率在「测量中」
+          这一态里是**已经读到的真值**，把它调暗等于说它也没读到——而那正是
+          这次要修的那种「让不知道和坏消息长得一样」的呈现。
+          title 点明这个数是哪一个量：一个孤立的「48 kHz」既可以被读成采样率、
+          也可以被读成带宽，而这两件事在这套界面上正好差 2 倍。 */}
       <span
         className={`metric-val small${grade ? ` tone-${qualityTone(grade)}` : typeof khz === 'number' ? '' : ' unknown'}`}
         data-testid={`metric-quality-value-${dir}-${fp}`}
+        title={typeof khz === 'number' ? t('metric.quality.rateWhy') : undefined}
       >
         {value}
       </span>
@@ -307,9 +324,19 @@ function QualityParts({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading 
         ? t('quality.part.level.value', { pct: fmt.pct(q.clipPct), db: fmt.decimal1(q.clipExcessDb) })
         : t('metric.quality.none');
     }
-    return typeof q.bandwidthKhz === 'number'
-      ? t('quality.part.bandwidth.value', { khz: fmt.int(q.bandwidthKhz) })
-      : t('metric.quality.none');
+    // Q3 这一行**同时给两个数**：带宽（本分量本身）与它的来源采样率。
+    //
+    // 只给带宽 ⇒ 就是一级界面那次误读的形态（用户设 48、读到 24）。
+    // 只给采样率 ⇒ 丢掉 Q3 本身，而 Q3 是三分量之一、等级的输入之一。
+    // 并排给 ⇒ 2 倍关系当场可见，不需要用户自己去推，也不需要他先知道奈奎斯特。
+    // 采样率读不到（旧 daemon）时退回只给带宽——**不拿 ×2 顶替**。
+    if (typeof q.bandwidthKhz !== 'number') return t('metric.quality.none');
+    return typeof q.wireRateKhz === 'number'
+      ? t('quality.part.bandwidth.valueWithRate', {
+        khz: fmt.int(q.bandwidthKhz),
+        rate: fmt.int(q.wireRateKhz),
+      })
+      : t('quality.part.bandwidth.value', { khz: fmt.int(q.bandwidthKhz) });
   }
 
   return (

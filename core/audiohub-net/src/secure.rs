@@ -121,6 +121,22 @@ pub struct QualityReading {
     pub clip_excess_db: Option<f64>,
     /// Q3 原料：对端实际收到的音频带宽（Hz，= 线上采样率 / 2）。
     pub bandwidth_hz: u32,
+    /// 对端实际收到的**线上采样率**（Hz），取自媒体包头 `h.sample_rate`。
+    ///
+    /// # 为什么与 `bandwidth_hz` 并存，而不是让读方 ×2 推出来
+    ///
+    /// 今天 `bandwidth_hz ≡ wire_rate_hz / 2` 是一条恒等式（Q3 是从阶梯格号算出
+    /// 来的标称值，树里没有任何频谱分析）。既然如此，"读方 ×2" 现在能得到正确
+    /// 答案 —— **但那是把奈奎斯特关系又刻了一份在读方**。规格 §4.2 允许 Q3 将来
+    /// 换成真实频谱测量；那一天恒等式失效，而所有 ×2 的读方会把「2 × 实测带宽」
+    /// 当成采样率报出去，并且**没有任何一处会报错**。这正是本项目反复栽的那种
+    /// 「看起来对、其实是编的」。所以线上采样率是一等原料，与带宽各走各的。
+    ///
+    /// `#[serde(default)]` ⇒ 旧对端省略它，收方得到 0。收方**不许**把 0 当采样率
+    /// 用；`grade_peer_quality` 只在这一种情况下回退到 `bandwidth_hz * 2`，
+    /// 并且那条回退路径带着「这是旧对端」的注释，不会扩散到别处。
+    #[serde(default)]
+    pub wire_rate_hz: u32,
     /// 对端是否判定本流与另一路重复（站点级一票否决，规格 §4.4）。
     #[serde(default)]
     pub duplicate: bool,
@@ -893,6 +909,7 @@ mod wire_compat_tests {
                     clip_ratio: clip,
                     clip_excess_db: excess,
                     bandwidth_hz: 24_000,
+                    wire_rate_hz: 48_000,
                     duplicate: true,
                 }),
                 seq_us: 7,
@@ -907,10 +924,33 @@ mod wire_compat_tests {
             assert_eq!((q.plc_ticks, q.silence_ticks, q.popped_ticks), (3, 1, 1000));
             assert_eq!((q.underruns, q.jb_dropped), (2, 4));
             assert_eq!(q.bandwidth_hz, 24_000);
+            // **带宽与采样率是两个数，差 2 倍。** 两者必须各自穿过线缆：
+            // 若哪天有人把 `wire_rate_hz` 删掉、让读方拿 `bandwidth_hz * 2` 顶替，
+            // 今天它仍然算得对（恒等式），但 Q3 一旦换成实测频谱（规格 §4.2 允许）
+            // 就会把「2 × 实测带宽」当采样率报出去，且不会有任何一处报错。
+            assert_eq!(q.wire_rate_hz, 48_000, "线上采样率没活过线缆");
+            assert_ne!(
+                q.wire_rate_hz, q.bandwidth_hz,
+                "采样率与带宽被当成了同一个数——正是 2026-08-04 那次误读的根"
+            );
             assert!(q.duplicate);
             assert_eq!(q.clip_ratio, clip, "「还没测」与「测了是 0」被线缆混为一谈");
             assert_eq!(q.clip_excess_db, excess);
         }
+    }
+
+    /// 旧对端不发 `wire_rate_hz` ⇒ 解析出 0。**这一条是回退路径的前提**：
+    /// `grade_peer_quality` 只在读到 0 时才由 `bandwidth_hz * 2` 反推，
+    /// 而它凭什么认定「0 = 旧对端」就靠这里的 `#[serde(default)]`。
+    /// 若有人给这个字段加上别的默认值，那条回退会对着新对端的真读数生效。
+    #[test]
+    fn a_quality_reading_from_an_old_peer_has_wire_rate_zero() {
+        let json = r#"{"window_s":10.0,"conceal_ratio":0.0,"plc_ticks":0,
+                       "silence_ticks":0,"popped_ticks":100,"underruns":0,
+                       "jb_dropped":0,"bandwidth_hz":16000}"#;
+        let q: QualityReading = serde_json::from_str(json).expect("旧对端的原料必须照常解析");
+        assert_eq!(q.bandwidth_hz, 16_000);
+        assert_eq!(q.wire_rate_hz, 0, "缺席必须是 0，收方据此才认得出旧对端");
     }
 
     /// 不带 `quality` 的老报文照常解析，那一格是 `None`。

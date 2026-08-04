@@ -565,8 +565,25 @@ pub struct QualityStats {
     /// `None` 的含义同 `clip_ratio`。
     #[serde(default)]
     pub clip_excess_db: Option<f64>,
-    /// Q3：`rung_rate / 2`（Nyquist）。
+    /// Q3：可用带宽（Hz）= 线上采样率的一半（Nyquist 上限）。
+    ///
+    /// ⚠ **它与 `wire_rate_hz` 差 2 倍，而两者在界面上都会写成「kHz」。**
+    /// 2026-08-04 用户实测：设置里选了 `PCM 48 kHz`（采样率），卡片显示 `24 kHz`
+    /// （本字段），于是判定「设置没生效」——而设置生效得好好的。任何呈现本字段
+    /// 的地方**必须同时说明它是带宽**，否则它会被读成用户刚设的那个数字的反例。
+    /// 面向用户的那一格显示 `wire_rate_hz`（与设置同量纲），本字段进明细。
     pub bandwidth_hz: u32,
+    /// 这条流**线上的采样率**（Hz）。与设置里的质量档同量纲、同数字：
+    /// `pcm48k` ⇒ 48000。
+    ///
+    /// 之所以是一等字段而不是 `bandwidth_hz * 2`：见 `audiohub_net::secure::
+    /// QualityReading::wire_rate_hz` 的论证（今天是恒等式，将来 Q3 换成实测频谱
+    /// 就不是了，而 ×2 的读方届时不会报错，只会撒谎）。
+    ///
+    /// `#[serde(default)]` ⇒ 旧 daemon 省略它 ⇒ 0 ⇒ UI 显示「—」。
+    /// **0 不是采样率**，读取方不许拿它当数用。
+    #[serde(default)]
+    pub wire_rate_hz: u32,
     /// "excellent" | "good" | "fair" | "poor" | "unknown"
     ///
     /// **三分量取 min（木桶），不是加权平均**：三家损伤在感知上不可互相补偿。

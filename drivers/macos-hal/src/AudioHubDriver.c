@@ -2793,6 +2793,24 @@ static OSStatus AudioHubDriver_StartIO(AudioServerPlugInDriverRef inDriver, Audi
     pthread_mutex_unlock(&theDevice->ioMutex);
     if(theBecameRunning)
     {
+        // Same reason AudioHub_PublishSlotRings gives, and it holds here word
+        // for word: we are this ring's consumer, and anything left in it
+        // belongs to a session that is over. AudioHubRing_Read starts from the
+        // OLDEST sample, so without this the first thing an application hears
+        // when it opens the virtual microphone is up to 500ms of the PREVIOUS
+        // session's audio — a correctness bug, not a latency one. It is also
+        // where the ratchet documented in docs/spec-hal-mic-latency.md became
+        // permanent: whatever the daemon wrote during the <=400ms it took our
+        // IoState(false) to reach it stayed in the ring forever, because the
+        // producer/consumer clocks are the same mach_absolute_time (measured
+        // |drift| < 5.2ppm) and nothing else ever drains it.
+        //
+        // Only the input direction: the speaker ring's consumer is the daemon,
+        // and moving read_idx from here would break the SPSC invariant.
+        if(theDevice->isInput && (theDevice->ring != NULL))
+        {
+            AudioHubBridge_FlushRingConsumer(theDevice->ring);
+        }
         bridge_io_state_changed(theDevice, true);
     }
     AudioHub_Release(theDevice);

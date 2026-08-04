@@ -70,6 +70,167 @@ pub(crate) struct ServoOut {
     pub at_ceiling: bool,
 }
 
+/// 伺服的**运行时证据**（IPC `daemon.status.latency_guard.servo`）。
+///
+/// # 为什么必须导出，而不是「测试绿了就够了」
+///
+/// 这条回路的全部失效模式都长成同一个样子：**没有任何一处报错，读数一动不动**。
+/// 用户把滑条拖到 200 ms，界面照旧显示 105 ms —— 此时至少有六种互斥的解释：
+///
+///   1. 档位压根没送到 daemon（写入路径断了）；
+///   2. 送到了但被拒绝，而调用方吞了错误；
+///   3. 收下了、落了盘，但 `publish` 没被调用（音频线程还在读旧值）；
+///   4. 音频线程读到了，但 `servo_pass` 这一拍根本没跑（回路没接上 ticker）；
+///   5. 跑了，但 `sum_ms` 恒 `None`（对端不报分项）⇒ 一直在开环预置；
+///   6. 跑了、也算出了新深度，但执行侧没有采纳（`engine.rs` 那一段接线断了）。
+///
+/// 六种里有五种在「字段等于 200」这件事上**完全一致**。所以只导出设置值等于
+/// 什么都没导出：本轮之前 `settings.get` 就已经能读到 `latency`，而这个项目仍然
+/// 在这条回路上栽了第六次。分辨它们需要的是**回路自己的心跳**：
+/// `ticks` 分开 3/4，`closed_loop` 分开 5，`jb_frames` 相对 `want_frames` 的
+/// 收敛分开 6。
+///
+/// 这里存的全是**观测量**，一个字节都不参与控制——`step()` 仍然是纯函数，
+/// 它不读这里的任何东西。
+#[derive(Debug, Default)]
+pub(crate) struct ServoObs {
+    /// 伺服跑过几拍。**这一个数就把「回路没在跑」与「回路在跑但没动」分开了**，
+    /// 而那两件事此前在外部完全不可区分。
+    ticks: u64,
+    /// 累计真的改变过几次深度（`want_frames != jb_frames`）。
+    moves: u64,
+    /// 最近一拍的全部输入与输出。`None` = 一拍都还没跑过。
+    last: Option<ServoSample>,
+    /// 最近一次真的动过深度是什么时候。`None` = 从没动过。
+    last_move: Option<std::time::Instant>,
+}
+
+/// 最近一拍的现场。字段与 [`ServoIn`] / [`ServoOut`] 一一对应，**不做任何加工**：
+/// 加工过的读数在排障时要先反推回原始量，而反推的那一步就是下一个错的地方。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServoSample {
+    pub target: LatencyTarget,
+    pub sum_ms: Option<f64>,
+    pub jb_frames: u32,
+    pub want_frames: u32,
+    pub lo_frames: u32,
+    pub hi_frames: u32,
+    pub at_floor: bool,
+    pub at_ceiling: bool,
+    /// 有 jitter buffer 可供伺服的接收流数。0 = 档位此刻没有作用对象。
+    pub streams: u32,
+}
+
+impl ServoObs {
+    /// `servo_pass` 每拍调一次，**无论档位是不是 AUTO**。
+    ///
+    /// AUTO 下也记：否则「选了 AUTO」与「回路死了」在读数上无法区分，
+    /// 而这两件事的下一步动作完全相反。
+    pub(crate) fn record(&mut self, s: ServoSample) {
+        self.ticks = self.ticks.saturating_add(1);
+        if s.want_frames != s.jb_frames {
+            self.moves = self.moves.saturating_add(1);
+            self.last_move = Some(std::time::Instant::now());
+        }
+        self.last = Some(s);
+    }
+
+    /// 导出成 IPC 的一个对象。
+    ///
+    /// **误差的符号是 `sum_ms − target_ms`**（正 = 比目标慢了、要削；
+    /// 负 = 还没填够、要加）。写死在这条注释里是因为符号搞反的读数比没有读数
+    /// 更坏：它会让下一个人朝相反方向去调。
+    pub(crate) fn json(&self) -> serde_json::Value {
+        let Some(s) = self.last else {
+            // 一拍都没跑过 —— 与「跑过但没动」是两件事，所以不能省略成空对象。
+            return serde_json::json!({
+                "ticks": self.ticks,
+                "moves": self.moves,
+                "last": serde_json::Value::Null,
+            });
+        };
+        let target_ms = match s.target {
+            LatencyTarget::Auto => None,
+            LatencyTarget::TotalMs(ms) => Some(ms),
+        };
+        let error_ms = match (s.sum_ms, target_ms) {
+            (Some(sum), Some(t)) => Some(sum - t as f64),
+            _ => None,
+        };
+        serde_json::json!({
+            "ticks": self.ticks,
+            "moves": self.moves,
+            "since_move_s": self.last_move.map(|t| t.elapsed().as_secs_f64()),
+            // 用户选的那一档，原样。
+            "target": s.target.as_wire(),
+            "target_ms": target_ms,
+            // 喂给这一拍的实测端到端总延迟。`null` ⇒ 开环。
+            "sum_ms": s.sum_ms,
+            "error_ms": error_ms,
+            // `false` = 这一拍没有实测值，走的是「JB 不许超过总目标」那个开环
+            // 上界。回路照样在动，但它不知道地板在哪 —— 两种状态的下一步不同。
+            "closed_loop": s.sum_ms.is_some(),
+            // 执行量：从哪里到哪里，差多少帧。`step_frames == 0` 且误差很大
+            // ⇒ 要么在死区里，要么贴边了，两者由下面两个布尔区分。
+            "jb_frames": s.jb_frames,
+            "want_frames": s.want_frames,
+            "step_frames": s.want_frames as i64 - s.jb_frames as i64,
+            "envelope_frames": [s.lo_frames, s.hi_frames],
+            "at_floor": s.at_floor,
+            "at_ceiling": s.at_ceiling,
+            "streams": s.streams,
+        })
+    }
+}
+
+/// 站点级的伺服心跳（plan §15 之后**唯一**还留在全局的那一份）。
+///
+/// # 为什么按流拆开之后它还必须存在
+///
+/// 零会话时 `by_stream` 是一个空对象，而「回路死了」与「没有东西可伺服」
+/// 在那个空对象上**完全一致**——正是 `ServoObs` 文档里六种解释的第 3/4 种。
+/// `ticks` 是零会话时唯一还在动的东西，`transport_tests` 的
+/// `the_servo_exports_a_heartbeat_even_with_no_sessions` 钉的就是它。
+///
+/// # 顶层为什么**没有** `target_ms` / `sum_ms` / `jb_frames`
+///
+/// 留一个顶层「代表值」就是 plan §14 裁定 1 那个「每卡一个数字，不管取哪条
+/// 都在替另一条撒谎」的 JSON 版本。删掉会打断 `ctl status --json |
+/// jq .latency_guard.servo.target_ms` 这条已文档化的诊断路径——**这个中断是
+/// 要的**：读旧路径的人会拿到 `null` 而不是一个静默错误的数。
+#[derive(Debug, Default)]
+pub(crate) struct ServoSite {
+    ticks: u64,
+    streams: u32,
+    /// 对端推来的档位里，**执行器不在本地这一侧**的那些（`SetTransport` 的
+    /// 断言 B/C）。
+    ///
+    /// 不静默忽略的理由：这两条断言不成立说明对端把交叉的那半边搞反了，
+    /// 而这种错误的**自然表现恰恰是「什么都没发生」**——不导出计数就永远
+    /// 查不出来。`debug_assert!` 不行，release 构建里它什么都不是。
+    bad_targets: u64,
+}
+
+impl ServoSite {
+    pub(crate) fn tick(&mut self, streams: u32) {
+        self.ticks = self.ticks.saturating_add(1);
+        self.streams = streams;
+    }
+
+    pub(crate) fn bad_target(&mut self) {
+        self.bad_targets = self.bad_targets.saturating_add(1);
+    }
+
+    pub(crate) fn json(&self, by_stream: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "ticks": self.ticks,
+            "streams": self.streams,
+            "bad_transport_targets": self.bad_targets,
+            "by_stream": by_stream,
+        })
+    }
+}
+
 /// 一拍。**纯函数**：没有锁、没有时间、没有全局状态，于是每一条分支都能被直接测。
 pub(crate) fn step(i: ServoIn) -> ServoOut {
     let hold = ServoOut {

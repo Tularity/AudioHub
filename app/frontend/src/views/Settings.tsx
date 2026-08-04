@@ -4,12 +4,11 @@
 // 等于把「那排开关为什么没了」的答案藏起来）。这里只放一面只读的镜子 + 去主面板
 // 的入口，避免同一个全局状态出现两个可点的控件、两处 pending 态。
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Icon } from '../components/Icon';
 import { ExtLink, Switch } from '../components/Controls';
-import { StopSlider } from '../components/StopSlider';
-import type { Stop } from '../components/StopSlider';
+import { transportCells } from '../components/PeerTransport';
 import { PermissionRow } from '../components/PermissionRow';
 import { toast } from '../components/Toasts';
 import { openExternal } from '../lib/external';
@@ -20,7 +19,6 @@ import {
   WEB_PORT_MAX, WEB_PORT_MIN,
 } from '../lib/webui';
 import type { WebUiPatch, WebUiStatus } from '../lib/webui';
-import type { DaemonSettings, QualityStop } from '../ipc/types';
 import { t, joinPhrases } from '../i18n';
 import type { MsgKey } from '../i18n';
 import { actions, useStore } from '../state/store';
@@ -499,188 +497,91 @@ function WebAccessCard() {
   );
 }
 
-// ---- 传输：延迟档 / 质量档 ----
-
-// **daemon 才是档表的唯一真值源**：档位随物理能力与构建选项变，前端写死一份，早晚
-// 会画出一个它自己都送不下去的档。下面两张表只在旧服务什么都不上报时兜底——目的是
-// 让滑条还有档可选，不是替 daemon 声明它支持什么。
-const LATENCY_STOPS_FALLBACK = [0, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000];
-
-// 兜底表里三档 Opus 一律置为不可用：拿不到 daemon 的应答时，「不知道能不能用」只能
-// 按不能用画。反过来（默认可用）会让用户选中一个根本发不出去的档。
-const QUALITY_STOPS_FALLBACK: QualityStop[] = [
-  { id: 'auto', available: true },
-  { id: 'opus64', kbps: 64, available: false, blocked_by: 'opus' },
-  { id: 'opus128', kbps: 128, available: false, blocked_by: 'opus' },
-  { id: 'opus256', kbps: 256, available: false, blocked_by: 'opus' },
-  // kbps = rate × 16 bit（s16 单声道），与 daemon 的 quality_stops() 逐档对齐。
-  { id: 'pcm16k', kbps: 256, rate: 16000, available: true },
-  { id: 'pcm24k', kbps: 384, rate: 24000, available: true },
-  { id: 'pcm32k', kbps: 512, rate: 32000, available: true },
-  { id: 'pcm48k', kbps: 768, rate: 48000, available: true },
-];
-
-// `Record<string, MsgKey>` 而不是 `Record<QualityId, MsgKey>`：id 由 daemon 定义，
-// 它加一档而前端还没跟上时，缺的那条必须能在运行期被发现（见下面的 raw-id 回落），
-// 而不是让 TS 强迫我们把一个虚构的联合类型当成契约。
-const QUALITY_LABEL_KEY: Record<string, MsgKey> = {
-  auto: 'settings.transport.q.auto',
-  opus64: 'settings.transport.q.opus64',
-  opus128: 'settings.transport.q.opus128',
-  opus256: 'settings.transport.q.opus256',
-  pcm16k: 'settings.transport.q.pcm16k',
-  pcm24k: 'settings.transport.q.pcm24k',
-  pcm32k: 'settings.transport.q.pcm32k',
-  pcm48k: 'settings.transport.q.pcm48k',
-};
-
-/** 旧服务的 `'min'` 与新档表里的 `'0'` 是同一档。数值串统一过一遍 Number，免得
- *  `'200.0'` 和 `'200'` 被当成两个不同的档而双双落空。认不出来就原样返回——
- *  硬塞进某一档等于替 daemon 编造一个它没说过的选择。 */
-function normLatency(v: string): string {
-  if (v === 'auto') return 'auto';
-  const n = Number(v === 'min' ? '0' : v);
-  return Number.isFinite(n) ? String(n) : v;
-}
-
-/** 旧服务的 `'pcm'` 指的是全带宽那一档。 */
-function normQuality(v: string): string {
-  return v === 'pcm' ? 'pcm48k' : v;
-}
-
-/**
- * 延迟读数。**只念实测值，绝不念目标值**——把用户刚选的档复述一遍的读数，正是这个
- * 项目反复栽过的那种「报告成功、其实什么都没发生」。分支顺序即优先级：没有流可测
- * 时连「正在测量」都不该说。
- */
-function latencyReadout(ds: DaemonSettings | null): string {
-  const live = ds ? ds.transport_live : null;
-  if (!live) return t('settings.transport.liveNa');
-  if (live.streams === 0) return t('settings.transport.noStreams');
-  const ms = live.achieved_ms;
-  if (ms == null || !Number.isFinite(ms)) return t('settings.transport.measuring');
-  const n = Math.round(ms);
-  if (live.at_floor) return t('settings.transport.atFloor', { n });
-  if (live.at_ceiling) return t('settings.transport.atCeiling', { n });
-  return t('settings.transport.achieved', { n });
-}
-
-/**
- * 采样率读数：同样是媒体面此刻真正在跑的值，不是所选档位的标称值。
- *
- * `streams === 0` 单独说一句，而不是笼统的「暂无读数」：契约里 `rate` 的
- * `None` 恰恰有「没有流」这一种成因，含糊过去会让用户以为设置没生效。
- */
-function qualityReadout(ds: DaemonSettings | null): string {
-  const live = ds ? ds.transport_live : null;
-  if (!live) return t('settings.transport.liveNa');
-  if (live.streams === 0) return t('settings.transport.noStreams');
-  const r = live.rate;
-  if (r == null || !Number.isFinite(r) || r <= 0) return t('settings.transport.measuring');
-  return t('settings.transport.qLive', { n: Math.round(r / 1000) });
-}
+// ---- 传输：只读总览 + 迁移说明（plan §15） ----
+//
+// # 这个位置**不许留空**
+//
+// §15 的病根逐字是「界面对此一个字都没说」。区块凭空消失 = 用户去设置页找不到
+// 滑条、也没被告知搬去哪了，是同一个病换个位置复发。
+//
+// # 为什么值得留一张只读总览，而不只是一句指引
+//
+// 这是**唯一**能一眼看全所有对端四个档位的地方。详情页一次只看一台，而
+// 「哪台还停在 auto」正是本次事故里没人看得见的那件事——30-win 的档位是 `min`
+// 且从未被设过，这件事在两台机器的任何一个界面上都不可见，只能靠
+// `ctl status --json` 挖出来。
+//
+// # testid 纪律
+//
+// 区块保留 `settings-transport`，但 `settings-latency` / `settings-quality`
+// 两个滑条 testid **必须消失**。不许「外层留名、内层换实现」——那样旧回归会
+// 静默地对着一个只读表格做滑条断言并**永远通过**。
 
 function TransportCard() {
   const ds = useStore((s) => s.daemonSettings);
-  // 没有 settings.* 的旧服务：拖了也不会有任何效果，禁用比假装能用诚实。
-  const noSettings = useStore((s) => s.settingsSupported === false);
-
-  const latencyStops = useMemo<Stop[]>(() => {
-    const raw = ds && Array.isArray(ds.latency_stops_ms) && ds.latency_stops_ms.length
-      ? ds.latency_stops_ms
-      : LATENCY_STOPS_FALLBACK;
-    const out: Stop[] = [{ value: 'auto', label: t('settings.transport.auto') }];
-    const seen = new Set<string>(['auto']);
-    for (const n of raw) {
-      if (typeof n !== 'number' || !Number.isFinite(n)) continue;
-      const value = String(n);
-      if (seen.has(value)) continue;   // 重复档会撞 React key，也没有任何意义
-      seen.add(value);
-      out.push({
-        value,
-        label: n === 0 ? t('settings.transport.latencyLowest') : t('settings.transport.ms', { n }),
-      });
-    }
-    return out;
-  }, [ds]);
-
-  const qualityStops = useMemo<Stop[]>(() => {
-    const raw = ds && Array.isArray(ds.quality_stops) && ds.quality_stops.length
-      ? ds.quality_stops
-      : QUALITY_STOPS_FALLBACK;
-    const out: Stop[] = [];
-    const seen = new Set<string>();
-    for (const q of raw) {
-      const id = q && typeof q.id === 'string' ? q.id : '';
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      const key = QUALITY_LABEL_KEY[id];
-      const off = q.available === false;
-      out.push({
-        value: id,
-        // daemon 加了一档而语料还没跟上：把原始 id 画出来。悄悄跳过它，新档位就在
-        // 界面上凭空消失了，而没有任何人会收到通知。
-        label: key ? t(key) : id,
-        available: !off,
-        why: off
-          ? (q.blocked_by === 'opus'
-            ? t('settings.transport.qBlockedOpus')
-            : t('settings.transport.qBlocked'))
-          : undefined,
-      });
-    }
-    return out;
-  }, [ds]);
-
-  // 回包即权威：失败时不改任何本地状态，StopSlider 会把 thumb 退回 daemon 的值。
-  function push(patch: Partial<DaemonSettings>): Promise<unknown> {
-    return applySettings(patch).catch(() => { /* rpc 已 toast */ });
-  }
-
-  const latency = normLatency(ds && typeof ds.latency === 'string' ? ds.latency : 'auto');
-  const quality = normQuality(ds && typeof ds.quality === 'string' ? ds.quality : 'auto');
+  const peers = useStore((s) => s.peers);
+  // 迁移说明是一次性的：读过就收起来。**只存在 localStorage 里**，因为它是
+  // 「这台机器上这个人已经知道了」这一件事，不是 daemon 的状态。
+  const [dismissed, setDismissed] = useState(() => {
+    try { return localStorage.getItem('ahb.transportMigrated') === '1'; } catch { return false; }
+  });
 
   return (
     <section className="card block" data-testid="settings-transport">
       <h3 className="block-title">{t('settings.transport.title')}</h3>
-      <SettingRow
-        title={t('settings.transport.latency')}
-        desc={t('settings.transport.latencyDesc')}
-        control={(
-          <div className="transport-ctl">
-            <StopSlider
-              testid="settings-latency"
-              label={t('settings.transport.latency')}
-              stops={latencyStops}
-              value={latency}
-              disabled={noSettings}
-              onSelect={(v) => push({ latency: v })}
-            />
-            <p className="transport-live" data-testid="settings-latency-readout">
-              {latencyReadout(ds)}
-            </p>
-          </div>
-        )}
-      />
-      <SettingRow
-        title={t('settings.transport.quality')}
-        desc={t('settings.transport.qualityDesc')}
-        control={(
-          <div className="transport-ctl">
-            <StopSlider
-              testid="settings-quality"
-              label={t('settings.transport.quality')}
-              stops={qualityStops}
-              value={quality}
-              disabled={noSettings}
-              onSelect={(v) => push({ quality: v })}
-            />
-            <p className="transport-live" data-testid="settings-quality-readout">
-              {qualityReadout(ds)}
-            </p>
-          </div>
-        )}
-      />
+      {dismissed ? null : (
+        <div className="notice" data-testid="settings-transport-migrated">
+          <p>{t('settings.transport.migrated')}</p>
+          <button
+            className="btn ghost small"
+            type="button"
+            data-testid="settings-transport-migrated-ok"
+            onClick={() => {
+              setDismissed(true);
+              try { localStorage.setItem('ahb.transportMigrated', '1'); } catch { /* 私有模式 */ }
+            }}
+          >
+            {t('common.gotIt')}
+          </button>
+        </div>
+      )}
+      {peers.length === 0 ? (
+        <p className="muted small" data-testid="settings-transport-empty">
+          {t('settings.transport.noPeers')}
+        </p>
+      ) : (
+        <table className="transport-table" data-testid="settings-transport-table">
+          <thead>
+            <tr>
+              <th>{t('settings.transport.colPeer')}</th>
+              <th>{t('settings.transport.colDir')}</th>
+              <th>{t('settings.transport.colLatency')}</th>
+              <th>{t('settings.transport.colQuality')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {peers.map((p) => transportCells(ds, p).map((row, i) => (
+              <tr key={`${p.fingerprint}-${row.dir}`} data-testid={`settings-transport-row-${row.dir}-${p.fingerprint}`}>
+                {i === 0 ? (
+                  <th rowSpan={2} scope="rowgroup" className="transport-peer">
+                    <button
+                      className="linkish"
+                      type="button"
+                      data-testid={`settings-transport-open-${p.fingerprint}`}
+                      onClick={() => actions.navigate('detail', p.fingerprint)}
+                    >
+                      {p.display_name || p.name || p.fingerprint.slice(0, 8)}
+                    </button>
+                  </th>
+                ) : null}
+                <td>{t(row.dir === 'out' ? 'peers.card.streamOut' : 'peers.card.streamIn')}</td>
+                <td data-testid={`settings-transport-cell-latency-${row.dir}-${p.fingerprint}`}>{row.latency}</td>
+                <td data-testid={`settings-transport-cell-quality-${row.dir}-${p.fingerprint}`}>{row.quality}</td>
+              </tr>
+            )))}
+          </tbody>
+        </table>
+      )}
       <p className="muted small">{t('settings.transport.noteLive')}</p>
     </section>
   );

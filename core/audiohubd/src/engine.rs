@@ -2168,13 +2168,13 @@ fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
             // 就是两条回路抢同一个水位：用户选的 200 ms 会在每一次 p95 更新时
             // 被改回抖动算出来的那个数，而界面照旧显示 200——「设置生效了」
             // 的错觉，正是本项目栽过五次的形态。
-            let servo_want = inner.transport.servo_frames();
+            let servo_want = rx.transport.servo_frames();
             if st.pushes % 100 == 0 {
                 // 包络（min/max_target）只能在构造时给定。用户把目标从 100 ms
                 // 拖到 1000 ms 时，默认包络 4..12 帧 = 40..120 ms 根本够不着，
                 // 于是必须重建。每秒问一次、已经对了就立刻返回。
                 let reseeded =
-                    reshape_jitter_envelope(&mut st, inner.transport.latency_target(), h.stream_id);
+                    reshape_jitter_envelope(&mut st, rx.transport.latency_target(), h.stream_id);
                 match servo_want {
                     // 刚重建过：`servo_want` 是上一拍在**旧包络**下算的，
                     // 拿它执行会把刚落好的预置立刻推翻。让伺服下一拍重新算。
@@ -2419,6 +2419,15 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
     // buckets actually used rather than to 16 * 480 floats per 10ms tick.
     let mut hal_bufs = vec![[0.0f32; F48]; crate::haldev::HAL_MAX_SLOTS];
     let mut hal_dirty: u16 = 0;
+    // `hal_mic` 水位闸门，每槽一份（见 `micgate` 的模块文档）。
+    //
+    // 状态放在**循环局部**而不是 `Shared` 里：它是「这条 mixer 循环对这个槽的
+    // 处置」，只有这一个线程读写，和 `SpkPhaseWindow` 同一条理由——把它放进
+    // 共享状态会让测试和 probe 与音频线程争同一个迟滞位。
+    let mut mic_gates = [crate::micgate::MicGate::new(); crate::haldev::HAL_MAX_SLOTS];
+    // 「这个槽真的有音频在送进虚拟麦克风」的粘滞位，见下面 `mic_live |= hal_dirty`
+    // 处的长注释：单靠 `hal_mic_io` 判不出来，它的初值是 true。
+    let mut mic_live: u16 = 0;
     // 重复流判据（规格 §4.6）：把**第一个**送进本机输出的 frame 拷进暂存，
     // 与**第二个**做零延迟归一化互相关。零延迟即可——重复流是同一份解码结果
     // 分两条会话进来，样本级已经对齐。480 点点积 ≈ 1.4k flops / 10 ms。
@@ -2583,27 +2592,63 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
         // 这一 tick 就没有这一级。
         let mut hal_mic_depth: [Option<StageDepth>; crate::haldev::HAL_MAX_SLOTS] =
             [None; crate::haldev::HAL_MAX_SLOTS];
-        if hal_dirty != 0 {
-            if let Some(h) = hal.as_ref() {
-                let mut out = [0.0f32; F48];
-                for slot in 0..crate::haldev::HAL_MAX_SLOTS {
-                    if hal_dirty & (1 << slot) == 0
-                        || !inner.hal_mic_io[slot].load(Ordering::Relaxed)
-                    {
-                        continue;
-                    }
-                    // 站点级削顶计入点 2/3：写进某个对端的虚拟麦克风。
-                    inner.mix_clip.feed(now_ms, &hal_bufs[slot]);
-                    for i in 0..F48 {
-                        out[i] = soft_clip(hal_bufs[slot][i]);
-                    }
-                    // 级 8″：模式 B 虚拟麦克风环（500 ms）。同样**写之前**读——
-                    // 读到的是「驱动还没取走的积压」，正是这一帧要等的排队量。
-                    // 这一级此前也完全没有建模：模式 B 的接收流上报的
-                    // `local_ms` 只有 jitter_buf + post_mix。
-                    hal_mic_depth[slot] = h.mic_depth(slot as u8);
-                    h.write_mic_mono(slot as u8, &out);
+        // 本 tick 之后仍然「有人在用」的槽。
+        //
+        // ⚠ 判据**不能**只用 `hal_mic_io`：它的初值是 `true`（`lib.rs` 的
+        // `from_fn(|_| AtomicBool::new(true))`，注释写明理由——「还没被告知」
+        // 时按乐观处理，否则新对端的虚拟麦克风在第一条 IoState 到达前是静音的）。
+        // 于是 16 个槽**默认全是 true**，只按它判会让闸门每 tick 观测 16 条
+        // 根本不存在的通路。第一版就是这么写的，实测 60 s 里把
+        // `starved_ticks` 刷到 95 730（= 6000 拍 × 15.95 个空槽），
+        // 而真正在用的那一条完全健康。
+        //
+        // 正确判据是「这个槽**真的有音频要送**」：`hal_dirty` 置位过，且
+        // `hal_mic_io` 还没被驱动告知已停。`hal_dirty` 是逐 tick 的，所以用
+        // 一个粘滞位记住——排空段里我们故意不写，那些 tick 上 `hal_dirty`
+        // 仍然是 1（音频照常到达），但即使不是，也必须继续观测水位。
+        mic_live |= hal_dirty;
+        if let Some(h) = hal.as_ref() {
+            let mut out = [0.0f32; F48];
+            for slot in 0..crate::haldev::HAL_MAX_SLOTS {
+                // 没有应用在读这只虚拟麦克风、或这个槽压根没有音频要送 ⇒ 不写，
+                // 并把闸门复位：上一条会话若结束在排空段中间，保留那个位会让
+                // 下一条会话的第一拍无条件少写（= 开头静音）。
+                if !inner.hal_mic_io[slot].load(Ordering::Relaxed) {
+                    mic_gates[slot].reset();
+                    mic_live &= !(1u16 << slot);
+                    continue;
                 }
+                if mic_live & (1 << slot) == 0 {
+                    continue;
+                }
+                // 级 8″：模式 B 虚拟麦克风环（500 ms）。**写之前**读——
+                // 读到的是「驱动还没取走的积压」，正是这一帧要等的排队量。
+                //
+                // ⚠ 这一读**移出了 `hal_dirty` 分支**。此前只有「本 tick 真有
+                // 音频要写」时才读，于是排空段（我们故意不写的那些 tick）里
+                // 这一级在遥测上**整个消失**——正好是最需要看见它的时候。
+                let Some(depth) = h.mic_depth(slot as u8) else { continue };
+                hal_mic_depth[slot] = Some(depth);
+                let plan = mic_gates[slot].decide(depth.samples, F48 as u32);
+                h.record_mic_gate(slot as u8, &plan, depth.samples);
+                if plan.drain_started {
+                    dlog!(
+                        "[audiohubd] hal_mic slot {slot}: 水位 {:.0} ms 越过天花板 {:.0} ms，\
+                         开始排空到 {:.0} ms（一次连续空洞代替永久延迟）",
+                        crate::micgate::frames_to_ms(depth.samples),
+                        crate::micgate::frames_to_ms(crate::micgate::D_CEIL),
+                        crate::micgate::frames_to_ms(crate::micgate::D_FLOOR),
+                    );
+                }
+                if hal_dirty & (1 << slot) == 0 || plan.allow == 0 {
+                    continue;
+                }
+                // 站点级削顶计入点 2/3：写进某个对端的虚拟麦克风。
+                inner.mix_clip.feed(now_ms, &hal_bufs[slot]);
+                for i in 0..F48 {
+                    out[i] = soft_clip(hal_bufs[slot][i]);
+                }
+                h.write_mic_mono(slot as u8, &out[..plan.allow as usize]);
             }
         }
         if any_spk {

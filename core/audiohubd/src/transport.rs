@@ -37,12 +37,37 @@ pub(crate) struct TransportLive {
     pub at_ceiling: bool,
     /// 当前实际线上采样率（Hz）。
     pub rate: Option<u32>,
-    /// 正在被伺服的接收流数。0 = 没有会话，档位暂时没有作用对象——
+    /// 正在被**延迟**伺服的接收流数。0 = 延迟档暂时没有作用对象——
     /// UI 要说这句，否则用户会以为设置没生效。
     pub streams: u32,
+    /// 本机正在**发送**的流数，也就是**质量**档的作用对象数。与 `streams`
+    /// 分开的理由（两个档位作用在相反方向上）写在 `audiohub_ipc::TransportLive`
+    /// 的同名字段上。
+    pub tx_streams: u32,
 }
 
 /// 音频线程能无锁读到的档位，加上伺服的输出。
+///
+/// # plan §15：**每条流一份**，不再有全局单例
+///
+/// 两个档位的执行器在相反的端上，而且**每一个执行器都是按流的**：
+/// 每条 rx 流有自己的 jitter buffer（`RxStream.jbs`），每条 tx 流有自己的
+/// 阶梯格号（`TxShared.rung`）。`MAX_STREAMS_PER_CONN = 16` 否掉了「每对端
+/// 至多一条同向流」这个假设，所以**目标是 per(peer, dir)，执行器是 per stream，
+/// 一个目标驱动 N 条回路**。N 通常是 1，但代码不许假设它是 1——那正是
+/// 2026-08-04 那个 bug 的形状（`worst` + 单一 `jb_frames` 驱动全部流）。
+///
+/// 于是这个结构现在挂在两个地方，**各用一半**：
+///   - `RxStream.transport`：延迟半边（`latency_*`、`servo_frames`、`live_*`）。
+///   - `TxShared.transport`：质量半边（`quality_rate`）。
+///
+/// 没有拆成两个类型，是因为 `generation` 那条「真的变了才作废旧输出」的逻辑
+/// 两边一字不差，而拆开就得复制一遍——复制的那一份迟早只改一处。用不到的那
+/// 半边保持默认值，谁也不读它。
+///
+/// ⚠ **`generation` 必须是每实例一个**。写成全局的话，改 A 对端的档位会把
+/// B 对端的伺服输出一起清零，B 那条链路会掉回抖动公式一拍——一个只在多对端
+/// 同时在线时才出现、且没有任何报错的失效。
 #[derive(Debug)]
 pub(crate) struct TransportControl {
     /// 固定质量档的采样率（Hz）。`0` = AUTO（阶梯当家）。
@@ -69,6 +94,7 @@ pub(crate) struct TransportControl {
     live_at_ceiling: AtomicBool,
     live_rate: AtomicU32,
     live_streams: AtomicU32,
+    live_tx_streams: AtomicU32,
 }
 
 impl Default for TransportControl {
@@ -85,43 +111,48 @@ impl Default for TransportControl {
             live_at_ceiling: AtomicBool::new(false),
             live_rate: AtomicU32::new(0),
             live_streams: AtomicU32::new(0),
+            live_tx_streams: AtomicU32::new(0),
         }
     }
 }
 
 impl TransportControl {
-    /// 把用户选的两个档位推给音频线程。**`settings.set` 落盘之后立刻调**，
-    /// 于是「改了要重启」在这条路上不成立。
+    /// 只推**延迟**半边（挂在 `RxStream` 上的那一份用这个）。
     ///
-    /// 换代号只在**真的变了**时才 +1：每次 `settings.set`（哪怕只是改了别的
-    /// 开关）都 +1 会让 rx 路径白重建一次 JB，每次重建都是一次重新预缓冲。
-    pub(crate) fn publish(&self, lat: LatencyTarget, qual: QualityTarget) {
-        let rate = match qual {
-            QualityTarget::Auto => 0,
-            QualityTarget::Rate(r) => r,
-        };
+    /// 不复用 `publish(lat, Auto)`：那样每一拍都会把 `quality_rate` 从当前值
+    /// 打回 0，若哪天有人在同一个实例上同时用了两半，就会出现「质量档每秒被
+    /// 清一次」这种没有任何报错的抖动。分开写让「rx 实例只碰延迟」成为一条
+    /// 由类型之外的代码保证不了、但由方法名说得清清楚楚的事实。
+    pub(crate) fn publish_latency(&self, lat: LatencyTarget) {
         let (fixed, ms) = match lat {
             LatencyTarget::Auto => (false, 0),
             LatencyTarget::TotalMs(m) => (true, m as u32),
         };
-        // 三个 swap **全部要执行**，所以先各自求值再合并：写成
-        // `a() || b() || c()` 会短路，第一个就变了的话后两个原子量根本不会被更新。
-        let q_moved = self.quality_rate.swap(rate, Ordering::Relaxed) != rate;
         let f_moved = self.latency_fixed.swap(fixed, Ordering::Relaxed) != fixed;
         let m_moved = self.latency_ms.swap(ms, Ordering::Relaxed) != ms;
-        // `latency_ms` 在 AUTO 下无意义，它单独变了不算变（AUTO -> AUTO 时
-        // `ms` 恒为 0，不会误判；固定档之间换值 `f_moved` 为假而 `m_moved` 为真，
-        // 那才是真的变了）。
-        let changed = q_moved || f_moved || (fixed && m_moved);
-        if changed {
-            self.generation.fetch_add(1, Ordering::Release);
-            // 档位换了，旧的伺服输出立刻作废：留着它会让 rx 路径在新目标下
-            // 继续执行上一个目标算出来的深度，直到伺服下一拍（最多 1 s）。
-            self.servo_frames.store(0, Ordering::Relaxed);
-            self.live_ms_valid.store(false, Ordering::Relaxed);
-            self.live_at_floor.store(false, Ordering::Relaxed);
-            self.live_at_ceiling.store(false, Ordering::Relaxed);
+        if f_moved || (fixed && m_moved) {
+            self.invalidate();
         }
+    }
+
+    /// 只推**质量**半边（挂在 `TxShared` 上的那一份用这个）。
+    pub(crate) fn publish_quality(&self, qual: QualityTarget) {
+        let rate = match qual {
+            QualityTarget::Auto => 0,
+            QualityTarget::Rate(r) => r,
+        };
+        if self.quality_rate.swap(rate, Ordering::Relaxed) != rate {
+            self.invalidate();
+        }
+    }
+
+    /// 档位换了，旧的伺服输出与读数立刻作废。
+    fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.servo_frames.store(0, Ordering::Relaxed);
+        self.live_ms_valid.store(false, Ordering::Relaxed);
+        self.live_at_floor.store(false, Ordering::Relaxed);
+        self.live_at_ceiling.store(false, Ordering::Relaxed);
     }
 
     /// 固定质量档的采样率，`None` = AUTO。音频线程每拍读它。
@@ -170,6 +201,8 @@ impl TransportControl {
         self.live_at_ceiling.store(live.at_ceiling, Ordering::Relaxed);
         self.live_rate.store(live.rate.unwrap_or(0), Ordering::Relaxed);
         self.live_streams.store(live.streams, Ordering::Relaxed);
+        self.live_tx_streams
+            .store(live.tx_streams, Ordering::Relaxed);
     }
 
     pub(crate) fn live(&self) -> TransportLive {
@@ -185,6 +218,7 @@ impl TransportControl {
                 r => Some(r),
             },
             streams: self.live_streams.load(Ordering::Relaxed),
+            tx_streams: self.live_tx_streams.load(Ordering::Relaxed),
         }
     }
 }
@@ -211,11 +245,13 @@ mod tests {
         assert_eq!(c.quality_rate(), None, "默认是 AUTO");
         assert_eq!(c.latency_target(), LatencyTarget::Auto);
 
-        c.publish(LatencyTarget::TotalMs(200), QualityTarget::Rate(24_000));
+        c.publish_latency(LatencyTarget::TotalMs(200));
+        c.publish_quality(QualityTarget::Rate(24_000));
         assert_eq!(c.quality_rate(), Some(24_000));
         assert_eq!(c.latency_target(), LatencyTarget::TotalMs(200));
 
-        c.publish(LatencyTarget::Auto, QualityTarget::Auto);
+        c.publish_latency(LatencyTarget::Auto);
+        c.publish_quality(QualityTarget::Auto);
         assert_eq!(c.quality_rate(), None);
         assert_eq!(c.latency_target(), LatencyTarget::Auto);
     }
@@ -227,23 +263,23 @@ mod tests {
     #[test]
     fn changing_the_target_invalidates_the_previous_servo_output() {
         let c = TransportControl::default();
-        c.publish(LatencyTarget::TotalMs(100), QualityTarget::Auto);
+        c.publish_latency(LatencyTarget::TotalMs(100));
         c.set_servo_frames(Some(7));
         c.set_live(TransportLive { achieved_ms: Some(101.0), ..Default::default() });
         assert_eq!(c.servo_frames(), Some(7));
 
         // 同一个档位再发一次：不许动。
-        c.publish(LatencyTarget::TotalMs(100), QualityTarget::Auto);
+        c.publish_latency(LatencyTarget::TotalMs(100));
         assert_eq!(c.servo_frames(), Some(7), "重复发布同一档位却把伺服清零了");
         assert_eq!(c.live().achieved_ms, Some(101.0), "重复发布把读数也清了");
 
-        c.publish(LatencyTarget::TotalMs(300), QualityTarget::Auto);
+        c.publish_latency(LatencyTarget::TotalMs(300));
         assert_eq!(c.servo_frames(), None, "换档后旧深度必须作废");
         assert_eq!(c.live().achieved_ms, None, "换档后旧读数必须作废");
 
         // 质量档单独变化同样算「变了」。
         c.set_servo_frames(Some(3));
-        c.publish(LatencyTarget::TotalMs(300), QualityTarget::Rate(48_000));
+        c.publish_quality(QualityTarget::Rate(48_000));
         assert_eq!(c.servo_frames(), None, "质量档变了也要作废旧输出");
     }
 
@@ -275,6 +311,7 @@ mod tests {
             at_ceiling: false,
             rate: Some(32_000),
             streams: 3,
+            tx_streams: 2,
         };
         c.set_live(want);
         assert_eq!(c.live(), want);

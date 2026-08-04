@@ -19,7 +19,7 @@ use audiohub_ipc::{
 };
 use audiohub_net::identity::{random_pin, PeerStore};
 
-use crate::{conn, dlog, haldev, lk, DaemonInner, PairingMode};
+use crate::{conn, dlog, haldev, lk, DaemonInner, PairingMode, DIR_RECV, DIR_SEND};
 
 pub(crate) fn accept_loop(inner: Arc<DaemonInner>, listener: TcpListener) {
     loop {
@@ -370,6 +370,8 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                             hal_device: None,
                             hal_reason: None,
                             display_name: String::new(),
+                            // 同上：这一刻它已经不在 store 里，没有档位可报。
+                            transport: Default::default(),
                             // This arm only runs when the peer vanished from
                             // the store between connecting and listing, so
                             // there is no channel to have heard a mode on.
@@ -494,40 +496,21 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                             *slot = v;
                         }
                     }
-                    // 传输档位：**先校验再收下**。
+                    // plan §15：`latency` / `quality` **不再在这里**。
                     //
-                    // 改动前这里是「有字符串就存」，于是 `{"quality":"opus999"}`
-                    // 会被收下、写盘、原样回显 —— 界面显示切成功了，媒体面一个
-                    // 字节都没变。这正是本项目栽过五次的形态，而且这一次它是
-                    // 真实存在的：Opus 三档在滑条上可见，`parse` 必须拒绝它们。
-                    if let Some(v) = params.get("latency").and_then(Value::as_str) {
-                        let t = LatencyTarget::parse(v).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "latency 必须是 '{LATENCY_AUTO}' 或档位表里的毫秒数 {:?}，收到 '{v}'",
-                                LATENCY_STOPS_MS
-                            )
-                        })?;
-                        // 存规范拼写而不是用户给的原样：旧的 "min" 与新的 "0"
-                        // 是同一档，盘上留两种写法只会让下一个读者以为是两档。
-                        let w = t.as_wire();
-                        changed |= s.latency != w;
-                        s.latency = w;
-                    }
-                    if let Some(v) = params.get("quality").and_then(Value::as_str) {
-                        let t = QualityTarget::parse(v).ok_or_else(|| {
-                            let avail: Vec<String> = audiohub_ipc::transport::quality_stops()
-                                .into_iter()
-                                .filter(|q| q.available)
-                                .map(|q| q.id)
-                                .collect();
-                            anyhow::anyhow!(
-                                "quality '{v}' 本 build 给不了；可选 {avail:?}\
-                                 （Opus 三档在档位表里可见但尚未实现）"
-                            )
-                        })?;
-                        let w = t.as_wire();
-                        changed |= s.quality != w;
-                        s.quality = w;
+                    // 不是「忽略」而是**拒绝**：一个旧客户端（或旧脚本）传
+                    // `{"latency":"300"}` 过来时，静默收下再什么都不做，正是
+                    // 本项目栽过六次的那个形状——那次的原话是「`settings.latency`
+                    // 从未被读过」。这里让它报错，调用方立刻知道要改用
+                    // `peers.set_transport`。
+                    for gone in ["latency", "quality"] {
+                        if params.get(gone).is_some() {
+                            anyhow::bail!(
+                                "'{gone}' 已改为每对端 × 每方向的设置（plan §15）：\
+                                 请用 '{}'（参数 peer / dir / latency / quality）",
+                                audiohub_ipc::methods::PEERS_SET_TRANSPORT
+                            );
+                        }
                     }
                     if changed {
                         // Persisted before it is answered: a UI that reads back
@@ -538,18 +521,6 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     }
                 }
                 if changed {
-                    // **「修改即生效」的那一行。** 落盘之后立刻把两个档位推给
-                    // 音频线程的无锁镜像；`tx_loop` / rx 路径下一拍（10 ms）就
-                    // 读到新值。不重启、不重连、不等下一次会话。
-                    //
-                    // 在回复之前做：一个刚写完就 `settings.get` 的客户端，
-                    // 拿到的 `transport_live` 必须已经属于新档位。
-                    {
-                        let s = lk(&inner.settings);
-                        inner
-                            .transport
-                            .publish(s.latency_target(), s.quality_target());
-                    }
                     dlog!("[audiohubd] settings changed; the device coordinator will reconcile");
                 }
                 if mode_changed {
@@ -625,6 +596,66 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     .unwrap_or_default();
                 json!({ "fingerprint": fp, "display_name": display })
             }
+            // plan §15：延迟与质量改为**每对端 × 每方向**。
+            //
+            // 写入口在这里做**严格校验**：`{"latency":"opus999"}` 被收下、写盘、
+            // 原样回显而媒体面一个字节没变，正是本项目栽过六次的形状。
+            methods::PEERS_SET_TRANSPORT => {
+                let sel = params
+                    .get("peer")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing 'peer'"))?;
+                let fp = conn::resolve_fingerprint(inner, sel)?;
+                let dir = params
+                    .get("dir")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing 'dir' ('recv' | 'send')"))?;
+                if dir != DIR_RECV && dir != DIR_SEND {
+                    anyhow::bail!("dir 必须是 '{DIR_RECV}'（本机收）或 '{DIR_SEND}'（本机发），收到 '{dir}'");
+                }
+                let mut t = lk(&inner.peer_transport).get(&fp);
+                {
+                    let slot = if dir == DIR_RECV { &mut t.recv } else { &mut t.send };
+                    if let Some(v) = params.get("latency").and_then(Value::as_str) {
+                        let parsed = LatencyTarget::parse(v).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "latency 必须是 '{LATENCY_AUTO}' 或档位表里的毫秒数 {:?}，收到 '{v}'",
+                                LATENCY_STOPS_MS
+                            )
+                        })?;
+                        // 存规范拼写而不是用户给的原样：旧的 "min" 与新的 "0"
+                        // 是同一档，盘上留两种写法只会让下一个读者以为是两档。
+                        slot.latency = parsed.as_wire();
+                    }
+                    if let Some(v) = params.get("quality").and_then(Value::as_str) {
+                        let parsed = QualityTarget::parse(v).ok_or_else(|| {
+                            let avail: Vec<String> = audiohub_ipc::transport::quality_stops()
+                                .into_iter()
+                                .filter(|q| q.available)
+                                .map(|q| q.id)
+                                .collect();
+                            anyhow::anyhow!(
+                                "quality '{v}' 本 build 给不了；可选 {avail:?}\
+                                 （Opus 三档在档位表里可见但尚未实现）"
+                            )
+                        })?;
+                        slot.quality = parsed.as_wire();
+                    }
+                }
+                {
+                    let mut store = lk(&inner.peer_transport);
+                    store.set(&fp, t);
+                    // 落盘在回包之前：一个刚写完就 `peers.list` 的客户端不许
+                    // 读到旧值，一个下一刻被杀掉的 daemon 要带着新档位回来。
+                    store.save(&inner.cfg_dir)?;
+                }
+                // **「修改即生效」的那两行。** 本地那半边灌进本机每条流的原子量，
+                // 交叉的那半边推给对端。都不重开流：重开 = 新 stream_id + 新
+                // media salt + JB 重建 + 重新预缓冲，听感上是一次明显的断续。
+                crate::publish_targets(inner, &crate::snapshot_sessions(inner));
+                conn::push_transport(inner, &fp);
+                serde_json::to_value(peer_transport_view(inner, &lk(&inner.state), &fp))?
+            }
             other => anyhow::bail!("unknown method '{other}'"),
         })
     })();
@@ -645,26 +676,56 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         effective_mode: haldev::effective_mode(inner),
         remove_virtual_on_disconnect: s.remove_virtual_on_disconnect,
         mark_offline_devices: s.mark_offline_devices,
-        latency: s.latency,
-        quality: s.quality,
-        // 档位表随每次 `settings.get` 一起发：前端不许自己写一份。
+        // 档表随每次 `settings.get` 一起发：前端不许自己写一份。
         // 两边各存一份表，分歧不会有任何报错——只会有一个选不中的档。
+        //
+        // ⚠ **档表留下、档位走了**（plan §15）：档表是这台机器的能力，
+        // 档位是用户对某一台对端某一个方向的选择，见 `PeerState::transport`。
         latency_stops_ms: LATENCY_STOPS_MS.to_vec(),
         quality_stops: audiohub_ipc::transport::quality_stops(),
-        // 用户要的在上面两个字段里，**拿到的在这里**。
-        transport_live: {
-            let l = inner.transport.live();
-            audiohub_ipc::TransportLive {
-                achieved_ms: l.achieved_ms,
-                at_floor: l.at_floor,
-                at_ceiling: l.at_ceiling,
-                rate: l.rate,
-                streams: l.streams,
-            }
-        },
         hal_capacity: capacity as u8,
         hal_used: used as u8,
     }
+}
+
+/// plan §15：一台对端的四个档位 + 它推给本机的那两个。
+///
+/// **两组来源分开报，绝不合并。** 本机存的那份在共享模式下对任何链路都不生效，
+/// 但照存不误（切回 A/B 时它是这台对端的既有设置）；对端推来的那两个只在本机
+/// 是**提供者**的会话上存在。UI 靠这两组的分离才回答得了「这个 300 是我设的
+/// 还是对端要求的」——而那正是本次事故里两台机器的任何界面都答不出来的问题。
+fn peer_transport_view(
+    inner: &Arc<DaemonInner>,
+    st: &crate::DaemonState,
+    fp: &str,
+) -> audiohub_ipc::PeerTransportView {
+    let mine = lk(&inner.peer_transport).get(fp);
+    let mut v = audiohub_ipc::PeerTransportView {
+        recv: audiohub_ipc::PeerTransportDir {
+            latency: mine.recv.latency.clone(),
+            quality: mine.recv.quality.clone(),
+        },
+        send: audiohub_ipc::PeerTransportDir {
+            latency: mine.send.latency.clone(),
+            quality: mine.send.quality.clone(),
+        },
+        peer_rx_latency: None,
+        peer_tx_quality: None,
+    };
+    for e in st.sessions.values() {
+        if e.conn.fp != fp || e.origin != crate::SessionOrigin::Peer {
+            continue;
+        }
+        // `None` 保持 `None`：「对端没表态」与「对端要求 auto」在执行上相同、
+        // 在界面上不同（「未设定 · 按自动运行」vs 一个真的被选中的档）。
+        if let Some(t) = *lk(&e.pushed.rx_latency) {
+            v.peer_rx_latency = Some(t.as_wire());
+        }
+        if let Some(t) = *lk(&e.pushed.tx_quality) {
+            v.peer_tx_quality = Some(t.as_wire());
+        }
+    }
+    v
 }
 
 fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
@@ -713,6 +774,7 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
                     .get(&p.fingerprint)
                     .cloned()
                     .unwrap_or_else(|| haldev::base_name(p)),
+                transport: peer_transport_view(inner, &st, &p.fingerprint),
                 peer: p.clone(),
             }
         })

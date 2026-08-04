@@ -10,6 +10,10 @@ pub mod halbridge;
 /// developed on, not only on the target.
 pub mod halbridge_win;
 mod ipcserv;
+/// `hal_mic` 生产侧水位闸门（纯状态机 + 一条不变式）。
+pub mod micgate;
+/// plan §15：每对端 × 每方向的传输档位（持久化 + 失效隔离）。
+mod peer_transport;
 /// plan §13 三模式互斥的接线测试（两台真 daemon 跑回环）。
 #[cfg(test)]
 mod mode_tests;
@@ -366,7 +370,10 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         announce_guard: Mutex::new(announce_guard),
         halbridge: Mutex::new(hal_bridge),
         settings: Mutex::new(settings::StoredSettings::load(&cfg_dir_for_state)),
-        transport: transport::TransportControl::default(),
+        peer_transport: Mutex::new(peer_transport::PeerTransportStore::load(
+            &cfg_dir_for_state,
+        )),
+        servo_site: Mutex::new(servo::ServoSite::default()),
         haldev: Mutex::new(haldev::HalDevState::new(haldev::SlotTable::load(
             &cfg_dir_for_state,
         ))),
@@ -383,13 +390,11 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         mix_meter: quality::MixMeter::new(),
     });
 
-    // 把盘上的档位推给音频线程。**开机就要做**：不做的话，一台设了固定档的机器
-    // 重启后会以 AUTO 跑，而 `settings.get` 照旧回显固定档 —— 界面与行为对不上，
-    // 且没有任何一处会报错。
-    {
-        let s = lk(&inner.settings);
-        inner.transport.publish(s.latency_target(), s.quality_target());
-    }
+    // plan §15 之前这里有一句「把盘上的档位推给音频线程」。**现在不需要，
+    // 而且不能有**：档位是每对端 × 每方向的，作用对象是流，而开机这一刻一条
+    // 流都还没有。灌入点改成 `publish_targets`——开流时走一次、此后每拍一次，
+    // 于是「重启后设了固定档的机器以 AUTO 跑」这个失效在结构上不可能发生
+    // （没有任何一条流会在没被灌过档位的情况下跑第二拍）。
 
     let mut threads = Vec::new();
     let spawn = |name: &str, f: Box<dyn FnOnce() + Send>| -> Result<JoinHandle<()>> {
@@ -559,13 +564,20 @@ pub(crate) struct DaemonInner {
     /// is a property of this MACHINE, so it cannot live in a UI's localStorage
     /// where two windows can disagree and the daemon is never told.
     pub settings: Mutex<settings::StoredSettings>,
-    /// 两个传输档位的**无锁**镜像，外加伺服的输出与读数。
+    /// plan §15：每对端 × 每方向的传输档位。**持久，按指纹索引。**
     ///
-    /// 与 `settings` 是同一份事实的两种形态：`settings` 是权威且持久的，但它是
-    /// 一把 `Mutex`，10 ms 的音频线程不许碰（只允许常数时间原子操作）。
-    /// `settings.set` 落盘后立刻 `publish` 到这里，音频线程下一拍就读到——
-    /// 这就是「修改即生效」的全部机制。
-    pub transport: transport::TransportControl,
+    /// 与 `settings` 分开一个文件的完整理由在 `peer_transport.rs` 的文件头；
+    /// 一句话版本：塞进 `settings.json` 会让任意一台对端的一个坏档位串把
+    /// **全机模式**重置回 `Share`，而模式是 §13 那条互斥线。
+    ///
+    /// 它不被音频线程读——档位从这里被灌进**每条流**的
+    /// `TransportControl`（`publish_targets`），音频线程只读那些原子量。
+    pub peer_transport: Mutex<peer_transport::PeerTransportStore>,
+    /// 延迟伺服的**站点级**心跳，由 `servo_pass` 每秒写、`daemon.status` 读。
+    ///
+    /// 每条流的现场在 `RxStream::servo_obs` 上（plan §15 把单例拆了）。
+    /// 这里只剩零会话时唯一还在动的那两个数 + 坏档位计数，见 `servo::ServoSite`。
+    pub servo_site: Mutex<servo::ServoSite>,
     /// Which peer owns which pair of virtual devices, plus everything the
     /// device/session coordinator tracks per slot (spec-m5b §5.1).
     pub haldev: Mutex<haldev::HalDevState>,
@@ -780,6 +792,29 @@ fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
             "skip_drained_frames": s.skip_drained_frames,
         })
     });
+    // 麦克风方向（`hal_mic`）的水位闸门。**此前这个键根本不存在**——
+    // `latency_guard` 只有 `['dll','hal_spk','media_send_q','play_servo',
+    // 'sched_late','skip']`，全部是扬声器方向或与方向无关的。于是「环里那
+    // 132 ms 是上一次会话的存量还是这一级的设计深度」在运行时无从分辨。
+    //
+    // 三条门限一并发出去，不是为了好看：`depth_ms` 单独一个数回答不了
+    // 「它是高还是低」，而门限写在代码里、读数在 JSON 里，排障的人要跨两个
+    // 地方对表。语义与读法见 `halbridge::HalMicGateCounters`。
+    let hal_mic = inner.hal().map(|h| {
+        let g = h.status().mic_gate;
+        serde_json::json!({
+            "floor_ms": micgate::frames_to_ms(micgate::D_FLOOR),
+            "ceil_ms": micgate::frames_to_ms(micgate::D_CEIL),
+            "consumer_quantum_ms": micgate::frames_to_ms(micgate::Q_C),
+            "band_top_ms": micgate::frames_to_ms(micgate::D_BAND_TOP),
+            "drain_events": g.drain_events,
+            "drain_ticks": g.drain_ticks,
+            "withheld_frames": g.withheld_frames,
+            "starved_ticks": g.starved_ticks,
+            "low_water_ms": g.low_water_ms,
+            "depth_ms": g.depth_ms,
+        })
+    });
     Ok(serde_json::json!({
         "skip": {
             "tx": engine::tx_skip_counters(),
@@ -860,7 +895,37 @@ fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
         // 没有这一项就没法判断环路到底在不在工作——`hal_spk.ms` 平稳既可能是
         // 环路在起作用，也可能是这段时间恰好没有扰动。
         "dll": engine::tx_dll_counters(),
+        // 延迟档伺服（`servo.rs`）的现场。**这是「用户拖了滑条之后到底发生了
+        // 什么」的唯一运行时证据**，语义与读法全文见 `servo::ServoObs`。
+        //
+        // **两层：站点级心跳 + `by_stream` 每流明细**（plan §15 把单例拆了）。
+        // 顶层**没有** `target_ms` / `sum_ms` / `jb_frames`：多流、双向之后
+        // 那样一个「代表值」不管取哪条都在替另一条撒谎（plan §14 裁定 1 的
+        // JSON 版本）。读旧路径的人会拿到 `null`，那个中断是要的。
+        //
+        // 现场怎么读，按排除顺序：
+        // - `ticks` 不涨 ⇒ 回路根本没在跑（ticker 断了 / daemon 卡住）。此时
+        //   下面所有的数都是陈的，先别读。
+        // - `streams == 0` / `by_stream` 是空对象 ⇒ 这台机器**没有接收流**，
+        //   延迟档此刻没有作用对象。注意这不是故障：发送方向的 jitter buffer
+        //   在**对端**，由**本机推给它**的 `send.latency` 管（plan §15）。
+        // - `bad_transport_targets` 在涨 ⇒ 有对端在推它无权推、或本机执行不了
+        //   的档位。三种成因：交叉的那半边接反了、跨连接的 stream_id、
+        //   §13 互斥被击穿。三种都不该发生，出现即是 bug 的运行时证据。
+        // - 以下逐条都在 `by_stream["<stream_id>"]` 里，**按流读，不许跨流合并**：
+        // - `target_from` = `"peer"` ⇒ 这个目标是**使用方要求的**，本机只是
+        //   执行者（共享模式）。`"local"` = 本机自己设的。
+        // - `closed_loop == false` ⇒ 有流但测不到 `sum_ms`（对端不上报分项，
+        //   或本侧某一级读不到）。回路仍在动，走的是「JB 不许超过总目标」这个
+        //   开环上界；此时 `at_floor` / `at_ceiling` 一定是 false，因为那两句
+        //   是关于物理的断言，而开环下地板是假设的 0。
+        // - `error_ms` 长期显著非零而 `step_frames` 恒为 0 ⇒ 贴边了
+        //   （看 `at_floor` / `at_ceiling`）或包络给错了（看 `envelope_frames`）。
+        // - `jb_frames` 追不上上一拍的 `want_frames` ⇒ 输出没被执行，
+        //   病在 `engine.rs` 那段接线上，不在这里。
+        "servo": lk(&inner.servo_site).json(servo_by_stream(inner)),
         "hal_spk": hal,
+        "hal_mic": hal_mic,
         // 接收侧：`play_ring` 的跨时钟速率伺服。这一级是全链路上**唯一真正
         // 跨时钟**的一段（mac 的发送节拍 vs Windows 声卡晶振，两个独立振荡器），
         // 也是治法 A 落地之后唯一还在无界积累的病灶。
@@ -1200,6 +1265,26 @@ pub(crate) struct SessionEntry {
     /// 是那条「不可跨流求和」约束的结构性载体。`Arc` 是因为 `SessionEntry` 每
     /// 秒被克隆做快照（与 `volume` 同一理由）。
     pub peer_lat: Arc<PeerLatCell>,
+    /// plan §15：**对端推给本机**的档位（`SessionMsg::SetTransport`）。
+    ///
+    /// 与 `inner.peer_transport`（本机自己设的）是**两个来源，绝不合并**：
+    /// 合并之后「这个 300 是我设的还是对端要求的」就再也答不出来，而那正是
+    /// 共享模式的详情页唯一要回答的问题。
+    pub pushed: Arc<PushedTransport>,
+}
+
+/// 对端推来、执行器在本机的两个档位。只有本机是**提供者**（`origin == Peer`）
+/// 的会话上才会有值。
+///
+/// 用 `Mutex<Option<_>>` 而不是原子量：写者是控制通道读取线程（每次
+/// `SetTransport` 一次），读者是 1 s 的协调线程，**都不在 10 ms 路径上**。
+/// 真正的无锁镜像在 `RxStream::transport` / `TxShared::transport`。
+#[derive(Default)]
+pub(crate) struct PushedTransport {
+    /// 执行器在本机 **rx** 侧（= 对端的「发送方向延迟」）。
+    pub rx_latency: Mutex<Option<audiohub_ipc::LatencyTarget>>,
+    /// 执行器在本机 **tx** 侧（= 对端的「接收方向音质」）。
+    pub tx_quality: Mutex<Option<audiohub_ipc::QualityTarget>>,
 }
 
 /// Per-session volume sync state (spec-m4b §A2). Shared behind an Arc because
@@ -1590,6 +1675,19 @@ pub(crate) struct RxStream {
     pub hal_mic: StageSlot,
     /// 本条接收流各级深度的 30 s 漂移窗口。由 1 s 的 ticker 喂点。
     pub drift: Mutex<DriftTracker>,
+    /// plan §15：**这一条流**的延迟目标与伺服输出（无锁，rx 路径每包读）。
+    ///
+    /// 每条 rx 流有自己的 jitter buffer ⇒ 每条 rx 流就得有自己的目标与自己的
+    /// 回路。拆分前是一个全局单例：两条来自不同对端、目标不同的接收流被
+    /// **同一个数**驱动，而 `servo_pass` 喂给它的是 `worst`（取最差那条的
+    /// `sum_ms`）+ 第一条流的 `jb_frames`——两条流的读数被混在一起，然后一起
+    /// 执行到两条流上。
+    pub transport: transport::TransportControl,
+    /// **这一条流**的伺服现场（`daemon.status.latency_guard.servo.by_stream`）。
+    ///
+    /// ⚠ **锁序**：取它之前必须先释放 `jbs`。`servo_pass` 在循环里两把都要，
+    /// 而本文件里已经记着一次 `jbs -> drift` 与 `drift -> jbs` 的 ABBA 死锁。
+    pub servo_obs: Mutex<servo::ServoObs>,
 }
 
 impl RxStream {
@@ -1643,6 +1741,8 @@ impl RxStream {
             bridge_ring: StageSlot::new(),
             hal_mic: StageSlot::new(),
             drift: Mutex::new(DriftTracker::new()),
+            transport: transport::TransportControl::default(),
+            servo_obs: Mutex::new(servo::ServoObs::default()),
         }
     }
 }
@@ -1704,6 +1804,11 @@ pub(crate) struct TxShared {
     pub stages: [StageSlot; 3],
     /// 本条发送流各级深度的 30 s 漂移窗口，由 1 s 的 ticker 喂点。
     pub drift: Mutex<DriftTracker>,
+    /// plan §15：**这一条流**的质量目标（无锁，`tx_loop` 每拍读）。
+    ///
+    /// 扇出时不串台：`rung` 与重采样器都在每条流自己的结构上，共享的只有源侧
+    /// 的 `SourceEnt`。一个源扇出给 N 个消费者时，各自的线上采样率互不影响。
+    pub transport: transport::TransportControl,
 }
 
 impl TxShared {
@@ -1722,6 +1827,7 @@ impl TxShared {
             dest_epoch: AtomicU64::new(0),
             stages: [StageSlot::new(), StageSlot::new(), StageSlot::new()],
             drift: Mutex::new(DriftTracker::new()),
+            transport: transport::TransportControl::default(),
         }
     }
 
@@ -2503,6 +2609,21 @@ fn build_session_info_with(
         mix_verdicts: None,
         volume: if e.volume.enabled { *lk(&e.volume.state) } else { None },
         pipeline: None,
+        // 目标档随每条流一起报（plan §14 裁定 4：界面必须说清「这是目标」）。
+        // 取自**执行器手边的那份原子量**，不是设置的副本——设置的副本正是
+        // 本项目栽过六次的那个东西。
+        latency_target: e.rx.as_ref().and_then(|rx| match rx.transport.latency_target() {
+            audiohub_ipc::LatencyTarget::Auto => None,
+            t => Some(t.as_wire()),
+        }),
+        quality_target: e
+            .tx
+            .as_ref()
+            .and_then(|tx| tx.transport.quality_rate())
+            .map(|r| audiohub_ipc::QualityTarget::Rate(r).as_wire()),
+        target_from: None,
+        at_floor: false,
+        at_ceiling: false,
         quality: None,
         jb_popped: 0,
         jb_underruns: 0,
@@ -2517,7 +2638,18 @@ fn build_session_info_with(
         jb_accel_deferred: 0,
         jb_underrun_penalty_frames: 0,
     };
+    // 目标是谁定的。`origin == Peer` ⇒ 本机是提供者，档位由使用方推来。
+    if s.latency_target.is_some() || s.quality_target.is_some() {
+        s.target_from = Some(
+            if e.origin == SessionOrigin::Peer { "peer" } else { "local" }.to_string(),
+        );
+    }
     if let Some(rx) = &e.rx {
+        {
+            let live = rx.transport.live();
+            s.at_floor = live.at_floor;
+            s.at_ceiling = live.at_ceiling;
+        }
         {
             let c = lk(&rx.stats);
             let dur = c.first.map(|f| f.elapsed().as_secs_f64()).unwrap_or(0.0);
@@ -2713,7 +2845,7 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                 // `else` 而不是提前 return/continue：这个 `for` 的后面还有音量
                 // 轮询，跳过去会让固定质量档顺手把音量同步也关掉——一个只在
                 // 「选了固定档 + 开了音量同步」时才出现的组合失效。
-                if let Some(rate) = inner.transport.quality_rate() {
+                if let Some(rate) = tx.transport.quality_rate() {
                     if let Some(rung) = transport::rung_of_rate(rate) {
                         tx.rung.store(rung, Ordering::Relaxed);
                     }
@@ -2760,13 +2892,68 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                 poll_provider_volume(e, live, renegotiate);
             }
         }
-        // 延迟伺服一拍。放在整个 `for` 之后：它要看**全部**接收流才能给出
-        // 一个站点级读数，逐条流各写各的会让 UI 读到最后一条流的值。
+        // plan §15：把每对端 × 每方向的档位灌进每条流的执行器镜像。
+        //
+        // **必须在 `servo_pass` 之前**：伺服这一拍读的是 `rx.transport` 里的
+        // 目标，先跑伺服就会用上一拍的目标算这一拍的深度。
+        //
+        // 每拍都做而不是只在变更时做，是因为「变更」有三个入口（IPC、
+        // `SetTransport`、开流）而流可以在任意时刻出现（模式 B 的设备协调器、
+        // 断线重放）。只在变更时灌的话，一条**在变更之后才建立**的流会带着
+        // 默认档位跑到下一次变更为止——一个只在特定时序下出现、没有任何报错
+        // 的失效。`publish_*` 里那条「真的变了才作废」的判断让重复灌入是免费的。
+        publish_targets(&inner, &entries);
+        // 延迟伺服一拍。放在整个 `for` 之后：装配层要一次拿到全部会话。
         servo_pass(&inner, &entries);
     }
 }
 
-/// 延迟伺服的一拍（1 s）。
+/// plan §15：把「谁的档位」灌进**每条流**的执行器镜像。
+///
+/// # 判据是 `origin`，不是 `dir`
+///
+/// `dir` 分不出消费者与提供者：持 `rx` 的一端 `dir` 恒为 `recv`，持 `tx` 的
+/// 一端恒为 `send`，两端都是如此。真正的判据是**这条会话是谁开的**——
+/// `origin == Peer` ⇒ 本机是提供者，档位由对端推来；否则本机是消费者，
+/// 档位是自己存的那一份。
+///
+/// # 交叉的那一半
+///
+/// | 本机角色 | 本机 rx 的延迟目标 | 本机 tx 的质量目标 |
+/// |---|---|---|
+/// | 消费者 | 自己的 `recv.latency` | 自己的 `send.quality` |
+/// | 提供者 | 对端推来的 `rx_latency` | 对端推来的 `tx_quality` |
+///
+/// 消费者的另外两个档（`recv.quality` / `send.latency`）**在本机没有执行器**，
+/// 它们由 `conn::push_transport` 送去对端。
+pub(crate) fn publish_targets(inner: &DaemonInner, entries: &[SessionEntry]) {
+    for e in entries {
+        let we_opened = e.origin != SessionOrigin::Peer;
+        // 只在真的需要时才去拿这把锁：提供者侧的两个值都在 `e.pushed` 上。
+        let mine = we_opened.then(|| lk(&inner.peer_transport).get(&e.conn.fp));
+        if let Some(rx) = &e.rx {
+            let lat = match &mine {
+                Some(t) => t.recv.latency_target(),
+                // 对端没表态 ⇒ AUTO。**不是 0**，也不是本机存的那一份：
+                // 本机存的那份在共享模式下对任何链路都不生效，拿它去驱动
+                // 一条由对端指挥的流，就是替对端做了一个它没做过的决定。
+                None => lk(&e.pushed.rx_latency)
+                    .unwrap_or(audiohub_ipc::LatencyTarget::Auto),
+            };
+            rx.transport.publish_latency(lat);
+        }
+        if let Some(tx) = &e.tx {
+            let q = match &mine {
+                Some(t) => t.send.quality_target(),
+                None => lk(&e.pushed.tx_quality)
+                    .unwrap_or(audiohub_ipc::QualityTarget::Auto),
+            };
+            tx.transport.publish_quality(q);
+        }
+    }
+}
+
+/// 延迟伺服的一拍（1 s）。**plan §15 之后：每条接收流各跑一次。**
 ///
 /// # 为什么在这里而不是在音频线程上
 ///
@@ -2780,62 +2967,97 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
 /// **伺服必须盯着 UI 显示的那同一个数。** 两处各算一份，就会出现「界面说
 /// 186 ms，伺服认为已经达标」这种谁也查不出来的分歧。这里复用装配层，
 /// 于是按定义不可能分歧。
+///
+/// # 拆成每流之后，三条既有纪律都变强了
+///
+/// 1. **「没有接收流 ⇒ 原地不动」** 现在由 `continue` 天然成立——不再需要
+///    `jb_frames.unwrap_or(lo)` 那个**造出来的**假读数。旧版没有流时喂进去
+///    一个凭空的 4，于是回路每秒算出「想走到 5」、得出「执行量 +1」，
+///    而这台机器上根本没有东西可以被伺服：一条看起来正在努力工作的死回路。
+/// 2. **「在写执行器之前记 `ServoObs`」** 顺序不变——下一拍的 `jb_frames`
+///    与本拍的 `want_frames` 一比，就是「输出到底有没有被采纳」的直接证据。
+/// 3. **`worst` 没了。** 旧版把全部接收流揉成一个读数（取最差的 `sum_ms` +
+///    第一条流的 `jb_frames`）再驱动每一条流。现在伺服看的数与卡片该方向
+///    显示的数**是同一条流的同一个量**。
 fn servo_pass(inner: &Arc<DaemonInner>, entries: &[SessionEntry]) {
-    let target = inner.transport.latency_target();
     let pipelines = assemble_pipelines(
         &inner.play_ring,
         &inner.play_drift,
         entries.iter().map(StreamLat::of).collect(),
     );
 
-    // 只有**接收**流手上有 jitter buffer，也只有它的深度是我们动得了的。
-    // 发送方向的缓冲在对端，改它要一条协议消息（见文件末尾的合并注记）。
-    let mut worst: Option<f64> = None;
-    let mut streams = 0u32;
-    let mut jb_frames: Option<u32> = None;
-    let mut lo = audiohub_net::media::JitterBuffer::MIN_TARGET;
-    let mut hi = audiohub_net::media::JitterBuffer::MAX_TARGET;
+    let mut live = 0u32;
     for (e, p) in entries.iter().zip(pipelines.iter()) {
+        // 只有**接收**流手上有 jitter buffer，也只有它的深度是我们动得了的。
+        // 发送方向的缓冲在对端，改它要一条协议消息（`SessionMsg::SetTransport`）。
         let Some(rx) = e.rx.as_ref() else { continue };
-        streams += 1;
+        live += 1;
+        // ⚠ 锁序：`jbs` 在这个块里取、在块结束时释放，`servo_obs` 在**之后**
+        // 才取。嵌套会与本文件里已记录的那次 `jbs -> drift` ABBA 同形。
         let (cur, tuning) = {
             let st = lk(&rx.jbs);
             (st.jb.target(), st.jb.tuning())
         };
-        // 站点级读数取**最差**的一条：多条流时用平均会把一条卡住的流藏起来，
-        // 而用户听见的恰恰是那一条。
-        if let Some(sum) = p.as_ref().and_then(|p| p.sum_ms) {
-            worst = Some(worst.map_or(sum, |w: f64| w.max(sum)));
-        }
-        if jb_frames.is_none() {
-            jb_frames = Some(cur);
-            lo = tuning.min_target;
-            hi = tuning.max_target;
-        }
+        let target = rx.transport.latency_target();
+        let sin = servo::ServoIn {
+            target,
+            sum_ms: p.as_ref().and_then(|p| p.sum_ms),
+            jb_frames: cur,
+            lo_frames: tuning.min_target,
+            hi_frames: tuning.max_target,
+        };
+        let out = servo::step(sin);
+        lk(&rx.servo_obs).record(servo::ServoSample {
+            target: sin.target,
+            sum_ms: sin.sum_ms,
+            jb_frames: sin.jb_frames,
+            want_frames: out.want_frames,
+            lo_frames: sin.lo_frames,
+            hi_frames: sin.hi_frames,
+            at_floor: out.at_floor,
+            at_ceiling: out.at_ceiling,
+            streams: 1,
+        });
+        // AUTO 下**不许**写深度：那一档按 plan §5 归抖动公式管。
+        rx.transport.set_servo_frames(match target {
+            audiohub_ipc::LatencyTarget::Auto => None,
+            audiohub_ipc::LatencyTarget::TotalMs(_) => Some(out.want_frames.max(1)),
+        });
+        rx.transport.set_live(transport::TransportLive {
+            achieved_ms: sin.sum_ms,
+            at_floor: out.at_floor,
+            at_ceiling: out.at_ceiling,
+            rate: None,
+            streams: 1,
+            tx_streams: 0,
+        });
     }
+    // 站点级心跳。零会话时它是唯一还在动的东西，也就是「回路死了」与
+    // 「没有东西可伺服」之间唯一的区分。
+    lk(&inner.servo_site).tick(live);
+}
 
-    let out = servo::step(servo::ServoIn {
-        target,
-        sum_ms: worst,
-        jb_frames: jb_frames.unwrap_or(lo),
-        lo_frames: lo,
-        hi_frames: hi,
-    });
-    // AUTO 下**不许**写深度：那一档按 plan §5 归抖动公式管。
-    inner.transport.set_servo_frames(match target {
-        audiohub_ipc::LatencyTarget::Auto => None,
-        audiohub_ipc::LatencyTarget::TotalMs(_) => Some(out.want_frames.max(1)),
-    });
-    inner.transport.set_live(transport::TransportLive {
-        achieved_ms: worst,
-        at_floor: out.at_floor,
-        at_ceiling: out.at_ceiling,
-        rate: entries
-            .iter()
-            .find_map(|e| e.tx.as_ref().map(|t| t.rung.load(Ordering::Relaxed)))
-            .map(audiohub_net::media::rung_rate),
-        streams,
-    });
+/// `daemon.status.latency_guard.servo.by_stream`：每条接收流的伺服现场。
+fn servo_by_stream(inner: &DaemonInner) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for e in snapshot_sessions(inner) {
+        let Some(rx) = e.rx.as_ref() else { continue };
+        let mut o = lk(&rx.servo_obs).json();
+        if let Some(obj) = o.as_object_mut() {
+            obj.insert("peer".into(), serde_json::json!(e.conn.fp));
+            obj.insert("kind".into(), serde_json::json!(e.kind));
+            obj.insert("dir".into(), serde_json::json!(e.dir));
+            // **这个字段就是「不许合并两个来源」那条规矩的可执行形式**：
+            // 共享模式的机器上，300 ms 是被对端要求的；使用端上，是自己设的。
+            // 两者在同一个 `target_ms` 上长得一模一样，只有这里能分开。
+            obj.insert(
+                "target_from".into(),
+                serde_json::json!(if e.origin == SessionOrigin::Peer { "peer" } else { "local" }),
+            );
+        }
+        m.insert(e.id.to_string(), o);
+    }
+    serde_json::Value::Object(m)
 }
 
 /// Ticks between unconditional VolumeState refreshes. Changes go out

@@ -19,6 +19,7 @@ export const zhCN = {
   'common.clear': '清除',
   'common.close': '关闭',
   'common.copy': '复制',
+  'common.gotIt': '知道了',
   // 复制失败在详情页与设置页是同一件事，一条键服务两处——分成两条早晚会各自漂移。
   'common.copyFailed': '复制失败，请手动选择文本',
   'common.retry': '重试',
@@ -183,6 +184,10 @@ export const zhCN = {
   'latency.seg.capture': '采集',
   'latency.seg.buffer': '缓冲',
   'latency.seg.playback': '播放',
+  // 段名会撒谎，这一句是它的解药。一段里并列着好几级：`playback` 段同时装着
+  // 真实播放环、桥接虚拟声卡环、**虚拟麦克风环**三条并行尾级。2026-08-04 现场
+  // 接收方向 136 ms 全在虚拟麦克风环上，段名却写着「播放」。
+  'latency.seg.dominant': '这一段此刻的大头是：{name}',
 
   // 就地展开的逐级明细：这里才出现内部级名，并各带一句说明。
   //
@@ -345,6 +350,29 @@ export const zhCN = {
   'peers.card.streamOut': '发送',
   'peers.card.idle': '空闲',
   'peers.card.kbps': '{v} kbps',
+
+  // —— 卡片指标区按方向分栏（2026-08-04 事故的界面修复）
+  //
+  // 病灶：`sess={micS || spkS}` 在两条真实存在的通路里选了一条，屏幕上只剩
+  // 接收方向的 170 ms，而发送方向实测 105 ms 一次都没出现过；四段色带又把
+  // `hal_mic`（虚拟麦克风环）的 136 ms 写成「播放 136」。用户据此得出
+  // 「扬声器慢」，方向完全反了。所以这一组文案的任务只有一个：
+  // **让每一个数字前面都先有方向。**
+  'peers.card.dirIdle': '未开通',
+  'peers.card.dirMulti': '{n} 路 · 显示最慢的一条',
+  'peers.card.dirMultiWhy':
+    '这个方向同时有多条通路在跑。一级界面显示其中最慢的一条——多路并行时体感由最差的一路决定。逐条明细在详情页。',
+  // 延迟档的**作用对象**按方向不对称，这两句是它的界面化。
+  //
+  // daemon 的 `servo_pass` 只遍历本机的接收流：发送方向那半条链路的抖动缓冲
+  // 在对端，由对端自己的延迟档管，本机没有执行器。不说的话，一台只发不收的
+  // 使用端拖了延迟滑条会看到「两栏里只有一栏在动」，唯一自然的结论是
+  // 「设置只生效了一半」——而系统是对的。设置页早已为此开了一条文案
+  // （settings.transport.noRecvStream），这两句是把同一条教训搬到卡片上。
+  'peers.card.dirGovLocal': '本机在收。延迟档作用在这个方向：它调的是本机的抖动缓冲。',
+  // ⚠ 语料里不许出现 Markdown 记号：这两句会直接进 `title` 与 `.metric-foot` 的
+  // 纯文本节点，`**…**` 会原样显示成四个星号。第一版写了，实测截图里就是那样。
+  'peers.card.dirGovPeer': '本机在发。这半条链路的缓冲在对端，由对端自己的延迟档决定，本机的滑条对它没有作用对象。',
 
   // 模式 B 下，虚拟麦克风已经真的出现在系统设备列表里、但还没有任何应用打开它。
   //
@@ -601,6 +629,40 @@ export const zhCN = {
   'settings.web.quitNote': '网页入口由本应用提供：从托盘选「退出界面（音频服务继续运行）」后它随之消失，音频不受影响；重新打开本应用即可恢复。',
   'settings.web.browserOnly': '你正在用网页端查看本页面。这三个选项只能在应用窗口里修改——否则一次误触就能把你自己正在用的这个入口关掉。此处显示的是按当前访问地址推断出的状态。',
 
+  // ---- plan §15：对端详情页的传输档位 ----
+  // 卡片上那一行「这个数是目标不是能力」。措辞必须让用户一眼分出两件事：
+  // 「我设的」与「对方要求的」。共享模式的机器只会看到后者。
+  'peers.card.targetMine': '目标 {ms} ms（你设定的，服务会主动填到这个值）',
+  'peers.card.targetByPeer': '目标 {ms} ms（由使用方要求）',
+
+  'detail.transport.title': '传输档位',
+  // §14 裁定 4：**常驻**，不是 tooltip。用户看到 300 ms 时必须能分辨
+  // 「这是我自己设的目标」而非「系统只能做到这样」——当前界面对此一个字都没说，
+  // 正是本次误判的直接成因。
+  'detail.transport.note': '这里设的是**目标值**，不是实测值。延迟档是端到端总延迟的目标：设成 300 ms 时服务会主动把缓冲填到 300 ms，而不是「这条链路只能做到 300 ms」。每格下方那一行才是实测读数。',
+  // 交叉的那半边要说出来，否则「我改了发送音质，为什么没反应」在界面上无解。
+  // 措辞按用户视角，不提「推给对端」——那是实现细节（plan §15 裁定 3）。
+  'detail.transport.where': '两个方向由本机单方决定，对端照办。延迟由**接收**的那一端执行、音质由**发送**的那一端执行，所以同一行里的两个档位分别落在两台机器上——这一点不影响你怎么设，只影响读数从哪一侧先动。',
+  'detail.transport.colLatency': '延迟（目标）',
+  'detail.transport.colQuality': '音质（目标）',
+  'detail.transport.latencyIn': '接收方向的延迟目标',
+  'detail.transport.latencyOut': '发送方向的延迟目标',
+  'detail.transport.qualityIn': '接收方向的音质目标',
+  'detail.transport.qualityOut': '发送方向的音质目标',
+  // 共享模式：显示对端推来的值 + 出处。**不隐藏、不置灰成空壳**——
+  // 本机真的有执行器在跑，只是被远程指挥；隐藏会让共享侧永远看不到自己
+  // 机器上正在被执行什么，而本次事故里缺的正是这个视图。
+  'detail.transport.sharedBy': '本机处于共享模式：收发档位由使用方（{name}）决定，这里只显示它此刻要求的值。',
+  // 「未设定」≠ 0，也 ≠ auto。对端没表态时按自动跑，但那与「对端明确选了
+  // AUTO」是两件事，混成一个值会让共享侧读出一个对方从未做过的决定。
+  'detail.transport.unset': '未设定 · 按自动运行',
+  'detail.transport.noStream': '这个方向当前没有音频流，暂无实测读数。',
+  'detail.transport.measuring': '正在测量，暂无读数。',
+  'detail.transport.liveMs': '实测 {n} ms',
+  'detail.transport.liveAtFloor': '实测 {n} ms · 已贴住物理下限',
+  'detail.transport.liveAtCeiling': '实测 {n} ms · 已贴住物理上限',
+  'detail.transport.liveKhz': '线上 {n} kHz',
+
   'settings.transport.title': '传输',
   'settings.transport.auto': 'AUTO',
 
@@ -624,18 +686,16 @@ export const zhCN = {
   'settings.transport.qBlocked': '本版本暂不支持这一档。',
   'settings.transport.qBlockedOpus': '本次构建未链接 libopus，这一档不可用。',
 
-  // 下面五条是**实测**读数，绝不可以变成对所选档位的复述。
-  'settings.transport.achieved': '实测端到端 {n} ms。',
-  'settings.transport.atFloor': '实测端到端 {n} ms：已贴住链路的物理下限，目标再往下调也降不动了。',
-  'settings.transport.atCeiling': '实测端到端 {n} ms：已贴住链路的物理上限，目标再往上调也升不上去。',
-  // 两行读数共用它，所以措辞不能倒向其中一边（「正在测量延迟…」放在采样率那行就是错的）。
-  'settings.transport.measuring': '正在测量，暂无读数。',
-  'settings.transport.noStreams': '当前没有正在传输的音频流，无从测量；设定会在下一条流建立时生效。',
-  'settings.transport.qLive': '当前实际采样率 {n} kHz。',
-  // 旧服务不上报 transport_live。这时候显示「正在测量」是一句永远兑现不了的承诺，
-  // 所以单列一条说清楚是拿不到，而不是还没测出来。
-  'settings.transport.liveNa': '本机服务未上报实测读数（版本较旧）。设定仍会下发，只是这里读不到它的实际效果。',
-  'settings.transport.noteLive': '两档都直接作用于正在运行的本机服务，松手即生效：不需要重启服务，也不需要与对端重新连接。下方两行是实测读数，不是你设定的目标值——两者对不上恰恰是这里要让你看见的信息。',
+  // plan §15：全局滑条下线，这个位置换成只读总览 + 一次性迁移说明。
+  // **位置不许留空**——区块凭空消失 = 用户找不到、也没被告知搬去哪了，
+  // 正是 §15 那个病根（「界面对此一个字都没说」）换个位置复发。
+  'settings.transport.migrated': '延迟与音质已改为**按对端**设置：收、发两个方向各有自己的一档延迟与一档音质。原来的全局档位不再生效，请到各对端的详情页重新设置。',
+  'settings.transport.noPeers': '还没有配对的对端。配对之后，每台对端的四个传输档位会列在这里。',
+  'settings.transport.colPeer': '对端',
+  'settings.transport.colDir': '方向',
+  'settings.transport.colLatency': '延迟（目标）',
+  'settings.transport.colQuality': '音质（目标）',
+  'settings.transport.noteLive': '这张表是**只读总览**，也是唯一能一眼看全所有对端档位的地方——「哪一台还停在 AUTO」在别处看不见。点对端名字进详情页去改；改动松手即生效，不需要重启服务，也不需要与对端重新连接。',
 
   'settings.devices.title': '虚拟设备',
   'settings.devices.removeTitle': '断开后移除虚拟设备',

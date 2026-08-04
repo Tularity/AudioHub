@@ -21,7 +21,7 @@ mod webui;
 /// 「服务版本不兼容」才暴露（2026-08-01 实测：daemon v2 起来了、音频正常，两端
 /// 界面同时被这个模态挡死）。守卫因此写在 audiohub-ipc 里，见那里的
 /// `the_three_ipc_version_declarations_agree`。
-const IPC_VERSION: u32 = 3;
+const IPC_VERSION: u32 = 4;
 
 /// How long a freshly spawned daemon gets to publish a connectable ipc.json.
 const READY_TIMEOUT: Duration = Duration::from_secs(8);

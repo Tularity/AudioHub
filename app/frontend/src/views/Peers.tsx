@@ -6,11 +6,12 @@
 
 import { useCallback, useRef, useState } from 'react';
 import { Icon } from '../components/Icon';
-import { Meter, Segmented, Switch } from '../components/Controls';
+import { Segmented, Switch } from '../components/Controls';
 import { VolumeControl } from '../components/VolumeControl';
 import { BridgeControl } from '../components/BridgeControl';
 import { ShareSourceControl } from '../components/ShareSourceControl';
 import { PeerMetrics } from '../components/PeerMetrics';
+import { splitByDirection } from '../lib/metrics';
 import { toast } from '../components/Toasts';
 import { bridgeTargets } from '../lib/bridge';
 import { backendParam, normalizeSource, SOURCE_SYSAUDIO } from '../lib/sysaudio';
@@ -320,31 +321,6 @@ function ModeBanner() {
 
 // ---------------------------------------------------------------- 对端卡片
 
-// `ready`（仅「接收」行会传真）= 通路真的通了、只是此刻没有应用在录音。它换掉的只是
-// 「空闲」那两个字，**电平条与码率一个数都不动**：没有音频在流动时不存在码率、不存在
-// 电平，随便填一个 0 上去就等于宣称「测过了，是 0」。这一行说的是状态，不是数据。
-function StreamRow({ fp, kind, label, sess, ready }: {
-  fp: string; kind: 'mic' | 'spk'; label: string; sess: SessionInfo | null; ready?: boolean;
-}) {
-  const kbps = sess && sess.stats ? sess.stats.bitrate_kbps : 0;
-  const idleReady = !sess && !!ready;
-  return (
-    <div
-      className={`stream${sess ? ' active' : ''}${idleReady ? ' ready' : ''}`}
-      data-testid={`stream-${kind}-${fp}`}
-      title={idleReady ? t('peers.card.micReadyWhy') : undefined}
-    >
-      <span className="stream-label">{label}</span>
-      <Meter testid={`level-${kind}-${fp}`} value={(kbps || 0) / 900} />
-      <span className="stream-rate">
-        {sess
-          ? t('peers.card.kbps', { v: fmt.kbps(kbps) })
-          : idleReady ? t('peers.card.micReadyShort') : t('peers.card.idle')}
-      </span>
-    </div>
-  );
-}
-
 // 模式 B 的对端卡片主体：这台对端的两台系统设备 + 它们此刻的状态。
 // 这里**没有任何选择器**——选哪台对端 = 在系统里选哪台设备（plan §7.1 冻结）。
 function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
@@ -429,8 +405,22 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
   const reconnecting = !peer.online && !!peer.reconnecting;
   useTick(1000, reconnecting);
 
+  // 两个开关**必须**按 `(kind, dir)` 取：它们各自开的是一条具体的通路
+  //（「取对方麦克风」= mic/recv，「送对方扬声器」= spk/send），这是使用端语义。
   const micS = sessions.find((x) => x.peer_fingerprint === fp && x.kind === 'mic' && x.dir === 'recv') || null;
   const spkS = sessions.find((x) => x.peer_fingerprint === fp && x.kind === 'spk' && x.dir === 'send') || null;
+  // 指标区按 **`dir`（本机视角）** 分栏，不按 `kind`（开流方视角）。
+  //
+  // 四种 `(kind, dir)` 组合全部落进这两个数组，包括共享模式的 `mic/send` 与
+  // `spk/recv`——此前那两种一个都匹配不上，共享模式下指标区恒显示「未建立通路」，
+  // 而隔壁隐私横幅同时亮着，同一张卡上下自相矛盾。
+  //
+  // 用 `filter` 而不是 `find`：同方向可以有多条会话（`MAX_STREAMS_PER_CONN = 16`，
+  // 去重只按 `stream_id`）。`find` 只是把「两个方向里选一个」这个 bug 降级成
+  // 「同方向 N 条里静默选第一条」，同一个形状换了个轴。
+  // 规则本身住在 `lib/metrics.ts`（纯函数，可被回归断言）：接线层零覆盖正是
+  // 这次事故能活下来的机制——有测试的那层没坏，坏的那层没测试。
+  const { send: sendList, recv: recvList } = splitByDirection(sessions, fp);
   // 对端发起、正在取用本机麦克风的会话（kind=mic + dir=send）。隐私相关，必须显式可见。
   const inbound = sessions.filter((x) => x.peer_fingerprint === fp && x.kind === 'mic' && x.dir === 'send');
 
@@ -441,7 +431,7 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
   //     `state === 'bound'` 而未被观测到时只是「已下发」，还不能承诺可用；
   //   - 没有 mic 方向的会话 —— 有会话时这一行显示的是实时码率，轮不到状态词。
   // 任一条不满足就退回原样（「空闲」/ 空白）：宣称一个兜不住的就绪状态，比不说更糟。
-  const micReady = !micS && !!peer.online && peer.hal_device?.observed === true;
+  const micReady = recvList.length === 0 && !!peer.online && peer.hal_device?.observed === true;
 
   const micBusy = busy.has(busyKey(fp, 'mic'));
   // 重连中不是「离线」：给和「连接中」同一种呼吸点，别让用户以为已经放弃了。
@@ -495,7 +485,7 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
           `peer` 是无会话时的兜底数据源：延迟按流统计，没有会话就整块没有，而控制面
           的网络单程（`PeerState.net_ms`）配对连上就有——它是「连着但闲着」这一态下
           唯一测得到的一段。 */}
-      <PeerMetrics fp={fp} peer={peer} sess={micS || spkS} />
+      <PeerMetrics fp={fp} peer={peer} sendList={sendList} recvList={recvList} micReady={micReady} />
 
       {/* ④ 隐私条紧贴指标区：原位夹在重连提示与开关之间，视觉权重低到会被略过，
           而「对方正在取用本机麦克风」是这张卡上唯一不该被略过的一行。 */}
@@ -582,21 +572,13 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
 
       <PeerDevices peer={peer} hidden={!modeB} />
 
-      {/* ⑤ 电平条两种模式都要：模式 B 的会话由系统的设备选择创建，那条流一样是这台
-          对端在收发，藏起来只会让「选了设备但没声音」少一个可看的地方。
-          收/发并成一行：省 20px，而且左右并置本来就比上下堆叠更容易做对比。 */}
-      <div className="peer-streams">
-        <StreamRow fp={fp} kind="mic" label={t('peers.card.streamIn')} sess={micS} ready={micReady} />
-        <StreamRow fp={fp} kind="spk" label={t('peers.card.streamOut')} sess={spkS} />
-        {/* 「接收」为什么空着：模式 B 下这条流要等**某个应用真的打开那只虚拟麦克风**
-            才会建立，在此之前一个字节都不会流动。此前这里只有「空闲」两个字，而它与
-            「对端离线」「驱动没起来」长得完全一样——用户明明知道麦克风是通的，界面
-            却什么都不肯说。这一行把「通路本身没问题」讲出来，且只在设备确实出现在
-            系统列表里（observed）且对端在线时才敢讲。 */}
-        <p className="stream-ready" data-testid={`mic-idle-${fp}`} hidden={!micReady} title={t('peers.card.micReadyWhy')}>
-          {micReady ? t('peers.card.micReady') : ''}
-        </p>
-      </div>
+      {/* ⑤ 电平条与码率**已并入指标区的方向块**（`PeerMetrics` 的 `DirBlock`）。
+          此前它们独立在卡底，按 `kind` 分成「接收 / 发送」两列——而上面的指标区
+          完全没有方向概念。同一张卡上两套坐标系，其中一套还是对的，正好把指标区
+          那个「170 是哪条通路」的问题衬托得更隐蔽：底下写着两行，上面只有一个数。
+          并进去之后码率与它自己那条通路的延迟 / 音质在同一块里，方向只讲一次。
+          「接收就绪、暂无应用在录音」那一态由 `DirBlock` 的 `ready` 承担，
+          `mic-idle-<fp>` 这个 testid 原样保留。 */}
     </article>
   );
 }

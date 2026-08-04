@@ -70,6 +70,61 @@ impl Node {
         self.ok(methods::SETTINGS_SET, json!({ "mode": m.as_str() }));
     }
 
+    /// plan §15：给**某一台对端某一个方向**设档位。
+    ///
+    /// `dir` 是**本机视角**：`"recv"` = 我收这台对端的音，`"send"` = 我发给它。
+    /// 只有消费者调它——共享模式的机器不设置、只接受。
+    fn set_transport(&self, fp: &str, dir: &str, key: &str, v: &str) -> Value {
+        self.ok(
+            methods::PEERS_SET_TRANSPORT,
+            json!({ "peer": fp, "dir": dir, key: v }),
+        )
+    }
+
+    /// 这台 daemon 上**每条接收流**的伺服现场，按 stream id 索引。
+    fn by_stream(&self) -> serde_json::Map<String, Value> {
+        self.servo()
+            .get("by_stream")
+            .and_then(|v| v.as_object().cloned())
+            .expect("servo.by_stream 必须存在")
+    }
+
+    /// **某一条**接收流的伺服现场。测试里至多一条，多的话取第一条并在断言
+    /// 里点名——`by_stream` 的键是 stream id，跨进程不可预测。
+    ///
+    /// 零流时返回 `Value::Null`：`.as_u64()` 于是恒为 `None`，断言会红在
+    /// 「读不到」而不是悄悄拿一个别处的数。
+    fn rx_servo(&self) -> Value {
+        self.by_stream()
+            .into_iter()
+            .next()
+            .map(|(_, v)| v)
+            .unwrap_or(Value::Null)
+    }
+
+    /// 在**真的加密控制通道**上发一条原始 `SessionMsg`。
+    ///
+    /// 只给「伪造一个行为不端的对端」用：正常路径上 daemon 自己不会发出这样
+    /// 的消息，而那正是那几道闸门存在的理由。走 `send_msg` 而不是直接调处理
+    /// 函数——闸门在分发里，绕过分发就是在测一个没人调用的函数。
+    fn send_raw(&self, to_fp: &str, msg: &audiohub_net::secure::SessionMsg) {
+        let c = crate::lk(&self.h.inner_for_test().state)
+            .conns
+            .get(to_fp)
+            .cloned()
+            .unwrap_or_else(|| panic!("没有到 {to_fp} 的控制连接"));
+        c.send_msg(msg).expect("send_msg");
+    }
+
+    /// 全部接收流累计的 `moves`。零流 = 0（**不是 None**：这里问的是
+    /// 「回路动过几次手」，没有对象时答案确实是零次）。
+    fn servo_moves(&self) -> u64 {
+        self.by_stream()
+            .values()
+            .filter_map(|v| v["moves"].as_u64())
+            .sum()
+    }
+
     fn fingerprint(&self) -> String {
         self.h.fingerprint.clone()
     }
@@ -87,6 +142,21 @@ impl Node {
 
     fn addr(&self) -> String {
         format!("127.0.0.1:{}", self.h.control_port)
+    }
+
+    /// **发送侧执行器**的固定档：这条流的 `TransportControl` 里那份采样率。
+    /// `None` = AUTO（阶梯当家）。
+    fn tx_quality_rate(&self) -> Option<u32> {
+        crate::snapshot_sessions(self.h.inner_for_test())
+            .iter()
+            .find_map(|e| e.tx.as_ref().and_then(|t| t.transport.quality_rate()))
+    }
+
+    /// **接收侧执行器**的伺服输出（帧）。`None` = AUTO / 还没算出来。
+    fn rx_servo_frames(&self) -> Option<u32> {
+        crate::snapshot_sessions(self.h.inner_for_test())
+            .iter()
+            .find_map(|e| e.rx.as_ref().and_then(|rx| rx.transport.servo_frames()))
     }
 
     /// **发送侧执行器**：这条 daemon 上任意一条发送流当前真的在用的格号。
@@ -116,6 +186,19 @@ impl Node {
         crate::snapshot_sessions(self.h.inner_for_test())
             .iter()
             .find_map(|e| e.rx.as_ref().map(|rx| lk(&rx.jbs).pushes))
+    }
+
+    /// 伺服导出的**运行时证据**（`daemon.status.latency_guard.servo`）。
+    ///
+    /// 走的是 IPC 而不是直接读 `inner.servo_obs`：这一整块的存在意义就是
+    /// 「现场能不能看见」，而现场只有 IPC 一条路。直接读结构体的测试会在
+    /// `latency_guard_status` 忘记挂这个键时照样全绿。
+    fn servo(&self) -> Value {
+        self.ok(methods::DAEMON_STATUS, json!({}))
+            .get("latency_guard")
+            .and_then(|g| g.get("servo"))
+            .cloned()
+            .expect("daemon.status.latency_guard.servo 必须存在")
     }
 
     /// JB 当前的包络（`min_target`, `max_target`）。
@@ -197,7 +280,7 @@ fn moving_the_quality_slider_really_changes_the_wire_rate() {
     for (id, want_rung) in
         [("pcm16k", 3u32), ("pcm24k", 2), ("pcm32k", 1), ("pcm48k", 0)]
     {
-        a.ok(methods::SETTINGS_SET, json!({ "quality": id }));
+        a.set_transport(&b.fingerprint(), "send", "quality", id);
         eventually(&format!("tx rung to become {want_rung} for {id}"), || {
             a.tx_rung() == Some(want_rung)
         });
@@ -215,7 +298,7 @@ fn a_fixed_quality_rung_is_not_overwritten_by_the_auto_ladder() {
     let _id = tone_session(&a, &b);
     eventually("a to have a sending stream", || a.tx_rung().is_some());
 
-    a.ok(methods::SETTINGS_SET, json!({ "quality": "pcm16k" }));
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm16k");
     eventually("the fixed rung to take", || a.tx_rung() == Some(3));
 
     // 跨过好几个 ticker 周期。阶梯若还在跑，干净链路会把格号一路升回 0。
@@ -243,17 +326,17 @@ fn switching_back_to_auto_hands_the_ladder_back_its_authority() {
     // 用 32 kHz（格号 1）而不是 16 kHz（格号 3）：`AutoLadder` 每升一格要 10 个
     // 干净周期 ≈ 10 s，从格号 3 升回 0 要三次共 ~30 s。测的是「阶梯是否重新掌权」，
     // 一格足以证明，三格只是在等。
-    a.ok(methods::SETTINGS_SET, json!({ "quality": "pcm32k" }));
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm32k");
     eventually("the fixed rung to take", || a.tx_rung() == Some(1));
     assert_eq!(
-        a.h.inner_for_test().transport.quality_rate(),
+        a.tx_quality_rate(),
         Some(32_000),
         "固定档没有被推给音频线程"
     );
 
-    a.ok(methods::SETTINGS_SET, json!({ "quality": "auto" }));
+    a.set_transport(&b.fingerprint(), "send", "quality", "auto");
     assert_eq!(
-        a.h.inner_for_test().transport.quality_rate(),
+        a.tx_quality_rate(),
         None,
         "切回 AUTO 之后固定档必须**立刻**撤销——等下一拍就是一段说不清归谁管的时间"
     );
@@ -301,7 +384,7 @@ fn the_servo_output_is_really_executed_not_just_the_reseed() {
     });
 
     // 100 ms 档：包络变成 1..12（从默认的 4..12），重建一次并预置到 10 帧。
-    b.ok(methods::SETTINGS_SET, json!({ "latency": "100" }));
+    a.set_transport(&b.fingerprint(), "send", "latency", "100");
     eventually_within(
         Duration::from_secs(20),
         "the buffer to be seeded at the 100ms depth",
@@ -310,7 +393,7 @@ fn the_servo_output_is_really_executed_not_just_the_reseed() {
     let envelope = b.jb_envelope().expect("envelope");
 
     // 20 ms 档：`max(ceil(20/10)+2, 12) == 12`，与上一档**同一个包络**。
-    b.ok(methods::SETTINGS_SET, json!({ "latency": "20" }));
+    a.set_transport(&b.fingerprint(), "send", "latency", "20");
     eventually_within(
         Duration::from_secs(25),
         "the servo to walk the buffer down to the 20ms depth",
@@ -349,14 +432,14 @@ fn raising_the_latency_target_really_deepens_the_receive_buffer() {
     });
 
     // 最低档：伺服往下压。
-    b.ok(methods::SETTINGS_SET, json!({ "latency": "0" }));
+    a.set_transport(&b.fingerprint(), "send", "latency", "0");
     eventually("the buffer to be driven shallow", || {
         b.jb_target().map_or(false, |t| t <= 2)
     });
     let shallow = b.jb_target().expect("target");
 
     // 高档：伺服往上加。500 ms 远高于回环链路的地板，所以必须一路加深。
-    b.ok(methods::SETTINGS_SET, json!({ "latency": "500" }));
+    a.set_transport(&b.fingerprint(), "send", "latency", "500");
     eventually("the buffer to be driven deep", || {
         b.jb_target().map_or(false, |t| t > shallow + 5)
     });
@@ -381,7 +464,7 @@ fn a_high_target_widens_the_envelope_instead_of_reporting_a_fake_ceiling() {
     eventually("b to have a receiving stream", || b.jb_envelope().is_some());
     let (_, default_hi) = b.jb_envelope().expect("envelope");
 
-    b.ok(methods::SETTINGS_SET, json!({ "latency": "750" }));
+    a.set_transport(&b.fingerprint(), "send", "latency", "750");
     eventually("the envelope to widen for a 750ms target", || {
         b.jb_envelope().map_or(false, |(_, hi)| hi > default_hi)
     });
@@ -395,7 +478,7 @@ fn a_high_target_widens_the_envelope_instead_of_reporting_a_fake_ceiling() {
 
     // 切回 AUTO ⇒ 恢复实测默认整定。固定档期间放开的下限不许留给 AUTO，
     // 那会悄悄改掉 plan §5 里 AUTO 的整定。
-    b.ok(methods::SETTINGS_SET, json!({ "latency": "auto" }));
+    a.set_transport(&b.fingerprint(), "send", "latency", "auto");
     eventually("the envelope to return to the measured default", || {
         b.jb_envelope() == Some((
             audiohub_net::media::JitterBuffer::MIN_TARGET,
@@ -411,11 +494,11 @@ fn auto_latency_leaves_the_servo_silent() {
     let _id = tone_session(&a, &b);
     eventually("b to have a receiving stream", || b.jb_target().is_some());
 
-    b.ok(methods::SETTINGS_SET, json!({ "latency": "auto" }));
+    a.set_transport(&b.fingerprint(), "send", "latency", "auto");
     // 给 ticker 几拍。
     std::thread::sleep(Duration::from_millis(2500));
     assert_eq!(
-        b.h.inner_for_test().transport.servo_frames(),
+        b.rx_servo_frames(),
         None,
         "AUTO 下伺服写了深度：两条回路在抢同一个水位"
     );
@@ -423,72 +506,113 @@ fn auto_latency_leaves_the_servo_silent() {
 
 // ------------------------------------------------------ 拒绝 / 契约
 
-/// **Opus 三档在滑条上看得见，`settings.set` 必须拒收。**
+/// **Opus 三档在滑条上看得见，`peers.set_transport` 必须拒收。**
 ///
 /// 收下它 = 界面显示「Opus 128k」而线上一个字节都没变。
 /// 顺带断言**拒绝之后盘上的值没被改动**：一次被拒的写入不许留下半个副作用。
 #[test]
 fn an_unimplemented_quality_rung_is_refused_and_changes_nothing() {
-    let a = Node::start("refuse");
-    let before = a.ok(methods::SETTINGS_GET, json!({}));
-    let before_q = before.get("quality").and_then(Value::as_str).unwrap().to_string();
+    let (a, b) = linked("refuse");
+    let fp = b.fingerprint();
+    let before = a.peer(&fp)["transport"]["send"]["quality"]
+        .as_str()
+        .expect("send.quality")
+        .to_string();
 
     for bad in ["opus64", "opus128", "opus256", "pcm96k", "", "PCM48K"] {
         let err = a
-            .call(methods::SETTINGS_SET, json!({ "quality": bad }))
+            .call(
+                methods::PEERS_SET_TRANSPORT,
+                json!({ "peer": &fp, "dir": "send", "quality": bad }),
+            )
             .expect_err(&format!("quality '{bad}' 本 build 给不了，必须拒收"));
         assert!(
             err.contains("quality"),
             "拒绝理由要说清楚是哪个字段的问题：{err}"
         );
     }
-    let after = a.ok(methods::SETTINGS_GET, json!({}));
     assert_eq!(
-        after.get("quality").and_then(Value::as_str),
-        Some(before_q.as_str()),
+        a.peer(&fp)["transport"]["send"]["quality"].as_str(),
+        Some(before.as_str()),
         "一次被拒的写入改动了盘上的值"
     );
-    assert_eq!(
-        a.h.inner_for_test().transport.quality_rate(),
-        None,
-        "被拒的档位泄漏到了音频线程"
-    );
+    assert_eq!(a.tx_quality_rate(), None, "被拒的档位泄漏到了音频线程");
 }
 
 /// 档位表以外的毫秒数同样拒收，**不是就近吸附**。
 #[test]
 fn a_latency_value_off_the_ladder_is_refused() {
-    let a = Node::start("refuse-lat");
+    let (a, b) = linked("refuse-lat");
+    let fp = b.fingerprint();
     for bad in ["137", "1", "1001", "-5", "auto ", "min2"] {
         let err = a
-            .call(methods::SETTINGS_SET, json!({ "latency": bad }))
+            .call(
+                methods::PEERS_SET_TRANSPORT,
+                json!({ "peer": &fp, "dir": "recv", "latency": bad }),
+            )
             .expect_err(&format!("latency '{bad}' 不是档位，必须拒收"));
         assert!(err.contains("latency"), "{err}");
     }
     // 每一个真档位都要收得下——否则上面的拒绝只是「什么都不接受」。
     for &ms in &audiohub_ipc::LATENCY_STOPS_MS {
-        let got = a.ok(methods::SETTINGS_SET, json!({ "latency": ms.to_string() }));
+        let got = a.set_transport(&fp, "recv", "latency", &ms.to_string());
         assert_eq!(
-            got.get("latency").and_then(Value::as_str),
+            got["recv"]["latency"].as_str(),
             Some(ms.to_string().as_str()),
             "{ms} ms 是档位表里的档，却没被收下"
         );
     }
-    a.ok(methods::SETTINGS_SET, json!({ "latency": "auto" }));
     // 旧拼写要被**规范化**存下来，不是原样留着：盘上留两种写法会让下一个
     // 读者以为是两档。
-    let got = a.ok(methods::SETTINGS_SET, json!({ "latency": "min" }));
-    assert_eq!(
-        got.get("latency").and_then(Value::as_str),
-        Some("0"),
-        "旧的 \"min\" 要被规范化成 \"0\""
+    let got = a.set_transport(&fp, "recv", "latency", "min");
+    assert_eq!(got["recv"]["latency"].as_str(), Some("0"), "旧的 \"min\" 要被规范化成 \"0\"");
+
+    // **方向必须说清楚。** 缺 `dir` 时挑一个默认方向去写，就是替用户决定了
+    // 「他改的是收还是发」——而那两件事的执行器在不同的机器上。
+    a.call(methods::PEERS_SET_TRANSPORT, json!({ "peer": &fp, "latency": "100" }))
+        .expect_err("缺 dir 必须报错，不许挑一个默认方向");
+    a.call(
+        methods::PEERS_SET_TRANSPORT,
+        json!({ "peer": &fp, "dir": "in", "latency": "100" }),
+    )
+    .expect_err("dir 只有 recv/send 两个取值（UI 的 in/out 是它自己的事）");
+}
+
+/// plan §15：`settings.set` 收到 `latency` / `quality` 必须**报错**，
+/// 不是静默忽略。
+///
+/// 静默忽略正是本项目栽过六次的那个形状——上一次的原话是
+/// 「`settings.latency` 从未被读过」。一个还在用旧 API 的脚本必须**立刻**
+/// 知道自己在对着空气说话。
+#[test]
+fn the_old_global_stops_are_refused_rather_than_silently_ignored() {
+    let a = Node::start("gone");
+    for (k, v) in [("latency", "300"), ("quality", "pcm32k")] {
+        let err = a
+            .call(methods::SETTINGS_SET, json!({ k: v }))
+            .expect_err(&format!("settings.set 不该再收 '{k}'"));
+        assert!(
+            err.contains(methods::PEERS_SET_TRANSPORT),
+            "报错要指出新入口在哪：{err}"
+        );
+    }
+    // 契约里也不该再有这两个键。
+    let view = a.ok(methods::SETTINGS_GET, json!({}));
+    assert!(view.get("latency").is_none(), "settings.get 还在报 latency");
+    assert!(view.get("quality").is_none(), "settings.get 还在报 quality");
+    assert!(
+        view.get("transport_live").is_none(),
+        "站点级 transport_live 双向拆开后没有指代对象，必须消失"
     );
+    // 档**表**留下——档表是能力，档位是选择，两件事不该一起搬。
+    assert!(view["latency_stops_ms"].is_array(), "档表被误删了");
+    assert!(view["quality_stops"].is_array(), "档表被误删了");
 }
 
 /// `settings.get` 必须把**档位表**发出去：前端不许自己写一份。
 /// 两边各存一份，分歧不会有任何报错——只会有一个选不中的档。
 #[test]
-fn the_settings_view_carries_the_ladders_and_the_live_readout() {
+fn the_settings_view_carries_the_ladders() {
     let a = Node::start("catalog");
     let v = a.ok(methods::SETTINGS_GET, json!({}));
 
@@ -524,14 +648,6 @@ fn the_settings_view_carries_the_ladders_and_the_live_readout() {
         assert_eq!(s["available"].as_bool(), Some(false));
     }
 
-    // 读数区必须存在，且**没有会话时如实说没有**——不是一个好看的 0。
-    let live = &v["transport_live"];
-    assert_eq!(live["streams"].as_u64(), Some(0), "没有会话就该报 0 条流");
-    assert!(
-        live["achieved_ms"].is_null(),
-        "没有测量结果时必须是 null，不是 0——0 会显示成「延迟极低」"
-    );
-    assert_eq!(live["at_floor"].as_bool(), Some(false));
 }
 
 /// **热生效：改设置不重启、不重连，也不动任何已开的会话。**
@@ -551,13 +667,16 @@ fn changing_transport_settings_keeps_existing_sessions_open() {
     let before = count();
     assert!(before > 0, "正向对照：先得真有会话");
 
-    for patch in [
-        json!({ "latency": "200" }),
-        json!({ "quality": "pcm24k" }),
-        json!({ "latency": "auto", "quality": "auto" }),
+    for (dir, key, v) in [
+        ("send", "latency", "200"),
+        ("send", "quality", "pcm24k"),
+        ("recv", "latency", "300"),
+        ("recv", "quality", "pcm32k"),
+        ("send", "latency", "auto"),
+        ("send", "quality", "auto"),
     ] {
-        a.ok(methods::SETTINGS_SET, patch.clone());
-        assert_eq!(count(), before, "{patch} 关掉了已有会话");
+        a.set_transport(&b.fingerprint(), dir, key, v);
+        assert_eq!(count(), before, "{dir}.{key}={v} 关掉了已有会话");
     }
     // 会话确实还是原来那一条，不是关掉又重开的新的。
     assert!(
@@ -760,10 +879,11 @@ fn an_offline_peer_reports_no_network_leg() {
     );
 }
 
-/// **重启之后固定档仍然在执行**，不只是仍然被显示。
+/// **重启之后每对端的固定档仍然在盘上、并且被执行。**
 ///
 /// 「盘上存着 pcm16k、回显 pcm16k、跑的是 AUTO」是这一整轮要消灭的形态，
-/// 而重启是它最容易复发的地方——启动时忘了 publish 就是这个结果。
+/// 而重启是它最容易复发的地方。plan §15 之后持久化换了文件
+/// （`peer_transport.json`），语义必须一字不改地保住。
 #[test]
 fn a_fixed_choice_is_still_in_force_after_a_restart() {
     let n = std::time::SystemTime::now()
@@ -780,27 +900,774 @@ fn a_fixed_choice_is_still_in_force_after_a_restart() {
         hal_bridge: Some(HalBridgeMode::Off),
     };
 
+    // 一台真对端：`peers.set_transport` 要解析指纹，没有配对就没有指纹。
+    let peer = Node::start("restart-peer");
+    peer.set_mode(Mode::Share);
+    let peer_fp = peer.fingerprint();
+    let peer_addr = format!("127.0.0.1:{}", peer.h.control_port);
+
     let first = start_daemon(cfg()).expect("start");
-    ipcserv::dispatch_for_test(
-        first.inner_for_test(),
-        methods::SETTINGS_SET,
-        &json!({ "latency": "300", "quality": "pcm24k" }),
-    )
-    .expect("set");
+    let call = |h: &DaemonHandle, m: &str, p: &Value| {
+        ipcserv::dispatch_for_test(h.inner_for_test(), m, p).expect("call")
+    };
+    call(&first, methods::SETTINGS_SET, &json!({ "mode": "a" }));
+    let pin = peer.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
+    let pin = pin["pin"].as_str().expect("pin").to_string();
+    call(&first, methods::PEERS_PAIR, &json!({ "addr": peer_addr, "pin": pin }));
+    call(
+        &first,
+        methods::PEERS_SET_TRANSPORT,
+        &json!({ "peer": &peer_fp, "dir": "recv", "latency": "300", "quality": "pcm24k" }),
+    );
+    call(
+        &first,
+        methods::PEERS_SET_TRANSPORT,
+        &json!({ "peer": &peer_fp, "dir": "send", "latency": "100", "quality": "pcm32k" }),
+    );
     first.shutdown();
 
     let second = start_daemon(cfg()).expect("restart");
-    let t = &second.inner_for_test().transport;
-    assert_eq!(
-        t.quality_rate(),
-        Some(24_000),
-        "重启后固定质量档没有被推给音频线程：回显是对的，执行的是 AUTO"
-    );
-    assert_eq!(
-        t.latency_target(),
-        audiohub_ipc::LatencyTarget::TotalMs(300),
-        "重启后固定延迟档没有生效"
-    );
+    let list = ipcserv::dispatch_for_test(second.inner_for_test(), methods::PEERS_LIST, &json!({}))
+        .expect("peers.list");
+    let p = list
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|p| p["fingerprint"].as_str() == Some(peer_fp.as_str()))
+        .expect("peer survived the restart");
+    assert_eq!(p["transport"]["recv"]["latency"].as_str(), Some("300"), "重启后收·延迟丢了");
+    assert_eq!(p["transport"]["recv"]["quality"].as_str(), Some("pcm24k"), "重启后收·音质丢了");
+    assert_eq!(p["transport"]["send"]["latency"].as_str(), Some("100"), "重启后发·延迟丢了");
+    assert_eq!(p["transport"]["send"]["quality"].as_str(), Some("pcm32k"), "重启后发·音质丢了");
+    // **盘上真的有这个文件**——只断言回显的话，一个把值留在内存里的实现
+    // 在同一个进程内照样全绿。
+    let raw = std::fs::read_to_string(dir.join("peer_transport.json")).expect("peer_transport.json");
+    assert!(raw.contains("300") && raw.contains("pcm24k"), "档位没落盘：{raw}");
     second.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **解除配对把这台对端的档位一并清掉。**
+///
+/// 留着的话，重新配对同一台机器会静默继承上一段关系的档位——
+/// 「我明明没设过 300」的又一种成因。
+#[test]
+fn unpairing_forgets_the_transport_choices_too() {
+    let (a, b) = linked("forget");
+    let fp = b.fingerprint();
+    a.set_transport(&fp, "recv", "latency", "300");
+    assert_eq!(a.peer(&fp)["transport"]["recv"]["latency"].as_str(), Some("300"));
+
+    a.ok(methods::PEERS_UNPAIR, json!({ "peer": &fp }));
+    // 重新配对同一台。
+    pair(&a, &b);
+    assert_eq!(
+        a.peer(&fp)["transport"]["recv"]["latency"].as_str(),
+        Some(audiohub_ipc::LATENCY_AUTO),
+        "重新配对之后继承了上一段关系的档位"
+    );
+}
+
+// -------------------------------------------------- 写入路径与运行时证据
+
+/// **契约表上的每一个键，`settings.set` 都必须真的照做。**
+///
+/// 这是 [`audiohub_ipc::SETTINGS_WRITABLE_KEYS`] 的 daemon 半边；CLI 半边在
+/// `audiohub-cli` 的 `ctl::tests::every_writable_setting_is_reachable_from_the_command_line`。
+/// 两边合起来才盖得住那个真实缺口：**后端读得对、前端点得动、而命令行连
+/// flag 都没有**，两侧测试各自全绿。
+///
+/// 判据是「写进去的值能被读回来」，不是「调用没报错」——一个把参数整个忽略
+/// 的实现照样返回 200 OK。
+#[test]
+fn every_writable_setting_key_is_really_honoured() {
+    let a = Node::start("keys");
+    // 每个键给一对「与默认不同」的取值，逐个写、逐个读回。
+    let cases: &[(&str, Value, &dyn Fn(&Value) -> Value)] = &[
+        (
+            "mode",
+            json!("a"),
+            &(|v: &Value| v.get("mode").cloned().unwrap_or(Value::Null)) as &dyn Fn(&Value) -> Value,
+        ),
+        (
+            "remove_virtual_on_disconnect",
+            json!(true),
+            &|v: &Value| v.get("remove_virtual_on_disconnect").cloned().unwrap_or(Value::Null),
+        ),
+        (
+            "mark_offline_devices",
+            json!(false),
+            &|v: &Value| v.get("mark_offline_devices").cloned().unwrap_or(Value::Null),
+        ),
+        (
+            "latency",
+            json!("200"),
+            &|v: &Value| v.get("latency").cloned().unwrap_or(Value::Null),
+        ),
+        (
+            "quality",
+            json!("pcm32k"),
+            &|v: &Value| v.get("quality").cloned().unwrap_or(Value::Null),
+        ),
+    ];
+    for key in audiohub_ipc::SETTINGS_WRITABLE_KEYS {
+        let (_, want, read) = cases
+            .iter()
+            .find(|(k, _, _)| k == key)
+            .unwrap_or_else(|| panic!("契约表里有 '{key}'，这条测试却没有覆盖它"));
+        let got = a.ok(methods::SETTINGS_SET, json!({ *key: want.clone() }));
+        assert_eq!(&read(&got), want, "settings.set 收下了 '{key}' 却没有照做");
+        // 再从**一次独立的读**里确认，排除「回包是把请求原样抄回来」。
+        let re = a.ok(methods::SETTINGS_GET, json!({}));
+        assert_eq!(&read(&re), want, "'{key}' 只体现在回包里，没有真的存下来");
+    }
+}
+
+/// **伺服必须导出「它此刻在做什么」，而且那份读数要随时间前进。**
+///
+/// 用户实测的形态是：设了 200 ms，卡片纹丝不动，而 `settings.get` 里
+/// **一个字段都没有**能说明回路死没死。`latency_guard` 当时只有棘轮那几项。
+///
+/// 这条测的是**心跳**：没有会话时伺服照样每秒跑一拍（`servo_pass` 在
+/// `ticker_loop` 里是无条件的），于是 `ticks` 必须涨。它把「回路没在跑」
+/// 与「回路在跑但这台机器没有可控对象」分开——两者的下一步完全不同。
+#[test]
+fn the_servo_exports_a_heartbeat_even_with_no_sessions() {
+    let a = Node::start("obs-idle");
+    let first = a.servo();
+    let t0 = first["ticks"].as_u64().expect("ticks 必须是个数");
+    eventually_within(Duration::from_secs(6), "the servo tick counter to advance", || {
+        a.servo()["ticks"].as_u64().unwrap_or(0) > t0
+    });
+    let now = a.servo();
+    assert_eq!(
+        now["streams"].as_u64(),
+        Some(0),
+        "没有会话时必须如实说 0 条流——档位此刻没有作用对象"
+    );
+    assert!(
+        now["by_stream"].as_object().map_or(false, |m| m.is_empty()),
+        "没有会话时 by_stream 必须是空对象：{now}"
+    );
+    // **顶层不许再有 `target_ms` / `sum_ms` / `jb_frames`。** 留一个「代表值」
+    // 就是 plan §14 裁定 1 那个「每卡一个数字、不管取哪条都在替另一条撒谎」
+    // 的 JSON 版本。读旧路径的人应当拿到 null 而不是一个静默错误的数。
+    for gone in ["target", "target_ms", "sum_ms", "jb_frames", "want_frames", "closed_loop"] {
+        assert!(
+            now.get(gone).is_none(),
+            "站点级 servo 还在报 `{gone}`：它在双向、多流下没有指代对象"
+        );
+    }
+    assert_eq!(
+        now["bad_transport_targets"].as_u64(),
+        Some(0),
+        "干净启动不该有任何被拒的外来档位"
+    );
+}
+
+/// **没有接收流时，固定档也不许报出「执行量」——哪怕一帧。**
+///
+/// 这条是本轮的运行时读数自己抓出来的缺陷，形态值得原样记下来。加了
+/// `latency_guard.servo` 之后，在一台**只发不收**的 daemon 上（使用端发 spk，
+/// 接收方的 JB 在对端）设 200 ms，现场是这样的：
+///
+/// ```text
+///   t  ticks moves target  jb want step str
+///  0.0    97     3    200   4    5    1   0
+///  2.1    99     5    200   4    5    1   0     ← moves 每秒 +1，永不停
+///  4.2   101     7    200   4    5    1   0
+/// ```
+///
+/// 那个 `jb=4` 是 `jb_frames.unwrap_or(lo)` 造出来的，不是任何一个真实缓冲的
+/// 深度。回路拿它当「现状」、算出「想到 5」、于是每一拍都记一次「动了一帧」。
+/// 读数看上去是一条正在收敛的活回路，而这台机器上根本没有可被伺服的东西。
+///
+/// **这比没有读数更坏**：它会让下一个排障的人认定回路是好的，然后去别处找病。
+///
+/// 判据必须是 `moves` 在一段时间里**一次都不涨**，而不是「某一拍 step 为 0」——
+/// 后者在上面那张表里也成立过（如果恰好采样在动作之间）。
+#[test]
+fn a_daemon_with_nothing_to_servo_reports_no_movement_rather_than_a_phantom_one() {
+    // `linked` 里 a 是使用端、b 是共享端；a 开一条 spk 把音**发**给 b。
+    // 于是 **a 只有 tx、没有任何接收流**，正是用户那台使用端的形状。
+    let (a, b) = linked("obs-nostream");
+    let _id = tone_session(&a, &b);
+    eventually("b to have a receiving stream", || b.jb_target().is_some());
+    assert_eq!(
+        a.jb_target(),
+        None,
+        "这条测试的前提是 a 没有接收流；前提不成立的话底下的 0 是白拿的"
+    );
+
+    // 使用端 a 设 `send.latency`：执行器在 **b** 的 JB 上，a 这台机器上一个
+    // 都没有。plan §15 之前这里是 `a.settings.set(latency)`，于是 a 自己的
+    // 全局回路会拿一个**造出来的** `jb=4` 当现状，每拍记一次「动了一帧」。
+    a.set_transport(&b.fingerprint(), "send", "latency", "200");
+    // 先等**对端**把新目标看进去，否则「a 这侧没动」可能只是因为消息还没到。
+    eventually("b to adopt the pushed target", || {
+        b.rx_servo()["target_ms"].as_u64() == Some(200)
+    });
+    let m0 = a.servo_moves();
+    let t0 = a.servo()["ticks"].as_u64().expect("ticks");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let s = a.servo();
+        assert_eq!(
+            a.servo_moves(),
+            m0,
+            "这台 daemon 上没有任何接收流，伺服却在记「又动了一帧」：{s}"
+        );
+        assert!(
+            s["by_stream"].as_object().map_or(false, |m| m.is_empty()),
+            "只发不收的机器上出现了接收流的伺服条目：{s}"
+        );
+        assert_eq!(s["streams"].as_u64(), Some(0));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // 正向对照：心跳照旧。否则上面那串 0 也可能只是因为回路整个停了——
+    // 而「停了」与「在跑但没对象」正是这套读数要分开的两件事。
+    assert!(
+        a.servo()["ticks"].as_u64().unwrap_or(0) > t0,
+        "回路根本没在跑，上面那些「没动」的断言什么都没证明"
+    );
+    // 而**同一时刻**真的有接收流的那一侧照旧走到位——否则这条测试可能只是
+    // 证明了「我们把伺服整个关掉了」。
+    eventually_within(
+        Duration::from_secs(25),
+        "the side that DOES have a buffer to still reach the target",
+        || {
+            b.rx_servo()["jb_frames"]
+                .as_u64()
+                .map_or(false, |f| (18..=22).contains(&f))
+        },
+    );
+    // 而且那条目必须标明**这个目标是对端推来的**，不是 b 自己设的。
+    assert_eq!(
+        b.rx_servo()["target_from"].as_str(),
+        Some("peer"),
+        "共享端把一个被要求的档位报成了自己设的：{}",
+        b.rx_servo()
+    );
+}
+
+/// **设了 200 ms 之后，daemon 侧真的朝 200 走——不是「字段等于 200」。**
+///
+/// 这条是本轮的验收断言，形状按用户的原话定：延迟档是**端到端总延迟的目标**，
+/// 设 200 就该主动往上填。所以断言分三层，缺一层都能被一个假实现骗过：
+///
+///   1. **目标被回路看见**：`servo.target_ms == 200`。只有这一层的话，
+///      一个只写 `settings.json` 的实现就能通过——正是本轮之前的状态。
+///   2. **回路在动**：`ticks` 前进、`moves` 前进。只有 1+2 的话，一个记了
+///      账却不驱动执行器的实现能通过。
+///   3. **执行器真的走到位**：`jb_frames`（从**真实 JB** 上读回来的深度）
+///      落在 200 ms 对应的 20 帧附近。这一层才是「朝 200 动」。
+///
+/// **第 3 层不区分「换档预置」与「伺服逐帧走」**，两条路都到得了 20 帧，
+/// 这条测试也不试图分开它们——用户要的是「设 200 就到 200」，两条路都算数。
+/// 把它们隔开的是 `the_servo_output_is_really_executed_not_just_the_reseed`
+/// （在共用同一个包络的两档之间切换，`reshape` 早退 ⇒ 只剩伺服能动深度）。
+/// 缺陷注入 I4 已经证明一条测试盖不住两段。
+///
+/// # 为什么判据落在 `jb_frames` 而不是 `sum_ms`
+///
+/// 无设备的回环里输出尾级 `rate == 0`，按「绝不用 0 填补」的规矩 `local_ms`
+/// 整体是 `None` ⇒ `sum_ms` 恒 `None` ⇒ 回路走**开环预置**（`closed_loop:false`）。
+/// 那不是缺陷，是测量纪律的正确结果，而且开环下唯一能被观测的执行量就是
+/// JB 深度。闭环收敛由 `servo::tests::the_loop_converges_onto_the_total_not_onto_a_buffer_size`
+/// 与 `a_moving_floor_is_re_solved_every_tick_not_cached` 两条纯函数测试覆盖。
+/// **这条测试因此顺带断言 `closed_loop == false`**：如果哪天它变成 true，
+/// 说明测量条件变了，上面那句解释也就该重写了。
+#[test]
+fn setting_two_hundred_milliseconds_really_walks_the_daemon_toward_two_hundred() {
+    let (a, b) = linked("obs200");
+    let _id = tone_session(&a, &b);
+    // 两级正向对照：先有接收流，再有真的音频进 JB。少了第二级，底下所有关于
+    // 深度的断言都会因为「根本没有包」这同一个原因通过或失败。
+    eventually("b to have a receiving stream", || b.jb_target().is_some());
+    eventually("media to actually reach b's jitter buffer", || {
+        b.jb_pushes().map_or(false, |n| n > 20)
+    });
+
+    let ticks0 = b.servo()["ticks"].as_u64().expect("ticks");
+    let moves0 = b.servo_moves();
+
+    a.set_transport(&b.fingerprint(), "send", "latency", "200");
+
+    // 层 1：回路看见了这个目标。
+    eventually("the servo to adopt the 200ms target", || {
+        b.rx_servo()["target_ms"].as_u64() == Some(200)
+    });
+
+    // 层 3：执行器走到位。20 帧 = 200 ms；给 ±2 帧，因为死区是半帧、
+    // 而 JB 自己的欠载惩罚也会在附近浮动。
+    eventually_within(
+        Duration::from_secs(25),
+        "the real jitter buffer to reach the 200ms depth",
+        || {
+            b.rx_servo()["jb_frames"]
+                .as_u64()
+                .map_or(false, |f| (18..=22).contains(&f))
+        },
+    );
+
+    let site = b.servo();
+    let now = b.rx_servo();
+    // 层 2：这段时间里回路确实在跑、确实动过手。
+    assert!(
+        site["ticks"].as_u64().unwrap_or(0) > ticks0,
+        "伺服没有再跑过一拍，上面那些数字全是陈的：{site}"
+    );
+    assert!(
+        b.servo_moves() > moves0,
+        "伺服一次都没有改变过深度，深度却到位了 —— 那是别人干的：{now}"
+    );
+    assert_eq!(now["target"].as_str(), Some("200"));
+    assert_eq!(
+        site["streams"].as_u64(),
+        Some(1),
+        "有一条接收流在被伺服，读数却不是 1：{site}"
+    );
+    assert_eq!(
+        now["closed_loop"].as_bool(),
+        Some(false),
+        "回环里没有真实输出设备，`sum_ms` 应当测不出来。这里变成 true 说明测量\
+         条件变了（好事），但本测试的解释与判据要跟着重写"
+    );
+    // 开环下**绝不宣布**「已达物理下限 / 上限」：那两句是关于物理的断言，
+    // 而开环把地板当成了 0。
+    assert_eq!(now["at_floor"].as_bool(), Some(false));
+    assert_eq!(now["at_ceiling"].as_bool(), Some(false));
+    // 包络必须装得下 200 ms，否则「到位」只是撞在了天花板上。
+    let env = now["envelope_frames"].as_array().expect("envelope_frames");
+    assert!(
+        env[1].as_u64().unwrap_or(0) >= 20,
+        "包络上限装不下 200 ms 的目标：{now}"
+    );
+
+    // 反方向：拖回 50 ms，深度必须**下来**。只测一个方向的话，一个「一路加深」
+    // 的实现（比如把目标当成了下限）照样全绿。
+    a.set_transport(&b.fingerprint(), "send", "latency", "50");
+    eventually_within(
+        Duration::from_secs(25),
+        "the buffer to come back down for the 50ms target",
+        || {
+            b.rx_servo()["jb_frames"]
+                .as_u64()
+                .map_or(false, |f| (3..=7).contains(&f))
+        },
+    );
+    assert_eq!(b.rx_servo()["target_ms"].as_u64(), Some(50));
+}
+
+/// **AUTO 与「回路死了」在读数上必须能分开。**
+///
+/// 两者的界面表现完全一样（深度不随滑条动），下一步动作却相反：一个是
+/// 「本来就该这样」，另一个是「去查 ticker」。分不开的读数等于没有读数。
+#[test]
+fn auto_is_distinguishable_from_a_dead_loop_in_the_readout() {
+    let (a, b) = linked("obsauto");
+    let _id = tone_session(&a, &b);
+    eventually("b to have a receiving stream", || b.jb_target().is_some());
+
+    a.set_transport(&b.fingerprint(), "send", "latency", "auto");
+    let t0 = b.servo()["ticks"].as_u64().expect("ticks");
+    eventually_within(Duration::from_secs(6), "the loop to keep ticking under AUTO", || {
+        b.servo()["ticks"].as_u64().unwrap_or(0) > t0
+    });
+    let now = b.rx_servo();
+    assert_eq!(now["target"].as_str(), Some(audiohub_ipc::LATENCY_AUTO));
+    assert_eq!(
+        now["step_frames"].as_i64(),
+        Some(0),
+        "AUTO 下伺服不许提出任何执行量：那一档归抖动公式管"
+    );
+    assert!(
+        b.servo()["streams"].as_u64().unwrap_or(0) >= 1,
+        "AUTO 也要如实报有几条流可控，否则「没在跑」与「没对象」还是分不开"
+    );
+}
+
+/// **两个档位的作用对象是相反方向的流，读数必须分开报。**
+///
+/// 一台只发不收的使用端（模式 A 把系统声音送去对端扬声器）：本机没有任何
+/// jitter buffer（延迟档在这台机器上没有执行器），而线上确有一条流、采样率
+/// 也确实随质量滑条在变。
+///
+/// plan §15 之前这两件事被一个站点级 `transport_live` 糊在一起，UI 的质量
+/// 读数照着 `streams` 说「当前没有正在传输的音频流」——而实测同一时刻
+/// `pcm16k/24k/32k/48k` 分别把线上格号打到 3/2/1/0。一个正在生效的设置被
+/// 界面说成「没有作用对象」，在用户那里与「设置没生效」是同一件事。
+///
+/// 拆成按流之后判据换成**执行器本身**：`SessionStats.latency_target` 只在有
+/// 接收流的那一侧非空，`quality_target` 只在有发送流的那一侧非空。
+#[test]
+fn the_two_stops_report_the_streams_they_can_actually_act_on() {
+    let (a, b) = linked("dirs");
+    let _id = tone_session(&a, &b); // a 发 -> b 收
+    eventually("b to have a receiving stream", || b.jb_target().is_some());
+    eventually("a to have a sending stream", || a.tx_rung().is_some());
+
+    let fp = b.fingerprint();
+    a.set_transport(&fp, "send", "quality", "pcm32k"); // 执行器在 a 的 tx
+    a.set_transport(&fp, "send", "latency", "200"); // 执行器在 b 的 rx
+
+    let stats = |n: &Node| n.ok(methods::SESSION_LIST, json!({}))[0]["stats"].clone();
+
+    eventually("a's send stream to carry the quality target", || {
+        stats(&a)["quality_target"].as_str() == Some("pcm32k")
+    });
+    let sa = stats(&a);
+    assert!(
+        sa["latency_target"].is_null(),
+        "a 没有接收流，延迟档在这台机器上没有执行器，却报出了目标：{sa}"
+    );
+    assert_eq!(sa["target_from"].as_str(), Some("local"), "a 是消费者，档位是自己设的");
+
+    eventually("b's receive stream to carry the pushed latency target", || {
+        stats(&b)["latency_target"].as_str() == Some("200")
+    });
+    let sb = stats(&b);
+    assert!(
+        sb["quality_target"].is_null(),
+        "b 没有发送流，质量档在这台机器上没有执行器，却报出了目标：{sb}"
+    );
+    assert_eq!(
+        sb["target_from"].as_str(),
+        Some("peer"),
+        "b 是提供者，这个 200 是被要求的，不是它自己设的：{sb}"
+    );
+
+    // 反向对照：两台机器读到的**不是同一对数字**。上面四条若都由同一个来源
+    // 供给，这一条会红。
+    assert_ne!(
+        (sa["latency_target"].clone(), sa["quality_target"].clone()),
+        (sb["latency_target"].clone(), sb["quality_target"].clone()),
+        "两端读到了同一对档位：说明这两个字段其实还是同一个来源"
+    );
+}
+
+// ------------------------------------ plan §15：交叉的那半边（承重四条）
+//
+// 这四条一起才能证明四个旋钮各自接到了**正确的执行器**上。任取三条通过、
+// 第四条失败，都说明有一个方向的旋钮接错了端——而那种错误的自然表现是
+// 「设了、存了、回显了，媒体面一个字节没变」，界面全绿。
+//
+// | 用户设的 | 执行器在 | 走线 |
+// |---|---|---|
+// | `recv.latency` | 本机 rx 的 JB | 本地 |
+// | `recv.quality` | **对端** tx 的阶梯 | 推 |
+// | `send.latency` | **对端** rx 的 JB | 推 |
+// | `send.quality` | 本机 tx 的阶梯 | 本地 |
+
+/// **承重 ①：`send.latency` 跨到对端，本机一动不动。**
+///
+/// `linked` 里 a 发 -> b 收，所以 JB 在 b 上。a 设 `send.latency` 必须治到
+/// b 那条流；a 自己没有接收流，`by_stream` 必须一直是空的。
+#[test]
+fn the_send_latency_lands_on_the_peers_buffer_and_nowhere_local() {
+    let (a, b) = linked("x-sendlat");
+    let _id = tone_session(&a, &b);
+    // 两级正向对照：先有接收流，再有真的音频进 JB。少了第二级，底下关于深度的
+    // 断言会因为「根本没有包」这同一个原因通过或失败。
+    eventually("b to have a receiving stream", || b.jb_target().is_some());
+    eventually("media to actually reach b's jitter buffer", || {
+        b.jb_pushes().map_or(false, |n| n > 20)
+    });
+    let depth0 = b.jb_target().expect("jb target");
+
+    a.set_transport(&b.fingerprint(), "send", "latency", "300");
+    eventually("the peer's buffer to adopt the pushed target", || {
+        b.rx_servo()["target_ms"].as_u64() == Some(300)
+    });
+    assert_eq!(b.rx_servo()["target_from"].as_str(), Some("peer"));
+
+    // **判据落在真实 JB 的深度上，不是「字段被写了」。**
+    // 300 ms = 30 帧；给 ±3 帧（死区半帧 + JB 自己的欠载惩罚会在附近浮动）。
+    // 只断言 `target_ms == 300` 的话，一个「收下了、记了账、没驱动执行器」的
+    // 实现照样全绿——本项目栽过六次的正是那个形状。
+    eventually_within(
+        Duration::from_secs(25),
+        "the peer's REAL jitter buffer to walk to the 300ms depth",
+        || b.jb_target().map_or(false, |t| (27..=33).contains(&t)),
+    );
+    assert!(
+        b.jb_target().expect("jb") > depth0,
+        "缓冲深度一动没动（起点 {depth0} 帧）：目标被存下来了，执行器没被驱动"
+    );
+
+    assert!(
+        a.servo()["by_stream"].as_object().map_or(false, |m| m.is_empty()),
+        "本机出现了接收流的伺服条目——延迟档被误留在了本地"
+    );
+}
+
+/// **承重 ②：`recv.latency` 只治本机，一个字节都不上线。**
+///
+/// 这条要一条**本机在收**的流：b 是共享端，让它开不了；改成让 a 取 b 的
+/// 麦克风（`kind=mic`）⇒ a 有 rx、b 有 tx。
+#[test]
+fn the_recv_latency_stays_home_and_is_never_pushed() {
+    let (a, b) = linked("x-recvlat");
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({ "peer": b.fingerprint(), "kind": "mic", "source": SOURCE_TONE, "freq": 1000.0 }),
+    );
+    eventually("a to have a receiving stream", || a.jb_target().is_some());
+
+    a.set_transport(&b.fingerprint(), "recv", "latency", "300");
+    eventually("the local buffer to adopt the target", || {
+        a.rx_servo()["target_ms"].as_u64() == Some(300)
+    });
+    assert_eq!(
+        a.rx_servo()["target_from"].as_str(),
+        Some("local"),
+        "本机自己设的档位被报成了对端推来的"
+    );
+    // b 那侧没有接收流，也不该收到任何被拒的外来档位。
+    assert!(
+        b.servo()["by_stream"].as_object().map_or(false, |m| m.is_empty()),
+        "`recv.latency` 被推到了对端：那边没有 rx，它无处执行"
+    );
+    assert_eq!(
+        b.servo()["bad_transport_targets"].as_u64(),
+        Some(0),
+        "对端收到了一个它执行不了的档位——交叉的那半边接反了"
+    );
+}
+
+/// **承重 ③：`send.quality` 只改本机的线上采样率。**
+#[test]
+fn the_send_quality_acts_on_the_local_sender_only() {
+    let (a, b) = linked("x-sendq");
+    let _id = tone_session(&a, &b); // a 有 tx
+    eventually("a to have a sending stream", || a.tx_rung().is_some());
+
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm16k");
+    eventually("the local sender to move to rung 3", || a.tx_rung() == Some(3));
+    assert_eq!(a.tx_quality_rate(), Some(16_000));
+    assert_eq!(b.tx_quality_rate(), None, "对端没有发送流，档位却落到了它身上");
+    assert_eq!(b.servo()["bad_transport_targets"].as_u64(), Some(0));
+}
+
+/// **承重 ④：`recv.quality` 跨到对端的发送侧。**
+///
+/// 这是四条里最容易被写反的一条：它长得像「接收方向」的设置，执行器却在
+/// **对端的发送**上——因为「我要收到多好的音质」只有发的人做得到。
+#[test]
+fn the_recv_quality_lands_on_the_peers_sender() {
+    let (a, b) = linked("x-recvq");
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({ "peer": b.fingerprint(), "kind": "mic", "source": SOURCE_TONE, "freq": 1000.0 }),
+    );
+    eventually("b to have a sending stream", || b.tx_rung().is_some());
+
+    a.set_transport(&b.fingerprint(), "recv", "quality", "pcm16k");
+    eventually("the peer's sender to move to rung 3", || b.tx_rung() == Some(3));
+    assert_eq!(b.tx_quality_rate(), Some(16_000));
+    assert_eq!(
+        a.tx_quality_rate(),
+        None,
+        "本机没有发送流，`recv.quality` 却留在了本地——它在这里无处执行"
+    );
+}
+
+/// **先设档位、后开流：新建的流必须带着已有的档位起跑。**
+///
+/// 这条钉的是「档位灌入点必须**每拍**都跑」，而不是只在变更时跑一次。
+/// 变更有三个入口（IPC、`SetTransport`、开流），而流可以在**任意时刻**出现
+/// （模式 B 的设备协调器、断线重放）。只在变更时灌的话，一条**在变更之后才
+/// 建立**的流会带着默认档位一路跑到下一次变更为止——一个只在特定时序下出现、
+/// 且没有任何报错的失效。
+///
+/// 缺陷注入对照：把 ticker 里那句 `publish_targets(&inner, &entries);` 删掉。
+/// 其余每一条传输测试都照旧全绿（它们都是「先开流、后设档位」），只有这条红。
+#[test]
+fn a_stream_opened_after_the_stops_were_set_starts_with_them_in_force() {
+    let (a, b) = linked("late-open");
+    // **先**设，此刻一条流都没有 —— 于是这两个档位没有任何作用对象。
+    a.set_transport(&b.fingerprint(), "recv", "latency", "300");
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm16k");
+    assert!(
+        crate::snapshot_sessions(a.h.inner_for_test()).is_empty(),
+        "这条测试的前提是设档位时还没有流；有流的话它测的就是别的东西了"
+    );
+
+    // **后**开：一条本机收（mic）+ 一条本机发（spk），两个执行器各一个。
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({ "peer": b.fingerprint(), "kind": "mic", "source": SOURCE_TONE, "freq": 1000.0 }),
+    );
+    tone_session(&a, &b);
+
+    eventually("the freshly opened receive stream to carry the stored target", || {
+        a.rx_servo()["target_ms"].as_u64() == Some(300)
+    });
+    eventually("the freshly opened send stream to carry the stored quality", || {
+        a.tx_quality_rate() == Some(16_000)
+    });
+}
+
+/// **多对端隔离：改 A 的档位不许碰 B 的伺服输出。**
+///
+/// 这条盯的是 `generation` 那条「档位真变了才作废旧输出」的逻辑：写成全局的
+/// 话，改 A 对端的档位会把 B 对端的伺服输出一起清零，B 那条链路会掉回抖动
+/// 公式一拍——一个只在多对端同时在线时出现、且没有任何报错的失效。
+#[test]
+fn changing_one_peers_stops_leaves_the_other_peers_loop_untouched() {
+    let consumer = Node::start("iso-c");
+    consumer.set_mode(Mode::A);
+    let p1 = Node::start("iso-p1");
+    p1.set_mode(Mode::Share);
+    let p2 = Node::start("iso-p2");
+    p2.set_mode(Mode::Share);
+    pair(&consumer, &p1);
+    pair(&consumer, &p2);
+    tone_session(&consumer, &p1);
+    tone_session(&consumer, &p2);
+    eventually("p1 to have a receiving stream", || p1.jb_target().is_some());
+    eventually("p2 to have a receiving stream", || p2.jb_target().is_some());
+
+    // 两台都先走到 200，于是「没变」不会是「本来就没设过」的同义词。
+    for p in [&p1, &p2] {
+        consumer.set_transport(&p.fingerprint(), "send", "latency", "200");
+    }
+    for p in [&p1, &p2] {
+        eventually_within(
+            Duration::from_secs(25),
+            "both peers to adopt 200",
+            || p.rx_servo()["target_ms"].as_u64() == Some(200),
+        );
+    }
+    // **等 p2 收敛完再取基线。** 收敛途中 `moves` 每拍都在涨，那时取的基线只是
+    // 「它还在走」，底下的比较测不出任何东西（负载高时更是随机通过 / 随机失败）。
+    let mut p2_moves0 = p2.servo_moves();
+    eventually_within(Duration::from_secs(30), "p2's loop to settle", || {
+        std::thread::sleep(Duration::from_millis(1500));
+        let now = p2.servo_moves();
+        let settled = now == p2_moves0;
+        p2_moves0 = now;
+        settled
+    });
+
+    // 只改 p1。
+    consumer.set_transport(&p1.fingerprint(), "send", "latency", "500");
+    eventually_within(Duration::from_secs(25), "p1 to adopt 500", || {
+        p1.rx_servo()["target_ms"].as_u64() == Some(500)
+    });
+    assert_eq!(
+        p2.rx_servo()["target_ms"].as_u64(),
+        Some(200),
+        "改 p1 的档位把 p2 的目标也改了：单例没拆干净"
+    );
+    // p2 的回路**不该因为 p1 换档而被清零重来**。`generation` 写成全局时
+    // `servo_frames` 会被清 0，下一拍从抖动公式重新起步 ⇒ 一条已经收敛的链路
+    // 会重新走一段，`moves` 跟着跳。基线已经是收敛值，所以这里的容差只需要
+    // 覆盖「恰好在这两拍之间自然微调了一次」。
+    let jumped = p2.servo_moves().saturating_sub(p2_moves0);
+    assert!(jumped <= 1, "p2 的伺服被 p1 的换档惊动了 {jumped} 次（基线是收敛值）");
+}
+
+/// **断言 A：属于**另一条连接**的流，`SetTransport` 一律拒绝并计数。**
+///
+/// `stream_id` 在 daemon 内是**全局**的（媒体头里还是明文），只是按连接认领。
+/// 不查归属的话，共享模式下同时服务两台机器时，其中一台可以去调另一台那条流
+/// 的 jitter buffer——一次跨对端的静默篡改，被调的那一侧不会有任何报错。
+///
+/// 形状要害：注入用的 stream_id **必须是提供者真的持有的那一条**（属于另一条
+/// 连接），不能是它压根没见过的号。后者被「查不到这条流」挡下，无论归属校验
+/// 在不在都会被拒——那样的测试对着一个删掉了归属校验的实现照样全绿。
+///
+/// 注入走**真的加密控制通道**（`ConnShared::send_msg`），不是直接调处理函数：
+/// 归属校验的位置在分发里，绕过分发去测它等于测了一个没人调用的函数。
+#[test]
+fn a_set_transport_for_another_connections_stream_is_refused_and_counted() {
+    let provider = Node::start("own-p");
+    provider.set_mode(Mode::Share);
+    let c1 = Node::start("own-c1");
+    c1.set_mode(Mode::A);
+    let c2 = Node::start("own-c2");
+    c2.set_mode(Mode::A);
+    pair(&c1, &provider);
+    pair(&c2, &provider);
+    let victim = tone_session(&c2, &provider) as u32; // provider 上归 c2 的那条流
+    eventually("the provider to have c2's receiving stream", || {
+        provider.jb_target().is_some()
+    });
+    // c2 把它设到 300，于是「没变」是一个可观测的事实而不是「本来就没设过」。
+    c2.set_transport(&provider.fingerprint(), "send", "latency", "300");
+    eventually("c2's stream to adopt 300", || {
+        provider.rx_servo()["target_ms"].as_u64() == Some(300)
+    });
+    // c1 也要有一条连接（pair 已建立），但没有会话——它无权碰 victim。
+    let before = provider.servo()["bad_transport_targets"].as_u64().unwrap_or(0);
+
+    c1.send_raw(
+        &provider.fingerprint(),
+        &audiohub_net::secure::SessionMsg::SetTransport {
+            stream_id: victim,
+            rx_latency: Some("1000".into()),
+            tx_quality: None,
+        },
+    );
+    eventually("the provider to count the cross-connection attempt", || {
+        provider.servo()["bad_transport_targets"].as_u64().unwrap_or(0) > before
+    });
+    // 而 c2 那条真流**一个字都没变**：拒绝不该有副作用。
+    // 多等几拍再断言——被采纳的话，伺服下一拍就会把 target_ms 改成 1000。
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(
+        provider.rx_servo()["target_ms"].as_u64(),
+        Some(300),
+        "另一条连接改掉了这条流的目标：{}",
+        provider.rx_servo()
+    );
+}
+
+/// **断言 C（§13 互斥）：处于使用端模式的机器拒绝一切外来档位，并且计数。**
+///
+/// 这条**理论上不可达**——§13 保证每条链路恰好一个消费者。所以它触发时是
+/// 「互斥被击穿了」的唯一运行时证据，值一个计数器而不是一句 `debug_assert!`
+/// （release 构建里后者什么都不是）。
+///
+/// 注入方式因此也必须绕开正常路径：直接在控制通道上发一条 `SetTransport`，
+/// 模拟一个「不守 §13」的对端。这不是伪造数据，是伪造一个**行为不端的对端**
+/// ——闸门存在的全部理由就是它。
+///
+/// 形状要害：被指挥的那台机器**必须真的持有这条流**（这里是它自己作为消费者
+/// 开的那一条），否则归属校验会先把消息挡下，而这条测试就变成了断言 A 的重复
+/// ——删掉 §13 闸门它照样全绿。
+#[test]
+fn a_consumer_mode_machine_refuses_pushed_stops_and_counts_them() {
+    // provider = 共享端；consumer 处于模式 A 并**自己**开了一条发送流。
+    // 于是 consumer 手上有一条它自己拥有的流，而它不该被任何人指挥。
+    let provider = Node::start("gate-p");
+    provider.set_mode(Mode::Share);
+    let consumer = Node::start("gate-c");
+    consumer.set_mode(Mode::A);
+    pair(&consumer, &provider);
+    let sid = tone_session(&consumer, &provider) as u32;
+    eventually("the consumer to have a sending stream", || consumer.tx_rung().is_some());
+    // 正向对照：这条流此刻跑在 AUTO 上（阶梯当家），固定档为 None。
+    assert_eq!(consumer.tx_quality_rate(), None);
+    let before = consumer.servo()["bad_transport_targets"].as_u64().unwrap_or(0);
+
+    // 提供者反过来指挥消费者：这正是 §13 不允许的方向。
+    provider.send_raw(
+        &consumer.fingerprint(),
+        &audiohub_net::secure::SessionMsg::SetTransport {
+            stream_id: sid,
+            rx_latency: None,
+            tx_quality: Some("pcm16k".into()),
+        },
+    );
+    eventually("the refusal to be counted", || {
+        consumer.servo()["bad_transport_targets"].as_u64().unwrap_or(0) > before
+    });
+    assert_eq!(
+        consumer.tx_quality_rate(),
+        None,
+        "一台使用端接受了对端塞过来的档位：§13 的互斥线被击穿了"
+    );
 }

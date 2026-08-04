@@ -428,6 +428,34 @@ pub struct HalUnderrunCounters {
     pub worst_run_frames: u32,
 }
 
+/// `hal_mic` 生产侧闸门（`crate::micgate`）的现场读数。
+///
+/// 怎么读，按排除顺序：
+///
+/// - `starved_ticks` **非 0** ⇒ 驱动已经取不满过，App 那侧录到了静音或断续。
+///   这是这一级唯一的欠载信号，且它比扬声器方向的欠载更要紧：那一级我们自己
+///   读不满、当场就知道；这一级发生在驱动进程里，没有任何回执。
+/// - `low_water_ms` 贴近 `Q_C`（10.7 ms）⇒ 还没欠载，但余量已经吃完了。
+///   `starved_ticks == 0` 时它是唯一还能回答「还剩多少」的读数。
+/// - `drain_events` 在**稳态**下涨 ⇒ 天花板定低了，闸门在误伤一条健康的会话。
+///   健康稳态的判据是它恒为 0（自由带 20.7–41.3 ms 整个在天花板 60 ms 之下）。
+/// - `drain_events` 只在**开流后不久**涨一次 ⇒ 正常，那是上一条会话的存量
+///   被一次性排掉，正是这套治理要做的事。看 `withheld_frames` 判断空洞多长。
+/// - `depth_ms` 稳定落在 `[floor_ms, ceil_ms]` ⇒ 闸门在工作。
+///   稳定**高于** `ceil_ms` ⇒ 闸门没被调用（接线断了），因为它结构上不可能
+///   允许水位停在天花板之上。
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct HalMicGateCounters {
+    pub drain_events: u64,
+    pub drain_ticks: u64,
+    pub withheld_frames: u64,
+    pub starved_ticks: u64,
+    /// 观测到的最低水位（ms）。`None` = 还没观测过任何一拍。
+    pub low_water_ms: Option<f32>,
+    /// 最近一次观测到的水位（ms）。
+    pub depth_ms: f32,
+}
+
 /// Per-slot traffic and state, summed into the three headline counters and
 /// reported per slot beside them (spec-m5b §6.1).
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
@@ -443,6 +471,8 @@ pub struct HalSlotCounters {
     /// 治法 A 在跳 tick 时从这个槽的扬声器环里排掉的帧
     /// （规格 §10.1 的 `skip.drained_frames`，按槽分摊）。
     pub skip_drained_frames: u64,
+    /// `hal_mic` 生产侧闸门的现场（见 [`HalMicGateCounters`]）。
+    pub mic_gate: HalMicGateCounters,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -494,6 +524,10 @@ pub struct HalBridgeStatus {
     pub underrun: HalUnderrunCounters,
     /// 治法 A 从扬声器环里排掉的帧，跨槽汇总。
     pub skip_drained_frames: u64,
+    /// `hal_mic` 闸门，跨槽汇总。计数求和；两个水位读数取**最坏**
+    /// （`low_water` 取最小、`depth` 取最大）——它们是水位不是流量，
+    /// 相加没有物理含义，取平均会把一个正在饿死的槽藏进另一个健康的槽里。
+    pub mic_gate: HalMicGateCounters,
     /// Per-slot detail, indexed by slot.
     pub slots: Vec<HalSlotCounters>,
 }
@@ -594,7 +628,41 @@ impl HalBridge {
                     .unwrap_or(0),
             },
             skip_drained_frames: slots.iter().map(|c| c.skip_drained_frames).sum(),
+            mic_gate: HalMicGateCounters {
+                drain_events: slots.iter().map(|c| c.mic_gate.drain_events).sum(),
+                drain_ticks: slots.iter().map(|c| c.mic_gate.drain_ticks).sum(),
+                withheld_frames: slots.iter().map(|c| c.mic_gate.withheld_frames).sum(),
+                starved_ticks: slots.iter().map(|c| c.mic_gate.starved_ticks).sum(),
+                // 取最小，且**跳过没观测过的槽**：`None` 参与 min 会让一个
+                // 从未被使用的槽把汇总读数据为己有。
+                low_water_ms: slots
+                    .iter()
+                    .filter_map(|c| c.mic_gate.low_water_ms)
+                    .fold(None, |acc: Option<f32>, v| Some(acc.map_or(v, |a| a.min(v)))),
+                depth_ms: slots.iter().map(|c| c.mic_gate.depth_ms).fold(0.0, f32::max),
+            },
             slots,
+        }
+    }
+
+    /// 记录一次 `hal_mic` 闸门处置。**只被 mixer 循环调用**（每槽每 tick 一次）。
+    ///
+    /// 全部 `Relaxed`：这些量只被读来看，不参与任何同步，而它跑在 10 ms
+    /// 截止期线程上，代价必须是零。
+    pub fn record_mic_gate(&self, slot: u8, plan: &crate::micgate::MicPlan, occupied: u32) {
+        let Some(c) = self.shared.slots.get(slot as usize) else { return };
+        c.mic_depth_frames.store(occupied, Ordering::Relaxed);
+        c.mic_low_water.fetch_min(occupied, Ordering::Relaxed);
+        if plan.starved {
+            c.mic_starved_ticks.fetch_add(1, Ordering::Relaxed);
+        }
+        if plan.drain_started {
+            c.mic_drain_events.fetch_add(1, Ordering::Relaxed);
+        }
+        if plan.draining {
+            c.mic_drain_ticks.fetch_add(1, Ordering::Relaxed);
+            c.mic_withheld_frames
+                .fetch_add(plan.withheld as u64, Ordering::Relaxed);
         }
     }
 
@@ -3816,6 +3884,29 @@ struct SlotShared {
     underrun_worst_run: AtomicU32,
     skip_drained: AtomicU64,
 
+    // ---- `hal_mic` 生产侧闸门（`micgate`）的埋点。
+    //
+    // 这一级此前**一个仪表都没有**：`latency_guard` 的键里根本没有 `hal_mic`，
+    // 「环里 132 ms 是存量还是设计深度」在运行时无法分辨，而唯一沾边的
+    // `mic_dropped` 只在环**满**（500 ms）时才动——132 ms 时它是 0，
+    // 499 ms 时它还是 0，只有饱和才报警。
+    /// 排空段的**段数**（进入排空 +1），以及它持续了多少拍、丢掉多少帧。
+    /// 段数与拍数分开：一次 47 拍的连续空洞与 47 次单拍毛刺是完全不同的听感。
+    mic_drain_events: AtomicU64,
+    mic_drain_ticks: AtomicU64,
+    mic_withheld_frames: AtomicU64,
+    /// **麦克风方向的欠载判据**：观测到水位 < 一个消费量子的拍数。
+    ///
+    /// 扬声器方向的欠载我们当场就知道（自己读不满）；这一级的欠载发生在驱动
+    /// 进程里、没有任何回执，表现是 App 录到静音或断续。所以判据只能是
+    /// 「水位低到驱动下一次读必然取不满」，而且必须比扬声器方向更早报警。
+    mic_starved_ticks: AtomicU64,
+    /// 会话内观测到的**最低**水位（帧）。`u32::MAX` = 还没观测过。
+    /// 它是 `mic_starved_ticks` 恒为 0 时唯一还能回答「余量还剩多少」的读数。
+    mic_low_water: AtomicU32,
+    /// 最近一次观测到的水位（帧）。排空段里也发布——那正是最该看见它的时候。
+    mic_depth_frames: AtomicU32,
+
     // ---- 归因埋点：「上一次 X 发生在什么时候」（[`mono_us`]，0 = 从未）。
     //
     // 存在的理由只有一条：欠载**只有计数没有时刻**时，「排空过头」与「生产侧
@@ -3880,6 +3971,12 @@ impl SlotShared {
             underrun_events: AtomicU64::new(0),
             underrun_worst_run: AtomicU32::new(0),
             skip_drained: AtomicU64::new(0),
+            mic_drain_events: AtomicU64::new(0),
+            mic_drain_ticks: AtomicU64::new(0),
+            mic_withheld_frames: AtomicU64::new(0),
+            mic_starved_ticks: AtomicU64::new(0),
+            mic_low_water: AtomicU32::new(u32::MAX),
+            mic_depth_frames: AtomicU32::new(0),
             dll_err_frames: AtomicU32::new(0),
             dll_epoch: AtomicU64::new(0),
             disc_epoch: AtomicU64::new(0),
@@ -3914,6 +4011,22 @@ impl SlotShared {
                 worst_run_frames: self.underrun_worst_run.load(Ordering::Relaxed),
             },
             skip_drained_frames: self.skip_drained.load(Ordering::Relaxed),
+            mic_gate: HalMicGateCounters {
+                drain_events: self.mic_drain_events.load(Ordering::Relaxed),
+                drain_ticks: self.mic_drain_ticks.load(Ordering::Relaxed),
+                withheld_frames: self.mic_withheld_frames.load(Ordering::Relaxed),
+                starved_ticks: self.mic_starved_ticks.load(Ordering::Relaxed),
+                // `u32::MAX` 是「一拍都还没观测过」的哨兵。**不折成 0**：
+                // 0 帧是「环空了、必然短读」这个最坏读数，与「还不知道」
+                // 长得完全一样就会把一次未观测报成一次事故。
+                low_water_ms: match self.mic_low_water.load(Ordering::Relaxed) {
+                    u32::MAX => None,
+                    f => Some(crate::micgate::frames_to_ms(f)),
+                },
+                depth_ms: crate::micgate::frames_to_ms(
+                    self.mic_depth_frames.load(Ordering::Relaxed),
+                ),
+            },
         }
     }
 }

@@ -32,12 +32,18 @@ pub use transport::{
 /// 于是把模式渲染成默认值 —— 一个「显示 A、实际 Share」的界面比拒连坏得多，
 /// 所以照既有的**严格相等**语义拒连（见下方三处同步要求）。
 ///
+/// **4（plan §15 每对端 × 每方向）：又一次真正的不兼容变更。**
+/// `DaemonSettings` 的 `latency` / `quality` / `transport_live` **三个字段消失**，
+/// 档位搬到 [`PeerState::transport`]（`peers.set_transport` 写、`peers.list` 读）。
+/// 旧客户端读新 daemon 会拿到 `undefined` 并把滑条渲染成默认档——一个
+/// 「显示 auto、实际 300」的界面与 v3 那次是同一种病，所以同样拒连。
+///
 /// ⚠ **必须同步改的两处**（不在本 crate，改这里就得改它们，否则 App 拒连）：
 ///   - `app/src-tauri/src/main.rs` 的 `const IPC_VERSION: u32`
 ///   - `app/frontend/src/ipc/client.ts` 的 `export const IPC_VERSION`
 /// 两处都做**严格相等**校验（`main.rs` 的 `port_alive` 分支会直接报版本不符），
 /// 所以它们与本常量是一个原子的三件套。
-pub const IPC_VERSION: u32 = 3;
+pub const IPC_VERSION: u32 = 4;
 
 pub use audiohub_core::audio::DevicesReport;
 pub use audiohub_core::dsp::ToneVerdict;
@@ -168,6 +174,29 @@ pub struct OpenSessionParams {
     pub override_mode: bool,
 }
 
+/// `settings.set` 收得下的**全部**字段名。契约的一部分，不是文档。
+///
+/// # 为什么这张表必须存在
+///
+/// `latency` / `quality` 曾经**只有 UI 一条写入路径**：`ipcserv.rs` 读它们，
+/// `Settings.tsx` 写它们，而 `audiohub ctl settings` 连这两个 flag 都没有。
+/// 用户去命令行核对时拿到的是 `error: unexpected argument '--latency' found`，
+/// 于是「档位到底有没有被下发」这件事在不开窗口的情况下无法验证——而这条回路
+/// 的失效恰恰是无声的（见 `audiohubd::servo::ServoObs` 里那六种解释）。
+///
+/// 缺口不是谁写错了一行，是**没有任何一处会因为少一个入口而变红**：
+/// 后端有测试（字段读得对）、前端有测试（按钮点得动），两边都绿，中间少一条腿。
+///
+/// 这张表把「有哪些可写字段」变成一个两端都要对齐的**单一事实**：
+///   - daemon 侧 `settings.set` 必须真的honour每一个键（`transport_tests.rs`）；
+///   - CLI 侧每一个键必须有一个 flag 到得了（`ctl.rs` 的 tests）。
+/// 加字段时忘了任何一端，那一端的测试就红。
+pub const SETTINGS_WRITABLE_KEYS: &[&str] = &[
+    "mode",
+    "remove_virtual_on_disconnect",
+    "mark_offline_devices",
+];
+
 /// Daemon-owned settings, `settings.get` / `settings.set` (spec-m5b §6.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonSettings {
@@ -189,49 +218,80 @@ pub struct DaemonSettings {
     /// Append `（离线）` to a disconnected peer's device names, so "no sound"
     /// is visible in the system's own device list (spec-m5b OPEN QUESTION 1).
     pub mark_offline_devices: bool,
-    /// 端到端**总延迟**的目标：`"auto"` 或 [`LATENCY_STOPS_MS`] 里的毫秒数。
-    ///
-    /// 曾经的注释写着「persisted for the UI; not yet wired to the media plane」。
-    /// 那句话是真的：这两个字段被收下、写盘、原样回显，**没有任何一行代码读它们**，
-    /// 重启也不生效。现在它们真的驱动媒体面（见 `audiohubd::transport`）。
-    pub latency: String,
-    /// 质量档：`"auto"` 或某个**可用**档位 id（见 [`transport::quality_stops`]）。
-    pub quality: String,
     /// 延迟滑条的固定档（毫秒，升序）。**daemon 是唯一真值源**——前端不许自己
     /// 写一份，否则两边的「有哪些档」会各自演化，而分歧不会有任何报错。
+    ///
+    /// ⚠ plan §15 之后**档表仍然是全局的，档位选择不是**：档表是这台机器的
+    /// **能力**（这个 build 支持哪几档），档位是用户对**某一台对端某一个方向**
+    /// 的选择。两件事不该一起搬，所以 `latency`/`quality` 走了、这两张表留下。
     pub latency_stops_ms: Vec<u16>,
     /// 质量滑条的完整档位表，**含不可用档**（UI 画成灰刻度）。
     pub quality_stops: Vec<QualityStop>,
-    /// 媒体面**真的**在做什么。与上面两个字段是两回事：那是用户要的，这是拿到的。
-    pub transport_live: TransportLive,
     /// Virtual-device slots the attached driver offers, and how many are bound.
     pub hal_capacity: u8,
     pub hal_used: u8,
 }
 
-/// 传输档位的**实测**读数。
+/// 一台对端 × 一个方向的两个**目标**档位（plan §15）。
 ///
-/// 存在的唯一理由是「够不到的时候要如实呈现」：目标 0 ms 而物理下限 90 ms 时，
-/// UI 必须显示 90 与「已达物理下限」，而不是把用户选的 0 回显成当前值。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct TransportLive {
-    /// 实测端到端总延迟（ms）。`None` = 还没测出来（对端分项未到 / RTT 窗口未攒够）。
-    /// **绝不用目标值或上一次的值顶替。**
+/// 「方向」是**用户视角**的收/发，不是执行器所在的那一端——两者交叉，
+/// 见 [`PeerTransportView`]。这个类型只在**本机存储与 UI** 之间流动，
+/// 线上永远不出现。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerTransportDir {
+    /// `"auto"` 或 [`LATENCY_STOPS_MS`] 里的毫秒数。**这是目标，不是实测值**——
+    /// 设 300 时系统会主动把缓冲填到 300，而不是「系统只能做到这么慢」。
+    /// UI 必须把这句话说出来（plan §14 附）。
+    pub latency: String,
+    /// `"auto"` 或某个可用档位 id（见 [`transport::quality_stops`]）。
+    pub quality: String,
+}
+
+impl Default for PeerTransportDir {
+    fn default() -> Self {
+        PeerTransportDir { latency: LATENCY_AUTO.to_string(), quality: QUALITY_AUTO.to_string() }
+    }
+}
+
+/// 一台对端的四个档位 + 对端推给本机的那两个（plan §15）。
+///
+/// # 为什么「本机设的」与「对端推来的」是两组字段，绝不合并
+///
+/// 合并之后「这个 300 是我设的还是对端要求的」就再也答不出来，而那正是共享
+/// 模式的详情页唯一要回答的问题：本次事故里 30-win 的档位是 `min` 且从未被
+/// 设过，这件事**在两台机器的任何一个界面上都不可见**。
+///
+/// # 交叉的那一半（照字面实现会造出一条永不生效的回路）
+///
+/// 两个档位的执行器在**相反的端**上：延迟的执行器是**接收侧**的 jitter
+/// buffer，质量的执行器是**发送侧**的阶梯格号。于是消费者设的四个值里，
+/// 跨到线上的是交叉的一半：
+///
+/// | 用户设的 | 执行器在 | 走线 |
+/// |---|---|---|
+/// | `recv.latency` | 本机 rx 的 JB | 本地 |
+/// | `recv.quality` | **对端** tx 的阶梯 | **推给对端**（`tx_quality`） |
+/// | `send.latency` | **对端** rx 的 JB | **推给对端**（`rx_latency`） |
+/// | `send.quality` | 本机 tx 的阶梯 | 本地 |
+///
+/// 一句话记法：**每一端推的是「执行器在对面」的那个旋钮**。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerTransportView {
+    /// 本机作为**消费者**时对这台对端设的档位。共享模式下照存不误、只是不生效
+    /// （切回 A/B 时它是这台对端的既有设置，丢掉等于每次切模式重设一遍）。
     #[serde(default)]
-    pub achieved_ms: Option<f64>,
-    /// 目标够不到，已经贴在物理下限上。
+    pub recv: PeerTransportDir,
     #[serde(default)]
-    pub at_floor: bool,
-    /// 目标够不到，已经贴在物理上限上。
+    pub send: PeerTransportDir,
+    /// 对端推来、**执行器在本机接收侧**的延迟档（= 对端的 `send.latency`）。
+    ///
+    /// 字段名说的是**执行器**，不是用户看到的收/发。`None` = 对端没有对这一项
+    /// 表态 ⇒ UI 显示「未设定 · 按自动运行」，**不显示 0、不显示本机存的值**。
     #[serde(default)]
-    pub at_ceiling: bool,
-    /// 当前实际线上采样率（Hz）。`None` = 没有流。
+    pub peer_rx_latency: Option<String>,
+    /// 对端推来、**执行器在本机发送侧**的质量档（= 对端的 `recv.quality`）。
     #[serde(default)]
-    pub rate: Option<u32>,
-    /// 正在被伺服的接收流数。`0` = 暂无会话，档位还没有作用对象——
-    /// UI 要说这句，否则用户会以为设置没生效。
-    #[serde(default)]
-    pub streams: u32,
+    pub peer_tx_quality: Option<String>,
 }
 
 /// One published (or intended) virtual device pair, `hal.devices`.
@@ -610,6 +670,34 @@ pub struct SessionStats {
     /// 逐级延迟会计。`None` = 本端未采集（非媒体会话，或该会话尚无可读的级）。
     #[serde(default)]
     pub pipeline: Option<PipelineLatency>,
+
+    // ---- plan §15 / §14 裁定 4：**这条流此刻在执行的目标档**。
+    //
+    // 存在的理由逐字来自 plan §14 附：「用户看到 300 ms 时必须能分辨**这是自己
+    // 设定的目标**而非系统能力不足——当前界面对此一个字都没说，是本次误判的
+    // 直接成因」。没有这两个字段，UI 只能拿全局设置去猜某一条流的目标，而
+    // §15 之后全局设置根本不存在了。
+    /// 这条**接收**流的延迟目标（`LatencyTarget::as_wire()`）。
+    /// `None` = AUTO 或本流没有接收侧（延迟的执行器只在接收端）。
+    #[serde(default)]
+    pub latency_target: Option<String>,
+    /// 这条**发送**流的质量目标。`None` = AUTO（阶梯当家）或没有发送侧。
+    #[serde(default)]
+    pub quality_target: Option<String>,
+    /// 目标是谁定的：`"local"`（本机是消费者，自己设的）| `"peer"`（本机是
+    /// 提供者，档位由使用方推来）。`None` = 这条流上没有目标在执行。
+    ///
+    /// **这一个字段就是「两个来源绝不合并」那条规矩的可执行形式。** 合并之后
+    /// 「这个 300 是我设的还是对端要求的」就再也答不出来，而共享模式的机器
+    /// 需要回答的正是这个问题。
+    #[serde(default)]
+    pub target_from: Option<String>,
+    /// 目标够不到，已经贴在物理下限 / 上限上。**只在闭环（真有实测值）时为真**：
+    /// 开环下地板是假设的 0，拿它断言物理事实等于凭空宣布一个没测过的结论。
+    #[serde(default)]
+    pub at_floor: bool,
+    #[serde(default)]
+    pub at_ceiling: bool,
     /// 音质三分量。`None` = 窗口还不够长 / 这条流没有接收侧（发送会话没有
     /// 「送进扬声器的样本」可言）。**不是 0 分**。
     #[serde(default)]
@@ -763,6 +851,13 @@ pub struct PeerState {
     /// would have to read `None` as "fine" to keep the offline case quiet.
     #[serde(default)]
     pub peer_unusable: bool,
+    /// plan §15：这台对端的四个传输档位（收/发 × 延迟/音质）+ 它推给本机的两个。
+    ///
+    /// **不放进 `peer`（那个 `#[serde(flatten)]` 的 `PairedPeer`）**：那里装的
+    /// 是「对方告诉我的身份」，而这里是「我自己设的」。混成一层之后 UI 就再也
+    /// 分不出这两件事——而共享模式的详情页存在的唯一意义正是分出它们。
+    #[serde(default)]
+    pub transport: PeerTransportView,
 }
 
 /// Method names (params -> result):
@@ -811,8 +906,11 @@ pub struct PeerState {
 /// - "stats.subscribe"   {interval_ms?}        -> {} (then "stats" events with Vec<SessionInfo>)
 /// - "settings.get"      {}                    -> DaemonSettings
 /// - "settings.set"      {mode?, remove_virtual_on_disconnect?,
-///                        mark_offline_devices?, latency?, quality?}
+///                        mark_offline_devices?}
 ///                                             -> DaemonSettings
+///       `latency` / `quality` **不再在这里**（plan §15）：它们是每对端 × 每
+///       方向的选择，走 "peers.set_transport"。旧客户端传这两个键会被拒绝，
+///       而不是被静默收下——静默收下正是本项目栽过六次的那个形状。
 ///       The mode is DAEMON-owned global state (plan §7.1/§13) and the three
 ///       modes are mutually exclusive, so setting it is never only a display
 ///       change. Switching AWAY from `share` closes every session a peer opened
@@ -828,6 +926,11 @@ pub struct PeerState {
 /// - "peers.set_alias"   {peer, alias}         -> {fingerprint, display_name}
 ///       Renames the peer's virtual devices in place: same UID, same
 ///       AudioObjectID, so an application's device selection survives it.
+/// - "peers.set_transport" {peer, dir, latency?, quality?} -> PeerTransportView
+///       plan §15。`dir` = "recv" | "send"，**本机视角**（收 = 我取对方的音）。
+///       只传要改的那一项，另一项保持原值。立刻生效：写盘之后马上把
+///       「执行器在对面」的那半边（见 `PeerTransportView`）推给对端，
+///       本地那半边灌进本机每条流的原子量。**没有重启、没有重连。**
 pub mod methods {
     pub const DAEMON_STATUS: &str = "daemon.status";
     pub const DAEMON_SHUTDOWN: &str = "daemon.shutdown";
@@ -850,6 +953,7 @@ pub mod methods {
     pub const PEERS_PAIR: &str = "peers.pair";
     pub const PEERS_UNPAIR: &str = "peers.unpair";
     pub const PEERS_SET_ALIAS: &str = "peers.set_alias";
+    pub const PEERS_SET_TRANSPORT: &str = "peers.set_transport";
 }
 
 #[cfg(test)]

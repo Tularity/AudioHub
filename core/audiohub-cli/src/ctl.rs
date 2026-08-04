@@ -202,6 +202,39 @@ pub enum CtlCmd {
         #[arg(long)]
         mark_offline_devices: Option<bool>,
     },
+    /// plan §15：某一台对端、某一个方向的延迟与音质档。
+    ///
+    /// **必须能从这里写。** 在此之前档位只有 UI 一条写入路径，于是「档位到底
+    /// 有没有被下发」这件事无法在不开窗口的情况下验证——而这一整条回路的失效
+    /// 恰恰是无声的。
+    ///
+    /// 不带 `--latency` / `--quality` 就是**只读**这台对端的四个档。
+    PeerTransport {
+        /// fingerprint or a unique prefix of one
+        #[arg(long)]
+        peer: String,
+        /// 本机视角：`recv` = 我收这台对端的音，`send` = 我发给它。
+        ///
+        /// 两个方向的执行器在**不同的机器上**（延迟在接收端的 jitter buffer，
+        /// 音质在发送端的阶梯），所以这个参数没有默认值：挑一个默认方向去写
+        /// 就是替用户决定了他改的是哪一半。
+        #[arg(long, value_parser = ["recv", "send"])]
+        dir: Option<String>,
+        /// END-TO-END latency target: "auto", or one of the ladder's
+        /// milliseconds (see `latency_stops_ms` in `ctl settings --json`).
+        ///
+        /// This is the TOTAL, network segment included — not a buffer size.
+        /// `--latency 200` on a link that measures 105 ms means the daemon
+        /// deliberately ADDS ~95 ms. Watch it work in
+        /// `ctl status --json | jq '.latency_guard.servo.by_stream'`.
+        #[arg(long)]
+        latency: Option<String>,
+        /// wire quality: "auto", or a stop id ("pcm48k", "pcm32k", …; see
+        /// `quality_stops` in `ctl settings --json`). Opus stops are listed
+        /// but refused — this build cannot deliver them.
+        #[arg(long)]
+        quality: Option<String>,
+    },
     /// pair with a peer that has pairing mode enabled
     Pair {
         /// host or host:port
@@ -479,6 +512,20 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             methods::DAEMON_SIMULATE_DEVICE_CHANGE,
             json!({ "kind": kind }),
         ),
+        // 传输档位（`latency` / `quality`）**必须能从这里写**。
+        //
+        // 在此之前它们只有 UI 一条写入路径，于是「档位到底有没有被下发」这件事
+        // 无法在不开窗口的情况下验证——而这一整条回路的失效恰恰是无声的。
+        // 用户实测 `ctl settings --latency 200` 报 `unexpected argument`，
+        // 那正是这两行缺失的样子。
+        //
+        // **不在本地做档位校验**，尽管 `LATENCY_STOPS_MS` 就在 `audiohub-ipc`
+        // 里、抬手可及。理由是版本错位：CLI 与 daemon 是两个可以独立更新的
+        // 二进制，一个旧 CLI 拿自己那份旧表去挡，会把一个 daemon 明明支持的
+        // 新档位判死，而错误信息还会言之凿凿地列出一张过时的表。校验权归
+        // daemon 独有（`ipcserv.rs` 的 `LatencyTarget::parse`），它同时也是
+        // UI / 任何第三方客户端唯一的那道关——多一道本地关不会更安全，
+        // 只会多一处可以与它分歧的地方。
         CtlCmd::Settings {
             mode,
             remove_virtual_on_disconnect,
@@ -502,6 +549,30 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
                 methods::SETTINGS_SET
             };
             (method, Value::Object(p))
+        }
+        CtlCmd::PeerTransport { peer, dir, latency, quality } => {
+            if latency.is_none() && quality.is_none() {
+                // 只读：走 peers.list，回包里挑这一台。写一个「读」的专用方法
+                // 只会多一处可以与 `peers.list` 分歧的地方。
+                (methods::PEERS_LIST, json!({}))
+            } else {
+                let dir = dir.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "写档位必须带 --dir recv|send：两个方向的执行器在不同的机器上，\
+                         挑一个默认方向就是替你决定了改的是哪一半"
+                    )
+                })?;
+                let mut p = serde_json::Map::new();
+                p.insert("peer".into(), json!(peer));
+                p.insert("dir".into(), json!(dir));
+                if let Some(v) = latency {
+                    p.insert("latency".into(), json!(v));
+                }
+                if let Some(v) = quality {
+                    p.insert("quality".into(), json!(v));
+                }
+                (methods::PEERS_SET_TRANSPORT, Value::Object(p))
+            }
         }
         CtlCmd::Pair { addr, pin } => {
             (methods::PEERS_PAIR, json!({ "addr": addr, "pin": pin }))
@@ -785,6 +856,11 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 val_u64(v, "hal_used"),
                 val_u64(v, "hal_capacity"),
             ));
+            // plan §15：延迟与音质**不再是全局设置**，所以这里不再印它们。
+            // 印一个「代表值」正是 §14 裁定 1 那个「不管取哪条都在替另一条
+            // 撒谎」的命令行版本——每对端两个方向，一共四个，它们互不相等。
+            info("  (延迟与音质已改为每对端 × 每方向：`ctl peer-transport --peer <fp>` 读，\
+                  加 --dir recv|send --latency/--quality 写)");
             if val_str(v, "mode") == "b" && val_str(v, "effective_mode") != "b" {
                 info("  (mode B is not in force: no HAL bridge on this daemon)");
             }
@@ -793,6 +869,83 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
             if val_str(v, "effective_mode") == "share" {
                 info("  (share mode: this machine serves peers and does not open sessions of \
                       its own — plan §13)");
+            }
+        }
+        CtlCmd::PeerTransport { peer, dir, latency, quality } => {
+            if latency.is_none() && quality.is_none() {
+                // 回包是 peers.list：挑出这一台，四个档位并排印出来。
+                let row = v
+                    .as_array()
+                    .and_then(|a| {
+                        a.iter().find(|p| {
+                            val_str(p, "fingerprint").starts_with(peer.as_str())
+                        })
+                    })
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if row.is_null() {
+                    info(&format!("no paired peer matching '{peer}'"));
+                    return;
+                }
+                let t = row.get("transport").cloned().unwrap_or(Value::Null);
+                let cell = |d: &str, k: &str| -> String {
+                    t.get(d)
+                        .and_then(|x| x.get(k))
+                        .and_then(Value::as_str)
+                        .unwrap_or("—")
+                        .to_string()
+                };
+                info(&format!(
+                    "{} ({})",
+                    val_str(&row, "display_name"),
+                    val_str(&row, "fingerprint")
+                ));
+                info(&format!(
+                    "  recv (this machine receives): latency={} quality={}",
+                    cell("recv", "latency"),
+                    cell("recv", "quality")
+                ));
+                info(&format!(
+                    "  send (this machine sends):    latency={} quality={}",
+                    cell("send", "latency"),
+                    cell("send", "quality")
+                ));
+                // 对端推来的两个：**只有本机是提供者时才有**，而且必须与上面
+                // 四个分开印。合成一栏之后「这个 300 是我设的还是对端要求的」
+                // 就再也答不出来。
+                let pushed = |k: &str| {
+                    t.get(k).and_then(Value::as_str).map(str::to_string)
+                };
+                match (pushed("peer_rx_latency"), pushed("peer_tx_quality")) {
+                    (None, None) => {}
+                    (l, q) => info(&format!(
+                        "  pushed BY THIS PEER (it is the consumer): \
+                         our-receive-latency={} our-send-quality={}",
+                        l.unwrap_or_else(|| "未设定".into()),
+                        q.unwrap_or_else(|| "未设定".into())
+                    )),
+                }
+                info(
+                    "  (延迟档是**目标**：设 300 时 daemon 会主动把缓冲填到 300，\
+                     不是「只能做到这么慢」。执行器：延迟在接收端、音质在发送端)",
+                );
+            } else {
+                let d = dir.as_deref().unwrap_or("?");
+                let cell = |k: &str| {
+                    v.get(if d == "recv" { "recv" } else { "send" })
+                        .and_then(|x| x.get(k))
+                        .and_then(Value::as_str)
+                        .unwrap_or("—")
+                };
+                info(&format!(
+                    "{peer} {d}: latency={} quality={}",
+                    cell("latency"),
+                    cell("quality")
+                ));
+                info(
+                    "  (已即时生效：本地那半边灌进每条流的原子量，交叉的那半边推给对端。\
+                     `ctl status --json | jq '.latency_guard.servo.by_stream'` 看回路)",
+                );
             }
         }
         CtlCmd::Pair { addr, .. } => info(&format!(
@@ -810,5 +963,182 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
             val_str(v, "display_name")
         )),
         CtlCmd::Shutdown => info("daemon shutdown requested"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// 走**真正的命令行解析**，不是直接构造 `CtlCmd`。
+    ///
+    /// 这一条是承重的：`--latency` 缺失时构造出来的 `CtlCmd::Settings` 照样
+    /// 可以带一个 `latency` 字段，而用户在终端里拿到的是 `unexpected argument`。
+    /// 只有从 `argv` 出发才测得到那个缺口。
+    fn req(args: &[&str]) -> (&'static str, Value) {
+        let cli = crate::Cli::try_parse_from(args)
+            .unwrap_or_else(|e| panic!("{args:?} 解析不了：{e}"));
+        let crate::TopCmd::M4(M4Cmd::Ctl { cmd }) = cli.cmd else {
+            panic!("{args:?} 没有落到 ctl 子命令上")
+        };
+        request_for(&cmd).expect("request_for")
+    }
+
+    fn settings(args: &[&str]) -> (&'static str, Value) {
+        let mut v = vec!["audiohub", "ctl", "settings"];
+        v.extend_from_slice(args);
+        req(&v)
+    }
+
+    fn pt(args: &[&str]) -> (&'static str, Value) {
+        let mut v = vec!["audiohub", "ctl", "peer-transport", "--peer", "ab12"];
+        v.extend_from_slice(args);
+        req(&v)
+    }
+
+    /// **`settings.set` 收得下的每一个字段，命令行都必须够得到。**
+    ///
+    /// 这条测试就是用户实测那个 `unexpected argument '--latency' found` 的
+    /// 机械化版本。判据不是「`--latency` 在不在」——那样加第三个字段时它照旧
+    /// 全绿；判据是 [`SETTINGS_WRITABLE_KEYS`] 这张契约表**逐项**都能从 argv
+    /// 出发被送进 `settings.set` 的 params 里。
+    #[test]
+    fn every_writable_setting_is_reachable_from_the_command_line() {
+        // 每个键给一个合法取值。取值本身不重要（daemon 才是校验方），
+        // 重要的是这个 flag 存在、并且落进同名的 params 键。
+        let sample: &[(&str, &str, Value)] = &[
+            ("mode", "--mode=share", json!("share")),
+            (
+                "remove_virtual_on_disconnect",
+                "--remove-virtual-on-disconnect=true",
+                json!(true),
+            ),
+            ("mark_offline_devices", "--mark-offline-devices=false", json!(false)),
+        ];
+        for key in audiohub_ipc::SETTINGS_WRITABLE_KEYS {
+            let (_, flag, want) = sample
+                .iter()
+                .find(|(k, _, _)| k == key)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "settings.set 收得下 '{key}'，但命令行没有对应的 flag —— \
+                         这正是 `--latency` 消失了整整一轮的那个缺口"
+                    )
+                });
+            let (method, params) = settings(&[flag]);
+            assert_eq!(method, methods::SETTINGS_SET, "{flag} 没走写入路径");
+            assert_eq!(
+                params.get(*key),
+                Some(want),
+                "{flag} 没有落到 params['{key}'] 上"
+            );
+        }
+    }
+
+    /// **档位表里的每一档都送得出去，原样。**
+    ///
+    /// 本地不做校验（版本错位时旧 CLI 会挡掉 daemon 支持的新档，理由见
+    /// `request_for` 里那段注释），所以这里断言的是「不篡改」：`0` 不许变成
+    /// `"min"`，`200` 不许变成 `200`（数字）——daemon 读的是字符串。
+    #[test]
+    fn every_latency_stop_goes_out_verbatim() {
+        let mut wire: Vec<String> = vec![audiohub_ipc::LATENCY_AUTO.to_string()];
+        wire.extend(audiohub_ipc::LATENCY_STOPS_MS.iter().map(|m| m.to_string()));
+        for v in wire {
+            let (method, params) = pt(&["--dir=send", &format!("--latency={v}")]);
+            assert_eq!(method, methods::PEERS_SET_TRANSPORT);
+            assert_eq!(
+                params.get("latency").and_then(Value::as_str),
+                Some(v.as_str()),
+                "档位 {v} 在路上被改写了"
+            );
+        }
+        // 档位表以外的值同样**原样送出**：拒绝是 daemon 的事，不是 CLI 的。
+        // 本地先挡的话，一个旧 CLI 会把新 daemon 的新档判死。
+        let (_, params) = pt(&["--dir=recv", "--latency=137"]);
+        assert_eq!(params.get("latency").and_then(Value::as_str), Some("137"));
+    }
+
+    #[test]
+    fn every_quality_stop_goes_out_verbatim() {
+        let mut ids: Vec<String> = vec![audiohub_ipc::QUALITY_AUTO.to_string()];
+        ids.extend(
+            audiohub_ipc::transport::quality_stops()
+                .into_iter()
+                .map(|q| q.id),
+        );
+        for id in ids {
+            let (method, params) = pt(&["--dir=send", &format!("--quality={id}")]);
+            assert_eq!(method, methods::PEERS_SET_TRANSPORT);
+            assert_eq!(
+                params.get("quality").and_then(Value::as_str),
+                Some(id.as_str()),
+                "质量档 {id} 在路上被改写了"
+            );
+        }
+    }
+
+    /// **plan §15：`settings` 上的两个旧 flag 必须真的消失。**
+    ///
+    /// 留着一个「收下但不发」的 flag 会让旧脚本继续跑、继续报成功、
+    /// 什么都不发生——本项目栽过六次的那个形状。判据是 argv **解析失败**，
+    /// 不是 params 里没有那个键：后者一个「解析了再丢掉」的实现照样通过。
+    #[test]
+    fn the_global_stop_flags_are_gone_from_settings() {
+        for bad in ["--latency=200", "--quality=pcm32k"] {
+            assert!(
+                crate::Cli::try_parse_from(["audiohub", "ctl", "settings", bad]).is_err(),
+                "`ctl settings {bad}` 还能解析：旧脚本会继续对着空气说话"
+            );
+        }
+    }
+
+    /// **写档位必须点名方向。** 两个方向的执行器在不同的机器上，挑一个默认
+    /// 方向就是替用户决定了他改的是哪一半——而错的那一半是静默无效的。
+    #[test]
+    fn writing_a_stop_without_a_direction_is_refused() {
+        let cli = crate::Cli::try_parse_from([
+            "audiohub", "ctl", "peer-transport", "--peer", "ab12", "--latency", "200",
+        ])
+        .expect("argv 本身是合法的");
+        let crate::TopCmd::M4(M4Cmd::Ctl { cmd }) = cli.cmd else { panic!() };
+        assert!(request_for(&cmd).is_err(), "缺 --dir 却被放行了");
+    }
+
+    /// 不带 `--latency` / `--quality` 是**只读**，走 `peers.list`，
+    /// 一个字段都不写。
+    #[test]
+    fn peer_transport_without_stops_cannot_write_anything() {
+        let (method, _) = pt(&[]);
+        assert_eq!(method, methods::PEERS_LIST, "一条只读命令走了写入路径");
+        // 带了 --dir 但没带任何档位，同样是只读：`--dir` 本身不是一次写入。
+        let (method, _) = pt(&["--dir=send"]);
+        assert_eq!(method, methods::PEERS_LIST);
+    }
+
+    /// 不带 flag 仍然是**读**，而且 params 是空的。
+    ///
+    /// 反向对照：没有它，一个「把所有字段都填上默认值」的实现会让
+    /// `audiohub ctl settings` 这条纯查询命令悄悄改写用户的设置。
+    #[test]
+    fn settings_without_flags_cannot_write_anything() {
+        let (method, params) = settings(&[]);
+        assert_eq!(method, methods::SETTINGS_GET);
+        assert_eq!(params, json!({}), "一条只读命令带上了字段");
+    }
+
+    /// 两个档位一起给时**互不吞没**，也不牵连别的字段。
+    #[test]
+    fn the_transport_stops_travel_together_without_inventing_fields() {
+        let (method, params) = pt(&["--dir=recv", "--latency=auto", "--quality=pcm48k"]);
+        assert_eq!(method, methods::PEERS_SET_TRANSPORT);
+        assert_eq!(params.get("latency").and_then(Value::as_str), Some("auto"));
+        assert_eq!(params.get("quality").and_then(Value::as_str), Some("pcm48k"));
+        assert_eq!(params.get("dir").and_then(Value::as_str), Some("recv"));
+        assert_eq!(params.get("peer").and_then(Value::as_str), Some("ab12"));
+        // 没给的字段一个都不许出现：这是 patch 语义，凭空补一个键就是替用户
+        // 改了一项他没碰过的设置——而另一个方向的档位在**另一台机器**上执行。
+        assert_eq!(params.as_object().map(|o| o.len()), Some(4));
     }
 }

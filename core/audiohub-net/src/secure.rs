@@ -157,6 +157,16 @@ pub enum SessionMsg {
         /// predates the field still opens streams.
         #[serde(default)]
         volume_sync: bool,
+        /// plan §15 的初值，与 [`SessionMsg::SetTransport`] 同名同义
+        /// （**按执行器命名**，见那里的文档）。
+        ///
+        /// 为什么初值和增量两条路都要：只有增量的话，`OpenStream` 到第一条
+        /// `SetTransport` 之间有一个窗口，对端跑它自己的默认值——那正是
+        /// 「我设的值此刻没有在生效」这一种最难解释的现象。
+        #[serde(default)]
+        rx_latency: Option<String>,
+        #[serde(default)]
+        tx_quality: Option<String>,
     },
     AcceptStream {
         stream_id: u32,
@@ -340,6 +350,35 @@ pub enum SessionMsg {
     /// （此处原有注释写的是「老对端解析失败会丢弃通道」，与实现相反。若将来
     /// 有人照那句话把行为改回断连，上面这条保证会静默失效。）
     Unpaired {},
+    /// 消费者 -> 提供者：这条流上**执行器在你那一侧**的档位，照办（plan §15）。
+    ///
+    /// # 字段名说的是执行器，不是用户看到的「收 / 发」
+    ///
+    /// 两者在这条消息上**恰好相反**：延迟的执行器是接收侧的 jitter buffer，
+    /// 质量的执行器是发送侧的阶梯格号。于是消费者的 `send.latency` 要治的是
+    /// **对端的 rx**，`recv.quality` 要治的是**对端的 tx**。按用户视角命名的话，
+    /// 收方要先回答「他说的 send 是他的 send 还是我的 send」——那个问题没有
+    /// 正确答案，而错误的那个答案会让一个方向静默失效、界面全绿。
+    ///
+    /// 一条流上这两项**至多一项有值**：持 `rx` 的那端没有 `tx`，反之亦然。
+    /// 收方对此有硬校验（执行器不在本地就计数拒绝，不静默忽略）。
+    ///
+    /// # `Option` 而不是 `String`
+    ///
+    /// `None` = 发送方没有对这一项表态，收方保持现状；`Some("auto")` = 明确
+    /// 要求 AUTO。两者不同，且前者正是「只改了延迟没改音质」的增量更新形态。
+    /// 用空串表达「未表态」会与「档位串是空的」逐位相同。
+    SetTransport {
+        stream_id: u32,
+        /// 这条流在**你的接收侧**要达到的端到端总延迟目标
+        /// （`LatencyTarget::as_wire()`）。只有持 `rx` 的那一端可执行。
+        #[serde(default)]
+        rx_latency: Option<String>,
+        /// 这条流**你的发送侧**的线上质量档（`QualityTarget::as_wire()`）。
+        /// 只有持 `tx` 的那一端可执行。
+        #[serde(default)]
+        tx_quality: Option<String>,
+    },
     Bye {},
 }
 

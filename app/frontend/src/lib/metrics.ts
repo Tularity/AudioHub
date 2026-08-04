@@ -484,6 +484,116 @@ export function countedTail(stages: Record<string, StageReading | undefined>): s
   return best;
 }
 
+// ------------------------------------------------- 卡片指标区的分栏规则
+//
+// 这一段是 2026-08-04 事故的正面防线，所以它在**这里**而不是在组件里。
+//
+// 事故：`PeerMetrics` 拿到的是 `sess={micS || spkS}` —— 两条真实存在的通路里
+// 用 `||` 选了一条，界面上不留任何痕迹。回归覆盖当时的分布是：
+// `lib/metrics.ts` 的纯函数（`readLatency` 等）测得很扎实，**组件接线层零覆盖**，
+// 而 bug 正好长在接线层。「有测试的那层没坏，坏的那层没测试」——把接线规则搬进
+// 纯函数，是让它第一次变得可断言的唯一办法。
+
+/** 本机视角的方向。testid 里的 `<dir>` 段沿用 `peer-device-out-<fp>` 的约定。 */
+export type Dir = 'out' | 'in';
+
+/**
+ * 一张卡片的两栏各装哪些会话。
+ *
+ * 判据是 **`dir`（本机视角）**，不是 `kind`（开流方视角）。四种 `(kind, dir)`
+ * 组合全部有归属：
+ *
+ * | kind | dir | 含义 | 落进 |
+ * |---|---|---|---|
+ * | `mic` | `recv` | 我取对方麦克风（使用端·收） | `recv` |
+ * | `spk` | `send` | 我送对方扬声器（使用端·发） | `send` |
+ * | `mic` | `send` | 对方取本机麦克风（共享端·发） | `send` |
+ * | `spk` | `recv` | 对方送本机扬声器（共享端·收） | `recv` |
+ *
+ * 后两种此前**一个都匹配不上**（旧代码只找 `mic/recv` 与 `spk/send`），
+ * 于是共享模式下指标区恒显示「未建立通路」，而隔壁隐私横幅同时亮着。
+ *
+ * 返回**数组**而不是单条：同一对端同一方向可以有多条会话
+ *（`MAX_STREAMS_PER_CONN = 16`，daemon 去重只按 `stream_id`）。返回单条就是把
+ * 「两个方向里选一个」的 bug 降级成「同方向 N 条里选第一条」。
+ */
+export function splitByDirection(
+  sessions: readonly SessionInfo[],
+  fp: string,
+): { send: SessionInfo[]; recv: SessionInfo[] } {
+  const send: SessionInfo[] = [];
+  const recv: SessionInfo[] = [];
+  for (const s of sessions) {
+    if (s.peer_fingerprint !== fp) continue;
+    if (s.dir === 'send') send.push(s);
+    else if (s.dir === 'recv') recv.push(s);
+    // 认不出的 dir（旧 / 新 daemon 的其它取值）**两栏都不进**。猜一个方向
+    // 比不显示更糟：那正是本次事故的形态——一个没有来源的数字挂在某一栏里。
+  }
+  return { send, recv };
+}
+
+/**
+ * 同一方向的 N 条会话里，**显示最慢的那条**。
+ *
+ * 三条候选规则里只有这一条站得住：
+ *
+ * - 「取第一条」= `find()` —— 那就是本次事故的同构形态，只是轴从 `dir` 换成了
+ *   会话顺序。而 daemon 按 `stream id` 升序返回（`lib.rs` 的 `sort_by_key`），
+ *   「第一条」= id 最小 = **最老**的那条，断线重连时它可能已经死了。
+ * - 「取最快」—— 把一个正在拖后腿的通路藏起来，与「不得用 0 填补缺失分项」
+ *   同一类错误：让坏消息长得像没消息。
+ * - 「取最慢」—— 用户在这张卡上问的是「这条方向用起来好不好」，而多路并行时
+ *   体感由最差的一路决定。
+ *
+ * 无论取哪条，界面都会把「一共几路」说出来（`peer-dir-count-<dir>-<fp>`）：
+ * 一个不标来源的数字背后站着 N 个候选，正是这次要消灭的形态。
+ */
+export function pickWorst(list: readonly SessionInfo[]): SessionInfo | null {
+  if (list.length === 0) return null;
+  let best = list[0];
+  let bestMs = -1;
+  for (const s of list) {
+    const ms = readLatency(s)?.totalMs;
+    // 读不到延迟的会话不参与比较，但**也不会被排除**：全都读不到时仍然要有
+    // 一条被渲染，否则「N 条会话在跑却显示未开通」比选错一条更糟。
+    if (typeof ms === 'number' && ms > bestMs) {
+      bestMs = ms;
+      best = s;
+    }
+  }
+  return best;
+}
+
+/**
+ * 一段色带里**此刻占大头**的那一级，没有任何读数时为 undefined。
+ *
+ * 存在的理由是段名会撒谎。段名是静态的、按物理流向定的，而一段里并列着好几级：
+ * `playback` 段同时装着 `play_ring`（真实播放环）、`bridge_ring`（第三方虚拟
+ * 声卡）和 `hal_mic`（**虚拟麦克风环**）三条并行尾级。2026-08-04 的现场里
+ * 接收方向 136 ms 全在 `hal_mic` 上，界面写着「播放 136」——用户据此去查扬声器，
+ * 一查一个准地查错方向，而扬声器那条通路实测只有 24 ms。
+ *
+ * 并行尾级取 max（与 `segmentTotals` 同一条规则），串联级取最大的那一个：
+ * 两种情形下"这一段的大头"都是同一句话。
+ */
+export function segmentDominantStage(
+  r: LatencyReading,
+  seg: LatencySegmentId,
+): StageSpec | undefined {
+  let best: StageSpec | undefined;
+  let bestMs = -1;
+  for (const spec of LATENCY_STAGES) {
+    if (spec.segment !== seg) continue;
+    const ms = r.stages[spec.id]?.ms;
+    if (typeof ms === 'number' && ms > bestMs) {
+      bestMs = ms;
+      best = spec;
+    }
+  }
+  return best;
+}
+
 /**
  * 这一级显示成「对方主机」还是「本机」。
  *

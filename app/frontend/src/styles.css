@@ -507,23 +507,84 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 
 /* ---- 一级指标：延迟 / 音质（spec-telemetry-ia §2.2） ---- */
 
-/* min-height 是承重的：无会话时 ②③ 塌成一行，但**卡片高度必须不变**。否则一排卡片
-   里只有开了通路的那几张变高，扫一眼像排版坏了。88px = 有会话时的实测高度
-   （指标行 + 色带 + 数字行 + 两处 gap + 内边距 + 边框），两态因此严格等高。 */
+/* min-height 仍然是承重的，但**语义变了**：改版前它护的是「有会话 / 无会话」两态
+   等高；分方向之后要护的是「0 / 1 / 2 条会话」三态等高，否则一排卡片里开了两条的
+   那几张明显更高，扫一眼像排版坏了。
+   承重点因此下移到 `.dir-block`（每块一个固定下限），这里只保留一个兜底值：
+   两块各 40px + 一处 gap 8px + 上下内边距 20px + 边框 2px = 110px。
+   ⚠ 改这个数之前先改 `.dir-block` 的 min-height，两者是同一个不变式的两半。 */
 .peer-metrics {
   display: flex; flex-direction: column; gap: 8px;
-  min-height: 88px;
+  min-height: 110px;
   padding: 10px 12px; border-radius: var(--radius-sm);
   background: var(--bg-2); border: 1px solid var(--line);
 }
 .peer-metrics.idle { justify-content: center; }
+
+/* ---- 方向块（每方向一块，spec-card-layout 方案一） ----
+   分栏轴是 `dir`（本机视角）而不是 `kind`（开流方视角）：`kind` 分栏会把
+   「对端正在取用本机麦克风」标成「取对方麦克风」，那个坑已经栽过一次。 */
+
+/* min-height 40px = 标题行(约 26px) + 流量行(14px)。**「未开通」的那一块也占这个
+   高度**——不是为了对齐好看，是为了让「一开一关」与「两开」两态严格等高。
+   给它留白而不是让它塌陷，代价是 26px 空白，收益是一整排卡片不会互相错位。 */
+.dir-block {
+  display: flex; flex-direction: column; gap: 4px;
+  min-height: 40px; justify-content: center;
+}
+/* 两块之间一条极淡的分隔：它们是两个独立的物理量，不能读成同一件事的两行。 */
+.dir-block + .dir-block { border-top: 1px dashed var(--line); padding-top: 8px; }
+/* 三态灰度必须在一眼之内分开（此前「就绪」与「离线」是同一个灰度，用户明知
+   麦克风是通的却看不出来）：.45 空闲 / .75 就绪 / 1 正在跑。 */
+.dir-block { opacity: .45; transition: opacity .2s ease-out; }
+.dir-block.ready { opacity: .75; }
+.dir-block.active { opacity: 1; }
+
+/* 标题行。有会话时它是按钮（点开该方向的明细），无会话时是普通行。 */
+.dir-head {
+  display: flex; align-items: center; gap: 8px; overflow: hidden;
+  background: none; border: 0; padding: 0; margin: 0;
+  color: inherit; text-align: left; cursor: pointer; width: 100%;
+}
+.dir-head.idle { cursor: default; }
+/* 方向词 + 箭头。**整个方案的要害**：数字前面永远先有方向，物理上不可能再把
+   接收方向的 170 读成「全部」。箭头是冗余编码，中文两字是无障碍主体。 */
+.dir-name {
+  flex: none; display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; color: var(--text-dim); letter-spacing: .04em; white-space: nowrap;
+}
+.dir-arrow { font-size: 12px; opacity: .8; }
+/* 同方向多条会话时的「N 路」。与 .metric-origin 同一套语言（小字 + 淡边框）。 */
+.dir-count {
+  flex: none; font-size: 10px; color: var(--text-dim);
+  border: 1px solid var(--line); border-radius: 999px; padding: 1px 6px; white-space: nowrap;
+}
+/* 流量行：码率条 + 码率数字。⚠ 那条不是电平，是 kbps/900 的另一种画法。 */
+.dir-stream { display: flex; align-items: center; gap: 10px; }
+.dir-detail { display: flex; flex-direction: column; gap: 6px; padding-top: 4px; }
+/* 延迟档主导权那一句：它是**警告性的补充**（本机滑条对这个方向有没有作用对象），
+   不是普通脚注，所以比 .metric-foot 亮一档。 */
+.metric-foot.gov { color: var(--text-dim); border-left: 2px solid var(--line); padding-left: 8px; }
+/* 无会话时卡片级的网络单程那一格。 */
+.metric-netfoot { display: flex; flex-direction: column; gap: 4px; }
+/* 音质三分量：并进同一个展开面板（全卡至多一个面板展开），用一条细线隔开。 */
+.quality-parts {
+  display: flex; flex-direction: column; gap: 4px;
+  border-top: 1px solid var(--line); padding-top: 6px; margin-top: 2px;
+}
+/* 一行里要并排两个 22px 的数字（延迟 + 音质带宽）会互相争夺，且卡片明显变高。
+   音质那格降到 15px：它是第二个一级项，不是第二个头条。 */
+.metric-val.small { font-size: 14px; font-weight: 600; }
+/* `.metric-why` 已删：那枚 12px 的问号角标 + 一处 gap 在 320px 卡宽上正好把
+   等级词挤成「可用于...」。理由改挂在数字 span 的 title 上，「≥」本身就是提示符。 */
 
 /* 不换行：一旦指标行折成两行，「两态等高」当场失效。窄卡片上让两格自己收缩、
    等级文字省略号截断，而不是把行挤到下面去。 */
 /* gap 收到 10px（原 18）：在 1000×700 默认窗口的实际列宽（464px）下，18px 会把两个
    等级词全部挤成省略号——而「可用于对话 / 良好」恰是这两个指标里唯一面向用户的那一半，
    数字只是它的依据。留白让位给文案。 */
-.metric-line { display: flex; align-items: center; gap: 10px; overflow: hidden; }
+/* `.metric-line` 已删：一级指标不再是「一行两格」，而是「每方向一块」。
+   载体见 `.dir-head`。 */
 /* 指标格本身是按钮（点开就地展开明细）：按钮外观全部清掉，只留下光标与焦点环。 */
 .metric-cell {
   display: flex; align-items: baseline; gap: 6px;
@@ -566,10 +627,14 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   white-space: nowrap; align-self: center;
 }
 
-.metric-sep { font-size: 12px; color: var(--text-dim); opacity: .5; }
-.metric-idle { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-.metric-idle .metric-val { font-size: 16px; }
-.metric-idle-text { font-size: 12px; color: var(--text-dim); }
+/* 无会话时的**状态**一行。plan §14 裁定 2 之后它不再顶替指标：延迟与音质
+   两格照旧占位（灰色的「—」），这一行降到它们下面说明「为什么是空的」。
+   状态是状态、数据是数据，两者不该互相顶替——顶替之后用户就没法在同一个
+   位置对比两个方向了。 */
+.metric-idle-text { font-size: 11px; color: var(--text-dim); margin: 0; }
+/* 这条流此刻的**延迟目标**（§14 附）。比读数再暗一档、字更小：它不是测量
+   结果，它是那个测量结果的解释。 */
+.metric-target { font-size: 10px; color: var(--text-dim); opacity: .85; margin: 0; }
 /* 无会话时的网络单程读数。**故意不长得像端到端总数**：16px（而不是 22px）、不上
    色阶、值自带「（仅网络）」后缀，右边再跟一枚 warn 色的「不是总延迟」。这个数与真实
    感知延迟能差三个数量级，长得像总数就是撒谎。 */
@@ -611,8 +676,9 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 .seg-name { font-size: 10.5px; color: var(--text-dim); }
 .seg-num { font-size: 11px; color: var(--text); font-variant-numeric: tabular-nums; }
 
-/* 就地展开的逐级明细：排障时要边听边看数字变，跳页会打断这个循环。 */
-.metric-detail {
+/* 就地展开的逐级明细：排障时要边听边看数字变，跳页会打断这个循环。
+   `.dir-detail` 是分方向之后的载体；`.metric-detail` 留给详情页等其它调用点。 */
+.metric-detail, .dir-detail {
   display: flex; flex-direction: column; gap: 2px;
   border-top: 1px solid var(--line); padding-top: 8px;
   animation: viewIn .18s ease-out;
@@ -725,29 +791,17 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 .toggle-row .ico { color: var(--text-dim); }
 .toggle-label { flex: 1; font-size: 13px; }
 
-/* 收 / 发并成一行（规格 §2.3 ⑤）：省 20px，而且左右并置比上下堆叠更容易做对比。
-   窄卡片上仍会自动折回两行——不为并行牺牲可读性。 */
-.peer-streams {
-  display: flex; flex-wrap: wrap; gap: 8px 16px;
-  border-top: 1px solid var(--line); padding-top: 12px;
-}
-.stream {
-  display: flex; align-items: center; gap: 10px; opacity: .45;
-  flex: 1 1 140px; min-width: 0;
-  transition: opacity .2s ease-out;
-}
-.stream.active { opacity: 1; }
-/* 「通路就绪、只是没人在用」：介于 .45（空闲/不可用）与 1（正在跑）之间。三态在一眼
-   之内必须能分开——此前就绪与离线是同一个灰度，用户明知麦克风是通的却看不出来。 */
-.stream.ready { opacity: .75; }
-.stream.ready .stream-rate { color: var(--text); }
-/* 就绪那句话独占一行（flex-basis 100% 让它在 .peer-streams 里换行）。它是**状态**，
-   所以留在 dim 字号里——旁边的电平条与码率一个数都没变，不能让它看起来像数据。 */
+/* `.peer-streams` / `.stream` / `.stream-label` 已删：收发两行**并进了指标区的
+   方向块**（`.dir-block`）。此前它们独立在卡底、按 kind 分成两列，而上面的指标区
+   完全没有方向概念——同一张卡上两套坐标系，正好把「上面那个数字是哪条通路」
+   衬托得更隐蔽。三态灰度（空闲 / 就绪 / 正在跑）迁到 `.dir-block` 上，
+   语义与灰度值一字未改。 */
+/* 就绪那句话：它是**状态**，所以留在 dim 字号里——旁边的码率一个数都没变，
+   不能让它看起来像数据。 */
 .stream-ready {
-  flex: 0 0 100%; width: 100%; margin: 0;
+  width: 100%; margin: 0;
   font-size: 11px; color: var(--text-dim); line-height: 1.5;
 }
-.stream-label { font-size: 11px; color: var(--text-dim); width: 32px; flex: none; }
 .stream-rate { font-size: 11px; color: var(--text-dim); width: 72px; text-align: right; flex: none; font-variant-numeric: tabular-nums; }
 
 .meter { flex: 1; height: 6px; border-radius: 3px; background: #242b37; overflow: hidden; }
@@ -1098,9 +1152,14 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 
 /* ---- 离散档滑条（传输：延迟档 / 质量档） ----
  *
- * 视觉语言沿用 .vol-slider（同一套双引擎写法：-webkit- 为主，-moz- 兜浏览器形态），
- * 差别只在多了一排刻度。--fill 由 JS 写成一个 calc()，而不是简单的百分比：轨道两端
- * 各被 thumb 的一半占住，直接用百分比的话填充线和刻度都会与 thumb 中心差半个球。 */
+ * **轨道、填充、thumb、刻度全部是自己画的 div**，不再用原生 range 的
+ * ::-webkit-slider-* / ::-moz-range-* 伪元素。原因不是审美：原生 thumb 的位置
+ * 由 input.value 决定，而 `step=1` 让它只能停在整数档上 —— 「拖动时无极」在那套
+ * 机制下**做不到**。原生 input 留着，但只当无障碍与键盘的本体（见 .stop-slider）。
+ * 副作用是双引擎写法一并消失：位置是普通 CSS `left`，Firefox / WebKit 同一份。
+ *
+ * 位置一律写成 `calc(7px + (100% - 14px) * f)` 而不是简单的百分比：轨道两端各被
+ * thumb 的一半占住，直接用百分比的话填充线和刻度都会与 thumb 中心差半个球。 */
 
 .transport-ctl { display: flex; flex-direction: column; align-items: stretch; gap: 6px; width: 268px; }
 .transport-live {
@@ -1109,60 +1168,89 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 }
 
 .stop-slider-box { display: flex; flex-direction: column; gap: 2px; }
-.stop-slider-row { position: relative; display: flex; align-items: center; }
 
+/* 轨道容器 = 拖动的命中区。整块都接指针事件（不只是那条 6px 的线），
+   否则在一条 6px 高的目标上按下去就是一次微操。 */
+.stop-slider-row {
+  position: relative; height: 18px;
+  cursor: pointer; touch-action: none;   /* touch-action: 触屏上不要把横拖变成滚页 */
+}
+.stop-slider-row:has(.stop-slider:disabled) { cursor: not-allowed; }
+
+/* 原生 <input type="range">：**只当无障碍与键盘的本体**，视觉上完全不可见。
+   位置由 .stop-thumb 决定，与它无关。
+
+   为什么留着它而不是自己写 role=slider：焦点管理、方向键 / Home / End、
+   读屏对 slider 的既有支持，全都是免费的且比手写的正确。
+   为什么不让它参与指针：它的 step=1 会在指针落点上再吸附一次 —— 那正是用户
+   说的「机械」，两套指针逻辑并存等于把刚拆掉的东西装回去。
+
+   opacity:0 而不是 visibility:hidden / display:none —— 后两者会把它从
+   无障碍树里摘掉，那就把这个元素存在的唯一理由也一并删了。 */
 .stop-slider {
   -webkit-appearance: none; appearance: none;
-  flex: 1; min-width: 0; height: 18px;
-  background: transparent; cursor: pointer;
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  margin: 0; padding: 0; opacity: 0; pointer-events: none;
 }
-.stop-slider::-webkit-slider-runnable-track {
-  height: 6px; border-radius: 3px;
-  background: linear-gradient(90deg, var(--accent) 0 var(--fill, 0px), #2a3140 var(--fill, 0px) 100%);
-}
-.stop-slider::-webkit-slider-thumb {
-  -webkit-appearance: none; appearance: none;
-  width: 14px; height: 14px; margin-top: -4px;
-  border-radius: 50%; background: #e8eaf0; border: none;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, .5);
-  transition: transform .15s ease-out, box-shadow .15s ease-out, background .15s ease-out;
-}
-.stop-slider:hover:not(:disabled)::-webkit-slider-thumb { transform: scale(1.15); }
-.stop-slider:active:not(:disabled)::-webkit-slider-thumb { transform: scale(1.25); box-shadow: 0 0 0 4px #31c8b033; }
-.stop-slider:disabled { cursor: not-allowed; }
-.stop-slider:disabled::-webkit-slider-runnable-track { background: #2a3140; }
-.stop-slider:disabled::-webkit-slider-thumb { background: #5a6372; box-shadow: none; }
-/* 请求还在路上：thumb 先跟手，但要看得出「尚未落定」——旁边的值标签同时保持在
-   daemon 确认过的那一档上。 */
-.stop-slider[aria-busy="true"]::-webkit-slider-thumb { background: var(--accent); }
-.stop-slider[aria-busy="true"]::-moz-range-thumb { background: var(--accent); }
-/* Firefox（浏览器测试形态可能用到；Tauri 走 WebKit） */
-.stop-slider::-moz-range-track { height: 6px; border-radius: 3px; background: #2a3140; }
-.stop-slider::-moz-range-progress { height: 6px; border-radius: 3px; background: var(--accent); }
-.stop-slider::-moz-range-thumb {
-  width: 14px; height: 14px; border-radius: 50%;
-  background: #e8eaf0; border: none;
-  transition: transform .15s ease-out;
-}
-.stop-slider:disabled::-moz-range-progress { background: #2a3140; }
-.stop-slider:disabled::-moz-range-thumb { background: #5a6372; }
 
-/* 刻度浮在轨道下方，纯装饰（aria-hidden）：档位的语义由 aria-valuetext 承担。
-   pointer-events: none 是硬要求——否则刻度会挡住滑条本身的拖动。 */
-.stop-ticks {
-  position: absolute; left: 0; right: 0; bottom: 1px; height: 4px;
-  pointer-events: none;
+.stop-track { position: absolute; inset: 0; pointer-events: none; }
+/* 轨道底色 */
+.stop-track::before {
+  content: ''; position: absolute; left: 0; right: 0; top: 6px;
+  height: 6px; border-radius: 3px; background: #2a3140;
 }
+.stop-fill {
+  position: absolute; left: 0; top: 6px; height: 6px;
+  border-radius: 3px; background: var(--accent);
+  transition: width var(--dur) var(--ease-spring);
+}
+.stop-thumb {
+  position: absolute; top: 2px; width: 14px; height: 14px;
+  margin-left: -7px; border-radius: 50%;
+  background: #e8eaf0;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .5);
+  transition: left var(--dur) var(--ease-spring), transform .15s ease-out,
+    box-shadow .15s ease-out, background .15s ease-out;
+}
+.stop-slider-row:hover .stop-thumb { transform: scale(1.15); }
+
+/* **拖动中关掉位置过渡**：留着的话 thumb 会以 220 ms 的延迟追手指。
+   回弹正是靠松手那一刻这个属性消失、同时位置跳到整数档而发生的 —— 换句话说，
+   「无极」与「回弹」是同一条 transition 的开与关，不是两套代码。
+   prefers-reduced-motion 下 styles.css 末尾那条全局规则把过渡整个关掉 ⇒
+   回弹退化为瞬时归位，终态一致。 */
+.stop-slider-row[data-dragging] .stop-thumb,
+.stop-slider-row[data-dragging] .stop-fill { transition: none; }
+.stop-slider-row[data-dragging] .stop-thumb {
+  transform: scale(1.25); box-shadow: 0 0 0 4px #31c8b033;
+}
+
+/* 焦点环：原生 input 是透明的，它自己的焦点环看不见，得借 thumb 显示。
+   没有这一条，键盘用户完全不知道焦点在哪。 */
+.stop-slider:focus-visible ~ .stop-track .stop-thumb {
+  box-shadow: 0 0 0 3px var(--bg-1), 0 0 0 5px var(--accent);
+}
+
+.stop-slider:disabled ~ .stop-track .stop-fill { background: #2a3140; }
+.stop-slider:disabled ~ .stop-track .stop-thumb { background: #5a6372; box-shadow: none; }
+/* 请求还在路上：thumb 已经回弹到目标档，但要看得出「尚未落定」——旁边的值
+   标签同时仍停在 daemon 确认过的那一档上。 */
+.stop-slider[aria-busy="true"] ~ .stop-track .stop-thumb { background: var(--accent); }
+
+/* 刻度纯装饰（aria-hidden）：档位的语义由 aria-valuetext 承担。 */
 .stop-tick {
-  position: absolute; top: 0; width: 2px; height: 4px;
+  position: absolute; bottom: 1px; width: 2px; height: 4px;
   margin-left: -1px; border-radius: 1px;
   background: #3a4353;
   transition: background .15s ease-out;
 }
+/* 亮起的是「此刻这个滑条代表哪一档」：拖动中是**松手会落到的那一档**，
+   其余时候是已落定的那一档（plan §14 裁定 4）。它与值标签同源，所以两者
+   不可能各说各话。 */
 .stop-tick.on { background: var(--accent); }
 /* 不可用档照画不误，只是明显更暗：不画出来，用户就无从知道「本机缺了什么」。
    title（由 JS 给）说明原因，但刻度不接指针事件，所以滑条本身也带一份 title。 */
-.stop-tick.off { background: #2a3140; height: 3px; top: 1px; }
+.stop-tick.off { background: #2a3140; height: 3px; bottom: 2px; }
 
 .stop-slider-val {
   align-self: flex-end;
@@ -1171,6 +1259,10 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 }
 /* 有请求在飞：显示的仍是 daemon 确认过的那一档，只是提示它可能马上要变。 */
 .stop-slider-val.pending { color: var(--text-dim); opacity: .7; }
+/* 拖动中的预览：**看得见 ≠ 已生效**（下发在松手之后）。用主色 + 加粗把
+   「这是我正在选的」与「这是当前生效的」分开——两者同一个位置、同一个字号，
+   不区分就等于宣称松手前就已经改了。 */
+.stop-slider-val.previewing { color: var(--accent); font-weight: 600; opacity: 1; }
 
 /* ---- 使用端模式栏（主面板通栏） ---- */
 
@@ -1563,3 +1655,75 @@ body.is-tauri .gate-drag {
     transition: none !important;
   }
 }
+
+
+/* ---- plan §15：对端详情页的传输档位（2 行 × 2 列） ---- */
+
+/* 行 = 方向、列 = 档位。**行序与卡片指标区逐字一致**（发在上、收在下），
+   卡片给实测、这里给目标，位置对得上用户才连得起「我设的 300」与「卡上的 304」。 */
+.transport-grid {
+  display: grid;
+  grid-template-columns: minmax(72px, auto) 1fr 1fr;
+  gap: 6px 14px;
+  align-items: center;
+  margin-top: 10px;
+}
+.transport-corner { display: block; }
+.transport-col {
+  font-size: 12px; color: var(--text-dim); font-weight: 600;
+}
+/* 一行本身也是 grid，列宽由 subgrid 继承：两行的三列必须严格对齐，
+   否则「同一列是同一个档位」这条约定在视觉上就不成立了。 */
+.transport-row {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
+  align-items: start;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+.transport-rowname {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 13px; color: var(--text); padding-top: 6px;
+}
+.transport-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+/* 实测读数：比目标暗一档。两者同字号会让人以为是同一类东西，而它们恰恰是
+   这一页要区分的两件事。 */
+.transport-live { font-size: 11px; color: var(--text-dim); margin: 0; line-height: 1.5; }
+/* 「未设定 · 按自动运行」：**灰，但不是 0**。占住滑条的位置，于是两行仍然
+   可以在同一位置对比（§14 裁定 2）。 */
+.transport-unset {
+  font-size: 12px; color: var(--text-dim); margin: 0;
+  padding: 6px 0; font-style: italic;
+}
+/* 出处行：共享模式下「这个值是谁要求的」。克制但常驻——本次事故里缺的正是
+   这一句，只写进 title 的话不悬停就永远读不到。 */
+.transport-provenance {
+  font-size: 12px; color: var(--accent);
+  border-left: 2px solid var(--accent);
+  padding: 4px 0 4px 8px; margin: 8px 0 0;
+}
+
+/* ---- 设置页的只读总览 ---- */
+
+/* 一次性迁移说明。**不是 toast**：toast 会在用户没看的那一秒消失，而这条要
+   回答的是「我的滑条去哪了」——一个用户可能几天后才问的问题。 */
+.notice {
+  display: flex; align-items: flex-start; gap: 10px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 8px; padding: 8px 10px; margin: 8px 0;
+}
+.notice p { margin: 0; font-size: 12px; line-height: 1.6; color: var(--text); }
+
+.transport-table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 12px; }
+.transport-table th, .transport-table td {
+  text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line);
+}
+.transport-table thead th { color: var(--text-dim); font-weight: 600; }
+.transport-peer { vertical-align: top; }
+.linkish {
+  background: none; border: 0; padding: 0; cursor: pointer;
+  color: var(--accent); font: inherit; text-align: left;
+}
+.linkish:hover { text-decoration: underline; }

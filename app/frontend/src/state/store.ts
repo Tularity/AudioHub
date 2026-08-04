@@ -42,8 +42,9 @@ export interface ConnError {
 }
 
 export interface LocalSettings {
-  latency: string;
-  quality: string;
+  // plan §15：`latency` / `quality` 从这里走了。它们是**每对端 × 每方向**的
+  // 选择（`PeerState.transport`），一台机器上有 N×4 个，缓存一份「全局值」
+  // 只会在首帧画出一个谁都不对应的档。
   removeVirtual: boolean;
   /** plan §13：`consumerMode` 改名为 `mode`，取值多了 `share`。 */
   mode: AppMode;
@@ -117,7 +118,7 @@ function loadSettings(): LocalSettings {
   // 任何时候 daemon 的值都覆盖它——见 state/mode.ts 的 requestedMode/effectiveMode。
   // 默认与 daemon 的 `StoredSettings::default` 一致（plan §13：共享模式）。这只是
   // 首帧兜底，daemon 的回包一到就被覆盖。
-  const dft: LocalSettings = { latency: 'min', quality: 'auto', removeVirtual: false, mode: 'share' };
+  const dft: LocalSettings = { removeVirtual: false, mode: 'share' };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (raw) {
@@ -323,8 +324,6 @@ export const actions = {
       const m = parseMode(d.mode);
       if (m) settings.mode = m;
       if (typeof d.remove_virtual_on_disconnect === 'boolean') settings.removeVirtual = d.remove_virtual_on_disconnect;
-      if (typeof d.latency === 'string') settings.latency = d.latency;
-      if (typeof d.quality === 'string') settings.quality = d.quality;
       saved = settings;
       return { daemonSettings: d, settingsSupported: true, settings };
     });

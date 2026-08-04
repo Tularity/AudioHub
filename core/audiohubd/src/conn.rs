@@ -504,6 +504,8 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
             backend,
             simulate_loss_pct,
             volume_sync,
+            rx_latency,
+            tx_quality,
             ..
         } => {
             let reply = match handle_remote_open(
@@ -519,6 +521,8 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 backend.as_deref(),
                 simulate_loss_pct,
                 volume_sync,
+                rx_latency.as_deref(),
+                tx_quality.as_deref(),
             ) {
                 Ok(()) => SessionMsg::AcceptStream { stream_id },
                 Err(e) => SessionMsg::RejectStream { stream_id, reason: format!("{e:#}") },
@@ -545,6 +549,66 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 r.lost = r.lost.saturating_add(lost);
                 r.iv_loss_pct = loss_pct;
                 r.iv_jitter_ms = jitter_ms;
+            }
+        }
+        // plan §15：对端（消费者）要求本机把**执行器在本机这一侧**的档位改掉。
+        //
+        // 三条断言，全部会计数、都不静默：
+        //   A 流必须属于这条连接（`owned_session`）——`stream_id` 在 daemon 内
+        //     是全局的，不查归属的话，共享模式下同时服务两台机器时，其中一台
+        //     可以去调另一台那条流的 jitter buffer。
+        //   B 执行器必须真的在本地这一侧（`rx_latency ⇒ 有 rx`）。不成立说明
+        //     对端把交叉的那半边搞反了，而那种错误的自然表现恰恰是「什么都
+        //     没发生」。
+        //   C §13 互斥：只有共享模式的机器接受外来档位。判据取**本机**的
+        //     `effective_mode`，不取对端自报的 `ModeState`——把通告当权威会把
+        //     防中继的闸门放到线的错误一侧。
+        SessionMsg::SetTransport { stream_id, rx_latency, tx_quality } => {
+            // 断言 C **先于**断言 A：§13 问的是「这台机器此刻允不允许被指挥」，
+            // 与是哪一条流无关。放在归属校验之后的话，一台处于使用端模式的机器
+            // 收到一个陌生 stream_id 时会先撞归属校验，于是那条互斥线**永远不会
+            // 被执行到**——一道理论上不可达、实际上也不可达的闸门，等于没有。
+            if let Some(why) = haldev::refuse_being_used(haldev::effective_mode(inner)) {
+                dlog!(
+                    "[audiohubd] 拒绝 {} 对流 {stream_id} 的 set_transport：{why}",
+                    conn.fp
+                );
+                lk(&inner.servo_site).bad_target();
+                return false;
+            }
+            let Some(e) = owned_session(inner, conn, stream_id, "set_transport") else {
+                // 归属校验没过（或流已经不在了）。计数，否则这条丢失完全不可见。
+                lk(&inner.servo_site).bad_target();
+                return false;
+            };
+            let mut bad = false;
+            if let Some(v) = &rx_latency {
+                if e.rx.is_some() {
+                    *lk(&e.pushed.rx_latency) = audiohub_ipc::LatencyTarget::parse(v);
+                } else {
+                    bad = true;
+                }
+            }
+            if let Some(v) = &tx_quality {
+                if e.tx.is_some() {
+                    *lk(&e.pushed.tx_quality) = audiohub_ipc::QualityTarget::parse(v);
+                } else {
+                    bad = true;
+                }
+            }
+            if bad {
+                dlog!(
+                    "[audiohubd] {} 对流 {stream_id} 下的档位在本机没有执行器\
+                     （rx={} tx={}, rx_latency={rx_latency:?} tx_quality={tx_quality:?}）",
+                    conn.fp,
+                    e.rx.is_some(),
+                    e.tx.is_some()
+                );
+                lk(&inner.servo_site).bad_target();
+            } else {
+                // 立刻灌进执行器，不等下一拍：`publish_targets` 每秒也会做一次，
+                // 但那一秒里跑的是旧档位，而「修改即生效」是这条路冻结的形状。
+                crate::publish_targets(inner, std::slice::from_ref(&e));
             }
         }
         SessionMsg::VolumeSet { stream_id, scalar, muted, src } => {
@@ -892,6 +956,8 @@ fn handle_remote_open(
     backend: Option<&str>,
     loss: Option<f32>,
     volume_sync: bool,
+    rx_latency: Option<&str>,
+    tx_quality: Option<&str>,
 ) -> Result<()> {
     if let Some(why) = haldev::refuse_being_used(haldev::effective_mode(inner)) {
         bail!("{why}");
@@ -901,6 +967,19 @@ fn handle_remote_open(
     }
     let salt = decode_media_salt(media_salt_b64)?;
     claim_stream_id(inner, conn, stream_id)?;
+    // plan §15：档位的初值随 `OpenStream` 一起到，于是从第一个媒体包起对端要的
+    // 档位就在生效。只有增量消息的话，这中间有一个窗口跑我们自己的默认值——
+    // 那正是「我设的值此刻没有在生效」这一种最难解释的现象。
+    //
+    // 未表态（`None`）保持默认，**不写成 auto**：两者在这里的执行上相同，但
+    // 在 `peers.list` 的回显上不同（「未设定 · 按自动运行」vs「对方要求 auto」）。
+    let pushed = Arc::new(crate::PushedTransport::default());
+    if let Some(v) = rx_latency {
+        *lk(&pushed.rx_latency) = audiohub_ipc::LatencyTarget::parse(v);
+    }
+    if let Some(v) = tx_quality {
+        *lk(&pushed.tx_quality) = audiohub_ipc::QualityTarget::parse(v);
+    }
     match dir {
         // opener sends media -> we receive; verify_freq applies here
         DIR_SEND => {
@@ -931,6 +1010,7 @@ fn handle_remote_open(
                     replay: None, // the opener re-opens it after a reconnect
                     origin: SessionOrigin::Peer,
                     peer_lat: Arc::new(PeerLatCell::new()),
+                    pushed: pushed.clone(),
                 },
             );
         }
@@ -966,6 +1046,7 @@ fn handle_remote_open(
                     replay: None,
                     origin: SessionOrigin::Peer,
                     peer_lat: Arc::new(PeerLatCell::new()),
+                    pushed: pushed.clone(),
                 },
             );
         }
@@ -1456,6 +1537,59 @@ fn alloc_stream_id(inner: &DaemonInner) -> u32 {
     }
 }
 
+/// plan §15：这条流上**要推给对端**的那半边档位。
+///
+/// # 每一端推的是「执行器在对面」的那个旋钮
+///
+/// 两个档位的执行器在相反的端上（延迟 = 接收侧的 jitter buffer，质量 =
+/// 发送侧的阶梯格号），所以消费者设的四个值里跨到线上的是**交叉的一半**：
+///
+/// | 本机开的这条流 | 对端手上有 | 推过去的 |
+/// |---|---|---|
+/// | `consuming`（mic：本机收） | `tx` | `tx_quality` = 本机的 `recv.quality` |
+/// | 否（spk：本机发） | `rx` | `rx_latency` = 本机的 `send.latency` |
+///
+/// 另一半（`recv.latency` / `send.quality`）的执行器就在本机，由
+/// `publish_targets` 直接灌进本机那条流的原子量，**不上线**。
+///
+/// 照 plan §15 裁定 3 的字面「把 `send.*` 整组推过去」会得到：`send.quality`
+/// 推到对端后无处执行（那条流在对端是 `dir=recv`，没有 `tx`），而本机的
+/// `tx.rung` 没人写 ⇒ 拖「发送音质」滑条线上采样率纹丝不动。设了、存了、
+/// 回显了、媒体面一个字节没变——本项目栽过六次的那个形状。
+fn wire_transport(
+    inner: &DaemonInner,
+    fp: &str,
+    consuming: bool,
+) -> (Option<String>, Option<String>) {
+    let t = lk(&inner.peer_transport).get(fp);
+    if consuming {
+        (None, Some(t.recv.quality_target().as_wire()))
+    } else {
+        (Some(t.send.latency_target().as_wire()), None)
+    }
+}
+
+/// 档位变了：把交叉的那半边推给对端**已经在跑的**每一条流。
+///
+/// 走增量消息而不是重开流：重开 = 新 `stream_id` + 新 media salt + JB 重建 +
+/// 重新预缓冲，听感上是一次明显的断续，而「修改即生效」是这条路冻结的形状。
+///
+/// 只推**本机开的**会话（`origin != Peer`）：本机是提供者的那些流上，档位由
+/// 对端决定，我们没有资格发言。
+pub(crate) fn push_transport(inner: &Arc<DaemonInner>, fp: &str) {
+    for e in crate::snapshot_sessions(inner) {
+        if e.conn.fp != fp || e.origin == SessionOrigin::Peer {
+            continue;
+        }
+        let (rx_latency, tx_quality) = wire_transport(inner, fp, e.rx.is_some());
+        let _ = e.conn.send_msg(&SessionMsg::SetTransport {
+            stream_id: e.id,
+            rx_latency,
+            tx_quality,
+        });
+    }
+}
+
 /// IPC and CLI entry point. Everything opened this way is a USER session: the
 /// device coordinator may never close one (spec-m5b §5.6).
 pub(crate) fn open_session(
@@ -1598,6 +1732,13 @@ pub(crate) fn open_session_from(
         }
     };
 
+    // plan §15：档位在**发这条消息的这一刻**从 `inner.peer_transport` 现读，
+    // **不进 `OpenSessionParams`**。
+    //
+    // 进了参数就会被 `SessionEntry.replay` 冻结，而重放是断线重连唯一的开流
+    // 路径——于是「用户在断线期间改的档位会被静默还原成断线前的值」。三个
+    // 开流入口（UI / 模式 B 设备协调器 / 断线重放）因此天然一致。
+    let (rx_latency, tx_quality) = wire_transport(inner, &conn.fp, consuming);
     let open = SessionMsg::OpenStream {
         stream_id,
         kind: params.kind.clone(),
@@ -1611,6 +1752,8 @@ pub(crate) fn open_session_from(
         backend: params.backend.clone(),
         simulate_loss_pct: params.simulate_loss_pct,
         volume_sync: vol_sync,
+        rx_latency,
+        tx_quality,
     };
     if let Err(e) = conn.send_msg(&open) {
         unwind(inner, &conn);
@@ -1643,6 +1786,7 @@ pub(crate) fn open_session_from(
             replay,
             origin,
             peer_lat: Arc::new(PeerLatCell::new()),
+            pushed: Arc::new(crate::PushedTransport::default()),
         }
     } else {
         let shared = Arc::new(TxShared::new());
@@ -1674,6 +1818,7 @@ pub(crate) fn open_session_from(
             replay,
             origin,
             peer_lat: Arc::new(PeerLatCell::new()),
+            pushed: Arc::new(crate::PushedTransport::default()),
         }
     };
     // Liveness is re-checked under the SAME lock that inserts. A peer that
@@ -1717,6 +1862,14 @@ pub(crate) fn forget_peer(inner: &Arc<DaemonInner>, fp: &str) {
             if s.remove_by_fingerprint(fp) {
                 let _ = s.save();
             }
+        }
+    }
+    // plan §15：这台对端的四个档位一并清掉。留着的话，重新配对同一台机器会
+    // **静默继承**上一段关系的档位——「我明明没设过 300」的又一种成因。
+    {
+        let mut t = lk(&inner.peer_transport);
+        if t.remove(fp) {
+            let _ = t.save(&inner.cfg_dir);
         }
     }
     reconnect::disarm(inner, fp);

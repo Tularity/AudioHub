@@ -8,6 +8,7 @@ import { volumeText } from '../components/VolumeControl';
 import { fmt, sessionFlow, dirLabel } from '../lib/fmt';
 import { t, joinPhrases } from '../i18n';
 import { actions, useStore } from '../state/store';
+import { PeerTransportCard } from '../components/PeerTransport';
 import { peerDeviceRows, halReasonText, halDeviceOf, deviceStateLabel, isModeB } from '../state/mode';
 import { refreshPeers, rpc } from '../state/connection';
 import type { PeerState, SessionInfo, VolumeState } from '../ipc/types';
@@ -286,6 +287,11 @@ export function DetailView() {
           </div>
         </div>
       </section>
+
+      {/* plan §15：传输档位紧跟身份之后、会话列表之前。
+          控件在只读表格之前；且用户点进详情页最常见的两个意图是「这是谁」与
+          「调它」。 */}
+      <PeerTransportCard peer={peer} />
 
       <AliasCard peer={peer} />
       <DevicesCard peer={peer} />

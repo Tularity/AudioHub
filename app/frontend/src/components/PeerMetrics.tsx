@@ -1,8 +1,37 @@
-// 对端卡片的一级指标区：延迟 + 音质，以及可就地展开的分段明细。
+// 对端卡片的一级指标区：**按方向分成两块**，每块一行延迟 + 音质 + 电平/码率，
+// 可就地展开该方向的分段明细。
 //
-// 为什么是「就地展开」而不是跳诊断页（规格 §2.3）：排障时人要**边听边看数字变**，
-// 跳页会打断这个循环。诊断页回答的是另一个问题——「这一分钟怎么变的、大头一直在
-// 哪一段」，那是时间序列，不是此刻的快照。
+// ## 为什么分方向（2026-08-04 事故，本文件是事故现场）
+//
+// 改版前这里是：
+//
+//     <PeerMetrics fp={fp} peer={peer} sess={micS || spkS} />
+//
+// `micS`（取对方麦克风，recv）优先，**`spk/send` 那条从未被渲染过**。现场两条
+// 通路同时在跑：`spk/send` sum≈105 ms、`mic/recv` sum≈170 ms，屏幕上只有 170，
+// 而四段色带把 `hal_mic` 的 136 ms 归进 `playback` 段、显示成「播放 136」——
+// **没有一个字说明这是麦克风方向的尾级**。一个理性的用户读到「延迟 170、
+// 播放占 136」，唯一自然的结论就是「扬声器那边慢」，而扬声器那条实测 105，
+// 快 62 %，且一次都没上过屏。
+//
+// 所以病灶不是 `readLatency`（它诚实地报告了喂给它的那条会话），是**上层用
+// `||` 在两条真实存在的通路里选了一条，还没在界面上留下"这是哪一条"的痕迹**。
+// 修法只能是：两条都渲染，各自带方向标签。
+//
+// ## 顺带修掉的第二个缺陷
+//
+// `micS`/`spkS` 只匹配**使用端**的两种 `(kind, dir)` 组合。共享模式下本机跑的
+// 是 `mic/send` 与 `spk/recv`，两者都匹配不上 ⇒ 指标区恒显示「未建立通路」，
+// 而隔壁 `inbound-mic-<fp>` 隐私横幅同时亮着。同一张卡上下自相矛盾。
+// 分栏之后判据换成 `dir`，四种组合**全部**落进某一栏。
+//
+// ## 同方向可以有多条会话
+//
+// `conn.rs` 的 `MAX_STREAMS_PER_CONN = 16`，去重只按 `stream_id`，**从不按
+// `(peer, kind, dir)`**；`peers.card.inboundMicN`（「对方正在取用本机麦克风
+// （{n} 路）」）这条语料的存在本身就是证据。所以这里**不许再用 `find`**——
+// 那只是把「两个方向里选一个」降级成「同方向 N 条里选第一条」，同一个 bug
+// 换了个轴。见 `pickWorst`。
 //
 // 读数一律走 lib/metrics 的两个读取入口；缺失即「—」，绝不用 0 填补
 //（见 lib/metrics.ts 顶部的红线）。
@@ -11,16 +40,17 @@ import { useState } from 'react';
 import { fmt } from '../lib/fmt';
 import { t, joinPhrases } from '../i18n';
 import { stageChips } from '../lib/stagefacts';
+import { Meter } from './Controls';
 import {
   LATENCY_SEGMENTS, LATENCY_STAGES, SEGMENT_LABEL, QUALITY_DOTS, QUALITY_PARTS,
   QUALITY_PART_DESC, QUALITY_PART_NAME,
   confidenceKey, coversWholeChain, isLowerBound, isQualityMeasuring, latencyGrade,
   latencyGradeKey, latencyTone, latencyValueKey, medianOf5, qualityDots,
   qualityGradeTextKey, qualityTone, qualityWorstKey,
-  readLatency, readPeerNet, readQuality, stageHost,
+  pickWorst, readLatency, readPeerNet, readQuality, segmentDominantStage, stageHost,
 } from '../lib/metrics';
 import type {
-  LatencyReading, PeerNetReading, QualityReading, StageReading, StageSpec,
+  Dir, LatencyReading, PeerNetReading, QualityReading, StageReading, StageSpec,
 } from '../lib/metrics';
 import { useStore } from '../state/store';
 import type { PeerState, SessionInfo } from '../ipc/types';
@@ -52,9 +82,8 @@ function stageText(r: StageReading | undefined): string {
  * 历史序列由 store 提供（`pushMaybe` 保证缺读数时不入列，所以序列里不会混进 0）。
  * 就地展开的明细**保持瞬时**：排障看的就是那一下的抖动，中位数会把它抹平。
  */
-function LatencyCell({ fp, lat, series, open, onToggle }: {
-  fp: string; lat: LatencyReading | undefined; series: number[];
-  open: boolean; onToggle: () => void;
+function LatencyCell({ fp, dir, lat, series }: {
+  fp: string; dir: Dir; lat: LatencyReading | undefined; series: number[];
 }) {
   // 序列还没攒起来（首帧）就退回瞬时值——**不退回 undefined**：那会让刚建立的
   // 通路在第一秒显示「—」，而我们明明已经有一个读数了。
@@ -70,85 +99,83 @@ function LatencyCell({ fp, lat, series, open, onToggle }: {
   // 否则 ≥474 ms 孤零零挂在那里，仍然会被读成端到端总延迟。
   const scope = typeof ms === 'number' && !whole ? t('metric.latency.scopeLocal') : '';
 
+  const why = joinPhrases([
+    lower && whole ? t('metric.latency.lowerBoundWhy') : null,
+    lat && lat.deviceUnreliable ? t('latency.conf.deviceUnreliable') : null,
+  ]);
+
   let value: string;
   if (typeof ms === 'number') value = t(latencyValueKey(lat), { ms: fmt.int(ms) });
   else if (lat && lat.confidence === 'converging') value = t('metric.latency.measuring');
   else if (lat && lat.confidence === 'unavailable') value = t('metric.latency.unsupported');
   else value = t('metric.latency.none');
 
-  // 「≥」的理由必须能被读到，否则它看起来只是个装饰符号（plan §7.6 补充裁定）。
-  const title = joinPhrases([
-    scope ? t('metric.latency.scopeLocalWhy') : null,
-    lower && whole ? t('metric.latency.lowerBoundWhy') : null,
-    lat && lat.deviceUnreliable ? t('latency.conf.deviceUnreliable') : null,
-    t('metric.latency.footnote'),
-  ]);
-
-  // aria-label **替换**整个可访问名，所以它必须把值一起带上：只写「查看分段」会让
-  // 读屏用户永远听不到这次改版唯一新增的一级信息。范围标记同样进名字——对读屏
-  // 用户来说，「这不是端到端」是比等级词更要紧的一句。展开态由 aria-expanded 表达。
   return (
-    <button
-      type="button"
-      className="metric-cell"
-      data-testid={`metric-latency-${fp}`}
-      aria-expanded={open}
-      aria-controls={`latency-detail-${fp}`}
-      aria-label={joinPhrases([
-        t('metric.latency.label'),
-        value,
-        grade ? t(latencyGradeKey(grade)) : null,
-        scope || null,
-        t(open ? 'metric.latency.collapse' : 'metric.latency.expand'),
-      ])}
-      title={title}
-      onClick={(e) => { e.stopPropagation(); onToggle(); }}
-    >
+    <span className="metric-cell" data-testid={`metric-latency-${dir}-${fp}`}>
       <span className="metric-cap">{t('metric.latency.label')}</span>
       {/* 没有等级就没有色阶：给一个只覆盖半条链路的数字上色，等于替它做了那个
           不成立的端到端判断。此时用正文色（既不是 tone-*，也不是「读不到」的暗色）。 */}
+      {/* 「≥」的理由挂在数字自己身上。此前它是数字旁边一枚独立的 `?` 角标——
+          实测在 320px 卡宽上，那 12px + 一处 gap 正好把等级词挤成
+          「可用于...」，而等级词才是这一格面向用户的那一半，数字只是它的依据。
+          理由没有丢：它进了这个 span 的 title，而「≥」本身就是可见的提示符。 */}
       <span
         className={`metric-val${grade ? ` tone-${latencyTone(grade)}` : typeof ms === 'number' ? '' : ' unknown'}`}
-        data-testid={`metric-latency-value-${fp}`}
+        data-testid={`metric-latency-value-${dir}-${fp}`}
+        title={why || undefined}
       >
         {value}
       </span>
-      <span className="metric-grade" data-testid={`metric-latency-grade-${fp}`} hidden={!grade}>
+      <span className="metric-grade" data-testid={`metric-latency-grade-${dir}-${fp}`} hidden={!grade}>
         {grade ? t(latencyGradeKey(grade)) : ''}
       </span>
-      <span className="metric-scope" data-testid={`metric-latency-scope-${fp}`} hidden={!scope}>
+      <span className="metric-scope" data-testid={`metric-latency-scope-${dir}-${fp}`} hidden={!scope}>
         {scope}
       </span>
-      <span className={`metric-chev${open ? ' open' : ''}`} aria-hidden="true" />
-    </button>
+    </span>
   );
 }
 
-function LatencyBand({ fp, lat }: { fp: string; lat: LatencyReading | undefined }) {
+/**
+ * 四段色带 + 四段数字。**双栏之后它下沉进展开区**，一级界面上不再出现。
+ *
+ * 这不是为简洁而藏，是因为它在一级界面上会**撒谎**：段名是按物理流向定的
+ * （`lib/metrics.ts` 的 `LATENCY_STAGES`），`hal_mic`（虚拟麦克风环）与
+ * `play_ring`（真实播放环）并列归在 `playback` 段。接收方向的 136 ms 全在
+ * `hal_mic` 上，一级界面却写着「播放 136」——用户据此去查扬声器，一查一个准
+ * 地查错方向。放进展开区之后它紧挨着 `StageRow`（带级名与「本机 / 对方主机」），
+ * 段名不再是唯一线索。`title` 里再点名这一段此刻的大头是哪一级，双保险。
+ */
+function LatencyBand({ fp, dir, lat }: { fp: string; dir: Dir; lat: LatencyReading | undefined }) {
   const vals = LATENCY_SEGMENTS.map((id) => (lat ? lat.segments[id] : undefined));
   const known = vals.some((v) => typeof v === 'number');
 
   return (
     <>
-      <div className="metric-band" data-testid={`latency-band-${fp}`} data-empty={known ? undefined : 'true'}>
+      <div className="metric-band" data-testid={`latency-band-${dir}-${fp}`} data-empty={known ? undefined : 'true'}>
         {LATENCY_SEGMENTS.map((id, i) => (
           <span
             key={id}
             className={`band-seg band-${id}`}
-            data-testid={`latency-band-${id}-${fp}`}
+            data-testid={`latency-band-${id}-${dir}-${fp}`}
             // 未知时四段等宽：那是「还没测到」的形状，不是「四段一样长」的结论。
             style={{ flexGrow: known ? Math.max(0.001, vals[i] ?? 0) : 1 }}
           />
         ))}
       </div>
-      <div className="metric-segs" data-testid={`latency-segs-${fp}`}>
+      <div className="metric-segs" data-testid={`latency-segs-${dir}-${fp}`}>
         {LATENCY_SEGMENTS.map((id, i) => {
           const v = vals[i];
+          // 这一段此刻的大头是哪一级。段名是静态的、按物理流向定的，而同一段里
+          // 并列着好几级（`playback` 段有 play_ring / bridge_ring / hal_mic 三条
+          // **并行**尾级）——不点名就会把「虚拟麦克风环」读成「播放」。
+          const dom = lat ? segmentDominantStage(lat, id) : undefined;
           return (
             <span
               key={id}
               className="seg-item"
-              data-testid={`latency-seg-${id}-${fp}`}
+              data-testid={`latency-seg-${id}-${dir}-${fp}`}
+              title={dom ? t('latency.seg.dominant', { name: t(dom.nameKey) }) : undefined}
               style={{ flexGrow: known ? Math.max(0.001, v ?? 0) : 1 }}
             >
               <span className="seg-name">{t(SEGMENT_LABEL[id])}</span>
@@ -169,13 +196,13 @@ function LatencyBand({ fp, lat }: { fp: string; lat: LatencyReading | undefined 
  * 就把整行占满，**饱和 / 丢弃量 / 漂移在实际渲染里从来没有被看见过**。字段接上了
  * 但看不到，和没接上是同一个结果。
  */
-function StageRow({ fp, spec, r, side }: {
-  fp: string; spec: StageSpec; r: StageReading | undefined; side: 'send' | 'recv' | undefined;
+function StageRow({ fp, dir, spec, r, side }: {
+  fp: string; dir: Dir; spec: StageSpec; r: StageReading | undefined; side: 'send' | 'recv' | undefined;
 }) {
   const host = stageHost(spec, r, side);
   const chips = stageChips(r);
   return (
-    <div className="stage-item" data-testid={`latency-stage-${spec.id}-${fp}`}>
+    <div className="stage-item" data-testid={`latency-stage-${spec.id}-${dir}-${fp}`}>
       <div className="stage-row">
         <span className="stage-name" title={t(spec.descKey)}>{t(spec.nameKey)}</span>
         <span className="stage-host" hidden={!host}>
@@ -183,12 +210,12 @@ function StageRow({ fp, spec, r, side }: {
         </span>
         <span className={`stage-ms${r && typeof r.ms === 'number' ? '' : ' unknown'}`}>{stageText(r)}</span>
       </div>
-      <div className="stage-facts" hidden={chips.length === 0} data-testid={`latency-stage-facts-${spec.id}-${fp}`}>
+      <div className="stage-facts" hidden={chips.length === 0} data-testid={`latency-stage-facts-${spec.id}-${dir}-${fp}`}>
         {chips.map((c) => (
           <span
             key={c.id}
             className={`stage-chip${c.warn ? ' warn' : ''}`}
-            data-testid={`latency-stage-${c.id}-${spec.id}-${fp}`}
+            data-testid={`latency-stage-${c.id}-${spec.id}-${dir}-${fp}`}
             title={c.title}
           >
             {c.text}
@@ -199,39 +226,9 @@ function StageRow({ fp, spec, r, side }: {
   );
 }
 
-function LatencyDetail({ fp, lat }: { fp: string; lat: LatencyReading | undefined }) {
-  const stale = lat && typeof lat.peerAgeS === 'number' && lat.peerAgeS > PEER_STALE_S
-    ? lat.peerAgeS
-    : undefined;
-  return (
-    <div className="metric-detail" id={`latency-detail-${fp}`} data-testid={`latency-detail-${fp}`}>
-      {LATENCY_STAGES.map((s) => (
-        <StageRow key={s.id} fp={fp} spec={s} r={lat ? lat.stages[s.id] : undefined} side={lat?.side} />
-      ))}
-      {/* P1 的实测采样年龄。它与 Σ 各级是两条**独立**路径（墙钟差 vs 分级模型求和），
-          差值就是上面那行「未归属」——所以只有它在场时那一行才可能有数。 */}
-      <p className="metric-foot" data-testid={`latency-e2e-${fp}`} hidden={typeof lat?.e2eMs !== 'number'}>
-        {typeof lat?.e2eMs === 'number' ? t('latency.detail.e2e', { ms: fmt.int(lat.e2eMs) }) : ''}
-      </p>
-      <p className="metric-foot" data-testid={`latency-peer-stale-${fp}`} hidden={stale === undefined}>
-        {stale === undefined ? '' : t('latency.conf.peerStale', { s: fmt.int(stale) })}
-      </p>
-      <p className="metric-foot" data-testid={`latency-confidence-${fp}`}>
-        {/* convergingS 缺失时**不能兜底成 0**：「约 0 秒后可用」与事实正好相反。
-            fmt.int(undefined) 自己会出「—」，读作「约 — 秒后可用」——难看，但不撒谎。 */}
-        {lat
-          ? t(confidenceKey(lat.confidence), { s: fmt.int(lat.convergingS) })
-          : t('metric.latency.footnote')}
-      </p>
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------- 音质
 
-function QualityCell({ fp, q, open, onToggle }: {
-  fp: string; q: QualityReading | undefined; open: boolean; onToggle: () => void;
-}) {
+function QualityCell({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading | undefined }) {
   const grade = q ? q.grade : undefined;
   const dots = qualityDots(grade);
   const khz = q ? q.bandwidthKhz : undefined;
@@ -244,38 +241,20 @@ function QualityCell({ fp, q, open, onToggle }: {
   const measuring = isQualityMeasuring(q);
   const gradeKey = qualityGradeTextKey(q);
   const gradeText = gradeKey ? t(gradeKey) : '';
-  // 出处标记。**必须在数字旁边**，不能只进 title：本机在这条通路上是发送侧、
-  // 根本没有音质测点，不标就等于让这张卡宣称了一个它测不出来的结论。
+  // 出处标记。**必须在数字旁边**，不能只进 title：本机在发送方向上没有音质测点、
+  // 根本量不到，不标就等于让这张卡宣称了一个它测不出来的结论。
+  //
+  // 它**只在一栏出现**这件事本身就在教用户「两个方向不对称」，比任何一句解释都省。
+  // 注意判据是 `fromPeer`（数据驱动，见 metrics.ts 的 `fromPeer: !own`），
+  // **不是方向**：一条 recv 会话回退到 `peer_quality` 时它同样该出现。
   const fromPeer = !!q?.fromPeer;
-  const title = joinPhrases([
-    fromPeer ? t('metric.quality.fromPeerWhy') : null,
-    measuring ? t('metric.quality.measuringWhy') : null,
-    grade && q?.partial ? t('metric.quality.partial') : null,
-  ]);
 
-  // 与延迟格同理：可访问名要带上值，「●●●○」是 aria-hidden 的装饰，等级词是它的文字对应物。
   return (
-    <button
-      type="button"
-      className="metric-cell"
-      data-testid={`metric-quality-${fp}`}
-      aria-expanded={open}
-      aria-controls={`quality-detail-${fp}`}
-      aria-label={joinPhrases([
-        t('metric.quality.label'),
-        value,
-        gradeText || null,
-        // 出处进可访问名：对读屏用户来说「这个数是对面量的」和等级词一样要紧。
-        fromPeer ? t('metric.quality.fromPeer') : null,
-        t(open ? 'metric.quality.collapse' : 'metric.quality.expand'),
-      ])}
-      title={title || undefined}
-      onClick={(e) => { e.stopPropagation(); onToggle(); }}
-    >
+    <span className="metric-cell" data-testid={`metric-quality-${dir}-${fp}`}>
       <span className="metric-cap">{t('metric.quality.label')}</span>
       <span
         className="quality-dots"
-        data-testid={`metric-quality-dots-${fp}`}
+        data-testid={`metric-quality-dots-${dir}-${fp}`}
         data-state={measuring ? 'measuring' : undefined}
         aria-hidden="true"
       >
@@ -287,14 +266,14 @@ function QualityCell({ fp, q, open, onToggle }: {
           这一态里是**已经测出来的真读数**，把它调暗等于说它也没测到——而那正是
           这次要修的那种「让不知道和坏消息长得一样」的呈现。 */}
       <span
-        className={`metric-val${grade ? ` tone-${qualityTone(grade)}` : typeof khz === 'number' ? '' : ' unknown'}`}
-        data-testid={`metric-quality-value-${fp}`}
+        className={`metric-val small${grade ? ` tone-${qualityTone(grade)}` : typeof khz === 'number' ? '' : ' unknown'}`}
+        data-testid={`metric-quality-value-${dir}-${fp}`}
       >
         {value}
       </span>
       <span
         className={`metric-grade${measuring ? ' measuring' : ''}`}
-        data-testid={`metric-quality-grade-${fp}`}
+        data-testid={`metric-quality-grade-${dir}-${fp}`}
         hidden={!gradeText}
       >
         {gradeText}
@@ -303,18 +282,17 @@ function QualityCell({ fp, q, open, onToggle }: {
           dim 而不是 warn：这不是警告——读数是真的，只是量它的人在对面。 */}
       <span
         className="metric-origin"
-        data-testid={`quality-frompeer-${fp}`}
+        data-testid={`quality-frompeer-${dir}-${fp}`}
         title={t('metric.quality.fromPeerWhy')}
         hidden={!fromPeer}
       >
         {fromPeer ? t('metric.quality.fromPeer') : ''}
       </span>
-      <span className={`metric-chev${open ? ' open' : ''}`} aria-hidden="true" />
-    </button>
+    </span>
   );
 }
 
-function QualityDetail({ fp, q }: { fp: string; q: QualityReading | undefined }) {
+function QualityParts({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading | undefined }) {
   // 三分量物理上互不换算，所以逐条列出而不是给一个 0–100 分：分数假装可加，
   // 而「73 分」回答不了「哪一项拖后腿」（规格 §4.4）。
   function partValue(id: (typeof QUALITY_PARTS)[number]): string {
@@ -335,9 +313,9 @@ function QualityDetail({ fp, q }: { fp: string; q: QualityReading | undefined })
   }
 
   return (
-    <div className="metric-detail" id={`quality-detail-${fp}`} data-testid={`quality-detail-${fp}`}>
+    <div className="quality-parts" data-testid={`quality-detail-${dir}-${fp}`}>
       {QUALITY_PARTS.map((id) => (
-        <div key={id} className="stage-row" data-testid={`quality-part-${id}-${fp}`}>
+        <div key={id} className="stage-row" data-testid={`quality-part-${id}-${dir}-${fp}`}>
           <span className="stage-name" title={t(QUALITY_PART_DESC[id])}>{t(QUALITY_PART_NAME[id])}</span>
           <span className="stage-note" hidden={q?.worst !== id}>
             {q?.worst === id ? t(qualityWorstKey(id)) : ''}
@@ -347,26 +325,17 @@ function QualityDetail({ fp, q }: { fp: string; q: QualityReading | undefined })
       ))}
       {/* 出处整句。角标只有四个字（「对端测得」），展开明细的人要的是那句完整的
           解释——为什么本机给不出这三个数字。 */}
-      <p
-        className="metric-foot"
-        data-testid={`quality-frompeer-note-${fp}`}
-        hidden={!q?.fromPeer}
-      >
+      <p className="metric-foot" data-testid={`quality-frompeer-note-${dir}-${fp}`} hidden={!q?.fromPeer}>
         {q?.fromPeer ? t('metric.quality.fromPeerWhy') : ''}
       </p>
       {/* 等级已经触底时，缺一块板改不了结论——于是 grade 有值而 partial 仍为真。
-          这两件事都要说：结论成立，但它是在缺一项的情况下得出的（只会更低）。
-          等级根本不成立时这行不出，那个状态由格子里的「测量中…」承担。 */}
-      <p className="metric-foot" data-testid={`quality-partial-${fp}`} hidden={!(q?.grade && q?.partial)}>
+          这两件事都要说：结论成立，但它是在缺一项的情况下得出的（只会更低）。 */}
+      <p className="metric-foot" data-testid={`quality-partial-${dir}-${fp}`} hidden={!(q?.grade && q?.partial)}>
         {q?.grade && q?.partial ? t('metric.quality.partial') : ''}
       </p>
       {/* 窗口长度**没有兜底值**：`?? 10` 会让一个什么都没测的窗口宣称「最近 10 秒」，
           和用 0 填补缺失分项是同一类错误，只是 10 更难被发现。读不到就整行不出。 */}
-      <p
-        className="metric-foot"
-        data-testid={`quality-window-${fp}`}
-        hidden={typeof q?.windowS !== 'number'}
-      >
+      <p className="metric-foot" data-testid={`quality-window-${dir}-${fp}`} hidden={typeof q?.windowS !== 'number'}>
         {typeof q?.windowS === 'number' ? t('quality.part.window', { s: fmt.int(q.windowS) }) : ''}
       </p>
     </div>
@@ -378,8 +347,12 @@ function QualityDetail({ fp, q }: { fp: string; q: QualityReading | undefined })
 /**
  * 「连上了，但还没人在用」时唯一能给出的延迟读数。
  *
- * 这一格与有会话时那个 22px 的端到端总数是**两个量**，所以它在四个维度上都长得
- * 不一样，任何一个维度单独被看到都不会误读：
+ * 它属于**连接**，不属于任何一个方向（`PeerState.net_ms` 是控制面 min-RTT/2，
+ * 一条连接一个值）——所以它在**卡片级**，绝不进任一方向栏：进了栏就等于宣称
+ * 「这个方向的网络是 0.6 ms、那个方向不是」，而它们是同一条链路。
+ *
+ * 这一格与有会话时那个端到端总数是**两个量**，所以它在四个维度上都长得不一样，
+ * 任何一个维度单独被看到都不会误读：
  *
  *   1. 标签不是「延迟」而是「网络单程」；
  *   2. 值自带「（仅网络）」后缀——被截图、被复制走时它跟着走；
@@ -409,10 +382,7 @@ function NetOnly({ fp, net }: { fp: string; net: PeerNetReading }) {
       <span className="metric-cap">{t('metric.latency.netOnlyLabel')}</span>
       {/* 不上色阶：色阶是「这个延迟好不好用」的判断，而在一段网络时间上做那个
           判断本身就不成立——缓冲与声卡还一个数都没有。 */}
-      <span
-        className={`metric-val${known ? '' : ' unknown'}`}
-        data-testid={`peer-netonly-value-${fp}`}
-      >
+      <span className={`metric-val${known ? '' : ' unknown'}`} data-testid={`peer-netonly-value-${fp}`}>
         {value}
       </span>
       <span className="metric-scope">{t('metric.latency.netOnlyScope')}</span>
@@ -420,84 +390,230 @@ function NetOnly({ fp, net }: { fp: string; net: PeerNetReading }) {
   );
 }
 
-// ---------------------------------------------------------------- 指标区
+// ---------------------------------------------------------------- 一个方向
 
 /**
- * `sess` 是这张卡上用来读指标的那条通路：优先「取对方麦克风」（recv），否则
- * 「送对方扬声器」（send）。取 recv 优先是因为延迟的物理定义就是这一条——从对方
- * 声卡采到、到本机声卡送出（规格 §3.2）。
+ * 一个方向的完整呈现：标题行（方向 + 延迟 + 音质）、流量行（电平 + 码率）、
+ * 可展开的明细（该方向的分段 + 逐级 + 音质三分量 + 主导权说明）。
  *
- * 无会话时整块塌成一行，但**卡片高度不变**（CSS 上有 min-height）：一排卡片里
- * 只有开了通路的那几张变高，扫一眼时像是排版坏了。
+ * ## 「未开通」与「读不到」必须长得不一样
+ *
+ * `data-empty` 那条等宽色带只表示「有会话、四段都还没读到」。**没有会话的方向
+ * 根本不画色带**，整块塌成一行灰字。两态共用一个形状的话，双栏会把这个混淆放大
+ * 成「左边有条右边没条，是坏了吗」。
+ *
+ * ## 为什么「未开通」的那一栏也要渲染
+ *
+ * 不做「只有一条时隐藏另一条」：隐藏会让用户失去「另一条没开」这条信息，
+ * 而「没开」恰恰是他下一步可能要做的操作。
  */
-export function PeerMetrics({ fp, peer, sess }: {
-  fp: string; peer: PeerState | null; sess: SessionInfo | null;
+function DirBlock({ fp, dir, list, open, onToggle, ready }: {
+  fp: string;
+  dir: Dir;
+  list: SessionInfo[];
+  open: boolean;
+  onToggle: () => void;
+  /** 仅接收方向传真：通路已就绪、只是还没有应用在用它。 */
+  ready?: boolean;
 }) {
-  const [open, setOpen] = useState<'latency' | 'quality' | null>(null);
-  // 头条数字要平滑（规格 §2.6），而平滑要历史序列——store 里已经有一条 60 点的，
-  // 由 pushStats 每秒推一点，缺读数时原地不动（所以序列里不会混进 0）。
-  // `EMPTY` 是模块级常量：每次渲染新造一个 `[]` 会让选择器的引用每帧都变。
+  const sess = pickWorst(list);
   const series = useStore((s) => (sess ? s.history[String(sess.id)]?.latency : undefined) ?? EMPTY);
   const lat = readLatency(sess);
   const q = readQuality(sess);
-  const sep = t('common.bullet');
+  const kbps = sess && sess.stats ? sess.stats.bitrate_kbps : 0;
+  const idleReady = !sess && !!ready;
 
-  // 整张卡片是可点的（进详情页），但指标区里的东西要**留在原地**：展开明细后想看清
-  // 或框选某一级的 ms 数字，冒泡上去就会跳走，展开态一并丢失。设备区（Peers.tsx）
-  // 早就防住了同一类问题，指标区不能漏。
-  const keep = (e: React.MouseEvent) => e.stopPropagation();
+  const dirLabel = t(dir === 'out' ? 'peers.card.streamOut' : 'peers.card.streamIn');
+  // 方向语义 + 延迟档主导权。**这一句是把 Settings 里那条教训搬到卡片上**：
+  // `servo_pass` 只遍历本机的接收流，发送方向的 jitter buffer 在对端、由对端
+  // 自己的档位管。不说的话，一台只发不收的使用端拖了延迟滑条会看到「两栏里
+  // 只有一栏在动」，唯一自然的结论是「设置只生效了一半」——而系统是对的。
+  const govKey = dir === 'in' ? 'peers.card.dirGovLocal' : 'peers.card.dirGovPeer';
 
-  // 无会话时唯一还活着的延迟读数：控制面的网络单程。**离线即 undefined**——
-  // 记忆里的往返时间是关于过去的陈述，挂在一台离线主机上会被读成「它现在这么快」。
-  const net = sess ? undefined : readPeerNet(peer);
+  // 这条流此刻在执行的**延迟目标**，以及它是谁定的。
+  // `null` = AUTO（没有固定目标）⇒ 整行不出：一句「目标：自动」是噪声，
+  // 而这一行存在的意义是解释一个**看起来异常大**的数字从哪来。
+  const targetMs = sess?.stats?.latency_target;
+  const fromPeer = sess?.stats?.target_from === 'peer';
+  const targetText = typeof targetMs === 'string' && targetMs !== 'auto'
+    ? t(fromPeer ? 'peers.card.targetByPeer' : 'peers.card.targetMine', { ms: targetMs })
+    : '';
 
+  // ## 没有会话时**两格指标照旧占位**（plan §14 裁定 2）
+  //
+  // 上一版在这里整块换成一行文字（「通路就绪 · 暂无应用在录音」），裁定 2
+  // 逐字否掉了那种形态：
+  //
+  // > 麦克风未使用时，延迟与音质**仍然占位显示**，以灰色表示无数据。
+  // > **不得**用「通路就绪 · 暂无应用在录音」这类纯文本把指标整块换掉——
+  // > 那让用户无法在同一位置对比两个方向。
+  //
+  // 于是 `LatencyCell` / `QualityCell` 照旧渲染，只是喂 `undefined`：
+  // 两者对空读数的既有行为就是「—」+ `.unknown` 暗色。**灰 ≠ 0**，这条红线
+  // 由那两个组件自己保证（它们从不用 0 填补），这里不许绕过它们自己画一个数。
+  //
+  // 那句状态文字并没有丢，它降级成指标行下面的一行说明——状态是状态，
+  // 数据是数据，两者不该互相顶替。
   if (!sess) {
     return (
-      <div className="peer-metrics idle" data-testid={`peer-metrics-${fp}`} onClick={keep}>
-        <div className="metric-idle">
-          {/* 连着的时候把这一格让给网络单程：此前这里恒是「延迟 —」，而「—」在
-              离线、刚连上、通路正常闲置三种情形下长得一模一样，用户从中读不出
-              「连接是通的、而且很快」这条已经实实在在测到了的事实。 */}
-          {net ? (
-            <NetOnly fp={fp} net={net} />
-          ) : (
-            <>
-              <span className="metric-cap">{t('metric.latency.label')}</span>
-              <span className="metric-val unknown">{t('metric.latency.none')}</span>
-            </>
-          )}
-          <span className="metric-sep" aria-hidden="true">{sep}</span>
-          <span className="metric-cap">{t('metric.quality.label')}</span>
-          <span className="metric-val unknown">{t('metric.quality.none')}</span>
-          <span className="metric-sep" aria-hidden="true">{sep}</span>
-          <span className="metric-idle-text" data-testid={`peer-no-session-${fp}`}>
-            {t('peers.card.noSession')}
+      <div className={`dir-block idle${idleReady ? ' ready' : ''}`} data-dir={dir} data-testid={`metric-dir-${dir}-${fp}`}>
+        <div className="dir-head idle">
+          <span className="dir-name" title={t(govKey)}>
+            <span className="dir-arrow" aria-hidden="true">{dir === 'out' ? '↑' : '↓'}</span>
+            {dirLabel}
           </span>
+          <LatencyCell fp={fp} dir={dir} lat={undefined} series={EMPTY} />
+          <QualityCell fp={fp} dir={dir} q={undefined} />
         </div>
-        {/* 缺的是哪两段、为什么现在量不到——这句必须**看得见**。只写进 title 的话，
-            不悬停鼠标的人拿到的仍然是一个孤零零的毫秒数。 */}
-        <p className="metric-foot" data-testid={`peer-netonly-note-${fp}`} hidden={!net}>
-          {net ? t('metric.latency.netOnlyNote') : ''}
+        <p className="metric-idle-text" data-testid={`peer-dir-idle-${dir}-${fp}`}>
+          {idleReady ? t('peers.card.micReady') : t('peers.card.dirIdle')}
+        </p>
+        {/* 就绪那句的理由。`mic-idle-<fp>` 这个 testid 保持不变：它标的是
+            「虚拟麦克风通了但没人用」这个**状态**，与分栏无关。 */}
+        <p className="stream-ready" data-testid={`mic-idle-${fp}`} hidden={!idleReady}>
+          {idleReady ? t('peers.card.micReadyWhy') : ''}
         </p>
       </div>
     );
   }
 
   return (
-    <div className="peer-metrics" data-testid={`peer-metrics-${fp}`} onClick={keep}>
-      <div className="metric-line">
-        <LatencyCell
-          fp={fp} lat={lat} series={series} open={open === 'latency'}
-          onToggle={() => setOpen((v) => (v === 'latency' ? null : 'latency'))}
-        />
-        <QualityCell
-          fp={fp} q={q} open={open === 'quality'}
-          onToggle={() => setOpen((v) => (v === 'quality' ? null : 'quality'))}
-        />
+    <div className="dir-block active" data-dir={dir} data-testid={`metric-dir-${dir}-${fp}`}>
+      <button
+        type="button"
+        className="dir-head"
+        aria-expanded={open}
+        aria-controls={`latency-detail-${dir}-${fp}`}
+        aria-label={joinPhrases([
+          dirLabel,
+          t(open ? 'metric.latency.collapse' : 'metric.latency.expand'),
+        ])}
+        title={joinPhrases([t(govKey), t('metric.latency.footnote')])}
+        onClick={(e) => { e.stopPropagation(); onToggle(); }}
+      >
+        <span className="dir-name">
+          <span className="dir-arrow" aria-hidden="true">{dir === 'out' ? '↑' : '↓'}</span>
+          {dirLabel}
+        </span>
+        {/* 同方向 N 条会话：把「一共几路、显示的是哪一路」说出来。不说的话，
+            一个不标来源的数字背后站着 N 个候选——正是这次事故的形态。 */}
+        <span
+          className="dir-count"
+          data-testid={`peer-dir-count-${dir}-${fp}`}
+          hidden={list.length < 2}
+          title={t('peers.card.dirMultiWhy')}
+        >
+          {list.length > 1 ? t('peers.card.dirMulti', { n: list.length }) : ''}
+        </span>
+        <LatencyCell fp={fp} dir={dir} lat={lat} series={series} />
+        <QualityCell fp={fp} dir={dir} q={q} />
+        <span className={`metric-chev${open ? ' open' : ''}`} aria-hidden="true" />
+      </button>
+      {/* plan §14 附：**用户看到 300 ms 时必须能分辨这是自己设定的目标**，
+          而不是「系统只能做到这样」。当前界面对此一个字都没说，正是本次误判
+          的直接成因。
+          目标取自**这条流的执行器**（`SessionStats.latency_target`），不是全局
+          设置——§15 之后全局设置根本不存在了，而拿别的流的目标来解释这一条，
+          就是「一个数替另一条撒谎」换了个地方。
+          `target_from` 让共享模式的机器说得出「这是对方要求的」。 */}
+      <p className="metric-target" data-testid={`metric-target-${dir}-${fp}`} hidden={!targetText}>
+        {targetText}
+      </p>
+      <div className="dir-stream" data-testid={`stream-${dir}-${fp}`}>
+        {/* ⚠ 这条不是电平，是**码率除以 900**（`Meter` 只接一个标量）。所以它与
+            右边那个 kbps 是同一个数的两种画法，不是「一件事的两个尺度」。
+            别在文案里把它讲成电平——那会让用户以为静音时它会掉下去。 */}
+        <Meter testid={`level-${dir}-${fp}`} value={(kbps || 0) / 900} />
+        <span className="stream-rate">{t('peers.card.kbps', { v: fmt.kbps(kbps) })}</span>
       </div>
-      <LatencyBand fp={fp} lat={lat} />
-      {open === 'latency' ? <LatencyDetail fp={fp} lat={lat} /> : null}
-      {open === 'quality' ? <QualityDetail fp={fp} q={q} /> : null}
+      {open ? (
+        <div className="dir-detail" id={`latency-detail-${dir}-${fp}`} data-testid={`latency-detail-${dir}-${fp}`}>
+          <LatencyBand fp={fp} dir={dir} lat={lat} />
+          {LATENCY_STAGES.map((s) => (
+            <StageRow key={s.id} fp={fp} dir={dir} spec={s} r={lat ? lat.stages[s.id] : undefined} side={lat?.side} />
+          ))}
+          {/* P1 的实测采样年龄。它与 Σ 各级是两条**独立**路径（墙钟差 vs 分级模型
+              求和），差值就是上面那行「未归属」——所以只有它在场时那一行才可能有数。 */}
+          <p className="metric-foot" data-testid={`latency-e2e-${dir}-${fp}`} hidden={typeof lat?.e2eMs !== 'number'}>
+            {typeof lat?.e2eMs === 'number' ? t('latency.detail.e2e', { ms: fmt.int(lat.e2eMs) }) : ''}
+          </p>
+          <p
+            className="metric-foot"
+            data-testid={`latency-peer-stale-${dir}-${fp}`}
+            hidden={!(lat && typeof lat.peerAgeS === 'number' && lat.peerAgeS > PEER_STALE_S)}
+          >
+            {lat && typeof lat.peerAgeS === 'number' && lat.peerAgeS > PEER_STALE_S
+              ? t('latency.conf.peerStale', { s: fmt.int(lat.peerAgeS) })
+              : ''}
+          </p>
+          <p className="metric-foot" data-testid={`latency-confidence-${dir}-${fp}`}>
+            {/* convergingS 缺失时**不能兜底成 0**：「约 0 秒后可用」与事实正好相反。 */}
+            {lat ? t(confidenceKey(lat.confidence), { s: fmt.int(lat.convergingS) }) : t('metric.latency.footnote')}
+          </p>
+          {/* 延迟档对这个方向到底有没有作用对象。一级界面上不说（那是噪声），
+              但展开明细的人正是在排「我拖了滑条为什么没反应」这条障。 */}
+          <p className="metric-foot gov" data-testid={`latency-gov-${dir}-${fp}`}>{t(govKey)}</p>
+          <QualityParts fp={fp} dir={dir} q={q} />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- 指标区
+
+/**
+ * 两个方向各一块。分栏轴是 **`dir`（本机视角）**，不是 `kind`。
+ *
+ * `kind` 是**开流方**视角，`dir` 是本机视角。`progress.md:311` 记着这个坑已经
+ * 栽过一次（「对端正在取用本机麦克风」被标成「取对方麦克风」），按 `kind` 分栏
+ * 就是再栽一次。卡片底部原有的 `.peer-streams` 本来就是按 `dir` 分的——只是
+ * 指标区没参与进去，这次把它整个吸收进来。
+ *
+ * 全卡**同一时刻至多一个展开面板**（`open` 是一个 `Dir | null`，不是两个布尔）：
+ * `spec-telemetry-ia` §2.1 冻结了「卡片就地展开只承载分段明细」，双栏之后若给
+ * 每个方向各留延迟 / 音质两个面板，一张卡会长出四个。
+ */
+export function PeerMetrics({ fp, peer, sendList, recvList, micReady }: {
+  fp: string;
+  peer: PeerState | null;
+  /** 本机在**发**的会话（`dir === 'send'`），含共享模式的 `mic/send`。 */
+  sendList: SessionInfo[];
+  /** 本机在**收**的会话（`dir === 'recv'`），含共享模式的 `spk/recv`。 */
+  recvList: SessionInfo[];
+  micReady: boolean;
+}) {
+  const [open, setOpen] = useState<Dir | null>(null);
+  const any = sendList.length > 0 || recvList.length > 0;
+
+  // 整张卡片是可点的（进详情页），但指标区里的东西要**留在原地**：展开明细后想看清
+  // 或框选某一级的 ms 数字，冒泡上去就会跳走，展开态一并丢失。
+  const keep = (e: React.MouseEvent) => e.stopPropagation();
+
+  // 无会话时唯一还活着的延迟读数：控制面的网络单程。**离线即 undefined**——
+  // 记忆里的往返时间是关于过去的陈述，挂在一台离线主机上会被读成「它现在这么快」。
+  //
+  // 有会话时它已经作为 `network` 段进了色带，卡片级那格随即让位给方向块，避免重复。
+  const net = any ? undefined : readPeerNet(peer);
+
+  return (
+    <div className={`peer-metrics${any ? '' : ' idle'}`} data-testid={`peer-metrics-${fp}`} onClick={keep}>
+      <DirBlock
+        fp={fp} dir="out" list={sendList}
+        open={open === 'out'} onToggle={() => setOpen((v) => (v === 'out' ? null : 'out'))}
+      />
+      <DirBlock
+        fp={fp} dir="in" list={recvList} ready={micReady}
+        open={open === 'in'} onToggle={() => setOpen((v) => (v === 'in' ? null : 'in'))}
+      />
+      <div className="metric-netfoot" hidden={!net}>
+        {net ? <NetOnly fp={fp} net={net} /> : null}
+        {/* 缺的是哪两段、为什么现在量不到——这句必须**看得见**。只写进 title 的话，
+            不悬停鼠标的人拿到的仍然是一个孤零零的毫秒数。 */}
+        <p className="metric-foot" data-testid={`peer-netonly-note-${fp}`}>
+          {net ? t('metric.latency.netOnlyNote') : ''}
+        </p>
+      </div>
     </div>
   );
 }

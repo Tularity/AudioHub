@@ -12,8 +12,22 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use audiohub_ipc::{LatencyTarget, Mode, QualityTarget};
+use audiohub_ipc::Mode;
 
+/// Bumped to 3 by plan §15: `latency` / `quality` **left this file** and became
+/// per-peer × per-direction (`peer_transport.json`).
+///
+/// 迁移是**删字段**，不是翻译。serde 默认忽略未知字段，所以一个 v2 文件照常
+/// 解析，`mode` / `remove_virtual_on_disconnect` / `mark_offline_devices`
+/// 全部保住，随后按 v3 重写盘。
+///
+/// **不把旧的全局值翻译成每对端值。** 把 300 写进每台对端的两个方向，等于替
+/// 用户做了一个他从未做过的决定：`send.latency = 300` 这个值在旧世界里**从来
+/// 没有存在过**（旧世界里发送方向由对端自己的档位管，实测对端是 `min`）。
+/// 凭空造一个设定值再宣布「已迁移」，与下面拒绝翻译 `consumer_mode` 是同一条
+/// 理由。用户此前的全局档位**丢失，需要按对端重设**，设置页那一块位置换成一条
+/// 迁移说明——沉默地丢掉也不行。
+///
 /// Bumped to 2 by plan §13: `consumer_mode` became `mode` and gained `share`.
 ///
 /// Nothing migrates. A v1 file simply fails to provide `mode`, so the whole
@@ -22,7 +36,7 @@ use audiohub_ipc::{LatencyTarget, Mode, QualityTarget};
 /// a provider AND a consumer at once, so both `"a"` and `"b"` are half of the
 /// answer and neither is the whole one. Choosing for the user here would
 /// silently decide which half of their setup keeps working.
-pub(crate) const SETTINGS_VERSION: u32 = 2;
+pub(crate) const SETTINGS_VERSION: u32 = 3;
 
 /// Exactly the fields this daemon owns. `effective_mode`, `hal_capacity` and
 /// `hal_used` are NOT here: they are derived at read time from what the driver
@@ -34,21 +48,6 @@ pub(crate) struct StoredSettings {
     pub mode: Mode,
     pub remove_virtual_on_disconnect: bool,
     pub mark_offline_devices: bool,
-    /// 端到端总延迟的目标：`"auto"` 或档位表里的十进制毫秒数。
-    ///
-    /// 仍然是 `String` 而不是枚举，理由只有一条：**盘上的旧值不能让整条记录
-    /// 失效**。`StoredSettings` 是 `#[derive(Deserialize)]` 的一个整体，任何
-    /// 字段解析失败 ⇒ 整个文件回落到默认值（见 `load`）。把它换成枚举之后，
-    /// 一个来自旧版本或未来版本的档位字符串会把用户的**模式**也一起重置——
-    /// 而模式是 §13 那条互斥线，重置它比丢一个档位严重得多。
-    ///
-    /// 所以：字段松，取值紧。写入口 (`settings.set`) 用
-    /// [`LatencyTarget::parse`] 严格校验并拒绝未知值，读出口用
-    /// [`StoredSettings::latency_target`] 兜底，两头都不给「静默变成别的档」
-    /// 留缝。
-    pub latency: String,
-    /// 质量档：`"auto"` 或某个**可用**档位的 id。同上，字段松取值紧。
-    pub quality: String,
 }
 
 impl Default for StoredSettings {
@@ -94,8 +93,6 @@ impl Default for StoredSettings {
             //
             // 一个用户没要求过、也不会被告知的听感变化，不该由「把默认值抄成
             // 文档里那句话」引入。想要最低延迟的人现在有一个真的能用的 `0` 档。
-            latency: audiohub_ipc::LATENCY_AUTO.to_string(),
-            quality: audiohub_ipc::QUALITY_AUTO.to_string(),
         }
     }
 }
@@ -138,8 +135,22 @@ impl StoredSettings {
     /// the failure would be silent on exactly the axis §13 exists to police
     /// ("can this machine be used"). Falling back to the default is loud in the
     /// only way that matters — the user sees the mode they did not choose.
+    ///
+    /// # 判据是 `>`，不是 `!=`（2026-08-04 实机事故）
+    ///
+    /// `!=` 把**每一次自家版本号上调**也算成「来自未来」。§15 把
+    /// `SETTINGS_VERSION` 从 2 提到 3（只是删掉 `latency`/`quality` 两个字段，
+    /// `mode` 的语义一个字没改），于是升级后第一次启动时，所有老用户的
+    /// `mode` 都被重置为 `share`——实测：磁盘上还写着 `"mode":"b"`，运行中的
+    /// daemon 却报 `mode=share`，§13 随即拆掉全部虚拟设备、会话归零、
+    /// 对端判为离线。用户没做任何操作，一次升级就把模式换掉了。
+    ///
+    /// 旧版本**必须**保住 `mode`：能读出 `mode` 字段就说明它是 §13 之后的文件，
+    /// 取值域与本 build 相同。真正不可翻译的是 §13 **之前**的 v1
+    /// （字段名还叫 `consumer_mode`），那种文件在 `load` 里就反序列化失败、
+    /// 整条记录落到默认值，根本走不到这里 —— 见 `SETTINGS_VERSION` 的注释。
     fn normalized(mut self) -> StoredSettings {
-        if self.version != SETTINGS_VERSION {
+        if self.version > SETTINGS_VERSION {
             crate::dlog!(
                 "[audiohubd] settings.json is version {} (this build writes {SETTINGS_VERSION}); \
                  keeping the file's other fields but resetting mode to {}",
@@ -148,24 +159,16 @@ impl StoredSettings {
             );
             self.mode = Mode::Share;
             self.version = SETTINGS_VERSION;
-        }
-        // 盘上的 `"min"` 是**行为守恒**地迁移到 AUTO 的，不是翻译成 `0`。
-        //
-        // `"min"` 只可能由本轮之前的 build 写下，而在那些 build 里这个字段
-        // 被读过零次 —— 那台机器实际跑的是 AUTO 那条路。把它读成 `TotalMs(0)`
-        // 会在升级的一瞬间改变一台没人动过的机器的听感（JB 50 ms -> 10 ms）。
-        //
-        // 「`"min"` 的语义等于 `0`」这件事本身是对的，`LatencyTarget::parse`
-        // 照旧那么翻 —— 那条路服务的是**明确写来**的请求（老客户端的
-        // `settings.set`），与「从盘上读到一个从未生效过的值」是两回事。
-        if self.latency == audiohub_ipc::LATENCY_LEGACY_MIN {
+        } else if self.version < SETTINGS_VERSION {
+            // 老版本：只补版本号，**不碰 mode**。写回发生在下一次 `save`，
+            // 届时那些本 build 不认识的字段（`latency`/`quality`）自然消失。
             crate::dlog!(
-                "[audiohubd] settings.json 的 latency=\"{}\" 出自一个从不读它的版本；\
-                 按该机器一直以来的实际行为迁移到 \"{}\"",
-                audiohub_ipc::LATENCY_LEGACY_MIN,
-                audiohub_ipc::LATENCY_AUTO
+                "[audiohubd] settings.json is version {} (this build writes {SETTINGS_VERSION}); \
+                 keeping mode={} and dropping any fields this build no longer owns",
+                self.version,
+                self.mode
             );
-            self.latency = audiohub_ipc::LATENCY_AUTO.to_string();
+            self.version = SETTINGS_VERSION;
         }
         self
     }
@@ -180,39 +183,6 @@ impl StoredSettings {
         Ok(())
     }
 
-    /// 盘上的延迟档。**认不出来就回落到默认档并说出来**——不是 panic，
-    /// 也不是「就近取一个」。
-    ///
-    /// 会走到这条兜底的只有两种文件：本模块出现之前写的（`"min"`，
-    /// [`LatencyTarget::parse`] 认得，翻译是忠实的），以及未来版本写的
-    /// （新档位，这个 build 给不了）。后者回落到 AUTO 而不是某个固定毫秒数：
-    /// 一个这个 build 兑现不了的固定目标，会让伺服一直贴在边界上报「够不到」，
-    /// 而 AUTO 至少是一个**这个 build 能完整执行**的语义。
-    pub(crate) fn latency_target(&self) -> LatencyTarget {
-        LatencyTarget::parse(&self.latency).unwrap_or_else(|| {
-            crate::dlog!(
-                "[audiohubd] settings.json 的 latency=\"{}\" 不是本 build 认识的档，按 AUTO 运行",
-                self.latency
-            );
-            LatencyTarget::Auto
-        })
-    }
-
-    /// 盘上的质量档。同上：认不出来 ⇒ AUTO。
-    ///
-    /// **Opus 三档会走到这里。** 它们在档位表里可见（UI 要画灰刻度），但
-    /// [`QualityTarget::parse`] 拒绝它们，于是一个手工写进 settings.json 的
-    /// `"quality":"opus128"` 落到 AUTO 并留下一行日志，而不是被当成某个 PCM 档
-    /// 悄悄执行。
-    pub(crate) fn quality_target(&self) -> QualityTarget {
-        QualityTarget::parse(&self.quality).unwrap_or_else(|| {
-            crate::dlog!(
-                "[audiohubd] settings.json 的 quality=\"{}\" 本 build 给不了，按 AUTO 运行",
-                self.quality
-            );
-            QualityTarget::Auto
-        })
-    }
 }
 
 #[cfg(test)]
@@ -340,99 +310,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 默认档在**语义**上是什么，而不是它拼作哪个字符串。
+    /// plan §15 的迁移：一个 v2 文件里的 `latency` / `quality` **被丢掉**，
+    /// 而 `mode` 与另外两个开关**一个都不许丢**。
     ///
-    /// 两档都必须是 AUTO —— 这是**行为守恒**的要求，不是偏好：本轮之前这两个
-    /// 字段没人读，每台机器实际跑的都是 AUTO 那条路。默认写成别的，就是在升级
-    /// 那一刻替所有没动过设置的用户改听感。理由全文见 `StoredSettings::default`。
+    /// 前半句是刻意的（见 `SETTINGS_VERSION`：凭空造一个 `send.latency=300`
+    /// 等于替用户做了一个他从未做过的决定）。后半句是承重的：`mode` 是 §13
+    /// 那条互斥线，把它一起重置比丢一个档位严重得多，而「删字段」这个做法
+    /// 之所以安全，正是因为 serde 默认忽略未知字段。
     #[test]
-    fn the_defaults_preserve_the_behaviour_machines_already_had() {
-        let d = StoredSettings::default();
-        assert_eq!(
-            d.latency_target(),
-            LatencyTarget::Auto,
-            "默认延迟档必须是 AUTO：改成固定档会在升级时把每一台机器的 JB 重新整定"
-        );
-        assert_eq!(d.quality_target(), QualityTarget::Auto, "默认质量档必须是 AUTO");
-    }
-
-    /// 盘上的旧 `"min"` **迁移到 AUTO**，不是翻译成 `0`。
-    ///
-    /// 它出自一个从不读这个字段的 build，那台机器实际跑的是 AUTO。
-    /// 读成 `TotalMs(0)` 会在升级的一瞬间把 JB 从 50 ms 削到 10 ms
-    /// （`JbTuning` 实测表：欠载 0.18 -> 3.75 次/min），而用户什么都没做。
-    #[test]
-    fn a_legacy_min_on_disk_migrates_to_auto_rather_than_changing_the_sound() {
-        let dir = tmp("legacymin");
-        std::fs::write(
-            dir.join("settings.json"),
-            br#"{"version":2,"mode":"share","remove_virtual_on_disconnect":false,
-                 "mark_offline_devices":true,"latency":"min","quality":"auto"}"#,
-        )
-        .expect("write");
-        assert_eq!(
-            StoredSettings::load(&dir).latency_target(),
-            LatencyTarget::Auto,
-            "盘上的 \"min\" 必须行为守恒地迁移，不是翻译成最低档"
-        );
-        // 但**明确写来**的 "min"（老客户端的 settings.set）仍然是 0：
-        // 那是一个真实的请求，与「从盘上读到一个从未生效过的值」是两回事。
-        assert_eq!(
-            LatencyTarget::parse(audiohub_ipc::LATENCY_LEGACY_MIN),
-            Some(LatencyTarget::TotalMs(0)),
-            "明确请求的 \"min\" 仍然是最低档"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 盘上认不出来的档 ⇒ AUTO，而且**其余字段一个都不受影响**。
-    ///
-    /// 关键在后半句：`StoredSettings` 是一个整体 `Deserialize`，若哪天有人把
-    /// `latency` 换成枚举，一个陌生档位会让整份记录（含**模式**）回落默认——
-    /// 而模式是 §13 的互斥线。这条测试钉住「档位坏了不许波及模式」。
-    #[test]
-    fn an_unknown_transport_choice_falls_back_to_auto_without_touching_the_mode() {
-        let dir = tmp("badstop");
+    fn dropping_the_global_stops_does_not_take_the_mode_with_them() {
+        let dir = tmp("v15mig");
         std::fs::write(
             dir.join("settings.json"),
             br#"{"version":2,"mode":"b","remove_virtual_on_disconnect":true,
-                 "mark_offline_devices":false,"latency":"137","quality":"opus128"}"#,
+                 "mark_offline_devices":false,"latency":"300","quality":"pcm32k"}"#,
         )
         .expect("write");
         let got = StoredSettings::load(&dir);
-        assert_eq!(got.latency_target(), LatencyTarget::Auto, "137 ms 不是档位 -> AUTO");
-        assert_eq!(
-            got.quality_target(),
-            QualityTarget::Auto,
-            "opus128 本 build 给不了 -> AUTO，而不是被当成某个 PCM 档悄悄执行"
-        );
-        assert_eq!(got.mode, Mode::B, "档位认不出来不许波及模式");
-        assert!(got.remove_virtual_on_disconnect, "也不许波及别的开关");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 每一个档位都能穿过**文件**活下来。只测内存里的 parse 不够：
-    /// 档位是要写进 settings.json 再读回来的。
-    #[test]
-    fn every_transport_choice_survives_the_file() {
-        let dir = tmp("stops");
-        let mut want: Vec<LatencyTarget> = vec![LatencyTarget::Auto];
-        want.extend(
-            audiohub_ipc::LATENCY_STOPS_MS
-                .iter()
-                .map(|&m| LatencyTarget::TotalMs(m)),
-        );
-        for t in want {
-            let s = StoredSettings { latency: t.as_wire(), ..StoredSettings::default() };
-            s.save(&dir).expect("save");
-            assert_eq!(StoredSettings::load(&dir).latency_target(), t, "{t:?} 没活过文件");
-        }
-        for stop in audiohub_ipc::transport::quality_stops() {
-            let Some(q) = QualityTarget::parse(&stop.id) else { continue };
-            let s = StoredSettings { quality: q.as_wire(), ..StoredSettings::default() };
-            s.save(&dir).expect("save");
-            assert_eq!(StoredSettings::load(&dir).quality_target(), q, "{q:?} 没活过文件");
-        }
+        // 这一条是本测试的承重断言，而它此前**只写在上面的注释里、没有断言**——
+        // 于是 `normalized()` 用 `!=` 把自家的 2→3 也当成「来自未来」，升级后
+        // 把每一个老用户的 mode 重置为 share，测试全绿。实测现场：磁盘上
+        // `"mode":"b"`，运行中的 daemon 报 `mode=share`，§13 拆掉全部虚拟设备。
+        assert_eq!(got.mode, Mode::B, "老版本文件的 mode 必须原样保住");
+        assert_eq!(got.version, SETTINGS_VERSION, "读回来要按本 build 的版本重写");
+        assert!(got.remove_virtual_on_disconnect, "普通开关必须原样保住");
+        assert!(!got.mark_offline_devices);
+        // 两个走掉的字段不该在结构上留下任何痕迹。
+        let json = serde_json::to_string(&got).expect("serialize");
+        assert!(!json.contains("\"latency\""), "latency 还在 settings.json 里：{json}");
+        assert!(!json.contains("\"quality\""), "quality 还在 settings.json 里：{json}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

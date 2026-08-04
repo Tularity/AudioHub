@@ -113,6 +113,13 @@ export interface PeerState {
    */
   peer_unusable?: boolean;
   /**
+   * plan §15：这台对端的四个传输档位（收/发 × 延迟/音质）+ 它推给本机的两个。
+   *
+   * **不在 `PairedPeer` 那一层**：那里装的是「对方告诉我的身份」，而这里是
+   * 「我自己设的」。混成一层之后界面就再也分不出这两件事。
+   */
+  transport?: PeerTransportView;
+  /**
    * 控制面 Ping/Pong 的**单向**网络延迟估计（min-RTT / 2，毫秒）。
    *
    * 它挂在**连接**上，与有没有媒体会话无关——这正是它存在的理由：
@@ -301,6 +308,28 @@ export interface SessionStats {
    * 的读数冒充成本机量到的。
    */
   peer_quality?: QualityStats | null;
+  /**
+   * plan §15 / §14 裁定 4：**这条流此刻在执行的目标档**。
+   *
+   * 存在的理由逐字来自 plan §14 附：「用户看到 300 ms 时必须能分辨这是自己
+   * 设定的目标而非系统能力不足」。没有它，界面只能拿全局设置去猜某一条流的
+   * 目标——而 §15 之后全局设置根本不存在了。
+   *
+   * `latency_target` 只在**接收**流上非空（延迟的执行器在接收端），
+   * `quality_target` 只在**发送**流上非空（音质的执行器在发送端）。
+   * `null` 也可能是 AUTO：两者的界面表现相同（没有固定目标）。
+   */
+  latency_target?: string | null;
+  quality_target?: string | null;
+  /**
+   * 目标是谁定的：`'local'`（本机是消费者，自己设的）| `'peer'`（本机是提供者，
+   * 档位由使用方推来）。**这一个字段就是「两个来源绝不合并」那条规矩的可执行
+   * 形式**——合并之后「这个 300 是我设的还是对端要求的」就再也答不出来。
+   */
+  target_from?: string | null;
+  /** 目标够不到，已经贴在物理下限 / 上限上。**只在闭环（真有实测值）时为真。** */
+  at_floor?: boolean;
+  at_ceiling?: boolean;
 }
 
 export type SessionKind = 'mic' | 'spk' | string;
@@ -344,24 +373,51 @@ export interface QualityStop {
   blocked_by?: string | null;
 }
 
+/** 一台对端 × 一个方向的两个**目标**档位（plan §15）。 */
+export interface PeerTransportDir {
+  /**
+   * `'auto'`，或 `latency_stops_ms` 中某一档的十进制毫秒串（`'0'`/`'200'`…）。
+   *
+   * ⚠ **这是目标，不是实测值。** 设 300 时系统会主动把缓冲填到 300，
+   * 而不是「系统只能做到这么慢」。界面必须把这句话说出来（plan §14 附）——
+   * 不说的话，用户看到 300 的第一反应是「这条链路很慢」。
+   */
+  latency?: string;
+  /** `'auto'`，或某个 `available` 的 `QualityStop.id`。 */
+  quality?: string;
+}
+
 /**
- * 伺服/媒体面**实际**在做的事——用来如实显示，**不是**回显用户的选择。
+ * 一台对端的四个档位 + 它推给本机的那两个（plan §15）。
  *
- * 这个区分是这两行读数存在的全部理由：把目标值原样念一遍的读数，等于「报告成功、
- * 其实什么都没发生」，而那正是这个项目反复栽过的地方。所以 `achieved_ms` 只能是实测
- * 端到端延迟，`rate` 只能是当前真正在跑的采样率。
+ * # 两组来源分开，**绝不合并**
+ *
+ * 合并之后「这个 300 是我设的还是对端要求的」就再也答不出来，而那正是共享
+ * 模式的详情页唯一要回答的问题：本次事故里 30-win 的档位是 `min` 且从未被
+ * 设过，这件事在两台机器的任何一个界面上都不可见。
+ *
+ * # 交叉的那一半
+ *
+ * 两个档位的执行器在**相反的端**上：延迟的执行器是**接收侧**的 jitter
+ * buffer，音质的执行器是**发送侧**的阶梯格号。于是消费者设的四个值里，
+ * 跨到线上的是交叉的一半（`recv.quality` 与 `send.latency`）。
+ * 下面两个 `peer_*` 字段按**执行器**命名，不按用户视角的收/发。
  */
-export interface TransportLive {
-  /** 实测端到端总延迟（ms）。`null` = 还没测出来，**不是 0**。 */
-  achieved_ms?: number | null;
-  /** 目标够不到：已贴住链路物理下限。 */
-  at_floor?: boolean;
-  /** 目标够不到：已贴住链路物理上限。 */
-  at_ceiling?: boolean;
-  /** 当前实际采样率（Hz）。 */
-  rate?: number | null;
-  /** 正在被伺服的接收流数。0 = 暂无会话，此时任何延迟读数都无从谈起。 */
-  streams?: number;
+export interface PeerTransportView {
+  /** 本机**收**这台对端（我取它的麦克风）。 */
+  recv?: PeerTransportDir;
+  /** 本机**发**给这台对端（我送它的扬声器）。 */
+  send?: PeerTransportDir;
+  /**
+   * 对端推来、执行器在**本机接收侧**的延迟档（= 对端的 `send.latency`）。
+   *
+   * `null` / 缺席 = 对端没有对这一项表态 ⇒ 界面显示「未设定 · 按自动运行」，
+   * **不显示 0、不显示本机存的那一份**（本机那份在共享模式下不生效，
+   * 显示它就是撒谎）。
+   */
+  peer_rx_latency?: string | null;
+  /** 对端推来、执行器在**本机发送侧**的音质档（= 对端的 `recv.quality`）。 */
+  peer_tx_quality?: string | null;
 }
 
 /** settings.get / settings.set 的回包（daemon 拥有的全局设置）。 */
@@ -372,12 +428,11 @@ export interface DaemonSettings {
    */
   mode?: 'share' | 'a' | 'b' | string;
   effective_mode?: 'share' | 'a' | 'b' | string;
-  /** `'auto'`，或 `latency_stops_ms` 中某一档的十进制毫秒串（`'0'`/`'200'`…）。 */
-  latency?: string;
-  /** `'auto'`，或某个 `available` 的 `QualityStop.id`。 */
-  quality?: string;
   /**
    * 延迟档滑条的固定档（毫秒，升序），`0` = 「尽可能低」。
+   *
+   * ⚠ plan §15 之后**档表仍是全局的，档位选择不是**：档表是这台机器的能力，
+   * 档位是用户对某一台对端某一个方向的选择（见 `PeerState.transport`）。
    * **daemon 是唯一真值源**：档表随物理能力变，前端写死一份就会给出它自己都
    * 送不下去的档。缺席（旧服务）时前端回落到内置常量，见 Settings.tsx。
    */
@@ -388,11 +443,6 @@ export interface DaemonSettings {
   mark_offline_devices?: boolean;
   hal_capacity?: number;
   hal_used?: number;
-  /**
-   * 媒体面此刻的实测读数。**缺席 = 旧服务不上报**，界面必须说「拿不到」，
-   * 而不是显示成「正在测量」——后者是一句永远不会兑现的承诺。
-   */
-  transport_live?: TransportLive;
 }
 
 export interface DiscoverResult {

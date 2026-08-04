@@ -1327,9 +1327,17 @@ mod tests {
     }
 
     /// **真读数 0 与「读不到」必须分得开。** 我们自己的 HAL 驱动就声明
-    /// latency=0 / safetyOffset=0 / streamLatency=0（AudioHubDriver.c:1958-1962、
-    /// :2206-2209）——那是正确答案（虚拟设备没有 DAC，样本不经任何模拟环节），
-    /// 不是缺项。若把 0 当缺项，模式 B 的虚拟设备会永远报不出延迟；若把缺项当 0，
+    /// latency=0 / safetyOffset=0 / streamLatency=0（`AudioHubDriver.c` 的
+    /// `case kAudioDevicePropertyLatency` 与 `case kAudioStreamPropertyLatency`，
+    /// 两处都挂着 PHASE 2 MARKER）。
+    ///
+    /// ⚠ **那个 0 对本模块是真读数，对操作系统是一句谎**，两件事必须分开：
+    /// 本模块问的是「驱动声明了多少」，答案确实是 0，如实转述即可；而驱动
+    /// **声明** 0 说的是「你交给我的帧立刻就响」，真相是约 150 ms 后在另一台
+    /// 机器上响。修的是驱动那一侧（第二阶段），不是这里。
+    /// 「虚拟设备没有 DAC 所以是 0」这个旧理由本身也是错的——AirPlay 同样没有
+    /// DAC 却报 88200 帧。见 `docs/research-device-latency-property.md` §2.3。
+    /// 这一格**不是缺项**：若把 0 当缺项，模式 B 的虚拟设备会永远报不出延迟；若把缺项当 0，
     /// 蓝牙耳机会看起来和模拟输出一样好。两个方向都得防。
     ///
     /// 夹具就是本机 2026-08-02 对默认输出「AudioHub – WIN-IR01HVEFU7G 扬声器」的

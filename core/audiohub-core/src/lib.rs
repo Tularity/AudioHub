@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod devcal;
 pub mod devlat;
 pub mod dsp;
 pub mod latency;

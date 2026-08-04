@@ -206,6 +206,12 @@ pub mod wire {
     /// virtual endpoint's node must follow. Touches no sample — the rings carry
     /// full scale and the far side does the attenuating.
     pub const IOCTL_NOTIFY: u32 = ah_ioctl(0x806);
+    /// How many frames of downstream latency the driver must subtract from the
+    /// presentation position it reports for one endpoint — i.e. how long after
+    /// it accepts a frame that frame is audible on the peer's speakers. The
+    /// driver cannot know this (it spans a network and another machine's sound
+    /// card); the daemon measures the chain stage by stage and sends it here.
+    pub const IOCTL_LATENCY: u32 = ah_ioctl(0x807);
 
     // The two new codes as LITERALS, transcribed from the C_ASSERTs at the
     // bottom of AudioHubIoctl.h. `ah_ioctl` is a macro on both sides, so this
@@ -213,6 +219,7 @@ pub mod wire {
     // rather than against itself.
     const _: () = assert!(IOCTL_MAP_RINGS == 0x0022_E014);
     const _: () = assert!(IOCTL_NOTIFY == 0x0022_E018);
+    const _: () = assert!(IOCTL_LATENCY == 0x0022_E01C);
 
     // -- status codes -------------------------------------------------------
 
@@ -371,6 +378,8 @@ pub mod wire {
     pub const MAP_REPLY_BYTES: usize = 40 + 8 * RING_SLOTS_MAX;
     pub const NOTIFY_REQUEST_BYTES: usize = 24;
     pub const NOTIFY_REPLY_BYTES: usize = 8;
+    pub const LATENCY_REQUEST_BYTES: usize = 24;
+    pub const LATENCY_REPLY_BYTES: usize = 8;
 
     const _: () = assert!(QUERY_SLOTS_REPLY_BYTES == 848);
     const _: () = assert!(MAP_REPLY_BYTES == 296);
@@ -390,6 +399,20 @@ pub mod wire {
     /// ring, once on the peer's real device — and the result is quieter than
     /// asked for by the SQUARE of the setting, which nothing reports.
     pub const CAP_VOLUME: u32 = 0x2;
+    /// `AH_CAP_LATENCY`: [`IOCTL_LATENCY`] works, i.e. this driver can be told
+    /// how long after it accepts a frame that frame is audible, and subtracts
+    /// it from the presentation position it reports.
+    ///
+    /// A CAPABILITY BIT RATHER THAN A PROTOCOL BUMP, unlike every other change
+    /// to this contract. The bumps exist for pairings that fail SILENTLY AND
+    /// HARMFULLY; this one cannot. A driver without the bit reports presentation
+    /// position exactly as every build before this one did, and the daemon KNOWS
+    /// because the bit is clear — it can say "this driver cannot be told the
+    /// latency" instead of believing it declared something. A version bump would
+    /// instead make an old driver refuse to bind at all, i.e. every AudioHub
+    /// endpoint disappears from the system, as the price of an addition whose
+    /// absence costs nothing that today does not already cost.
+    pub const CAP_LATENCY: u32 = 0x4;
 
     // -- helpers ------------------------------------------------------------
 
@@ -967,6 +990,59 @@ pub mod wire {
             return None;
         }
         Some(NotifyReply { status: get_u32(b, 0), applied: get_u32(b, 4) })
+    }
+
+    pub const LATENCYFLAG_INPUT: u32 = 0x1;
+
+    /// Ceiling the driver enforces on a declared latency: four seconds at 48k.
+    /// Mirrored here so the daemon can refuse an absurd value BEFORE spending an
+    /// IOCTL on it, and so the constant has a second, independently transcribed
+    /// copy the way every other number in this file does.
+    pub const LATENCY_MAX_FRAMES: u32 = 48_000 * 4;
+
+    /// `AH_LATENCY_REQUEST`.
+    ///
+    /// `frames` is a FRAME COUNT, not a scalar: unlike `encode_notify_request`
+    /// there is no fixed-point conversion, because there is nothing fractional
+    /// to preserve. `generation` is dropped by the driver when it does not match
+    /// the slot's stamp — a latency measured against the slot's previous tenant
+    /// describes a different machine reached over a different network.
+    pub fn encode_latency_request(
+        session_id: u64,
+        slot: u8,
+        generation: u32,
+        input: bool,
+        frames: u32,
+    ) -> [u8; LATENCY_REQUEST_BYTES] {
+        let mut b = [0u8; LATENCY_REQUEST_BYTES];
+        put_u64(&mut b, 0, session_id);
+        put_u32(&mut b, 8, slot as u32);
+        put_u32(&mut b, 12, generation);
+        put_u32(&mut b, 16, if input { LATENCYFLAG_INPUT } else { 0 });
+        put_u32(&mut b, 20, frames);
+        b
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LatencyReply {
+        pub status: u32,
+        /// What the driver NOW holds for that endpoint, read back out of its own
+        /// storage rather than echoed from the request.
+        ///
+        /// The distinction is the whole point: an echo would make "the IOCTL
+        /// completed" and "the value was stored" the same observation, and this
+        /// project has been burned eight times by exactly that substitution. A
+        /// refused value (past `LATENCY_MAX_FRAMES`, or a stale generation) comes
+        /// back as whatever the slot still carries, so the caller can see that
+        /// nothing moved.
+        pub frames: u32,
+    }
+
+    pub fn decode_latency_reply(b: &[u8]) -> Option<LatencyReply> {
+        if b.len() != LATENCY_REPLY_BYTES {
+            return None;
+        }
+        Some(LatencyReply { status: get_u32(b, 0), frames: get_u32(b, 4) })
     }
 
     /// `\\.\AudioHubVadCtl` as a NUL-terminated UTF-16 path for `CreateFileW`.
@@ -2835,6 +2911,57 @@ pub mod session {
             Ok(rep.applied())
         }
 
+        /// [`wire::CAP_LATENCY`]: this driver understands [`wire::IOCTL_LATENCY`].
+        /// A driver without it keeps reporting presentation position the way
+        /// every build before this feature did — which is not a failure, but it
+        /// is something the daemon must be able to SAY rather than assume away.
+        pub fn has_latency(&self) -> bool {
+            self.caps & wire::CAP_LATENCY != 0
+        }
+
+        /// `IOCTL_LATENCY`: tell the driver how long after it accepts a frame
+        /// that frame is audible on the peer's speakers, so its presentation
+        /// position stops claiming "accepted == presented".
+        ///
+        /// Returns what the driver NOW holds, read back from its own storage.
+        /// A value it refused (past the ceiling, or a stale generation) comes
+        /// back unchanged, so the caller can tell "stored" from "the IOCTL
+        /// completed" — which are not the same fact.
+        ///
+        /// Streams already running are unaffected by design: each captured its
+        /// own copy when it was created. A presentation clock whose offset moves
+        /// can appear to run backwards, and that is worse than a constant error.
+        pub fn set_latency(
+            &self,
+            slot: u8,
+            generation: u32,
+            input: bool,
+            frames: u32,
+        ) -> Result<u32> {
+            let req =
+                wire::encode_latency_request(self.session_id, slot, generation, input, frames);
+            let mut out = [0u8; wire::LATENCY_REPLY_BYTES];
+            let n = transport::ioctl(
+                &self.handle,
+                wire::IOCTL_LATENCY,
+                &req,
+                &mut out,
+                IOCTL_TIMEOUT_MS,
+            )?;
+            if n as usize != wire::LATENCY_REPLY_BYTES {
+                return Err(anyhow!("the latency reply was {n} bytes"));
+            }
+            let rep = wire::decode_latency_reply(&out)
+                .ok_or_else(|| anyhow!("undecodable latency reply"))?;
+            if rep.status != wire::STATUS_OK {
+                return Err(anyhow!(
+                    "the driver refused the latency: {}",
+                    wire::status_label(rep.status)
+                ));
+            }
+            Ok(rep.frames)
+        }
+
         /// True when the driver could only enforce the DACL — i.e. nobody has
         /// written `AudioHubDaemonImage` into the device software key. Surfaced
         /// rather than silently accepted: a degraded check that nobody can see
@@ -3741,6 +3868,66 @@ mod tests {
         assert_eq!(q16_to_scalar(scalar_to_q16(1.0)), 1.0);
         assert_eq!(scalar_to_q16(1.0), 0x1_0000, "0x10000 IS 1.0");
         assert_eq!(scalar_to_q16(0.5), 0x8000);
+    }
+
+    // -- LATENCY ------------------------------------------------------------
+
+    /// Every field at the offset `AudioHubIoctl.h`'s `C_ASSERT`s pin, and the
+    /// FRAME COUNT AS A PLAIN INTEGER.
+    ///
+    /// That last clause is the one worth a test. The sibling message on this
+    /// same IOCTL family carries a 16.16 fixed-point scalar at the very same
+    /// offset 20, so `scalar_to_q16(frames as f32)` is a one-line "consistency
+    /// fix" somebody will be tempted to make. It compiles, it sends, the driver
+    /// answers AH_STATUS_OK — and 5808 frames arrive as 380,633,088, which is
+    /// past AH_LATENCY_MAX_FRAMES, so the driver refuses and the declaration
+    /// silently never happens.
+    #[test]
+    fn latency_request_fields_land_at_the_header_offsets_with_frames_as_an_integer() {
+        let b = encode_latency_request(0x0102_0304_0506_0708, 9, 0x1234_5678, true, 5808);
+        assert_eq!(b.len(), LATENCY_REQUEST_BYTES);
+        assert_eq!(&b[0..8], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(&b[8..12], &9u32.to_le_bytes(), "slot @8");
+        assert_eq!(&b[12..16], &0x1234_5678u32.to_le_bytes(), "generation @12");
+        assert_eq!(&b[16..20], &LATENCYFLAG_INPUT.to_le_bytes(), "flags @16");
+        assert_eq!(&b[20..24], &5808u32.to_le_bytes(), "frames @20, VERBATIM");
+        // and specifically NOT the two ways it could have been mangled
+        assert_ne!(&b[20..24], &5808f32.to_bits().to_le_bytes(), "float bits");
+        assert_ne!(&b[20..24], &scalar_to_q16(5808.0).to_le_bytes(), "16.16 fixed point");
+    }
+
+    /// The speaker direction leaves the flag CLEAR. Nothing declares the
+    /// microphone today (`hal_mic` is still a free parameter), so a request
+    /// that arrived with this bit set would be a bug on the sending side — and
+    /// it would land in the driver's OTHER latency cell, where no stream would
+    /// ever read it. Silent, and only this bit distinguishes the two.
+    #[test]
+    fn the_speaker_direction_sends_no_input_flag() {
+        let b = encode_latency_request(1, 0, 0, false, 100);
+        assert_eq!(&b[16..20], &0u32.to_le_bytes());
+    }
+
+    /// The reply's `frames` is read back from the driver's storage, so the
+    /// decoder must surface it even when the status is a refusal — that is the
+    /// only way "it refused and still holds 0" is distinguishable from
+    /// "it accepted 0".
+    #[test]
+    fn a_refused_latency_still_reports_what_the_driver_holds() {
+        let mut b = [0u8; LATENCY_REPLY_BYTES];
+        b[0..4].copy_from_slice(&STATUS_BAD_ARGUMENT.to_le_bytes());
+        b[4..8].copy_from_slice(&5808u32.to_le_bytes());
+        let r = decode_latency_reply(&b).expect("well formed");
+        assert_eq!(r.status, STATUS_BAD_ARGUMENT);
+        assert_eq!(r.frames, 5808, "拒绝了，但它手上仍然是上一次那个值");
+        assert!(decode_latency_reply(&b[..7]).is_none(), "短回复不许当成 0 帧");
+    }
+
+    /// The ceiling this side enforces IS the driver's, transcribed
+    /// independently from `AH_LATENCY_MAX_FRAMES`.
+    #[test]
+    fn the_latency_ceiling_matches_the_drivers() {
+        assert_eq!(LATENCY_MAX_FRAMES, 192_000, "AudioHubIoctl.h: 48000u * 4u");
+        assert_eq!(LATENCY_MAX_FRAMES, crate::devdecl::MAX_FRAMES, "and the daemon's own");
     }
 
     /// Out of range in either direction is CLAMPED, not wrapped. This number

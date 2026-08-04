@@ -289,6 +289,7 @@ Return Value:
     m_AhSlot        = AUDIOHUB_WIN_MAX_SLOTS;
     m_AhFramesMoved = 0;
     m_AhFramesShort = 0;
+    m_AhPresentationOffsetFrames = 0;
     {
         ULONG   ahSlot  = 0;
         BOOLEAN ahInput = FALSE;
@@ -297,6 +298,19 @@ Return Value:
             if ((ahInput ? TRUE : FALSE) == (m_bCapture ? TRUE : FALSE))
             {
                 m_AhSlot = ahSlot;
+                //
+                // THE ONE READ of this slot's declared latency. Everything
+                // about why it happens here and never again is on
+                // m_AhPresentationOffsetFrames. Render only: on the capture
+                // side the corresponding delay is upstream of us (it happened
+                // before the frame reached this machine), so subtracting it
+                // from a CAPTURE position would claim we have not yet delivered
+                // audio the application already holds.
+                //
+                if (!m_bCapture)
+                {
+                    m_AhPresentationOffsetFrames = AhSlotLatencyGet(ahSlot, FALSE);
+                }
             }
             else
             {
@@ -1137,7 +1151,53 @@ NTSTATUS CMiniportWaveRTStream::GetPresentationPosition(_Out_  KSAUDIO_PRESENTAT
         return status;
     }
 
-    _pPresentationPosition->u64PositionInBlocks = ullPresentationPosition * m_pWfExt->Format.nSamplesPerSec / m_pWfExt->Format.nAvgBytesPerSec;
+    // =============== PRESENTED, NOT MERELY ACCEPTED ======================================
+    //
+    // `ullPresentationPosition` is incremented in UpdatePosition() by exactly the same
+    // ByteDisplacement that advances the linear position (see UpdatePosition) -- same
+    // source, no offset. Reported unmodified it says "every byte the DMA has consumed is
+    // already audible". For sysvad, which this code came from, that was true: its "device"
+    // really is the end of the line. For us it is not -- those bytes went to
+    // AhPushRender(), across a network, and become audible ~121 ms later on the PEER.
+    //
+    // Microsoft's rule (learn.microsoft.com "Low Latency Audio - Windows drivers",
+    // "Improve the coordination between driver and OS"), verbatim:
+    //   "The timestamps SHOULDN'T reflect the time at which samples were transferred to
+    //    or from Windows to the DSP."
+    //   "Factor in any constant delays due to signal processing algorithms or pipeline or
+    //    hardware transports, unless these delays are otherwise accounted for."
+    //
+    // So the frame count reported as PRESENTED is the count accepted minus the downstream
+    // latency D that the daemon measured for this endpoint (IOCTL_AUDIOHUB_LATENCY).
+    //
+    // THREE PROPERTIES THIS ARITHMETIC MUST KEEP.
+    //  1. MONOTONIC. `frames` is monotonic and D is constant for the life of the stream
+    //     (see m_AhPresentationOffsetFrames), so `frames - D` is monotonic too. This is
+    //     precisely why D is not allowed to follow the slot while a stream is running: a
+    //     shrinking offset would make this clock jump forward and a growing one would make
+    //     it run BACKWARDS, which no consumer of a presentation clock tolerates.
+    //  2. SATURATE AT 0, and only at the start. During a stream's first D frames nothing
+    //     has been presented yet, and 0 is the correct report. Because D is constant, the
+    //     clamp stops applying by itself once `frames` passes D and can never re-engage;
+    //     a clamp still firing later would mean D had moved, i.e. bug (1).
+    //  3. LINEAR POSITION IS UNTOUCHED. GetPositions still reports
+    //     `m_ullLinearPosition` verbatim -- that number answers "how far has the DMA read
+    //     into the buffer", it really is about this ring, and the engine's own buffer
+    //     accounting rests on it. Only the PRESENTATION half describes the far end.
+    //
+    // D == 0 is the cold start (no measurement yet) and leaves this identical to every
+    // earlier build. It is not a claim of zero latency, it is the absence of a claim.
+    //
+    // Symmetric site on the other platform: drivers/macos-hal/src/AudioHubDriver.c,
+    // `case kAudioDevicePropertyLatency`. Both are fed by the SAME daemon-side number.
+    // Full investigation: docs/research-device-latency-property.md sections 2.4 and 3.4.
+    // =====================================================================================
+    ULONGLONG framesAccepted = ullPresentationPosition * m_pWfExt->Format.nSamplesPerSec / m_pWfExt->Format.nAvgBytesPerSec;
+
+    _pPresentationPosition->u64PositionInBlocks =
+        (framesAccepted > m_AhPresentationOffsetFrames)
+            ? (framesAccepted - m_AhPresentationOffsetFrames)
+            : 0;
     _pPresentationPosition->u64QPCPosition = (UINT64)timeStamp.QuadPart;
 
     return STATUS_SUCCESS;

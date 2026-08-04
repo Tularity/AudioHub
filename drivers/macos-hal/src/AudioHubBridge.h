@@ -281,6 +281,27 @@ static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t 
 // message against, and what makes publication CLOSED-LOOP: "I sent a Bind and
 // mach returned OK" is not evidence a device exists (spec-m5b §4.6).
 #define kAudioHubCtl_BindState   5u
+// The driver's answer to kAudioHubNotify_Latency: what this endpoint's
+// kAudioDevicePropertyLatency ACTUALLY returns right now.
+//   payload: endpoint = the one the notify named, generation = that slot's
+//            stamp, scalar_bits = the EFFECTIVE frame count (a plain UInt32,
+//            NOT float bits -- see kAudioHubNotify_Latency),
+//            flags: bit3 (kAudioHubFlag_LatencyPending) set when a newer value
+//            has been received but cannot take effect until IO stops.
+//
+// WHY AN ACK RATHER THAN A PROTOCOL BUMP. A driver that predates this op
+// ignores the notify (bridge_handle_notify only dispatches ops it knows) and
+// keeps declaring 0 -- silently, which is the shape this project keeps getting
+// burned by. The obvious answer, bumping kAudioHubProtocolVersion, is far too
+// blunt: a v2 driver refuses a v3 daemon outright, so every AudioHub device on
+// the machine disappears until the user reinstalls the plug-in with sudo and
+// restarts coreaudiod. That is a heavy, audible break in exchange for a purely
+// ADDITIVE capability whose absence costs exactly what today already costs.
+// So the loop is closed the same way binding is: the daemon compares what it
+// asked for against what came back, re-sends while they differ, and reports
+// "this driver never acknowledged a latency" after a bounded number of tries.
+// "The send returned KERN_SUCCESS" is not evidence the property changed.
+#define kAudioHubCtl_LatencyState 6u
 
 // Slot states carried in kAudioHubCtl_BindState's scalar_bits.
 #define kAudioHubSlot_Free       0u
@@ -290,6 +311,19 @@ static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t 
 // Notify ops (daemon -> driver)
 #define kAudioHubNotify_Volume   1u // peer's real device reported a new volume: update the control's value
 #define kAudioHubNotify_Ping     2u
+// How many frames of latency this endpoint must declare to CoreAudio, i.e.
+// how long after an application hands us a frame it is audible on the PEER's
+// speakers. Carried in scalar_bits as a PLAIN UInt32 -- that field is already
+// polymorphic (a kAudioHubSlot_* state in BindState), and reinterpreting a
+// frame count as float bits would make 7200 arrive as 1.0e-41.
+//
+// The daemon derives it from the same `sum_ms` the UI shows, so the number the
+// system is told and the number the user reads are the same measurement.
+// The driver applies it to kAudioDevicePropertyLatency ONLY, never to
+// kAudioDevicePropertySafetyOffset (that one participates in IO scheduling),
+// and only while that endpoint's IO is stopped -- see the long comment at
+// `case kAudioDevicePropertyLatency` in AudioHubDriver.c.
+#define kAudioHubNotify_Latency  3u
 
 // Bind ops (daemon -> driver), in AudioHubBindMsg.op
 #define kAudioHubBind_Clear      0u // retire the slot; generation must match the current one
@@ -441,6 +475,14 @@ _Static_assert(sizeof(AudioHubBindMsg) == 472, "bind ABI drift");
 #define kAudioHubFlag_Muted     0x1u
 #define kAudioHubFlag_IORunning 0x2u
 #define kAudioHubFlag_IsInput   0x4u
+// kAudioHubCtl_LatencyState only: the driver holds a value it has not been able
+// to install yet because an application is doing IO on that endpoint. The
+// declared latency is fixed for the life of an open stream ON PURPOSE (VLC and
+// Chromium both read the property exactly once, at open, and neither installs a
+// listener; changing it mid-stream would force the host to stop and restart IO
+// for a value nobody re-reads). This bit is how the daemon can SAY "sent, takes
+// effect when the app releases the device" instead of looking stuck.
+#define kAudioHubFlag_LatencyPending 0x8u
 
 // ---------------------------------------------------------------- driver API
 //
@@ -533,6 +575,11 @@ typedef struct AudioHubBridgeHooks
     // The peer's real device reported a new volume. Must NOT post a volume back
     // or the two sides ping-pong forever.
     void (*notify_volume)(uint32_t inEndpoint, uint32_t inGeneration, float inScalar, int inMuted);
+    // How many frames this endpoint should declare as kAudioDevicePropertyLatency.
+    // Unlike notify_volume this one MUST answer, with kAudioHubCtl_LatencyState:
+    // the daemon has no other way to learn whether the property actually moved,
+    // and a silent no-op is precisely what this whole mechanism exists to end.
+    void (*notify_latency)(uint32_t inEndpoint, uint32_t inGeneration, uint32_t inFrames);
     // Drain the per-device outboxes. Returns non-zero while the daemon is alive.
     int (*flush)(void);
     // End of one service pass: retire whatever is due and announce a device-list

@@ -200,6 +200,19 @@ const CTL_SUPERSEDED: u32 = 4;
 /// generation every other control message is then filtered against, and what
 /// makes publication closed-loop rather than fire-and-hope (spec-m5b §4.6).
 const CTL_BIND_STATE: u32 = 5;
+/// The driver's answer to `NOTIFY_LATENCY`: what that endpoint's
+/// `kAudioDevicePropertyLatency` ACTUALLY returns, in frames, carried in
+/// `scalar_bits` as a plain `u32` (NOT float bits). `FLAG_LATENCY_PENDING` says
+/// a newer value is being held back until the application stops IO.
+///
+/// This ack is what makes latency declaration closed-loop, and it is the whole
+/// reason there is no protocol bump for the feature: a driver that predates it
+/// simply never answers, the daemon reports "this driver never acknowledged a
+/// latency", and every AudioHub device keeps working. A version bump would have
+/// made an old driver refuse the daemon outright — sixteen devices vanish until
+/// the user reinstalls the plug-in with sudo — for a purely additive capability
+/// whose absence costs exactly what today already costs.
+const CTL_LATENCY_STATE: u32 = 6;
 
 /// Slot states carried in `CTL_BIND_STATE`'s `scalar_bits`.
 const SLOT_FREE: u32 = 0;
@@ -208,6 +221,12 @@ const SLOT_DELISTED: u32 = 2;
 
 const NOTIFY_VOLUME: u32 = 1;
 const NOTIFY_PING: u32 = 2;
+/// How many frames of latency this endpoint must declare to CoreAudio — i.e.
+/// how long after an application hands us a frame it is audible on the PEER's
+/// speakers. A plain `u32` in `scalar_bits`, not float bits: sending
+/// `5800f32.to_bits()` would arrive as 1,163,395,072 frames, and the driver's
+/// ceiling would be the only thing between that and CoreAudio.
+const NOTIFY_LATENCY: u32 = 3;
 
 /// `hal.status_reason` for "a driver is installed but speaks another protocol".
 /// The UI keys its third driver state off this exact string (spec-m5b §6.2),
@@ -245,6 +264,10 @@ const STATUS_BAD_REQUEST: u32 = 4;
 const FLAG_MUTED: u32 = 0x1;
 const FLAG_IO_RUNNING: u32 = 0x2;
 const FLAG_IS_INPUT: u32 = 0x4;
+/// `CTL_LATENCY_STATE` only: the driver is holding a newer value it cannot
+/// install while an application is doing IO on that endpoint. Distinguishes
+/// "sent, takes effect when the app releases the device" from "ignored".
+const FLAG_LATENCY_PENDING: u32 = 0x8;
 
 // ---------------------------------------------------------------- public API
 
@@ -323,6 +346,10 @@ pub enum HalControlEvent {
     IoState { at: HalEndpoint, generation: u32, running: bool },
     /// A slot changed state, or answered an idempotent `Bind`.
     BindState { slot: u8, generation: u32, state: HalSlotState },
+    /// What this endpoint's declared device latency ACTUALLY is now, in frames.
+    /// The driver's answer to a latency notify — never an echo of the request.
+    /// `pending` = a newer value is held back until the application stops IO.
+    LatencyState { at: HalEndpoint, generation: u32, frames: u32, pending: bool },
     /// A handshake completed. Everything this daemon still intends must be
     /// re-`Set` after this — the driver replays a slot's IO state and volume
     /// only when an idempotent Set lands on it (spec-m5b §1, third trade-off),
@@ -908,6 +935,15 @@ impl HalBridge {
     /// tenant of a slot off the new one's control.
     pub fn notify_volume(&self, at: HalEndpoint, generation: u32, scalar: f32, muted: bool) {
         self.shared.notify_volume(at, generation, scalar, muted);
+    }
+
+    /// Tell the driver how many frames of latency this endpoint must declare to
+    /// the OS. Best effort in the same sense as `notify_volume` — but unlike it,
+    /// this one is answered: the driver replies with `LatencyState` carrying
+    /// what the property NOW returns, and the caller re-sends while the two
+    /// differ. Nothing here treats a successful send as evidence of anything.
+    pub fn notify_latency(&self, at: HalEndpoint, generation: u32, frames: u32) {
+        self.shared.notify_latency(at, generation, frames);
     }
 
     /// Binds `slot` to a peer, or re-states an existing binding. IDEMPOTENT by
@@ -4182,6 +4218,10 @@ impl Shared {
     fn notify_volume(&self, at: HalEndpoint, generation: u32, scalar: f32, muted: bool) {
         platform::send_notify(self, at, generation, scalar, muted);
     }
+
+    fn notify_latency(&self, at: HalEndpoint, generation: u32, frames: u32) {
+        platform::send_latency(self, at, generation, frames);
+    }
 }
 
 // ---------------------------------------------------------------- macOS
@@ -5635,7 +5675,7 @@ mod platform {
                     state,
                 });
             }
-            CTL_VOLUME | CTL_IO_STATE => {
+            CTL_VOLUME | CTL_IO_STATE | CTL_LATENCY_STATE => {
                 let Some(at) = HalEndpoint::from_wire(msg.endpoint) else { return };
                 let Some(c) = shared.slots.get(at.slot as usize) else { return };
                 let want = c.generation.load(Ordering::Acquire);
@@ -5652,23 +5692,40 @@ mod platform {
                     );
                     return;
                 }
-                if msg.op == CTL_VOLUME {
-                    let scalar = f32::from_bits(msg.scalar_bits);
-                    if !scalar.is_finite() {
-                        return;
+                match msg.op {
+                    CTL_VOLUME => {
+                        let scalar = f32::from_bits(msg.scalar_bits);
+                        if !scalar.is_finite() {
+                            return;
+                        }
+                        shared.push_event(HalControlEvent::Volume {
+                            at,
+                            generation: msg.generation,
+                            scalar: scalar.clamp(0.0, 1.0),
+                            muted: msg.flags & FLAG_MUTED != 0,
+                        });
                     }
-                    shared.push_event(HalControlEvent::Volume {
-                        at,
-                        generation: msg.generation,
-                        scalar: scalar.clamp(0.0, 1.0),
-                        muted: msg.flags & FLAG_MUTED != 0,
-                    });
-                } else {
-                    shared.push_event(HalControlEvent::IoState {
-                        at,
-                        generation: msg.generation,
-                        running: msg.flags & FLAG_IO_RUNNING != 0,
-                    });
+                    // `scalar_bits` READ AS AN INTEGER here, unlike the arm
+                    // above. Both arms take the same 32 bits off the same wire
+                    // and one of them is wrong for the other's op: reading a
+                    // 5800-frame latency through `f32::from_bits` yields
+                    // 8.1e-42, which `is_finite()` accepts, so the mistake
+                    // would produce a plausible zero rather than an error.
+                    CTL_LATENCY_STATE => {
+                        shared.push_event(HalControlEvent::LatencyState {
+                            at,
+                            generation: msg.generation,
+                            frames: msg.scalar_bits,
+                            pending: msg.flags & FLAG_LATENCY_PENDING != 0,
+                        });
+                    }
+                    _ => {
+                        shared.push_event(HalControlEvent::IoState {
+                            at,
+                            generation: msg.generation,
+                            running: msg.flags & FLAG_IO_RUNNING != 0,
+                        });
+                    }
                 }
             }
             CTL_HEARTBEAT => {}
@@ -5684,6 +5741,21 @@ mod platform {
         op: u32,
         endpoint: u32,
         scalar: f32,
+        flags: u32,
+        generation: u32,
+    ) -> (KernReturn, MachPort) {
+        send_to_driver_raw(shared, op, endpoint, scalar.to_bits(), flags, generation)
+    }
+
+    /// The same send with the `scalar_bits` word supplied VERBATIM. `NOTIFY_LATENCY`
+    /// puts a frame count there, and routing it through the `f32` parameter above
+    /// would turn 5800 frames into 1,163,395,072 — a number the driver's ceiling
+    /// refuses, i.e. a feature that reports success and never works.
+    fn send_to_driver_raw(
+        shared: &Shared,
+        op: u32,
+        endpoint: u32,
+        scalar_bits: u32,
         flags: u32,
         generation: u32,
     ) -> (KernReturn, MachPort) {
@@ -5703,7 +5775,7 @@ mod platform {
             },
             op,
             endpoint,
-            scalar_bits: scalar.to_bits(),
+            scalar_bits,
             flags,
             // 0 is the wire's "concerns no slot", which is what a Ping is; a
             // Volume notify carries the slot's current stamp so the driver can
@@ -5746,6 +5818,23 @@ mod platform {
         // the session, and the service loop then goes back to looking up.
         if kr != MACH_MSG_SUCCESS && kr != MACH_SEND_TIMED_OUT {
             disconnect_port(shared, port, "volume relay found its port dead");
+        }
+    }
+
+    pub fn send_latency(shared: &Shared, at: HalEndpoint, generation: u32, frames: u32) {
+        let (kr, port) = send_to_driver_raw(
+            shared,
+            NOTIFY_LATENCY,
+            at.to_wire(),
+            frames,
+            if at.input { FLAG_IS_INPUT } else { 0 },
+            generation,
+        );
+        // A dropped latency notify is harmless on its own: the caller re-sends
+        // while the driver's ack disagrees with what it asked for, so a full
+        // queue costs one tick. Only a dead port ends the session.
+        if kr != MACH_MSG_SUCCESS && kr != MACH_SEND_TIMED_OUT {
+            disconnect_port(shared, port, "latency relay found its port dead");
         }
     }
 
@@ -8743,6 +8832,9 @@ mod platform {
     }
 
     #[cfg(not(windows))]
+    pub fn send_latency(_shared: &Shared, _at: HalEndpoint, _generation: u32, _frames: u32) {}
+
+    #[cfg(not(windows))]
     pub fn send_bind_set(_shared: &Shared, _req: &HalBindRequest) -> bool {
         false
     }
@@ -9002,6 +9094,44 @@ mod platform {
                 "[audiohubd] hal: slot {} volume notify failed: {e:#}",
                 at.slot
             );
+        }
+    }
+
+    /// The Windows leg of latency declaration. Unlike macOS -- where the driver
+    /// answers asynchronously with `CTL_LATENCY_STATE` -- the IOCTL returns the
+    /// stored value right here, so this pushes the SAME `LatencyState` event the
+    /// mach path pushes. One event shape, one consumer, one place that decides
+    /// whether the declaration took.
+    ///
+    /// A driver without `CAP_LATENCY` pushes NOTHING. That is what leaves the
+    /// caller's "asked for X, acked nothing" state standing, which is exactly
+    /// what it should report: this driver cannot be told. Pushing a fabricated
+    /// ack here would turn a known limitation into a silent one.
+    #[cfg(windows)]
+    pub fn send_latency(shared: &Shared, at: HalEndpoint, generation: u32, frames: u32) {
+        let guard = lk(&shared.rings.session);
+        let Some(s) = guard.as_ref() else { return };
+        if !s.has_latency() {
+            return;
+        }
+        match s.set_latency(at.slot, generation, at.input, frames) {
+            Ok(stored) => {
+                drop(guard);
+                shared.push_event(HalControlEvent::LatencyState {
+                    at,
+                    generation,
+                    frames: stored,
+                    // Windows has no "held back until IO stops" state: the value
+                    // is stored at once and each stream captures its own copy
+                    // when it is created, so what is pending is the STREAM, not
+                    // the value. Reporting `pending` here would name a state the
+                    // driver does not have.
+                    pending: false,
+                });
+            }
+            Err(e) => {
+                dlog!("[audiohubd] hal: slot {} latency declaration failed: {e:#}", at.slot);
+            }
         }
     }
 

@@ -77,6 +77,19 @@ enum
 #define kVolume_MinDB (-64.0f)
 #define kVolume_MaxDB (0.0f)
 
+// Ceiling on what the daemon may make kAudioDevicePropertyLatency say: four
+// seconds at 48k. Not a judgement about what a sane link looks like -- the
+// daemon owns that -- but a bound on what one corrupted word can make CoreAudio
+// believe. Deliberately generous: AirPlay declares 88200 frames (2.0 s), so a
+// ceiling anywhere near "reasonable" would be a second, undocumented policy.
+#define kDevice_MaxDeclaredLatency (48000u * 4u)
+
+// The only `inChangeAction` this driver ever requests. AudioServerPlugIn.h:564
+// lists "changing presentation latency" among the changes that must go through
+// RequestDeviceConfigurationChange, and this names which one it was so
+// PerformDeviceConfigurationChange does not have to guess.
+#define kAudioHubChange_Latency  1ull
+
 // One pending control-plane post. Each is a single 64-bit word so a reader can
 // never see the scalar of one post paired with the flags of another; the
 // sequence counter is what tells the service thread there is something new, and
@@ -130,11 +143,24 @@ typedef struct AudioHubDevice
     // ---- control-plane outbox
     AudioHubMailbox vol;
     AudioHubMailbox io;
+    AudioHubMailbox lat; // kAudioHubCtl_LatencyState: what the property REALLY says
 
     // ---- mutable state; scalar/mute/streamIsActive guarded by
     // gPlugIn_StateMutex, IO fields guarded by ioMutex
     pthread_mutex_t ioMutex;
     UInt64          ioRunning;
+    // DECLARED LATENCY, both guarded by ioMutex because the rule that governs
+    // them is an IO rule: `wanted` is whatever the daemon last measured,
+    // `latency` is what kAudioDevicePropertyLatency answers, and the second
+    // only ever follows the first WHILE ioRunning == 0. See the long comment at
+    // `case kAudioDevicePropertyLatency`.
+    //
+    // Both start at 0, and 0 is the deliberate cold start: it means "nobody has
+    // ever measured this path". Inventing a plausible-looking placeholder here
+    // would put a number in front of every consumer that no measurement backs,
+    // which is the one thing worse than the honest 0 this round is replacing.
+    UInt32          latencyFrames;
+    UInt32          latencyWanted;
     Float64         sampleRate;
     Float64         hostTicksPerFrame;
     UInt64          anchorHostTime;
@@ -416,6 +442,67 @@ static void bridge_io_state_changed(AudioHubDevice* inDevice, Boolean inRunning)
     AudioHub_Post(&inDevice->io, 0.0f, theFlags);
 }
 
+// THE LATCH. Installs whatever the daemon last asked for, but only while this
+// endpoint's IO is stopped; returns what the property now answers and sets
+// *outPending when a newer value is being held back.
+//
+// Callers must NOT already hold ioMutex.
+//
+// Why a latch and not a plain assignment: the declared latency has to be
+// CONSTANT for the life of an open stream. Every consumer that reads this
+// property reads it once, at open (VLC auhal.c:1629 in Start(), Chromium in
+// Open(); neither installs a listener for it). A number that moved underneath
+// them would therefore never be re-read by anyone, while the only sanctioned
+// way to move it -- RequestDeviceConfigurationChange -- makes the host stop and
+// restart IO. Servoing it would be pure cost against zero readers.
+// outChanged is "this call moved the property", which is a different question
+// from "the value differs from what the daemon wants" (outPending) -- and it is
+// the one that decides whether the host has to be told. Both are computed under
+// the same lock as the latch itself: sampling latencyFrames before the call and
+// comparing afterwards would be a read of ioMutex-guarded state without the
+// mutex, and the answer would be wrong exactly when two threads race.
+static UInt32 AudioHub_LatchLatency(AudioHubDevice* inDevice, Boolean* outPending, Boolean* outChanged)
+{
+    pthread_mutex_lock(&inDevice->ioMutex);
+    const UInt32 theBefore = inDevice->latencyFrames;
+    if(inDevice->ioRunning == 0)
+    {
+        inDevice->latencyFrames = inDevice->latencyWanted;
+    }
+    const UInt32 theFrames = inDevice->latencyFrames;
+    const Boolean thePending = (inDevice->latencyFrames != inDevice->latencyWanted);
+    pthread_mutex_unlock(&inDevice->ioMutex);
+    if(outPending != NULL)
+    {
+        *outPending = thePending;
+    }
+    if(outChanged != NULL)
+    {
+        *outChanged = (theFrames != theBefore);
+    }
+    return theFrames;
+}
+
+// The ack half of kAudioHubNotify_Latency. Reports what the property ACTUALLY
+// answers, never what was requested: "the mach send returned KERN_SUCCESS" is
+// not evidence a property moved, and this project has been burned eight times
+// by exactly that substitution.
+static void bridge_latency_state(AudioHubDevice* inDevice)
+{
+    Boolean thePending = false;
+    const UInt32 theFrames = AudioHub_LatchLatency(inDevice, &thePending, NULL);
+    uint32_t theFlags = thePending ? kAudioHubFlag_LatencyPending : 0u;
+    if(inDevice->isInput)
+    {
+        theFlags |= kAudioHubFlag_IsInput;
+    }
+    // The frame count travels in the scalar slot as a PLAIN uint32, so it must
+    // not go through AudioHub_Post's Float32 parameter -- 7200.0f would arrive
+    // as 0x45E10000 and the daemon would read 1,172,242,432 frames.
+    atomic_store(&inDevice->lat.word, ((uint64_t)theFlags << 32) | (uint64_t)theFrames);
+    atomic_fetch_add(&inDevice->lat.seq, 1);
+}
+
 // Returns non-zero while the daemon is still reachable. Only a DELIVERED post
 // advances the sent marker: a send that merely timed out was not delivered, and
 // marking it sent used to throw the volume change away with no retry.
@@ -457,7 +544,8 @@ static int AudioHub_FlushOutbox(void)
         {
             AudioHubDevice* theDevice = &theSlot->dev[theDir];
             if(!AudioHub_FlushMailbox(&theDevice->vol, kAudioHubCtl_Volume, theDevice->endpoint, theGeneration) ||
-               !AudioHub_FlushMailbox(&theDevice->io, kAudioHubCtl_IOState, theDevice->endpoint, theGeneration))
+               !AudioHub_FlushMailbox(&theDevice->io, kAudioHubCtl_IOState, theDevice->endpoint, theGeneration) ||
+               !AudioHub_FlushMailbox(&theDevice->lat, kAudioHubCtl_LatencyState, theDevice->endpoint, theGeneration))
             {
                 return 0;
             }
@@ -610,8 +698,16 @@ static void AudioHub_ReplaySlotState(AudioHubSlot* inSlot)
 
         theDevice->vol.sent = 0;
         theDevice->io.sent = 0;
+        theDevice->lat.sent = 0;
         bridge_volume_changed(theDevice, theScalar, theMuted);
         bridge_io_state_changed(theDevice, theRunning);
+        // The latency the property answers survives a daemon restart (it lives
+        // in this record, not in the daemon), so the new daemon must be told
+        // what it is rather than assume 0 and re-push. Without this line a
+        // daemon that reconnects to a device an application is currently
+        // playing through would see "acked 0", conclude the driver ignored it,
+        // and report a failure that is not happening.
+        bridge_latency_state(theDevice);
     }
 }
 
@@ -761,12 +857,21 @@ static int AudioHub_BindSlot(AudioHubSlot* inSlot, const AudioHubBindMsg* inMsg)
             theDevice->timeStampCount = 0;
             theDevice->ioRunning      = 0;
 
+            // A fresh binding means a DIFFERENT peer over a different network
+            // path, so the previous tenant's measured latency is worthless here
+            // and keeping it would declare one machine's distance for another's.
+            theDevice->latencyFrames  = 0;
+            theDevice->latencyWanted  = 0;
+
             theDevice->vol.sent = 0;
             theDevice->io.sent = 0;
+            theDevice->lat.sent = 0;
             atomic_store(&theDevice->vol.word, 0);
             atomic_store(&theDevice->vol.seq, 0);
             atomic_store(&theDevice->io.word, 0);
             atomic_store(&theDevice->io.seq, 0);
+            atomic_store(&theDevice->lat.word, 0);
+            atomic_store(&theDevice->lat.seq, 0);
 
             atomic_store(&theDevice->live, 1); // last: everything above is visible by now
         }
@@ -926,12 +1031,17 @@ static void AudioHub_RetireDueSlots(void)
             theDevice->ioRunning      = 0;
             theDevice->timeStampCount = 0;
             theDevice->anchorHostTime = 0;
+            theDevice->latencyFrames  = 0;
+            theDevice->latencyWanted  = 0;
             atomic_store(&theDevice->vol.word, 0);
             atomic_store(&theDevice->vol.seq, 0);
             atomic_store(&theDevice->io.word, 0);
             atomic_store(&theDevice->io.seq, 0);
+            atomic_store(&theDevice->lat.word, 0);
+            atomic_store(&theDevice->lat.seq, 0);
             theDevice->vol.sent = 0;
             theDevice->io.sent = 0;
+            theDevice->lat.sent = 0;
         }
         AudioHub_RebuildDeviceListLocked();
         pthread_mutex_unlock(&gPlugIn_StateMutex);
@@ -1203,6 +1313,49 @@ static void AudioHub_ApplyDaemonVolume(uint32_t inEndpoint, uint32_t inGeneratio
     }
 }
 
+// Control plane, the honesty half: the daemon has measured how long it really
+// takes for a frame this endpoint accepts to become audible on the peer's
+// speakers, and that is what kAudioDevicePropertyLatency must answer.
+// Runs on the bridge thread.
+//
+// THIS FUNCTION MAKES NO HOST CALLS. RequestDeviceConfigurationChange is the
+// header-sanctioned way to move this property and it is invoked from StopIO
+// instead (see there): the bridge thread is the one that also answers the
+// heartbeat, and a daemon that stops hearing it for five seconds re-Hellos and
+// re-binds every slot. Stashing plus a mailbox post is all this path costs.
+static void AudioHub_ApplyDaemonLatency(uint32_t inEndpoint, uint32_t inGeneration, uint32_t inFrames)
+{
+    if(inEndpoint >= kAudioHubMaxEndpoints)
+    {
+        return;
+    }
+    AudioHubSlot* theSlot = &gSlots[AUDIOHUB_ENDPOINT_SLOT(inEndpoint)];
+    if((theSlot->state != kSlotBound) || (inGeneration != theSlot->generation))
+    {
+        // A latency measured against the peer that USED to hold this slot.
+        // Declaring another machine's distance is the same class of error as
+        // moving another machine's slider.
+        return;
+    }
+    AudioHubDevice* theDevice = &theSlot->dev[AUDIOHUB_ENDPOINT_DIR(inEndpoint)];
+    // A quarter of a second at 48k. Not a policy about what is reasonable --
+    // the daemon owns that -- but a bound on what a corrupted or hostile word
+    // can make CoreAudio believe about this device. AirPlay declares 88200
+    // (2.0 s), so the ceiling is deliberately generous.
+    if(inFrames > kDevice_MaxDeclaredLatency)
+    {
+        os_log_error(OS_LOG_DEFAULT, kAudioHubDriverLog "refused an absurd latency for endpoint %u: %u frames",
+                     inEndpoint, inFrames);
+        return;
+    }
+    pthread_mutex_lock(&theDevice->ioMutex);
+    theDevice->latencyWanted = inFrames;
+    pthread_mutex_unlock(&theDevice->ioMutex);
+    // Latches immediately when nothing is playing, holds otherwise, and either
+    // way tells the daemon which of the two happened.
+    bridge_latency_state(theDevice);
+}
+
 // ---------------------------------------------------------------- bridge hooks
 
 static void AudioHub_BridgeAttached(void)
@@ -1239,6 +1392,7 @@ static const AudioHubBridgeHooks gBridgeHooks =
     .detached        = AudioHub_BridgeDetached,
     .bind            = AudioHub_HandleBind,
     .notify_volume   = AudioHub_ApplyDaemonVolume,
+    .notify_latency  = AudioHub_ApplyDaemonLatency,
     .flush           = AudioHub_FlushOutbox,
     .tick            = AudioHub_BridgeTick,
     .io_running_mask = AudioHub_IORunningMask
@@ -1509,9 +1663,11 @@ static OSStatus AudioHubDriver_RemoveDeviceClient(AudioServerPlugInDriverRef inD
 
 static OSStatus AudioHubDriver_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt64 inChangeAction, void* inChangeInfo)
 {
-    // Sample rate is fixed at 48kHz in the scaffold, so no change actions are
-    // ever requested; keep the timing recompute so the mechanism stays honest.
-    (void)inChangeAction;
+    // The sample rate is fixed at 48kHz, so kAudioHubChange_Latency (StopIO,
+    // after installing a newly measured value) is the only action anything ever
+    // requests. The timing recompute runs unconditionally anyway: it was here
+    // before there were any actions at all, to keep the mechanism honest, and
+    // it is cheap and idempotent.
     (void)inChangeInfo;
     if(inDriver != gAudioServerPlugInDriverRef)
     {
@@ -1525,6 +1681,14 @@ static OSStatus AudioHubDriver_PerformDeviceConfigurationChange(AudioServerPlugI
     pthread_mutex_lock(&theDevice->ioMutex);
     AudioHub_InitDeviceTiming(theDevice);
     pthread_mutex_unlock(&theDevice->ioMutex);
+    if(inChangeAction == kAudioHubChange_Latency)
+    {
+        // The value is already installed (StopIO latched it before asking); this
+        // is belt and braces for the case where the host defers the callback
+        // long enough for another StartIO/StopIO pair to have happened, and it
+        // re-acks so the daemon's picture matches the property once more.
+        bridge_latency_state(theDevice);
+    }
     AudioHub_Release(theDevice);
     return kAudioHardwareNoError;
 }
@@ -1956,7 +2120,67 @@ static OSStatus AudioHub_GetDevicePropertyData(AudioHubDevice* inDevice, const A
             *outDataSize = sizeof(UInt32);
             break;
         case kAudioDevicePropertyLatency:
+            // ======================= WHAT THIS NUMBER MEANS, AND WHY =========================
+            //
+            // AudioHardwareBase.h:689 -- "the number of frames of latency IN THE AudioDevice".
+            // For us that is: how long after an application hands us a frame does it come out
+            // of the PEER's speakers. Measured on the real link, ~121 ms, i.e. ~5800 frames.
+            //
+            // Until 2026-08 this returned 0, which told the OS "the frame you hand me at time
+            // T is audible at time T". The excuse -- "a virtual device has no DAC, so 0" --
+            // was wrong on its own terms: the header says latency IN THE DEVICE, not in its
+            // DAC. AirPlay has no DAC either and declares 88200 frames (2.0 s); this Mac's
+            // Continuity iPhone microphone has no ADC here and declares 6000 frames (125 ms).
+            // BlackHole / Teams / WeMeet declare 0 TRUTHFULLY -- they ARE local loopbacks.
+            // We are not: there is a machine and a network in between.
+            //
+            // WHAT THE HONEST NUMBER BUYS, AND WHAT IT DOES NOT.
+            // Buys: a/v sync. Chromium sums this into GetPlayoutTime() and its own comment
+            // says "a/v sync"; VLC sums it in GetLatency() for ca_TimeGet; AVAudioPlayerNode
+            // fires ...CompletionDataPlayedBack against it; a web page reads it as
+            // AudioContext.outputLatency. All four were being fed a constant ~121 ms error,
+            // and 121 ms is far past the point where a viewer sees lips out of sync.
+            // Does NOT buy: responsiveness. NO consumer uses this property to size a buffer;
+            // play/pause does not get one millisecond faster. AirPlay's instant response is
+            // its own Buffered Audio stream plus PTP anchoring, an unrelated mechanism.
+            // Full investigation: docs/research-device-latency-property.md.
+            //
+            // THREE RULES THIS CODE ENFORCES.
+            //  1. ONLY this property. `kAudioDevicePropertySafetyOffset` -- which used to
+            //     share this `case` -- is defined as "frames ahead of the current hardware
+            //     position that is safe to do IO", i.e. it PARTICIPATES IN IO SCHEDULING.
+            //     Raising it really does add that much latency and really does disturb the
+            //     DLL servo behind `hal_spk`. It now has its own `case` below and its own 0.
+            //  2. Constant for the life of an open stream: AudioHub_LatchLatency only
+            //     installs a new value while ioRunning == 0. Reasoning is on that function.
+            //  3. kAudioDevicePropertyBufferFrameSize is NOT included. Apple's own formula
+            //     (AUAudioUnit.h:1487) is "I/O buffer + safety offset + device latency", so
+            //     consumers add the buffer themselves; folding it in here would double-count
+            //     512 frames (10.7 ms). By the same formula the number below is complete on
+            //     its own -- the app-to-IOProc wait IS the buffer term, and everything after
+            //     the IOProc (the hal_spk ring, pacing, the network, the peer's jitter
+            //     buffer, its play ring and its sound card) is what the daemon measures.
+            //
+            // Two things this returns 0 for, both deliberate:
+            //   - the MICROPHONE direction, because `hal_mic` is still a [0, 500 ms] free
+            //     parameter with no restoring force (docs/spec-hal-mic-latency.md).
+            //     Enforced in the daemon, which is where the reason lives; the driver takes
+            //     whatever it is told.
+            //   - a peer whose path has never been measured. Refusing to invent a number is
+            //     the point of the whole change.
+            // ================================================================================
+            if(inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+            *((UInt32*)outData) = AudioHub_LatchLatency(inDevice, NULL, NULL);
+            *outDataSize = sizeof(UInt32);
+            break;
         case kAudioDevicePropertySafetyOffset:
+            // ZERO, AND IT MUST STAY ZERO. This is not the honesty property; it is an IO
+            // SCHEDULING one (AudioHardwareBase.h:706: "the number [of] frames ahead (for
+            // output) or behind (for input) the current hardware position that is safe to do
+            // IO"). Whatever goes here, the HAL really does call us that much earlier, so a
+            // non-zero value ADDS REAL LATENCY -- the opposite of what the sibling case above
+            // is for -- and perturbs the DLL servo that `hal_spk`'s depth accounting rests
+            // on. Our IOProc copies into a lock-free ring and needs no head start at all.
             if(inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
             *((UInt32*)outData) = 0;
             *outDataSize = sizeof(UInt32);
@@ -2204,6 +2428,18 @@ static OSStatus AudioHub_GetStreamPropertyData(AudioHubDevice* inDevice, const A
             *outDataSize = sizeof(UInt32);
             break;
         case kAudioStreamPropertyLatency:
+            // ZERO BECAUSE THE DEVICE CARRIES THE WHOLE NUMBER, not because there is
+            // nothing to declare. AudioHardwareBase.h:1091: "If both the device and the
+            // stream say they have latency, then the total latency for the stream is the
+            // device latency summed with the stream latency." Every consumer adds the two
+            // (Chromium core_audio_util_mac.cc, VLC auhal.c:1479), so putting the number in
+            // BOTH would report it twice. It has to be exactly one of them, and the device
+            // is the one this driver uses -- see `case kAudioDevicePropertyLatency`.
+            //
+            // Which one is genuinely free: this Mac's built-in devices put the bulk HERE
+            // (Microphone 1439 f = 29.98 ms, Speakers 639 f = 14.49 ms) and near-nothing on
+            // the device. The device side wins here only because there is one declared
+            // number per endpoint and it already lives in the device record.
             if(inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
             *((UInt32*)outData) = 0;
             *outDataSize = sizeof(UInt32);
@@ -2850,6 +3086,28 @@ static OSStatus AudioHubDriver_StopIO(AudioServerPlugInDriverRef inDriver, Audio
     if(theBecameIdle)
     {
         bridge_io_state_changed(theDevice, false);
+        // THE ONE PLACE THE DECLARED LATENCY IS ANNOUNCED. Nothing is playing
+        // any more, so the change the header demands go through
+        // RequestDeviceConfigurationChange (AudioServerPlugIn.h:564 names
+        // "changing presentation latency" explicitly) costs an IO stop/start on
+        // a device that is already stopped -- no interruption for anyone.
+        //
+        // Why here and not on the bridge thread that receives the value: this
+        // is a plain HAL callback thread, while the bridge thread also answers
+        // the heartbeat and must not make a host call that could sit. And why
+        // announce at all when the property getter latches on its own: so the
+        // HAL drops any copy it cached the last time somebody read it. The
+        // getter's latch keeps the OPENING client correct even if the host
+        // never asks again; this keeps a client that already asked from holding
+        // a value we have since contradicted.
+        Boolean theChanged = false;
+        (void)AudioHub_LatchLatency(theDevice, NULL, &theChanged);
+        if(theChanged && (gPlugIn_Host != NULL))
+        {
+            gPlugIn_Host->RequestDeviceConfigurationChange(
+                gPlugIn_Host, AudioHub_ID(&theDevice->deviceID), kAudioHubChange_Latency, NULL);
+        }
+        bridge_latency_state(theDevice);
     }
     AudioHub_Release(theDevice);
     return theAnswer;

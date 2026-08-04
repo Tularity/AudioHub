@@ -139,6 +139,25 @@ protected:
     // silence from outside, and only a count tells them apart.
     ULONGLONG                   m_AhFramesMoved;
     ULONGLONG                   m_AhFramesShort;
+    //
+    // DOWNSTREAM LATENCY for this stream, in frames: how long after this driver
+    // accepts a frame it is audible on the peer's speakers. Subtracted from the
+    // presentation position reported by GetPresentationPosition, and from
+    // NOTHING else -- the linear position keeps meaning "bytes the DMA has
+    // consumed", which is what the engine's own bookkeeping rests on.
+    //
+    // SAMPLED ONCE, in Init(), and never re-read. Unlike m_AhSlot's ring
+    // pointer -- which is deliberately re-fetched every pass so a daemon that
+    // attaches mid-stream is picked up -- this one must NOT follow the slot,
+    // because presentation position is a CLOCK. Moving its offset underneath a
+    // running consumer can make that clock appear to run backwards, and a
+    // non-monotonic presentation position is a worse defect than a constant
+    // offset error. A value that arrives mid-stream therefore applies to the
+    // next stream on this endpoint, which is also exactly what the macOS side
+    // does with kAudioDevicePropertyLatency (consumers there read it once at
+    // open and none of them installs a listener).
+    //
+    ULONGLONG                   m_AhPresentationOffsetFrames;
     // Member variable as config params for tone generator
     ULONG                       m_ulHostCaptureToneFrequency;
     // If abs(m_dwHostCaptureToneAmplitude) + abs(m_dwHostCaptureToneDCValue) > 100

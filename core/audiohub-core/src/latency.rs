@@ -92,7 +92,7 @@ impl LatSource {
 /// 声卡自身的固有延迟。P0 阶段恒为 `Unavailable`（平台查询是 P1 的活），
 /// 保留类型是为了让「缺项 ⇒ 总和 None ⇒ UI 带『≥』」这条链路现在就成立，
 /// 而不是等 P1 再回来补一遍判空。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DevLatency {
     pub frames: u32,
     pub rate: u32,

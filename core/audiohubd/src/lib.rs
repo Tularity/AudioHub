@@ -2,6 +2,10 @@
 //! Frozen lib entry: `DaemonCfg` / `DaemonHandle` / `start_daemon`.
 
 mod conn;
+/// 向系统**如实声明**虚拟设备的延迟：口径、死区与闭环判据。
+mod devdecl;
+/// 设备固有延迟（规格 §3.2 的级 2 `cap_dev` / 级 9 `play_dev`）接进遥测的地方。
+mod devlats;
 mod engine;
 pub mod haldev;
 pub mod halbridge;
@@ -53,6 +57,8 @@ use audiohub_core::dsp::{self, LinearResampler};
 use audiohub_core::latency::{
     DevLatency, DriftTracker, DropMode, StageDepth, StageId, StageSlot,
 };
+#[cfg(test)]
+use audiohub_core::latency::LatSource;
 use audiohub_core::sysaudio::{self, VirtualCard};
 use audiohub_core::volume::{self, VolumeState, VolumeSync};
 use audiohub_ipc::{
@@ -384,6 +390,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         dev_in_epoch: AtomicU64::new(0),
         dev_out_epoch: AtomicU64::new(0),
         devices: Mutex::new(None),
+        dev_lat: devlats::DevLatCache::new(),
         play_ring: StageSlot::new(),
         play_drift: Mutex::new(DriftTracker::new()),
         mix_clip: quality::ClipMeter::new(),
@@ -608,6 +615,15 @@ pub(crate) struct DaemonInner {
     pub dev_in_epoch: AtomicU64,
     pub dev_out_epoch: AtomicU64,
     pub devices: Mutex<Option<DeviceCache>>,
+    /// 规格 §3.2 的级 2 `cap_dev` 与级 9 `play_dev`：两个**默认设备**的固有延迟。
+    ///
+    /// 与 `play_ring` 同一条归属理由——它是**设备**属性，不属于任何一条会话，
+    /// 所以挂在 daemon 上、按方向各一份。多条流报同一个 `play_dev` 是物理事实
+    /// （规格 §7.2 R7），同样**不可跨流求和**。
+    ///
+    /// 缓存与失效规则见 [`devlats::DevLatCache`]；它只在 1 s 的 ticker /
+    /// `session.list` 上被读，**不在音频节拍上**。
+    pub dev_lat: devlats::DevLatCache,
     /// 真实默认输出的播放环深度（规格 §3.2 的级 8 `play_ring`），由混音线程
     /// 每 10 ms 发布。
     ///
@@ -783,6 +799,43 @@ pub(crate) fn status_with_hal(
 /// `hal` 里那份 `audiohub_ipc::HalStatus` 是**发布过的**结构，它的字段被
 /// `test/tests/hal_wiring.rs` 冻结；trim/underrun/skip 是新量，挂在自己的键下，
 /// 一个字段都不动老结构。
+/// `daemon.status.latency_guard.dev_lat`：两台默认设备的固有延迟现场。
+///
+/// 走缓存（`dev_lats()` 会按需刷新），所以 `daemon.status` 不会变成一条
+/// 「每次调用都问四遍 CoreAudio」的路径。
+fn dev_lats_status(inner: &DaemonInner) -> serde_json::Value {
+    let lats = dev_lats(inner);
+    serde_json::json!({
+        "cap_dev_ms": lats.input.ms(),
+        "play_dev_ms": lats.output.ms(),
+        "detail": inner.dev_lat.report(),
+    })
+}
+
+/// `daemon.status.latency_guard.declared`：本机每台虚拟扬声器**对系统声明**了
+/// 多少延迟，以及驱动自陈它此刻真的声明了多少。
+///
+/// 两个数分开列，这是本功能唯一的验收面。合成一个（「已声明 X」）就退回了
+/// 「我发过所以它生效了」，而驱动可能：太旧不认这条消息、正被某个 App 占着
+/// 装不上、或者压根没收到。三种情形在「我发过」那一栏里长得完全一样。
+fn declared_status(inner: &DaemonInner) -> serde_json::Value {
+    let st = lk(&inner.haldev);
+    let mut lines = Vec::new();
+    for (slot, rec) in st.slots.iter().enumerate() {
+        if rec.fingerprint.is_empty() {
+            continue;
+        }
+        lines.push(devdecl::line(&format!("slot {slot} spk ({})", rec.fingerprint), &rec.decl_out));
+    }
+    serde_json::json!({
+        // 每台虚拟扬声器一行。麦克风方向刻意不在这里：它根本不声明
+        // （`hal_mic` 在 spec-hal-mic-latency.md 里还是一个无回复力的自由参数）。
+        "spk": lines,
+        "deadband_frames": devdecl::DEADBAND_FRAMES,
+        "give_up_after": devdecl::GIVE_UP_AFTER,
+    })
+}
+
 fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
     let hal = inner.hal().map(|h| {
         let s = h.status();
@@ -926,6 +979,20 @@ fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
         "servo": lk(&inner.servo_site).json(servo_by_stream(inner)),
         "hal_spk": hal,
         "hal_mic": hal_mic,
+        // 规格 §3.2 的级 2 / 级 9：两台**默认设备**此刻报出来的固有延迟原始形态。
+        //
+        // 为什么要把逐项（`device` / `safety_offset` / `stream` / `io_buffer`，
+        // Windows 上是 `device_period` 或标定来的 `write_to_play`）都发出去，
+        // 而不是只发一个合计毫秒数：这一级**最常见的故障是「少答了一项」**，
+        // 而合计在那种情况下是 `unavailable`——一个说不出「缺了哪一项」的
+        // `unavailable` 让人分不清「这台机器不支持」和「四项里有一项没答」。
+        // `source` 同样必须在：`api` / `assumed` / `unreliable` 三者的读数
+        // 长得一模一样，只有这个标签能说出哪个能当真值用。
+        "dev_lat": dev_lats_status(inner),
+        // 「我们对系统说这台虚拟设备有多少延迟」——本轮之前恒为 0，即一句
+        // 已知为假的话。收益在音视频同步（播放器据此推后画面），**不在响应
+        // 速度**：没有任何消费者拿这个属性决定缓冲大小。见 `devdecl` 文件头。
+        "declared": declared_status(inner),
         // 接收侧：`play_ring` 的跨时钟速率伺服。这一级是全链路上**唯一真正
         // 跨时钟**的一段（mac 的发送节拍 vs Windows 声卡晶振，两个独立振荡器），
         // 也是治法 A 落地之后唯一还在无界积累的病灶。
@@ -1878,10 +1945,11 @@ pub(crate) fn build_session_infos(inner: &DaemonInner) -> Vec<SessionInfo> {
     };
     // 逐级延迟会计**全部**在装配层一次算完（见 `assemble_pipelines`）：
     // N 条流进，N 条读数出，第 i 条只由第 i 条流自己的队列决定。
+    let lats = dev_lats(inner);
     let pipelines = assemble_pipelines(
         &inner.play_ring,
         &inner.play_drift,
-        entries.iter().map(StreamLat::of).collect(),
+        entries.iter().map(|e| StreamLat::of(e, lats)).collect(),
     );
     // ⚠ 两个 `into_iter()` 都不是风格选择，是 R8 在这一层的封口：`entries` 与
     // `pipelines` 双双被**移进**迭代器，于是闭包里的
@@ -1913,6 +1981,18 @@ pub(crate) fn build_session_infos(inner: &DaemonInner) -> Vec<SessionInfo> {
 /// 刻意不含 `conn`、不含 `SessionEntry`：见 `assemble_pipelines` 的文档。
 /// 这也是这一层能被测试驱动的原因——`SessionEntry.conn` 要一条真 TCP 与一次
 /// 完整握手才造得出来，收它当参数就等于把装配层永久挡在测试之外。
+/// 两个默认设备此刻的固有延迟读数。带缓存，见 [`devlats::DevLatCache`]。
+///
+/// epoch 的合成方式与 `device_listing` **逐字相同**（两个方向相加）：
+/// 任一方向的默认设备变了都要重查，因为一条流的头和尾分别挂在两边。
+pub(crate) fn dev_lats(inner: &DaemonInner) -> devlats::DevLats {
+    let epoch = inner
+        .dev_in_epoch
+        .load(Ordering::Relaxed)
+        .wrapping_add(inner.dev_out_epoch.load(Ordering::Relaxed));
+    inner.dev_lat.read(epoch)
+}
+
 pub(crate) struct StreamLat<'a> {
     is_send: bool,
     tx: Option<&'a TxShared>,
@@ -1921,18 +2001,53 @@ pub(crate) struct StreamLat<'a> {
     peer: Option<PeerLatSnapshot>,
     /// 这条流所在**连接**的时钟估计。队列属于流，时钟属于主机。
     clock: Option<ClockEstimate>,
+    /// **这一条流**经过的那台声卡（级 2 / 级 9），`None` = 路径上没有设备级。
+    /// 判据见 [`devlats::stream_dev`]——它是按流的，读数是按方向的。
+    dev: Option<DevLatency>,
 }
 
 impl<'a> StreamLat<'a> {
-    fn of(e: &'a SessionEntry) -> StreamLat<'a> {
+    fn of(e: &'a SessionEntry, lats: devlats::DevLats) -> StreamLat<'a> {
         StreamLat {
             is_send: e.dir == DIR_SEND,
             tx: e.tx.as_deref(),
             rx: e.rx.as_deref(),
             peer: e.peer_lat.snapshot(),
             clock: lk(&e.conn.clock).estimate(),
+            dev: devlats::stream_dev(
+                e.dir == DIR_SEND,
+                e.tx.as_deref().is_some_and(has_capture_stage),
+                e.rx.as_deref().is_some_and(renders_to_default_output),
+                lats,
+            ),
         }
     }
+}
+
+/// 这条发送流的源**是一台真实采集设备**吗？
+///
+/// 判据取自实际发出来的级，不取自配置：`cap_ring`（级 1）只由
+/// `MicSource::depths()` 发射——`SysAudioFrames` 只发 `src_fifo`、
+/// `HalSpeakerSource` 只发 `hal_spk`、`ToneSource` 一级都不发。
+///
+/// 为什么不去问 `SourceSpec`：`SessionEntry` 根本拿不到它（源住在 tx 引擎的
+/// `SourceEnt` 表里，按 spec 去重、被 N 条流共享）。而即使拿得到，「配置说要开
+/// 麦克风」与「麦克风这一 tick 真的在供数」也是两件事——设备刚被拔掉时前者仍为真。
+fn has_capture_stage(tx: &TxShared) -> bool {
+    tx.stages
+        .iter()
+        .filter_map(|s| s.load())
+        .any(|d| d.id == StageId::CapRing)
+}
+
+/// 这条接收流**送本机默认输出**吗？
+///
+/// 与 `attach_output_tails` 里决定要不要挂 `play_ring` 的判据**逐字相同**，
+/// 刻意如此：`play_ring` 与 `play_dev` 是同一条物理路径上前后相邻的两级，
+/// 一个在而另一个不在是不可能的。两处若各写各的，就会出现「环报了、声卡没报」
+/// 这种谁也说不清的读数。
+fn renders_to_default_output(rx: &RxStream) -> bool {
+    rx.is_spk || rx.monitor
 }
 
 /// 装配层：**N 条流进，N 条读数出，第 i 条只由第 i 条流的队列决定。**
@@ -1964,7 +2079,7 @@ fn assemble_pipelines(
     streams
         .into_iter()
         .map(|s| {
-            let mut p = build_pipeline_from(s.is_send, s.tx, s.rx)?;
+            let mut p = build_pipeline_from(s.is_send, s.tx, s.rx, s.dev)?;
             if let Some(rx) = s.rx {
                 attach_output_tails(play_ring, play_drift, rx, &mut p);
             }
@@ -2115,14 +2230,21 @@ fn sum_stage_ms(stages: &[PipelineStage]) -> Option<f64> {
 /// 真的 TCP 连接与一次完整握手才造得出来，而这个函数真正的内容（JB 用
 /// contiguous 还是 depth、容量取 target+6、丢弃方向、缺项如何变成 None）一条
 /// 都不需要连接。下面这一行是全部的胶水，逻辑全在 `build_pipeline_from` 里。
-fn build_pipeline(e: &SessionEntry) -> Option<PipelineLatency> {
-    build_pipeline_from(e.dir == DIR_SEND, e.tx.as_deref(), e.rx.as_deref())
+fn build_pipeline(e: &SessionEntry, dev: Option<DevLatency>) -> Option<PipelineLatency> {
+    build_pipeline_from(e.dir == DIR_SEND, e.tx.as_deref(), e.rx.as_deref(), dev)
 }
 
+/// `dev` = **这一条流**经过的那台声卡（规格 §3.2 的级 2 / 级 9），由调用方按
+/// [`devlats::stream_dev`] 判好再传进来。
+///
+/// 三态，缺一个就会撒一次谎（见 `devlats` 文件头纪律 2）：
+/// `None` = 这条流路径上没有这台设备（模式 B 的虚拟扬声器源、纯桥接尾级）；
+/// `Some(Unavailable)` = 有，但读不到；`Some(_)` = 有，且读到了。
 fn build_pipeline_from(
     is_send: bool,
     tx: Option<&TxShared>,
     rx: Option<&RxStream>,
+    dev: Option<DevLatency>,
 ) -> Option<PipelineLatency> {
     let mut stages: Vec<PipelineStage> = Vec::new();
     let side = if is_send { "send" } else { "recv" };
@@ -2175,9 +2297,15 @@ fn build_pipeline_from(
         side: side.to_string(),
         local_ms: sum_stage_ms(&stages),
         stages,
-        // P0：平台设备延迟属性还没查（那是 P1 的活）。**恒 Unavailable，
-        // 绝不填 0** —— 正因为它缺，下面的 confidence 才不可能是 Full。
-        dev: Some(DevLatency::unavailable()),
+        // 级 2 / 级 9：**真值**（`devlats` 接的线），不再是恒 `Unavailable`。
+        //
+        // ⚠ 它**不**进 `local_ms`：`local_ms` 的定义是「Σ 我这一侧的队列级」，
+        // 而收方拿着 `stages` 用同一个 `sum_stage_ms` 重算它做交叉校验
+        // （`PeerLatCell::accept` 的 `PEER_SUM_MISMATCH_MS`）。设备级不在
+        // `stages` 里，把它加进 `local_ms` 会让那条校验**每一拍都报不一致**，
+        // 而那条校验存在的理由是「两端求和口径分岔时能被发现」。
+        // 设备级在 `compose_sum_ms` 里进总数，两侧各进各的。
+        dev,
         // 对端分项与网络段由 `attach_peer_and_net` 在**这一层之外**填（P0b/P1）：
         // 这个函数只认识本侧的队列，它连一条连接都拿不到。默认值是「什么都没有」
         // ——一条从未收到过对端上报的流会原样保持这个形态。
@@ -2249,29 +2377,53 @@ fn attach_output_tails(
 
 // ------------------------------------------- P0b/P1：合成对端分项 + 网络单程
 
-/// 一条流的总延迟：**本侧 Σ + 网络单程 + 对端 Σ**（规格 §3.3）。
+/// 一条流的总延迟：**本侧 Σ + 本侧声卡 + 网络单程 + 对端 Σ + 对端声卡**（规格 §3.3）。
 ///
 /// # 只收标量，收不了切片——这是 R8 的类型级封口
 ///
 /// 规格 §7.2 R8：扇出时一个源被 N 条流引用，物理队列只有一份，N 条流报的
 /// `src_fifo` 是同一个数。把 N 条流的读数相加会得到 N 倍假延迟。这个签名让
 /// 那件事写不出来：没有 `&[PipelineLatency]`，没有 `sum()`，调用点必须先挑出
-/// **一条流**的三个数。合成因此只能是逐流的。
+/// **一条流**的那几个数。合成因此只能是逐流的。
 ///
-/// # 三项缺一即 `None`，绝不用 0 填补
+/// # 五项缺一即 `None`，绝不用 0 填补
 ///
 /// - `local_ms = None`：本侧有一级读不到（`rate == 0`）。
 /// - `peer_local_ms = None`：对端没回传，或它此刻也有一级读不到。
 /// - `net_ms = None`：min-RTT 窗口还没攒够 8 个样本。
+/// - `local_dev` / `peer_dev` = `Some(读不到)`：那一台声卡的属性没答上来。
 ///
 /// 任何一项按 0 计入都会让读数变漂亮而错误——蓝牙耳机那 150~250 ms 就是这么
 /// 消失的。
+///
+/// # 两个设备项是 `Option<DevLatency>`，**三态**
+///
+/// `None` = **这条流路径上没有这台设备**（模式 B 的虚拟扬声器源没有采集声卡、
+/// 纯桥接尾级没走真实输出），贡献 0 且不毒化——没有的东西不占时间。
+/// `Some(unavailable)` = 有这台设备但读不到，**毒化**。
+/// 两者的分界线由 [`devlats::dev_sum_ms`] 执行，那里有一条注入对照测试盯着
+/// 它们不合流。
+///
+/// # 接线之前这里少一整段
+///
+/// 到 `3ed03ff` 为止 `dev` 恒 `Unavailable` 且**根本没进这个函数**，于是
+/// `sum_ms` 系统性少算两台声卡。30-win 实测那条链上光 `play_dev` 一项就是
+/// **41.92 ms**（`docs/spec-playdev-measurement.md` §3），占真实 e2e 的 27%。
+/// ⚠ 接线后 `sum_ms` 往上跳**不是延迟变大**，是一直存在的那段终于被算进来了。
 fn compose_sum_ms(
     local_ms: Option<f64>,
     net_ms: Option<f64>,
     peer_local_ms: Option<f64>,
+    local_dev: Option<DevLatency>,
+    peer_dev: Option<DevLatency>,
 ) -> Option<f64> {
-    Some(local_ms? + net_ms? + peer_local_ms?)
+    Some(
+        local_ms?
+            + net_ms?
+            + peer_local_ms?
+            + devlats::dev_sum_ms(local_dev)?
+            + devlats::dev_sum_ms(peer_dev)?,
+    )
 }
 
 /// 把对端分项（P0b）与网络单程 / 时钟偏移（P1）挂到一条流的读数上。
@@ -2288,28 +2440,25 @@ fn compose_sum_ms(
 /// | 对端没回传 / 回传已过期 | `LocalOnly` | 「对端未上报」，只画本机段 |
 /// | 对端有数，但 min-RTT 窗口没收敛 | `Converging` | 「测量中」（约 8 s） |
 /// | 都有了，但某一级读不到 | `Unavailable` | 「无法测量」 |
-/// | 都有了 | `LowerBound` | 「≥ N ms」——设备固有延迟仍缺 |
+/// | 都有了，两侧声卡都是 `Api` 真值 | `Full` | 一个精确的端到端物理量 |
+/// | 都有了，但至少一侧声卡够不上真值 | `LowerBound` | 「≥ N ms」 |
 ///
-/// `Full` 在这一期**不可达**，故意的：它要求设备固有延迟项齐全，而那是 P1 的
-/// 另一半（`audiohub_core::devlat` 查平台属性），此刻 `dev` 恒 `Unavailable`。
-/// 让它可达就是在说谎。
+/// ⚠ **`Full` 是这一轮才第一次可达的**（`devlats` 把 `dev` 接上之前它恒为
+/// `LowerBound`）。它的判据**落在 `LatSource::is_exact()` 上，不落在
+/// 「有没有值」上**，这条区别是承重的：
 ///
-/// ⚠ **接上设备固有延迟时必须同时改三处**，少改一处就是一个静默的谎：
-/// 1. `compose_sum_ms`：把 `dev` / `peer_dev` 的 ms 加进总数；
-/// 2. 这里的 `LowerBound`：**只有当两侧 dev 都 `LatSource::is_exact()`（即都是
-///    `Api`）时**才谈得上不再是下限；
-/// 3. `the_total_is_both_sides_plus_exactly_one_network_segment` 那条测试。
+/// - Windows 的 `GetDevicePeriod` **有值**（10.00 ms），而同一端点「写进去到
+///   播出来」实测 **41.92 ms**——低报 4.2 倍（`docs/spec-playdev-measurement.md`
+///   §3）。按「有值就升级」做 ⇒ 报出「121 ms」且不带「≥」，而真值 ≈153 ms。
+/// - Windows 的那次开流标定同样**有值**（41.92 ms，准确得多），但它带着
+///   ±8 ms 的开流竞态与「标定流≠生产流」的迁移假设，所以标 `Assumed`
+///   （`devcal` 文件头）——**照样够不上 `Full`**。
+/// - `dev = None`（这条流上没有那台设备）也够不上：那两种情形各自还漏着一截
+///   未建模的缓冲，见 [`devlats::both_exact`]。
 ///
-/// 第 3 条里有一句 `assert!(p.dev…ms().is_none())`，它就是这个前提的看门狗：
-/// 设备项一旦真有值，那条测试会先红，把改动逼到该改的两个地方去。
-///
-/// ⚠⚠ **第 2 条此前写的是「设备项齐全后它不再是下限」，那句话会直接制造一个谎。**
-/// 2026-08-04 于 30-win 实测：Windows 侧 `devlat` 报的 `GetDevicePeriod`
-/// = 10.00 ms，而同一端点「写进去到播出来」实测 **41.92 ms**（低报 4.2 倍，
-/// `docs/spec-playdev-measurement.md` §3）。照原话做 ⇒ 报出「121 ms」且不带「≥」，
-/// 而真值 ≈153 ms。所以 `devlat` 的 Windows 路径已改标 `Unreliable`，
-/// 而**判据必须落在 `is_exact()` 上，不是落在「有没有值」上**：
 /// 「有值」和「是真值」是两件事，这一整套遥测的存在理由就是把它们分开。
+/// 判据抽成 [`devlats::both_exact`] 而不是写在这个 `match` 里，是为了让
+/// `only_two_api_readings_earn_the_word_exact` 那条注入对照能单独盯住它。
 ///
 /// θ 未收敛**不**单独降级：本期显示的 `sum_ms` 里没有 θ 的份（它只服务于 P1
 /// 的 `e2e_ms`）。拿一个与显示值无关的量去把读数标成「测量中」，是另一种形式
@@ -2341,9 +2490,10 @@ fn attach_peer_and_net(
     p.peer_local_ms = peer.local_ms;
     p.peer_dev = peer.dev;
     p.peer_age_s = Some(peer.age_s);
-    p.sum_ms = compose_sum_ms(p.local_ms, p.net_ms, p.peer_local_ms);
+    p.sum_ms = compose_sum_ms(p.local_ms, p.net_ms, p.peer_local_ms, p.dev, p.peer_dev);
     p.confidence = match (p.sum_ms, p.net_ms) {
-        // 齐了。仍带「≥」：设备固有延迟项还没查（`dev` 恒 `Unavailable`）。
+        // 齐了。两侧声卡都是 `Api` 真值才算精确，否则仍带「≥」。
+        (Some(_), _) if devlats::both_exact(p.dev, p.peer_dev) => LatConfidence::Full,
         (Some(_), _) => LatConfidence::LowerBound,
         // 网络段还没收敛（约 8 s）。UI：测量中。
         (None, None) => LatConfidence::Converging,
@@ -2362,7 +2512,13 @@ fn attach_peer_and_net(
 /// 两边若各拼各的，对端拿到的分项会与本机 UI 显示的不是同一个东西，而这种
 /// 分歧只会在两台机器的截图并排放时才被发现。
 fn local_pipeline(inner: &DaemonInner, e: &SessionEntry) -> Option<PipelineLatency> {
-    let mut p = build_pipeline(e)?;
+    let dev = devlats::stream_dev(
+        e.dir == DIR_SEND,
+        e.tx.as_deref().is_some_and(has_capture_stage),
+        e.rx.as_deref().is_some_and(renders_to_default_output),
+        dev_lats(inner),
+    );
+    let mut p = build_pipeline(e, dev)?;
     if let Some(rx) = &e.rx {
         attach_output_tails(&inner.play_ring, &inner.play_drift, rx, &mut p);
     }
@@ -2607,9 +2763,13 @@ pub(crate) fn build_session_info(
     mix_snap: Option<&[f32]>,
     hal_device: Option<&str>,
 ) -> SessionInfo {
-    let pipeline = assemble_pipelines(&inner.play_ring, &inner.play_drift, vec![StreamLat::of(e)])
-        .pop()
-        .flatten();
+    let pipeline = assemble_pipelines(
+        &inner.play_ring,
+        &inner.play_drift,
+        vec![StreamLat::of(e, dev_lats(inner))],
+    )
+    .pop()
+    .flatten();
     build_session_info_with(inner, e, mix_freqs, mix_snap, hal_device, pipeline)
 }
 
@@ -2955,8 +3115,98 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
         // 默认档位跑到下一次变更为止——一个只在特定时序下出现、没有任何报错
         // 的失效。`publish_*` 里那条「真的变了才作废」的判断让重复灌入是免费的。
         publish_targets(&inner, &entries);
-        // 延迟伺服一拍。放在整个 `for` 之后：装配层要一次拿到全部会话。
-        servo_pass(&inner, &entries);
+        // 延迟这一拍。放在整个 `for` 之后：装配层要一次拿到全部会话。
+        latency_pass(&inner, &entries);
+    }
+}
+
+/// 逐级延迟这一拍：**算一次读数，两个消费者。**
+///
+/// 伺服要盯着 UI 显示的那个数，向系统声明的也必须是同一个数。三处各算一份，
+/// 就会出现「界面说 121 ms、伺服认为已达标、而 CoreAudio 被告知 79 ms」这种
+/// 谁也查不出来的三方分歧。这一层算一次、发下去，于是按定义不可能分岔。
+fn latency_pass(inner: &Arc<DaemonInner>, entries: &[SessionEntry]) {
+    // ⚠ **本轮起 `sum_ms` 里含两台声卡的固有延迟**（`devlats` 接的线）。
+    let lats = dev_lats(inner);
+    let pipelines = assemble_pipelines(
+        &inner.play_ring,
+        &inner.play_drift,
+        entries.iter().map(|e| StreamLat::of(e, lats)).collect(),
+    );
+    // 声明在伺服**之前**：两者互不依赖，但声明只读不写，先跑它意味着这一拍
+    // 送进驱动的数与这一拍 UI 显示的数来自同一次采样，中间没有伺服的副作用。
+    declare_pass(inner, entries, &pipelines);
+    servo_pass(inner, entries, &pipelines);
+}
+
+/// 把「这条链路真实多长」告诉本机的虚拟扬声器，让它对系统**如实声明**。
+///
+/// # 选哪条流
+///
+/// 判据是**指纹 + 方向 + 种类**，不是 `origin`：一条以某个槽的虚拟扬声器为源的
+/// 发送流，可以由设备协调器开（`origin == Hal`），也可以由 UI/CLI 开
+/// （`origin == User`），两者走的是同一条物理路径。按 `origin` 挑会漏掉后者，
+/// 而症状只是「那台设备一直声明 0」——没有任何报错。
+/// 这与 `haldev::carries_volume_for` 是同一条判据，刻意如此。
+///
+/// # 只有扬声器方向
+///
+/// 虚拟麦克风那条链的尾级是 `hal_mic`，`docs/spec-hal-mic-latency.md` 记着它
+/// 曾是 `[0, 500 ms]` 的**无回复力自由参数**。在它稳定之前声明麦克风方向，
+/// 等于把一个随机数广播给系统。这条策略只写在这里一处：驱动照单全收。
+fn declare_pass(
+    inner: &Arc<DaemonInner>,
+    entries: &[SessionEntry],
+    pipelines: &[Option<PipelineLatency>],
+) {
+    let Some(hal) = inner.hal() else { return };
+    let mut pending: Vec<(halbridge::HalEndpoint, u32, u32)> = Vec::new();
+    {
+        let mut st = lk(&inner.haldev);
+        for slot in 0..halbridge::HAL_MAX_SLOTS {
+            let (fp, generation) = {
+                let rec = &st.slots[slot];
+                if rec.fingerprint.is_empty()
+                    || rec.state != Some(halbridge::HalSlotState::Bound)
+                {
+                    continue;
+                }
+                (rec.fingerprint.clone(), rec.generation)
+            };
+            let fresh = entries
+                .iter()
+                .zip(pipelines)
+                .find(|(e, _)| {
+                    e.conn.fp == fp && e.kind == KIND_SPK && e.dir == DIR_SEND
+                })
+                .and_then(|(_, p)| p.as_ref())
+                .and_then(devdecl::frames_for);
+            let rec = &mut st.slots[slot];
+            if let Some(f) = fresh {
+                // 死区：目标只在真的变了的时候动。抖动不该每秒招来一次
+                // 配置变更（mac 侧那是要停一次 IO 的）。
+                if let Some(next) = devdecl::advance_want(rec.decl_out.want, f) {
+                    rec.decl_out.want = Some(next);
+                    // 目标变了 ⇒ 重试计数归零。这是「没答」与「答的是旧目标」
+                    // 之间唯一的区分点。
+                    rec.decl_out.tries = 0;
+                }
+            }
+            // 没有 `fresh` 时**什么都不做**，而不是把 `want` 清成 0：
+            // 一次测不到（对端刚断、某一级读不到）不是「这条路变成零延迟了」。
+            // 驱动保持它上一个测出来的值，那仍然是一个测出来的值。
+            let Some(want) = rec.decl_out.want else { continue };
+            if !devdecl::should_send(&rec.decl_out, want) {
+                continue;
+            }
+            rec.decl_out.tries = rec.decl_out.tries.saturating_add(1);
+            pending.push((halbridge::HalEndpoint::out(slot as u8), generation, want));
+        }
+    }
+    // 锁外发：一次 mach 发送可以坐满它 500 ms 的超时，而这把锁也被
+    // `daemon.status` 的报告路径拿。与 `haldev::push_peer_volumes` 同一条纪律。
+    for (at, generation, frames) in pending {
+        hal.notify_latency(at, generation, frames);
     }
 }
 
@@ -3031,13 +3281,19 @@ pub(crate) fn publish_targets(inner: &DaemonInner, entries: &[SessionEntry]) {
 /// 3. **`worst` 没了。** 旧版把全部接收流揉成一个读数（取最差的 `sum_ms` +
 ///    第一条流的 `jb_frames`）再驱动每一条流。现在伺服看的数与卡片该方向
 ///    显示的数**是同一条流的同一个量**。
-fn servo_pass(inner: &Arc<DaemonInner>, entries: &[SessionEntry]) {
-    let pipelines = assemble_pipelines(
-        &inner.play_ring,
-        &inner.play_drift,
-        entries.iter().map(StreamLat::of).collect(),
-    );
-
+fn servo_pass(
+    inner: &Arc<DaemonInner>,
+    entries: &[SessionEntry],
+    pipelines: &[Option<PipelineLatency>],
+) {
+    // ⚠ **`sum_ms` 里含两台声卡的固有延迟**（`devlats` 接的线）。
+    // 对伺服来说这不是装饰：用户设「总延迟 300 ms」时，那 300 是从对端的
+    // 采集声卡到本机的播放声卡，30-win 实测光 `play_dev` 一项就 41.92 ms。
+    // 此前伺服拿着一个系统性偏低的 `sum_ms` 去追目标，等于把那 41.92 ms
+    // 又额外塞进抖动缓冲。接线之后回路第一次看到的是它真正要控的那个量。
+    //
+    // `pipelines` 由 `latency_pass` 算好传进来，**不在这里重算**：向系统声明
+    // 的那个数与伺服追的这个数必须是同一次采样的同一个量。
     let mut live = 0u32;
     for (e, p) in entries.iter().zip(pipelines.iter()) {
         // 只有**接收**流手上有 jitter buffer，也只有它的深度是我们动得了的。
@@ -3611,7 +3867,7 @@ mod telemetry_tests {
             );
         }
 
-        let p = build_pipeline_from(false, None, Some(&rx)).expect("接收侧必须有分项");
+        let p = build_pipeline_from(false, None, Some(&rx), None).expect("接收侧必须有分项");
         let jb = p
             .stages
             .iter()
@@ -3661,7 +3917,7 @@ mod telemetry_tests {
             assert_eq!(st.jb.depth(), 3);
             assert_eq!(st.jb.contiguous(), 2);
         }
-        let p = build_pipeline_from(false, None, Some(&rx)).unwrap();
+        let p = build_pipeline_from(false, None, Some(&rx), None).unwrap();
         let jb = p.stages.iter().find(|s| s.id == "jitter_buf").unwrap();
         assert_eq!(jb.ms, Some(20.0), "100/101 连续 = 20 ms；depth 会报 30 ms");
     }
@@ -3696,7 +3952,7 @@ mod telemetry_tests {
             lk(&rx.post).advance(Some(vec![0.5; 1_440]), &mut out);
         }
 
-        let p = build_pipeline_from(false, None, Some(&rx)).expect("有分项");
+        let p = build_pipeline_from(false, None, Some(&rx), None).expect("有分项");
         assert_eq!(p.side, "recv");
         let ids: Vec<&str> = p.stages.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["jitter_buf", "post_mix"], "按数据流顺序");
@@ -3709,10 +3965,21 @@ mod telemetry_tests {
         );
         assert!(p.net_ms.is_none(), "RTT 只能当一段，且现在还没有可信的单程值");
         assert!(p.sum_ms.is_none(), "对端分项缺失 ⇒ 总和无从谈起，绝不用 0 填补");
+        // 设备级由**调用方**给（本例传 `None`）。三态的分界线在这里就要钉住：
+        // `None` = 这条流路径上没有那台声卡；`Some(unavailable)` = 有但读不到。
+        // 两者在求和里的行为**相反**（贡献 0 / 否决总数），混起来只差一个字符。
+        assert_eq!(p.dev, None, "调用方传的是「本流没有设备级」，构建函数不许自作主张编一个");
+        let with_dead_device =
+            build_pipeline_from(false, None, Some(&rx), Some(DevLatency::unavailable()))
+                .expect("有分项");
         assert_eq!(
-            p.dev.expect("设备项这个结构必须在").ms(),
+            with_dead_device.dev.expect("这一路必须带着那个结构").ms(),
             None,
-            "P0 读不到声卡固有缓冲 ⇒ None，绝不填 0（否则蓝牙耳机看起来和模拟输出一样好）"
+            "读不到声卡固有缓冲 ⇒ None，绝不填 0（否则蓝牙耳机看起来和模拟输出一样好）"
+        );
+        assert_eq!(
+            with_dead_device.local_ms, p.local_ms,
+            "设备级不进 local_ms —— 那是「Σ 我这一侧的队列级」，对端要按同一份 stages 重算它"
         );
     }
 
@@ -3730,7 +3997,7 @@ mod telemetry_tests {
             dropped: Some(11),
             drop_mode: DropMode::Oldest,
         }));
-        let p = build_pipeline_from(true, Some(&tx), None).expect("有分项");
+        let p = build_pipeline_from(true, Some(&tx), None, None).expect("有分项");
         assert_eq!(p.side, "send");
         assert_eq!(p.stages.len(), 1, "第二个槽是空的 ⇒ 不占位，不报 0 样本的假读数");
         assert_eq!(p.stages[0].id, "src_fifo");
@@ -3747,7 +4014,7 @@ mod telemetry_tests {
             dropped: Some(0),
             drop_mode: DropMode::Newest,
         }));
-        let p = build_pipeline_from(true, Some(&tx), None).unwrap();
+        let p = build_pipeline_from(true, Some(&tx), None, None).unwrap();
         let ids: Vec<&str> = p.stages.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["src_fifo", "cap_ring"]);
         assert_eq!(p.local_ms, Some(600.0), "500 + 100，两级速率不同也照样求和");
@@ -3776,7 +4043,7 @@ mod telemetry_tests {
             ))
         };
         let slope_now = |tx: &TxShared| {
-            build_pipeline_from(true, Some(tx), None).unwrap().stages[0].drift_sps
+            build_pipeline_from(true, Some(tx), None, None).unwrap().stages[0].drift_sps
         };
 
         let tx = TxShared::new();
@@ -3792,7 +4059,7 @@ mod telemetry_tests {
         tx.stages[0].store(None);
         sample_tx_drift(31.0, &tx);
         assert!(
-            build_pipeline_from(true, Some(&tx), None).is_none(),
+            build_pipeline_from(true, Some(&tx), None, None).is_none(),
             "槽空了就没有任何可读的级 —— 这一刻正是历史该被断掉的那一刻"
         );
 
@@ -3812,10 +4079,10 @@ mod telemetry_tests {
     /// 一条没有任何可读级的会话报 `None`，不是一个空壳 `PipelineLatency`。
     #[test]
     fn a_session_with_no_readable_stage_reports_no_pipeline_at_all() {
-        assert!(build_pipeline_from(true, None, None).is_none());
+        assert!(build_pipeline_from(true, None, None, None).is_none());
         // ...空的 `TxShared`（源还没发布过任何一级）同理。
         let tx = TxShared::new();
-        assert!(build_pipeline_from(true, Some(&tx), None).is_none());
+        assert!(build_pipeline_from(true, Some(&tx), None, None).is_none());
     }
 
     /// 每一级的 id 都必须能被前端认出来。漏一条就是那一级静默显示「未知」。
@@ -3936,7 +4203,7 @@ mod telemetry_tests {
             DropMode::Oldest,
         )));
         tx.stages[2].store(Some(StageDepth::send_pace()));
-        let p = build_pipeline_from(true, Some(&tx), None).expect("有分项");
+        let p = build_pipeline_from(true, Some(&tx), None, None).expect("有分项");
         let ids: Vec<&str> = p.stages.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&"send_pace"), "组帧节拍必须出现在分项里, got {ids:?}");
         assert_eq!(p.local_ms, Some(105.0), "100 + 5；漏掉节拍会报 100");
@@ -4244,7 +4511,22 @@ mod telemetry_tests {
             DropMode::Oldest,
         )));
         tx.stages[2].store(Some(StageDepth::send_pace()));
-        build_pipeline_from(true, Some(&tx), None).expect("有分项")
+        build_pipeline_from(true, Some(&tx), None, None).expect("有分项")
+    }
+
+    /// `send_pipeline` 的带设备级版本。设备级由**调用方**给，与生产路径一致
+    /// （生产路径由 `StreamLat::of` 按 `devlats::stream_dev` 判好再传）。
+    fn send_pipeline_with_dev(src_fifo_samples: u32, dev: Option<DevLatency>) -> PipelineLatency {
+        let tx = TxShared::new();
+        tx.stages[0].store(Some(StageDepth::new(
+            StageId::SrcFifo,
+            src_fifo_samples,
+            48_000,
+            48_000,
+            DropMode::Oldest,
+        )));
+        tx.stages[2].store(Some(StageDepth::send_pace()));
+        build_pipeline_from(true, Some(&tx), None, dev).expect("有分项")
     }
 
     fn clock(min_rtt_us: u64) -> ClockEstimate {
@@ -4310,31 +4592,109 @@ mod telemetry_tests {
             (net_share - 0.29).abs() < 1e-9,
             "网络只能占一段（单程），实得 {net_share}"
         );
-        // 「带『≥』」这个结论的**前提**：设备固有延迟还读不到。前提与结论一起
-        // 断言，否则前提变了而结论没跟着变，读数会静默地从下限变成谎话。
+        // 「带『≥』」这个结论的**前提**：这条流上两侧都没有可采信的设备级。
+        // `send_pipeline` 传的是 `dev = None`（这条构造流没有采集设备），
+        // 对端的 `cell_reporting` 也不带 `dev`。前提与结论一起断言，否则前提
+        // 变了而结论没跟着变，读数会静默地从下限变成谎话。
+        assert_eq!(p.dev, None, "本条的前提是「没有设备级」，不是「设备级读不到」");
+        assert_eq!(p.peer_dev, None);
         assert!(
-            p.dev.and_then(|d| d.ms()).is_none(),
-            "设备固有延迟已经有值了 ⇒ 必须同时改 compose_sum_ms（把它加进总数）\
-             与 attach_peer_and_net 的 confidence 梯子；见后者的文档"
+            !devlats::both_exact(p.dev, p.peer_dev),
+            "两侧只要有一侧够不上 `Api` 真值，`Full` 就不许出现"
         );
-        // 而「有值」**不等于**可以清掉「≥」。看门狗被触发时，正确的下一步判据是
-        // `is_exact()` 而不是 `is_some()`：Windows 的 `GetDevicePeriod` 有值
-        // （10 ms）却实测低报 4.2 倍（真值 41.92 ms，
-        // `docs/spec-playdev-measurement.md` §3），标 `Unreliable`。
-        // 按「有值就升级」做，用户会看到一个不带「≥」的 121 ms 而真值 153 ms。
-        for d in [p.dev, p.peer_dev].into_iter().flatten() {
-            assert!(
-                !d.source.is_exact() || d.ms().is_none(),
-                "出现了一个自称真值的设备读数 ⇒ 先确认 compose_sum_ms 真把它加进去了，\
-                 再谈 confidence 升级；两步只做一步就是一个静默少算的总数"
-            );
-        }
         assert_eq!(
             p.confidence,
             LatConfidence::LowerBound,
-            "分项齐了，但设备固有延迟仍缺 ⇒ 带「≥」"
+            "分项齐了，但设备级要么缺席要么不是真值 ⇒ 带「≥」"
         );
         assert!(p.peer_age_s.unwrap() < 1.0);
+    }
+
+    /// **接线之后 `sum_ms` 往上跳，跳的正好是两台声卡那一段。**
+    ///
+    /// 这条是本轮改动的核心断言，同一条流跑两遍，唯一的差别是设备级在不在：
+    ///
+    /// | | local | net | peer | cap_dev | play_dev | sum |
+    /// |---|---|---|---|---|---|---|
+    /// | 接线前（`dev = None`） | 205 | 0.29 | 180 | — | — | **385.29** |
+    /// | 接线后 | 205 | 0.29 | 180 | 10.00 | **41.92** | **437.21** |
+    ///
+    /// ⚠ 这 51.92 ms **不是新增的延迟**，是一直存在、一直没被算进去的那一段。
+    /// 30-win 实测（`docs/spec-playdev-measurement.md` §3/§6）：上报 110.96 ms
+    /// 而真实 e2e ≈153 ms，差的就是 `play_dev` 那 41.92。
+    ///
+    /// 注入对照：把 `compose_sum_ms` 里两个 `dev_sum_ms(..)?` 拿掉（= 退回接线前）
+    /// ⇒ 第二个断言红，且红出来的差值就是被吞掉的那一段。
+    #[test]
+    fn wiring_the_device_stages_raises_the_total_by_exactly_those_two_stages() {
+        let cap = DevLatency { frames: 480, rate: 48_000, source: LatSource::Api };
+        // 30-win 实测的那 2012 帧：`written − IAudioClock::GetPosition()`
+        let play = DevLatency { frames: 2_012, rate: 48_000, source: LatSource::Assumed };
+
+        let before = {
+            let mut p = send_pipeline(9_600);
+            attach_peer_and_net(&mut p, cell_reporting(&[180.0]).snapshot(), Some(clock(580)));
+            p
+        };
+        let after = {
+            let mut p = send_pipeline_with_dev(9_600, Some(cap));
+            let mut peer = cell_reporting(&[180.0]).snapshot().expect("对端有读数");
+            peer.dev = Some(play);
+            attach_peer_and_net(&mut p, Some(peer), Some(clock(580)));
+            p
+        };
+        assert!((before.sum_ms.unwrap() - 385.29).abs() < 1e-9, "接线前");
+        assert!(
+            (after.sum_ms.unwrap() - 437.2066).abs() < 1e-3,
+            "接线后应当是 385.29 + 10.00 + 41.92，实得 {:?}",
+            after.sum_ms
+        );
+        let jump = after.sum_ms.unwrap() - before.sum_ms.unwrap();
+        assert!(
+            (jump - (cap.ms().unwrap() + play.ms().unwrap())).abs() < 1e-9,
+            "跳的量必须**恰好**是两台声卡之和，不多不少，实得 {jump}"
+        );
+        // 本侧的队列 Σ **一毫秒都不许动**：设备级不进 `local_ms`，
+        // 否则对端按 `stages` 重算出来的值会与我们自报的对不上，
+        // `PEER_SUM_MISMATCH_MS` 那条交叉校验会每拍报一次假警。
+        assert_eq!(after.local_ms, before.local_ms, "local_ms 是「Σ 我这一侧的队列级」");
+        // 对端那台是标定值（`Assumed`）⇒ 仍是下限，「≥」不许消失。
+        assert_eq!(
+            after.confidence,
+            LatConfidence::LowerBound,
+            "Windows 的标定值带 ±8 ms 开流竞态 ⇒ 够不上 Full"
+        );
+    }
+
+    /// **两侧都是 `Api` 真值时，`Full` 第一次可达**——而且只在那时可达。
+    ///
+    /// 逐项注入：把任一侧换成 `Assumed`（Windows 标定值）/ `Unreliable`
+    /// （蓝牙 / HDMI / `GetDevicePeriod`）/ `None`（这条流没有设备级），
+    /// 都必须掉回 `LowerBound`。
+    ///
+    /// 这条与 `every_one_of_the_five_terms_can_veto_the_total` 是两件事：
+    /// 那条管「总数算不算得出来」，这条管「算出来的总数敢不敢自称精确」。
+    #[test]
+    fn full_confidence_needs_two_api_readings_and_nothing_less() {
+        let api = DevLatency { frames: 480, rate: 48_000, source: LatSource::Api };
+        let full = |local: Option<DevLatency>, peer_dev: Option<DevLatency>| {
+            let mut p = send_pipeline_with_dev(9_600, local);
+            let mut peer = cell_reporting(&[180.0]).snapshot().expect("对端有读数");
+            peer.dev = peer_dev;
+            attach_peer_and_net(&mut p, Some(peer), Some(clock(580)));
+            p.confidence
+        };
+        assert_eq!(full(Some(api), Some(api)), LatConfidence::Full, "两侧都是平台真值");
+        for degraded in [LatSource::Assumed, LatSource::Unreliable] {
+            let d = DevLatency { frames: 480, rate: 48_000, source: degraded };
+            assert_eq!(full(Some(d), Some(api)), LatConfidence::LowerBound, "{degraded:?} 在本侧");
+            assert_eq!(full(Some(api), Some(d)), LatConfidence::LowerBound, "{degraded:?} 在对端");
+        }
+        assert_eq!(full(None, Some(api)), LatConfidence::LowerBound, "本侧没有设备级");
+        assert_eq!(full(Some(api), None), LatConfidence::LowerBound, "对端没有设备级");
+        // 读不到则连总数都没有 ⇒ 更谈不上 Full
+        let dead = DevLatency::unavailable();
+        assert_eq!(full(Some(dead), Some(api)), LatConfidence::Unavailable);
     }
 
     /// **对端那一侧有一级读不到 ⇒ 总和 `None`，绝不按 0 计入。**
@@ -4390,7 +4750,7 @@ mod telemetry_tests {
         )));
         tx.stages[2].store(Some(StageDepth::send_pace()));
 
-        let mut p = build_pipeline_from(true, Some(&tx), None).expect("有分项");
+        let mut p = build_pipeline_from(true, Some(&tx), None, None).expect("有分项");
         assert!(p.local_ms.is_none(), "前提：本侧 Σ 里有洞");
         assert!(!p.stages.is_empty(), "分项本身照样展示给排障看");
 
@@ -4408,22 +4768,33 @@ mod telemetry_tests {
         );
     }
 
-    /// **三个入参一视同仁**：任意一个缺席都必须让总和 `None`。
+    /// **五个入参一视同仁**：任意一个「有这一级但读不到」都必须让总和 `None`。
     ///
     /// 上面三条测试各自走一条真路径，这一条是它们的判据表：把
     /// 「绝不用 0 填补」写成一个对称的、一眼可查的断言，谁给任何一个入参加上
     /// `unwrap_or(0.0)`，这里当场红。
+    ///
+    /// ⚠ **本轮从三项扩到五项**：两台声卡的固有延迟接线之后也进总数
+    /// （`devlats`）。它们是最容易被「顺手兜个底」的两项——设备属性读不到看着
+    /// 像个无关紧要的小缺口，而 30-win 实测 `play_dev` 一项就是 41.92 ms。
     #[test]
-    fn every_one_of_the_three_terms_can_veto_the_total() {
+    fn every_one_of_the_five_terms_can_veto_the_total() {
         let (l, n, pe) = (Some(205.0), Some(0.29), Some(180.0));
+        // 两台声卡：本侧 10 ms（480 帧 @48k），对端 41.92 ms（2012 帧，30-win 实测）
+        let ld = Some(DevLatency { frames: 480, rate: 48_000, source: LatSource::Api });
+        let pd = Some(DevLatency { frames: 2_012, rate: 48_000, source: LatSource::Assumed });
+        let dead = Some(DevLatency::unavailable());
         assert!(
-            (compose_sum_ms(l, n, pe).unwrap() - 385.29).abs() < 1e-9,
-            "三项齐了才有总和"
+            (compose_sum_ms(l, n, pe, ld, pd).unwrap() - 437.2066).abs() < 1e-3,
+            "五项齐了才有总和：205 + 0.29 + 180 + 10 + 41.92，实得 {:?}",
+            compose_sum_ms(l, n, pe, ld, pd)
         );
         for (name, got, if_zeroed) in [
-            ("local_ms", compose_sum_ms(None, n, pe), 180.29),
-            ("net_ms", compose_sum_ms(l, None, pe), 385.0),
-            ("peer_local_ms", compose_sum_ms(l, n, None), 205.29),
+            ("local_ms", compose_sum_ms(None, n, pe, ld, pd), 232.21),
+            ("net_ms", compose_sum_ms(l, None, pe, ld, pd), 436.92),
+            ("peer_local_ms", compose_sum_ms(l, n, None, ld, pd), 257.21),
+            ("local_dev", compose_sum_ms(l, n, pe, dead, pd), 427.21),
+            ("peer_dev", compose_sum_ms(l, n, pe, ld, dead), 395.29),
         ] {
             assert_eq!(
                 got, None,
@@ -4431,6 +4802,17 @@ mod telemetry_tests {
                  一个比真值小得多、看起来却完全正常的数字"
             );
         }
+        // **但「这条流上没有这台声卡」不是缺席**：它贡献 0 且不否决。
+        // 两者共用一个 `Option` 的外层，混起来只差一个字符，后果却相反：
+        // 前者按 0 计入是撒谎，后者按缺席处理会让模式 B 的总数整个消失。
+        assert!(
+            (compose_sum_ms(l, n, pe, None, pd).unwrap() - 427.2066).abs() < 1e-3,
+            "本侧没有采集声卡（hal_spk 源）⇒ 少那 10 ms，而不是没有总数"
+        );
+        assert!(
+            (compose_sum_ms(l, n, pe, None, None).unwrap() - 385.29).abs() < 1e-9,
+            "两侧都没有设备级 ⇒ 退回接线前的那个数，一毫秒不多不少"
+        );
     }
 
     /// min-RTT 窗口还没收敛（约 8 s）⇒ `Converging`，UI 显示「测量中」。
@@ -4545,8 +4927,8 @@ mod telemetry_tests {
         engine::publish_send_stages(&a.stages, &depths);
         engine::publish_send_stages(&b.stages, &depths);
 
-        let pa = build_pipeline_from(true, Some(&a), None).expect("流 A 有分项");
-        let pb = build_pipeline_from(true, Some(&b), None).expect("流 B 有分项");
+        let pa = build_pipeline_from(true, Some(&a), None, None).expect("流 A 有分项");
+        let pb = build_pipeline_from(true, Some(&b), None, None).expect("流 B 有分项");
         assert_eq!(pa.local_ms, Some(1005.0), "1000 ms 队列 + 5 ms 节拍");
         assert_eq!(pb.local_ms, pa.local_ms, "同一个队列，两条流读到同一个数");
 
@@ -4554,8 +4936,8 @@ mod telemetry_tests {
         let peer = Some(20.0);
         let net = Some(0.29);
         for sum in [
-            compose_sum_ms(pa.local_ms, net, peer),
-            compose_sum_ms(pb.local_ms, net, peer),
+            compose_sum_ms(pa.local_ms, net, peer, None, None),
+            compose_sum_ms(pb.local_ms, net, peer, None, None),
         ] {
             assert!((sum.unwrap() - 1025.29).abs() < 1e-9, "每条流各自 1005+0.29+20，实得 {sum:?}");
         }
@@ -4584,7 +4966,7 @@ mod telemetry_tests {
     }
 
     fn send_lat<'a>(tx: &'a TxShared, peer: Option<PeerLatSnapshot>, clock: Option<ClockEstimate>) -> StreamLat<'a> {
-        StreamLat { is_send: true, tx: Some(tx), rx: None, peer, clock }
+        StreamLat { is_send: true, tx: Some(tx), rx: None, peer, clock, dev: None }
     }
 
     /// **装配层：N 条流进，N 条读数出，谁的深度都不许流进别人的读数。**
@@ -4705,8 +5087,8 @@ mod telemetry_tests {
             &play_ring,
             &play_drift,
             vec![
-                StreamLat { is_send: false, tx: None, rx: Some(&r1), peer: None, clock: None },
-                StreamLat { is_send: false, tx: None, rx: Some(&r2), peer: None, clock: None },
+                StreamLat { is_send: false, tx: None, rx: Some(&r1), peer: None, clock: None, dev: None },
+                StreamLat { is_send: false, tx: None, rx: Some(&r2), peer: None, clock: None, dev: None },
             ],
         );
         let ring_ms = |p: &Option<PipelineLatency>| {
@@ -4928,7 +5310,7 @@ mod fault_injection {
 
     /// 走完整条生产汇总链路，返回这条会话此刻上报的 `PipelineLatency`。
     fn report(play_ring: &StageSlot, play_drift: &Mutex<DriftTracker>, rx: &RxStream) -> PipelineLatency {
-        let mut p = build_pipeline_from(false, None, Some(rx)).expect("这条流有可读的级");
+        let mut p = build_pipeline_from(false, None, Some(rx), None).expect("这条流有可读的级");
         attach_output_tails(play_ring, play_drift, rx, &mut p);
         p
     }
@@ -5138,7 +5520,7 @@ mod fault_injection {
         let depths: SourceDepths = [Some(hal), None];
         engine::publish_send_stages(&tx.stages, &depths);
 
-        let p = build_pipeline_from(true, Some(&tx), None).expect("有分项");
+        let p = build_pipeline_from(true, Some(&tx), None, None).expect("有分项");
         let spk = stage_of(&p, "hal_spk");
         assert_eq!(spk.ms, Some(400.0));
         assert!(
@@ -5155,7 +5537,7 @@ mod fault_injection {
         // 对照：环是空的时候这一级**仍然存在**，只是 0 ms。空 ≠ 不存在。
         let empty = StageDepth { samples: 0, ..hal };
         engine::publish_send_stages(&tx.stages, &[Some(empty), None]);
-        let p = build_pipeline_from(true, Some(&tx), None).unwrap();
+        let p = build_pipeline_from(true, Some(&tx), None, None).unwrap();
         assert_eq!(stage_of(&p, "hal_spk").ms, Some(0.0));
         assert_eq!(p.local_ms, Some(5.0), "只剩组帧节拍");
     }

@@ -900,18 +900,28 @@ static void bridge_handle_notify(BridgeRcvBuf* inBuf, mach_msg_size_t inSize)
     // of this dispatch rejects the same shape.
     if(((theMsg->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) == 0) &&
        (inSize >= sizeof(AudioHubControlMsg)) &&
-       (theMsg->op == kAudioHubNotify_Volume) &&
        (theMsg->endpoint < kAudioHubMaxEndpoints) &&
-       (gHooks != NULL) && (gHooks->notify_volume != NULL))
+       (gHooks != NULL))
     {
-        float theScalar;
-        memcpy(&theScalar, &theMsg->scalar_bits, sizeof(theScalar));
         // The generation goes through unchecked HERE and is checked by the slot
         // that owns it: this file does not know what generation any slot is at,
         // and duplicating that state to filter earlier would be a second copy to
         // keep in sync for no gain.
-        gHooks->notify_volume(theMsg->endpoint, theMsg->generation, theScalar,
-                              (theMsg->flags & kAudioHubFlag_Muted) != 0);
+        if((theMsg->op == kAudioHubNotify_Volume) && (gHooks->notify_volume != NULL))
+        {
+            float theScalar;
+            memcpy(&theScalar, &theMsg->scalar_bits, sizeof(theScalar));
+            gHooks->notify_volume(theMsg->endpoint, theMsg->generation, theScalar,
+                                  (theMsg->flags & kAudioHubFlag_Muted) != 0);
+        }
+        // scalar_bits read as a PLAIN UInt32, not through memcpy-into-float:
+        // this op carries a frame count. Reading it as float bits would turn
+        // 7200 frames into 1.0e-41 and then back into 0 frames, i.e. exactly
+        // the "everything reported success and nothing happened" outcome.
+        else if((theMsg->op == kAudioHubNotify_Latency) && (gHooks->notify_latency != NULL))
+        {
+            gHooks->notify_latency(theMsg->endpoint, theMsg->generation, theMsg->scalar_bits);
+        }
     }
     mach_msg_destroy(&theMsg->header);
 }

@@ -200,7 +200,10 @@ export const zhCN = {
   'latency.stage.capRing.name': '声卡采集缓冲',
   'latency.stage.capRing.desc': '声卡把声音交给 AudioHub 之前的排队。',
   'latency.stage.capDev.name': '声卡采集延迟',
-  'latency.stage.capDev.desc': '声卡从收到声音到交出采样之间的固有延迟。',
+  // ⚠ 「计入总延迟」这半句是必须的。这两级在 2026-08-04 之前**从未被上报**，
+  // 接上之后总延迟的数字会往上跳一截——不写清楚，用户会把「一直存在、只是这次
+  // 才算进来的那段」读成一次性能退化。
+  'latency.stage.capDev.desc': '声卡从收到声音到交出采样之间的固有延迟，计入总延迟。',
   'latency.stage.srcFifo.name': '发送队列',
   'latency.stage.srcFifo.desc': '采集侧等待打包发出的音频。',
   'latency.stage.halSpk.name': '虚拟扬声器环',
@@ -220,7 +223,9 @@ export const zhCN = {
   'latency.stage.halMic.name': '虚拟麦克风环',
   'latency.stage.halMic.desc': '写进虚拟麦克风、尚未被应用取走的音频。与播放队列并行，不叠加。',
   'latency.stage.playDev.name': '声卡播放缓冲',
-  'latency.stage.playDev.desc': '声卡收到音频到真正发声之间的固有延迟。',
+  // 「常常是最大的一段」不是修辞：30-win 实测 41.9 毫秒（写进系统到真正出声），
+  // 其中 30 毫秒是 Windows 共享音频引擎与 KS 传输，换一块声卡也一样。
+  'latency.stage.playDev.desc': '音频交给系统到声卡真正发声之间的固有延迟，计入总延迟。Windows 上实测约 42 毫秒，常常是整条链路上最大的一段。',
   'latency.stage.residual.name': '未归属',
   'latency.stage.residual.desc': '实测总延迟减去各分段之和。持续偏大说明链路上还有未被统计的缓冲。',
   'latency.stage.ms': '{ms} ms',
@@ -258,11 +263,18 @@ export const zhCN = {
   'latency.stage.driftUnknownWhy': '样本点还不够判趋势（不足 3 点或跨度不到 5 秒）。**不等于不漂移。**',
 
   'latency.conf.full': '各分段完整',
-  'latency.conf.lowerBound': '下限（缺声卡缓冲）',
+  // 接线之前这里写的是「缺声卡缓冲」——那时两级设备延迟根本没查。现在查了，
+  // 「仍是下限」的成因换成了另外两种，而两种都必须说得出口：
+  // ① 系统给的声卡读数已知偏低（蓝牙 / HDMI，或 Windows 上那个靠开流标定、
+  //    带 ±8 毫秒开流竞态的值）；② 这条链路的某一端压根没有实体声卡
+  //    （虚拟扬声器 / 虚拟麦克风），那一小截还没建模。
+  'latency.conf.lowerBound': '下限（声卡延迟未取到精确值）',
   'latency.conf.converging': '时钟对齐中，约 {s} 秒后可用',
   // 说人话版：原文「仅本机分段，对端未上报」是照着字段名写的，用户读不出后果。
   'latency.conf.localOnly': '以上只有本机这一侧的分段。对方主机还没上报它那一半，所以这不是端到端的总延迟。',
   'latency.conf.deviceUnreliable': '输出设备（蓝牙 / HDMI）的延迟系统少报，实际更高',
+  // 只在两台声卡都给出平台真值时才显示（confidence = full）。
+  'latency.conf.fullWhy': '两端的声卡固有延迟都取到了平台真值，这个数字覆盖从对方采集到本机发声的整条链路。',
   'latency.conf.peerStale': '对方主机的分段是 {s} 秒前的读数',
   'latency.detail.e2e': '实测采样年龄 {ms} ms（与各分段之和的差记入「未归属」）',
 

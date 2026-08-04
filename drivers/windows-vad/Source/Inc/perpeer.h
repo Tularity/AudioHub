@@ -236,6 +236,20 @@ typedef struct _AH_SLOT
     BOOLEAN             MuteOut[AH_VOLUME_MAX_CHANNELS];
     BOOLEAN             MuteIn[AH_VOLUME_MAX_CHANNELS];
 
+    //
+    // DOWNSTREAM LATENCY, per direction, in frames: how long after this driver
+    // accepts a frame it is audible at the far end. Written by
+    // IOCTL_AUDIOHUB_LATENCY, read ONCE by each stream when it is created.
+    //
+    // Zero is the cold start and means "never measured", which is a different
+    // claim from "instantaneous" -- it is only what can honestly be said before
+    // a measurement exists. Reset to zero on every bind: a new peer is a
+    // different machine at the end of a different network, so the previous
+    // tenant's distance describes nothing here.
+    //
+    LONG                LatencyFramesOut;
+    LONG                LatencyFramesIn;
+
     // Handed to every miniport of this slot as its DeviceContext. By value, so
     // the address is stable for the life of the driver image -- PortCls holds
     // it for as long as the miniport lives.
@@ -406,6 +420,24 @@ BOOLEAN AhSlotMuteGet(_In_ ULONG Slot, _In_ BOOLEAN Input, _In_ ULONG Channel);
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN AhSlotMuteSet(_In_ ULONG Slot, _In_ BOOLEAN Input, _In_ ULONG Channel, _In_ BOOLEAN Value);
+
+//
+// Per-slot, per-direction downstream latency in FRAMES (see AH_SLOT).
+//
+// Get is called from CMiniportWaveRTStream's constructor, i.e. once per stream,
+// and never again for that stream's life: presentation position is a clock, and
+// an offset that moved underneath a running clock could make it appear to go
+// backwards. Set comes from IOCTL_AUDIOHUB_LATENCY at PASSIVE. Interlocked
+// because those are different threads.
+//
+// Set REFUSES anything above AH_LATENCY_MAX_FRAMES and returns FALSE, so
+// "the driver stored it" is answerable rather than assumed.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG AhSlotLatencyGet(_In_ ULONG Slot, _In_ BOOLEAN Input);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN AhSlotLatencySet(_In_ ULONG Slot, _In_ BOOLEAN Input, _In_ ULONG Frames);
 
 //
 // The slot's current generation, or 0 when it is free. Events carry it so a

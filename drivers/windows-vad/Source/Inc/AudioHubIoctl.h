@@ -187,6 +187,11 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 #define IOCTL_AUDIOHUB_CONTROL_PEND CTL_CODE(AH_DEVICE_TYPE, 0x804, METHOD_BUFFERED, AH_ACCESS)
 #define IOCTL_AUDIOHUB_MAP_RINGS    CTL_CODE(AH_DEVICE_TYPE, 0x805, METHOD_BUFFERED, AH_ACCESS)
 #define IOCTL_AUDIOHUB_NOTIFY       CTL_CODE(AH_DEVICE_TYPE, 0x806, METHOD_BUFFERED, AH_ACCESS)
+//
+// How many frames of DOWNSTREAM latency the driver must subtract from the
+// presentation position it reports for a slot's endpoint. See AH_LATENCY_REQUEST.
+//
+#define IOCTL_AUDIOHUB_LATENCY      CTL_CODE(AH_DEVICE_TYPE, 0x807, METHOD_BUFFERED, AH_ACCESS)
 
 //=============================================================================
 // Status codes carried INSIDE the reply payload
@@ -301,6 +306,30 @@ typedef struct _AH_HELLO_REPLY {
                                     // SCALE. A daemon that syncs volume to a
                                     // peer while this bit is CLEAR is applying
                                     // the user's setting twice.
+#define AH_CAP_LATENCY      0x4u    // IOCTL_AUDIOHUB_LATENCY works, i.e. this
+                                    // driver can be told how long after it
+                                    // accepts a frame that frame is audible,
+                                    // and subtracts it from the presentation
+                                    // position it reports.
+                                    //
+                                    // A CAPABILITY BIT RATHER THAN A PROTOCOL
+                                    // BUMP, and that is a deliberate departure
+                                    // from every other entry in this file. The
+                                    // bumps above all exist for pairings that
+                                    // fail SILENTLY AND HARMFULLY -- a speaker
+                                    // named "<speaker>" reported as carrying
+                                    // its peer's name, audio attenuated by the
+                                    // square of the user's setting. This one
+                                    // cannot: a driver without the bit reports
+                                    // presentation position exactly as it
+                                    // always has, which is what every build
+                                    // before this one did, and the daemon KNOWS
+                                    // because the bit is clear. A version bump
+                                    // would instead make an old driver refuse
+                                    // to bind at all -- every AudioHub endpoint
+                                    // disappears from the system -- as the
+                                    // price of an addition whose absence costs
+                                    // nothing new.
 
 //=============================================================================
 // BIND
@@ -574,6 +603,75 @@ typedef struct _AH_NOTIFY_REPLY {
 } AH_NOTIFY_REPLY;
 
 //=============================================================================
+// LATENCY (IOCTL_AUDIOHUB_LATENCY)
+//
+// How long after this driver accepts a frame does that frame actually become
+// audible. For an AudioHub endpoint the answer is not "one DMA period": the
+// bytes go to AhPushRender(), across a network, into another machine's jitter
+// buffer and out of ITS sound card, ~121 ms later.
+//
+// Microsoft's rule for what a driver must report, verbatim from
+// learn.microsoft.com "Low Latency Audio - Windows drivers", section "Improve
+// the coordination between driver and OS":
+//
+//     "The timestamps SHOULDN'T reflect the time at which samples were
+//      transferred to or from Windows to the DSP."
+//     "Factor in any constant delays due to signal processing algorithms or
+//      pipeline or hardware transports, unless these delays are otherwise
+//      accounted for."
+//
+// The driver cannot compute this number -- it knows nothing about the network
+// or the peer's playout depth -- so the daemon, which measures the whole chain
+// stage by stage, sends it here. It is applied to
+// IMiniportWaveRTOutputStream::GetPresentationPosition and NOTHING ELSE: the
+// linear position keeps meaning "bytes the DMA has consumed", because that one
+// really is about the ring and is what the engine's own bookkeeping rests on.
+//
+// WHEN IT TAKES EFFECT: a stream samples this value ONCE, when it is created,
+// and holds it for its whole life. Every consumer of presentation position
+// treats it as a clock, and a clock whose offset jumps is worse than one with a
+// constant error -- it can appear to run backwards, which is the one thing
+// u64PositionInBlocks may never do. So a value that arrives mid-stream applies
+// to the NEXT stream on that endpoint, exactly as on macOS, where the same
+// reasoning falls out of consumers reading kAudioDevicePropertyLatency once at
+// open. There is deliberately no servo on either platform.
+//=============================================================================
+
+#define AH_LATENCYFLAG_INPUT    0x1u    // the virtual MICROPHONE, else speaker
+
+typedef struct _AH_LATENCY_REQUEST {
+    UINT64 session_id;
+    UINT32 slot;
+    UINT32 generation;      // dropped if it does not match the slot's current
+                            // stamp -- a latency measured against the peer that
+                            // USED to hold this slot describes a different
+                            // machine at the other end of a different network
+    UINT32 flags;           // AH_LATENCYFLAG_*
+    UINT32 frames;          // downstream latency, in frames at the endpoint's
+                            // sample rate. 0 means "never measured", which is
+                            // the cold start and is NOT the same claim as "this
+                            // endpoint is instantaneous" -- it is simply the
+                            // only honest thing to say before a measurement
+                            // exists. The driver refuses anything absurd.
+} AH_LATENCY_REQUEST;
+
+typedef struct _AH_LATENCY_REPLY {
+    UINT32 status;
+    UINT32 frames;          // what the driver now holds for that endpoint, read
+                            // back rather than echoed. Streams already open are
+                            // still running on their own captured copy; this is
+                            // what the NEXT one will use.
+} AH_LATENCY_REPLY;
+
+//
+// Ceiling the driver enforces: four seconds at 48k. Not a judgement about what
+// a sane link looks like (the daemon owns that) but a bound on what one
+// corrupted word can make the audio engine's clock believe. Generous on
+// purpose -- macOS AirPlay declares 2.0 s of latency in the equivalent place.
+//
+#define AH_LATENCY_MAX_FRAMES   (48000u * 4u)
+
+//=============================================================================
 // Layout assertions. These are the whole point of the file: the Rust mirror
 // asserts the same numbers, and test/tests/halwire_win.rs asserts both against
 // a third, independently transcribed copy.
@@ -590,6 +688,8 @@ C_ASSERT(sizeof(AH_MAP_REQUEST) == 24);
 C_ASSERT(sizeof(AH_MAP_REPLY) == 296);
 C_ASSERT(sizeof(AH_NOTIFY_REQUEST) == 24);
 C_ASSERT(sizeof(AH_NOTIFY_REPLY) == 8);
+C_ASSERT(sizeof(AH_LATENCY_REQUEST) == 24);
+C_ASSERT(sizeof(AH_LATENCY_REPLY) == 8);
 
 C_ASSERT(AH_FIELD_OFFSET(AH_MAP_REQUEST, wake_event) == 8);
 C_ASSERT(AH_FIELD_OFFSET(AH_MAP_REQUEST, protocol_version) == 16);
@@ -597,6 +697,8 @@ C_ASSERT(AH_FIELD_OFFSET(AH_MAP_REPLY, spk_bytes) == 28);
 C_ASSERT(AH_FIELD_OFFSET(AH_MAP_REPLY, va) == 40);
 C_ASSERT(AH_FIELD_OFFSET(AH_NOTIFY_REQUEST, slot) == 8);
 C_ASSERT(AH_FIELD_OFFSET(AH_NOTIFY_REQUEST, scalar_q16) == 20);
+C_ASSERT(AH_FIELD_OFFSET(AH_LATENCY_REQUEST, slot) == 8);
+C_ASSERT(AH_FIELD_OFFSET(AH_LATENCY_REQUEST, frames) == 20);
 
 C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REPLY, stage) == 16);
 C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REPLY, nt_status) == 20);
@@ -628,5 +730,6 @@ C_ASSERT(IOCTL_AUDIOHUB_QUERY_SLOTS  == 0x0022E00C);
 C_ASSERT(IOCTL_AUDIOHUB_CONTROL_PEND == 0x0022E010);
 C_ASSERT(IOCTL_AUDIOHUB_MAP_RINGS    == 0x0022E014);
 C_ASSERT(IOCTL_AUDIOHUB_NOTIFY       == 0x0022E018);
+C_ASSERT(IOCTL_AUDIOHUB_LATENCY      == 0x0022E01C);
 
 #endif // _AUDIOHUB_IOCTL_H_

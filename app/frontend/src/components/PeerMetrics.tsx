@@ -102,6 +102,10 @@ function LatencyCell({ fp, dir, lat, series }: {
   const why = joinPhrases([
     lower && whole ? t('metric.latency.lowerBoundWhy') : null,
     lat && lat.deviceUnreliable ? t('latency.conf.deviceUnreliable') : null,
+    // `full` 在 2026-08-04 之前**不可达**（两级声卡固有延迟根本没查）。现在它
+    // 可达了，而一个不带「≥」的数字与一个带「≥」的数字在界面上只差一个字符——
+    // 必须有一句话说出这次是凭什么去掉的，否则用户无从判断该不该信这个精度。
+    lat && lat.confidence === 'full' ? t('latency.conf.fullWhy') : null,
   ]);
 
   let value: string;

@@ -813,7 +813,15 @@ AhCtlDeviceControl(
         // "the audio engine did not insert a software volume APO ahead of us,
         // so the samples in the rings are full scale".
         //
-        rep->caps             = AH_CAP_DATAPLANE | AH_CAP_VOLUME;
+        //
+        // AH_CAP_LATENCY likewise: IOCTL_AUDIOHUB_LATENCY is compiled in below,
+        // so the bit is a statement about this BUILD. It is the reason there is
+        // no protocol bump for latency declaration -- a driver without it keeps
+        // reporting presentation position exactly as every earlier build did,
+        // and the daemon can SAY so instead of silently believing it declared
+        // something. See AH_CAP_LATENCY in AudioHubIoctl.h.
+        //
+        rep->caps             = AH_CAP_DATAPLANE | AH_CAP_VOLUME | AH_CAP_LATENCY;
         rep->sample_rate      = AUDIOHUB_RING_SAMPLE_RATE;
         rep->out_channels     = AUDIOHUB_SPK_CHANNELS;
         rep->in_channels      = AUDIOHUB_MIC_CHANNELS;
@@ -1085,6 +1093,75 @@ AhCtlDeviceControl(
 
         rep->status  = AH_STATUS_OK;
         rep->applied = changed ? 1u : 0u;
+        return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+    }
+
+    case IOCTL_AUDIOHUB_LATENCY:
+    {
+        //
+        // How long after this driver accepts a frame that frame is audible on
+        // the peer's speakers. Applied to GetPresentationPosition and nothing
+        // else. See AH_LATENCY_REQUEST for why the daemon has to supply it and
+        // why a stream that is already running keeps its own copy.
+        //
+        if (inLen != sizeof(AH_LATENCY_REQUEST) || outLen != sizeof(AH_LATENCY_REPLY) || buffer == NULL)
+        {
+            return AhCompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
+        }
+        if (!g_SessionGreeted)
+        {
+            return AhCompleteIrp(Irp, STATUS_INVALID_DEVICE_STATE, 0);
+        }
+
+        AH_LATENCY_REQUEST req = *(AH_LATENCY_REQUEST *)buffer;
+        AH_LATENCY_REPLY  *rep = (AH_LATENCY_REPLY *)buffer;
+
+        RtlZeroMemory(rep, sizeof(*rep));
+
+        if (req.session_id != g_SessionId)
+        {
+            rep->status = AH_STATUS_STALE_SESSION;
+            return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+        }
+        if (req.slot >= AUDIOHUB_WIN_MAX_SLOTS)
+        {
+            rep->status = AH_STATUS_BAD_ARGUMENT;
+            return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+        }
+
+        BOOLEAN input = (req.flags & AH_LATENCYFLAG_INPUT) ? TRUE : FALSE;
+
+        //
+        // Same generation filter as NOTIFY, for the same reason in a different
+        // unit: a latency measured against the peer that used to hold this slot
+        // describes a different machine at the other end of a different
+        // network. `frames` comes back as whatever the slot still holds, so a
+        // rejected push is distinguishable from an accepted one that happened
+        // to carry the same number.
+        //
+        ULONG gen = AhSlotGeneration(req.slot);
+        if (gen == 0 || (req.generation != 0 && req.generation != gen))
+        {
+            rep->status = AH_STATUS_NOT_BOUND;
+            rep->frames = AhSlotLatencyGet(req.slot, input);
+            return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+        }
+
+        if (!AhSlotLatencySet(req.slot, input, req.frames))
+        {
+            //
+            // Past AH_LATENCY_MAX_FRAMES. Refused rather than clamped: a clamp
+            // would report success for a number nobody asked for, and the
+            // daemon reads `frames` back precisely so "stored" is a fact rather
+            // than an inference.
+            //
+            rep->status = AH_STATUS_BAD_ARGUMENT;
+            rep->frames = AhSlotLatencyGet(req.slot, input);
+            return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+        }
+
+        rep->status = AH_STATUS_OK;
+        rep->frames = AhSlotLatencyGet(req.slot, input);
         return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
     }
 

@@ -393,6 +393,14 @@ pub struct SlotRec {
     /// Per-slot echo suppression for the volume relay. Replaces a single global
     /// cell, which could only ever be right for one peer at a time.
     pub vol_echo: Option<(f32, bool)>,
+    /// What this slot's virtual SPEAKER declares to the OS as its latency, and
+    /// what the driver says it actually declares. See `crate::devdecl`.
+    ///
+    /// Speaker only. The microphone direction is deliberately never declared:
+    /// its tail stage `hal_mic` is recorded in docs/spec-hal-mic-latency.md as a
+    /// [0, 500 ms] free parameter with no restoring force, and broadcasting a
+    /// random number to the system is worse than declaring nothing.
+    pub decl_out: crate::devdecl::DeclState,
 }
 
 impl SlotRec {
@@ -1006,6 +1014,20 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
                     rec.observed = false;
                     rec.io_out = false;
                     rec.io_in = false;
+                    // We no longer KNOW what the driver's latency property
+                    // says, so stop claiming we do. Not zeroed — cleared: the
+                    // difference is that `want` survives (it is our own
+                    // measurement, still valid) while `acked` goes back to
+                    // "never answered" so the next attach re-establishes it.
+                    //
+                    // Without this, a driver that came back with a property of
+                    // 0 (coreaudiod restarted; that value lives in the driver's
+                    // device record, not ours) would face a daemon whose
+                    // `acked` still equalled `want`, so it would never re-send
+                    // and the device would silently go back to declaring zero.
+                    rec.decl_out.acked = None;
+                    rec.decl_out.pending = false;
+                    rec.decl_out.tries = 0;
                 }
                 for s in 0..HAL_MAX_SLOTS {
                     inner.hal_mic_io[s].store(true, Ordering::Relaxed);
@@ -1054,6 +1076,29 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
                     if running { "started" } else { "stopped" },
                     if fp.is_empty() { "-" } else { &fp }
                 );
+            }
+            HalControlEvent::LatencyState { at, frames, pending, .. } => {
+                // The driver's account of what its latency property NOW says.
+                // Recorded, never compared against what we asked for here: the
+                // decision to re-send belongs to the one place that also knows
+                // what the current measurement is (`devdecl::should_send`).
+                //
+                // The INPUT direction can only appear if some future change
+                // starts declaring the microphone; storing it in `decl_out`
+                // would then quietly make the speaker's status page describe the
+                // microphone. Dropped with a log instead.
+                if at.input {
+                    dlog!(
+                        "[audiohubd] hal: slot {} reported a MICROPHONE latency ({frames}f); \
+                         nothing declares that direction, so this is a bug on one side or the other",
+                        at.slot
+                    );
+                    continue;
+                }
+                let mut st = lk(&inner.haldev);
+                let Some(rec) = st.slots.get_mut(at.slot as usize) else { continue };
+                rec.decl_out.acked = Some(frames);
+                rec.decl_out.pending = pending;
             }
             HalControlEvent::Volume { at, scalar, muted, .. } => {
                 if at.input {

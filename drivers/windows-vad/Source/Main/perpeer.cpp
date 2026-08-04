@@ -951,6 +951,19 @@ Routine Description:
     }
 
     //
+    // And the declared downstream latency goes back to "never measured".
+    //
+    // A slot that changes hands is a DIFFERENT peer, reached over a different
+    // network, so the number the previous tenant measured describes nothing
+    // here. Carrying it over would make the new endpoint's presentation clock
+    // wrong by however far apart the two peers happen to be -- with nothing
+    // anywhere reporting a change, because the value would look perfectly
+    // plausible.
+    //
+    Slot->LatencyFramesOut = 0;
+    Slot->LatencyFramesIn  = 0;
+
+    //
     // Render pair.
     //
     RtlZeroMemory(&Slot->OutPair, sizeof(Slot->OutPair));
@@ -1217,6 +1230,71 @@ AhSlotMuteSet(
     BOOLEAN prev = *cell;
     *cell = Value;
     return (prev != Value) ? TRUE : FALSE;
+}
+
+#pragma code_seg()
+ULONG
+AhSlotLatencyGet(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input
+    )
+/*++
+
+Routine Description:
+
+    How many frames of DOWNSTREAM latency this endpoint carries -- the interval
+    between this driver accepting a frame and that frame being audible, which
+    for an AudioHub endpoint spans a network and another machine's sound card.
+
+    Zero means "never measured". It is NOT a claim that the endpoint is
+    instantaneous; it is the absence of a claim, which is the only honest thing
+    to report before the daemon has measured the chain.
+
+--*/
+{
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS)
+    {
+        return 0;
+    }
+    LONG v = Input ? g_AhSlots[Slot].LatencyFramesIn : g_AhSlots[Slot].LatencyFramesOut;
+    return (v > 0) ? (ULONG)v : 0;
+}
+
+#pragma code_seg()
+BOOLEAN
+AhSlotLatencySet(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input,
+    _In_ ULONG Frames
+    )
+/*++
+
+Routine Description:
+
+    Stores the downstream latency for one endpoint. FALSE means nothing was
+    stored -- an unknown slot, or a value past AH_LATENCY_MAX_FRAMES.
+
+    The ceiling is not a policy about plausible links (the daemon owns that); it
+    bounds what one corrupted word can do to the clock the audio engine derives
+    from GetPresentationPosition. It is generous on purpose: macOS AirPlay
+    declares 2.0 s in the equivalent place, so a "reasonable" ceiling here would
+    be a second, undocumented policy silently overruling the first.
+
+    Streams already running are UNAFFECTED: each captured its own copy when it
+    was created and holds it until it stops. A presentation clock whose offset
+    moves can appear to run backwards, and monotonicity is the one property
+    u64PositionInBlocks may never lose.
+
+--*/
+{
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS || Frames > AH_LATENCY_MAX_FRAMES)
+    {
+        return FALSE;
+    }
+
+    PLONG cell = Input ? &g_AhSlots[Slot].LatencyFramesIn : &g_AhSlots[Slot].LatencyFramesOut;
+    InterlockedExchange(cell, (LONG)Frames);
+    return TRUE;
 }
 
 #pragma code_seg()

@@ -221,11 +221,29 @@ pub enum ControlMsg {
     ///
     /// The frames that follow are **not** covered by it: each one is still
     /// self-authenticating under `MediaCrypto`, exactly as the UDP datagram it
-    /// is byte-identical to. So whoever steals a ticket gets to inject bytes
-    /// that fail AEAD and get counted and dropped — the same thing they could
-    /// already do by sending us UDP. Making the ticket carry more weight than
-    /// that would put a second, weaker authenticator in front of a stronger
-    /// one, which is how the weaker one ends up being the one that matters.
+    /// is byte-identical to. Injected frames fail AEAD, are counted
+    /// (`SessionStats.auth_failed`) and dropped. Making the ticket carry more
+    /// weight than that would put a second, weaker authenticator in front of a
+    /// stronger one, which is how the weaker one ends up being the one that
+    /// matters.
+    ///
+    /// ## …but attaching is not a write-only privilege, so the address is
+    /// checked too
+    ///
+    /// This paragraph replaces an earlier one that said a stolen ticket bought
+    /// nothing but "bytes that fail AEAD — the same thing they could already do
+    /// by sending us UDP". That was wrong in a way worth recording, because
+    /// everything downstream of it inherited the mistake. Attaching **replaces
+    /// the connection's media path**: the holder receives that peer's entire
+    /// media egress (the real peer then hears nothing, and the holder gets the
+    /// ciphertext stream's timing and lengths, which name the bit-depth rung),
+    /// and it can drop the control connection at will by closing its socket.
+    ///
+    /// So `tcpmedia::claim` also requires the source address to be the control
+    /// peer's, for the same reason `handle_datagram` refuses a `PullReq` whose
+    /// source is not `conn.peer_ip`. Defence in depth, not the door: a ticket
+    /// only ever travels inside an established AEAD channel, so holding one
+    /// already means that channel is compromised or the peer is hostile.
     MediaAttach {
         ticket_b64: String,
     },

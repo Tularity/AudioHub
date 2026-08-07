@@ -406,6 +406,17 @@ pub enum SessionMsg {
     /// `None` = 发送方没有对这一项表态，收方保持现状；`Some("auto")` = 明确
     /// 要求 AUTO。两者不同，且前者正是「只改了延迟没改音质」的增量更新形态。
     /// 用空串表达「未表态」会与「档位串是空的」逐位相同。
+    SetTransport {
+        stream_id: u32,
+        /// 这条流在**你的接收侧**要达到的端到端总延迟目标
+        /// （`LatencyTarget::as_wire()`）。只有持 `rx` 的那一端可执行。
+        #[serde(default)]
+        rx_latency: Option<String>,
+        /// 这条流**你的发送侧**的线上质量档（`QualityTarget::as_wire()`）。
+        /// 只有持 `tx` 的那一端可执行。
+        #[serde(default)]
+        tx_quality: Option<String>,
+    },
     /// "Give me a ticket, I want to attach a tier 1 media connection."
     ///
     /// Sent only by the side that **initiated the control TCP**, and that
@@ -425,16 +436,18 @@ pub enum SessionMsg {
     MediaAttachTicket {
         ticket_b64: String,
     },
-    SetTransport {
-        stream_id: u32,
-        /// 这条流在**你的接收侧**要达到的端到端总延迟目标
-        /// （`LatencyTarget::as_wire()`）。只有持 `rx` 的那一端可执行。
-        #[serde(default)]
-        rx_latency: Option<String>,
-        /// 这条流**你的发送侧**的线上质量档（`QualityTarget::as_wire()`）。
-        /// 只有持 `tx` 的那一端可执行。
-        #[serde(default)]
-        tx_quality: Option<String>,
+    /// The other answer to [`SessionMsg::MediaAttachRequest`]: no ticket, and
+    /// why.
+    ///
+    /// Exists because the asking side **blocks** on the reply — it holds up
+    /// `register_conn` so that no stream is opened onto the transport that is
+    /// about to be replaced. Silence is a legitimate answer to that question
+    /// only if the asker is willing to wait out the whole attach timeout for a
+    /// peer that has already decided, and a peer pinned to tier 0 has decided.
+    /// Answering turns "eight seconds of nothing" into a named refusal in one
+    /// round trip.
+    MediaAttachRefused {
+        reason: String,
     },
     Bye {},
 }

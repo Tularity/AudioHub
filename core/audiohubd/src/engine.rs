@@ -2347,7 +2347,15 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
         Kind::Media => {
             let rx = rd(&inner.rx_table).get(&h.stream_id).cloned();
             let Some(rx) = rx else { return };
-            let Ok((h, plain)) = rx.crypto.open(dg) else { return }; // tampered/foreign
+            // tampered/foreign. Counted, because this was the one drop on the
+            // media path with no number anywhere behind it — and on tier 1 it
+            // is the only thing that can explain a `frames_read` that climbs
+            // while `received` does not (`frames_read` counts every Kind::Media
+            // frame off the socket, authenticated or not).
+            let Ok((h, plain)) = rx.crypto.open(dg) else {
+                lk(&rx.stats).auth_failed += 1;
+                return;
+            };
             // 位深由包头的 `codec` 决定，**不是由我们的假设决定**。认不出的
             // codec（Opus / Passthrough / 将来的新值）直接丢包：按 s16 硬解一个
             // 24 位载荷会得到一段**有声音、但全是垃圾**的波形，没有任何一处会报错。
@@ -4243,7 +4251,7 @@ pub(crate) mod tests {
 // 而那条尾只有跑上几小时、再和对端的 `jb_underruns` 对起来才看得见。
 // 所以它们必须守在源码与运行时上，不能指望别的测试顺带抓到。
 #[cfg(test)]
-mod deadline_thread_guards {
+pub(crate) mod deadline_thread_guards {
     use super::tests::{code, fn_body, strip_comments};
     use super::*;
     use std::sync::mpsc;
@@ -4264,7 +4272,15 @@ mod deadline_thread_guards {
     /// 带点只认得 `s.write_all(..)`；`Write::write_all(&mut s, ..)` 是同一件事的
     /// 另一种拼法，一个字都匹配不上。这不是推测——2026-08-07 的注入对照里，
     /// 带点的判据对着一行真的 `std::io::Write::write_all(..)` 报了绿。
-    const BANNED_ON_THE_DEADLINE_THREAD: &[(&str, &str)] = &[
+    ///
+    /// # 它必须跟着调用跨文件走
+    ///
+    /// 下面这张表只扫 `engine.rs` 里那三个函数体。`tx_loop` 今天还**同步调进**
+    /// `tcpmedia::TcpMediaLink::enqueue` / `wake`（tier 1 的投递口），而它们在
+    /// 另一个文件里 —— 禁表跟不过去。所以 `tcpmedia.rs` 的 guard 段引用的是
+    /// **这一张**表，不是它自己抄的一份：抄一份的那一版会在这里加一行、那边
+    /// 忘一行的时候静默失去覆盖，而那正是本条注释在讲的病。
+    pub(crate) const BANNED_ON_THE_DEADLINE_THREAD: &[(&str, &str)] = &[
         ("send_to(", "sendto 进内核网络栈，单次耗时上界不可预知"),
         ("write(", "write 进内核网络栈；TCP 媒体（tier 1）就是靠它发的"),
         ("write_all(", "同上，而且它会一直重试到写完，上界更差"),

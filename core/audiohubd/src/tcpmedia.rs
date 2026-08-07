@@ -44,7 +44,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -81,12 +81,28 @@ use crate::{dlog, lk, ConnShared, DaemonInner, TxShared};
 /// 200 ms sits between them, which is also the figure design §3.2 defence 1
 /// names for the tier 1 profile. It is a budget, not a measurement, and it is
 /// stated here rather than derived so that P4's `JbTuning::DEGRADED`
-/// (`max_target = 40`) forces somebody to revisit it deliberately instead of
-/// having it move underneath them.
+/// (`max_target = 40`) forces somebody to name which profile this budget
+/// belongs to instead of letting it move underneath them.
 pub(crate) const STALE_BUDGET: Duration = Duration::from_millis(200);
 
+/// The two numbers the budget above is bracketed by, **read from the jitter
+/// buffer** rather than copied.
+///
+/// The first version of this assertion spelled them `12 * 10` and `24 * 10`.
+/// It went red when `STALE_BUDGET` moved and stayed green when
+/// `JbTuning::DEFAULT` moved — which is backwards, because the failure message
+/// asserts a *relationship* between them, and only one side of that
+/// relationship was actually being read. Verified by mutation on 2026-08-08:
+/// with the literals, dropping `max_frames` to 16 compiled clean; with the
+/// constants below it fails to compile.
+const JB_DEEPEST_TARGET_MS: u64 =
+    audiohub_net::media::JbTuning::DEFAULT.max_target as u64 * crate::engine::FRAME_MS;
+const JB_HARD_CEILING_MS: u64 =
+    audiohub_net::media::JbTuning::DEFAULT.max_frames as u64 * crate::engine::FRAME_MS;
+
 const _: () = assert!(
-    STALE_BUDGET.as_millis() as u64 > 12 * 10 && (STALE_BUDGET.as_millis() as u64) < 24 * 10,
+    STALE_BUDGET.as_millis() as u64 > JB_DEEPEST_TARGET_MS
+        && (STALE_BUDGET.as_millis() as u64) < JB_HARD_CEILING_MS,
     "the stale budget left the window between the jitter buffer's deepest target and its hard \
      ceiling: below the target it drops audio the receiver would have played, above the ceiling \
      the receiver drops it anyway and nothing on this side counts it"
@@ -140,6 +156,26 @@ const FRAME_COMPLETION_LIMIT: Duration = Duration::from_secs(5);
 const TICKET_TTL: Duration = Duration::from_secs(10);
 
 const TICKET_LEN: usize = 32;
+
+/// How long `register_conn` will block waiting for the tier 1 link.
+///
+/// Must exceed `conn::CONNECT_TIMEOUT` plus a round trip, because the dial it
+/// is waiting on gets that long to fail on its own — a backstop shorter than
+/// the thing it backstops would fire first and every time. It is a backstop and
+/// not the normal exit: a refusal, a dead channel and a failed dial all end the
+/// wait in one round trip.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(8);
+
+const _: () = assert!(
+    ATTACH_TIMEOUT.as_secs() > crate::conn::CONNECT_TIMEOUT.as_secs(),
+    "the attach backstop is shorter than the dial it backstops, so it fires before the dial can \
+     report what actually went wrong"
+);
+
+/// Slice for both waits during negotiation: how long one `recv_timeout` blocks
+/// while pumping for the ticket, and the longest a `Condvar` wait sits without
+/// re-reading `alive`.
+const PUMP_SLICE: Duration = Duration::from_millis(50);
 
 // ------------------------------------------------------------------ MediaPath
 
@@ -535,6 +571,10 @@ pub(crate) fn serve(
     inner: &Arc<DaemonInner>,
     conn: &Arc<ConnShared>,
     mut s: TcpStream,
+    // Held, never read: it is this function's exclusive right to own
+    // `conn.media_path`, and it is released by `Drop` when serving ends —
+    // including on any `?` below. See [`AttachClaim`].
+    _claim: AttachClaim,
 ) -> Result<()> {
     // **Media plane: Nagle is not optional.** The control plane can afford
     // `let _ = set_nodelay(...)` at ~1 Hz; here Nagle coalesces 10 ms frames
@@ -561,6 +601,9 @@ pub(crate) fn serve(
         .context("spawn the tier 1 media writer")?;
 
     *lk(&conn.media_path) = MediaPath::Tcp(link.clone());
+    // Wakes `negotiate`, which is holding `register_conn` open precisely so
+    // that no stream is created before this line runs.
+    conn.media_gate.announce();
     dlog!("[audiohubd] tier1 media attached to {} via {peer}", conn.fp);
 
     read_loop(inner, &link, &mut s, peer);
@@ -579,6 +622,10 @@ pub(crate) fn serve(
     // streams, and using it makes a dead media path as loud as a dead control
     // path instead of a peer that is connected and silent.
     *lk(&conn.media_path) = MediaPath::Udp(SocketAddr::new(conn.peer_ip, conn.peer.port));
+    // The link is no longer in flight either, so a waiter that is still around
+    // stops believing one is coming.
+    conn.media_attaching.store(false, Ordering::SeqCst);
+    conn.media_gate.announce();
     if !inner.shutdown.load(Ordering::SeqCst) && conn.alive.load(Ordering::SeqCst) {
         dlog!(
             "[audiohubd] tier1 media to {} is gone; dropping the control connection so the \
@@ -599,6 +646,13 @@ pub(crate) struct MediaTicket {
     /// any other peer even before it expires.
     fp: String,
     expires: Instant,
+}
+
+/// Mint a ticket without going through the offer path, so a test can produce a
+/// *second* one — `offer_ticket` suppresses those on purpose.
+#[cfg(test)]
+pub(crate) fn mint_ticket_for_test(inner: &Arc<DaemonInner>, fp: &str) -> String {
+    mint_ticket(inner, fp)
 }
 
 fn mint_ticket(inner: &Arc<DaemonInner>, fp: &str) -> String {
@@ -643,26 +697,165 @@ fn we_dialled(inner: &DaemonInner, conn: &ConnShared) -> bool {
     conn.initiator_fp == inner.id.fingerprint
 }
 
-/// Called once per connection, right after it is registered. Manual pinning
-/// only — automatic downgrade detection is P4.
+/// Called once per connection, right after it is registered — and it **blocks
+/// until the link is up or the attempt is over**. Manual pinning only;
+/// automatic downgrade detection is P4.
+///
+/// # Why this is synchronous
+///
+/// It was not, and that was the bug. Attaching takes a request, a ticket, a
+/// dial and a handshake: ~200 ms on loopback, measured 2026-08-08, against a
+/// `connect_peer` that returns the moment the *control* handshake is done.
+/// Every stream opened in that window binds itself to the UDP path for its
+/// whole life (design §5.1 rules out switching inside a live stream), so on the
+/// links tier 1 exists for — the ones where UDP is blocked — the result is two
+/// healthy ends, an all-green screen and total silence.
+///
+/// And the window is not a race that "usually" resolves the right way: it is
+/// hit every single time by `session.open` to a peer that is not connected yet,
+/// and by `reconnect::replay_sessions`, which re-opens every stream as soon as
+/// `connect_peer` returns. That second one closes a loop — [`serve`]'s teardown
+/// deliberately drops the control connection so replay rebuilds both — so
+/// without this wait, every tier 1 link death would rebuild the streams pinned
+/// back onto UDP, permanently, until a human re-opened them by hand.
+///
+/// Costs nothing on tier 0: the tier check below returns before anything is
+/// sent, so a connection that is not pinned never waits at all.
 pub(crate) fn negotiate(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
     if lk(&inner.peer_transport).tier(&conn.fp) != TransportTier::Tier1 {
         return;
     }
-    if we_dialled(inner, conn) {
-        // We can dial, so we ask for the ticket that lets us.
-        let _ = conn.send_msg(&SessionMsg::MediaAttachRequest {});
+    let deadline = Instant::now() + ATTACH_TIMEOUT;
+    let dialling = if we_dialled(inner, conn) {
+        // We can dial, so we ask for the ticket that lets us — and then read
+        // the answer off the channel ourselves, because `conn_reader` does not
+        // exist yet (`register_conn` starts it only after we return).
+        if conn.send_msg(&SessionMsg::MediaAttachRequest {}).is_err() {
+            return;
+        }
+        if !pump_for_ticket(inner, conn, deadline) {
+            return;
+        }
+        true
     } else {
         // We cannot dial this peer, so we offer the peer a ticket unprompted.
         // A peer pinned to tier 0 will ignore it, which is the correct outcome:
         // an offer is not an instruction.
         offer_ticket(inner, conn);
+        false
+    };
+    await_attach(conn, deadline, dialling);
+}
+
+/// Read the control channel until the attach ticket shows up.
+///
+/// Returns `true` when a dial is now under way. Everything that is not an
+/// answer to our request is **parked**, not handled: an `OpenStream` handled
+/// here would bind a stream to the media path we are in the middle of
+/// replacing, which is the whole failure this wait exists to prevent.
+/// `conn_reader` drains the park before it touches the socket, so channel order
+/// survives.
+fn pump_for_ticket(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, deadline: Instant) -> bool {
+    while Instant::now() < deadline {
+        if matches!(*lk(&conn.media_path), MediaPath::Tcp(_)) {
+            return true; // a ticket arrived some other way and won the race
+        }
+        if !conn.alive.load(Ordering::SeqCst) || inner.shutdown.load(Ordering::SeqCst) {
+            return false;
+        }
+        let res = {
+            let mut ch = lk(&conn.chan);
+            ch.recv_timeout(PUMP_SLICE)
+        };
+        match res {
+            Ok(Some(SessionMsg::MediaAttachTicket { ticket_b64 })) => {
+                conn.note_rx();
+                on_ticket(inner, conn, ticket_b64);
+                return true;
+            }
+            Ok(Some(SessionMsg::MediaAttachRefused { reason })) => {
+                conn.note_rx();
+                dlog!(
+                    "[audiohubd] {} refused a tier 1 media attach: {reason}; staying on tier 0",
+                    conn.fp
+                );
+                return false;
+            }
+            Ok(Some(other)) => {
+                conn.note_rx();
+                lk(&conn.deferred).push_back(other);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                dlog!("[audiohubd] control channel {} while attaching tier 1: {e:#}", conn.fp);
+                return false;
+            }
+        }
     }
+    dlog!(
+        "[audiohubd] {} never answered our tier 1 media attach request within {ATTACH_TIMEOUT:?}; \
+         media stays on UDP",
+        conn.fp
+    );
+    false
+}
+
+/// Block until the media path really is tier 1, or until we know it will not be.
+///
+/// `dialling` says whether the local dial thread is the thing we are waiting on.
+/// If it is, its `media_attaching` flag doubles as "still trying": the dial
+/// clears it on failure, which is what lets a refused or unreachable peer end
+/// the wait in one round trip instead of one timeout. The accepting side has no
+/// such signal — it is waiting for the *peer* to dial in — so it waits out the
+/// deadline.
+fn await_attach(conn: &Arc<ConnShared>, deadline: Instant, dialling: bool) {
+    let mut path = lk(&conn.media_path);
+    loop {
+        if matches!(*path, MediaPath::Tcp(_)) {
+            return;
+        }
+        if dialling && !conn.media_attaching.load(Ordering::SeqCst) {
+            break; // the dial gave up and said so
+        }
+        if !conn.alive.load(Ordering::SeqCst) {
+            break;
+        }
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
+        if left.is_zero() {
+            break;
+        }
+        // Capped slices so `alive` and `media_attaching` are re-read even if a
+        // notify is lost — the wait is a deadline, not a handshake.
+        let (p, _) = conn
+            .media_gate
+            .settled
+            .wait_timeout(path, left.min(PUMP_SLICE))
+            .unwrap_or_else(|e| e.into_inner());
+        path = p;
+    }
+    drop(path);
+    dlog!(
+        "[audiohubd] {} is pinned to tier 1 but no media link came up; its media will go over \
+         UDP, which is the transport tier 1 exists because it cannot use",
+        conn.fp
+    );
 }
 
 fn offer_ticket(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
     if matches!(*lk(&conn.media_path), MediaPath::Tcp(_)) {
         return; // already attached; a second link would be a second writer
+    }
+    // One live ticket per peer. A negotiation can reach here twice — the
+    // responder offers unprompted and then the initiator's request arrives —
+    // and the second ticket is spent by nobody yet lives out its whole TTL.
+    // Both paths run over the same reliable control channel, so the first
+    // ticket is certain to be delivered and the second is certain to be waste.
+    {
+        let now = Instant::now();
+        let t = lk(&inner.media_tickets);
+        if t.iter().any(|x| x.fp == conn.fp && x.expires > now) {
+            return;
+        }
     }
     let ticket_b64 = mint_ticket(inner, &conn.fp);
     let _ = conn.send_msg(&SessionMsg::MediaAttachTicket { ticket_b64 });
@@ -679,6 +872,12 @@ pub(crate) fn on_request(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
              tier 0, refusing",
             conn.fp
         );
+        // Said out loud rather than dropped: the asker is blocking on this
+        // answer, and a refusal it has to infer from a timeout is a refusal
+        // that costs it the whole attach budget.
+        let _ = conn.send_msg(&SessionMsg::MediaAttachRefused {
+            reason: "this peer is pinned to tier 0".into(),
+        });
         return;
     }
     offer_ticket(inner, conn);
@@ -716,11 +915,18 @@ pub(crate) fn on_ticket(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, ticket
                 dlog!("[audiohubd] tier 1 media to {} ({dest}): {e:#}", owned_conn.fp);
                 // Let a later ticket try again. Leaving the flag set would make
                 // one failed dial permanent for the life of the connection.
+                //
+                // Clearing it is also how `await_attach` learns the attempt is
+                // over: it is holding `register_conn` open, and without the
+                // notify it would sit out the entire backstop for a failure we
+                // already know about.
                 owned_conn.media_attaching.store(false, Ordering::SeqCst);
+                owned_conn.media_gate.announce();
             }
         });
     if spawned.is_err() {
         conn.media_attaching.store(false, Ordering::SeqCst);
+        conn.media_gate.announce();
     }
 }
 
@@ -736,6 +942,11 @@ fn dial_and_serve(
         // an error naming nothing.
         bail!("no port recorded for this peer, so there is nothing to dial");
     }
+    // Claimed before the socket exists, so a dial and an inbound attach racing
+    // on the same connection cannot both install a link.
+    let Some(claim) = AttachClaim::take(&conn.media_gate) else {
+        bail!("a media link is already attached to this connection");
+    };
     let mut s = TcpStream::connect_timeout(&dest, crate::conn::CONNECT_TIMEOUT)
         .with_context(|| format!("connect {dest}"))?;
     s.set_read_timeout(Some(crate::conn::HANDSHAKE_TIMEOUT))?;
@@ -747,7 +958,66 @@ fn dial_and_serve(
         ControlMsg::Error { message } => bail!("peer refused the media attach: {message}"),
         other => bail!("unexpected reply to media_attach: {other:?}"),
     }
-    serve(inner, conn, s)
+    serve(inner, conn, s, claim)
+}
+
+/// One connection's media-link latch, and the condvar that announces its
+/// `media_path` settling.
+///
+/// The two live together because they are the two halves of one question — "is
+/// a link being installed, and has it finished?" — and every waiter needs both:
+/// the flag says whether to keep waiting, the condvar says when to look again.
+pub(crate) struct AttachGate {
+    claimed: AtomicBool,
+    /// Signalled on every write to `ConnShared::media_path`. Pairs with that
+    /// `Mutex`, not with the flag above.
+    settled: Condvar,
+}
+
+impl AttachGate {
+    pub(crate) fn new() -> Arc<AttachGate> {
+        Arc::new(AttachGate { claimed: AtomicBool::new(false), settled: Condvar::new() })
+    }
+
+    /// Wake everyone waiting for `media_path` to settle.
+    pub(crate) fn announce(&self) {
+        self.settled.notify_all();
+    }
+}
+
+/// The right to install a media link on one connection, held for as long as the
+/// install lasts and put back on **every** exit path.
+///
+/// # Why a latch and not a look
+///
+/// The check it replaces read `media_path` and released the lock, while the
+/// install happened later, in [`serve`] — with a `set_nodelay`, a `try_clone`
+/// and a thread spawn in between. Two attaches arriving together could both
+/// pass the look and the second would overwrite the first's `media_path`,
+/// leaving one link with a writer nobody reads and no counter anywhere saying
+/// so. Check and install are one operation, so they are one CAS.
+///
+/// Released by `Drop`, which is the point: the install has half a dozen `?`
+/// exits (socket options, clone, spawn) and a hand-written release would have
+/// to name all of them. Missing one would not fail — it would make the
+/// connection refuse every future attach, for its whole life.
+pub(crate) struct AttachClaim(Arc<AttachGate>);
+
+impl AttachClaim {
+    /// `None` when an attach is already installed or being installed.
+    fn take(gate: &Arc<AttachGate>) -> Option<AttachClaim> {
+        gate.claimed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| AttachClaim(gate.clone()))
+    }
+}
+
+impl Drop for AttachClaim {
+    fn drop(&mut self) {
+        self.0.claimed.store(false, Ordering::SeqCst);
+        self.0.announce();
+    }
 }
 
 /// Inbound half: spend a ticket and hand back the connection it belongs to.
@@ -759,7 +1029,7 @@ pub(crate) fn claim(
     inner: &Arc<DaemonInner>,
     s: &mut TcpStream,
     ticket_b64: &str,
-) -> Result<Arc<ConnShared>> {
+) -> Result<(Arc<ConnShared>, AttachClaim)> {
     let refuse = |s: &mut TcpStream, why: &str| {
         let _ = write_frame(s, &ControlMsg::Error { message: why.into() });
     };
@@ -772,12 +1042,37 @@ pub(crate) fn claim(
         refuse(s, "no live control connection for that ticket");
         bail!("media_attach for {fp}, which has no live control connection");
     };
-    if matches!(*lk(&conn.media_path), MediaPath::Tcp(_)) {
+    // **The ticket is not the only credential; the address is the other one.**
+    //
+    // Installing a link is not the write-only privilege the ticket's own
+    // documentation used to claim. `serve` overwrites `conn.media_path`, so
+    // whoever attaches receives this peer's entire media egress — the real peer
+    // then hears nothing, and the attacker gets the ciphertext stream's timing
+    // and lengths for free. It can also kill the control connection at will, by
+    // closing the socket it was handed.
+    //
+    // So the attach is bound to the address the control handshake proved, for
+    // exactly the reason `handle_datagram`'s `PullReq` arm refuses a keepalive
+    // whose source is not `conn.peer_ip`. A ticket is a far stronger credential
+    // than a cleartext header, but "stronger" is not "a reason to skip the
+    // check".
+    match s.peer_addr() {
+        Ok(a) if a.ip() == conn.peer_ip => {}
+        Ok(a) => {
+            refuse(s, "media attach from an address that is not the control peer");
+            bail!("media_attach for {fp} from {a}, whose control peer is {}", conn.peer_ip);
+        }
+        Err(e) => {
+            refuse(s, "media attach socket has no peer address");
+            bail!("media_attach for {fp}: peer_addr: {e}");
+        }
+    }
+    let Some(claim) = AttachClaim::take(&conn.media_gate) else {
         refuse(s, "a media link is already attached");
         bail!("second media_attach for {fp} while one is already attached");
-    }
+    };
     write_frame(s, &ControlMsg::Ok {}).context("ack media_attach")?;
-    Ok(conn)
+    Ok((conn, claim))
 }
 
 // ------------------------------------------------------------------ tests
@@ -1168,6 +1463,122 @@ mod tests {
             "frames are dropped without being counted, which is the observability hole the whole \
              design says not to reopen"
         );
+    }
+
+    /// **The attach latch is taken once and put back on every exit.**
+    ///
+    /// Covers what the end-to-end refusal test cannot: that test asserts a
+    /// second attach is refused, and the `matches!(media_path, Tcp)` look this
+    /// replaced refused it too — in the *unraced* case. What the look could not
+    /// do is refuse an attach that arrives while the first one is between its
+    /// check and `serve`'s write of `media_path`, which is a `set_nodelay`, a
+    /// `try_clone` and a thread spawn wide. A CAS has no such interval, and a
+    /// test cannot demonstrate the absence of an interval; it can only pin the
+    /// mechanism that has none.
+    ///
+    /// The `Drop` half is the one worth a test on its own. Getting it wrong
+    /// does not fail — it makes the connection refuse every future attach for
+    /// the rest of its life, which reads exactly like a peer that stopped
+    /// wanting tier 1.
+    #[test]
+    fn the_attach_latch_admits_one_holder_and_is_returned_when_it_is_dropped() {
+        let gate = AttachGate::new();
+        let first = AttachClaim::take(&gate).expect("the first claim must succeed");
+        assert!(
+            AttachClaim::take(&gate).is_none(),
+            "two holders got the right to install a link on one connection; the second would \
+             overwrite the first's media_path and leave its writer with no reader"
+        );
+        drop(first);
+        assert!(
+            AttachClaim::take(&gate).is_some(),
+            "the latch was not returned, so this connection now refuses every attach it will \
+             ever be offered — which looks exactly like a peer that stopped wanting tier 1"
+        );
+    }
+
+    /// **An attach is bound to the address the control handshake proved.**
+    ///
+    /// Guarded on the source because it cannot be guarded on behaviour here:
+    /// every socket in a loopback test comes from 127.0.0.1, which is also
+    /// every `conn.peer_ip`, so a build with the check and a build without it
+    /// are indistinguishable to any test this repository can run unprivileged.
+    ///
+    /// Why the check has to exist at all — the design's own description of the
+    /// ticket ("whoever steals one gets to inject bytes that fail AEAD") turned
+    /// out to understate it. `serve` *replaces* `conn.media_path`, so attaching
+    /// takes over the peer's whole media egress: the real peer goes silent, the
+    /// holder gets the ciphertext stream's timing and lengths, and it can drop
+    /// the control connection whenever it likes by closing the socket.
+    /// `handle_datagram` refuses a `PullReq` from the wrong source IP for the
+    /// weaker version of the same reason.
+    #[test]
+    fn an_inbound_attach_must_come_from_the_control_peers_address() {
+        let src = code();
+        let at = src.find("pub(crate) fn claim(").expect("claim is gone");
+        let end = at + src[at..].find("\n}\n").expect("claim has no end");
+        let body = &src[at..end];
+        assert!(
+            body.contains("peer_addr()"),
+            "claim no longer looks at where the attach came from, so any host that gets hold of \
+             a ticket can take over this peer's media egress"
+        );
+        assert!(
+            body.contains("conn.peer_ip"),
+            "claim reads the attaching socket's address but never compares it with the address \
+             the control handshake proved; reading it without comparing it is a diagnostic, not \
+             a check"
+        );
+        // ...and that it decides by taking the latch, not by looking at
+        // `media_path` and installing later. The unit test above pins what the
+        // latch does; this pins that `claim` is the thing using it.
+        assert!(
+            body.contains("AttachClaim::take("),
+            "claim decides whether a link is already attached by some means other than taking \
+             the latch, so the check and the install are two operations again"
+        );
+    }
+
+    /// **The deadline-thread ban list follows `tx_loop`'s calls into this
+    /// file.**
+    ///
+    /// `engine.rs`'s guard scans three function bodies, all of them in
+    /// `engine.rs`. But `tx_loop` calls [`TcpMediaLink::enqueue`] and
+    /// [`TcpMediaLink::wake`] **synchronously**, and they live here — so the
+    /// ban stops at the file boundary and everything past it is unguarded.
+    /// Whatever these two do happens on the 10 ms deadline thread just as much
+    /// as if it had been written inline.
+    ///
+    /// Uses `engine`'s table rather than a copy of it. A copy is the failure
+    /// this whole guard family exists to prevent, one level up: somebody adds a
+    /// transport, adds a row over there, and this side keeps passing because it
+    /// is checking yesterday's list.
+    ///
+    /// Injection control (run 2026-08-08): put `let _ = w.write(b"x");` in
+    /// `enqueue` ⇒ red, naming `write(`. Comment the same line out ⇒ green,
+    /// because [`code`] strips comments first.
+    #[test]
+    fn the_queueing_calls_tx_loop_makes_into_this_file_are_guarded_too() {
+        let src = code();
+        for f in ["fn enqueue(", "fn wake("] {
+            let at = src.find(f).unwrap_or_else(|| {
+                panic!("{f} is gone from tcpmedia.rs; tx_loop's entry point moved and this guard \
+                        is now checking nothing")
+            });
+            let open = at + src[at..].find(" {\n").expect("no signature end") + 3;
+            let end = open + src[open..].find("\n    }\n").expect("no function end");
+            let body = &src[open..end];
+            assert!(!body.is_empty(), "{f}'s body came out empty, so every check below is vacuous");
+            for (needle, why) in crate::engine::deadline_thread_guards::BANNED_ON_THE_DEADLINE_THREAD
+            {
+                assert!(
+                    !body.contains(needle),
+                    "tcpmedia's `{f}` contains `{needle}` — {why}.\nIt is called synchronously \
+                     from tx_loop, so this is the 10 ms deadline thread; the write belongs in \
+                     write_loop."
+                );
+            }
+        }
     }
 
     /// Exactly one producer and one consumer on the tier 1 queue — the entire

@@ -2,7 +2,7 @@
 //! -> SecureChannel -> SessionMsg loop; PairInit -> pair_responder when
 //! pairing mode is active), outbound connects, and session open/close flows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::panic::AssertUnwindSafe;
@@ -217,9 +217,9 @@ fn handle_inbound(
             // an unauthenticated-handshake slot for hours — the bound exists to
             // cap concurrent *handshakes*, and this socket stopped being one
             // the moment the ticket was spent.
-            let conn = crate::tcpmedia::claim(inner, &mut stream, &ticket_b64)?;
+            let (conn, claim) = crate::tcpmedia::claim(inner, &mut stream, &ticket_b64)?;
             drop(preauth);
-            crate::tcpmedia::serve(inner, &conn, stream)
+            crate::tcpmedia::serve(inner, &conn, stream, claim)
         }
         other => {
             let _ = write_frame(
@@ -341,7 +341,9 @@ fn register_conn(
         media_path: Mutex::new(crate::tcpmedia::MediaPath::Udp(SocketAddr::new(
             peer_ip, peer.port,
         ))),
+        media_gate: crate::tcpmedia::AttachGate::new(),
         media_attaching: AtomicBool::new(false),
+        deferred: Mutex::new(VecDeque::new()),
         tx_key: mk.tx,
         rx_key: mk.rx,
         peer,
@@ -471,10 +473,17 @@ pub(crate) fn conn_reader(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
         if inner.shutdown.load(Ordering::SeqCst) || !conn.alive.load(Ordering::SeqCst) {
             break;
         }
+        // Anything `register_conn` pulled off the channel while it was bringing
+        // a tier 1 media link up comes first, so channel order is preserved:
+        // those messages arrived before whatever is still in the socket.
+        let parked = lk(&conn.deferred).pop_front();
         // short recv slices so senders can interleave on the chan mutex
-        let res = {
-            let mut ch = lk(&conn.chan);
-            ch.recv_timeout(Duration::from_millis(50))
+        let res = match parked {
+            Some(m) => Ok(Some(m)),
+            None => {
+                let mut ch = lk(&conn.chan);
+                ch.recv_timeout(Duration::from_millis(50))
+            }
         };
         match res {
             Ok(Some(msg)) => {
@@ -571,6 +580,14 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
         SessionMsg::MediaAttachTicket { ticket_b64 } => {
             crate::tcpmedia::on_ticket(inner, conn, ticket_b64)
         }
+        // Only reachable when the refusal lost the race with `negotiate`'s own
+        // pump (it reads this message itself, because it is blocking on it).
+        // Logged rather than ignored: a peer that refuses tier 1 is the reason
+        // this connection stayed on UDP, and that reason should be findable.
+        SessionMsg::MediaAttachRefused { reason } => dlog!(
+            "[audiohubd] {} refused a tier 1 media attach: {reason}",
+            conn.fp
+        ),
         SessionMsg::AcceptStream { stream_id } => notify_pending(conn, stream_id, Ok(())),
         SessionMsg::RejectStream { stream_id, reason } => {
             notify_pending(conn, stream_id, Err(reason))

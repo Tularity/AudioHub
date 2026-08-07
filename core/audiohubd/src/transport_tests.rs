@@ -2424,3 +2424,247 @@ fn a_peer_pinned_to_tier_zero_refuses_the_attach() {
     assert!(a.tcp_media().is_empty(), "a tier 0 peer granted a media attach: {:?}", a.tcp_media());
     assert!(b.tcp_media().is_empty(), "a tier 0 peer accepted a media attach: {:?}", b.tcp_media());
 }
+
+/// **A stream opened the instant the peers are paired still goes over TCP.**
+///
+/// This is the production ordering, and the e2e test above does not exercise
+/// it: that one waits for the link before opening, which is a courtesy no
+/// caller in the daemon extends. `session.open` to a peer that is not connected
+/// yet dials and opens back to back, and `reconnect::replay_sessions` re-opens
+/// every stream the moment `connect_peer` returns.
+///
+/// Measured on 2026-08-08 before the fix, with exactly this shape: both ends
+/// reported `alive: true`, the session counted 513 packets, and the link
+/// reported `frames_written: 0` — every byte went over UDP. Attach finished at
+/// t=0.310 and the control connection at t=0.112, so the window was ~200 ms,
+/// which is not a race to lose occasionally but the normal case.
+///
+/// That mattered most on the path that closes the loop: `tcpmedia::serve`'s
+/// teardown drops the control connection *on purpose*, so the reconnect+replay
+/// machinery rebuilds both — and replay is precisely the caller that does not
+/// wait. So every tier 1 link death used to rebuild its streams pinned back
+/// onto UDP, permanently.
+///
+/// Injection control (run 2026-08-08): make `tcpmedia::negotiate` return
+/// without calling `await_attach` ⇒ red at `frames_written == 0`, with the
+/// tone still audible and both links still `alive` — which is the whole point.
+#[test]
+fn a_stream_opened_without_waiting_for_the_link_still_goes_over_tcp() {
+    let a = Node::start("t1-race-a");
+    let b = Node::start("t1-race-b");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    pin_tier(&a, &b.fingerprint(), "tier1");
+    pin_tier(&b, &a.fingerprint(), "tier1");
+    pair(&a, &b);
+
+    // No `eventually` on the link: open immediately, the way replay does.
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({
+            "peer": b.fingerprint(), "kind": KIND_SPK, "source": SOURCE_TONE,
+            "freq": 1000.0, "verify_freq": 1000.0
+        }),
+    );
+    eventually_within(Duration::from_secs(20), "B's 1 kHz verdict", || {
+        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
+    });
+
+    let written = a
+        .tcp_link()
+        .and_then(|l| l["frames_written"].as_u64())
+        .unwrap_or(0);
+    assert!(
+        written > 0,
+        "the tone arrived but no frame was written to the tier 1 link, so it went over UDP: \
+         a={:?} b={:?}",
+        a.tcp_media(),
+        b.tcp_media()
+    );
+    // Sampling order is load-bearing: both counters are still climbing, so
+    // `received` must be read FIRST. The other way round the link reading is
+    // the older of the two and this assertion goes red on a perfectly healthy
+    // link — measured once, at 6015 >= 6025. A tolerance would be the wrong
+    // repair; it would also hide a stream that really did leak onto UDP.
+    let received = b
+        .ok(methods::SESSION_LIST, json!({}))
+        .as_array()
+        .and_then(|ss| ss.iter().find(|s| s["dir"].as_str() == Some("recv")).cloned())
+        .and_then(|s| s["stats"]["received"].as_u64())
+        .expect("a received count");
+    let read = b.tcp_link().and_then(|l| l["frames_read"].as_u64()).unwrap_or(0);
+    assert!(
+        read >= received,
+        "{received} packets reached the session but only {read} came off the tier 1 link, so \
+         some of the stream opened onto UDP"
+    );
+}
+
+/// **A peer that refuses tier 1 says so, instead of letting the asker time
+/// out.**
+///
+/// `negotiate` blocks `register_conn` until the attach resolves, so silence
+/// from a peer that has already decided costs the asker the whole
+/// `ATTACH_TIMEOUT`. That is the cost this assertion bounds: without
+/// `SessionMsg::MediaAttachRefused`, `peers.connect` below returns after the
+/// full backstop rather than after one round trip.
+///
+/// The bound is deliberately loose (2 s against an 8 s backstop). A tight one
+/// would be measuring loopback scheduling, and this test is about which of two
+/// exits was taken, not about how fast the fast one is.
+#[test]
+fn a_tier_zero_peer_refuses_out_loud_rather_than_by_timing_out() {
+    let a = Node::start("t1-refuse-a");
+    let b = Node::start("t1-refuse-b");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    pin_tier(&a, &b.fingerprint(), "tier1");
+    pin_tier(&b, &a.fingerprint(), "tier0");
+
+    let pin = b.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
+    let pin = pin.get("pin").and_then(Value::as_str).expect("pin").to_string();
+    a.ok(methods::PEERS_PAIR, json!({ "addr": b.addr(), "pin": pin }));
+    let t0 = Instant::now();
+    a.ok(
+        methods::PEERS_CONNECT,
+        json!({ "peer": b.fingerprint(), "addr": b.addr() }),
+    );
+    let took = t0.elapsed();
+
+    assert!(a.tcp_media().is_empty(), "a tier 0 peer granted a media attach");
+    assert!(
+        took < Duration::from_secs(2),
+        "connecting took {took:?}; a refusal that has to be inferred from a timeout costs the \
+         whole attach backstop, which is what MediaAttachRefused exists to avoid"
+    );
+}
+
+/// **A second media attach is refused while one is installed.**
+///
+/// The check it guards used to read `media_path`, release the lock, and let
+/// `serve` install the link some microseconds later — so two attaches arriving
+/// together could both pass and the second would overwrite the first's
+/// `media_path`, leaving a writer nobody reads and no counter saying so.
+///
+/// Driven from outside the daemon, through a real socket and a real ticket, so
+/// what is tested is the frame handler and not a function called by nobody.
+///
+/// ⚠ **What this test cannot cover**: `claim` also requires the attaching
+/// socket's source IP to equal `conn.peer_ip`. On loopback every address is
+/// 127.0.0.1, so a refusal and an acceptance are indistinguishable here; that
+/// half is guarded on the source text instead, in `tcpmedia.rs`.
+#[test]
+fn a_second_media_attach_is_refused_while_one_is_installed() {
+    use audiohub_net::control::{read_frame, write_frame, ControlMsg};
+    use std::net::TcpStream;
+
+    let a = Node::start("t1-dup-a");
+    let b = Node::start("t1-dup-b");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    pin_tier(&a, &b.fingerprint(), "tier1");
+    pin_tier(&b, &a.fingerprint(), "tier1");
+    pair(&a, &b);
+    eventually("a tier 1 media link on the accepting side", || {
+        b.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+
+    // A ticket B would have handed out itself. Minting it directly is the only
+    // way to get a *second* one: `offer_ticket` deliberately suppresses a
+    // second live ticket per peer.
+    let ticket_b64 = crate::tcpmedia::mint_ticket_for_test(b.h.inner_for_test(), &a.fingerprint());
+    let mut s = TcpStream::connect(b.addr()).expect("dial B's control port");
+    s.set_read_timeout(Some(Duration::from_secs(5))).expect("read timeout");
+    write_frame(&mut s, &ControlMsg::MediaAttach { ticket_b64 }).expect("send media_attach");
+    match read_frame(&mut s).expect("read the reply") {
+        ControlMsg::Error { message } => assert!(
+            message.contains("already attached"),
+            "refused for the wrong reason: {message}"
+        ),
+        ControlMsg::Ok {} => panic!(
+            "a second media link was installed over the live one; the first link's writer now \
+             has no reader and nothing counts it"
+        ),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+
+    // ...and the original link is untouched.
+    let link = b.tcp_link().expect("the first link survived");
+    assert_eq!(link["alive"], Value::Bool(true), "the refusal killed the live link: {link}");
+}
+
+/// **A media frame that fails AEAD is counted, not merely dropped.**
+///
+/// `control.rs` promises that a stolen attach ticket buys nothing but "bytes
+/// that fail AEAD and get counted and dropped". The dropping was real; the
+/// counting was not — the arm was a bare `else { return }` and no counter in
+/// the repository moved. On tier 1 the gap is worse than cosmetic:
+/// `tcp_media.frames_read` increments for every `Kind::Media` frame off the
+/// socket whether or not it authenticates, so injected traffic raises
+/// `frames_read` while the session's `received` stays put, and the e2e
+/// `read >= received` assertion stays green while it happens.
+///
+/// Injected over UDP because that needs no ticket and reaches the identical
+/// `handle_datagram`; what is being tested is the counter, not the transport.
+///
+/// Injection control (run 2026-08-08): revert the arm to `else { return }` ⇒
+/// red with `auth_failed == 0`.
+#[test]
+fn a_media_frame_that_fails_aead_is_counted() {
+    use audiohub_net::packet::{Codec, Header, Kind};
+    use std::net::UdpSocket;
+
+    let (a, b) = linked("authfail");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    let sid = tone_session(&a, &b) as u32;
+    eventually("B to be receiving the tone", || {
+        b.ok(methods::SESSION_LIST, json!({}))
+            .as_array()
+            .is_some_and(|ss| ss.iter().any(|s| s["stats"]["received"].as_u64().unwrap_or(0) > 0))
+    });
+
+    // A well-formed header for a stream that exists, over a payload that is
+    // not its ciphertext. Everything up to the AEAD passes.
+    // `local_addr` reports the wildcard bind (`0.0.0.0:port`), which is not a
+    // destination anything can be sent to; only the port is wanted.
+    let port = b.h.inner_for_test().udp.local_addr().expect("B's media port").port();
+    let dest: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("dest");
+    let payload = [0u8; 64];
+    let mut dg = Vec::new();
+    Header {
+        kind: Kind::Media,
+        codec: Codec::PcmS16le,
+        channels: 1,
+        sample_rate: 48000,
+        session_id: 0,
+        stream_id: sid,
+        seq: 1,
+        timestamp_us: 0,
+        payload_len: payload.len() as u32,
+    }
+    .encode_append(&payload, &mut dg);
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("probe socket");
+    for _ in 0..3 {
+        sock.send_to(&dg, dest).expect("inject");
+    }
+
+    eventually("the forged frames to be counted", || {
+        b.ok(methods::SESSION_LIST, json!({}))
+            .as_array()
+            .is_some_and(|ss| {
+                ss.iter().any(|s| s["stats"]["auth_failed"].as_u64().unwrap_or(0) >= 3)
+            })
+    });
+    // ...and nothing was let through: `received` counts authenticated packets.
+    let recv = b
+        .ok(methods::SESSION_LIST, json!({}))
+        .as_array()
+        .and_then(|ss| ss.iter().find(|s| s["dir"].as_str() == Some("recv")).cloned())
+        .expect("a receiving session");
+    assert_eq!(
+        recv["stats"]["lost"].as_u64(),
+        Some(0),
+        "a forged frame was admitted far enough to disturb the sequence accounting: {recv}"
+    );
+}

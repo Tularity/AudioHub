@@ -882,6 +882,19 @@ pub struct SessionStats {
     /// 五个计数器对它**全部免疫**——判据见 `engine::handle_datagram`。
     #[serde(default)]
     pub format_mismatch: u64,
+    /// 通过了包头解析、却**没通过 AEAD** 因而被丢弃的媒体包数（lifetime）。
+    ///
+    /// 在 UDP 上这是「路径上有人往这个 stream id 里灌字节」的唯一证据。
+    /// 在 Tier 1 上它还多一层用处：`tcp_media.frames_read` 对**每一个**
+    /// `Kind::Media` 帧递增，认证过不过都算，于是注入流量会同时抬高
+    /// `frames_read` 而这条会话的 `received` 不动 —— 两个数之间那道缺口
+    /// 只有这个字段能命名。
+    ///
+    /// `control.rs` 的 `MediaAttach` 文档承诺偷到票的人「只能注入会被
+    /// **计数并丢弃**的字节」。这就是那个计数器；在它存在之前那句承诺是
+    /// 假的（丢弃是真的，计数不存在）。
+    #[serde(default)]
+    pub auth_failed: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

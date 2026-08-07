@@ -802,18 +802,7 @@ pub(crate) fn status_with_hal(
     Ok(v)
 }
 
-/// 棘轮治理（治法 A + B）的现场读数。**必须经 IPC 暴露**：这一整类病的特征就是
-/// 「除了水位读数本身没有一个数字会动」，上一轮花了整轮调查才把它挖出来。埋点留在
-/// 进程里不导出，等于下一次复发时又得重来一遍。
-///
-/// `hal` 里那份 `audiohub_ipc::HalStatus` 是**发布过的**结构，它的字段被
-/// `test/tests/hal_wiring.rs` 冻结；trim/underrun/skip 是新量，挂在自己的键下，
-/// 一个字段都不动老结构。
-/// `daemon.status.latency_guard.dev_lat`：两台默认设备的固有延迟现场。
-///
-/// 走缓存（`dev_lats()` 会按需刷新），所以 `daemon.status` 不会变成一条
-/// 「每次调用都问四遍 CoreAudio」的路径。
-/// `daemon.status.tcp_media`：每条活着的 Tier 1 媒体链路一行。
+/// `daemon.status.latency_guard.tcp_media`：每条活着的 Tier 1 媒体链路一行。
 ///
 /// 空数组 = 没有任何对端在降级链路上，**不是**「读不到」。区别是有意义的：
 /// 这套遥测反对的正是「用 0 冒充未知」。
@@ -847,6 +836,10 @@ fn tcp_media_status(inner: &DaemonInner) -> serde_json::Value {
     )
 }
 
+/// `daemon.status.latency_guard.dev_lat`：两台默认设备的固有延迟现场。
+///
+/// 走缓存（`dev_lats()` 会按需刷新），所以 `daemon.status` 不会变成一条
+/// 「每次调用都问四遍 CoreAudio」的路径。
 fn dev_lats_status(inner: &DaemonInner) -> serde_json::Value {
     let lats = dev_lats(inner);
     serde_json::json!({
@@ -880,6 +873,13 @@ fn declared_status(inner: &DaemonInner) -> serde_json::Value {
     })
 }
 
+/// 棘轮治理（治法 A + B）的现场读数。**必须经 IPC 暴露**：这一整类病的特征就是
+/// 「除了水位读数本身没有一个数字会动」，上一轮花了整轮调查才把它挖出来。埋点留在
+/// 进程里不导出，等于下一次复发时又得重来一遍。
+///
+/// `hal` 里那份 `audiohub_ipc::HalStatus` 是**发布过的**结构，它的字段被
+/// `test/tests/hal_wiring.rs` 冻结；trim/underrun/skip 是新量，挂在自己的键下，
+/// 一个字段都不动老结构。
 fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
     let hal = inner.hal().map(|h| {
         let s = h.status();
@@ -1088,10 +1088,50 @@ pub(crate) struct ConnShared {
     /// clone taken when the stream was created (design §5.1: promotion happens
     /// at the *next* stream open, never inside a live one).
     pub media_path: Mutex<tcpmedia::MediaPath>,
+    /// Signalled on every write to [`Self::media_path`].
+    ///
+    /// `register_conn` blocks on this until the tier 1 link is up (or the
+    /// attempt is over), and that wait is not a nicety. Attaching takes a
+    /// request, a ticket, a dial and a handshake — roughly 200 ms on loopback,
+    /// measured — while `connect_peer` returns as soon as the *control*
+    /// handshake finishes. Every stream opened in that window binds itself to
+    /// the UDP path for its whole life (design §5.1: never switch inside a live
+    /// stream), so on a link where tier 1 exists because UDP is blocked, the
+    /// result is two healthy ends, an all-green screen and total silence —
+    /// which is the exact failure `PROTOCOL_VERSION 4` was bumped to prevent,
+    /// arrived at through our own timing instead of through a version skew.
+    ///
+    /// The window is not a narrow race. `serve`'s teardown deliberately drops
+    /// the control connection so the reconnect machinery rebuilds both, and
+    /// `replay_sessions` re-opens every stream the instant `connect_peer`
+    /// returns — so without this wait, *every* tier 1 link death would rebuild
+    /// the streams pinned back onto UDP.
+    /// Plus the latch that makes "is one attached?" and "install this one" a
+    /// single operation rather than a look followed some microseconds later by
+    /// a write. See `tcpmedia::AttachGate`.
+    pub media_gate: Arc<tcpmedia::AttachGate>,
     /// Claimed once by whoever gets to dial the tier 1 link, so that the
     /// initiator's request and the responder's unprompted offer cannot both
     /// produce one. Two links would mean two writers on one peer.
+    ///
+    /// Also the dialling side's "still trying" flag: it is cleared when a dial
+    /// fails, which is what lets the waiter above stop early instead of sitting
+    /// out the whole timeout.
     pub media_attaching: AtomicBool,
+    /// Control messages read off the channel before `conn_reader` existed.
+    ///
+    /// `register_conn` pumps the channel itself while it waits for an attach
+    /// ticket, because the ticket arrives on this channel and the reader thread
+    /// is not running yet. Anything else it finds is parked here rather than
+    /// handled: handling an `OpenStream` at that moment would bind the stream to
+    /// the media path we are in the middle of replacing, which is precisely the
+    /// failure the wait exists to prevent.
+    ///
+    /// Drained by `conn_reader` before it reads the socket, so ordering on the
+    /// channel is preserved. A `Ping` parked here is answered up to the attach
+    /// timeout late; `ClockFilter` keeps a min-RTT window, so the one inflated
+    /// sample is filtered rather than believed.
+    pub deferred: Mutex<VecDeque<SessionMsg>>,
     /// Fingerprint of whoever opened this TCP connection. Both peers apply the
     /// same "lower fingerprint wins" rule to a simultaneous bidirectional
     /// connect, so they converge on one connection instead of evicting each
@@ -1798,6 +1838,12 @@ pub(crate) struct RxCell {
     /// 分了岔」这件事在整套遥测上**一个字都不会出现**，只在耳朵里表现为周期性
     /// 静音洞。详见 `engine::handle_datagram` 里那段判据的注释。
     pub format_mismatch: u64,
+    /// 包头解析通过、`MediaCrypto::open` 失败因而被丢弃的包数（lifetime）。
+    ///
+    /// 这条路径此前是**完全静默**的 `else { return }`。UDP 上它是「有人在往
+    /// 这个 stream id 灌字节」的唯一痕迹；Tier 1 上它还是 `frames_read` 与
+    /// `received` 之间那道缺口的唯一解释 —— `frames_read` 不看认证结果。
+    pub auth_failed: u64,
     pub prev_transit: Option<i64>,
     // per-interval accounting for Stats/AUTO (the cumulative RxStats figures
     // stay untouched for the lifetime display)
@@ -1958,6 +2004,7 @@ impl RxStream {
                 last_rate: 48000,
                 last_depth: None,
                 format_mismatch: 0,
+                auth_failed: 0,
                 prev_transit: None,
                 iv_received: 0,
                 iv_expected: 0,
@@ -3061,6 +3108,7 @@ fn build_session_info_with(
         jb_underrun_penalty_frames: 0,
         jb_half_conceal: 0,
         format_mismatch: 0,
+        auth_failed: 0,
         wire_bytes: 0,
         datagram_bytes: 0,
     };
@@ -3120,6 +3168,7 @@ fn build_session_info_with(
                 .and_then(|d| audiohub_net::media::rung_of(c.last_rate, d))
                 .unwrap_or(0);
             s.format_mismatch = c.format_mismatch;
+            s.auth_failed = c.auth_failed;
         }
         {
             // JitterBuffer 早就有这五个 `pub` 计数器（media.rs），一个都没导出过。

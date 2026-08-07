@@ -288,15 +288,39 @@ mod codec_depth_tests {
     /// ⚠ 这条**保证不了跨版本安全**：`PcmF32le = 1` 在协议 v2 里就是合法值，
     /// 而 v2 的收流路径根本不看 `codec` ⇒ 它会把 f32 载荷按 s16 静默错解。
     /// 挡住这件事的是 `control::PROTOCOL_VERSION`（已升到 3），不是这条断言。
+    ///
+    /// Stated as the **whole** 0..=255 space, for the same reason as
+    /// [`the_kind_byte_values_are_frozen`] below — and this test is where that
+    /// reason was first learned. The unassigned side used to be four samples,
+    /// `[4, 5, 100, 254]`, which leaves two holes: assigning codec 4 turns a
+    /// sample into a claim that a *valid* codec must be rejected, and a
+    /// `from_u8` that accepted some byte nobody sampled would go unnoticed
+    /// entirely. Enumerating closes both, and makes assigning a codec fail here
+    /// on purpose, next to the `PROTOCOL_VERSION` note above that such an edit
+    /// has to revisit.
     #[test]
     fn the_codec_byte_values_are_frozen() {
+        let assigned: [(u8, Codec); 5] = [
+            (0, Codec::PcmS16le),
+            (1, Codec::PcmF32le),
+            (2, Codec::Opus),
+            (3, Codec::PcmS24le),
+            (255, Codec::Passthrough),
+        ];
         assert_eq!(Codec::PcmS16le as u8, 0);
         assert_eq!(Codec::PcmF32le as u8, 1);
         assert_eq!(Codec::Opus as u8, 2);
         assert_eq!(Codec::PcmS24le as u8, 3, "改这个值 = 换线格式，两端会各说各话");
         assert_eq!(Codec::Passthrough as u8, 255);
-        for bad in [4u8, 5, 100, 254] {
-            assert_eq!(Codec::from_u8(bad), None, "{bad} 不该被认出来");
+
+        for (byte, want) in assigned {
+            assert_eq!(Codec::from_u8(byte), Some(want), "codec byte {byte} must decode to {want:?}");
+        }
+        for bad in 0u8..=255 {
+            if assigned.iter().any(|(b, _)| *b == bad) {
+                continue;
+            }
+            assert_eq!(Codec::from_u8(bad), None, "unassigned codec byte {bad} must not be recognised");
         }
     }
 

@@ -517,19 +517,73 @@ impl Grade {
     }
 }
 
-/// Q1 隐藏率分档（规格 §4.3）。
+/// Q1 conceal-rate band edges (spec §4.3).
 ///
-/// 「优」线 0.2% 是**结构性噪声底**，不是审美：`MIN_TARGET = 2`，每次启动与
-/// 每次 underrun 后都重进 prebuffering，都会产生 1~2 帧隐藏。10 秒 = 1000 帧，
-/// 1~2 帧就是 0.1~0.2%。**低于这条线的差异是本系统自己的结构噪声，不是质量
-/// 信息。** 1% / 3% 两线取自 G.107 E-model：PCM 语音丢失 <1% 时 R 值几乎不降
-/// （业界「透明线」），3% 左右 R 值跌破 70（「用户开始不满意」档）。
+/// `GOOD` / `FAIR` come from the G.107 E-model and are external to this
+/// system: PCM speech barely moves the R factor below 1% frame loss (the
+/// industry "transparency line"), and R drops through 70 ("users start to be
+/// dissatisfied") around 3%.
+///
+/// `EXCELLENT` is ours, and its old justification was wrong. It used to be
+/// documented as a *structural noise floor* — "`MIN_TARGET = 2`, every start
+/// and every post-underrun re-prebuffer conceals 1~2 frames, and 1~2 frames
+/// out of a 1000-tick window is 0.1~0.2%". Measured against the code, all
+/// three halves of that are false:
+///
+///   * **Startup conceals nothing at all.** `JitterBuffer::push` never sets
+///     `next_seq`; only `start_playback` does, and that only runs once depth
+///     reaches the target. So the whole initial pre-buffer returns `None`
+///     from `pop()` — no tick, no counter, no denominator. Measured 0.000%
+///     at `min_target` 2/3/4/5, whether frames trickle in one per tick or
+///     arrive as a burst (a burst becomes `dropped`, which Q1 does not count).
+///   * **It forgot the ×3 silence weight** that [`conceal_ratio`] applies.
+///   * **Even the post-underrun path never fit under 0.2%.** The cheapest
+///     possible underrun costs `min_target + 1` concealed frames; at the
+///     `min_target = 2` the comment was written for that is already 0.299%.
+///
+/// So the floor those 0.2% were supposed to clear does not exist and never
+/// did — the floor is exactly zero, which is also what the live link reports
+/// (114/114 samples over a healthy gigabit LAN: `conceal_ratio = 0.0`,
+/// grade `excellent`).
+///
+/// What the line actually has to do is sit in the open interval between
+/// "nothing happened" (0) and "one real dropout happened", so that a single
+/// underrun is *visible* to Q1 without being *over-reported*:
+///
+/// ```text
+/// 0  <  EXCELLENT  <  cost of one underrun  <  FAIR
+/// ```
+///
+/// That upper bound is the one with teeth, and it is where the real coupling
+/// to `JbTuning` lives — running in the direction opposite to the one the old
+/// comment implied. One underrun costs `min_target + 1` concealed frames, and
+/// past 5 consecutive frames `conceal()` switches from PLC to silence, which
+/// weighs ×3. So the cost of one identical physical stall climbs with the
+/// buffer depth while these band edges stay put:
+///
+/// ```text
+/// min_target   1      2..5           >= 6
+/// one underrun Excellent(!)  Good     Fair(!)
+/// ```
+///
+/// Both ends are wrong for the same reason: the grade of one dropout must not
+/// be decided by a tuning constant. The shipped `min_target = 4` sits in the
+/// middle of the good band (0.498%), and
+/// [`tests::one_underrun_at_the_shipped_jb_tuning_must_land_in_the_good_band`]
+/// re-derives that cost from a real `JitterBuffer` on every run, so moving
+/// `min_target` out of the safe range turns the suite red instead of silently
+/// re-grading dropouts.
+pub(crate) const CONCEAL_EXCELLENT: f64 = 0.002;
+pub(crate) const CONCEAL_GOOD: f64 = 0.01;
+pub(crate) const CONCEAL_FAIR: f64 = 0.03;
+
+/// Q1 隐藏率分档（规格 §4.3）。边界见 [`CONCEAL_EXCELLENT`]。
 pub(crate) fn grade_conceal(ratio: f64) -> Grade {
-    if ratio < 0.002 {
+    if ratio < CONCEAL_EXCELLENT {
         Grade::Excellent
-    } else if ratio < 0.01 {
+    } else if ratio < CONCEAL_GOOD {
         Grade::Good
-    } else if ratio < 0.03 {
+    } else if ratio < CONCEAL_FAIR {
         Grade::Fair
     } else {
         Grade::Poor
@@ -636,6 +690,7 @@ pub(crate) fn compose(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use audiohub_net::media::{JbTuning, JitterBuffer};
 
     // ---- Q1 窗口 ----
 
@@ -923,11 +978,161 @@ mod tests {
     #[test]
     fn conceal_thresholds_sit_where_the_spec_put_them() {
         assert_eq!(grade_conceal(0.0), Grade::Excellent);
-        assert_eq!(grade_conceal(0.0019), Grade::Excellent); // 结构噪声底之下
+        assert_eq!(grade_conceal(0.0019), Grade::Excellent);
         assert_eq!(grade_conceal(0.002), Grade::Good);
         assert_eq!(grade_conceal(0.009), Grade::Good); // G.107「透明线」之下
         assert_eq!(grade_conceal(0.01), Grade::Fair);
         assert_eq!(grade_conceal(0.03), Grade::Poor); // R 值跌破 70
+    }
+
+    // ---- Q1 band edges vs. the shipped jitter-buffer tuning ----
+    //
+    // These two tests exist because the band edges used to carry a *hand-copied*
+    // justification: `grade_conceal`'s doc quoted `MIN_TARGET = 2` from
+    // `media.rs`, and `media.rs` in turn pointed back at a line number here.
+    // Nothing executed either claim, so when `min_target` became 4 both sides
+    // kept asserting a derivation that no longer described the code (and, as it
+    // turned out, had never described it). Everything below is re-derived from
+    // `JbTuning::DEFAULT` by driving a real `JitterBuffer`, so the relationship
+    // is checked rather than narrated.
+
+    /// 10 ms per frame, 48 kHz mono — the cadence `JitterBuffer` assumes.
+    fn jb_frame() -> Vec<f32> {
+        vec![0.1f32; 480]
+    }
+
+    fn jb_counts(jb: &JitterBuffer) -> JbCounts {
+        c(jb.popped, jb.plc_count, jb.silence_count)
+    }
+
+    /// Drive a real `JitterBuffer` through a 1000-tick (= 10 s) window that
+    /// contains exactly one underrun, and return that window's counters.
+    ///
+    /// The stall is the *cheapest* one that still underruns: `media.rs` pins
+    /// `underrun <=> consecutive starved ticks >= target_effective()`, so on a
+    /// clean link that is exactly `min_target` ticks. Anything longer would
+    /// measure the stall, not the buffer.
+    fn window_with_one_underrun(cfg: JbTuning) -> JbCounts {
+        let mut jb = JitterBuffer::with_tuning(cfg.min_target, cfg);
+        let mut seq = 0u32;
+        for _ in 0..300 {
+            jb.push(seq, jb_frame());
+            seq = seq.wrapping_add(1);
+            jb.pop();
+        }
+        let before = jb_counts(&jb);
+        let stall = cfg.min_target as usize;
+        for _ in 0..stall {
+            jb.pop();
+        }
+        for _ in 0..(1000 - stall) {
+            jb.push(seq, jb_frame());
+            seq = seq.wrapping_add(1);
+            jb.pop();
+        }
+        assert_eq!(jb.underruns, 1, "the harness must produce exactly one underrun");
+        JbCounts::delta(jb_counts(&jb), before)
+    }
+
+    /// **The initial pre-buffer conceals nothing** — the premise the band edges
+    /// actually rest on.
+    ///
+    /// `push` never sets `next_seq`; only `start_playback` does, once depth
+    /// reaches the target. Until then `pop()` returns `None`: no tick is
+    /// emitted, so no counter moves and the window has no structural noise
+    /// floor to clear. If someone ever makes pre-buffering emit concealed
+    /// frames instead, the excellent band stops meaning "nothing happened" and
+    /// this goes red.
+    #[test]
+    fn the_initial_prebuffer_contributes_no_conceal_at_any_depth() {
+        for min_target in [1u32, 2, 3, 4, 5, 8, 12] {
+            let cfg = JbTuning { min_target, ..JbTuning::DEFAULT };
+
+            // Frames trickling in at real-time pace.
+            let mut jb = JitterBuffer::with_tuning(min_target, cfg);
+            for seq in 0..1000u32 {
+                jb.push(seq, jb_frame());
+                jb.pop();
+            }
+            assert_eq!(
+                (jb.plc_count, jb.silence_count),
+                (0, 0),
+                "min_target={min_target}: cold start must conceal nothing (trickle arrival)"
+            );
+
+            // Frames arriving as a burst: the surplus is clamped away as
+            // `dropped`, which Q1 deliberately does not count either.
+            let mut jb = JitterBuffer::with_tuning(min_target, cfg);
+            for seq in 0..20u32 {
+                jb.push(seq, jb_frame());
+            }
+            for seq in 20..1000u32 {
+                jb.push(seq, jb_frame());
+                jb.pop();
+            }
+            assert_eq!(
+                (jb.plc_count, jb.silence_count),
+                (0, 0),
+                "min_target={min_target}: cold start must conceal nothing (burst arrival)"
+            );
+            assert_eq!(
+                conceal_ratio(&jb_counts(&jb)),
+                Some(0.0),
+                "min_target={min_target}: a clean cold start is exactly 0%, not 'nearly 0%'"
+            );
+        }
+    }
+
+    /// **One underrun must grade `Good` at the shipped tuning — not `Excellent`,
+    /// not `Fair`.** This is the test that goes red when `min_target` and the
+    /// band edges drift apart.
+    ///
+    /// A single underrun costs `min_target + 1` concealed frames, and past 5
+    /// consecutive frames `conceal()` switches from PLC to silence (weight ×3).
+    /// So its weighted cost climbs with buffer depth while the band edges stay
+    /// put, and the grade of one identical stall walks across three bands:
+    ///
+    /// ```text
+    /// min_target      1        2..5       >= 6
+    /// one underrun    Excellent  Good      Fair
+    /// ```
+    ///
+    /// Too low and Q1 cannot see a real dropout at all; too high and one
+    /// PLC-covered 40 ms gap in 10 seconds gets reported as a degraded link.
+    /// Either way the verdict would be decided by a jitter-buffer tuning knob
+    /// rather than by what the user heard.
+    #[test]
+    fn one_underrun_at_the_shipped_jb_tuning_must_land_in_the_good_band() {
+        let cfg = JbTuning::DEFAULT;
+        let cost = conceal_ratio(&window_with_one_underrun(cfg)).expect("window has output");
+
+        assert!(
+            cost > CONCEAL_EXCELLENT,
+            "min_target={} makes one underrun cost {cost:.5} (<= the excellent edge \
+             {CONCEAL_EXCELLENT}), so a real dropout would still grade 'excellent' and Q1 \
+             would be blind to it. Lower CONCEAL_EXCELLENT or raise min_target.",
+            cfg.min_target
+        );
+        assert!(
+            cost < CONCEAL_GOOD,
+            "min_target={} makes one underrun cost {cost:.5} (>= the good edge \
+             {CONCEAL_GOOD}), so a single PLC-covered stall would grade 'fair' purely \
+             because the buffer got deeper. Raise CONCEAL_GOOD or lower min_target.",
+            cfg.min_target
+        );
+        assert_eq!(
+            grade_conceal(cost),
+            Grade::Good,
+            "one underrun at min_target={} must grade Good",
+            cfg.min_target
+        );
+
+        // The two constants must describe the same buffer the daemon runs.
+        assert_eq!(
+            JitterBuffer::MIN_TARGET,
+            cfg.min_target,
+            "JitterBuffer::MIN_TARGET must stay derived from JbTuning::DEFAULT"
+        );
     }
 
     #[test]

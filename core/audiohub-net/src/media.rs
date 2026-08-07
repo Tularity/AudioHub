@@ -496,9 +496,24 @@ pub struct JitterBuffer {
 }
 
 impl JitterBuffer {
-    /// 保留给外部读者的两个界。**从 [`JbTuning::DEFAULT`] 派生**，不许与整定
-    /// 表各写一份（`quality.rs:504` 的「优」线 0.2 % 就是照 `MIN_TARGET = 2`
-    /// 推出来的结构性噪声底，两处漂了就没人发现）。
+    /// The two bounds kept for outside readers. **Derived from
+    /// [`JbTuning::DEFAULT`]** — never a second hand-written copy of the
+    /// tuning table.
+    ///
+    /// This comment used to warn that `quality.rs`'s "excellent" conceal edge
+    /// of 0.2 % was derived from `MIN_TARGET = 2` and that "if the two drift
+    /// apart nobody will notice". Both halves came true: `min_target` became 4
+    /// and nobody noticed, and the derivation itself turned out never to have
+    /// been right (the initial pre-buffer conceals *nothing* — `pop()` returns
+    /// `None` until `start_playback` runs, so it emits no tick and moves no
+    /// counter).
+    ///
+    /// The coupling that does exist runs the other way: one underrun costs
+    /// `min_target + 1` concealed frames, so raising `min_target` makes a
+    /// single stall look *worse* to Q1, not better. That relationship is now
+    /// executed rather than narrated — `quality.rs` re-derives the cost from a
+    /// real `JitterBuffer` at `JbTuning::DEFAULT` and fails the suite if it
+    /// leaves the "good" band. Change `min_target` and the test will tell you.
     pub const MIN_TARGET: u32 = JbTuning::DEFAULT.min_target;
     pub const MAX_TARGET: u32 = JbTuning::DEFAULT.max_target;
     const DEFAULT_FRAME_LEN: usize = 480; // 48k @ 10ms

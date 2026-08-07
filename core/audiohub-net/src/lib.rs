@@ -1,6 +1,9 @@
 pub mod control;
 pub mod discovery;
 pub mod echo;
+/// Framing for byte-stream transports (design §2 decision B). A library with no
+/// caller yet: nothing in the daemon reads or writes a frame.
+pub mod framed;
 pub mod identity;
 pub mod media;
 /// A second `ControlIo` implementation, built out of byte queues, and the proof

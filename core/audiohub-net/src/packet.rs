@@ -26,6 +26,26 @@ pub const VERSION: u8 = 1;
 /// `stream_id as u64`，8 字节纯重复。它排在 `timestamp_us` 前面。
 pub const HEADER_LEN: usize = 40;
 
+/// What a packet is. Byte 5 of the header, validated by [`Header::parse`], so a
+/// value the reader does not know is a parse failure rather than something that
+/// falls through.
+///
+/// # ⚠ Adding a value here is a wire-format change — check `PROTOCOL_VERSION`
+///
+/// Same discipline as [`Codec`] below, and the same failure mode. A peer that
+/// predates the value gets `None` from [`Kind::from_u8`] ⇒ [`Header::parse`]
+/// returns [`PacketError::BadKind`] ⇒ `handle_datagram` returns **with no log
+/// at all**. Both ends healthy, both screens green, no audio and no diagnostic.
+/// The only gate against that is the strict-equality version comparison at
+/// handshake time (`control::PROTOCOL_VERSION`).
+///
+/// [`Kind::Control`] and [`Kind::MuxKeepalive`] exist for the framed transports
+/// of `framed.rs`, and `PROTOCOL_VERSION` is deliberately **not** bumped for
+/// them: nothing emits them yet, so no peer can receive one. **The bump belongs
+/// to the change that first puts one of these on a socket**, not to the change
+/// that names them — "the value exists" and "the value can arrive" are separate
+/// events, and only the second can break a peer. Whoever wires the framed
+/// transport up owns that bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Media = 0,
@@ -33,6 +53,16 @@ pub enum Kind {
     EchoResp = 2,
     PullReq = 3,
     Bye = 4,
+    /// A slice of the control byte stream, carried on a framed transport.
+    ///
+    /// The payload is **not** one `ControlMsg`. It is a chunk of the existing
+    /// `u32 length ‖ JSON` stream cut wherever the writer chose to cut it, so a
+    /// message may span several frames and a frame may hold several messages.
+    /// Reassembly belongs to the control reader, not to the frame layer.
+    Control = 5,
+    /// Keeps a framed transport alive when neither media nor control has
+    /// anything to say. Carries no payload.
+    MuxKeepalive = 6,
 }
 
 impl Kind {
@@ -43,6 +73,8 @@ impl Kind {
             2 => Kind::EchoResp,
             3 => Kind::PullReq,
             4 => Kind::Bye,
+            5 => Kind::Control,
+            6 => Kind::MuxKeepalive,
             _ => return None,
         })
     }
@@ -167,6 +199,18 @@ impl Header {
     /// `encode` 逐字相同 —— 两份实现就是两份线格式，所以 `encode` 改成调它。
     pub fn encode_into(&self, payload: &[u8], out: &mut Vec<u8>) {
         out.clear();
+        self.encode_append(payload, out);
+    }
+
+    /// The same bytes as [`Header::encode_into`], **appended** rather than
+    /// replacing what `out` already holds.
+    ///
+    /// Split out for the stream framing in [`crate::framed`], which puts
+    /// several frames in one buffer and therefore cannot use the clearing form.
+    /// It is a split, not a copy: two encoders would be two wire formats, and
+    /// the field order below is the only one that exists.
+    #[inline]
+    pub fn encode_append(&self, payload: &[u8], out: &mut Vec<u8>) {
         out.reserve(HEADER_LEN + payload.len());
         out.extend_from_slice(&MAGIC);
         out.push(VERSION);
@@ -253,6 +297,52 @@ mod codec_depth_tests {
         assert_eq!(Codec::Passthrough as u8, 255);
         for bad in [4u8, 5, 100, 254] {
             assert_eq!(Codec::from_u8(bad), None, "{bad} 不该被认出来");
+        }
+    }
+
+    /// The on-wire byte for every packet class is frozen, `Control` and
+    /// `MuxKeepalive` included.
+    ///
+    /// Injection control: change `Control` to 7 and this goes red. Without it,
+    /// that edit ships a build whose framed transport is mutually unintelligible
+    /// with every other build — and the symptom is `BadKind`, which
+    /// `handle_datagram` drops without a log.
+    ///
+    /// Stated as the **whole** 0..=255 space, not as a handful of samples. That
+    /// is not thoroughness for its own sake: `parse_rejects_bad_kind` in the
+    /// out-of-tree suite held a bare "5 and 255 are not assigned", so the moment
+    /// `Control` took 5 it was asserting that a valid kind must be rejected —
+    /// green right up until the parser learned the value, then red for a reason
+    /// that had nothing to do with the change. Sampling is what let a stale
+    /// claim survive; enumerating is what makes assigning a kind fail here, on
+    /// purpose, in front of the `PROTOCOL_VERSION` note on [`Kind`].
+    #[test]
+    fn the_kind_byte_values_are_frozen() {
+        let assigned: [(u8, Kind); 7] = [
+            (0, Kind::Media),
+            (1, Kind::EchoReq),
+            (2, Kind::EchoResp),
+            (3, Kind::PullReq),
+            (4, Kind::Bye),
+            (5, Kind::Control),
+            (6, Kind::MuxKeepalive),
+        ];
+        assert_eq!(Kind::Media as u8, 0);
+        assert_eq!(Kind::EchoReq as u8, 1);
+        assert_eq!(Kind::EchoResp as u8, 2);
+        assert_eq!(Kind::PullReq as u8, 3);
+        assert_eq!(Kind::Bye as u8, 4);
+        assert_eq!(Kind::Control as u8, 5, "changing this splits the framed transport in two");
+        assert_eq!(Kind::MuxKeepalive as u8, 6, "changing this splits the framed transport in two");
+
+        for (byte, want) in assigned {
+            assert_eq!(Kind::from_u8(byte), Some(want), "byte {byte} must decode to {want:?}");
+        }
+        for bad in 0u8..=255 {
+            if assigned.iter().any(|(b, _)| *b == bad) {
+                continue;
+            }
+            assert_eq!(Kind::from_u8(bad), None, "unassigned kind byte {bad} must not be recognised");
         }
     }
 

@@ -270,7 +270,11 @@ export const actions = {
         history[key] = {
           loss: push60(prev.loss, num(st.loss_pct)),
           jitter: push60(prev.jitter, num(st.jitter_ms)),
-          bitrate: push60(prev.bitrate, num(st.bitrate_kbps)),
+          // `pushMaybe`，不是 `push60(num(...))`：`bitrate_kbps` 现在是滑动窗口，
+          // 窗口不够长时是 `null`（「还没测出来」）。用 `num()` 会把它记成 0，
+          // 于是折线上「刚开流」与「一个字节都没在流」画成同一条——正是
+          // `pushMaybe` 那段注释里的红线。
+          bitrate: pushMaybe(prev.bitrate, st.bitrate_kbps ?? undefined),
           rung: push60(prev.rung, num(st.rung)),
           latency: pushMaybe(prev.latency, readLatency(info)?.totalMs),
           intact: pushMaybe(prev.intact, conceal == null ? undefined : 100 - conceal),

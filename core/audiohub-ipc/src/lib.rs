@@ -709,7 +709,33 @@ pub struct SessionStats {
     pub lost: u64,
     pub loss_pct: f64,
     pub jitter_ms: f64,
-    pub bitrate_kbps: f64,
+    /// **Payload** bitrate over the last ~3 s. `None` = not enough window yet.
+    ///
+    /// # Three things this field used to get wrong
+    ///
+    /// 1. **It was a lifetime average**, so it had no inverse. On a session that
+    ///    had been up 2400 s, switching the rung changed 20 s of traffic — 0.8%
+    ///    of the denominator — and the reading moved 0.34%. Measured: the three
+    ///    48 kHz rungs, whose true payload rates are 768 / 1152 / 1536 kbps, all
+    ///    read back as 1469.2 / 1464.3 / 1467.0. Both directions were affected;
+    ///    the receive side reported 1452.0 / 1447.8 / 1448.9 for the same three,
+    ///    i.e. +89.1% / +25.7% / −5.7% against the truth.
+    /// 2. **The two directions used different numerators**: send counted whole
+    ///    datagrams, receive counted plaintext. One stream read 1525 kbps on one
+    ///    machine and 1458 on the other and nothing could flag it.
+    /// 3. `wire_bytes`, added specifically so that (1) could be worked around by
+    ///    differencing, **was never assigned on the send side at all** — it was
+    ///    a hard zero on every `send` session.
+    ///
+    /// Now: a sliding window over payload bytes, same numerator on both sides.
+    /// Directly comparable to the `kbps` of the quality stop the user picked
+    /// (`rate x depth`, mono). For what the link actually costs, including
+    /// framing, difference [`SessionStats::datagram_bytes`].
+    ///
+    /// `None` rather than `0.0` when the window is too short: "no measurement
+    /// yet" and "nothing is flowing" are different claims.
+    #[serde(default)]
+    pub bitrate_kbps: Option<f64>,
     pub jb_depth_frames: u32,       // current jitter buffer depth (recv side)
     pub sent_packets: u64,          // send side
     pub rung: u32,                  // current AUTO ladder rung (0 = best)
@@ -810,6 +836,52 @@ pub struct SessionStats {
     /// 付过代价，水位是它自己长上去的**，不是整定拍出来的。
     #[serde(default)]
     pub jb_underrun_penalty_frames: u32,
+
+    /// 这条流的**明文载荷字节数**（lifetime 累计，AEAD 之内、不含包头与标签）。
+    ///
+    /// **两个方向都有**：接收侧数解密后的 `plain.len()`，发送侧数
+    /// `TxShared::sent_payload_bytes`（同一条「内核收下了才算」的判据）。
+    /// 此前只有接收侧赋值，发送侧恒为 0 —— 于是本字段承诺的那条「唯一硬证据」
+    /// 在 `send` 会话上根本不存在，而契约文本照旧写着它是硬证据。
+    ///
+    /// # 它与 [`SessionStats::bitrate_kbps`] 的分工
+    ///
+    /// `bitrate_kbps` 已经是滑动窗口，日常读它就够。这个计数器是**可差分**的
+    /// 原始量：取两次、除以两次之间的墙钟，得到的是不受任何窗口整定影响的
+    /// 稳态码率——回归脚本与跨机验证要的是这一个，因为它的误差**恰好为零**
+    /// （`Δbytes / Δpkts` 里不含墙钟）。
+    #[serde(default)]
+    pub wire_bytes: u64,
+
+    /// 这条流的**整数据报字节数**（lifetime 累计，含包头与 AEAD 标签）。
+    ///
+    /// 与 `wire_bytes` 分成两个字段而不是共用一个名字：这两个量在同一条流上
+    /// 差着约 56 B/包，而深档按 5 ms 分包、每 10 ms 付两份包头 —— 于是「开销
+    /// 占比」本身随档位变。此前发送侧报前者、接收侧报后者却共用一个字段名，
+    /// 两端的数对不上而没有任何一处会报错。
+    ///
+    /// 要回答「这条链路实际吃多少带宽」用它；要回答「位深有没有生效」用
+    /// `wire_bytes`。**仍不含 IP/UDP 头**（28 B/包）：那两层不归本进程所有，
+    /// 报出来就是在替内核估算。
+    #[serde(default)]
+    pub datagram_bytes: u64,
+
+    // ------------------------------------------------ 位深进阶梯带来的两个降级
+    /// 深档（5 ms 分包）里「搭档半帧没来、按半帧隐藏交付」的次数（lifetime）。
+    ///
+    /// **必须单独上报**：半帧隐藏交付的是一个**长度完整**的帧，JB 因此不记 PLC、
+    /// 不记 underrun —— 若不单独计数，「深档丢了一半的包」这件事在整套遥测上
+    /// 一个字都不会出现。它同时以 0.5 帧的权重计入 Q1 隐藏率
+    /// （`quality::conceal_ratio`）：一次半帧隐藏正好伪造了半帧音频。
+    #[serde(default)]
+    pub jb_half_conceal: u64,
+    /// 包头声明的线上格式与载荷长度对不上、因而被丢弃的包数（lifetime）。
+    ///
+    /// **非零 = 两端对线上格式的理解分了岔**（典型：一端发 s16 却把包头写成
+    /// s24）。这个态在耳朵里是周期性静音洞，而 `DecodeStats.ragged` 与 JB 的
+    /// 五个计数器对它**全部免疫**——判据见 `engine::handle_datagram`。
+    #[serde(default)]
+    pub format_mismatch: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -819,7 +891,15 @@ pub struct SessionInfo {
     pub peer_name: String,
     pub kind: String,               // KIND_MIC | KIND_SPK
     pub dir: String,                // "send" | "recv"
+    /// 这条流**线上的采样率**（Hz）。`0` = 两侧都报不出。
     pub sample_rate: u32,
+    /// 这条流**线上的位深**：`"s16" | "s24" | "f32"`；`""` = 报不出。
+    ///
+    /// 与 `sample_rate` 成对：位深进阶梯之后，只写一个维度的读数是**有歧义的**
+    /// （`48 kHz` 说不出它是 16 还是 24 位）。呈现时两个维度必须一起写全，
+    /// 为了短而只写一个，就回到了这次改动要消灭的那个歧义。
+    #[serde(default)]
+    pub wire_depth: String,
     pub channels: u8,
     pub stats: SessionStats,
     /// ORIGIN_USER | ORIGIN_HAL | ORIGIN_PEER. A `hal` session exists because

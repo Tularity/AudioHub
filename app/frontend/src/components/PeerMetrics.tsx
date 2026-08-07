@@ -46,7 +46,7 @@ import {
   QUALITY_PART_DESC, QUALITY_PART_NAME,
   confidenceKey, coversWholeChain, isLowerBound, isQualityMeasuring, latencyGrade,
   latencyGradeKey, latencyTone, latencyValueKey, medianOf5, qualityDots,
-  qualityGradeTextKey, qualityTone, qualityWorstKey,
+  qualityDepthKey, qualityGradeTextKey, qualityTone, qualityWorstKey,
   pickWorst, readLatency, readPeerNet, readQuality, segmentDominantStage, stageHost,
 } from '../lib/metrics';
 import type {
@@ -308,9 +308,16 @@ function QualityCell({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading |
       >
         {value}
       </span>
+      {/* `title` 是 `metric.quality.rateDepth` 那条注释里承诺的兜底，必须真的存在。
+          这一行的宽度账：`.dir-head` 是 `overflow:hidden`，`.metric-val` 是
+          `white-space:nowrap; flex:none` ⇒ **等级词是这一行里唯一可收缩的元素**。
+          值从「48 kHz」变成「48 kHz · 32 bit 浮点」之后，多出来的宽度全部从这里
+          扣，而 styles.css 里已经记载过「18px 的 gap 就会把两个等级词全挤成省略号」
+          ——余量本来就是零。被截断时至少还能悬停读回来。 */}
       <span
         className={`metric-grade${measuring ? ' measuring' : ''}`}
         data-testid={`metric-quality-grade-${dir}-${fp}`}
+        title={gradeText || undefined}
         hidden={!gradeText}
       >
         {gradeText}
@@ -467,7 +474,9 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
   const series = useStore((s) => (sess ? s.history[String(sess.id)]?.latency : undefined) ?? EMPTY);
   const lat = readLatency(sess);
   const q = readQuality(sess);
-  const kbps = sess && sess.stats ? sess.stats.bitrate_kbps : 0;
+  // `null` / 缺席保持原样交给 `fmt.kbps`（它画「—」）。**不折成 0**：
+  // 「窗口还不够长」与「没有码率」在这一格上是两件事。
+  const kbps = sess?.stats?.bitrate_kbps ?? undefined;
   const idleReady = !sess && !!ready;
 
   const dirLabel = t(dir === 'out' ? 'peers.card.streamOut' : 'peers.card.streamIn');

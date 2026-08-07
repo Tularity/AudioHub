@@ -1,5 +1,29 @@
 pub const MAGIC: [u8; 4] = *b"AUHB";
 pub const VERSION: u8 = 1;
+
+/// 包头长度。逐字段：`MAGIC 4 + VERSION 1 + kind 1 + codec 1 + channels 1
+/// + sample_rate 4 + session_id 8 + stream_id 4 + seq 4 + timestamp_us 8
+/// + payload_len 4 = 40`。无保留位。
+///
+/// # 别再来砍这个包头（把这笔账算死，省下后人反复算）
+///
+/// 反复出现的想法是「砍掉几个字节，好让最深的档挤进一个不分片的数据报」。
+/// 算术上它是**不可能**的：以太网 MTU 1500 − IP/UDP 28 − AEAD 标签 16 = 1456
+/// 是密文预算；而 48 kHz × 24 bit × 10 ms = 1440 字节明文
+/// ⇒ 包头必须 **≤ 16 字节**。
+///
+/// 16 字节的包头恰好是 `MAGIC 4 + VERSION 1 + kind 1 + codec 1 + channels 1
+/// + stream_id 4 + seq 4` —— **一个字节都不剩，`timestamp_us` 必须整个删掉**。
+/// 而 `timestamp_us` 是 transit / RFC 3550 抖动的**全部原料**
+/// （`engine.rs` 的 `transit = arrival − timestamp_us`），删了它 AUTO 阶梯
+/// 就没有升降判据了。
+///
+/// ⇒ **绑定约束是 10 ms 的包时长，不是包头。** 深档的解法是把线上包时长
+/// 压到 5 ms（`FRAME_MS` 一个字不改，只动线路层；见
+/// `docs/design-bitdepth-ladder.md` §1.B），不是砍包头。
+///
+/// 真要腾字节时**第一顺位是 `session_id`**：`engine.rs` 里它恒等于
+/// `stream_id as u64`，8 字节纯重复。它排在 `timestamp_us` 前面。
 pub const HEADER_LEN: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

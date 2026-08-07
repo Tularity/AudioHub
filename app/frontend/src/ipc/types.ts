@@ -301,13 +301,67 @@ export interface PipelineLatency {
 export interface SessionStats {
   loss_pct?: number;
   jitter_ms?: number;
-  bitrate_kbps?: number;
+  /**
+   * **载荷**码率（kbps），最近约 3 秒的滑动窗口。缺席 / `null` = 窗口还不够长
+   * （渲染成「—」，**不是 0**：「还没测出来」与「一个字节都没在流」是两回事）。
+   *
+   * # 这个字段此前错在三处，全部已修
+   *
+   * 1. 它是**自首包起的 lifetime 平均**，没有反函数。一条跑了 2400 s 的会话上
+   *    换档只影响后 20 s（分母的 0.8 %），实测三个 48 kHz 档（真值 768 / 1152 /
+   *    1536 kbps）读出来是 1469.2 / 1464.3 / 1467.0——0.34 % 的抖动看着像噪声，
+   *    其实是这个指标对线上 2 倍的变化完全失明。
+   * 2. **两个方向的分子不同**：发送侧数整数据报、接收侧数明文载荷，同一条流
+   *    两端报 1525 与 1458，差的正好是每包 56 B 的头 + 标签。
+   * 3. 为绕开第 1 条而加的 `wire_bytes`，**发送侧根本没赋值**，恒为 0。
+   *
+   * 现在两端同一个分子（载荷），并且是窗口而非平均。它与用户刚选的那一档的
+   * `QualityStop.kbps`（采样率 × 位深）**直接可比**。要问「这条链路实际吃多少
+   * 带宽」（含协议开销）请差分 `datagram_bytes`。
+   */
+  bitrate_kbps?: number | null;
   rung?: number;
   received?: number;
   lost?: number;
   sent_packets?: number;
   jb_depth_frames?: number;
   rung_changes?: number;
+  /**
+   * 这条流的**明文载荷字节数**（lifetime 累计，不含包头与 AEAD 标签）。
+   * **收发两个方向都有**——发送侧此前恒为 0。
+   *
+   * `bitrate_kbps` 现在已是滑动窗口，日常显示读它就够。这个计数器是**可差分**
+   * 的原始量：取两次、除以墙钟差，得到的稳态码率不受任何窗口整定影响，
+   * 跨机回归脚本要的是这一个。
+   */
+  wire_bytes?: number;
+  /**
+   * 这条流的**整数据报字节数**（lifetime 累计，含包头与 AEAD 标签，
+   * 不含 IP/UDP 头）。收发两个方向都有。
+   *
+   * 与 `wire_bytes` 分成两个字段，是因为两者在同一条流上差着约 56 B/包，
+   * 而深档按 5 ms 分包、每 10 ms 付两份包头 ⇒ **开销占比本身随档位变**。
+   * 此前两端共用一个字段名却各报一个，两台机器的数对不上而无人能发现。
+   *
+   * 问「位深有没有生效」用 `wire_bytes`；问「实际吃多少带宽」用这个。
+   */
+  datagram_bytes?: number;
+  /**
+   * 深档（5 ms 分包）里「搭档半帧没来、按半帧隐藏交付」的次数（lifetime）。
+   *
+   * **必须露在界面上。** 半帧隐藏交付的是一个**长度完整**的帧 ⇒ JB 不记 PLC、
+   * 不记 underrun、`popped` 照常增长。若这个数不显示，「深档丢掉了一半的包」
+   * 这件事在整套遥测上一个字都不会出现，只在耳朵里表现为持续的粗糙感。
+   */
+  jb_half_conceal?: number;
+  /**
+   * 包头声明的线上格式与载荷长度对不上、因而被丢弃的包数（lifetime）。
+   *
+   * **非零 = 两端对线上格式的理解分了岔**（典型：一端发 s16 却把包头写成 s24，
+   * 或两端版本不一致）。这个态在耳朵里是周期性静音洞，而丢包率、抖动、JB 的
+   * 五个计数器对它**全部免疫**——它只在这一个数上现形。
+   */
+  format_mismatch?: number;
   volume?: VolumeState | null;
   verdict?: Verdict | null;
   mix_verdicts?: unknown[];

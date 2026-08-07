@@ -296,7 +296,9 @@ pub fn run_rx(
                 match h.kind {
                     Kind::Media => {
                         last_activity = Instant::now();
-                        stats.on_packet(h.seq, h.timestamp_us, arrival, payload.len());
+                        // `n` = the whole datagram off the socket; `payload` is
+                        // what is left after the header.
+                        stats.on_packet(h.seq, h.timestamp_us, arrival, payload.len(), n);
                         if first_arrival_us.is_none() {
                             first_arrival_us = Some(arrival);
                         }
@@ -304,7 +306,12 @@ pub fn run_rx(
                         sample_rate = h.sample_rate;
                         channels = h.channels;
                         accum_cap = ACCUM_CAP_SECS * sample_rate.max(1) as usize;
-                        let frame = dsp::s16le_to_f32(payload);
+                        // 按**包头声明的** codec 解，不按发送侧的假设解。
+                        // 探针今天只发 s16，但收方要能诚实地拒绝它不认识的深度：
+                        // 按 s16 硬解一个 24 位载荷会得到一段**有声音、但全是垃圾**
+                        // 的波形，而没有任何一处会报错。
+                        let Some(depth) = h.codec.wire_depth() else { continue };
+                        let frame = dsp::decode_pcm(payload, depth);
                         if let Some(cb) = on_frame.as_mut() {
                             cb(&frame);
                         }

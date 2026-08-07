@@ -68,7 +68,7 @@ use audiohub_ipc::{
 };
 use audiohub_net::discovery::{self, AnnounceGuard};
 use audiohub_net::identity::{LocalIdentity, PairedPeer};
-use audiohub_net::media::{AutoLadder, JitterBuffer, MediaCrypto, AUTO_RATES};
+use audiohub_net::media::{AutoLadder, JitterBuffer, MediaCrypto};
 use audiohub_net::secure::{SecureChannel, SessionMsg, StageReading};
 use audiohub_net::stats::RxStats;
 
@@ -1577,13 +1577,41 @@ pub(crate) struct JbState {
     pub pushes: u32,
     pub last_dropped: u64, // starvation detector (expected-seq raced ahead)
     pub late_streak: u32,
+    /// 当前线上**每帧几个数据报**（深档按 5 ms 分包 ⇒ 2）。
+    ///
+    /// 它是 JB 帧序号的换算基准（`frame_seq = wire_seq / wire_parts`），
+    /// 所以**它一变，帧序号的基准就变了** ⇒ 必须干净重建 JB，见
+    /// `engine::handle_datagram`。0 = 还没收到过包。
+    pub wire_parts: usize,
+    /// 深档半帧重组：已到达、还在等搭档的那半帧。
+    ///
+    /// `(帧序号, 是不是后半, 样本)`。**没有超时定时器**：下一帧的包一到，
+    /// 上一帧的残片就作废（按半帧隐藏交付）。等待会把延迟目标顶穿，
+    /// 而这条管线的全部纪律就是不许为了平滑多留任何一帧。
+    pub half: Option<(u32, bool, Vec<f32>)>,
+    /// 搭档没来、按半帧隐藏交付了多少次（lifetime）。
+    ///
+    /// **必须有这个计数器**：半帧隐藏交付的是一个「看起来完整」的帧，JB 因此
+    /// 不会记 PLC ⇒ 若不单独计数，深档丢一半包这件事在 Q1 上**完全不可见**。
+    /// 一个不可见的降级正是本项目反复栽的那个形态。
+    ///
+    /// ⚠ 光有计数器不算数——它**必须被读**。两条读者都已接上，改任何一条前先
+    /// 想清楚这条降级还剩几条可见路径：
+    ///   1. `JbState::counts()` → `quality::JbCounts::half_conceal` →
+    ///      `conceal_ratio` 以 **0.5 帧**权重进 Q1（那里有权重依据）；
+    ///   2. `build_session_info_with` → `SessionStats::jb_half_conceal` →
+    ///      前端会话明细表那一格。
+    pub half_conceal: u64,
     /// Q1 的 10 s 非消费型窗口（规格 §4.6）。放在这里而不是 `JitterBuffer` 里，
     /// 是为了让 `audiohub-net` 保持纯累计——它不需要知道窗口的存在。
     pub conceal: quality::ConcealWindow,
 }
 
 impl JbState {
-    /// 当前 JB 的五个 lifetime 计数器快照。
+    /// 当前 JB 的五个 lifetime 计数器快照，**外加**重组层的半帧隐藏计数。
+    ///
+    /// 第六个数不来自 `JitterBuffer`：半帧隐藏发生在它上游，JB 只看到一个长度
+    /// 完整的帧。放进同一个快照是为了让它跟着同一个 10 s 窗口差分并计入 Q1。
     pub(crate) fn counts(&self) -> quality::JbCounts {
         quality::JbCounts {
             popped: self.jb.popped,
@@ -1591,6 +1619,7 @@ impl JbState {
             silence: self.jb.silence_count,
             underruns: self.jb.underruns,
             dropped: self.jb.dropped,
+            half_conceal: self.half_conceal,
         }
     }
 
@@ -1643,10 +1672,47 @@ impl PostMix {
     }
 }
 
+/// How far back `bitrate_kbps` is measured.
+///
+/// 3 s at the ticker's 1 Hz cadence gives 3-4 points, so a rung change is fully
+/// reflected within 3 s while a single late packet cannot swing the reading.
+/// The old lifetime average never converged at all: on a 2400 s session a new
+/// rung owned 0.8% of the denominator.
+const RATE_WINDOW: Duration = Duration::from_secs(3);
+
+/// Shortest span that still yields a number. Below it the denominator is small
+/// enough that one packet's sampling phase moves the result by ~10%, so the
+/// honest answer is `None` (rendered as "—") rather than a confident wrong one.
+const RATE_MIN_SPAN: Duration = Duration::from_millis(400);
+
+fn new_rate_window() -> audiohub_net::stats::RateWindow {
+    audiohub_net::stats::RateWindow::new(RATE_WINDOW, RATE_MIN_SPAN)
+}
+
 pub(crate) struct RxCell {
     pub rx: RxStats,
+    /// Sliding window over the payload byte counter inside [`RxCell::rx`].
+    ///
+    /// Lives here rather than inside `RxStats` so the net crate keeps its
+    /// counters purely cumulative, exactly as `quality::ConcealWindow` keeps
+    /// `JitterBuffer` purely cumulative.
+    pub rate: audiohub_net::stats::RateWindow,
     pub first: Option<Instant>,
     pub last_rate: u32,
+    /// 最近一个媒体包头声明的**线上位深**（由 `codec` 字节导出）。
+    ///
+    /// `None` = 还没收到过任何能解出位深的包（也包括收到的是 Opus/Passthrough）。
+    /// **不许兜底成 `S16`**：位深进阶梯之前线上恒为 16 位，所以那个兜底今天
+    /// 碰巧是对的，而它正是遥测里 `wire_depth` 这个字段要消灭的那种猜测。
+    pub last_depth: Option<audiohub_core::dsp::WireDepth>,
+    /// 包头声明的格式与载荷长度对不上、因而被丢弃的包数（lifetime）。
+    ///
+    /// **必须单独计数**：`DecodeStats.ragged` 对这件事完全免疫（一帧的三个合法
+    /// 字节数 960/1440/1920 与它们的半数，被 2/3/4 除的余数全部为 0），而下游的
+    /// JB 与 PostMix 都会静默吞掉短帧。没有这个计数器，「两端对线上格式的理解
+    /// 分了岔」这件事在整套遥测上**一个字都不会出现**，只在耳朵里表现为周期性
+    /// 静音洞。详见 `engine::handle_datagram` 里那段判据的注释。
+    pub format_mismatch: u64,
     pub prev_transit: Option<i64>,
     // per-interval accounting for Stats/AUTO (the cumulative RxStats figures
     // stay untouched for the lifetime display)
@@ -1836,12 +1902,29 @@ pub(crate) struct TxShared {
     pub rung: AtomicU32,
     pub rung_changes: AtomicU32,
     pub sent_packets: AtomicU64,
+    /// Whole datagrams handed to the kernel (payload + header + AEAD tag).
     pub sent_bytes: AtomicU64,
+    /// Plaintext payload only, same "kernel accepted it" criterion.
+    ///
+    /// **This is the counter the bit-depth rung moves**, and it is the send-side
+    /// mirror of what the receive side records as `RxSummary::bytes`. Without it
+    /// the two ends reported the same field name with a 56 B/packet difference
+    /// in meaning, so the same stream read 1525 kbps here and 1458 kbps there.
+    pub sent_payload_bytes: AtomicU64,
     pub ka_count: AtomicU64,
     /// keepalives dropped because their source IP was not the control-TCP peer
     pub ka_rejected: AtomicU64,
     ka_warned: AtomicBool,
-    pub created: Instant,
+    // NOTE: there used to be a `created: Instant` here whose sole consumer was
+    // `sent_bytes / created.elapsed()`, the lifetime mean that could not follow
+    // a rung change. It went out with that expression rather than being left
+    // around as an attractive denominator for the next such metric.
+    /// Sliding window over [`TxShared::sent_payload_bytes`].
+    ///
+    /// ⚠ **Never taken from the 10 ms deadline thread**, same rule as
+    /// [`TxShared::dest_override`]. It is fed by the 1 s ticker and read by IPC
+    /// snapshots; `udp_send_loop` only touches the atomics.
+    pub rate: Mutex<audiohub_net::stats::RateWindow>,
     pub remote: Mutex<RemoteStats>,
     /// Receiver PORT learned from its keepalives; the IP always stays the
     /// control-TCP peer's (spec-m4a §3 freezes the destination IP).
@@ -1887,14 +1970,25 @@ pub(crate) struct TxShared {
 impl TxShared {
     pub(crate) fn new() -> TxShared {
         TxShared {
-            rung: AtomicU32::new(0),
+            // **起步格是 AUTO 的天花板，不是阶梯顶端。**
+            //
+            // 位深进阶梯之前这两个是同一个数（rung 0 = 48 kHz/s16）。现在
+            // rung 0 是 48 kHz/32 位浮点：写 0 的话，每一条流在 ticker 第一次
+            // 给它派格号之前的那一小段都会用**最深的档**发（还要按 5 ms 分包），
+            // 然后突然掉回 rung 2 —— 接收侧看到分包数从 2 变成 1，只能重建
+            // 抖动缓冲，于是每条流开头都白白多一次重新预缓冲。
+            //
+            // 实测：写 0 时 `the_send_latency_lands_on_the_peers_buffer_and_
+            // nowhere_local` 从 1.4 s 变成 25 s 甚至超时。
+            rung: AtomicU32::new(audiohub_net::media::AUTO_TOP_RUNG),
             rung_changes: AtomicU32::new(0),
             sent_packets: AtomicU64::new(0),
             sent_bytes: AtomicU64::new(0),
+            sent_payload_bytes: AtomicU64::new(0),
+            rate: Mutex::new(new_rate_window()),
             ka_count: AtomicU64::new(0),
             ka_rejected: AtomicU64::new(0),
             ka_warned: AtomicBool::new(false),
-            created: Instant::now(),
             remote: Mutex::new(RemoteStats::default()),
             dest_override: Mutex::new(None),
             dest_epoch: AtomicU64::new(0),
@@ -2111,11 +2205,27 @@ fn sample_telemetry(inner: &DaemonInner, entries: &[SessionEntry]) {
         // 环不存在时清历史，否则下次开流会继承上一次会话的斜率。
         None => lk(&inner.play_drift).clear(StageId::PlayRing),
     }
+    // One wall-clock reading for every rate window this pass, so that streams
+    // sampled in the same tick share a timebase.
+    let now = Instant::now();
     for e in entries {
         if let Some(tx) = &e.tx {
             sample_tx_drift(now_s, tx);
+            // The rate windows are also sampled at IPC read time, but that path
+            // only runs when somebody is looking. Without this 1 Hz heartbeat a
+            // UI that polls once after a long idle would difference two points
+            // straddling the gap and report a rate averaged over the idle
+            // period — the same "the window froze and reported the pretty
+            // numbers from before the blackout" failure `ConcealWindow` already
+            // had to defend against.
+            lk(&tx.rate).sample(now, tx.sent_payload_bytes.load(Ordering::Relaxed));
         }
         if let Some(rx) = &e.rx {
+            {
+                let mut c = lk(&rx.stats);
+                let bytes = c.rx.summary(0.0).bytes;
+                c.rate.sample(now, bytes);
+            }
             // ⚠ 锁序：**先把读数取出来并释放各自的锁，再去拿 drift**。
             // 曾经这里是 `jbs -> drift` 嵌套，而 `build_pipeline` 是
             // `drift -> jbs` 嵌套，两条路径一跑就是 ABBA 死锁。现在两边都
@@ -2606,7 +2716,10 @@ fn peer_quality_payload(
     // `AUTO_RATES.position(..).unwrap_or(0)` 会把任何**不在阶梯上**的速率
     // 静默记成格号 0，于是 `rung_rate(0)/2 = 24 kHz`——一个我们从没收到过的
     // 「满带宽、优」。除掉这一跳，off-ladder 的速率就照实报。
-    let last_rate = lk(&rx.stats).last_rate;
+    let (last_rate, last_depth) = {
+        let c = lk(&rx.stats);
+        (c.last_rate, c.last_depth)
+    };
     let (window_s, d) = lk(&rx.jbs).conceal.window()?;
     let conceal = quality::conceal_ratio(&d)?;
     let clip = rx.clip.window();
@@ -2820,7 +2933,7 @@ fn build_session_info_with(
         lost: 0,
         loss_pct: 0.0,
         jitter_ms: 0.0,
-        bitrate_kbps: 0.0,
+        bitrate_kbps: None,
         jb_depth_frames: 0,
         sent_packets: 0,
         rung: 0,
@@ -2839,8 +2952,8 @@ fn build_session_info_with(
         quality_target: e
             .tx
             .as_ref()
-            .and_then(|tx| tx.transport.quality_rate())
-            .map(|r| audiohub_ipc::QualityTarget::Rate(r).as_wire()),
+            .and_then(|tx| tx.transport.quality_rung())
+            .map(|r| audiohub_ipc::QualityTarget::Fixed(r).as_wire()),
         target_from: None,
         at_floor: false,
         at_ceiling: false,
@@ -2857,6 +2970,10 @@ fn build_session_info_with(
         jb_accel_frames: 0,
         jb_accel_deferred: 0,
         jb_underrun_penalty_frames: 0,
+        jb_half_conceal: 0,
+        format_mismatch: 0,
+        wire_bytes: 0,
+        datagram_bytes: 0,
     };
     // 目标是谁定的。`origin == Peer` ⇒ 本机是提供者，档位由使用方推来。
     if s.latency_target.is_some() || s.quality_target.is_some() {
@@ -2871,6 +2988,11 @@ fn build_session_info_with(
     // 「采样率 48000 Hz」在阶梯掉到 16 kHz 时照样写着 48000——一个永远为真、
     // 因而永远不含信息的数字，正是本项目要消灭的那类「报告成功什么都没发生」。
     let mut wire_rate: Option<u32> = None;
+    // 这条流**线上的位深**。与 `wire_rate` 各走各的，理由与 `QualityReading`
+    // 上的 `wire_depth` 逐字相同：让读方从 codec 推一遍，就是在读方复刻一份
+    // 映射表，两处一漂没有任何地方会报错。`None` = 两侧都没有（**不许兜底成
+    // s16**：位深进阶梯之前线上恒为 16 位，所以那个兜底今天碰巧是对的）。
+    let mut wire_depth: Option<audiohub_core::dsp::WireDepth> = None;
     if let Some(rx) = &e.rx {
         {
             let live = rx.transport.live();
@@ -2878,21 +3000,37 @@ fn build_session_info_with(
             s.at_ceiling = live.at_ceiling;
         }
         {
-            let c = lk(&rx.stats);
+            let mut c = lk(&rx.stats);
             let dur = c.first.map(|f| f.elapsed().as_secs_f64()).unwrap_or(0.0);
             let sm = c.rx.summary(dur);
             s.received = sm.received;
             s.lost = sm.lost;
             s.loss_pct = sm.loss_pct;
             s.jitter_ms = sm.jitter_ms;
-            s.bitrate_kbps = sm.bitrate_kbps;
-            // 速率与格号是**两件事**：速率是包头里观测到的量，格号是把它归进
-            // AUTO 阶梯的分类。归不进去时格号只能给 0，而速率照实报。
+            // Sliding window, **not** `sm.mean_payload_kbps`. The mean is what
+            // made three rungs 2x apart on the wire all read back within 0.34%
+            // of each other. Sampling here as well as in the ticker keeps the
+            // newest point fresh for fast IPC pollers; the window is
+            // non-consuming so any number of readers may do this.
+            let payload_total = sm.bytes;
+            c.rate.sample(Instant::now(), payload_total);
+            s.bitrate_kbps = c.rate.kbps();
+            // 原始字节计数：可差分，误差恰好为零。窗口整定改了也不影响它。
+            s.wire_bytes = sm.bytes;
+            s.datagram_bytes = sm.datagram_bytes;
+            // 格式与格号是**两件事**：格式是包头里观测到的量（采样率 + codec
+            // 导出的位深），格号是把它归进阶梯的分类。归不进去时格号只能给 0，
+            // 而格式照实报。
+            //
+            // ⚠ 反查必须带**位深**：48 kHz 在阶梯上出现三次，只按速率查会把
+            // 48 kHz/24 bit 报成 48 kHz/32f —— 一个界面上完全看不出错的错。
             wire_rate = Some(c.last_rate);
-            s.rung = AUTO_RATES
-                .iter()
-                .position(|&r| r == c.last_rate)
-                .unwrap_or(0) as u32;
+            wire_depth = c.last_depth;
+            s.rung = c
+                .last_depth
+                .and_then(|d| audiohub_net::media::rung_of(c.last_rate, d))
+                .unwrap_or(0);
+            s.format_mismatch = c.format_mismatch;
         }
         {
             // JitterBuffer 早就有这五个 `pub` 计数器（media.rs），一个都没导出过。
@@ -2911,6 +3049,9 @@ fn build_session_info_with(
             s.jb_accel_frames = st.jb.accel_frames;
             s.jb_accel_deferred = st.jb.accel_deferred;
             s.jb_underrun_penalty_frames = st.jb.underrun_penalty();
+            // 深档的半帧隐藏。**它不住在 `JitterBuffer` 里**：那一层看到的是一个
+            // 长度完整的帧，降级发生在它上游的重组环节，所以计数器在 `JbState`。
+            s.jb_half_conceal = st.half_conceal;
         }
         if let (Some(f), Some(ring)) = (rx.verify_freq, rx.ring.as_ref()) {
             let snap: Vec<f32> = lk(ring).iter().copied().collect();
@@ -2949,8 +3090,26 @@ fn build_session_info_with(
             0.0
         };
         s.jitter_ms = r.iv_jitter_ms;
-        let el = tx.created.elapsed().as_secs_f64().max(1e-3);
-        s.bitrate_kbps = tx.sent_bytes.load(Ordering::Relaxed) as f64 * 8.0 / el / 1000.0;
+        // ---- byte accounting, send side ---------------------------------
+        //
+        // Both counters get published, and `bitrate_kbps` is derived from the
+        // **payload** one so that the two directions finally mean the same
+        // thing. What was here before was
+        //   `sent_bytes / tx.created.elapsed()`
+        // i.e. a lifetime mean of whole datagrams, which is wrong twice over:
+        // the mean cannot follow a rung change on a long session, and the
+        // numerator carries ~56 B/packet of framing the receive side did not
+        // count. Meanwhile `wire_bytes` — documented as the one hard piece of
+        // evidence that a bit depth took effect — was never written in this
+        // branch at all and read a constant 0 on every `send` session.
+        let payload_total = tx.sent_payload_bytes.load(Ordering::Relaxed);
+        s.wire_bytes = payload_total;
+        s.datagram_bytes = tx.sent_bytes.load(Ordering::Relaxed);
+        {
+            let mut w = lk(&tx.rate);
+            w.sample(Instant::now(), payload_total);
+            s.bitrate_kbps = w.kbps();
+        }
     }
     // ---- P0a：逐级延迟会计（本侧）+ P0b/P1：对端分项与网络单程 ----
     //
@@ -2966,7 +3125,11 @@ fn build_session_info_with(
             && build_mix_health(inner).map_or(false, |h| h.duplicate_suspect);
         // 喂的是**观测到的线上速率**，不是 `s.rung`：格号已经过了一次
         // `unwrap_or(0)`，用它算带宽等于让一个不认识的速率报「满带宽、优」。
-        s.quality = build_quality(rx, lk(&rx.stats).last_rate, duplicate);
+        let (obs_rate, obs_depth) = {
+            let c = lk(&rx.stats);
+            (c.last_rate, c.last_depth)
+        };
+        s.quality = build_quality(rx, obs_rate, obs_depth, duplicate);
     }
     // 对端那一侧的音质。**与本侧至多一个非空**：一条流不会两端都是接收端。
     // 这一格是纯发送流唯一可能的音质来源——没有它，`[spk/send]` 永远空着。
@@ -3091,10 +3254,10 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                 // `else` 而不是提前 return/continue：这个 `for` 的后面还有音量
                 // 轮询，跳过去会让固定质量档顺手把音量同步也关掉——一个只在
                 // 「选了固定档 + 开了音量同步」时才出现的组合失效。
-                if let Some(rate) = tx.transport.quality_rate() {
-                    if let Some(rung) = transport::rung_of_rate(rate) {
-                        tx.rung.store(rung, Ordering::Relaxed);
-                    }
+                if let Some(rung) = tx.transport.quality_rung() {
+                    // 用户选的**就是**格号——不再经「速率 → 格号」反查
+                    // （48 kHz 在阶梯上出现三次，那个反查已经没有唯一解）。
+                    tx.rung.store(rung, Ordering::Relaxed);
                     // 阶梯的历史状态也扔掉：切回 AUTO 时应当从当前格重新学，
                     // 而不是接着用固定档期间那段没有意义的干净计数。
                     autos.remove(&e.id);
@@ -3108,10 +3271,17 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                         // 以为自己在 0，而 `feed_stats` 只在 `rung > 0` 时升档 ⇒
                         // 线上永远停在固定档那一格，界面却显示 AUTO。
                         //
-                        // 对齐方向取 0（最好那一格）而不是把阶梯拨到线上那一格：
-                        // 阶梯的设计就是「升档保守、降档激进」（plan §5），
-                        // 从最好起步、链路一差就快速掉下来，正是它要的形状。
-                        tx.rung.store(0, Ordering::Relaxed);
+                        // 对齐方向取 AUTO 的天花板（`AUTO_TOP_RUNG`）而不是把
+                        // 阶梯拨到线上那一格：阶梯的设计就是「升档保守、降档
+                        // 激进」（plan §5），从它能到的最好那一格起步、链路一差
+                        // 就快速掉下来，正是它要的形状。
+                        //
+                        // ⚠ 取的是天花板不是 0：AUTO 不许自己走进深档
+                        // （`AUTO_TOP_RUNG` 的文档写了理由）。写 0 的后果是
+                        // 从固定深档切回 AUTO 时带宽**留在**翻倍状态，
+                        // 而界面显示的是 AUTO。
+                        tx.rung
+                            .store(audiohub_net::media::AUTO_TOP_RUNG, Ordering::Relaxed);
                         AutoCell { ladder: AutoLadder::new(), last_seq: 0 }
                     });
                     if r.seq > cell.last_seq {
@@ -3369,7 +3539,7 @@ fn servo_pass(
             achieved_ms: sin.sum_ms,
             at_floor: out.at_floor,
             at_ceiling: out.at_ceiling,
-            rate: None,
+            rung: None,
             streams: 1,
             tx_streams: 0,
         });
@@ -3753,7 +3923,14 @@ mod telemetry_tests {
         st.conceal.sample(then, quality::JbCounts::default());
         st.conceal.sample(
             now,
-            quality::JbCounts { popped, plc, silence: 0, underruns: 0, dropped: 0 },
+            quality::JbCounts {
+                popped,
+                plc,
+                silence: 0,
+                underruns: 0,
+                dropped: 0,
+                half_conceal: 0,
+            },
         );
     }
 

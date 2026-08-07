@@ -26,11 +26,20 @@ const QUALITY_STOPS_FALLBACK: QualityStop[] = [
   { id: 'opus64', kbps: 64, available: false, blocked_by: 'opus' },
   { id: 'opus128', kbps: 128, available: false, blocked_by: 'opus' },
   { id: 'opus256', kbps: 256, available: false, blocked_by: 'opus' },
-  // kbps = rate × 16 bit（s16 单声道），与 daemon 的 quality_stops() 逐档对齐。
-  { id: 'pcm16k', kbps: 256, rate: 16000, available: true },
-  { id: 'pcm24k', kbps: 384, rate: 24000, available: true },
-  { id: 'pcm32k', kbps: 512, rate: 32000, available: true },
-  { id: 'pcm48k', kbps: 768, rate: 48000, available: true },
+  // kbps = 采样率 × 位深（单声道），与 daemon 的 `quality_stops()` 逐档对齐。
+  //
+  // ⚠ 这里**曾经**写着「rate × 16 bit（s16 单声道）」。位深进阶梯之后那句话
+  // 是假的：线上位深现在是 16 / 24 / 32f 三选一，而 `depth` 是一等字段。
+  // 留着旧注释就会变成第二处「以为线上恒为 16 位」的陈旧断言。
+  //
+  // 另注：`kbps` 是**音频**码率，不含协议开销。深档按 5 ms 分包，每 10 ms 付
+  // 两份包头 + 两份 AEAD 标签，实测带宽会高于这个数——那不是 bug。
+  { id: 'pcm16k16', kbps: 256, rate: 16000, depth: 's16', available: true },
+  { id: 'pcm24k16', kbps: 384, rate: 24000, depth: 's16', available: true },
+  { id: 'pcm32k16', kbps: 512, rate: 32000, depth: 's16', available: true },
+  { id: 'pcm48k16', kbps: 768, rate: 48000, depth: 's16', available: true },
+  { id: 'pcm48k24', kbps: 1152, rate: 48000, depth: 's24', available: true },
+  { id: 'pcm48k32f', kbps: 1536, rate: 48000, depth: 'f32', available: true },
 ];
 
 // `Record<string, MsgKey>` 而不是 `Record<QualityId, MsgKey>`：id 由 daemon 定义，
@@ -41,10 +50,24 @@ const QUALITY_LABEL_KEY: Record<string, MsgKey> = {
   opus64: 'settings.transport.q.opus64',
   opus128: 'settings.transport.q.opus128',
   opus256: 'settings.transport.q.opus256',
-  pcm16k: 'settings.transport.q.pcm16k',
-  pcm24k: 'settings.transport.q.pcm24k',
-  pcm32k: 'settings.transport.q.pcm32k',
-  pcm48k: 'settings.transport.q.pcm48k',
+  pcm16k16: 'settings.transport.q.pcm16k16',
+  pcm24k16: 'settings.transport.q.pcm24k16',
+  pcm32k16: 'settings.transport.q.pcm32k16',
+  pcm48k16: 'settings.transport.q.pcm48k16',
+  pcm48k24: 'settings.transport.q.pcm48k24',
+  pcm48k32f: 'settings.transport.q.pcm48k32f',
+};
+
+// 副标签：定性词，**只用词不用数**（见 zh-CN.ts 里那段注释）。
+// 缺一条不是错——没有副标签的档就只画主标签，不画一个编出来的词。
+const QUALITY_SUBLABEL_KEY: Record<string, MsgKey> = {
+  auto: 'settings.transport.qSub.auto',
+  pcm16k16: 'settings.transport.qSub.pcm16k16',
+  pcm24k16: 'settings.transport.qSub.pcm24k16',
+  pcm32k16: 'settings.transport.qSub.pcm32k16',
+  pcm48k16: 'settings.transport.qSub.pcm48k16',
+  pcm48k24: 'settings.transport.qSub.pcm48k24',
+  pcm48k32f: 'settings.transport.qSub.pcm48k32f',
 };
 
 /**
@@ -93,12 +116,15 @@ export function qualityStops(ds: DaemonSettings | null): Stop[] {
     if (!id || seen.has(id)) continue;
     seen.add(id);
     const key = QUALITY_LABEL_KEY[id];
+    const subKey = QUALITY_SUBLABEL_KEY[id];
     const off = q.available === false;
     out.push({
       value: id,
       // daemon 加了一档而语料还没跟上：把原始 id 画出来。悄悄跳过它，新档位就在
       // 界面上凭空消失了，而没有任何人会收到通知。
       label: key ? t(key) : id,
+      // 副标签缺席就没有副标签——**不拿 id 或采样率凑一个**。
+      sublabel: subKey ? t(subKey) : undefined,
       available: !off,
       why: off
         ? (q.blocked_by === 'opus'

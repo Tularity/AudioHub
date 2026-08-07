@@ -30,7 +30,25 @@ pub const CONTROL_MAX_FRAME: usize = 65536;
 /// Version 1 = the unversioned pre-§13 protocol. Peers of that vintage send no
 /// `version` field at all, which `serde(default)` reads as [`VERSION_ABSENT`]
 /// so the refusal can name the problem instead of failing as a parse error.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// ## 版本 3：位深进质量阶梯（`docs/design-bitdepth-ladder.md`）
+///
+/// 线上格式从「s16 写死」变成 (采样率, 位深) 六档。**这一次必须升版本号**，
+/// 理由不是「新增了能力」，而是**老对端会静默错解**：
+///
+/// - rung 1 的 `codec = 3`（`PcmS24le`）在 v2 里不存在 ⇒ 老对端 `Codec::from_u8`
+///   返回 `BadCodec`，`handle_datagram` 无日志早退 ⇒ **全程静音、零诊断**。
+/// - rung 0 的 `codec = 1`（`PcmF32le`）**在 v2 里就是个合法枚举值**，只是从没
+///   有人发过它。v2 的收流路径一行都不看 `h.codec`，直接 `s16le_to_f32(&plain)`
+///   ⇒ 960 B 的 f32 半帧被当成 480 个 s16 样本，**满长度垃圾帧直接进 mixer，
+///   从用户的真实扬声器全音量放出来**。AEAD 帮不上忙：那个包是合法签名的。
+///
+/// 而这个方向**用户单方面就能触发**（`publish_targets` 用的是本机的质量档，
+/// 从来没问过对端能不能解）。所以唯一的闸门就是握手时这一次严格相等比较。
+///
+/// ⚠ `packet.rs` 的 `Codec` 注释曾写「零线格式风险，老对端得到 `BadCodec`
+/// 显式失败」——那句话**只对 codec 3 成立**，已在那里改正。
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// What a missing `version` field decodes to: a peer old enough to have no
 /// version at all. Distinct from any real version so the refusal message can

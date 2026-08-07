@@ -229,9 +229,14 @@ pub enum CtlCmd {
         /// `ctl status --json | jq '.latency_guard.servo.by_stream'`.
         #[arg(long)]
         latency: Option<String>,
-        /// wire quality: "auto", or a stop id ("pcm48k", "pcm32k", …; see
-        /// `quality_stops` in `ctl settings --json`). Opus stops are listed
-        /// but refused — this build cannot deliver them.
+        /// wire quality: "auto", or a stop id. A stop id spells out BOTH
+        /// dimensions: `pcm<kHz>k<depth>` where depth is 16 / 24 / 32f
+        /// (e.g. "pcm48k16", "pcm48k24", "pcm48k32f", "pcm32k16"). See
+        /// `quality_stops` in `ctl settings --json` for the live table.
+        /// The old depth-less ids ("pcm48k", …) are REFUSED, not translated:
+        /// the translation had to be mirrored in the UI and one of the read
+        /// paths there forgot to, so one stored value rendered two ways.
+        /// Opus stops are listed but refused — this build cannot deliver them.
         #[arg(long)]
         quality: Option<String>,
     },
@@ -1086,7 +1091,7 @@ mod tests {
     /// 不是 params 里没有那个键：后者一个「解析了再丢掉」的实现照样通过。
     #[test]
     fn the_global_stop_flags_are_gone_from_settings() {
-        for bad in ["--latency=200", "--quality=pcm32k"] {
+        for bad in ["--latency=200", "--quality=pcm32k16"] {
             assert!(
                 crate::Cli::try_parse_from(["audiohub", "ctl", "settings", bad]).is_err(),
                 "`ctl settings {bad}` 还能解析：旧脚本会继续对着空气说话"
@@ -1131,10 +1136,10 @@ mod tests {
     /// 两个档位一起给时**互不吞没**，也不牵连别的字段。
     #[test]
     fn the_transport_stops_travel_together_without_inventing_fields() {
-        let (method, params) = pt(&["--dir=recv", "--latency=auto", "--quality=pcm48k"]);
+        let (method, params) = pt(&["--dir=recv", "--latency=auto", "--quality=pcm48k24"]);
         assert_eq!(method, methods::PEERS_SET_TRANSPORT);
         assert_eq!(params.get("latency").and_then(Value::as_str), Some("auto"));
-        assert_eq!(params.get("quality").and_then(Value::as_str), Some("pcm48k"));
+        assert_eq!(params.get("quality").and_then(Value::as_str), Some("pcm48k24"));
         assert_eq!(params.get("dir").and_then(Value::as_str), Some("recv"));
         assert_eq!(params.get("peer").and_then(Value::as_str), Some("ab12"));
         // 没给的字段一个都不许出现：这是 patch 语义，凭空补一个键就是替用户

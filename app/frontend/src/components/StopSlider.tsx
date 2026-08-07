@@ -56,6 +56,17 @@ export interface Stop {
   value: string;
   /** 刻度标签，同时用作 aria-valuetext——读屏念一个裸下标毫无用处。 */
   label: string;
+  /**
+   * 可选的**定性**副标签，画在主标签下面一行（例：主「PCM 48 kHz · 24 bit」，
+   * 副「全带宽 · 高精度」）。
+   *
+   * 存在的理由：业界一致用定性词做档位名，而本项目按用户裁定把参数写在主位。
+   * 两条信息都要在，于是参数在上、定性在下。
+   *
+   * ⚠ 副标签**只用词、不用数**：再写一个带单位的数字，就会与主标签上的数字
+   * 被拿去互相比较——那正是本项目栽过的那次 48/24 误读的形状。
+   */
+  sublabel?: string;
   available?: boolean;
   /** 置灰原因，落在刻度与滑条的 title 上。 */
   why?: string;
@@ -109,6 +120,20 @@ export function shownStopLabel(
   if (previewIdx >= 0 && stops[previewIdx]) return stops[previewIdx].label;
   if (confirmedIdx >= 0 && stops[confirmedIdx]) return stops[confirmedIdx].label;
   return rawValue;
+}
+
+/**
+ * 与 [`shownStopLabel`] 同一套选取规则的副标签。**认不出的档没有副标签**
+ * （不像主标签那样回落到 `rawValue`）：副标签是可选的，编一个出来毫无意义。
+ */
+export function shownStopSublabel(
+  stops: Stop[],
+  confirmedIdx: number,
+  previewIdx: number,
+): string | undefined {
+  if (previewIdx >= 0 && stops[previewIdx]) return stops[previewIdx].sublabel;
+  if (confirmedIdx >= 0 && stops[confirmedIdx]) return stops[confirmedIdx].sublabel;
+  return undefined;
 }
 
 function fracOf(i: number, n: number): number {
@@ -278,6 +303,7 @@ export function StopSlider({
   // ——预览是一个关于「松手会怎样」的陈述，手一松它就该让位给事实。
   const previewing = preview >= 0 && stops[preview] != null;
   const shownLabel = shownStopLabel(stops, confirmed, preview, value);
+  const shownSub = shownStopSublabel(stops, confirmed, preview);
 
   return (
     <div className="stop-slider-box" data-testid={`${testid}-box`}>
@@ -329,7 +355,9 @@ export function StopSlider({
               key={s.value}
               className={`stop-tick${s.available === false ? ' off' : ''}${i === lit ? ' on' : ''}`}
               style={{ left: trackPos(fracOf(i, stops.length)) }}
-              title={s.available === false ? (s.why || '') : s.label}
+              title={s.available === false
+                ? (s.why || '')
+                : (s.sublabel ? `${s.label} — ${s.sublabel}` : s.label)}
             />
           ))}
           <div
@@ -349,6 +377,11 @@ export function StopSlider({
         data-preview={previewing ? 'true' : undefined}
       >
         {shownLabel}
+        {/* 副标签只在有的时候出现。没有就什么都不画——**不拿主标签、id 或
+            采样率凑一个**，那等于替 daemon 编一个它没说过的描述。 */}
+        {shownSub ? (
+          <span className="stop-slider-sub" data-testid={`${testid}-sub`}>{shownSub}</span>
+        ) : null}
       </span>
     </div>
   );

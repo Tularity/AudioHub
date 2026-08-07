@@ -1789,14 +1789,20 @@ impl RxStream {
                 pushes: 0,
                 last_dropped: 0,
                 late_streak: 0,
+                wire_parts: 0,
+                half: None,
+                half_conceal: 0,
                 conceal: quality::ConcealWindow::new(),
             }),
             post: Mutex::new(PostMix { fifo: VecDeque::new(), dropped: 0 }),
             ring: verify_freq.map(|_| Mutex::new(VecDeque::new())),
             stats: Mutex::new(RxCell {
                 rx: RxStats::new(),
+                rate: new_rate_window(),
                 first: None,
                 last_rate: 48000,
+                last_depth: None,
+                format_mismatch: 0,
                 prev_transit: None,
                 iv_received: 0,
                 iv_expected: 0,
@@ -2619,6 +2625,8 @@ fn peer_quality_payload(
         clip_excess_db: clip.map(|w| w.excess_db()),
         bandwidth_hz: last_rate / 2,
         wire_rate_hz: last_rate,
+        // `""` = 还没收到过能解出位深的包。**不许兜底成 s16**（见字段文档）。
+        wire_depth: last_depth.map_or(String::new(), |d| d.as_str().to_string()),
         duplicate,
     })
 }
@@ -2656,6 +2664,10 @@ fn grade_peer_quality(q: &audiohub_net::secure::QualityReading) -> QualityStats 
         } else {
             q.bandwidth_hz.saturating_mul(2)
         },
+        // 位深**没有**与之对应的回退：旧对端不发它，就是不知道。
+        // 「空就当 s16」在旧对端上碰巧总是对的（那些 build 线上恒为 16 位），
+        // 正因为碰巧总是对，它会一直躺着，直到某天不对了也没有一处会报错。
+        wire_depth: q.wire_depth.clone(),
         grade: grade.map_or("unknown", quality::Grade::as_str).to_string(),
         worst: worst.to_string(),
         partial,
@@ -2667,7 +2679,12 @@ fn grade_peer_quality(q: &audiohub_net::secure::QualityReading) -> QualityStats 
 /// 参数从「阶梯格号」换成「速率」是有意的：格号要经
 /// `AUTO_RATES.position(..).unwrap_or(0)` 才拿得到，而那个 `unwrap_or` 会把任何
 /// 不在阶梯上的速率报成满带宽。速率是**观测到的量**，格号是对它的分类。
-fn build_quality(rx: &RxStream, wire_rate_hz: u32, duplicate: bool) -> Option<QualityStats> {
+fn build_quality(
+    rx: &RxStream,
+    wire_rate_hz: u32,
+    wire_depth: Option<audiohub_core::dsp::WireDepth>,
+    duplicate: bool,
+) -> Option<QualityStats> {
     // 这个参数**曾经是阶梯格号**（0..3）。两者都是 u32，传错编译照过，而后果是
     // 静默的：格号 0 会被当成 0 Hz ⇒ 带宽 0 ⇒ Q3 判「差」⇒ 整条流报「差」，
     // 没有任何一处报错。改名挡住了大部分，这条 `debug_assert` 挡住剩下的。
@@ -2678,6 +2695,16 @@ fn build_quality(rx: &RxStream, wire_rate_hz: u32, duplicate: bool) -> Option<Qu
     debug_assert!(
         wire_rate_hz >= 8_000,
         "build_quality 收到 {wire_rate_hz}——这看起来是阶梯格号，不是线上采样率",
+    );
+    // 位深版本的同一条自检：它必须落在三个合法拼写里，或者干脆缺席。
+    // 一个拼错的位深串在 UI 上表现为「—」，与「旧对端」完全无法区分。
+    debug_assert!(
+        wire_depth.is_none()
+            || matches!(
+                wire_depth.map(|d| d.as_str()),
+                Some("s16") | Some("s24") | Some("f32")
+            ),
+        "build_quality 收到一个不认识的位深：{wire_depth:?}",
     );
     // Q1：10 s 非消费型窗口的差分。窗口不够长 ⇒ 整个 QualityStats 为 None，
     // 而不是给一个分母只有几帧的随机比率。
@@ -2726,6 +2753,7 @@ fn build_quality(rx: &RxStream, wire_rate_hz: u32, duplicate: bool) -> Option<Qu
         clip_excess_db: clip.map(|w| w.excess_db()),
         bandwidth_hz,
         wire_rate_hz,
+        wire_depth: wire_depth.map_or(String::new(), |d| d.as_str().to_string()),
         // 等级不成立时是 `"unknown"`，**不是在场分量的 min**。IPC 契约上
         // `grade` 早就把 "unknown" 列为合法取值，此前没有任何路径产生它——
         // 那个空位就是这个缺陷藏身的地方。
@@ -2903,9 +2931,12 @@ fn build_session_info_with(
         s.sent_packets = tx.sent_packets.load(Ordering::Relaxed);
         s.rung = tx.rung.load(Ordering::Relaxed);
         s.rung_changes = tx.rung_changes.load(Ordering::Relaxed);
-        // 发送侧的线上速率就是格号对应的那一档——`engine.rs` 的 tx_loop 用同一个
-        // `rung_rate(tx.rung)` 既建重采样器、又写进包头，所以这里没有第二个真值源。
-        wire_rate = Some(audiohub_net::media::rung_rate(s.rung));
+        // 发送侧的线上格式就是格号对应的那一档——`engine.rs` 的 tx_loop 用同一个
+        // `rung_format(tx.rung)` 既建重采样器、又写进包头（采样率 + codec），
+        // 所以这里没有第二个真值源。
+        let f = audiohub_net::media::rung_format(s.rung);
+        wire_rate = Some(f.rate_hz);
+        wire_depth = Some(f.depth);
         let r = *lk(&tx.remote);
         // lifetime totals for display; loss_pct is derived from them so the UI
         // still shows a session-wide figure while AUTO reacts to the last window
@@ -2954,6 +2985,9 @@ fn build_session_info_with(
         // `0` = 这条流没有任何一侧报得出速率——**宁可是 0 也不填 48000**：
         // 那正是本字段修掉的那个硬编码。
         sample_rate: wire_rate.unwrap_or(0),
+        // `""` = 两侧都报不出。**不许兜底成 `"s16"`**：那正是本字段修掉的那个
+        // 硬编码在位深维度上的等价物（`sample_rate` 曾经硬编码成 48000）。
+        wire_depth: wire_depth.map_or(String::new(), |d| d.as_str().to_string()),
         channels: 1,
         stats: s,
         origin: e.origin.label().to_string(),
@@ -3753,7 +3787,7 @@ mod telemetry_tests {
         // 削顶页还没攒满
         assert!(rx.clip.window().is_none(), "前提：这一页还没完成");
 
-        let q = build_quality(&rx, 48_000, false).expect("Q1/Q3 有读数 ⇒ 分量明细照给");
+        let q = build_quality(&rx, 48_000, Some(audiohub_core::dsp::WireDepth::S16), false).expect("Q1/Q3 有读数 ⇒ 分量明细照给");
         assert_eq!(q.clip_ratio, None, "还没测 ⇒ None。填 0 会说成『测了，一点没削』");
         assert_eq!(q.clip_excess_db, None);
         assert!(q.partial, "木桶少了一块板，必须说出来");
@@ -3768,7 +3802,7 @@ mod telemetry_tests {
 
         // 同一条流，页攒满之后：Q2 立刻把等级拉到底，并指名是电平的问题。
         flip_a_loud_clip_page(&rx.clip);
-        let q = build_quality(&rx, 48_000, false).expect("三分量齐全");
+        let q = build_quality(&rx, 48_000, Some(audiohub_core::dsp::WireDepth::S16), false).expect("三分量齐全");
         assert_eq!(q.clip_ratio, Some(1.0), "整页都在越界");
         assert!(!q.partial);
         assert_eq!(q.grade, "poor");
@@ -3787,7 +3821,7 @@ mod telemetry_tests {
         seed_conceal(&rx, 900, 100); // Q1 = 100/1000 = 10% -> Poor
         assert!(rx.clip.window().is_none(), "前提：削顶页仍未完成");
 
-        let q = build_quality(&rx, 48_000, false).expect("有结论");
+        let q = build_quality(&rx, 48_000, Some(audiohub_core::dsp::WireDepth::S16), false).expect("有结论");
         assert_eq!(q.grade, "poor", "断续已经触底，削顶再差也压不下去");
         assert_eq!(q.worst, "continuity");
         assert!(q.partial, "等级确定，但木桶确实少了一块板 —— 两件事都要说");
@@ -3821,7 +3855,7 @@ mod telemetry_tests {
         let rx = rx_stream();
         seed_conceal(&rx, 1000, 0); // Q1 = 0 -> Excellent
         assert!(rx.clip.window().is_none());
-        let q = build_quality(&rx, 48_000, true).expect("有结论");
+        let q = build_quality(&rx, 48_000, Some(audiohub_core::dsp::WireDepth::S16), true).expect("有结论");
         assert_eq!(q.grade, "poor", "两路重复流相加把整段波形 ×2");
         assert_eq!(q.worst, "level");
         assert!(!q.partial, "一票否决是实测结论，不是缺席");
@@ -4294,6 +4328,7 @@ mod telemetry_tests {
             clip_excess_db: Some(6.02),
             bandwidth_hz: 24_000,
             wire_rate_hz: 48_000,
+            wire_depth: "s24".into(),
             grade: "poor".into(),
             worst: "level".into(),
             partial: false,
@@ -4307,6 +4342,10 @@ mod telemetry_tests {
         // 「与设置对不上的数」和「丢掉诊断量」之间二选一。
         assert_eq!(v["wire_rate_hz"], 48_000);
         assert_ne!(v["wire_rate_hz"], v["bandwidth_hz"]);
+        // 位深与采样率是**两个维度**，两个都得上 IPC：只写一个的读数是有歧义
+        // 的（`48 kHz` 说不出它是 16 位还是 24 位）。且**不许报裸的 32**。
+        assert_eq!(v["wire_depth"], "s24");
+        assert_ne!(v["wire_depth"], "32");
         assert_eq!(v["window_s"], 10.0);
         assert_eq!(v["clip_ratio"], 0.31);
         assert_eq!(v["partial"], false);

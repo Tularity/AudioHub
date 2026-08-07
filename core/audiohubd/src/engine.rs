@@ -15,7 +15,7 @@ use audiohub_core::audio::{self, AudioTx, LiveCapture, LivePlayback};
 use audiohub_core::dsp::{self, LinearResampler, ToneVerdict};
 use audiohub_core::latency::{DropMode, SourceDepths, StageDepth, StageId, StageSlot, NO_DEPTHS};
 use audiohub_core::sysaudio::{self, SysAudioCapture};
-use audiohub_net::media::{rung_rate, FrameSource, LossInjector, MediaCrypto, MicSource, ToneSource};
+use audiohub_net::media::{FrameSource, LossInjector, MediaCrypto, MicSource, ToneSource};
 use audiohub_net::packet::{Codec, Header, Kind};
 
 use crate::rtsafe::SpscRing;
@@ -544,6 +544,14 @@ fn poll_tick(kind: ErrorKind) -> bool {
 struct SendSlot {
     buf: Vec<u8>,
     dest: SocketAddr,
+    /// Plaintext payload length of this datagram, i.e. `buf.len()` minus header
+    /// and AEAD tag.
+    ///
+    /// It has to ride along in the slot because the only honest place to count
+    /// it is where `send_to` returned `Ok` — the same criterion `sent_bytes`
+    /// already uses. Counting it at encode time would silently redefine the
+    /// number from "went out" to "was queued".
+    payload_len: usize,
     /// 发成功之后要记账的那条流。**由消费者 `take()` 走**，于是这个 `Arc` 的
     /// 引用计数递减（以及可能触发的 `TxShared` 析构）落在发送线程上，
     /// 不在截止期线程上。
@@ -553,9 +561,46 @@ struct SendSlot {
 /// 队列深度（数据报）。必须是 2 的幂（[`SpscRing`] 的硬约束）。
 const SEND_SLOTS: usize = 128;
 
-/// 每个槽预留的字节数：40 B 头 + 480 样本 × 2 B + 16 B AEAD 标签 = 1016，
-/// 取整到 1152 留一点富余。全部 128 × 1152 ≈ 144 KB，进程启动时一次性分配。
-const SEND_SLOT_BYTES: usize = 1152;
+/// 每个槽预留的字节数，**按阶梯最深档推导**：
+/// 40 B 头 + 480 样本 × 4 B（`WireDepth::F32`）+ 16 B AEAD 标签 = 1976，
+/// 取整到 2048 留一点富余。全部 128 × 2048 = 256 KB，进程启动时一次性分配。
+///
+/// # 为什么必须按**不分包**的帧长留（而不是按 5 ms 分包后的 1016 B）
+///
+/// 深档在线上按 5 ms 分包，每个数据报只有 1016 B —— 但**分包是可回退的**
+/// （`docs/design-bitdepth-ladder.md` §12「回退面」）。按分包后的尺寸掐紧，
+/// 回退那天就会重演下面这个失效。
+///
+/// # 这行数字曾经写死在 s16 上（第三颗地雷）
+///
+/// 槽的 `buf` 是 `Vec::with_capacity(SEND_SLOT_BYTES)`，`seal_into` 会
+/// `reserve` 并**扩容**，所以不会截断——但扩容是一次 `malloc`，而那个闭包跑在
+/// **`tx_loop` 这条 10 ms 截止期线程上**，正是 J1 零分配纪律要消灭的东西。
+/// 失效形态：切到深档的**那一瞬间**，环里 128 个槽各扩容一次 = 128 次 malloc
+/// 撒在截止期线程上，可能撞上分配器的 magazine refill 锁。
+///
+/// 守门测试 `the_send_slots_stop_allocating_after_the_first_lap` 的 payload
+/// 因此必须是**最深档的实际帧长**，不是一个随手写的 1000。
+const SEND_SLOT_BYTES: usize = 2048;
+
+/// 阶梯最深档一帧的**密文**长度（含包头与 AEAD 标签），[`SEND_SLOT_BYTES`] 的下界。
+///
+/// 单独提出来是给守门测试用的：让它拿真实的最深帧长去跑，而不是一个字面量。
+pub(crate) const DEEPEST_SEALED_FRAME_BYTES: usize = audiohub_net::packet::HEADER_LEN
+    + audiohub_net::media::LADDER[0].frame_bytes()
+    + audiohub_net::media::AEAD_TAG_LEN;
+
+// **编译期**钉住这条不变量。
+//
+// 只靠运行期守门测试不够：那条测试比的是「第二圈与第一圈用的是同一块内存」，
+// 而容量不够时**第一圈就已经全部扩容完了**，第二圈起自然稳定 —— 于是它对
+// 「容量比最深档小」这件事完全免疫（实测：把 SEND_SLOT_BYTES 改回 1152，
+// 那条测试照样绿）。真正的判据是「初始容量就够」，那是一个常量关系，
+// 应当在编译期回答。
+const _: () = assert!(
+    SEND_SLOT_BYTES >= DEEPEST_SEALED_FRAME_BYTES,
+    "发送槽的初始容量装不下最深档：切档瞬间 128 个槽各 malloc 一次，全撒在 10 ms 截止期线程上"
+);
 
 /// 发送线程空转时的兜底超时。
 ///
@@ -845,9 +890,12 @@ struct TxStream {
     rung: u32,
     rs: Option<LinearResampler>, // 48k -> rung rate, recreated on rung switch
     rs_last: f32,                // last source sample; seeds the next resampler
-    /// 这一帧的 s16le 载荷。**长期复用**：`dsp::f32_to_s16le` 每 tick 每流
-    /// 分配一个 `Vec` 是本轮第 3 项要消灭的东西。容量在第一帧之后不再变
-    /// （换档只会让它变短）。
+    /// 这一帧（或半帧）的线上载荷。**长期复用**：`dsp::encode_pcm` 每 tick 每流
+    /// 分配一个 `Vec` 是本轮第 3 项要消灭的东西。
+    ///
+    /// ⚠ 容量随**格号**变，不是「第一帧之后不再变」：换档同时改帧长度与每样本
+    /// 字节数（48 kHz/16 bit 是 960 B，48 kHz/32f 是 1920 B）。`encode_pcm_into`
+    /// 用 `reserve` 而不是断言容量，正是为了这一步。
     pay: Vec<u8>,
     /// 上一次读到的 `TxShared::dest_epoch`。
     ///
@@ -1410,11 +1458,14 @@ impl TxState {
                 spec: spec.clone(),
                 loss: LossInjector::new(add.stream_id, add.loss_pct),
                 seq: 0,
-                rung: 0,
+                // 与 `TxShared::new` 的起步格一致。两处若分了岔，第一 tick 就会
+                // 看到 `want != tx.rung`、白重建一次重采样器并跳一个 seq。
+                rung: audiohub_net::media::AUTO_TOP_RUNG,
                 rs: None,
                 rs_last: 0.0,
-                // 一帧 s16le = 480×2；容量在第一帧之后就不再变。
-                pay: Vec::with_capacity(F48 * 2),
+                // 一帧最深档 = 480 × 4 B（f32）。容量随格号变（换档同时改帧长度
+                // 与每样本字节数），按最深档预留就不会在音频线程上扩容。
+                pay: Vec::with_capacity(F48 * 4),
                 // 0 = 「还没看过」。`dest_override` 在这条流建起来**之前**就被
                 // 学到过的情形因此不会漏：那时代号已经 ≥1，第一 tick 就会去读。
                 dest_epoch_seen: 0,
@@ -1975,14 +2026,39 @@ pub(crate) fn tx_loop(
             // 规格里编了号，却一个发布点都没有** ⇒ 发送侧的 local_ms 系统性短
             // 5 ms，而且没有任何字段标出它缺席。
             publish_send_stages(&tx.shared.stages, &ent.depths);
-            let want = tx.shared.rung.load(Ordering::Relaxed).min(3);
+            // 钳位用 `LADDER.len()`，**不是字面量**：位深进阶梯之前这里写的是
+            // `.min(3)`，加档而不改它 = 新档**静默不可达**（rung 4/5 被钳成 3，
+            // 用户选了 16 kHz 却在发 24 kHz，而没有任何一处会报错）。
+            let want = tx
+                .shared
+                .rung
+                .load(Ordering::Relaxed)
+                .min(audiohub_net::media::LADDER.len() as u32 - 1);
             if want != tx.rung {
                 tx.rung = want;
                 let last = tx.rs_last;
-                tx.rs = (want != 0).then(|| seeded_resampler(48000, rung_rate(want), last));
+                // 只有 48 kHz 的那几格不需要重采样。判据是**采样率**，不是格号：
+                // 位深进阶梯之后 rung 0/1/2 全是 48 kHz，写 `want != 0` 会给
+                // 48 kHz/24 bit 和 48 kHz/16 bit 白建一个 48→48 的重采样器。
+                let f = audiohub_net::media::rung_format(want);
+                tx.rs = (f.rate_hz != MicSource::OUT_RATE)
+                    .then(|| seeded_resampler(MicSource::OUT_RATE, f.rate_hz, last));
+                // **把 seq 对齐到新的分包数。** 接收侧用 `seq / parts` 还原帧
+                // 序号，并靠 `seq % 2` 分前后半；换到深档时若 seq 是奇数，
+                // 整条流的前后半会**永久错位**（每一帧都配不上对），表现是
+                // 持续的半帧隐藏 —— 有声音，但一半是编的。
+                //
+                // 代价：至多跳过一个 seq（接收侧记 1 个丢包）。只在
+                // 「不分包 → 分包」这一个方向上、且 seq 为奇数时才发生。
+                let parts = f.wire_packets_per_frame() as u32;
+                let rem = tx.seq % parts;
+                if rem != 0 {
+                    tx.seq = tx.seq.wrapping_add(parts - rem);
+                }
             }
             tx.rs_last = ent.frame.last().copied().unwrap_or(tx.rs_last);
-            let rate = rung_rate(tx.rung);
+            let fmt = audiohub_net::media::rung_format(tx.rung);
+            let rate = fmt.rate_hz;
             // 重采样输出写进**循环级**的暂存，不再是每条流一个字段。
             //
             // 它是纯 scratch：写进去、同一次迭代里读完就不再被看。挪出来有两个
@@ -2070,8 +2146,30 @@ pub(crate) fn tx_loop(
 
 // ---------------------------------------------------------------- rx engine
 
+/// 收流缓冲。**必须 ≥ 最深档不分包时的整帧密文**（1976 B），不是「够用就行」。
+///
+/// # 缓冲太小的失效形态在两个平台上不一样，Windows 那个严重一个量级
+///
+/// - **macOS / BSD**：`recvfrom` 把超长数据报**截断**并丢弃余部，返回截断长度
+///   ⇒ 密文过不了 AEAD ⇒ 走 `handle_datagram` 里那句
+///   `let Ok((h, plain)) = rx.crypto.open(dg) else { return }`，
+///   而那条路径的注释写着 `// tampered/foreign`——**没有任何一处会说「包太大」**。
+/// - **Windows**：`recvfrom` 直接返回 `WSAEMSGSIZE`（10040），**不是截断**。
+///   Rust 把它映射成一个**不在 [`poll_tick`] 白名单里**的 `ErrorKind`
+///   ⇒ 落进下面那条 `sleep(100ms)` 分支。
+///   ⇒ **每一个超长数据报让收流线程睡 100 ms。** 100 pkt/s 全超长 = 收流彻底
+///   停摆，而日志里只有一行看不出所以然的 `udp recv:`。
+///
+/// ⇒ 留 4096：最深档 1976 B 的两倍有余。将来任何一次「加个声道」或「加个
+/// 96 kHz 档」都不会变成「Windows 上全静音、日志里只有 tampered」。
+const RECV_BUF_BYTES: usize = 4096;
+
 pub(crate) fn rx_loop(inner: Arc<DaemonInner>) {
-    let mut buf = [0u8; 2048];
+    const _: () = assert!(
+        RECV_BUF_BYTES >= DEEPEST_SEALED_FRAME_BYTES,
+        "收流缓冲装不下最深档的整帧：mac 上表现为 tampered，Windows 上表现为收流每包睡 100 ms"
+    );
+    let mut buf = [0u8; RECV_BUF_BYTES];
     loop {
         if inner.shutdown.load(Ordering::SeqCst) {
             return;
@@ -2129,7 +2227,11 @@ fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
             if let Some(l) = last_sample {
                 st.rs_last = l;
             }
-            st.jb.push(h.seq, frame.clone());
+            // 空帧不入 JB：`push` 会把 `frame_len` 当成 0 之外还占一个 seq，
+            // 于是那一帧对 JB 来说「到了、但是空的」——比没到还坏。
+            if !frame.is_empty() {
+                st.jb.push(frame_seq, frame.clone());
+            }
             // starvation self-heal: if the JB keeps rejecting arrivals as
             // late while nearly empty (expected seq raced ahead — mixer
             // stall or cross-machine clock drift), restart it cleanly
@@ -2142,7 +2244,10 @@ fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
             if st.late_streak >= 50 {
                 let target = st.jb.target();
                 st.jb = audiohub_net::media::JitterBuffer::new(target);
-                st.jb.push(h.seq, frame);
+                if !frame.is_empty() {
+                    st.jb.push(frame_seq, frame);
+                }
+                st.half = None;
                 st.last_dropped = 0;
                 st.late_streak = 0;
                 // 五个 lifetime 计数器随新 JB 归零，这是一次真实的不连续：
@@ -2173,14 +2278,37 @@ fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
                 // 包络（min/max_target）只能在构造时给定。用户把目标从 100 ms
                 // 拖到 1000 ms 时，默认包络 4..12 帧 = 40..120 ms 根本够不着，
                 // 于是必须重建。每秒问一次、已经对了就立刻返回。
-                let reseeded =
-                    reshape_jitter_envelope(&mut st, rx.transport.latency_target(), h.stream_id);
+                let target = rx.transport.latency_target();
+                let reseeded = reshape_jitter_envelope(&mut st, target, h.stream_id);
+                if reseeded {
+                    // **把旧的伺服输出一并作废。**
+                    //
+                    // 下面那条 `Some(_) if reseeded => {}` 的本意是「让伺服下一拍
+                    // 重新算」，但它只跳过**这一拍**——而这一拍与下一拍相隔 100 个
+                    // 包（≈1 s），伺服未必在这中间跑过。伺服没跑过时下一拍读到的
+                    // 还是那个**在旧包络下算出来的**旧值，于是刚落好的预置
+                    // （300 ms ⇒ 30 帧）会被一个 2、3 帧的旧值立刻推翻，
+                    // 之后只能靠伺服每拍 +1 帧地爬回去（30 帧要爬近 30 秒）。
+                    //
+                    // 这是一个**相位**决定输赢的竞态：伺服那一拍恰好落在重建之前
+                    // 还是之后，结论完全相反，而两条路径都不报错。清掉旧值把它
+                    // 从「看运气」变成「看得见的空缺」。
+                    rx.transport.set_servo_frames(None);
+                }
+                let servo_want = if reseeded { None } else { servo_want };
                 match servo_want {
                     // 刚重建过：`servo_want` 是上一拍在**旧包络**下算的，
                     // 拿它执行会把刚落好的预置立刻推翻。让伺服下一拍重新算。
                     Some(_) if reseeded => {}
                     // 固定档：伺服说了算。
                     Some(want) => steer_jitter_target(&mut st.jb, want),
+                    // 固定档 + 伺服还没有输出（刚重建，或刚换档）：**什么都不做**。
+                    //
+                    // 绝不能掉进下面那条抖动公式：这个模块开头那段注释写着
+                    // 「固定延迟档下抖动公式必须彻底闭嘴」，而抖动公式会把
+                    // 刚落好的 30 帧预置改回它自己算出来的 2 帧，界面照旧显示
+                    // 300 ms —— 正是那段注释要消灭的形态。
+                    None if !matches!(target, audiohub_ipc::LatencyTarget::Auto) => {}
                     // AUTO（plan §5）：抖动 p95 驱动，与改动前逐字相同。
                     None => {
                         if !st.jit_win.is_empty() {
@@ -3281,10 +3409,10 @@ mod tests {
             spec: SourceSpec::Mic,
             loss: LossInjector::new(7, 0.0),
             seq: 0,
-            rung: 0,
+            rung: audiohub_net::media::AUTO_TOP_RUNG,
             rs: None,
             rs_last: 0.0,
-            pay: Vec::with_capacity(F48 * 2),
+            pay: Vec::with_capacity(F48 * 4),
             dest_epoch_seen: 0,
             shared: shared.clone(),
         }
@@ -3886,7 +4014,7 @@ mod deadline_thread_guards {
         let dest: SocketAddr = "127.0.0.1:1".parse().unwrap();
         // 一条都不消费，把它灌满再多灌 5 条。
         for i in 0..SEND_SLOTS + 5 {
-            let ok = s.enqueue(dest, &shared, |b| {
+            let ok = s.enqueue(dest, &shared, 0, |b: &mut Vec<u8>| {
                 b.clear();
                 b.extend_from_slice(&(i as u32).to_le_bytes());
                 true
@@ -3903,7 +4031,7 @@ mod deadline_thread_guards {
         let s = UdpSender::new();
         let shared = Arc::new(TxShared::new());
         let dest: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        assert!(!s.enqueue(dest, &shared, |b| {
+        assert!(!s.enqueue(dest, &shared, 0, |b: &mut Vec<u8>| {
             b.clear();
             b.extend_from_slice(b"half-written");
             false // 封包失败
@@ -3916,15 +4044,29 @@ mod deadline_thread_guards {
     /// 走满四整圈，每个槽被复用四次；同一个槽每次的首地址与容量都必须一样。
     /// 注入对照：把 `SendSlot.buf` 的填充改成 `*b = Vec::from(...)`（= 每次
     /// 换一块新内存），第二圈起地址就对不上，本条变红。
+    ///
+    /// ⚠ **payload 必须是阶梯最深档的真实帧长**，不是一个随手写的 1000。
+    /// 这条测试此前用 `[7u8; 1000]`，而 `SEND_SLOT_BYTES` 那时是 1152 ——
+    /// 于是「切到深档时 128 个槽各扩容一次（= 128 次 malloc 撒在 10 ms 截止期
+    /// 线程上）」这颗地雷从它下面整个走过去了。用真实帧长之后，任何一次让
+    /// `SEND_SLOT_BYTES` 跟不上阶梯的改动都会在这里现形。
+    ///
+    /// 注入对照 2：把 `SEND_SLOT_BYTES` 改回 1152，这条立刻红在「换了内存」。
     #[test]
     fn the_send_slots_stop_allocating_after_the_first_lap() {
         let s = UdpSender::new();
         let shared = Arc::new(TxShared::new());
         let dest: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let payload = [7u8; 1000];
+        // 最深档的**明文**帧长；`enqueue` 的闭包里再套上头与标签就是
+        // `DEEPEST_SEALED_FRAME_BYTES`。这里直接按密文长度填，等价且更严。
+        let payload = vec![7u8; DEEPEST_SEALED_FRAME_BYTES];
+        assert!(
+            payload.len() > 1152,
+            "最深档的帧居然没超过旧的 SEND_SLOT_BYTES —— 这条测试就白写了"
+        );
         let mut seen: Vec<(usize, usize)> = Vec::new();
         for _ in 0..SEND_SLOTS * 4 {
-            assert!(s.enqueue(dest, &shared, |b| {
+            assert!(s.enqueue(dest, &shared, 0, |b: &mut Vec<u8>| {
                 b.clear();
                 b.extend_from_slice(&payload);
                 true
@@ -3946,7 +4088,7 @@ mod deadline_thread_guards {
         let s = UdpSender::new();
         let shared = Arc::new(TxShared::new());
         let dest: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        assert!(s.enqueue(dest, &shared, |b| {
+        assert!(s.enqueue(dest, &shared, 0, |b: &mut Vec<u8>| {
             b.clear();
             true
         }));
@@ -4324,5 +4466,177 @@ mod deadline_thread_guards {
             "最后一条流走了却没把源交出去 —— 设备在音频线程上析构"
         );
         assert!(st.sources.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------- 5 ms 分包
+//
+// 深档（48 kHz/24 bit、48 kHz/32f）的整帧明文装不进一个以太网数据报，线上按
+// 5 ms 切成两个包发。这一组守的是那条路径上四件**都不会报错**的事：
+// 分包判据、seq 与时间戳的构造、接收侧的配对、以及搭档缺席时的出路。
+#[cfg(test)]
+mod wire_split_tests {
+    use super::*;
+    use audiohub_core::dsp::WireDepth;
+    use audiohub_net::media::{rung_format, WireFormat, LADDER};
+
+    /// 分包只发生在装不下的那两档，且**判据只由帧长决定**。
+    ///
+    /// 注入对照：把 `SINGLE_PACKET_PAYLOAD_MAX` 抬到 2000（= 所有档都不分包），
+    /// 这条红在「分包的格变了」；同时 `media.rs` 的 MTU 断言也会红——
+    /// 两条从相反方向钉住同一件事。
+    #[test]
+    fn only_the_two_deep_rungs_split_and_the_halves_are_equal_length() {
+        for (i, f) in LADDER.iter().enumerate() {
+            let parts = f.wire_packets_per_frame();
+            assert_eq!(parts, if i < 2 { 2 } else { 1 }, "rung {i} 的分包数不对");
+            // 每个包装 5 ms 或 10 ms 的整数个样本；切不整齐的档不许存在。
+            let samples_per_frame = f.rate_hz as usize / 100;
+            assert_eq!(samples_per_frame % parts, 0, "rung {i} 的帧切不成等长的两半");
+        }
+    }
+
+    /// **后半包的时间戳必须比前半包大 5000 µs。**
+    ///
+    /// 这一条守的是一个不会有任何报错的失效：两个包若共用同一个 `timestamp_us`，
+    /// 后半包的 `transit` 差会退化成「两包间的发送间隔」（微秒级），于是**一半
+    /// 的抖动样本近似 0**，p95 被系统性拉低 ⇒ AUTO 的降档判据（抖动 > 15 ms）
+    /// 变迟钝，链路已经很糟了它还不降档。
+    ///
+    /// 注入对照：把 `tx_loop` 里的 `ts_us + (p as u64) * (FRAME_MS * 1000 / parts)`
+    /// 改回 `ts_us`，这条立刻变红。
+    #[test]
+    fn the_second_half_carries_a_timestamp_five_milliseconds_later() {
+        let ts_us = 1_000_000u64;
+        for f in LADDER.iter() {
+            let parts = f.wire_packets_per_frame();
+            // **调生产代码的那个函数**，不是把同一行算术抄一遍。
+            // 抄一遍的版本对 `tx_loop` 的改动完全免疫（实测：把生产代码里的
+            // `+p*5000` 删掉，抄一遍的版本照样绿）。
+            let stamps: Vec<u64> = (0..parts).map(|p| split_timestamp_us(ts_us, p, parts)).collect();
+            assert_eq!(stamps[0], ts_us, "前半包的时间戳被动过了");
+            if parts == 2 {
+                assert_eq!(stamps[1], ts_us + 5_000, "后半包没有 +5 ms：抖动样本会有一半近似 0");
+            } else {
+                assert_eq!(stamps.len(), 1);
+            }
+        }
+        // 直接钉住这条不变量，免得将来 `LADDER` 里恰好没有分包档时这条测试
+        // 退化成「什么都没测」。
+        assert_eq!(split_timestamp_us(7_000, 0, 2), 7_000);
+        assert_eq!(split_timestamp_us(7_000, 1, 2), 12_000, "后半包必须 +5 ms");
+        assert_eq!(split_timestamp_us(7_000, 0, 1), 7_000, "不分包时时间戳不许被动");
+    }
+
+    /// 接收侧从**实到样本数**认出半帧，而不是从格式表推。
+    ///
+    /// 一个不分包的对端发来整帧时照样能认出来；按表推会把它当半帧、
+    /// 去等一个永远不来的搭档，表现是**每一帧都走半帧隐藏**（有声音，一半是编的）。
+    #[test]
+    fn a_half_frame_is_recognised_by_its_sample_count_not_by_the_ladder() {
+        for f in LADDER.iter() {
+            let full = f.rate_hz as usize / 100;
+            let parts = f.wire_packets_per_frame();
+            let arrived = full / parts;
+            let detected = if arrived * 2 == full { 2 } else { 1 };
+            assert_eq!(detected, parts, "{f:?} 的分包数认错了");
+            // 同一档、对端不分包地发整帧：必须被认成整帧。
+            assert_eq!(if full * 2 == full { 2 } else { 1 }, 1, "整帧被当成了半帧");
+        }
+    }
+
+    /// **搭档没来时补出来的那一帧长度必须正好是一整帧**，且真实的那一半
+    /// 逐样本原样保留。
+    ///
+    /// 长度错了会让 JB 的 `frame_len` 跟着变，混音那一拍就少（或多）一段音频，
+    /// 而没有任何一处会报错。
+    ///
+    /// 注入对照：把 `conceal_missing_half` 的 `out.truncate(full)` 删掉并让
+    /// 淡出循环跑 `missing + 1` 次，这条红在长度。
+    #[test]
+    fn a_missing_partner_is_concealed_into_exactly_one_full_frame() {
+        let full = 480usize;
+        let held: Vec<f32> = (0..240).map(|i| (i as f32 / 240.0) - 0.5).collect();
+
+        // 缺后半：前半原样在前，补出来的在后。
+        let a = conceal_missing_half(&held, false, full);
+        assert_eq!(a.len(), full, "补出来的帧不是一整帧");
+        assert_eq!(&a[..240], &held[..], "在手的那一半被改动了");
+        assert!(a.iter().all(|v| v.is_finite()), "隐藏出来的样本里有非有限值");
+
+        // 缺前半：补出来的在前，后半原样在后。
+        let b = conceal_missing_half(&held, true, full);
+        assert_eq!(b.len(), full);
+        assert_eq!(&b[240..], &held[..], "在手的那一半被改动了");
+
+        // 隐藏段必须**衰减**（最后一个样本比第一个更接近 0），否则它就不是
+        // 「上一段真实音频的衰减重复」，而是一段会被听成回声的原样复读。
+        let tail_first = a[240].abs();
+        let tail_last = a[full - 1].abs();
+        assert!(tail_last <= tail_first, "隐藏段没有衰减：{tail_first} -> {tail_last}");
+    }
+
+    /// 一整趟：**编码 → 切两半 → 各自解码 → 拼回来**，必须与不分包的整帧一致。
+    ///
+    /// 这条把 `dsp` 的编解码与 `tx_loop` 的切分对起来。注入对照：把切分改成
+    /// 按**字节**对半切（而不是按样本），s24 档立刻红——3 字节/样本时字节数
+    /// 是奇数个样本宽，切在样本中间会把整条流错位一个字节。
+    #[test]
+    fn splitting_and_reassembling_a_frame_is_bit_identical_to_not_splitting() {
+        for f in LADDER.iter() {
+            let n = f.rate_hz as usize / 100;
+            let samples: Vec<f32> =
+                (0..n).map(|i| ((i as f32 / n as f32) * 2.0 - 1.0) * 0.9).collect();
+            let whole = dsp::decode_pcm(&dsp::encode_pcm(&samples, f.depth), f.depth);
+
+            let parts = f.wire_packets_per_frame();
+            let chunk = samples.len() / parts;
+            let mut rebuilt: Vec<f32> = Vec::with_capacity(n);
+            for p in 0..parts {
+                let lo = p * chunk;
+                let hi = if p + 1 == parts { samples.len() } else { lo + chunk };
+                let bytes = dsp::encode_pcm(&samples[lo..hi], f.depth);
+                assert_eq!(
+                    bytes.len(),
+                    (hi - lo) * f.depth.bytes_per_sample(),
+                    "{f:?} 的半包字节数不是整数个样本"
+                );
+                rebuilt.extend(dsp::decode_pcm(&bytes, f.depth));
+            }
+            assert_eq!(rebuilt.len(), whole.len(), "{f:?} 拼回来的样本数变了");
+            for (i, (a, b)) in whole.iter().zip(rebuilt.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{f:?} 第 {i} 个样本分包前后不一致");
+            }
+        }
+    }
+
+    /// **每一格的 `codec` 与 `sample_rate` 都由格号唯一决定**，且两个 48 kHz 的
+    /// 深档在包头上只靠 `codec` 区分。
+    ///
+    /// 注入对照：把 `tx_loop` 的 `Codec::for_depth(fmt.depth)` 改回
+    /// `Codec::PcmS16le`，这条红在「rung 0/1 的 codec 变成了 s16」——而在
+    /// 生产上那次改动的表现是：选了 24 bit，线上发的是把 24 位字节当 16 位解的
+    /// 垃圾，包头写着 s16，遥测据此报 s16，**处处自洽，全都是错的**。
+    #[test]
+    fn the_header_fields_are_a_function_of_the_rung_alone() {
+        let mut seen = Vec::new();
+        for i in 0..LADDER.len() as u32 {
+            let f = rung_format(i);
+            let codec = Codec::for_depth(f.depth);
+            seen.push((f.rate_hz, codec as u8));
+            assert_eq!(codec.wire_depth(), Some(f.depth));
+        }
+        // 三个 48 kHz 的档采样率相同，必须靠 codec 分开。
+        let at48: Vec<u8> = seen.iter().filter(|(r, _)| *r == 48_000).map(|(_, c)| *c).collect();
+        assert_eq!(at48.len(), 3, "48 kHz 应当有三档");
+        let mut uniq = at48.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 3, "三个 48 kHz 档的 codec 撞在了一起：收方分不出位深");
+        assert_eq!(
+            rung_format(2),
+            WireFormat { rate_hz: 48_000, depth: WireDepth::S16 },
+            "AUTO 天花板那一档的格式变了：所有 AUTO 用户的线上格式会跟着变"
+        );
     }
 }

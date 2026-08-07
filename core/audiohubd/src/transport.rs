@@ -16,9 +16,12 @@
 //!
 //! # 编码：0 是「AUTO」，不是「第 0 档」
 //!
-//! `quality_rate` / `latency_ms` 都用 0 表示 AUTO。质量档的 0 不会与真档位相撞
-//! （采样率不可能是 0）；延迟档的 0 会——用户选的 0 ms 是一个合法档位。
-//! 所以延迟走**两个**原子量：`latency_fixed`（是不是固定档）与 `latency_ms`。
+//! `quality_rung1` / `latency_ms` 都用 0 表示 AUTO。
+//!
+//! ⚠ 质量档此前存的是**采样率**，0 与真档位撞不上（采样率不可能是 0）。
+//! 位深进阶梯之后它存的是**格号**，而格号 0 是一个合法档（阶梯最顶端）——
+//! 于是存的是 `格号 + 1`。延迟档撞上过同一件事（用户选的 0 ms 是合法档），
+//! 那里的解法是**两个**原子量：`latency_fixed` 与 `latency_ms`。
 //! 一个 `u32` 塞两件事，就是下一个人读错的地方。
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -35,8 +38,11 @@ pub(crate) struct TransportLive {
     pub achieved_ms: Option<f64>,
     pub at_floor: bool,
     pub at_ceiling: bool,
-    /// 当前实际线上采样率（Hz）。
-    pub rate: Option<u32>,
+    /// 当前实际线上格式的**阶梯格号**。`None` = 还没有读数 / 不在阶梯上。
+    ///
+    /// 存格号而不是采样率：位深进阶梯之后 48000 在阶梯上出现三次，
+    /// 采样率**不再唯一标识一档**。UI 侧经 `LADDER` 把它解回 (kHz, bit)。
+    pub rung: Option<u32>,
     /// 正在被**延迟**伺服的接收流数。0 = 延迟档暂时没有作用对象——
     /// UI 要说这句，否则用户会以为设置没生效。
     pub streams: u32,
@@ -59,7 +65,7 @@ pub(crate) struct TransportLive {
 ///
 /// 于是这个结构现在挂在两个地方，**各用一半**：
 ///   - `RxStream.transport`：延迟半边（`latency_*`、`servo_frames`、`live_*`）。
-///   - `TxShared.transport`：质量半边（`quality_rate`）。
+///   - `TxShared.transport`：质量半边（`quality_rung1`）。
 ///
 /// 没有拆成两个类型，是因为 `generation` 那条「真的变了才作废旧输出」的逻辑
 /// 两边一字不差，而拆开就得复制一遍——复制的那一份迟早只改一处。用不到的那
@@ -70,8 +76,19 @@ pub(crate) struct TransportLive {
 /// 同时在线时才出现、且没有任何报错的失效。
 #[derive(Debug)]
 pub(crate) struct TransportControl {
-    /// 固定质量档的采样率（Hz）。`0` = AUTO（阶梯当家）。
-    quality_rate: AtomicU32,
+    /// 固定质量档的**阶梯格号 + 1**。`0` = AUTO（阶梯当家）。
+    ///
+    /// # 为什么存格号，而不是「采样率 + 位深」两个原子量
+    ///
+    /// 位深进阶梯之后一档是一个 `(采样率, 位深)` 二元组。音频线程每拍读它；
+    /// 两个独立的原子量之间会**撕裂**——瞬间读出一个阶梯上根本不存在的组合
+    /// （新的 48 kHz 配上还没更新的 16 bit），而那一拍会照着这个组合发一包，
+    /// 没有任何一处会报错。**存一个格号从根上消灭这个态。**
+    ///
+    /// `+1` 是为了让 0 保持「AUTO」的含义：格号 0 是一个合法档（阶梯最顶端），
+    /// 与延迟档的 0 ms 同一个形状的问题。此前存的是采样率，采样率不可能为 0，
+    /// 所以那一版不需要这个偏移；换成格号之后必须有。
+    quality_rung1: AtomicU32,
     /// 延迟档是不是固定档。
     latency_fixed: AtomicBool,
     /// 固定档的目标总延迟（ms）。`latency_fixed == false` 时无意义。
@@ -92,7 +109,8 @@ pub(crate) struct TransportControl {
     live_ms_valid: AtomicBool,
     live_at_floor: AtomicBool,
     live_at_ceiling: AtomicBool,
-    live_rate: AtomicU32,
+    /// 线上格号 + 1（`0` = 没有读数），与 `quality_rung1` 同一套编码。
+    live_rung1: AtomicU32,
     live_streams: AtomicU32,
     live_tx_streams: AtomicU32,
 }
@@ -100,7 +118,7 @@ pub(crate) struct TransportControl {
 impl Default for TransportControl {
     fn default() -> Self {
         TransportControl {
-            quality_rate: AtomicU32::new(0),
+            quality_rung1: AtomicU32::new(0),
             latency_fixed: AtomicBool::new(false),
             latency_ms: AtomicU32::new(0),
             generation: AtomicU32::new(0),
@@ -109,7 +127,7 @@ impl Default for TransportControl {
             live_ms_valid: AtomicBool::new(false),
             live_at_floor: AtomicBool::new(false),
             live_at_ceiling: AtomicBool::new(false),
-            live_rate: AtomicU32::new(0),
+            live_rung1: AtomicU32::new(0),
             live_streams: AtomicU32::new(0),
             live_tx_streams: AtomicU32::new(0),
         }
@@ -119,7 +137,7 @@ impl Default for TransportControl {
 impl TransportControl {
     /// 只推**延迟**半边（挂在 `RxStream` 上的那一份用这个）。
     ///
-    /// 不复用 `publish(lat, Auto)`：那样每一拍都会把 `quality_rate` 从当前值
+    /// 不复用 `publish(lat, Auto)`：那样每一拍都会把 `quality_rung1` 从当前值
     /// 打回 0，若哪天有人在同一个实例上同时用了两半，就会出现「质量档每秒被
     /// 清一次」这种没有任何报错的抖动。分开写让「rx 实例只碰延迟」成为一条
     /// 由类型之外的代码保证不了、但由方法名说得清清楚楚的事实。
@@ -137,11 +155,11 @@ impl TransportControl {
 
     /// 只推**质量**半边（挂在 `TxShared` 上的那一份用这个）。
     pub(crate) fn publish_quality(&self, qual: QualityTarget) {
-        let rate = match qual {
+        let v = match qual {
             QualityTarget::Auto => 0,
-            QualityTarget::Rate(r) => r,
+            QualityTarget::Fixed(r) => r + 1,
         };
-        if self.quality_rate.swap(rate, Ordering::Relaxed) != rate {
+        if self.quality_rung1.swap(v, Ordering::Relaxed) != v {
             self.invalidate();
         }
     }
@@ -155,11 +173,11 @@ impl TransportControl {
         self.live_at_ceiling.store(false, Ordering::Relaxed);
     }
 
-    /// 固定质量档的采样率，`None` = AUTO。音频线程每拍读它。
-    pub(crate) fn quality_rate(&self) -> Option<u32> {
-        match self.quality_rate.load(Ordering::Relaxed) {
+    /// 固定质量档的**阶梯格号**，`None` = AUTO。音频线程每拍读它。
+    pub(crate) fn quality_rung(&self) -> Option<u32> {
+        match self.quality_rung1.load(Ordering::Relaxed) {
             0 => None,
-            r => Some(r),
+            v => Some(v - 1),
         }
     }
 
@@ -199,7 +217,8 @@ impl TransportControl {
         }
         self.live_at_floor.store(live.at_floor, Ordering::Relaxed);
         self.live_at_ceiling.store(live.at_ceiling, Ordering::Relaxed);
-        self.live_rate.store(live.rate.unwrap_or(0), Ordering::Relaxed);
+        self.live_rung1
+            .store(live.rung.map_or(0, |r| r + 1), Ordering::Relaxed);
         self.live_streams.store(live.streams, Ordering::Relaxed);
         self.live_tx_streams
             .store(live.tx_streams, Ordering::Relaxed);
@@ -213,9 +232,9 @@ impl TransportControl {
                 .then(|| self.live_ms_x100.load(Ordering::Relaxed) as f64 / 100.0),
             at_floor: self.live_at_floor.load(Ordering::Relaxed),
             at_ceiling: self.live_at_ceiling.load(Ordering::Relaxed),
-            rate: match self.live_rate.load(Ordering::Relaxed) {
+            rung: match self.live_rung1.load(Ordering::Relaxed) {
                 0 => None,
-                r => Some(r),
+                v => Some(v - 1),
             },
             streams: self.live_streams.load(Ordering::Relaxed),
             tx_streams: self.live_tx_streams.load(Ordering::Relaxed),
@@ -223,16 +242,11 @@ impl TransportControl {
     }
 }
 
-/// 采样率 -> 阶梯格号。`None` = 这个速率不在阶梯上。
-///
-/// **刻意不做就近吸附**：找不到就是找不到，调用方得决定怎么办。
-/// 吸附会让一个不存在的档静默变成一个存在的档，而 UI 显示的还是原来那个。
-pub(crate) fn rung_of_rate(rate: u32) -> Option<u32> {
-    audiohub_net::media::AUTO_RATES
-        .iter()
-        .position(|&r| r == rate)
-        .map(|i| i as u32)
-}
+// ⚠ 这里**曾经**有一个 `rung_of_rate(rate) -> Option<u32>`。位深进阶梯之后
+// 它必须消失：48000 在 `LADDER` 上出现三次（32f / 24 / 16），**采样率不再唯一
+// 标识一档**。留着它的后果不是编译错误，而是「48 kHz/24 bit 被查成 48 kHz/32f」
+// 这类静默错档。要反查格号请用 `audiohub_net::media::rung_of(rate, depth)`，
+// 它同样**不做就近吸附**：查不到就是查不到，调用方自己决定怎么办。
 
 #[cfg(test)]
 mod tests {
@@ -241,18 +255,33 @@ mod tests {
     /// 发布之后**立刻**读得到——中间没有任何一步需要重启、重连或等下一拍。
     #[test]
     fn a_published_choice_is_readable_immediately() {
+        use audiohub_core::dsp::WireDepth;
         let c = TransportControl::default();
-        assert_eq!(c.quality_rate(), None, "默认是 AUTO");
+        assert_eq!(c.quality_rung(), None, "默认是 AUTO");
         assert_eq!(c.latency_target(), LatencyTarget::Auto);
 
         c.publish_latency(LatencyTarget::TotalMs(200));
-        c.publish_quality(QualityTarget::Rate(24_000));
-        assert_eq!(c.quality_rate(), Some(24_000));
+        c.publish_quality(QualityTarget::Fixed(4)); // 24 kHz / 16 bit
+        assert_eq!(c.quality_rung(), Some(4));
+        assert_eq!(
+            c.quality_rung().map(audiohub_net::media::rung_format),
+            Some(audiohub_net::media::WireFormat { rate_hz: 24_000, depth: WireDepth::S16 })
+        );
         assert_eq!(c.latency_target(), LatencyTarget::TotalMs(200));
+
+        // **格号 0 是一个合法档，不是 AUTO。** 存的是 `格号 + 1` 正是为了它；
+        // 少了那个偏移，用户选阶梯顶端（48 kHz/32f）会被读成 AUTO，
+        // 而界面照旧显示「32 bit 浮点」——本项目栽过五次的那个形态。
+        c.publish_quality(QualityTarget::Fixed(0));
+        assert_eq!(c.quality_rung(), Some(0), "格号 0 被当成了 AUTO");
+        assert_eq!(
+            c.quality_rung().map(audiohub_net::media::rung_format),
+            Some(audiohub_net::media::WireFormat { rate_hz: 48_000, depth: WireDepth::F32 })
+        );
 
         c.publish_latency(LatencyTarget::Auto);
         c.publish_quality(QualityTarget::Auto);
-        assert_eq!(c.quality_rate(), None);
+        assert_eq!(c.quality_rung(), None);
         assert_eq!(c.latency_target(), LatencyTarget::Auto);
     }
 
@@ -279,7 +308,7 @@ mod tests {
 
         // 质量档单独变化同样算「变了」。
         c.set_servo_frames(Some(3));
-        c.publish_quality(QualityTarget::Rate(48_000));
+        c.publish_quality(QualityTarget::Fixed(2));
         assert_eq!(c.servo_frames(), None, "质量档变了也要作废旧输出");
     }
 
@@ -309,7 +338,7 @@ mod tests {
             achieved_ms: Some(88.25),
             at_floor: true,
             at_ceiling: false,
-            rate: Some(32_000),
+            rung: Some(3),
             streams: 3,
             tx_streams: 2,
         };
@@ -317,37 +346,41 @@ mod tests {
         assert_eq!(c.live(), want);
     }
 
-    /// 阶梯外的速率**不被吸附**。吸附会让「用户选了一个不存在的档」静默变成
-    /// 「daemon 执行了一个别的档」，而 UI 两边都不会报错。
-    #[test]
-    fn a_rate_outside_the_ladder_is_refused_not_snapped() {
-        for (rate, want) in [(48_000u32, Some(0u32)), (32_000, Some(1)), (24_000, Some(2)), (16_000, Some(3))] {
-            assert_eq!(rung_of_rate(rate), want, "{rate} 的格号不对");
-        }
-        for bad in [0, 1, 8_000, 44_100, 47_999, 96_000] {
-            assert_eq!(rung_of_rate(bad), None, "{bad} 不在阶梯上，不该给出格号");
-        }
-    }
-
-    /// 每一个**可选**的质量档都能落到一个真实格号上。
+    /// 每一个**可选**的质量档都能落到一个真实格号上，且**格号在阶梯范围内**。
     ///
-    /// 这条把 `transport.rs`（契约）与 `AUTO_RATES`（能力）扣在一起：
+    /// 这条把 `audiohub_ipc::transport`（契约）与 `LADDER`（能力）扣在一起：
     /// 契约里多出一档而阶梯里没有，这条就红——而没有它，那一档会被
-    /// `settings.set` 收下、写盘、然后在 `rung_of_rate` 处**静默**回落。
+    /// `settings.set` 收下、写盘、然后在发送侧被 `.min(LADDER.len()-1)`
+    /// **静默**钳回去。
     #[test]
     fn every_selectable_quality_stop_maps_onto_a_real_rung() {
+        use audiohub_net::media::LADDER;
+        let mut hit = vec![false; LADDER.len()];
         for stop in audiohub_ipc::transport::quality_stops() {
             let Some(t) = QualityTarget::parse(&stop.id) else {
                 assert!(!stop.available, "{} 可选却 parse 不了", stop.id);
                 continue;
             };
-            if let QualityTarget::Rate(r) = t {
+            if let QualityTarget::Fixed(r) = t {
                 assert!(
-                    rung_of_rate(r).is_some(),
-                    "质量档 {} 的速率 {r} 不在 AUTO_RATES 上：选中它会被静默忽略",
+                    (r as usize) < LADDER.len(),
+                    "质量档 {} 落在格号 {r}，超出阶梯长度 {}：选中它会被静默钳回去",
+                    stop.id,
+                    LADDER.len()
+                );
+                hit[r as usize] = true;
+                // 格号解回来的格式必须与档表里报的 (rate, depth) 一致，
+                // 否则用户选 24 bit、线上发 16 bit，而两处各自自洽。
+                let f = LADDER[r as usize];
+                assert_eq!(Some(f.rate_hz), stop.rate, "{} 的采样率对不上", stop.id);
+                assert_eq!(
+                    Some(f.depth.as_str().to_string()),
+                    stop.depth,
+                    "{} 的位深对不上",
                     stop.id
                 );
             }
         }
+        assert!(hit.iter().all(|&b| b), "阶梯上有格子没有任何一个质量档能选中：{hit:?}");
     }
 }

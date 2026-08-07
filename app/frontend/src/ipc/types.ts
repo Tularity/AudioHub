@@ -194,6 +194,19 @@ export interface QualityStats {
    */
   wire_rate_hz?: number;
   /**
+   * 线上位深：`"s16" | "s24" | "f32"`。
+   *
+   * 与 `wire_rate_hz` 成对：位深进阶梯之后，**只写采样率的读数是有歧义的**
+   * （`48 kHz` 说不出它是 16 位还是 24 位，而两档都存在、码率差 50 %）。
+   *
+   * ⚠ `undefined` / `""` = 旧 daemon 或读不到 ⇒ 「—」。**不许兜底成 `"s16"`**：
+   * 位深进阶梯之前线上恒为 16 位，所以那个兜底今天碰巧总是对的，正因为碰巧
+   * 总是对，它会一直躺着直到某天不对了也没有一处会报错。
+   *
+   * ⚠ 也**不许从 codec / 码率反推**：那是在前端复刻一份 daemon 的映射表。
+   */
+  wire_depth?: string;
+  /**
    * "excellent" | "good" | "fair" | "poor" | **"unknown"**。
    *
    * `"unknown"` = 等级不成立（某个分量还没读数，在场分量的 min 只是上界）。
@@ -357,7 +370,19 @@ export interface SessionInfo {
   dir: SessionDir;
   origin?: 'hal' | 'peer' | string | null;
   hal_device?: string | null;
+  /** 这条流**线上的采样率**（Hz）。`0` / `undefined` = 两侧都报不出。 */
   sample_rate?: number;
+  /**
+   * 这条流**线上的位深**：`"s16" | "s24" | "f32"`。
+   *
+   * 与 `sample_rate` **成对**。呈现时两个维度必须一起写全：位深进阶梯之后
+   * `线上 48000 Hz` 一句话对应阶梯上**三档**（f32 / s24 / s16，码率差到 2 倍），
+   * 为了短而只写一个，就回到了这次改动要消灭的那个歧义。
+   *
+   * ⚠ `undefined` / `""` = 两侧都报不出 ⇒ 只写采样率。**不许兜底成 `"s16"`**，
+   * 也**不许从码率反推**——理由与 `QualityStats.wire_depth` 逐字相同。
+   */
+  wire_depth?: string;
   channels?: number;
   stats?: SessionStats | null;
   /**
@@ -375,12 +400,33 @@ export interface SessionInfo {
  * 把它们在服务端就滤掉，用户看到的是一条短滑条，而「本机缺 libopus」这件事无从得知。
  */
 export interface QualityStop {
-  /** 'auto' | 'opus64' | 'opus128' | 'opus256' | 'pcm16k' | 'pcm24k' | 'pcm32k' | 'pcm48k' */
+  /**
+   * `'auto' | 'opus64' | 'opus128' | 'opus256'`，或一个 PCM 档 id。
+   *
+   * PCM 档 id 把**两个维度都写出来**：`pcm<kHz>k<位深>`，位深是 `16` / `24` /
+   * `32f`（`pcm16k16` / `pcm48k24` / `pcm48k32f` …）。
+   * 位深进阶梯之前的 id 只写采样率（`pcm48k`），而「PCM 16 kHz」极易被读成
+   * 「16 位」。那批旧 id 现在**不再被翻译**：兼容层已整层删除，daemon 的
+   * `QualityTarget::parse` 对认不出的串一律返回 `None`，由 `StoredDir::sanitize`
+   * 在装载时一次性重置为默认，并经 `quality_reset_from` 把这件事带到 UI 说明。
+   */
   id: string;
-  /** 码率（kbps）。'auto' 没有。 */
+  /**
+   * **音频**码率（kbps）= 采样率 × 位深，单声道。`'auto'` 没有。
+   *
+   * ⚠ 不含协议开销。深档在线上按 5 ms 分包，每 10 ms 付两份包头 + 两份 AEAD
+   * 标签，实测带宽会高于这个数——那不是 bug。
+   */
   kbps?: number | null;
   /** 采样率（Hz）。Opus 档没有。 */
   rate?: number | null;
+  /**
+   * 线上位深：`'s16' | 's24' | 'f32'`。Opus / AUTO 没有。
+   *
+   * **不许从 `id` 里解析它**：id 的拼法是给人看的，位深是数据。解析 id 就是在
+   * 前端复刻一份格式表，两处一漂没有任何地方会报错。
+   */
+  depth?: string | null;
   /** false = 画出来但选不中。 */
   available: boolean;
   /** 'opus' = 需要 libopus，本次构建没有链接。 */

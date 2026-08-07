@@ -25,6 +25,14 @@ use audiohub_ipc::{methods, Mode, KIND_SPK, SOURCE_TONE};
 use crate::halbridge::HalBridgeMode;
 use crate::{ipcserv, lk, start_daemon, DaemonCfg, DaemonHandle};
 
+/// 阶梯格号的助记名。位深进阶梯之后 `LADDER` 是六格（rung 0 = 48 kHz/32f 最好），
+/// 用字面量写会在下次加档时静默错位——而错位的表现是「测试仍然绿，只是测了
+/// 另一档」。
+const RUNG_48K_16: u32 = 2;
+const RUNG_32K: u32 = 3;
+const RUNG_24K: u32 = 4;
+const RUNG_16K: u32 = 5;
+
 struct Node {
     h: DaemonHandle,
     dir: PathBuf,
@@ -144,12 +152,16 @@ impl Node {
         format!("127.0.0.1:{}", self.h.control_port)
     }
 
-    /// **发送侧执行器**的固定档：这条流的 `TransportControl` 里那份采样率。
+    /// **发送侧执行器**的固定档：这条流的 `TransportControl` 里那个**格号**。
     /// `None` = AUTO（阶梯当家）。
-    fn tx_quality_rate(&self) -> Option<u32> {
+    ///
+    /// 位深进阶梯之前这里存的是采样率。改存格号的理由见 `TransportControl`：
+    /// 一档现在是 `(采样率, 位深)` 二元组，两个原子量之间会撕裂出一个阶梯上
+    /// 根本不存在的组合。
+    fn tx_quality_rung(&self) -> Option<u32> {
         crate::snapshot_sessions(self.h.inner_for_test())
             .iter()
-            .find_map(|e| e.tx.as_ref().and_then(|t| t.transport.quality_rate()))
+            .find_map(|e| e.tx.as_ref().and_then(|t| t.transport.quality_rung()))
     }
 
     /// **接收侧执行器**的伺服输出（帧）。`None` = AUTO / 还没算出来。
@@ -182,6 +194,83 @@ impl Node {
             .iter()
             .find_map(|s| s["sample_rate"].as_u64())
             .map(|v| v as u32)
+    }
+
+    /// 界面读到的**线上位深**：`SessionInfo.wire_depth`。
+    /// `""` = 两侧都报不出（**不是 s16**）。
+    fn session_wire_depth(&self) -> Option<String> {
+        self.ok(methods::SESSION_LIST, json!({}))
+            .as_array()?
+            .iter()
+            .find_map(|s| s["wire_depth"].as_str())
+            .map(str::to_string)
+    }
+
+    /// One numeric field out of the first session's `stats`, **through IPC**.
+    ///
+    /// Going through `session.list` rather than reading the counters directly
+    /// is load-bearing here: the whole defect being fixed was that
+    /// `SessionStats.wire_bytes` was never assigned on the send side. A test
+    /// that read `TxShared` directly would have been green throughout.
+    fn stat_f64(&self, key: &str) -> Option<f64> {
+        self.ok(methods::SESSION_LIST, json!({}))
+            .as_array()?
+            .iter()
+            .find_map(|s| s["stats"][key].as_f64())
+    }
+
+    fn stat_u64(&self, key: &str) -> Option<u64> {
+        self.ok(methods::SESSION_LIST, json!({}))
+            .as_array()?
+            .iter()
+            .find_map(|s| s["stats"][key].as_u64())
+    }
+
+    /// Two `stats` counters out of **one** `session.list` call.
+    ///
+    /// Reading them in two calls skews the ratio by however many packets went
+    /// out in between — about 1% per call gap here, which is the same order as
+    /// the framing overhead the byte account is meant to detect. One snapshot
+    /// removes the skew and lets the tolerance be tight enough to matter.
+    fn stat_pair_u64(&self, a: &str, b: &str) -> Option<(u64, u64)> {
+        self.ok(methods::SESSION_LIST, json!({}))
+            .as_array()?
+            .iter()
+            .find_map(|s| Some((s["stats"][a].as_u64()?, s["stats"][b].as_u64()?)))
+    }
+
+    /// Steady-state payload bytes per delivered 10 ms frame, measured on **this**
+    /// node's `wire_bytes` and this node's frame count.
+    ///
+    /// Works in both directions, which is the point: the send side has no
+    /// jitter buffer, so frames are counted from `sent_packets` and the wire
+    /// packets-per-frame of the rung in force. Expected values are 960 / 1440 /
+    /// 1920 B for s16 / s24 / f32 at 48 kHz.
+    fn tx_wire_bytes_per_frame(&self, window: Duration) -> Option<f64> {
+        let (b0, p0) = self.stat_pair_u64("wire_bytes", "sent_packets")?;
+        std::thread::sleep(window);
+        let (b1, p1) = self.stat_pair_u64("wire_bytes", "sent_packets")?;
+        let pkts = p1.checked_sub(p0)?;
+        // A deep rung splits each 10 ms frame into two wire packets, so packets
+        // alone do not equal frames; normalise by the split of the live rung.
+        let parts = audiohub_net::media::rung_format(self.tx_rung()?).wire_packets_per_frame() as u64;
+        let frames = pkts / parts.max(1);
+        if frames < 50 {
+            return None;
+        }
+        Some(b1.checked_sub(b0)? as f64 / frames as f64)
+    }
+
+    /// 音质原料里的位深：`QualityStats.wire_depth`（本机侧优先，回落对端回传）。
+    fn quality_wire_depth(&self) -> Option<String> {
+        self.ok(methods::SESSION_LIST, json!({}))
+            .as_array()?
+            .iter()
+            .find_map(|s| {
+                let st = &s["stats"];
+                let q = st["quality"].as_object().or_else(|| st["peer_quality"].as_object())?;
+                q.get("wire_depth")?.as_str().map(str::to_string)
+            })
     }
 
     /// 音质那一格的两个数：`(wire_rate_hz, bandwidth_hz)`。
@@ -217,6 +306,45 @@ impl Node {
         crate::snapshot_sessions(self.h.inner_for_test())
             .iter()
             .find_map(|e| e.rx.as_ref().map(|rx| lk(&rx.jbs).pushes))
+    }
+
+    /// **真的落在线上的载荷字节数**（累计，AEAD 解密后的明文长度之和）。
+    ///
+    /// 这是位深生效的**唯一硬证据**。上面 `session_wire_depth` 那一族读的全是
+    /// 包头里对端**自称**的位深——发送侧把包头写对、载荷写错时它们一条都不会红
+    /// （包头是 `Codec::for_depth(fmt.depth)`，与 `encode_pcm_into` 用的是同一个
+    /// `fmt`，但那两处可以各自被改坏）。
+    fn rx_payload_bytes(&self) -> Option<u64> {
+        crate::snapshot_sessions(self.h.inner_for_test())
+            .iter()
+            .find_map(|e| e.rx.as_ref().map(|rx| lk(&rx.stats).rx.summary(1.0).bytes))
+    }
+
+    /// 这条 daemon 上任意一条接收流的 JB 已经交付出去多少**帧**（10 ms 音频）。
+    fn jb_popped(&self) -> Option<u64> {
+        crate::snapshot_sessions(self.h.inner_for_test())
+            .iter()
+            .find_map(|e| e.rx.as_ref().map(|rx| lk(&rx.jbs).jb.popped))
+    }
+
+    /// **每 10 ms 音频对应多少载荷字节** —— 由真实字节数导出，与包头无关。
+    ///
+    /// 拿 `jb.popped`（交付出去的帧数）而不是墙钟做分母：这样测量窗口里的调度
+    /// 抖动被自动归一掉，判据变成「同样一段音频，线上花了多少字节」——那正是
+    /// 位深这一维**唯一**的物理含义。
+    ///
+    /// 48 kHz 三档的期望值是 960 / 1440 / 1920，两两相差 1.5× 与 2×，
+    /// ±15 % 的容差下三个区间互不重叠。
+    fn wire_bytes_per_frame(&self, window: Duration) -> Option<f64> {
+        let (b0, p0) = (self.rx_payload_bytes()?, self.jb_popped()?);
+        std::thread::sleep(window);
+        let (b1, p1) = (self.rx_payload_bytes()?, self.jb_popped()?);
+        let frames = p1.checked_sub(p0)?;
+        // 窗口里至少要有半秒音频，否则分母太小、一个包的取样错位就能歪 10 %。
+        if frames < 50 {
+            return None;
+        }
+        Some(b1.checked_sub(b0)? as f64 / frames as f64)
     }
 
     /// 伺服导出的**运行时证据**（`daemon.status.latency_guard.servo`）。
@@ -307,13 +435,33 @@ fn moving_the_quality_slider_really_changes_the_wire_rate() {
     // 任何事——一条永远是 `None` 的读数会让每一次比较都「通过」。
     eventually("a to have a sending stream", || a.tx_rung().is_some());
 
-    // AUTO_RATES = [48000, 32000, 24000, 16000] ⇒ 格号 0..3。
-    for (id, want_rung) in
-        [("pcm16k", 3u32), ("pcm24k", 2), ("pcm32k", 1), ("pcm48k", 0)]
-    {
+    // `LADDER` = [48k/32f, 48k/24, 48k/16, 32k/16, 24k/16, 16k/16] ⇒ 格号 0..5。
+    // **深档也要走一遍**：只测老四档的话，「新档被 `.min(3)` 静默钳回去」这个
+    // 地雷会原样活下来（那正是位深进阶梯之前 `engine.rs` 里写死的那个字面量）。
+    for (id, want_rung) in [
+        ("pcm16k16", RUNG_16K),
+        ("pcm24k16", RUNG_24K),
+        ("pcm32k16", RUNG_32K),
+        ("pcm48k16", RUNG_48K_16),
+        ("pcm48k24", 1u32),
+        ("pcm48k32f", 0),
+    ] {
         a.set_transport(&b.fingerprint(), "send", "quality", id);
         eventually(&format!("tx rung to become {want_rung} for {id}"), || {
             a.tx_rung() == Some(want_rung)
+        });
+        // ⚠ **`tx_rung()` 一个人证明不了线上真的变了。** 它读的是 `TxShared.rung`
+        // 那个原子量，而 `tx_loop` 在**读它之后**还有一道钳位
+        // （`.min(LADDER.len()-1)`）。钳位写死成字面量时（位深进阶梯之前正是
+        // `.min(3)`），这个原子量照样是 5，而线上跑的是格号 3 ——
+        // 只断言原子量的测试对那颗地雷**完全免疫**（实测：把钳位改回 `.min(3)`，
+        // 只有本断言的版本照样绿）。
+        //
+        // 所以判据落在**对端从包头读出来的东西**上：那是线路的事实。
+        let want = audiohub_net::media::rung_format(want_rung);
+        eventually(&format!("b 从包头读出 {id} 的格式"), || {
+            b.session_wire_rate() == Some(want.rate_hz)
+                && b.session_wire_depth().as_deref() == Some(want.depth.as_str())
         });
     }
 }
@@ -343,7 +491,14 @@ fn the_number_in_the_quality_stop_id_is_the_number_ipc_reports() {
     let _id = tone_session(&a, &b);
     eventually("a to have a sending stream", || a.tx_rung().is_some());
 
-    for (id, khz) in [("pcm16k", 16u32), ("pcm24k", 24), ("pcm32k", 32), ("pcm48k", 48)] {
+    for (id, khz) in [
+        ("pcm16k16", 16u32),
+        ("pcm24k16", 24),
+        ("pcm32k16", 32),
+        ("pcm48k16", 48),
+        ("pcm48k24", 48),
+        ("pcm48k32f", 48),
+    ] {
         a.set_transport(&b.fingerprint(), "send", "quality", id);
         let want = khz * 1000;
         eventually(&format!("session.list 的 sample_rate 变成 {want} （档 {id}）"), || {
@@ -360,7 +515,7 @@ fn the_number_in_the_quality_stop_id_is_the_number_ipc_reports() {
 
     // 音质原料那一份（一级界面读 `wire_rate_hz`、明细读 `bandwidth_hz`）。
     // 它只在**接收**侧算得出来，所以看 b 那台：a 在发，b 在收。
-    a.set_transport(&b.fingerprint(), "send", "quality", "pcm32k");
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm32k16");
     eventually("b 侧音质原料里的采样率变成 32000", || {
         b.session_quality_rate() == Some((32_000, 16_000))
     });
@@ -370,6 +525,316 @@ fn the_number_in_the_quality_stop_id_is_the_number_ipc_reports() {
     assert_ne!(
         rate, bw,
         "采样率与带宽成了同一个数——两者在界面上都写作 kHz，混同即 2026-08-04 那次误读",
+    );
+}
+
+/// **接线 ③：位深真的走上了线，而且是收方从包头读出来的。**
+///
+/// 这一条是位深进阶梯的承重测试。它比「格号变了」严格得多：格号是发送侧的
+/// 内部序号，`sample_rate` 在三个 48 kHz 档上**完全相同** —— 只有位深这一个
+/// 维度会变。若线上仍然发 s16 而只有设置里写着 24 bit，
+/// 这条会红在「收方读出来的位深」。
+///
+/// # ⚠ 只读包头是不够的——这条测试自己曾栽在这里
+///
+/// 下面第 1、3 条注入改的是包头 / 格号，收方从包头读出的位深因此变了 ⇒ 红。
+/// 但**镜像的那次注入是绿的**：把 `encode_pcm_into` 的位深参数改成 `S16`
+/// 而**包头保持诚实**（`Codec::for_depth(fmt.depth)` 一字不动），于是包头写
+/// 「s24」、载荷是 s16 字节 —— 整条判据链（`c.last_depth` ← `h.codec.wire_depth()`
+/// → `SessionInfo.wire_depth` / `QualityStats.wire_depth`）**全部只读包头**，
+/// 一条断言都不会红，而声音是废的：收方按 s24 解 480 B 得 160 样本，
+/// `160×2 ≠ 480` ⇒ 分包重组整个失效，每 10 ms 只交付 320 样本，
+/// 界面三处却一致显示「48 kHz · 24 bit」。
+///
+/// ⇒ 必须有一条**由真实载荷字节导出**的断言，见下面的 `wire_bytes_per_frame`。
+///
+/// 缺陷注入对照（都实跑过）：
+///   1. `tx_loop` 的 `Codec::for_depth(fmt.depth)` 改回 `Codec::PcmS16le`
+///      ⇒ 红：深档收到的位深仍是 s16；
+///   2. `tx_loop` 的 `encode_pcm_into(..., fmt.depth, ...)` 改成写死
+///      `WireDepth::S16`（包头不动）⇒ 红在**字节账**那一条，且只红在那一条；
+///   3. `engine.rs` 的钳位 `.min(LADDER.len()-1)` 改回 `.min(3)`
+///      ⇒ 红：`pcm16k16`（格号 5）被钳成格号 3，采样率报 32000。
+#[test]
+fn the_bit_depth_really_travels_on_the_wire() {
+    let (a, b) = linked("qdepth");
+    let _id = tone_session(&a, &b); // a 发 -> b 收
+    eventually("a to have a sending stream", || a.tx_rung().is_some());
+    eventually("b to have a receiving stream", || b.jb_target().is_some());
+
+    // 三个 **48 kHz** 档：采样率一模一样，只有位深不同。
+    // 这正是「只看采样率的测试对位深完全免疫」的那一组。
+    // `want_bytes` = 每 10 ms 音频的**明文载荷字节数** = 480 样本 × 位深宽度。
+    for (id, want_depth, want_bytes) in [
+        ("pcm48k16", "s16", 960.0f64),
+        ("pcm48k24", "s24", 1440.0),
+        ("pcm48k32f", "f32", 1920.0),
+    ] {
+        a.set_transport(&b.fingerprint(), "send", "quality", id);
+        eventually(&format!("b 从包头读出的位深变成 {want_depth}（档 {id}）"), || {
+            b.session_wire_depth().as_deref() == Some(want_depth)
+        });
+        assert_eq!(
+            b.session_wire_rate(),
+            Some(48_000),
+            "档 {id} 的采样率不是 48000 —— 三个深档的采样率必须完全相同",
+        );
+        assert_eq!(
+            b.session_wire_depth().as_deref(),
+            Some(want_depth),
+            "档 {id} 的线上位深不是 {want_depth}",
+        );
+
+        // ---- 字节账：位深生效的唯一硬证据 --------------------------------
+        //
+        // 上面三条读的都是对端**自称**的位深。这一条数的是真的落地的字节，
+        // 与包头没有任何关系：同样一段音频（分母是交付出去的帧数），
+        // 16 / 24 / 32 位分别要花 960 / 1440 / 1920 字节。
+        let mut got = None;
+        eventually(&format!("档 {id} 的载荷字节账稳定下来"), || {
+            got = b.wire_bytes_per_frame(Duration::from_millis(800));
+            got.is_some_and(|v| (v - want_bytes).abs() < want_bytes * 0.15)
+        });
+        let got = got.expect("窗口里必须有音频，否则这条断言等于没测");
+        assert!(
+            (got - want_bytes).abs() < want_bytes * 0.15,
+            "档 {id}（{want_depth}）每帧实测 {got:.0} 字节，应为 {want_bytes:.0} —— \
+             线上字节数与包头声明的位深对不上，声音是废的而界面三处都显示对的",
+        );
+        // 音质原料那一份也要带上位深，且**与 SessionInfo 的那一份一致**。
+        // 两处不一致 = 界面上两格各说各话，而没有任何一处会报错。
+        eventually("音质原料里的位深跟上", || {
+            b.quality_wire_depth().as_deref() == Some(want_depth)
+        });
+        // 发送侧自己也报得出来（它的真值源是格号，不是包头）。
+        assert_eq!(a.session_wire_depth().as_deref(), Some(want_depth), "发送侧的位深读数不对");
+    }
+
+    // 低采样率档必须仍是 16 位：阶梯上不存在「低采样率 + 高位深」的组合。
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm16k16");
+    eventually("回到 16 kHz / 16 bit", || {
+        b.session_wire_rate() == Some(16_000) && b.session_wire_depth().as_deref() == Some("s16")
+    });
+}
+
+/// **The send side reports the payload bytes it actually put on the wire, and
+/// they track the bit depth.**
+///
+/// # The hole this closes
+///
+/// `SessionStats::wire_bytes` is documented as the one hard piece of evidence
+/// that a bit depth took effect — and on the send side it was **never assigned**
+/// (`snapshot_sessions` wrote it only in the `rx` branch). Every `spk/send`
+/// session reported a constant `0`, while the field's own doc comment promised
+/// it was differenceable proof. `the_bit_depth_really_travels_on_the_wire`
+/// covers the same ground for the **receive** side only, so nothing caught this.
+///
+/// The assertion is derived from bytes, not from the header: the numerator is
+/// the payload counter incremented where `send_to` returned `Ok`, and the
+/// denominator is frames. A build that wrote an honest header over a
+/// wrongly-encoded payload still fails here.
+///
+/// Injection checks (both run, see the report):
+///   1. drop `s.wire_bytes = payload_total` from the tx branch of
+///      `snapshot_sessions` (restoring the old behaviour) => red on "stayed 0";
+///   2. make `udp_send_loop` count `slot.buf.len()` into `sent_payload_bytes`
+///      instead of `slot.payload_len` => red on the byte account, because the
+///      per-frame figure picks up the framing overhead.
+#[test]
+fn the_send_side_reports_the_payload_bytes_it_put_on_the_wire() {
+    let (a, b) = linked("txbytes");
+    let _id = tone_session(&a, &b); // a sends -> b receives
+    eventually("a to have a sending stream", || a.tx_rung().is_some());
+
+    // Positive control first: the counter must actually move. Without this, a
+    // build that reports a constant 0 would sail through every ratio below
+    // (0/n == 0/m), which is exactly the shape of the defect being fixed.
+    eventually("a's send-side wire_bytes to become non-zero", || {
+        a.stat_u64("wire_bytes").is_some_and(|v| v > 0)
+    });
+
+    for (id, want_depth, want_bytes) in [
+        ("pcm48k16", "s16", 960.0f64),
+        ("pcm48k24", "s24", 1440.0),
+        ("pcm48k32f", "f32", 1920.0),
+    ] {
+        let depth = audiohub_core::dsp::WireDepth::parse(want_depth).expect("known depth");
+        let want_rung = audiohub_net::media::rung_of(48_000, depth).expect("48 kHz rung");
+        a.set_transport(&b.fingerprint(), "send", "quality", id);
+        eventually(&format!("the wire to settle on {want_depth} for {id}"), || {
+            a.tx_rung() == Some(want_rung)
+        });
+
+        // ±4%, not the ±15% the receive-side test uses. The three rungs are
+        // 1.5x apart so a loose band still separates them — but framing
+        // overhead is only +5.8% (s16) to +7.8% (s24) of the payload, so a
+        // ±15% band cannot tell payload bytes from whole datagrams. Measured
+        // and confirmed: at ±15% an injected `sent_payload_bytes +=
+        // slot.buf.len()` sailed through this test. The counters come from one
+        // snapshot, so the residual noise is ~1 packet in 150 frames.
+        const TOL: f64 = 0.04;
+        let mut got = None;
+        eventually(&format!("the send-side byte account to settle for {id}"), || {
+            got = a.tx_wire_bytes_per_frame(Duration::from_millis(1500));
+            got.is_some_and(|v| (v - want_bytes).abs() < want_bytes * TOL)
+        });
+        let got = got.expect("the window must contain audio, or this asserts nothing");
+        assert!(
+            (got - want_bytes).abs() < want_bytes * TOL,
+            "rung {id} ({want_depth}): the sender put {got:.1} payload bytes on the wire per \
+             10 ms frame, expected {want_bytes:.0}. Either the header says one thing and the \
+             bytes say another, or the counter is measuring datagrams rather than payload.",
+        );
+    }
+}
+
+/// **Both ends count the same thing, and the datagram figure is the larger one.**
+///
+/// The send side used to divide whole datagrams by session age while the
+/// receive side divided plaintext by session age, under one field name. The
+/// same stream therefore read 1525 kbps on one machine and 1458 on the other —
+/// exactly 56 B/packet of header and AEAD tag — and no display could notice,
+/// because both numbers were individually plausible.
+///
+/// Injection check: set `s.wire_bytes = tx.sent_bytes...` (the datagram
+/// counter) in the tx branch => red on the cross-machine payload comparison,
+/// because the sender then reports ~6% more payload than the receiver saw.
+#[test]
+fn the_two_ends_agree_on_what_a_wire_byte_is() {
+    let (a, b) = linked("bytecal");
+    let _id = tone_session(&a, &b); // a sends -> b receives
+    eventually("a to have a sending stream", || a.tx_rung().is_some());
+    eventually("b to have a receiving stream", || b.jb_target().is_some());
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm48k24");
+    eventually("both sides to be carrying payload", || {
+        a.stat_u64("wire_bytes").is_some_and(|v| v > 100_000)
+            && b.stat_u64("wire_bytes").is_some_and(|v| v > 100_000)
+    });
+
+    let (tx_pay, tx_dg) = (a.stat_u64("wire_bytes").unwrap(), a.stat_u64("datagram_bytes").unwrap());
+    let (rx_pay, rx_dg) = (b.stat_u64("wire_bytes").unwrap(), b.stat_u64("datagram_bytes").unwrap());
+
+    // Same numerator on both sides: whatever the sender calls payload, the
+    // receiver decrypts the same count. Loss is possible, so the receiver may
+    // trail; it must not *exceed*, and it must not trail by a framing-sized gap.
+    assert!(rx_pay <= tx_pay, "the receiver saw more payload ({rx_pay}) than was sent ({tx_pay})");
+    let shortfall = (tx_pay - rx_pay) as f64 / tx_pay as f64;
+    assert!(
+        shortfall < 0.02,
+        "the two ends disagree on what `wire_bytes` counts: sender {tx_pay}, receiver {rx_pay} \
+         ({:.1}% apart). A gap this size is a caliber difference (header + tag), not packet loss.",
+        shortfall * 100.0,
+    );
+
+    // The datagram figure is strictly bigger on both sides: header + AEAD tag
+    // are real bytes. Equality means one of the two is being reported twice.
+    assert!(
+        tx_dg > tx_pay,
+        "send side: datagram_bytes ({tx_dg}) must exceed wire_bytes ({tx_pay}) by the framing"
+    );
+    assert!(
+        rx_dg > rx_pay,
+        "recv side: datagram_bytes ({rx_dg}) must exceed wire_bytes ({rx_pay}) by the framing"
+    );
+}
+
+/// **`bitrate_kbps` follows the rung — on BOTH directions, within seconds.**
+///
+/// This is the reported contradiction, made executable. The user switched the
+/// three 48 kHz rungs on a live `spk/send` session and read 1469.2 / 1464.3 /
+/// 1467.0 kbps where the truth was 768 / 1152 / 1536. The bytes on the wire were
+/// correct all along; the metric was a lifetime average and could not move.
+///
+/// So the assertion is not "the number is right once" but "**the three rungs are
+/// separated**", which a lifetime average can never satisfy no matter how long
+/// the test waits. The tolerance is 15%; the rungs are 1.5x and 2x apart, so the
+/// three admissible bands do not overlap.
+///
+/// Injection check: change `s.bitrate_kbps` back to the lifetime form
+/// (`payload_total * 8.0 / age`) on either side => red, since after the first
+/// rung the average is pinned and the second rung's band is unreachable.
+#[test]
+fn the_reported_bitrate_follows_the_rung_in_both_directions() {
+    let (a, b) = linked("brate");
+    let _id = tone_session(&a, &b); // a sends -> b receives
+    eventually("a to have a sending stream", || a.tx_rung().is_some());
+    eventually("b to have a receiving stream", || b.jb_target().is_some());
+
+    // Burn some session time on a rung that is NOT one of the three under test.
+    // A lifetime average over a session that only ever ran the rung being
+    // measured would look correct; this is what makes the average detectable.
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm16k16");
+    eventually("the priming rung to take", || a.tx_rung() == Some(RUNG_16K));
+    std::thread::sleep(Duration::from_secs(3));
+
+    for (id, want_kbps) in [("pcm48k16", 768.0f64), ("pcm48k24", 1152.0), ("pcm48k32f", 1536.0)] {
+        a.set_transport(&b.fingerprint(), "send", "quality", id);
+        for (who, node) in [("sender", &a), ("receiver", &b)] {
+            eventually_within(
+                Duration::from_secs(20),
+                &format!("{who}'s bitrate_kbps to reach the {id} band"),
+                || {
+                    node.stat_f64("bitrate_kbps")
+                        .is_some_and(|v| (v - want_kbps).abs() < want_kbps * 0.15)
+                },
+            );
+            let got = node.stat_f64("bitrate_kbps").expect("a rate must be readable by now");
+            assert!(
+                (got - want_kbps).abs() < want_kbps * 0.15,
+                "{who} reports {got:.1} kbps on rung {id}, expected ~{want_kbps:.0}. \
+                 A reading that will not move between rungs 2x apart is a lifetime average, \
+                 and it is what made three different wire formats read as one number.",
+            );
+        }
+    }
+}
+
+/// **A stale quality id is refused at the RPC, and the wire does not move.**
+///
+/// The compatibility layer this replaces silently translated `pcm32k` to
+/// `pcm32k16`. That translation had to be mirrored in the frontend, one of the
+/// three read paths there forgot to apply it, and the same stored value then
+/// rendered as `pcm32k` on the overview and "PCM 32 kHz - 16 bit" on the detail
+/// page — a real regression manufactured by the compatibility code itself.
+///
+/// So the contract is now: unknown id in, error out, wire untouched. Resetting
+/// a *stored* value to the default happens on load and is reported to the UI
+/// (`peer_transport::StoredDir::sanitize`); an explicit set of an unknown id is
+/// simply refused, because there is no user intent to preserve.
+///
+/// Injection check: put the translation back in `QualityTarget::parse`
+/// (`if s == "pcm32k" { s = "pcm32k16" }`) and this goes red on "was accepted".
+#[test]
+fn a_stale_quality_id_is_refused_and_leaves_the_wire_alone() {
+    let (a, b) = linked("qlegacy");
+    let _id = tone_session(&a, &b);
+    eventually("a to have a sending stream", || a.tx_rung().is_some());
+
+    // Park on a known rung first, so "the wire did not move" is a real claim
+    // rather than a comparison against an unknown starting point.
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm48k24");
+    eventually("the wire to settle on 48 kHz / s24", || {
+        b.session_wire_rate() == Some(48_000) && b.session_wire_depth().as_deref() == Some("s24")
+    });
+
+    for old in ["pcm", "pcm48k", "pcm32k", "pcm24k", "pcm16k"] {
+        let r = a.call(
+            methods::PEERS_SET_TRANSPORT,
+            json!({ "peer": b.fingerprint(), "dir": "send", "quality": old }),
+        );
+        assert!(
+            r.is_err(),
+            "stale id {old} was accepted; the silent translation is back and the UI can \
+             once again draw a stop the daemon never executed"
+        );
+    }
+
+    // Nothing the refusals touched: still the rung we parked on.
+    assert_eq!(b.session_wire_rate(), Some(48_000), "a refused set still moved the wire");
+    assert_eq!(
+        b.session_wire_depth().as_deref(),
+        Some("s24"),
+        "a refused set still moved the wire"
     );
 }
 
@@ -384,15 +849,15 @@ fn a_fixed_quality_rung_is_not_overwritten_by_the_auto_ladder() {
     let _id = tone_session(&a, &b);
     eventually("a to have a sending stream", || a.tx_rung().is_some());
 
-    a.set_transport(&b.fingerprint(), "send", "quality", "pcm16k");
-    eventually("the fixed rung to take", || a.tx_rung() == Some(3));
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm16k16");
+    eventually("the fixed rung to take", || a.tx_rung() == Some(RUNG_16K));
 
-    // 跨过好几个 ticker 周期。阶梯若还在跑，干净链路会把格号一路升回 0。
+    // 跨过好几个 ticker 周期。阶梯若还在跑，干净链路会把格号一路升回天花板。
     let deadline = Instant::now() + Duration::from_secs(4);
     while Instant::now() < deadline {
         assert_eq!(
             a.tx_rung(),
-            Some(3),
+            Some(RUNG_16K),
             "固定质量档被 AUTO 阶梯改掉了：界面显示 16 kHz，线上跑的是别的"
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -409,30 +874,34 @@ fn switching_back_to_auto_hands_the_ladder_back_its_authority() {
     let _id = tone_session(&a, &b);
     eventually("a to have a sending stream", || a.tx_rung().is_some());
 
-    // 用 32 kHz（格号 1）而不是 16 kHz（格号 3）：`AutoLadder` 每升一格要 10 个
-    // 干净周期 ≈ 10 s，从格号 3 升回 0 要三次共 ~30 s。测的是「阶梯是否重新掌权」，
-    // 一格足以证明，三格只是在等。
-    a.set_transport(&b.fingerprint(), "send", "quality", "pcm32k");
-    eventually("the fixed rung to take", || a.tx_rung() == Some(1));
+    // 用 32 kHz（天花板下面一格）而不是 16 kHz（最低一格）：`AutoLadder` 每升
+    // 一格要 10 个干净周期 ≈ 10 s，从最低格升回天花板要三次共 ~30 s。
+    // 测的是「阶梯是否重新掌权」，一格足以证明，三格只是在等。
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm32k16");
+    eventually("the fixed rung to take", || a.tx_rung() == Some(RUNG_32K));
     assert_eq!(
-        a.tx_quality_rate(),
-        Some(32_000),
+        a.tx_quality_rung(),
+        Some(RUNG_32K),
         "固定档没有被推给音频线程"
     );
 
     a.set_transport(&b.fingerprint(), "send", "quality", "auto");
     assert_eq!(
-        a.tx_quality_rate(),
+        a.tx_quality_rung(),
         None,
         "切回 AUTO 之后固定档必须**立刻**撤销——等下一拍就是一段说不清归谁管的时间"
     );
-    // 干净回环上阶梯会把格号升回 0（10 个干净周期）。这是「阶梯真的重新在写
-    // `tx.rung`」的唯一证据：只断言 `quality_rate() == None` 的话，一个把阶梯
-    // 永久停掉的实现照样绿。
+    // 干净回环上阶梯会把格号升回**它的天花板**（10 个干净周期）。这是「阶梯
+    // 真的重新在写 `tx.rung`」的唯一证据：只断言 `quality_rung() == None` 的话，
+    // 一个把阶梯永久停掉的实现照样绿。
+    //
+    // ⚠ 目标是 `AUTO_TOP_RUNG` 而**不是 0**：AUTO 不许自己走进深档
+    // （那会让所有 AUTO 用户的带宽静默翻倍）。写 0 的版本会在这里超时——
+    // 这条断言同时是那条纪律的守门人。
     eventually_within(
         Duration::from_secs(30),
-        "the ladder to promote back to rung 0",
-        || a.tx_rung() == Some(0),
+        "the ladder to promote back to its ceiling",
+        || a.tx_rung() == Some(audiohub_net::media::AUTO_TOP_RUNG),
     );
 }
 
@@ -622,7 +1091,7 @@ fn an_unimplemented_quality_rung_is_refused_and_changes_nothing() {
         Some(before.as_str()),
         "一次被拒的写入改动了盘上的值"
     );
-    assert_eq!(a.tx_quality_rate(), None, "被拒的档位泄漏到了音频线程");
+    assert_eq!(a.tx_quality_rung(), None, "被拒的档位泄漏到了音频线程");
 }
 
 /// 档位表以外的毫秒数同样拒收，**不是就近吸附**。
@@ -673,7 +1142,7 @@ fn a_latency_value_off_the_ladder_is_refused() {
 #[test]
 fn the_old_global_stops_are_refused_rather_than_silently_ignored() {
     let a = Node::start("gone");
-    for (k, v) in [("latency", "300"), ("quality", "pcm32k")] {
+    for (k, v) in [("latency", "300"), ("quality", "pcm32k16")] {
         let err = a
             .call(methods::SETTINGS_SET, json!({ k: v }))
             .expect_err(&format!("settings.set 不该再收 '{k}'"));
@@ -755,9 +1224,9 @@ fn changing_transport_settings_keeps_existing_sessions_open() {
 
     for (dir, key, v) in [
         ("send", "latency", "200"),
-        ("send", "quality", "pcm24k"),
+        ("send", "quality", "pcm24k16"),
         ("recv", "latency", "300"),
-        ("recv", "quality", "pcm32k"),
+        ("recv", "quality", "pcm32k16"),
         ("send", "latency", "auto"),
         ("send", "quality", "auto"),
     ] {
@@ -868,6 +1337,7 @@ fn a_peer_reading_without_a_clip_page_does_not_become_excellent() {
         clip_excess_db: None,
         bandwidth_hz: 24_000, // Q3 满带宽
         wire_rate_hz: 48_000, // 线上采样率：与带宽差 2 倍，是两个数
+        wire_depth: "s16".to_string(),
         duplicate: false,
     };
     let unmeasured = crate::grade_peer_quality(&base);
@@ -1004,12 +1474,12 @@ fn a_fixed_choice_is_still_in_force_after_a_restart() {
     call(
         &first,
         methods::PEERS_SET_TRANSPORT,
-        &json!({ "peer": &peer_fp, "dir": "recv", "latency": "300", "quality": "pcm24k" }),
+        &json!({ "peer": &peer_fp, "dir": "recv", "latency": "300", "quality": "pcm24k16" }),
     );
     call(
         &first,
         methods::PEERS_SET_TRANSPORT,
-        &json!({ "peer": &peer_fp, "dir": "send", "latency": "100", "quality": "pcm32k" }),
+        &json!({ "peer": &peer_fp, "dir": "send", "latency": "100", "quality": "pcm32k16" }),
     );
     first.shutdown();
 
@@ -1023,13 +1493,13 @@ fn a_fixed_choice_is_still_in_force_after_a_restart() {
         .find(|p| p["fingerprint"].as_str() == Some(peer_fp.as_str()))
         .expect("peer survived the restart");
     assert_eq!(p["transport"]["recv"]["latency"].as_str(), Some("300"), "重启后收·延迟丢了");
-    assert_eq!(p["transport"]["recv"]["quality"].as_str(), Some("pcm24k"), "重启后收·音质丢了");
+    assert_eq!(p["transport"]["recv"]["quality"].as_str(), Some("pcm24k16"), "重启后收·音质丢了");
     assert_eq!(p["transport"]["send"]["latency"].as_str(), Some("100"), "重启后发·延迟丢了");
-    assert_eq!(p["transport"]["send"]["quality"].as_str(), Some("pcm32k"), "重启后发·音质丢了");
+    assert_eq!(p["transport"]["send"]["quality"].as_str(), Some("pcm32k16"), "重启后发·音质丢了");
     // **盘上真的有这个文件**——只断言回显的话，一个把值留在内存里的实现
     // 在同一个进程内照样全绿。
     let raw = std::fs::read_to_string(dir.join("peer_transport.json")).expect("peer_transport.json");
-    assert!(raw.contains("300") && raw.contains("pcm24k"), "档位没落盘：{raw}");
+    assert!(raw.contains("300") && raw.contains("pcm24k16"), "档位没落盘：{raw}");
     second.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1093,7 +1563,7 @@ fn every_writable_setting_key_is_really_honoured() {
         ),
         (
             "quality",
-            json!("pcm32k"),
+            json!("pcm32k16"),
             &|v: &Value| v.get("quality").cloned().unwrap_or(Value::Null),
         ),
     ];
@@ -1383,7 +1853,7 @@ fn auto_is_distinguishable_from_a_dead_loop_in_the_readout() {
 ///
 /// plan §15 之前这两件事被一个站点级 `transport_live` 糊在一起，UI 的质量
 /// 读数照着 `streams` 说「当前没有正在传输的音频流」——而实测同一时刻
-/// `pcm16k/24k/32k/48k` 分别把线上格号打到 3/2/1/0。一个正在生效的设置被
+/// `pcm16k16/24k16/32k16/48k16` 分别把线上格号打到 5/4/3/2。一个正在生效的设置被
 /// 界面说成「没有作用对象」，在用户那里与「设置没生效」是同一件事。
 ///
 /// 拆成按流之后判据换成**执行器本身**：`SessionStats.latency_target` 只在有
@@ -1396,13 +1866,13 @@ fn the_two_stops_report_the_streams_they_can_actually_act_on() {
     eventually("a to have a sending stream", || a.tx_rung().is_some());
 
     let fp = b.fingerprint();
-    a.set_transport(&fp, "send", "quality", "pcm32k"); // 执行器在 a 的 tx
+    a.set_transport(&fp, "send", "quality", "pcm32k16"); // 执行器在 a 的 tx
     a.set_transport(&fp, "send", "latency", "200"); // 执行器在 b 的 rx
 
     let stats = |n: &Node| n.ok(methods::SESSION_LIST, json!({}))[0]["stats"].clone();
 
     eventually("a's send stream to carry the quality target", || {
-        stats(&a)["quality_target"].as_str() == Some("pcm32k")
+        stats(&a)["quality_target"].as_str() == Some("pcm32k16")
     });
     let sa = stats(&a);
     assert!(
@@ -1530,10 +2000,10 @@ fn the_send_quality_acts_on_the_local_sender_only() {
     let _id = tone_session(&a, &b); // a 有 tx
     eventually("a to have a sending stream", || a.tx_rung().is_some());
 
-    a.set_transport(&b.fingerprint(), "send", "quality", "pcm16k");
-    eventually("the local sender to move to rung 3", || a.tx_rung() == Some(3));
-    assert_eq!(a.tx_quality_rate(), Some(16_000));
-    assert_eq!(b.tx_quality_rate(), None, "对端没有发送流，档位却落到了它身上");
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm16k16");
+    eventually("the local sender to move to the 16 kHz rung", || a.tx_rung() == Some(RUNG_16K));
+    assert_eq!(a.tx_quality_rung(), Some(RUNG_16K));
+    assert_eq!(b.tx_quality_rung(), None, "对端没有发送流，档位却落到了它身上");
     assert_eq!(b.servo()["bad_transport_targets"].as_u64(), Some(0));
 }
 
@@ -1550,11 +2020,11 @@ fn the_recv_quality_lands_on_the_peers_sender() {
     );
     eventually("b to have a sending stream", || b.tx_rung().is_some());
 
-    a.set_transport(&b.fingerprint(), "recv", "quality", "pcm16k");
-    eventually("the peer's sender to move to rung 3", || b.tx_rung() == Some(3));
-    assert_eq!(b.tx_quality_rate(), Some(16_000));
+    a.set_transport(&b.fingerprint(), "recv", "quality", "pcm16k16");
+    eventually("the peer's sender to move to the 16 kHz rung", || b.tx_rung() == Some(RUNG_16K));
+    assert_eq!(b.tx_quality_rung(), Some(RUNG_16K));
     assert_eq!(
-        a.tx_quality_rate(),
+        a.tx_quality_rung(),
         None,
         "本机没有发送流，`recv.quality` 却留在了本地——它在这里无处执行"
     );
@@ -1575,7 +2045,7 @@ fn a_stream_opened_after_the_stops_were_set_starts_with_them_in_force() {
     let (a, b) = linked("late-open");
     // **先**设，此刻一条流都没有 —— 于是这两个档位没有任何作用对象。
     a.set_transport(&b.fingerprint(), "recv", "latency", "300");
-    a.set_transport(&b.fingerprint(), "send", "quality", "pcm16k");
+    a.set_transport(&b.fingerprint(), "send", "quality", "pcm16k16");
     assert!(
         crate::snapshot_sessions(a.h.inner_for_test()).is_empty(),
         "这条测试的前提是设档位时还没有流；有流的话它测的就是别的东西了"
@@ -1592,7 +2062,7 @@ fn a_stream_opened_after_the_stops_were_set_starts_with_them_in_force() {
         a.rx_servo()["target_ms"].as_u64() == Some(300)
     });
     eventually("the freshly opened send stream to carry the stored quality", || {
-        a.tx_quality_rate() == Some(16_000)
+        a.tx_quality_rung() == Some(RUNG_16K)
     });
 }
 
@@ -1737,7 +2207,7 @@ fn a_consumer_mode_machine_refuses_pushed_stops_and_counts_them() {
     let sid = tone_session(&consumer, &provider) as u32;
     eventually("the consumer to have a sending stream", || consumer.tx_rung().is_some());
     // 正向对照：这条流此刻跑在 AUTO 上（阶梯当家），固定档为 None。
-    assert_eq!(consumer.tx_quality_rate(), None);
+    assert_eq!(consumer.tx_quality_rung(), None);
     let before = consumer.servo()["bad_transport_targets"].as_u64().unwrap_or(0);
 
     // 提供者反过来指挥消费者：这正是 §13 不允许的方向。
@@ -1746,14 +2216,14 @@ fn a_consumer_mode_machine_refuses_pushed_stops_and_counts_them() {
         &audiohub_net::secure::SessionMsg::SetTransport {
             stream_id: sid,
             rx_latency: None,
-            tx_quality: Some("pcm16k".into()),
+            tx_quality: Some("pcm16k16".into()),
         },
     );
     eventually("the refusal to be counted", || {
         consumer.servo()["bad_transport_targets"].as_u64().unwrap_or(0) > before
     });
     assert_eq!(
-        consumer.tx_quality_rate(),
+        consumer.tx_quality_rung(),
         None,
         "一台使用端接受了对端塞过来的档位：§13 的互斥线被击穿了"
     );

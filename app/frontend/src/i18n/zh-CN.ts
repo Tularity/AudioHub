@@ -289,7 +289,18 @@ export const zhCN = {
   // 但同一个界面上**设置用采样率、显示用带宽，差 2 倍且都叫 kHz**。
   // 带宽没有丢，它在展开明细里与采样率并排（quality.part.bandwidth.valueWithRate）。
   'metric.quality.rate': '{khz} kHz',
-  'metric.quality.rateWhy': '线上采样率，与你在详情页设的音质档同一个数。可用带宽是它的一半（展开「音质构成」可以看到）。',
+  // 位深进阶梯之后，**只写采样率的读数是有歧义的**：`48 kHz` 说不出它是 16 位
+  // 还是 24 位，而这两档现在都存在、码率差 50%。所以一级格两个维度一起写。
+  //
+  // ⚠ 排版塞不下时**优先保住位深写全**，把等级词移进 title；
+  // 绝不许为了短而只写一个维度——那正好回到本次要消灭的那个歧义。
+  'metric.quality.rateDepth': '{khz} kHz · {depth}',
+  // 位深的三个拼写。**`f32` 写成「32 bit 浮点」而不是「32 bit」**：
+  // 裸的 32 与 32 位整数无法区分，而线上根本没有 32 位整数这一档。
+  'metric.quality.depth.s16': '16 bit',
+  'metric.quality.depth.s24': '24 bit',
+  'metric.quality.depth.f32': '32 bit 浮点',
+  'metric.quality.rateWhy': '线上采样率与位深，与你在详情页设的音质档是同一档。可用带宽是采样率的一半（展开「音质构成」可以看到）；位深决定每个采样点的精度，不影响带宽。',
   'metric.quality.grade.excellent': '优',
   'metric.quality.grade.good': '良好',
   'metric.quality.grade.fair': '一般',
@@ -683,6 +694,13 @@ export const zhCN = {
   // 「未设定」≠ 0，也 ≠ auto。对端没表态时按自动跑，但那与「对端明确选了
   // AUTO」是两件事，混成一个值会让共享侧读出一个对方从未做过的决定。
   'detail.transport.unset': '未设定 · 按自动运行',
+  // 存盘的档位串本 build 不认识时的说明。**必须说出原值**：只说「已重置」
+  // 的话，用户没有任何线索去判断自己当初选的是什么、要不要重新选。
+  //
+  // 这一格的前身是一层静默翻译（旧 id `pcm32k` → `pcm32k16`），它自己制造了
+  // 一个真回归：同一个存盘值在详情页和总览里显示成两种写法。静默重置只是把
+  // 同一个病换个方向——用户的选择消失了而界面处处自洽。所以：重置照做，说出来。
+  'detail.transport.stopReset': '{dir}的{kind}原来存的是「{old}」，这个版本已经没有这一档，已重置为自动。请重新选择。',
   'detail.transport.noStream': '这个方向当前没有音频流，暂无实测读数。',
   'detail.transport.measuring': '正在测量，暂无读数。',
   'detail.transport.liveMs': '实测 {n} ms',
@@ -692,6 +710,15 @@ export const zhCN = {
   // 它此前显示奈奎斯特带宽（24），于是相邻两行是「PCM 48 kHz」与「线上 24 kHz」
   // ——全应用里单位混淆最刺眼的一处。现在两行同量纲，且措辞点名是采样率。
   'detail.transport.liveKhz': '线上采样率 {n} kHz',
+  // 位深进阶梯之后这一行要把两个维度都写出来，理由同 `metric.quality.rateDepth`。
+  // 位深读不到（旧对端）时退回上面那条只写采样率的——**不许猜一个 16 bit 填上**。
+  'detail.transport.liveFormat': '线上格式 {khz} kHz · {depth}',
+  // 两个档位的权威解释（`settings.transport.latencyDesc` / `qualityDesc`）的
+  // 展开开关。§15 把档位搬到详情页时那两条语料的渲染点留在了设置页 ⇒ 成了死键，
+  // 于是「位深是什么、为什么带宽翻倍、AUTO 为什么不会自己上去」界面上没有一处
+  // 说得出。收起态是因为那两段很长，而这张卡的主角是四个控件。
+  'detail.transport.helpShow': '这两个档位是什么？',
+  'detail.transport.helpHide': '收起说明',
 
   'settings.transport.title': '传输',
   'settings.transport.auto': 'AUTO',
@@ -707,7 +734,7 @@ export const zhCN = {
   // ⚠ 这句话是「采样率 / 带宽」这一对的**权威解释**，措辞不能再把两者说成一回事。
   // 旧版写「可调的是采样率，也就是能传过去的音频带宽（上限为采样率的一半）」——
   // 一句里先说「就是」再说「一半」，正是界面上那次 48/24 误读的文字版。
-  'settings.transport.qualityDesc': '这里调的是**线上采样率**：16 kHz 够清晰说话，48 kHz 是全带宽。能传过去的最高音频频率是采样率的**一半**（48 kHz 采样率 ⇒ 24 kHz 带宽），所以卡片上的「音质」显示采样率、展开明细里才是带宽，两个数差一倍是正常的。三档 Opus 尚未实现——照样画在滑条上但选不中，好让「本机为什么没有它」看得见。AUTO 按丢包与抖动在质量阶梯（rung）上自动升降。',
+  'settings.transport.qualityDesc': '这里调的是**线上格式**，一档同时定下两件事：**采样率**（kHz）与**位深**（bit）。\n\n采样率决定能传过去的最高音频频率——上限是采样率的**一半**（48 kHz 采样率 ⇒ 24 kHz 带宽），所以卡片上的「音质」显示采样率、展开明细里才是带宽，两个数差一倍是正常的。16 kHz 够清晰说话，48 kHz 是全带宽。\n\n位深决定每个采样点的精度：16 bit 是 CD 的精度，24 bit 是专业音频设备之间的标准交换精度，32 bit 浮点与本机内部管线同格式、线路这一段不做任何量化。**位深不影响带宽，只影响本底噪声**，一般听不出差别；它在这里是为了让你能选，不是因为你必须选。\n\n⚠ 两个数字容易看混：`16 kHz` 是**采样率**不是位深，`16 bit` 才是位深。所以每一档的标签都把两个维度写全。\n\n档位按码率从低到高排：先把采样率买满 48 kHz，再往上买位深——低采样率配高位深没有意义，那等于用更多字节去描述一段已经被砍掉高频的声音。\n\n三档 Opus 尚未实现——照样画在滑条上但选不中，好让「本机为什么没有它」看得见。AUTO 按丢包与抖动在质量阶梯上自动升降，但**它的上限是 48 kHz · 16 bit**：更深的档带宽翻倍而听感差别听不出来，不该在你没要求时自动发生。',
   'settings.transport.q.auto': 'AUTO',
   // 「64k」→「64 kbps」：**同一条滑条上 Opus 档是码率、PCM 档是采样率**，两种量纲
   // 并排。这是编解码器的惯例（Opus 按码率参数化、PCM 按采样率），改不了，但
@@ -716,10 +743,36 @@ export const zhCN = {
   'settings.transport.q.opus64': 'Opus 64 kbps',
   'settings.transport.q.opus128': 'Opus 128 kbps',
   'settings.transport.q.opus256': 'Opus 256 kbps',
-  'settings.transport.q.pcm16k': 'PCM 16 kHz',
-  'settings.transport.q.pcm24k': 'PCM 24 kHz',
-  'settings.transport.q.pcm32k': 'PCM 32 kHz',
-  'settings.transport.q.pcm48k': 'PCM 48 kHz',
+  // 六档 PCM：**两个维度都写在主标签里**（用户裁定）。
+  //
+  // 业界（Spotify / Apple Music / Qobuz / RAVENNA）一致把档位名写成定性词
+  // （`Lossless` / `Hi-Res`），参数只出现在说明文字里。我们与它们相反，
+  // 三条本项目特有的理由：① 用户明确要求两维写全；② 这条滑条本来就是数字标签
+  // （Opus 档按码率、PCM 档按采样率，两种量纲并排是编解码器的惯例）；
+  // ③ 本项目刚因「数字量纲不写全」栽过一次（设 `pcm48k` 却在卡片看到 24 kHz，
+  // 用户判定「没生效」），当时确立的处置惯例是**写全单位**，不是删掉数字。
+  //
+  // 折中：主标签写参数，副标签（`qSub.*`）写定性词，两条信息都在。
+  'settings.transport.q.pcm16k16': 'PCM 16 kHz · 16 bit',
+  'settings.transport.q.pcm24k16': 'PCM 24 kHz · 16 bit',
+  'settings.transport.q.pcm32k16': 'PCM 32 kHz · 16 bit',
+  'settings.transport.q.pcm48k16': 'PCM 48 kHz · 16 bit',
+  'settings.transport.q.pcm48k24': 'PCM 48 kHz · 24 bit',
+  'settings.transport.q.pcm48k32f': 'PCM 48 kHz · 32 bit 浮点',
+  // 副标签：**只用词，不用数**。
+  //
+  // ⚠ 这里绝对不许再出现第二个 kHz 数字（例如「8 kHz 带宽」）——那正好把
+  // 「设置用采样率、显示用带宽」那次 48/24 误读原样搬进副标签。
+  'settings.transport.qSub.auto': '随链路自动升降',
+  'settings.transport.qSub.pcm16k16': '语音清晰',
+  'settings.transport.qSub.pcm24k16': '语音优先',
+  'settings.transport.qSub.pcm32k16': '均衡',
+  'settings.transport.qSub.pcm48k16': '全带宽（推荐）',
+  'settings.transport.qSub.pcm48k24': '全带宽 · 高精度',
+  // 「不再量化」是可辩护的措辞：管线内部全程 f32，这一档的编解码退化成小端
+  // 字节序搬运，**线路这一段**不做任何量化。它没有承诺端到端无损——
+  // 两端的虚拟设备端点各有自己的位深上限，线路再深也补不回来。
+  'settings.transport.qSub.pcm48k32f': '全带宽 · 不再量化',
   'settings.transport.qBlocked': '本版本暂不支持这一档。',
   'settings.transport.qBlockedOpus': '本次构建未链接 libopus，这一档不可用。',
 
@@ -789,6 +842,10 @@ export const zhCN = {
   'stats.metric.jitter': '抖动',
   'stats.metric.bitrate': '码率',
   'stats.metric.rung': '质量阶梯',
+  // 这个裸数字**需要一句解释**：位深进阶梯之后阶梯从四档变六档，含义静默换了
+  // ——改动前 AUTO 稳态是 0，现在是 2，而 0 成了最高的 48 kHz/32 位浮点。
+  // 同一个位置的同一个数字改了意思，界面上必须有一处说出来。
+  'stats.metric.rungWhy': '质量阶梯上的格号，0 = 最高（48 kHz · 32 bit 浮点），数字越大档位越低。AUTO 的上限是 2（48 kHz · 16 bit），更深的两档只有手动选才会用到。',
   'stats.metric.latency': '延迟',
   'stats.metric.intact': '完整度',
   'stats.unit.pct': '%',
@@ -800,6 +857,11 @@ export const zhCN = {
   // 「本机在用 16k 播放」，而一个 48000 会被读成「质量档没生效」——后者正是这个
   // 字段此前的实际形态：它是硬编码的 48000，无论阶梯掉到哪一档都写 48000。
   'stats.meta.sampleRate': '线上 {v} Hz',
+  // 位深读得到时走这一条：**两个维度一起写**。只写采样率的话，`线上 48000 Hz`
+  // 一句话对应阶梯上三档（48k/f32、48k/s24、48k/s16），码率从 768 到 1536 kbps——
+  // 这正是本轮改动要消灭的那个歧义，只是搬到了统计页。
+  // 位深读不到就退回上面那条（旧 daemon 不发 `wire_depth`），**不猜 16 bit**。
+  'stats.meta.sampleRateDepth': '线上 {v} Hz · {depth}',
   // 两侧都报不出速率（不该发生，但 daemon 此时发 0）。**不显示「0 Hz」，也不兜底
   // 成 48000**：那个兜底就是被修掉的那个 bug。
   'stats.meta.sampleRateNone': '线上采样率 —',
@@ -819,6 +881,14 @@ export const zhCN = {
   'stats.extra.jbDepth': '缓冲 {n} 帧',
   'stats.extra.jbDepthMs': '缓冲 {n} 帧（{ms} ms）',
   'stats.extra.rungChanges': '档位变更 {n} 次',
+  // 位深进阶梯带来的两个**静默降级**。两者的共同点：JB 的丢包率 / 抖动 /
+  // 五个计数器全部一片正常，而声音已经坏了 —— 所以它们各有自己的一格，
+  // 挂在别人身上就等于没有。非零才显示：两个恒为 0 的数占住位置只会训练
+  // 用户忽略这一行。
+  'stats.extra.halfConceal': '半帧补偿 {n} 次',
+  'stats.extra.halfConcealWhy': '高位深档在线上按 5 ms 分成两个包发。这个数是「只到了一半、另一半没来」的次数——那一帧的后半是补出来的。偶发几次听不出来；持续增长说明这条链路丢包，可以把音质档降一格（48 kHz · 16 bit 及以下不分包）。',
+  'stats.extra.formatMismatch': '格式不符 {n} 包',
+  'stats.extra.formatMismatchWhy': '对方在包头里声明的线上格式与它实际发来的字节数对不上，这些包已被丢弃。**非零没有良性解释**：通常是两端版本不一致，请把两台主机都升到同一版本。',
   'stats.extra.verdictPass': '校验通过 {snr} dB',
   'stats.extra.verdictFail': '校验未通过',
   'stats.extra.mixProbes': '混音探针 {n} 路',

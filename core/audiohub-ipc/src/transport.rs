@@ -10,8 +10,10 @@
 //!
 //! # 两个档位的语义**不对称**，这是关键
 //!
-//! - **质量档**是**手段**：它直接指定阶梯上的一格（采样率），发送侧照做。
-//!   选中什么就是什么，没有伺服，也不需要。
+//! - **质量档**是**手段**：它直接指定阶梯上的一格 —— 一个 **(采样率, 线上位深)
+//!   二元组** —— 发送侧照做。选中什么就是什么，没有伺服，也不需要。
+//!   （位深进阶梯之前这里只有采样率，而「线上恒为 16 位」这件事没有任何一处
+//!   代码说得出来。）
 //! - **延迟档是目标，不是手段。** 用户裁定的原话是「区间内固定延迟需要考虑
 //!   实际与对方连接的延迟包含进去等于这个数」——即它是**端到端总延迟**
 //!   （`PipelineLatency.sum_ms`，含 `net_ms` 与对端分项）的目标值，
@@ -119,8 +121,32 @@ impl LatencyTarget {
 
 pub const QUALITY_AUTO: &str = "auto";
 
-/// 本模块出现之前 `settings.json` 里的「PCM」。等价于满速率那一档。
-pub const QUALITY_LEGACY_PCM: &str = "pcm";
+// NOTE (deleted compatibility layer): `QUALITY_LEGACY_PCM` and
+// `QUALITY_LEGACY_IDS` used to translate the pre-bit-depth spellings
+// (`pcm`, `pcm48k`, `pcm32k`, `pcm24k`, `pcm16k`) onto the new rungs. The
+// project has no released users, and the layer manufactured a real regression
+// of its own: the frontend had to mirror the same table, one of the three read
+// paths (`PeerTransport.transportCells`) forgot to apply it, and the same
+// stored value rendered as `pcm32k` on one page and "PCM 32 kHz - 16 bit" on
+// another with nothing to flag the divergence. The identifiers are now the six
+// ladder ids plus `auto`, and an unrecognised string is **rejected** by
+// `QualityTarget::parse` so the caller can reset to the default and say so —
+// see `PeerTransport::sanitize`. Silent translation is what allowed a stored
+// value to keep meaning something the UI never showed.
+
+/// 一格的线上 id：`pcm<kHz>k<位深>`，位深 32 浮点写 `32f`。
+///
+/// 形如 `pcm48k24` / `pcm48k32f`，可正则解析（`^pcm(\d+)k(\d+)(f?)$`）。
+/// **不写成 `pcm48kf32`**：那样「先采样率后位深」的顺序会在浮点档上被打断。
+pub fn quality_stop_id(f: audiohub_net::media::WireFormat) -> String {
+    use audiohub_core::dsp::WireDepth;
+    let tag = match f.depth {
+        WireDepth::S16 => "16",
+        WireDepth::S24 => "24",
+        WireDepth::F32 => "32f",
+    };
+    format!("pcm{}k{}", f.rate_hz / 1000, tag)
+}
 
 /// 一个质量档，连同**它是否真的存在**。
 ///
@@ -131,10 +157,20 @@ pub const QUALITY_LEGACY_PCM: &str = "pcm";
 pub struct QualityStop {
     /// 线上 id，同时是前端查文案的键。
     pub id: String,
-    /// 线速率（kbps）。`None` = AUTO（速率随链路变）。
+    /// **音频**码率（kbps）= `采样率 × 位深`，单声道。`None` = AUTO。
+    ///
+    /// ⚠ 不含协议开销。深档按 5 ms 分包，每 10 ms 付两份包头 + 两份 AEAD 标签，
+    /// 实测带宽会高于这个数——那不是 bug。
     pub kbps: Option<u32>,
     /// 采样率（Hz）。`None` = AUTO 或非 PCM 档。
     pub rate: Option<u32>,
+    /// 线上位深：`"s16" | "s24" | "f32"`。`None` = AUTO 或非 PCM 档。
+    ///
+    /// **前端不许从 `id` 里解析它**。id 的拼法是给人看的，位深是数据；
+    /// 让前端解析 id 就是在前端复刻一份格式表，两处一漂没有任何地方会报错。
+    /// **刻意不报数字 `32`**：`32` 在整数与浮点之间是歧义的。
+    #[serde(default)]
+    pub depth: Option<String>,
     /// 本 build 能不能真的用这一档。
     pub available: bool,
     /// 不可用的原因**标识符**（不是文案——文案在前端 i18n）。
@@ -144,54 +180,57 @@ pub struct QualityStop {
 
 /// 阶梯的**唯一**真值。前端从 `settings.get` 拿它，不自己写一份。
 ///
-/// # 排序：按线速率升序，AUTO 在最左
+/// # 排序：按**音频码率**升序，AUTO 在最左
 ///
-/// 用户要的是「AUTO … 常见档 … PCM」。这里的「常见档」取的是**音频带宽**那条
-/// 众所周知的阶梯（宽带 / 超宽带 / 准全带 / 全带），因为本 build 真正能调的
-/// 就是采样率——`AUTO_RATES = [48000, 32000, 24000, 16000]`，s16 单声道。
+/// 用户要的是「AUTO … 常见档 … PCM」。位深进阶梯之后，这条滑条上的一格是一个
+/// **(采样率, 位深) 二元组**，而不再只是一个采样率——两个维度合并成一条按码率
+/// 排序的阶梯（用户裁定：「只是会因此多出更多档位而已」）。
+///
+/// 表本身是 `audiohub_net::media::LADDER` 的**投影**，不是第二份手写表：
+/// 那里的注释写了排序准则（先把采样率买满 48 kHz，再买位深）与它的依据。
+/// `LADDER` 是 rung 0 最好，这里要滑条从左到右越来越好，所以**倒着投影**。
 ///
 /// Opus 三档来自 plan §5，**一行编解码器都没有**（`docs/audit-open-items.md`
-/// 第 67 行：`Cargo.toml` 无 opus 依赖，发送恒为 `Codec::PcmS16le`）。
-/// 它们在表里但 `available = false`，位置按各自码率排在 PCM 档之下——
-/// 有损压缩在同码率下承载的信息不多于原始 PCM，这是可辩护的排序依据，
-/// 而「Opus 256k 听起来比 16 kHz PCM 好」是个我拿不出测量的主观断言。
+/// 第 67 行：`Cargo.toml` 无 opus 依赖）。它们在表里但 `available = false`，
+/// 位置按各自码率排在 PCM 档之下——有损压缩在同码率下承载的信息不多于原始 PCM，
+/// 这是可辩护的排序依据，而「Opus 256k 听起来比 16 kHz PCM 好」是个我拿不出
+/// 测量的主观断言。
 pub fn quality_stops() -> Vec<QualityStop> {
-    fn pcm(id: &str, rate: u32) -> QualityStop {
-        QualityStop {
-            id: id.to_string(),
-            // s16 单声道：rate × 16 bit。这是**线上真实字节数**，
-            // 不是标称值——载荷就是 `dsp::f32_to_s16le` 的输出。
-            kbps: Some(rate * 16 / 1000),
-            rate: Some(rate),
-            available: true,
-            blocked_by: None,
-        }
-    }
     fn opus(id: &str, kbps: u32) -> QualityStop {
         QualityStop {
             id: id.to_string(),
             kbps: Some(kbps),
             rate: None,
+            depth: None,
             available: false,
             blocked_by: Some("opus".to_string()),
         }
     }
-    vec![
+    let mut out = vec![
         QualityStop {
             id: QUALITY_AUTO.to_string(),
             kbps: None,
             rate: None,
+            depth: None,
             available: true,
             blocked_by: None,
         },
         opus("opus64", 64),
         opus("opus128", 128),
         opus("opus256", 256),
-        pcm("pcm16k", 16_000),
-        pcm("pcm24k", 24_000),
-        pcm("pcm32k", 32_000),
-        pcm("pcm48k", 48_000),
-    ]
+    ];
+    // `LADDER` 是 rung 0 最好 ⇒ 倒序投影出「从左到右越来越好」。
+    for f in audiohub_net::media::LADDER.iter().rev() {
+        out.push(QualityStop {
+            id: quality_stop_id(*f),
+            kbps: Some(f.kbps()),
+            rate: Some(f.rate_hz),
+            depth: Some(f.depth.as_str().to_string()),
+            available: true,
+            blocked_by: None,
+        });
+    }
+    out
 }
 
 /// 用户选的质量档。
@@ -199,15 +238,29 @@ pub fn quality_stops() -> Vec<QualityStop> {
 pub enum QualityTarget {
     /// plan §5：按丢包/抖动在阶梯上升降（既有的 `AutoLadder`）。
     Auto,
-    /// 钉死在这个采样率上，AUTO 阶梯停摆。
-    Rate(u32),
+    /// 钉死在 `LADDER` 的这一格上，AUTO 阶梯停摆。
+    ///
+    /// # 为什么是**格号**而不是 `(采样率, 位深)` 两个值
+    ///
+    /// 音频线程每拍读它。两个独立的值意味着两次读，中间会**撕裂**：
+    /// 瞬间读出一个阶梯上根本不存在的组合（新的 48 kHz 配上还没更新的 16 bit）。
+    /// 存一个格号从根上消灭这个态。
+    Fixed(u32),
 }
 
 impl QualityTarget {
     pub fn as_wire(self) -> String {
         match self {
             QualityTarget::Auto => QUALITY_AUTO.to_string(),
-            QualityTarget::Rate(r) => format!("pcm{}k", r / 1000),
+            QualityTarget::Fixed(r) => quality_stop_id(audiohub_net::media::rung_format(r)),
+        }
+    }
+
+    /// 这一档的线上格式。`None` = AUTO（格式随链路变）。
+    pub fn format(self) -> Option<audiohub_net::media::WireFormat> {
+        match self {
+            QualityTarget::Auto => None,
+            QualityTarget::Fixed(r) => Some(audiohub_net::media::rung_format(r)),
         }
     }
 
@@ -215,26 +268,25 @@ impl QualityTarget {
     /// 它们在 [`quality_stops`] 里可见、可解释，但选不中。
     /// 一个能被 `settings.set` 收下的 `"opus128"` 会让用户以为改成了 Opus，
     /// 而线上照旧是 PCM——正是「一切都报成功，什么都没发生」。
+    ///
+    /// 认不出来的串一律 `None`，**不翻译、不就近吸附**。盘上留着的旧拼写
+    /// （`pcm48k` 那一族）现在走这条：调用方据此重置到默认并让 UI 说明，
+    /// 而不是静默落到某一档——静默翻译正是被删掉的那层兼容代码干的事。
     pub fn parse(s: &str) -> Option<QualityTarget> {
         if s == QUALITY_AUTO {
             return Some(QualityTarget::Auto);
-        }
-        if s == QUALITY_LEGACY_PCM {
-            return Some(QualityTarget::Rate(48_000));
         }
         let stop = quality_stops().into_iter().find(|q| q.id == s)?;
         if !stop.available {
             return None;
         }
-        stop.rate.map(QualityTarget::Rate)
+        let (rate, depth) = (stop.rate?, audiohub_core::dsp::WireDepth::parse(&stop.depth?)?);
+        audiohub_net::media::rung_of(rate, depth).map(QualityTarget::Fixed)
     }
 
     pub fn slider_index(self) -> usize {
         let id = self.as_wire();
-        quality_stops()
-            .iter()
-            .position(|q| q.id == id)
-            .unwrap_or(0)
+        quality_stops().iter().position(|q| q.id == id).unwrap_or(0)
     }
 }
 
@@ -299,27 +351,84 @@ mod tests {
         assert_eq!(sorted, (0..=LATENCY_STOPS_MS.len()).collect::<Vec<_>>());
     }
 
-    /// **本 build 能给的质量档，恰好是 `AUTO_RATES` 那四个采样率。**
+    /// **本 build 能给的质量档，恰好是 `LADDER` 那六个 (采样率, 位深)。**
     ///
     /// 这条把契约钉在能力上而不是钉在一张手写表上：有人往 `quality_stops()`
-    /// 里加一档 `pcm96k`，而 `AUTO_RATES` 里没有 96000，这条就红。
+    /// 里加一档 `pcm96k16`，而 `LADDER` 里没有它，这条就红。
     /// 没有它，多出来的那一档会一路走到 `settings.set` 被收下、被写盘、
-    /// 然后 `rung_of_rate` 找不到它 —— 而那一步是**静默**回落。
+    /// 然后 `rung_of` 找不到它 —— 而那一步是**静默**回落。
+    ///
+    /// ⚠ 位深进阶梯之后**只比采样率是不够的**：48000 在阶梯上出现三次，
+    /// 只比采样率的版本会把「多了一档 48 kHz/20 bit」放过去。
     #[test]
-    fn the_available_stops_are_exactly_the_rates_the_media_plane_has() {
-        use audiohub_net::media::AUTO_RATES;
-        let mut have: Vec<u32> = quality_stops()
+    fn the_available_stops_are_exactly_the_formats_the_media_plane_has() {
+        use audiohub_net::media::LADDER;
+        let mut have: Vec<(u32, String)> = quality_stops()
             .iter()
             .filter(|q| q.available)
-            .filter_map(|q| q.rate)
+            .filter_map(|q| Some((q.rate?, q.depth.clone()?)))
             .collect();
-        have.sort_unstable();
-        let mut want = AUTO_RATES.to_vec();
-        want.sort_unstable();
+        have.sort();
+        let mut want: Vec<(u32, String)> =
+            LADDER.iter().map(|f| (f.rate_hz, f.depth.as_str().to_string())).collect();
+        want.sort();
         assert_eq!(
             have, want,
-            "可选质量档与媒体面的采样率阶梯对不上；多出来的那档会被静默忽略"
+            "可选质量档与媒体面的格式阶梯对不上；多出来的那档会被静默忽略"
         );
+        // 每一档都必须同时报出采样率**与**位深——少一个，前端就得去解析 id。
+        for q in quality_stops().iter().filter(|q| q.available && q.id != QUALITY_AUTO) {
+            assert!(q.rate.is_some(), "{} 没报采样率", q.id);
+            assert!(q.depth.is_some(), "{} 没报位深", q.id);
+            assert!(q.kbps.is_some(), "{} 没报码率", q.id);
+        }
+    }
+
+    /// **每个 id 都把两个维度写全**，且**位深绝不写成裸的 `32`**。
+    ///
+    /// 注入对照：把 `quality_stop_id` 里 `F32 => "32f"` 改成 `"32"`，这条变红。
+    /// 那次改动在界面上的表现是 `pcm48k32`——与「32 位整数」无法区分，
+    /// 而两端根本没有 32 位整数这一档。
+    #[test]
+    fn every_pcm_stop_id_spells_out_both_dimensions() {
+        let re_ok = |id: &str| {
+            let rest = id.strip_prefix("pcm")?;
+            let (khz, depth) = rest.split_once('k')?;
+            khz.parse::<u32>().ok()?;
+            matches!(depth, "16" | "24" | "32f").then_some(())
+        };
+        for q in quality_stops().iter().filter(|q| q.rate.is_some()) {
+            assert!(
+                re_ok(&q.id).is_some(),
+                "{} 不符合 `pcm<kHz>k<16|24|32f>`：两个维度必须都写在 id 里",
+                q.id
+            );
+            assert_ne!(q.id, "pcm48k32", "裸的 32 与 32 位整数无法区分");
+        }
+    }
+
+    /// The pre-bit-depth spellings are gone from the table **and** rejected by
+    /// `parse` — no silent translation survives anywhere.
+    ///
+    /// Injection check: restore the old
+    /// `if s == "pcm48k" { s = "pcm48k16" }` translation in `parse` and this
+    /// goes red on "was silently translated". That translation is what let a
+    /// stored `pcm32k` execute as one rung while a read-only overview drew the
+    /// raw string, with nothing able to notice.
+    #[test]
+    fn the_pre_bit_depth_quality_ids_are_rejected_not_translated() {
+        for old in ["pcm", "pcm48k", "pcm32k", "pcm24k", "pcm16k"] {
+            assert!(
+                !quality_stops().iter().any(|q| q.id == old),
+                "stale id {old} is still in the stop table: the ambiguity moved into the code"
+            );
+            assert_eq!(
+                QualityTarget::parse(old),
+                None,
+                "{old} was silently translated; an unknown stop must be refused so the \
+                 caller can reset to the default and say so in the UI"
+            );
+        }
     }
 
     /// **Opus 三档看得见但选不中。**
@@ -380,8 +489,34 @@ mod tests {
         }
         assert_eq!(
             stops.last().unwrap().id,
-            "pcm48k",
-            "最右必须是满速率 PCM（用户点名 AUTO … PCM）"
+            "pcm48k32f",
+            "最右必须是阶梯顶端（满速率 + 最深位深）"
         );
+    }
+
+    /// 滑条位置：AUTO 在 0，其余各占一格且**互不重叠**；
+    /// 每一档的 `slider_index` 与它在表里的位置一致。
+    ///
+    /// 这条挡的是「`as_wire()` 拼出来的 id 与 `quality_stops()` 里的 id 不一致」
+    /// ——那种情况下 `position()` 找不到，`unwrap_or(0)` 会把**所有**固定档都
+    /// 画在 AUTO 那一格上，而没有任何一处会报错。
+    #[test]
+    fn quality_slider_indices_match_the_table_positions() {
+        let stops = quality_stops();
+        assert_eq!(QualityTarget::Auto.slider_index(), 0, "AUTO 必须在最左");
+        let mut seen = vec![0usize];
+        for (i, q) in stops.iter().enumerate() {
+            let Some(t) = QualityTarget::parse(&q.id) else { continue };
+            assert_eq!(t.slider_index(), i, "{} 的滑条位置与它在表里的位置对不上", q.id);
+            if i > 0 {
+                seen.push(i);
+            }
+        }
+        // 六个 PCM 档 + AUTO 各占一格，没有两个撞在一起。
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "两个质量档撞到了同一个滑条位置");
+        assert_eq!(n, 1 + audiohub_net::media::LADDER.len(), "可选档数与阶梯长度对不上");
     }
 }

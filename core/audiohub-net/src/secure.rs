@@ -137,6 +137,25 @@ pub struct QualityReading {
     /// 并且那条回退路径带着「这是旧对端」的注释，不会扩散到别处。
     #[serde(default)]
     pub wire_rate_hz: u32,
+    /// 对端实际收到的**线上位深**，取自媒体包头的 `codec` 字节。
+    /// 取值 `"s16" | "s24" | "f32"`；`""` = 旧对端/未知。
+    ///
+    /// # 为什么是一等字段，而不是让读方从 codec 推
+    ///
+    /// 理由与上面 `wire_rate_hz` **逐字相同**：今天「从 codec 推位深」算得对，
+    /// **正因为算得对它会一直躺着**。让前端做这一步推导，就是在前端复刻一份
+    /// codec → 位深的映射表；两处一漂**没有任何地方会报错**，界面只会安静地
+    /// 报一个线上从没出现过的位深。
+    ///
+    /// 缺席语义与 `wire_rate_hz` 的 `0` 是同一套：`""` 是「对面没说」，
+    /// **不是「16 位」**。读方**不许**把 `""` 当成 s16 —— 位深进阶梯之前
+    /// 线上恒为 16 位，所以那个猜测今天碰巧是对的，而它正是这个字段要消灭的
+    /// 那种「看起来对、其实是编的」。
+    ///
+    /// ⚠ **不报数字 `32`**：`32` 在整数与浮点之间是歧义的，而位深进阶梯这件事
+    /// 的全部目的就是消歧。
+    #[serde(default)]
+    pub wire_depth: String,
     /// 对端是否判定本流与另一路重复（站点级一票否决，规格 §4.4）。
     #[serde(default)]
     pub duplicate: bool,
@@ -910,6 +929,7 @@ mod wire_compat_tests {
                     clip_excess_db: excess,
                     bandwidth_hz: 24_000,
                     wire_rate_hz: 48_000,
+                    wire_depth: "s24".to_string(),
                     duplicate: true,
                 }),
                 seq_us: 7,
@@ -924,6 +944,9 @@ mod wire_compat_tests {
             assert_eq!((q.plc_ticks, q.silence_ticks, q.popped_ticks), (3, 1, 1000));
             assert_eq!((q.underruns, q.jb_dropped), (2, 4));
             assert_eq!(q.bandwidth_hz, 24_000);
+            // 位深与采样率**各走各的**，两个都得活过线缆。少了位深，
+            // 收方就得从 codec 推一遍——而那份推导是第二处真值源。
+            assert_eq!(q.wire_depth, "s24", "线上位深没活过线缆");
             // **带宽与采样率是两个数，差 2 倍。** 两者必须各自穿过线缆：
             // 若哪天有人把 `wire_rate_hz` 删掉、让读方拿 `bandwidth_hz * 2` 顶替，
             // 今天它仍然算得对（恒等式），但 Q3 一旦换成实测频谱（规格 §4.2 允许）

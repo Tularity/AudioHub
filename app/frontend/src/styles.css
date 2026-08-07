@@ -1256,7 +1256,20 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   align-self: flex-end;
   font-size: 12px; color: var(--text);
   font-variant-numeric: tabular-nums;
+  text-align: right;
 }
+/* 定性副标签：参数在上、定性词在下。业界（Spotify / Apple Music / Qobuz /
+   RAVENNA）一致把定性词放主位；我们按用户裁定把参数放主位，副标签补上另一半。
+   刻意比主标签小一号、暗一档：它是注解，不是第二个可以拿去互相比较的数字。 */
+.stop-slider-sub {
+  display: block;
+  font-size: 11px; color: var(--text-dim);
+  font-weight: 400;
+  line-height: 1.3;
+}
+/* 预览态下副标签也跟着走，但**不加粗**：加粗两行会把「我正在选的」这条信息
+   摊薄成一整块彩色文字，反而看不出重点在哪一行。 */
+.stop-slider-val.previewing .stop-slider-sub { color: var(--accent); opacity: .85; }
 /* 有请求在飞：显示的仍是 daemon 确认过的那一档，只是提示它可能马上要变。 */
 .stop-slider-val.pending { color: var(--text-dim); opacity: .7; }
 /* 拖动中的预览：**看得见 ≠ 已生效**（下发在松手之后）。用主色 + 加粗把
@@ -1702,6 +1715,39 @@ body.is-tauri .gate-drag {
   font-size: 12px; color: var(--accent);
   border-left: 2px solid var(--accent);
   padding: 4px 0 4px 8px; margin: 8px 0 0;
+}
+/* 存盘档位被重置的说明。用告警色而不是 accent：这一条报告的是**用户的选择
+   没了**，与「对端在指挥你」那条（provenance）的性质不同，同色会让它读起来
+   像一句普通的出处说明。 */
+.transport-reset {
+  font-size: 12px; color: var(--warn);
+  border-left: 2px solid var(--warn);
+  padding: 4px 0 4px 8px; margin: 8px 0 0;
+}
+/* 两个档位的权威解释。收起态是默认：那两段各有五六行，常驻会把四个控件挤下屏。
+   开关做成一条低调的文字按钮而不是图标——「这两个档位是什么？」自己就是标签，
+   一个问号图标还得先被认出来。 */
+.transport-help-toggle {
+  background: none; border: none; padding: 2px 0; margin: 4px 0 0;
+  font: inherit; font-size: 12px; color: var(--accent);
+  cursor: pointer; text-align: left; text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+.transport-help-toggle:hover { color: var(--text); }
+.transport-help {
+  margin-top: 6px; padding: 8px 10px;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  border-radius: 8px;
+}
+.transport-help h4 {
+  margin: 8px 0 4px; font-size: 12px; font-weight: 600; color: var(--text);
+}
+.transport-help h4:first-child { margin-top: 0; }
+/* 语料里用 `\n\n` 分段。`pre-wrap` 让那些换行真的换行——否则六段会连成一堵墙，
+   而那两段解释的价值全在分段上（采样率一段、位深一段、排序准则一段…）。 */
+.transport-help p {
+  margin: 0; font-size: 12px; line-height: 1.7; color: var(--text-dim);
+  white-space: pre-wrap;
 }
 
 /* ---- 设置页的只读总览 ---- */

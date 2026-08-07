@@ -12,7 +12,7 @@ import { fmt, sessionFlow, dirLabel } from '../lib/fmt';
 import { useTick } from '../lib/hooks';
 import {
   LATENCY_STAGES, PARALLEL_TAILS, countedTail, coversWholeChain, isLowerBound,
-  latencyValueKey, readLatency, readQuality,
+  latencyValueKey, qualityDepthKey, readLatency, readQuality,
 } from '../lib/metrics';
 import { t, joinPhrases } from '../i18n';
 import type { MsgKey } from '../i18n';
@@ -90,12 +90,57 @@ const METRICS: {
   },
   { key: 'loss', labelKey: 'stats.metric.loss', unitKey: 'stats.unit.pct', val: (i) => i.stats?.loss_pct, fmt: (v) => fmt.pct(v) },
   { key: 'jitter', labelKey: 'stats.metric.jitter', unitKey: 'stats.unit.ms', val: (i) => i.stats?.jitter_ms, fmt: (v) => fmt.ms(v) },
-  { key: 'bitrate', labelKey: 'stats.metric.bitrate', unitKey: 'stats.unit.kbps', val: (i) => i.stats?.bitrate_kbps, fmt: (v) => fmt.kbps(v) },
-  { key: 'rung', labelKey: 'stats.metric.rung', unitKey: 'stats.unit.rung', val: (i) => i.stats?.rung, fmt: (v) => fmt.int(v) },
+  // `?? undefined`：`bitrate_kbps` 是滑动窗口，窗口不够长时是 `null`。
+  // 两者在这里都该画成「—」，而 `null` 不是本表的缺席表示。
+  { key: 'bitrate', labelKey: 'stats.metric.bitrate', unitKey: 'stats.unit.kbps', val: (i) => i.stats?.bitrate_kbps ?? undefined, fmt: (v) => fmt.kbps(v) },
+  {
+    key: 'rung',
+    labelKey: 'stats.metric.rung',
+    unitKey: 'stats.unit.rung',
+    val: (i) => i.stats?.rung,
+    fmt: (v) => fmt.int(v),
+    // 位深进阶梯之后**这个裸数字的含义静默换了**：改动前阶梯只有四档采样率，
+    // AUTO 的稳态是 `0`；现在阶梯是六档 (采样率, 位深)，AUTO 的稳态是 `2`
+    // （`AUTO_TOP_RUNG`），而 `0` 变成了 48 kHz/32 位浮点。同一个位置、同一个
+    // 数字、不同的意思，界面上一个字都没说。所以把它对应的格式写进 title——
+    // 拿的是这条流**实测**的两个维度，不是按格号反查一张前端自己的表。
+    titleOf: (info) => {
+      const k = qualityDepthKey(info.wire_depth);
+      const hz = info.sample_rate;
+      if (typeof hz !== 'number' || hz <= 0) return t('stats.metric.rungWhy');
+      const f = k
+        ? t('stats.meta.sampleRateDepth', { v: fmt.count(hz), depth: t(k) })
+        : t('stats.meta.sampleRate', { v: fmt.count(hz) });
+      return `${t('stats.metric.rungWhy')}\n\n${f}`;
+    },
+  },
 ];
 
 function peerLabel(info: SessionInfo): string {
   return info.peer_name || String(info.peer_fingerprint || '').slice(0, 8);
+}
+
+/**
+ * 会话头那一格的**线上格式**：采样率 + 位深，两个维度一起写。
+ *
+ * # 为什么这一格不能只写采样率
+ *
+ * 位深进阶梯之后 `线上 48000 Hz` 一句话对应阶梯上**三档**（48k/f32、48k/s24、
+ * 48k/s16），码率从 768 一直到 1536 kbps。这是本轮改完之后界面上仅存的一处
+ * 裸采样率读数——滑条标签、卡片一级格、详情页实测行三处都已经两维写全，
+ * 唯独这一格漏了，等于把要消灭的那个歧义从滑条搬到了统计页。
+ *
+ * 三种态各有自己的写法，**一种都不能合并**：
+ *   两个都读得到 ⇒ `线上 48000 Hz · 24 bit`
+ *   只读得到速率 ⇒ `线上 48000 Hz`（旧 daemon 不发 `wire_depth`，**不猜 16 bit**）
+ *   两个都读不到 ⇒ 「读不到」（**不显示 0 Hz、不兜底 48000**）
+ */
+function liveFormatPhrase(info: SessionInfo): string {
+  const hz = info.sample_rate;
+  if (typeof hz !== 'number' || hz <= 0) return t('stats.meta.sampleRateNone');
+  const k = qualityDepthKey(info.wire_depth);
+  if (!k) return t('stats.meta.sampleRate', { v: fmt.count(hz) });
+  return t('stats.meta.sampleRateDepth', { v: fmt.count(hz), depth: t(k) });
 }
 
 // ---------------------------------------------------------------- 延迟瀑布
@@ -200,9 +245,11 @@ function SessionCard({ info, hist }: { info: SessionInfo; hist: MetricHistory | 
             // `sample_rate` 现在是**线上**速率（随质量档变），不再是硬编码的
             // 48000。0 = 两侧都报不出来 ⇒ 说「读不到」，**不显示 0 Hz、也不兜底
             // 成 48000**——那个兜底正是这一格此前恒写 48000 的来路。
-            typeof info.sample_rate === 'number' && info.sample_rate > 0
-              ? t('stats.meta.sampleRate', { v: fmt.count(info.sample_rate) })
-              : t('stats.meta.sampleRateNone'),
+            //
+            // 位深与它**成对**：`线上 48000 Hz` 一句话对应阶梯上三档
+            // （f32 / s24 / s16，码率差到 2 倍）。位深读不到就退回只写采样率的
+            // 那一条——**不猜 16 bit**（滑条与卡片两处同一条规矩）。
+            liveFormatPhrase(info),
             t('stats.meta.channels', { v: fmt.count(info.channels) }),
           ])}
         </span>
@@ -262,6 +309,25 @@ function SessionCard({ info, hist }: { info: SessionInfo; hist: MetricHistory | 
             : t('stats.extra.jbDepth', { n: fmt.count(st.jb_depth_frames) })}
         </span>
         <span>{t('stats.extra.rungChanges', { n: fmt.count(st.rung_changes) })}</span>
+        {/* ---- 两个**静默降级**计数器：非零才显示，且非零就是坏消息 ----------
+            两个都是「JB 的五个计数器全部一片正常，而声音已经坏了」的那类故障，
+            所以它们必须有自己的位置——挂在别人身上就等于没有。
+            恒显示会让两个恒为 0 的数占住这一行的位置并训练用户忽略它们；
+            所以按 `> 0` 显形，并用 danger/warn 的语气，因为非零没有良性解释。 */}
+        {typeof st.jb_half_conceal === 'number' && st.jb_half_conceal > 0
+          ? (
+            <span className="tag warn" title={t('stats.extra.halfConcealWhy')}>
+              {t('stats.extra.halfConceal', { n: fmt.count(st.jb_half_conceal) })}
+            </span>
+          )
+          : null}
+        {typeof st.format_mismatch === 'number' && st.format_mismatch > 0
+          ? (
+            <span className="tag danger" title={t('stats.extra.formatMismatchWhy')}>
+              {t('stats.extra.formatMismatch', { n: fmt.count(st.format_mismatch) })}
+            </span>
+          )
+          : null}
         {st.verdict
           ? (st.verdict.detected
             ? <span className="tag ok">{t('stats.extra.verdictPass', { snr: fmt.decimal1(st.verdict.snr_db) })}</span>

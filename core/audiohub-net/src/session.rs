@@ -147,10 +147,14 @@ pub fn run_tx_tone(sock: &UdpSocket, mode: TxMode, cfg: &ToneTxCfg) -> anyhow::R
         }
 
         let base = n as usize * frame_samples;
-        let payload = dsp::f32_to_s16le(&tone[base..base + frame_samples]);
+        // 探针路径**刻意固定在 s16**：它测的是链路本身，不是阶梯。
+        // 位深写在这里而不是隐含在函数名里 —— 与包头的 `codec` 是同一件事的
+        // 两次声明，写错会在下面的 `Codec::for_depth` 断言上现形。
+        const PROBE_DEPTH: dsp::WireDepth = dsp::WireDepth::S16;
+        let payload = dsp::encode_pcm(&tone[base..base + frame_samples], PROBE_DEPTH);
         let header = Header {
             kind: Kind::Media,
-            codec: Codec::PcmS16le,
+            codec: Codec::for_depth(PROBE_DEPTH),
             channels: 1,
             sample_rate: cfg.sample_rate,
             session_id,

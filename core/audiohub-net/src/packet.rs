@@ -24,11 +24,41 @@ impl Kind {
     }
 }
 
+/// 线上编码。**对线性 PCM 而言位深就是编码方式**，所以位深住在这个字节里，
+/// 不是包头里另一个字段。
+///
+/// # 为什么位深进 `codec` 而采样率留在 `sample_rate`
+///
+/// 这与 IETF 的切法完全同构：**位深是不同的 payload type**（`L16` 在 RFC
+/// 3551/2586，`L20`/`L24` 在 RFC 3190，各有独立 MIME 注册），
+/// 而**采样率是同一 payload type 内的 `rate` 参数**。
+/// 「改采样率 = 改参数；改位深 = 换编码」。
+///
+/// 好处是 `HEADER_LEN` / `VERSION` / 40 字节布局一字不动。
+///
+/// # ⚠ 但这**不等于**「零跨版本风险」——两个新 codec 的失效形态完全不同
+///
+/// 这里曾写着「老对端收到 `codec = 3` 得到 `BadCodec` 并丢包，显式失败而不是
+/// 静默错解」。那句话**只对 rung 1 成立**，逐条订正：
+///
+/// | rung | codec | 老对端（协议 v2）的行为 |
+/// |---|---|---|
+/// | 1 | `PcmS24le = 3` | v2 的 [`Codec::from_u8`] 不认识 3 ⇒ `BadCodec` ⇒ `handle_datagram` **无日志**早退 ⇒ 全程静音、零诊断。不是错解，但也谈不上「显式」。 |
+/// | 0 | `PcmF32le = 1` | **v2 里这个枚举值就存在**，只是从没人发过。而 v2 的收流路径一行都不看 `codec`，直接 `s16le_to_f32(&plain)` ⇒ f32 半帧被当成两倍数量的 s16 样本，**满长度垃圾帧全音量进 mixer**。AEAD 挡不住：包是合法签名的。 |
+///
+/// ⇒ **唯一的闸门是握手时的协议版本严格相等比较**
+/// （`control::PROTOCOL_VERSION`，位深进阶梯时已由 2 升到 3）。
+/// 往 `Codec` 里加值时请连带检查那个常数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
+    /// 16 位有符号整数，小端。
     PcmS16le = 0,
+    /// 32 位浮点，小端。枚举值一直在，位深进阶梯之后才首次真正上线。
     PcmF32le = 1,
     Opus = 2,
+    /// 24 位有符号整数，**3 字节紧凑打包**，小端。
+    /// ⚠ RFC 3190 的 `audio/L24` 用网络序，这一档与它字节序相反（见 `dsp.rs`）。
+    PcmS24le = 3,
     Passthrough = 255,
 }
 
@@ -38,9 +68,35 @@ impl Codec {
             0 => Codec::PcmS16le,
             1 => Codec::PcmF32le,
             2 => Codec::Opus,
+            3 => Codec::PcmS24le,
             255 => Codec::Passthrough,
             _ => return None,
         })
+    }
+
+    /// 这个 codec 的线上位深。`None` = 不是线性 PCM（Opus / Passthrough）。
+    ///
+    /// **单向映射只写这一处。** 让别处（前端、遥测）各自复刻一份 codec → 位深
+    /// 的对照表，两处一漂**没有任何地方会报错**——那正是 `wire_depth` 要做成
+    /// 一等字段的同一条理由。
+    pub fn wire_depth(self) -> Option<audiohub_core::dsp::WireDepth> {
+        use audiohub_core::dsp::WireDepth;
+        Some(match self {
+            Codec::PcmS16le => WireDepth::S16,
+            Codec::PcmS24le => WireDepth::S24,
+            Codec::PcmF32le => WireDepth::F32,
+            Codec::Opus | Codec::Passthrough => return None,
+        })
+    }
+
+    /// 承载这个位深的 codec。与 [`Codec::wire_depth`] 互逆。
+    pub fn for_depth(depth: audiohub_core::dsp::WireDepth) -> Codec {
+        use audiohub_core::dsp::WireDepth;
+        match depth {
+            WireDepth::S16 => Codec::PcmS16le,
+            WireDepth::S24 => Codec::PcmS24le,
+            WireDepth::F32 => Codec::PcmF32le,
+        }
     }
 }
 
@@ -135,5 +191,74 @@ impl Header {
             },
             &datagram[HEADER_LEN..],
         ))
+    }
+}
+
+#[cfg(test)]
+mod codec_depth_tests {
+    use super::*;
+    use audiohub_core::dsp::WireDepth;
+
+    /// codec ↔ 位深必须是一一对应，且**这是唯一一份映射**。
+    ///
+    /// 注入对照：把 `for_depth(S24)` 改成返回 `Codec::PcmS16le`，这条立刻变红。
+    /// 没有它，那次改动的表现是「选了 24 bit，线上发的是 16 bit，包头写着
+    /// PcmS16le，遥测据此报 s16」——**处处自洽，全都是错的**。
+    #[test]
+    fn every_pcm_codec_maps_onto_exactly_one_wire_depth_and_back() {
+        for depth in [WireDepth::S16, WireDepth::S24, WireDepth::F32] {
+            let c = Codec::for_depth(depth);
+            assert_eq!(c.wire_depth(), Some(depth), "{depth:?} 的 codec 往返对不上");
+        }
+        // 非 PCM 的两个不该冒出一个位深来。
+        assert_eq!(Codec::Opus.wire_depth(), None);
+        assert_eq!(Codec::Passthrough.wire_depth(), None);
+    }
+
+    /// 三个 PCM codec 的线上字节值**冻结**，且 `PcmS24le` 是新加的那个。
+    ///
+    /// ⚠ 这条**保证不了跨版本安全**：`PcmF32le = 1` 在协议 v2 里就是合法值，
+    /// 而 v2 的收流路径根本不看 `codec` ⇒ 它会把 f32 载荷按 s16 静默错解。
+    /// 挡住这件事的是 `control::PROTOCOL_VERSION`（已升到 3），不是这条断言。
+    #[test]
+    fn the_codec_byte_values_are_frozen() {
+        assert_eq!(Codec::PcmS16le as u8, 0);
+        assert_eq!(Codec::PcmF32le as u8, 1);
+        assert_eq!(Codec::Opus as u8, 2);
+        assert_eq!(Codec::PcmS24le as u8, 3, "改这个值 = 换线格式，两端会各说各话");
+        assert_eq!(Codec::Passthrough as u8, 255);
+        for bad in [4u8, 5, 100, 254] {
+            assert_eq!(Codec::from_u8(bad), None, "{bad} 不该被认出来");
+        }
+    }
+
+    /// 包头长度与逐字段之和一致；顺手把 §1.A 那笔 MTU 账钉成断言。
+    #[test]
+    fn the_header_is_forty_bytes_and_leaves_no_room_for_a_deeper_rung() {
+        let h = Header {
+            kind: Kind::Media,
+            codec: Codec::PcmS24le,
+            channels: 1,
+            sample_rate: 48_000,
+            session_id: 7,
+            stream_id: 7,
+            seq: 3,
+            timestamp_us: 1234,
+            payload_len: 0,
+        };
+        assert_eq!(h.encode(&[]).len(), HEADER_LEN);
+        // 48 kHz × 24 bit × 10 ms = 1440 B 明文；1500 − 28(IP/UDP) − 16(AEAD)
+        // = 1456 ⇒ 包头预算 16 字节。今天的包头是 40 ⇒ **装不下**，
+        // 这正是深档要按 5 ms 分包的理由。这条断言把「装不下」钉住，
+        // 免得有人以为砍几个字段就能塞进去。
+        const MTU: usize = 1500;
+        const IP_UDP: usize = 28;
+        const AEAD_TAG: usize = 16;
+        let ten_ms_48k_24bit = 480 * 3;
+        assert!(
+            HEADER_LEN + ten_ms_48k_24bit + AEAD_TAG + IP_UDP > MTU,
+            "48k/24 的 10 ms 帧居然进得去一个数据报了——若真是包头变小了，\
+             请重新读 HEADER_LEN 上方那段账：能塞下的包头是没有 timestamp_us 的那个"
+        );
     }
 }

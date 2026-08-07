@@ -198,8 +198,16 @@ mod tests {
         s.set(
             "aa11",
             PeerTransport {
-                recv: StoredDir { latency: "300".into(), quality: "pcm32k".into() },
-                send: StoredDir { latency: "100".into(), quality: "auto".into() },
+                recv: StoredDir {
+                    latency: "300".into(),
+                    quality: "pcm32k16".into(),
+                    ..StoredDir::default()
+                },
+                send: StoredDir {
+                    latency: "100".into(),
+                    quality: "auto".into(),
+                    ..StoredDir::default()
+                },
             },
         );
         s.save(&dir).expect("save");
@@ -207,7 +215,7 @@ mod tests {
         let back = PeerTransportStore::load(&dir);
         assert_eq!(back.get("aa11").recv.latency, "300");
         assert_eq!(back.get("aa11").send.latency, "100");
-        assert_eq!(back.get("aa11").recv.quality, "pcm32k");
+        assert_eq!(back.get("aa11").recv.quality, "pcm32k16");
         // 没设过的对端拿到默认，不是恐慌也不是 None。
         assert_eq!(back.get("zz99"), PeerTransport::default());
         let _ = std::fs::remove_dir_all(&dir);

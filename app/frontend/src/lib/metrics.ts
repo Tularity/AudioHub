@@ -302,6 +302,16 @@ export interface QualityReading {
    * 由 daemon 一等上报，**绝不由 `bandwidthKhz * 2` 推**（理由见 types.ts）。
    */
   wireRateKhz?: number;
+  /**
+   * 线上位深：`'s16' | 's24' | 'f32'`。`undefined` = 旧 daemon / 读不到。
+   *
+   * 与 `wireRateKhz` 成对呈现：位深进阶梯之后，只写采样率的读数是有歧义的
+   * （`48 kHz` 说不出它是 16 位还是 24 位）。
+   *
+   * **一行推导都没有**：daemon 一等上报，前端不从 codec / 码率反推
+   * （理由与 `wireRateKhz` 逐字相同，见 types.ts）。
+   */
+  wireDepth?: string;
   /** 加权隐藏率（%）。 */
   concealPct?: number;
   /** 削顶占比（%）与超出深度（dB）：占比说明多广，深度说明多狠。 */
@@ -377,6 +387,30 @@ export function qualityGradeTextKey(q: QualityReading | undefined): MsgKey | und
   if (q && q.grade) return qualityGradeKey(q.grade);
   if (q) return 'metric.quality.measuring';
   return undefined;
+}
+
+/**
+ * 线上位深 → 文案键。**全应用只此一份。**
+ *
+ * 位深只有三个合法取值，冒出第四个说明两端版本对不上 ⇒ 返回 `undefined`，
+ * 调用方就只写采样率。**不把原始串画出来**：画一个 `s48` 出来只会让人以为
+ * 那是一档。**更不许兜底成 16 bit**——位深进阶梯之前线上恒为 16 位，那个兜底
+ * 今天碰巧总是对的，正因为碰巧总是对，它会一直躺着直到某天不对了也没人发现。
+ *
+ * # 为什么必须是一份而不是三份
+ *
+ * 这张表原本在 `PeerMetrics.tsx`（返回字符串）与 `PeerTransport.tsx`
+ * （返回 MsgKey）各有一份、形状还不同，统计页正要写第三份。三处一漂，
+ * 界面上同一条流的位深就会有三种写法，而没有任何一处会报错——与 daemon
+ * 坚持自己当档表唯一真值源是同一条理由。
+ */
+export function qualityDepthKey(d: string | null | undefined): MsgKey | undefined {
+  switch (d) {
+    case 's16': return 'metric.quality.depth.s16';
+    case 's24': return 'metric.quality.depth.s24';
+    case 'f32': return 'metric.quality.depth.f32';
+    default: return undefined;
+  }
 }
 
 /** 一级的「●●●○」：四点，点数由等级定。读不到时 0 点全空。 */
@@ -811,12 +845,15 @@ export function readQuality(sess: SessionInfo | null | undefined): QualityReadin
   // 它会一直躺在这里，直到 Q3 换成实测频谱（规格 §4.2 允许）的那天开始撒谎，
   // 而那一天不会有任何一处报错。旧 daemon 不发这个字段 ⇒ undefined ⇒ 「—」。
   const rateHz = num(q.wire_rate_hz);
+  // 位深同样是**独立读取**的字段。空串 = 「对面没说」，不是 s16。
+  const depth = typeof q.wire_depth === 'string' && q.wire_depth ? q.wire_depth : undefined;
   return {
     grade,
     worst,
     // Hz → kHz。0 Hz 不是带宽读数（rung 解析不出来才会是 0），照样算没读到。
     bandwidthKhz: hz !== undefined && hz > 0 ? hz / 1000 : undefined,
     wireRateKhz: rateHz !== undefined && rateHz > 0 ? rateHz / 1000 : undefined,
+    wireDepth: depth,
     concealPct: pctOf(q.conceal_ratio),
     clipPct: pctOf(q.clip_ratio),
     clipExcessDb: num(q.clip_excess_db),

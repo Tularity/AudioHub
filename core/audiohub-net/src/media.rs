@@ -1238,16 +1238,152 @@ impl LossInjector {
     }
 }
 
-/// AUTO quality ladder rungs 0..3, s16 mono at these rates.
-pub const AUTO_RATES: [u32; 4] = [48000, 32000, 24000, 16000];
+// ---------------------------------------------------------------- 质量阶梯
+//
+// # 一条阶梯，两个维度
+//
+// 这里曾经只有 `AUTO_RATES: [u32; 4]`——阶梯只管**采样率**，位深写死 16 位，
+// 而「写死 16 位」这件事没有任何一处代码说得出来。用户裁定位深必须有选项，
+// 且 (kHz, bit) 两个维度**合并成一条按码率排序的阶梯**（不是两个滑条）。
+//
+// # 排序准则：先把采样率买满 48 kHz，再买位深
+//
+// 主序是音频码率升序。但 `32 kHz × 24 bit` 与 `48 kHz × 16 bit` **都是
+// 768 kbps、数据报还逐字节等长**，码率排不了序，必须另给准则。最强的一条依据
+// 只依赖本仓库的代码：
+//
+//   **48 kHz 是唯一不经重采样的档**（`engine.rs` 的 tx 侧只在 `rung != 0` 建
+//   重采样器，rx 侧 `if h.sample_rate == 48000` 直通），而 [`LinearResampler`]
+//   是**纯线性插值、没有任何抗混叠低通**。48 k → 16 k 抽取时 12 kHz 的分量
+//   折回 4 kHz 只被压约 1.8 dB —— 比 16 位量化噪声底高约 90 dB 量级。
+//   ⇒ 拿 48 kHz 换位深 = 用 90 dB 的损伤换 48 dB 的改善。
+//
+// ⇒ 阶梯是「链」不是「网格」：4 采样率 × 3 位深的全网格会在 384 / 512 / 768
+// kbps 上撞出**三处精确并列**，而滑条这个控件的前提是全序。
+//
+// # 反着走 = 先扔最不值钱的
+//
+// 从顶往下是 `32f → 24 bit → 16 bit → 32 kHz → 24 kHz → 16 kHz`，
+// 即**先掉位深（听不出），再掉带宽（听得出）**。这是排序准则的副产品，
+// 所以 `AutoLadder` 不需要第二套规则来决定「网络变差先降哪个」。
 
+use audiohub_core::dsp::WireDepth;
+
+/// 阶梯上的一格：(采样率, 线上位深)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WireFormat {
+    pub rate_hz: u32,
+    pub depth: WireDepth,
+}
+
+impl WireFormat {
+    /// 一帧（`FRAME_MS = 10 ms`）单声道的**明文**字节数。
+    pub const fn frame_bytes(&self) -> usize {
+        (self.rate_hz as usize / 100) * self.depth.bytes_per_sample()
+    }
+
+    /// **音频**码率（kbps）= `rate × depth_bits / 1000`，单声道。
+    ///
+    /// ⚠ **不含协议开销**，与改动前 `rate * 16 / 1000` 同一口径（单调性因此
+    /// 保住）。深档的开销比例更高：它们按 5 ms 分包，每 10 ms 要付**两份**
+    /// 56 字节的头 + 标签。拿这个数去反推实测带宽对不上是正常的，不是 bug。
+    pub const fn kbps(&self) -> u32 {
+        self.rate_hz / 1000 * self.depth.bits()
+    }
+
+    /// 线上是不是按 5 ms 分成两个包发（见 [`WireFormat::wire_packets_per_frame`]）。
+    pub const fn splits_frame(&self) -> bool {
+        self.frame_bytes() > SINGLE_PACKET_PAYLOAD_MAX
+    }
+
+    /// 一帧上线拆成几个数据报。今天只有 1 或 2。
+    pub const fn wire_packets_per_frame(&self) -> usize {
+        if self.splits_frame() {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+/// 一个数据报能装的最大明文字节数，**留足以太网 MTU 的余量**。
+///
+/// 1500 − 28 (IPv4 + UDP) − 40 (`HEADER_LEN`) − 16 (AEAD 标签) = 1416。
+/// 这里取 1200：常见隧道 MTU（WireGuard 1420 / PPPoE 1492）下也不分片。
+/// 超过它的档在线上按 5 ms 分成两个包（`engine.rs` 的 `tx_loop`）——
+/// **`FRAME_MS` 一个字不改，只动线路层的包时长**。
+///
+/// 这就是 AES67「缩短包时长」那条正解，只用在线路层：AES67 没有我们这种抖动
+/// 缓冲，所以它把「包时长」与「调度节拍」当成一件事；我们不必。
+pub const SINGLE_PACKET_PAYLOAD_MAX: usize = 1200;
+
+/// 质量阶梯。**rung 0 = 最好**（与 `AutoLadder` 的 `rung += 1` 是降档方向一致）。
+///
+/// | rung | 采样率 | 位深 | 音频码率 | 每帧明文 | 线上分包 |
+/// |---|---|---|---|---|---|
+/// | 0 | 48 kHz | 32 float | 1536 kbps | 1920 B | 2 × 5 ms |
+/// | 1 | 48 kHz | 24 | 1152 kbps | 1440 B | 2 × 5 ms |
+/// | 2 | 48 kHz | 16 | 768 kbps | 960 B | 1 × 10 ms |
+/// | 3 | 32 kHz | 16 | 512 kbps | 640 B | 1 × 10 ms |
+/// | 4 | 24 kHz | 16 | 384 kbps | 480 B | 1 × 10 ms |
+/// | 5 | 16 kHz | 16 | 256 kbps | 320 B | 1 × 10 ms |
+///
+/// 下半段四档与位深进阶梯之前**逐位相同**（那四个采样率正对 ITU-T 的
+/// 窄带/宽带/超宽带/全频带分级，`quality.rs` 的 Q3 直接映射它）。
+/// 上半段两档是位深维度上仅有的两个有工业意义的取值：24 bit 是 AES67 /
+/// RFC 3190 的标准交换深度，32 bit 浮点是本管线的原生格式。
+pub const LADDER: [WireFormat; 6] = [
+    WireFormat { rate_hz: 48000, depth: WireDepth::F32 },
+    WireFormat { rate_hz: 48000, depth: WireDepth::S24 },
+    WireFormat { rate_hz: 48000, depth: WireDepth::S16 },
+    WireFormat { rate_hz: 32000, depth: WireDepth::S16 },
+    WireFormat { rate_hz: 24000, depth: WireDepth::S16 },
+    WireFormat { rate_hz: 16000, depth: WireDepth::S16 },
+];
+
+/// AUTO 能升到的**最高**格（数值最小 = 最好）。
+///
+/// = `pcm48k16`，即位深进阶梯之前 AUTO 的顶档。
+///
+/// # 为什么 AUTO 不去拿那两个深档
+///
+/// **AUTO 不该在用户没要求时把带宽翻倍。** 今天 AUTO 的稳态是 768 kbps；
+/// 若顶档变成 1536 kbps，所有 AUTO 用户的带宽**静默翻倍**，而收益听不出来。
+/// AUTO 的职责是「别浪费」，深档是「用户明确要求」。
+///
+/// ⇒ 改成 `0` 就能让 AUTO 也升到 32 位浮点，代价只有「默认带宽翻倍」这一件事。
+pub const AUTO_TOP_RUNG: u32 = 2;
+
+/// 格号 → 格式。越界钳到最低档（最差那一格）。
+pub fn rung_format(rung: u32) -> WireFormat {
+    LADDER[(rung as usize).min(LADDER.len() - 1)]
+}
+
+/// 格号 → 采样率。[`rung_format`] 的投影，留着是因为只关心采样率的调用点很多。
 pub fn rung_rate(rung: u32) -> u32 {
-    AUTO_RATES[rung.min(AUTO_RATES.len() as u32 - 1) as usize]
+    rung_format(rung).rate_hz
+}
+
+/// (采样率, 位深) → 格号。`None` = 这个组合不在阶梯上。
+///
+/// **刻意不做就近吸附**：找不到就是找不到，调用方得决定怎么办。
+/// 吸附会让一个不存在的档静默变成一个存在的档，而 UI 显示的还是原来那个。
+///
+/// ⚠ 位深进阶梯之后**不存在「采样率 → 格号」这个函数**：48000 在阶梯上出现
+/// 三次，速率不再唯一标识一档。凡是从速率反查格号的老代码都必须补上位深。
+pub fn rung_of(rate_hz: u32, depth: WireDepth) -> Option<u32> {
+    LADDER
+        .iter()
+        .position(|f| f.rate_hz == rate_hz && f.depth == depth)
+        .map(|i| i as u32)
 }
 
 /// Pure sender-side ladder state machine, fed once per 1s stats period.
 /// Demote fast (loss>5% or jitter>15ms), promote after 10 clean periods
 /// (loss<0.5% and jitter<5ms); middling stats reset the clean streak.
+///
+/// 阶梯变长（4 → 6 格）**没有改这个状态机一行逻辑**，只是把两个边界常数从
+/// 「字面量 / `AUTO_RATES.len()`」换成 [`AUTO_TOP_RUNG`] 与 [`LADDER`]。
 pub struct AutoLadder {
     rung: u32,
     clean: u32,
@@ -1256,7 +1392,8 @@ pub struct AutoLadder {
 
 impl AutoLadder {
     pub fn new() -> Self {
-        AutoLadder { rung: 0, clean: 0, rung_changes: 0 }
+        // 从 AUTO 的天花板起步，不是从阶梯顶端起步。
+        AutoLadder { rung: AUTO_TOP_RUNG, clean: 0, rung_changes: 0 }
     }
 
     pub fn rung(&self) -> u32 {
@@ -1267,11 +1404,15 @@ impl AutoLadder {
         rung_rate(self.rung)
     }
 
+    pub fn format(&self) -> WireFormat {
+        rung_format(self.rung)
+    }
+
     /// Some(new rung index) only when the rung actually changed.
     pub fn feed_stats(&mut self, loss_pct: f64, jitter_ms: f64) -> Option<u32> {
         if loss_pct > 5.0 || jitter_ms > 15.0 {
             self.clean = 0;
-            if self.rung < AUTO_RATES.len() as u32 - 1 {
+            if self.rung < LADDER.len() as u32 - 1 {
                 self.rung += 1;
                 self.rung_changes += 1;
                 return Some(self.rung);
@@ -1280,7 +1421,8 @@ impl AutoLadder {
         }
         if loss_pct < 0.5 && jitter_ms < 5.0 {
             self.clean = self.clean.saturating_add(1);
-            if self.clean >= 10 && self.rung > 0 {
+            // `> AUTO_TOP_RUNG` 而不是 `> 0`：AUTO 不许自己走进深档。
+            if self.clean >= 10 && self.rung > AUTO_TOP_RUNG {
                 self.clean = 0;
                 self.rung -= 1;
                 self.rung_changes += 1;
@@ -1296,6 +1438,211 @@ impl AutoLadder {
 impl Default for AutoLadder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::*;
+    use crate::packet::{Codec, HEADER_LEN};
+
+    /// **MTU 预算钉成断言**：每档「每帧明文字节数」与设计表一致，且**每个
+    /// 数据报**（含 40 B 头 + 16 B AEAD 标签 + 28 B IP/UDP）都进得去 1500 MTU。
+    ///
+    /// 没有它，下次有人加一档（96 kHz？立体声？）会撞同一堵墙，而失效形态是
+    /// **Windows 上收流线程每个超长包睡 100 ms**、日志里只有一行 `udp recv:`。
+    #[test]
+    fn every_rung_fits_in_one_ethernet_datagram() {
+        const MTU: usize = 1500;
+        const IP_UDP: usize = 28;
+        const AEAD_TAG: usize = 16;
+        let want_frame_bytes = [1920usize, 1440, 960, 640, 480, 320];
+        let want_kbps = [1536u32, 1152, 768, 512, 384, 256];
+        assert_eq!(LADDER.len(), want_frame_bytes.len());
+        for (i, f) in LADDER.iter().enumerate() {
+            assert_eq!(f.frame_bytes(), want_frame_bytes[i], "rung {i} 的每帧明文变了");
+            assert_eq!(f.kbps(), want_kbps[i], "rung {i} 的音频码率变了");
+            // 分包之后每个数据报装 frame_bytes / n。
+            let per_packet = f.frame_bytes() / f.wire_packets_per_frame();
+            let ip_datagram = HEADER_LEN + per_packet + AEAD_TAG + IP_UDP;
+            assert!(
+                ip_datagram <= MTU,
+                "rung {i} 的 IP 报文 {ip_datagram} B 超过 MTU {MTU}：\
+                 要么调 SINGLE_PACKET_PAYLOAD_MAX，要么这一档不该存在"
+            );
+            // 分包必须切得整齐：半帧的样本数与字节数都得是整数。
+            assert_eq!(
+                f.frame_bytes() % f.wire_packets_per_frame(),
+                0,
+                "rung {i} 的帧切不成等长的两半"
+            );
+        }
+    }
+
+    /// 阶梯的形状：码率**严格递减**（rung 0 最好）、格式两两不同、
+    /// 且下半段四档与位深进阶梯之前逐位相同。
+    #[test]
+    fn the_ladder_is_strictly_ordered_and_keeps_the_four_legacy_rungs() {
+        for w in LADDER.windows(2) {
+            assert!(
+                w[0].kbps() > w[1].kbps(),
+                "阶梯码率不是严格递减：{} !> {}",
+                w[0].kbps(),
+                w[1].kbps()
+            );
+        }
+        let mut seen: Vec<(u32, &str)> =
+            LADDER.iter().map(|f| (f.rate_hz, f.depth.as_str())).collect();
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "阶梯上有两格是同一个 (采样率, 位深)");
+        // 位深进阶梯之前的四档：48/32/24/16 kHz，全 s16。
+        let legacy: Vec<u32> = LADDER[AUTO_TOP_RUNG as usize..]
+            .iter()
+            .inspect(|f| assert_eq!(f.depth, WireDepth::S16, "老四档必须仍是 s16"))
+            .map(|f| f.rate_hz)
+            .collect();
+        assert_eq!(legacy, vec![48000, 32000, 24000, 16000], "老四档的采样率被动过了");
+    }
+
+    /// **AUTO 从 `AUTO_TOP_RUNG` 起步，且升档永不越过它。**
+    ///
+    /// 注入对照：把 `feed_stats` 的 `self.rung > AUTO_TOP_RUNG` 改回 `> 0`，
+    /// 这条立刻变红——而那次改动在生产上的表现是「所有 AUTO 用户的带宽
+    /// 静默翻倍」，没有任何一处会报错。
+    #[test]
+    fn auto_starts_at_its_ceiling_and_never_promotes_past_it() {
+        let mut l = AutoLadder::new();
+        assert_eq!(l.rung(), AUTO_TOP_RUNG, "AUTO 起步格不是天花板");
+        assert_eq!(l.format(), WireFormat { rate_hz: 48000, depth: WireDepth::S16 });
+        // 一直干净：升到天花板就停住，绝不进深档。
+        for _ in 0..500 {
+            l.feed_stats(0.0, 0.0);
+            assert!(l.rung() >= AUTO_TOP_RUNG, "AUTO 升进了深档 rung {}", l.rung());
+        }
+        assert_eq!(l.rung(), AUTO_TOP_RUNG);
+        // 一直很差：降到最低档就停住，不会越界。
+        for _ in 0..500 {
+            l.feed_stats(50.0, 100.0);
+        }
+        assert_eq!(l.rung(), LADDER.len() as u32 - 1, "降档没停在最低格");
+        // 再一路干净：回到天花板，仍不越过。
+        for _ in 0..500 {
+            l.feed_stats(0.0, 0.0);
+        }
+        assert_eq!(l.rung(), AUTO_TOP_RUNG, "回升没停在天花板");
+    }
+
+    /// **升降各自一次只走一格**，且 `feed_stats` 的返回值如实报出每一步。
+    ///
+    /// 上面那条只比 500 次之后的**终点**，所以「一次坏统计直接踩到最低档」
+    /// 与「逐格下降」在它眼里完全相同 —— 它对降档路径免疫。而那两种行为在
+    /// 生产上差得很远：一次抖动尖峰（≥15 ms，正常链路波动就能到）若直接把
+    /// 48 kHz 打到 16 kHz，中间的 32 k / 24 k 两档形同虚设，然后要 30 个干净
+    /// 周期（≈30 s）才爬得回来；顺带 `rung_changes` 从 3 变 1，界面上的
+    /// 「换档次数」跟着说谎。
+    ///
+    /// 判据用**返回值**而不是 `rung()`：`feed_stats` 返回 `Some(新格号)`
+    /// 正是为此存在，只看终态就等于把它的契约放空。
+    #[test]
+    fn each_stats_period_moves_the_rung_by_exactly_one_step() {
+        let mut l = AutoLadder::new();
+        // 降档：从天花板一路到最低格，每次恰好一格。
+        for want in (AUTO_TOP_RUNG + 1)..LADDER.len() as u32 {
+            assert_eq!(l.feed_stats(50.0, 100.0), Some(want), "降档跳格了：一次坏统计只许走一格");
+        }
+        assert_eq!(l.feed_stats(50.0, 100.0), None, "到底之后不该再报变化");
+        let down_steps = LADDER.len() as u32 - 1 - AUTO_TOP_RUNG;
+        assert_eq!(l.rung_changes, down_steps, "换档次数与实际走过的格数对不上");
+
+        // 升档：10 个干净周期换一格，同样一次一格。
+        for want in (AUTO_TOP_RUNG..LADDER.len() as u32 - 1).rev() {
+            for i in 0..9 {
+                assert_eq!(l.feed_stats(0.0, 0.0), None, "第 {i} 个干净周期就升档了：升档必须保守");
+            }
+            assert_eq!(l.feed_stats(0.0, 0.0), Some(want), "升档跳格了");
+        }
+        assert_eq!(l.feed_stats(0.0, 0.0), None, "到天花板之后不该再报变化");
+        assert_eq!(l.rung_changes, down_steps * 2, "一降一升，换档次数应当翻倍");
+    }
+
+    /// `rung_of` 不做就近吸附；**采样率单独不再能标识一档**。
+    #[test]
+    fn a_format_outside_the_ladder_is_refused_not_snapped() {
+        assert_eq!(rung_of(48000, WireDepth::F32), Some(0));
+        assert_eq!(rung_of(48000, WireDepth::S24), Some(1));
+        assert_eq!(rung_of(48000, WireDepth::S16), Some(2));
+        assert_eq!(rung_of(32000, WireDepth::S16), Some(3));
+        assert_eq!(rung_of(24000, WireDepth::S16), Some(4));
+        assert_eq!(rung_of(16000, WireDepth::S16), Some(5));
+        // 48 kHz 在阶梯上出现三次 ⇒ 只给速率查不到唯一一格，这正是
+        // `rung_of_rate` 必须消失的理由。
+        for bad in [
+            (32000, WireDepth::S24),
+            (16000, WireDepth::F32),
+            (44100, WireDepth::S16),
+            (0, WireDepth::S16),
+            (96000, WireDepth::F32),
+        ] {
+            assert_eq!(rung_of(bad.0, bad.1), None, "{bad:?} 不在阶梯上，不该给出格号");
+        }
+        // 往返：每一格都查得回自己。
+        for (i, f) in LADDER.iter().enumerate() {
+            assert_eq!(rung_of(f.rate_hz, f.depth), Some(i as u32));
+        }
+    }
+
+    /// **阶梯上线的 codec 集合一变，协议版本号必须跟着变。**
+    ///
+    /// 这条是 `PROTOCOL_VERSION` 与线上字节之间唯一的机械耦合。它挡的不是
+    /// 「加了个新 codec」，而是「加了个新 codec **却没升版本号**」——那次
+    /// 改动的失效形态取决于新值撞不撞上老对端认识的枚举值：
+    ///
+    /// - 撞不上（如 `PcmS24le = 3` 之于 v2）⇒ 老对端 `BadCodec` 无日志早退，
+    ///   **全程静音、零诊断**；
+    /// - 撞上了（如 `PcmF32le = 1` 之于 v2 —— 那个值一直在，只是从没人发过）
+    ///   ⇒ 老对端**根本不看 codec**，按 s16 静默错解，满长度垃圾帧全音量播出。
+    ///
+    /// 两种都不会有任何一处报错，而握手时那一次严格相等比较是唯一的闸门。
+    #[test]
+    fn changing_the_set_of_wire_codecs_forces_a_protocol_bump() {
+        use crate::control::PROTOCOL_VERSION;
+        let mut on_wire: Vec<u8> =
+            LADDER.iter().map(|f| Codec::for_depth(f.depth) as u8).collect();
+        on_wire.sort_unstable();
+        on_wire.dedup();
+        assert_eq!(
+            on_wire,
+            vec![Codec::PcmS16le as u8, Codec::PcmF32le as u8, Codec::PcmS24le as u8]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "阶梯上线的 codec 集合变了"
+        );
+        assert_eq!(
+            PROTOCOL_VERSION, 3,
+            "线上 codec 集合与协议版本 3 是配套的。改了上面那个集合就必须升这个数——\
+             否则老对端要么静音要么把新载荷按 s16 错解，两种都零报错"
+        );
+    }
+
+    /// 每一格的位深都有一个 codec 承载它，且**分包判据只由帧长决定**。
+    #[test]
+    fn each_rung_has_a_codec_and_only_the_two_deep_rungs_split() {
+        for (i, f) in LADDER.iter().enumerate() {
+            assert_eq!(
+                Codec::for_depth(f.depth).wire_depth(),
+                Some(f.depth),
+                "rung {i} 的位深没有 codec 承载"
+            );
+        }
+        let split: Vec<usize> = (0..LADDER.len()).filter(|&i| LADDER[i].splits_frame()).collect();
+        assert_eq!(split, vec![0, 1], "分包的格变了：分包判据必须只由帧长决定");
+        // 钳位：越界的格号落到最低档，不是 panic、不是回绕到 rung 0。
+        assert_eq!(rung_format(LADDER.len() as u32), *LADDER.last().unwrap());
+        assert_eq!(rung_format(u32::MAX), *LADDER.last().unwrap());
     }
 }
 

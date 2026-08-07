@@ -53,6 +53,11 @@ pub(crate) struct JbCounts {
     pub silence: u64,
     pub underruns: u64,
     pub dropped: u64,
+    /// 深档（5 ms 分包）里按**半帧隐藏**交付的帧数。
+    ///
+    /// 不来自 `JitterBuffer`——它在重组环节，见 `JbState::half_conceal`。放进
+    /// 这个快照是为了让它跟着同一个 10 s 窗口差分，并计入 [`conceal_ratio`]。
+    pub half_conceal: u64,
 }
 
 impl JbCounts {
@@ -66,6 +71,7 @@ impl JbCounts {
             silence: newer.silence.saturating_sub(older.silence),
             underruns: newer.underruns.saturating_sub(older.underruns),
             dropped: newer.dropped.saturating_sub(older.dropped),
+            half_conceal: newer.half_conceal.saturating_sub(older.half_conceal),
         }
     }
 }
@@ -122,12 +128,24 @@ impl ConcealWindow {
     }
 }
 
-/// Q1 加权隐藏率：`(plc + 3*silence) / (popped + plc + silence)`。
+/// Q1 加权隐藏率：`(plc + 3*silence + 0.5*half_conceal) / (popped + plc + silence)`。
 ///
 /// **silence 权重 3 的依据**：PLC 在 `media.rs` 是「上一帧 ×0.7 重复」，仍有
 /// 能量、仍连续；silence 是彻底的真空。ITU-T G.113 附录 I 对帧擦除给出有隐藏 /
 /// 无隐藏两条 Ie 曲线，同一丢失率下无隐藏的损伤值约为有隐藏的 2.5~3 倍。取 3
 /// 是这条经验的整数化，且与「PLC 连续 5 帧后转静音」自洽。
+///
+/// # `half_conceal` 权重 0.5 的依据（位深进阶梯新增）
+///
+/// 深档按 5 ms 分包，搭档半帧没来时 `conceal_missing_half` 会把到手的那半帧
+/// 淡出、补齐成一个**长度完整**的帧交付。于是：
+///
+/// - 它**已经在分母里**：那一帧照常进 JB、照常被 pop，`popped` 算过它。
+/// - 它伪造的正好是 **10 ms 里的 5 ms** —— 半个 PLC 帧的隐藏量，且伪造方式
+///   与 PLC 同族（衰减延续），所以权重取 PLC 的一半，不是 1、也不是 3。
+///
+/// 不计它的后果是这条降级**在 Q1 上完全不可见**：JB 看到的是完整长度的帧，
+/// 不记 PLC、不记 underrun，`popped` 照常增长 ⇒ 深档丢掉一半的包，等级仍报「优」。
 ///
 /// 分母为 0（窗口内一个 tick 都没输出）⇒ `None`：没有输出就没有音质可言。
 pub(crate) fn conceal_ratio(c: &JbCounts) -> Option<f64> {
@@ -135,7 +153,7 @@ pub(crate) fn conceal_ratio(c: &JbCounts) -> Option<f64> {
     if total == 0 {
         return None;
     }
-    Some((c.plc as f64 + 3.0 * c.silence as f64) / total as f64)
+    Some((c.plc as f64 + 3.0 * c.silence as f64 + 0.5 * c.half_conceal as f64) / total as f64)
 }
 
 // ---------------------------------------------------------------- Q2 电平
@@ -622,7 +640,12 @@ mod tests {
     // ---- Q1 窗口 ----
 
     fn c(popped: u64, plc: u64, silence: u64) -> JbCounts {
-        JbCounts { popped, plc, silence, underruns: 0, dropped: 0 }
+        JbCounts { popped, plc, silence, underruns: 0, dropped: 0, half_conceal: 0 }
+    }
+
+    /// 带半帧隐藏的那一版（深档专用）。
+    fn ch(popped: u64, plc: u64, silence: u64, half: u64) -> JbCounts {
+        JbCounts { half_conceal: half, ..c(popped, plc, silence) }
     }
 
     /// 规格 §6.2：构造 lifetime 计数序列，断言窗口值不受 10 s 之前的事件影响。
@@ -698,6 +721,45 @@ mod tests {
     #[test]
     fn no_output_at_all_is_none_not_a_perfect_score() {
         assert_eq!(conceal_ratio(&c(0, 0, 0)), None);
+    }
+
+    /// **深档的半帧隐藏必须动 Q1**，且权重恰是 PLC 的一半。
+    ///
+    /// 这条挡的是本项目反复栽的那个形态：计数器加了、注释写了「否则 Q1 上完全
+    /// 不可见」、然后**没有任何一处读它**。半帧隐藏交付的是一个长度完整的帧，
+    /// JB 不记 PLC、不记 underrun、`popped` 照常增长 ⇒ 不接进来的话，深档丢掉
+    /// 一半的包，Q1 仍然报满分。
+    ///
+    /// 注入对照：把 `conceal_ratio` 里的 `0.5 * c.half_conceal` 删掉 ⇒ 红在
+    /// 第一条断言（深档丢一半包与完全干净的链路读数相同）。
+    #[test]
+    fn a_half_frame_conceal_costs_half_a_plc_frame_in_q1() {
+        let clean = conceal_ratio(&c(100, 0, 0)).unwrap();
+        let halves = conceal_ratio(&ch(100, 0, 0, 20)).unwrap();
+        assert!(
+            halves > clean,
+            "20 次半帧隐藏与完全干净的链路给出同一个 Q1（{halves} vs {clean}）：\
+             深档丢一半包在等级上完全不可见"
+        );
+        // 权重 = PLC 的一半：一次半帧隐藏正好伪造 10 ms 里的 5 ms。
+        assert!((halves - 10.0 / 100.0).abs() < 1e-12, "(0.5*20)/100, got {halves}");
+        // 与整帧 PLC 比时**分母必须对齐**：PLC 帧是 JB 自己造出来的，它进分母
+        // （`popped + plc + silence`）；半帧隐藏那一帧是真的被 pop 出去的，
+        // `popped` 已经算过它。所以「同样 100 帧输出，其中 20 帧全隐藏」对的是
+        // `c(80, 20, 0)`，不是 `c(100, 20, 0)`——后者是 120 帧输出。
+        let full_plc = conceal_ratio(&c(80, 20, 0)).unwrap();
+        assert!(
+            (full_plc - 2.0 * halves).abs() < 1e-12,
+            "同样 100 帧输出里 20 帧整帧 PLC，必须恰是 20 次半帧隐藏的两倍：\
+             {full_plc} vs {halves}"
+        );
+        // 分母不变：那一帧照常进 JB、照常被 pop，`popped` 已经算过它。
+        assert!(
+            (conceal_ratio(&ch(100, 4, 2, 0)).unwrap() - conceal_ratio(&c(100, 4, 2)).unwrap())
+                .abs()
+                < 1e-12,
+            "half_conceal = 0 时结论必须与改动前逐位相同"
+        );
     }
 
     // ---- Q2 削顶 ----
@@ -880,7 +942,9 @@ mod tests {
 
     #[test]
     fn bandwidth_maps_the_auto_ladder_rungs() {
-        // AUTO_RATES = [48000, 32000, 24000, 16000] -> Nyquist 24k/16k/12k/8k
+        // `LADDER` 的四个采样率 48/32/24/16 kHz -> Nyquist 24k/16k/12k/8k。
+        // ⚠ Q3 只看采样率，**位深不参与定级**：位深在本链路上从来不是限制项，
+        // 给它编一条阈值等于制造一个永远是「优」的指标。
         assert_eq!(grade_bandwidth(24_000), Grade::Excellent);
         assert_eq!(grade_bandwidth(16_000), Grade::Good);
         assert_eq!(grade_bandwidth(12_000), Grade::Fair);

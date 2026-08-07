@@ -688,10 +688,12 @@ fn cmd_sysaudio(
             accum.extend_from_slice(&frame);
         }
         if let Some(s) = sock.as_ref() {
-            let payload = dsp::f32_to_s16le(&frame);
+            // 探针**刻意固定在 s16**：它测的是链路，不是阶梯。位深写出来而不是
+            // 隐含在函数名里，`codec` 由它导出 —— 两处若各写各的就是两份线格式。
+            let payload = dsp::encode_pcm(&frame, dsp::WireDepth::S16);
             let datagram = Header {
                 kind: Kind::Media,
-                codec: Codec::PcmS16le,
+                codec: Codec::for_depth(dsp::WireDepth::S16),
                 channels: 1,
                 sample_rate: rate,
                 session_id,
@@ -846,16 +848,26 @@ fn cmd_selftest(json: bool) -> Result<i32> {
     let p2k = dsp::goertzel_power(&sine, 48000, 2000.0);
     check("goertzel_selectivity", p1k > p2k * 100.0);
 
-    // f32 <-> s16le round trip
+    // f32 <-> 线上 PCM 往返：**三种位深各跑一遍**。
+    // 只测 s16 的版本会把「深档编解码写错」整个放过去——而那正是位深进阶梯
+    // 这次改动新增的面。
     let src: Vec<f32> = vec![-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 0.9999, 1.0];
-    let back = dsp::s16le_to_f32(&dsp::f32_to_s16le(&src));
-    let rt_ok = back.len() == src.len()
-        && src
-            .iter()
-            .zip(back.iter())
-            .all(|(a, b)| (a - b).abs() < 1.0 / 32768.0 + 1e-6)
-        && dsp::s16le_to_f32(&dsp::f32_to_s16le(&[1.5]))[0] > 0.999;
-    check("s16le_roundtrip", rt_ok);
+    let mut rt_ok = true;
+    for depth in [dsp::WireDepth::S16, dsp::WireDepth::S24, dsp::WireDepth::F32] {
+        let back = dsp::decode_pcm(&dsp::encode_pcm(&src, depth), depth);
+        // 1 LSB = 2 / 2^bits；f32 档要求逐位相等，用 0 容差表达。
+        let tol = if depth == dsp::WireDepth::F32 {
+            0.0
+        } else {
+            2.0 / (1u32 << (depth.bits() - 1)) as f32
+        };
+        rt_ok &= back.len() == src.len()
+            && src.iter().zip(back.iter()).all(|(a, b)| (a - b).abs() <= tol);
+        // 整数档必须削顶到满幅；f32 档**不削顶**（线路这一段不做任何量化）。
+        let over = dsp::decode_pcm(&dsp::encode_pcm(&[1.5], depth), depth)[0];
+        rt_ok &= if depth == dsp::WireDepth::F32 { over == 1.5 } else { over > 0.999 };
+    }
+    check("wire_pcm_roundtrip", rt_ok);
 
     // localhost tx/rx session with tone verification
     let e2e = (|| -> Result<bool> {
@@ -1012,10 +1024,12 @@ fn run_tx_mic(
         rx.pop(&mut pending);
         while pending.len() >= frame_samples {
             let frame: Vec<f32> = pending.drain(..frame_samples).collect();
-            let payload = dsp::f32_to_s16le(&frame);
+            // 探针**刻意固定在 s16**：它测的是链路，不是阶梯。位深写出来而不是
+            // 隐含在函数名里，`codec` 由它导出 —— 两处若各写各的就是两份线格式。
+            let payload = dsp::encode_pcm(&frame, dsp::WireDepth::S16);
             let datagram = Header {
                 kind: Kind::Media,
-                codec: Codec::PcmS16le,
+                codec: Codec::for_depth(dsp::WireDepth::S16),
                 channels: 1,
                 sample_rate: rate,
                 session_id,

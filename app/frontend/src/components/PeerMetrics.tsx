@@ -246,13 +246,29 @@ function StageRow({ fp, dir, spec, r, side }: {
  * 带宽没有丢：它进了展开明细的 Q3 行，并且在那里**与采样率并排显示**
  * （`quality.part.bandwidth.value`），2 倍关系是看得见的，不需要用户自己去推。
  */
+/**
+ * 线上位深的人类可读串。`undefined` = 对面没说（或拼写认不出）—— 调用方
+ * 就只写采样率。映射表本身在 `lib/metrics` 的 `qualityDepthKey`，
+ * **全应用只此一份**，理由见那里。
+ */
+function depthLabel(d: string | undefined): string | undefined {
+  const k = qualityDepthKey(d);
+  return k ? t(k) : undefined;
+}
+
 function QualityCell({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading | undefined }) {
   const grade = q ? q.grade : undefined;
   const dots = qualityDots(grade);
   const khz = q ? q.wireRateKhz : undefined;
-  const value = typeof khz === 'number'
-    ? t('metric.quality.rate', { khz: fmt.int(khz) })
-    : t('metric.quality.none');
+  // 位深进阶梯之后**两个维度一起写**：`48 kHz` 单独说不出它是 16 位还是 24 位，
+  // 而这两档现在都存在、码率差 50 %。位深读不到（旧 daemon）就只写采样率——
+  // **不许猜一个 16 bit 填上**，那正是这个字段要消灭的那种「看起来对、其实是编的」。
+  const depthText = depthLabel(q?.wireDepth);
+  const value = typeof khz !== 'number'
+    ? t('metric.quality.none')
+    : depthText
+      ? t('metric.quality.rateDepth', { khz: fmt.int(khz), depth: depthText })
+      : t('metric.quality.rate', { khz: fmt.int(khz) });
 
   // 三态判定（有等级 / 有读数但等级不成立 / 什么都没有）在 lib/metrics 里，那样它
   // 可以被回归断言——「某个状态压根没被渲染」是类型检查看不见的那类缺陷。

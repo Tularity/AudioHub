@@ -38,12 +38,21 @@ pub use transport::{
 /// 旧客户端读新 daemon 会拿到 `undefined` 并把滑条渲染成默认档——一个
 /// 「显示 auto、实际 300」的界面与 v3 那次是同一种病，所以同样拒连。
 ///
+/// **5（位深进质量阶梯）：不兼容变更。**
+/// 质量档 id 全部改名，两个维度都写进去（`pcm48k` ⇒ `pcm48k16`，另加
+/// `pcm48k24` / `pcm48k32f` 两档）；`QualityStop` 新增 `depth`；
+/// `QualityStats` / `SessionInfo` 新增 `wire_depth`。
+/// 旧客户端读新 daemon 会在 `QUALITY_LABEL_KEY` 里查不到任何一个新 id，于是把
+/// 六档全画成原始 id（`pcm48k32f`），并且**永远显示不出位深**——一个「设了
+/// 24 bit、界面上没有任何一处提到位深」的界面与 v3/v4 那两次是同一种病，
+/// 所以同样拒连。
+///
 /// ⚠ **必须同步改的两处**（不在本 crate，改这里就得改它们，否则 App 拒连）：
 ///   - `app/src-tauri/src/main.rs` 的 `const IPC_VERSION: u32`
 ///   - `app/frontend/src/ipc/client.ts` 的 `export const IPC_VERSION`
 /// 两处都做**严格相等**校验（`main.rs` 的 `port_alive` 分支会直接报版本不符），
 /// 所以它们与本常量是一个原子的三件套。
-pub const IPC_VERSION: u32 = 4;
+pub const IPC_VERSION: u32 = 5;
 
 pub use audiohub_core::audio::DevicesReport;
 pub use audiohub_core::dsp::ToneVerdict;
@@ -584,6 +593,19 @@ pub struct QualityStats {
     /// **0 不是采样率**，读取方不许拿它当数用。
     #[serde(default)]
     pub wire_rate_hz: u32,
+    /// 这条流**线上的位深**：`"s16" | "s24" | "f32"`。`""` = 未知。
+    ///
+    /// 与 `wire_rate_hz` 一样是一等字段，理由逐字相同：让读方从 codec 推一遍，
+    /// 就是在读方复刻一份 codec → 位深的映射表，两处一漂**没有任何地方会报错**。
+    ///
+    /// ⚠ **`""` 是「不知道」，不是「16 位」。** 位深进阶梯之前线上恒为 16 位，
+    /// 所以「空就当 s16」这个兜底今天碰巧是对的——而它正是本字段要消灭的那种
+    /// 「看起来对、其实是编的」。UI 上空值必须显示成「—」。
+    ///
+    /// ⚠ **不报数字 `32`**：`32` 在整数与浮点之间是歧义的，而位深进阶梯这件事
+    /// 的全部目的就是消歧。32 位浮点报 `"f32"`。
+    #[serde(default)]
+    pub wire_depth: String,
     /// "excellent" | "good" | "fair" | "poor" | "unknown"
     ///
     /// **三分量取 min（木桶），不是加权平均**：三家损伤在感知上不可互相补偿。

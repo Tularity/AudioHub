@@ -132,7 +132,14 @@ function liveQuality(list: SessionInfo[]): string {
   const q = readQuality(s);
   const khz = q && typeof q.wireRateKhz === 'number' ? q.wireRateKhz : null;
   if (khz == null) return t('detail.transport.measuring');
-  return t('detail.transport.liveKhz', { n: fmt.int(khz) });
+  // 与滑条档位标签同量纲、同两个维度：滑条上写「PCM 48 kHz · 24 bit」，
+  // 这一行就得写「线上格式 48 kHz · 24 bit」。只写采样率会让相邻两行看起来
+  // 像是在说两件不同的事，而那正是这一行当初被改掉的理由。
+  // 位深 → 文案键的映射表在 `lib/metrics`，**全应用只此一份**（理由见那里）。
+  // 认不出的拼写没有条目 ⇒ 退回只写采样率那一行，不猜一个 16 bit 填上。
+  const depth = qualityDepthKey(q?.wireDepth);
+  if (!depth) return t('detail.transport.liveKhz', { n: fmt.int(khz) });
+  return t('detail.transport.liveFormat', { khz: fmt.int(khz), depth: t(depth) });
 }
 
 export function PeerTransportCard({ peer }: { peer: PeerState }) {
@@ -140,6 +147,7 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
   const ds = useStore((s) => s.daemonSettings);
   const sessions = useStore((s) => s.sessions);
   const [busy, setBusy] = useState(false);
+  const [help, setHelp] = useState(false);
 
   const lStops = useMemo(() => latencyStops(ds), [ds]);
   const qStops = useMemo(() => qualityStops(ds), [ds]);

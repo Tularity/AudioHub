@@ -1,9 +1,81 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
+use std::time::{Duration, Instant};
 
 pub const CONTROL_MAX_FRAME: usize = 65536;
+
+/// The byte transport the control stack runs on.
+///
+/// The frame codec below, the verify exchange in `pairing`, and `SecureChannel`
+/// only ever needed `Read + Write` — except in three places where they reached
+/// past the byte stream and touched the socket directly: `set_read_timeout`,
+/// `set_nodelay` and `peer_addr`. Those three calls were the entire reason the
+/// control stack was typed on [`TcpStream`], so they are collected here and
+/// nowhere else. Everything above this trait is now transport-agnostic.
+///
+/// ## Why the read bound is a *deadline* and not a timeout
+///
+/// `SO_RCVTIMEO` is a property of a socket. The second implementation of this
+/// trait (design §4: control frames sharing one connection with media, handed
+/// out by a demultiplexing reader thread) has no socket to set it on — "how
+/// long may this read block" is answered there by waiting on a condition
+/// variable. A trait method spelled `set_read_timeout` would export an
+/// implementation detail that only one implementor can honour, and the other
+/// would have to fake it. "Do not block past this instant" is a question both
+/// can answer, so that is what this trait asks.
+pub trait ControlIo: Read + Write + Send {
+    /// Reads must not block past `deadline`. `None` = no bound.
+    ///
+    /// Advisory in the same way `SO_RCVTIMEO` is: a read that hits the bound
+    /// reports [`std::io::ErrorKind::WouldBlock`] or
+    /// [`std::io::ErrorKind::TimedOut`] having consumed nothing, and the caller
+    /// re-arms the deadline before the next read it wants bounded. It is not a
+    /// cancellation: a read already blocked when the deadline moves is not
+    /// required to notice.
+    fn set_read_deadline(&mut self, deadline: Option<Instant>) -> std::io::Result<()>;
+
+    /// The address of the other end, for transports that have one.
+    ///
+    /// Fallible on purpose. A multiplexed or in-memory transport has no peer
+    /// address at all, and the honest answer there is an error rather than a
+    /// synthetic `0.0.0.0:0` that reads like a measurement.
+    fn peer_addr(&self) -> std::io::Result<SocketAddr>;
+
+    /// Disable Nagle, where the transport has Nagle to disable.
+    ///
+    /// Best effort by contract: transports without it return `Ok(())`. Every
+    /// caller on the control plane already ignores the result (`let _ = ...`),
+    /// which is acceptable at ~1 Hz — the media plane will not have that
+    /// latitude, and that is a separate change.
+    fn set_nodelay(&mut self, nodelay: bool) -> std::io::Result<()>;
+}
+
+impl ControlIo for TcpStream {
+    fn set_read_deadline(&mut self, deadline: Option<Instant>) -> std::io::Result<()> {
+        // A socket can only express "per read call", so the deadline is
+        // converted at the moment it is armed — which is exactly what the
+        // callers used to compute inline.
+        let timeout = deadline.map(|d| {
+            // `set_read_timeout(Some(ZERO))` means "block forever" to the
+            // option and is rejected outright on Unix, so an already-elapsed
+            // deadline has to become the *shortest* bound the socket can
+            // express rather than the longest.
+            d.saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1))
+        });
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        TcpStream::peer_addr(self)
+    }
+
+    fn set_nodelay(&mut self, nodelay: bool) -> std::io::Result<()> {
+        TcpStream::set_nodelay(self, nodelay)
+    }
+}
 
 /// Peer-to-peer control protocol version, compared for **strict equality** on
 /// every verify (see `pairing::check_protocol`). A mismatch refuses the
@@ -153,7 +225,10 @@ pub enum ControlMsg {
     },
 }
 
-pub fn write_frame(s: &mut TcpStream, msg: &ControlMsg) -> std::io::Result<()> {
+/// Generic over the sink rather than typed on [`TcpStream`]: the frame is four
+/// little-endian length bytes followed by JSON, and nothing about that needs a
+/// socket. See [`ControlIo`] for the three things that did.
+pub fn write_frame<W: Write + ?Sized>(s: &mut W, msg: &ControlMsg) -> std::io::Result<()> {
     let body = serde_json::to_vec(msg)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if body.len() > CONTROL_MAX_FRAME {
@@ -168,7 +243,11 @@ pub fn write_frame(s: &mut TcpStream, msg: &ControlMsg) -> std::io::Result<()> {
 }
 
 /// Returns the decoded message, including `ControlMsg::Error` as-is (caller interprets).
-pub fn read_frame(s: &mut TcpStream) -> Result<ControlMsg> {
+///
+/// How long this may block is the source's business, not this function's: on a
+/// socket it is `SO_RCVTIMEO`, elsewhere it is whatever
+/// [`ControlIo::set_read_deadline`] was last told.
+pub fn read_frame<R: Read + ?Sized>(s: &mut R) -> Result<ControlMsg> {
     let mut len_bytes = [0u8; 4];
     s.read_exact(&mut len_bytes).context("read frame length")?;
     let len = u32::from_le_bytes(len_bytes) as usize;

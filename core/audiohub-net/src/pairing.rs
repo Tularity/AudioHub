@@ -1,4 +1,6 @@
-use crate::control::{read_frame, write_frame, ControlMsg, PROTOCOL_VERSION, VERSION_ABSENT};
+use crate::control::{
+    read_frame, write_frame, ControlIo, ControlMsg, PROTOCOL_VERSION, VERSION_ABSENT,
+};
 use crate::identity::{fingerprint_of, verify_sig, LocalIdentity, PairedPeer, PeerStore};
 use anyhow::{anyhow, bail, Result};
 use base64::prelude::*;
@@ -6,7 +8,6 @@ use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
-use std::net::TcpStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const IDENT_INITIATOR: &[u8] = b"audiohub-initiator";
@@ -148,13 +149,15 @@ fn pub_arr(pub_b64: &str) -> Result<[u8; 32]> {
 
 /// Runs the full initiator side including waiting for the final `Ok`.
 /// Caller persists (store.upsert + save) after this returns Ok, and fills peer.last_addr.
-pub fn pair_initiator(
-    s: &mut TcpStream,
+pub fn pair_initiator<T: ControlIo + ?Sized>(
+    s: &mut T,
     pin: &str,
     id: &LocalIdentity,
     my_listen_port: u16,
 ) -> Result<PairOutcome> {
     let _ = s.set_nodelay(true);
+    // Unchanged fallback: a transport with no peer address records port 0,
+    // which the store already reads as "no port we can dial" (see `conn.rs`).
     let target_port = s.peer_addr().map(|a| a.port()).unwrap_or(0);
 
     let (state, msg_a) = Spake2::<Ed25519Group>::start_a(
@@ -218,7 +221,11 @@ pub fn pair_initiator(
 /// Does NOT send the final `Ok` frame: caller must persist the peer first,
 /// then send `ControlMsg::Ok {}` via `control::write_frame` (spec: responder
 /// persists before Ok, initiator persists after receiving Ok).
-pub fn pair_responder(s: &mut TcpStream, pin: &str, id: &LocalIdentity) -> Result<PairOutcome> {
+pub fn pair_responder<T: ControlIo + ?Sized>(
+    s: &mut T,
+    pin: &str,
+    id: &LocalIdentity,
+) -> Result<PairOutcome> {
     let _ = s.set_nodelay(true);
 
     let (msg_a, peer_name, listen_port) = match read_frame(s)? {
@@ -397,8 +404,8 @@ fn verify_preimage(nonce: &[u8], fp_first: &str, fp_second: &str) -> Vec<u8> {
 // challenge (before the initiator's), because the initiator cannot know the
 // responder's fingerprint — needed in its own signature preimage — earlier.
 // Signature preimages are exactly per spec.
-pub fn verify_initiator(
-    s: &mut TcpStream,
+pub fn verify_initiator<T: ControlIo + ?Sized>(
+    s: &mut T,
     id: &LocalIdentity,
     store: &PeerStore,
 ) -> Result<PairedPeer> {
@@ -500,8 +507,8 @@ fn adopt_name(peer: &mut PairedPeer, name: String) {
     peer.name = name[..end].to_string();
 }
 
-pub fn verify_responder(
-    s: &mut TcpStream,
+pub fn verify_responder<T: ControlIo + ?Sized>(
+    s: &mut T,
     id: &LocalIdentity,
     store: &PeerStore,
 ) -> Result<PairedPeer> {

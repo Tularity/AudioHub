@@ -1,7 +1,10 @@
 //! Post-verify encryption upgrade for the control channel (spec-m4a §2).
-//! Callers run M3 verify first, then establish_* on the same TcpStream.
+//! Callers run M3 verify first, then establish_* on the same transport — any
+//! [`crate::control::ControlIo`], which is a `TcpStream` everywhere today.
 
-use std::io::{ErrorKind, Read};
+// `Read` is not imported: the byte reads below go through the `ControlIo`
+// bound, whose supertrait brings the method with it.
+use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -18,7 +21,7 @@ use zeroize::Zeroize;
 
 use audiohub_core::latency::{DevLatency, DropMode};
 
-use crate::control::{read_frame, write_frame, ControlMsg, CONTROL_MAX_FRAME};
+use crate::control::{read_frame, write_frame, ControlIo, ControlMsg, CONTROL_MAX_FRAME};
 use crate::identity::{verify_sig, LocalIdentity, PairedPeer};
 
 const SEC_LABEL_I: &[u8] = b"audiohub-sec-i";
@@ -509,8 +512,15 @@ fn ctr_nonce(n: u64) -> [u8; 12] {
     out
 }
 
-pub struct SecureChannel {
-    stream: TcpStream,
+/// The encrypted control channel, over any [`ControlIo`].
+///
+/// `T` defaults to [`TcpStream`] because that is what every caller in the tree
+/// uses today and the default keeps `SecureChannel` spelled the same in every
+/// type position it already appears in. The parameter exists so the degraded
+/// transports (design §3/§4) can carry the same channel without a second
+/// implementation of any of the code below.
+pub struct SecureChannel<T = TcpStream> {
+    stream: T,
     tx_cipher: ChaCha20Poly1305,
     rx_cipher: ChaCha20Poly1305,
     tx_n: u64,
@@ -526,14 +536,17 @@ pub struct SecureChannel {
     rd_buf: Vec<u8>,
 }
 
-impl SecureChannel {
+impl<T: ControlIo> SecureChannel<T> {
     pub fn establish_initiator(
-        mut s: TcpStream,
+        mut s: T,
         id: &LocalIdentity,
         peer: &PairedPeer,
-    ) -> Result<SecureChannel> {
+    ) -> Result<SecureChannel<T>> {
         let _ = s.set_nodelay(true);
-        s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        // Armed once for the whole handshake, as the socket option was: on a
+        // socket this installs the same per-read `SO_RCVTIMEO` the old call
+        // installed, because the deadline is converted where it is armed.
+        s.set_read_deadline(Some(Instant::now() + HANDSHAKE_TIMEOUT))?;
 
         let eph_secret = StaticSecret::random_from_rng(OsRng);
         let eph_pub = PublicKey::from(&eph_secret);
@@ -577,12 +590,13 @@ impl SecureChannel {
     }
 
     pub fn establish_responder(
-        mut s: TcpStream,
+        mut s: T,
         id: &LocalIdentity,
         peer: &PairedPeer,
-    ) -> Result<SecureChannel> {
+    ) -> Result<SecureChannel<T>> {
         let _ = s.set_nodelay(true);
-        s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        // Same as the initiator side: one arming for the whole handshake.
+        s.set_read_deadline(Some(Instant::now() + HANDSHAKE_TIMEOUT))?;
 
         let (eph_i_b64, nonce_i_b64, sig_i_b64) = match read_frame(&mut s)? {
             ControlMsg::SecInit { eph_pub_b64, nonce_b64, sig_b64 } => {
@@ -624,7 +638,7 @@ impl SecureChannel {
         Ok(SecureChannel::from_parts(s, keys, peer.clone()))
     }
 
-    fn from_parts(stream: TcpStream, keys: DerivedKeys, peer: PairedPeer) -> SecureChannel {
+    fn from_parts(stream: T, keys: DerivedKeys, peer: PairedPeer) -> SecureChannel<T> {
         SecureChannel {
             stream,
             tx_cipher: ChaCha20Poly1305::new(Key::from_slice(&keys.c_tx)),
@@ -727,8 +741,11 @@ impl SecureChannel {
             if now >= deadline {
                 return Ok(None);
             }
-            let remaining = (deadline - now).max(Duration::from_millis(1));
-            self.stream.set_read_timeout(Some(remaining))?;
+            // The deadline goes to the transport as a deadline. On a socket it
+            // is converted to the same `now`-relative timeout this line used to
+            // compute by hand; on a transport with no socket under it there is
+            // nothing to convert.
+            self.stream.set_read_deadline(Some(deadline))?;
             let mut tmp = [0u8; 4096];
             match self.stream.read(&mut tmp) {
                 Ok(0) => bail!("connection closed by peer"),
@@ -766,6 +783,9 @@ impl SecureChannel {
         &self.peer
     }
 
+    /// The address of the other end, when the transport has one. A transport
+    /// without addresses (multiplexed, in-memory) reports an error here rather
+    /// than a synthetic address — see [`ControlIo::peer_addr`].
     pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
         self.stream.peer_addr()
     }
@@ -1017,7 +1037,7 @@ mod wire_compat_tests {
     }
 }
 
-impl Drop for SecureChannel {
+impl<T> Drop for SecureChannel<T> {
     fn drop(&mut self) {
         // Control-plane keys live inside the ChaCha ciphers (wiped by their own
         // Drop); the media keys are our plain copies.

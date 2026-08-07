@@ -51,6 +51,16 @@ pub(crate) struct StoredDir {
     pub latency: String,
     #[serde(default = "auto_quality")]
     pub quality: String,
+    /// 这一格的质量档在装载时**没被认出来**，已重置为默认；这里留着它原来的
+    /// 字符串，只为让 UI 说得出「你存的 X 这个 build 不认识」。
+    ///
+    /// `#[serde(skip)]` —— **绝不落盘**。落盘的话，一次重置会在文件里长住，
+    /// 而用户下次改这一格时它还在，界面就会永远挂着一条已经不成立的说明。
+    /// 用户一写入就自然消失（写入口造的是一个全新的 `StoredDir`）。
+    #[serde(skip)]
+    pub quality_reset_from: Option<String>,
+    #[serde(skip)]
+    pub latency_reset_from: Option<String>,
 }
 
 fn auto_latency() -> String {
@@ -63,7 +73,12 @@ fn auto_quality() -> String {
 
 impl Default for StoredDir {
     fn default() -> Self {
-        StoredDir { latency: auto_latency(), quality: auto_quality() }
+        StoredDir {
+            latency: auto_latency(),
+            quality: auto_quality(),
+            quality_reset_from: None,
+            latency_reset_from: None,
+        }
     }
 }
 
@@ -74,6 +89,29 @@ impl StoredDir {
 
     pub(crate) fn quality_target(&self) -> QualityTarget {
         QualityTarget::parse(&self.quality).unwrap_or(QualityTarget::Auto)
+    }
+
+    /// Replace any stop string this build does not recognise with the default,
+    /// remembering what was there so the UI can explain the reset.
+    ///
+    /// # Why reset instead of translating, and why say so instead of resetting
+    /// # quietly
+    ///
+    /// Translating is what the deleted legacy layer did: an on-disk `pcm32k`
+    /// executed as one rung while a read-only overview drew the raw string, and
+    /// nothing could notice the two disagreed. Resetting quietly swaps that for
+    /// a different version of the same disease — the user's choice disappears
+    /// and every surface stays self-consistent about the wrong thing.
+    ///
+    /// So: the value is reset (an unexecutable string must not sit there
+    /// pretending), and the original is carried out to the UI.
+    fn sanitize(&mut self) {
+        if LatencyTarget::parse(&self.latency).is_none() {
+            self.latency_reset_from = Some(std::mem::replace(&mut self.latency, auto_latency()));
+        }
+        if QualityTarget::parse(&self.quality).is_none() {
+            self.quality_reset_from = Some(std::mem::replace(&mut self.quality, auto_quality()));
+        }
     }
 }
 
@@ -131,7 +169,27 @@ impl PeerTransportStore {
         };
         for (fp, v) in peers {
             match serde_json::from_value::<PeerTransport>(v.clone()) {
-                Ok(t) => {
+                Ok(mut t) => {
+                    // Unrecognised stop strings are reset here, once, at the
+                    // single point where the file becomes in-memory state — not
+                    // at each of the several read sites, which is how the two
+                    // halves of the deleted legacy layer drifted apart.
+                    t.recv.sanitize();
+                    t.send.sanitize();
+                    for (dir, d) in [("recv", &t.recv), ("send", &t.send)] {
+                        if let Some(old) = &d.latency_reset_from {
+                            crate::dlog!(
+                                "[audiohubd] peer_transport.json {fp}/{dir}: 延迟档 `{old}` \
+                                 本 build 不认识，已重置为默认（UI 会说明）"
+                            );
+                        }
+                        if let Some(old) = &d.quality_reset_from {
+                            crate::dlog!(
+                                "[audiohubd] peer_transport.json {fp}/{dir}: 质量档 `{old}` \
+                                 本 build 不认识，已重置为默认（UI 会说明）"
+                            );
+                        }
+                    }
                     map.insert(fp.clone(), t);
                 }
                 // **只有这一台**回默认。整表回默认会让一个手工写坏的字符串
@@ -245,13 +303,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 盘上写着一个本 build 不认识的档位串：**只有那一格**退回 AUTO，
-    /// 同一条记录的其它三格照常。松存紧取的可执行形式。
+    /// An unrecognised stop is reset **per cell**, and the original string is
+    /// carried out so the UI can explain it. The other cells are untouched.
+    ///
+    /// `pcm32k` is the interesting case: it used to be silently translated to
+    /// `pcm32k16` by the deleted compatibility layer. Silent translation is
+    /// exactly what let one page draw `pcm32k` and another draw
+    /// "PCM 32 kHz - 16 bit" for the same stored byte, with nothing to notice.
+    ///
+    /// Injection check: make `sanitize` leave the string alone (return early)
+    /// and this goes red on "was left in place"; make it reset without setting
+    /// `*_reset_from` and it goes red on "reset silently".
     #[test]
-    fn an_unknown_stop_string_falls_back_per_cell_not_per_record() {
-        let d = StoredDir { latency: "nonsense".into(), quality: "pcm32k".into() };
+    fn an_unrecognised_stop_is_reset_per_cell_and_reported() {
+        let mut d = StoredDir {
+            latency: "nonsense".into(),
+            quality: "pcm32k".into(),
+            ..StoredDir::default()
+        };
+        d.sanitize();
+
+        assert_eq!(d.latency, "auto", "unrecognised latency was left in place");
+        assert_eq!(
+            d.latency_reset_from.as_deref(),
+            Some("nonsense"),
+            "latency was reset silently; the UI has nothing to explain it with"
+        );
+        assert_eq!(d.quality, "auto", "stale id `pcm32k` was left in place or translated");
+        assert_eq!(
+            d.quality_reset_from.as_deref(),
+            Some("pcm32k"),
+            "quality was reset silently; the UI has nothing to explain it with"
+        );
         assert_eq!(d.latency_target(), LatencyTarget::Auto);
-        assert_eq!(d.quality_target(), QualityTarget::Rate(32_000));
+        assert_eq!(d.quality_target(), QualityTarget::Auto);
+    }
+
+    /// A recognised value is left completely alone — no reset marker, so the UI
+    /// does not show an explanation nobody needs.
+    ///
+    /// Without this, a `sanitize` that reset everything unconditionally would
+    /// pass the test above.
+    #[test]
+    fn a_recognised_stop_is_untouched_by_sanitize() {
+        let mut d = StoredDir {
+            latency: "300".into(),
+            quality: "pcm48k24".into(),
+            ..StoredDir::default()
+        };
+        d.sanitize();
+        assert_eq!(d.latency, "300");
+        assert_eq!(d.quality, "pcm48k24");
+        assert_eq!(d.latency_reset_from, None, "a valid stop was flagged as reset");
+        assert_eq!(d.quality_reset_from, None, "a valid stop was flagged as reset");
+    }
+
+    /// The reset happens **on load**, so every read site sees the sanitised
+    /// value. Having each read site fall back on its own is how the deleted
+    /// legacy layer ended up with one path that forgot to.
+    #[test]
+    fn loading_a_file_with_a_stale_id_resets_it_and_remembers_the_original() {
+        let dir = tmpdir("stale");
+        let raw = r#"{
+          "version": 1,
+          "peers": {
+            "aa11": { "recv": { "latency": "300", "quality": "pcm32k" },
+                      "send": { "latency": "auto", "quality": "pcm48k24" } }
+          }
+        }"#;
+        std::fs::write(PeerTransportStore::path(&dir), raw).expect("write");
+
+        let t = PeerTransportStore::load(&dir).get("aa11");
+        assert_eq!(t.recv.quality, "auto", "stale id survived the load path");
+        assert_eq!(t.recv.quality_reset_from.as_deref(), Some("pcm32k"));
+        assert_eq!(t.recv.latency, "300", "a valid neighbouring cell was collateral damage");
+        assert_eq!(t.send.quality, "pcm48k24", "a valid cell in the other direction was reset");
+        assert_eq!(t.send.quality_reset_from, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reset marker **never reaches disk**. Persisting it would leave a
+    /// permanent note on a file the user has since fixed.
+    #[test]
+    fn the_reset_marker_is_not_persisted() {
+        let dir = tmpdir("nomark");
+        let mut s = PeerTransportStore::default();
+        let mut d = StoredDir { quality: "pcm32k".into(), ..StoredDir::default() };
+        d.sanitize();
+        s.set("aa11", PeerTransport { recv: d, send: StoredDir::default() });
+        s.save(&dir).expect("save");
+
+        let raw = std::fs::read_to_string(PeerTransportStore::path(&dir)).expect("read");
+        assert!(
+            !raw.contains("reset_from"),
+            "the reset marker was written to disk; it would outlive the condition it describes"
+        );
+        assert!(!raw.contains("pcm32k"), "the stale id was written back out");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

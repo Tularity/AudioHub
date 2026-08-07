@@ -24,8 +24,8 @@ import { useMemo, useState } from 'react';
 import { StopSlider } from './StopSlider';
 import { t } from '../i18n';
 import { fmt } from '../lib/fmt';
-import { latencyStops, normLatency, normQuality, qualityStops, stopLabel } from '../lib/transportStops';
-import { pickWorst, readLatency, readQuality, splitByDirection } from '../lib/metrics';
+import { latencyStops, normLatency, qualityStops, stopLabel } from '../lib/transportStops';
+import { pickWorst, qualityDepthKey, readLatency, readQuality, splitByDirection } from '../lib/metrics';
 import type { Dir } from '../lib/metrics';
 import { rpc, refreshPeers } from '../state/connection';
 import { useStore } from '../state/store';
@@ -181,7 +181,7 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
       }
       if (dir === 'out' && kind === 'quality') {
         const v = tr.peer_tx_quality;
-        return typeof v === 'string' ? normQuality(v) : null;
+        return typeof v === 'string' ? v : null;
       }
       return null;
     }
@@ -190,10 +190,25 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
     // 使用端这一侧**不许**出现「未设定」：daemon 对每台配对过的对端都给得出
     // 四个值（没设过就是 auto）。读不到只可能是旧服务 —— 回落到 auto 而不是
     // 空着，否则滑条会整个消失，用户连改都改不了。
+    // 质量档**不做任何规范化**：daemon 装载时已经把认不出来的串重置为默认，
+    // 这里再翻一次就是在前端复刻一份档表（那正是被删掉的那层兼容代码）。
     return typeof raw === 'string'
-      ? (kind === 'latency' ? normLatency(raw) : normQuality(raw))
-      : (kind === 'latency' ? 'auto' : 'auto');
+      ? (kind === 'latency' ? normLatency(raw) : raw)
+      : 'auto';
   }
+
+  /** 装载时被重置掉的档位格（daemon 报的原值）。空数组 = 一切正常。 */
+  const resets = ROWS.flatMap((dir) => {
+    const slot = dir === 'in' ? tr.recv : tr.send;
+    const out: { dir: Dir; kind: 'latency' | 'quality'; old: string }[] = [];
+    if (typeof slot?.latency_reset_from === 'string') {
+      out.push({ dir, kind: 'latency', old: slot.latency_reset_from });
+    }
+    if (typeof slot?.quality_reset_from === 'string') {
+      out.push({ dir, kind: 'quality', old: slot.quality_reset_from });
+    }
+    return out;
+  });
 
   async function set(dir: Dir, kind: 'latency' | 'quality', v: string): Promise<void> {
     if (busy) return;
@@ -215,6 +230,18 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
       {shared ? (
         <p className="transport-provenance" data-testid="detail-transport-shared">
           {t('detail.transport.sharedBy', { name: peer.display_name || peer.name || fp.slice(0, 8) })}
+        </p>
+      ) : null}
+      {/* 盘上存着一个本 build 不认识的档位串时，daemon 已经把它重置为默认，
+          这里**必须把这件事说出来**。静默重置与被删掉的那层静默翻译是同一个病：
+          用户的选择消失了，而界面上处处自洽。 */}
+      {resets.length ? (
+        <p className="transport-reset" data-testid="detail-transport-reset">
+          {resets.map((r) => t('detail.transport.stopReset', {
+            dir: t(r.dir === 'out' ? 'peers.card.streamOut' : 'peers.card.streamIn'),
+            kind: t(r.kind === 'latency' ? 'settings.transport.latency' : 'settings.transport.quality'),
+            old: r.old,
+          })).join(' ')}
         </p>
       ) : null}
       <div className="transport-grid" data-testid="detail-transport-grid">
@@ -249,11 +276,56 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
           值被推到了哪里（plan §15 裁定 3），但需要知道「一个方向的两个旋钮不在
           同一台机器上执行」。 */}
       <p className="muted small" data-testid="detail-transport-where">{t('detail.transport.where')}</p>
+
+      {/* ---- 两个档位的权威解释 --------------------------------------------
+          `settings.transport.latencyDesc` / `qualityDesc` 是这两个旋钮的**权威
+          解释**（延迟是端到端目标而非缓冲深度；音质一档定下采样率与位深两件事）。
+          §15 把档位从设置页搬到这里时，那两条语料的渲染点留在了原地 ⇒ 它们成了
+          **死键**：全仓无任何组件引用，界面上没有一处说得出位深是什么、为什么
+          带宽翻倍、AUTO 为什么不会自己上去。
+
+          所以接在这里。**收起态**是因为这两段很长，而这张卡的主角是四个控件；
+          常驻会把控件挤下屏。留一段没人读的「权威解释」在语料里，下一个人会
+          以为它在线上——那比没有更坏。 */}
+      <button
+        type="button"
+        className="transport-help-toggle"
+        data-testid="detail-transport-help-toggle"
+        aria-expanded={help}
+        aria-controls="detail-transport-help"
+        onClick={() => setHelp((v) => !v)}
+      >
+        {t(help ? 'detail.transport.helpHide' : 'detail.transport.helpShow')}
+      </button>
+      <div
+        className="transport-help"
+        id="detail-transport-help"
+        data-testid="detail-transport-help"
+        hidden={!help}
+      >
+        <h4>{t('settings.transport.latency')}</h4>
+        <p>{t('settings.transport.latencyDesc')}</p>
+        <h4>{t('settings.transport.quality')}</h4>
+        <p>{t('settings.transport.qualityDesc')}</p>
+      </div>
     </section>
   );
 }
 
-/** 设置页那张只读总览用得到：一台对端四个档的文本形态。 */
+/**
+ * 设置页那张只读总览用得到：一台对端四个档的文本形态。
+ *
+ * # 这里为什么不再有「规范化」这一步
+ *
+ * 曾经有。质量档串有三条读路径（详情页滑条的 `valueOf`、本函数、共享模式的
+ * 回显），每条都得记得调一次 `normQuality()` —— 而**本函数漏掉了**：同一个
+ * 存盘值在详情页显示「PCM 32 kHz · 16 bit」、在这张总览里显示裸的 `pcm32k`，
+ * 两处各说各话且没有任何一处会报错。那层兼容代码自己制造了这个回归。
+ *
+ * 现在 daemon 在**装载时一次性**把认不出来的串重置为默认（`StoredDir::sanitize`），
+ * 于是这里拿到的永远是档表里有的 id，三条读路径不可能再分岔。
+ * 重置这件事本身由 `quality_reset_from` / `latency_reset_from` 带到 UI 说明。
+ */
 export function transportCells(
   ds: import('../ipc/types').DaemonSettings | null,
   peer: PeerState,
@@ -266,7 +338,8 @@ export function transportCells(
     return {
       dir,
       // 读不到就是 `—`（`stopLabel` 返回 null）：**绝不填一个 auto 冒充**。
-      latency: stopLabel(l, slot?.latency) ?? t('common.dash'),
+      latency: stopLabel(l, slot?.latency ? normLatency(slot.latency) : slot?.latency)
+        ?? t('common.dash'),
       quality: stopLabel(q, slot?.quality) ?? t('common.dash'),
     };
   });

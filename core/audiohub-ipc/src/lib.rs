@@ -15,7 +15,7 @@ pub mod transport;
 
 pub use transport::{
     LatencyTarget, QualityStop, QualityTarget, LATENCY_AUTO, LATENCY_LEGACY_MIN, LATENCY_STOPS_MS,
-    QUALITY_AUTO, QUALITY_LEGACY_PCM,
+    QUALITY_AUTO,
 };
 
 /// 2 起：daemon 保证 `SessionStats.pipeline` / `.quality` 两个字段**存在**
@@ -254,11 +254,34 @@ pub struct PeerTransportDir {
     pub latency: String,
     /// `"auto"` 或某个可用档位 id（见 [`transport::quality_stops`]）。
     pub quality: String,
+    /// 盘上写着一个本 build 不认识的质量档时，**它原来的字符串**；
+    /// 此时上面的 `quality` 已经被重置成默认（`auto`）。`None` = 一切正常。
+    ///
+    /// # 为什么要把它报出来，而不是静默重置
+    ///
+    /// 这一格的前身是一层**静默翻译**（旧 id `pcm32k` → `pcm32k16`）。那层代码
+    /// 自己制造了一个真回归：前端要镜像同一张表，而三条读路径里有一条
+    /// （`PeerTransport.transportCells`）漏掉了它，于是同一个存盘值在详情页
+    /// 显示「PCM 32 kHz · 16 bit」、在总览里显示裸的 `pcm32k`，
+    /// **没有任何一处会报错**。
+    ///
+    /// 静默重置只是把同一个病换个方向：用户的选择消失了而界面照旧自洽。
+    /// 所以重置照做（不能让一个执行不了的值留在那里），但**必须说出来**。
+    #[serde(default)]
+    pub quality_reset_from: Option<String>,
+    /// 同上，延迟档那一格。
+    #[serde(default)]
+    pub latency_reset_from: Option<String>,
 }
 
 impl Default for PeerTransportDir {
     fn default() -> Self {
-        PeerTransportDir { latency: LATENCY_AUTO.to_string(), quality: QUALITY_AUTO.to_string() }
+        PeerTransportDir {
+            latency: LATENCY_AUTO.to_string(),
+            quality: QUALITY_AUTO.to_string(),
+            quality_reset_from: None,
+            latency_reset_from: None,
+        }
     }
 }
 

@@ -81,10 +81,18 @@ export function normLatency(v: string): string {
   return Number.isFinite(n) ? String(n) : v;
 }
 
-/** 旧服务的 `'pcm'` 指的是全带宽那一档。 */
-export function normQuality(v: string): string {
-  return v === 'pcm' ? 'pcm48k' : v;
-}
+// NOTE（已删除的兼容层）：这里曾有一张 `QUALITY_LEGACY` 旧 id → 新 id 的表和一个
+// `normQuality()`，与 daemon 的 `QUALITY_LEGACY_IDS` 互为镜像。
+//
+// **那层代码自己制造了一个真回归**：档位串有三条读路径（详情页滑条的
+// `valueOf`、只读总览的 `transportCells`、共享模式的回显），而 `transportCells`
+// 漏掉了这道规范化 —— 于是同一个存盘值在详情页显示「PCM 32 kHz · 16 bit」、
+// 在总览里显示裸的 `pcm32k`，两个页面各说各话且没有任何一处会报错。
+//
+// 现在标识符只有阶梯那六个 + `auto`。daemon 装载时把认不出来的串重置为默认，
+// 并通过 `PeerTransportDir.quality_reset_from` / `.latency_reset_from` 把原值带
+// 上来让 UI 说明（见 `PeerTransport.tsx` 那条提示）。前端**不再做任何翻译**：
+// 翻译的前提是前端知道 daemon 的档表，而档表的唯一真值源在 daemon。
 
 export function latencyStops(ds: DaemonSettings | null): Stop[] {
   const raw = ds && Array.isArray(ds.latency_stops_ms) && ds.latency_stops_ms.length

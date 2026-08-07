@@ -464,11 +464,6 @@ mod tests {
             assert_eq!(t.as_wire(), q.id, "{} 的 as_wire 与 id 不一致", q.id);
             assert_eq!(QualityTarget::parse(&t.as_wire()), Some(t));
         }
-        assert_eq!(
-            QualityTarget::parse(QUALITY_LEGACY_PCM),
-            Some(QualityTarget::Rate(48_000)),
-            "旧的 PCM 档就是满速率那一档"
-        );
     }
 
     /// id 唯一、码率单调不减 —— 滑条从左到右必须越来越好，否则「往右拖 = 提质量」

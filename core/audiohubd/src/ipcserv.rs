@@ -704,10 +704,14 @@ fn peer_transport_view(
         recv: audiohub_ipc::PeerTransportDir {
             latency: mine.recv.latency.clone(),
             quality: mine.recv.quality.clone(),
+            quality_reset_from: mine.recv.quality_reset_from.clone(),
+            latency_reset_from: mine.recv.latency_reset_from.clone(),
         },
         send: audiohub_ipc::PeerTransportDir {
             latency: mine.send.latency.clone(),
             quality: mine.send.quality.clone(),
+            quality_reset_from: mine.send.quality_reset_from.clone(),
+            latency_reset_from: mine.send.latency_reset_from.clone(),
         },
         peer_rx_latency: None,
         peer_tx_quality: None,

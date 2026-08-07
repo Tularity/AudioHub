@@ -445,6 +445,23 @@ export interface PeerTransportDir {
   latency?: string;
   /** `'auto'`，或某个 `available` 的 `QualityStop.id`。 */
   quality?: string;
+  /**
+   * 盘上存着一个 daemon 不认识的音质档时，**它原来的字符串**；此时上面的
+   * `quality` 已经被重置成 `'auto'`。缺席 / `null` = 一切正常。
+   *
+   * # 为什么这条要走到界面上
+   *
+   * 这一格的前身是一层**静默翻译**（旧 id `pcm32k` → `pcm32k16`），前端要镜像
+   * 同一张表，而三条读路径里有一条漏掉了它 ⇒ 同一个存盘值在详情页显示
+   * 「PCM 32 kHz · 16 bit」、在设置页总览里显示裸的 `pcm32k`，**两处各说各话
+   * 且没有任何一处会报错**。那层兼容代码自己制造了这个回归，已整层删除。
+   *
+   * 静默重置只是把同一个病换个方向：用户的选择消失了而界面处处自洽。
+   * 所以重置照做（一个执行不了的串不能留在那里冒充选择），但必须说出来。
+   */
+  quality_reset_from?: string | null;
+  /** 同上，延迟档那一格。 */
+  latency_reset_from?: string | null;
 }
 
 /**

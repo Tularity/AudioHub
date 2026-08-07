@@ -360,6 +360,35 @@ impl Node {
             .expect("daemon.status.latency_guard.servo 必须存在")
     }
 
+    /// This daemon's live tier 1 media links (M8). Empty = every peer is on
+    /// tier 0, which is a fact and not a missing reading.
+    ///
+    /// Lives under `latency_guard` beside `media_send_q`: both answer the same
+    /// question — is the send side falling behind, and by how much — and the
+    /// tier 1 stale gate is ratchet governance, which is what that block is.
+    fn tcp_media(&self) -> Vec<Value> {
+        self.ok(methods::DAEMON_STATUS, json!({}))
+            .get("latency_guard")
+            .and_then(|g| g.get("tcp_media"))
+            .and_then(|v| v.as_array().cloned())
+            .expect("daemon.status.latency_guard.tcp_media 必须存在")
+    }
+
+    fn tcp_link(&self) -> Option<Value> {
+        self.tcp_media().into_iter().next()
+    }
+
+    /// One recv-side session's tone verdict, or `None` while none has been
+    /// formed yet.
+    fn recv_verdict(&self) -> Option<Value> {
+        self.ok(methods::SESSION_LIST, json!({}))
+            .as_array()?
+            .iter()
+            .find(|s| s["dir"].as_str() == Some("recv"))
+            .and_then(|s| s["stats"]["verdict"].as_object().cloned())
+            .map(Value::Object)
+    }
+
     /// JB 当前的包络（`min_target`, `max_target`）。
     fn jb_envelope(&self) -> Option<(u32, u32)> {
         crate::snapshot_sessions(self.h.inner_for_test())
@@ -371,6 +400,29 @@ impl Node {
                 })
             })
     }
+}
+
+/// Pin a peer's connectivity tier (M8). **Must be called before the control
+/// connection exists**: `tcpmedia::negotiate` runs once, inside `register_conn`,
+/// so a tier set afterwards is a tier that only takes effect on the next
+/// connection — which is the intended product semantics (design §5.1: never
+/// switch transports inside a live stream) and therefore also the shape a test
+/// has to respect.
+///
+/// Goes straight at `inner.peer_transport` rather than through IPC because P3
+/// has no IPC verb for it: manual pinning is a developer/test affordance until
+/// P4 gives it an automatic path and the UI a control.
+fn pin_tier(n: &Node, fp: &str, tier: &str) {
+    let inner = n.h.inner_for_test();
+    let mut store = lk(&inner.peer_transport);
+    let mut t = store.get(fp);
+    t.transport_tier = tier.to_string();
+    store.set(fp, t);
+    assert_eq!(
+        store.tier(fp),
+        crate::peer_transport::TransportTier::parse(tier).expect("a tier this build knows"),
+        "the tier did not stick; every assertion downstream would be about tier 0"
+    );
 }
 
 fn pair(a: &Node, b: &Node) {
@@ -2227,4 +2279,148 @@ fn a_consumer_mode_machine_refuses_pushed_stops_and_counts_them() {
         None,
         "一台使用端接受了对端塞过来的档位：§13 的互斥线被击穿了"
     );
+}
+
+// ------------------------------------------------------- M8 tier 1 (TCP media)
+
+/// **Acceptance 1 (design §6, P3): two real daemons, pinned to tier 1, carry a
+/// 1 kHz tone over TCP.**
+///
+/// The unit tests in `tcpmedia.rs` prove the queue, the stale gate and the
+/// completion rule against a fake sink. None of them proves the thing that has
+/// gone wrong five times in this repository: that the code is **wired in** —
+/// that a ticket is minted, a second TCP connection is dialled and accepted,
+/// that `ConnShared.media_path` really becomes `Tcp`, and that a stream opened
+/// afterwards really sends its frames down it.
+///
+/// So the assertions are:
+///   1. a live link exists **on both sides** (one connection, two ends);
+///   2. the receiver's tone verdict detects 1 kHz with a healthy SNR — audio
+///      crossed, not just bytes;
+///   3. nothing was lost, because loopback TCP cannot lose anything;
+///   4. **the frames the receiver read off the TCP link account for every
+///      packet its session received.** This is the one that makes the test
+///      about tier 1 rather than about "audio works": without it, a wiring bug
+///      that silently left media on UDP would pass every other assertion.
+///
+/// Injection controls (both run 2026-08-07, both red as described):
+///   - drop `tcpmedia::negotiate(inner, &conn)` from `register_conn` ⇒ times
+///     out at (1), "a tier 1 media link on the dialling side".
+///   - make `conn.rs`'s four `conn.current_media_path()` call sites pass
+///     `MediaPath::Udp(..)` instead ⇒ **(1), (2) and (3) all still pass** — the
+///     link is up, the tone arrives, nothing is lost — and (4) goes red on
+///     "the sender never wrote a frame to the tier 1 link". That is the whole
+///     reason (4) exists: it is the only assertion here that can tell a
+///     working downgrade from a decorative one.
+#[test]
+fn two_daemons_pinned_to_tier_one_carry_a_tone_over_tcp() {
+    let a = Node::start("t1-a");
+    let b = Node::start("t1-b");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    // Before pairing: `negotiate` runs inside `register_conn`, which the pair
+    // flow reaches immediately.
+    pin_tier(&a, &b.fingerprint(), "tier1");
+    pin_tier(&b, &a.fingerprint(), "tier1");
+    pair(&a, &b);
+
+    // (1) one link, two ends.
+    eventually("a tier 1 media link on the dialling side", || {
+        a.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+    eventually("a tier 1 media link on the accepting side", || {
+        b.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+    assert_eq!(
+        a.tcp_link().expect("checked above")["fingerprint"].as_str(),
+        Some(b.fingerprint().as_str()),
+        "the link is attached to the wrong peer"
+    );
+
+    // A tone A -> B, with B verifying it.
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({
+            "peer": b.fingerprint(), "kind": KIND_SPK, "source": SOURCE_TONE,
+            "freq": 1000.0, "verify_freq": 1000.0
+        }),
+    );
+
+    // (2) the audio arrived, and it is the audio that was sent.
+    eventually_within(Duration::from_secs(20), "B's 1 kHz verdict", || {
+        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
+    });
+    let verdict = b.recv_verdict().expect("checked above");
+    let snr = verdict["snr_db"].as_f64().expect("a detected verdict carries an SNR");
+    assert!(snr >= 40.0, "1 kHz over loopback TCP should be clean, got {snr:.1} dB SNR");
+
+    // (3) loopback TCP loses nothing.
+    let sessions = b.ok(methods::SESSION_LIST, json!({}));
+    let recv = sessions
+        .as_array()
+        .and_then(|ss| ss.iter().find(|s| s["dir"].as_str() == Some("recv")))
+        .expect("B must have a receiving session")
+        .clone();
+    assert_eq!(recv["stats"]["lost"].as_u64(), Some(0), "TCP lost a packet: {recv}");
+    let received = recv["stats"]["received"].as_u64().expect("a received count");
+    assert!(received > 0, "the session reports no packets at all");
+
+    // (4) ...and they came off the TCP link, not off the UDP socket.
+    let a_link = a.tcp_link().expect("still attached");
+    let b_link = b.tcp_link().expect("still attached");
+    let written = a_link["frames_written"].as_u64().expect("a written count");
+    let read = b_link["frames_read"].as_u64().expect("a read count");
+    assert!(written > 0, "the sender never wrote a frame to the tier 1 link");
+    assert!(
+        read >= received,
+        "the session counted {received} packets but only {read} came off the tier 1 link, so \
+         the rest arrived over UDP — the downgrade is decorative"
+    );
+    assert_eq!(
+        a_link["stale_dropped"].as_u64(),
+        Some(0),
+        "the stale gate fired on an idle loopback link, which means it is measuring the wrong \
+         thing: there is nothing here for a frame to wait behind"
+    );
+    assert_eq!(
+        b_link["unexpected_kind"].as_u64(),
+        Some(0),
+        "a non-media frame arrived on the tier 1 link"
+    );
+}
+
+/// **A peer pinned to tier 0 refuses to be attached to, and says nothing on the
+/// media socket.**
+///
+/// "Advertisement is not authorisation" (design decision C) has exactly one
+/// concrete form on this path, and this is it. Without the check, one side
+/// pinning tier 1 would drag the other onto TCP regardless of what its own
+/// operator chose — and `plan.md` §16.2 says a manual override is always
+/// available, in both directions.
+#[test]
+fn a_peer_pinned_to_tier_zero_refuses_the_attach() {
+    let a = Node::start("t0-a");
+    let b = Node::start("t0-b");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    pin_tier(&a, &b.fingerprint(), "tier1"); // the dialler wants tier 1
+    pin_tier(&b, &a.fingerprint(), "tier0"); // ...the peer does not
+    pair(&a, &b);
+
+    // A tone still has to work — a refused downgrade must leave tier 0 intact.
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({
+            "peer": b.fingerprint(), "kind": KIND_SPK, "source": SOURCE_TONE,
+            "freq": 1000.0, "verify_freq": 1000.0
+        }),
+    );
+    eventually_within(Duration::from_secs(20), "B's 1 kHz verdict over UDP", || {
+        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
+    });
+
+    // Checked after the tone, not before: a link that takes a moment to appear
+    // would make an immediate assertion pass for the wrong reason.
+    assert!(a.tcp_media().is_empty(), "a tier 0 peer granted a media attach: {:?}", a.tcp_media());
+    assert!(b.tcp_media().is_empty(), "a tier 0 peer accepted a media attach: {:?}", b.tcp_media());
 }

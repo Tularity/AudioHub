@@ -30,6 +30,8 @@ mod rtsafe;
 /// 延迟目标的伺服回路（纯函数 + 一拍驱动）。
 mod servo;
 mod settings;
+/// Tier 1（M8 降级链路）：媒体走第二条 TCP 连接。附着、写线程、陈旧闸门、读线程。
+mod tcpmedia;
 /// 传输档位在 daemon 侧的活体状态：用户选了什么、媒体面真的在做什么。
 mod transport;
 /// 传输档位的接线测试（两台真 daemon，断言执行器而不是设置字段）。
@@ -42,7 +44,7 @@ mod transport_tests;
 pub use engine::resolve_bridge_device;
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, Once, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -385,6 +387,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         ))),
         hal_sess: Mutex::new(None),
         hal_mic_io: std::array::from_fn(|_| AtomicBool::new(true)),
+        media_tickets: Mutex::new(Vec::new()),
         preauth: AtomicUsize::new(0),
         recon: Mutex::new(HashMap::new()),
         dev_in_epoch: AtomicU64::new(0),
@@ -603,6 +606,13 @@ pub(crate) struct DaemonInner {
     /// PER SLOT: one flag would let an app recording peer A's microphone open
     /// the write path for every other peer's ring as well.
     pub hal_mic_io: [AtomicBool; haldev::HAL_MAX_SLOTS],
+    /// Unspent tier 1 media attach tickets (M8). Single use, ten second TTL,
+    /// each scoped to one peer's fingerprint.
+    ///
+    /// A `Vec` and not a map: there are at most a handful live, and a linear
+    /// scan lets the comparison be constant time — see `tcpmedia::claim_ticket`
+    /// for why that is worth the (nonexistent) cost here.
+    pub media_tickets: Mutex<Vec<tcpmedia::MediaTicket>>,
     /// Control connections past the first frame but not yet verified; bounds
     /// the number of unauthenticated handshake threads an attacker can pin.
     pub preauth: AtomicUsize,
@@ -803,6 +813,40 @@ pub(crate) fn status_with_hal(
 ///
 /// 走缓存（`dev_lats()` 会按需刷新），所以 `daemon.status` 不会变成一条
 /// 「每次调用都问四遍 CoreAudio」的路径。
+/// `daemon.status.tcp_media`：每条活着的 Tier 1 媒体链路一行。
+///
+/// 空数组 = 没有任何对端在降级链路上，**不是**「读不到」。区别是有意义的：
+/// 这套遥测反对的正是「用 0 冒充未知」。
+fn tcp_media_status(inner: &DaemonInner) -> serde_json::Value {
+    let links: Vec<Arc<tcpmedia::TcpMediaLink>> = lk(&inner.state)
+        .conns
+        .values()
+        .filter_map(|c| match &*lk(&c.media_path) {
+            tcpmedia::MediaPath::Tcp(l) => Some(l.clone()),
+            tcpmedia::MediaPath::Udp(_) => None,
+        })
+        .collect();
+    serde_json::Value::Array(
+        links
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "fingerprint": l.fp,
+                    "peer": l.peer.to_string(),
+                    "alive": l.is_alive(),
+                    "queued": l.queued(),
+                    "capacity": l.capacity(),
+                    "dropped": l.dropped(),
+                    "stale_dropped": l.stale_dropped(),
+                    "frames_written": l.frames_written(),
+                    "frames_read": l.frames_read(),
+                    "unexpected_kind": l.unexpected_kind(),
+                })
+            })
+            .collect(),
+    )
+}
+
 fn dev_lats_status(inner: &DaemonInner) -> serde_json::Value {
     let lats = dev_lats(inner);
     serde_json::json!({
@@ -932,6 +976,16 @@ fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
             "capacity": inner.media_send.capacity(),
             "dropped": inner.media_send.dropped(),
         },
+        // Tier 1 媒体链路（M8），每对端一条，没有降级的对端这里就是空数组。
+        //
+        // 怎么读：`stale_dropped` 与 `dropped` 是**解释「Tier 1 为什么难听」的
+        // 唯一两个数字，别处看不到**（设计 §5.2 第 4 条）。
+        // - `dropped` 涨 = 写线程卡的时间已经把 128 个槽灌满（单流 1.28 s）。
+        // - `stale_dropped` 涨 = 出队时帧已经超过 200 ms 预算，被主动丢掉。
+        //   **这不是一个新的丢包源，是把 TCP 抹掉的丢包信号按需造回来**：
+        //   丢弃留下 seq 空洞，对端 JB 于是按真丢包正确隐藏。
+        // - 两者都为 0 而对端仍在欠载 ⇒ 病不在这条链路的发送侧。
+        "tcp_media": tcp_media_status(inner),
         // 发送侧：`tx_loop` 唤醒周期的二阶 DLL（`halbridge::dll`）。它是
         // `hal_spk` 水位的**常规执行器**，`trim` 只是它够不着那一档的兜底。
         //
@@ -1016,8 +1070,28 @@ pub(crate) struct ConnShared {
     pub chan: Mutex<SecureChannel>,
     pub tx_key: [u8; 32],
     pub rx_key: [u8; 32],
-    /// Frozen: media destination = control-TCP peer IP + peer daemon port.
-    pub media_dest: SocketAddr,
+    /// The control-TCP peer's IP. Frozen as the only address media may be sent
+    /// to on tier 0, and the only source address a `PullReq` may be believed
+    /// from (a keepalive is an unencrypted header, so trusting its source would
+    /// let anyone on the path redirect the live stream to themselves).
+    pub peer_ip: IpAddr,
+    /// Where this peer's media actually goes right now (M8). Starts as
+    /// `Udp(peer_ip:peer.port)` — the frozen tier 0 destination — and becomes
+    /// `Tcp(..)` when a tier 1 link attaches.
+    ///
+    /// **Per connection, not per direction**: both directions share this
+    /// `ConnShared`, and after a downgrade they share one media TCP as well.
+    /// See `peer_transport::TransportTier`.
+    ///
+    /// Behind a `Mutex` because it is written by the attach path and read at
+    /// stream-open time; the 10 ms loops never touch it, they hold their own
+    /// clone taken when the stream was created (design §5.1: promotion happens
+    /// at the *next* stream open, never inside a live one).
+    pub media_path: Mutex<tcpmedia::MediaPath>,
+    /// Claimed once by whoever gets to dial the tier 1 link, so that the
+    /// initiator's request and the responder's unprompted offer cannot both
+    /// produce one. Two links would mean two writers on one peer.
+    pub media_attaching: AtomicBool,
     /// Fingerprint of whoever opened this TCP connection. Both peers apply the
     /// same "lower fingerprint wins" rule to a simultaneous bidirectional
     /// connect, so they converge on one connection instead of evicting each
@@ -1090,6 +1164,17 @@ impl PeerModeCell {
 }
 
 impl ConnShared {
+    /// The media path to bind a stream being created **right now** to.
+    ///
+    /// Read once, at stream creation, and then owned by that stream for its
+    /// whole life. Promotion and demotion happen between streams, never inside
+    /// one (design §5.1): switching live would mean a new jitter buffer, a new
+    /// destination, and reordering across two transports, to save one stream
+    /// open.
+    pub(crate) fn current_media_path(&self) -> tcpmedia::MediaPath {
+        lk(&self.media_path).clone()
+    }
+
     pub fn send_msg(&self, m: &SessionMsg) -> Result<()> {
         let r = lk(&self.chan).send(m);
         if r.is_err() {
@@ -1782,7 +1867,11 @@ pub(crate) struct RxStream {
     /// The SLOT, not a bare flag: the mixer routes by it, and a boolean here
     /// is what let every peer's audio end up in one ring.
     pub hal_slot: Option<u8>,
-    pub ka_dest: SocketAddr,
+    /// Where this stream's keepalive would go — **and whether it has anywhere
+    /// to go at all**. `MediaPath::Tcp` has no datagram destination, and
+    /// `send_pullreq` therefore does nothing on it: a keepalive exists to hold
+    /// NAT/firewall state open for a UDP flow that, on tier 1, does not exist.
+    pub ka_path: tcpmedia::MediaPath,
     pub jbs: Mutex<JbState>,
     pub post: Mutex<PostMix>,
     /// post-JB 48k tap (2s) for per-stream verdicts; only allocated when a
@@ -1834,7 +1923,7 @@ impl RxStream {
         monitor: bool,
         bridge: Option<String>,
         hal_slot: Option<u8>,
-        ka_dest: SocketAddr,
+        ka_path: tcpmedia::MediaPath,
     ) -> RxStream {
         RxStream {
             stream_id,
@@ -1845,7 +1934,7 @@ impl RxStream {
             monitor,
             bridge,
             hal_slot,
-            ka_dest,
+            ka_path,
             jbs: Mutex::new(JbState {
                 jb: JitterBuffer::new(2),
                 rs_rate: 48000,
@@ -3907,7 +3996,7 @@ mod telemetry_tests {
             false, // monitor
             None,
             None,
-            "127.0.0.1:1".parse().unwrap(),
+            tcpmedia::MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
         )
     }
 
@@ -5295,7 +5384,7 @@ mod telemetry_tests {
                 false, // monitor
                 None,
                 None,
-                "127.0.0.1:1".parse().unwrap(),
+                tcpmedia::MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
             )
         };
         let (r1, r2) = (mk(), mk());
@@ -5494,7 +5583,7 @@ mod fault_injection {
             false, // monitor
             None,
             None,
-            "127.0.0.1:1".parse().unwrap(),
+            tcpmedia::MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
         )
     }
 
@@ -5882,7 +5971,7 @@ mod fault_injection {
             false,
             Some("some-usb-dac".to_string()),
             None,
-            "127.0.0.1:1".parse().unwrap(),
+            tcpmedia::MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
         );
         seed_upstream_50ms(&rx);
         let empty_site = StageSlot::new();
@@ -6022,7 +6111,7 @@ mod fault_injection {
             false,
             None,
             Some(0), // 只写虚拟麦克风
-            "127.0.0.1:1".parse().unwrap(),
+            tcpmedia::MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
         );
         seed_upstream_50ms(&rx);
         // 真环的读数由 halbridge.rs 的 `HalBridge::mic_depth` 测试钉死；这里验
@@ -6060,7 +6149,7 @@ mod fault_injection {
             false,
             Some("dac".to_string()), // 同时桥接
             Some(1),                 // 同时写虚拟麦克风
-            "127.0.0.1:1".parse().unwrap(),
+            tcpmedia::MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
         );
         seed_upstream_50ms(&rx);
         let slot = StageSlot::new();

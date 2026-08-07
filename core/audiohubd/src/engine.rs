@@ -19,6 +19,7 @@ use audiohub_net::media::{FrameSource, LossInjector, MediaCrypto, MicSource, Ton
 use audiohub_net::packet::{Codec, Header, Kind};
 
 use crate::rtsafe::SpscRing;
+use crate::tcpmedia::MediaPath;
 use crate::{dlog, lk, rd, rtlog, DaemonInner, RxStream, TxShared};
 
 /// 一帧的毫秒数。`pub(crate)` 是为了让 `servo.rs` 能断言它与伺服里那份常量
@@ -467,7 +468,7 @@ static TX_DLL: DllCell = DllCell::new();
 /// 这只降低 >100 ms 卡顿的**频率**，不改变「一旦发生就永久」的性质，所以它
 /// 不能替代治法 A / DLL 伺服，只能叠加。
 #[cfg(target_os = "macos")]
-fn raise_audio_thread_qos(what: &str) {
+pub(crate) fn raise_audio_thread_qos(what: &str) {
     // <pthread/qos.h>：qos_class_t 是 unsigned int，QOS_CLASS_USER_INTERACTIVE
     // = 0x21。relative_priority 传 0 = 该 band 的最高档。
     const QOS_CLASS_USER_INTERACTIVE: libc::c_uint = 0x21;
@@ -485,7 +486,7 @@ fn raise_audio_thread_qos(what: &str) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn raise_audio_thread_qos(_what: &str) {
+pub(crate) fn raise_audio_thread_qos(_what: &str) {
     // Windows 的对应物是 `AvSetMmThreadCharacteristicsW("Pro Audio")`（avrt.dll）。
     // 收益同样是「降低被抢占的概率」，但代价是给这个 crate 引入一条 Windows
     // 系统库依赖，而 Cargo.toml 明确记着「gated so the windows-gnu build keeps
@@ -782,7 +783,10 @@ pub(crate) enum TxCmd {
         key: [u8; 32],
         /// Per-stream media salt from the stream opener (frozen API).
         salt: Vec<u8>,
-        dest: SocketAddr,
+        /// Where this stream's media goes: a UDP destination (tier 0) or this
+        /// peer's media TCP link (tier 1). Read from `ConnShared` once, when
+        /// the stream is created — see `ConnShared::current_media_path`.
+        path: MediaPath,
         spec: SourceSpec,
         loss_pct: f32,
         shared: Arc<TxShared>,
@@ -893,7 +897,11 @@ pub(crate) fn release_bridge(inner: &DaemonInner, device: &str) {
 struct TxStream {
     id: u32,
     crypto: MediaCrypto,
-    dest: SocketAddr,
+    /// This stream's media path, taken at creation and never changed
+    /// afterwards. On [`MediaPath::Udp`] `dest_override` may still move the
+    /// port (see `refresh_dest`); on [`MediaPath::Tcp`] there is no address to
+    /// move, which is the point of the enum.
+    path: MediaPath,
     spec: SourceSpec,
     loss: LossInjector,
     seq: u32,
@@ -1395,7 +1403,7 @@ struct PendingAdd {
     stream_id: u32,
     key: [u8; 32],
     salt: Vec<u8>,
-    dest: SocketAddr,
+    path: MediaPath,
     loss_pct: f32,
     shared: Arc<TxShared>,
     ack: Option<mpsc::Sender<std::result::Result<(), String>>>,
@@ -1464,7 +1472,7 @@ impl TxState {
                 // real streams are always keyed per stream, never with
                 // the bare connection media key
                 crypto: MediaCrypto::new_for_stream(&add.key, add.stream_id, &add.salt),
-                dest: add.dest,
+                path: add.path,
                 spec: spec.clone(),
                 loss: LossInjector::new(add.stream_id, add.loss_pct),
                 seq: 0,
@@ -1609,8 +1617,8 @@ impl TxState {
 /// 现在它只做三件常数时间的事：查表、推一条请求进通道、（源已在时）装流。
 fn apply_txcmd(st: &mut TxState, cmd: TxCmd) {
     match cmd {
-        TxCmd::Add { stream_id, key, salt, dest, spec, loss_pct, shared, ack } => {
-            let add = PendingAdd { stream_id, key, salt, dest, loss_pct, shared, ack };
+        TxCmd::Add { stream_id, key, salt, path, spec, loss_pct, shared, ack } => {
+            let add = PendingAdd { stream_id, key, salt, path, loss_pct, shared, ack };
             // 源已经在跑：扇出一份就行，和搬家前一样是**同步**完成的。
             if let Some(ent) = st.sources.get_mut(&spec) {
                 ent.refs += 1;
@@ -1772,16 +1780,25 @@ fn request_mic_rebuild(st: &mut TxState) {
 /// [`crate::rtlog`] 那种「彻底搬走」在这里做不到而且不值得：要做到就得给
 /// `SocketAddr` 手写一个 seqlock 编码（v4/v6/scope_id/flowinfo），
 /// 而编码写错的表现是**媒体流被静默发去错误的地址**——比它治的病更坏。
+///
+/// # Tier 1 (M8)
+///
+/// Does nothing on [`MediaPath::Tcp`]. There is no destination to learn: the
+/// media connection *is* the destination, and tier 1 sends no `PullReq` in the
+/// first place — a keepalive exists to hold NAT/firewall state open for a UDP
+/// flow. The `match` is what makes that skip structural rather than a rule
+/// somebody has to remember (design §4.2 item 3).
 fn refresh_dest(tx: &mut TxStream) {
+    let MediaPath::Udp(dest) = &mut tx.path else { return };
     let epoch = tx.shared.dest_epoch.load(Ordering::Acquire);
     if epoch == tx.dest_epoch_seen {
         return;
     }
     tx.dest_epoch_seen = epoch;
     if let Some(a) = *lk(&tx.shared.dest_override) {
-        if a != tx.dest {
-            dlog!("[audiohubd] stream {} dest {} -> {} (keepalive)", tx.id, tx.dest, a);
-            tx.dest = a;
+        if a != *dest {
+            dlog!("[audiohubd] stream {} dest {} -> {} (keepalive)", tx.id, dest, a);
+            *dest = a;
         }
     }
 }
@@ -2010,7 +2027,14 @@ pub(crate) fn tx_loop(
             }
         }
         reap_dead_sources(&inner, &mut st);
-        let ts_us = start.elapsed().as_micros() as u64;
+        // One clock read, shared by two consumers that must agree: the wire
+        // timestamp (`tx_loop`'s own epoch, read by the peer's jitter buffer)
+        // and the tier 1 queue stamp (an absolute `Instant`, read by the write
+        // thread's stale gate). Deriving `ts_us` from `tick_at` is not a
+        // micro-optimisation — it is what stops the two from being two
+        // separate samples of the clock that can straddle a scheduling gap.
+        let tick_at = Instant::now();
+        let ts_us = tick_at.duration_since(start).as_micros() as u64;
         // 拆开借用：这一趟要同时按流迭代（`&mut`）和按 spec 查源（`&`）。
         let TxState { streams, sources, .. } = &mut st;
         let mut queued_any = false;
@@ -2113,6 +2137,14 @@ pub(crate) fn tx_loop(
                 continue;
             }
             refresh_dest(tx);
+            // The tier 1 link this stream queued into, if any, so it can be
+            // woken **once per stream** rather than once per packet.
+            //
+            // UDP wakes once per tick because there is one socket and therefore
+            // one send thread. Tier 1 has one thread PER PEER, so a single wake
+            // cannot cover them; per stream is the next bound down. A redundant
+            // wake to an already-running writer costs a fence and a load.
+            let mut tcp_link: Option<&Arc<crate::tcpmedia::TcpMediaLink>> = None;
             let chunk = samples.len() / parts;
             for p in 0..parts {
                 let seq = tx.seq;
@@ -2141,17 +2173,38 @@ pub(crate) fn tx_loop(
                 // **`sendto` 不在这条线程上了**（J1-1）：就地把数据报封进发送
                 // 队列的槽里，由 `udp_send_loop` 去进内核。计数器也跟着搬过去，
                 // 判据不变（只有 `send_to` 返回 `Ok` 才算）。
-                if inner.media_send.enqueue(tx.dest, &tx.shared, tx.pay.len(), |buf| {
-                    match tx.crypto.seal_into(&header, &tx.pay, buf) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            dlog!("[audiohubd] media seal stream {}: {e}", tx.id);
-                            false
-                        }
+                //
+                // Tier 1 (M8) is the same shape with a different queue: a
+                // `write` into the kernel has no more of a predictable upper
+                // bound than a `sendto` does, so it lives on
+                // `tcpmedia::write_loop`'s thread for exactly the same reason.
+                // The frame bytes are identical either way — a sealed media
+                // datagram already *is* a mux frame (design decision B).
+                let seal = |buf: &mut Vec<u8>| match tx.crypto.seal_into(&header, &tx.pay, buf) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        dlog!("[audiohubd] media seal stream {}: {e}", tx.id);
+                        false
                     }
-                }) {
+                };
+                let queued = match &tx.path {
+                    MediaPath::Udp(dest) => {
+                        inner.media_send.enqueue(*dest, &tx.shared, tx.pay.len(), seal)
+                    }
+                    // `tick_at` and not a fresh `Instant::now()` per packet: the
+                    // stale gate measures how long a frame waited in OUR queue,
+                    // and both halves of a split frame waited the same amount.
+                    MediaPath::Tcp(link) => {
+                        tcp_link = Some(link);
+                        link.enqueue(tick_at, &tx.shared, tx.pay.len(), seal)
+                    }
+                };
+                if queued {
                     queued_any = true;
                 }
+            }
+            if let Some(l) = tcp_link {
+                l.wake();
             }
         }
         // 每 tick 至多一次唤醒，在**全部**流入队之后。见 `UdpSender::wake`。
@@ -2288,7 +2341,7 @@ fn conceal_missing_half(held: &[f32], held_is_second: bool, full: usize) -> Vec<
     out
 }
 
-fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
+pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
     let Ok((h, _payload)) = Header::parse(dg) else { return };
     match h.kind {
         Kind::Media => {
@@ -2582,7 +2635,7 @@ fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
                 let st = lk(&inner.state);
                 st.sessions
                     .get(&h.stream_id)
-                    .and_then(|e| e.tx.clone().map(|t| (t, e.conn.media_dest.ip())))
+                    .and_then(|e| e.tx.clone().map(|t| (t, e.conn.peer_ip)))
             };
             let Some((t, peer_ip)) = found else { return };
             t.ka_count.fetch_add(1, Ordering::Relaxed);
@@ -2614,7 +2667,17 @@ fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
 
 /// Receiver-side keepalive (spec §3): one unencrypted PullReq per stream per
 /// second toward the sender to hold NAT/firewall state.
+///
+/// # Tier 1 (M8): nothing to send, and nothing to send it to
+///
+/// A keepalive holds a UDP flow's NAT/firewall state open and teaches the
+/// sender which port to answer on. A tier 1 stream has no UDP flow, and its
+/// connection keeps its own state open by being a connection. Skipping is not
+/// an optimisation: [`MediaPath::Tcp`] has no address, so there is literally
+/// nowhere to address the datagram — which is why the early return reads it out
+/// of the path rather than off a tier flag somebody has to keep in sync.
 pub(crate) fn send_pullreq(inner: &DaemonInner, rx: &RxStream) {
+    let Some(dest) = rx.ka_path.udp_dest() else { return };
     let h = Header {
         kind: Kind::PullReq,
         codec: Codec::PcmS16le,
@@ -2626,7 +2689,7 @@ pub(crate) fn send_pullreq(inner: &DaemonInner, rx: &RxStream) {
         timestamp_us: inner.start.elapsed().as_micros() as u64,
         payload_len: 0,
     };
-    let _ = inner.udp.send_to(&h.encode(&[]), rx.ka_dest);
+    let _ = inner.udp.send_to(&h.encode(&[]), dest);
 }
 
 // ---------------------------------------------------------------- mixer
@@ -3170,7 +3233,7 @@ pub(crate) fn mix_tone_verdict(samples: &[f32], rate: u32, freq: f32) -> ToneVer
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// **调度迟到直方图的分桶必须与 `LATE_EDGES_MS` 声明的语义一致。**
@@ -3651,7 +3714,7 @@ mod tests {
         TxStream {
             id: 7,
             crypto: MediaCrypto::new_for_stream(&[0u8; 32], 7, &[0u8; 16]),
-            dest: "127.0.0.1:1".parse().unwrap(),
+            path: MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
             spec: SourceSpec::Mic,
             loss: LossInjector::new(7, 0.0),
             seq: 0,
@@ -3734,7 +3797,7 @@ mod tests {
     /// （唯三是 `'{}'`、`'{'`），所以不跟踪它不会污染字符串状态。
     /// 真有人写了 `'"'`，[`stripping_comments_really_removes_them`] 覆盖不到，
     /// 但那一刻别的断言会因为剥错而**变红**，不会静默放行。
-    pub(super) fn strip_comments(src: &str) -> String {
+    pub(crate) fn strip_comments(src: &str) -> String {
         let b = src.as_bytes();
         // **按字节扫，不按 `char`**：本文件里全是中文注释，而
         // `b[i] as char` 会把每一个 UTF-8 续字节当成一个 Latin-1 字符推出去，
@@ -3807,7 +3870,7 @@ mod tests {
         C.get_or_init(|| {
             let src = include_str!("engine.rs");
             let cut = src
-                .find("\n#[cfg(test)]\nmod tests {")
+                .find("\n#[cfg(test)]\npub(crate) mod tests {")
                 .expect("找不到测试模块的起点 —— code() 会把测试自己的字面量也扫进去");
             strip_comments(&src[..cut])
         })
@@ -4185,6 +4248,30 @@ mod deadline_thread_guards {
     use super::*;
     use std::sync::mpsc;
 
+    /// 截止期线程（`tx_loop` 及它同步调用的那几个）里**一个都不许出现**的调用，
+    /// 以及各自一旦出现会发生什么。
+    ///
+    /// # 为什么是一张表，而不是一个名字
+    ///
+    /// 扩容前这里只禁 `.send_to(`。M8 的 tier 1（`tcpmedia.rs`）把媒体搬到一条
+    /// TCP 上之后，「把系统调用放回截止期线程」的写法不再叫 `send_to`，叫
+    /// `write` / `write_all` —— **守卫还在、被守的东西没了**。所有测试仍然全绿，
+    /// 而 `write` 进内核网络栈的耗时上界与 `sendto` 一样不可预知。
+    /// 加一条新传输就要往这张表里加一行。
+    ///
+    /// # 子串**不带前导的点**
+    ///
+    /// 带点只认得 `s.write_all(..)`；`Write::write_all(&mut s, ..)` 是同一件事的
+    /// 另一种拼法，一个字都匹配不上。这不是推测——2026-08-07 的注入对照里，
+    /// 带点的判据对着一行真的 `std::io::Write::write_all(..)` 报了绿。
+    const BANNED_ON_THE_DEADLINE_THREAD: &[(&str, &str)] = &[
+        ("send_to(", "sendto 进内核网络栈，单次耗时上界不可预知"),
+        ("write(", "write 进内核网络栈；TCP 媒体（tier 1）就是靠它发的"),
+        ("write_all(", "同上，而且它会一直重试到写完，上界更差"),
+        ("flush(", "flush 会把攒着的字节推进内核，与 write 同级"),
+        ("write_frame(", "控制帧写在截止期线程上：JSON 序列化 + 阻塞 write"),
+    ];
+
     // ------------------------------------------------- 0. 守卫自己的守卫
 
     /// **剥注释必须真的把注释剥掉。**
@@ -4228,25 +4315,86 @@ mod deadline_thread_guards {
     ///
     /// 注入对照：把 `inner.media_send.enqueue(...)` 换回
     /// `inner.udp.send_to(&dg, tx.dest)`，本条变红。
+    ///
+    /// # ⚠ M8 扩容：只禁 `.send_to(` 的那一版**已经不再保护任何东西**
+    ///
+    /// Tier 1（`tcpmedia.rs`）把媒体搬到一条 TCP 上之后，把系统调用放回截止期
+    /// 线程的写法不再叫 `send_to`，叫 `write` / `write_all`。守卫还在、
+    /// 被守的东西没了 —— **这是本阶段最隐蔽的一种退化**：所有测试仍然全绿，
+    /// 而 `write` 进内核网络栈的耗时上界与 `sendto` 一样不可预知。
+    ///
+    /// 所以禁的是一张**表**，不是一个名字；加一条新传输就要往表里加一行。
+    /// 判据全部跑在 [`code`]（已剥注释、已砍测试模块）上：本仓的 grep 守卫
+    /// 对注释免疫过一次，那次的表现是「把功能注释掉，守卫照样绿」。
     #[test]
     fn the_send_tick_never_touches_the_socket_itself() {
+        // 每一项：(被禁的子串, 它一旦出现在截止期线程上会发生什么)
         for f in ["pub(crate) fn tx_loop(", "fn apply_txcmd(", "fn refresh_dest("] {
             let body = fn_body(f);
-            assert!(
-                !body.contains(".send_to("),
-                "{f} 里又直接调 socket 了 —— sendto 回到了 10 ms 截止期线程上"
-            );
+            for (needle, why) in BANNED_ON_THE_DEADLINE_THREAD {
+                assert!(
+                    !body.contains(needle),
+                    "{f} 里出现了 `{needle}` —— {why}。\n\
+                     媒体必须**入队**（`media_send.enqueue` / `TcpMediaLink::enqueue`），\
+                     由 `udp_send_loop` / `tcpmedia::write_loop` 去进内核。"
+                );
+            }
         }
         let body = fn_body("pub(crate) fn tx_loop(");
         assert!(
             body.contains("inner.media_send.enqueue("),
-            "tx_loop 不再往发送队列里投递了 —— 那它是怎么把音频发出去的？"
+            "tx_loop 不再往 UDP 发送队列里投递了 —— 那它是怎么把音频发出去的？"
+        );
+        assert!(
+            body.contains("link.enqueue("),
+            "tx_loop 不再往 tier 1 队列里投递了 —— 要么 tier 1 的发送路径没了，\
+             要么它改成在这条线程上直接写 socket 了"
         );
         // 而 `sendto` 必须还在，只是在发送线程上。
         assert!(
             fn_body("pub(crate) fn udp_send_loop(").contains("inner.udp.send_to("),
             "发送线程不发包了"
         );
+    }
+
+    /// **上面那张禁表必须真的能抓到每一种写法。**
+    ///
+    /// 守卫扩容之后最容易出的事有两种，这条都守：
+    ///   1. 表里漏了一种拼法（`sk.write_all(..)` 与
+    ///      `Write::write_all(&mut sk, ..)` 是同一件事的两种写法）；
+    ///   2. 表写对了，但判据跑在一份看不见它的文本上——例如 [`fn_body`] 因为
+    ///      签名改动切错了范围，于是每一条 `!contains` 都在空串上成立。
+    ///
+    /// ⚠ **这条测试本身第一次写错过，值得记下来**：它原本比的是一个硬写的
+    /// 子串字面量（`fake.contains("write_all(")`），而不是
+    /// [`BANNED_ON_THE_DEADLINE_THREAD`]。于是把 `write_all(` 从表里删掉之后
+    /// 它照样绿——**它测的是它自己的字面量，不是那张表**。这正是本仓「测试是
+    /// 戏剧」的标准形态，而且是在注入对照里当场抓到的。
+    ///
+    /// 注入对照（2026-08-07 实跑）：从表里删掉任意一行，对应的样本没人认领，
+    /// 本条变红并指名道姓说出是哪一份样本漏网。
+    #[test]
+    fn the_banned_call_list_actually_matches_a_write() {
+        // 每一份都是「有人把 socket 写搬回了截止期线程」的一种真实拼法。
+        const REGRESSIONS: &[&str] = &[
+            "fn t() {\n    sk.write_all(&dg);\n}\n",
+            "fn t() {\n    std::io::Write::write_all(&mut sk, &dg);\n}\n",
+            "fn t() {\n    let n = sk.write(&dg)?;\n}\n",
+            "fn t() {\n    sk.flush()?;\n}\n",
+            "fn t() {\n    inner.udp.send_to(&dg, dest);\n}\n",
+            "fn t() {\n    write_frame(&mut s, &msg)?;\n}\n",
+        ];
+        for sample in REGRESSIONS {
+            let text = strip_comments(sample);
+            assert!(
+                BANNED_ON_THE_DEADLINE_THREAD.iter().any(|(n, _)| text.contains(n)),
+                "禁表里没有任何一条认领得了这份回归样本，于是它可以原样落进 tx_loop：\n{text}"
+            );
+        }
+        // 而真正的 tx_loop 体是非空的（切范围没切歪）。
+        let body = fn_body("pub(crate) fn tx_loop(");
+        assert!(body.len() > 2000, "tx_loop 的函数体只有 {} 字节，切范围歪了", body.len());
+        assert!(body.contains("tx.crypto.seal_into("), "切出来的不是 tx_loop 的正文");
     }
 
     /// **队列满了要丢，不许阻塞、不许无界。**
@@ -4465,8 +4613,52 @@ mod deadline_thread_guards {
         let mut st = super::tests::tx_stream_for(&shared);
         st.dest_epoch_seen = 0;
         refresh_dest(&mut st);
-        assert_eq!(st.dest, learned, "代号动了但地址没被采纳");
+        assert_eq!(st.path.udp_dest(), Some(learned), "代号动了但地址没被采纳");
         assert_eq!(st.dest_epoch_seen, shared.dest_epoch.load(Ordering::Acquire));
+    }
+
+    /// **Tier 1 上 `refresh_dest` 与 `send_pullreq` 都不执行**（M8 设计 §4.2 第 3 条）。
+    ///
+    /// keepalive 存在的理由是给一条 UDP 流撑开 NAT/防火墙状态、并教发送侧对端
+    /// 用的哪个端口。TCP 媒体链路两件都不需要，而且**根本没有地址可以发**。
+    ///
+    /// 判据写成「它连锁都不去拿」而不是「地址没变」：后者在
+    /// [`MediaPath::Tcp`] 上恒成立（没有地址可变），于是一条把 `let MediaPath::Udp
+    /// (..) else { return }` 删掉的改动照样绿——而那条改动会让一条 tier 1 流
+    /// 每次代号变动都去抢一次 `rx_loop` 持着的锁。
+    ///
+    /// 注入对照：把 `refresh_dest` 开头那行 `let MediaPath::Udp(dest) = ... else
+    /// { return }` 换成 `if let MediaPath::Udp(..) = tx.path {}`（= 不再早退），
+    /// 第一条断言变红（`dest_epoch_seen` 被推进了）。
+    #[test]
+    fn a_tier_one_stream_neither_learns_a_destination_nor_sends_a_keepalive() {
+        let shared = Arc::new(TxShared::new());
+        *lk(&shared.dest_override) = Some("127.0.0.1:65000".parse().unwrap());
+        shared.dest_epoch.fetch_add(1, Ordering::Release);
+
+        let mut st = super::tests::tx_stream_for(&shared);
+        st.path = MediaPath::Tcp(Arc::new(crate::tcpmedia::TcpMediaLink::new_for_test(
+            "fp".into(),
+            "127.0.0.1:1".parse().unwrap(),
+        )));
+        st.dest_epoch_seen = 0;
+        refresh_dest(&mut st);
+        assert_eq!(
+            st.dest_epoch_seen, 0,
+            "refresh_dest 在 tier 1 流上仍然读了代号 —— 早退没了，锁竞争也就回来了"
+        );
+        assert!(st.path.udp_dest().is_none(), "tier 1 的路径上长出了一个 UDP 目的地");
+
+        // keepalive：判据是「没有目的地」，而 `send_pullreq` 的第一行正是据此早退。
+        let body = fn_body("pub(crate) fn send_pullreq(");
+        assert!(
+            body.contains("ka_path.udp_dest()"),
+            "send_pullreq 不再按路径判断了 —— tier 1 上它会往一个编出来的地址发"
+        );
+        assert!(
+            body.find("ka_path.udp_dest()") < body.find("Header {"),
+            "早退不在最前面：keepalive 的包头已经造好了才发现没地方发"
+        );
     }
 
     /// `rx_loop` 学到新地址之后必须**在写完值之后**推代号。
@@ -4536,7 +4728,7 @@ mod deadline_thread_guards {
                 stream_id: id,
                 key: [0u8; 32],
                 salt: vec![0u8; 16],
-                dest: "127.0.0.1:1".parse().unwrap(),
+                path: MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
                 spec,
                 loss_pct: 0.0,
                 shared: Arc::new(TxShared::new()),

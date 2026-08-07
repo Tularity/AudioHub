@@ -1620,9 +1620,29 @@ mod ladder_tests {
     ///   ⇒ 老对端**根本不看 codec**，按 s16 静默错解，满长度垃圾帧全音量播出。
     ///
     /// 两种都不会有任何一处报错，而握手时那一次严格相等比较是唯一的闸门。
+    ///
+    /// # 判据从「版本号 == 3」改成了「集合被钉住 + 版本号 ≥ 集合冻结时的版本」
+    ///
+    /// 原来第二条断言写的是 `PROTOCOL_VERSION == 3`。它**对本条要挡的那次改动
+    /// 没有贡献任何检测力**：改了集合而忘了升版本，第一条断言（集合被钉死）
+    /// 一定会先红。它唯一的实际效果是——**任何一次因为别的理由升版本，都会让
+    /// 这条测试变红**，于是修的人被推着去改那个数字，而不是去想集合。
+    ///
+    /// 2026-08-07 就发生了一次：M8 把版本升到 4（新增 `Kind::Control` /
+    /// `MuxKeepalive` 会上线、老对端 `Header::parse` 失败后无日志早退），
+    /// codec 集合一个字没动，这条却红了。**这正是本仓「测试是戏剧」那一类的
+    /// 前兆**：一条对着无关改动尖叫的守卫，教会人把它当噪声。
+    ///
+    /// 所以改成：集合照旧钉死（这才是有检测力的那一半），版本号只断言
+    /// **不低于**集合被冻结时的那一版。改集合的人会被第一条拦下，而拦下时的
+    /// 消息里写着「顺手把下面那个常量也改了」。
     #[test]
     fn changing_the_set_of_wire_codecs_forces_a_protocol_bump() {
         use crate::control::PROTOCOL_VERSION;
+        /// 当前这套 codec 集合是在哪一版协议上定型的。**改了下面钉住的集合，
+        /// 就必须同时升 `PROTOCOL_VERSION` 并把这个数改成新的版本号。**
+        const CODEC_SET_FROZEN_AT: u32 = 3;
+
         let mut on_wire: Vec<u8> =
             LADDER.iter().map(|f| Codec::for_depth(f.depth) as u8).collect();
         on_wire.sort_unstable();
@@ -1634,12 +1654,13 @@ mod ladder_tests {
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            "阶梯上线的 codec 集合变了"
+            "阶梯上线的 codec 集合变了：必须升 PROTOCOL_VERSION（当前 {PROTOCOL_VERSION}），\
+             并把本测试里的 CODEC_SET_FROZEN_AT 改成新版本号。否则老对端要么静音、\
+             要么把新载荷按 s16 错解，两种都零报错"
         );
-        assert_eq!(
-            PROTOCOL_VERSION, 3,
-            "线上 codec 集合与协议版本 3 是配套的。改了上面那个集合就必须升这个数——\
-             否则老对端要么静音要么把新载荷按 s16 错解，两种都零报错"
+        assert!(
+            PROTOCOL_VERSION >= CODEC_SET_FROZEN_AT,
+            "协议版本 {PROTOCOL_VERSION} 比 codec 集合定型时的 {CODEC_SET_FROZEN_AT} 还低"
         );
     }
 

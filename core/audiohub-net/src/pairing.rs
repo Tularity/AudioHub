@@ -777,6 +777,44 @@ mod protocol_version_tests {
         let _ = std::fs::remove_dir_all(&b.dir);
     }
 
+    /// **A refused handshake leaves the peer store byte-identical.**
+    ///
+    /// M8 acceptance (design §6, P3 item 5). The M8 deployment rule is "rebuild
+    /// both ends inside one window", and the safety net for getting that wrong
+    /// is this gate. A net that *also* edited the store while refusing would be
+    /// worse than none: the operator's fix is to upgrade and reconnect, and
+    /// they would be reconnecting into a record something already touched
+    /// while it was refusing to talk.
+    ///
+    /// Byte comparison of the file, not a field-by-field one: the failure being
+    /// guarded against is "something wrote to it", and a field comparison only
+    /// covers the fields whoever wrote the test thought of.
+    ///
+    /// Injection control: make `verify_responder` call `store.upsert(..)`
+    /// before `check_protocol` and this goes red on the byte compare.
+    #[test]
+    fn a_refused_version_leaves_both_peer_stores_untouched() {
+        let (a, b) = pair_of("nostorewrite");
+        let store_path = |p: &Party| p.dir.join("paired_peers.json");
+        let before: Vec<Vec<u8>> =
+            [&a, &b].iter().map(|p| std::fs::read(store_path(p)).expect("store")).collect();
+
+        // One version behind: the shape M8 produces when only one end is rebuilt.
+        let (out, reply) = exchange(&a.id.fingerprint, PROTOCOL_VERSION - 1, &b.dir);
+        assert!(was_protocol_mismatch(&out.expect_err("must be refused")));
+        assert!(matches!(reply, Ok(ControlMsg::Error { .. })), "the peer must be told: {reply:?}");
+
+        for (p, was) in [&a, &b].iter().zip(before) {
+            let now = std::fs::read(store_path(p)).expect("store");
+            assert_eq!(
+                now, was,
+                "{}'s peer store changed during a refused handshake",
+                p.id.fingerprint
+            );
+        }
+        cleanup([&a, &b]);
+    }
+
     /// Strict equality in BOTH directions. "Newer is fine" is the reading that
     /// quietly reopens the gap: a newer peer may define a mode whose exclusion
     /// rules this build cannot honour, and we would list it as usable.

@@ -19,7 +19,7 @@ use audiohub_ipc::{
     Mode, OpenSessionParams, SessionInfo, KIND_MIC, KIND_SPK, SOURCE_HAL_SPEAKER, SOURCE_MIC,
     SOURCE_SYSAUDIO, SOURCE_TONE,
 };
-use audiohub_net::control::{write_frame, ControlMsg, CONTROL_MAX_FRAME};
+use audiohub_net::control::{read_frame, write_frame, ControlMsg, CONTROL_MAX_FRAME};
 use audiohub_net::identity::{PairedPeer, PeerStore};
 use audiohub_net::pairing::{
     pair_initiator, pair_responder, verify_initiator, verify_responder, was_self_connection,
@@ -34,13 +34,13 @@ use crate::{
     TxShared, VolumeCell, DIR_RECV, DIR_SEND, MEDIA_SALT_LEN,
 };
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Control writes share the per-conn channel mutex with the reader and with the
 /// 1s ticker, so an unresponsive peer must not be able to block either: past
 /// this the write fails and the connection is declared dead.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long an OpenStream handler waits for the tx thread to actually build the
 /// media source before it answers Accept/Reject.
 const SOURCE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -199,6 +199,28 @@ fn handle_inbound(
             write_frame(&mut stream, &ControlMsg::Ok {})?;
             Ok(())
         }
+        // M8 tier 1: a second TCP connection for this peer's media. It carries
+        // no control stream, so it never becomes a `ConnShared` of its own —
+        // the ticket says which existing one it belongs to.
+        //
+        // The frame is consumed here rather than peeked-and-redone because,
+        // unlike the two handshakes above, nothing downstream needs to re-read
+        // it: `tcpmedia::accept` takes the socket already positioned at the
+        // first media frame.
+        ControlMsg::MediaAttach { .. } => {
+            let ticket_b64 = match read_frame(&mut stream)? {
+                ControlMsg::MediaAttach { ticket_b64 } => ticket_b64,
+                other => bail!("media_attach vanished between peek and read: {other:?}"),
+            };
+            // Claim first, THEN release the preauth slot, THEN serve. Serving
+            // runs for the life of the link, so releasing after it would hold
+            // an unauthenticated-handshake slot for hours — the bound exists to
+            // cap concurrent *handshakes*, and this socket stopped being one
+            // the moment the ticket was spent.
+            let conn = crate::tcpmedia::claim(inner, &mut stream, &ticket_b64)?;
+            drop(preauth);
+            crate::tcpmedia::serve(inner, &conn, stream)
+        }
         other => {
             let _ = write_frame(
                 &mut stream,
@@ -312,7 +334,14 @@ fn register_conn(
     let mk = chan.media_keys();
     let conn = Arc::new(ConnShared {
         fp: peer.fingerprint.clone(),
-        media_dest: SocketAddr::new(peer_ip, peer.port),
+        peer_ip,
+        // Tier 0 is the default assumption and costs nothing to assume: the
+        // control handshake proved TCP works, and only UDP is still unknown
+        // (design §5.1). A tier 1 link, if any, replaces this after the fact.
+        media_path: Mutex::new(crate::tcpmedia::MediaPath::Udp(SocketAddr::new(
+            peer_ip, peer.port,
+        ))),
+        media_attaching: AtomicBool::new(false),
         tx_key: mk.tx,
         rx_key: mk.rx,
         peer,
@@ -357,6 +386,11 @@ fn register_conn(
     let _ = conn.send_msg(&SessionMsg::ModeState {
         mode: haldev::effective_mode(inner).as_str().to_string(),
     });
+    // M8: if this peer is pinned to tier 1, start the media link now — before
+    // any stream exists, so the first stream opens straight onto it. A stream
+    // that opened first would be pinned to UDP for its whole life (design §5.1
+    // rules out switching transports inside a live stream).
+    crate::tcpmedia::negotiate(inner, &conn);
     Some(conn)
 }
 
@@ -528,6 +562,14 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 Err(e) => SessionMsg::RejectStream { stream_id, reason: format!("{e:#}") },
             };
             let _ = conn.send_msg(&reply);
+        }
+        // M8 tier 1 attachment. Both arms are cheap and non-blocking: minting a
+        // ticket is 32 bytes of randomness, and dialling happens on a thread of
+        // its own. Doing either inline would put a connect() on the reader
+        // thread, which also runs device I/O for every other message here.
+        SessionMsg::MediaAttachRequest {} => crate::tcpmedia::on_request(inner, conn),
+        SessionMsg::MediaAttachTicket { ticket_b64 } => {
+            crate::tcpmedia::on_ticket(inner, conn, ticket_b64)
         }
         SessionMsg::AcceptStream { stream_id } => notify_pending(conn, stream_id, Ok(())),
         SessionMsg::RejectStream { stream_id, reason } => {
@@ -900,7 +942,7 @@ fn start_tx_stream(
     stream_id: u32,
     key: [u8; 32],
     salt: Vec<u8>,
-    dest: SocketAddr,
+    path: crate::tcpmedia::MediaPath,
     spec: SourceSpec,
     loss_pct: f32,
     shared: Arc<TxShared>,
@@ -911,7 +953,7 @@ fn start_tx_stream(
             stream_id,
             key,
             salt,
-            dest,
+            path,
             spec,
             loss_pct,
             shared,
@@ -992,7 +1034,7 @@ fn handle_remote_open(
                 false,
                 None, // bridging is the local consumer's choice, never the peer's
                 None, // ...and so is the virtual microphone (spec-m5b §5.4)
-                conn.media_dest,
+                conn.current_media_path(),
             ));
             wr(&inner.rx_table).insert(stream_id, rx.clone());
             lk(&inner.state).sessions.insert(
@@ -1026,7 +1068,7 @@ fn handle_remote_open(
                 stream_id,
                 conn.tx_key,
                 salt,
-                conn.media_dest,
+                conn.current_media_path(),
                 spec,
                 loss.unwrap_or(0.0),
                 shared.clone(),
@@ -1715,7 +1757,7 @@ pub(crate) fn open_session_from(
             params.monitor,
             bridge.clone(),
             hal_slot,
-            conn.media_dest,
+            conn.current_media_path(),
         ));
         wr(&inner.rx_table).insert(stream_id, rx.clone());
         Some(rx)
@@ -1797,7 +1839,7 @@ pub(crate) fn open_session_from(
             stream_id,
             conn.tx_key,
             salt.to_vec(),
-            conn.media_dest,
+            conn.current_media_path(),
             spec.expect("validated above"),
             params.simulate_loss_pct.unwrap_or(0.0),
             shared.clone(),

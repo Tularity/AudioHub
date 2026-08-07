@@ -406,6 +406,25 @@ pub enum SessionMsg {
     /// `None` = 发送方没有对这一项表态，收方保持现状；`Some("auto")` = 明确
     /// 要求 AUTO。两者不同，且前者正是「只改了延迟没改音质」的增量更新形态。
     /// 用空串表达「未表态」会与「档位串是空的」逐位相同。
+    /// "Give me a ticket, I want to attach a tier 1 media connection."
+    ///
+    /// Sent only by the side that **initiated the control TCP**, and that
+    /// restriction is the whole protocol: the control handshake proved that
+    /// `initiator → responder` TCP works, and proved *nothing* about the
+    /// reverse direction. A tier 1 link dialled the other way would be dialled
+    /// into the dark, and the failure would look exactly like a peer that is
+    /// switched off.
+    MediaAttachRequest {},
+    /// The answer to [`SessionMsg::MediaAttachRequest`] — or an unsolicited
+    /// offer, when it is the *responder* whose configuration asks for tier 1
+    /// and it therefore cannot dial the link itself.
+    ///
+    /// 32 random bytes, base64. Single use, ten second TTL. What it does and
+    /// does not authenticate is written on [`crate::control::ControlMsg::MediaAttach`],
+    /// which is the frame that spends it.
+    MediaAttachTicket {
+        ticket_b64: String,
+    },
     SetTransport {
         stream_id: u32,
         /// 这条流在**你的接收侧**要达到的端到端总延迟目标

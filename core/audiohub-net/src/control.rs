@@ -120,7 +120,26 @@ impl ControlIo for TcpStream {
 ///
 /// ⚠ `packet.rs` 的 `Codec` 注释曾写「零线格式风险，老对端得到 `BadCodec`
 /// 显式失败」——那句话**只对 codec 3 成立**，已在那里改正。
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// ## 版本 4：降级链路（M8 Tier 1，`docs/design-m8-fallback.md` 决定 C）
+///
+/// 判据仍然是那一条：**缺席不等于没数据，而等于一个危险的默认行为**。
+///
+/// - 一台 v3 对端不认识 [`ControlMsg::MediaAttach`] 与那两条
+///   `SessionMsg::MediaAttach*`，于是它继续往一个（按前提）被封死的 UDP 洞里
+///   发，而我们坐在 TCP 上等。两端都健康、屏幕全绿、**全程静音**。这与
+///   `ModeState` 当初升版本的理由逐字相同。
+/// - `Kind::Control = 5` / `Kind::MuxKeepalive = 6` 对 v3 是
+///   `Kind::from_u8 → None` ⇒ `Header::parse` 失败 ⇒ `handle_datagram` 无日志
+///   早退。同样是静默。
+///
+/// 位一次留够：这两个 `Kind` 在 P2 就已经加进枚举，但**「值存在」与「值会到达」
+/// 是两件事**，只有后者能弄坏对端 —— 所以升版本的责任落在第一次把它们放上
+/// socket 的那次改动（P3），不是定义它们的那次（P2）。
+///
+/// 安全网是 `check_protocol` 的严格相等：它把版本不匹配变成一条指名道姓的拒绝，
+/// 且**不修改任何一侧的配对记录**。部署纪律因此是「同一窗口内两端全部重建」。
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// What a missing `version` field decodes to: a peer old enough to have no
 /// version at all. Distinct from any real version so the refusal message can
@@ -188,6 +207,27 @@ pub enum ControlMsg {
     Enc {
         n: u64,
         data_b64: String,
+    },
+    /// The one and only frame a **tier 1 media connection** opens with
+    /// (`docs/design-m8-fallback.md` decision A): a *second* TCP connection to
+    /// the same address the control channel already reached, carrying media
+    /// frames rather than a control stream.
+    ///
+    /// ## What the ticket does and does not authenticate
+    ///
+    /// It authenticates **attachment only** — "this socket belongs to that
+    /// already-verified connection". The 32 random bytes are minted on the
+    /// secure control channel, are single-use, and expire in ten seconds.
+    ///
+    /// The frames that follow are **not** covered by it: each one is still
+    /// self-authenticating under `MediaCrypto`, exactly as the UDP datagram it
+    /// is byte-identical to. So whoever steals a ticket gets to inject bytes
+    /// that fail AEAD and get counted and dropped — the same thing they could
+    /// already do by sending us UDP. Making the ticket carry more weight than
+    /// that would put a second, weaker authenticator in front of a stronger
+    /// one, which is how the weaker one ends up being the one that matters.
+    MediaAttach {
+        ticket_b64: String,
     },
     Ok {},
     /// "I am not paired with you any more." Sent instead of the generic

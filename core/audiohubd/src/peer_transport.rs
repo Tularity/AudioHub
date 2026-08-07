@@ -115,8 +115,57 @@ impl StoredDir {
     }
 }
 
-/// 一台对端的四个档位。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Which transport a peer's media runs on (`docs/plan.md` §16, design
+/// `docs/design-m8-fallback.md` §5.1).
+///
+/// # Why this is **per peer** and not per direction
+///
+/// Both directions share one `ConnShared`. On tier 0 they share one UDP socket
+/// and one destination; on tier 1 they share the one media TCP connection.
+/// **After a downgrade the transport is per peer as a matter of physics.** The
+/// asymmetry that does exist (our outbound UDP gets through, their inbound does
+/// not) belongs to *detection*, and it is carried by the reason string, not by
+/// splitting this into two values — a per-direction field would read as a
+/// promise that one direction can sit on tier 0 while the other sits on tier 1,
+/// and somebody would eventually try to implement it.
+///
+/// `Tier2` is deliberately absent: it is P5, and an enum variant nothing can
+/// produce is an invitation to write code that pretends it can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportTier {
+    /// Decide at runtime. **In P3 this behaves as [`TransportTier::Tier0`] for
+    /// dialling**, because automatic probing is P4 — but it still *grants* a
+    /// tier 1 attach a peer asks for, so pinning one side is enough to test.
+    Auto,
+    /// Pinned to UDP media. Refuses to attach a tier 1 link even when asked;
+    /// this is the "通告 ≠ 授权" rule (design decision C) in its one concrete
+    /// form on this path.
+    Tier0,
+    /// Pinned to media over a second TCP connection.
+    Tier1,
+}
+
+impl TransportTier {
+    pub(crate) fn parse(s: &str) -> Option<TransportTier> {
+        match s {
+            "auto" => Some(TransportTier::Auto),
+            "tier0" => Some(TransportTier::Tier0),
+            "tier1" => Some(TransportTier::Tier1),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            TransportTier::Auto => "auto",
+            TransportTier::Tier0 => "tier0",
+            TransportTier::Tier1 => "tier1",
+        }
+    }
+}
+
+/// 一台对端的四个档位，外加它的连通性档位。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PeerTransport {
     /// 本机**收**这台对端的音（我取它的麦克风）。
     #[serde(default)]
@@ -124,6 +173,50 @@ pub(crate) struct PeerTransport {
     /// 本机**发**给这台对端（我送它的扬声器）。
     #[serde(default)]
     pub send: StoredDir,
+    /// `auto | tier0 | tier1`，见 [`TransportTier`]。松存紧取，与两个档位串
+    /// 同一条纪律。
+    ///
+    /// **落点是这个文件，不是 `paired_peers.json`** —— `PeerStore::upsert` 会在
+    /// 对端下次重连时抹掉非保留字段（本文件头逐条论证过），而那正是「我明明钉了
+    /// tier1，重连之后又变回 auto」这一类现象的成因。
+    #[serde(default = "auto_tier")]
+    pub transport_tier: String,
+    /// 与 `*_reset_from` 同义、同纪律：**绝不落盘**。
+    #[serde(skip)]
+    pub transport_tier_reset_from: Option<String>,
+}
+
+fn auto_tier() -> String {
+    TransportTier::Auto.as_wire().to_string()
+}
+
+impl Default for PeerTransport {
+    fn default() -> Self {
+        PeerTransport {
+            recv: StoredDir::default(),
+            send: StoredDir::default(),
+            transport_tier: auto_tier(),
+            transport_tier_reset_from: None,
+        }
+    }
+}
+
+impl PeerTransport {
+    pub(crate) fn tier(&self) -> TransportTier {
+        TransportTier::parse(&self.transport_tier).unwrap_or(TransportTier::Auto)
+    }
+
+    /// Same shape as [`StoredDir::sanitize`], and for the same reason: an
+    /// unexecutable string must not sit in memory pretending to be a setting,
+    /// and the reset must not be silent.
+    fn sanitize(&mut self) {
+        self.recv.sanitize();
+        self.send.sanitize();
+        if TransportTier::parse(&self.transport_tier).is_none() {
+            self.transport_tier_reset_from =
+                Some(std::mem::replace(&mut self.transport_tier, auto_tier()));
+        }
+    }
 }
 
 /// 全部对端的档位表，按**指纹**索引。
@@ -174,8 +267,13 @@ impl PeerTransportStore {
                     // single point where the file becomes in-memory state — not
                     // at each of the several read sites, which is how the two
                     // halves of the deleted legacy layer drifted apart.
-                    t.recv.sanitize();
-                    t.send.sanitize();
+                    t.sanitize();
+                    if let Some(old) = &t.transport_tier_reset_from {
+                        crate::dlog!(
+                            "[audiohubd] peer_transport.json {fp}: 连通性档 `{old}` \
+                             本 build 不认识，已重置为 auto"
+                        );
+                    }
                     for (dir, d) in [("recv", &t.recv), ("send", &t.send)] {
                         if let Some(old) = &d.latency_reset_from {
                             crate::dlog!(
@@ -223,6 +321,13 @@ impl PeerTransportStore {
         self.map.insert(fp.to_string(), t);
     }
 
+    /// The connectivity tier for a peer we may never have heard of. Same
+    /// contract as [`PeerTransportStore::get`]: callers need something
+    /// executable, and "never set" executes the same as "set to auto".
+    pub(crate) fn tier(&self, fp: &str) -> TransportTier {
+        self.map.get(fp).map_or(TransportTier::Auto, PeerTransport::tier)
+    }
+
     /// 解除配对时清掉。留着的话，重新配对同一台机器会**静默继承**上一段关系的
     /// 档位——「我明明没设过 300」的又一种成因。
     pub(crate) fn remove(&mut self, fp: &str) -> bool {
@@ -266,6 +371,8 @@ mod tests {
                     quality: "auto".into(),
                     ..StoredDir::default()
                 },
+                transport_tier: "tier1".into(),
+                ..PeerTransport::default()
             },
         );
         s.save(&dir).expect("save");
@@ -274,9 +381,88 @@ mod tests {
         assert_eq!(back.get("aa11").recv.latency, "300");
         assert_eq!(back.get("aa11").send.latency, "100");
         assert_eq!(back.get("aa11").recv.quality, "pcm32k16");
+        assert_eq!(back.tier("aa11"), TransportTier::Tier1, "the pinned tier did not survive");
         // 没设过的对端拿到默认，不是恐慌也不是 None。
         assert_eq!(back.get("zz99"), PeerTransport::default());
+        assert_eq!(back.tier("zz99"), TransportTier::Auto);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record written before tier existed still loads, and reads as `auto`.
+    ///
+    /// Not a formality: this file is on disk on every machine that has ever run
+    /// a build predating P3, and `serde` would otherwise fail the whole record
+    /// and reset that peer's latency and quality — a downgrade feature silently
+    /// undoing two settings that have nothing to do with it.
+    #[test]
+    fn a_record_written_before_the_tier_field_existed_still_loads() {
+        let dir = tmpdir("notier");
+        let raw = r#"{
+          "version": 1,
+          "peers": {
+            "aa11": { "recv": { "latency": "300", "quality": "auto" },
+                      "send": { "latency": "auto", "quality": "auto" } }
+          }
+        }"#;
+        std::fs::write(PeerTransportStore::path(&dir), raw).expect("write");
+
+        let s = PeerTransportStore::load(&dir);
+        assert_eq!(s.get("aa11").recv.latency, "300", "the neighbouring setting was lost");
+        assert_eq!(s.tier("aa11"), TransportTier::Auto);
+        assert_eq!(s.get("aa11").transport_tier_reset_from, None, "absent is not corrupt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unrecognised tier resets to `auto` and says so — and takes nothing
+    /// else with it.
+    ///
+    /// `tier2` is the interesting value: it is a tier this project has designed
+    /// and not built (P5). A build that silently accepted it would pin a peer to
+    /// a transport that does not exist, and the symptom would be a peer that
+    /// never carries audio.
+    #[test]
+    fn an_unrecognised_tier_is_reset_and_reported() {
+        let mut t = PeerTransport {
+            recv: StoredDir { latency: "300".into(), ..StoredDir::default() },
+            transport_tier: "tier2".into(),
+            ..PeerTransport::default()
+        };
+        t.sanitize();
+        assert_eq!(t.transport_tier, "auto", "an unbuildable tier was left in place");
+        assert_eq!(
+            t.transport_tier_reset_from.as_deref(),
+            Some("tier2"),
+            "the tier was reset silently; the UI has nothing to explain it with"
+        );
+        assert_eq!(t.tier(), TransportTier::Auto);
+        assert_eq!(t.recv.latency, "300", "a valid neighbouring cell was collateral damage");
+    }
+
+    /// The tier's reset marker never reaches disk, same as the other two.
+    #[test]
+    fn the_tier_reset_marker_is_not_persisted() {
+        let dir = tmpdir("notiermark");
+        let mut s = PeerTransportStore::default();
+        let mut t = PeerTransport { transport_tier: "tier9".into(), ..PeerTransport::default() };
+        t.sanitize();
+        s.set("aa11", t);
+        s.save(&dir).expect("save");
+
+        let raw = std::fs::read_to_string(PeerTransportStore::path(&dir)).expect("read");
+        assert!(!raw.contains("reset_from"), "the reset marker was written to disk");
+        assert!(!raw.contains("tier9"), "the unrecognised tier was written back out");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The wire spelling round-trips. Freezes the three strings that
+    /// `peer_transport.json` and the IPC surface both quote.
+    #[test]
+    fn the_tier_spellings_round_trip() {
+        for t in [TransportTier::Auto, TransportTier::Tier0, TransportTier::Tier1] {
+            assert_eq!(TransportTier::parse(t.as_wire()), Some(t));
+        }
+        assert_eq!(TransportTier::parse("tier2"), None, "tier 2 is designed, not built");
+        assert_eq!(TransportTier::parse(""), None);
     }
 
     /// **一条坏记录只毒死它自己。**
@@ -390,7 +576,7 @@ mod tests {
         let mut s = PeerTransportStore::default();
         let mut d = StoredDir { quality: "pcm32k".into(), ..StoredDir::default() };
         d.sanitize();
-        s.set("aa11", PeerTransport { recv: d, send: StoredDir::default() });
+        s.set("aa11", PeerTransport { recv: d, ..PeerTransport::default() });
         s.save(&dir).expect("save");
 
         let raw = std::fs::read_to_string(PeerTransportStore::path(&dir)).expect("read");

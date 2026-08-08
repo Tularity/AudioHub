@@ -627,6 +627,32 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   white-space: nowrap; align-self: center;
 }
 
+/* ---- 降级归因条（plan §16.4）------------------------------------------------
+   位置就是它的全部意义：`.peer-metrics` 的第一个孩子，紧贴在下面两个延迟读数
+   之上。§16.4 第 1 条要求「因」与「果」落在同一视野里——挪到卡片头部就已经
+   不满足了，那里与延迟数字之间隔着整个状态区。
+   一张卡**至多一条**（tier 是每对端一个状态，不是每方向），且 **Tier 0 与
+   「未判定」都不画**（第 3 条：常驻的「一切正常」标记会训练用户忽略这个位置）。
+   ⇒ 于是这条一出现就一定是坏消息，用 warn 色带底是诚实的，不是吓唬人。 */
+.metric-tier {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  margin: 0; padding: 5px 8px; border-radius: 6px;
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border-left: 3px solid var(--warn);
+}
+/* 传输形态本身：与「未含对方主机」同一套语言（warn 色小字），比它重一档字重
+   ——那句是对读数范围的警告，这一句是读数为什么变差的**原因**。 */
+.metric-tier-label {
+  font-size: 12px; font-weight: 650; color: var(--warn);
+  white-space: nowrap; flex: none;
+}
+/* 后果那半句可收缩、可截断：窄卡片上先保住「经 TCP 中转」这个名词，
+   它单独也已经成立。 */
+.metric-tier-why {
+  font-size: 11px; color: var(--text-dim); line-height: 1.4;
+  flex: 1 1 auto; min-width: 0;
+}
+
 /* 无会话时的**状态**一行。plan §14 裁定 2 之后它不再顶替指标：延迟与音质
    两格照旧占位（灰色的「—」），这一行降到它们下面说明「为什么是空的」。
    状态是状态、数据是数据，两者不该互相顶替——顶替之后用户就没法在同一个
@@ -1460,6 +1486,21 @@ canvas.spark { width: 160px; height: 36px; display: block; }
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- 降级链路（design §5.2 第 4 条）----------------------------------------
+   一条链路一行。复用会话卡的 `.metrics` / `.session-extra` 版式，是因为读的人
+   在这一页已经学会了那两个版式的意思（大数字 = 头条量，脚注行 = 支撑计数）；
+   给同一类东西再造一套排版只会让人以为它是另一类东西。 */
+.degraded-list { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; }
+.degraded-row {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 12px; border-radius: 8px;
+  background: var(--bg-2);
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+}
+.degraded-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.degraded-head strong { font-size: 13px; }
+.degraded-row .session-extra { padding-top: 8px; }
+
 /* ---- 延迟构成瀑布（spec-telemetry-ia §2.5） ---- */
 
 /* 每通路一条 stacked bar，横轴 ms。卡片给「现在多少」，这里给「大头一直在哪一段」。 */
@@ -1729,6 +1770,33 @@ body.is-tauri .gate-drag {
    （「延迟与抖动明显更差」），而 <option> 里塞不下第二行——塞不下的结果是
    用户在一个只写着代号的下拉里选一个他不知道会付什么代价的东西。 */
 .transport-tier { margin-top: 14px; }
+/* ---- 现状那一行（plan §16.4 第 4、5 条）--------------------------------
+   放在选择控件**之前**：点进这一节最常见的问题是「我现在到底走的哪条路」。
+   三态必须在一眼之内分开——Tier 0 正文色、降级 warn 色、未判定灰色的「—」。
+   `.unknown` 的暗色在全应用只表示「读不到」，所以 Tier 0 绝不能用它。 */
+.transport-now {
+  display: flex; flex-direction: column; gap: 6px;
+  margin: 0 0 10px; padding: 8px 10px; border-radius: 8px;
+  background: var(--bg-2); border: 1px solid var(--line);
+}
+.transport-now[data-tier='tier1'],
+.transport-now[data-tier='tier2'] {
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+.transport-now-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.transport-now-cap {
+  font-size: 11px; color: var(--text-dim); letter-spacing: .06em; flex: none;
+}
+.transport-now-val { font-size: 15px; font-weight: 650; flex: none; }
+.transport-now-val.warn { color: var(--warn); }
+.transport-now-val.unknown { color: var(--text-dim); font-weight: 500; }
+.transport-now-why { font-size: 11.5px; color: var(--text-dim); flex: 1 1 auto; min-width: 0; }
+/* 现场证据：等宽数字，与统计页那些计数器同一套读法。 */
+.transport-now-facts {
+  display: flex; flex-wrap: wrap; gap: 4px 12px;
+  font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums;
+}
 .block-subtitle {
   margin: 0 0 4px; font-size: 12px; font-weight: 650;
   color: var(--text-dim); letter-spacing: .04em;

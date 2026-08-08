@@ -206,6 +206,118 @@ function Waterfall({ sessions, hidden }: { sessions: SessionInfo[]; hidden: bool
   );
 }
 
+// ------------------------------------------------------------ 降级链路诊断
+
+/**
+ * 降级链路（Tier 1 的专用 TCP / Tier 2 复用连接的媒体半边）的现场数字。
+ *
+ * ## 为什么它非在这一页不可
+ *
+ * design §5.2 第 4 条：`writeq_ms` 与 `stale_dropped` 是**解释「降级链路为什么
+ * 难听」的唯一两个数字，别处看不到**。它们不属于任何一条会话——一条链路由这台
+ * 对端的所有流共用——所以既进不了上面的会话卡，也进不了对端卡片那两栏。
+ *
+ * 怎么读（daemon 侧 `lib.rs` 那段注释的同一份账）：
+ *   - `dropped` 涨   = 写线程卡的时间已经把队列灌满。
+ *   - `stale_dropped` 涨 = 出队时帧已超过 200 ms 预算、被主动丢弃。**这不是一个
+ *     新的丢包源**，是把 TCP 抹掉的丢包信号按需造回来，好让对端 JB 正确隐藏。
+ *   - 两者都为 0 而对端仍在欠载 ⇒ 病不在这条链路的发送侧。
+ *
+ * ## 三态，一个都不能合并
+ *
+ * `tcp_media` 是数组且非空 ⇒ 逐条列出；
+ * 是数组但为空 ⇒ 「没有对端在降级链路上」，这是**一条结论**（daemon 侧逐字：
+ * 「空数组 = 没有任何对端在降级链路上，**不是**读不到」）；
+ * 整个键缺席 ⇒ 「这一版服务不上报」，那才是读不到。把后两者合并成一句「无」，
+ * 就是用一个缺席的字段去证明一切正常。
+ */
+function DegradedLinks() {
+  const daemon = useStore((s) => s.daemon);
+  const peers = useStore((s) => s.peers);
+  const list = daemon?.latency_guard?.tcp_media;
+  const muxes = daemon?.latency_guard?.mux;
+  const supported = Array.isArray(list);
+
+  function nameOf(fp: string | undefined): string {
+    const p = fp ? peers.find((x) => x.fingerprint === fp) : undefined;
+    return p?.display_name || p?.name || (fp ? fp.slice(0, 8) : t('common.dash'));
+  }
+
+  return (
+    <section className="card block" data-testid="stats-degraded">
+      <h3 className="block-title">{t('stats.degraded.title')}</h3>
+      <p className="muted small" data-testid="stats-degraded-note">{t('stats.degraded.note')}</p>
+      <div className="degraded-list" hidden={!supported || list!.length === 0}>
+        {(supported ? list! : []).map((l, i) => {
+          // Tier 2 的对端**同时**出现在两张表里（媒体半边在 tcp_media，控制帧计数
+          // 在 mux）。所以档位判据是「在不在 mux 里」，不是「在不在 tcp_media 里」。
+          const isMux = Array.isArray(muxes) && muxes.some((m) => m && m.fingerprint === l.fingerprint);
+          const key = l.fingerprint || String(i);
+          return (
+            <div className="degraded-row" key={key} data-testid={`degraded-link-${key}`}>
+              <div className="degraded-head">
+                <strong>{nameOf(l.fingerprint)}</strong>
+                <span className="tag warn" data-testid={`degraded-tier-${key}`}>
+                  {t(isMux ? 'tier.now.tier2' : 'tier.now.tier1')}
+                </span>
+                <span className={`tag${l.alive === false ? ' danger' : ''}`} hidden={l.alive == null}>
+                  {t(l.alive === false ? 'tier.now.linkDead' : 'tier.now.linkAlive')}
+                </span>
+                <code className="mono dim">{l.peer || t('common.dash')}</code>
+              </div>
+              {/* 两个头条数字用 metric 版式（与会话卡同一套），其余计数走脚注行。
+                  一律 `fmt.int` / `fmt.decimal1`：读不到画「—」，**不折成 0**。 */}
+              <div className="metrics">
+                <div className="metric">
+                  <div className="metric-label">{t('stats.degraded.writeq')}</div>
+                  <div
+                    className="metric-num"
+                    data-testid={`degraded-writeq-${key}`}
+                    title={t('stats.degraded.writeqWhy')}
+                  >
+                    {fmt.decimal1(l.writeq_ms)}
+                    <span className="unit">{t('stats.unit.ms')}</span>
+                  </div>
+                </div>
+                <div className="metric">
+                  <div className="metric-label">{t('stats.degraded.stale')}</div>
+                  <div
+                    className="metric-num"
+                    data-testid={`degraded-stale-${key}`}
+                    title={t('stats.degraded.staleWhy')}
+                  >
+                    {fmt.int(l.stale_dropped)}
+                  </div>
+                </div>
+              </div>
+              <footer className="session-extra" data-testid={`degraded-extra-${key}`}>
+                <span>{t('stats.degraded.writeqPeak', { v: fmt.decimal1(l.writeq_peak_ms) })}</span>
+                <span>{t('stats.degraded.writeqAuto', { v: fmt.decimal1(l.writeq_auto_ms) })}</span>
+                <span>{t('stats.degraded.queued', { n: fmt.int(l.queued), cap: fmt.int(l.capacity) })}</span>
+                <span>{t('stats.degraded.dropped', { n: fmt.int(l.dropped) })}</span>
+                <span>{t('stats.degraded.frames', { w: fmt.int(l.frames_written), r: fmt.int(l.frames_read) })}</span>
+                {typeof l.unexpected_kind === 'number' && l.unexpected_kind > 0
+                  ? (
+                    <span className="tag danger">
+                      {t('stats.degraded.unexpected', { n: fmt.int(l.unexpected_kind) })}
+                    </span>
+                  )
+                  : null}
+              </footer>
+            </div>
+          );
+        })}
+      </div>
+      <p className="muted small" data-testid="stats-degraded-empty" hidden={!supported || list!.length > 0}>
+        {t('stats.degraded.empty')}
+      </p>
+      <p className="muted small" data-testid="stats-degraded-unsupported" hidden={supported}>
+        {t('stats.degraded.unsupported')}
+      </p>
+    </section>
+  );
+}
+
 // ---------------------------------------------------------------- 会话卡
 
 function SessionCard({ info, hist }: { info: SessionInfo; hist: MetricHistory | undefined }) {
@@ -420,6 +532,10 @@ export function StatsView() {
           stats-empty 卡说的是同一件事，两条空态叠在一起只会让人以为出了两个问题。
           DOM 与 testid 都保留，只是 hidden。 */}
       <Waterfall sessions={sessions} hidden={sessions.length === 0} />
+
+      {/* 降级链路的两个数字（design §5.2 第 4 条）。**不随会话数收起**：一条链路
+          可以在没有任何会话时仍然存在并积压，而那正是需要被看见的时刻。 */}
+      <DegradedLinks />
 
       {/* 工具条只留分段选择器：这里原先复用了「活跃会话」那条 key 当标签，可上面
           已经有一张带数字的同名 tile，而这里既没数字也不说明分组维度——正是本次

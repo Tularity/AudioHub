@@ -52,6 +52,8 @@ import {
 import type {
   Dir, LatencyReading, PeerNetReading, QualityReading, StageReading, StageSpec,
 } from '../lib/metrics';
+import { TIER_LABEL, TIER_WHY, effectiveTier, isDegradedTier } from '../lib/tier';
+import type { EffectiveTier } from '../lib/tier';
 import { useStore } from '../state/store';
 import type { PeerState, SessionInfo } from '../ipc/types';
 
@@ -444,6 +446,58 @@ function NetOnly({ fp, net }: { fp: string; net: PeerNetReading }) {
   );
 }
 
+// ------------------------------------------------------------ 连通方式（tier）
+
+/**
+ * 降级链路的**归因条**。plan §16.4 的落点，也是这次改动的全部理由。
+ *
+ * ## 为什么它在这里，而不是卡片角上
+ *
+ * §16.4 第 1 条：降级 tier 是一级信息，**必须与延迟数字相邻**——「若用户需要移开
+ * 视线、或需要点进二级页面才能把『慢』和『为什么慢』联系起来，本条即未被满足」。
+ * 所以它是 `.peer-metrics` 的第一个孩子：紧接着它下面就是两个方向的延迟读数，
+ * 因与果落在同一视野里。挂到卡片头部（主机名那一行）就已经不满足了——那一行
+ * 与延迟数字之间隔着整个状态区。
+ *
+ * ## 为什么**一张卡只画一条**
+ *
+ * §16.1：降级是**每对端一个状态，不是每方向**。两个方向共用同一条连接，降级之后
+ * 在物理上就是每对端的。给每个方向块各画一条，等于在界面上宣布「可以一个方向
+ * Tier 0、另一个 Tier 1」——而那正是 daemon 侧那份契约明确要防止后人去实现的
+ * 一句话。方向上的不对称（只有入向 UDP 被封）由原因文字承载，不由这里承载。
+ *
+ * ## 为什么 Tier 0 **不出现**
+ *
+ * §16.4 第 3 条：给每台正常对端挂一个「一切正常」的标记，只会训练用户忽略这个
+ * 位置——而这里正是我们指望它在降级时被看见的地方。徽标的信息量来自稀有性，
+ * 常驻会把它清零。
+ *
+ * ## 「未判定」为什么也不出现在**卡片**上
+ *
+ * 同一条理由：一张离线卡片上常驻一个灰色的「连通方式 —」是纯噪声。§16.4 第 5 条
+ * 要求的是「未判定与 Tier 0 不得渲染成同一个样子」，而它的落点是**二级页面那一
+ * 行状态**（`PeerTransport` 的 `detail-transport-now`）——那里 Tier 0 写「直连
+ * （UDP）」、未判定写灰色的「—」，三态各有各的样子。卡片这一条只承担降级归因，
+ * 它的缺席在两种情形下都不构成任何断言。
+ */
+function TierBanner({ fp, tier }: { fp: string; tier: EffectiveTier }) {
+  return (
+    <p
+      className={`metric-tier ${tier}`}
+      data-testid={`peer-tier-${fp}`}
+      data-tier={tier}
+      role="status"
+      title={t('tier.now.title')}
+    >
+      <span className="metric-tier-label" data-testid={`peer-tier-label-${fp}`}>{t(TIER_LABEL[tier])}</span>
+      {/* 后果那半句**必须看得见**，不能只进 title：不悬停鼠标的人拿到的仍然只有
+          一个传输形态名词，而他要的是「所以呢」。措辞见 `TIER_WHY` 的注释——
+          写的是「更容易卡顿」而不是「延迟更高」，两者对用户的含义不同。 */}
+      <span className="metric-tier-why" data-testid={`peer-tier-why-${fp}`}>{t(TIER_WHY[tier])}</span>
+    </p>
+  );
+}
+
 // ---------------------------------------------------------------- 一个方向
 
 /**
@@ -641,6 +695,10 @@ export function PeerMetrics({ fp, peer, sendList, recvList, micReady }: {
 }) {
   const [open, setOpen] = useState<Dir | null>(null);
   const any = sendList.length > 0 || recvList.length > 0;
+  // 链路**现状**（不是用户在详情页选的那一档）。判据只此一份，见 lib/tier.ts。
+  // `daemon.status` 本来就是 5 秒一轮的既有轮询，这里不新增任何请求。
+  const daemon = useStore((s) => s.daemon);
+  const tier = effectiveTier(daemon, peer);
 
   // 整张卡片是可点的（进详情页），但指标区里的东西要**留在原地**：展开明细后想看清
   // 或框选某一级的 ms 数字，冒泡上去就会跳走，展开态一并丢失。
@@ -654,6 +712,9 @@ export function PeerMetrics({ fp, peer, sendList, recvList, micReady }: {
 
   return (
     <div className={`peer-metrics${any ? '' : ' idle'}`} data-testid={`peer-metrics-${fp}`} onClick={keep}>
+      {/* 降级归因条：**只在降级时出现**，且紧贴着下面两个延迟读数（§16.4 第 1、3 条）。
+          Tier 0 与「未判定」都不画——理由分别见 `TierBanner` 的注释。 */}
+      {isDegradedTier(tier) ? <TierBanner fp={fp} tier={tier} /> : null}
       <DirBlock
         fp={fp} dir="out" list={sendList}
         open={open === 'out'} onToggle={() => setOpen((v) => (v === 'out' ? null : 'out'))}

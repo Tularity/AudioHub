@@ -717,10 +717,12 @@ export const zhCN = {
   // **说人话，不显示内部代号**（§16.4 第 2 条）：`tier1` 对用户不解释任何事，
   // 而解释正是这一区块存在的全部理由。代号只出现在 IPC 与日志里。
   //
-  // 这里只做「可切换」这一半。§16.4 要求的另一半——把**当前实际**跑在哪个
-  // tier 提到一级、贴着延迟数字显示——需要 `transport_tier`（链路现状）这个
-  // 字段，它还不存在。两者**不得互相冒充**：下面显示的是用户的选择。
+  // 这里只做「可切换」这一半：下面这一组是**用户的选择**。链路的**现状**是
+  // 另一个量，语料在 `tier.now.*`，呈现在卡片（一级）与本节顶部那一行（二级）。
+  // 两者**不得互相冒充**——选「自动」的对端此刻可能正跑在 TCP 上，而这一组
+  // 仍然、并且应当显示「自动」。
   'detail.transport.tierTitle': '连通方式',
+  'detail.transport.tierPickNote': '下面这一组是**你的选择**，不是现在实际走的那一条——选「自动」时，上面那一行才是现状。',
   'detail.transport.tierNote': '媒体默认走 UDP（直连，延迟最好）。UDP 被网络挡住时可以改走 TCP：功能一样不少，但**延迟与抖动会明显变差**。「自动」= 由服务判断。改这一项会重新协商一次连接，约一秒内恢复。',
   'detail.transport.tierAuto': '自动',
   'detail.transport.tierAutoHint': '由服务判断（默认）',
@@ -729,6 +731,41 @@ export const zhCN = {
   'detail.transport.tier1': '经 TCP 中转',
   'detail.transport.tier1Hint': '钉住 TCP；延迟与抖动明显更差',
   'detail.transport.tierReset': '连通方式原来存的是「{old}」，这个版本不认识，已重置为「自动」。',
+  // ---- 链路**现状**（plan §16.4）------------------------------------------
+  //
+  // 与上面那一组（用户的选择）是两个量。这一组回答「此刻字节实际走在哪条路上」。
+  //
+  // 三条纪律，逐条对应 §16.4：
+  //   2. 说人话：写传输形态，不写 `tier1`。
+  //   3. Tier 0 不在卡片上挂徽标（只在二级页面那一行出现）——常驻的「一切正常」
+  //      标记只会训练用户忽略那个位置。
+  //   5. 「未判定」写灰色的「—」，与 Tier 0 的「直连（UDP）」不是同一个样子。
+  //
+  // ⚠ 后果那一句写的是「**更容易卡顿**」，不是「延迟更高」。TCP 的握手和 UDP
+  // 差不多快，初始延迟不一定高；变差的是抖动下的表现——一次 RTO 就是 200–300 ms。
+  // 跨机实测 150 s 增量：Tier 1 上 jb_underruns +4 / jb_dropped +13，Tier 0 上都是 0。
+  // 写成「延迟更高」会让用户去盯一个可能根本没动的毫秒数，然后判定这句提示是假的。
+  'tier.now.title': '这台对端的媒体此刻实际走的通路。它由服务按连接的真实传输判定，与你在详情页里选的那一档是两回事。',
+  'tier.now.cap': '当前连接方式',
+  'tier.now.tier0': '直连（UDP）',
+  'tier.now.tier0Why': '延迟与抖动最好',
+  'tier.now.tier1': '经 TCP 中转',
+  'tier.now.tier1Why': 'UDP 不通，功能不减，但更容易卡顿',
+  'tier.now.tier2': '经隧道复用',
+  'tier.now.tier2Why': '只有应用层通路，收发共用一条连接，最容易卡顿',
+  // 两种「不知道」需要相反的下一步，所以不合并成一句「未知」。
+  'tier.now.unknownUnsupported': '当前服务不上报连接方式',
+  'tier.now.unknownOffline': '对端未连接，没有可判定的通路',
+  'tier.now.linkAddr': '链路 {addr}',
+  'tier.now.linkAlive': '链路存活',
+  'tier.now.linkDead': '链路已断',
+  'tier.now.linkAliveUnknown': '链路存活状态未上报',
+  'tier.now.writeq': '发送队列积压 {ms} ms',
+  'tier.now.stale': '超时丢弃 {n} 帧',
+  'tier.now.muxFrames': '控制帧 发 {w} / 收 {r}',
+  // §16.4 第 4 条点名要二级页面给出「原因」与「判定时间」，而 daemon 还不上报
+  // 这两项。明说出来，不留白——留白会被读成「没有原因」。
+  'tier.now.reasonGap': '当前服务不上报降级的原因与判定时间，上面这些是能拿到的全部现场数据。',
   'detail.transport.noStream': '这个方向当前没有音频流，暂无实测读数。',
   'detail.transport.measuring': '正在测量，暂无读数。',
   'detail.transport.liveMs': '实测 {n} ms',
@@ -866,6 +903,28 @@ export const zhCN = {
   'stats.group.sessions': '{n} 条通路',
   'stats.waterfall.title': '延迟构成',
   'stats.waterfall.empty': '暂无活跃通路',
+  // ---- 降级链路（design §5.2 第 4 条）--------------------------------------
+  //
+  // 这两个数是解释「降级链路为什么难听」的**唯一两个，别处看不到**。它们属于
+  // 链路而不是会话（同一台对端的所有流共用一条），所以既进不了会话卡也进不了
+  // 对端卡片，只能在这一页有自己的位置。
+  'stats.degraded.title': '降级链路',
+  'stats.degraded.note': '媒体改走 TCP（或隧道复用）之后才存在的一条链路。下面两个数是解释「为什么听起来卡」的唯一线索，别的地方看不到。',
+  'stats.degraded.writeq': '发送积压',
+  'stats.degraded.writeqWhy': '帧在发送队列里等待的毫秒数（不是队列深度）。它涨说明写线程被 TCP 卡住了——这是降级链路上最直接的卡顿来源，也是 AUTO 降档的主要依据。',
+  'stats.degraded.stale': '超时丢弃',
+  'stats.degraded.staleWhy': '出队时已超过 200 ms 预算、被主动丢掉的帧数。这不是一个新的丢包源：TCP 会把丢包信号抹掉，主动丢弃留下的空洞才能让对端的抖动缓冲正确隐藏。它涨且对端在欠载 ⇒ 病在这条链路上；它和「队列丢弃」都为 0 而对端仍在欠载 ⇒ 病不在发送侧。',
+  'stats.degraded.writeqPeak': '积压峰值 {v} ms',
+  'stats.degraded.writeqAuto': 'AUTO 上次依据 {v} ms',
+  'stats.degraded.queued': '队列 {n} / {cap}',
+  'stats.degraded.dropped': '队列丢弃 {n} 帧',
+  'stats.degraded.frames': '帧 发 {w} / 收 {r}',
+  'stats.degraded.unexpected': '非预期帧型 {n}',
+  // 「空数组」与「键缺席」是两条不同的结论，**不合并**：前者是「确实没有对端在
+  // 降级链路上」，后者是「这一版服务说不出来」。合并等于用一个缺席的字段去证明
+  // 一切正常。
+  'stats.degraded.empty': '当前没有对端在降级链路上（这是一条结论，不是「读不到」）。',
+  'stats.degraded.unsupported': '当前服务不上报降级链路，无法判断是否有对端已降级。',
   'stats.metric.loss': '丢包率',
   'stats.metric.jitter': '抖动',
   'stats.metric.bitrate': '码率',

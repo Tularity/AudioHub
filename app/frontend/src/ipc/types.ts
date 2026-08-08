@@ -37,6 +37,82 @@ export interface HalStatus {
   last_driver_msg_secs?: number;
 }
 
+/**
+ * `daemon.status.latency_guard.tcp_media[]` 的一行：**一条降级媒体链路**
+ * （Tier 1 那条专用 TCP，或 Tier 2 那条复用连接的媒体半边）。
+ *
+ * # 这是全应用唯一说得出「这台对端现在实际跑在哪一档」的东西
+ *
+ * `PeerState.transport.tier` 是**用户的选择**（`auto` / `tier0` / `tier1`），
+ * 不是现状：选了「自动」的对端此刻可能正跑在 Tier 1 上，而那个字段照旧写着
+ * `auto`。daemon 侧那份契约（`audiohub-ipc` 的 `PeerTransportView::tier`）
+ * 逐字写着「现状要另一个字段（`transport_tier`，尚未落地）」，而两者
+ * **不得互相冒充**（plan §16.4 第 5 条）。
+ *
+ * 在那个字段落地之前，现状的唯一真实来源就是这张表：daemon 是按每条连接的
+ * `MediaPath` 枚举出来的，一条链路在这里出现 = 这台对端的媒体字节此刻真的在
+ * 走降级通路。空数组 = **没有对端在降级链路上**（不是「读不到」）；整个
+ * `tcp_media` 键缺席才是「这一版服务不上报」。判定逻辑只此一份，见 `lib/tier.ts`。
+ */
+export interface TcpMediaLinkStatus {
+  fingerprint?: string;
+  /** 这条链路的对端地址（`ip:port`）。Tier 2 上它是**隧道**的地址。 */
+  peer?: string;
+  alive?: boolean;
+  queued?: number;
+  capacity?: number;
+  /** 队列被灌满而丢弃的帧数（lifetime）。 */
+  dropped?: number;
+  /**
+   * 发送队列里帧的**等待毫秒数**（不是队列深度）。
+   *
+   * 与 `stale_dropped` 一起，是解释「降级链路为什么难听」的**仅有两个数字，
+   * 别处看不到**（design §5.2 第 4 条）。Tier 0 上整条链路不存在，于是这两个
+   * 键在直连的对端上根本不出现——那是「不适用」，不是 0。
+   */
+  writeq_ms?: number;
+  writeq_peak_ms?: number;
+  /** AUTO 上一秒实际据以决策的那个值（与瞬时读数是两个问题）。 */
+  writeq_auto_ms?: number;
+  /** 出队时已超过 200 ms 预算、被陈旧闸门主动丢掉的帧数（lifetime）。 */
+  stale_dropped?: number;
+  frames_written?: number;
+  frames_read?: number;
+  unexpected_kind?: number;
+}
+
+/**
+ * `daemon.status.latency_guard.mux[]` 的一行：**一条 Tier 2 复用连接**。
+ *
+ * 与 `tcp_media` 并列而不是合并，理由在 daemon 侧：媒体那半边两个 tier 完全同型
+ * （所以都在 `tcp_media` 里，Tier 2 的对端**同时**出现在两张表上），而控制帧计数
+ * 是 Tier 2 独有的。于是「fp 在 mux 里」就是「这台对端是 Tier 2」的判据。
+ *
+ * ⚠ 整个 `mux` 键缺席 = 这一版 daemon 根本没有 Tier 2（`mux_status` 与
+ * `MediaPath::Framed` 是同一个提交落地的），所以此时 `tcp_media` 里的一行
+ * 只可能是 Tier 1 —— 这不是猜，是版本推论。
+ */
+export interface MuxLinkStatus {
+  fingerprint?: string;
+  peer?: string;
+  alive?: boolean;
+  control_frames_written?: number;
+  control_frames_read?: number;
+  keepalives_read?: number;
+  /** `null` = 这条载体没有心跳（裸 TCP），**不是「心跳停了」**。 */
+  ws?: unknown;
+}
+
+/**
+ * `daemon.status.latency_guard`。**只声明本 UI 真的读的两张表**——其余十来项
+ * （`dev_lat` / `dll` / `hal_spk` / `sched_late` …）是给 probe 与回归脚本读的，
+ * 在这里镜像一遍只会造出一份必然过期的副本。
+ */
+export interface LatencyGuardStatus {
+  tcp_media?: TcpMediaLinkStatus[];
+  mux?: MuxLinkStatus[];
+}
+
 export interface VirtualCard {
   id?: string;
   name?: string;
@@ -67,6 +143,14 @@ export interface DaemonInfo {
   control_port?: number;
   uptime_s?: number;
   hal?: HalStatus | null;
+  /**
+   * 见 `LatencyGuardStatus`：本 UI 只读 `tcp_media` 与 `mux` 两张表，它们是
+   * 「这台对端现在实际跑在哪一档」的唯一来源（plan §16.4）。
+   *
+   * **缺席 = 这一版服务不上报**，判定结果必须落到「未判定」（灰色的「—」），
+   * 绝不能落到 Tier 0——那正是 §16.4 第 5 条那条红线。
+   */
+  latency_guard?: LatencyGuardStatus;
   output_devices?: string[];
   virtual_cards?: VirtualCard[];
   /** 见 SysAudioBackend：当前 daemon 一律缺席，UI 必须能在没有它时也说得通。 */

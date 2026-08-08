@@ -28,6 +28,9 @@ import { fmt } from '../lib/fmt';
 import { latencyStops, normLatency, qualityStops, stopLabel } from '../lib/transportStops';
 import { pickWorst, qualityDepthKey, readLatency, readQuality, splitByDirection } from '../lib/metrics';
 import type { Dir } from '../lib/metrics';
+import {
+  TIER_LABEL, TIER_WHY, effectiveTier, isDegradedTier, muxLink, tcpMediaLink, tierUnknownWhy,
+} from '../lib/tier';
 import { rpc, refreshPeers } from '../state/connection';
 import { useStore } from '../state/store';
 import type { PeerState, SessionInfo } from '../ipc/types';
@@ -141,6 +144,97 @@ function liveQuality(list: SessionInfo[]): string {
   const depth = qualityDepthKey(q?.wireDepth);
   if (!depth) return t('detail.transport.liveKhz', { n: fmt.int(khz) });
   return t('detail.transport.liveFormat', { khz: fmt.int(khz), depth: t(depth) });
+}
+
+/**
+ * 二级页面上的**现状**行 + 证据。plan §16.4 第 4 条：「提级不等于搬家」——
+ * 一级只回答「为什么慢」，二级回答「凭什么这么判的、我能不能改」，二级的内容
+ * 一条不减。
+ *
+ * ## 三态在这里必须各有各的样子（§16.4 第 5 条那条红线的落点）
+ *
+ * | 现状 | 这一行长什么样 |
+ * |---|---|
+ * | Tier 0（已判定为直连） | 正文色，写「直连（UDP）」 |
+ * | Tier 1 / 2（已判定为降级） | warn 色，写传输形态 + 后果 |
+ * | 未判定 | **灰色的「—」** + 一句说清是哪一种不知道 |
+ *
+ * 卡片上 Tier 0 不挂徽标（第 3 条），但那是「不画」而不是「等同于未判定」——
+ * 分辨这两者的地方就是这一行。
+ *
+ * ## 关于「原因串」与「判定时间」
+ *
+ * §16.4 第 4 条要求二级页面给出这两项。daemon 目前**不上报**它们
+ * （`transport_reason` / `transport_since` 在契约里都还不存在），所以这里
+ * 明写「本版服务未上报」而不是留空：留空会被读成「没有原因」，而事实是
+ * 「这一版说不出来」。能给的证据（链路地址、存活、两个降级计数）照给。
+ */
+function TierNow({ peer }: { peer: PeerState }) {
+  const fp = peer.fingerprint;
+  const daemon = useStore((s) => s.daemon);
+  const tier = effectiveTier(daemon, peer);
+  const degraded = isDegradedTier(tier);
+  const link = degraded ? tcpMediaLink(daemon, fp) : undefined;
+  const mux = tier === 'tier2' ? muxLink(daemon, fp) : undefined;
+
+  return (
+    <div className="transport-now" data-testid="detail-transport-now" data-tier={tier || 'unknown'}>
+      <div className="transport-now-head">
+        <span className="transport-now-cap">{t('tier.now.cap')}</span>
+        {/* `.unknown` 的暗色**只**表示读不到，与全应用同一条规矩（`metric-val.unknown`）。
+            Tier 0 走正文色：它是一个真结论，不该长得像没读到。 */}
+        <span
+          className={`transport-now-val${tier ? (degraded ? ' warn' : '') : ' unknown'}`}
+          data-testid="detail-transport-now-value"
+        >
+          {tier ? t(TIER_LABEL[tier]) : t('common.dash')}
+        </span>
+        <span className="transport-now-why" data-testid="detail-transport-now-why">
+          {tier ? t(TIER_WHY[tier]) : t(tierUnknownWhy(daemon) === 'unsupported'
+            ? 'tier.now.unknownUnsupported'
+            : 'tier.now.unknownOffline')}
+        </span>
+      </div>
+      {/* 证据。**只在降级时出现**：Tier 0 上这条链路根本不存在，画一行全是「—」的
+          计数器就是拿「不适用」冒充「零」。 */}
+      {degraded ? (
+        <div className="transport-now-facts" data-testid="detail-transport-now-facts">
+          <span data-testid="detail-transport-now-addr">
+            {t('tier.now.linkAddr', { addr: link?.peer || t('common.dash') })}
+          </span>
+          <span data-testid="detail-transport-now-alive">
+            {t(link?.alive === true ? 'tier.now.linkAlive'
+              : link?.alive === false ? 'tier.now.linkDead'
+                : 'tier.now.linkAliveUnknown')}
+          </span>
+          {/* 这两个数是解释「降级链路为什么难听」的**仅有两个**（design §5.2 第 4 条）。
+              读不到就写「—」，**不折成 0**：0 在这两个量上是一句强断言（队列没积压、
+              闸门没丢过帧），而它正是本项目反复栽过的那种编造。 */}
+          <span data-testid="detail-transport-now-writeq">
+            {t('tier.now.writeq', { ms: fmt.decimal1(link?.writeq_ms) })}
+          </span>
+          <span data-testid="detail-transport-now-stale">
+            {/* `fmt.int` 而**不是** `fmt.count`：后者把缺席折成 0，而 0 在这个量上
+                是一句强断言（闸门一帧都没丢过）。缺席要写「—」。 */}
+            {t('tier.now.stale', { n: fmt.int(link?.stale_dropped) })}
+          </span>
+          {mux ? (
+            <span data-testid="detail-transport-now-mux">
+              {t('tier.now.muxFrames', {
+                w: fmt.int(mux.control_frames_written),
+                r: fmt.int(mux.control_frames_read),
+              })}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+      {/* §16.4 第 4 条点名的两项，daemon 还给不出来。**明写出来**而不是留白：
+          留白会被读成「没有原因」。 */}
+      {degraded ? (
+        <p className="muted small" data-testid="detail-transport-now-gap">{t('tier.now.reasonGap')}</p>
+      ) : null}
+    </div>
+  );
 }
 
 export function PeerTransportCard({ peer }: { peer: PeerState }) {
@@ -306,14 +400,20 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
           （前者是「你决定」，后者是「钉住直连，别自己改」），做成开关就必须
           把其中一个藏起来。
 
-          ⚠ 这里显示的是**用户的选择**，不是链路现在实际跑在哪一档。后者是
-          §16.4 要求的一级信息（贴着延迟数字显示「经 TCP 中转」），它需要
-          `transport_tier` 这个尚不存在的字段。**不得用这一组按钮冒充它**：
-          选「自动」的对端此刻可能正跑在 tier 1 上，而这里仍然显示「自动」。 */}
+          ⚠ 这一组按钮显示的是**用户的选择**，不是链路现在实际跑在哪一档。
+          现状由上面的 `TierNow` 那一行负责（§16.4 的一级信息在卡片上，这里是
+          它的二级完整版）。**两者不得互相冒充**：选「自动」的对端此刻可能正跑在
+          tier 1 上，而这一组按钮仍然、并且应当显示「自动」。 */}
       <div className="transport-tier" data-testid="detail-transport-tier">
         <h4 className="block-subtitle">{t('detail.transport.tierTitle')}</h4>
+        {/* 现状在选择之前：用户点进这一节最常见的问题是「我现在到底走的哪条路」，
+            而不是「我上次选了什么」。 */}
+        <TierNow peer={peer} />
         <p className="muted small" data-testid="detail-transport-tier-note">
           {t('detail.transport.tierNote')}
+        </p>
+        <p className="muted small" data-testid="detail-transport-tier-pick-note">
+          {t('detail.transport.tierPickNote')}
         </p>
         {typeof tr.tier_reset_from === 'string' ? (
           <p className="transport-reset" data-testid="detail-transport-tier-reset">

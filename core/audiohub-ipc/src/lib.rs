@@ -340,6 +340,19 @@ pub struct PeerTransportView {
     /// `*_reset_from` 同纪律：静默重置与静默翻译是同一个病。
     #[serde(default)]
     pub tier_reset_from: Option<String>,
+    /// 哪一侧可以发起连接：`"both"` | `"outbound_only"` | `"inbound_only"`。
+    ///
+    /// 与 `tier` 并列而不是从它推导：tier 2 的隧道**不一定**是单向的，单向的
+    /// 通路也**不一定**是 tier 2（一台钉在 tier 0 的机器照样可能只能被拨）。
+    /// 从一个推另一个会在两种情形里各错一次。
+    #[serde(default = "default_dial_policy")]
+    pub dial_policy: String,
+    #[serde(default)]
+    pub dial_policy_reset_from: Option<String>,
+}
+
+fn default_dial_policy() -> String {
+    "both".to_string()
 }
 
 fn default_tier() -> String {
@@ -978,6 +991,21 @@ pub struct PeerState {
     /// peer THIS daemon has connected to itself.
     #[serde(default)]
     pub reconnecting: bool,
+    /// **The third connection state** (design §4.2 item 2, plan §16): this peer
+    /// is set to inbound-only, so this machine never dials it and it is
+    /// expected to connect to us.
+    ///
+    /// `online: false, awaiting_inbound: true` does **not** mean offline. On a
+    /// tunnel that only carries connections one way, a peer sitting here is a
+    /// peer whose setup is working exactly as configured; rendering it as
+    /// offline would put a permanent fault marker on a working system, and the
+    /// user's only available conclusion would be that the software is broken.
+    ///
+    /// Carried rather than derived from `reconnecting == false`, because that
+    /// is also what a peer we simply never dialled looks like — the two need
+    /// opposite words, and only the daemon can tell them apart.
+    #[serde(default)]
+    pub awaiting_inbound: bool,
     /// Seconds until the next retry, when `reconnecting`.
     #[serde(default)]
     pub retry_in_s: Option<f64>,
@@ -1148,7 +1176,12 @@ pub mod methods {
     pub const PEERS_UNPAIR: &str = "peers.unpair";
     pub const PEERS_SET_ALIAS: &str = "peers.set_alias";
     pub const PEERS_SET_TRANSPORT: &str = "peers.set_transport";
-    /// 连通性档位（`auto` | `tier0` | `tier1`），**每对端一个**。
+    /// 连通性档位（`auto` | `tier0` | `tier1` | `tier2`），**每对端一个**，
+    /// 可选带 `dial_policy`（`both` | `outbound_only` | `inbound_only`）。
+    ///
+    /// 两者同一个入口、同一次落盘：它们合起来才是「这台对端怎么连」这一个决定，
+    /// 而每一次写入都要拆一次控制连接——分两次下等于让对端经历两次重连，
+    /// 中间那一刻还是一个用户从没要求过的组合。
     ///
     /// # 为什么它不是 `peers.set_transport` 上的第三个字段
     ///

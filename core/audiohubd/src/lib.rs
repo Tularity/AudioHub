@@ -21,6 +21,9 @@ mod peer_transport;
 /// plan §13 三模式互斥的接线测试（两台真 daemon 跑回环）。
 #[cfg(test)]
 mod mode_tests;
+/// Tier 2（M8 降级链路）：控制流与两个方向的媒体复用在**一条**连接上。
+/// 读线程分发、写调度与控制信用额度。
+mod mux;
 mod quality;
 pub mod reconnect;
 /// 截止期线程的延迟落盘日志（阻塞 write + Stderr 全局锁不许上音频线程）。
@@ -71,7 +74,7 @@ use audiohub_ipc::{
 use audiohub_net::discovery::{self, AnnounceGuard};
 use audiohub_net::identity::{LocalIdentity, PairedPeer};
 use audiohub_net::media::{AutoLadder, JitterBuffer, MediaCrypto};
-use audiohub_net::secure::{SecureChannel, SessionMsg, StageReading};
+use audiohub_net::secure::{SessionMsg, StageReading};
 use audiohub_net::stats::RxStats;
 
 pub const DIR_SEND: &str = "send";
@@ -240,6 +243,25 @@ pub struct DaemonCfg {
     /// "HAL driver attached" for as long as the tests ran. The env var cannot
     /// express this: it is process-global and the tests share a process.
     pub hal_bridge: Option<halbridge::HalBridgeMode>,
+    /// Test-only send throttle for the degraded transports, in kbit/s.
+    /// `None` = whatever `AUDIOHUB_TEST_TX_KBPS` says (0 = unlimited).
+    ///
+    /// Same reason `hal_bridge` is here rather than left to the environment,
+    /// and it is the same sentence: **the env var is process-global and the
+    /// tests share a process.** A throttle set for one test would slow every
+    /// tier 1 and tier 2 link created anywhere in the binary while it ran,
+    /// which is a flake with no visible cause.
+    ///
+    /// It sits on the writer thread, i.e. *after* the queue and the stale gate,
+    /// which is the whole point: the backlog, `writeq_ms`, the gate firing and
+    /// AUTO's reaction are all the production path unmodified. Throttling
+    /// downstream instead (a slow tunnel) does not substitute — measured
+    /// 2026-08-08, a forwarder held at a tenth of the media rate put **eight
+    /// seconds** of backlog in the kernel send buffer, so a control frame that
+    /// won every scheduling decision still arrived eight seconds late. That
+    /// delay is real and is what tier 2 feels like on such a link; it just
+    /// cannot be used to measure a scheduler.
+    pub tx_throttle_kbps: Option<u64>,
 }
 
 pub struct DaemonHandle {
@@ -362,6 +384,10 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         token: token.clone(),
         udp,
         media_send: engine::UdpSender::new(),
+        tx_bps: cfg
+            .tx_throttle_kbps
+            .map(|kbps| kbps * 1000 / 8)
+            .unwrap_or_else(tcpmedia::token_bucket_from_env),
         start: Instant::now(),
         state: Mutex::new(DaemonState {
             conns: HashMap::new(),
@@ -555,6 +581,9 @@ pub(crate) struct DaemonInner {
     /// **`sendto` 不许回到 10 ms 截止期线程上** —— 它进内核网络栈，
     /// 单次调用的耗时上界不可预知（`docs/spec-latency-floor.md` §9.3 手段 J1）。
     pub media_send: engine::UdpSender,
+    /// Bytes/second the degraded transports' writers may put on the wire, 0 =
+    /// unlimited. See [`DaemonCfg::tx_throttle_kbps`].
+    pub tx_bps: u64,
     pub start: Instant,
     pub state: Mutex<DaemonState>,
     pub rx_table: RwLock<HashMap<u32, Arc<RxStream>>>,
@@ -802,25 +831,28 @@ pub(crate) fn status_with_hal(
     Ok(v)
 }
 
-/// `daemon.status.latency_guard.tcp_media`：每条活着的 Tier 1 媒体链路一行。
+/// `daemon.status.latency_guard.tcp_media`：每条活着的降级媒体链路一行
+/// （Tier 1 的第二条 TCP，或 Tier 2 那条复用连接的媒体半边）。
 ///
 /// 空数组 = 没有任何对端在降级链路上，**不是**「读不到」。区别是有意义的：
 /// 这套遥测反对的正是「用 0 冒充未知」。
+///
+/// Tier 2 混在同一张表里而不是另起一张：`writeq_ms` 与 `stale_dropped` 是
+/// 「降级链路为什么难听」的**仅有的两个数字**（design §5.2 第 4 条），
+/// 而它们在两个 tier 上是同一个量、由同一段代码产出。分成两张表只会让读的人
+/// 需要先知道对端在哪一档才知道该看哪一张。
 fn tcp_media_status(inner: &DaemonInner) -> serde_json::Value {
     let links: Vec<Arc<tcpmedia::TcpMediaLink>> = lk(&inner.state)
         .conns
         .values()
-        .filter_map(|c| match &*lk(&c.media_path) {
-            tcpmedia::MediaPath::Tcp(l) => Some(l.clone()),
-            tcpmedia::MediaPath::Udp(_) => None,
-        })
+        .filter_map(|c| lk(&c.media_path).media_link().cloned())
         .collect();
     serde_json::Value::Array(
         links
             .iter()
             .map(|l| {
                 serde_json::json!({
-                    "fingerprint": l.fp,
+                    "fingerprint": l.fp(),
                     "peer": l.peer.to_string(),
                     "alive": l.is_alive(),
                     "queued": l.queued(),
@@ -843,6 +875,41 @@ fn tcp_media_status(inner: &DaemonInner) -> serde_json::Value {
                     "frames_written": l.frames_written(),
                     "frames_read": l.frames_read(),
                     "unexpected_kind": l.unexpected_kind(),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// `daemon.status.latency_guard.mux`：每条活着的 Tier 2 复用连接一行。
+///
+/// **与 `tcp_media` 并列而不是合并**：媒体那半边（队列、陈旧闸门、`writeq_ms`）
+/// 两个 tier 完全同型，所以在 `tcp_media` 里；而控制帧计数是 tier 2 独有的——
+/// tier 0/1 的控制流走的是另一条 socket，没有帧可数。硬塞进同一行就必须给
+/// tier 1 填两个恒为 0 的字段，那正是这套遥测反对的「用 0 冒充不适用」。
+///
+/// 这三个计数是「控制流真的复用在这条连接上」的**唯一**可观测证据：媒体计数
+/// 在 tier 1 上也会动，只有它们能把「一条连接」和「两条连接」区分开。
+fn mux_status(inner: &DaemonInner) -> serde_json::Value {
+    let links: Vec<Arc<mux::MuxLink>> = lk(&inner.state)
+        .conns
+        .values()
+        .filter_map(|c| match &*lk(&c.media_path) {
+            tcpmedia::MediaPath::Framed(l) => Some(l.clone()),
+            _ => None,
+        })
+        .collect();
+    serde_json::Value::Array(
+        links
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "fingerprint": l.media().fp(),
+                    "peer": l.peer().to_string(),
+                    "alive": l.is_alive(),
+                    "control_frames_written": l.control_frames_written(),
+                    "control_frames_read": l.control_frames_read(),
+                    "keepalives_read": l.keepalives_read(),
                 })
             })
             .collect(),
@@ -999,6 +1066,7 @@ fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
         //   丢弃留下 seq 空洞，对端 JB 于是按真丢包正确隐藏。
         // - 两者都为 0 而对端仍在欠载 ⇒ 病不在这条链路的发送侧。
         "tcp_media": tcp_media_status(inner),
+        "mux": mux_status(inner),
         // 发送侧：`tx_loop` 唤醒周期的二阶 DLL（`halbridge::dll`）。它是
         // `hal_spk` 水位的**常规执行器**，`trim` 只是它够不着那一档的兜底。
         //
@@ -1080,7 +1148,10 @@ fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
 pub(crate) struct ConnShared {
     pub fp: String,
     pub peer: PairedPeer,
-    pub chan: Mutex<SecureChannel>,
+    /// The encrypted control channel, over whichever transport carries it:
+    /// its own socket on tier 0/1, `Kind::Control` frames on the mux on tier 2
+    /// (`mux::ControlTransport`).
+    pub chan: Mutex<mux::ControlChan>,
     pub tx_key: [u8; 32],
     pub rx_key: [u8; 32],
     /// The control-TCP peer's IP. Frozen as the only address media may be sent
@@ -1090,7 +1161,11 @@ pub(crate) struct ConnShared {
     pub peer_ip: IpAddr,
     /// Where this peer's media actually goes right now (M8). Starts as
     /// `Udp(peer_ip:peer.port)` — the frozen tier 0 destination — and becomes
-    /// `Tcp(..)` when a tier 1 link attaches.
+    /// `Tcp(..)` when a tier 1 link attaches. On tier 2 it is
+    /// `Framed(..)` from the moment the connection is registered, because the
+    /// mux carried the handshake that created it: there is no window in which a
+    /// stream could be opened onto the wrong transport, which is the race tier
+    /// 1 needed `media_gate` to close.
     ///
     /// **Per connection, not per direction**: both directions share this
     /// `ConnShared`, and after a downgrade they share one media TCP as well.
@@ -3503,9 +3578,9 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                     // user stays on a fixed rung, and the first AUTO tick after
                     // switching back reads a peak that may be minutes old as if
                     // it were this second's. Cheap to keep the name honest.
-                    if let tcpmedia::MediaPath::Tcp(l) = e.conn.current_media_path() {
+                    if let Some(l) = e.conn.current_media_path().media_link() {
                         writeq
-                            .entry(l.fp.clone())
+                            .entry(l.fp().to_string())
                             .or_insert_with(|| l.take_writeq_peak_ms());
                     }
                 } else {
@@ -3516,10 +3591,7 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                     // can move the stored value while a stream is live without
                     // the stream itself moving (design §5.1 — no transport
                     // switch inside a live stream).
-                    let link = match e.conn.current_media_path() {
-                        tcpmedia::MediaPath::Tcp(l) => Some(l),
-                        tcpmedia::MediaPath::Udp(_) => None,
-                    };
+                    let link = e.conn.current_media_path().media_link().cloned();
                     let streamed = link.is_some();
                     // Taken **once per link per tick**, then shared by every
                     // stream on that peer: `take_writeq_peak_ms` is consuming,
@@ -3528,7 +3600,7 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                     // clean zero to the rest.
                     let writeq_ms = link.as_ref().map(|l| {
                         *writeq
-                            .entry(l.fp.clone())
+                            .entry(l.fp().to_string())
                             .or_insert_with(|| l.take_writeq_peak_ms())
                     });
                     // Did the stale gate throw anything away since the previous
@@ -3543,9 +3615,9 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                     // — writing it per stream would let the first stream on a
                     // fanned-out peer absorb the growth and show the rest zero.
                     let stale_growing = link.as_ref().map(|l| {
-                        *stale_grew.entry(l.fp.clone()).or_insert_with(|| {
+                        *stale_grew.entry(l.fp().to_string()).or_insert_with(|| {
                             let now = l.stale_dropped();
-                            let prev = stale_seen.insert(l.fp.clone(), now);
+                            let prev = stale_seen.insert(l.fp().to_string(), now);
                             // First sighting of a link is not evidence of
                             // trouble: `None` means we have no baseline, not
                             // that the gate fired.

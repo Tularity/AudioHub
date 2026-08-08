@@ -193,6 +193,11 @@ pub(crate) fn note_outbound(
     fp: &str,
     addr: Option<&str>,
 ) -> Vec<PlannedSession> {
+    if !may_dial(inner, fp) {
+        // The one place an entry is created, and the one place to refuse. See
+        // `may_dial`.
+        return Vec::new();
+    }
     let mut m = lk(&inner.recon);
     let e = m
         .entry(fp.to_string())
@@ -221,8 +226,41 @@ pub(crate) fn arm_now(inner: &DaemonInner, fp: &str, sessions: Vec<PlannedSessio
 /// drop contributes the streams that were live on ITS connection and the sets
 /// are disjoint (a session belongs to exactly one conn), so a set arriving
 /// while a retry is already armed must not be thrown away.
+/// May this daemon originate a connection to `fp` (design §4.2 item 1)?
+///
+/// # Why the retry loop has to ask
+///
+/// The rule at the top of this file — only a peer we dialled gets a retry loop —
+/// already covers tier 2's discipline **for a peer we never dialled**. What it
+/// does not cover is a peer we dialled once and whose policy was set to
+/// inbound-only afterwards, or one that connected to us and whose entry a
+/// user-initiated `peers.connect` created before the setting changed. Those
+/// entries would keep retrying a dial the tunnel cannot carry, on the 30-second
+/// rung, forever — a log line every half minute describing a failure that is
+/// not one.
+///
+/// Checked here rather than only in `connect_peer` because arming is what makes
+/// the peer *look* like it is coming back. On an inbound-only peer that display
+/// is wrong twice over: nothing is being retried, and the peer is not offline
+/// in the first place — it is waiting to be dialled, which `PeerState`
+/// reports as its own state.
+fn may_dial(inner: &DaemonInner, fp: &str) -> bool {
+    lk(&inner.peer_transport).dial_policy(fp).may_dial()
+}
+
 fn arm_in(inner: &DaemonInner, fp: &str, sessions: Vec<PlannedSession>, immediate: bool) {
     if inner.shutdown.load(Ordering::SeqCst) {
+        return;
+    }
+    if !may_dial(inner, fp) {
+        // Any entry from before the policy changed goes too: leaving it would
+        // keep `peers.list` reporting a retry that will never be attempted.
+        if lk(&inner.recon).remove(fp).is_some() {
+            dlog!(
+                "[audiohubd] peer {fp}: set to inbound-only, so the retry loop is disarmed; \
+                 it will come back when it connects to us"
+            );
+        }
         return;
     }
     let armed = {

@@ -1,8 +1,8 @@
 pub mod control;
 pub mod discovery;
 pub mod echo;
-/// Framing for byte-stream transports (design §2 decision B). A library with no
-/// caller yet: nothing in the daemon reads or writes a frame.
+/// Framing for byte-stream transports (design §2 decision B): tier 1's media
+/// connection and tier 2's multiplexed one both decode with this.
 pub mod framed;
 pub mod identity;
 pub mod media;
@@ -12,6 +12,10 @@ pub mod media;
 #[cfg(test)]
 mod memduplex;
 pub mod mode;
+/// The control byte stream of a multiplexed connection (tier 2), as a
+/// `ControlIo`. The production second implementation `memduplex` was written to
+/// anticipate.
+pub mod muxio;
 pub mod packet;
 pub mod pairing;
 pub mod secure;

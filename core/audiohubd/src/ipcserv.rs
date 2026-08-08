@@ -366,6 +366,9 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                             net_ms: None,
                             rtt_ms: None,
                             reconnecting: false,
+                            // `online: true` on this arm, and the third state
+                            // is only meaningful while a peer is not connected.
+                            awaiting_inbound: false,
                             retry_in_s: None,
                             hal_device: None,
                             hal_reason: None,
@@ -666,20 +669,39 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing 'peer'"))?;
                 let fp = conn::resolve_fingerprint(inner, sel)?;
-                let v = params
-                    .get("tier")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("missing 'tier' ('auto' | 'tier0' | 'tier1')"))?;
+                let v = params.get("tier").and_then(Value::as_str).ok_or_else(|| {
+                    anyhow::anyhow!("missing 'tier' ('auto' | 'tier0' | 'tier1' | 'tier2')")
+                })?;
                 // 与 §15 两个档位串同一条纪律：写入口严格校验，未知值**拒绝**
                 // 而不是收下。收下一个执行不了的字符串、写盘、再原样回显，
                 // 正是本仓栽过六次的那个形状。
                 let tier = crate::peer_transport::TransportTier::parse(v).ok_or_else(|| {
-                    anyhow::anyhow!("tier 必须是 'auto'、'tier0' 或 'tier1'，收到 '{v}'")
+                    anyhow::anyhow!("tier 必须是 'auto'、'tier0'、'tier1' 或 'tier2'，收到 '{v}'")
                 })?;
+                // 拨号策略与 tier 同一个入口、同一次落盘：两者一起决定「这台
+                // 对端怎么连」，而分成两个方法就意味着两次落盘、两次拆连接，
+                // 中间那一刻是一个用户从没要求过的组合（tier2 + 仍然会拨号）。
+                // **并列而不是从 tier 推**：tier 2 的隧道不一定单向，单向的通路
+                // 也不一定是 tier 2。
+                let dial = match params.get("dial_policy").and_then(Value::as_str) {
+                    Some(d) => Some(crate::peer_transport::DialPolicy::parse(d).ok_or_else(
+                        || {
+                            anyhow::anyhow!(
+                                "dial_policy 必须是 'both'、'outbound_only' 或 \
+                                 'inbound_only'，收到 '{d}'"
+                            )
+                        },
+                    )?),
+                    None => None,
+                };
                 let prev = lk(&inner.peer_transport).tier(&fp);
+                let prev_dial = lk(&inner.peer_transport).dial_policy(&fp);
                 {
                     let mut t = lk(&inner.peer_transport).get(&fp);
                     t.transport_tier = tier.as_wire().to_string();
+                    if let Some(d) = dial {
+                        t.dial_policy = d.as_wire().to_string();
+                    }
                     let mut store = lk(&inner.peer_transport);
                     store.set(&fp, t);
                     // 落盘在生效之前：这一步之后连接就要被拆掉，而重连会重新
@@ -687,17 +709,20 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     // 带着旧档回来，而用户看到的是新档。
                     store.save(&inner.cfg_dir)?;
                 }
-                let applied = if prev == tier {
+                let changed = prev != tier || dial.is_some_and(|d| d != prev_dial);
+                let applied = if changed {
+                    conn::retier(inner, &fp)
+                } else {
                     // 值没变就什么都不做：拆一条健康的连接去应用一个没有变化
                     // 的设置，是拿一次真实的断流换零收益。
                     conn::Retier::Stored
-                } else {
-                    conn::retier(inner, &fp)
                 };
                 json!({
                     "fingerprint": fp,
                     "tier": tier.as_wire(),
                     "previous": prev.as_wire(),
+                    "dial_policy": dial.unwrap_or(prev_dial).as_wire(),
+                    "previous_dial_policy": prev_dial.as_wire(),
                     "applied": applied.as_wire(),
                 })
             }
@@ -762,6 +787,8 @@ fn peer_transport_view(
         peer_tx_quality: None,
         tier: mine.tier().as_wire().to_string(),
         tier_reset_from: mine.transport_tier_reset_from.clone(),
+        dial_policy: mine.dial_policy().as_wire().to_string(),
+        dial_policy_reset_from: mine.dial_policy_reset_from.clone(),
     };
     for e in st.sessions.values() {
         if e.conn.fp != fp || e.origin != crate::SessionOrigin::Peer {
@@ -817,6 +844,11 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
                 peer_mode: cell.mode(),
                 peer_unusable: cell.unusable(),
                 reconnecting,
+                // The third state, and it is only meaningful while the peer is
+                // not connected: an inbound-only peer with a live channel is
+                // simply online, and reporting both would ask the UI to choose.
+                awaiting_inbound: live.is_none()
+                    && !lk(&inner.peer_transport).dial_policy(&p.fingerprint).may_dial(),
                 retry_in_s,
                 hal_device: hal.peer_device(&p.fingerprint),
                 hal_reason: hal.reasons.get(&p.fingerprint).cloned(),

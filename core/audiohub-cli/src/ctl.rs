@@ -239,14 +239,25 @@ pub enum CtlCmd {
         /// Opus stops are listed but refused — this build cannot deliver them.
         #[arg(long)]
         quality: Option<String>,
-        /// plan §16.2 connectivity tier: "auto", "tier0" (UDP media) or
-        /// "tier1" (media over a second TCP connection).
+        /// plan §16.2 connectivity tier: "auto", "tier0" (UDP media),
+        /// "tier1" (media over a second TCP connection) or "tier2" (control
+        /// and both media directions multiplexed onto one connection).
         ///
         /// **Per peer, so it takes no `--dir`** — both directions share one
         /// control connection and, after a downgrade, one media transport.
         /// Applied hot: the daemon re-negotiates on the spot, no restart.
-        #[arg(long, value_parser = ["auto", "tier0", "tier1"])]
+        #[arg(long, value_parser = ["auto", "tier0", "tier1", "tier2"])]
         tier: Option<String>,
+        /// Which side may originate the connection (design §4.2): "both"
+        /// (default), "outbound_only", or "inbound_only" for a peer behind a
+        /// tunnel that only carries connections the other way.
+        ///
+        /// Set together with `--tier`, because they are one decision about how
+        /// this peer is reached and each write drops the control connection —
+        /// applying them separately would put the peer through two
+        /// reconnections and, in between, a combination nobody asked for.
+        #[arg(long, value_parser = ["both", "outbound_only", "inbound_only"], requires = "tier")]
+        dial_policy: Option<String>,
     },
     /// pair with a peer that has pairing mode enabled
     Pair {
@@ -348,6 +359,7 @@ fn cmd_daemon(port: u16, ipc_port: u16, announce: bool, secs: f32, json: bool) -
         config_dir: None, // resolve via AUDIOHUB_CONFIG_DIR / platform default, same as ctl
         announce,
         hal_bridge: None, // production: AUDIOHUB_HAL_BRIDGE decides
+        tx_throttle_kbps: None, // production: AUDIOHUB_TEST_TX_KBPS decides (normally unlimited)
     })?;
     info(&format!(
         "daemon running: control_port={port} ipc_port={} config_dir={}",
@@ -563,7 +575,7 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             };
             (method, Value::Object(p))
         }
-        CtlCmd::PeerTransport { peer, dir, latency, quality, tier } => {
+        CtlCmd::PeerTransport { peer, dir, latency, quality, tier, dial_policy } => {
             if let Some(t) = tier {
                 // Refused rather than sequenced into two calls: they are two
                 // writes with two failure modes, and one call reporting one
@@ -577,7 +589,13 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
                          （会重新协商传输），后两者是每方向的档位，两者是两个写入口"
                     );
                 }
-                return Ok((methods::PEERS_SET_TIER, json!({ "peer": peer, "tier": t })));
+                let mut p = serde_json::Map::new();
+                p.insert("peer".into(), json!(peer));
+                p.insert("tier".into(), json!(t));
+                if let Some(d) = dial_policy {
+                    p.insert("dial_policy".into(), json!(d));
+                }
+                return Ok((methods::PEERS_SET_TIER, Value::Object(p)));
             }
             if latency.is_none() && quality.is_none() {
                 // 只读：走 peers.list，回包里挑这一台。写一个「读」的专用方法
@@ -899,17 +917,19 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                       its own — plan §13)");
             }
         }
-        CtlCmd::PeerTransport { peer, dir, latency, quality, tier } => {
+        CtlCmd::PeerTransport { peer, dir, latency, quality, tier, dial_policy: _ } => {
             if tier.is_some() {
                 // `applied` 是这次调用与 `peers.set_transport` 的实质区别：
                 // 换 tier 必然要重新协商传输，而**能不能自己重建那条连接**
                 // 取决于这台机器是不是拨号的那一侧。印出来，别让用户去猜
                 // 一次沉默的等待是成功还是卡住了。
                 info(&format!(
-                    "{}: tier {} -> {} ({})",
+                    "{}: tier {} -> {}, dial {} -> {} ({})",
                     val_str(v, "fingerprint"),
                     val_str(v, "previous"),
                     val_str(v, "tier"),
+                    val_str(v, "previous_dial_policy"),
+                    val_str(v, "dial_policy"),
                     match &*val_str(v, "applied") {
                         "reconnecting" => "已拆连接，重连后按新档协商（约 1 s）",
                         "awaiting_peer" =>

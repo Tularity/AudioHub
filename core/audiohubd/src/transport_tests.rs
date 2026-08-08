@@ -15,6 +15,7 @@
 //! 「一切都报成功，什么都没发生」里，没有一次是函数写错了，全都是
 //! **函数没被调用**，而单元测试对着没人调用的函数照样绿。
 
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,12 @@ impl Drop for Node {
 
 impl Node {
     fn start(tag: &str) -> Node {
+        Node::start_throttled(tag, None)
+    }
+
+    /// `tx_throttle_kbps` in kbit/s on this daemon's degraded-transport writers
+    /// only. See `DaemonCfg::tx_throttle_kbps`.
+    fn start_throttled(tag: &str, tx_kbps: Option<u64>) -> Node {
         let n = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -60,6 +67,7 @@ impl Node {
             announce: false,
             // 与 mode_tests 同一条理由：`auto` 会把用户的真 daemon 从驱动上挤掉。
             hal_bridge: Some(HalBridgeMode::Off),
+            tx_throttle_kbps: tx_kbps,
         })
         .expect("start daemon");
         Node { h, dir }
@@ -378,6 +386,44 @@ impl Node {
         self.tcp_media().into_iter().next()
     }
 
+    /// This daemon's live tier 2 multiplexed connections (M8 P5).
+    ///
+    /// Beside `tcp_media` rather than inside it: the media half of a mux is a
+    /// `tcp_media` row (same queue, same stale gate, same two numbers), and
+    /// what is only here is the control-frame accounting — the one observable
+    /// that tells a multiplexed connection from two separate ones.
+    fn mux_links(&self) -> Vec<Value> {
+        self.ok(methods::DAEMON_STATUS, json!({}))
+            .get("latency_guard")
+            .and_then(|g| g.get("mux"))
+            .and_then(|v| v.as_array().cloned())
+            .expect("daemon.status.latency_guard.mux 必须存在")
+    }
+
+    fn mux_link(&self) -> Option<Value> {
+        self.mux_links().into_iter().next()
+    }
+
+    /// The address the **control channel's own socket** reports for a peer.
+    ///
+    /// On tier 2 this is the tunnel's, not the peer's, and that is the point:
+    /// see `a_tier_two_pair_survives_the_source_address_being_lost`.
+    fn conn_peer_addr(&self, fp: &str) -> Option<std::net::SocketAddr> {
+        let c = lk(&self.h.inner_for_test().state).conns.get(fp).cloned()?;
+        let addr = lk(&c.chan).peer_addr().ok();
+        addr
+    }
+
+    fn control_port(&self) -> u16 {
+        self.h.control_port
+    }
+
+    /// The last measured control-plane round trip, in milliseconds. `None`
+    /// until a `Pong` has come back.
+    fn rtt_ms(&self, fp: &str) -> Option<f64> {
+        self.peer(fp)["rtt_ms"].as_f64()
+    }
+
     /// One recv-side session's tone verdict, or `None` while none has been
     /// formed yet.
     fn recv_verdict(&self) -> Option<Value> {
@@ -426,12 +472,32 @@ fn pin_tier(n: &Node, fp: &str, tier: &str) {
 }
 
 fn pair(a: &Node, b: &Node) {
+    pair_through(a, b, &b.addr());
+}
+
+/// Pair and connect A to B **at `addr`**, which need not be B's own address.
+fn pair_through(a: &Node, b: &Node, addr: &str) {
     let pin = b.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
     let pin = pin.get("pin").and_then(Value::as_str).expect("pin").to_string();
-    a.ok(methods::PEERS_PAIR, json!({ "addr": b.addr(), "pin": pin }));
+    a.ok(methods::PEERS_PAIR, json!({ "addr": addr, "pin": pin }));
     a.ok(
         methods::PEERS_CONNECT,
-        json!({ "peer": b.fingerprint(), "addr": b.addr() }),
+        json!({ "peer": b.fingerprint(), "addr": addr }),
+    );
+}
+
+/// Set a peer's dial policy (M8 P5), the same way `pin_tier` sets its tier and
+/// for the same reason: before the control connection exists.
+fn set_dial_policy(n: &Node, fp: &str, policy: &str) {
+    let inner = n.h.inner_for_test();
+    let mut store = lk(&inner.peer_transport);
+    let mut t = store.get(fp);
+    t.dial_policy = policy.to_string();
+    store.set(fp, t);
+    assert_eq!(
+        store.dial_policy(fp),
+        crate::peer_transport::DialPolicy::parse(policy).expect("a policy this build knows"),
+        "the dial policy did not stick"
     );
 }
 
@@ -1507,6 +1573,9 @@ fn a_fixed_choice_is_still_in_force_after_a_restart() {
         config_dir: Some(dir.clone()),
         announce: false,
         hal_bridge: Some(HalBridgeMode::Off),
+        // Production and every test but the tier 2 starvation rig: whatever
+        // the environment says (normally nothing, i.e. unlimited).
+        tx_throttle_kbps: None,
     };
 
     // 一台真对端：`peers.set_transport` 要解析指纹，没有配对就没有指纹。
@@ -2668,3 +2737,629 @@ fn a_media_frame_that_fails_aead_is_counted() {
         "a forged frame was admitted far enough to disturb the sequence accounting: {recv}"
     );
 }
+
+// ------------------------------------------------ M8 tier 2 (multiplexed)
+
+/// A local application-layer TCP forwarder, and the whole of the tier 2 test
+/// environment (design §7 level 3).
+///
+/// It reproduces all three of tier 2's premises with **zero privileges and zero
+/// system configuration**: it forwards at the application layer only, the
+/// daemon on the far side sees `127.0.0.1:<ephemeral>` instead of the dialler's
+/// endpoint, and only one direction can originate a connection.
+///
+/// # ⚠ The port must not collide with a daemon's control port
+///
+/// `conn::is_self_endpoint` is `port == our control_port && ip_is_ours(ip)`,
+/// and `ip_is_ours` returns **true unconditionally for loopback**. So a
+/// forwarder that happened to listen on a participating daemon's control port
+/// number would be refused as a self-dial — a failure that looks like a
+/// downgrade bug and is not one. Bound to port 0 (the kernel picks) and
+/// asserted against both daemons in every test that uses it.
+struct Forwarder {
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Bytes carried, either direction. Only used to prove the throttle is
+    /// really the thing limiting the link.
+    carried: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Drop for Forwarder {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Forwarder {
+    fn start(to: std::net::SocketAddr) -> Forwarder {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind the forwarder");
+        let port = l.local_addr().expect("forwarder addr").port();
+        l.set_nonblocking(true).expect("nonblocking accept");
+        let stop = Arc::new(AtomicBool::new(false));
+        let carried = Arc::new(AtomicU64::new(0));
+
+        let (s, c) = (stop.clone(), carried.clone());
+        std::thread::spawn(move || {
+            while !s.load(Ordering::SeqCst) {
+                let Ok((down, _)) = l.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let Ok(up) = std::net::TcpStream::connect(to) else { continue };
+                // Nagle off on both legs. With it on, the forwarder itself
+                // would add up to 40 ms to every small frame and the round-trip
+                // figure this rig exists to measure would be measuring the rig.
+                let _ = down.set_nodelay(true);
+                let _ = up.set_nodelay(true);
+                for (from, to) in [
+                    (down.try_clone(), up.try_clone()),
+                    (up.try_clone(), down.try_clone()),
+                ] {
+                    let (Ok(mut from), Ok(mut to)) = (from, to) else { continue };
+                    let (s, c) = (s.clone(), c.clone());
+                    std::thread::spawn(move || {
+                        let _ = from.set_read_timeout(Some(Duration::from_millis(50)));
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            if s.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let n = match from.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(e)
+                                    if matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::TimedOut
+                                            | std::io::ErrorKind::Interrupted
+                                    ) =>
+                                {
+                                    continue
+                                }
+                                Err(_) => break,
+                            };
+                            if to.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                            c.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        let _ = to.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+            }
+        });
+        Forwarder { port, stop, carried }
+    }
+
+    fn addr(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+
+    fn carried(&self) -> u64 {
+        self.carried.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The precondition written into every test that uses one. See the type's
+    /// note about `is_self_endpoint`.
+    fn assert_not_a_control_port(&self, nodes: [&Node; 2]) {
+        for n in nodes {
+            assert_ne!(
+                self.port,
+                n.control_port(),
+                "the forwarder took a participating daemon's control port ({}), so \
+                 `is_self_endpoint` would refuse the dial as a self-connection and the failure \
+                 would look like a tier 2 bug",
+                self.port
+            );
+        }
+    }
+}
+
+/// Bring two daemons up on tier 2 through a forwarder, paired and connected.
+fn tier_two_pair(tag: &str, tx_kbps: Option<u64>) -> (Node, Node, Forwarder) {
+    let a = Node::start_throttled(&format!("{tag}-a"), tx_kbps);
+    let b = Node::start_throttled(&format!("{tag}-b"), tx_kbps);
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+
+    // The forwarder is never the throttle. Rate-limiting **downstream** of the
+    // socket puts the backlog in the kernel send buffer, where nothing this
+    // project writes can reorder it: measured 2026-08-08, a forwarder held at a
+    // tenth of the media rate produced control round trips of **eight seconds**
+    // with the scheduler working perfectly. The throttle that isolates the
+    // scheduler is the one on our own writer, ahead of the socket.
+    let fwd = Forwarder::start(
+        format!("127.0.0.1:{}", b.control_port()).parse().expect("B's control addr"),
+    );
+    fwd.assert_not_a_control_port([&a, &b]);
+
+    // Before pairing: the transport is chosen from the stored tier at the
+    // moment of the dial, and `register_conn` installs the media path before
+    // `conn_reader` starts.
+    pin_tier(&a, &b.fingerprint(), "tier2");
+    pin_tier(&b, &a.fingerprint(), "tier2");
+    // B is on the far side of a one-way tunnel: it can be dialled and cannot
+    // dial. This is the setting `reconnect` and `PeerState` both read.
+    set_dial_policy(&b, &a.fingerprint(), "inbound_only");
+
+    pair_through(&a, &b, &fwd.addr());
+    (a, b, fwd)
+}
+
+/// **Acceptance 1 and 2 (design §6, P5): pairing and bidirectional media across
+/// a forwarder that destroys the source address — and the fingerprint check
+/// still holds.**
+///
+/// This is `plan.md` §4's "身份基于指纹不基于源地址" as something that runs.
+/// The assertions that make it about tier 2 rather than about "loopback works":
+///
+///   1. the address A holds for B is the **forwarder's**, not B's — A has no
+///      way to reach B directly and never learns one;
+///   2. the address B sees for A is an ephemeral forwarder port, **not** A's
+///      control port — the source attribute really is gone;
+///   3. both daemons nevertheless have the other's real fingerprint, which is
+///      the only thing that was ever authenticated;
+///   4. control frames were carried **on the media connection** — the one
+///      observable that separates one multiplexed connection from two;
+///   5. the audio arrived, and the frames the receiver decoded account for the
+///      packets its session counted, so no byte quietly took the UDP path.
+///
+/// Injection controls (run 2026-08-08, both red as described):
+///   - make `connect_peer` ignore `TransportTier::Tier2` and dial plain TCP ⇒
+///     red at (4): `latency_guard.mux` stays empty on both sides, while (1),
+///     (2), (3) and the tone all still pass. That is the assertion's whole
+///     purpose — everything else here is true of a plain forwarded connection.
+///   - remove the `MAGIC` branch from `handle_inbound` ⇒ B refuses the
+///     connection with "first control frame too large" and the pair never
+///     forms, which is the loud failure `peek_looks_multiplexed`'s note
+///     predicts.
+#[test]
+fn a_tier_two_pair_survives_the_source_address_being_lost() {
+    let (a, b, fwd) = tier_two_pair("t2", None);
+
+    eventually("the mux to come up on the dialling side", || {
+        a.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+    eventually("the mux to come up on the accepting side", || {
+        b.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+
+    // (1) A's route to B is the tunnel, and only the tunnel.
+    let b_record = a.peer(&b.fingerprint());
+    assert_eq!(
+        b_record["port"].as_u64(),
+        Some(fwd.port as u64),
+        "A recorded something other than the forwarder as B's port, so it is not going through \
+         the tunnel at all: {b_record}"
+    );
+    assert_ne!(
+        fwd.port,
+        b.control_port(),
+        "the forwarder and B's control port coincided; (1) would be vacuous"
+    );
+
+    // (2) B cannot tell where A is. Same IP as every other loopback peer, and a
+    // port belonging to the forwarder rather than to A.
+    let seen = b.conn_peer_addr(&a.fingerprint()).expect("B has a live channel to A");
+    assert!(seen.ip().is_loopback(), "the forwarder was expected on loopback, saw {seen}");
+    assert_ne!(
+        seen.port(),
+        a.control_port(),
+        "B saw A's own control port, so the forwarder is not in the path and the premise of \
+         this test does not hold"
+    );
+
+    // (3) ...and identity survived anyway, in both directions.
+    assert_eq!(
+        b.peer(&a.fingerprint())["fingerprint"].as_str(),
+        Some(a.fingerprint().as_str()),
+        "B did not end up with A's fingerprint"
+    );
+    assert_eq!(a.peer(&b.fingerprint())["online"], Value::Bool(true));
+
+    // Audio, both directions, on the one connection.
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({
+            "peer": b.fingerprint(), "kind": KIND_SPK, "source": SOURCE_TONE,
+            "freq": 1000.0, "verify_freq": 1000.0
+        }),
+    );
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({
+            "peer": b.fingerprint(), "kind": audiohub_ipc::KIND_MIC, "source": SOURCE_TONE,
+            "freq": 1000.0, "verify_freq": 1000.0
+        }),
+    );
+
+    eventually_within(Duration::from_secs(25), "B's 1 kHz verdict over the mux", || {
+        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
+    });
+    eventually_within(Duration::from_secs(25), "A's 1 kHz verdict over the mux", || {
+        a.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
+    });
+    let snr = b
+        .recv_verdict()
+        .expect("checked above")["snr_db"]
+        .as_f64()
+        .expect("a detected verdict carries an SNR");
+    assert!(snr >= 40.0, "1 kHz over a loopback mux should be clean, got {snr:.1} dB SNR");
+
+    // (4) The control plane rode the same connection.
+    let a_mux = a.mux_link().expect("still up");
+    let b_mux = b.mux_link().expect("still up");
+    for (who, m) in [("A", &a_mux), ("B", &b_mux)] {
+        assert!(
+            m["control_frames_written"].as_u64().unwrap_or(0) > 0,
+            "{who} never wrote a control frame onto the mux, so its control plane is somewhere \
+             else and this is not one connection: {m}"
+        );
+        assert!(
+            m["control_frames_read"].as_u64().unwrap_or(0) > 0,
+            "{who} never read a control frame off the mux: {m}"
+        );
+    }
+    assert_eq!(
+        a_mux["fingerprint"].as_str(),
+        Some(b.fingerprint().as_str()),
+        "the mux is attached to the wrong peer"
+    );
+
+    // (5) ...and so did the media. `received` first, then `frames_read`: both
+    // are still climbing, and reading them the other way round reports a false
+    // failure on a perfectly healthy link (measured in P3).
+    let sessions = b.ok(methods::SESSION_LIST, json!({}));
+    let recv = sessions
+        .as_array()
+        .and_then(|ss| ss.iter().find(|s| s["dir"].as_str() == Some("recv")))
+        .expect("B must have a receiving session")
+        .clone();
+    let received = recv["stats"]["received"].as_u64().expect("a received count");
+    let read = b
+        .tcp_link()
+        .expect("the mux's media half is a tcp_media row")["frames_read"]
+        .as_u64()
+        .expect("a read count");
+    assert!(received > 0, "the session reports no packets at all");
+    assert!(
+        read >= received,
+        "the session counted {received} packets but only {read} came off the mux, so the rest \
+         arrived over UDP — the downgrade is decorative"
+    );
+    assert_eq!(recv["stats"]["lost"].as_u64(), Some(0), "loopback TCP lost a packet: {recv}");
+    assert!(fwd.carried() > 0, "the forwarder carried nothing, so it is not in the path");
+}
+
+/// **Acceptance 3 (design §6, P5): media at full rate must not starve the
+/// control plane. `Ping` → `Pong` p95 under 200 ms.**
+///
+/// The link is throttled **at the forwarder**, so the media queue is genuinely
+/// backed up for the whole window and every control frame has to be let through
+/// by the credit rather than by a gap in the traffic.
+///
+/// # ⚠ This test measures the number; it does **not** discriminate. Read on.
+///
+/// Deleting the `last_control.elapsed() >= CONTROL_CREDIT` disjunct from
+/// `mux::control_may_go` — leaving strict priority alone — was expected to make
+/// this go red. **It does not** (measured 2026-08-08: p95 129.7 ms with the
+/// credit removed, against 62.1 ms with it). The reason is worth writing down,
+/// because it is a real property of the design and not a defect in the rig:
+///
+/// **The media queue is self-emptying.** A frame the stale gate drops never
+/// reaches the wire, so it never charges the token bucket — dropping is *free*
+/// in link budget. Under any sustained oversubscription the gate therefore
+/// clears the backlog faster than it can accumulate, the queue reaches empty
+/// several times a second, and the `media.queued() == 0` half of the rule lets
+/// control out on its own. Tuning the throttle does not escape this: below
+/// saturation the queue empties because it drains, above it the queue empties
+/// because the gate fires, and the only state in between is not a steady one.
+///
+/// So there are two independent reasons control does not starve here, and this
+/// test cannot separate them. The credit's own injection control lives where it
+/// *is* decisive, driving the scheduler directly with both queues held full:
+/// `mux::tests::control_overtakes_media_once_the_credit_is_due` and
+/// `a_saturated_media_queue_cannot_starve_control_past_the_credit`, both red
+/// under exactly that deletion (verified 2026-08-08 — "an overdue control frame
+/// did not overtake the media backlog" and "only 0 control frames got out").
+///
+/// What this test is still for: the acceptance names a number measured on real
+/// daemons over a real connection, and no state-machine test can produce that.
+/// It also covers the failure the scheduler tests cannot see, which is the one
+/// that actually occurred here — before `write_one_queued` learned to take a
+/// deadline cap, a media frame blocked in `write` held the wire for a whole
+/// stale budget and the credit, checked only *between* frames, quietly became
+/// "100 ms plus however long one frame blocks". That produced no round trip at
+/// all for five seconds and `ping_and_reap` declared the channel dead.
+///
+/// # Why `#[ignore]`
+///
+/// **It is a wall-clock measurement and cannot share a machine with the
+/// parallel suite.** Run alone it reports p95 56–91 ms across repeated runs;
+/// run inside `cargo test --workspace`, alongside five hundred other tests and
+/// several other daemon pairs, the same code reports **311 ms** — the 1 Hz
+/// ticker and both audio loops slip under the load, and what the number then
+/// measures is the host, not the scheduler.
+///
+/// Leaving it in the default set would mean either a flaky suite or a threshold
+/// loosened until it stopped meaning anything. It runs deliberately, the way
+/// P3's and P4's acceptance measurements do:
+///
+/// ```text
+/// cargo test -p audiohubd --lib media_at_full_rate -- --ignored --nocapture
+/// ```
+///
+/// The properties that must hold on every run are covered by `mux::tests`,
+/// which are state-machine tests with no clock dependence beyond the credit
+/// itself.
+#[test]
+#[ignore = "wall-clock measurement: run alone, not inside the parallel suite (see the doc comment)"]
+fn media_at_full_rate_does_not_starve_the_control_plane() {
+    // # Choosing the throttle: it has to be *just* under the offered rate
+    //
+    // Each writer here carries one rung-0 stream: 10 ms of 48 kHz/32-bit mono
+    // is 1920 B, split into two 960 B halves, each +40 header +16 tag ⇒ 200
+    // frames/s x 1016 B = 203 KB/s = 1.63 Mbit/s.
+    //
+    // The first version of this test throttled to 2 Mbit/s — **above** that —
+    // and the injection control did not go red: the queue emptied between
+    // ticks, so strict priority alone was enough. A far *lower* throttle fails
+    // the same way for the opposite reason: every frame ages past
+    // `STALE_BUDGET`, the gate drops it without writing, and the queue empties
+    // just as thoroughly. Only a mild oversubscription keeps the queue
+    // permanently non-empty **with frames still worth writing**, which is the
+    // one state strict priority starves control in.
+    //
+    // 1500 kbit/s = 187.5 KB/s, about 92% of offered. The steady state is a
+    // queue held at roughly the stale budget's worth of frames, the gate
+    // trimming the excess, and never a moment when it is empty.
+    let (a, b, fwd) = tier_two_pair("t2-starve", Some(1500));
+    eventually("the mux to come up", || {
+        a.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+
+    // Rung 0 in both directions: the most media this ladder can produce.
+    for (n, peer, dir) in [(&a, b.fingerprint(), "send"), (&a, b.fingerprint(), "recv")] {
+        n.ok(
+            methods::PEERS_SET_TRANSPORT,
+            json!({ "peer": peer, "dir": dir, "quality": "pcm48k32f" }),
+        );
+    }
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({ "peer": b.fingerprint(), "kind": KIND_SPK, "source": SOURCE_TONE, "freq": 1000.0 }),
+    );
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({ "peer": b.fingerprint(), "kind": audiohub_ipc::KIND_MIC, "source": SOURCE_TONE,
+                "freq": 1000.0 }),
+    );
+
+    // Wait until the media queue really is backed up. Without this the sample
+    // window could open before saturation and measure an idle link — the shape
+    // of "the test passed because the condition never happened".
+    // The gauge, not the depth: `queued > 0` is true for an instant on any
+    // link, and a window that opened on that instant would be measuring an idle
+    // one. `writeq_ms` is how long the frame the writer just picked up had been
+    // waiting, so a sustained reading is saturation itself rather than a
+    // symptom of it.
+    eventually_within(Duration::from_secs(25), "the media queue to back up", || {
+        a.tcp_link().is_some_and(|l| l["writeq_ms"].as_f64().unwrap_or(0.0) > 50.0)
+    });
+
+    // Sample distinct round trips. `rtt_ms` is the last `Pong`'s, refreshed by
+    // the 1 Hz ticker, so the same reading appearing twice is one sample.
+    let mut samples: Vec<f64> = Vec::new();
+    let mut last = f64::NAN;
+    let until = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < until {
+        if let Some(rtt) = a.rtt_ms(&b.fingerprint()) {
+            if rtt != last {
+                samples.push(rtt);
+                last = rtt;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Six, not twenty. `Ping` is driven by the 1 Hz ticker, and this test runs
+    // two whole daemons plus their audio loops inside a test binary that is
+    // running everything else in parallel — the ticker slips under that load
+    // and the sample count is a property of the harness, not of the scheduler.
+    // The bound still separates the two outcomes decisively: with the credit
+    // removed the count is **zero** (no `Ping` ever reaches the wire) and the
+    // channel dies of silence, which no amount of ticker slip resembles.
+    assert!(
+        samples.len() >= 6,
+        "only {} round trips completed in 20 s of saturated media; the control plane is being \
+         starved, which is precisely the failure the credit exists to prevent (samples: {:?})",
+        samples.len(),
+        samples
+    );
+    samples.sort_by(f64::total_cmp);
+    let p95 = samples[((samples.len() as f64 * 0.95).ceil() as usize).min(samples.len()) - 1];
+    // Printed, not merely asserted: this is a distribution, and the number the
+    // acceptance names is only meaningful next to the sample count and the
+    // spread it came from. Visible under `--nocapture`.
+    eprintln!(
+        "[p5-acceptance-3] control RTT over a saturated mux: n={} min={:.1} p50={:.1} \
+         p95={:.1} max={:.1} ms",
+        samples.len(),
+        samples[0],
+        samples[samples.len() / 2],
+        p95,
+        samples[samples.len() - 1]
+    );
+    assert!(
+        p95 < 200.0,
+        "control round trip p95 was {p95:.1} ms over a saturated mux (n={}, max {:.1} ms); \
+         the credit is supposed to bound this at roughly one {:?} per side",
+        samples.len(),
+        samples.last().copied().unwrap_or(f64::NAN),
+        Duration::from_millis(100)
+    );
+
+    // The throttle really was the constraint: the link moved far less than an
+    // unthrottled loopback would have.
+    let queued = a.tcp_link().expect("a media queue")["queued"].as_u64().unwrap_or(0);
+    assert!(
+        queued > 0 || fwd.carried() > 0,
+        "nothing was in flight at all, so nothing was being prioritised over"
+    );
+}
+
+/// **The third connection state**: an inbound-only peer that is not connected
+/// is *waiting*, not offline, and nothing retries a dial toward it.
+///
+/// Both halves matter and they fail differently. Without the `reconnect` half,
+/// the retry ladder dials a tunnel that cannot carry the connection, forever,
+/// logging a failure every thirty seconds that is not one. Without the
+/// `PeerState` half, a correctly configured machine is drawn with a permanent
+/// fault marker and the user's only available conclusion is that the software
+/// is broken.
+#[test]
+fn an_inbound_only_peer_is_awaited_rather_than_dialled() {
+    let (a, b, _fwd) = tier_two_pair("t2-inbound", None);
+    eventually("the mux to come up", || {
+        b.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+
+    // While connected, the third state is not claimed: it answers "where is it
+    // when it is not here", and it is here.
+    assert_eq!(b.peer(&a.fingerprint())["online"], Value::Bool(true));
+    assert_eq!(
+        b.peer(&a.fingerprint())["awaiting_inbound"],
+        Value::Bool(false),
+        "a connected peer was reported as awaited"
+    );
+
+    // Now drop it from A's side, so B loses the channel it never dials.
+    a.ok(methods::PEERS_DISCONNECT, json!({ "peer": b.fingerprint() }));
+    eventually("B to notice A is gone", || {
+        b.peer(&a.fingerprint())["online"] == Value::Bool(false)
+    });
+
+    let p = b.peer(&a.fingerprint());
+    assert_eq!(
+        p["awaiting_inbound"],
+        Value::Bool(true),
+        "an inbound-only peer that is not connected must be reported as awaited, not merely as \
+         offline: {p}"
+    );
+    assert_eq!(
+        p["reconnecting"],
+        Value::Bool(false),
+        "B armed a retry toward a peer it cannot dial: {p}"
+    );
+
+    // ...and an explicit connect attempt is refused by name rather than by
+    // timing out on a dial the tunnel will not carry.
+    let e = b
+        .call(methods::PEERS_CONNECT, json!({ "peer": a.fingerprint() }))
+        .expect_err("dialling an inbound-only peer must be refused");
+    assert!(
+        e.contains("inbound-only"),
+        "the refusal does not name the reason, so it is indistinguishable from a dead peer: {e}"
+    );
+}
+
+/// **Acceptance 4 (design §6, P5): on `MediaPath::Framed`, `send_pullreq` sends
+/// nothing.**
+///
+/// **Counted, not grepped.** The P3 test for the same property on tier 1 asserts
+/// the *source text* of `send_pullreq` still reads the path — which this
+/// repository's own record says is the weaker form, because these guards are
+/// blind to comments and have been satisfied by commented-out code before. So
+/// this one binds a real socket and counts datagrams.
+///
+/// The positive control is what makes the zero mean something: the same stream,
+/// the same call, the same socket, with a `Udp` path — if that did not deliver,
+/// "zero on Framed" would be true because nothing works.
+#[test]
+fn a_tier_two_stream_sends_no_keepalive_datagrams() {
+    use std::net::UdpSocket;
+
+    let n = Node::start("t2-ka");
+    let inner = n.h.inner_for_test().clone();
+
+    // Somewhere a keepalive could go, and something that counts what arrives.
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("bind the keepalive sink");
+    sink.set_read_timeout(Some(Duration::from_millis(200))).expect("timeout");
+    let sink_addr = sink.local_addr().expect("sink addr");
+
+    let drain = |sink: &UdpSocket| -> usize {
+        let mut buf = [0u8; 2048];
+        let mut n = 0;
+        while sink.recv_from(&mut buf).is_ok() {
+            n += 1;
+        }
+        n
+    };
+
+    const CALLS: usize = 5;
+
+    // Positive control: a tier 0 stream really does put datagrams on the wire
+    // through this exact call.
+    let udp_rx = crate::RxStream::new(
+        7,
+        &[0u8; 32],
+        &[0u8; 12],
+        None,
+        true,
+        false,
+        None,
+        None,
+        crate::tcpmedia::MediaPath::Udp(sink_addr),
+    );
+    for _ in 0..CALLS {
+        crate::engine::send_pullreq(&inner, &udp_rx);
+    }
+    assert_eq!(
+        drain(&sink),
+        CALLS,
+        "the tier 0 keepalive did not arrive, so the zero asserted below would prove nothing"
+    );
+
+    // The subject: a tier 2 stream has no UDP destination and must send nothing.
+    //
+    // **The mux's recorded peer address is the sink's**, deliberately. That is
+    // the shape of the bug this asserts against: `ConnShared` used to compute
+    // `media_dest` as peer IP + advertised port unconditionally, and on a
+    // tunnel that address is well-formed, reachable and **someone else's**. If
+    // `MediaPath::Framed` ever grew a `udp_dest`, this is where those datagrams
+    // would land, and the counter would see them.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let link = crate::mux::MuxLink::new_for_test(
+        std::sync::Arc::new(crate::tcpmedia::TcpMediaLink::new_for_test(
+            "fp".into(),
+            sink_addr,
+        )),
+        listener.local_addr().expect("addr"),
+    );
+    let mux_rx = crate::RxStream::new(
+        8,
+        &[0u8; 32],
+        &[0u8; 12],
+        None,
+        true,
+        false,
+        None,
+        None,
+        crate::tcpmedia::MediaPath::Framed(link),
+    );
+    for _ in 0..CALLS {
+        crate::engine::send_pullreq(&inner, &mux_rx);
+    }
+    assert_eq!(
+        drain(&sink),
+        0,
+        "a tier 2 stream sent keepalive datagrams; there is no address they could correctly go \
+         to, so they went to one that was invented"
+    );
+}
+

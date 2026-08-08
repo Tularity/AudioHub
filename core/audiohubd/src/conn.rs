@@ -28,6 +28,7 @@ use audiohub_net::pairing::{
 use audiohub_net::secure::{SecureChannel, SessionMsg};
 
 use crate::engine::{self, SourceSpec, TxCmd};
+use crate::peer_transport::{DialPolicy, TransportTier};
 use crate::{
     build_session_info, dlog, gen_media_salt, haldev, lk, rd, reconnect, wr, ClockFilter,
     ConnShared, DaemonInner, DaemonState, PeerLatCell, RxStream, SessionEntry, SessionOrigin,
@@ -140,6 +141,13 @@ fn handle_inbound(
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
 
+    // M8 tier 2: a multiplexed connection announces itself by starting with a
+    // frame header instead of a length prefix, and the two cannot be confused —
+    // see `peek_looks_multiplexed`.
+    if peek_looks_multiplexed(&stream)? {
+        return mux_inbound(inner, stream, addr, preauth);
+    }
+
     // dispatch on a peeked copy: verify_responder / pair_responder each read
     // the first frame themselves
     match peek_first(&stream)? {
@@ -153,10 +161,10 @@ fn handle_inbound(
             // where a reconnect would have to look.
             peer.last_addr = Some(addr.ip().to_string());
             persist_peer(inner, peer.clone())?;
-            let chan = SecureChannel::establish_responder(stream, &inner.id, &peer)?;
+            let chan = SecureChannel::establish_responder(stream.into(), &inner.id, &peer)?;
             // we are the responder, so the peer is the initiator of this TCP
             let initiator_fp = chan.peer().fingerprint.clone();
-            let Some(conn) = register_conn(inner, chan, addr.ip(), initiator_fp) else {
+            let Some(conn) = register_conn(inner, chan, addr.ip(), initiator_fp, None) else {
                 return Ok(()); // lost the simultaneous-connect tie-break
             };
             drop(preauth); // verified: no longer an unauthenticated slot
@@ -280,6 +288,94 @@ fn release_pairing_pin(inner: &DaemonInner, pin: &str, ok: bool) {
     }
 }
 
+/// Does this connection speak frames rather than a bare control stream?
+///
+/// # Why the two can never be confused
+///
+/// A tier 0/1 control connection opens with `u32 little-endian length ‖ JSON`.
+/// A multiplexed one opens with a 40-byte packet header, whose first four bytes
+/// are the packet magic — `b"AUHB"`, which read as a little-endian length is
+/// **1_112_036_673**, seventeen thousand times [`CONTROL_MAX_FRAME`]. So the
+/// discriminator is not a heuristic: no legal control frame can ever take that
+/// value, and a build without this branch refuses a mux connection loudly
+/// rather than misreading one. Verified by injection (2026-08-08): deleting
+/// this branch produces `first control frame too large: 1112036673 bytes` and
+/// the pair never forms.
+///
+/// The check is a `peek`, so the bytes stay in the socket for whichever path
+/// takes over.
+fn peek_looks_multiplexed(stream: &TcpStream) -> Result<bool> {
+    let mut buf = [0u8; 4];
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for the first four bytes");
+        }
+        match stream.peek(&mut buf) {
+            Ok(0) => bail!("peer closed before the first frame"),
+            Ok(n) if n >= 4 => return Ok(buf == audiohub_net::packet::MAGIC),
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(e) => return Err(e).context("peek the first four bytes"),
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The tier 2 accept path: bring the mux up, then run the ordinary handshake
+/// **inside** it.
+///
+/// Only `VerifyHello` is accepted as a first message here, and pairing is
+/// deliberately not offered. Pairing is a one-shot exchange that finishes
+/// before any media exists, so a tunnel forwards it unchanged on a connection
+/// of its own (design §9 item 2 froze the flow as unchanged); carrying it here
+/// too would be a second code path serving no case the first does not.
+fn mux_inbound(
+    inner: &Arc<DaemonInner>,
+    stream: TcpStream,
+    addr: SocketAddr,
+    preauth: PreauthGuard,
+) -> Result<()> {
+    let (link, io) = crate::mux::accept(inner, stream)?;
+    // Every early return from here on has to take the mux with it: its reader
+    // and writer threads are already running, and a `ConnShared` that never
+    // gets built is not going to tear them down later.
+    let out = mux_handshake(inner, &link, io, addr, preauth);
+    if out.is_err() {
+        link.kill();
+    }
+    out
+}
+
+fn mux_handshake(
+    inner: &Arc<DaemonInner>,
+    link: &Arc<crate::mux::MuxLink>,
+    mut io: crate::mux::ControlTransport,
+    addr: SocketAddr,
+    preauth: PreauthGuard,
+) -> Result<()> {
+    let store = PeerStore::load_at(Some(&inner.cfg_dir))?;
+    let mut peer = verify_responder(&mut io, &inner.id, &store)?;
+    // **The address is the tunnel's, and it is recorded anyway.** On tier 2
+    // every peer arrives from the same place — `127.0.0.1` in the local
+    // forwarder, the tunnel's exit anywhere else — so this field stops being an
+    // identity and becomes a hint about where a reconnect might look. Identity
+    // is the fingerprint `verify_responder` just proved, which is precisely
+    // what plan §4 settled: "身份基于指纹不基于源地址".
+    peer.last_addr = Some(addr.ip().to_string());
+    persist_peer(inner, peer.clone())?;
+    let chan = SecureChannel::establish_responder(io, &inner.id, &peer)?;
+    let initiator_fp = chan.peer().fingerprint.clone();
+    let Some(conn) = register_conn(inner, chan, addr.ip(), initiator_fp, Some(link.clone())) else {
+        link.kill(); // lost the simultaneous-connect tie-break
+        return Ok(());
+    };
+    drop(preauth); // verified: no longer an unauthenticated slot
+    conn_reader(inner, &conn); // runs on this thread until close
+    link.kill();
+    Ok(())
+}
+
 fn peek_first(stream: &TcpStream) -> Result<ControlMsg> {
     let mut buf = [0u8; 4096];
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
@@ -326,9 +422,17 @@ fn persist_peer(inner: &DaemonInner, peer: PairedPeer) -> Result<()> {
 /// peer's, which is what used to let both sides tear down both connections.
 fn register_conn(
     inner: &Arc<DaemonInner>,
-    chan: SecureChannel,
+    chan: crate::mux::ControlChan,
     peer_ip: IpAddr,
     initiator_fp: String,
+    // Set only on tier 2: the mux the handshake we just completed travelled on.
+    // Passed in rather than discovered because the media path has to be right
+    // **before this function returns** — `conn_reader` starts immediately after
+    // and a stream opened on the wrong transport keeps it for life (design
+    // §5.1). Tier 1 needs a whole latch and an eight-second wait to reach the
+    // same state; tier 2 gets it for free, because the connection that carries
+    // the media is the one that carried the handshake.
+    mux: Option<Arc<crate::mux::MuxLink>>,
 ) -> Option<Arc<ConnShared>> {
     let peer = chan.peer().clone();
     let mk = chan.media_keys();
@@ -338,9 +442,17 @@ fn register_conn(
         // Tier 0 is the default assumption and costs nothing to assume: the
         // control handshake proved TCP works, and only UDP is still unknown
         // (design §5.1). A tier 1 link, if any, replaces this after the fact.
-        media_path: Mutex::new(crate::tcpmedia::MediaPath::Udp(SocketAddr::new(
-            peer_ip, peer.port,
-        ))),
+        media_path: Mutex::new(match &mux {
+            Some(l) => {
+                // The queue was built before the handshake that named the peer
+                // — this is the moment the name exists. Without it every tier 2
+                // link shares the empty-string key in the ticker's per-link
+                // maps, and two degraded peers report each other's backlog.
+                l.media().name_peer(&peer.fingerprint);
+                crate::tcpmedia::MediaPath::Framed(l.clone())
+            }
+            None => crate::tcpmedia::MediaPath::Udp(SocketAddr::new(peer_ip, peer.port)),
+        }),
         media_gate: crate::tcpmedia::AttachGate::new(),
         media_attaching: AtomicBool::new(false),
         deferred: Mutex::new(VecDeque::new()),
@@ -370,6 +482,13 @@ fn register_conn(
              fingerprint)",
             conn.fp
         );
+        // On tier 2 the connection we are dropping IS the mux, and its two
+        // threads are already running. Nothing else refers to it once this
+        // `ConnShared` is discarded, so without this they read and park on a
+        // socket forever — one leaked pair per simultaneous connect.
+        if let Some(l) = &mux {
+            l.kill();
+        }
         return None;
     }
     let old = st.conns.insert(conn.fp.clone(), conn.clone());
@@ -392,7 +511,16 @@ fn register_conn(
     // any stream exists, so the first stream opens straight onto it. A stream
     // that opened first would be pinned to UDP for its whole life (design §5.1
     // rules out switching transports inside a live stream).
-    crate::tcpmedia::negotiate(inner, &conn);
+    //
+    // Skipped outright on tier 2: the media path is already `Framed`, and
+    // negotiating a second TCP connection for a peer we reach only through a
+    // one-connection tunnel is the one thing tier 2 exists because we cannot
+    // do. The guard is on the mux and not on the stored tier so that a tier
+    // that changed under us cannot turn this into an eight-second wait for a
+    // link that will never come.
+    if mux.is_none() {
+        crate::tcpmedia::negotiate(inner, &conn);
+    }
     Some(conn)
 }
 
@@ -1180,6 +1308,14 @@ pub(crate) fn teardown_stream(inner: &DaemonInner, stream_id: u32, notify_remote
 
 fn teardown_conn(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
     conn.alive.store(false, Ordering::SeqCst);
+    // Tier 2: the control channel and the media path are the same socket, so
+    // this connection ending ends the mux — including when the end came from
+    // this side (`drop_conn`, `ping_and_reap`, a mode change), where nothing on
+    // the mux itself would ever notice. Idempotent, so the reader thread
+    // reaching the same call is harmless.
+    if let crate::tcpmedia::MediaPath::Framed(l) = conn.current_media_path() {
+        l.kill();
+    }
     for (_, tx) in lk(&conn.pending).drain() {
         let _ = tx.send(Err("connection closed".into()));
     }
@@ -1504,6 +1640,32 @@ pub(crate) enum ConnectOrigin {
     Retry,
 }
 
+/// Kills a freshly dialled tier 2 mux unless something took ownership of it.
+///
+/// Between the dial and `register_conn` there are seven ways out of
+/// `connect_peer` — an unpaired refusal, a fingerprint mismatch, a failed
+/// `SecureChannel`, three `?`s and a `bail!` — and a mux abandoned on any of
+/// them leaves **two threads and a socket** running for the life of the daemon,
+/// once per attempt, on a path the retry loop walks every few seconds. Naming
+/// all seven by hand is how one gets missed; the same argument
+/// `tcpmedia::AttachClaim` makes about its own half-dozen exits.
+struct MuxOnTrial(Option<Arc<crate::mux::MuxLink>>);
+
+impl MuxOnTrial {
+    /// The mux now belongs to somebody else. Nothing to kill on the way out.
+    fn keep(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for MuxOnTrial {
+    fn drop(&mut self) {
+        if let Some(l) = &self.0 {
+            l.kill();
+        }
+    }
+}
+
 pub(crate) fn connect_peer(
     inner: &Arc<DaemonInner>,
     selector: &str,
@@ -1533,6 +1695,19 @@ pub(crate) fn connect_peer(
             }
         }
     }
+    // plan §16 / design §4.2 item 1: some tunnels only let one side originate a
+    // connection, and this peer is on the far side of one. Dialling would fail
+    // in a way indistinguishable from a machine that is switched off, so the
+    // refusal names the real reason and the retry loop never arms (see
+    // `reconnect::may_dial`). The peer is not offline — it is expected to
+    // arrive, which is a third state and is reported as one.
+    if lk(&inner.peer_transport).dial_policy(&peer.fingerprint) == DialPolicy::InboundOnly {
+        bail!(
+            "{} is set to inbound-only: this machine cannot originate a connection to it \
+             (the tunnel only carries connections the other way), so it has to connect to us",
+            peer.fingerprint
+        );
+    }
     let addr = target_addr(&peer, addr_override)?;
     // Never dial ourselves. Measured on 2026-07-31: a peer whose record pointed
     // at this daemon's own control endpoint made the session coordinator open a
@@ -1548,11 +1723,23 @@ pub(crate) fn connect_peer(
             peer.fingerprint
         );
     }
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .with_context(|| format!("connect {addr}"))?;
-    let _ = stream.set_nodelay(true);
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    // M8 tier 2: one connection for everything, and the handshake below travels
+    // inside it. Decided here, from the stored tier, because the transport has
+    // to be chosen before the first byte — plan §16.2 makes tier 2 manual
+    // precisely because nothing observable distinguishes "the tunnel is L7
+    // only" from "the peer is off", so there is nothing to probe for.
+    let (mut trial, mut stream) =
+        if lk(&inner.peer_transport).tier(&peer.fingerprint) == TransportTier::Tier2 {
+            let (link, io) = crate::mux::dial(inner, addr)?;
+            (MuxOnTrial(Some(link)), io)
+        } else {
+            let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+                .with_context(|| format!("connect {addr}"))?;
+            let _ = s.set_nodelay(true);
+            s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+            s.set_write_timeout(Some(WRITE_TIMEOUT))?;
+            (MuxOnTrial(None), s.into())
+        };
     let verified = match verify_initiator(&mut stream, &inner.id, &store) {
         Ok(v) => v,
         Err(e) => {
@@ -1614,7 +1801,11 @@ pub(crate) fn connect_peer(
     let chan = SecureChannel::establish_initiator(stream, &inner.id, &verified)?;
     // we opened this TCP, so our own fingerprint is the tie-break key
     let initiator_fp = inner.id.fingerprint.clone();
-    match register_conn(inner, chan, addr.ip(), initiator_fp) {
+    let link = trial.0.clone();
+    // From here the mux's fate belongs to `register_conn` and the reader thread
+    // below, both of which handle it explicitly.
+    trial.keep();
+    match register_conn(inner, chan, addr.ip(), initiator_fp, link.clone()) {
         Some(conn) => {
             let i = inner.clone();
             let c = conn;
@@ -1625,6 +1816,13 @@ pub(crate) fn connect_peer(
                     if std::panic::catch_unwind(AssertUnwindSafe(|| conn_reader(&i, &c))).is_err() {
                         dlog!("[audiohubd] control conn {}: panicked, dropped", c.fp);
                         c.alive.store(false, Ordering::SeqCst);
+                    }
+                    // On tier 2 the control channel and the media path are one
+                    // connection, so the reader ending ends both. Without this
+                    // the mux's own two threads would outlive the conn they
+                    // serve and sit on a socket nobody reads.
+                    if let Some(l) = &link {
+                        l.kill();
                     }
                 });
         }

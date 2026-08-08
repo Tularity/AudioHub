@@ -50,6 +50,7 @@ fn main() {
         config_dir: None, // env/platform default
         announce,
         hal_bridge: None, // production: AUDIOHUB_HAL_BRIDGE decides
+        tx_throttle_kbps: None, // production: AUDIOHUB_TEST_TX_KBPS decides (normally unlimited)
     }) {
         Ok(h) => Arc::new(h),
         Err(e) => {

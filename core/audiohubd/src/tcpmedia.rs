@@ -146,17 +146,17 @@ const _: () = assert!(
 /// a spin; a short send timeout gives the writer the same "do not sit here
 /// forever" property with no spin anywhere. 20 ms is a tenth of
 /// [`STALE_BUDGET`], so the gate can overshoot by at most that much.
-const WRITE_SLICE: Duration = Duration::from_millis(20);
+pub(crate) const WRITE_SLICE: Duration = Duration::from_millis(20);
 
 /// Same, for the reader — it only needs to notice shutdown.
-const READ_SLICE: Duration = Duration::from_millis(200);
+pub(crate) const READ_SLICE: Duration = Duration::from_millis(200);
 
 /// A frame that has already put bytes on the wire **must** be finished, or the
 /// stream desynchronises and every following byte is misread. So the stale gate
 /// cannot apply mid-frame, and this is the backstop instead: a frame that
 /// cannot be completed in this long means the connection is gone, whatever the
 /// socket believes.
-const FRAME_COMPLETION_LIMIT: Duration = Duration::from_secs(5);
+pub(crate) const FRAME_COMPLETION_LIMIT: Duration = Duration::from_secs(5);
 
 /// Ticket lifetime. Long enough for a dial plus a handshake on a bad link,
 /// short enough that a leaked one is worthless by the time it is read out of a
@@ -204,6 +204,13 @@ pub(crate) enum MediaPath {
     Udp(SocketAddr),
     /// Tier 1: this peer's dedicated media TCP connection.
     Tcp(Arc<TcpMediaLink>),
+    /// Tier 2: the one multiplexed connection, shared with the control stream.
+    ///
+    /// Holds the mux rather than a [`TcpMediaLink`] directly even though the
+    /// media queue inside it is the same type, because the two are not
+    /// interchangeable anywhere it matters: killing a tier 1 link ends a media
+    /// connection, killing a mux ends the control channel with it.
+    Framed(Arc<crate::mux::MuxLink>),
 }
 
 impl MediaPath {
@@ -217,17 +224,36 @@ impl MediaPath {
     pub(crate) fn auto_top_rung(&self) -> u32 {
         match self {
             MediaPath::Udp(_) => audiohub_net::media::AUTO_TOP_RUNG,
-            MediaPath::Tcp(_) => audiohub_net::media::AUTO_TOP_RUNG_STREAMED,
+            MediaPath::Tcp(_) | MediaPath::Framed(_) => {
+                audiohub_net::media::AUTO_TOP_RUNG_STREAMED
+            }
         }
     }
 
     /// The UDP destination, or `None` on a transport that has none. Callers use
     /// this to skip UDP-only work; nobody may invent an address for the `None`
     /// case.
+    ///
+    /// On [`MediaPath::Framed`] the absence is not merely "we would rather
+    /// not": `conn.peer_ip` is the **tunnel's** address and `peer.port` is a
+    /// number the peer advertised about a listener the tunnel does not expose,
+    /// so the address that would have been computed here is a well-formed
+    /// address belonging to somebody else. That is the failure this enum
+    /// replaced, and it is why the variant carries no `SocketAddr` at all.
     pub(crate) fn udp_dest(&self) -> Option<SocketAddr> {
         match self {
             MediaPath::Udp(a) => Some(*a),
-            MediaPath::Tcp(_) => None,
+            MediaPath::Tcp(_) | MediaPath::Framed(_) => None,
+        }
+    }
+
+    /// The frame queue this path writes media into, on the transports that have
+    /// one. `None` on tier 0, where the queue is the shared `UdpSender`.
+    pub(crate) fn media_link(&self) -> Option<&Arc<TcpMediaLink>> {
+        match self {
+            MediaPath::Udp(_) => None,
+            MediaPath::Tcp(l) => Some(l),
+            MediaPath::Framed(m) => Some(m.media()),
         }
     }
 }
@@ -237,6 +263,7 @@ impl std::fmt::Debug for MediaPath {
         match self {
             MediaPath::Udp(a) => write!(f, "udp({a})"),
             MediaPath::Tcp(l) => write!(f, "tcp({})", l.peer),
+            MediaPath::Framed(m) => write!(f, "mux({})", m.media().peer),
         }
     }
 }
@@ -267,7 +294,14 @@ struct SendSlot {
 /// safety precondition and not a stylistic preference.
 pub(crate) struct TcpMediaLink {
     /// Fingerprint of the peer this belongs to.
-    pub(crate) fp: String,
+    ///
+    /// Deferred rather than required at construction, because tier 2 builds the
+    /// queue **before** the handshake that names the peer — the mux is what
+    /// carries that handshake. Written exactly once, by whichever side learns
+    /// the name first; the alternative (leaving it empty on tier 2) would make
+    /// every tier 2 link share one key in the per-tick maps that index on it,
+    /// so two degraded peers would report each other's backlog.
+    fp: OnceLock<String>,
     /// The remote end, for diagnostics.
     pub(crate) peer: SocketAddr,
     q: SpscRing<SendSlot>,
@@ -336,7 +370,7 @@ pub(crate) struct TcpMediaLink {
 /// **362.7 kbps** of datagram bytes over a 39 s steady-state window — 91% of
 /// the budget. Tests must therefore compare against a threshold with margin,
 /// never treat the nominal figure as an exact link capacity.
-fn token_bucket_from_env() -> u64 {
+pub(crate) fn token_bucket_from_env() -> u64 {
     std::env::var("AUDIOHUB_TEST_TX_KBPS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -345,9 +379,15 @@ fn token_bucket_from_env() -> u64 {
 }
 
 impl TcpMediaLink {
-    fn new(fp: String, peer: SocketAddr) -> TcpMediaLink {
+    /// Reachable from `mux` as well: tier 2's media half is this queue, this
+    /// stale gate and these counters, driven by a different writer.
+    pub(crate) fn new(fp: String, peer: SocketAddr, tx_bps: u64) -> TcpMediaLink {
+        let name = OnceLock::new();
+        if !fp.is_empty() {
+            let _ = name.set(fp);
+        }
         TcpMediaLink {
-            fp,
+            fp: name,
             peer,
             q: SpscRing::new(SEND_SLOTS, |_| SendSlot {
                 buf: Vec::with_capacity(SLOT_BYTES),
@@ -366,7 +406,7 @@ impl TcpMediaLink {
             wait_us_peak: AtomicU64::new(0),
             wait_us_window: AtomicU64::new(0),
             wait_us_taken: AtomicU64::new(0),
-            tx_bps: token_bucket_from_env(),
+            tx_bps,
         }
     }
 
@@ -441,6 +481,26 @@ impl TcpMediaLink {
         self.unexpected_kind.load(Ordering::Relaxed)
     }
 
+    /// One `Kind::Media` frame arrived. Counted on the way in, **before** the
+    /// AEAD has a say, which is why `SessionStats.auth_failed` exists beside
+    /// it: `frames_read >= received` would otherwise be green while injected
+    /// traffic made up the difference.
+    pub(crate) fn note_frame_read(&self) {
+        self.frames_read.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A frame arrived whose `Kind` does not belong on this transport.
+    pub(crate) fn note_unexpected_kind(&self) {
+        self.unexpected_kind.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The test-only rate limit this queue was built with
+    /// ([`token_bucket_from_env`]), so a writer that does not own the queue can
+    /// still build the same bucket.
+    pub(crate) fn tx_bps(&self) -> u64 {
+        self.tx_bps
+    }
+
     /// How long the most recently dequeued frame waited, in milliseconds.
     ///
     /// # What this measures, and why it is a wait and not a depth
@@ -495,18 +555,51 @@ impl TcpMediaLink {
         self.alive.load(Ordering::Relaxed)
     }
 
+    /// The peer's fingerprint, or `""` before it is known (tier 2, between the
+    /// socket coming up and the handshake completing on it).
+    pub(crate) fn fp(&self) -> &str {
+        self.fp.get().map_or("", String::as_str)
+    }
+
+    /// Name the peer this queue belongs to. Called once, from
+    /// `conn::register_conn`, on the tier 2 path where the queue predates the
+    /// name. A second call is ignored — the first name is the right one.
+    pub(crate) fn name_peer(&self, fp: &str) {
+        let _ = self.fp.set(fp.to_string());
+    }
+
     /// A link with no socket behind it, for tests that need a
     /// [`MediaPath::Tcp`] to exist rather than to carry anything.
     #[cfg(test)]
     pub(crate) fn new_for_test(fp: String, peer: SocketAddr) -> TcpMediaLink {
-        TcpMediaLink::new(fp, peer)
+        TcpMediaLink::new(fp, peer, 0)
     }
 
-    fn kill(&self) {
+    pub(crate) fn kill(&self) {
         self.alive.store(false, Ordering::SeqCst);
         if let Some(t) = self.thread.get() {
             t.unpark();
         }
+    }
+
+    /// Register the calling thread as the one [`TcpMediaLink::wake`] unparks.
+    /// Called once by whichever writer owns this queue — [`write_loop`] on tier
+    /// 1, `mux::write_loop` on tier 2.
+    pub(crate) fn adopt_writer_thread(&self) {
+        let _ = self.thread.get_or_init(std::thread::current);
+    }
+
+    /// Park until woken or `timeout`, unless the queue already has work. The
+    /// `parked` flag is set before the re-check, pairing with
+    /// [`TcpMediaLink::wake`]'s publish-then-read; skipping the re-check is the
+    /// classic lost wakeup, and its symptom is one frame arriving a park slice
+    /// late with nothing to point at.
+    pub(crate) fn park_writer(&self, timeout: Duration, also_ready: impl Fn() -> bool) {
+        self.parked.store(true, Ordering::SeqCst);
+        if self.q.len() == 0 && !also_ready() {
+            std::thread::park_timeout(timeout);
+        }
+        self.parked.store(false, Ordering::SeqCst);
     }
 }
 
@@ -514,7 +607,7 @@ impl TcpMediaLink {
 
 /// Why a frame did not go out whole.
 #[derive(Debug, PartialEq)]
-enum WriteOutcome {
+pub(crate) enum WriteOutcome {
     Sent,
     /// Aged past its budget before a single byte reached the socket. The frame
     /// is dropped; the `seq` hole it leaves is what the receiver conceals.
@@ -523,7 +616,7 @@ enum WriteOutcome {
     Dead,
 }
 
-fn blocked(k: ErrorKind) -> bool {
+pub(crate) fn blocked(k: ErrorKind) -> bool {
     matches!(k, ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
@@ -540,7 +633,7 @@ fn blocked(k: ErrorKind) -> bool {
 ///   bytes as this frame's payload and every byte after that is garbage. So
 ///   from then on the only bound is [`FRAME_COMPLETION_LIMIT`], and exceeding
 ///   it kills the connection rather than desynchronising it.
-fn write_one_frame<W: Write>(
+pub(crate) fn write_one_frame<W: Write>(
     w: &mut W,
     buf: &[u8],
     stale_at: Instant,
@@ -580,19 +673,19 @@ fn write_one_frame<W: Write>(
 /// up front would let the first second of a measurement run at full speed and
 /// the backlog would appear only afterwards, which is precisely the shape that
 /// makes a 60 s acceptance window ambiguous.
-struct TokenBucket {
+pub(crate) struct TokenBucket {
     bps: u64,
     next_at: Option<Instant>,
 }
 
 impl TokenBucket {
-    fn new(bps: u64) -> TokenBucket {
+    pub(crate) fn new(bps: u64) -> TokenBucket {
         TokenBucket { bps, next_at: None }
     }
 
     /// Block until the simulated link is free. Sliced so shutdown is still
     /// noticed promptly; the queue backing up behind this is the point.
-    fn gate(&mut self, shutdown: &AtomicBool) {
+    pub(crate) fn gate(&mut self, shutdown: &AtomicBool) {
         if self.bps == 0 {
             return;
         }
@@ -605,7 +698,7 @@ impl TokenBucket {
         }
     }
 
-    fn charge(&mut self, bytes: usize) {
+    pub(crate) fn charge(&mut self, bytes: usize) {
         if self.bps == 0 {
             return;
         }
@@ -613,6 +706,86 @@ impl TokenBucket {
         let base = self.next_at.unwrap_or_else(Instant::now).max(Instant::now());
         self.next_at = Some(base + cost);
     }
+}
+
+/// Take **one** queued frame and put it on the wire, applying the stale gate
+/// and the accounting. `None` = the queue was empty.
+///
+/// Split out of [`write_loop`] rather than inlined there because tier 2's
+/// writer (`mux::write_loop`) has to interleave control frames between media
+/// frames, and it must interleave them into *this* gate rather than a second
+/// copy of it. A copy is what the guard at the bottom of this file exists to
+/// prevent one directory over; it would be a poor answer here.
+///
+/// `give_up_at` caps the pre-first-byte deadline. Tier 1 passes `None` and gets
+/// the stale budget alone; the mux passes the instant its control credit falls
+/// due, because otherwise a media frame blocked in `write` holds the wire for
+/// **up to a whole stale budget** and the credit — which is only ever checked
+/// between frames — silently becomes "100 ms plus however long one frame
+/// blocks". Measured 2026-08-08 before this parameter existed: a saturated
+/// tier 2 link produced no round trip at all for 5 s and
+/// `conn::ping_and_reap` declared the connection dead.
+///
+/// It caps only the deadline that applies while **nothing has been written**.
+/// Once a byte is out the frame must be completed whatever else is waiting —
+/// the header carries the length, so an abandoned frame desynchronises the
+/// stream.
+pub(crate) fn write_one_queued<W: Write>(
+    link: &TcpMediaLink,
+    w: &mut W,
+    shutdown: &AtomicBool,
+    bucket: &mut TokenBucket,
+    give_up_at: Option<Instant>,
+) -> Option<WriteOutcome> {
+    let mut seen = None;
+    link.q.consume(|slot| {
+        let owner = slot.owner.take(); // dropped on THIS thread
+        let queued_at = slot.queued_at;
+        // The stale gate's subtraction, reused as the backlog gauge. One
+        // reading per dequeue covers a stalled writer too: with
+        // `SO_SNDTIMEO` at `WRITE_SLICE`, a blocked write returns, the
+        // frame ages out, the gate drops it and the next frame is dequeued
+        // already old — so the gauge climbs towards `STALE_BUDGET` rather
+        // than freezing at whatever it read before the stall.
+        bucket.gate(shutdown);
+        let waited = queued_at.elapsed();
+        link.note_wait(waited);
+        let stale_at = match give_up_at {
+            Some(cap) => cap.min(queued_at + STALE_BUDGET),
+            None => queued_at + STALE_BUDGET,
+        };
+        let outcome = if waited > STALE_BUDGET || Instant::now() >= stale_at {
+            WriteOutcome::Stale
+        } else {
+            write_one_frame(
+                w,
+                &slot.buf,
+                stale_at,
+                queued_at + FRAME_COMPLETION_LIMIT,
+                shutdown,
+            )
+        };
+        match outcome {
+            WriteOutcome::Sent => {
+                // Only bytes that reached the wire spend the budget: a frame
+                // the gate dropped never occupied the link.
+                bucket.charge(slot.buf.len());
+                link.frames_written.fetch_add(1, Ordering::Relaxed);
+                if let Some(o) = owner {
+                    o.sent_packets.fetch_add(1, Ordering::Relaxed);
+                    o.sent_bytes.fetch_add(slot.buf.len() as u64, Ordering::Relaxed);
+                    o.sent_payload_bytes
+                        .fetch_add(slot.payload_len as u64, Ordering::Relaxed);
+                }
+            }
+            WriteOutcome::Stale => {
+                link.stale_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            WriteOutcome::Dead => {}
+        }
+        seen = Some(outcome);
+    });
+    seen
 }
 
 /// The writer thread's body, generic over the sink so the ratchet property can
@@ -627,48 +800,10 @@ fn write_loop<W: Write>(link: &TcpMediaLink, w: &mut W, shutdown: &AtomicBool) {
         // Drain everything queued, applying the gate to each frame as it comes
         // off — not once per batch. A batch can span the whole budget.
         let mut fatal = false;
-        while link.q.consume(|slot| {
-            let owner = slot.owner.take(); // dropped on THIS thread
-            let queued_at = slot.queued_at;
-            // The stale gate's subtraction, reused as the backlog gauge. One
-            // reading per dequeue covers a stalled writer too: with
-            // `SO_SNDTIMEO` at `WRITE_SLICE`, a blocked write returns, the
-            // frame ages out, the gate drops it and the next frame is dequeued
-            // already old — so the gauge climbs towards `STALE_BUDGET` rather
-            // than freezing at whatever it read before the stall.
-            bucket.gate(shutdown);
-            let waited = queued_at.elapsed();
-            link.note_wait(waited);
-            let outcome = if waited > STALE_BUDGET {
-                WriteOutcome::Stale
-            } else {
-                write_one_frame(
-                    w,
-                    &slot.buf,
-                    queued_at + STALE_BUDGET,
-                    queued_at + FRAME_COMPLETION_LIMIT,
-                    shutdown,
-                )
-            };
-            match outcome {
-                WriteOutcome::Sent => {
-                    // Only bytes that reached the wire spend the budget: a frame
-                    // the gate dropped never occupied the link.
-                    bucket.charge(slot.buf.len());
-                    link.frames_written.fetch_add(1, Ordering::Relaxed);
-                    if let Some(o) = owner {
-                        o.sent_packets.fetch_add(1, Ordering::Relaxed);
-                        o.sent_bytes.fetch_add(slot.buf.len() as u64, Ordering::Relaxed);
-                        o.sent_payload_bytes
-                            .fetch_add(slot.payload_len as u64, Ordering::Relaxed);
-                    }
-                }
-                WriteOutcome::Stale => {
-                    link.stale_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-                WriteOutcome::Dead => fatal = true,
+        while let Some(outcome) = write_one_queued(link, w, shutdown, &mut bucket, None) {
+            if outcome == WriteOutcome::Dead {
+                fatal = true;
             }
-        }) {
             if fatal || !link.alive.load(Ordering::Relaxed) {
                 break;
             }
@@ -709,14 +844,14 @@ fn read_loop(inner: &Arc<DaemonInner>, link: &TcpMediaLink, s: &mut TcpStream, f
         }
         let n = match s.read(&mut scratch) {
             Ok(0) => {
-                dlog!("[audiohubd] tier1 media {}: peer closed the media connection", link.fp);
+                dlog!("[audiohubd] tier1 media {}: peer closed the media connection", link.fp());
                 return;
             }
             Ok(n) => n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) if blocked(e.kind()) => continue,
             Err(e) => {
-                dlog!("[audiohubd] tier1 media {}: read: {e}", link.fp);
+                dlog!("[audiohubd] tier1 media {}: read: {e}", link.fp());
                 return;
             }
         };
@@ -731,7 +866,7 @@ fn read_loop(inner: &Arc<DaemonInner>, link: &TcpMediaLink, s: &mut TcpStream, f
                     // delimiter to resynchronise onto, so carrying on would mean
                     // resynchronising on boundaries somebody else chose.
                     Err(e) => {
-                        dlog!("[audiohubd] tier1 media {}: framing: {e}", link.fp);
+                        dlog!("[audiohubd] tier1 media {}: framing: {e}", link.fp());
                         return;
                     }
                 };
@@ -781,7 +916,7 @@ pub(crate) fn serve(
     s.set_read_timeout(Some(READ_SLICE))?;
     let peer = s.peer_addr()?;
 
-    let link = Arc::new(TcpMediaLink::new(conn.fp.clone(), peer));
+    let link = Arc::new(TcpMediaLink::new(conn.fp.clone(), peer, inner.tx_bps));
     let mut wsock = s.try_clone().context("clone the media socket for the writer")?;
 
     let wlink = link.clone();
@@ -1360,7 +1495,7 @@ mod tests {
     }
 
     fn link() -> TcpMediaLink {
-        TcpMediaLink::new("fp".into(), "127.0.0.1:1".parse().unwrap())
+        TcpMediaLink::new("fp".into(), "127.0.0.1:1".parse().unwrap(), 0)
     }
 
     /// The queue is bounded, drops the newest, and counts it — the shape
@@ -1629,34 +1764,71 @@ mod tests {
         }
     }
 
-    /// The stale gate is in `write_loop` and reads the frame's own queue time.
+    /// The stale gate reads the frame's own queue time, and **both** writers go
+    /// through it.
     ///
     /// The behavioural test above is the real one; this catches the shape of
     /// the regression it cannot — a "simplification" that keeps a gate but
     /// times it from something that is not the frame's own age (the current
     /// tick, the batch start, a fixed counter), which stays green on a stall
     /// short enough to fit in one batch.
+    ///
+    /// # Why the subject moved from `write_loop` to `write_one_queued`
+    ///
+    /// P5 needed the gate to run between interleaved control frames, so the
+    /// per-frame body was lifted out of `write_loop` into `write_one_queued`
+    /// and both writers now call it. This guard went red on that move, which is
+    /// what it is for; retargeting it is only safe **together with** the two
+    /// assertions below, which say the callers still reach it. Without those,
+    /// tier 2 could grow a second, gateless write path and this would stay
+    /// green — the copy-instead-of-reference failure the grep guard at the
+    /// bottom of this file exists to prevent, one layer up.
     #[test]
     fn the_stale_gate_times_each_frame_from_when_that_frame_was_queued() {
         let src = code();
-        let at = src.find("fn write_loop").expect("write_loop is gone");
+        let at = src.find("fn write_one_queued").expect("write_one_queued is gone");
         let body = &src[at..];
-        let end = body.find("\n}\n").expect("write_loop has no end");
+        let end = body.find("\n}\n").expect("write_one_queued has no end");
         let body = &body[..end];
         assert!(
             body.contains("slot.queued_at"),
-            "write_loop no longer reads the frame's own queue time, so whatever it is gating on \
+            "the writer no longer reads the frame's own queue time, so whatever it is gating on \
              is not that frame's age"
         );
         assert!(
             body.contains("STALE_BUDGET"),
-            "the stale gate is gone from write_loop; the ratchet has no hard bound left"
+            "the stale gate is gone from the writer; the ratchet has no hard bound left"
         );
         assert!(
             body.contains("stale_dropped.fetch_add"),
             "frames are dropped without being counted, which is the observability hole the whole \
              design says not to reopen"
         );
+
+        // ...and every writer still reaches it. A gate nothing calls is a gate
+        // that is not there, and each of these files owns one whole tier's
+        // media egress.
+        for (what, text) in [
+            ("tier 1 (tcpmedia::write_loop)", src.clone()),
+            ("tier 2 (mux::write_loop)", mux_code()),
+        ] {
+            assert!(
+                text.contains("write_one_queued("),
+                "{what} no longer goes through the stale gate, so that tier's media queue has no \
+                 bound on how old a frame may be when it reaches the wire"
+            );
+        }
+    }
+
+    /// `mux.rs`'s production text, comments stripped, for the cross-file half
+    /// of the guard above. Referenced rather than copied: a second gate is
+    /// precisely what these guards exist to prevent.
+    fn mux_code() -> String {
+        let src = include_str!("mux.rs");
+        let cut = src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("mux.rs's test module marker moved; this would scan its tests too");
+        crate::engine::tests::strip_comments(&src[..cut])
     }
 
     /// **The attach latch is taken once and put back on every exit.**

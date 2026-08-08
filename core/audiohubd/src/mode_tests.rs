@@ -47,6 +47,9 @@ impl Node {
             // one, and the two then oscillate (progress.md 2026-08-03 — the
             // root cause of a 200-minute underrun investigation).
             hal_bridge: Some(HalBridgeMode::Off),
+            // Production and every test but the tier 2 starvation rig: whatever
+            // the environment says (normally nothing, i.e. unlimited).
+            tx_throttle_kbps: None,
         })
         .expect("start daemon");
         Node { h, dir }

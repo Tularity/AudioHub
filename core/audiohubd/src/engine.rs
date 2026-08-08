@@ -1405,7 +1405,15 @@ pub(crate) fn envelope_for(
 pub(crate) fn jb_tuning_for(path: &crate::tcpmedia::MediaPath) -> audiohub_net::media::JbTuning {
     match path {
         crate::tcpmedia::MediaPath::Udp(_) => audiohub_net::media::JbTuning::from_env(),
-        crate::tcpmedia::MediaPath::Tcp(_) => audiohub_net::media::JbTuning::degraded_from_env(),
+        // Tier 1 and tier 2 share the degraded profile because they share the
+        // failure they exist for: TCP's minimum retransmission timeout is
+        // 200–300 ms against a default `max_target` of 120 ms, so **any**
+        // retransmission punches through the buffer. Tier 2 is if anything
+        // worse (both directions on one congestion window), so the deeper
+        // profile is if anything more right there.
+        crate::tcpmedia::MediaPath::Tcp(_) | crate::tcpmedia::MediaPath::Framed(_) => {
+            audiohub_net::media::JbTuning::degraded_from_env()
+        }
     }
 }
 
@@ -2254,10 +2262,20 @@ pub(crate) fn tx_loop(
                     // `tick_at` and not a fresh `Instant::now()` per packet: the
                     // stale gate measures how long a frame waited in OUR queue,
                     // and both halves of a split frame waited the same amount.
-                    MediaPath::Tcp(link) => {
-                        tcp_link = Some(link);
-                        link.enqueue(tick_at, &tx.shared, tx.pay.len(), seal)
-                    }
+                    //
+                    // Tier 1 and tier 2 are one arm on purpose. The frame is the
+                    // same sealed datagram, the queue is the same type and the
+                    // stale gate is the same gate; what differs is only who
+                    // drains it (`tcpmedia::write_loop` against
+                    // `mux::write_loop`), and that difference has no business
+                    // being re-decided on the 10 ms deadline thread.
+                    other => match other.media_link() {
+                        Some(link) => {
+                            tcp_link = Some(link);
+                            link.enqueue(tick_at, &tx.shared, tx.pay.len(), seal)
+                        }
+                        None => false,
+                    },
                 };
                 if queued {
                     queued_any = true;
@@ -4790,6 +4808,60 @@ pub(crate) mod deadline_thread_guards {
         assert!(
             body.find("ka_path.udp_dest()") < body.find("Header {"),
             "早退不在最前面：keepalive 的包头已经造好了才发现没地方发"
+        );
+    }
+
+    /// **Acceptance 4 (design §6, P5), the `refresh_dest` half: on
+    /// `MediaPath::Framed` it does the work **zero** times.**
+    ///
+    /// Counted, not grepped. The count is how many times `refresh_dest`
+    /// advanced `dest_epoch_seen` — i.e. how many times it went and read the
+    /// address — over N epoch bumps. Its sibling above uses the same
+    /// observable for tier 1; the difference here is the positive control,
+    /// which is what stops "zero" from being true because nothing runs.
+    ///
+    /// On tier 2 the stakes are higher than on tier 1. `conn.peer_ip` is the
+    /// **tunnel's** address and `peer.port` a number about a listener the tunnel
+    /// does not expose, so a `refresh_dest` that ran here would not merely waste
+    /// a lock — it would install a well-formed address belonging to somebody
+    /// else and send media there.
+    #[test]
+    fn a_tier_two_stream_never_learns_a_udp_destination() {
+        const BUMPS: u64 = 6;
+
+        let count_updates = |path: crate::tcpmedia::MediaPath| -> u64 {
+            let shared = Arc::new(TxShared::new());
+            *lk(&shared.dest_override) = Some("127.0.0.1:65000".parse().unwrap());
+            let mut st = super::tests::tx_stream_for(&shared);
+            st.path = path;
+            st.dest_epoch_seen = 0;
+            let mut updates = 0;
+            for _ in 0..BUMPS {
+                shared.dest_epoch.fetch_add(1, Ordering::Release);
+                let before = st.dest_epoch_seen;
+                refresh_dest(&mut st);
+                if st.dest_epoch_seen != before {
+                    updates += 1;
+                }
+            }
+            updates
+        };
+
+        // Positive control: the same loop, the same call, a UDP path.
+        assert_eq!(
+            count_updates(MediaPath::Udp("127.0.0.1:1".parse().unwrap())),
+            BUMPS,
+            "the tier 0 path did not learn its address either, so the zero below proves nothing"
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let peer = listener.local_addr().expect("addr");
+        let link = Arc::new(crate::tcpmedia::TcpMediaLink::new_for_test("fp".into(), peer));
+        assert_eq!(
+            count_updates(MediaPath::Framed(crate::mux::MuxLink::new_for_test(link, peer))),
+            0,
+            "a tier 2 stream went and read a UDP destination; on this transport the address it \
+             would have found belongs to the tunnel, not to the peer"
         );
     }
 

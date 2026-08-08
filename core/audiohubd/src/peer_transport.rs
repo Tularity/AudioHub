@@ -129,8 +129,13 @@ impl StoredDir {
 /// promise that one direction can sit on tier 0 while the other sits on tier 1,
 /// and somebody would eventually try to implement it.
 ///
-/// `Tier2` is deliberately absent: it is P5, and an enum variant nothing can
-/// produce is an invitation to write code that pretends it can.
+/// # Tier 2 is reachable only by pinning, and that is the design, not a gap
+///
+/// plan §16.2: tier 0 → 1 is automatic because it has a clean criterion (UDP
+/// silence plus a healthy control channel), and → 2 is **manual** because its
+/// premise is a property of the user's tunnel that cannot be observed — "the
+/// peer cannot be dialled" and "the peer is switched off" are the same
+/// observation. Automatic probing could only be repeated dialling and guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportTier {
     /// Decide at runtime. **In P3 this behaves as [`TransportTier::Tier0`] for
@@ -143,6 +148,8 @@ pub(crate) enum TransportTier {
     Tier0,
     /// Pinned to media over a second TCP connection.
     Tier1,
+    /// Pinned to **one** connection carrying control and both media directions.
+    Tier2,
 }
 
 impl TransportTier {
@@ -151,6 +158,7 @@ impl TransportTier {
             "auto" => Some(TransportTier::Auto),
             "tier0" => Some(TransportTier::Tier0),
             "tier1" => Some(TransportTier::Tier1),
+            "tier2" => Some(TransportTier::Tier2),
             _ => None,
         }
     }
@@ -160,7 +168,65 @@ impl TransportTier {
             TransportTier::Auto => "auto",
             TransportTier::Tier0 => "tier0",
             TransportTier::Tier1 => "tier1",
+            TransportTier::Tier2 => "tier2",
         }
+    }
+}
+
+/// Which side may originate the control connection to a peer (design §4.2
+/// item 1).
+///
+/// # Why this is a setting and not something we discover
+///
+/// The same argument that makes tier 2 manual: a tunnel that only forwards one
+/// way produces failed dials, and a failed dial is exactly what a powered-off
+/// machine produces. The difference is knowledge the user has and we do not.
+///
+/// # Why it lives here and not in `paired_peers.json`
+///
+/// See this file's header: `PeerStore::upsert` rebuilds a record from the wire
+/// and keeps only the fields it explicitly preserves, so a local setting put
+/// there is erased **the next time the peer reconnects** — silently, with the
+/// UI still showing the old value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialPolicy {
+    /// The default and the tier 0/1 behaviour: dial when we have somewhere to
+    /// dial, accept when we do not.
+    Both,
+    /// Only ever dial out. We are on the side of the tunnel that can originate,
+    /// and the peer will never reach us.
+    OutboundOnly,
+    /// **Never dial; wait to be dialled.** The peer is behind a tunnel that
+    /// only carries connections in the other direction.
+    ///
+    /// The consequence that is easy to miss: such a peer is not *offline* while
+    /// it is not connected — it is waiting, which is a third state and has to
+    /// be reported as one. Rendering it as offline would put a permanent red
+    /// mark on a peer whose setup is working exactly as configured.
+    InboundOnly,
+}
+
+impl DialPolicy {
+    pub(crate) fn parse(s: &str) -> Option<DialPolicy> {
+        match s {
+            "both" => Some(DialPolicy::Both),
+            "outbound_only" => Some(DialPolicy::OutboundOnly),
+            "inbound_only" => Some(DialPolicy::InboundOnly),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            DialPolicy::Both => "both",
+            DialPolicy::OutboundOnly => "outbound_only",
+            DialPolicy::InboundOnly => "inbound_only",
+        }
+    }
+
+    /// May this daemon originate a connection to the peer?
+    pub(crate) fn may_dial(self) -> bool {
+        !matches!(self, DialPolicy::InboundOnly)
     }
 }
 
@@ -184,10 +250,20 @@ pub(crate) struct PeerTransport {
     /// 与 `*_reset_from` 同义、同纪律：**绝不落盘**。
     #[serde(skip)]
     pub transport_tier_reset_from: Option<String>,
+    /// `both | outbound_only | inbound_only`，见 [`DialPolicy`]。同一条松存紧取
+    /// 纪律，同一个落点理由。
+    #[serde(default = "both_dial")]
+    pub dial_policy: String,
+    #[serde(skip)]
+    pub dial_policy_reset_from: Option<String>,
 }
 
 fn auto_tier() -> String {
     TransportTier::Auto.as_wire().to_string()
+}
+
+fn both_dial() -> String {
+    DialPolicy::Both.as_wire().to_string()
 }
 
 impl Default for PeerTransport {
@@ -197,6 +273,8 @@ impl Default for PeerTransport {
             send: StoredDir::default(),
             transport_tier: auto_tier(),
             transport_tier_reset_from: None,
+            dial_policy: both_dial(),
+            dial_policy_reset_from: None,
         }
     }
 }
@@ -204,6 +282,10 @@ impl Default for PeerTransport {
 impl PeerTransport {
     pub(crate) fn tier(&self) -> TransportTier {
         TransportTier::parse(&self.transport_tier).unwrap_or(TransportTier::Auto)
+    }
+
+    pub(crate) fn dial_policy(&self) -> DialPolicy {
+        DialPolicy::parse(&self.dial_policy).unwrap_or(DialPolicy::Both)
     }
 
     /// Same shape as [`StoredDir::sanitize`], and for the same reason: an
@@ -215,6 +297,10 @@ impl PeerTransport {
         if TransportTier::parse(&self.transport_tier).is_none() {
             self.transport_tier_reset_from =
                 Some(std::mem::replace(&mut self.transport_tier, auto_tier()));
+        }
+        if DialPolicy::parse(&self.dial_policy).is_none() {
+            self.dial_policy_reset_from =
+                Some(std::mem::replace(&mut self.dial_policy, both_dial()));
         }
     }
 }
@@ -274,6 +360,12 @@ impl PeerTransportStore {
                              本 build 不认识，已重置为 auto"
                         );
                     }
+                    if let Some(old) = &t.dial_policy_reset_from {
+                        crate::dlog!(
+                            "[audiohubd] peer_transport.json {fp}: 拨号策略 `{old}` \
+                             本 build 不认识，已重置为 both"
+                        );
+                    }
                     for (dir, d) in [("recv", &t.recv), ("send", &t.send)] {
                         if let Some(old) = &d.latency_reset_from {
                             crate::dlog!(
@@ -326,6 +418,12 @@ impl PeerTransportStore {
     /// executable, and "never set" executes the same as "set to auto".
     pub(crate) fn tier(&self, fp: &str) -> TransportTier {
         self.map.get(fp).map_or(TransportTier::Auto, PeerTransport::tier)
+    }
+
+    /// Same contract again: a peer nobody has configured dials both ways, which
+    /// is what every peer did before this setting existed.
+    pub(crate) fn dial_policy(&self, fp: &str) -> DialPolicy {
+        self.map.get(fp).map_or(DialPolicy::Both, PeerTransport::dial_policy)
     }
 
     /// 解除配对时清掉。留着的话，重新配对同一台机器会**静默继承**上一段关系的
@@ -416,22 +514,30 @@ mod tests {
     /// An unrecognised tier resets to `auto` and says so — and takes nothing
     /// else with it.
     ///
-    /// `tier2` is the interesting value: it is a tier this project has designed
-    /// and not built (P5). A build that silently accepted it would pin a peer to
-    /// a transport that does not exist, and the symptom would be a peer that
-    /// never carries audio.
+    /// # This test used to name `tier2`, and that is worth recording
+    ///
+    /// P3 wrote it as "`tier2` is designed and not built", which was true then
+    /// and became **an assertion that a legal value must be refused** the
+    /// moment P5 built it — green the whole time, right up until the parser
+    /// learned the value. Identical in shape to `parse_rejects_bad_kind`
+    /// asserting `Kind` 5 was illegal until `Kind::Control` took 5, which the
+    /// P2 record notes had *already* happened once to `Codec` 3.
+    ///
+    /// So the subject is now a string that cannot become a tier, and the
+    /// whole-space freeze lives in `the_tier_spellings_round_trip` where a new
+    /// tier makes it fail loudly instead of silently.
     #[test]
     fn an_unrecognised_tier_is_reset_and_reported() {
         let mut t = PeerTransport {
             recv: StoredDir { latency: "300".into(), ..StoredDir::default() },
-            transport_tier: "tier2".into(),
+            transport_tier: "tier-of-the-week".into(),
             ..PeerTransport::default()
         };
         t.sanitize();
         assert_eq!(t.transport_tier, "auto", "an unbuildable tier was left in place");
         assert_eq!(
             t.transport_tier_reset_from.as_deref(),
-            Some("tier2"),
+            Some("tier-of-the-week"),
             "the tier was reset silently; the UI has nothing to explain it with"
         );
         assert_eq!(t.tier(), TransportTier::Auto);
@@ -454,15 +560,127 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The wire spelling round-trips. Freezes the three strings that
-    /// `peer_transport.json` and the IPC surface both quote.
+    /// The wire spellings round-trip, and **the set of them is frozen**.
+    ///
+    /// Whole-space, in the shape `packet.rs`'s `the_kind_byte_values_are_frozen`
+    /// settled on: the previous version pinned three values and separately
+    /// asserted that `tier2` was refused, which meant P5 had to delete an
+    /// assertion to add a tier — and deleting an assertion is not a review
+    /// step anybody notices. This version goes red on *any* change to the set,
+    /// which is right: a new tier needs a stored string, a UI sentence
+    /// (plan §16.4 rule 2 forbids showing the code name) and a decision about
+    /// what `auto` may promote to. Failing here is how those get remembered.
     #[test]
     fn the_tier_spellings_round_trip() {
-        for t in [TransportTier::Auto, TransportTier::Tier0, TransportTier::Tier1] {
-            assert_eq!(TransportTier::parse(t.as_wire()), Some(t));
+        let all = [
+            (TransportTier::Auto, "auto"),
+            (TransportTier::Tier0, "tier0"),
+            (TransportTier::Tier1, "tier1"),
+            (TransportTier::Tier2, "tier2"),
+        ];
+        for (t, wire) in all {
+            assert_eq!(t.as_wire(), wire, "a stored tier string changed under the file on disk");
+            assert_eq!(TransportTier::parse(wire), Some(t));
         }
-        assert_eq!(TransportTier::parse("tier2"), None, "tier 2 is designed, not built");
-        assert_eq!(TransportTier::parse(""), None);
+        for other in ["", "tier3", "TIER1", "udp", "mux", " tier1"] {
+            assert_eq!(
+                TransportTier::parse(other),
+                None,
+                "'{other}' parsed as a tier; the accepted set is exactly {:?}",
+                all.map(|(_, w)| w)
+            );
+        }
+    }
+
+    /// The same freeze for the dial policy, and for the same reason: each of
+    /// these three strings is a different sentence in the UI, and
+    /// `inbound_only` in particular is the one that decides whether a peer is
+    /// drawn as "offline" or as "waiting to be connected to".
+    #[test]
+    fn the_dial_policy_spellings_round_trip() {
+        let all = [
+            (DialPolicy::Both, "both", true),
+            (DialPolicy::OutboundOnly, "outbound_only", true),
+            (DialPolicy::InboundOnly, "inbound_only", false),
+        ];
+        for (p, wire, may_dial) in all {
+            assert_eq!(p.as_wire(), wire);
+            assert_eq!(DialPolicy::parse(wire), Some(p));
+            assert_eq!(p.may_dial(), may_dial, "'{wire}' decides the wrong way about dialling");
+        }
+        for other in ["", "inbound", "outbound", "none", "InboundOnly"] {
+            assert_eq!(DialPolicy::parse(other), None, "'{other}' parsed as a dial policy");
+        }
+    }
+
+    /// An unrecognised dial policy resets to `both` and says so, and does not
+    /// take the tier beside it down.
+    ///
+    /// `both` is the right fallback and not merely the default: it is what
+    /// every peer did before this setting existed, so a corrupt value degrades
+    /// to the previous behaviour rather than to "never dial this peer again" —
+    /// which would be indistinguishable, from the user's side, from the peer
+    /// having disappeared.
+    #[test]
+    fn an_unrecognised_dial_policy_is_reset_and_reported() {
+        let mut t = PeerTransport {
+            transport_tier: "tier2".into(),
+            dial_policy: "sometimes".into(),
+            ..PeerTransport::default()
+        };
+        t.sanitize();
+        assert_eq!(t.dial_policy, "both");
+        assert_eq!(t.dial_policy_reset_from.as_deref(), Some("sometimes"));
+        assert_eq!(t.dial_policy(), DialPolicy::Both);
+        assert_eq!(t.transport_tier, "tier2", "a valid neighbouring cell was collateral damage");
+    }
+
+    /// A record written before `dial_policy` existed still loads and reads as
+    /// `both`. Every machine that has run any earlier build has such a file.
+    #[test]
+    fn a_record_written_before_the_dial_policy_field_existed_still_loads() {
+        let dir = tmpdir("nodial");
+        let raw = r#"{
+          "version": 1,
+          "peers": {
+            "aa11": { "recv": { "latency": "300", "quality": "auto" },
+                      "send": { "latency": "auto", "quality": "auto" },
+                      "transport_tier": "tier1" }
+          }
+        }"#;
+        std::fs::write(PeerTransportStore::path(&dir), raw).expect("write");
+
+        let s = PeerTransportStore::load(&dir);
+        assert_eq!(s.dial_policy("aa11"), DialPolicy::Both);
+        assert_eq!(s.tier("aa11"), TransportTier::Tier1, "the neighbouring setting was lost");
+        assert_eq!(s.get("aa11").dial_policy_reset_from, None, "absent is not corrupt");
+        assert_eq!(s.dial_policy("zz99"), DialPolicy::Both, "an unknown peer must still dial");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tier 2 and the dial policy survive a round trip through the file
+    /// together. They are set in one operation (`peers.set_tier`) and a peer
+    /// that came back with only one of them applied would be in a combination
+    /// the user never asked for.
+    #[test]
+    fn tier_two_and_its_dial_policy_survive_a_round_trip_together() {
+        let dir = tmpdir("tier2rt");
+        let mut s = PeerTransportStore::default();
+        s.set(
+            "bb22",
+            PeerTransport {
+                transport_tier: "tier2".into(),
+                dial_policy: "inbound_only".into(),
+                ..PeerTransport::default()
+            },
+        );
+        s.save(&dir).expect("save");
+
+        let back = PeerTransportStore::load(&dir);
+        assert_eq!(back.tier("bb22"), TransportTier::Tier2);
+        assert_eq!(back.dial_policy("bb22"), DialPolicy::InboundOnly);
+        assert!(!back.dial_policy("bb22").may_dial());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **一条坏记录只毒死它自己。**

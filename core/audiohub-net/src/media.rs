@@ -1516,13 +1516,30 @@ pub const STREAMED_WRITEQ_HOT_MS: f64 = 20.0;
 /// 谁就同时改了升档线，不会只动一半。
 pub const STREAMED_WRITEQ_CLEAN_MS: f64 = STREAMED_WRITEQ_HOT_MS / 2.0;
 
-/// 升档的辅助闸门：接收侧单向时延展布（`stats::SpreadWindow`）。
+/// 升档的辅助闸门之一：接收侧单向时延展布（`stats::SpreadWindow`）。
 ///
-/// 干净线取 [`JbTuning::DEGRADED`] 的**最浅**深度：展布小于抖动缓冲在它最浅
-/// 处就能吸收的量 ⇒ 这条链路的交付时序没有让接收端付过代价，可以谈加带宽。
-/// 与 `min_target` 绑定而不是写死一个数：整定一动，这条线跟着动。
+/// 干净线取 [`JbTuning::DEGRADED`] 深度包络的**一半**：展布落在缓冲能吸收的
+/// 量以内、且留了一倍余量 ⇒ 交付时序没有让接收端付过代价，可以谈加带宽。
+///
+/// # 第一版锚在 `min_target` 上，锚错了
+///
+/// 初版写的是 `min_target * FRAME_MS` = 40 ms，理由是「缓冲在它**最浅**处就能
+/// 吸收」。但 `min_target` 是包络的**地板**，不是缓冲的工作点：tier 1 实测缓冲
+/// 稳定跑在 39–41 帧 ≈ 400 ms，于是那条线比真实工作深度低了一个数量级——它
+/// 衡量的不是「接收端付了代价」，而是「展布小于一个几乎用不到的下界」。后果
+/// 落在**升档**侧：一条其实完全健康的链路会被这条线按住不许升档。
+///
+/// # ⚠ 这个量有测量盲区，它**不足以**单独把关升档
+///
+/// 陈旧闸门（`tcpmedia::STALE_BUDGET`）会在帧到达对端之前就把超预算的帧扔掉，
+/// 于是 `SpreadWindow` **只看得见活下来的那些**。实测：链路 100 % 过载、
+/// `stale_dropped` 持续增长时，展布读数仍是 13–22 ms，全部判为「干净」。
+/// 这与本仓否定 RFC 3550 抖动的理由同型——一个在链路最糟时被系统性低估的量。
+///
+/// 所以升档另有一条**没有盲区**的闸门：见 [`AutoLadder::feed_streamed`] 的
+/// `stale_growing`。那个计数器是闸门自己的，本地可得，过载时只会变大。
 pub const STREAMED_SPREAD_CLEAN_MS: f64 =
-    (JbTuning::DEGRADED.min_target as u64 * FRAME_MS) as f64;
+    (JbTuning::DEGRADED.max_target as u64 * FRAME_MS) as f64 / 2.0;
 
 /// 连续几个周期越线才降一格。
 ///
@@ -1653,26 +1670,47 @@ impl AutoLadder {
     ///
     /// # 为什么 TCP 上必须换判据（这是本方法存在的全部理由）
     ///
-    /// - `loss_pct` 在 TCP 上**恒为 0**。重传把丢包变成延迟，于是 Tier 0 的
-    ///   主判据在这条链路上是一个常数——它不是变迟钝了，是完全没有信号。
+    /// - `loss_pct` 在 TCP 上**来得太晚**——晚到没法当降档信号用。
+    ///
+    ///   ⚠ 早先这里写的是「TCP 上 `loss_pct` **恒为 0**」。**那句话是错的**，
+    ///   而且错得有害：陈旧闸门（`tcpmedia::STALE_BUDGET`）是一等产品机制，
+    ///   它在持续过载下必然开火，于是 TCP 上 loss 不但有信号、还是**强**信号
+    ///   （实测 40 s 跑里从 6.1 % 一路涨到 41.7 %）。照着「恒为 0」去写对照
+    ///   实验，得到的结论会与事实相反。
+    ///
+    ///   成立的论证是**次序**，不是有无：TCP 上的 loss 由闸门制造，而闸门只在
+    ///   帧已经压够 440 ms **之后**才开火 ⇒ 丢包信号在构造上**不可能早于第一次
+    ///   丢音**。拿它降档，等于要求先难听几秒再来救。实测两次：本判据 t=2 s
+    ///   降档，换回 `loss_pct > 5.0` 要到 t=3 s，而 t=2 s 时闸门已经扔了 71 帧。
     /// - `jitter_ms` 是 RFC 3550 一阶差分，而 TCP 的失效形态是「停顿一下、
     ///   然后**成串**送达」：串内相邻差分近似 0，只有停顿后第一个包扛住全部
     ///   延迟 ⇒ 窗口分位数被**系统性低估**。这与 `engine.rs` 那条「两个半包
     ///   共用时间戳把一半抖动样本压成 0」的教训完全同型。
     ///
-    /// # 两个信号的分工
+    /// # 三个信号的分工
     ///
     /// - **主：`writeq_ms`**（发送侧队列积压）。它是 `loss_pct` 在 TCP 上的
     ///   直接对应物，而且**本地可得**——不必等对端的 `Stats` 回传，所以降档
-    ///   比 Tier 0 早一整个统计周期。
-    /// - **辅：`spread_ms`**（接收侧单向时延展布，p95 − 同窗口最小值）。
+    ///   比 Tier 0 早一整个统计周期，也早于闸门开火。**唯一参与降档的信号。**
+    /// - **辅（升档）：`spread_ms`**（接收侧单向时延展布，p95 − 同窗口最小值）。
     ///   **只参与升档，不参与降档**：tier 1 上一次重传就会如实推高展布，而
     ///   重传是这条链路的常态；拿它降档等于每次重传砍一格，几秒钟就到底。
+    /// - **辅（升档）：`stale_growing`**（本周期陈旧闸门是否又扔了帧）。
+    ///   `spread_ms` 有测量盲区——被闸门扔掉的帧根本不进展布窗口，于是链路最
+    ///   糟时它反而读得最好看（见 [`STREAMED_SPREAD_CLEAN_MS`]）。这条闸门补
+    ///   的正是那个洞：计数器是闸门自己的，本地可得，**过载时只会变大**。
+    ///   正在丢音的链路一律不许升档。
     ///
     /// `spread_ms = None`（对端没报 / 窗口还不够长）**按干净处理**。理由与
     /// 本仓反复吃过的「缺席不等于坏」是同一条：主信号是本地的、永远有值，
     /// 而让一个沉默的对端把档位永久钉住，是把「没有测量」当成了「测到很糟」。
-    pub fn feed_streamed(&mut self, writeq_ms: f64, spread_ms: Option<f64>) -> Option<u32> {
+    /// `stale_growing` 没有这个问题——它不是对端报的，缺席不可能发生。
+    pub fn feed_streamed(
+        &mut self,
+        writeq_ms: f64,
+        spread_ms: Option<f64>,
+        stale_growing: bool,
+    ) -> Option<u32> {
         if writeq_ms > STREAMED_WRITEQ_HOT_MS {
             self.clean = 0;
             self.hot = self.hot.saturating_add(1);
@@ -1689,7 +1727,10 @@ impl AutoLadder {
         // 一个不越线的周期就把连击清零：判据是「**连续** 3 个」。
         self.hot = 0;
         let spread_ok = spread_ms.is_none_or(|s| s < STREAMED_SPREAD_CLEAN_MS);
-        if writeq_ms <= STREAMED_WRITEQ_CLEAN_MS && spread_ok {
+        // 正在丢音就一律不算干净周期。放在 `spread_ok` 旁边而不是合进去：
+        // 这两条闸门的证据来源不同（一个是对端报的、有盲区，一个是本地的、
+        // 没有盲区），合并会让下一个人以为少了哪条都还剩一层保护。
+        if writeq_ms <= STREAMED_WRITEQ_CLEAN_MS && spread_ok && !stale_growing {
             self.clean = self.clean.saturating_add(1);
             if self.clean >= 10 && self.rung > self.top_rung {
                 self.clean = 0;
@@ -1899,10 +1940,14 @@ mod ladder_tests {
         assert_eq!(l.rung(), AUTO_TOP_RUNG_STREAMED, "degraded AUTO did not start at its ceiling");
         let hot = STREAMED_WRITEQ_HOT_MS + 1.0;
         for i in 1..STREAMED_HOT_PERIODS {
-            assert_eq!(l.feed_streamed(hot, None), None, "demoted after only {i} hot period(s)");
+            assert_eq!(
+                l.feed_streamed(hot, None, false),
+                None,
+                "demoted after only {i} hot period(s)"
+            );
         }
         assert_eq!(
-            l.feed_streamed(hot, None),
+            l.feed_streamed(hot, None, false),
             Some(AUTO_TOP_RUNG_STREAMED + 1),
             "three consecutive hot periods must demote exactly one rung"
         );
@@ -1910,11 +1955,15 @@ mod ladder_tests {
         // Without this the counter is "three hot periods ever", and a link that
         // hiccups once a minute walks to the bottom of the ladder in an hour.
         for _ in 0..(STREAMED_HOT_PERIODS - 1) {
-            assert_eq!(l.feed_streamed(hot, None), None);
+            assert_eq!(l.feed_streamed(hot, None, false), None);
         }
-        assert_eq!(l.feed_streamed(0.0, None), None, "a clean period moved the rung by itself");
+        assert_eq!(
+            l.feed_streamed(0.0, None, false),
+            None,
+            "a clean period moved the rung by itself"
+        );
         for _ in 0..(STREAMED_HOT_PERIODS - 1) {
-            assert_eq!(l.feed_streamed(hot, None), None, "the hot run was not restarted");
+            assert_eq!(l.feed_streamed(hot, None, false), None, "the hot run was not restarted");
         }
     }
 
@@ -1924,7 +1973,7 @@ mod ladder_tests {
     fn a_streamed_ladder_promotes_slowly_and_stops_at_the_degraded_ceiling() {
         let mut l = AutoLadder::new_streamed();
         for _ in 0..(STREAMED_HOT_PERIODS * 3) {
-            l.feed_streamed(STREAMED_WRITEQ_HOT_MS + 1.0, None);
+            l.feed_streamed(STREAMED_WRITEQ_HOT_MS + 1.0, None, false);
         }
         let floor = LADDER.len() as u32 - 1;
         assert_eq!(l.rung(), floor, "setup did not reach the bottom rung");
@@ -1934,20 +1983,24 @@ mod ladder_tests {
         // receiving what we already send on time.
         for i in 0..50 {
             assert_eq!(
-                l.feed_streamed(0.0, Some(STREAMED_SPREAD_CLEAN_MS + 1.0)),
+                l.feed_streamed(0.0, Some(STREAMED_SPREAD_CLEAN_MS + 1.0), false),
                 None,
                 "promoted on period {i} while the receiver's delay spread was over the line"
             );
         }
         // Spread clears: ten clean periods, then one rung.
         for i in 0..9 {
-            assert_eq!(l.feed_streamed(0.0, Some(0.0)), None, "promoted on clean period {i}");
+            assert_eq!(
+                l.feed_streamed(0.0, Some(0.0), false),
+                None,
+                "promoted on clean period {i}"
+            );
         }
-        assert_eq!(l.feed_streamed(0.0, Some(0.0)), Some(floor - 1));
+        assert_eq!(l.feed_streamed(0.0, Some(0.0), false), Some(floor - 1));
 
         // All the way up, then stop — at 3, not at tier 0's 2.
         for _ in 0..500 {
-            l.feed_streamed(0.0, None);
+            l.feed_streamed(0.0, None, false);
             assert!(
                 l.rung() >= AUTO_TOP_RUNG_STREAMED,
                 "degraded AUTO climbed past its ceiling to rung {} — plan §16.3 caps it at {}",
@@ -1987,13 +2040,117 @@ mod ladder_tests {
     fn an_unreported_spread_does_not_block_promotion_forever() {
         let mut l = AutoLadder::new_streamed();
         for _ in 0..STREAMED_HOT_PERIODS {
-            l.feed_streamed(STREAMED_WRITEQ_HOT_MS + 1.0, None);
+            l.feed_streamed(STREAMED_WRITEQ_HOT_MS + 1.0, None, false);
         }
         assert_eq!(l.rung(), AUTO_TOP_RUNG_STREAMED + 1);
         for _ in 0..9 {
-            assert_eq!(l.feed_streamed(0.0, None), None);
+            assert_eq!(l.feed_streamed(0.0, None, false), None);
         }
-        assert_eq!(l.feed_streamed(0.0, None), Some(AUTO_TOP_RUNG_STREAMED));
+        assert_eq!(l.feed_streamed(0.0, None, false), Some(AUTO_TOP_RUNG_STREAMED));
+    }
+
+    /// A link that is still dropping audio must not be promoted, even when
+    /// every other signal reads clean.
+    ///
+    /// This is the gate that covers `spread_ms`'s blind spot. Measured on the
+    /// 400 kbps bench: the stale gate was discarding ~3 frames/s and `loss_pct`
+    /// had climbed past 40 %, while the spread the peer reported sat at
+    /// 13–22 ms — comfortably "clean" — because the frames that would have
+    /// widened it had been thrown away before they could be measured. With only
+    /// the queue and the spread in the gate, that link is a promotion
+    /// candidate: send *more* bits over a link already failing to deliver what
+    /// it has.
+    ///
+    /// Injection control: drop `&& !stale_growing` from `feed_streamed` and the
+    /// first half of this test goes red.
+    #[test]
+    fn a_link_still_dropping_frames_is_never_promoted() {
+        let mut l = AutoLadder::new_streamed();
+        for _ in 0..(STREAMED_HOT_PERIODS * 3) {
+            l.feed_streamed(STREAMED_WRITEQ_HOT_MS + 1.0, None, false);
+        }
+        let floor = LADDER.len() as u32 - 1;
+        assert_eq!(l.rung(), floor, "setup did not reach the bottom rung");
+
+        // Empty queue, spread well inside the line, gate still firing.
+        for i in 0..50 {
+            assert_eq!(
+                l.feed_streamed(0.0, Some(1.0), true),
+                None,
+                "promoted on period {i} while the stale gate was still discarding frames"
+            );
+        }
+        // The gate stops firing: normal promotion resumes from zero clean
+        // periods, i.e. the vetoed periods did not bank any credit either.
+        for i in 0..9 {
+            assert_eq!(l.feed_streamed(0.0, Some(1.0), false), None, "promoted early on {i}");
+        }
+        assert_eq!(l.feed_streamed(0.0, Some(1.0), false), Some(floor - 1));
+    }
+
+    /// The promotion spread line is anchored to the depth the degraded buffer
+    /// actually works at, not to the floor of its envelope.
+    ///
+    /// The first version read `min_target * FRAME_MS` = 40 ms on the argument
+    /// that it was "what the buffer absorbs at its shallowest". `min_target` is
+    /// the envelope's floor and the buffer is not there: on the cross-machine
+    /// bench it sits at 39–41 frames, so the line was an order of magnitude
+    /// under the real working depth and held promotion off a healthy link.
+    #[test]
+    fn the_spread_line_is_anchored_to_the_working_depth_not_the_floor() {
+        let floor_ms = (JbTuning::DEGRADED.min_target as u64 * FRAME_MS) as f64;
+        assert!(
+            STREAMED_SPREAD_CLEAN_MS > floor_ms,
+            "the spread line fell back onto the envelope floor ({floor_ms} ms)"
+        );
+        // Inside the envelope: a line above what the buffer can hold would not
+        // be a gate at all.
+        let ceil_ms = (JbTuning::DEGRADED.max_target as u64 * FRAME_MS) as f64;
+        assert!(
+            STREAMED_SPREAD_CLEAN_MS < ceil_ms,
+            "the spread line reached the envelope ceiling — nothing can trip it"
+        );
+    }
+
+    /// Rebuilding a buffer through its **own** tuning preserves both the
+    /// profile and the depth it had learned; rebuilding it through the default
+    /// profile destroys both.
+    ///
+    /// This is the mechanism behind the `jb resync` fix in `engine.rs`. The
+    /// starvation self-heal there used `JitterBuffer::new(target)`, which
+    /// reaches for `JbTuning::cached()` = `DEFAULT`, so a single resync on a
+    /// tier 1 stream swapped `DEGRADED` for `DEFAULT` *and* — via
+    /// `with_tuning`'s `clamp(1, max_target)` — chopped a depth of up to 40
+    /// frames down to 12. The envelope is restored within a second by
+    /// `reshape_jitter_envelope`, but its seed is the already-clamped
+    /// `target()`, so the depth is not: it can only be re-earned one frame per
+    /// underrun, which is tens of minutes.
+    #[test]
+    fn rebuilding_a_buffer_through_its_own_tuning_keeps_the_depth_it_learned() {
+        let deep = JbTuning::DEGRADED.max_target;
+        assert!(
+            deep > JbTuning::DEFAULT.max_target,
+            "the two profiles no longer differ in depth, so this test proves nothing"
+        );
+        let learned = JitterBuffer::with_tuning(deep, JbTuning::DEGRADED);
+        assert_eq!(learned.target(), deep, "the setup buffer did not reach the degraded ceiling");
+
+        // What the fix does.
+        let kept = JitterBuffer::with_tuning(learned.target(), learned.tuning());
+        assert_eq!(kept.target(), deep, "a resync lost the depth the buffer had learned");
+        assert_eq!(
+            kept.tuning().max_target,
+            JbTuning::DEGRADED.max_target,
+            "a resync swapped the degraded profile for another one"
+        );
+
+        // What it replaced, spelled out so the difference is not hypothetical.
+        let reset = JitterBuffer::with_tuning(learned.target(), JbTuning::DEFAULT);
+        assert_eq!(
+            reset.target(),
+            JbTuning::DEFAULT.max_target,
+            "rebuilding on DEFAULT was expected to clamp the depth down"
+        );
     }
 
     /// `rung_of` 不做就近吸附；**采样率单独不再能标识一档**。
@@ -3204,8 +3361,12 @@ mod water_level_tests {
             t.hard_slack
         );
         // The promotion gate AUTO uses on this transport is derived from this
-        // profile, not written down twice.
-        assert_eq!(STREAMED_SPREAD_CLEAN_MS, d.min_target as f64 * FRAME_MS as f64);
+        // profile, not written down twice. It is anchored to `max_target` (the
+        // depth this profile actually works at on a degraded link — measured at
+        // 39-41 frames) rather than to `min_target`, which is the envelope's
+        // floor and an order of magnitude below anything the buffer ever sits
+        // at. See `STREAMED_SPREAD_CLEAN_MS`.
+        assert_eq!(STREAMED_SPREAD_CLEAN_MS, d.max_target as f64 * FRAME_MS as f64 / 2.0);
     }
 }
 

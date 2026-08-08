@@ -224,8 +224,13 @@ pub enum SessionMsg {
         jitter_ms: f64,
         /// One-way delay spread, p95 − window minimum, milliseconds
         /// (`stats::SpreadWindow`). AUTO's auxiliary signal on tier 1/2, where
-        /// `loss_pct` is identically zero and `jitter_ms` — a first difference —
-        /// under-reads a stall-then-burst by construction.
+        /// `jitter_ms` — a first difference — under-reads a stall-then-burst by
+        /// construction, and `loss_pct` cannot arrive before the audio it is
+        /// reporting on is already gone (TCP's loss is manufactured by the
+        /// stale gate, which fires only *after* a frame has been stuck for
+        /// `STALE_BUDGET`). An earlier version of this comment claimed
+        /// `loss_pct` is "identically zero" on TCP — it is not; see
+        /// `media::AutoLadder::feed_streamed`.
         ///
         /// `#[serde(default)]` and `Option`: absent means the sender's window is
         /// still too short, and that is a different claim from `0.0`. It also

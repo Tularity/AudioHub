@@ -1996,6 +1996,17 @@ impl RxStream {
         hal_slot: Option<u8>,
         ka_path: tcpmedia::MediaPath,
     ) -> RxStream {
+        // Build the first buffer on the profile this path actually uses.
+        // `JitterBuffer::new` reaches for `JbTuning::cached()` (= `DEFAULT`),
+        // which on tier 1 leaves the stream running a 12-frame target and a
+        // 24-frame (240 ms) memory ceiling until the first
+        // `reshape_jitter_envelope` pass — 100 pushes, ~1 s in. During that
+        // window the *sender's* stale gate is `STALE_BUDGET` = 440 ms, so
+        // frames the gate deliberately let through get trimmed on arrival with
+        // no counter on this side to explain it. That inversion is the exact
+        // thing the compile-time bracket in `tcpmedia.rs` exists to forbid,
+        // pointing the other way.
+        let jb_tuning = engine::jb_tuning_for(&ka_path);
         RxStream {
             stream_id,
             // real streams always key off the opener's per-stream salt
@@ -2007,7 +2018,7 @@ impl RxStream {
             hal_slot,
             ka_path,
             jbs: Mutex::new(JbState {
-                jb: JitterBuffer::new(2),
+                jb: JitterBuffer::with_tuning(2, jb_tuning),
                 rs_rate: 48000,
                 rs: None,
                 rs_last: 0.0,
@@ -2065,6 +2076,11 @@ pub(crate) struct RemoteStats {
     /// it is an auxiliary gate on *promotion*, and a peer that never reports
     /// would otherwise pin the rung for the life of the session. Absence is not
     /// evidence of trouble.
+    ///
+    /// ⚠ It is also not a sufficient gate: the stale gate drops late frames
+    /// before they can enter the peer's window, so this reads at its cleanest
+    /// exactly when the link is dropping audio. The blind-spot-free half of the
+    /// promotion gate is the local `stale_dropped` delta, not this.
     pub iv_spread_ms: Option<f64>,
 }
 
@@ -3374,6 +3390,11 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
         streamed: bool,
     }
     let mut autos: HashMap<u32, AutoCell> = HashMap::new();
+    // Lifetime `stale_dropped` per link as of the previous tick, keyed by
+    // fingerprint. Lives outside the loop because the signal AUTO wants is the
+    // *delta*, and a counter that only grows says nothing on its own — a link
+    // that dropped 300 frames an hour ago and none since is healthy now.
+    let mut stale_seen: HashMap<String, u64> = HashMap::new();
     let mut dev_epoch = inner.dev_out_epoch.load(Ordering::Relaxed);
     loop {
         for _ in 0..5 {
@@ -3416,6 +3437,9 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
         // Populated lazily and read at most once per link, because the getter
         // behind it resets its window (see `take_writeq_peak_ms`).
         let mut writeq: HashMap<String, f64> = HashMap::new();
+        // Whether the stale gate fired on each link during *this* tick, derived
+        // once per link from the `stale_seen` baseline that outlives the tick.
+        let mut stale_grew: HashMap<String, bool> = HashMap::new();
         for e in &entries {
             let live = e.conn.alive.load(Ordering::SeqCst);
             // P0b：把**本侧**这条流的分项回传给对端，好让它合成总延迟。
@@ -3472,6 +3496,18 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                     // 阶梯的历史状态也扔掉：切回 AUTO 时应当从当前格重新学，
                     // 而不是接着用固定档期间那段没有意义的干净计数。
                     autos.remove(&e.id);
+                    // Drain the send-queue peak here too, and throw it away.
+                    // `take_writeq_peak_ms` is a "since you last looked" window
+                    // with exactly one consumer; if the fixed-quality branch
+                    // never looks, the window accumulates for as long as the
+                    // user stays on a fixed rung, and the first AUTO tick after
+                    // switching back reads a peak that may be minutes old as if
+                    // it were this second's. Cheap to keep the name honest.
+                    if let tcpmedia::MediaPath::Tcp(l) = e.conn.current_media_path() {
+                        writeq
+                            .entry(l.fp.clone())
+                            .or_insert_with(|| l.take_writeq_peak_ms());
+                    }
                 } else {
                     let r = *lk(&tx.remote);
                     // Which family of signals this stream's ladder runs on. The
@@ -3494,6 +3530,27 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                         *writeq
                             .entry(l.fp.clone())
                             .or_insert_with(|| l.take_writeq_peak_ms())
+                    });
+                    // Did the stale gate throw anything away since the previous
+                    // tick? Blind-spot-free veto on promotion: `spread_ms` only
+                    // ever sees the frames that *survived* the gate, so it reads
+                    // at its cleanest exactly when the link is dropping audio.
+                    // This counter is the gate's own and only grows.
+                    //
+                    // Deduped per link like the peak above, but for the opposite
+                    // reason: `stale_dropped()` is non-consuming, and it is the
+                    // *baseline* map that must be updated once per link per tick
+                    // — writing it per stream would let the first stream on a
+                    // fanned-out peer absorb the growth and show the rest zero.
+                    let stale_growing = link.as_ref().map(|l| {
+                        *stale_grew.entry(l.fp.clone()).or_insert_with(|| {
+                            let now = l.stale_dropped();
+                            let prev = stale_seen.insert(l.fp.clone(), now);
+                            // First sighting of a link is not evidence of
+                            // trouble: `None` means we have no baseline, not
+                            // that the gate fired.
+                            prev.is_some_and(|p| now > p)
+                        })
                     });
                     if autos.get(&e.id).is_some_and(|c| c.streamed != streamed) {
                         autos.remove(&e.id);
@@ -3535,7 +3592,11 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                     let moved = match writeq_ms {
                         Some(q) => {
                             cell.last_seq = r.seq;
-                            cell.ladder.feed_streamed(q, r.iv_spread_ms)
+                            cell.ladder.feed_streamed(
+                                q,
+                                r.iv_spread_ms,
+                                stale_growing.unwrap_or(false),
+                            )
                         }
                         None if r.seq > cell.last_seq => {
                             cell.last_seq = r.seq;
@@ -3573,6 +3634,12 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
         // 默认档位跑到下一次变更为止——一个只在特定时序下出现、没有任何报错
         // 的失效。`publish_*` 里那条「真的变了才作废」的判断让重复灌入是免费的。
         publish_targets(&inner, &entries);
+        // Forget links that carried no AUTO stream this tick, so the baseline
+        // map cannot grow without bound across a long-lived daemon. A link that
+        // comes back gets re-baselined and reads "no evidence" for one tick,
+        // which is the safe direction: promotion needs ten consecutive clean
+        // periods, so one un-vetoed tick cannot promote anything on its own.
+        stale_seen.retain(|fp, _| stale_grew.contains_key(fp));
         // 延迟这一拍。放在整个 `for` 之后：装配层要一次拿到全部会话。
         latency_pass(&inner, &entries);
     }

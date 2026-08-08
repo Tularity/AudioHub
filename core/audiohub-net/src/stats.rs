@@ -109,6 +109,16 @@ impl RateWindow {
 /// Non-consuming, like [`RateWindow`] and `quality::ConcealWindow`: reading it
 /// never mutates history, so the 1 Hz ticker and any number of IPC readers can
 /// share one window.
+///
+/// # There is deliberately no `reset()`
+///
+/// `transit` carries a per-connection clock offset, so history from two
+/// different connections must never share a window. That is enforced by
+/// construction rather than by a method someone has to remember to call: the
+/// window is owned by `RxCell` and built fresh per stream. An earlier version
+/// shipped a `reset()` documented as "call this when the stream is rebuilt"
+/// with **zero callers anywhere** — a `pub fn` with usage instructions and no
+/// users reads as "somebody is handling this" to the next person.
 pub struct SpreadWindow {
     /// Raw `transit` samples in arrival order, newest at the back.
     samples: VecDeque<i64>,
@@ -170,12 +180,6 @@ impl SpreadWindow {
         self.samples.is_empty()
     }
 
-    /// Drop all history. Call this when the stream is rebuilt: `transit`
-    /// carries a per-connection clock offset, and mixing two of them produces a
-    /// spread that is the offset difference rather than anything about delay.
-    pub fn reset(&mut self) {
-        self.samples.clear();
-    }
 }
 
 impl Default for SpreadWindow {

@@ -1321,8 +1321,12 @@ fn steer_jitter_target(jb: &mut audiohub_net::media::JitterBuffer, want: u32) {
 /// 重建丢掉队列里的帧并重新预缓冲（几十毫秒，由 PLC 遮掉）。它**只在换代号
 /// 变化时**发生，也就是用户动了滑条那一下。稳态一次都不会发生。
 ///
-/// AUTO 时恢复 `JbTuning::cached()` 那个实测默认——固定档期间放开的下限
+/// AUTO 时恢复调用方给的 `base` 整定——固定档期间放开的下限
 /// （`min_target = 1`）不许留给 AUTO，那会悄悄改掉 plan §5 里 AUTO 的整定。
+///
+/// ⚠ `base` **不一定是 `JbTuning::DEFAULT`**。生产走 [`jb_tuning_for`]：
+/// tier 0 是 `DEFAULT`，tier 1/2 是 `DEGRADED`。这里早先写死「恢复
+/// `JbTuning::cached()` 那个实测默认」，在降级链路上是一句假话。
 /// 目标 -> JB 应有的包络。**纯函数**，于是「哪个目标该配哪个包络」这条规则
 /// 可以被直接测，不必起一台 daemon。
 ///
@@ -1334,7 +1338,8 @@ pub(crate) fn envelope_for(
 ) -> audiohub_net::media::JbTuning {
     use audiohub_ipc::LatencyTarget;
     match target {
-        // AUTO：一个字段都不改，回到 `JbTuning::DEFAULT` 的实测整定。
+        // AUTO：一个字段都不改，回到**这条链路的** base 整定
+        // （tier 0 = `DEFAULT`，tier 1/2 = `DEGRADED`；见 `jb_tuning_for`）。
         // 固定档期间放开的下限**不许**留给 AUTO——那会悄悄改掉 plan §5 里
         // AUTO 的整定，而 AUTO 是默认档。
         LatencyTarget::Auto => base,
@@ -2614,7 +2619,22 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
             st.last_dropped = st.jb.dropped;
             if st.late_streak >= 50 {
                 let target = st.jb.target();
-                st.jb = audiohub_net::media::JitterBuffer::new(target);
+                // Restart this buffer, do **not** re-tune it. `JitterBuffer::new`
+                // would reach for `JbTuning::cached()` — i.e. `DEFAULT` — and a
+                // resync would silently swap a tier 1 stream's `DEGRADED`
+                // profile for the tier 0 one, on top of `with_tuning`'s
+                // `clamp(1, max_target)` chopping a learned depth of up to 40
+                // frames down to 12. The envelope comes back on the next
+                // `reshape_jitter_envelope` pass (<=1s), but its seed is
+                // `st.jb.target()` — already clamped — so the depth does not:
+                // it can only be re-earned one frame per underrun.
+                //
+                // The trigger is `late_streak >= 50`, i.e. arrivals judged late
+                // while the buffer sits near empty. That is precisely TCP's
+                // stall-then-burst shape, so the site fires *more* readily on
+                // the very link `DEGRADED` exists for. Same class of mistake as
+                // the stale-gate subject drift, one site over.
+                st.jb = audiohub_net::media::JitterBuffer::with_tuning(target, st.jb.tuning());
                 if !frame.is_empty() {
                     st.jb.push(frame_seq, frame);
                 }
@@ -4002,6 +4022,37 @@ pub(crate) mod tests {
     /// 回来一次，相位扰动就重新开始被永久积分，而**表面上什么都不会变**——
     /// 包数、丢包率、音调探针全绿，只有水位在几小时里慢慢爬。整轮调查就是这么
     /// 花掉的，所以它守在源码上。
+    /// **The starvation self-heal restarts the buffer; it does not re-tune it.**
+    ///
+    /// `JitterBuffer::new` reads `JbTuning::cached()` = `DEFAULT`, so writing
+    /// the resync that way makes every self-heal on a tier 1 stream silently
+    /// swap the `DEGRADED` profile for the tier 0 one and — through
+    /// `with_tuning`'s `clamp(1, max_target)` — cut a learned depth of up to 40
+    /// frames to 12. Nothing reports it: the envelope comes back on the next
+    /// `reshape_jitter_envelope` pass, so the only visible trace is a buffer
+    /// that has to re-earn its depth one frame per underrun.
+    ///
+    /// It is guarded in source because the trigger (`late_streak >= 50`) needs a
+    /// stalled mixer or real cross-machine clock drift to reach, and the damage
+    /// is invisible for the second it takes the envelope to return. The
+    /// mechanism itself is tested in
+    /// `media::ladder_tests`, test
+    /// `rebuilding_a_buffer_through_its_own_tuning_keeps_the_depth_it_learned`.
+    #[test]
+    fn the_jb_resync_keeps_the_profile_the_stream_was_running() {
+        let body = fn_body("pub(crate) fn handle_datagram(");
+        assert!(
+            body.contains("JitterBuffer::with_tuning(target, st.jb.tuning())"),
+            "the resync no longer rebuilds through the buffer's own tuning, so a tier 1 stream \
+             loses DEGRADED (and its learned depth) on every self-heal"
+        );
+        assert!(
+            !body.contains("JitterBuffer::new("),
+            "a JitterBuffer is being built from the cached DEFAULT tuning inside handle_datagram; \
+             on a degraded link that is the wrong profile"
+        );
+    }
+
     #[test]
     fn the_tx_deadline_is_driven_by_the_dll_not_by_open_loop_accumulation() {
         let body = fn_body("pub(crate) fn tx_loop(");

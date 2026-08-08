@@ -491,6 +491,35 @@ mod driver_audit {
         );
     }
 
+    /// **A receive stream's first jitter buffer is built on its own path's
+    /// profile, not on the cached default.**
+    ///
+    /// `JitterBuffer::new` reads `JbTuning::cached()` = `DEFAULT`. Written that
+    /// way, a tier 1 stream spends its first ~1 s (100 pushes, until
+    /// `reshape_jitter_envelope` first runs) with a 24-frame = 240 ms memory
+    /// ceiling while the *sender's* stale gate is `STALE_BUDGET` = 440 ms. The
+    /// two are supposed to bracket each other — `tcpmedia.rs` carries a
+    /// compile-time assertion saying so — and in that window they are inverted:
+    /// frames the gate deliberately forwards get trimmed on arrival, with no
+    /// counter on the receiving side to account for them.
+    ///
+    /// Injection control: put `JitterBuffer::new(2)` back and this goes red.
+    #[test]
+    fn a_receive_stream_starts_on_the_jitter_profile_its_path_uses() {
+        let src = read("core/audiohubd/src/lib.rs");
+        let body = window(&src, "    ) -> RxStream {", 1200);
+        assert!(
+            body.contains("JitterBuffer::with_tuning(2, jb_tuning)")
+                && body.contains("engine::jb_tuning_for(&ka_path)"),
+            "RxStream::new no longer picks its jitter tuning from the media path, so a degraded \
+             stream opens with the tier 0 envelope under a tier 1 stale gate"
+        );
+        assert!(
+            !body.contains("JitterBuffer::new("),
+            "RxStream::new is back to building its buffer on the cached DEFAULT tuning"
+        );
+    }
+
     /// **`sum_ms` 与被声明的那个数必须来自同一次装配。**
     ///
     /// 注入对照：让 `declare_pass` 自己调一次 `assemble_pipelines`（而不是收

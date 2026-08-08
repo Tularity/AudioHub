@@ -5,4 +5,5 @@ pub mod dsp;
 pub mod latency;
 pub mod permissions;
 pub mod sysaudio;
+pub mod volindep;
 pub mod volume;

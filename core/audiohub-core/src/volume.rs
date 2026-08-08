@@ -106,6 +106,104 @@ pub fn set_output_mute(dev: Option<&str>, muted: bool) -> Result<()> {
     imp::set_mute(dev, muted)
 }
 
+// -------------------------------------------------- borrow-and-return a knob
+
+/// Borrows an output device's volume/mute, and puts them back.
+///
+/// The volume knob this touches is a knob the USER owns: on the machine this
+/// runs on it may be the one carrying their music right now. Every tool that
+/// moves it for a measurement therefore has to move it back, including on the
+/// paths nobody writes code for — an early `?`, a panic in the middle of a
+/// measurement leg, a probe that is `^C`'d halfway. That is what makes this a
+/// guard and not a pair of helper functions: `Drop` runs on all three (the
+/// workspace unwinds — nothing sets `panic = "abort"`), so the only way to
+/// leave the volume moved is to `std::mem::forget` this value or to kill the
+/// process with SIGKILL.
+///
+/// [`Self::restore`] exists on top of `Drop` for the one thing `Drop` cannot
+/// do: report that putting it back FAILED. A caller that cares (a probe writing
+/// a verdict) should call it explicitly and surface the error; `Drop` is the
+/// net underneath, and is silent by design because a panicking `Drop` during an
+/// unwind aborts the process.
+pub struct OutputVolumeGuard {
+    /// `None` = the system default output, same convention as [`get_output_volume`].
+    device: Option<String>,
+    original: VolumeState,
+    /// Cleared by `restore` so `Drop` does not write the device a second time.
+    outstanding: bool,
+}
+
+impl OutputVolumeGuard {
+    /// Reads the current state and takes responsibility for restoring it.
+    ///
+    /// Fails when the device exposes no writable volume (`adjustable == false`):
+    /// a guard over a knob that cannot be turned would hand the caller a
+    /// measurement in which nothing was ever varied, and "the level did not
+    /// change" would read as independence.
+    pub fn capture(device: Option<&str>) -> Result<OutputVolumeGuard> {
+        let original = get_output_volume(device)?;
+        if !original.adjustable {
+            bail!(
+                "{} exposes no writable volume, so nothing can be varied",
+                match device {
+                    None => "the default output device".to_string(),
+                    Some(name) => format!("output device {name:?}"),
+                }
+            );
+        }
+        Ok(OutputVolumeGuard {
+            device: device.map(str::to_string),
+            original,
+            outstanding: false,
+        })
+    }
+
+    pub fn original(&self) -> VolumeState {
+        self.original
+    }
+
+    fn dev(&self) -> Option<&str> {
+        self.device.as_deref()
+    }
+
+    /// Sets the volume and returns what the device READ BACK, which is not
+    /// always what was written: macOS quantises the scalar on several built-in
+    /// outputs (1/16 steps), so a caller that predicts the level change from
+    /// the requested scalar predicts from a number the hardware never used.
+    pub fn set_volume(&mut self, scalar: f32) -> Result<VolumeState> {
+        self.outstanding = true;
+        set_output_volume(self.dev(), scalar)?;
+        get_output_volume(self.dev())
+    }
+
+    pub fn set_mute(&mut self, muted: bool) -> Result<VolumeState> {
+        self.outstanding = true;
+        set_output_mute(self.dev(), muted)?;
+        get_output_volume(self.dev())
+    }
+
+    /// Puts the volume and mute back where they were found, and reports failure.
+    /// Idempotent: a second call (or the `Drop` that follows) is a no-op.
+    pub fn restore(&mut self) -> Result<()> {
+        if !self.outstanding {
+            return Ok(());
+        }
+        // Unmute LAST: restoring the volume while muted is inaudible, whereas
+        // the reverse order can put a full-scale scalar onto live speakers for
+        // the width of one call.
+        let vol = set_output_volume(self.dev(), self.original.scalar);
+        let mute = set_output_mute(self.dev(), self.original.muted);
+        self.outstanding = false;
+        vol.and(mute)
+    }
+}
+
+impl Drop for OutputVolumeGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 /// Resolves the name the user typed against the devices a backend enumerated.
 /// Shared so both backends refuse a typo the same way instead of silently
 /// landing on the wrong card.
@@ -1407,6 +1505,134 @@ mod send_gain_authority_tests {
         assert_eq!(
             authority_for(Some(VolumeState { scalar: 0.9, muted: true, adjustable: false })),
             VolumeAuthority::SendGain
+        );
+    }
+}
+
+#[cfg(test)]
+mod output_volume_guard_hardware_tests {
+    //! The one property of [`OutputVolumeGuard`] no pure test can reach: that a
+    //! REAL device's volume comes back after a real write, including when the
+    //! body between the write and the restore panics.
+    //!
+    //! # Why every test here is `#[ignore]`d and needs a device named
+    //!
+    //! It turns a volume knob. On a machine running AudioHub the system default
+    //! output is the user's live audio path — on the development host it is
+    //! currently a mode B virtual speaker carrying real audio to a peer, where
+    //! a 「turn it to 25% and mute it」 test is not a test, it is an outage. So
+    //! the device is **required** and read from the environment: there is no
+    //! default, and in particular no fallback to the system default.
+    //!
+    //! Point it at something inaudible (a virtual card with nothing behind it):
+    //!
+    //! ```text
+    //! AUDIOHUB_VOLUME_GUARD_DEVICE="BlackHole 2ch" \
+    //!   cargo test -p audiohub-core output_volume_guard_hardware -- --ignored --nocapture
+    //! ```
+
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::{Mutex, MutexGuard};
+
+    const ENV: &str = "AUDIOHUB_VOLUME_GUARD_DEVICE";
+
+    /// The device is one shared piece of global state and `cargo test` runs
+    /// these on parallel threads by default.
+    ///
+    /// This is not tidiness — without it the suite is theatre. Measured: with
+    /// `Drop`'s restore deliberately deleted, both tests still passed, because
+    /// the other test's restore ran between the panic and the read-back and
+    /// handed it a clean device. A test that stays green while the property it
+    /// names is gone is worse than no test.
+    static DEVICE: Mutex<()> = Mutex::new(());
+
+    /// Poison-tolerant: an assertion failure in one test must not turn the
+    /// other into a spurious failure about a poisoned lock.
+    fn lock() -> MutexGuard<'static, ()> {
+        DEVICE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn device() -> String {
+        std::env::var(ENV).unwrap_or_else(|_| {
+            panic!(
+                "set {ENV} to an OUTPUT DEVICE NAME before running this. There is no default \
+                 on purpose: the system default output is where the user's audio is."
+            )
+        })
+    }
+
+    /// `restore` is only meaningful if the write it undoes actually landed. A
+    /// device whose volume control is a no-op knob would make every restore
+    /// assertion pass without anything having happened, so the mid-run reading
+    /// is checked first and the test refuses such a device by name.
+    #[test]
+    #[ignore = "moves a real volume knob; needs AUDIOHUB_VOLUME_GUARD_DEVICE"]
+    fn a_real_write_lands_and_is_undone() {
+        let _serial = lock();
+        let dev = device();
+        let before = get_output_volume(Some(&dev)).expect("read the device before touching it");
+        assert!(before.adjustable, "{dev:?} reports no writable volume");
+        assert!(
+            before.scalar > 0.2,
+            "{dev:?} is at {:.3}; raise it before running, this test only turns volumes down",
+            before.scalar
+        );
+
+        let mid = {
+            let mut g = OutputVolumeGuard::capture(Some(&dev)).expect("capture the guard");
+            let mid = g.set_volume(before.scalar * 0.25).expect("write the volume");
+            g.restore().expect("restore must report its own failure");
+            mid
+        };
+        assert!(
+            (mid.scalar - before.scalar).abs() > SAME_EPS,
+            "the write did not land: {dev:?} read back {:.4} where it was {:.4}. Its volume \
+             control is a no-op knob, so nothing this test asserts afterwards means anything",
+            mid.scalar,
+            before.scalar
+        );
+
+        let after = get_output_volume(Some(&dev)).expect("read the device back");
+        assert!(
+            (after.scalar - before.scalar).abs() <= SAME_EPS,
+            "volume left at {:.4}, was {:.4}",
+            after.scalar,
+            before.scalar
+        );
+        assert_eq!(after.muted, before.muted);
+    }
+
+    /// The path nobody writes code for: a measurement leg panics halfway. `Drop`
+    /// is the only thing standing between that and a user whose speakers are
+    /// left muted at a quarter volume.
+    #[test]
+    #[ignore = "moves a real volume knob; needs AUDIOHUB_VOLUME_GUARD_DEVICE"]
+    fn a_panic_between_the_write_and_the_restore_still_puts_it_back() {
+        let _serial = lock();
+        let dev = device();
+        let before = get_output_volume(Some(&dev)).expect("read the device before touching it");
+        assert!(before.adjustable && before.scalar > 0.2, "{dev:?}: {before:?}");
+
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            let mut g = OutputVolumeGuard::capture(Some(&dev)).expect("capture the guard");
+            g.set_volume(before.scalar * 0.25).expect("write the volume");
+            g.set_mute(true).expect("write the mute");
+            panic!("injected: a measurement leg died here");
+        }));
+        assert!(caught.is_err(), "the injected panic did not happen");
+
+        let after = get_output_volume(Some(&dev)).expect("read the device back");
+        assert!(
+            (after.scalar - before.scalar).abs() <= SAME_EPS,
+            "volume left at {:.4} after a panic, was {:.4}",
+            after.scalar,
+            before.scalar
+        );
+        assert_eq!(
+            after.muted, before.muted,
+            "mute left at {} after a panic, was {}",
+            after.muted, before.muted
         );
     }
 }

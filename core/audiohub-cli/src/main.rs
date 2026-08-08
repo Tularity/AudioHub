@@ -1,5 +1,6 @@
 mod ctl;
 mod m3;
+mod volindep;
 mod winvad;
 
 use std::io::ErrorKind;
@@ -20,7 +21,7 @@ use audiohub_net::packet::{Codec, Header, Kind, PacketError};
 use audiohub_net::session::{run_rx, run_tx_tone, RxCfg, RxMode, ToneTxCfg, TxMode, TxReport};
 
 const DEFAULT_PORT: u16 = 47810;
-const EXIT_CHECK_FAILED: i32 = 2;
+pub(crate) const EXIT_CHECK_FAILED: i32 = 2;
 const EXIT_NO_TRAFFIC: i32 = 3;
 const EXIT_ERROR: i32 = 4;
 
@@ -170,6 +171,10 @@ enum ProbeCmd {
         /// forward the captured audio as media packets (repeatable)
         #[arg(long)]
         to: Vec<SocketAddr>,
+        /// plan §7.1 volume-independence check. Its own mode: when
+        /// --check-volume-independence is set the flags above are ignored.
+        #[command(flatten)]
+        vi: volindep::ViArgs,
     },
     Echo {
         #[arg(long)]
@@ -189,11 +194,11 @@ enum ProbeCmd {
     },
 }
 
-fn info(msg: &str) {
+pub(crate) fn info(msg: &str) {
     eprintln!("[audiohub] {msg}");
 }
 
-fn emit_json<T: serde::Serialize>(json: bool, value: &T) {
+pub(crate) fn emit_json<T: serde::Serialize>(json: bool, value: &T) {
     if json {
         println!("{}", serde_json::to_string(value).expect("json encode"));
     }
@@ -288,17 +293,24 @@ fn dispatch(cmd: ProbeCmd, json: bool) -> Result<i32> {
             self_tone,
             play_pull,
             to,
-        } => cmd_sysaudio(
-            list,
-            &backend,
-            secs,
-            verify_freq,
-            absent_freq,
-            self_tone,
-            play_pull,
-            &to,
-            json,
-        ),
+            vi,
+        } => {
+            if vi.check_volume_independence {
+                volindep::run(&vi, &backend, json)
+            } else {
+                cmd_sysaudio(
+                    list,
+                    &backend,
+                    secs,
+                    verify_freq,
+                    absent_freq,
+                    self_tone,
+                    play_pull,
+                    &to,
+                    json,
+                )
+            }
+        }
         ProbeCmd::Echo {
             to,
             count,
@@ -1202,4 +1214,81 @@ fn cmd_rx(
         return Ok(EXIT_CHECK_FAILED);
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod cli_parse_tests {
+    //! The command tree itself, parsed.
+    //!
+    //! `#[command(flatten)]` derives each argument's clap ID from its FIELD
+    //! NAME, not from its `long`. `ViArgs::secs` (`--vi-secs`) therefore landed
+    //! on the same ID as `ProbeCmd::Sysaudio::secs` (`--secs`) and the two
+    //! merged: every `probe sysaudio` invocation started failing with "required
+    //! argument was not provided: secs", and no unit test noticed, because
+    //! nothing here had ever run the parser. These do.
+
+    use super::*;
+    use clap::CommandFactory;
+
+    /// clap's own structural check: duplicate IDs, conflicting shorts, bad
+    /// defaults. Catches the whole class, not just the instance above.
+    #[test]
+    fn the_command_tree_is_internally_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    /// Explicit IDs are only half the fix — the flags have to still reach their
+    /// fields with the values the user typed.
+    #[test]
+    fn the_volume_independence_flags_parse_alongside_the_capture_flags() {
+        let cli = Cli::try_parse_from([
+            "audiohub",
+            "probe",
+            "sysaudio",
+            "--secs",
+            "7",
+            "--check-volume-independence",
+            "--vi-secs",
+            "3",
+            "--vi-device",
+            "BlackHole 2ch",
+            "--vi-low",
+            "0.1",
+            "--vi-expect",
+            "independent",
+            "--vi-expect-survives-mute",
+            "true",
+        ])
+        .expect("probe sysaudio must accept both flag families at once");
+        let TopCmd::Probe {
+            cmd: ProbeCmd::Sysaudio { secs, vi, .. },
+        } = cli.cmd
+        else {
+            panic!("parsed into the wrong subcommand");
+        };
+        assert_eq!(secs, 7.0, "--secs must not be swallowed by --vi-secs");
+        assert_eq!(vi.secs, 3.0, "--vi-secs must not be swallowed by --secs");
+        assert!(vi.check_volume_independence);
+        assert_eq!(vi.device.as_deref(), Some("BlackHole 2ch"));
+        assert_eq!(vi.low, 0.1);
+        assert_eq!(vi.expect, Some(volindep::ExpectCoupling::Independent));
+        assert_eq!(vi.expect_survives_mute, Some(true));
+    }
+
+    /// The default path must stay exactly as it was: no new required argument,
+    /// and the check off.
+    #[test]
+    fn a_plain_probe_sysaudio_still_parses_with_no_arguments() {
+        let cli = Cli::try_parse_from(["audiohub", "probe", "sysaudio"])
+            .expect("probe sysaudio takes no required arguments");
+        let TopCmd::Probe {
+            cmd: ProbeCmd::Sysaudio { secs, vi, .. },
+        } = cli.cmd
+        else {
+            panic!("parsed into the wrong subcommand");
+        };
+        assert_eq!(secs, 5.0, "the pre-existing --secs default");
+        assert_eq!(vi.secs, 2.0, "the volume-independence leg default");
+        assert!(!vi.check_volume_independence, "the check must be opt-in");
+    }
 }

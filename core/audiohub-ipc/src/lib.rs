@@ -372,7 +372,7 @@ pub struct PeerTransportView {
     /// | 问题 | 读哪里 |
     /// |---|---|
     /// | 用户要什么 | **本字段** |
-    /// | 字节此刻在哪条通路上 | `daemon.status.latency_guard.{tcp_media, mux}`（按连接的 `MediaPath` 枚举）。**现状仍然没有自己的字段**，plan §16.4 里说的那个 `transport_tier` 至今未落地 |
+    /// | 字节此刻在哪条通路上 | **按会话**：[`SessionStats::transport`]（由该流绑定的 `MediaPath` 直接投影）。**按对端**：仍然没有自己的字段，只能从 `daemon.status.latency_guard.{tcp_media, mux}` 推——plan §16.4 里说的那个 per-peer `transport_tier` 至今未落地 |
     /// | daemon 自动判定这条链路只能跑哪一档 | [`PeerState::auto_tier`] + 理由 + 时刻 |
     ///
     /// 后两个**不是同一件事**：一台钉死 tier 0 的机器，判定可以是 `tier1`
@@ -1017,6 +1017,47 @@ pub struct SessionStats {
     /// 假的（丢弃是真的，计数不存在）。
     #[serde(default)]
     pub auth_failed: u64,
+
+    // -------------------------------------------- M8: which transport carries this
+    /// The connectivity tier **this session's bytes actually travel on**:
+    /// `"tier0"` (UDP) | `"tier1"` (a dedicated media TCP connection) |
+    /// `"tier2"` (the one multiplexed connection). `None` = the daemon did not
+    /// report it, which a reader must render as "unknown" and **never as
+    /// tier 0** (plan §16.4 rule 5: "already decided it is direct" and "nothing
+    /// has been decided" may not look the same).
+    ///
+    /// # This is the link, never the setting, never the verdict
+    ///
+    /// Three quantities share this vocabulary and **none may stand in for
+    /// another** (plan §16.4 rule 5):
+    ///
+    /// | question | read |
+    /// |---|---|
+    /// | what the user asked for | [`PeerTransportView::tier`] (also `"auto"`) |
+    /// | what the detector concluded | [`PeerState::auto_tier`] + reason + time |
+    /// | **where the bytes go** | **this field** |
+    ///
+    /// They diverge in ordinary operation. A peer left on AUTO that has been
+    /// downgraded reads `"auto"` for the setting and `"tier1"` here. A peer
+    /// pinned to `"tier1"` whose partner is pinned to `"tier0"` had its attach
+    /// refused, so it reads `"tier1"` for the setting and `"tier0"` here.
+    /// Serving this from the store would report the tier the user *wanted* on a
+    /// link that never got it — the one reading that makes a degraded link
+    /// indistinguishable from a healthy one, which is the entire reason plan
+    /// §16.4 wants the tier surfaced at all.
+    ///
+    /// # Why it is per session and not only per peer
+    ///
+    /// design §5.2: the tier is one value per peer, but session statistics are
+    /// read **per session**, and a reader of one session should not have to go
+    /// back and join against the peer table to find out how its bytes travel.
+    /// The value is frozen when the stream is created, from the same
+    /// `MediaPath` the stream is bound to (design §5.1: transports switch
+    /// between streams, never inside one), so during a promotion or demotion
+    /// two sessions on the same peer may legitimately disagree — and each is
+    /// telling the truth about itself.
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

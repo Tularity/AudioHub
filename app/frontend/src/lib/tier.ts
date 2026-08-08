@@ -11,7 +11,7 @@
 //
 // | 读哪里 | 是什么 | 谁写的 |
 // |---|---|---|
-// | `PeerState.transport.tier` | **用户的选择**：`auto` / `tier0` / `tier1` | 用户，经 `peers.set_tier` |
+// | `PeerState.transport.tier` | **用户的选择**：`auto` / `tier0` / `tier1` / `tier2` | 用户，经 `peers.set_tier` |
 // | 本文件的 `effectiveTier()` | **链路的现状**：字节此刻在哪条通路上 | daemon 的 `MediaPath` |
 //
 // 选了「自动」的对端此刻完全可能正跑在 Tier 1 上，而 `transport.tier` 照旧是
@@ -42,10 +42,15 @@
 //
 // # 未来
 //
-// 若将来 daemon 报出一个真正的「现状」字段（按 `MediaPath` 直接投影，而不是
-// `auto_tier` 那种判定记录），`effectiveTier()` 应当整体换成读那一个字段，
-// **判定不再由 UI 做**。届时本文件的三行判据全部删掉，调用点一行不动 ——
-// 这正是它被收进单个函数的理由。
+// 若将来 daemon 报出一个真正的**按对端**的「现状」字段（按 `MediaPath` 直接
+// 投影，而不是 `auto_tier` 那种判定记录），`effectiveTier()` 应当整体换成读那
+// 一个字段，**判定不再由 UI 做**。届时本文件的三行判据全部删掉，调用点一行不动
+// —— 这正是它被收进单个函数的理由。
+//
+// ⚠ **`SessionStats.transport` 不是那个字段，不要拿它来换。** 它确实是按
+// `MediaPath` 直接投影的现状（见 [`sessionTier`]），但它**按会话**：一台连着而
+// 此刻没有任何会话的对端仍然要答得出「现在怎么连的」，而那时一条会话都没有，
+// 换过去只会让对端卡片在空闲时倒退回「未判定」。两者并存，各答各的问题。
 //
 // 而 `auto_tier` / `auto_tier_reason` / `auto_tier_since` 是**另一件事**，
 // 归 plan §16.4 的二级页面：现状回答「为什么慢」，判定回答「凭什么这么判的」。
@@ -160,3 +165,32 @@ export const TIER_WHY: Record<EffectiveTier, MsgKey> = {
   tier1: 'tier.now.tier1Why',
   tier2: 'tier.now.tier2Why',
 };
+
+// -------------------------------------------------------- 按会话的现状（M8 §9）
+
+/**
+ * **这一条会话**的字节走在哪一档，取自 daemon 的 `SessionStats.transport`。
+ *
+ * `null` = **未判定**（这一版服务不上报这个字段）。调用方必须渲染成灰色的「—」，
+ * **绝不能当成 Tier 0**——与 [`effectiveTier`] 同一条红线（plan §16.4 第 5 条）。
+ *
+ * # 为什么这是一个函数而不是 `info.stats?.transport as EffectiveTier`
+ *
+ * 那个 `as` 会把 daemon 某天新增的第四档（或一个打错的串）直接当成合法档位交给
+ * `TIER_LABEL`，查表落空、界面上出现一个空白徽标而没有任何地方会报错。这里做
+ * 一次白名单收敛：认不出来的串一律回到「未判定」，与本项目在 `tierPickLabel`
+ * 上的处置同一条规矩。
+ *
+ * # 它读的是链路，不是设置
+ *
+ * daemon 侧这个字段来自该流绑定的 `MediaPath`（`SessionEntry::media_tier`），
+ * 不是 `PeerState.transport.tier`。两者在日常运行中就分岔：钉在 tier 1 而对端
+ * 钉在 tier 0 的机器，设置读 `tier1`、这里读 `tier0`。**不许互相冒充**。
+ */
+export function sessionTier(
+  info: { stats?: { transport?: string | null } | null } | null | undefined,
+): EffectiveTier | null {
+  const t = info?.stats?.transport;
+  return t === 'tier0' || t === 'tier1' || t === 'tier2' ? t : null;
+}
+

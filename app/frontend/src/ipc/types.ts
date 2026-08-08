@@ -43,7 +43,7 @@ export interface HalStatus {
  *
  * # 这是全应用唯一说得出「这台对端现在实际跑在哪一档」的东西
  *
- * `PeerState.transport.tier` 是**用户的选择**（`auto` / `tier0` / `tier1`），
+ * `PeerState.transport.tier` 是**用户的选择**（`auto` / `tier0` / `tier1` / `tier2`），
  * 不是现状：选了「自动」的对端此刻可能正跑在 Tier 1 上，而那个字段照旧写着
  * `auto`。daemon 侧那份契约（`audiohub-ipc` 的 `PeerTransportView::tier`）
  * 逐字写着这一点，而两者**不得互相冒充**（plan §16.4 第 5 条）。
@@ -524,6 +524,34 @@ export interface SessionStats {
   /** 目标够不到，已经贴在物理下限 / 上限上。**只在闭环（真有实测值）时为真。** */
   at_floor?: boolean;
   at_ceiling?: boolean;
+  /**
+   * 这条会话的字节**此刻实际走在哪一档**：`'tier0'`（UDP）/ `'tier1'`（专用媒体
+   * TCP）/ `'tier2'`（单连接复用）。
+   *
+   * 缺席 / `null` = **这一版服务不上报**，必须渲染成「—」，**绝不能当成 tier0**
+   * （plan §16.4 第 5 条：「已判定为直连」与「未判定」不得渲染成同一个样子）。
+   *
+   * # 它是**链路**，不是**设置**，也不是**判定**
+   *
+   * 三个量共用这套词汇，谁也不许冒充谁（plan §16.4 第 5 条）：
+   *
+   * | 问题 | 读哪里 |
+   * |---|---|
+   * | 用户要什么 | `PeerState.transport.tier`（还可能是 `'auto'`） |
+   * | daemon 判定这条链路只能跑哪一档 | `PeerState.auto_tier` + 理由 + 时刻 |
+   * | **字节实际走哪** | **本字段** |
+   *
+   * 它们在日常运行中就会分岔：钉在 `'tier1'` 而对端钉在 `'tier0'` 的机器，媒体
+   * attach 被拒、字节照旧走 UDP —— 设置读 `'tier1'`，这里读 `'tier0'`。拿设置去
+   * 填这一格，等于让一条没拿到降级链路的连接看起来和拿到了的一模一样。
+   *
+   * # 与 `effectiveTier()` 的分工
+   *
+   * 本字段**按会话**，`lib/tier.ts` 的 `effectiveTier()` **按对端**。后者不能改成
+   * 读这个字段：一台连着但没有任何会话的对端仍然要答得出「现在怎么连的」，而那时
+   * 一条会话都没有。两者并存，各自回答各自的问题。
+   */
+  transport?: string | null;
 }
 
 export type SessionKind = 'mic' | 'spk' | string;

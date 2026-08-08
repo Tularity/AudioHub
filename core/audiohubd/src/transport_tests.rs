@@ -2664,6 +2664,131 @@ fn a_tier_zero_peer_refuses_out_loud_rather_than_by_timing_out() {
     );
 }
 
+// ------------------------------------------- the tier a session REPORTS (M8, §9)
+
+/// Every session this daemon holds, as `(id, stats.transport)`.
+///
+/// Read through IPC rather than off `snapshot_sessions`, because the field
+/// under test is an IPC contract field: a value that exists in `SessionEntry`
+/// but never reaches the wire is exactly the failure `SessionStats.transport`
+/// was added to end.
+fn session_tiers(n: &Node) -> Vec<(u64, Option<String>)> {
+    n.ok(methods::SESSION_LIST, json!({}))
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .map(|s| {
+            (
+                s["id"].as_u64().unwrap_or(0),
+                s["stats"]["transport"].as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+fn assert_all_sessions_report(n: &Node, who: &str, want: &str) {
+    let got = session_tiers(n);
+    assert!(!got.is_empty(), "{who} has no session, so this assertion would be vacuous");
+    for (id, tier) in &got {
+        assert_eq!(
+            tier.as_deref(),
+            Some(want),
+            "{who} session {id} reports transport {tier:?}, want {want:?}; all of {who}: {got:?}"
+        );
+    }
+}
+
+/// **A session on a tier 1 link says so** (plan §9 M8: the tier must be
+/// labelled in the statistics, not only in the UI).
+///
+/// The positive control for the test below. On its own it has little resolving
+/// power — a hard-coded `"tier1"` would pass it — which is precisely why the
+/// two are a pair: this one forbids a constant `"tier0"`, the next forbids
+/// serving the field out of the settings store.
+///
+/// Both directions are checked. The consumer's session is a `send` (its media
+/// path lives on the tx thread) and the provider's is a `recv` (its path lives
+/// on `RxStream`), so a field wired up on only one of the two halves is red
+/// here on the other.
+#[test]
+fn a_session_on_a_tier_one_link_reports_tier_one() {
+    let a = Node::start("t1-stat-a");
+    let b = Node::start("t1-stat-b");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    pin_tier(&a, &b.fingerprint(), "tier1");
+    pin_tier(&b, &a.fingerprint(), "tier1");
+    pair(&a, &b);
+    eventually("a tier 1 media link on the accepting side", || {
+        b.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+
+    tone_session(&a, &b);
+    eventually("the provider to have its receiving session", || !session_tiers(&b).is_empty());
+
+    assert_all_sessions_report(&a, "the consumer", "tier1");
+    assert_all_sessions_report(&b, "the provider", "tier1");
+}
+
+/// **`SessionStats.transport` names the LINK, never the SETTING.**
+///
+/// This is the one assertion that separates the two, and the contract on the
+/// field (and `MediaPath::tier_wire`, and plan §16.4 rule 5) says they may
+/// never stand in for one another. The rig is the cheapest place where they
+/// genuinely disagree without any fault injection: A is pinned to tier 1 and B
+/// is pinned to tier 0, so B refuses the media attach and A's media stays on
+/// UDP — while A's stored tier goes on reading `"tier1"`, because a refused
+/// attach is not a reason to silently rewrite what the user asked for.
+///
+/// So: setting `"tier1"`, link `"tier0"`. An implementation that read
+/// `inner.peer_transport` (or `PeerState.transport.tier`, or `effective_tier`)
+/// would report `"tier1"` here and make a link that never got what it asked for
+/// indistinguishable from one that did — the exact misreading plan §16.4 wants
+/// the tier surfaced in order to prevent.
+///
+/// The `assert_ne!` at the end is deliberate and load-bearing: without it a
+/// later change that made the two agree (say, by rewriting the pin on refusal)
+/// would leave this test green while destroying its entire resolving power.
+#[test]
+fn the_session_transport_names_the_link_not_the_setting() {
+    let a = Node::start("t1-stat-refuse-a");
+    let b = Node::start("t1-stat-refuse-b");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    // A wants tier 1. B will not grant it.
+    pin_tier(&a, &b.fingerprint(), "tier1");
+    pin_tier(&b, &a.fingerprint(), "tier0");
+    pair(&a, &b);
+    assert!(
+        a.tcp_media().is_empty(),
+        "B granted the attach after all, so the setting and the link agree and this test has \
+         nothing left to distinguish"
+    );
+
+    tone_session(&a, &b);
+    eventually("the provider to have its receiving session", || !session_tiers(&b).is_empty());
+
+    // The premise, restated as an assertion: the SETTING still says tier 1.
+    let setting = a.peer(&b.fingerprint())["transport"]["tier"].as_str().map(str::to_string);
+    assert_eq!(
+        setting.as_deref(),
+        Some("tier1"),
+        "A's stored tier is no longer tier 1, so `assert_ne!` below is comparing two equal \
+         things and the discriminating power of this test is gone"
+    );
+
+    // ...and the LINK says tier 0, on both machines.
+    assert_all_sessions_report(&a, "the consumer", "tier0");
+    assert_all_sessions_report(&b, "the provider", "tier0");
+
+    let reported = session_tiers(&a).first().and_then(|(_, t)| t.clone());
+    assert_ne!(
+        reported, setting,
+        "the session reported the tier the user ASKED for. A degraded link now reads exactly \
+         like a healthy one, which is what plan §16.4 rule 5 forbids"
+    );
+}
+
 /// **A second media attach is refused while one is installed.**
 ///
 /// The check it guards used to read `media_path`, release the lock, and let
@@ -3090,6 +3215,15 @@ fn a_tier_two_pair_survives_the_source_address_being_lost() {
     );
     assert_eq!(recv["stats"]["lost"].as_u64(), Some(0), "loopback TCP lost a packet: {recv}");
     assert!(fwd.carried() > 0, "the forwarder carried nothing, so it is not in the path");
+
+    // (6) ...and the statistics **say** tier 2 (plan §9 M8: the tier has to be
+    // labelled in the statistics too). This is the only rig in the tree where a
+    // session is bound to `MediaPath::Framed`, so it is the only place the third
+    // arm of `MediaPath::tier_wire` is exercised against a real connection — the
+    // other two arms are covered by the pair of tests beside
+    // `a_tier_zero_peer_refuses_out_loud_rather_than_by_timing_out`.
+    assert_all_sessions_report(&a, "the consumer", "tier2");
+    assert_all_sessions_report(&b, "the provider", "tier2");
 }
 
 /// **Acceptance 3 (design §6, P5): media at full rate must not starve the

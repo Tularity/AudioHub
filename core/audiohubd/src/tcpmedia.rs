@@ -256,6 +256,40 @@ impl MediaPath {
             MediaPath::Framed(m) => Some(m.media()),
         }
     }
+
+    /// This path's connectivity tier, in the wire vocabulary the IPC contract
+    /// uses ([`audiohub_ipc::SessionStats::transport`]).
+    ///
+    /// # This is the link, never the setting
+    ///
+    /// Three quantities share this vocabulary and **none of them may stand in
+    /// for another** (plan §16.4 rule 5):
+    ///
+    /// | question | source |
+    /// |---|---|
+    /// | what the user asked for | `PeerTransport::transport_tier` (also `"auto"`) |
+    /// | what the detector concluded | `PeerTransport::auto_tier` |
+    /// | **where the bytes actually go** | **this function** |
+    ///
+    /// They diverge in ordinary operation, not just in corner cases: a peer left
+    /// on AUTO that has been downgraded reads `"auto"` for the setting and
+    /// `"tier1"` here, and a peer pinned to `"tier1"` whose partner is pinned to
+    /// `"tier0"` reads `"tier1"` for the setting and `"tier0"` here — the attach
+    /// was refused. Deriving this from the store would report the tier the user
+    /// wanted on a link that never got it, which is the one reading that makes
+    /// a degraded link indistinguishable from a healthy one.
+    ///
+    /// Returning a `&'static str` rather than a [`TransportTier`] is deliberate:
+    /// the enum carries `Auto`, which is a statement about a *preference* and
+    /// can never describe a live path. The strings still come from that enum so
+    /// the two vocabularies cannot drift apart.
+    pub(crate) fn tier_wire(&self) -> &'static str {
+        match self {
+            MediaPath::Udp(_) => TransportTier::Tier0.as_wire(),
+            MediaPath::Tcp(_) => TransportTier::Tier1.as_wire(),
+            MediaPath::Framed(_) => TransportTier::Tier2.as_wire(),
+        }
+    }
 }
 
 impl std::fmt::Debug for MediaPath {

@@ -1398,6 +1398,11 @@ fn handle_remote_open(
     match dir {
         // opener sends media -> we receive; verify_freq applies here
         DIR_SEND => {
+            // ONE read of the path, shared by the stream that is bound to it and
+            // by the tier the session reports. Two reads could straddle an
+            // attach and leave a stream saying it travels somewhere it does not.
+            let path = conn.current_media_path();
+            let media_tier = path.tier_wire();
             let rx = Arc::new(RxStream::new(
                 stream_id,
                 &conn.rx_key,
@@ -1407,7 +1412,7 @@ fn handle_remote_open(
                 false,
                 None, // bridging is the local consumer's choice, never the peer's
                 None, // ...and so is the virtual microphone (spec-m5b §5.4)
-                conn.current_media_path(),
+                path,
             ));
             wr(&inner.rx_table).insert(stream_id, rx.clone());
             lk(&inner.state).sessions.insert(
@@ -1427,6 +1432,7 @@ fn handle_remote_open(
                     peer_lat: Arc::new(PeerLatCell::new()),
                     pushed: pushed.clone(),
                     armed_conn_ms: conn.clock_ms(),
+                    media_tier,
                 },
             );
         }
@@ -1437,6 +1443,7 @@ fn handle_remote_open(
             let slot = lk(&inner.haldev).slot_of(&conn.fp);
             let spec = source_spec(source, freq, backend, slot)?;
             let path = conn.current_media_path();
+            let media_tier = path.tier_wire();
             let shared = Arc::new(TxShared::new_on(path.auto_top_rung()));
             start_tx_stream(
                 inner,
@@ -1465,6 +1472,7 @@ fn handle_remote_open(
                     peer_lat: Arc::new(PeerLatCell::new()),
                     pushed: pushed.clone(),
                     armed_conn_ms: conn.clock_ms(),
+                    media_tier,
                 },
             );
         }
@@ -2308,6 +2316,13 @@ pub(crate) fn open_session_from(
     let (ptx, prx) = mpsc::channel();
     lk(&conn.pending).insert(stream_id, ptx);
 
+    // ONE read of the path for this session, whichever half of it gets built:
+    // the stream is bound to it and the session reports its tier, and two reads
+    // straddling an attach would leave a stream saying it travels somewhere it
+    // does not.
+    let path = conn.current_media_path();
+    let media_tier = path.tier_wire();
+
     // register the receive side before OpenStream goes out so no early media
     // is dropped once the provider accepts
     let rx_arc = if consuming {
@@ -2320,7 +2335,7 @@ pub(crate) fn open_session_from(
             params.monitor,
             bridge.clone(),
             hal_slot,
-            conn.current_media_path(),
+            path.clone(),
         ));
         wr(&inner.rx_table).insert(stream_id, rx.clone());
         Some(rx)
@@ -2363,7 +2378,6 @@ pub(crate) fn open_session_from(
     // （`the_two_ends_agree_on_what_a_wire_byte_is` 盯的正是这个差）。
     let mut tx_shared: Option<Arc<TxShared>> = None;
     if !consuming {
-        let path = conn.current_media_path();
         let shared = Arc::new(TxShared::new_on(path.auto_top_rung()));
         shared.armed.store(false, Ordering::SeqCst);
         if let Err(e) = start_tx_stream(
@@ -2445,6 +2459,7 @@ pub(crate) fn open_session_from(
             peer_lat: Arc::new(PeerLatCell::new()),
             pushed: Arc::new(crate::PushedTransport::default()),
             armed_conn_ms: conn.clock_ms(),
+            media_tier,
         }
     } else {
         SessionEntry {
@@ -2462,6 +2477,7 @@ pub(crate) fn open_session_from(
             peer_lat: Arc::new(PeerLatCell::new()),
             pushed: Arc::new(crate::PushedTransport::default()),
             armed_conn_ms: conn.clock_ms(),
+            media_tier,
         }
     };
     // Liveness is re-checked under the SAME lock that inserts. A peer that

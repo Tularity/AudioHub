@@ -942,12 +942,20 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                         .collect();
                     extra.push_str(&format!(" mix[{}]", parts.join(",")));
                 }
+                // `transport` is the tier this session's bytes REALLY travel on
+                // (daemon side: the stream's own `MediaPath`), never the tier
+                // the user pinned — those two disagree whenever an attach was
+                // refused, and telling them apart is the whole point of the
+                // field. `?` for "this daemon did not report it": an older
+                // daemon must not read as tier 0 (plan §16.4 rule 5).
+                let transport = st.get("transport").and_then(Value::as_str).unwrap_or("?");
                 info(&format!(
-                    "session {} {}/{} peer={} recv={} lost={} loss={:.2}% jitter={:.2}ms jb={} sent={} rung={} rung_changes={}{}",
+                    "session {} {}/{} peer={} transport={} recv={} lost={} loss={:.2}% jitter={:.2}ms jb={} sent={} rung={} rung_changes={}{}",
                     val_u64(s, "id"),
                     val_str(s, "kind"),
                     val_str(s, "dir"),
                     val_str(s, "peer_name"),
+                    transport,
                     val_u64(&st, "received"),
                     val_u64(&st, "lost"),
                     val_f64(&st, "loss_pct"),

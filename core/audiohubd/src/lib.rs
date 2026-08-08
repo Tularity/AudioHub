@@ -1758,6 +1758,27 @@ pub(crate) struct SessionEntry {
     /// This field is that shape, so it is named for its one purpose: it is the
     /// moment a watchdog was armed, not the age of the session.
     pub armed_conn_ms: u64,
+    /// The connectivity tier **this session's media really travels on**, in the
+    /// wire vocabulary of [`audiohub_ipc::SessionStats::transport`]. Taken from
+    /// the very `MediaPath` this stream was bound to, at the moment it was
+    /// bound.
+    ///
+    /// # Why it is frozen here and not read off `conn` when the stats are built
+    ///
+    /// A stream owns its `MediaPath` for life (design §5.1; see
+    /// [`ConnShared::current_media_path`]), while `conn.media_path` keeps
+    /// moving: `tcpmedia::serve`'s teardown writes `MediaPath::Udp` back
+    /// *before* the control connection is dropped, so a stats build landing in
+    /// that window would report `"tier0"` for streams whose bytes were going —
+    /// and failing to go — over a dead TCP link. Reading `conn` would also make
+    /// every session on a peer report one identical value, which is exactly the
+    /// per-peer reading design §5.2 says this field must not be a copy of.
+    ///
+    /// A `&'static str` rather than the `MediaPath`: the session table is
+    /// cloned once a second for snapshots, and holding the path here would keep
+    /// an `Arc<TcpMediaLink>` (and its buffers) alive for as long as the entry
+    /// outlives the link.
+    pub media_tier: &'static str,
 }
 
 /// 对端推来、执行器在本机的两个档位。只有本机是**提供者**（`origin == Peer`）
@@ -3554,6 +3575,14 @@ fn build_session_info_with(
         auth_failed: 0,
         wire_bytes: 0,
         datagram_bytes: 0,
+        // Where THIS stream's bytes go, frozen when it was bound (see
+        // `SessionEntry::media_tier`). Deliberately **not** derived from
+        // `inner.peer_transport`: that store holds what the user ASKED for, and
+        // a peer pinned to tier 1 whose partner refused the attach is running
+        // on tier 0 while the store still says `"tier1"`. Reporting the setting
+        // here would make a degraded link read exactly like a healthy one,
+        // which is the reading plan §16.4 exists to prevent.
+        transport: Some(e.media_tier.to_string()),
     };
     // 目标是谁定的。`origin == Peer` ⇒ 本机是提供者，档位由使用方推来。
     if s.latency_target.is_some() || s.quality_target.is_some() {
@@ -5344,6 +5373,16 @@ mod telemetry_tests {
         assert!(s.quality.is_none());
         assert_eq!(s.jb_popped, 0);
         assert_eq!(s.jb_contiguous_frames, 0);
+        // Absent must decode as "not reported", never as tier 0. A `#[serde(default)]`
+        // on a `String` (rather than on the `Option`) would make every session an
+        // older daemon ever sent read back as `""`, and every reader that treats
+        // "not tier1/tier2" as "direct" would then quietly claim a direct link on
+        // evidence nobody supplied — the reading plan §16.4 rule 5 forbids.
+        assert!(
+            s.transport.is_none(),
+            "a v1 stats block decoded to a transport tier: {:?}",
+            s.transport
+        );
     }
 
     // ================================================== P1：时钟偏移与网络单程

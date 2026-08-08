@@ -14,6 +14,7 @@ import {
   LATENCY_STAGES, PARALLEL_TAILS, countedTail, coversWholeChain, isLowerBound,
   latencyValueKey, qualityDepthKey, readLatency, readQuality,
 } from '../lib/metrics';
+import { isDegradedTier, sessionTier, TIER_LABEL, TIER_WHY } from '../lib/tier';
 import { t, joinPhrases } from '../i18n';
 import type { MsgKey } from '../i18n';
 import { useStore } from '../state/store';
@@ -328,6 +329,9 @@ function SessionCard({ info, hist }: { info: SessionInfo; hist: MetricHistory | 
   // 抖动缓冲这一级的 ms，由 daemon 算好（`jitter_buf`）。用来给下面那格帧数配一个
   // 与延迟档同量纲的读数；读不到就不配（不拿帧数 ×10 编一个）。
   const jbMs = readLatency(info)?.stages?.jitter_buf?.ms;
+  // 这条会话的字节走哪条通路（M8）。`null` = 服务不上报 ⇒ 下面那行写「—」，
+  // **不当成直连**（plan §16.4 第 5 条）。
+  const tier = sessionTier(info);
 
   return (
     <article className="card session-card" data-testid={`session-row-${info.id}`}>
@@ -335,6 +339,23 @@ function SessionCard({ info, hist }: { info: SessionInfo; hist: MetricHistory | 
         <strong>{t('stats.session', { id: info.id })}</strong>
         <span className="tag accent" title={flow.label} data-testid={`session-flow-${info.id}`}>{flow.short}</span>
         <span className="tag">{dirLabel(info.dir)}</span>
+        {/* 降级档位是**一级信息**，且必须与延迟数字同屏（plan §16.4 第 1 条）：
+            这枚徽标就在下面那排 metric 的正上方，用户读到那个变大的延迟数时
+            原因已经在旁边了。
+            **Tier 0 不挂**（第 3 条）——给每条正常会话挂一枚「一切正常」只会
+            训练用户忽略这个位置，而这正是指望它在降级时被看见的地方。
+            「未判定」也不挂：它在下面那行脚注里有自己的写法，两者不同形。 */}
+        {isDegradedTier(tier)
+          ? (
+            <span
+              className="tag warn"
+              title={t(TIER_WHY[tier])}
+              data-testid={`session-transport-${info.id}`}
+            >
+              {t(TIER_LABEL[tier])}
+            </span>
+          )
+          : null}
         {/* origin=hal 的会话必须写出是**哪一台**虚拟设备触发的：模式 B 下这是用户唯一
             能把「统计页这一行」和「我刚在系统里选的那台设备」对上的线索。 */}
         {origin
@@ -421,6 +442,17 @@ function SessionCard({ info, hist }: { info: SessionInfo; hist: MetricHistory | 
             : t('stats.extra.jbDepth', { n: fmt.count(st.jb_depth_frames) })}
         </span>
         <span>{t('stats.extra.rungChanges', { n: fmt.count(st.rung_changes) })}</span>
+        {/* 通路的**全文**，三态各写各的（plan §16.4 第 4/5 条）。上面那枚徽标只在
+            降级时出现，所以只有它的话，「直连」与「服务不上报」在这一页上会长得
+            一模一样——而第 5 条点名禁止这两者同形。 */}
+        <span
+          data-testid={`session-transport-full-${info.id}`}
+          title={t(tier ? 'stats.extra.transportWhy' : 'stats.extra.transportUnknownWhy')}
+        >
+          {tier
+            ? t('stats.extra.transport', { v: t(TIER_LABEL[tier]) })
+            : t('stats.extra.transportUnknown')}
+        </span>
         {/* ---- 两个**静默降级**计数器：非零才显示，且非零就是坏消息 ----------
             两个都是「JB 的五个计数器全部一片正常，而声音已经坏了」的那类故障，
             所以它们必须有自己的位置——挂在别人身上就等于没有。

@@ -12,14 +12,21 @@ macro_rules! elog {
 }
 
 fn usage() -> ! {
-    elog!("usage: audiohubd [--port N] [--ipc-port N] [--announce] [--secs N] [--json]");
+    elog!(
+        "usage: audiohubd [--port N] [--ipc-port N] [--announce|--no-announce] [--secs N] [--json]"
+    );
     std::process::exit(2);
 }
 
 fn main() {
     let mut port: u16 = 47810;
     let mut ipc_port: u16 = 0;
-    let mut announce = false;
+    // `None` = follow `settings.discovery_announce`, and it is the default
+    // because this is the process the app and the autostart entries spawn with
+    // no arguments at all. When announcing was a flag, that was the whole bug:
+    // the shipping app never announced itself and 「同网段互见」 only ever
+    // worked for someone running the CLI by hand.
+    let mut announce: Option<bool> = None;
     let mut secs: f64 = 0.0;
     let mut json = false;
 
@@ -38,7 +45,8 @@ fn main() {
                 Some(v) if v >= 0.0 => secs = v,
                 _ => usage(),
             },
-            "--announce" => announce = true,
+            "--announce" => announce = Some(true),
+            "--no-announce" => announce = Some(false),
             "--json" => json = true,
             _ => usage(),
         }
@@ -52,6 +60,7 @@ fn main() {
         hal_bridge: None, // production: AUDIOHUB_HAL_BRIDGE decides
         tx_throttle_kbps: None, // production: AUDIOHUB_TEST_TX_KBPS decides (normally unlimited)
         block_udp: None, // production: AUDIOHUB_TEST_BLOCK_UDP decides (normally nothing)
+        announce_fault: false, // test-only knob; there is no production value for it
     }) {
         Ok(h) => Arc::new(h),
         Err(e) => {

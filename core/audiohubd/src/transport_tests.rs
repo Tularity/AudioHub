@@ -78,11 +78,15 @@ impl Node {
             control_port: 0,
             ipc_port: 0,
             config_dir: Some(dir.clone()),
-            announce: false,
+            // Pinned, never `None`: a test daemon that followed the stored
+            // setting would announce itself on the user's real LAN under this
+            // machine's real name (see `DaemonCfg::announce`).
+            announce: Some(false),
             // 与 mode_tests 同一条理由：`auto` 会把用户的真 daemon 从驱动上挤掉。
             hal_bridge: Some(HalBridgeMode::Off),
             tx_throttle_kbps: tx_kbps,
             block_udp,
+            announce_fault: false,
         })
         .expect("start daemon");
         Node { h, dir }
@@ -1602,12 +1606,13 @@ fn a_fixed_choice_is_still_in_force_after_a_restart() {
         control_port: 0,
         ipc_port: 0,
         config_dir: Some(dir.clone()),
-        announce: false,
+        announce: Some(false),
         hal_bridge: Some(HalBridgeMode::Off),
         // Production and every test but the tier 2 starvation rig: whatever
         // the environment says (normally nothing, i.e. unlimited).
         tx_throttle_kbps: None,
         block_udp: None,
+        announce_fault: false,
     };
 
     // 一台真对端：`peers.set_transport` 要解析指纹，没有配对就没有指纹。
@@ -1718,6 +1723,15 @@ fn every_writable_setting_key_is_really_honoured() {
             "mode_a_mute_local",
             json!(true),
             &|v: &Value| v.get("mode_a_mute_local").cloned().unwrap_or(Value::Null),
+        ),
+        // `false` is the away-from-default value here — this is the one setting
+        // that ships ON — and it is also the only value a test may write: a
+        // test daemon that turned announcing ON would put itself on the user's
+        // real LAN (see `DaemonCfg::announce`).
+        (
+            "discovery_announce",
+            json!(false),
+            &|v: &Value| v.get("discovery_announce").cloned().unwrap_or(Value::Null),
         ),
         (
             "latency",

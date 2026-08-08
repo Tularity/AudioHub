@@ -712,6 +712,17 @@ export interface DaemonSettings {
    * 通路的那一刻静音本机一次，此后不做维持；用户之后取消静音即予尊重。
    */
   mode_a_mute_local?: boolean;
+  /**
+   * plan M3「同网段互见」：本机**要不要**通过 mDNS 广播自己，让同网段的其它
+   * 机器不用手打 IP 就能在扫描列表里看见它。可写，就是那个隐私开关。
+   */
+  discovery_announce?: boolean;
+  /**
+   * 此刻**是不是真的**在广播。派生值，daemon 每次现算，**不是上面那个的副本**：
+   * 组播被封、或 macOS 的「本地网络」权限还没授予时，上面是 true 而这个是
+   * false。与 `mode` / `effective_mode` 是同一对关系。
+   */
+  discovery_announcing?: boolean;
   hal_capacity?: number;
   hal_used?: number;
 }

@@ -23,9 +23,15 @@ pub enum M4Cmd {
         /// local IPC WebSocket port (0 = random)
         #[arg(long, default_value_t = 0)]
         ipc_port: u16,
-        /// announce over mDNS while running
+        /// force mDNS announcing ON for this run, whatever settings.json says
+        /// (the default is to follow `settings.discovery_announce`, which is
+        /// itself on unless the user turned it off)
         #[arg(long)]
         announce: bool,
+        /// force mDNS announcing OFF for this run without changing the stored
+        /// preference
+        #[arg(long, conflicts_with = "announce")]
+        no_announce: bool,
         /// stop after N seconds (0 = run until killed)
         #[arg(long, default_value_t = 0.0)]
         secs: f32,
@@ -209,6 +215,12 @@ pub enum CtlCmd {
         /// up; a later unmute is respected (plan §7.1)
         #[arg(long)]
         mode_a_mute_local: Option<bool>,
+        /// announce this machine over mDNS so others can find it without
+        /// typing an IP (plan M3). Off = this machine is not listable; every
+        /// other capability is unaffected. Takes effect without a restart, and
+        /// passing `true` when it is already true retries a failed announce.
+        #[arg(long)]
+        discovery_announce: Option<bool>,
     },
     /// plan §15：某一台对端、某一个方向的延迟与音质档。
     ///
@@ -312,8 +324,9 @@ pub fn dispatch(cmd: M4Cmd, json: bool) -> Result<i32> {
             port,
             ipc_port,
             announce,
+            no_announce,
             secs,
-        } => cmd_daemon(port, ipc_port, announce, secs, json),
+        } => cmd_daemon(port, ipc_port, announce_override(announce, no_announce), secs, json),
         M4Cmd::Ctl { cmd } => cmd_ctl(cmd, json),
         M4Cmd::Volume { device, set, mute, unmute } => {
             cmd_volume(device, set, mute, unmute, json)
@@ -371,7 +384,31 @@ fn cmd_volume(
     Ok(0)
 }
 
-fn cmd_daemon(port: u16, ipc_port: u16, announce: bool, secs: f32, json: bool) -> Result<i32> {
+/// Two flags, three states. Neither given is `None` — **follow the stored
+/// setting** — and that is the one the app and the autostart entries take, so
+/// it has to be the one that announces.
+///
+/// Clap refuses `--announce --no-announce` together (`conflicts_with`), so the
+/// `(true, true)` row cannot be reached from the command line; it is written
+/// out anyway rather than left to a wildcard, because the reachable-by-mistake
+/// version of this function is the one that reads only the first flag and
+/// silently ignores the second.
+pub(crate) fn announce_override(announce: bool, no_announce: bool) -> Option<bool> {
+    match (announce, no_announce) {
+        (false, false) => None,
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        (true, true) => None,
+    }
+}
+
+fn cmd_daemon(
+    port: u16,
+    ipc_port: u16,
+    announce: Option<bool>,
+    secs: f32,
+    json: bool,
+) -> Result<i32> {
     #[allow(unused_mut)]
     let mut handle = audiohubd::start_daemon(audiohubd::DaemonCfg {
         control_port: port,
@@ -381,6 +418,7 @@ fn cmd_daemon(port: u16, ipc_port: u16, announce: bool, secs: f32, json: bool) -
         hal_bridge: None, // production: AUDIOHUB_HAL_BRIDGE decides
         tx_throttle_kbps: None, // production: AUDIOHUB_TEST_TX_KBPS decides (normally unlimited)
         block_udp: None, // production: AUDIOHUB_TEST_BLOCK_UDP decides (normally nothing)
+        announce_fault: false, // test-only knob; there is no production value for it
     })?;
     info(&format!(
         "daemon running: control_port={port} ipc_port={} config_dir={}",
@@ -578,6 +616,7 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             mark_offline_devices,
             mode_a_volume_sync,
             mode_a_mute_local,
+            discovery_announce,
         } => {
             let mut p = serde_json::Map::new();
             if let Some(m) = mode {
@@ -594,6 +633,9 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             }
             if let Some(v) = mode_a_mute_local {
                 p.insert("mode_a_mute_local".into(), json!(v));
+            }
+            if let Some(v) = discovery_announce {
+                p.insert("discovery_announce".into(), json!(v));
             }
             // A read and a write are the same call with no fields to change,
             // so `settings` with no flags cannot accidentally write anything.
@@ -927,6 +969,7 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
             info(&format!(
                 "mode={} effective_mode={} remove_virtual_on_disconnect={} \
                  mark_offline_devices={} mode_a_volume_sync={} mode_a_mute_local={} \
+                 discovery_announce={} discovery_announcing={} \
                  virtual devices {}/{}",
                 val_str(v, "mode"),
                 val_str(v, "effective_mode"),
@@ -934,9 +977,22 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 val_bool(v, "mark_offline_devices"),
                 val_bool(v, "mode_a_volume_sync"),
                 val_bool(v, "mode_a_mute_local"),
+                val_bool(v, "discovery_announce"),
+                val_bool(v, "discovery_announcing"),
                 val_u64(v, "hal_used"),
                 val_u64(v, "hal_capacity"),
             ));
+            // Printed only when they disagree, and printed as the FACT rather
+            // than the wish: 「已开启」 next to a machine nobody can see is the
+            // failure this second field exists to make impossible.
+            if val_bool(v, "discovery_announce") && !val_bool(v, "discovery_announcing") {
+                info(
+                    "  ⚠ 本机想要广播，但广播没有建立起来：同网段的其它机器扫不到它。\
+                     手动填 IP 配对、接受别人连入、扫描别人都不受影响。\
+                     macOS 首次运行需要「本地网络」权限；授权后重新执行 \
+                     `ctl settings --discovery-announce=true` 即可重试。",
+                );
+            }
             // plan §15：延迟与音质**不再是全局设置**，所以这里不再印它们。
             // 印一个「代表值」正是 §14 裁定 1 那个「不管取哪条都在替另一条
             // 撒谎」的命令行版本——每对端两个方向，一共四个，它们互不相等。
@@ -1110,6 +1166,43 @@ mod tests {
         req(&v)
     }
 
+    /// **`audiohub daemon` with no flag must FOLLOW the stored setting.**
+    ///
+    /// From argv, not from the helper, because the value under test is what the
+    /// argument parser produces when nobody passes anything — and that is the
+    /// only shape the shipping product ever uses. `Some(false)` here is the
+    /// whole of the mDNS half of 🟠4: the daemon that the app spawns, the
+    /// Windows scheduled task runs and the macOS LaunchAgent runs all take this
+    /// branch, so a `false` in it is a machine that never appears on anybody's
+    /// network no matter what the user chose in the interface.
+    #[test]
+    fn a_daemon_launched_with_no_flag_follows_the_stored_announce_setting() {
+        fn parse(args: &[&str]) -> Option<bool> {
+            let cli = crate::Cli::try_parse_from(args)
+                .unwrap_or_else(|e| panic!("{args:?} 解析不了：{e}"));
+            let crate::TopCmd::M4(M4Cmd::Daemon { announce, no_announce, .. }) = cli.cmd else {
+                panic!("{args:?} 没有落到 daemon 子命令上")
+            };
+            announce_override(announce, no_announce)
+        }
+        assert_eq!(
+            parse(&["audiohub", "daemon"]),
+            None,
+            "不带参数启动的 daemon 没有去读设置 —— App、开机自启、每一条出厂路径 \
+             都走这一支，于是出厂形态永远不广播自己"
+        );
+        assert_eq!(parse(&["audiohub", "daemon", "--announce"]), Some(true));
+        assert_eq!(parse(&["audiohub", "daemon", "--no-announce"]), Some(false));
+        // The two cannot be given together — clap refuses, and it has to be the
+        // parser that refuses: resolving the contradiction here would pick one
+        // silently.
+        assert!(
+            crate::Cli::try_parse_from(["audiohub", "daemon", "--announce", "--no-announce"])
+                .is_err(),
+            "--announce 与 --no-announce 同时给出时必须报错，而不是悄悄挑一个"
+        );
+    }
+
     /// **`settings.set` 收得下的每一个字段，命令行都必须够得到。**
     ///
     /// 这条测试就是用户实测那个 `unexpected argument '--latency' found` 的
@@ -1130,6 +1223,7 @@ mod tests {
             ("mark_offline_devices", "--mark-offline-devices=false", json!(false)),
             ("mode_a_volume_sync", "--mode-a-volume-sync=true", json!(true)),
             ("mode_a_mute_local", "--mode-a-mute-local=true", json!(true)),
+            ("discovery_announce", "--discovery-announce=false", json!(false)),
         ];
         for key in audiohub_ipc::SETTINGS_WRITABLE_KEYS {
             let (_, flag, want) = sample

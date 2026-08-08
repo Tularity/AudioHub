@@ -42,7 +42,7 @@ impl Node {
             control_port: 0, // ephemeral: the suite must not fight the real daemon
             ipc_port: 0,
             config_dir: Some(dir.clone()),
-            announce: false,
+            announce: Some(false),
             // Never `auto`: a test daemon that attaches evicts the user's real
             // one, and the two then oscillate (progress.md 2026-08-03 — the
             // root cause of a 200-minute underrun investigation).
@@ -51,6 +51,7 @@ impl Node {
             // the environment says (normally nothing, i.e. unlimited).
             tx_throttle_kbps: None,
             block_udp: None,
+            announce_fault: false,
         })
         .expect("start daemon");
         Node { h, dir }

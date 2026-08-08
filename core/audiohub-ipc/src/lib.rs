@@ -206,6 +206,7 @@ pub const SETTINGS_WRITABLE_KEYS: &[&str] = &[
     "mark_offline_devices",
     "mode_a_volume_sync",
     "mode_a_mute_local",
+    "discovery_announce",
 ];
 
 /// Daemon-owned settings, `settings.get` / `settings.set` (spec-m5b §6.1).
@@ -245,6 +246,22 @@ pub struct DaemonSettings {
     /// is respected until the next stream comes up.
     #[serde(default)]
     pub mode_a_mute_local: bool,
+    /// plan M3 「同网段互见」: whether this machine ASKS to be announced over
+    /// mDNS. Writable; the privacy off switch.
+    ///
+    /// Absent from an older daemon's reply, and `false` is the right reading
+    /// there — a daemon that predates this field is one that never announced.
+    #[serde(default)]
+    pub discovery_announce: bool,
+    /// Whether an announcement is actually live right now. Derived, never
+    /// stored, and it is **not** a copy of the field above: multicast can be
+    /// blocked, and on macOS the local-network permission may not be granted
+    /// yet, in which case the wish is true and this is false. Same relationship
+    /// as `mode` to `effective_mode`, for the same reason — an interface that
+    /// can only see the wish will state that this machine is discoverable while
+    /// nobody can discover it.
+    #[serde(default)]
+    pub discovery_announcing: bool,
     /// 延迟滑条的固定档（毫秒，升序）。**daemon 是唯一真值源**——前端不许自己
     /// 写一份，否则两边的「有哪些档」会各自演化，而分歧不会有任何报错。
     ///
@@ -1217,8 +1234,12 @@ pub struct PeerState {
 /// - "settings.get"      {}                    -> DaemonSettings
 /// - "settings.set"      {mode?, remove_virtual_on_disconnect?,
 ///                        mark_offline_devices?, mode_a_volume_sync?,
-///                        mode_a_mute_local?}
+///                        mode_a_mute_local?, discovery_announce?}
 ///                                             -> DaemonSettings
+///       `discovery_announce` takes effect at once — no restart — and the reply
+///       carries `discovery_announcing` for whether it actually took. Setting
+///       it to a value it already has is a deliberate RETRY rather than a
+///       no-op: the machine whose announcement failed already holds `true`.
 ///       `latency` / `quality` **不再在这里**（plan §15）：它们是每对端 × 每
 ///       方向的选择，走 "peers.set_transport"。旧客户端传这两个键会被拒绝，
 ///       而不是被静默收下——静默收下正是本项目栽过六次的那个形状。

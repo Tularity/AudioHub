@@ -14,6 +14,16 @@ use serde::{Deserialize, Serialize};
 
 use audiohub_ipc::Mode;
 
+/// Bumped to 5 by plan M3 「同网段互见」: `discovery_announce` arrived.
+///
+/// It is the first field here whose absent value is **not** the `bool` default.
+/// A bare `#[serde(default)]` would read as `false`, so every machine that
+/// already has a settings.json would come back from the upgrade invisible on
+/// the network while a machine installed the same day would be visible — a
+/// split nothing in the interface could explain, and nothing in the code would
+/// report. `#[serde(default = "announce_by_default")]` makes "absent" mean the
+/// same thing as "fresh", which is the only reading that keeps one behaviour.
+///
 /// Bumped to 4 by plan §7.1: the two mode-A volume switches
 /// (`mode_a_volume_sync` / `mode_a_mute_local`) arrived.
 ///
@@ -45,7 +55,14 @@ use audiohub_ipc::Mode;
 /// a provider AND a consumer at once, so both `"a"` and `"b"` are half of the
 /// answer and neither is the whole one. Choosing for the user here would
 /// silently decide which half of their setup keeps working.
-pub(crate) const SETTINGS_VERSION: u32 = 4;
+pub(crate) const SETTINGS_VERSION: u32 = 5;
+
+/// `discovery_announce` defaults ON — see `StoredSettings::discovery_announce`.
+/// A named function rather than `#[serde(default)]` on purpose; the comment on
+/// [`SETTINGS_VERSION`] says why.
+fn announce_by_default() -> bool {
+    true
+}
 
 /// Exactly the fields this daemon owns. `effective_mode`, `hal_capacity` and
 /// `hal_used` are NOT here: they are derived at read time from what the driver
@@ -76,6 +93,22 @@ pub(crate) struct StoredSettings {
     /// with no per-peer state to remember afterwards.
     #[serde(default)]
     pub mode_a_mute_local: bool,
+    /// plan M3 「同网段互见」: announce this machine over mDNS so the others can
+    /// list it without anyone typing an IP.
+    ///
+    /// **Machine state, not a launch flag.** It used to be `--announce`, and
+    /// the consequence was that the shipping app never announced at all: the
+    /// UI spawns the daemon with no arguments, the autostart entries do the
+    /// same, and only two hand-run CLI subcommands passed it. A flag also has
+    /// no way back — nothing in the interface can turn a launch argument off,
+    /// which is exactly what the privacy half of this switch needs.
+    ///
+    /// Default ON: 「打开就看见对方」 is the M3 acceptance criterion, and a
+    /// discovery feature that is off until found is not a feature. The cost is
+    /// disclosed and reversible — see `audiohub_net::discovery` for what the
+    /// record contains and why the fingerprint is in it.
+    #[serde(default = "announce_by_default")]
+    pub discovery_announce: bool,
 }
 
 impl Default for StoredSettings {
@@ -115,6 +148,14 @@ impl Default for StoredSettings {
             // that hands its volume knob to another machine, is not a default.
             mode_a_volume_sync: false,
             mode_a_mute_local: false,
+            // ON, unlike the two above, and the difference is the direction the
+            // switch points: those two reach OUT and change a device the user
+            // is listening to right now, so they have to be asked for. This one
+            // only makes this machine listable by machines that can already
+            // reach its control port, and it is the whole content of M3
+            // 「同网段互见」 — off by default, the acceptance criterion is a
+            // feature nobody finds.
+            discovery_announce: announce_by_default(),
             // **AUTO，不是「最低」**，尽管 plan §5 写的是「默认建议延迟固定取
             // 最低」。理由是行为守恒，不是偏好：
             //
@@ -262,6 +303,81 @@ mod tests {
             "「静音本机」 must be opt-in: on by default, the first stream silences a machine \
              the user never asked to silence"
         );
+        // plan M3 「同网段互见」. The opposite default from the two above, and
+        // the asymmetry is the point: those reach out and change a device the
+        // user is listening to, this one only makes this machine listable.
+        assert!(
+            d.discovery_announce,
+            "a fresh machine must announce itself: 「打开就看见对方」 is the M3 acceptance \
+             criterion, and off by default it is a feature nobody finds"
+        );
+    }
+
+    /// **A settings.json written before this field existed must read as ON.**
+    ///
+    /// This is the whole reason `discovery_announce` uses
+    /// `#[serde(default = "announce_by_default")]` and not a bare
+    /// `#[serde(default)]`. With the bare one, absent reads as `false`: every
+    /// machine that upgrades comes back invisible on the network while a
+    /// machine installed the same afternoon is visible, the two disagree
+    /// forever, and nothing anywhere reports a difference — the file simply
+    /// does not have the key.
+    ///
+    /// The v4 body below is a real one: `mode` and both mode-A switches present
+    /// and non-default, so a failure here also shows whether the record
+    /// survived at all or fell back wholesale.
+    #[test]
+    fn a_settings_file_from_before_discovery_announce_still_announces() {
+        let dir = tmp("m3announce");
+        std::fs::write(
+            dir.join("settings.json"),
+            br#"{"version":4,"mode":"b","remove_virtual_on_disconnect":true,
+                 "mark_offline_devices":false,"mode_a_volume_sync":true,
+                 "mode_a_mute_local":true}"#,
+        )
+        .expect("write");
+        let got = StoredSettings::load(&dir);
+        assert!(
+            got.discovery_announce,
+            "an upgraded machine went silent: an absent 'discovery_announce' must mean the \
+             default (on), not bool::default() (off)"
+        );
+        // The rest of the record is untouched — adding a field must never be
+        // able to change a mode (see SETTINGS_VERSION).
+        assert_eq!(got.mode, Mode::B, "加字段把用户的模式重置了");
+        assert!(got.remove_virtual_on_disconnect);
+        assert!(!got.mark_offline_devices);
+        assert!(got.mode_a_volume_sync);
+        assert!(got.mode_a_mute_local);
+        assert_eq!(got.version, SETTINGS_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The privacy switch has to survive the file in **both** directions.
+    ///
+    /// Asserting only `false` would pass against an implementation that never
+    /// reads the key back and always answers with the default — which is `true`
+    /// — and asserting only `true` would pass against one that never writes it.
+    #[test]
+    fn the_discovery_switch_survives_the_file_both_ways() {
+        let dir = tmp("m3switch");
+        for want in [false, true, false] {
+            let s = StoredSettings { discovery_announce: want, ..StoredSettings::default() };
+            s.save(&dir).expect("save");
+            let got = StoredSettings::load(&dir);
+            assert_eq!(
+                got.discovery_announce, want,
+                "discovery_announce={want} 没有活过盘：隐私开关关掉之后重启又自己广播了"
+            );
+            assert_eq!(got, s, "这一个开关之外还有别的字段被这次写入改掉了");
+        }
+        // And it is really IN the file, not merely reconstructed from defaults.
+        let body = std::fs::read_to_string(dir.join("settings.json")).expect("read");
+        assert!(
+            body.contains("\"discovery_announce\""),
+            "settings.json 里没有 discovery_announce 这个键：{body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// plan §7.1 的两个开关必须真的**落盘并读回**。

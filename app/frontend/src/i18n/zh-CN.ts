@@ -643,6 +643,9 @@ export const zhCN = {
   'settings.identity.note': '对方在配对时核对的就是这串指纹。',
 
   'settings.net.title': '网络',
+  'settings.net.announceTitle': '在局域网内广播本机',
+  'settings.net.announceDesc': '开启后，同网段的其它 AudioHub 会在扫描时直接看见这台机器，双方都不用手打 IP。广播的内容只有三样：这台机器的名字、控制端口，以及本机身份指纹——指纹是公钥的摘要，任何能连上控制端口的机器在握手时本来就会拿到它，这里公开它只是让扫描列表能认出「这台是我自己」和「这台已经配过对」。关掉之后本机不再被扫描到，但手动填 IP 配对、接受别人连入、扫描别人全都照常可用。',
+  'settings.net.announceNotInForce': '⚠ 已开启，但广播没有建立起来：同网段的其它机器扫不到这台机器。macOS 首次运行需要在「系统设置 › 隐私与安全性 › 本地网络」里允许 AudioHub；授权之后把这个开关关掉再打开即可重试，不必重启。手动填 IP 配对、接受别人连入、扫描别人不受影响。',
   'settings.net.controlPort': '控制端口',
   'settings.net.controlPortDesc': 'daemon 对外的 TCP 控制端口（TLS + 指纹校验）。M4a 为只读展示，暂不支持修改。',
   'settings.net.controlPortBadge': '只读 · M4a',

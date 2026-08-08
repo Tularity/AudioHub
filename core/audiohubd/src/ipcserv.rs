@@ -431,7 +431,14 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     .unwrap_or(5.0)
                     .clamp(0.5, 60.0) as f32;
                 let store = PeerStore::load_at(Some(&inner.cfg_dir))?;
-                serde_json::to_value(audiohub_net::discovery::browse(secs, &store)?)?
+                // THIS daemon's fingerprint, not whatever the ambient config
+                // dir holds: now that we announce, filtering against the wrong
+                // identity means listing ourselves. See `discovery::browse`.
+                serde_json::to_value(audiohub_net::discovery::browse(
+                    secs,
+                    &store,
+                    &inner.id.fingerprint,
+                )?)?
             }
             methods::SESSION_OPEN => {
                 let p: OpenSessionParams = serde_json::from_value(params.clone())?;
@@ -481,6 +488,11 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 // transition below. Any other setting changing must not close
                 // anybody's sessions.
                 let mut mode_changed = false;
+                // Applied AFTER the settings lock is released: starting an
+                // announcement waits on the mDNS daemon (up to 3s when the
+                // network refuses), and every `settings.get` on every other IPC
+                // connection takes this same lock.
+                let mut announce_target: Option<bool> = None;
                 {
                     let mut s = lk(&inner.settings);
                     if let Some(m) = params.get("mode").and_then(Value::as_str) {
@@ -499,16 +511,29 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                         // plan §7.1 模式 A 的两个独立开关。
                         ("mode_a_volume_sync", 2u8),
                         ("mode_a_mute_local", 3u8),
+                        // plan M3 「同网段互见」 / its privacy off switch.
+                        ("discovery_announce", 4u8),
                     ] {
                         if let Some(v) = params.get(key).and_then(Value::as_bool) {
                             let slot = match field {
                                 0 => &mut s.remove_virtual_on_disconnect,
                                 1 => &mut s.mark_offline_devices,
                                 2 => &mut s.mode_a_volume_sync,
-                                _ => &mut s.mode_a_mute_local,
+                                3 => &mut s.mode_a_mute_local,
+                                _ => &mut s.discovery_announce,
                             };
                             changed |= *slot != v;
                             *slot = v;
+                            if field == 4 {
+                                // Unconditional, not `if changed`: a machine
+                                // whose announcement failed at startup has the
+                                // setting already true, so "set it to true
+                                // again" is precisely the retry a user reaches
+                                // for after granting the permission. Treating
+                                // it as a no-op would leave the one machine
+                                // that needs the retry unable to ask for it.
+                                announce_target = Some(v);
+                            }
                         }
                     }
                     // plan §15：`latency` / `quality` **不再在这里**。
@@ -533,6 +558,20 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                         // a daemon killed a moment later must come back in the
                         // mode the user chose.
                         s.save(&inner.cfg_dir)?;
+                    }
+                }
+                if let Some(want) = announce_target {
+                    let now = crate::apply_announce(inner, want);
+                    if want && !now {
+                        // Not an error reply: the preference IS saved, and
+                        // failing the call would make the switch spring back to
+                        // a value the daemon no longer holds. The reply's
+                        // `discovery_announcing: false` is where the interface
+                        // reads that the wish is not in force.
+                        dlog!(
+                            "[audiohubd] discovery_announce=true saved, but announcing failed; \
+                             reported as discovery_announcing=false"
+                        );
                     }
                 }
                 if changed {
@@ -785,6 +824,12 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         mark_offline_devices: s.mark_offline_devices,
         mode_a_volume_sync: s.mode_a_volume_sync,
         mode_a_mute_local: s.mode_a_mute_local,
+        discovery_announce: s.discovery_announce,
+        // Derived, exactly like `effective_mode` above and for the same reason:
+        // the wish and the fact can differ (multicast blocked, local-network
+        // permission not granted yet) and a UI that could only read the wish
+        // would insist this machine is discoverable while it is not.
+        discovery_announcing: lk(&inner.announce_guard).is_some(),
         // 档表随每次 `settings.get` 一起发：前端不许自己写一份。
         // 两边各存一份表，分歧不会有任何报错——只会有一个选不中的档。
         //

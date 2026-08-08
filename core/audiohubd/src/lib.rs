@@ -47,6 +47,9 @@ mod wsshell;
 /// 传输档位的接线测试（两台真 daemon，断言执行器而不是设置字段）。
 #[cfg(test)]
 mod transport_tests;
+/// plan M3 「同网段互见」：mDNS 广播的开关、持久化与诚实上报。
+#[cfg(test)]
+mod discovery_tests;
 
 /// Public for the deviceless test that pins the "one device = one bridge
 /// refcount" rule: a raw selector and its resolved name must key the same
@@ -238,7 +241,44 @@ pub struct DaemonCfg {
     pub control_port: u16,
     pub ipc_port: u16,
     pub config_dir: Option<PathBuf>, // explicit override beats AUDIOHUB_CONFIG_DIR / platform default
-    pub announce: bool,
+    /// `None` = follow `settings.discovery_announce` — **the production path**.
+    /// `Some(x)` pins it for this run without touching the stored preference.
+    ///
+    /// It was a plain `bool` and it defaulted to `false`, which is how the
+    /// shipping app came to never announce itself: the UI spawns the daemon
+    /// with no arguments and so do the autostart entries, so nothing outside
+    /// two hand-run CLI subcommands ever passed `--announce`. Making the
+    /// *stored setting* the source of truth is what fixes that — a launcher
+    /// cannot forget a file.
+    ///
+    /// The type changed rather than the default so the change could not land
+    /// quietly: every construction site had to say which of the two it meant,
+    /// and the test daemons say `Some(false)` on purpose (see below).
+    ///
+    /// **Tests must pass `Some(false)`.** A test daemon that announces puts a
+    /// service instance on the user's real LAN under this machine's real name,
+    /// where the other machines' scan lists pick it up and offer a peer whose
+    /// ports vanish when the test ends.
+    pub announce: Option<bool>,
+    /// Test-only: make every mDNS announce fail, as a machine with multicast
+    /// blocked — or a Mac before its local-network permission is granted — does.
+    ///
+    /// A plain `bool` and not an `Option<bool>` like its neighbours, because
+    /// there is no environment variable behind it: this one has no production
+    /// meaning at all, so "what does `None` follow" has no answer.
+    ///
+    /// It exists because the property it guards is otherwise **unobservable**.
+    /// Announcing is deliberately not fatal at startup (see `start_announce`),
+    /// and the machine where that matters is the one where multicast does not
+    /// work — which is never the machine running the suite. Turning
+    /// `start_announce(...)` back into `announce(...)?` would pass every test
+    /// in this repository and then refuse to start on a first launch, which is
+    /// the single most common state a new install is in.
+    ///
+    /// It is also the only way to observe that `discovery_announcing` is read
+    /// off the live guard rather than copied from the wish: with real mDNS
+    /// working, the two agree and a copy is indistinguishable from a reading.
+    pub announce_fault: bool,
     /// `None` = whatever `AUDIOHUB_HAL_BRIDGE` says (the production path).
     ///
     /// Tests must pass `Some(HalBridgeMode::Off)`. The driver hands its rings to
@@ -337,6 +377,80 @@ impl DaemonHandle {
     }
 }
 
+/// Announce, and report failure by returning `None` rather than by propagating.
+///
+/// The one place the reason is allowed to disappear is the log line: nothing
+/// downstream can act on *why* multicast did not work, and everything
+/// downstream needs to know *that* it did not — which is what the `Option`
+/// says. `discovery_announcing` in `settings.get` is this value, observed.
+fn start_announce(
+    fault: bool,
+    id: &LocalIdentity,
+    control_port: u16,
+) -> Option<discovery::AnnounceGuard> {
+    let attempt = if fault {
+        Err(anyhow::anyhow!(
+            "DaemonCfg::announce_fault is set (test-only): pretending multicast is blocked"
+        ))
+    } else {
+        discovery::announce(id, control_port)
+    };
+    match attempt {
+        Ok(g) => Some(g),
+        Err(e) => {
+            dlog!(
+                "[audiohubd] mDNS announce failed ({e:#}); this machine will not appear in \
+                 other machines' scans until it succeeds. Everything else is unaffected: \
+                 pairing by IP, incoming connections and scanning for others all still work."
+            );
+            None
+        }
+    }
+}
+
+/// Start or stop announcing on a daemon that is already running, and report
+/// what is now true. Called by `settings.set`.
+///
+/// Synchronous, and the 3s worst case when it fails is deliberate: the caller
+/// is a user who just moved a switch and is looking at it. Answering
+/// immediately and letting the truth arrive later means the switch shows the
+/// wish rather than the outcome, and on the failing machine — which is the only
+/// machine where the difference matters — it would show it forever.
+pub(crate) fn apply_announce(inner: &Arc<DaemonInner>, want: bool) -> bool {
+    if !want {
+        // Dropping the guard unregisters (a goodbye packet, ~500ms worst case)
+        // with the lock held. That is short enough to be unobservable, and it
+        // keeps "the slot is empty" and "we are off the network" the same fact.
+        *lk(&inner.announce_guard) = None;
+        return false;
+    }
+    if lk(&inner.announce_guard).is_some() {
+        return true; // already announcing — nothing to retry
+    }
+    // The announce itself runs with the lock RELEASED. It waits on the mDNS
+    // daemon for up to 3s, and two other paths take this lock: `settings_view`
+    // (every `settings.get`, on any other IPC connection) and `begin_shutdown`,
+    // whose own comment promises that dropping mDNS "cannot block".
+    let fresh = start_announce(inner.announce_fault, &inner.id, inner.control_port);
+    let ok = fresh.is_some();
+    if inner.shutdown.load(Ordering::SeqCst) {
+        // Shutdown ran while we were on the wire; its cleanup already emptied
+        // the slot, so storing ours now would leave this machine advertised by
+        // a daemon that is gone. Dropping `fresh` here unregisters it.
+        return false;
+    }
+    let mut slot = lk(&inner.announce_guard);
+    if slot.is_none() {
+        *slot = fresh;
+        ok
+    } else {
+        // Another caller won the race while we were on the wire. Keep theirs
+        // and let ours unregister as it drops: publishing this machine twice is
+        // the one outcome here worth going out of the way to avoid.
+        true
+    }
+}
+
 pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     let cfg_dir = cfg
         .config_dir
@@ -348,8 +462,21 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     control_listener.set_nonblocking(true)?;
     udp.set_read_timeout(Some(Duration::from_millis(100)))?;
 
-    let announce_guard = if cfg.announce {
-        Some(discovery::announce(&id, control_port).context("mdns announce")?)
+    // Read once and handed to `DaemonInner` below, so the announce decision and
+    // the settings the daemon then serves cannot come from two different reads
+    // of the same file.
+    let stored = settings::StoredSettings::load(&cfg_dir);
+    let announce_guard = if cfg.announce.unwrap_or(stored.discovery_announce) {
+        // NOT `?`. Announcing is a convenience on top of a daemon that works
+        // without it — manual IP pairing, incoming connections and browsing
+        // others all work with no announcement of our own. Failing startup here
+        // would turn "multicast does not work on this network" into "the app
+        // will not start", and the commonest instance of that is a first launch
+        // on macOS before the user has granted local-network access, i.e. every
+        // new install. `settings.get` reports the outcome as
+        // `discovery_announcing`, and toggling the switch retries — so a user
+        // who grants the permission afterwards does not have to restart.
+        start_announce(cfg.announce_fault, &id, control_port)
     } else {
         None
     };
@@ -423,8 +550,9 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         shutdown: AtomicBool::new(false),
         cleanup: Once::new(),
         announce_guard: Mutex::new(announce_guard),
+        announce_fault: cfg.announce_fault,
         halbridge: Mutex::new(hal_bridge),
-        settings: Mutex::new(settings::StoredSettings::load(&cfg_dir_for_state)),
+        settings: Mutex::new(stored),
         peer_transport: Mutex::new(peer_transport::PeerTransportStore::load(
             &cfg_dir_for_state,
         )),
@@ -622,6 +750,8 @@ pub(crate) struct DaemonInner {
     pub shutdown: AtomicBool,
     cleanup: Once,
     pub announce_guard: Mutex<Option<AnnounceGuard>>,
+    /// See [`DaemonCfg::announce_fault`]. `false` in every real run.
+    pub announce_fault: bool,
     /// macOS HAL bridge. `None` is the normal case (no LaunchAgent, mode off,
     /// or another platform) — the daemon must behave exactly as before then.
     /// Behind an `Arc` so the 10ms loops can lift a handle out with one short

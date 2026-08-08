@@ -676,8 +676,41 @@ export function SettingsView() {
       <ModeMirrorCard />
       <IdentityCard />
 
-      <section className="card block">
+      <section className="card block" data-testid="settings-net">
         <h3 className="block-title">{t('settings.net.title')}</h3>
+        {/*
+          plan M3「同网段互见」的开关，以及它的隐私那一半。
+          放在网络这一格而不是配对页：它是这台机器的一个持续属性（关掉之后
+          永远不广播），不是配对流程里的一个步骤。
+        */}
+        <SettingRow
+          title={t('settings.net.announceTitle')}
+          desc={t('settings.net.announceDesc')}
+          control={(
+            <Switch
+              testid="settings-discovery-announce"
+              label={t('settings.net.announceTitle')}
+              // 缺席时按 false 画，而不是按默认值 true：一个还没答复、或者太旧
+              // 而没有这个字段的 daemon，画成「正在广播」就是在替它撒谎。
+              checked={!!(ds && ds.discovery_announce)}
+              pending={writing > 0}
+              disabled={noSettings}
+              onToggle={(want) => void pushSetting({ discovery_announce: want })}
+            />
+          )}
+        />
+        {/*
+          只在**想广播却没广播成**时出现。两个字段一致时说任何话都是噪音，
+          而它们不一致时，开关自己看上去是「开着的」——这一句是界面上唯一
+          能说出「别人其实看不见这台机器」的地方。
+        */}
+        <p
+          className="muted small"
+          data-testid="settings-announce-warn"
+          hidden={!(ds && ds.discovery_announce && !ds.discovery_announcing)}
+        >
+          {t('settings.net.announceNotInForce')}
+        </p>
         <SettingRow
           title={t('settings.net.controlPort')}
           desc={t('settings.net.controlPortDesc')}

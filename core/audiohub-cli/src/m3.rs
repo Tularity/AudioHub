@@ -169,7 +169,10 @@ fn cmd_id(json: bool) -> Result<i32> {
 fn cmd_discover(secs: f32, json: bool) -> Result<i32> {
     let store = PeerStore::load()?;
     info(&format!("browsing {} for {secs}s", discovery::SERVICE_TYPE));
-    let peers = discovery::browse(secs, &store)?;
+    // The identity of the config dir this command runs against, so a probe run
+    // with AUDIOHUB_CONFIG_DIR pointed elsewhere filters out the right machine.
+    let me = LocalIdentity::load_or_create()?;
+    let peers = discovery::browse(secs, &store, &me.fingerprint)?;
     for p in &peers {
         info(&format!(
             "found instance={} name={:?} fp={:?} addrs={:?} port={} paired={}",

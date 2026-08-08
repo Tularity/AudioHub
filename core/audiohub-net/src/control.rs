@@ -6,6 +6,17 @@ use std::time::{Duration, Instant};
 
 pub const CONTROL_MAX_FRAME: usize = 65536;
 
+/// How long any one control handshake may sit waiting for the next frame.
+///
+/// Lives here, next to [`ControlIo`], because it is the bound *every* handshake
+/// on this trait has to arm for itself. It used to be a private constant in
+/// `secure`, which was survivable only while `TcpStream` was the sole
+/// implementor and its callers had already set `SO_RCVTIMEO` to the same value
+/// before handing the socket over. A transport whose reads block on a condition
+/// variable has no such ambient bound, so the requirement moved into the
+/// handshakes — see `pairing::verify_initiator`.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The byte transport the control stack runs on.
 ///
 /// The frame codec below, the verify exchange in `pairing`, and `SecureChannel`

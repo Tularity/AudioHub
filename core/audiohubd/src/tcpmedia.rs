@@ -722,9 +722,21 @@ impl TokenBucket {
 /// due, because otherwise a media frame blocked in `write` holds the wire for
 /// **up to a whole stale budget** and the credit — which is only ever checked
 /// between frames — silently becomes "100 ms plus however long one frame
-/// blocks". Measured 2026-08-08 before this parameter existed: a saturated
-/// tier 2 link produced no round trip at all for 5 s and
-/// `conn::ping_and_reap` declared the connection dead.
+/// blocks".
+///
+/// **A defensive bound, not a measured fix.** An earlier version of this
+/// docblock attributed it to an observed 5-second round trip on a saturated
+/// tier 2 link. That attribution does not survive review: the rig that produced
+/// it was rate-limiting *downstream* of the socket, which parks the backlog in
+/// the kernel send buffer where nothing here can reorder it and which produced
+/// eight-second round trips with the scheduler working perfectly (see
+/// `transport_tests::tier_two_pair`). The two are most likely the same artefact
+/// counted twice. What survives is the mechanism above, which is an argument
+/// about this function rather than about a network, and which
+/// `the_cap_gives_up_on_a_blocked_frame_before_the_stale_budget_would` pins.
+/// The window where the cap is the deciding factor is genuinely narrow — the
+/// frame must still be fresh *and* the send window fully shut — so it is
+/// carried as a bound on the worst case, not as a routine optimisation.
 ///
 /// It caps only the deadline that applies while **nothing has been written**.
 /// Once a byte is out the frame must be completed whatever else is waiting —
@@ -1171,8 +1183,19 @@ fn await_attach(conn: &Arc<ConnShared>, deadline: Instant, dialling: bool) {
 }
 
 fn offer_ticket(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
-    if matches!(*lk(&conn.media_path), MediaPath::Tcp(_)) {
-        return; // already attached; a second link would be a second writer
+    match *lk(&conn.media_path) {
+        // already attached; a second link would be a second writer
+        MediaPath::Tcp(_) => return,
+        // Tier 2 has no second connection to offer. The address a ticket would
+        // be redeemed at is `conn.peer_ip` — the tunnel's — plus a port the
+        // peer advertised about a listener the tunnel does not expose, i.e.
+        // well-formed and somebody else's, which is the failure
+        // `MediaPath::Framed` carries no `SocketAddr` to prevent. Today nothing
+        // reaches here on tier 2 because `register_conn` skips `negotiate`
+        // when a mux is present, but that guard is two files away and is about
+        // the mux rather than about the path; this one is about the path.
+        MediaPath::Framed(_) => return,
+        MediaPath::Udp(_) => {}
     }
     // One live ticket per peer. A negotiation can reach here twice — the
     // responder offers unprompted and then the initiator's request arrives —
@@ -1216,6 +1239,21 @@ pub(crate) fn on_request(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
 pub(crate) fn on_ticket(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, ticket_b64: String) {
     if lk(&inner.peer_transport).tier(&conn.fp) == TransportTier::Tier0 {
         return; // pinned; ignore the offer
+    }
+    // The dial below computes `SocketAddr::new(conn.peer_ip, conn.peer.port)`,
+    // which on tier 2 is the tunnel's address and a port belonging to a
+    // listener behind it. Refused on the path rather than on the tier, because
+    // the path is what the dial would corrupt: a link that came up here
+    // overwrites `media_path` with `Tcp`, and its teardown writes back
+    // `MediaPath::Udp(...)` — synthesising, on a connection that reached us
+    // through a tunnel, exactly the UDP destination `Framed` exists to deny.
+    if matches!(*lk(&conn.media_path), MediaPath::Framed(_)) {
+        dlog!(
+            "[audiohubd] ignoring a media attach ticket from {}: this connection is multiplexed, \
+             so there is no address to redeem it at",
+            conn.fp
+        );
+        return;
     }
     if !we_dialled(inner, conn) {
         dlog!(
@@ -1496,6 +1534,49 @@ mod tests {
 
     fn link() -> TcpMediaLink {
         TcpMediaLink::new("fp".into(), "127.0.0.1:1".parse().unwrap(), 0)
+    }
+
+    /// `give_up_at` really does shorten the pre-first-byte deadline.
+    ///
+    /// The parameter had **no coverage at all**: only `mux::write_loop` passes
+    /// it non-`None`, no test drives that loop, and every other call site
+    /// passes `None` — so deleting the whole `give_up_at` branch left the suite
+    /// green. This is the narrow window in which it is the deciding factor: the
+    /// frame is fresh, so `STALE_BUDGET` is far away, and the send window is
+    /// shut, so nothing has reached the wire. Capped, the writer gives up at the
+    /// cap and goes to serve control; uncapped, it holds the wire for the whole
+    /// 440 ms stale budget and the control credit becomes "100 ms plus however
+    /// long one frame blocks".
+    ///
+    /// Giving up here is invisible to the peer — not one byte was written, so
+    /// the `seq` hole is indistinguishable from the loss it is reported as.
+    #[test]
+    fn the_cap_gives_up_on_a_blocked_frame_before_the_stale_budget_would() {
+        let l = link();
+        let owner = Arc::new(TxShared::new());
+        let shutdown = AtomicBool::new(false);
+
+        // Blocked far past both candidate deadlines, so the only thing that can
+        // end the wait is a deadline rather than the sink relenting.
+        let mut sink = FakeSink::new(4096);
+        sink.blocked_until = Some(Instant::now() + STALE_BUDGET * 4);
+
+        let queued_at = Instant::now();
+        assert!(push(&l, queued_at, &owner, 0));
+
+        let cap = queued_at + Duration::from_millis(60);
+        let mut bucket = TokenBucket::new(0);
+        let t0 = Instant::now();
+        let out = write_one_queued(&l, &mut sink, &shutdown, &mut bucket, Some(cap));
+        let waited = t0.elapsed();
+
+        assert_eq!(out, Some(WriteOutcome::Stale), "a frame that never got a byte out must be dropped");
+        assert!(
+            waited < STALE_BUDGET / 2,
+            "the writer held the wire for {waited:?}: the cap was ignored and the frame ran to \
+             the {STALE_BUDGET:?} stale budget instead"
+        );
+        assert_eq!(sink.written.len(), 0, "a frame the gate dropped reached the wire");
     }
 
     /// The queue is bounded, drops the newest, and counts it — the shape

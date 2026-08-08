@@ -25,6 +25,15 @@
 //! guarantees one control frame every [`CONTROL_CREDIT`], and lets control run
 //! freely whenever media is idle.
 //!
+//! The guarantee is a **floor plus one frame**, not a flat period: the credit is
+//! checked between frames, so a control frame due at `t` goes out once whatever
+//! media frame is already in `write` has finished. Under saturation the
+//! observed gap is therefore `CONTROL_CREDIT` plus one frame completion — 122 ms
+//! measured against a send buffer refilled at link rate, where the flat reading
+//! would predict 100. `write_one_queued`'s `give_up_at` bounds the *other* half
+//! of that sum, the part before a frame's first byte; once a byte is out the
+//! frame must finish, because the header already told the peer its length.
+//!
 //! Why a time credit and not "one control frame per N media frames":
 //! **because `Ping`/`Pong` has to be inside it.** On tier 2 the round-trip time
 //! is the only number through which a user can perceive how bad the tunnel is,
@@ -439,7 +448,15 @@ pub(crate) fn write_loop<W: Write>(link: &MuxLink, w: &mut W, shutdown: &AtomicB
         // Parked on the media queue's flag, re-checking control in the same
         // breath: both producers wake this thread, so both have to be part of
         // the "is there work?" question or one of them loses its wakeup.
-        link.media.park_writer(WRITE_SLICE, || link.io.control_pending());
+        //
+        // **Both flags, one park.** The predicate alone only closes the race in
+        // one direction — a flush that lands *after* the re-check still has to
+        // find someone to unpark, and `MuxIo::writer` is the flag it looks at.
+        // Arming it around the park is what makes `MuxControlStream::flush`'s
+        // `wake()` reach this thread instead of returning silently.
+        link.io.writer.armed(|| {
+            link.media.park_writer(WRITE_SLICE, || link.io.control_pending());
+        });
     }
 }
 
@@ -847,6 +864,74 @@ mod tests {
         link.media.note_unexpected_kind();
         assert_eq!(link.media.unexpected_kind(), 1);
         assert!(link.is_alive(), "an unexpected kind is not a reason to drop the connection");
+    }
+
+    /// A flush must **unpark** the writer, not wait out its park slice.
+    ///
+    /// Drives the real [`write_loop`] on a thread, because the subject is the
+    /// wiring rather than the state machine: the two producers each own a
+    /// `parked` flag, media parks the thread, and control's flag has to be armed
+    /// across that park or `MuxControlStream::flush`'s `wake()` unparks nobody.
+    /// When it did not, a control frame left on the *next* [`WRITE_SLICE`]
+    /// expiry — a uniform 0–20 ms tax on every message, ~11 ms at the median,
+    /// paid twice per `Ping`/`Pong`.
+    ///
+    /// Ten rounds summed rather than one measured: a single round passes by
+    /// luck a quarter of the time even when the wakeup is lost, while the sum
+    /// separates ~0.5 ms from ~100 ms with no overlap worth worrying about.
+    #[test]
+    fn a_control_flush_wakes_the_parked_writer_instead_of_waiting_out_the_slice() {
+        let link = test_link();
+        let mut w = Recorder::default();
+        let seen = w.frames.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let wlink = link.clone();
+        let wshutdown = shutdown.clone();
+        let writer = std::thread::Builder::new()
+            .name("test-mux-tx".into())
+            .spawn(move || write_loop(&wlink, &mut w, &wshutdown))
+            .expect("spawn the writer");
+
+        let mut ctl = MuxControlStream::new(link.io.clone());
+        const ROUNDS: usize = 10;
+        let mut total = Duration::ZERO;
+        for i in 0..ROUNDS {
+            // Let it reach the park. The media queue is empty throughout, so
+            // the only thing that can wake it is the flush below.
+            std::thread::sleep(Duration::from_millis(30));
+            let before = seen.lock().unwrap().len();
+
+            let body = [0x11u8; 8];
+            let t0 = Instant::now();
+            ctl.write_all(&(body.len() as u32).to_le_bytes()).expect("len");
+            ctl.write_all(&body).expect("body");
+            ctl.flush().expect("flush");
+
+            let deadline = t0 + Duration::from_secs(2);
+            loop {
+                if seen.lock().unwrap().len() > before {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "round {i}: the frame never reached the wire");
+                std::thread::yield_now();
+            }
+            total += t0.elapsed();
+        }
+
+        shutdown.store(true, Ordering::SeqCst);
+        link.io.writer.wake();
+        link.media.wake();
+        let _ = writer.join();
+
+        // A woken writer does each round in tens of microseconds; a writer that
+        // sleeps out its slice averages WRITE_SLICE/2 per round.
+        let budget = Duration::from_millis(20);
+        assert!(
+            total < budget,
+            "{ROUNDS} control flushes took {total:?} to reach the wire (budget {budget:?}): the \
+             writer is waiting out its {WRITE_SLICE:?} park slice instead of being unparked"
+        );
     }
 
     /// Killing the link closes the control inbox, which is how a dead mux

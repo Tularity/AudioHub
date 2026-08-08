@@ -21,12 +21,13 @@ use zeroize::Zeroize;
 
 use audiohub_core::latency::{DevLatency, DropMode};
 
-use crate::control::{read_frame, write_frame, ControlIo, ControlMsg, CONTROL_MAX_FRAME};
+use crate::control::{
+    read_frame, write_frame, ControlIo, ControlMsg, CONTROL_MAX_FRAME, HANDSHAKE_TIMEOUT,
+};
 use crate::identity::{verify_sig, LocalIdentity, PairedPeer};
 
 const SEC_LABEL_I: &[u8] = b"audiohub-sec-i";
 const SEC_LABEL_R: &[u8] = b"audiohub-sec-r";
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Length of the per-stream media salt carried by OpenStream.
 pub const MEDIA_SALT_LEN: usize = 16;

@@ -3047,9 +3047,14 @@ fn a_tier_two_pair_survives_the_source_address_being_lost() {
 ///
 /// Deleting the `last_control.elapsed() >= CONTROL_CREDIT` disjunct from
 /// `mux::control_may_go` — leaving strict priority alone — was expected to make
-/// this go red. **It does not** (measured 2026-08-08: p95 129.7 ms with the
-/// credit removed, against 62.1 ms with it). The reason is worth writing down,
-/// because it is a real property of the design and not a defect in the rig:
+/// this go red. **It does not, and its resolving power here is zero rather than
+/// merely weak.** An earlier note recorded p95 129.7 ms with the credit removed
+/// against 62.1 ms with it, which reads like a weak signal; that gap does not
+/// reproduce. Re-measured twice on 2026-08-08 under review, the pairs were
+/// 61.4/64.1 ms and 68.0/73.8 ms (with credit / without, n=15 each) — the
+/// difference is inside the run-to-run spread of the metric itself. The reason
+/// is worth writing down, because it is a real property of the design and not a
+/// defect in the rig:
 ///
 /// **The media queue is self-emptying.** A frame the stale gate drops never
 /// reaches the wire, so it never charges the token bucket — dropping is *free*
@@ -3070,12 +3075,20 @@ fn a_tier_two_pair_survives_the_source_address_being_lost() {
 ///
 /// What this test is still for: the acceptance names a number measured on real
 /// daemons over a real connection, and no state-machine test can produce that.
-/// It also covers the failure the scheduler tests cannot see, which is the one
-/// that actually occurred here — before `write_one_queued` learned to take a
-/// deadline cap, a media frame blocked in `write` held the wire for a whole
-/// stale budget and the credit, checked only *between* frames, quietly became
-/// "100 ms plus however long one frame blocks". That produced no round trip at
-/// all for five seconds and `ping_and_reap` declared the channel dead.
+/// That is its whole remit — it is a "the number is still sane" screen, not a
+/// discriminator for any single mechanism.
+///
+/// It used to claim one more thing: that it covered the blocked-frame failure
+/// `write_one_queued`'s deadline cap was added for ("no round trip at all for
+/// five seconds"). That claim is withdrawn. The rig it was measured on
+/// throttled **downstream** of the socket, which parks the backlog in the
+/// kernel send buffer and on its own produces round trips of seconds with the
+/// scheduler working perfectly — see the comment in `tier_two_pair`, which
+/// records exactly that artefact at eight seconds. The two observations are
+/// most likely one artefact attributed twice. The cap is now carried as a
+/// defensive bound and pinned by
+/// `tcpmedia::tests::the_cap_gives_up_on_a_blocked_frame_before_the_stale_budget_would`,
+/// which drives the deadline directly instead of hoping a network reproduces it.
 ///
 /// # Why `#[ignore]`
 ///
@@ -3265,6 +3278,62 @@ fn an_inbound_only_peer_is_awaited_rather_than_dialled() {
     assert!(
         e.contains("inbound-only"),
         "the refusal does not name the reason, so it is indistinguishable from a dead peer: {e}"
+    );
+}
+
+/// The **other order**: dialled first, set to inbound-only afterwards.
+///
+/// `an_inbound_only_peer_is_awaited_rather_than_dialled` tests the side that
+/// never dialled at all, which has no `reconnect` entry to disarm — so it
+/// passes whether or not the retry ladder honours the policy, and has no
+/// resolving power over this. The case that has to work is the one `may_dial`'s
+/// own documentation names: an entry created while dialling was allowed, and a
+/// policy that changed under it.
+///
+/// It failed. Checking `may_dial` only when *arming* misses it, because an
+/// already-armed entry never re-arms: `attempt`'s failure path writes `next_at`
+/// in place and `supervisor_loop` dispatches on `next_at` alone. The entry
+/// re-armed itself up the ladder to the 30-second rung and stayed there,
+/// logging a failure every half minute for a peer that is not failing.
+#[test]
+fn a_policy_flip_after_the_retry_was_armed_disarms_it() {
+    let (a, b, fwd) = tier_two_pair("t2-flip", None);
+    eventually("the mux to come up", || {
+        b.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+
+    // A dialled B, so A has a retry entry — the thing the never-dialled side
+    // does not have. Killing the tunnel arms it while dialling is still allowed.
+    drop(fwd);
+    eventually("A to arm a retry toward B", || {
+        let p = a.peer(&b.fingerprint());
+        p["online"] == Value::Bool(false) && p["reconnecting"] == Value::Bool(true)
+    });
+
+    // Now the policy changes under the armed entry.
+    set_dial_policy(&a, &b.fingerprint(), "inbound_only");
+
+    eventually_within(Duration::from_secs(20), "A to stop retrying a peer it may not dial", || {
+        a.peer(&b.fingerprint())["reconnecting"] == Value::Bool(false)
+    });
+
+    // And it is reported as the third state, not as a fault: reporting both
+    // `awaiting_inbound` and `reconnecting` would leave the UI to choose.
+    let p = a.peer(&b.fingerprint());
+    assert_eq!(
+        p["awaiting_inbound"],
+        Value::Bool(true),
+        "a peer that may not be dialled must be reported as awaited: {p}"
+    );
+    assert_eq!(
+        p["reconnecting"],
+        Value::Bool(false),
+        "the retry ladder outlived the policy that permitted it: {p}"
+    );
+    assert_eq!(
+        p["retry_in_s"],
+        Value::Null,
+        "a disarmed entry must not still advertise a countdown: {p}"
     );
 }
 

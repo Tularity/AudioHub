@@ -461,6 +461,23 @@ fn attempt(inner: &Arc<DaemonInner>, fp: &str) {
             return;
         }
     }
+    // Re-asked on every attempt, not only when arming. `may_dial` is checked in
+    // `arm_in`, but an entry that is **already armed** never goes back through
+    // it: the failure path below re-arms `next_at` in place and
+    // `supervisor_loop` dispatches on `next_at` alone. So a peer dialled once
+    // and then set to inbound-only — the exact case `may_dial`'s own
+    // documentation claims to cover — kept climbing the backoff ladder to the
+    // 30-second rung and staying there, logging a failure every half minute for
+    // a peer that is not failing, while `peers.list` reported `awaiting_inbound`
+    // and `reconnecting` at once and left the UI to pick.
+    if !may_dial(inner, fp) {
+        disarm(inner, fp);
+        dlog!(
+            "[audiohubd] peer {fp}: set to inbound-only since the retry was armed; the retry \
+             loop is disarmed, and it will come back when it connects to us"
+        );
+        return;
+    }
     let addr = lk(&inner.recon).get(fp).and_then(|e| e.addr.clone());
     match conn::connect_peer(inner, fp, addr.as_deref(), ConnectOrigin::Retry) {
         Ok(_) => {

@@ -2269,7 +2269,12 @@ pub(crate) fn tx_loop(
                     // drains it (`tcpmedia::write_loop` against
                     // `mux::write_loop`), and that difference has no business
                     // being re-decided on the 10 ms deadline thread.
-                    other => match other.media_link() {
+                    // Listed rather than caught by `_`, so a fourth transport
+                    // is a compile error here instead of media silently
+                    // vanishing down `media_link() == None`. That is the same
+                    // bargain `ControlTransport` makes, and it should not be
+                    // made in one place and declined in the other.
+                    MediaPath::Tcp(_) | MediaPath::Framed(_) => match tx.path.media_link() {
                         Some(link) => {
                             tcp_link = Some(link);
                             link.enqueue(tick_at, &tx.shared, tx.pay.len(), seal)

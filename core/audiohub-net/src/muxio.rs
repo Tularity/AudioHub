@@ -40,7 +40,7 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::control::ControlIo;
 use crate::framed::{control_header, encode_frame, MUX_MAX_PAYLOAD};
@@ -51,13 +51,33 @@ use crate::framed::{control_header, encode_frame, MUX_MAX_PAYLOAD};
 /// # Why refusing beats growing
 ///
 /// The outbox exists because the writer is busy with media; it is not a buffer
-/// for a peer that has stopped reading. At ~1 Hz of control traffic this is
-/// **64 seconds** of backlog, an order of magnitude past the five seconds of
-/// silence `conn::CONTROL_SILENCE_LIMIT` already treats as a dead channel. So a
-/// full outbox is never congestion — it is a connection that is already gone,
-/// and the honest report is a write error, which marks the `SecureChannel`
-/// poisoned and drops the connection. An unbounded queue would instead keep the
-/// peer looking online while every message aged in memory.
+/// for a peer that has stopped reading. A full outbox should therefore never be
+/// congestion — it should be a connection that is already gone — and the honest
+/// report is a write error, which marks the `SecureChannel` poisoned and drops
+/// the connection. An unbounded queue would instead keep the peer looking
+/// online while every message aged in memory.
+///
+/// # The headroom, counted honestly
+///
+/// This bound is in **frames**, and a message is not a frame: [`MUX_MAX_PAYLOAD`]
+/// is 4096 against a `CONTROL_MAX_FRAME` of 65536, so one maximum-size control
+/// message is 16 frames and four of them fill this queue outright.
+///
+/// Nor is the traffic 1 Hz. Per peer it is one `Ping` per second plus, **per
+/// stream**, a `StageReport` and a `Stats` on the same one-second tick
+/// (`audiohubd`'s telemetry ticker). Four streams is therefore ~9 messages a
+/// second, and 64 frames is closer to **7 seconds** of backlog than to the 64
+/// this comment used to claim.
+///
+/// Seven seconds still lands on the correct side of the five that
+/// `conn::CONTROL_SILENCE_LIMIT` already treats as a dead channel, so the
+/// ordering the design depends on holds: silence is declared before the queue
+/// bursts, and a full outbox remains a diagnosis rather than back-pressure. But
+/// the margin is ~1.4×, not the order of magnitude previously asserted, and it
+/// shrinks as streams per peer grow. If that ratio ever inverts the symptom is
+/// specific and worth recognising: a peer that is plainly still there, killed
+/// by its own outbox. Raising this bound (or deriving it from
+/// `CONTROL_SILENCE_LIMIT` and a byte budget) is the fix if it does.
 const MAX_PENDING_FRAMES: usize = 64;
 
 /// Bytes of undelivered control stream allowed to accumulate in the inbox.
@@ -102,12 +122,30 @@ impl WriterPark {
         let _ = self.thread.set(std::thread::current());
     }
 
-    /// Park up to `timeout` unless `ready()` says there is already work.
-    pub fn park_unless(&self, timeout: Duration, ready: impl Fn() -> bool) {
+    /// Run `park`, with this half of the writer's wakeup armed for its duration.
+    ///
+    /// # Why arming is separate from parking
+    ///
+    /// The mux writer has **two** producers and only one park. Media wakes it
+    /// through `TcpMediaLink`, which owns its own `parked` flag and its own
+    /// `park_timeout` call; control wakes it through [`WriterPark::wake`]. Since
+    /// the actual park belongs to the media link, this type cannot be the thing
+    /// that calls `park_timeout` — but it must still be *armed* across it, or
+    /// [`wake`] reads a flag that is permanently false and unparks nobody. That
+    /// was the defect: control frames sat until the media park slice expired, so
+    /// the median flush-to-wire delay on an idle tier 2 link was ~11 ms instead
+    /// of ~0.05 ms, and every `Ping`/`Pong` round trip paid it twice.
+    ///
+    /// Ordering is what makes it correct: `parked` is stored **before**
+    /// `park` re-checks its queues, so a flush landing in the middle is caught
+    /// by that re-check, and one landing after it is caught by the `unpark`
+    /// this flag now permits. `park_timeout` consumes a token left by an
+    /// `unpark` that arrives first, so neither order loses the wakeup.
+    ///
+    /// [`wake`]: WriterPark::wake
+    pub fn armed(&self, park: impl FnOnce()) {
         self.parked.store(true, Ordering::SeqCst);
-        if !ready() {
-            std::thread::park_timeout(timeout);
-        }
+        park();
         self.parked.store(false, Ordering::SeqCst);
     }
 
@@ -371,6 +409,7 @@ mod tests {
     use crate::framed::FrameDecoder;
     use crate::packet::Kind;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn io() -> Arc<MuxIo> {
         Arc::new(MuxIo::new("127.0.0.1:47870".parse().unwrap()))

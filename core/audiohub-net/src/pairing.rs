@@ -1,5 +1,6 @@
 use crate::control::{
-    read_frame, write_frame, ControlIo, ControlMsg, PROTOCOL_VERSION, VERSION_ABSENT,
+    read_frame, write_frame, ControlIo, ControlMsg, HANDSHAKE_TIMEOUT, PROTOCOL_VERSION,
+    VERSION_ABSENT,
 };
 use crate::identity::{fingerprint_of, verify_sig, LocalIdentity, PairedPeer, PeerStore};
 use anyhow::{anyhow, bail, Result};
@@ -8,7 +9,7 @@ use hmac::{Hmac, Mac};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const IDENT_INITIATOR: &[u8] = b"audiohub-initiator";
 const IDENT_RESPONDER: &[u8] = b"audiohub-responder";
@@ -410,6 +411,8 @@ pub fn verify_initiator<T: ControlIo + ?Sized>(
     store: &PeerStore,
 ) -> Result<PairedPeer> {
     let _ = s.set_nodelay(true);
+    // Armed here and not left to the caller. See `verify_responder`.
+    s.set_read_deadline(Some(Instant::now() + HANDSHAKE_TIMEOUT))?;
 
     let mut nonce_i = [0u8; 16];
     OsRng.fill_bytes(&mut nonce_i);
@@ -507,12 +510,27 @@ fn adopt_name(peer: &mut PairedPeer, name: String) {
     peer.name = name[..end].to_string();
 }
 
+/// # The deadline is armed here, not by the caller
+///
+/// This runs **before any key exchange**, on bytes from a stranger, so an
+/// unbounded read here is an unauthenticated hang. It was bounded for years
+/// only by accident: every caller happened to hold a `TcpStream` and had set
+/// `SO_RCVTIMEO` on it before calling. Once `ControlIo` admitted a second
+/// implementation that ambient bound stopped existing — `MuxControlStream`
+/// starts with no deadline and waits on a condition variable, so four bytes of
+/// frame magic followed by silence held a pre-auth slot and three threads
+/// forever, and 32 of them shut the control listener down for good.
+///
+/// So the requirement is stated where it is depended on, exactly as
+/// `SecureChannel::establish_responder` already states it. A transport added
+/// later cannot forget to satisfy a precondition nobody has to remember.
 pub fn verify_responder<T: ControlIo + ?Sized>(
     s: &mut T,
     id: &LocalIdentity,
     store: &PeerStore,
 ) -> Result<PairedPeer> {
     let _ = s.set_nodelay(true);
+    s.set_read_deadline(Some(Instant::now() + HANDSHAKE_TIMEOUT))?;
 
     let (fp_i, nonce_i) = match read_frame(s)? {
         ControlMsg::VerifyHello { fingerprint, nonce_b64, version } => {
@@ -593,6 +611,111 @@ pub fn verify_responder<T: ControlIo + ?Sized>(
     // Same rule as the initiator side: adopted only once the signature holds.
     adopt_name(&mut peer, name_i);
     Ok(peer)
+}
+
+/// The verify exchange must bound its own reads, on **every** transport.
+///
+/// Regression cover for the pre-auth hang: `verify_*` used to rely on the
+/// caller having set `SO_RCVTIMEO`, which only a `TcpStream` caller could do.
+/// The transport here is the shape that broke it — one whose reads have no
+/// ambient bound at all — so the test fails on a `verify_*` that does not arm a
+/// deadline itself, whatever the caller did or forgot to do.
+#[cfg(test)]
+mod handshake_deadline_tests {
+    use super::*;
+    use crate::identity::PeerStore;
+    use std::io::{self, Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::path::PathBuf;
+
+    /// A peer that connects and then says nothing, ever.
+    ///
+    /// Stands in for `MuxControlStream` before a deadline is armed: there is no
+    /// socket option underneath, so an unbounded read is an unbounded read. A
+    /// read attempted with nothing armed is the defect itself, and panicking is
+    /// how a test observes it — blocking forever is precisely what the bug
+    /// does, and a hung test reports nothing.
+    struct SilentPeer {
+        deadline: Option<Instant>,
+        reads_before_any_deadline: usize,
+    }
+
+    impl Read for SilentPeer {
+        fn read(&mut self, _out: &mut [u8]) -> io::Result<usize> {
+            if self.deadline.is_none() {
+                self.reads_before_any_deadline += 1;
+                panic!(
+                    "verify_* read from an unauthenticated peer with no read deadline armed: \
+                     on a transport without SO_RCVTIMEO this read never returns, which holds a \
+                     pre-auth slot and its threads for the life of the process"
+                );
+            }
+            // The deadline is armed, so this read is bounded. Report the bound
+            // having elapsed rather than actually sleeping for it.
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "silent peer"))
+        }
+    }
+
+    impl Write for SilentPeer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ControlIo for SilentPeer {
+        fn set_read_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+            self.deadline = deadline;
+            Ok(())
+        }
+        fn peer_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)))
+        }
+        fn set_nodelay(&mut self, _on: bool) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let p = std::env::temp_dir().join(format!("ahb-hsdl-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).expect("mkdir");
+        p
+    }
+
+    #[test]
+    fn verify_responder_bounds_its_own_reads_without_help_from_the_caller() {
+        let dir = scratch("resp");
+        let id = LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
+        let store = PeerStore::load_at(Some(&dir)).expect("store");
+
+        let mut peer = SilentPeer { deadline: None, reads_before_any_deadline: 0 };
+        let out = verify_responder(&mut peer, &id, &store);
+
+        assert!(out.is_err(), "a peer that never speaks must not be waited on forever");
+        assert_eq!(peer.reads_before_any_deadline, 0);
+        assert!(peer.deadline.is_some(), "verify_responder left the read unbounded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dialling side too: there the hang costs a `reconnect` entry that
+    /// never clears `in_flight`, so the peer is never retried again.
+    #[test]
+    fn verify_initiator_bounds_its_own_reads_without_help_from_the_caller() {
+        let dir = scratch("init");
+        let id = LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
+        let store = PeerStore::load_at(Some(&dir)).expect("store");
+
+        let mut peer = SilentPeer { deadline: None, reads_before_any_deadline: 0 };
+        let out = verify_initiator(&mut peer, &id, &store);
+
+        assert!(out.is_err(), "a tunnel that accepts and stays silent must not hang the dialler");
+        assert_eq!(peer.reads_before_any_deadline, 0);
+        assert!(peer.deadline.is_some(), "verify_initiator left the read unbounded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

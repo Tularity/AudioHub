@@ -21,5 +21,9 @@
 
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo"
   },
-  "include": ["src"]
+  // Tests live in `tsconfig.test.json` instead, which is the same project plus
+  // node types. Excluding them here keeps `"types": ["vite/client"]` meaningful
+  // for application code -- see the comment in that file.
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
 }

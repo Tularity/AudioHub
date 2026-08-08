@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    // The only delta from the app project. Tests read the Rust sources off disk
+    // to cross-check the stop tables against the daemon, which needs node
+    // builtins; `tsconfig.app.json` deliberately does NOT carry "node", so
+    // application code still cannot reach for `process`/`fs` and have it
+    // typecheck. Widening the app project instead would have removed that guard
+    // from every file in src/ just to satisfy three test imports.
+    "types": ["vite/client", "node"],
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.test.tsbuildinfo"
+  },
+  // Seeded with the test files only, not all of `src`: TypeScript pulls the
+  // modules under test in by following their imports anyway, and listing `src`
+  // here as well would put every source file in two build projects at once.
+  "include": ["src/**/*.test.ts", "vitest.config.ts"]
+}

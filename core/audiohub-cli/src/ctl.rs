@@ -380,6 +380,7 @@ fn cmd_daemon(port: u16, ipc_port: u16, announce: bool, secs: f32, json: bool) -
         announce,
         hal_bridge: None, // production: AUDIOHUB_HAL_BRIDGE decides
         tx_throttle_kbps: None, // production: AUDIOHUB_TEST_TX_KBPS decides (normally unlimited)
+        block_udp: None, // production: AUDIOHUB_TEST_BLOCK_UDP decides (normally nothing)
     })?;
     info(&format!(
         "daemon running: control_port={port} ipc_port={} config_dir={}",

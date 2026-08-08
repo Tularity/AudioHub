@@ -350,8 +350,21 @@ pub struct PeerTransportView {
     /// 明确要防止后人去实现的一句话。
     ///
     /// 这是**用户的选择**，不是链路的现状：`"auto"` 说的是「让 daemon 决定」，
-    /// 不是「现在跑在 tier 0 上」。现状要另一个字段（`transport_tier`，尚未落地，
-    /// plan §16.4），两者**不得互相冒充**——§16.4 第 5 条那条红线就是这个。
+    /// 不是「现在跑在 tier 0 上」。**三个量，谁也不许冒充谁**（§16.4 第 5 条）：
+    ///
+    /// | 问题 | 读哪里 |
+    /// |---|---|
+    /// | 用户要什么 | **本字段** |
+    /// | 字节此刻在哪条通路上 | `daemon.status.latency_guard.{tcp_media, mux}`（按连接的 `MediaPath` 枚举）。**现状仍然没有自己的字段**，plan §16.4 里说的那个 `transport_tier` 至今未落地 |
+    /// | daemon 自动判定这条链路只能跑哪一档 | [`PeerState::auto_tier`] + 理由 + 时刻 |
+    ///
+    /// 后两个**不是同一件事**：一台钉死 tier 0 的机器，判定可以是 `tier1`
+    /// （它的链路确实没有 UDP），而现状照旧是 tier 0（我们尊重那个钉子）。
+    ///
+    /// 自动降级（plan §16.2）只写 `auto_tier`。它不许把这里的 `"auto"` 改成
+    /// `"tier1"`：那等于把「让 daemon 决定」这句话悄悄换成「我钉了 tier 1」，
+    /// 而且不可逆——写完之后本机没有任何一处还记得用户选过 AUTO，用户只能去
+    /// 手动取消一个他从没钉过的钉子。
     #[serde(default = "default_tier")]
     pub tier: String,
     /// 装载时不被认识、已被重置的连通性档串。`None` = 一切正常。与
@@ -1082,6 +1095,41 @@ pub struct PeerState {
     /// 最近一次 Pong 的 RTT（毫秒），交叉校验用。`None` 同上。
     #[serde(default)]
     pub rtt_ms: Option<f64>,
+    /// **daemon 自动判定**这条链路只能跑哪一档（plan §16.2 的 Tier 0→1）：
+    /// `"tier1"`，或缺席表示「从没判定过」。
+    ///
+    /// # 它既不是用户的选择，也不完全是链路的现状
+    ///
+    /// 名字里带 `auto` 不是修辞：这是**我们的结论**，不是那两个量中的任何一个。
+    ///
+    /// - 与 `transport.tier` 的区别：那是用户要什么，这是我们测到什么。
+    /// - 与 `latency_guard.{tcp_media, mux}` 的区别：那是字节**此刻**在哪条
+    ///   通路上，这是我们记在案的判定。两者通常一致，但一台钉死 tier 0 的机器
+    ///   会让它们分开——判定是 `tier1`（链路确实没有 UDP），现状是 tier 0
+    ///   （我们尊重那个钉子）。**那一格正是界面唯一能说出「你的链路没有 UDP，
+    ///   而你让我别退让」的地方**，把两者合成一个字段就把它抹掉了。
+    ///
+    /// 判定值**只可能是 `"tier1"`**：tier 2 的前提（只有 L7 通路、只有一方能
+    /// 发起）观测不出来，拨不通的对端与关机的对端长得一模一样（plan §16.2）。
+    ///
+    /// 「已判定为 tier 0（直连）」也不会出现，而且是**故意**的：给每台正常
+    /// 对端挂一个「一切正常」的标记只会训练用户忽略这个位置，而这个位置正是
+    /// 我们指望它在降级时被看见的地方（design §5.2 呈现规则 2）。缺席就是
+    /// 缺席，渲染成置灰的「—」，**绝不用 `"tier0"` 冒充**。
+    #[serde(default)]
+    pub auto_tier: Option<String>,
+    /// 判定的理由，直接给人看（如「no inbound UDP media on this link」）。
+    ///
+    /// 降级之后传输在物理上是**每对端**的，但**检测**是有方向的（我们出去的
+    /// UDP 通、他们回来的不通）。那份方向信息全部由这条串承载 —— 把 tier 拆成
+    /// 每方向一个来保留它，等于在契约表面上宣布「可以一个方向 tier 0、另一个
+    /// tier 1」，而那是实现里明确要防止后人去做的事（design §5.2）。
+    #[serde(default)]
+    pub auto_tier_reason: Option<String>,
+    /// 判定时刻，unix 秒。与理由成对：一条没有时间的判定，用户无从知道它说的
+    /// 是此刻还是三次重启之前。
+    #[serde(default)]
+    pub auto_tier_since: Option<u64>,
     /// The mode this peer last told us it is in (plan §13 推论 1), from
     /// `SessionMsg::ModeState` on the live control channel.
     ///

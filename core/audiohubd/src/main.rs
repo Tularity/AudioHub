@@ -51,6 +51,7 @@ fn main() {
         announce,
         hal_bridge: None, // production: AUDIOHUB_HAL_BRIDGE decides
         tx_throttle_kbps: None, // production: AUDIOHUB_TEST_TX_KBPS decides (normally unlimited)
+        block_udp: None, // production: AUDIOHUB_TEST_BLOCK_UDP decides (normally nothing)
     }) {
         Ok(h) => Arc::new(h),
         Err(e) => {

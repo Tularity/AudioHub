@@ -375,6 +375,13 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                             display_name: String::new(),
                             // 同上：这一刻它已经不在 store 里，没有档位可报。
                             transport: Default::default(),
+                            // ...and no verdict either. `None` here is the
+                            // "never observed" cell, which is the truth on this
+                            // arm and is rendered as a greyed dash, not as
+                            // tier 0.
+                            auto_tier: None,
+                            auto_tier_reason: None,
+                            auto_tier_since: None,
                             // This arm only runs when the peer vanished from
                             // the store between connecting and listing, so
                             // there is no channel to have heard a mode on.
@@ -871,6 +878,10 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
             // 时钟窗口提到 per-peer 复用，这一句就立刻从防御变成承重。
             // 删掉它不会有任何测试变红，所以这段注释就是它的保险丝。
             let clock = live.and_then(|c| crate::lk(&c.clock).estimate());
+            // `None` for a peer nobody has a record for: "never observed" and
+            // "observed to be fine" must not render the same way, and `get`
+            // would hand back a default that reads as the latter.
+            let auto = lk(&inner.peer_transport).peek(&p.fingerprint);
             PeerState {
                 net_ms: clock.map(|e| e.min_rtt_us as f64 / 2000.0),
                 rtt_ms: clock.map(|e| e.last_rtt_us as f64 / 1000.0),
@@ -892,6 +903,15 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
                     .cloned()
                     .unwrap_or_else(|| haldev::base_name(p)),
                 transport: peer_transport_view(inner, &st, &p.fingerprint),
+                // The link's state, beside the user's choice and never on top
+                // of it. Read straight out of the store rather than derived
+                // from the live `media_path`: a peer that is offline right now
+                // still has a verdict, and that is exactly when the interface
+                // most needs to be able to explain why it will come back on
+                // TCP.
+                auto_tier: auto.as_ref().and_then(|t| t.auto_tier.clone()),
+                auto_tier_reason: auto.as_ref().and_then(|t| t.auto_tier_reason.clone()),
+                auto_tier_since: auto.as_ref().and_then(|t| t.auto_tier_since),
                 peer: p.clone(),
             }
         })

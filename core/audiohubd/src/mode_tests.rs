@@ -50,6 +50,7 @@ impl Node {
             // Production and every test but the tier 2 starvation rig: whatever
             // the environment says (normally nothing, i.e. unlimited).
             tx_throttle_kbps: None,
+            block_udp: None,
         })
         .expect("start daemon");
         Node { h, dir }

@@ -138,9 +138,16 @@ impl StoredDir {
 /// observation. Automatic probing could only be repeated dialling and guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportTier {
-    /// Decide at runtime. **In P3 this behaves as [`TransportTier::Tier0`] for
-    /// dialling**, because automatic probing is P4 — but it still *grants* a
-    /// tier 1 attach a peer asks for, so pinning one side is enough to test.
+    /// Decide at runtime: **the only value that defers to the detector**
+    /// ([`PeerTransport::effective_tier`]). Dials tier 0 until something has
+    /// been observed, then tier 1 for as long as the verdict stands.
+    ///
+    /// It also *grants* a tier 1 attach a peer asks for, which is a separate
+    /// question from what it dials and is decided by [`PeerTransport::tier`],
+    /// not the effective tier. Two AUTO machines are both nominally tier 0
+    /// until one of them notices something; if the granting side asked the
+    /// effective tier, each would refuse the other and no downgrade could ever
+    /// complete.
     Auto,
     /// Pinned to UDP media. Refuses to attach a tier 1 link even when asked;
     /// this is the "通告 ≠ 授权" rule (design decision C) in its one concrete
@@ -250,6 +257,47 @@ pub(crate) struct PeerTransport {
     /// 与 `*_reset_from` 同义、同纪律：**绝不落盘**。
     #[serde(skip)]
     pub transport_tier_reset_from: Option<String>,
+    /// What the **link turned out to be**, as opposed to what the user asked
+    /// for. `None` = never observed, or the observation has been retired for a
+    /// re-probe. Only ever `Some("tier1")` (see [`PeerTransport::auto_tier`]).
+    ///
+    /// # This field exists because the alternative is a lie
+    ///
+    /// The obvious implementation of automatic downgrade is to write `tier1`
+    /// into `transport_tier` and be done. That silently converts the sentence
+    /// "let the daemon decide" into the sentence "I, the user, pinned tier 1" —
+    /// and it is not reversible, because after the write nothing on this
+    /// machine remembers that AUTO was ever selected. The user would then have
+    /// to un-pin, by hand, a pin they never made, on a link that has since
+    /// recovered.
+    ///
+    /// So the two are stored separately and combined only at the point of use
+    /// ([`PeerTransport::effective_tier`]). `plan.md` §16.4 rule 5 and the
+    /// contract note on `PeerTransportView::tier` both spell this out: the
+    /// choice and the state of the link **must not impersonate each other**.
+    ///
+    /// # Why it is persisted
+    ///
+    /// design §5.1: without it every connection to a peer behind a UDP-blocking
+    /// firewall replays the detection delay — 600 ms of silence before any
+    /// sound, every single time. Persisting turns that into a one-off.
+    #[serde(default)]
+    pub auto_tier: Option<String>,
+    /// Why the detector reached that verdict, in the words the UI shows.
+    /// Carried with the tier so a downgrade is never a bare fact with nobody
+    /// able to say what caused it (design §5.2: the reason string is where the
+    /// per-direction asymmetry of *detection* goes, since the tier itself is
+    /// per peer).
+    #[serde(default)]
+    pub auto_tier_reason: Option<String>,
+    /// When it was reached, unix seconds. Drives the low-frequency re-probe
+    /// (design §5.1 "后台低频重探 UDP") and is shown next to the reason.
+    ///
+    /// Unix seconds rather than an `Instant` because it outlives the process:
+    /// an observation made three restarts ago is exactly the one that most
+    /// needs retiring.
+    #[serde(default)]
+    pub auto_tier_since: Option<u64>,
     /// `both | outbound_only | inbound_only`，见 [`DialPolicy`]。同一条松存紧取
     /// 纪律，同一个落点理由。
     #[serde(default = "both_dial")]
@@ -297,6 +345,9 @@ impl Default for PeerTransport {
             send: StoredDir::default(),
             transport_tier: auto_tier(),
             transport_tier_reset_from: None,
+            auto_tier: None,
+            auto_tier_reason: None,
+            auto_tier_since: None,
             dial_policy: both_dial(),
             dial_policy_reset_from: None,
             endpoint: String::new(),
@@ -310,8 +361,58 @@ impl PeerTransport {
         TransportTier::parse(&self.transport_tier).unwrap_or(TransportTier::Auto)
     }
 
+    /// The tier the detector settled on, if any.
+    ///
+    /// Narrowed to tier 1 on the way out, not merely on the way in: tier 2's
+    /// premise cannot be observed (plan §16.2 — an L7-only tunnel and a
+    /// switched-off machine produce the same failed dial), so a stored
+    /// `"tier2"` here can only have come from a hand-edited file or from a
+    /// future version whose meaning this build does not know. Either way,
+    /// executing it would silently reroute a peer's media through a transport
+    /// nobody selected.
+    pub(crate) fn auto_tier(&self) -> Option<TransportTier> {
+        match TransportTier::parse(self.auto_tier.as_deref()?) {
+            Some(TransportTier::Tier1) => Some(TransportTier::Tier1),
+            _ => None,
+        }
+    }
+
+    /// **The one place the user's choice and the link's state are combined.**
+    ///
+    /// `Auto` is the only value that defers: it means "you decide", so the
+    /// observation gets to speak. Every other value is a pin, and a pin beats
+    /// an observation — including `Tier0`, where the user is explicitly saying
+    /// "do not fall back", and where honouring the detector would be the
+    /// setting failing to do the single thing it exists for.
+    ///
+    /// Nothing else in the daemon may reconstruct this expression. Two copies
+    /// of a precedence rule are how one of them ends up inverted on a path that
+    /// only runs on a broken link — which is the least tested path there is.
+    pub(crate) fn effective_tier(&self) -> TransportTier {
+        match self.tier() {
+            TransportTier::Auto => self.auto_tier().unwrap_or(TransportTier::Tier0),
+            pinned => pinned,
+        }
+    }
+
     pub(crate) fn dial_policy(&self) -> DialPolicy {
         DialPolicy::parse(&self.dial_policy).unwrap_or(DialPolicy::Both)
+    }
+
+    /// Record a detector verdict. The three fields move together — a tier with
+    /// no reason is a downgrade nobody can explain, and a tier with no
+    /// timestamp can never be retired for a re-probe.
+    pub(crate) fn set_auto_tier(&mut self, tier: TransportTier, reason: &str, now_unix: u64) {
+        self.auto_tier = Some(tier.as_wire().to_string());
+        self.auto_tier_reason = Some(reason.to_string());
+        self.auto_tier_since = Some(now_unix);
+    }
+
+    /// Retire the observation, so the next connection starts from tier 0 again.
+    pub(crate) fn clear_auto_tier(&mut self) {
+        self.auto_tier = None;
+        self.auto_tier_reason = None;
+        self.auto_tier_since = None;
     }
 
     /// Same shape as [`StoredDir::sanitize`], and for the same reason: an
@@ -327,6 +428,19 @@ impl PeerTransport {
         if DialPolicy::parse(&self.dial_policy).is_none() {
             self.dial_policy_reset_from =
                 Some(std::mem::replace(&mut self.dial_policy, both_dial()));
+        }
+        // An observation this build cannot execute is simply discarded, and —
+        // uniquely on this struct — **without** a `*_reset_from` companion.
+        //
+        // Every other field here is the user's choice, where a silent reset
+        // destroys something only the user can recreate, so the reset has to be
+        // reported. This one is our own measurement of a link, and the detector
+        // makes it again 600 ms into the next stream. Carrying "your stored
+        // observation was unreadable" out to the interface would put a
+        // permanent notice on screen about a value the user never entered and
+        // cannot influence.
+        if self.auto_tier.is_some() && self.auto_tier().is_none() {
+            self.clear_auto_tier();
         }
         if !self.endpoint.is_empty() && crate::wsshell::WsUrl::parse(&self.endpoint).is_err() {
             self.endpoint_reset_from = Some(std::mem::replace(&mut self.endpoint, String::new()));
@@ -444,6 +558,17 @@ impl PeerTransportStore {
         self.map.get(fp).cloned().unwrap_or_default()
     }
 
+    /// [`PeerTransportStore::get`]'s honest twin: `None` when there is no
+    /// record, instead of a default that is indistinguishable from one.
+    ///
+    /// Every *executing* caller wants `get` — "never set" and "set to auto" run
+    /// the same. Every *reporting* caller wants this one, because "we have
+    /// never observed this link" and "we observed it and it was fine" are
+    /// different sentences and the interface has to be able to tell them apart.
+    pub(crate) fn peek(&self, fp: &str) -> Option<PeerTransport> {
+        self.map.get(fp).cloned()
+    }
+
     pub(crate) fn set(&mut self, fp: &str, t: PeerTransport) {
         self.map.insert(fp.to_string(), t);
     }
@@ -453,6 +578,51 @@ impl PeerTransportStore {
     /// executable, and "never set" executes the same as "set to auto".
     pub(crate) fn tier(&self, fp: &str) -> TransportTier {
         self.map.get(fp).map_or(TransportTier::Auto, PeerTransport::tier)
+    }
+
+    /// The tier to actually **run** on: [`PeerTransport::effective_tier`] for a
+    /// peer we may never have heard of.
+    ///
+    /// Read by the dialling path. Deliberately *not* read by `on_request` /
+    /// `on_ticket`, which decide whether to let a peer attach: those two ask
+    /// [`PeerTransportStore::tier`] because the question there is "did this
+    /// machine's user forbid tier 1", and a peer under AUTO that has not
+    /// observed anything yet must still grant an attach the peer asks for. Ask
+    /// the effective tier there and a symmetric pair of AUTO machines refuses
+    /// each other forever: each one is nominally tier 0, so each one says no,
+    /// and no downgrade can ever complete.
+    pub(crate) fn effective_tier(&self, fp: &str) -> TransportTier {
+        self.map.get(fp).map_or(TransportTier::Tier0, PeerTransport::effective_tier)
+    }
+
+    /// Record a detector verdict for `fp`. Returns `true` when it changed
+    /// something, so callers can skip the disk write and the peer notification
+    /// on a re-detection of what is already stored.
+    pub(crate) fn note_auto_tier(
+        &mut self,
+        fp: &str,
+        tier: TransportTier,
+        reason: &str,
+        now_unix: u64,
+    ) -> bool {
+        let e = self.map.entry(fp.to_string()).or_default();
+        if e.auto_tier() == Some(tier) {
+            return false;
+        }
+        e.set_auto_tier(tier, reason, now_unix);
+        true
+    }
+
+    /// Retire a stale observation so the next connection re-probes UDP.
+    /// Returns `true` when there was one to retire.
+    pub(crate) fn clear_auto_tier(&mut self, fp: &str) -> bool {
+        match self.map.get_mut(fp) {
+            Some(e) if e.auto_tier.is_some() => {
+                e.clear_auto_tier();
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Same contract again: a peer nobody has configured dials both ways, which
@@ -860,5 +1030,139 @@ mod tests {
         s.set("aa11", PeerTransport::default());
         assert!(s.remove("aa11"));
         assert!(!s.remove("aa11"), "第二次删该报 false（没有这条了）");
+    }
+
+    // ------------------------------------------- automatic downgrade (plan §16.2)
+
+    /// **The red line** (`plan.md` §16.4 rule 5): an automatic verdict is a
+    /// statement about the link and must never be written into the field that
+    /// holds the user's choice.
+    ///
+    /// Why this is worth its own test rather than being left to the integration
+    /// suite: the wrong implementation — `transport_tier = "tier1"` — makes
+    /// every behavioural assertion about downgrading pass. Media moves to TCP,
+    /// audio comes back, the link is repaired. The only thing that breaks is
+    /// that the user's "let the daemon decide" has silently become "I pinned
+    /// tier 1", irreversibly, because after the write nothing remembers
+    /// otherwise. Nothing observable about the audio can catch that.
+    #[test]
+    fn an_automatic_verdict_does_not_touch_the_users_choice() {
+        let mut s = PeerTransportStore::default();
+        assert!(s.note_auto_tier("aa11", TransportTier::Tier1, "no inbound UDP", 1_000));
+        let t = s.get("aa11");
+        assert_eq!(
+            t.transport_tier, "auto",
+            "the detector overwrote the user's setting; AUTO is now indistinguishable from a pin"
+        );
+        assert_eq!(t.tier(), TransportTier::Auto, "the choice must still read as AUTO");
+        assert_eq!(
+            t.effective_tier(),
+            TransportTier::Tier1,
+            "...while the tier actually run is the one that was observed"
+        );
+        assert_eq!(t.auto_tier_reason.as_deref(), Some("no inbound UDP"));
+        assert_eq!(t.auto_tier_since, Some(1_000));
+    }
+
+    /// A pin beats an observation, in **both** directions — including the one
+    /// that matters most: `tier0` means "do not fall back", and a detector that
+    /// overrode it would be the setting failing at the single job it has.
+    #[test]
+    fn a_pinned_tier_beats_a_verdict_in_both_directions() {
+        let mut s = PeerTransportStore::default();
+        s.note_auto_tier("pinned0", TransportTier::Tier1, "no inbound UDP", 1);
+        let mut t = s.get("pinned0");
+        t.transport_tier = "tier0".into();
+        s.set("pinned0", t);
+        assert_eq!(
+            s.effective_tier("pinned0"),
+            TransportTier::Tier0,
+            "a verdict overrode an explicit tier 0 pin — the one setting whose entire meaning \
+             is 'do not do that'"
+        );
+        // ...and the observation is still *recorded*, because "your link has no
+        // UDP and you told me not to fall back" is the one sentence the
+        // interface needs here.
+        assert_eq!(s.get("pinned0").auto_tier(), Some(TransportTier::Tier1));
+
+        // The other direction: pinned to tier 1 with nothing ever observed.
+        let mut t = PeerTransport::default();
+        t.transport_tier = "tier1".into();
+        s.set("pinned1", t);
+        assert_eq!(s.effective_tier("pinned1"), TransportTier::Tier1);
+        assert_eq!(s.get("pinned1").auto_tier(), None, "a pin is not an observation");
+    }
+
+    /// An unknown peer runs tier 0, and "never observed" is not stored as
+    /// "observed to be tier 0".
+    #[test]
+    fn a_peer_nobody_has_observed_runs_tier_zero_and_says_so() {
+        let s = PeerTransportStore::default();
+        assert_eq!(s.effective_tier("nobody"), TransportTier::Tier0);
+        assert_eq!(s.peek("nobody"), None, "`peek` must not invent a record to report");
+        assert_eq!(s.get("nobody").auto_tier(), None);
+    }
+
+    /// Only tier 1 is reachable without a human (plan §16.2: tier 2's premise
+    /// cannot be observed). A stored `tier2` — hand-edited, or written by a
+    /// future version — must not silently reroute a peer's media through a
+    /// transport nobody selected.
+    #[test]
+    fn a_verdict_may_only_ever_name_tier_one() {
+        for bogus in ["tier2", "tier0", "auto", "tier-of-the-week"] {
+            let mut t = PeerTransport::default();
+            t.auto_tier = Some(bogus.to_string());
+            assert_eq!(t.auto_tier(), None, "`{bogus}` was accepted as an automatic verdict");
+            assert_eq!(
+                t.effective_tier(),
+                TransportTier::Tier0,
+                "`{bogus}` steered the link even though it was refused as a verdict"
+            );
+            // ...and it is dropped rather than left on disk for ever.
+            t.sanitize();
+            assert_eq!(t.auto_tier, None, "the unexecutable `{bogus}` is still stored");
+        }
+    }
+
+    /// 「降了就记住」: the verdict survives a restart, or the 600 ms of silence
+    /// is paid again on every single connection to a firewalled peer.
+    #[test]
+    fn a_verdict_survives_a_round_trip_through_the_file() {
+        let dir = tmpdir("verdict");
+        let mut s = PeerTransportStore::default();
+        s.note_auto_tier("aa11", TransportTier::Tier1, "no inbound UDP media", 1_700_000_000);
+        s.save(&dir).expect("save");
+        let back = PeerTransportStore::load(&dir);
+        assert_eq!(
+            back.effective_tier("aa11"),
+            TransportTier::Tier1,
+            "the verdict did not survive; every reconnect replays the detection silence"
+        );
+        let t = back.get("aa11");
+        assert_eq!(t.transport_tier, "auto", "the user's choice was rewritten on the way out");
+        assert_eq!(t.auto_tier_reason.as_deref(), Some("no inbound UDP media"));
+        assert_eq!(t.auto_tier_since, Some(1_700_000_000));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Re-detecting what is already stored is not a change, and the caller uses
+    /// that to avoid rewriting the file and re-announcing to the peer several
+    /// times a second for as long as the link stays broken.
+    #[test]
+    fn re_detecting_the_same_verdict_reports_no_change() {
+        let mut s = PeerTransportStore::default();
+        assert!(s.note_auto_tier("aa11", TransportTier::Tier1, "first", 1));
+        assert!(
+            !s.note_auto_tier("aa11", TransportTier::Tier1, "second", 2),
+            "an unchanged verdict reported a change; the announcement would repeat every sweep"
+        );
+        assert_eq!(
+            s.get("aa11").auto_tier_reason.as_deref(),
+            Some("first"),
+            "the original reason and timestamp are what the user has been looking at"
+        );
+        assert!(s.clear_auto_tier("aa11"));
+        assert!(!s.clear_auto_tier("aa11"), "clearing twice is not a second change");
+        assert_eq!(s.effective_tier("aa11"), TransportTier::Tier0, "retired means re-probe");
     }
 }

@@ -467,6 +467,45 @@ pub enum SessionMsg {
     MediaAttachRefused {
         reason: String,
     },
+    /// "I have decided this link cannot carry UDP; I am moving to `tier`, and
+    /// so should you." Sent by the side that made the observation (plan §16.2,
+    /// design §5.1).
+    ///
+    /// # Why the *observer* announces instead of both sides deciding for
+    /// # themselves
+    ///
+    /// Only the receiving side can see "nothing arrived", and only the sending
+    /// side can see "no keepalive ever came back". Each of those is one half of
+    /// one link, and the tier is per peer — so whichever half notices first has
+    /// to tell the other, or the two ends spend the next hour disagreeing about
+    /// which transport this peer is on.
+    ///
+    /// # What the receiver is expected to do, and what it must not do
+    ///
+    /// Record it as **an observation about the link**, next to (never on top
+    /// of) the tier the user chose. A peer's report is evidence, not
+    /// authorisation: a machine pinned to `tier0` stays on tier 0 and merely
+    /// knows why it is silent. This is the same "通告 ≠ 授权" rule that
+    /// `handle_remote_open` applies to `ModeState` and `on_request` applies to
+    /// a tier 1 attach.
+    ///
+    /// # Why this variant did **not** need its own protocol bump
+    ///
+    /// Unlike `ModeState`, absence here is not a dangerous default — it is a
+    /// slower path to the same place. A peer that skips this message still gets
+    /// downgraded, because the announcer also drops the control connection and
+    /// the reconnect renegotiates from its own stored observation. The message
+    /// buys the *other* side a head start and a reason string to show; losing
+    /// it costs one extra detection cycle, not silence.
+    TransportSwitch {
+        /// `TransportTier::as_wire()`. Carried as a string, like `ModeState`'s
+        /// mode, so a tier this build does not know arrives as itself and can
+        /// be refused by name instead of failing the whole frame and making the
+        /// peer look like it never spoke.
+        tier: String,
+        /// Human-readable, for the peer's UI. Never parsed.
+        reason: String,
+    },
     Bye {},
 }
 

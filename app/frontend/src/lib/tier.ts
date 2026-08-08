@@ -21,8 +21,10 @@
 //
 // # 为什么现状是**推导**出来的，以及它推导自什么
 //
-// daemon 目前没有 `PeerState.transport_tier` 这个字段（契约里写着「尚未落地」）。
-// 但它有一份**按连接枚举 `MediaPath` 得到的**实时表：
+// daemon 至今没有一个「现状」字段。（`PeerState.auto_tier` 存在，但它是自动
+// 降级**记在案的判定**，不是现状：钉死 tier 0 的对端判定可以是 `tier1` 而现状
+// 仍是 Tier 0。拿它当现状会在那一格上说反。）
+// 但 daemon 有一份**按连接枚举 `MediaPath` 得到的**实时表：
 // `daemon.status.latency_guard.{tcp_media, mux}`。一条链路在那里出现，等价于
 // 那台对端的 `MediaPath` 不是 `Udp` —— 这不是启发式，是同一个枚举的另一种投影。
 //
@@ -40,9 +42,13 @@
 //
 // # 未来
 //
-// `PeerState.transport_tier`（连同 `transport_reason` / `transport_since`）落地
-// 之后，`effectiveTier()` 应当整体换成读那一个字段，**判定不再由 UI 做**。届时
-// 本文件的三行判据全部删掉，调用点一行不动 —— 这正是它被收进单个函数的理由。
+// 若将来 daemon 报出一个真正的「现状」字段（按 `MediaPath` 直接投影，而不是
+// `auto_tier` 那种判定记录），`effectiveTier()` 应当整体换成读那一个字段，
+// **判定不再由 UI 做**。届时本文件的三行判据全部删掉，调用点一行不动 ——
+// 这正是它被收进单个函数的理由。
+//
+// 而 `auto_tier` / `auto_tier_reason` / `auto_tier_since` 是**另一件事**，
+// 归 plan §16.4 的二级页面：现状回答「为什么慢」，判定回答「凭什么这么判的」。
 
 import type { MsgKey } from '../i18n';
 import type {

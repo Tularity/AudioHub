@@ -722,10 +722,21 @@ pub(crate) fn udp_send_loop(inner: Arc<DaemonInner>) {
     // 的延迟原样搬回来。它每 tick 只做一次 `sendto`，抢不走什么。
     raise_audio_thread_qos("udp_send_loop");
     let _ = inner.media_send.thread.set(std::thread::current());
+    // Read once, outside the loop, like `rx_loop`'s half of the same hook.
+    let block_out = inner.udp_block.out;
     loop {
         while inner.media_send.q.consume(|slot| {
             let owner = slot.owner.take(); // 在**本线程**析构
-            if inner.udp.send_to(&slot.buf, slot.dest).is_ok() {
+            // The counters still advance when the hook is swallowing the
+            // datagram, and that is the whole point: a firewall drops packets
+            // the kernel already accepted, so `sent_packets` climbs on a
+            // blocked link exactly as it does on a working one. Skipping the
+            // accounting too would make the simulated link differ from the real
+            // one in precisely the variable the keepalive signal reads
+            // (`autotier`'s `sent_packets > 0` guard), and that signal would
+            // then be untestable through this hook.
+            let accepted = block_out || inner.udp.send_to(&slot.buf, slot.dest).is_ok();
+            if accepted {
                 if let Some(o) = owner {
                     o.sent_packets.fetch_add(1, Ordering::Relaxed);
                     o.sent_bytes.fetch_add(slot.buf.len() as u64, Ordering::Relaxed);
@@ -2126,6 +2137,16 @@ pub(crate) fn tx_loop(
         // 见下面用到它的那处注释：循环级的重采样暂存。
         staged.clear();
         for tx in streams.values_mut() {
+            // Source built, peer has not accepted yet (`TxShared::armed`). There
+            // is nowhere for a datagram to go — the peer has no receiving stream
+            // — and one sent anyway lands in our payload counter and in nobody
+            // else's. Stages are cleared for the same reason the missing-source
+            // arm below clears them: a stale reading left in the slot is a
+            // number the UI keeps showing about a stream that is not running.
+            if !tx.shared.armed.load(Ordering::Relaxed) {
+                clear_send_stages(tx);
+                continue;
+            }
             let Some(ent) = sources.get(&tx.spec) else {
                 // 源已经不在表里了（`reap_dead_sources` 收了尸，或 Remove 把
                 // refs 减到 0），而这条流的 `TxShared` 还活着并且仍在被报告线程
@@ -2382,17 +2403,107 @@ pub(crate) fn tx_loop(
 /// 96 kHz 档」都不会变成「Windows 上全静音、日志里只有 tampered」。
 const RECV_BUF_BYTES: usize = 4096;
 
+/// Which directions the `AUDIOHUB_TEST_BLOCK_UDP` hook is swallowing.
+///
+/// # What this is for, and the honesty it costs
+///
+/// The automatic tier 0 → 1 downgrade cannot be tested without a link where
+/// UDP does not get through, and every other way of producing one needs
+/// administrative privileges on a machine that is also carrying the user's real
+/// audio (`pfctl`, `New-NetFirewallRule`). This hook needs none: it drops
+/// datagrams at the point **closest to the socket** on each side, so almost the
+/// entire path under test is the real one.
+///
+/// What it is not: a firewall. It is our own simulator being fed to our own
+/// detector, and a real-firewall confirmation is a separate, one-off exercise
+/// (design §7 Level 2b). That limitation is why the hook sits at the socket
+/// rather than somewhere convenient higher up — the smaller the faked segment,
+/// the less the two can disagree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UdpBlock {
+    pub out: bool,
+    pub inbound: bool,
+}
+
+impl UdpBlock {
+    pub(crate) const OFF: UdpBlock = UdpBlock { out: false, inbound: false };
+
+    /// Parse the hook's value. **An unrecognised value blocks both
+    /// directions.**
+    ///
+    /// Deliberately the harsh reading. Treating a typo as "off" would let a
+    /// harness believe it had built a blocked link, watch the downgrade not
+    /// happen, and record a pass — the exact shape of a test that is theatre.
+    /// Blocking too much can only make a test fail loudly, which is a fault
+    /// somebody investigates.
+    pub(crate) fn parse(v: &str) -> UdpBlock {
+        match v {
+            "out" => UdpBlock { out: true, inbound: false },
+            "in" => UdpBlock { out: false, inbound: true },
+            _ => UdpBlock { out: true, inbound: true },
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match (self.out, self.inbound) {
+            (true, true) => "in both directions",
+            (true, false) => "on the way out",
+            (false, true) => "on the way in",
+            (false, false) => "nowhere",
+        }
+    }
+
+    /// Resolve the hook for one daemon: the explicit setting if there is one,
+    /// otherwise `AUDIOHUB_TEST_BLOCK_UDP`.
+    ///
+    /// Both, and in that order, for the reason
+    /// [`crate::DaemonCfg::tx_throttle_kbps`] gives at length: **the
+    /// environment is process-global and the tests share a process.** An
+    /// in-process pair of daemons cannot express "block this one's UDP and not
+    /// that one's" through the environment at all — and a one-directional block
+    /// is precisely what the keepalive signal exists to catch, so without the
+    /// explicit form half the detector would be untestable.
+    ///
+    /// The environment form stays because it is the only one available to a
+    /// separate-process harness (`regress/`), where the daemon is a binary and
+    /// there is nobody to pass a struct to.
+    pub(crate) fn resolve(explicit: Option<&str>) -> UdpBlock {
+        let b = match explicit {
+            Some(v) => UdpBlock::parse(v),
+            None => match std::env::var("AUDIOHUB_TEST_BLOCK_UDP") {
+                Ok(v) => UdpBlock::parse(&v),
+                Err(_) => return UdpBlock::OFF,
+            },
+        };
+        // Said out loud, because a stray setting produces total silence with
+        // every counter and every screen looking healthy — this line is the
+        // only thing that would tell it apart from a network fault.
+        dlog!(
+            "[audiohubd] ⚠ UDP test block active: dropping UDP datagrams {}. \
+             This is a TEST HOOK; tier 0 audio will not work.",
+            b.describe()
+        );
+        b
+    }
+}
+
 pub(crate) fn rx_loop(inner: Arc<DaemonInner>) {
     const _: () = assert!(
         RECV_BUF_BYTES >= DEEPEST_SEALED_FRAME_BYTES,
         "收流缓冲装不下最深档的整帧：mac 上表现为 tampered，Windows 上表现为收流每包睡 100 ms"
     );
     let mut buf = [0u8; RECV_BUF_BYTES];
+    // Read once, outside the loop: the loop runs at the packet rate.
+    let block_in = inner.udp_block.inbound;
     loop {
         if inner.shutdown.load(Ordering::SeqCst) {
             return;
         }
         match inner.udp.recv_from(&mut buf) {
+            // Dropped after `recv_from` and before anything else looks at it —
+            // as close to the socket as this side gets, which is what keeps the
+            // simulated segment down to a single branch.
+            Ok(_) if block_in => {}
             Ok((n, from)) => handle_datagram(&inner, &buf[..n], from),
             Err(e) if poll_tick(e.kind()) => {}
             Err(e) => {
@@ -2470,6 +2581,11 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
         Kind::Media => {
             let rx = rd(&inner.rx_table).get(&h.stream_id).cloned();
             let Some(rx) = rx else { return };
+            // Before the AEAD, before the codec check, before anything that can
+            // reject this datagram: the tier watchdog's question is whether the
+            // *network* delivered anything, and every early return below is a
+            // fault this daemon can diagnose on its own. See `RxStream::media_seen`.
+            rx.media_seen.fetch_add(1, Ordering::Relaxed);
             // tampered/foreign. Counted, because this was the one drop on the
             // media path with no number anywhere behind it — and on tier 1 it
             // is the only thing that can explain a `frames_read` that climbs
@@ -2845,7 +2961,13 @@ pub(crate) fn send_pullreq(inner: &DaemonInner, rx: &RxStream) {
         timestamp_us: inner.start.elapsed().as_micros() as u64,
         payload_len: 0,
     };
-    let _ = inner.udp.send_to(&h.encode(&[]), dest);
+    // Same hook as the media path. A keepalive is a UDP datagram on the same
+    // socket, so a simulated block that let it through would be simulating a
+    // firewall nobody has — and it would defeat the very signal this keepalive
+    // feeds (`autotier`'s second signal is "no keepalive ever arrived").
+    if !inner.udp_block.out {
+        let _ = inner.udp.send_to(&h.encode(&[]), dest);
+    }
 }
 
 // ---------------------------------------------------------------- mixer

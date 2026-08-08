@@ -1063,7 +1063,16 @@ fn we_dialled(inner: &DaemonInner, conn: &ConnShared) -> bool {
 /// Costs nothing on tier 0: the tier check below returns before anything is
 /// sent, so a connection that is not pinned never waits at all.
 pub(crate) fn negotiate(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
-    if lk(&inner.peer_transport).tier(&conn.fp) != TransportTier::Tier1 {
+    // A verdict old enough to re-test is retired here, before the tier is read,
+    // so this connection starts on tier 0 and the detector gets another look.
+    // This is the *only* place a peer is promoted back — between connections,
+    // never inside a live stream (design §5.1).
+    crate::autotier::retire_stale_verdict(inner, &conn.fp);
+    // The EFFECTIVE tier, so an automatic verdict recorded on an earlier
+    // connection brings the media link up without the user having pinned
+    // anything. `tier()` here — the raw setting — is what left P3's automatic
+    // downgrade unimplementable: it can only ever read what a human typed.
+    if lk(&inner.peer_transport).effective_tier(&conn.fp) != TransportTier::Tier1 {
         return;
     }
     let deadline = Instant::now() + ATTACH_TIMEOUT;

@@ -48,7 +48,7 @@ const SOURCE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Silence that declares a control channel dead (spec-m4c §C wants the drop
 /// visible in ~5s). The ticker pings every second, so this is five missed
 /// round trips on a channel where the peer answers Ping without doing any work.
-const CONTROL_SILENCE_LIMIT: Duration = Duration::from_secs(5);
+pub(crate) const CONTROL_SILENCE_LIMIT: Duration = Duration::from_secs(5);
 const MAX_PAIR_FAILURES: u32 = 5;
 pub(crate) const MAX_PAIRING_TTL_S: u64 = 300;
 const MAX_STREAMS_PER_CONN: usize = 16;
@@ -750,6 +750,12 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
             "[audiohubd] {} refused a tier 1 media attach: {reason}",
             conn.fp
         ),
+        // The peer's half of the automatic downgrade. Handled inline like the
+        // attach messages above and for the same reason it is safe to: it does
+        // a store write and at most a `drop_conn`, no device I/O and no dial.
+        SessionMsg::TransportSwitch { tier, reason } => {
+            crate::autotier::on_peer_switch(inner, &conn.fp, &tier, &reason)
+        }
         SessionMsg::AcceptStream { stream_id } => notify_pending(conn, stream_id, Ok(())),
         SessionMsg::RejectStream { stream_id, reason } => {
             notify_pending(conn, stream_id, Err(reason))
@@ -1420,6 +1426,7 @@ fn handle_remote_open(
                     origin: SessionOrigin::Peer,
                     peer_lat: Arc::new(PeerLatCell::new()),
                     pushed: pushed.clone(),
+                    armed_conn_ms: conn.clock_ms(),
                 },
             );
         }
@@ -1457,6 +1464,7 @@ fn handle_remote_open(
                     origin: SessionOrigin::Peer,
                     peer_lat: Arc::new(PeerLatCell::new()),
                     pushed: pushed.clone(),
+                    armed_conn_ms: conn.clock_ms(),
                 },
             );
         }
@@ -2323,11 +2331,56 @@ pub(crate) fn open_session_from(
         lk(&conn.pending).remove(&stream_id);
         if consuming {
             wr(&inner.rx_table).remove(&stream_id);
+        } else {
+            // The send side is brought up BEFORE `OpenStream` goes out (see
+            // below), so every failure path from here on has a media source to
+            // take back down. Unknown ids are a no-op in `TxState::remove_stream`,
+            // which is what makes this safe on the paths that failed earlier.
+            let _ = lk(&inner.tx_cmds).send(TxCmd::Remove { stream_id });
         }
         if let Some(name) = &bridge {
             engine::release_bridge(inner, name);
         }
     };
+
+    // plan §16.2 的自动降级判定是**接收侧**的：对端在收到 `OpenStream` 的那一刻
+    // 就给这条流上膛（`handle_remote_open` 的 `DIR_SEND` 臂），此后 600 ms 没有
+    // 任何媒体数据报到达就是一条「这条链路过不去 UDP」的证据。
+    //
+    // 所以源必须在**发出这条消息之前**跑起来。建源本身可以慢：`start_tx_stream`
+    // 等的是 `SOURCE_ACK_TIMEOUT`（5 s），而 mac 上的 CATap 要建进程 tap + 聚合
+    // 设备，首次还要走一遍 TCC 授权——把它放在 accept 之后，对端的表从 0 开始
+    // 跑而我们最多 5 s 之后才发第一个包，判定在 1 s 出结果，代价是一条好链路被
+    // **落盘一小时**的降级钉在 TCP 上。
+    //
+    // 这也正是 `handle_remote_open` 早就守着的纪律（源建不出来就不 accept，
+    // 而不是 accept 一条永远没有声音的流）；两个开流方向从此同一条规矩。
+    //
+    // 「跑起来」到此为止是**源**跑起来，不是数据报出门：`armed = false` 让这条流
+    // 在对端 accept 之前一个包都不发。那段时间里包无处可去（对端还没有接收流，
+    // 收到也只能丢），而发了就会记进本机的 payload 计数、永远记不进对端的——
+    // 两个本该逐字相等的计数器之间从此挂着一段固定的差
+    // （`the_two_ends_agree_on_what_a_wire_byte_is` 盯的正是这个差）。
+    let mut tx_shared: Option<Arc<TxShared>> = None;
+    if !consuming {
+        let path = conn.current_media_path();
+        let shared = Arc::new(TxShared::new_on(path.auto_top_rung()));
+        shared.armed.store(false, Ordering::SeqCst);
+        if let Err(e) = start_tx_stream(
+            inner,
+            stream_id,
+            conn.tx_key,
+            salt.to_vec(),
+            path,
+            spec.expect("validated above"),
+            params.simulate_loss_pct.unwrap_or(0.0),
+            shared.clone(),
+        ) {
+            unwind(inner, &conn);
+            return Err(e.context("start media source"));
+        }
+        tx_shared = Some(shared);
+    }
 
     // plan §15：档位在**发这条消息的这一刻**从 `inner.peer_transport` 现读，
     // **不进 `OpenSessionParams`**。
@@ -2367,6 +2420,13 @@ pub(crate) fn open_session_from(
             bail!("open timed out after {OPEN_TIMEOUT:?}");
         }
     }
+    // The peer has a receiving stream now, so the datagrams have somewhere to
+    // land. Before the table insert below, deliberately: the audio starting is
+    // what the peer is waiting for, and the insert only concerns this daemon's
+    // own bookkeeping.
+    if let Some(shared) = &tx_shared {
+        shared.armed.store(true, Ordering::SeqCst);
+    }
 
     // exactly what a reconnect replays; the fresh stream id and media salt are
     // minted by this function, not carried here (spec-m4c §C)
@@ -2384,39 +2444,24 @@ pub(crate) fn open_session_from(
             origin,
             peer_lat: Arc::new(PeerLatCell::new()),
             pushed: Arc::new(crate::PushedTransport::default()),
+            armed_conn_ms: conn.clock_ms(),
         }
     } else {
-        let path = conn.current_media_path();
-        let shared = Arc::new(TxShared::new_on(path.auto_top_rung()));
-        // the peer already accepted, so a local source failure has to be undone
-        // on the wire too — never leave it waiting on a stream we cannot feed
-        if let Err(e) = start_tx_stream(
-            inner,
-            stream_id,
-            conn.tx_key,
-            salt.to_vec(),
-            path,
-            spec.expect("validated above"),
-            params.simulate_loss_pct.unwrap_or(0.0),
-            shared.clone(),
-        ) {
-            unwind(inner, &conn);
-            let _ = conn.send_msg(&SessionMsg::CloseStream { stream_id });
-            return Err(e.context("start media source"));
-        }
         SessionEntry {
             id: stream_id,
             conn: conn.clone(),
             kind: params.kind.clone(),
             dir: DIR_SEND.to_string(),
             rx: None,
-            tx: Some(shared),
+            // Built above, before `OpenStream` went out.
+            tx: Some(tx_shared.expect("the send side is built before OpenStream")),
             // consumer of a spk stream: our slider drives the PEER's output
             volume: Arc::new(VolumeCell::new(vol_sync)),
             replay,
             origin,
             peer_lat: Arc::new(PeerLatCell::new()),
             pushed: Arc::new(crate::PushedTransport::default()),
+            armed_conn_ms: conn.clock_ms(),
         }
     };
     // Liveness is re-checked under the SAME lock that inserts. A peer that
@@ -2435,10 +2480,10 @@ pub(crate) fn open_session_from(
         live
     };
     if !inserted {
+        // `unwind` takes the media source down too, so nothing extra is needed
+        // here — and the peer, which did accept, is told by the CloseStream the
+        // teardown of this control channel already implies.
         unwind(inner, &conn);
-        if !consuming {
-            let _ = lk(&inner.tx_cmds).send(TxCmd::Remove { stream_id });
-        }
         bail!(
             "control channel to {} closed while the stream was being opened",
             conn.fp

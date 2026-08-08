@@ -48,12 +48,26 @@ impl Drop for Node {
 
 impl Node {
     fn start(tag: &str) -> Node {
-        Node::start_throttled(tag, None)
+        Node::start_with(tag, None, None)
     }
 
     /// `tx_throttle_kbps` in kbit/s on this daemon's degraded-transport writers
     /// only. See `DaemonCfg::tx_throttle_kbps`.
     fn start_throttled(tag: &str, tx_kbps: Option<u64>) -> Node {
+        Node::start_with(tag, tx_kbps, None)
+    }
+
+    /// A daemon whose UDP is swallowed in the named direction(s) — `"out"`,
+    /// `"in"` or `"both"`. See `DaemonCfg::block_udp`.
+    ///
+    /// **Per node, not per process.** The two automatic-downgrade signals sit
+    /// on opposite ends of a link, so proving the keepalive one needs exactly
+    /// this: one node blocked, its partner not.
+    fn start_blocked(tag: &str, block: &str) -> Node {
+        Node::start_with(tag, None, Some(block.to_string()))
+    }
+
+    fn start_with(tag: &str, tx_kbps: Option<u64>, block_udp: Option<String>) -> Node {
         let n = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -68,6 +82,7 @@ impl Node {
             // 与 mode_tests 同一条理由：`auto` 会把用户的真 daemon 从驱动上挤掉。
             hal_bridge: Some(HalBridgeMode::Off),
             tx_throttle_kbps: tx_kbps,
+            block_udp,
         })
         .expect("start daemon");
         Node { h, dir }
@@ -1592,6 +1607,7 @@ fn a_fixed_choice_is_still_in_force_after_a_restart() {
         // Production and every test but the tier 2 starvation rig: whatever
         // the environment says (normally nothing, i.e. unlimited).
         tx_throttle_kbps: None,
+        block_udp: None,
     };
 
     // 一台真对端：`peers.set_transport` 要解析指纹，没有配对就没有指纹。
@@ -3746,4 +3762,409 @@ fn the_websocket_heartbeat_survives_ninety_seconds_without_media() {
         ws_block(&a.mux_link().unwrap()),
         ws_block(&b.mux_link().unwrap())
     );
+}
+
+// ================================================================ M8: automatic tier 0 -> 1
+//
+// `plan.md` §9 (M8 acceptance) asks for "**automatic**/manual downgrade", and
+// §16.2 assigns the halves: 0 -> 1 automatic, -> 2 manual. Everything above
+// this line reaches tier 1 by `pin_tier`, i.e. by a human. These tests are the
+// automatic half.
+//
+// What makes them able to fail is `DaemonCfg::block_udp`: a per-daemon switch
+// that swallows datagrams at the socket, so a link with no UDP can be built in
+// process, without a firewall rule, without privileges, and — the part that
+// matters for the keepalive signal — **asymmetrically**.
+
+/// This daemon's stored verdict about `fp`: `(auto_tier, reason)`.
+///
+/// Reads the store rather than `peers.list` so a failure points at the daemon
+/// state and not at the reporting layer; the reporting layer gets its own
+/// assertion in the end-to-end test below.
+fn verdict(n: &Node, fp: &str) -> (Option<String>, Option<String>) {
+    let inner = n.h.inner_for_test();
+    let store = lk(&inner.peer_transport);
+    let t = store.get(fp);
+    (t.auto_tier.clone(), t.auto_tier_reason.clone())
+}
+
+/// Pre-seed a verdict, the way `pin_tier` pre-seeds a pin and for the same
+/// reason: the transport is chosen from the store before the first byte.
+///
+/// `age_s` is how long ago it was reached, which is what decides whether
+/// `autotier::retire_stale_verdict` throws it away at the next connection.
+fn seed_verdict(n: &Node, fp: &str, age_s: u64) {
+    let inner = n.h.inner_for_test();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let mut store = lk(&inner.peer_transport);
+    let mut t = store.get(fp);
+    t.set_auto_tier(
+        crate::peer_transport::TransportTier::Tier1,
+        "seeded by a test",
+        now.saturating_sub(age_s),
+    );
+    store.set(fp, t);
+    assert_eq!(
+        store.effective_tier(fp),
+        crate::peer_transport::TransportTier::Tier1,
+        "the seeded verdict did not stick; every assertion downstream would be about tier 0"
+    );
+}
+
+/// 「降了就记住」, end to end: a verdict left over from an earlier connection
+/// brings the **next** one up on tier 1, with nobody pinning anything.
+///
+/// This is the whole point of persisting it. Without it every connection to a
+/// peer behind a UDP-blocking firewall replays the detection delay — 600 ms of
+/// silence before any sound, for ever.
+///
+/// Deliberately runs on a link where UDP works fine, so that the only thing
+/// that can put media on TCP is the stored verdict being read.
+///
+/// Injection control (run 2026-08-09, red as described): revert
+/// `tcpmedia::negotiate` to `tier(&conn.fp)` — the P3 reading, the user's
+/// choice — and this times out at "a tier 1 link on the dialling side", because
+/// a verdict is not a pin and `tier()` can only ever see a pin.
+#[test]
+fn a_stored_verdict_brings_the_next_connection_up_on_tier_one() {
+    let a = Node::start("auto-mem-a");
+    let b = Node::start("auto-mem-b");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    // Neither side is pinned. `peers.set_tier` is never called.
+    seed_verdict(&a, &b.fingerprint(), 0);
+    seed_verdict(&b, &a.fingerprint(), 0);
+    pair(&a, &b);
+
+    eventually("a tier 1 link on the dialling side", || {
+        a.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+    eventually("a tier 1 link on the accepting side", || {
+        b.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+    // The red line, restated on the reporting surface: the user chose nothing,
+    // and every surface still says so.
+    assert_eq!(
+        a.peer(&b.fingerprint())["transport"]["tier"].as_str(),
+        Some("auto"),
+        "a stored verdict was reported as the user's choice"
+    );
+    assert_eq!(
+        a.peer(&b.fingerprint())["auto_tier"].as_str(),
+        Some("tier1"),
+        "the link's state is not being reported at all, so the UI cannot explain the latency"
+    );
+}
+
+/// The re-probe (design §5.1): a verdict older than an hour is retired at the
+/// next connection, so a link that has since been fixed goes back to UDP.
+///
+/// Without it, one transient firewall — or one afternoon on a hotel network —
+/// pins a peer to TCP permanently, and nothing but a hand edit would ever
+/// undo it.
+///
+/// Injection control (run 2026-08-09, red as described): delete the
+/// `retire_stale_verdict` call from `negotiate` and the stale verdict survives,
+/// so the first assertion fails with `Some("tier1")`.
+#[test]
+fn a_verdict_older_than_the_retry_window_is_retired_and_udp_is_probed_again() {
+    let a = Node::start("auto-age-a");
+    let b = Node::start("auto-age-b");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    // Two hours old, against a one hour window. UDP works on this link.
+    seed_verdict(&a, &b.fingerprint(), 2 * crate::autotier::AUTO_TIER_RETRY_SECS);
+    pair(&a, &b);
+
+    eventually("the stale verdict to be retired", || {
+        verdict(&a, &b.fingerprint()).0.is_none()
+    });
+    // ...and the connection really came up on tier 0, not merely lost its
+    // paperwork. `negotiate` returns before sending anything on tier 0, so a
+    // media link would be the sign that the retirement happened too late to
+    // matter.
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({
+            "peer": b.fingerprint(), "kind": KIND_SPK, "source": SOURCE_TONE,
+            "freq": 1000.0, "verify_freq": 1000.0
+        }),
+    );
+    eventually_within(Duration::from_secs(20), "B's 1 kHz verdict over UDP", || {
+        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
+    });
+    assert!(
+        a.tcp_link().is_none(),
+        "media went to TCP on a link whose only reason to do so had just expired"
+    );
+}
+
+/// **Signal 1, end to end**: the receiving side notices that no media datagram
+/// has arrived, downgrades the link on its own, tells the peer, and the audio
+/// comes back over TCP.
+///
+/// B's inbound UDP is swallowed at its socket. A's is untouched, so A's
+/// keepalive counter keeps ticking and signal 2 provably cannot be what fires
+/// here — which the reason-string assertion pins down.
+///
+/// The last assertion is the one that makes this a test of the feature rather
+/// than of the bookkeeping: **a tone crosses**. Everything before it could be
+/// satisfied by a daemon that writes the right words into a store and leaves
+/// the peer silent, which is precisely the failure mode this repository has
+/// shipped five times.
+///
+/// Injection controls (both run 2026-08-09, both red as described):
+///   - delete the `rx` arm of `autotier::watchdog_pass` ⇒ times out at "B to
+///     notice that no UDP is arriving"; nothing else in the daemon notices.
+///   - write the verdict into `transport_tier` (the user's field) **and** read
+///     the user's pin back from before that write, i.e. a build that downgrades
+///     perfectly and only records the decision in the wrong place ⇒ the link
+///     comes up, the tone crosses over TCP, every audio assertion passes, and
+///     the run fails at the red line and nowhere else. That is the whole
+///     justification for the red line being a rule: **no observation of the
+///     sound can catch this bug.** It is also why the audio assertions were
+///     moved above it — so the injection has to pass them to reach it.
+///   - the simpler version of that injection (write `transport_tier` and leave
+///     the rest alone) fails earlier, at "a tier 1 link after the downgrade",
+///     and the reason is worth knowing: overwriting the user's field changes
+///     what `downgrade` reads back as the user's pin, so it takes the "the user
+///     pinned this, do not act" branch and applies nothing. Corrupting that
+///     field does not merely mislabel the decision, it feeds back into it.
+#[test]
+fn a_receiver_that_gets_no_udp_downgrades_the_link_by_itself() {
+    let a = Node::start("auto-rx-a");
+    let b = Node::start_blocked("auto-rx-b", "in");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    let (afp, bfp) = (a.fingerprint(), b.fingerprint());
+    pair(&a, &b);
+    // A consumer -> provider tone. A sends, B receives, so B is the only side
+    // that can see "nothing arrived".
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({
+            "peer": bfp, "kind": KIND_SPK, "source": SOURCE_TONE,
+            "freq": 1000.0, "verify_freq": 1000.0
+        }),
+    );
+
+    eventually("B to notice that no UDP is arriving", || verdict(&b, &afp).0.is_some());
+    let (tier, why) = verdict(&b, &afp);
+    assert_eq!(tier.as_deref(), Some("tier1"));
+    let why = why.expect("a verdict without a reason cannot be explained to anyone");
+    assert!(
+        why.contains("inbound"),
+        "the wrong signal fired: expected the receiver's silence, got `{why}`"
+    );
+
+    // The peer was told, so its next connection starts on tier 1 too instead of
+    // spending another detection cycle finding out.
+    eventually("A to be told by B", || verdict(&a, &bfp).0.is_some());
+
+    // The audio comes back — over TCP, on a link where UDP is dead. Asserted
+    // BEFORE the red line so that a build which downgrades correctly but lies
+    // about who decided gets all the way here and fails only below.
+    eventually_within(Duration::from_secs(40), "a tier 1 link after the downgrade", || {
+        a.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+    eventually_within(Duration::from_secs(40), "B's 1 kHz verdict over TCP", || {
+        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
+    });
+
+    // THE RED LINE (plan §16.4 rule 5). The daemon decided; the user did not.
+    assert_eq!(
+        lk(&b.h.inner_for_test().peer_transport).get(&afp).transport_tier,
+        "auto",
+        "the automatic downgrade overwrote the user's `auto` with a pin they never made"
+    );
+    assert_eq!(
+        b.peer(&afp)["transport"]["tier"].as_str(),
+        Some("auto"),
+        "...and the reporting layer repeated the lie"
+    );
+    assert_eq!(b.peer(&afp)["auto_tier"].as_str(), Some("tier1"));
+    assert!(
+        b.peer(&afp)["auto_tier_reason"].as_str().is_some_and(|r| r.contains("inbound")),
+        "the reason is not reported, so the UI can show a slower link and not say why"
+    );
+}
+
+/// **Signal 2**: the sending side notices that not one keepalive has come back.
+///
+/// This is the case signal 1 cannot see from here. A is a pure sender — it has
+/// no receiving stream at all — so "nothing arrived" is not a question it can
+/// ask. Its inbound UDP is blocked while its outbound is not, so its media
+/// reaches B perfectly and B has nothing to complain about; the only evidence
+/// on this link is the keepalive that never comes back.
+///
+/// That asymmetry is why `block_udp` is a per-daemon setting rather than an
+/// environment variable: it cannot be expressed process-wide.
+///
+/// Injection control (run 2026-08-09, red as described): delete the `tx` arm of
+/// `autotier::watchdog_pass` ⇒ times out at "A to notice its keepalives never
+/// come back", and B never reports anything either, because from B's side this
+/// link looks perfect.
+#[test]
+fn a_sender_whose_keepalives_never_arrive_downgrades_too() {
+    let a = Node::start_blocked("auto-tx-a", "in");
+    let b = Node::start("auto-tx-b");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    let bfp = b.fingerprint();
+    pair(&a, &b);
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({ "peer": bfp, "kind": KIND_SPK, "source": SOURCE_TONE, "freq": 1000.0 }),
+    );
+
+    eventually_within(
+        Duration::from_secs(15),
+        "A to notice its keepalives never come back",
+        || verdict(&a, &bfp).0.is_some(),
+    );
+    let (tier, why) = verdict(&a, &bfp);
+    assert_eq!(tier.as_deref(), Some("tier1"));
+    assert!(
+        why.as_deref().is_some_and(|w| w.contains("keepalive")),
+        "the wrong signal fired: expected the missing keepalive, got {why:?}"
+    );
+    assert_eq!(
+        lk(&a.h.inner_for_test().peer_transport).get(&bfp).transport_tier,
+        "auto",
+        "the automatic downgrade overwrote the user's choice"
+    );
+}
+
+/// A peer pinned to tier 0 is saying "do not fall back". The verdict is still
+/// recorded — "your link has no UDP and you told me not to work around it" is
+/// the single most useful thing an interface can say here — but **nothing acts
+/// on it**.
+///
+/// Both ends are pinned, so in a correct build **no connection is ever torn
+/// down** and the last assertion has a clean thing to check. That assertion is
+/// the one that matters: applying a verdict means dropping the control channel
+/// so a reconnect can renegotiate, and against a pin that buys nothing at all —
+/// the reconnect comes back on the same pinned tier. The cost is a real
+/// teardown plus a session replay on a link the user configured deliberately.
+///
+/// ⚠ **This test was theatre in its first version and was caught by its own
+/// injection control**, which is worth leaving written down. It originally
+/// asserted `online == true` five seconds later and claimed to be guarding
+/// against "a permanent reconnect loop". There is no loop — `note_auto_tier`
+/// reports no change on the second sweep, so a wrong build drops the connection
+/// exactly *once* — and `online` is back to true about a second after a
+/// teardown. So the assertion passed under the injection: it was watching for a
+/// failure that cannot happen, and blind to the one that can. Identity of the
+/// `ConnShared` is what actually distinguishes "never dropped" from "dropped
+/// and rebuilt", and holding the `Arc` (rather than comparing raw addresses)
+/// keeps the allocation alive so a reused address cannot forge a match.
+///
+/// It also holds the second half of the same rule: a pinned machine does not
+/// **announce** either. Advertising 「switch to tier 1」 and then refusing the
+/// peer's attach (`tcpmedia::on_request`) costs the peer a teardown and a
+/// session replay to reach somewhere this machine will not let it go.
+///
+/// Injection controls (run 2026-08-09, red as described):
+///   - remove the `user_tier != Auto` early return from `autotier::downgrade`
+///     ⇒ "the control connection to survive a verdict it must not act on"
+///     fails, because the channel B is holding has been replaced;
+///   - move `if announce` back above that early return ⇒ "a machine pinned to
+///     tier 0 announced a downgrade it will not take part in" fails, because A
+///     records B's verdict as `the peer reported ...`.
+#[test]
+fn a_peer_pinned_to_tier_zero_records_the_verdict_but_does_not_act_on_it() {
+    let a = Node::start("auto-pin0-a");
+    let b = Node::start_blocked("auto-pin0-b", "in");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    let (afp, bfp) = (a.fingerprint(), b.fingerprint());
+    // Both ends pinned: whatever either side concludes, neither may act.
+    pin_tier(&a, &bfp, "tier0");
+    pin_tier(&b, &afp, "tier0");
+    pair(&a, &b);
+    a.ok(
+        methods::SESSION_OPEN,
+        json!({ "peer": bfp, "kind": KIND_SPK, "source": SOURCE_TONE, "freq": 1000.0 }),
+    );
+    // Taken before the verdict, and held: the comparison at the end is object
+    // identity, so this `Arc` has to outlive any teardown that might happen.
+    let held = live_conn(&b, &afp).expect("B has a control channel to A");
+
+    eventually("B to record the verdict", || verdict(&b, &afp).0.is_some());
+    assert_eq!(
+        lk(&b.h.inner_for_test().peer_transport).get(&afp).transport_tier,
+        "tier0",
+        "the pin was overwritten by the detector"
+    );
+    assert_eq!(
+        b.peer(&afp)["auto_tier"].as_str(),
+        Some("tier1"),
+        "the observation must still be reported: it is the only way the interface can explain \
+         why a pinned-to-tier-0 link is silent"
+    );
+
+    // Nothing acted on it. Checked continuously rather than once at the end of
+    // a sleep, for two reasons:
+    //
+    //  - a wrong build tears the connection down on the FIRST verdict, i.e.
+    //    within a sweep or two of the assertion above, so polling reports it
+    //    immediately instead of five seconds later;
+    //  - `conn::ping_and_reap` declares a channel dead after 5 s of silence, so
+    //    a single `sleep(5s)` sat exactly on that limit. Under `--test-threads=1`
+    //    a stall elsewhere in the process (the mixer loop has been measured at
+    //    7.5 s) pushed a *correct* build over it and failed this test for a
+    //    reason that has nothing to do with what it is about. Two and a half
+    //    seconds is ~12 watchdog sweeps and half the exposure.
+    let watch = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < watch {
+        assert!(
+            b.tcp_link().is_none(),
+            "a tier 1 link was brought up for a peer explicitly pinned to tier 0"
+        );
+        // A verdict-driven teardown happens while the channel is healthy — that
+        // is the whole shape of the bug. A teardown because the channel really
+        // did fall silent for `conn::ping_and_reap`'s limit is a different
+        // cause, and on a loaded machine it is a reachable one: this process
+        // runs several daemons and its mixer loop has been measured stalling
+        // for seconds. Reading the silence first is what keeps the assertion
+        // below about the verdict rather than about the scheduler.
+        if held.silent_for() >= crate::conn::CONTROL_SILENCE_LIMIT {
+            eprintln!(
+                "[test] the control channel went genuinely silent for {:.1}s — this process \
+                 stalled, which is not what this test is about; stopping the watch early",
+                held.silent_for().as_secs_f64()
+            );
+            break;
+        }
+        assert!(
+            live_conn(&b, &afp).is_some_and(|now| std::sync::Arc::ptr_eq(&held, &now)),
+            "the control connection did not survive a verdict it must not act on: it was torn \
+             down and rebuilt, costing a session replay, to renegotiate the very tier it was \
+             already on"
+        );
+        assert!(
+            held.alive.load(std::sync::atomic::Ordering::SeqCst),
+            "...the object survived but was marked dead, which is the same teardown one step \
+             earlier"
+        );
+        // ...and B did not tell A to switch either. A `TransportSwitch` from a
+        // machine that will then refuse the attach (`tcpmedia::on_request`:
+        // "this peer is pinned to tier 0") costs A a teardown and a session
+        // replay to arrive somewhere B does not allow it to go. A pin binds what
+        // this machine asks of the peer, not only what it does itself.
+        assert!(
+            !verdict(&a, &bfp).1.is_some_and(|w| w.contains("the peer reported")),
+            "a machine pinned to tier 0 announced a downgrade it will not take part in"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The live `ConnShared` for `fp`, held by the caller so that object identity
+/// stays a meaningful comparison.
+fn live_conn(n: &Node, fp: &str) -> Option<std::sync::Arc<crate::ConnShared>> {
+    lk(&n.h.inner_for_test().state).conns.get(fp).cloned()
 }

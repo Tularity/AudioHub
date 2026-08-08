@@ -1,6 +1,9 @@
 //! audiohubd — daemon assembly (spec-m4a §1/§4).
 //! Frozen lib entry: `DaemonCfg` / `DaemonHandle` / `start_daemon`.
 
+/// Noticing that UDP does not get through, and moving the peer to tier 1
+/// without being asked (plan §16.2).
+mod autotier;
 mod conn;
 /// 向系统**如实声明**虚拟设备的延迟：口径、死区与闭环判据。
 mod devdecl;
@@ -266,6 +269,19 @@ pub struct DaemonCfg {
     /// delay is real and is what tier 2 feels like on such a link; it just
     /// cannot be used to measure a scheduler.
     pub tx_throttle_kbps: Option<u64>,
+    /// Test-only UDP block: `"out"`, `"in"` or `"both"` (any other string reads
+    /// as `"both"`). `None` = whatever `AUDIOHUB_TEST_BLOCK_UDP` says.
+    ///
+    /// Exists so the automatic tier 0 → 1 downgrade can be tested at all. The
+    /// alternative is a real firewall rule, which needs administrative rights
+    /// on machines that are also carrying the user's live audio.
+    ///
+    /// Here rather than only in the environment for the same reason as
+    /// `tx_throttle_kbps`, and it bites harder here: the two detector signals
+    /// live on opposite ends of the link, so proving the keepalive signal needs
+    /// **one** daemon of an in-process pair blocked and the other not — a
+    /// distinction a process-global variable cannot make.
+    pub block_udp: Option<String>,
 }
 
 pub struct DaemonHandle {
@@ -392,6 +408,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
             .tx_throttle_kbps
             .map(|kbps| kbps * 1000 / 8)
             .unwrap_or_else(tcpmedia::token_bucket_from_env),
+        udp_block: engine::UdpBlock::resolve(cfg.block_udp.as_deref()),
         start: Instant::now(),
         state: Mutex::new(DaemonState {
             conns: HashMap::new(),
@@ -588,6 +605,13 @@ pub(crate) struct DaemonInner {
     /// Bytes/second the degraded transports' writers may put on the wire, 0 =
     /// unlimited. See [`DaemonCfg::tx_throttle_kbps`].
     pub tx_bps: u64,
+    /// Which directions of UDP this daemon is pretending are firewalled off.
+    /// See [`DaemonCfg::block_udp`]. `UdpBlock::OFF` in every real run.
+    ///
+    /// Resolved once at startup and then plain field reads: `rx_loop` and
+    /// `udp_send_loop` hoist it out of their loops, so the hook costs one
+    /// already-hot branch on the media path and no environment access at all.
+    pub(crate) udp_block: engine::UdpBlock,
     pub start: Instant,
     pub state: Mutex<DaemonState>,
     pub rx_table: RwLock<HashMap<u32, Arc<RxStream>>>,
@@ -1337,6 +1361,29 @@ impl ConnShared {
         Duration::from_millis(now.saturating_sub(self.last_rx_ms.load(Ordering::Relaxed)))
     }
 
+    /// Millis on **this connection's own clock** — the same one
+    /// [`ConnShared::last_rx_ms`] is written in.
+    ///
+    /// Exposed so that "how long since this stream armed" and "has the peer
+    /// spoken since it armed" are answered off one clock. Computing the first
+    /// from an `Instant` and the second from this counter would put a
+    /// comparison between two time bases in the middle of the one decision that
+    /// only ever executes on a broken link.
+    pub(crate) fn clock_ms(&self) -> u64 {
+        self.created.elapsed().as_millis() as u64
+    }
+
+    /// Has a complete control frame arrived since `mark` (this connection's
+    /// clock)?
+    ///
+    /// Strictly greater, not greater-or-equal: a mark taken in the same
+    /// millisecond as the frame that caused it — which is the normal case, the
+    /// mark is taken while handling that very frame — must not count as
+    /// evidence of anything later.
+    pub(crate) fn heard_since_ms(&self, mark: u64) -> bool {
+        self.last_rx_ms.load(Ordering::Relaxed) > mark
+    }
+
     /// True the first time only: a peer that floods nonsense Pongs must not be
     /// able to turn stderr into the amplifier (same rule as `first_ka_warning`).
     pub(crate) fn first_clock_warning(&self) -> bool {
@@ -1560,6 +1607,27 @@ pub(crate) struct SessionEntry {
     /// 合并之后「这个 300 是我设的还是对端要求的」就再也答不出来，而那正是
     /// 共享模式的详情页唯一要回答的问题。
     pub pushed: Arc<PushedTransport>,
+    /// When this session became answerable for carrying media, on
+    /// [`ConnShared::clock_ms`]'s clock. Read only by `autotier::watchdog_pass`.
+    ///
+    /// # Why a connection-relative millisecond count and not an `Instant`
+    ///
+    /// The watchdog asks two questions about this moment — "how long ago was
+    /// it" and "has the peer said anything on control since" — and the second
+    /// can only be answered against `ConnShared::last_rx_ms`, which is millis
+    /// since the connection was created because `Instant` is not atomic and it
+    /// is written on every frame. Storing an `Instant` here would force one of
+    /// the two comparisons to convert, on the path that runs only when a link
+    /// is already broken.
+    ///
+    /// # Not a denominator
+    ///
+    /// `TxShared` used to carry a `created: Instant` whose only consumer was a
+    /// lifetime mean that could not follow a rung change, and it went out with
+    /// that expression rather than being left around as an attractive divisor.
+    /// This field is that shape, so it is named for its one purpose: it is the
+    /// moment a watchdog was armed, not the age of the session.
+    pub armed_conn_ms: u64,
 }
 
 /// 对端推来、执行器在本机的两个档位。只有本机是**提供者**（`origin == Peer`）
@@ -2050,6 +2118,21 @@ pub(crate) struct RxStream {
     /// verdict was actually requested, so N streams cost N*0 rings by default
     pub ring: Option<Mutex<VecDeque<f32>>>,
     pub stats: Mutex<RxCell>,
+    /// Media datagrams that reached this stream, **counted before the AEAD**.
+    ///
+    /// The one consumer is `autotier::watchdog_pass`, whose question is "did
+    /// anything for this stream cross the network", and a datagram that arrives
+    /// and then fails to authenticate answers that question yes. Counting after
+    /// the AEAD instead would make a key mismatch look identical to a blocked
+    /// firewall, and the daemon would respond to it by moving the stream onto
+    /// TCP — where the key would still not match, and the only visible effect
+    /// would be that a diagnosable fault had acquired a second, wrong
+    /// explanation.
+    ///
+    /// Its own atomic rather than a field of [`RxCell`]: the watchdog reads it
+    /// five times a second per stream, and `RxCell` is behind the mutex the
+    /// 10 ms receive path takes for every packet.
+    pub media_seen: AtomicU64,
     pub ka_seq: AtomicU32,
     /// Q2 的可归属那一半：本流在**加进混音之前**的电平/削顶（规格 §4.6）。
     /// 测点在 `PostMix::advance` 之后、各目的地之前，所以它回答的是「我这一路
@@ -2149,6 +2232,7 @@ impl RxStream {
                 iv_jit_sum: 0.0,
                 iv_jit_n: 0,
             }),
+            media_seen: AtomicU64::new(0),
             ka_seq: AtomicU32::new(0),
             clip: quality::ClipMeter::new(),
             bridge_ring: StageSlot::new(),
@@ -2266,6 +2350,25 @@ pub(crate) struct TxShared {
     /// 与 `rung` 同一条扇出理由，而且更硬：增益是**对端**属性。一支麦克风送给
     /// 两个对端时，两个对端的增益可以不同，而 `TxShared` 恰好是每条流一份。
     pub send_gain: AtomicU32,
+    /// May this stream put datagrams on the wire yet?
+    ///
+    /// Exists for exactly one window. `conn::open_session_from` builds the media
+    /// source **before** it sends `OpenStream`, because the peer arms its
+    /// UDP-silence watchdog the moment that message lands and a device that
+    /// takes a second to open would otherwise read as a link that cannot carry
+    /// UDP (see `autotier`). During that window the source is running and the
+    /// peer has not accepted — so there is nowhere for a datagram to go: the
+    /// peer has no receiving stream yet and drops every one.
+    ///
+    /// Left as waste it is not merely untidy. Those datagrams are counted in
+    /// `sent_payload_bytes` and never in the peer's, which puts a fixed gap
+    /// between two counters whose whole job is to agree
+    /// (`the_two_ends_agree_on_what_a_wire_byte_is`).
+    ///
+    /// Default `true`: every other way a send stream comes into being
+    /// (`handle_remote_open`, which only builds its source once the peer has
+    /// already asked) has nothing to wait for.
+    pub armed: AtomicBool,
 }
 
 /// [`TxShared::send_gain`] 的「不兜底」哨兵。
@@ -2319,6 +2422,7 @@ impl TxShared {
             transport: transport::TransportControl::default(),
             // 满幅是默认。兜底只在对端明说「我的设备没有可写音量」之后接手。
             send_gain: AtomicU32::new(SEND_GAIN_OFF),
+            armed: AtomicBool::new(true),
         }
     }
 
@@ -3546,6 +3650,14 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
             // device reconcile, the volume relay and the session coordinator
             // share one 200ms cadence there, and none of them may run on a
             // thread that also has 1s work to do.
+            //
+            // The UDP watchdog is here rather than there, and rather than on
+            // the 1 s tick below, because its budget is 600 ms: sampled once a
+            // second the verdict would land anywhere in [0.6, 1.6] s, tripling
+            // the silence the design costed out. It stays off haldev's thread
+            // for the reason above — that thread's 200 ms cadence is spoken
+            // for.
+            autotier::watchdog_pass(&inner);
         }
         // spec-m4c §D: the output device the consumer's slider drives is a
         // different device now, so every volume_sync'd spk session must be told

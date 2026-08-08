@@ -8,6 +8,8 @@
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --force",
     "preview": "vite preview",
+    "check-test-project": "node scripts/check-test-project.mjs",
+    "pretest": "npm run check-test-project",
     "test": "vitest run"
   },
   "dependencies": {

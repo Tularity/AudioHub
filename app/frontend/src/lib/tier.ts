@@ -57,7 +57,7 @@
 
 import type { MsgKey } from '../i18n';
 import type {
-  DaemonInfo, LatencyGuardStatus, MuxLinkStatus, PeerState, TcpMediaLinkStatus,
+  DaemonInfo, LatencyGuardStatus, MuxLinkStatus, PeerState, SessionInfo, TcpMediaLinkStatus,
 } from '../ipc/types';
 
 /** 链路**现状**的三个取值。用户的选择另有 `auto`，那是另一个量，不在这里。 */
@@ -186,9 +186,18 @@ export const TIER_WHY: Record<EffectiveTier, MsgKey> = {
  * daemon 侧这个字段来自该流绑定的 `MediaPath`（`SessionEntry::media_tier`），
  * 不是 `PeerState.transport.tier`。两者在日常运行中就分岔：钉在 tier 1 而对端
  * 钉在 tier 0 的机器，设置读 `tier1`、这里读 `tier0`。**不许互相冒充**。
+ *
+ * # 为什么参数写 `SessionInfo` 而不是 `{ stats?: { transport?: string | null } }`
+ *
+ * 后者是本函数原先的写法，它有两个问题。一是**与同族函数不一致**：本文件的
+ * `effectiveTier()` 收的是 `DaemonInfo` / `PeerState` 这样的具名镜像类型，只有
+ * 这里手写了一个结构类型，而两者是同一件事（「现状」）的两个投影。二是那个手写
+ * 结构与 `SessionStats` **没有任何类型上的联系**：它只是碰巧长得一样。真正的
+ * 调用点（`Stats.tsx`）传的从来都是 `SessionInfo`，写成具名类型之后，镜像那边
+ * 改了字段名这里会当场编译失败，而不是继续编译、把每条会话都读成「未判定」。
  */
 export function sessionTier(
-  info: { stats?: { transport?: string | null } | null } | null | undefined,
+  info: SessionInfo | null | undefined,
 ): EffectiveTier | null {
   const t = info?.stats?.transport;
   return t === 'tier0' || t === 'tier1' || t === 'tier2' ? t : null;

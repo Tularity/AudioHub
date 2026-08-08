@@ -13,5 +13,11 @@
   // Seeded with the test files only, not all of `src`: TypeScript pulls the
   // modules under test in by following their imports anyway, and listing `src`
   // here as well would put every source file in two build projects at once.
-  "include": ["src/**/*.test.ts", "vitest.config.ts"]
+  "include": ["src/**/*.test.ts", "vitest.config.ts"],
+  // MUST stay, and MUST stay empty. `exclude` is inherited through `extends`,
+  // so without this the parent's `"exclude": ["src/**/*.test.ts"]` cancels out
+  // every path this project `include`s and the whole project typechecks as one
+  // file (vitest.config.ts) -- silently, with exit code 0. `check-test-project`
+  // in package.json fails the build if that ever happens again.
+  "exclude": []
 }

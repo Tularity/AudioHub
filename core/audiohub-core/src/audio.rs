@@ -800,6 +800,65 @@ impl Dll {
         self.z3 += self.w2 * self.z2;
         1.0 - (self.z2 + self.z3)
     }
+
+    /// [`update`](Self::update), but clamped to `[lo, hi]` **and refusing to
+    /// integrate deeper once the output is against a rail** — textbook
+    /// conditional integration (a.k.a. integrator clamping). Returns
+    /// `(corr, saturated)`.
+    ///
+    /// # Why the plain `update` is not enough behind a clamp
+    ///
+    /// Of the three states only `z1` and `z2` are self-limiting: each is a
+    /// one-pole lowpass chasing its input, so each is bounded by `w1·err`.
+    /// `z3` is a **bare accumulator** — `z3 += w2·z2`, no leak term — and that
+    /// is the whole integrator. Feed it a `z2` that keeps its sign and it ramps
+    /// without bound, while the caller's `raw.clamp(lo, hi)` quietly throws the
+    /// excess away. The loop filter never learns that its output stopped
+    /// moving: PipeWire's `spa_dll` has no anti-windup because upstream clamps
+    /// outside the loop and lets the plant unwind it; we clamp at
+    /// [`PlayServo::MAX_PPM`] and would not.
+    ///
+    /// The cost is a dead zone proportional to how long the rail was held. Once
+    /// the mismatch reverses, `z3` has to be walked all the way back before the
+    /// correction can leave the rail, and it only moves `w2·z2` per update.
+    /// Measured on the `rate_servo::Sim` harness before this method existed:
+    /// 10 s pinned bought 8.4 s of deafness, 30 s bought 11.7 s, 60 s bought
+    /// 16.7 s, 120 s bought 26.7 s — i.e. it never levels off. Throughout that
+    /// window the servo is holding ±500 ppm against an error that already
+    /// wants the opposite sign, so the ring drifts the *wrong* way at full
+    /// authority. `rearm_capture`'s `dll.reset()` bounds this only for streams
+    /// lucky enough to hard-jump; a mismatch just past the rail's authority
+    /// (net drift too slow to reach `max_resync`) never hard-jumps at all and
+    /// so never gets the reset. That is the shape 30-win showed on 2026-08-09:
+    /// `clamped = 1988` of `updates = 1989`, pinned at −500 ppm start to end.
+    ///
+    /// # Why freezing `z3` alone is the right knob
+    ///
+    /// `z3` is the only unbounded state, so it is the only one that can wind
+    /// up; `z1`/`z2` must keep tracking, because they are what notices the
+    /// error changing sign. Holding `z3` where it was when we hit the rail
+    /// keeps the loop's memory of the standing mismatch (so it does not have
+    /// to re-learn it, the way a `reset()` would force) while making the
+    /// release immediate: the update after the error flips, `w2·z2` points
+    /// back out of the rail, the guard stops applying, and `z3` unwinds
+    /// normally.
+    pub fn update_clamped(&mut self, err: f64, lo: f64, hi: f64) -> (f64, bool) {
+        let z3_held = self.z3;
+        let raw = self.update(err);
+        let corr = raw.clamp(lo, hi);
+        if corr == raw {
+            return (corr, false);
+        }
+        // Output = `1 − (z2 + z3)`, so a *low* rail means `z2 + z3` is large
+        // and positive, and "deeper" means `z3` still climbing. Only that case
+        // is windup; a `z3` already heading back is the recovery we want to
+        // let through untouched.
+        let deeper = if raw < lo { self.z3 > z3_held } else { self.z3 < z3_held };
+        if deeper {
+            self.z3 = z3_held;
+        }
+        (corr, true)
+    }
 }
 
 /// 变比率重采样器：4 点 Catmull-Rom（三次 Hermite）。
@@ -1693,12 +1752,15 @@ impl AudioTx {
             return action;
         }
         // ---- 细调 ----
+        // 钳位与积分**必须一起做**（`Dll::update_clamped`，不是 `update` 之后
+        // 再 `clamp`）：`z3` 是环里唯一无泄漏的累加器，钳位期间照常积分就会缠绕
+        // 出一段与「贴钳位多久」成正比的死区，那段时间里伺服顶着满幅修正对抗一个
+        // 已经反号的误差。推导与实测数字见 `Dll::update_clamped`。
         let fed = err.clamp(-self.servo.max_error, self.servo.max_error);
-        let raw = self.servo.dll.update(fed);
         let lo = 1.0 - PlayServo::MAX_PPM * 1e-6;
         let hi = 1.0 + PlayServo::MAX_PPM * 1e-6;
-        let corr = raw.clamp(lo, hi);
-        if corr != raw {
+        let (corr, saturated) = self.servo.dll.update_clamped(fed, lo, hi);
+        if saturated {
             PLAY_SERVO.clamped.fetch_add(1, Ordering::Relaxed);
         }
         self.servo.corr = corr;
@@ -3582,6 +3644,19 @@ mod rate_servo {
             self.tx.queued()
         }
 
+        /// Change the crystal mismatch mid-run, keeping every other piece of
+        /// loop state (ring depth, DLL accumulators, capture window) exactly
+        /// where it was. Sign conventions are `Sim::new`'s.
+        ///
+        /// This is the only way to make the servo see an error that *changes
+        /// sign* while the loop is already saturated — the case anti-windup
+        /// exists for. Re-creating the `Sim` cannot do it: a fresh one starts
+        /// with the accumulators at zero, which is precisely the state under
+        /// test.
+        fn set_ppm(&mut self, ppm: f64) {
+            self.cb_period_ns = CB as f64 / (48_000.0 * (1.0 + ppm * 1e-6)) * 1e9;
+        }
+
         /// 跑 `minutes` 分钟虚拟时间，每分钟采一次观测量（ms）。
         fn run(&mut self, minutes: u64) -> Vec<f64> {
             let mut trace = Vec::new();
@@ -3601,6 +3676,100 @@ mod rate_servo {
     /// 模拟时长。200 ppm × 20 min = 11 520 样本 = **240 ms** 的应有漂移，
     /// 与 30 ms 的目标水位差一个数量级，绿/红一眼可判。
     const MINUTES: u64 = 20;
+
+    // ========================================================== 抗缠绕
+    //
+    // 钳位的代价：`Dll` 的 `z3` 是无泄漏累加器，贴着钳位照常积分就会缠绕。
+    // 机理与推导在 `Dll::update_clamped` 的文档里，这两条钉住它的**后果**。
+
+    /// 一个失配**反号**之后，伺服必须在「它正在纠的那个误差消失」之前松开钳位。
+    /// 松得更晚，按定义就是在满幅纠一个已经不存在的误差——而被它推走的那段
+    /// 水位就是可闻的部分。
+    ///
+    /// 贴钳位期间水位仍然偏高时**继续**贴着是**正确**的，所以这条不量「多久
+    /// 离开钳位」（那里面含着一段物理上必须的排空时间），只量伺服有没有把水位
+    /// 推到目标**以下**——那是它自己造出来的、纯属缠绕的亏空。
+    ///
+    /// 注入对照（本机实测）：把 `update_clamped` 里的 `deeper` 恒置为 `false`
+    /// （即退回「先 `update` 再 `clamp`」），第一个保持时长（10 s）就变红，
+    /// 亏空 **7.8 ms**（目标 15.7 ms）。逐个量下来，四个保持时长的表现一致：
+    /// 水位穿过目标之后伺服还顶着 −500 ppm 又跑 **6.52 s**，亏空稳定在 7.8 ms
+    /// ——即这段过冲**与保持多久无关**，只要贴过钳位就有。
+    #[test]
+    fn a_reversed_mismatch_releases_the_rail_before_the_servo_undershoots() {
+        // 700 ppm：超出 ±500 ppm 的可校正范围，所以细调会整段贴在钳位上；
+        // 但净漂移只有 200 ppm（0.2 ms/s），远不足以在这段时间里够到
+        // `max_resync` 的硬跳——而硬跳会 `dll.reset()`，把待测的状态清掉。
+        // 30-win 2026-08-09 那次 `clamped=1988 / updates=1989` 正是这个形态。
+        for hold_s in [10u64, 30, 60, 120] {
+            let mut s = Sim::new(-700.0, true);
+            for _ in 0..(hold_s * 100) {
+                s.tick();
+            }
+            assert!(
+                s.tx.servo_corr_ppm() < -PlayServo::MAX_PPM + 1.0,
+                "前提不成立：保持 {hold_s}s 之后修正应当贴在 −500 ppm 钳位上，\
+                 实测 {:.0} ppm——没贴上钳位就谈不上缠绕",
+                s.tx.servo_corr_ppm()
+            );
+            s.set_ppm(700.0);
+            let target_ms = s.tx.servo_target() as f64 / 48.0;
+            let mut worst_under = 0.0f64;
+            for _ in 0..120_000 {
+                s.tick();
+                worst_under = worst_under.max(target_ms - s.downstream_ms);
+                if s.tx.servo_corr_ppm() > -PlayServo::MAX_PPM + 1.0 {
+                    break;
+                }
+            }
+            assert!(
+                worst_under < 2.0,
+                "保持 {hold_s}s 后反号：伺服把水位压到目标以下 {worst_under:.1} ms \
+                 才松开钳位（目标 {target_ms:.1} ms）。这段亏空不是失配造成的，\
+                 是钳位期间继续积分缠绕出来的"
+            );
+        }
+    }
+
+    /// 上一条的机理层：环路滤波器离开钳位所需的更新次数**不许随贴钳位的时长
+    /// 增长**。这是「有没有抗缠绕」的判别式本身——缠绕的定义就是这个量无界。
+    ///
+    /// 直接喂 `Dll`，不经过 `Sim`：这样量到的是控制律本身，不掺任何水位排空的
+    /// 物理时间。
+    ///
+    /// 注入对照（本机实测）：`deeper` 恒置 `false` ⇒ 贴钳位 500 000 次之后要
+    /// **498 278** 次更新才松开，而贴 1 000 次只要 **122** 次——几乎 1:1 跟着
+    /// 保持时长走，正是「无界」的样子。
+    #[test]
+    fn the_loop_filter_leaves_the_rail_in_time_independent_of_how_long_it_was_pinned() {
+        let lo = 1.0 - PlayServo::MAX_PPM * 1e-6;
+        let hi = 1.0 + PlayServo::MAX_PPM * 1e-6;
+        // 15 ms @48k = `PlayServo::MAX_ERROR_MS` 喂进来的最大值，即最狠的缠绕。
+        let err = 15.0 * 48.0;
+        let updates_to_release = |hold: usize| -> usize {
+            let mut d = Dll::new(Dll::BW_MIN, 480, 48_000);
+            for _ in 0..hold {
+                d.update_clamped(err, lo, hi);
+            }
+            assert!(
+                d.update_clamped(err, lo, hi).1,
+                "前提不成立：保持 {hold} 次之后输出应当仍在钳位上"
+            );
+            for n in 1..2_000_000 {
+                if d.update_clamped(-err, lo, hi).0 > lo {
+                    return n;
+                }
+            }
+            usize::MAX
+        };
+        let short = updates_to_release(1_000);
+        let long = updates_to_release(500_000);
+        assert!(
+            long <= short + 100,
+            "贴钳位 500 000 次之后要 {long} 次更新才松开，贴 1 000 次只要 {short} 次\
+             ——这个量随贴钳位时长增长，就是积分器缠绕"
+        );
+    }
 
     // ============================================================== 注入 E-1
     //

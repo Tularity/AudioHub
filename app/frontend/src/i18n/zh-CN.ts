@@ -457,6 +457,7 @@ export const zhCN = {
   'volume.mutedPct': '已静音 · {n}%',
   'volume.failed': '音量调节失败，请稍后重试',
   'volume.unadjustable': '对端设备不支持音量调节',
+  'volume.softwareGain': '对端设备不支持音量调节，已由本机软件增益接管',
   'volume.reading': '正在读取对端音量…',
   'volume.noSync': '该会话未启用音量同步',
   'volume.notAdjustable.tag': '不可调',

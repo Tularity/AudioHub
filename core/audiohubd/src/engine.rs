@@ -929,6 +929,13 @@ struct TxStream {
     /// `Mutex`」换成「每 tick 一次 relaxed load」。0 = 还没看过，所以在这条流
     /// 建起来**之前**就学到的地址不会漏掉。
     dest_epoch_seen: u64,
+    /// plan §7.2 发送侧软件增益的**斜坡与 dither 状态**。
+    ///
+    /// **在这里，不在 `SourceEnt` 上。** 源是扇出的（一份 `frame` 发给 N 条流），
+    /// 增益是对端属性（N 个对端可以有 N 个音量）。挂到源上不是「串台一次」，
+    /// 而是**逐帧复利** —— 0.5 的增益在第 k 帧上累成 0.5ᵏ，而包数、丢包率、
+    /// 音调探针全绿。目标值来自 `shared.send_gain`，这里只有执行状态。
+    gain: dsp::SendGain,
     shared: Arc<TxShared>,
 }
 
@@ -1556,6 +1563,9 @@ impl TxState {
                 // 0 = 「还没看过」。`dest_override` 在这条流建起来**之前**就被
                 // 学到过的情形因此不会漏：那时代号已经 ≥1，第一 tick 就会去读。
                 dest_epoch_seen: 0,
+                // 透明起步。`shared.send_gain` 的默认也是 `SEND_GAIN_OFF`，
+                // 所以一条流在对端明说「我的设备没有可写音量」之前满幅传输。
+                gain: dsp::SendGain::new(),
                 shared: add.shared,
             },
         );
@@ -1911,6 +1921,12 @@ pub(crate) fn tx_loop(
     // 重采样暂存，进程内只分配这一次。48k→其它档只会变短，`F48 * 2` 够用；
     // 真不够 `rs.process` 会自己扩一次，此后不再扩。
     let mut staged: Vec<f32> = Vec::with_capacity(F48 * 2);
+    // plan §7.2 软件增益的输出暂存。与 `staged` 同样是**循环级**的纯 scratch：
+    // 写进去、同一次迭代里编完就不再被看，N 条流共一块。
+    //
+    // 它必须是一块**独立**的缓冲，不能就地写回 `staged` 或 `ent.frame`：
+    // 后者是扇出的共享帧（改了它，同一个源上的其余流全被带偏，而且逐帧复利）。
+    let mut gained: Vec<f32> = Vec::with_capacity(F48 * 2);
     loop {
         if inner.shutdown.load(Ordering::SeqCst) {
             return;
@@ -2179,6 +2195,30 @@ pub(crate) fn tx_loop(
                 }
                 None => &ent.frame,
             };
+            // ------------------------------------ plan §7.2 发送侧软件增益
+            //
+            // 对端真实设备没有我们驱得动的音量时（macOS 聚合设备），使用端虚拟
+            // 设备自管音量，增益就落在这里。**默认路径一次乘法都不做**：
+            // `SendGain::apply` 在透明态把 `samples` 原样还回去（同一个指针），
+            // 不复制、不分配。而这条线程是 10 ms 截止期线程。
+            //
+            // # 位置：重采样之后，编码之前
+            //
+            // - 在**编码之前**是这条支路存在的全部意义：写到编码之后，线上仍是
+            //   满幅，兜底等于没接。
+            // - 在**重采样之后**是为了 dither：dither 必须紧贴量化器
+            //   （`encode_pcm_into` 的 round），先 dither 再重采样会被线性插值
+            //   低通掉、相邻样本变成相关的，TPDF 那点性质就没了。斜坡因此按
+            //   **线上**采样率算（`rate`），于是任何格号上都是同样的毫秒数。
+            //
+            // # 增益属于流，不属于源
+            //
+            // `ent.frame` 是**扇出**的（一份，发给挂在这个源上的每条流），而
+            // `tx.gain` 每条流一份。`apply` 的入参是 `&[f32]`，所以「就地把共享
+            // 帧乘掉」在这里连写都写不出来 —— 那个 bug 的形状是逐帧复利
+            //（0.5ᵏ）而不是一次串台，且全线指标不动。
+            tx.gain.set_target(TxShared::gain_of(tx.shared.send_gain.load(Ordering::Relaxed)));
+            let samples: &[f32] = tx.gain.apply(samples, rate, fmt.depth, &mut gained);
             // 线上一帧拆成几个数据报。深档（48k/24、48k/32f）的整帧明文超过
             // 一个以太网数据报装得下的量，按 **5 ms** 切成两个包发。
             //
@@ -3839,6 +3879,7 @@ pub(crate) mod tests {
             rs_last: 0.0,
             pay: Vec::with_capacity(F48 * 4),
             dest_epoch_seen: 0,
+            gain: dsp::SendGain::new(),
             shared: shared.clone(),
         }
     }
@@ -4074,6 +4115,70 @@ pub(crate) mod tests {
             "a JitterBuffer is being built from the cached DEFAULT tuning inside handle_datagram; \
              on a degraded link that is the wrong profile"
         );
+    }
+
+    /// **plan §7.2 软件增益的接线守卫。**
+    ///
+    /// 增益本身在 `dsp::SendGain` 里有单测（斜坡、dither、只衰减一次）。这里守的
+    /// 是**接线**，而接线恰恰是单测够不着、真机又要一台没有主音量的聚合设备才
+    /// 触发得了的那一层：
+    ///
+    /// 1. 增益经 **`tx`** 施加（每条流一份）。挂到 `ent`（共享的源）上不是「串台
+    ///    一次」而是**逐帧复利** —— 0.5 的增益在第 k 帧上累成 0.5ᵏ，而包数、
+    ///    丢包率、音调探针全绿。
+    /// 2. 在**编码之前**。写到 `encode_pcm_into` 之后，线上仍是满幅，兜底等于没接。
+    /// 3. 在**重采样之后**：dither 必须紧贴量化器，先 dither 再线性插值会把它
+    ///    低通掉。
+    /// 4. 目标值从**每条流自己的** `TxShared` 上读。
+    /// 5. 流循环不许拿到源的可变引用——那是第 1 条唯一可能的落地形态。
+    #[test]
+    fn the_send_gain_is_per_stream_and_lands_between_the_resampler_and_the_encoder() {
+        let body = fn_body("pub(crate) fn tx_loop(");
+        let at = body.find("tx.gain.apply(").unwrap_or_else(|| {
+            panic!(
+                "发送侧软件增益没有按流施加（plan §7.2）：要么根本没接，\
+                 要么挂到了共享的源上\n{body}"
+            )
+        });
+        let enc = body.find("encode_pcm_into(").expect("编码不见了");
+        assert!(at < enc, "增益施加在编码之后 —— 线上仍是满幅，兜底等于没接");
+        let rs = body.find("rs.process(").expect("重采样不见了");
+        assert!(
+            rs < at,
+            "增益施加在重采样之前 —— dither 会被线性插值低通掉，TPDF 的性质没了"
+        );
+        assert!(
+            body.contains("tx.shared.send_gain.load("),
+            "增益目标不是从每条流自己的 TxShared 上读的"
+        );
+        assert!(
+            !body.contains("sources.get_mut("),
+            "流循环拿到了源的可变引用：增益一旦就地写进那份扇出的共享帧，\
+             同一个源上的其余流全被带偏，而且逐帧复利"
+        );
+    }
+
+    /// [`crate::SEND_GAIN_OFF`] 与任何合法增益都不可能撞上——`send_gain` 用
+    /// 一个原子量同时表达「启不启用」和「多大」，这条编码是它成立的前提。
+    ///
+    /// 注入对照：把 `SEND_GAIN_OFF` 改成 `0`（= 增益 0.0 的位型），这条立刻变红，
+    /// 而线上的表现会是「一开兜底就全程静音」。
+    #[test]
+    fn the_send_gain_off_sentinel_is_not_a_gain() {
+        assert_eq!(TxShared::gain_of(crate::SEND_GAIN_OFF), 1.0, "哨兵必须读作透明");
+        for i in 0..=1000u32 {
+            let g = i as f32 / 1000.0;
+            let bits = TxShared::gain_bits(g);
+            assert_ne!(bits, crate::SEND_GAIN_OFF, "合法增益 {g} 撞上了哨兵");
+            assert_eq!(TxShared::gain_of(bits), g, "增益 {g} 转一圈变了");
+        }
+        // 非有限值在编码这一步就被挡住，永远到不了 10 ms 线程。
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(TxShared::gain_of(TxShared::gain_bits(bad)), 1.0, "{bad}");
+        }
+        // 越界值被钳住而不是被当成非有限值。
+        assert_eq!(TxShared::gain_of(TxShared::gain_bits(-1.0)), 0.0);
+        assert_eq!(TxShared::gain_of(TxShared::gain_bits(9.0)), 1.0);
     }
 
     #[test]

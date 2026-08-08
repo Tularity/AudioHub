@@ -147,7 +147,11 @@ export function VolumeControl({
 
   const cur = intent.current || reported;
   const adjustable = reported ? reported.adjustable !== false : false;
-  const usable = !!reported && adjustable;
+  // plan §7.2：对端设备没有可写音量时，daemon 把音量接管到本机发送侧的软件增益上。
+  // 此时 `adjustable` 仍然是 false（那是关于**对端设备**的事实，没有变），但滑块
+  // 是真的 —— 它动的是本机的增益。只看 `adjustable` 就会把一个管用的控件置灰。
+  const softwareGain = !!sess?.stats?.volume_software_gain;
+  const usable = !!reported && (adjustable || softwareGain);
   const pct = cur ? pctOf(cur.scalar) : 0;
   const muted = !!(cur && cur.muted);
 
@@ -164,7 +168,9 @@ export function VolumeControl({
 
   let note = '';
   if (errAt.current && Date.now() - errAt.current < ERR_MS) note = t('volume.failed');
-  else if (reported && !adjustable) note = t('volume.unadjustable');
+  // 兜底生效时也要说一句，但说的是**另一件事**：不是「调不了」，而是「对端调不了，
+  // 所以由本机接管」——用户据此才明白线上此刻带着音量。
+  else if (reported && !adjustable) note = t(softwareGain ? 'volume.softwareGain' : 'volume.unadjustable');
   else if (!reported && id != null) {
     note = Date.now() - seenAt.current < WAIT_MS ? t('volume.reading') : t('volume.noSync');
   }
@@ -173,7 +179,7 @@ export function VolumeControl({
 
   return (
     <div
-      className={`volume-box${reported && !adjustable ? ' unadjustable' : ''}`}
+      className={`volume-box${reported && !usable ? ' unadjustable' : ''}`}
       data-testid={`${volumeTestid}-box`}
       hidden={id == null}
       // 对端卡片整体可点击（进入详情）：控件里的点击绝不能冒泡上去。

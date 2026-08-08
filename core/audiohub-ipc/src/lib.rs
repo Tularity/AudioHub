@@ -828,6 +828,18 @@ pub struct SessionStats {
     /// means the session does not sync volume (or nothing arrived yet).
     #[serde(default)]
     pub volume: Option<VolumeState>,
+    /// plan §7.2: this reading is served by the SEND-side software gain, because
+    /// the peer's real device exposes no volume we can drive.
+    ///
+    /// It is deliberately NOT folded into `volume.adjustable`. Those are two
+    /// different claims and the UI needs both: `adjustable == false` still says
+    /// "the peer's device has no volume control", while this says "the slider
+    /// nevertheless works — it moves our gain, not their device". Collapsing
+    /// them would either grey out a control that works, or hide from the user
+    /// that the wire is now carrying volume (which is the one case where the
+    /// bit depth matters, see `dsp::SendGain`).
+    #[serde(default)]
+    pub volume_software_gain: bool,
 
     // ---- 以下为 P0a / P0q 追加。**纯追加**：既有 12 个字段的顺序与语义未动。
     //

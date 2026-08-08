@@ -1593,6 +1593,17 @@ pub(crate) struct VolumeCell {
     pub sync: Mutex<VolumeSync>,
     /// Ticks since the last VolumeState we put on the wire.
     pub since_report: AtomicU32,
+    /// plan §7.2: this side has taken the volume over, because the peer's real
+    /// device has none we can drive. The scalar now rides `TxShared::send_gain`
+    /// instead of the wire.
+    ///
+    /// **Not the same claim as `state.adjustable == false`.** That one is a fact
+    /// about the peer's device, repeated in every report once a second; this one
+    /// is the state "our knob is currently driving a gain", and it changes only
+    /// on the transition. The difference is load-bearing: the handover seeds the
+    /// knob, and seeding off the repeated fact would re-seed it every second,
+    /// dragging the user's slider back to where it started.
+    pub software_gain: AtomicBool,
     /// One stderr line per session when the device cannot be read at all.
     read_warned: AtomicBool,
 }
@@ -1604,6 +1615,7 @@ impl VolumeCell {
             state: Mutex::new(None),
             sync: Mutex::new(VolumeSync::new()),
             since_report: AtomicU32::new(0),
+            software_gain: AtomicBool::new(false),
             read_warned: AtomicBool::new(false),
         }
     }
@@ -2240,7 +2252,24 @@ pub(crate) struct TxShared {
     /// 扇出时不串台：`rung` 与重采样器都在每条流自己的结构上，共享的只有源侧
     /// 的 `SourceEnt`。一个源扇出给 N 个消费者时，各自的线上采样率互不影响。
     pub transport: transport::TransportControl,
+    /// plan §7.2 兜底支路的**执行器**：发送侧软件增益，`tx_loop` 每拍读一次。
+    ///
+    /// [`SEND_GAIN_OFF`] = 不兜底（默认：满幅传输，10 ms 线程上一次乘法都不做）；
+    /// 其余取值是 `f32::to_bits` 的线性增益，恒在 `[0, 1]`。
+    ///
+    /// **一个原子量，不是「标志位 + 值」两个。** 两个原子量之间没有顺序，10 ms
+    /// 线程完全可能读到「已启用 + 上一次的值」这种从没存在过的组合。
+    /// `SEND_GAIN_OFF` 是一个 NaN 位型，而合法增益恒在 `[0, 1]`（位型至多
+    /// `0x3F80_0000`），两者撞不上——`the_send_gain_off_sentinel_is_not_a_gain`
+    /// 钉着这条。
+    ///
+    /// 与 `rung` 同一条扇出理由，而且更硬：增益是**对端**属性。一支麦克风送给
+    /// 两个对端时，两个对端的增益可以不同，而 `TxShared` 恰好是每条流一份。
+    pub send_gain: AtomicU32,
 }
+
+/// [`TxShared::send_gain`] 的「不兜底」哨兵。
+pub(crate) const SEND_GAIN_OFF: u32 = u32::MAX;
 
 impl TxShared {
     /// Tier 0's starting rung. Kept as the bare `new()` because every test that
@@ -2288,6 +2317,24 @@ impl TxShared {
             stages: [StageSlot::new(), StageSlot::new(), StageSlot::new()],
             drift: Mutex::new(DriftTracker::new()),
             transport: transport::TransportControl::default(),
+            // 满幅是默认。兜底只在对端明说「我的设备没有可写音量」之后接手。
+            send_gain: AtomicU32::new(SEND_GAIN_OFF),
+        }
+    }
+
+    /// 把线性增益编成 [`TxShared::send_gain`] 的存储形态。非有限值读作 1.0：
+    /// 这是把 NaN 挡在 10 ms 线程之外的第一道（第二道在 `dsp::SendGain::set_target`）。
+    pub(crate) fn gain_bits(gain: f32) -> u32 {
+        let g = if gain.is_finite() { gain.clamp(0.0, 1.0) } else { 1.0 };
+        g.to_bits()
+    }
+
+    /// [`TxShared::gain_bits`] 的逆。哨兵读作 1.0 = 透明。
+    pub(crate) fn gain_of(bits: u32) -> f32 {
+        if bits == SEND_GAIN_OFF {
+            1.0
+        } else {
+            f32::from_bits(bits)
         }
     }
 
@@ -3235,6 +3282,10 @@ fn build_session_info_with(
         verdict: None,
         mix_verdicts: None,
         volume: if e.volume.enabled { *lk(&e.volume.state) } else { None },
+        // plan §7.2。读的是**旗标**而不是 `volume.adjustable`：两者是两句不同的话
+        // （对端设备的事实 vs 本机此刻在不在兜底里），见 `VolumeCell::software_gain`。
+        volume_software_gain: e.volume.enabled
+            && e.volume.software_gain.load(Ordering::Relaxed),
         pipeline: None,
         // 目标档随每条流一起报（plan §14 裁定 4：界面必须说清「这是目标」）。
         // 取自**执行器手边的那份原子量**，不是设置的副本——设置的副本正是
@@ -4002,6 +4053,19 @@ pub(crate) fn mode_a_volume(inner: &DaemonInner) -> volume::ModeAVolume {
 /// output is the thing that plays the mirror.
 pub(crate) fn mode_a_in_force(inner: &DaemonInner) -> bool {
     haldev::effective_mode(inner) == Mode::A
+}
+
+/// True when the mode actually in force is B — the only mode plan §7.2 gives the
+/// software-gain fallback to.
+///
+/// §7.2 frames the fallback as 「使用端**虚拟设备**自管音量」, and a virtual device
+/// is the one thing mode A does not have. Mode A's volume story is §7.1's
+/// 「与对端音量同步」, where the peer is authoritative and drives THIS machine's
+/// real output; attenuating the mirrored stream on top of that would be two
+/// mechanisms moving the same loudness — the double-attenuation shape plan §12.5
+/// makes a starred assertion out of.
+pub(crate) fn mode_b_in_force(inner: &DaemonInner) -> bool {
+    haldev::effective_mode(inner) == Mode::B
 }
 
 /// Ticks between unconditional VolumeState refreshes. Changes go out

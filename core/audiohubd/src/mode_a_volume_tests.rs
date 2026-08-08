@@ -226,3 +226,28 @@ fn the_switches_are_judged_against_the_mode_actually_in_force() {
         "conn.rs 的两个调用点必须经 mode_a_in_force 判模式"
     );
 }
+
+/// §7.2 的软件增益兜底与 §7.1 的「与对端音量同步」是**互斥**的两条路，分界就是
+/// 生效中的模式，而分界只写在一处：`VolumeState` 处理里那个 `&& mode_b_in_force`。
+///
+/// 少了它，模式 A 上两件事同时发生：发送侧施加软件增益（§7.2），本机默认输出又
+/// 跟着对端走（§7.1）——两个机制在动同一个响度，正是 plan §12.5 拿来做星标断言
+/// 的那个双重衰减形状。而且 `fallback` 会恒真，`else` 那一支再也不执行，模式 A
+/// 的同步整个**静默失效**。
+///
+/// 注入对照（2026-08-09 实跑）：删掉 `&& crate::mode_b_in_force(inner)`，
+/// `mode_a_volume_tests` + `mode_tests` + core 的 `volume::`/`dsp::` 全绿——
+/// 这条分界此前零覆盖。
+#[test]
+fn the_software_gain_fallback_is_fenced_off_from_mode_a() {
+    let src = read("conn.rs");
+    assert!(
+        has(&src, "&& crate::mode_b_in_force(inner)"),
+        "§7.2 兜底的接手判据没有模式门：模式 A 上会同时跑软件增益与「与对端音量同步」，\
+         两个机制动同一个响度（plan §12.5 的双重衰减），而 §7.1 的那条同步会静默失效"
+    );
+    assert!(
+        has(&src, "volume::authority_for(Some(state))"),
+        "接手判据没有走 authority_for：对端设备可不可调音量这件事就没人问了"
+    );
+}

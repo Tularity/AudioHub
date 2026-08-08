@@ -109,7 +109,17 @@ pub fn verify_tone(samples: &[f32], sample_rate: u32, freq_hz: f32) -> ToneVerdi
 // 音量，**软件增益在发送侧施加**，传输的是带音量的音频。
 // ⇒ 那条支路一旦启用，衰减到 −40 dB 的信号在 16 位里只剩约 9 个有效位。
 // **该链路的线上位深至少取 24 bit，或在那条路径上加 TPDF dither。**
-// 今天那条支路还没有生产代码，这句话是留给启用它的那个人的。
+//
+// 那条支路现在有生产代码了，就是本文件的 [`SendGain`]。plan 那句「至少 24 bit
+// **或** TPDF dither」在它里面是**按档分工**兑现的，不是二选一：
+//
+// - rung 0（48 k/f32）与 rung 1（48 k/s24）本身就满足「至少 24 bit」，
+//   [`dither_lsb`] 对这两档返回 0，一个字节的噪声都不掺；
+// - rung 2..5 全是 s16（48/32/24/16 kHz），由 [`SendGain`] 就地加高通 TPDF。
+//
+// **没有**改成「兜底一启用就把格号钳到 ≤1」。阶梯存在的全部理由是让链路在坏
+// 网络上活着；让一次拖动滑块把线上码率从 256 kbps 顶到 1152 kbps，等于拿
+// 「还有声音」去换「音量能调」——而兜底本身只是一个音量开关。
 
 /// 线上样本格式。与 `audiohub_net::packet::Codec` 的 PCM 三个取值一一对应。
 ///
@@ -328,6 +338,176 @@ impl LinearResampler {
     }
 }
 
+// ------------------------------------------------------ §7.2 发送侧软件增益
+
+/// 增益的**转移速率**：走完满量程要这么久。
+///
+/// 是恒定**斜率**，不是恒定时长。拖滑块产生的是一串小步，恒定时长下每一步都要
+/// 摊满 20 ms，下一步到来时上一步还没走完 ⇒ 增益永远追不上手指；恒定斜率下小步
+/// 几乎立刻到位，而一次 0→1 的大跳仍然被摊到 20 ms 上（这才是防爆音要的那一半）。
+const GAIN_SLEW_MS: u32 = 20;
+
+/// 这一档的量化台阶（f32 域）——也就是 dither 的幅度基准。0 = 这一档不掺。
+///
+/// **只有 s16 非零。** 这是模块头那条「至少 24 bit **或** TPDF dither」的落地
+/// 分工：f32 档线路上根本不量化，s24 档的量化噪声在 −144 dBFS，衰减 40 dB 之后
+/// 仍在听阈以下——这两档自己就占住了「至少 24 bit」那一半，再掺 dither 只是白白
+/// 抬高噪声底。低采样率的三个格（32/24/16 kHz）都是 s16，一并由这里覆盖。
+fn dither_lsb(depth: WireDepth) -> f32 {
+    match depth {
+        // `encode_pcm_into` 的 s16 惯例是「× 32767 再 round」⇒ 台阶就是 1/32767。
+        WireDepth::S16 => 1.0 / 32767.0,
+        WireDepth::S24 | WireDepth::F32 => 0.0,
+    }
+}
+
+/// plan §7.2 的**兜底支路**：对端真实设备没有我们驱得动的音量时（典型如 macOS
+/// 音频 MIDI 设置拼出来的聚合设备），使用端虚拟设备自管音量，增益在**发送侧**
+/// 施加——线上从此传的是带音量的音频。
+///
+/// # 为什么状态是「每条流一份」而不是「每个源一份」
+///
+/// 采集源在 `engine.rs` 里是**扇出**的：一个 `SourceEnt` 的 `frame` 每 tick 读一次、
+/// 发给挂在它上面的 N 条流（物理队列只有一份）。而增益是**对端**属性——同一支
+/// 麦克风送给两个对端，两个对端的增益可以不同。所以：
+///
+/// - 斜坡进度与 dither 相位挂在 `TxStream` 上，与 `rung`、重采样器同级；
+/// - [`SendGain::apply`] 的入参是 `&[f32]`，**结构上无法就地改写那份共享帧**。
+///
+/// 就地改写的后果不是「串台一次」而是**逐帧复利**：0.5 的增益在第 k 帧上累成
+/// 0.5ᵏ，而包数、丢包率、音调探针全绿——本项目栽过的那个形状。
+///
+/// # 默认路径一次乘法都不做
+///
+/// `tx_loop` 是 10 ms 截止期线程，而**满幅是默认、增益是例外**。[`SendGain::apply`]
+/// 在透明态把入参**原样**还回去（同一个指针）：不复制、不分配、不乘。
+///
+/// 透明的判据是**增益值**，不是「兜底有没有启用」：兜底启用而用户把音量拉到
+/// 100 % 时，线上应当与默认路径逐位相同，那时也不该有乘法和 dither。
+pub struct SendGain {
+    /// 此刻真正施加的增益。斜坡的状态量，跨调用保持（与 [`LinearResampler`] 同理）。
+    cur: f32,
+    /// 斜坡的去向。
+    target: f32,
+    /// dither 的 LCG 状态。常数与 `audiohub_net::media::LossInjector` 同一套。
+    rng: u64,
+    /// 上一个均匀抽样。高通 TPDF 靠「相邻两个抽样之差」构造三角分布，见
+    /// [`SendGain::dither`]。
+    prev_u: f32,
+}
+
+impl Default for SendGain {
+    fn default() -> Self {
+        SendGain::new()
+    }
+}
+
+impl SendGain {
+    /// 透明（满幅）。**这是默认态**，兜底不启用的流一辈子停在这里。
+    pub fn new() -> SendGain {
+        SendGain {
+            cur: 1.0,
+            target: 1.0,
+            // 非零即可；固定值 ⇒ dither 序列可复现，测试因此不靠运气。
+            rng: 0x2545_F491_4F6C_DD1D,
+            prev_u: 0.0,
+        }
+    }
+
+    /// 设定去向。`1.0` = 把音量交还给对端真实设备（兜底未启用或刚解除）。
+    ///
+    /// 非有限值一律读作 1.0。这个值是从一个原子量穿过来的，而 10 ms 线程上唯一
+    /// 比「音量没反应」更糟的是**把 NaN 乘进音频**——一个 NaN 进了对端 JB 会经
+    /// `mixer_loop` 的求和扩散成整段静音或爆音（见 [`DecodeStats::nonfinite`]）。
+    /// 真正的校验在写入侧（`conn.rs` 拒收非有限 scalar）；这里只是不给自己留一条
+    /// 能把 NaN 送上线的路。
+    pub fn set_target(&mut self, gain: f32) {
+        self.target = if gain.is_finite() { gain.clamp(0.0, 1.0) } else { 1.0 };
+    }
+
+    /// 此刻**真正施加**的增益（斜坡的当前值，不是去向）。
+    pub fn current(&self) -> f32 {
+        self.cur
+    }
+
+    /// 这一刻线上与默认路径逐位相同 ⇒ [`SendGain::apply`] 是一次比较加一次返回。
+    pub fn is_transparent(&self) -> bool {
+        self.cur == 1.0 && self.target == 1.0
+    }
+
+    /// 施加增益。透明态返回 `input` **本身**；否则把结果写进 `out` 并返回它。
+    ///
+    /// `rate_hz` 是**线上**采样率（这一步在重采样之后），斜坡因此在任何格号上都
+    /// 走同样的毫秒数；`depth` 决定要不要掺 dither（见 [`dither_lsb`]）。
+    ///
+    /// `out` 由调用方长期复用：这条线程上的每一次 `malloc` 都是一条尾巴
+    /// （`docs/spec-latency-floor.md` §9.3 手段 J1），与 `encode_pcm_into` 同一条
+    /// 纪律。
+    pub fn apply<'a>(
+        &mut self,
+        input: &'a [f32],
+        rate_hz: u32,
+        depth: WireDepth,
+        out: &'a mut Vec<f32>,
+    ) -> &'a [f32] {
+        if self.is_transparent() {
+            return input;
+        }
+        out.clear();
+        out.reserve(input.len());
+        // 每样本的最大位移。`max(1)` 只是不让荒谬的小采样率把步长除成 0
+        //（步长为 0 的斜坡永远收敛不了，增益会永久卡在起点）。
+        let slew = 1.0 / ((rate_hz as u64 * GAIN_SLEW_MS as u64 / 1000).max(1) as f32);
+        // **静音就是数字静音。** 斜坡已经到 0 且不打算离开时不再掺 dither，
+        // 否则「静音」在 s16 档上听起来是一段 −90 dBFS 的嘶声。
+        let lsb = if self.cur == 0.0 && self.target == 0.0 {
+            0.0
+        } else {
+            dither_lsb(depth)
+        };
+        for &x in input {
+            if self.cur != self.target {
+                let d = self.target - self.cur;
+                // 剩下的路不够一步就直接落到目标：否则会在目标附近永久抖动。
+                self.cur = if d.abs() <= slew { self.target } else { self.cur + slew.copysign(d) };
+            }
+            // **一次乘法，不是两次。** 写成 `x * self.cur * something` 就是
+            // plan §12.5 那条「不存在双重衰减」在本机这一侧的失效形态。
+            let y = x * self.cur;
+            out.push(if lsb > 0.0 { y + self.dither(lsb) } else { y });
+        }
+        out
+    }
+
+    /// 一次高通 TPDF 抽样，幅度 ±1 LSB。
+    ///
+    /// TPDF（三角概率密度）是把量化误差从「与信号相关的失真」变成「与信号无关的
+    /// 噪声」所需的最小 dither，而这正是模块头那句警告的落点：衰减 40 dB 之后
+    /// s16 只剩约 9 个有效位，此时**难听的不是噪声底而是相关失真**。它还有一个
+    /// 更硬的性质——dither 之后量化器的**平均值无偏**，也就是说「拖到 30 % 就真的
+    /// 是 30 %」，而无 dither 的量化器在低电平上有一个确定的直流偏差。
+    ///
+    /// 用「相邻两个均匀抽样之差」而不是「两个独立抽样之和」：
+    ///
+    /// 1. 两者分布同为 [−1, 1] 上的三角分布，去相关效果相同；
+    /// 2. 差的形式**每样本只走一次 LCG**，和的形式要两次；
+    /// 3. 差在频域上是一阶高通 ⇒ 噪声被推到听感最不敏感的高频。
+    ///
+    /// 这就是通常说的 highpass TPDF。
+    fn dither(&mut self, lsb: f32) -> f32 {
+        // Knuth MMIX 常数。
+        self.rng = self
+            .rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        // 取高 24 位：LCG 的低位周期短，而 24 位正好是 f32 尾数的宽度。
+        let u = (self.rng >> 40) as f32 / (1u64 << 24) as f32; // [0, 1)
+        let d = u - self.prev_u;
+        self.prev_u = u;
+        d * lsb
+    }
+}
+
 #[cfg(test)]
 mod zero_alloc_tests {
     use super::*;
@@ -500,5 +680,289 @@ mod zero_alloc_tests {
         assert_eq!(WireDepth::parse("s32"), None);
         assert_eq!(WireDepth::parse(""), None);
         assert_eq!(WireDepth::parse("S16"), None, "拼写是精确匹配，不做大小写吸附");
+    }
+}
+
+/// plan §7.2 兜底支路（[`SendGain`]）。
+#[cfg(test)]
+mod send_gain_tests {
+    use super::*;
+
+    const SR: u32 = 48_000;
+    const FRAME: usize = 480; // 10 ms @ 48 kHz，与 `tx_loop` 的一 tick 同长
+
+    /// 把增益推到目标并让斜坡走完，返回稳态之后的**一帧**输出。
+    fn settle(g: &mut SendGain, input: &[f32], depth: WireDepth) -> Vec<f32> {
+        let mut scratch = Vec::new();
+        // 满量程斜坡要 GAIN_SLEW_MS = 20 ms = 两帧；跑四帧留足余量。
+        for _ in 0..4 {
+            g.apply(input, SR, depth, &mut scratch);
+        }
+        g.apply(input, SR, depth, &mut scratch).to_vec()
+    }
+
+    /// **默认路径一次乘法、一次复制、一次分配都不做。**
+    ///
+    /// 判据是**指针相等**：返回的就是入参那块内存，而不是一份内容相同的拷贝。
+    /// 内容相等的断言抓不到「老老实实复制了一遍」——而那正是要避免的开销。
+    ///
+    /// 注入对照：把 `apply` 开头的 `if self.is_transparent() { return input; }`
+    /// 删掉，指针断言与「暂存必须还是空的」同时变红。
+    #[test]
+    fn the_default_path_returns_the_input_slice_itself_and_never_touches_the_scratch() {
+        let input: Vec<f32> = gen_sine(1_000.0, SR, FRAME, 0.9);
+        for depth in [WireDepth::S16, WireDepth::S24, WireDepth::F32] {
+            let mut g = SendGain::new();
+            assert!(g.is_transparent(), "新建的 SendGain 必须是透明的");
+            let mut scratch = Vec::new();
+            let out = g.apply(&input, SR, depth, &mut scratch);
+            assert_eq!(
+                out.as_ptr(),
+                input.as_ptr(),
+                "{depth:?} 默认路径复制了一份 —— 10 ms 线程上白付一次遍历"
+            );
+            assert!(scratch.is_empty(), "{depth:?} 默认路径动了暂存缓冲");
+            assert_eq!(scratch.capacity(), 0, "{depth:?} 默认路径分配了内存");
+        }
+        // 兜底启用但音量在 100 %：仍然必须是透明的（线上与默认路径逐位相同）。
+        let mut g = SendGain::new();
+        g.set_target(1.0);
+        assert!(g.is_transparent(), "增益 = 1.0 却不透明：白付一次乘法 + 一次 dither");
+    }
+
+    /// **增益变更必须走斜坡。** 一次跳变就是一次阶跃，阶跃就是爆音；
+    /// plan §7.2 明写「增益渐变，避免爆音」。
+    ///
+    /// 直流输入 1.0 + f32 档（不掺 dither）⇒ 输出逐样本就是增益本身，
+    /// 于是「有没有爆音」这个问题变成了一句可断言的话。
+    ///
+    /// 注入对照：把 `apply` 里的斜坡换成 `self.cur = self.target;`，
+    /// 「单样本位移」这一条立刻变红（第一个样本就跳满 1.0）。
+    #[test]
+    fn a_volume_change_slews_instead_of_stepping() {
+        let dc = vec![1.0f32; FRAME];
+        let mut g = SendGain::new();
+        g.set_target(0.0);
+        let mut scratch = Vec::new();
+        let out = g.apply(&dc, SR, WireDepth::F32, &mut scratch).to_vec();
+        // 满量程 / 20 ms ⇒ 48 kHz 上每样本至多走 1/960。
+        let max_step = 1.0f32 / 960.0;
+        let mut prev = 1.0f32;
+        for (i, &y) in out.iter().enumerate() {
+            assert!(
+                (prev - y) <= max_step * 1.000_01,
+                "第 {i} 个样本增益从 {prev} 跳到 {y}，超过一步 {max_step} —— 这是一次爆音"
+            );
+            assert!(y <= prev, "斜坡在往回走：第 {i} 个样本 {prev} -> {y}");
+            prev = y;
+        }
+        // 一帧 = 10 ms = 半程。**这一条钉住的是「够慢」**：只断言不跳变的话，
+        // 一个 0.999 的步长照样过关，而那与跳变听不出区别。
+        assert!(
+            (g.current() - 0.5).abs() < 1e-3,
+            "10 ms 之后增益应当刚好走完满量程的一半，实际 {}",
+            g.current()
+        );
+        // 再一帧走完，并且**精确停在**目标上（不越过、不抖动、不留残差）。
+        //
+        // 「精确」是承重的而不是洁癖：斜坡回到 1.0 时若留下 1e-6 的残差，
+        // [`SendGain::is_transparent`] 就永远回不了 true，于是一条音量已经拉满的
+        // 流会永远多付一次乘法加一次 dither。第三帧（而不是第二帧）才断言相等，
+        // 是因为 960 次 1/960 的浮点累加会差出几个 ULP，最后那一步要等下一个
+        // 样本才吸附得上 —— 也就是「至多 20 ms + 1 个样本」。
+        g.apply(&dc, SR, WireDepth::F32, &mut scratch);
+        assert!(g.current().abs() < 1e-4, "两帧之后还差 {}", g.current());
+        g.apply(&dc, SR, WireDepth::F32, &mut scratch);
+        assert_eq!(g.current(), 0.0, "斜坡没有精确落到目标上（或越了过去）");
+        // 回程同理：必须精确回到 1.0，否则再也变不回透明。
+        g.set_target(1.0);
+        for _ in 0..3 {
+            g.apply(&dc, SR, WireDepth::F32, &mut scratch);
+        }
+        assert_eq!(g.current(), 1.0, "回程没有精确回到满幅");
+        assert!(g.is_transparent(), "回到满幅之后没有恢复透明 —— 白付乘法与 dither");
+    }
+
+    /// 斜坡时长与**格号无关**：低采样率格上必须还是 20 ms，不是 20 ms × 3。
+    ///
+    /// 注入对照：把 `apply` 里的 `rate_hz` 换成常数 48_000，16 kHz 那一支变红。
+    #[test]
+    fn the_slew_takes_the_same_milliseconds_on_every_rung() {
+        for rate in [48_000u32, 32_000, 24_000, 16_000] {
+            let mut g = SendGain::new();
+            g.set_target(0.0);
+            // 20 ms 的样本数 = 满量程斜坡的长度（+1 是浮点累加的吸附样本，
+            // 见上一条测试里的说明）。
+            let n = (rate as usize * GAIN_SLEW_MS as usize) / 1000 + 1;
+            let dc = vec![1.0f32; n];
+            let mut scratch = Vec::new();
+            g.apply(&dc, rate, WireDepth::F32, &mut scratch);
+            assert_eq!(g.current(), 0.0, "{rate} Hz 上 20 ms 没走完满量程斜坡");
+            let mut g = SendGain::new();
+            g.set_target(0.0);
+            let half = vec![1.0f32; n / 2];
+            g.apply(&half, rate, WireDepth::F32, &mut scratch);
+            assert!(
+                (g.current() - 0.5).abs() < 0.02,
+                "{rate} Hz 上 10 ms 走了 {}，不是半程 —— 斜坡按样本数而不是按时间算的",
+                1.0 - g.current()
+            );
+        }
+    }
+
+    /// **扇出：一个源、两条流、两个增益。**
+    ///
+    /// 同一支麦克风送给两个对端，两个对端的增益可以不同。这条钉三件事：
+    /// ① 共享帧一个样本都没被改；② 透明的那条流拿到的还是原帧；
+    /// ③ 衰减的那条流**只衰减一次**（不是逐帧复利，也不是双重衰减）。
+    ///
+    /// 注入对照（③）：把 `apply` 里的 `x * self.cur` 写成 `x * self.cur * self.cur`
+    ///（plan §12.5「不存在双重衰减」的失效形态），第三条立刻变红。
+    #[test]
+    fn one_source_frame_fans_out_to_two_streams_with_independent_gains() {
+        let source: Vec<f32> = gen_sine(440.0, SR, FRAME, 0.8);
+        let pristine = source.clone();
+        let mut quiet = SendGain::new();
+        quiet.set_target(0.25);
+        let mut loud = SendGain::new(); // 透明：这条流仍然要满幅
+
+        let mut sa = Vec::new();
+        let mut sb = Vec::new();
+        // 九帧：就地改写的话，`source` 会被复利成 0.25⁹ ≈ 4e-6。
+        let mut ya = Vec::new();
+        let mut yb = Vec::new();
+        for _ in 0..9 {
+            ya = quiet.apply(&source, SR, WireDepth::F32, &mut sa).to_vec();
+            yb = loud.apply(&source, SR, WireDepth::F32, &mut sb).to_vec();
+        }
+        assert_eq!(source, pristine, "共享的源帧被就地改写了 —— 扇出的其余流全被带偏");
+        assert_eq!(yb, pristine, "透明的那条流没有拿到原帧");
+        assert_eq!(ya.len(), source.len(), "输出长度变了 —— 暂存多半没被清空");
+        for (i, (&x, &y)) in pristine.iter().zip(ya.iter()).enumerate() {
+            assert!(
+                (y - x * 0.25).abs() < 1e-6,
+                "第 {i} 个样本衰减了不止一次：期望 {}，实际 {y}",
+                x * 0.25
+            );
+        }
+    }
+
+    /// **s16 档掺 dither，深档不掺。** 模块头那条「至少 24 bit **或** dither」
+    /// 的按档分工，正着反着各钉一次。
+    ///
+    /// 注入对照：`dither_lsb` 的 S16 分支返回 0.0 ⇒ 第一条变红；
+    /// 让 S24 分支返回非零 ⇒ 深档那条变红。
+    #[test]
+    fn only_the_sixteen_bit_rungs_get_dither() {
+        let quiet = vec![0.0f32; 4096];
+        let mut g = SendGain::new();
+        g.set_target(0.5);
+        let y = settle(&mut g, &quiet, WireDepth::S16);
+        assert!(
+            y.iter().any(|v| *v != 0.0),
+            "s16 档没有掺 dither —— 衰减之后量化误差会与信号相关（听感是失真而不是噪声）"
+        );
+        let lsb = 1.0f32 / 32767.0;
+        assert!(
+            y.iter().all(|v| v.abs() <= lsb * 1.000_01),
+            "dither 幅度超过 1 LSB：{:?}",
+            y.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs())) / lsb
+        );
+        for depth in [WireDepth::S24, WireDepth::F32] {
+            let mut g = SendGain::new();
+            g.set_target(0.5);
+            let y = settle(&mut g, &quiet, depth);
+            assert!(
+                y.iter().all(|v| *v == 0.0),
+                "{depth:?} 掺了 dither —— 这一档本身就满足「至少 24 bit」，白抬噪声底"
+            );
+        }
+    }
+
+    /// **§7.2 那句警告的验收。** dither 之后的量化器**平均值无偏**：
+    /// 把音量拖到 x，线上解出来的就真的是 x；无 dither 的量化器在低电平上有一个
+    /// **确定的**直流偏差（不是噪声，是偏差 —— 它不会随时间平均掉）。
+    ///
+    /// 构造：直流输入 1.0，增益取到「100.3 个 16 位码字」这个刻意的非整数位置。
+    /// 无 dither ⇒ 每个样本都 round 到 100，偏差恒为 0.3 LSB；
+    /// 有 dither ⇒ 均值收敛回 100.3。
+    ///
+    /// 注入对照：`dither_lsb` 的 S16 分支返回 0.0，这条立刻变红
+    ///（生产路径的偏差跳到 0.3 LSB，与那条对照路径一模一样）。
+    #[test]
+    fn dither_makes_the_quantiser_unbiased_at_low_level() {
+        const CODES: f32 = 100.3; // 刻意落在两个码字之间
+        let want = CODES / 32767.0;
+        let dc = vec![1.0f32; SR as usize]; // 1 s，够均值收敛
+        // 对照：直接乘、不掺 dither，就是模块头警告的那条路。
+        let plain: Vec<f32> = dc.iter().map(|x| x * want).collect();
+        let plain_back = decode_pcm(&encode_pcm(&plain, WireDepth::S16), WireDepth::S16);
+        let lsb = 1.0f32 / 32767.0;
+        let plain_bias = (mean(&plain_back) - want).abs() / lsb;
+        assert!(
+            plain_bias > 0.2,
+            "对照路径没有偏差（{plain_bias} LSB），这条测试就什么都没证明 —— \
+             多半是 CODES 落在了码字上"
+        );
+        // 生产路径。
+        let mut g = SendGain::new();
+        g.set_target(want);
+        let mut scratch = Vec::new();
+        g.apply(&dc[..960], SR, WireDepth::S16, &mut scratch); // 先把斜坡走完
+        let gained = g.apply(&dc, SR, WireDepth::S16, &mut scratch).to_vec();
+        let back = decode_pcm(&encode_pcm(&gained, WireDepth::S16), WireDepth::S16);
+        let bias = (mean(&back) - want).abs() / lsb;
+        assert!(
+            bias < 0.05,
+            "dither 之后量化器仍有 {bias} LSB 的直流偏差（对照路径是 {plain_bias}）：\
+             拖到 {CODES} 个码字，线上并不是 {CODES} 个码字"
+        );
+    }
+
+    fn mean(xs: &[f32]) -> f32 {
+        (xs.iter().map(|&x| x as f64).sum::<f64>() / xs.len() as f64) as f32
+    }
+
+    /// **静音是数字静音，不是一段嘶声。** 静音随音量同步一起走（plan §16），
+    /// 在兜底支路上它的形态就是增益 0；而 0 加 dither 会变成 −90 dBFS 的噪声。
+    ///
+    /// 注入对照：删掉 `apply` 里那条 `cur == 0.0 && target == 0.0` 的判断，
+    /// 这条立刻变红。
+    #[test]
+    fn muting_is_digital_silence_not_a_dither_hiss() {
+        let tone: Vec<f32> = gen_sine(440.0, SR, FRAME, 0.8);
+        let mut g = SendGain::new();
+        g.set_target(0.0);
+        let y = settle(&mut g, &tone, WireDepth::S16);
+        assert!(
+            y.iter().all(|v| *v == 0.0),
+            "静音之后线上还有 {} 的残留",
+            y.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()))
+        );
+    }
+
+    /// **非有限增益永远上不了线。** 值是从一个原子量穿过来的，而一个 NaN 进了
+    /// 对端 JB 会经 `mixer_loop` 的求和扩散成整段静音或爆音。
+    ///
+    /// 注入对照：把 `set_target` 写成 `self.target = gain.clamp(0.0, 1.0);`
+    ///（`f32::clamp` 对 NaN 返回 NaN），这条立刻变红。
+    #[test]
+    fn a_non_finite_target_can_never_reach_the_wire() {
+        let tone: Vec<f32> = gen_sine(440.0, SR, FRAME, 0.8);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut g = SendGain::new();
+            g.set_target(0.5);
+            settle(&mut g, &tone, WireDepth::F32);
+            g.set_target(bad);
+            let y = settle(&mut g, &tone, WireDepth::F32);
+            assert!(y.iter().all(|v| v.is_finite()), "{bad} 把非有限样本送上了线");
+            assert_eq!(g.current(), 1.0, "{bad} 之后增益没有回到满幅");
+        }
+        // 越界值被钳住，而不是被当成非有限值扔掉。
+        let mut g = SendGain::new();
+        g.set_target(-0.5);
+        assert_eq!(g.target, 0.0);
+        g.set_target(4.0);
+        assert_eq!(g.target, 1.0);
     }
 }

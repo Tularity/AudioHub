@@ -456,6 +456,16 @@ export interface SessionStats {
    */
   format_mismatch?: number;
   volume?: VolumeState | null;
+  /**
+   * plan §7.2：这条会话的音量由**本机发送侧的软件增益**兑现，因为对端真实设备
+   * 没有可写的音量（典型如 macOS 音频 MIDI 设置拼出来的聚合设备）。
+   *
+   * **与 `volume.adjustable` 不是一句话**，两个都要看：`adjustable === false`
+   * 说的是「对端设备没有音量控件」（仍然为 false，那是事实），这一个说的是
+   * 「旋钮照样管用 —— 它动的是本机的增益，不是对端的设备」。合成一个字段的话，
+   * 要么把一个真的能用的控件置灰，要么瞒住「线上此刻带着音量」这件事。
+   */
+  volume_software_gain?: boolean;
   verdict?: Verdict | null;
   mix_verdicts?: unknown[];
   /**

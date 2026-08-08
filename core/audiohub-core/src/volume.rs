@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 /// `adjustable=false` means the device exposes no volume we can drive
 /// (aggregate devices, most HDMI/optical outs). `scalar` is then display-only
-/// and the setters fail; that is the documented trigger for the software-gain
-/// fallback plan §7.2 defers to M5.
+/// and the setters fail; that is the documented trigger for the plan §7.2
+/// software-gain fallback — see [`authority_for`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VolumeState {
     pub scalar: f32,
@@ -35,6 +35,43 @@ pub const SAME_EPS: f32 = 0.035;
 /// so a write the device silently refused cannot swallow an unrelated later
 /// change that happens to land on the same value.
 const PENDING_POLLS: u32 = 3;
+
+// ------------------------------------------- plan §7.2 software-gain fallback
+
+/// Who actually applies the volume for a spk stream this side drives (plan §7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeAuthority {
+    /// The default, and the only path with untouched audio quality: the peer's
+    /// real device has a volume we can drive, so the wire stays full-scale and
+    /// the scalar travels as a `VolumeSet` control message.
+    Peer,
+    /// plan §7.2's documented exception: the peer's device exposes no writable
+    /// volume (aggregate devices, most HDMI/optical outs), so the consumer's
+    /// virtual device self-manages and the scalar is applied as SEND-side
+    /// software gain. The wire then carries volume — which is the one case where
+    /// the bit depth matters, see `dsp::SendGain`.
+    SendGain,
+}
+
+/// `last` is the peer's most recent `VolumeState` report; `None` = nothing heard
+/// from it yet.
+///
+/// **No report means no fallback.** Engaging on `None` would attenuate audio on
+/// the strength of a fact that has not arrived; the provider reports once a
+/// second, so the cost of waiting is bounded, and the switch itself is a 20 ms
+/// gain ramp. Guessing the other way is not bounded: a stream that opens
+/// straight into the fallback multiplies every sample by a scalar nobody has
+/// agreed on yet.
+///
+/// This answers only "what did the peer's device say". Whether the fallback may
+/// run at all is a separate question the daemon asks alongside it — §7.2 gives
+/// it to mode B, whose virtual device is the thing doing the self-managing.
+pub fn authority_for(last: Option<VolumeState>) -> VolumeAuthority {
+    match last {
+        Some(v) if !v.adjustable => VolumeAuthority::SendGain,
+        _ => VolumeAuthority::Peer,
+    }
+}
 
 pub fn get_default_output_volume() -> Result<VolumeState> {
     get_output_volume(None)
@@ -1343,3 +1380,33 @@ mod mode_a_tests {
     }
 }
 
+/// plan §7.2 兜底支路的**接手判据**。
+#[cfg(test)]
+mod send_gain_authority_tests {
+    use super::*;
+
+    /// 正反两面各钉一次。
+    ///
+    /// 注入对照：把 `authority_for` 的 `None` 分支改成 `SendGain`（即「还没听到
+    /// 对端就先兜底」），第一条断言立刻变红。
+    #[test]
+    fn the_software_gain_fallback_waits_for_the_peer_to_say_so() {
+        // 还没听到对端 ⇒ 绝不兜底：那会拿一个尚未到达的事实去衰减音频。
+        assert_eq!(authority_for(None), VolumeAuthority::Peer);
+        // 对端设备能调 ⇒ 走控制面（线上满幅），这是默认路径。
+        assert_eq!(
+            authority_for(Some(VolumeState { scalar: 0.4, muted: false, adjustable: true })),
+            VolumeAuthority::Peer
+        );
+        // 对端设备不能调 ⇒ 本机接手（macOS 聚合设备：scalar 恒为 0 且不可写）。
+        assert_eq!(
+            authority_for(Some(VolumeState { scalar: 0.0, muted: false, adjustable: false })),
+            VolumeAuthority::SendGain
+        );
+        // 静音态与判据无关：能不能调是设备的事，静没静音是状态。
+        assert_eq!(
+            authority_for(Some(VolumeState { scalar: 0.9, muted: true, adjustable: false })),
+            VolumeAuthority::SendGain
+        );
+    }
+}

@@ -858,20 +858,40 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                         muted,
                         adjustable,
                     };
-                    *lk(&e.volume.state) = Some(state);
-                    // spec-round2 §B2 reverse direction rides on THIS cell: the
-                    // ticker pushes genuine changes into the virtual speaker's
-                    // control. Deliberately not sent from here — a mach send can
-                    // sit for up to its 500ms timeout, and this is the thread
-                    // that reads the peer's control channel.
-                    //
-                    // plan §7.1 模式 A 「与对端音量同步」 IS applied from here,
-                    // and the distinction is not an inconsistency: this writes
-                    // the OS volume property (the same call `apply_peer_volume`
-                    // already makes on this very thread), not a mach message to
-                    // the driver. Doing it on the 1s ticker instead would make
-                    // 「以对端为准」 lag a second behind the peer's knob.
-                    follow_peer_volume(inner, &e, state);
+                    // plan §7.2：对端设备**没有**可写音量时，这条流的音量改由本机
+                    // 的发送侧软件增益兑现。判据只看对端这一句话，模式门单独加：
+                    // §7.2 说的是「使用端**虚拟设备**自管音量」，而模式 A 没有虚拟
+                    // 设备，它的音量故事是 §7.1 的「以对端为准」——两条一起跑就是
+                    // 两个机制在动同一个响度（plan §12.5 的双重衰减）。
+                    let fallback = volume::authority_for(Some(state))
+                        == volume::VolumeAuthority::SendGain
+                        && crate::mode_b_in_force(inner);
+                    if fallback {
+                        // 接手（幂等；只有第一次真的播种起点）。之后**一个字都
+                        // 不写进单元格**：对端每秒都会把它那个冻住的读数（聚合
+                        // 设备上恒为 0）再送一次，照抄进来就会每秒把用户刚拖到的
+                        // 位置拽回去 —— 而 `push_peer_volumes` 会把这个拽回去的
+                        // 值一路推到虚拟设备的音量控件上。
+                        engage_send_gain(&e);
+                    } else {
+                        // 交还（同样幂等）：对端换回能调音量的设备之后，增益斜坡
+                        // 回到 1.0，显示值重新由对端的读数驱动。
+                        release_send_gain(&e);
+                        *lk(&e.volume.state) = Some(state);
+                        // spec-round2 §B2 reverse direction rides on THIS cell:
+                        // the ticker pushes genuine changes into the virtual
+                        // speaker's control. Deliberately not sent from here — a
+                        // mach send can sit for up to its 500ms timeout, and this
+                        // is the thread that reads the peer's control channel.
+                        //
+                        // plan §7.1 模式 A 「与对端音量同步」 IS applied from here,
+                        // and the distinction is not an inconsistency: this writes
+                        // the OS volume property (the same call `apply_peer_volume`
+                        // already makes on this very thread), not a mach message to
+                        // the driver. Doing it on the 1s ticker instead would make
+                        // 「以对端为准」 lag a second behind the peer's knob.
+                        follow_peer_volume(inner, &e, state);
+                    }
                 }
             }
         }
@@ -1151,6 +1171,16 @@ pub(crate) fn set_session_volume(
         bail!("scalar must be finite");
     }
     let s = scalar.clamp(0.0, 1.0);
+    // plan §7.2 兜底支路。对端真实设备没有可写音量时，标量**不下发**——下发也
+    // 只会在对端的 `set_default_output_volume` 上失败一次、留一行日志、旋钮照旧
+    // 是假的——改为在本机发送侧施加软件增益，线上从此传带音量的音频。
+    //
+    // 判据取**旗标**而不是当场重算 `authority_for`：接手这件事只在
+    // `SessionMsg::VolumeState` 那一处发生（那里还要一并管模式门与起点播种），
+    // 两处各判一次就会有「一处认为已接手、另一处还在往线上发」的窗口。
+    if e.volume.software_gain.load(Ordering::Relaxed) {
+        return apply_send_gain(&e, s, muted);
+    }
     e.conn.send_msg(&SessionMsg::VolumeSet {
         stream_id: id,
         scalar: s,
@@ -1164,6 +1194,71 @@ pub(crate) fn set_session_volume(
     let shown = muted.or_else(|| last.map(|v| v.muted)).unwrap_or(false);
     *lk(&e.volume.state) = Some(VolumeState { scalar: s, muted: shown, adjustable });
     Ok(())
+}
+
+/// plan §7.2 兜底支路的**写入端**：把音量记到这条流的发送侧增益上，并让显示
+/// 单元格跟着走（`push_peer_volumes` 会把它一路推到虚拟设备的音量控件上）。
+///
+/// **静音折进增益。** 对端设备连音量都写不进去，`set_default_output_mute` 同样
+/// 会失败（macOS 聚合设备两个属性一起缺），所以静音这一半也只能在这边兑现。
+/// 它走的是同一条 20 ms 斜坡，于是静音/解除静音同样不会爆音。plan §16 把静音
+/// 动作定为音量同步的一部分，这里就是它在兜底支路上的形态。
+///
+/// 显示值里的 `adjustable` 仍然是 `false`：那是关于**对端设备**的事实，没有变。
+/// 「旋钮此刻是真的」由 `SessionStats::volume_software_gain` 单独说。
+fn apply_send_gain(e: &SessionEntry, scalar: f32, muted: Option<bool>) -> Result<()> {
+    let tx = e
+        .tx
+        .as_ref()
+        .ok_or_else(|| anyhow!("session {} has no send stream to carry the software gain", e.id))?;
+    let last = *lk(&e.volume.state);
+    // `None` = 不动静音态，与 `SessionMsg::VolumeSet` 的语义一致。
+    let m = muted.or_else(|| last.map(|v| v.muted)).unwrap_or(false);
+    tx.send_gain.store(
+        TxShared::gain_bits(if m { 0.0 } else { scalar }),
+        Ordering::Relaxed,
+    );
+    *lk(&e.volume.state) = Some(VolumeState { scalar, muted: m, adjustable: false });
+    Ok(())
+}
+
+/// 兜底接手：这条流的音量从此由本机的发送侧增益兑现。
+///
+/// **起点取 1.0，不取对端上报的那个标量。** 一个真的没有音量属性的设备
+///（macOS 聚合设备）上报的 `scalar` 恒为 0 —— `volume.rs::get` 在找不到任何
+/// 通道元素时就是这么取的 —— 拿它当增益等于一接手就静音。而且接手的那一刻
+/// **没有任何一侧在衰减**：对端写不进去，虚拟设备的音量是纯控制节点、不碰采样
+///（`docs/spec-windows-driver.md` §1.4「不存在双重衰减」）。所以 1.0 既是响度上
+/// 的**不变**，也是显示上的**实话**——「此刻没有人在衰减」。
+fn engage_send_gain(e: &SessionEntry) {
+    if e.volume.software_gain.swap(true, Ordering::Relaxed) {
+        return; // 已经在兜底里了
+    }
+    if let Some(tx) = e.tx.as_ref() {
+        tx.send_gain.store(TxShared::gain_bits(1.0), Ordering::Relaxed);
+    }
+    *lk(&e.volume.state) = Some(VolumeState { scalar: 1.0, muted: false, adjustable: false });
+    dlog!(
+        "[audiohubd] stream {}: the peer's output device has no volume we can drive; this side \
+         takes the volume over as send-side software gain (plan §7.2)",
+        e.id
+    );
+}
+
+/// 交还：对端换回了能调音量的设备（plan §7.2「对端默认设备切换后重新协商」）。
+/// 增益斜坡回到 1.0（`SendGain` 的 20 ms 渐变，不爆音），显示值改由对端驱动。
+fn release_send_gain(e: &SessionEntry) {
+    if !e.volume.software_gain.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    if let Some(tx) = e.tx.as_ref() {
+        tx.send_gain.store(crate::SEND_GAIN_OFF, Ordering::Relaxed);
+    }
+    dlog!(
+        "[audiohubd] stream {}: the peer's output is adjustable again, handing the volume back \
+         to it (plan §7.2); the send-side gain ramps to unity",
+        e.id
+    );
 }
 
 fn decode_media_salt(b64: &str) -> Result<Vec<u8>> {

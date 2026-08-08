@@ -4316,3 +4316,151 @@ fn a_peer_pinned_to_tier_zero_records_the_verdict_but_does_not_act_on_it() {
 fn live_conn(n: &Node, fp: &str) -> Option<std::sync::Arc<crate::ConnShared>> {
     lk(&n.h.inner_for_test().state).conns.get(fp).cloned()
 }
+
+/// `peers.set_tier` **over IPC** -- the write path behind the detail page's
+/// connectivity controls, and the one `plan-conformance` §三.4 records as
+/// having zero coverage ("every test bypasses IPC and writes the store
+/// directly", so `dial_policy` and `endpoint` were never exercised as
+/// parameters at all).
+///
+/// Four claims, each load-bearing for something the UI now puts on screen:
+///
+///  1. **`tier2` is accepted on a peer whose address is a plain `IP:port`.**
+///     `connect_peer` picks the carrier with
+///     `endpoint.is_some() || tier == Tier2` -- two independent disjuncts -- so
+///     the pin alone selects the bare-TCP mux, no URL required. That is what
+///     makes the fourth button in the selector a real choice instead of a
+///     greyed-out one reading "needs a tunnel address", which would have been
+///     a false statement about this daemon.
+///  2. **A `ws://` endpoint persists, including across a restart.** This is the
+///     entire difference from `peers.connect`, whose URL `conn.rs` deliberately
+///     does not store ("the caller asked for one connection, not a setting").
+///     Before this the only durable entry was the `--endpoint` CLI flag, so the
+///     UI had no way to keep a tunnel address across a reconnect.
+///  3. **`wss://` is refused at the write, not at the dial**, and a refused
+///     write must leave the stored value untouched -- an address that stores
+///     fine and dials never is exactly the silent failure this repo keeps
+///     finding.
+///  4. **`""` clears it**, putting the peer back on its paired address.
+#[test]
+fn set_tier_over_ipc_takes_tier2_and_a_persistent_ws_endpoint() {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ahb-tr-settier-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let cfg = || DaemonCfg {
+        control_port: 0,
+        ipc_port: 0,
+        config_dir: Some(dir.clone()),
+        announce: Some(false),
+        hal_bridge: Some(HalBridgeMode::Off),
+        tx_throttle_kbps: None,
+        block_udp: None,
+        announce_fault: false,
+    };
+
+    // A real peer: `peers.set_tier` resolves a fingerprint, and there is no
+    // fingerprint without a pairing.
+    let peer = Node::start("settier-peer");
+    peer.set_mode(Mode::Share);
+    let fp = peer.fingerprint();
+    let peer_addr = format!("127.0.0.1:{}", peer.h.control_port);
+
+    let first = start_daemon(cfg()).expect("start");
+    let call = |h: &DaemonHandle, m: &str, p: &Value| ipcserv::dispatch_for_test(h.inner_for_test(), m, p);
+    let ok = |h: &DaemonHandle, m: &str, p: &Value| call(h, m, p).expect("call");
+    ok(&first, methods::SETTINGS_SET, &json!({ "mode": "a" }));
+    let pin = peer.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
+    let pin = pin["pin"].as_str().expect("pin").to_string();
+    ok(&first, methods::PEERS_PAIR, &json!({ "addr": peer_addr, "pin": pin }));
+
+    // (1) tier 2 on a peer reachable at a plain address. No endpoint anywhere.
+    let r = ok(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier2" }));
+    assert_eq!(r["tier"].as_str(), Some("tier2"), "tier2 was not accepted: {r}");
+    assert_eq!(r["previous"].as_str(), Some("auto"), "the previous tier is misreported: {r}");
+    assert_eq!(
+        r["endpoint"].as_str(),
+        Some(""),
+        "pinning tier2 invented an endpoint; the UI would then show a tunnel address \
+         the user never typed: {r}"
+    );
+
+    // Every tier this build knows has to survive the same round trip, or the
+    // selector offers a button the daemon will reject at click time.
+    for t in ["auto", "tier0", "tier1", "tier2"] {
+        let r = ok(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": t }));
+        assert_eq!(r["tier"].as_str(), Some(t), "{t} did not round-trip: {r}");
+    }
+    // ...and one this build does not know is refused rather than stored and
+    // echoed back, which is the shape this repo has been caught in six times.
+    let e = call(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier9" }))
+        .expect_err("an unknown tier must be refused at the write");
+    assert!(e.contains("tier9"), "the refusal does not name the value it refused: {e}");
+
+    // (3) wss:// is refused, and the refusal names the real gap (no TLS client)
+    // rather than reporting the address as unparseable.
+    let stored = "ws://tunnel.example:8080/audio";
+    ok(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "auto", "endpoint": stored }));
+    let e = call(
+        &first,
+        methods::PEERS_SET_TIER,
+        &json!({ "peer": &fp, "tier": "auto", "endpoint": "wss://tunnel.example/audio" }),
+    )
+    .expect_err("wss:// must be refused at the write, not at the dial");
+    assert!(e.contains("wss://"), "the refusal does not say which scheme it refused: {e}");
+    assert!(e.contains("TLS"), "the refusal does not name the real gap: {e}");
+    // The refused write must not have taken half of itself with it.
+    let p = peer_row(&first, &fp);
+    assert_eq!(
+        p["transport"]["endpoint"].as_str(),
+        Some(stored),
+        "a refused endpoint write clobbered the stored one: {p}"
+    );
+
+    // (2) It survives a restart. `peers.connect`'s URL does not, and that
+    // difference is the whole point of routing this through `peers.set_tier`.
+    first.shutdown();
+    let second = start_daemon(cfg()).expect("restart");
+    let p = peer_row(&second, &fp);
+    assert_eq!(
+        p["transport"]["endpoint"].as_str(),
+        Some(stored),
+        "the tunnel address did not survive a restart -- reconnect still forgets it: {p}"
+    );
+    // Asserting the echo alone would stay green for an implementation that kept
+    // the value in memory only, so check the file too.
+    let raw = std::fs::read_to_string(dir.join("peer_transport.json")).expect("peer_transport.json");
+    assert!(raw.contains(stored), "the endpoint never reached the disk: {raw}");
+
+    // (4) An empty string clears it -- distinct from omitting the parameter,
+    // which leaves the stored value alone.
+    ok(&second, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier1" }));
+    let p = peer_row(&second, &fp);
+    assert_eq!(
+        p["transport"]["endpoint"].as_str(),
+        Some(stored),
+        "omitting `endpoint` cleared it; then no caller could change only the tier: {p}"
+    );
+    ok(&second, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier1", "endpoint": "" }));
+    let p = peer_row(&second, &fp);
+    assert_eq!(p["transport"]["endpoint"].as_str(), Some(""), "the endpoint did not clear: {p}");
+    assert_eq!(p["transport"]["tier"].as_str(), Some("tier1"), "clearing the endpoint moved the tier: {p}");
+
+    second.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// This peer's `peers.list` row, read through IPC so the assertions are about
+/// the contract the UI actually receives rather than about the store.
+fn peer_row(h: &DaemonHandle, fp: &str) -> Value {
+    ipcserv::dispatch_for_test(h.inner_for_test(), methods::PEERS_LIST, &json!({}))
+        .expect("peers.list")
+        .as_array()
+        .expect("peers.list is an array")
+        .iter()
+        .find(|p| p["fingerprint"].as_str() == Some(fp))
+        .unwrap_or_else(|| panic!("{fp} is not in peers.list"))
+        .clone()
+}

@@ -79,3 +79,39 @@ function isPort(s: string): boolean {
   const n = Number(s);
   return n > 0 && n <= 65535;
 }
+
+// -------------------------------------------------------------- 隧道地址那一格
+//
+// 上面的 `classifyPeerAddr` 服务的是「添加对端 / 配对」那两格：那里 `IP:端口`
+// 是**主流**用法。下面这一格不同——它存的就是「隧道地址」，直连在这里的表达
+// 方式是**留空**，不是填一个 IP。同一个判别函数，两条不同的收活规则。
+
+/**
+ * 隧道地址那一格能不能存。
+ *
+ * `ok` 的两种：`''`（清除，改回直连）与一个 `ws://` URL。其余全拒，且**拒在
+ * 按下按钮之前**——daemon 的 `peers.set_tier` 也会拒（`WsUrl::parse` +
+ * `require_plaintext`），但那条报错是英文的、带 Rust 上下文的，而这一格的四种
+ * 写错方式各自有一句能直接照做的中文。
+ *
+ * `notUrl` 是这一格**独有**的一条：`192.168.1.9:47810` 在「添加对端」那格是
+ * 完全正常的输入，在这里却是个错误——存进去 daemon 也读不出 `WsUrl`，于是这一
+ * 格看起来填了、实际等于没填。这正是「存得下、拨不动」那类静默失效。
+ */
+export type EndpointCheck =
+  | { ok: true; value: string }
+  | { ok: false; why: 'notUrl' | 'wss' | BadUrlReason };
+
+export function checkEndpoint(raw: string): EndpointCheck {
+  const s = raw.trim();
+  if (!s) return { ok: true, value: '' };
+  const shape = classifyPeerAddr(s);
+  switch (shape.kind) {
+    case 'ws': return { ok: true, value: s };
+    case 'wss': return { ok: false, why: 'wss' };
+    case 'badUrl': return { ok: false, why: shape.reason };
+    // 不是 URL 形态。**不替用户脑补一个 `ws://` 前缀**：他想要的可能是直连
+    // （那该留空），补前缀会把一个笔误变成一次没人要求过的传输切换。
+    case 'direct': return { ok: false, why: 'notUrl' };
+  }
+}

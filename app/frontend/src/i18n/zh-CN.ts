@@ -618,7 +618,13 @@ export const zhCN = {
   // 报成「地址无法识别」。
   'addr.wssUnsupported': '本版本还不支持 wss://（没有内置 TLS 客户端）。请填隧道的明文入口 ws://…，或在本机前面终结 TLS。',
   // 配对不走 WebSocket：P5 有意没有在复用连接上再开一条配对路径，P6 未改。
+  // ⚠ 这句话指的路（「到该对端的详情里把地址改成隧道 URL」）现在**真的存在**了，
+  // 就是详情页「连通方式」下面那一格；在它落地之前这是一句做不到的指路。
   'addr.pairNotOverWs': '配对暂时不能走 ws:// 隧道。请先用 IP:端口 完成配对，再到该对端的详情里把地址改成隧道 URL。',
+  // 隧道地址那一格独有的一条：`192.168.1.9:47810` 在「添加对端」里完全正常，
+  // 在那一格里却等于没填（daemon 读不出 WsUrl）。所以要点明「直连 = 留空」，
+  // 而不是把它报成一句泛泛的「地址无法识别」。
+  'addr.endpointNeedsUrl': '隧道地址必须以 ws:// 开头。要走直连就把这一格留空——直连用的是配对时记下的地址。',
   'pair.right.done': '已与「{name}」完成配对',
   'pair.right.failed': '配对失败：{message}。确认对方已开启配对模式、PIN 未过期、地址可达；也可用 CLI 复现：audiohub pair --to {addr} --pin {pin}',
   'pair.right.note': '经 peers.pair 由本机服务发起：配对成功后双向信任立即生效，模式 B 下对方主机会同时作为一对音频设备出现在「系统设置 › 声音」里。',
@@ -730,14 +736,31 @@ export const zhCN = {
   // 仍然、并且应当显示「自动」。
   'detail.transport.tierTitle': '连通方式',
   'detail.transport.tierPickNote': '下面这一组是**你的选择**，不是现在实际走的那一条——选「自动」时，上面那一行才是现状。',
-  'detail.transport.tierNote': '媒体默认走 UDP（直连，延迟最好）。UDP 被网络挡住时可以改走 TCP：功能一样不少，但**延迟与抖动会明显变差**。「自动」= 由服务判断。改这一项会重新协商一次连接，约一秒内恢复。',
+  'detail.transport.tierNote': '媒体默认走 UDP（直连，延迟最好）。UDP 被网络挡住时可以改走 TCP：功能一样不少，但**延迟与抖动会明显变差**。两者都不通、只剩应用层隧道时，还可以把控制与两个方向的音频全部挤进一条连接（最后一档）。「自动」= 由服务判断。改这一项会重新协商一次连接，约一秒内恢复。',
   'detail.transport.tierAuto': '自动',
   'detail.transport.tierAutoHint': '由服务判断（默认）',
   'detail.transport.tier0': '直连（UDP）',
   'detail.transport.tier0Hint': '钉住直连；UDP 不通时不会自己改走 TCP',
   'detail.transport.tier1': '经 TCP 中转',
   'detail.transport.tier1Hint': '钉住 TCP；延迟与抖动明显更差',
+  // 这一档**不需要**隧道地址就能选：填了地址是「带 WebSocket 外壳的复用」，
+  // 不填是「裸 TCP 上的复用」，两者都是单连接复用。所以这句提示不许写成
+  // 「需要隧道地址」——那会把一个此刻就生效的选择说成一个前置条件没满足的选择。
+  'detail.transport.tier2': '单连接复用',
+  'detail.transport.tier2Hint': '控制与两个方向的音频挤在一条连接上；延迟最差、双向互相干扰。只在直连与 TCP 都不通时用。要经 HTTP 隧道请在下面填 ws:// 地址。',
   'detail.transport.tierReset': '连通方式原来存的是「{old}」，这个版本不认识，已重置为「自动」。',
+  // ---- 隧道地址（plan §16.2「地址即传输选择」）-----------------------------
+  //
+  // 这一格是**能存住**隧道地址的唯一界面入口。「添加对端」那一格也收 ws://，
+  // 但它走 peers.connect，daemon 明写那个 URL 不落盘 ⇒ 重连即失忆。
+  'detail.transport.endpointTitle': '隧道地址',
+  'detail.transport.endpointField': '对端地址（ws://）',
+  'detail.transport.endpointPlaceholder': 'ws://隧道主机[:端口][/路径]',
+  'detail.transport.endpointNote': '留空 = 用配对时记下的 IP:端口 直连。填 ws:// = 把连接套进 WebSocket，用于只放行 HTTP 的隧道；这时无论上面选哪一档，本机主动连它都走单连接复用。这一格会存盘，重连后仍然有效。**本版本不支持 wss://**（没有内置 TLS 客户端）：请填隧道的明文入口，或在本机前面终结 TLS。',
+  'detail.transport.endpointSaved': '已保存隧道地址：{addr}',
+  'detail.transport.endpointCleared': '已清除隧道地址，改回按配对时记下的地址直连。',
+  'detail.transport.endpointShadow': '已填隧道地址：本机主动连它时一律走单连接复用，上面选的「{tier}」对出站连接不生效。要用回上面那一档，先清空这一格。',
+  'detail.transport.endpointReset': '隧道地址原来存的是「{old}」，这个版本读不懂，已清空。',
   // ---- 链路**现状**（plan §16.4）------------------------------------------
   //
   // 与上面那一组（用户的选择）是两个量。这一组回答「此刻字节实际走在哪条路上」。

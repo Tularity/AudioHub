@@ -1766,7 +1766,7 @@ body.is-tauri .gate-drag {
   padding: 4px 0 4px 8px; margin: 8px 0 0;
 }
 /* ---- 连通方式（plan §16.2 的手动覆盖）---------------------------------
-   三个互斥选项做成一排卡片而不是 <select>：每一档都要带一句后果说明
+   四个互斥选项做成一排卡片而不是 <select>：每一档都要带一句后果说明
    （「延迟与抖动明显更差」），而 <option> 里塞不下第二行——塞不下的结果是
    用户在一个只写着代号的下拉里选一个他不知道会付什么代价的东西。 */
 .transport-tier { margin-top: 14px; }
@@ -1822,6 +1822,13 @@ body.is-tauri .gate-drag {
 /* 后果说明比标签暗一档，与 `.transport-live` 同一条纪律：两者同字号会让
    「这一档叫什么」和「选它会怎样」读起来像同一类东西。 */
 .transport-tier-hint { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
+/* 隧道地址那一格。跟在四个档位**之后**、并且明显分隔开：它不是第五个档，
+   而是一个会**盖过**那四个的设置（daemon 选承载的判据是「或」）。挨太近会被
+   读成同一组选项里的一员，那正好是它最容易被误解的方式。 */
+.transport-endpoint {
+  margin-top: 12px; padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
 
 /* 两个档位的权威解释。收起态是默认：那两段各有五六行，常驻会把四个控件挤下屏。
    开关做成一条低调的文字按钮而不是图标——「这两个档位是什么？」自己就是标签，

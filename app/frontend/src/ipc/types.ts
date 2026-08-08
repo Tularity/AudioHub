@@ -691,7 +691,7 @@ export interface PeerTransportView {
   /** 对端推来、执行器在**本机发送侧**的音质档（= 对端的 `recv.quality`）。 */
   peer_tx_quality?: string | null;
   /**
-   * 连通性档位（plan §16.2）：`'auto'` | `'tier0'` | `'tier1'`。
+   * 连通性档位（plan §16.2）：`'auto'` | `'tier0'` | `'tier1'` | `'tier2'`。
    *
    * **每对端一个，不分方向。** 两个方向共用一条控制连接，降级之后也共用一条
    * 媒体传输；做成每方向的会在界面上宣布一件做不到的事。
@@ -699,10 +699,39 @@ export interface PeerTransportView {
    * ⚠ 这是**用户的选择**，不是链路的现状。`'auto'` 的意思是「让服务决定」，
    * 不是「此刻跑在 tier 0 上」。现状是另一件事（plan §16.4 的一级信息，
    * 尚未落地），两者**不得互相冒充**。
+   *
+   * ⚠ `'tier2'` **不是**唯一的复用入口，也不是 `endpoint` 的同义词：daemon 选
+   * 承载的判据是 `endpoint.is_some() || tier == Tier2`（`conn.rs`）。所以一台
+   * 选着 `'tier0'` 而 `endpoint` 非空的对端，出站拨号照样是复用的。判定收在
+   * `lib/tier.ts` 的 `dialsMultiplexed()`，全应用只此一份。
    */
   tier?: string;
   /** 装载时不被认识、已被重置的连通性档串。缺席 = 一切正常。 */
   tier_reset_from?: string | null;
+  /**
+   * 哪一侧可以发起连接：`'both'` | `'outbound_only'` | `'inbound_only'`。
+   *
+   * 与 `tier` **并列而不是从它推导**：tier 2 的隧道不一定单向，单向的通路也
+   * 不一定是 tier 2。从一个推另一个会在两种情形里各错一次。
+   *
+   * ⚠ 目前**只有 CLI 写得了**（`peers.set_tier` 的同名参数）。界面读得到、
+   * 但还没有控件——所以别拿这个字段的缺省值去证明「用户选了双向」。
+   */
+  dial_policy?: string;
+  dial_policy_reset_from?: string | null;
+  /**
+   * URL 形态的对端地址（`ws://host[:port][/path]`），没有则为**空串**。
+   *
+   * **地址即传输选择**（plan §16.2）：填 URL 就是要求走 WebSocket 外壳的单连接
+   * 复用，与「填 `IP:端口` 就是要求直连」同一条语义。它与 `tier` 是**或**的
+   * 关系，不是二选一——见 `tier` 上那条警告。
+   *
+   * 缺席（旧服务）与空串在这里**含义相同**（都没有隧道地址），所以这一个字段
+   * 上不需要区分两者。
+   */
+  endpoint?: string;
+  /** 装载时没认出来、已被清空的那个 URL。缺席 = 一切正常。 */
+  endpoint_reset_from?: string | null;
 }
 
 /** settings.get / settings.set 的回包（daemon 拥有的全局设置）。 */

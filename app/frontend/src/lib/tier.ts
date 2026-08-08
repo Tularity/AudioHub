@@ -194,3 +194,116 @@ export function sessionTier(
   return t === 'tier0' || t === 'tier1' || t === 'tier2' ? t : null;
 }
 
+// ---------------------------------------------------------------- 用户的选择
+//
+// 上面到此为止都是**现状**。下面是另一个量：**用户在选择器上钉的那一档**。
+// 两者不得互相冒充（本文件开头那张表）。
+
+/**
+ * 「连通方式」选择器上的四个互斥选项。
+ *
+ * # 为什么 tier 2 是一个**真的能点**的档，而不是一个置灰的档
+ *
+ * 曾经有人提议把它画成灰的、旁边写「需要隧道地址」。**那句话是假的**，而且
+ * 有三条各自独立的依据：
+ *
+ * 1. **plan §16.2 逐字**：「**手动覆盖恒可用**：任何对端都可以被钉在指定 tier 上，
+ *    包括钉回 Tier 0。」「任何」与「指定」两个词把 tier 2 也包在里面了。
+ *    同一节里那句「由对端地址的形态决定」讲的是**自动**那条路为什么不存在
+ *    （隧道的属性我们观测不到），它是在解释 tier 2 没有自动入口，
+ *    不是在宣布 tier 2 只有地址这一个入口。
+ * 2. **daemon 就是这么实现的**：`conn.rs` 里选承载的那一行是
+ *    `endpoint.is_some() || tier == Tier2` —— 两个**或**的条件，各自成立。
+ *    钉 tier 2 而地址是普通 `IP:端口` ⇒ 走**裸 TCP 上的单连接复用**，
+ *    与 §4.3 给 tier 2 的定义（「单连接复用」）完全一致，少的只是 WebSocket 外壳，
+ *    而外壳在 §4.3 里本来就写着是「**选项**」。
+ * 3. **它跑得通，且有测试**：`transport_tests.rs::tier_two_pair` 钉了 tier 2 之后
+ *    直接用普通 `127.0.0.1:端口` 配对连接，双向媒体在那条复用连接上过，
+ *    全程没有任何 URL。（同文件另一处钉 tier 2 的 `tier_two_ws_pair` **不算**
+ *    这条的证据：它虽然也用普通地址配对，但连接前给对端存了 `ws://` endpoint，
+ *    走的是「外壳」那条路。一处足以成立，不要把它数成两处。）
+ *
+ * 所以置灰会同时违反三件事：一句 plan 原文、一个 daemon 行为、一组绿着的测试。
+ * 「点了引导用户去改地址」同样不行——它把一个此刻就能生效的选择变成一次跳转，
+ * 用户改完地址回来会发现自己得到的是**另一种** tier 2（带外壳的那种）。
+ *
+ * 诚实的做法是两个入口都给、并且把它们的差别说清楚：这一组按钮给「复用」，
+ * 下面那一格给「外壳 + 隧道地址」，而地址一旦填了就**盖过**这一组
+ * （见 [`endpointShadowsTier`]）。
+ */
+export type TierChoice = 'auto' | 'tier0' | 'tier1' | 'tier2';
+
+/** 选择器上的顺序：自动在先，其余按「越往后越降级」。 */
+export const TIER_CHOICES: readonly TierChoice[] = ['auto', 'tier0', 'tier1', 'tier2'];
+
+/** 选项标签。**说人话，不显示内部代号**（§16.4 第 2 条）。 */
+export const TIER_PICK_LABEL: Record<TierChoice, MsgKey> = {
+  auto: 'detail.transport.tierAuto',
+  tier0: 'detail.transport.tier0',
+  tier1: 'detail.transport.tier1',
+  tier2: 'detail.transport.tier2',
+};
+
+/** 选项下面那一行**后果**。每一档都必须有一句，理由见 `styles.css` 上的注释：
+ *  一个只写着代号的选项等于让用户选一个他不知道会付什么代价的东西。 */
+export const TIER_PICK_HINT: Record<TierChoice, MsgKey> = {
+  auto: 'detail.transport.tierAutoHint',
+  tier0: 'detail.transport.tier0Hint',
+  tier1: 'detail.transport.tier1Hint',
+  tier2: 'detail.transport.tier2Hint',
+};
+
+/**
+ * 把 daemon 报来的 tier 串映射成选项标签。
+ *
+ * 认不出来的串退回「自动」那一条，**不是**编造一个标签：daemon 装载时就把不
+ * 认识的串重置成 `auto` 并通过 `tier_reset_from` 说明，界面在这里跟着说同一
+ * 句话，两边不会分岔。
+ */
+export function tierPickLabel(tier: string | null | undefined): MsgKey {
+  return tier && Object.prototype.hasOwnProperty.call(TIER_PICK_LABEL, tier)
+    ? TIER_PICK_LABEL[tier as TierChoice]
+    : TIER_PICK_LABEL.auto;
+}
+
+/** 存了一个隧道地址（`ws://…`）。空串 / 缺席 = 没存。 */
+export function hasEndpoint(endpoint: string | null | undefined): boolean {
+  return typeof endpoint === 'string' && endpoint.trim() !== '';
+}
+
+/**
+ * 下一次**本机主动拨号**会不会走单连接复用。
+ *
+ * **逐字镜像 daemon**（`core/audiohubd/src/conn.rs` 选承载的那一行）：
+ *
+ * ```rust
+ * let tier2 = endpoint.is_some()
+ *     || lk(&inner.peer_transport).tier(&peer.fingerprint) == TransportTier::Tier2;
+ * ```
+ *
+ * 写成**或**而不是「tier 说了算」：地址本身就是一次传输选择（plan §16.2），
+ * 再要求一个开关去附和它只会造出一个两者打架的状态。界面必须按 daemon 的这条
+ * 规则说话，否则就会出现「按钮上写着直连、字节走在复用连接上」——正是本仓
+ * 反复审的那类「界面处处自洽、事实不是这样」。
+ *
+ * ⚠ 只管**出站**。对端拨过来的那条连接由对端的设置决定，本机说了不算。
+ */
+export function dialsMultiplexed(
+  tier: string | null | undefined,
+  endpoint: string | null | undefined,
+): boolean {
+  return hasEndpoint(endpoint) || tier === 'tier2';
+}
+
+/**
+ * 隧道地址是否**盖过**了选择器上那一档。
+ *
+ * 为真时界面必须说出来。不说的话，一个选着「直连（UDP）」又填了 `ws://` 的
+ * 用户会一直以为自己在直连——而 [`dialsMultiplexed`] 那条规则说他不是。
+ */
+export function endpointShadowsTier(
+  tier: string | null | undefined,
+  endpoint: string | null | undefined,
+): boolean {
+  return hasEndpoint(endpoint) && tier !== 'tier2';
+}

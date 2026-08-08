@@ -20,16 +20,19 @@
 // 的人永远看不到自己机器上正在被执行什么，而本次事故里缺的正是这个视图。
 // 置灰成空壳 ⇒ 把一个正在生效的真实值画成「没有值」，撞 §14 裁定 2 的红线。
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { StopSlider } from './StopSlider';
+import { toast } from './Toasts';
 import { t } from '../i18n';
-import type { MsgKey } from '../i18n';
 import { fmt } from '../lib/fmt';
+import { checkEndpoint } from '../lib/peerAddr';
 import { latencyStops, normLatency, qualityStops, stopLabel } from '../lib/transportStops';
 import { pickWorst, qualityDepthKey, readLatency, readQuality, splitByDirection } from '../lib/metrics';
 import type { Dir } from '../lib/metrics';
 import {
-  TIER_LABEL, TIER_WHY, effectiveTier, isDegradedTier, muxLink, tcpMediaLink, tierUnknownWhy,
+  TIER_CHOICES, TIER_LABEL, TIER_PICK_HINT, TIER_PICK_LABEL, TIER_WHY,
+  effectiveTier, endpointShadowsTier, isDegradedTier, muxLink, tcpMediaLink,
+  tierPickLabel, tierUnknownWhy,
 } from '../lib/tier';
 import { rpc, refreshPeers } from '../state/connection';
 import { useStore } from '../state/store';
@@ -237,6 +240,131 @@ function TierNow({ peer }: { peer: PeerState }) {
   );
 }
 
+/**
+ * 隧道地址那一格（plan §16.2 的「地址即传输选择」）。
+ *
+ * # 为什么它必须在**详情页**，而不是只在「添加对端」表单里
+ *
+ * 「添加对端」那一格接受 `ws://…`，但它走的是 `peers.connect`，而 daemon 在
+ * `conn.rs` 上明写那个 URL **不落盘**（「调用方要的是一次连接，不是一个设置」）。
+ * 于是隧道地址**重连即失忆**，而唯一能存住它的入口在命令行（`--endpoint`）。
+ * 更糟的是语料里已经有一句 `addr.pairNotOverWs` 逐字告诉用户「先用 IP:端口
+ * 完成配对，**再到该对端的详情里把地址改成隧道 URL**」——而详情里根本没有这一格。
+ * 一句写在界面上的、做不到的指路，比不写更坏。
+ *
+ * # 为什么存地址**不顺手把上面那一档改成 tier 2**
+ *
+ * 因为那是**替用户改他的选择**。daemon 的判据是「或」（见 `dialsMultiplexed`），
+ * 地址存下之后复用**已经生效**，不需要再动那一档；而动了之后，用户哪天清掉
+ * 地址，留在选择器上的就是一个他从没点过的 tier 2 钉子。
+ * 取而代之的是把「这一格盖过了那一组」直接写在屏幕上。
+ */
+function EndpointField({ fp, tier, endpoint, reset }: {
+  fp: string;
+  tier: string;
+  endpoint: string;
+  reset?: string | null;
+}) {
+  const [busy, setBusy] = useState(false);
+  const ref = useRef<HTMLInputElement>(null);
+
+  // 与改名那一格同一条：输入框只在用户没在编辑时跟随 daemon，否则每秒一帧的
+  // 刷新会把正在敲的字冲掉。
+  useEffect(() => {
+    const node = ref.current;
+    if (node && document.activeElement !== node) node.value = endpoint;
+  }, [endpoint]);
+
+  async function save(raw: string): Promise<void> {
+    if (busy) return;
+    // 拒在按下按钮之前。daemon 也会拒（`WsUrl::parse` + `require_plaintext`），
+    // 但那条报错是英文的、带 Rust 上下文的，而这里四种写错方式各有一句能照做
+    // 的中文——尤其 `wss://`，它的问题不是「写错了」而是「这一版没有 TLS 客户端」。
+    const chk = checkEndpoint(raw);
+    if (!chk.ok) {
+      toast(
+        chk.why === 'notUrl' ? t('addr.endpointNeedsUrl')
+          : chk.why === 'wss' ? t('addr.wssUnsupported')
+            : t(`addr.badUrl.${chk.why}`, { addr: raw.trim() }),
+        'warn',
+      );
+      ref.current?.focus();
+      return;
+    }
+    setBusy(true);
+    try {
+      // `tier` 原样带上：`peers.set_tier` 的 `tier` 是必填的，而这一次操作
+      // 要改的只有地址。带上当前值 ⇒ daemon 侧 `changed` 只由地址决定，
+      // 地址没变就不会白拆一条健康的连接。
+      await rpc('peers.set_tier', { peer: fp, tier, endpoint: chk.value });
+      toast(chk.value
+        ? t('detail.transport.endpointSaved', { addr: chk.value })
+        : t('detail.transport.endpointCleared'), 'ok');
+      await refreshPeers();
+    } catch { /* rpc 已 toast */ } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="transport-endpoint" data-testid="detail-transport-endpoint">
+      <h4 className="block-subtitle">{t('detail.transport.endpointTitle')}</h4>
+      {/* 盘上那串读不懂、已被 daemon 清空 ⇒ 说出来。与档位重置同一条纪律：
+          静默清除等于用户的设置消失了，而界面处处自洽。 */}
+      {typeof reset === 'string' ? (
+        <p className="transport-reset" data-testid="detail-transport-endpoint-reset">
+          {t('detail.transport.endpointReset', { old: reset })}
+        </p>
+      ) : null}
+      <div className="form-row">
+        <label className="field grow">
+          <span className="field-label">{t('detail.transport.endpointField')}</span>
+          <input
+            ref={ref}
+            className="input"
+            data-testid="detail-transport-endpoint-input"
+            placeholder={t('detail.transport.endpointPlaceholder')}
+            autoComplete="off"
+            spellCheck="false"
+            defaultValue={endpoint}
+            onKeyDown={(e) => {
+              if (e.key !== 'Enter') return;
+              e.preventDefault();
+              void save(e.currentTarget.value);
+            }}
+          />
+        </label>
+        <span className="field-btn">
+          <button
+            className="btn primary small" type="button"
+            data-testid="detail-transport-endpoint-save" disabled={busy}
+            onClick={() => void save(ref.current?.value || '')}
+          >
+            {t('common.save')}
+          </button>
+          <button
+            className="btn ghost small" type="button"
+            data-testid="detail-transport-endpoint-clear" disabled={busy || !endpoint}
+            onClick={() => { if (ref.current) ref.current.value = ''; void save(''); }}
+          >
+            {t('common.clear')}
+          </button>
+        </span>
+      </div>
+      {/* **这一格盖过上面那一组**时必须说出来，否则一个选着「直连（UDP）」又填了
+          `ws://` 的用户会一直以为自己在直连——而 daemon 说他不是。 */}
+      {endpointShadowsTier(tier, endpoint) ? (
+        <p className="transport-reset" data-testid="detail-transport-endpoint-shadow">
+          {t('detail.transport.endpointShadow', { tier: t(tierPickLabel(tier)) })}
+        </p>
+      ) : null}
+      <p className="muted small" data-testid="detail-transport-endpoint-note">
+        {t('detail.transport.endpointNote')}
+      </p>
+    </div>
+  );
+}
+
 export function PeerTransportCard({ peer }: { peer: PeerState }) {
   const fp = peer.fingerprint;
   const ds = useStore((s) => s.daemonSettings);
@@ -332,11 +460,8 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
   // 读不到就是 `auto`，与四个档位串同一条理由：daemon 对每台配对过的对端都
   // 给得出一个值，读不到只可能是旧服务——空着会让整组按钮消失。
   const tier = typeof tr.tier === 'string' ? tr.tier : 'auto';
-  const TIERS: { id: string; label: MsgKey; hint: MsgKey }[] = [
-    { id: 'auto', label: 'detail.transport.tierAuto', hint: 'detail.transport.tierAutoHint' },
-    { id: 'tier0', label: 'detail.transport.tier0', hint: 'detail.transport.tier0Hint' },
-    { id: 'tier1', label: 'detail.transport.tier1', hint: 'detail.transport.tier1Hint' },
-  ];
+  // 缺席与空串在这里含义相同（都没有隧道地址），所以不区分两者。
+  const endpoint = typeof tr.endpoint === 'string' ? tr.endpoint : '';
 
   return (
     <section className="card block" data-testid="detail-transport">
@@ -396,9 +521,13 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
 
       {/* ---- 连通方式（plan §16.2 的「手动覆盖恒可用」）--------------------
           放在四个档位**之后**：那四个是日常旋钮，这一个是「网络不让我直连」
-          时才动的。三个互斥选项而不是一个开关——`auto` 与 `tier0` 不是同一件事
+          时才动的。四个互斥选项而不是一个开关——`auto` 与 `tier0` 不是同一件事
           （前者是「你决定」，后者是「钉住直连，别自己改」），做成开关就必须
           把其中一个藏起来。
+
+          ⚠ **四个，含 tier2**（曾经只有三个，见 `lib/tier.ts` 上 `TIER_CHOICES`
+          的那段论证）。tier2 不需要隧道地址就能选：不填地址是裸 TCP 上的复用，
+          填了是带 WebSocket 外壳的复用，两者都是 §4.3 的「单连接复用」。
 
           ⚠ 这一组按钮显示的是**用户的选择**，不是链路现在实际跑在哪一档。
           现状由上面的 `TierNow` 那一行负责（§16.4 的一级信息在卡片上，这里是
@@ -421,22 +550,23 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
           </p>
         ) : null}
         <div className="transport-tier-row" role="radiogroup" aria-label={t('detail.transport.tierTitle')}>
-          {TIERS.map((o) => (
+          {TIER_CHOICES.map((id) => (
             <button
-              key={o.id}
+              key={id}
               type="button"
               role="radio"
-              aria-checked={tier === o.id}
-              className={`transport-tier-opt${tier === o.id ? ' is-on' : ''}`}
-              data-testid={`detail-transport-tier-${o.id}`}
+              aria-checked={tier === id}
+              className={`transport-tier-opt${tier === id ? ' is-on' : ''}`}
+              data-testid={`detail-transport-tier-${id}`}
               disabled={busy}
-              onClick={() => void setTier(o.id)}
+              onClick={() => void setTier(id)}
             >
-              <span className="transport-tier-label">{t(o.label)}</span>
-              <span className="transport-tier-hint">{t(o.hint)}</span>
+              <span className="transport-tier-label">{t(TIER_PICK_LABEL[id])}</span>
+              <span className="transport-tier-hint">{t(TIER_PICK_HINT[id])}</span>
             </button>
           ))}
         </div>
+        <EndpointField fp={fp} tier={tier} endpoint={endpoint} reset={tr.endpoint_reset_from} />
       </div>
 
       {/* ---- 两个档位的权威解释 --------------------------------------------

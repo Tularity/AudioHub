@@ -1,4 +1,5 @@
 mod ctl;
+mod loopest;
 mod m3;
 mod volindep;
 mod winvad;
@@ -14,7 +15,7 @@ use audiohub_core::audio::{
     default_devices_report, device_name_for_uid, play_samples_blocking, play_servo_counters,
     watch_device_list, DeviceEvent, DeviceKind, LiveCapture, LivePlayback,
 };
-use audiohub_core::{dsp, sysaudio};
+use audiohub_core::{devlat, dsp, sysaudio};
 use audiohub_net::echo::{run_echo_client, run_echo_server_for, EchoCfg};
 use audiohub_net::media::{FrameSource, SysAudioSource, ToneSource};
 use audiohub_net::packet::{Codec, Header, Kind, PacketError};
@@ -465,22 +466,53 @@ fn cmd_tone(
 
 fn cmd_loopback(secs: f32, json: bool) -> Result<i32> {
     info("starting mic->speaker loopback; macOS may show a microphone permission (TCC) prompt");
+    // plan §9 M1 acceptance asks this command to print an estimated latency.
+    // The two device readings are pure property queries (devlat opens no
+    // stream, changes no routing and raises no prompt), so they are taken
+    // BEFORE the streams exist: whatever they report is then a statement about
+    // the devices, not about this process's own effect on them.
+    let capture_dev = devlat::default_input();
+    let play_dev = devlat::default_output();
+
     let (capture, mut rx, capture_rate) = LiveCapture::start()?;
     let (playback, mut tx) = LivePlayback::start(capture_rate)?;
+    // The two rings run at different rates whenever the output device is not
+    // at the capture rate; converting either with a hardcoded 48000 would be a
+    // systematic error, so each observation carries its own.
+    let mut cap_ring = loopest::RingObservation::new(rx.rate());
+    let mut play_ring = loopest::RingObservation::new(tx.dev_rate());
     let deadline = Instant::now() + Duration::from_secs_f32(secs);
     let mut buf: Vec<f32> = Vec::new();
     while Instant::now() < deadline {
         buf.clear();
+        // Sampling order is the contract stated in `RING_SAMPLING_NOTE` and is
+        // not arbitrary: the capture backlog is read BEFORE the drain (that is
+        // what a sample actually waited through, and `pop` empties the ring),
+        // the playback depth AFTER the push (that is what sits ahead of the
+        // sample just written). Reading either on the other side of its
+        // operation reports a number biased toward zero.
+        cap_ring.observe(rx.queued());
         if rx.pop(&mut buf) > 0 {
             tx.push(&buf);
         }
+        play_ring.observe(tx.queued());
         std::thread::sleep(Duration::from_millis(5));
     }
     drop(capture);
     drop(playback);
+
+    let est = loopest::estimate(&capture_dev, &cap_ring, &play_ring, &play_dev);
+    info(&loopest::to_line(&est));
     emit_json(
         json,
-        &serde_json::json!({"ok": true, "secs": secs, "capture_rate": capture_rate}),
+        &serde_json::json!({
+            "ok": true,
+            "secs": secs,
+            "capture_rate": capture_rate,
+            // An ESTIMATE and it says so in its own payload — see loopest.rs.
+            // Never read `total_ms` without `calibrated`/`source` next to it.
+            "est_latency": loopest::to_json(&est),
+        }),
     );
     Ok(0)
 }

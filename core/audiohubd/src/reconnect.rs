@@ -411,7 +411,12 @@ fn replay_sessions(inner: &Arc<DaemonInner>, fp: &str, sessions: Vec<PlannedSess
         // OpenSessionParams carries neither, so a replay cannot re-use the old
         // pair and re-create the AEAD nonce reuse defect. `origin` is the one
         // the session was opened with, never a hardcoded `User`.
-        match conn::open_session_from(inner, &p.params, origin) {
+        //
+        // `Replay` is what keeps plan §7.1's one-shot mute out of this loop: the
+        // session is the same one, so the origin is unchanged, but the moment is
+        // not 「与对端建立连接的那一刻」 and a mute the user cancelled must not
+        // come back because the link blipped.
+        match conn::open_session_from(inner, &p.params, origin, conn::OpenCause::Replay) {
             Ok(info) => dlog!(
                 "[audiohubd] peer {fp}: recovered {} session as stream {}",
                 p.params.kind,

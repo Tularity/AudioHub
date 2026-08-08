@@ -67,6 +67,12 @@ function micParams(fp: string): Record<string, unknown> {
 // backend 只在选了具体后端时才带：缺席 = daemon 的 'auto'，由它按优先级挑第一个可用的。
 // volume_sync 一律带（spec-m4b §A3-4）：daemon 只对开了它的会话接受 session.set_volume，
 // 不带就等于卡片上的音量滑块必然报错。
+//
+// ⚠ **它不是 plan §7.1 那个「与对端音量同步」开关**，不要把用户的开关接到这里。
+// 这个 `volume_sync` 是线上协商：这条扬声器流**能不能携带**音量消息。关掉它，
+// 卡片上的音量滑块与对端的音量读数一起消失，而那两样与 §7.1 的开关无关。
+// §7.1 的开关决定的是「收到的读数**要不要也写进本机的默认输出设备**」，它是
+// daemon 的全局设置（`settings.mode_a_volume_sync`），在设置页里。
 function spkParams(fp: string): Record<string, unknown> {
   const s = getState();
   const source = normalizeSource(s.spkSourcePref[fp]);

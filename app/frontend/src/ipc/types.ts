@@ -678,6 +678,20 @@ export interface DaemonSettings {
   quality_stops?: QualityStop[];
   remove_virtual_on_disconnect?: boolean;
   mark_offline_devices?: boolean;
+  /**
+   * plan §7.1 模式 A「与对端音量同步」：本机系统输出与对端真实输出设备互相
+   * 跟随，**以对端为准**。
+   *
+   * 与 `session.open` 的 `volume_sync` 不是一回事：那个是让扬声器流**能不能
+   * 携带**音量消息的线上协商（对端卡片上那个音量滑块就建在它上面，一直开着），
+   * 这个决定收到的读数**要不要也写进本机设备**。
+   */
+  mode_a_volume_sync?: boolean;
+  /**
+   * plan §7.1 模式 A「静音本机输出」：**一次性动作**，只在与对端建立扬声器
+   * 通路的那一刻静音本机一次，此后不做维持；用户之后取消静音即予尊重。
+   */
+  mode_a_mute_local?: boolean;
   hal_capacity?: number;
   hal_used?: number;
 }

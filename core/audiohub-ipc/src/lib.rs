@@ -204,6 +204,8 @@ pub const SETTINGS_WRITABLE_KEYS: &[&str] = &[
     "mode",
     "remove_virtual_on_disconnect",
     "mark_offline_devices",
+    "mode_a_volume_sync",
+    "mode_a_mute_local",
 ];
 
 /// Daemon-owned settings, `settings.get` / `settings.set` (spec-m5b §6.1).
@@ -227,6 +229,22 @@ pub struct DaemonSettings {
     /// Append `（离线）` to a disconnected peer's device names, so "no sound"
     /// is visible in the system's own device list (spec-m5b OPEN QUESTION 1).
     pub mark_offline_devices: bool,
+    /// plan §7.1 模式 A 「与对端音量同步」: this machine's system output follows
+    /// the peer's real output device (and the other way round), **peer
+    /// authoritative**. Global, not per peer — see `StoredSettings` for why.
+    ///
+    /// Not to be confused with `OpenSessionParams::volume_sync`, which is the
+    /// wire negotiation that lets a speaker stream carry volume messages at
+    /// all. That one stays on unconditionally (the peer card's slider is built
+    /// on it); this one decides whether the readings it carries are also
+    /// applied to the LOCAL device.
+    #[serde(default)]
+    pub mode_a_volume_sync: bool,
+    /// plan §7.1 模式 A 「静音本机输出」: a ONE-SHOT system mute when a speaker
+    /// stream to a peer is established. Never maintained — unmuting afterwards
+    /// is respected until the next stream comes up.
+    #[serde(default)]
+    pub mode_a_mute_local: bool,
     /// 延迟滑条的固定档（毫秒，升序）。**daemon 是唯一真值源**——前端不许自己
     /// 写一份，否则两边的「有哪些档」会各自演化，而分歧不会有任何报错。
     ///
@@ -1138,7 +1156,8 @@ pub struct PeerState {
 /// - "stats.subscribe"   {interval_ms?}        -> {} (then "stats" events with Vec<SessionInfo>)
 /// - "settings.get"      {}                    -> DaemonSettings
 /// - "settings.set"      {mode?, remove_virtual_on_disconnect?,
-///                        mark_offline_devices?}
+///                        mark_offline_devices?, mode_a_volume_sync?,
+///                        mode_a_mute_local?}
 ///                                             -> DaemonSettings
 ///       `latency` / `quality` **不再在这里**（plan §15）：它们是每对端 × 每
 ///       方向的选择，走 "peers.set_transport"。旧客户端传这两个键会被拒绝，

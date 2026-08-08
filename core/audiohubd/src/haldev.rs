@@ -1345,7 +1345,12 @@ pub(crate) fn session_worker(inner: Arc<DaemonInner>, rx: mpsc::Receiver<SessCmd
                     hal: !out,
                     override_mode: true, // this IS the mode-B path
                 };
-                let res = conn::open_session_from(&inner, &params, SessionOrigin::Hal { slot });
+                let res = conn::open_session_from(
+                    &inner,
+                    &params,
+                    SessionOrigin::Hal { slot },
+                    conn::OpenCause::Fresh,
+                );
                 let mut st = lk(&inner.haldev);
                 if out {
                     st.opening_out[slot as usize] = false;

@@ -25,6 +25,7 @@ import { actions, useStore } from '../state/store';
 import type { AppState } from '../state/store';
 import { actionOf } from '../state/permissions';
 import type { PermissionState } from '../state/permissions';
+import type { DaemonSettings } from '../ipc/types';
 import {
   halState, requestedMode, effectiveMode, isModeB, modeDowngraded, deviceStateLabel,
 } from '../state/mode';
@@ -174,6 +175,68 @@ function ModeMirrorCard() {
         )}
       />
       <p className={`muted small tone-${hs.tone}`} data-testid="settings-mode-note">{note}</p>
+    </section>
+  );
+}
+
+// plan §7.1 模式 A 的两个**独立**开关。
+//
+// 放在设置页而不是对端卡片上，与 daemon 把它们存进 settings.json 是同一条理由：
+// 模式是全局设置（§7.1 冻结），这两个是那个模式的选项；而且它们动的是**本机
+// 那一个**默认输出设备，不是每台对端各一份。
+//
+// 不禁用：模式不是 A 时它们确实不生效，但用户完全可能先配好再切模式。禁用会
+// 把「为什么点不动」变成一个界面上答不出的问题，所以改用一句说明。
+function ModeAVolumeCard({ writing, noSettings, onPush }: {
+  writing: number;
+  noSettings: boolean;
+  onPush: (patch: Partial<DaemonSettings>) => Promise<void>;
+}) {
+  const s = useStore();
+  const ds = s.daemonSettings;
+  const inForce = effectiveMode(s) === 'a';
+  const muteLocal = !!(ds && ds.mode_a_mute_local);
+
+  return (
+    <section className="card block" data-testid="settings-mode-a-volume">
+      <h3 className="block-title">{t('settings.modeAVolume.title')}</h3>
+      <SettingRow
+        title={t('settings.modeAVolume.syncTitle')}
+        // 例外必须写在界面上，不能只活在代码注释里：开着「静音本机」时这个
+        // 开关**只同步音量、不同步静音**，而两个开关分列两行，用户没有任何
+        // 其它地方能读到这条互相作用。
+        desc={joinPhrases([
+          t('settings.modeAVolume.syncDesc'),
+          muteLocal ? t('settings.modeAVolume.syncMuteException') : '',
+        ])}
+        control={(
+          <Switch
+            testid="settings-mode-a-volume-sync"
+            label={t('settings.modeAVolume.syncTitle')}
+            checked={!!(ds && ds.mode_a_volume_sync)}
+            pending={writing > 0}
+            disabled={noSettings}
+            onToggle={(want) => void onPush({ mode_a_volume_sync: want })}
+          />
+        )}
+      />
+      <SettingRow
+        title={t('settings.modeAVolume.muteTitle')}
+        desc={t('settings.modeAVolume.muteDesc')}
+        control={(
+          <Switch
+            testid="settings-mode-a-mute-local"
+            label={t('settings.modeAVolume.muteTitle')}
+            checked={muteLocal}
+            pending={writing > 0}
+            disabled={noSettings}
+            onToggle={(want) => void onPush({ mode_a_mute_local: want })}
+          />
+        )}
+      />
+      <p className="muted small" data-testid="settings-mode-a-volume-note">
+        {inForce ? t('settings.modeAVolume.noteInForce') : t('settings.modeAVolume.noteIdle')}
+      </p>
     </section>
   );
 }
@@ -641,6 +704,8 @@ export function SettingsView() {
       <TransportCard />
 
       <BridgeCard />
+
+      <ModeAVolumeCard writing={writing} noSettings={noSettings} onPush={pushSetting} />
 
       <section className="card block" data-testid="settings-devices">
         <h3 className="block-title">{t('settings.devices.title')}</h3>

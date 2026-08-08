@@ -489,11 +489,16 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     for (key, field) in [
                         ("remove_virtual_on_disconnect", 0u8),
                         ("mark_offline_devices", 1u8),
+                        // plan §7.1 模式 A 的两个独立开关。
+                        ("mode_a_volume_sync", 2u8),
+                        ("mode_a_mute_local", 3u8),
                     ] {
                         if let Some(v) = params.get(key).and_then(Value::as_bool) {
                             let slot = match field {
                                 0 => &mut s.remove_virtual_on_disconnect,
-                                _ => &mut s.mark_offline_devices,
+                                1 => &mut s.mark_offline_devices,
+                                2 => &mut s.mode_a_volume_sync,
+                                _ => &mut s.mode_a_mute_local,
                             };
                             changed |= *slot != v;
                             *slot = v;
@@ -771,6 +776,8 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         effective_mode: haldev::effective_mode(inner),
         remove_virtual_on_disconnect: s.remove_virtual_on_disconnect,
         mark_offline_devices: s.mark_offline_devices,
+        mode_a_volume_sync: s.mode_a_volume_sync,
+        mode_a_mute_local: s.mode_a_mute_local,
         // 档表随每次 `settings.get` 一起发：前端不许自己写一份。
         // 两边各存一份表，分歧不会有任何报错——只会有一个选不中的档。
         //

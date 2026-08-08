@@ -201,6 +201,14 @@ pub enum CtlCmd {
         /// append "（离线）" to a disconnected peer's device names
         #[arg(long)]
         mark_offline_devices: Option<bool>,
+        /// mode A: make this machine's system output follow the peer's output
+        /// device, peer authoritative (plan §7.1)
+        #[arg(long)]
+        mode_a_volume_sync: Option<bool>,
+        /// mode A: mute this machine's output ONCE when a speaker stream comes
+        /// up; a later unmute is respected (plan §7.1)
+        #[arg(long)]
+        mode_a_mute_local: Option<bool>,
     },
     /// plan §15：某一台对端、某一个方向的延迟与音质档。
     ///
@@ -567,6 +575,8 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             mode,
             remove_virtual_on_disconnect,
             mark_offline_devices,
+            mode_a_volume_sync,
+            mode_a_mute_local,
         } => {
             let mut p = serde_json::Map::new();
             if let Some(m) = mode {
@@ -577,6 +587,12 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             }
             if let Some(v) = mark_offline_devices {
                 p.insert("mark_offline_devices".into(), json!(v));
+            }
+            if let Some(v) = mode_a_volume_sync {
+                p.insert("mode_a_volume_sync".into(), json!(v));
+            }
+            if let Some(v) = mode_a_mute_local {
+                p.insert("mode_a_mute_local".into(), json!(v));
             }
             // A read and a write are the same call with no fields to change,
             // so `settings` with no flags cannot accidentally write anything.
@@ -909,11 +925,14 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
         CtlCmd::Settings { .. } => {
             info(&format!(
                 "mode={} effective_mode={} remove_virtual_on_disconnect={} \
-                 mark_offline_devices={} virtual devices {}/{}",
+                 mark_offline_devices={} mode_a_volume_sync={} mode_a_mute_local={} \
+                 virtual devices {}/{}",
                 val_str(v, "mode"),
                 val_str(v, "effective_mode"),
                 val_bool(v, "remove_virtual_on_disconnect"),
                 val_bool(v, "mark_offline_devices"),
+                val_bool(v, "mode_a_volume_sync"),
+                val_bool(v, "mode_a_mute_local"),
                 val_u64(v, "hal_used"),
                 val_u64(v, "hal_capacity"),
             ));
@@ -1108,6 +1127,8 @@ mod tests {
                 json!(true),
             ),
             ("mark_offline_devices", "--mark-offline-devices=false", json!(false)),
+            ("mode_a_volume_sync", "--mode-a-volume-sync=true", json!(true)),
+            ("mode_a_mute_local", "--mode-a-mute-local=true", json!(true)),
         ];
         for key in audiohub_ipc::SETTINGS_WRITABLE_KEYS {
             let (_, flag, want) = sample

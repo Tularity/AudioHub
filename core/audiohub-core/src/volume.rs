@@ -147,9 +147,168 @@ pub fn classify_set(is_spk_provider: bool, sync_enabled: bool, src: &str) -> Set
     SetAction::Apply
 }
 
+// -------------------------------------------- plan §7.1 mode A: two switches
+
+/// The two independent mode-A options (plan §7.1), carried as ONE value.
+///
+/// They are separate switches with separate meanings, but they are not
+/// independent at the point of use: §7.1's exception says 「静音本机」 suppresses
+/// the *mute* half of 「与对端音量同步」 while leaving the volume half alone.
+/// A call site that could read one without the other is a call site that can
+/// implement half the rule, which is how that exception goes missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ModeAVolume {
+    /// 「与对端音量同步」. This machine's system output follows the peer's real
+    /// output device, and vice versa. **Peer authoritative**: an inbound
+    /// reading is written here unconditionally, which is what makes plan §7.1's
+    /// 「双向同时变更冲突时对端值覆盖本机」 true without any timestamp, sequence
+    /// number or arbitration rule — the last thing the peer said always lands.
+    pub sync: bool,
+    /// 「静音本机输出」. Mute this machine's output ONCE, at the moment a
+    /// speaker stream to the peer is established, and never maintain it: plan
+    /// §7.1 reads a later unmute as "this machine should sound too" and
+    /// respects it until the next stream comes up.
+    pub mute_local: bool,
+}
+
+/// A volume change to write somewhere, or to put on the wire.
+///
+/// `muted: None` is the same "leave the mute control alone" that
+/// `SessionMsg::VolumeSet` uses, and it is how §7.1's exception is expressed:
+/// with 「静音本机」 on, both directions carry a scalar and no mute.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumeWrite {
+    pub scalar: f32,
+    pub muted: Option<bool>,
+}
+
+/// What mode-A volume following must do with one reading.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FollowAction {
+    /// Do nothing; the payload is the reason, safe to log.
+    Ignore(&'static str),
+    Apply(VolumeWrite),
+}
+
+/// plan §7.1 mode A 「与对端音量同步」 — **one rule, both directions**.
+///
+/// §7.1 says the two outputs 「互相跟随」, so the same admission and the same
+/// mute exception have to hold whichever way a reading is travelling. Fed the
+/// peer's reading it says what to write on this machine; fed this machine's own
+/// reading it says what to send to the peer. Writing the two directions as two
+/// functions is how they drift, and a mute exception that holds in only one
+/// direction still mutes the peer.
+///
+/// Gates, in the order their reasons differ for the operator:
+///
+/// - `is_spk_consumer`: only the consumer of a speaker stream has a peer whose
+///   *output* device this is about. On a stream we provide, the output device
+///   is ours and the peer's slider already drives it through `classify_set`;
+///   following there would close the two into a loop.
+/// - `mode_is_a`: this is a mode-A option. In mode B the virtual speaker is the
+///   volume control (§7.2) and in share mode this machine is not a consumer at
+///   all, so in both cases "make the system output follow a peer" would be a
+///   change nobody asked for on a device they are using for something else.
+/// - `opt.sync`: the switch itself, off by default.
+/// - `state.adjustable`: see below. It is the gate that keeps the two outputs
+///   from following each other into silence.
+///
+/// # Why `adjustable == false` means "no reading", not "a reading of zero"
+///
+/// On a device with no volume control there is nothing for `scalar` to be read
+/// from, and every backend has to put *something* in the field: [`imp::get`]
+/// averages whatever channel elements exist, and on a macOS aggregate device
+/// there are none, so it reports `0.0`. That zero is an **absence, not a
+/// level** — and following it writes silence onto a perfectly good speaker.
+///
+/// Which is unrecoverable rather than merely wrong: the user turns the knob
+/// back up, this side reports the change, the peer's `set_default_output_volume`
+/// fails on a device that has no volume to set, and the peer's next reading —
+/// still `0.0` — pulls it straight back down. All while the interface says
+/// "not muted, volume 0%".
+///
+/// One rule, both directions, so this single gate covers both halves: it stops
+/// us adopting a peer's absent reading, and it stops us pushing our own absent
+/// reading onto a peer whose speaker works fine. It is also the same fact
+/// [`authority_for`] reads — `adjustable == false` means "this device's volume
+/// is not a thing anyone can drive". §7.2 answers it with send-side software
+/// gain because mode B has a virtual device to self-manage; mode A has none, so
+/// the only honest answer here is to leave both devices alone.
+pub fn classify_follow(
+    is_spk_consumer: bool,
+    mode_is_a: bool,
+    opt: ModeAVolume,
+    state: VolumeState,
+) -> FollowAction {
+    if !is_spk_consumer {
+        return FollowAction::Ignore("only the consumer of a spk stream follows a peer's volume");
+    }
+    if !mode_is_a {
+        return FollowAction::Ignore("volume following is a mode A option (plan §7.1)");
+    }
+    if !opt.sync {
+        return FollowAction::Ignore("「与对端音量同步」 is off");
+    }
+    if !state.adjustable {
+        return FollowAction::Ignore(
+            "that device has no volume control, so its reported scalar is an absence, not a level",
+        );
+    }
+    FollowAction::Apply(VolumeWrite {
+        scalar: state.scalar.clamp(0.0, 1.0),
+        // plan §7.1 的例外：与「静音本机」同时启用时**只同步音量、不同步静音**
+        // ——否则连接时那一次性静音会顺着这条同步把对端也静掉，而镜像的全部
+        // 意义就是让对端出声。
+        muted: (!opt.mute_local).then_some(state.muted),
+    })
+}
+
+/// What to do about 「静音本机」 when a mode-A speaker stream comes up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuteOnConnect {
+    /// Payload is the reason, safe to log.
+    Skip(&'static str),
+    Mute,
+}
+
+/// plan §7.1 「静音本机输出」, evaluated exactly once per established stream.
+///
+/// `capture_survives_mute` answers §7.1's stated technical precondition —
+/// 「捕获点位需在音量/静音之前，否则静音连镜像一起无声」 — for the backend this
+/// stream actually captures with. `None` = not established for that backend (or
+/// the source is not a system capture at all, e.g. the microphone), and the
+/// user's explicit request wins: doing nothing while they watch the switch sit
+/// in the "on" position is the worse of the two failures, and unmuting undoes
+/// it. `Some(false)` is the one case that must NOT fire — plan names Windows
+/// device loopback as post-mix, and muting there takes the mirror down with it,
+/// which is a failure the user cannot attribute to this switch.
+pub fn classify_mute_on_connect(
+    mode_is_a: bool,
+    opt: ModeAVolume,
+    capture_survives_mute: Option<bool>,
+) -> MuteOnConnect {
+    if !opt.mute_local {
+        return MuteOnConnect::Skip("「静音本机」 is off");
+    }
+    if !mode_is_a {
+        return MuteOnConnect::Skip("「静音本机」 is a mode A option (plan §7.1)");
+    }
+    if capture_survives_mute == Some(false) {
+        return MuteOnConnect::Skip(
+            "this capture backend reads the stream AFTER the output volume, so muting here \
+             would silence the mirror too (plan §7.1)",
+        );
+    }
+    MuteOnConnect::Mute
+}
+
 /// Provider-side tracker: decides which device readings the peer must hear
 /// about. A reading that merely echoes a write the peer itself asked for is
 /// swallowed (spec §A2 source tagging); a genuine local change is reported.
+///
+/// Used by the mode-A consumer too (plan §7.1), on its own default output and
+/// in the same shape: a reading it just adopted from the peer must not be
+/// reported back as if the local user had made it.
 pub struct VolumeSync {
     reported: Option<VolumeState>,
     /// Value written on the peer's behalf, plus its remaining lifetime in polls.
@@ -1008,3 +1167,179 @@ mod imp {
         bail!("output mute control is not implemented on this platform");
     }
 }
+
+// ------------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod mode_a_tests {
+    //! plan §7.1 / §7.2 的两个模式 A 开关。判定是纯函数，接线在
+    //! `audiohubd::conn` 与 `audiohubd::poll_consumer_volume`——那里另有守卫
+    //! 测试，因为一个写对了却没人调的判定函数在这里照样全绿。
+
+    use super::*;
+
+    fn peer(scalar: f32, muted: bool) -> VolumeState {
+        VolumeState { scalar, muted, adjustable: true }
+    }
+
+    const BOTH_OFF: ModeAVolume = ModeAVolume { sync: false, mute_local: false };
+    const SYNC_ONLY: ModeAVolume = ModeAVolume { sync: true, mute_local: false };
+    const BOTH_ON: ModeAVolume = ModeAVolume { sync: true, mute_local: true };
+
+    fn applied(a: FollowAction) -> VolumeWrite {
+        match a {
+            FollowAction::Apply(w) => w,
+            FollowAction::Ignore(why) => panic!("expected an Apply, got Ignore({why})"),
+        }
+    }
+
+    /// The switch is an OPTION (plan §7.1), so off is off — including the case
+    /// that used to be hard-coded on: a speaker stream on a mode-A consumer.
+    #[test]
+    fn nothing_is_followed_until_the_switch_is_on() {
+        assert!(matches!(
+            classify_follow(true, true, BOTH_OFF, peer(0.5, false)),
+            FollowAction::Ignore(_)
+        ));
+        // ...and 「静音本机」 alone does not smuggle the sync in.
+        let mute_only = ModeAVolume { sync: false, mute_local: true };
+        assert!(matches!(
+            classify_follow(true, true, mute_only, peer(0.5, false)),
+            FollowAction::Ignore(_)
+        ));
+    }
+
+    /// plan §7.1 gives both switches to mode A only. In mode B the virtual
+    /// speaker IS the volume control (§7.2) and in share mode this machine is
+    /// not a consumer, so following there would move a device the user is
+    /// using for something else.
+    #[test]
+    fn following_belongs_to_mode_a_only() {
+        assert!(matches!(
+            classify_follow(true, false, BOTH_ON, peer(0.5, false)),
+            FollowAction::Ignore(_)
+        ));
+    }
+
+    /// Only the CONSUMER of a speaker stream has a peer whose output device
+    /// this is about. On a stream we provide, the peer's slider already drives
+    /// our device through `classify_set`; following as well closes a loop.
+    #[test]
+    fn a_provider_never_follows_its_own_stream() {
+        assert!(matches!(
+            classify_follow(false, true, BOTH_ON, peer(0.5, false)),
+            FollowAction::Ignore(_)
+        ));
+    }
+
+    /// plan §7.2 的那条例外，两半都要断言：**音量照旧同步，静音不同步。**
+    ///
+    /// 只断言「muted 是 None」是不够的——一个把整条同步关掉的实现也能满足它，
+    /// 而那正好是例外要防的反面（例外说的是「只同步音量」，不是「什么都不同步」）。
+    #[test]
+    fn muting_this_machine_suppresses_the_mute_half_and_only_that_half() {
+        let with = applied(classify_follow(true, true, SYNC_ONLY, peer(0.25, true)));
+        assert_eq!(with.muted, Some(true), "with 「静音本机」 off the mute travels");
+        assert_eq!(with.scalar, 0.25);
+
+        let without = applied(classify_follow(true, true, BOTH_ON, peer(0.25, true)));
+        assert_eq!(
+            without.muted, None,
+            "plan §7.2: 启用「静音本机」时只同步音量、不同步静音——否则连接时那一次性\
+             静音会顺着同步把对端也静掉"
+        );
+        assert_eq!(
+            without.scalar, 0.25,
+            "the volume half must survive the exception; 「只同步音量」 is the point of it"
+        );
+    }
+
+    /// One rule, both directions (§7.1 「互相跟随」). Fed our own reading it has
+    /// to say the same thing it says about the peer's — a mute exception that
+    /// held inbound only would still mute the peer.
+    #[test]
+    fn the_same_rule_answers_for_the_outbound_direction() {
+        let local = VolumeState { scalar: 0.8, muted: true, adjustable: true };
+        assert_eq!(applied(classify_follow(true, true, BOTH_ON, local)).muted, None);
+        assert_eq!(
+            applied(classify_follow(true, true, SYNC_ONLY, local)).muted,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_peer_scalar_outside_the_range_is_clamped_not_refused() {
+        assert_eq!(applied(classify_follow(true, true, SYNC_ONLY, peer(9.0, false))).scalar, 1.0);
+        assert_eq!(applied(classify_follow(true, true, SYNC_ONLY, peer(-9.0, false))).scalar, 0.0);
+    }
+
+    /// A device with no volume control reports the scalar it does not have as
+    /// `0.0` (`imp::get` averages an empty set of channel elements — a macOS
+    /// aggregate device is exactly that). Following that reading writes silence
+    /// onto a working speaker, and the loop that follows is unrecoverable: the
+    /// user turns it back up, the peer's setter fails on a device with nothing
+    /// to set, and the next reading — still `0.0` — pulls it down again.
+    ///
+    /// One rule, both directions, so this one gate also stops us pushing our
+    /// own absent reading onto a peer whose speaker is fine.
+    #[test]
+    fn a_device_with_no_volume_control_reports_an_absence_not_a_level() {
+        let aggregate = VolumeState { scalar: 0.0, muted: false, adjustable: false };
+        assert!(
+            matches!(classify_follow(true, true, SYNC_ONLY, aggregate), FollowAction::Ignore(_)),
+            "an aggregate device's 0.0 was adopted as a volume: this mutes the other machine, \
+             and the user cannot turn it back up"
+        );
+        // Not about the value: any reading from a device with no control is an
+        // absence, even one that happens to look plausible.
+        assert!(matches!(
+            classify_follow(true, true, SYNC_ONLY, VolumeState {
+                scalar: 0.4,
+                muted: false,
+                adjustable: false
+            }),
+            FollowAction::Ignore(_)
+        ));
+    }
+
+    #[test]
+    fn the_one_shot_mute_needs_the_switch_and_mode_a() {
+        assert_eq!(
+            classify_mute_on_connect(true, SYNC_ONLY, None),
+            MuteOnConnect::Skip("「静音本机」 is off")
+        );
+        assert!(matches!(
+            classify_mute_on_connect(false, BOTH_ON, None),
+            MuteOnConnect::Skip(_)
+        ));
+        assert_eq!(classify_mute_on_connect(true, BOTH_ON, None), MuteOnConnect::Mute);
+    }
+
+    /// plan §7.1 的技术前提：捕获点位在音量之后的后端上，静音会连镜像一起静掉。
+    /// 那种失效在对端看来是「没声音」，与网络故障无从分辨，所以这条不许开火。
+    #[test]
+    fn a_post_mix_capture_backend_blocks_the_one_shot_mute() {
+        assert!(matches!(
+            classify_mute_on_connect(true, BOTH_ON, Some(false)),
+            MuteOnConnect::Skip(_)
+        ));
+        assert_eq!(classify_mute_on_connect(true, BOTH_ON, Some(true)), MuteOnConnect::Mute);
+        // Unknown is NOT treated as post-mix: the user asked, unmuting undoes
+        // it, and a switch that silently does nothing is the worse failure.
+        assert_eq!(classify_mute_on_connect(true, BOTH_ON, None), MuteOnConnect::Mute);
+    }
+
+    /// The consumer's echo suppression is the provider's, reused (plan §7.1
+    /// 「复用 §7.2 的 volume_set/volume_state 消息与来源标记防乒乓」): a reading
+    /// that is merely the device confirming what we just adopted from the peer
+    /// must not travel back as a local change.
+    #[test]
+    fn a_value_adopted_from_the_peer_is_not_reported_back_as_ours() {
+        let mut s = VolumeSync::new();
+        s.note_peer_apply(0.4, false);
+        assert_eq!(s.poll(peer(0.4, false)), None, "that is the peer's own value coming back");
+        // A genuine move afterwards still travels.
+        assert!(s.poll(peer(0.9, false)).is_some());
+    }
+}
+

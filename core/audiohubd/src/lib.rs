@@ -21,6 +21,9 @@ mod peer_transport;
 /// plan §13 三模式互斥的接线测试（两台真 daemon 跑回环）。
 #[cfg(test)]
 mod mode_tests;
+/// plan §7.1 模式 A 两个音量开关的接线测试（执行器是本机真设备，故守卫调用点）。
+#[cfg(test)]
+mod mode_a_volume_tests;
 /// Tier 2（M8 降级链路）：控制流与两个方向的媒体复用在**一条**连接上。
 /// 读线程分发、写调度与控制信用额度。
 mod mux;
@@ -68,9 +71,9 @@ use audiohub_core::latency::LatSource;
 use audiohub_core::sysaudio::{self, VirtualCard};
 use audiohub_core::volume::{self, VolumeState, VolumeSync};
 use audiohub_ipc::{
-    IpcEndpoint, LatConfidence, MixHealth, OpenSessionParams, PipelineLatency, PipelineStage,
-    QualityStats, SessionInfo, SessionStats, IPC_VERSION, KIND_SPK, ORIGIN_HAL, ORIGIN_PEER,
-    ORIGIN_USER,
+    IpcEndpoint, LatConfidence, MixHealth, Mode, OpenSessionParams, PipelineLatency,
+    PipelineStage, QualityStats, SessionInfo, SessionStats, IPC_VERSION, KIND_SPK, ORIGIN_HAL,
+    ORIGIN_PEER, ORIGIN_USER,
 };
 use audiohub_net::discovery::{self, AnnounceGuard};
 use audiohub_net::identity::{LocalIdentity, PairedPeer};
@@ -1581,7 +1584,12 @@ pub(crate) struct VolumeCell {
     /// Last known provider-device state: read from our own device on the
     /// provider side, taken from VolumeState reports on the consumer side.
     pub state: Mutex<Option<VolumeState>>,
-    /// Provider-side echo suppression; untouched on the consumer side.
+    /// Echo suppression for whichever end owns a real device on this stream:
+    /// the provider always, and the mode-A consumer as well once plan §7.1's
+    /// 「与对端音量同步」 is on (it then drives its OWN default output, and a
+    /// reading it just adopted from the peer must not be reported back as a
+    /// local change). A session is one end or the other — `dir` decides — so
+    /// the two uses can never meet on the same cell.
     pub sync: Mutex<VolumeSync>,
     /// Ticks since the last VolumeState we put on the wire.
     pub since_report: AtomicU32,
@@ -3700,6 +3708,12 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                 }
                 poll_provider_volume(e, live, renegotiate);
             }
+            // plan §7.1 模式 A 「与对端音量同步」, the half that had no code at
+            // all: our own system output is the second thing playing this
+            // stream, so a change the user makes to it has to reach the peer.
+            if e.volume.enabled && e.kind == KIND_SPK && e.dir == DIR_SEND {
+                poll_consumer_volume(&inner, e, live);
+            }
         }
         // plan §15：把每对端 × 每方向的档位灌进每条流的执行器镜像。
         //
@@ -3971,6 +3985,25 @@ fn servo_by_stream(inner: &DaemonInner) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
+/// plan §7.1's two mode-A switches, read together (see `ModeAVolume` for why
+/// they are one value). One short lock, so every call site is free to take it
+/// per tick rather than caching a copy that can go stale mid-session.
+pub(crate) fn mode_a_volume(inner: &DaemonInner) -> volume::ModeAVolume {
+    let s = lk(&inner.settings);
+    volume::ModeAVolume {
+        sync: s.mode_a_volume_sync,
+        mute_local: s.mode_a_mute_local,
+    }
+}
+
+/// True when the mode actually in force is A — the only mode plan §7.1 gives
+/// these two switches to. `effective_mode`, not the requested one: a machine
+/// that asked for B without a usable driver IS running mode A, and its system
+/// output is the thing that plays the mirror.
+pub(crate) fn mode_a_in_force(inner: &DaemonInner) -> bool {
+    haldev::effective_mode(inner) == Mode::A
+}
+
 /// Ticks between unconditional VolumeState refreshes. Changes go out
 /// immediately; the refresh only exists so a consumer that missed one (or
 /// joined after the last change) converges without touching its slider.
@@ -4014,6 +4047,61 @@ fn poll_provider_volume(e: &SessionEntry, live: bool, force: bool) {
         muted: cur.muted,
         adjustable: cur.adjustable,
     });
+}
+
+/// Consumer side of plan §7.1 「与对端音量同步」: report a GENUINE change to
+/// THIS machine's own default output to the peer, so the two follow each other.
+///
+/// The mirror image of `poll_provider_volume`, with three differences that are
+/// all consequences of §7.1:
+///
+///  - It is gated on the switch and on mode A. Both are checked BEFORE the
+///    device read: with the switch off this must cost nothing, and reading the
+///    device once a second per session is not nothing.
+///  - It refuses to speak until the peer has spoken once
+///    (`e.volume.state.is_some()`). §7.1 makes the peer authoritative for the
+///    initial alignment — 「初始对齐时本机采用对端当前值」 — and a consumer that
+///    pushed first would invert exactly that.
+///  - No periodic refresh. `VOLUME_REFRESH_TICKS` exists so a consumer that
+///    missed a report converges; here the peer is the authority and re-sending
+///    an unchanged local value would fight it once a refresh interval.
+fn poll_consumer_volume(inner: &Arc<DaemonInner>, e: &SessionEntry, live: bool) {
+    if !live {
+        return;
+    }
+    let opt = mode_a_volume(inner);
+    let mode_a = mode_a_in_force(inner);
+    // Cheap gates first — `classify_follow` says the same thing, but only after
+    // a device read this branch has no reason to pay for.
+    if !opt.sync || !mode_a {
+        return;
+    }
+    if lk(&e.volume.state).is_none() {
+        return; // 还没收到对端的第一份读数：此刻本机的值不是「变化」
+    }
+    let Ok(cur) = volume::get_default_output_volume() else {
+        if e.volume.first_read_warning() {
+            dlog!(
+                "[audiohubd] stream {}: cannot read the default output volume to follow the peer",
+                e.id
+            );
+        }
+        return;
+    };
+    let Some(changed) = lk(&e.volume.sync).poll(cur) else {
+        return; // unchanged, or the echo of a value we just adopted FROM the peer
+    };
+    match volume::classify_follow(true, mode_a, opt, changed) {
+        volume::FollowAction::Ignore(_) => {}
+        volume::FollowAction::Apply(w) => {
+            let _ = e.conn.send_msg(&SessionMsg::VolumeSet {
+                stream_id: e.id,
+                scalar: w.scalar,
+                muted: w.muted,
+                src: volume::SRC_LOCAL.to_string(),
+            });
+        }
+    }
 }
 
 // ---------------------------------------------------------------- plumbing

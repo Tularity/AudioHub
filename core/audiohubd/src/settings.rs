@@ -14,6 +14,15 @@ use serde::{Deserialize, Serialize};
 
 use audiohub_ipc::Mode;
 
+/// Bumped to 4 by plan §7.1: the two mode-A volume switches
+/// (`mode_a_volume_sync` / `mode_a_mute_local`) arrived.
+///
+/// Both are `#[serde(default)]`, and that is load-bearing rather than tidy: a
+/// field without it makes every v3 file fail to deserialize, which sends the
+/// WHOLE record to the defaults and resets `mode` — the exact 2026-08-04
+/// accident recorded under `normalized()`. Adding a field must never be able to
+/// change a mode.
+///
 /// Bumped to 3 by plan §15: `latency` / `quality` **left this file** and became
 /// per-peer × per-direction (`peer_transport.json`).
 ///
@@ -36,7 +45,7 @@ use audiohub_ipc::Mode;
 /// a provider AND a consumer at once, so both `"a"` and `"b"` are half of the
 /// answer and neither is the whole one. Choosing for the user here would
 /// silently decide which half of their setup keeps working.
-pub(crate) const SETTINGS_VERSION: u32 = 3;
+pub(crate) const SETTINGS_VERSION: u32 = 4;
 
 /// Exactly the fields this daemon owns. `effective_mode`, `hal_capacity` and
 /// `hal_used` are NOT here: they are derived at read time from what the driver
@@ -48,6 +57,25 @@ pub(crate) struct StoredSettings {
     pub mode: Mode,
     pub remove_virtual_on_disconnect: bool,
     pub mark_offline_devices: bool,
+    /// plan §7.1 「与对端音量同步」 — a mode-A option, so it lives HERE and not
+    /// in `peer_transport.json`. Three reasons, in order of weight:
+    ///
+    ///  1. §7.1 freezes 「模式是全局设置，不是每个对端各自的开关」, and this is
+    ///     an option *of that mode*, introduced in the same paragraph.
+    ///  2. §7.1 also keeps 「同一时刻只能使用一个对端」 as mode A's own rule, so
+    ///     a per-peer copy would have at most one row that could ever be in
+    ///     force, and nothing in the interface could say which one.
+    ///  3. What it drives is THIS machine's default output device — one device,
+    ///     machine-global. Stored per peer, two peers could hold contradictory
+    ///     opinions about it and we would have to invent an arbitration rule
+    ///     plan never wrote.
+    #[serde(default)]
+    pub mode_a_volume_sync: bool,
+    /// plan §7.1 「静音本机输出」. Same file for the same reasons, plus one of
+    /// its own: it is a ONE-SHOT action on the local device at stream setup,
+    /// with no per-peer state to remember afterwards.
+    #[serde(default)]
+    pub mode_a_mute_local: bool,
 }
 
 impl Default for StoredSettings {
@@ -81,6 +109,12 @@ impl Default for StoredSettings {
             // failure (peer asleep -> default output silent) is invisible
             // everywhere except inside our own window.
             mark_offline_devices: true,
+            // plan §7.1 calls both of these 「选项」/「独立开关」 — opt-in, and
+            // both reach outside our own process to change a device the user is
+            // listening to right now. A default that silences a machine, or
+            // that hands its volume knob to another machine, is not a default.
+            mode_a_volume_sync: false,
+            mode_a_mute_local: false,
             // **AUTO，不是「最低」**，尽管 plan §5 写的是「默认建议延迟固定取
             // 最低」。理由是行为守恒，不是偏好：
             //
@@ -216,6 +250,66 @@ mod tests {
         );
         assert!(!d.remove_virtual_on_disconnect, "plan §7.3 freezes 'keep'");
         assert!(d.mark_offline_devices);
+        // plan §7.1 calls both of these 「选项」. Both reach outside this process
+        // to change a device the user is listening to; neither is a default.
+        assert!(
+            !d.mode_a_volume_sync,
+            "「与对端音量同步」 must be opt-in: on by default, a fresh pairing hands this \
+             machine's volume knob to another machine"
+        );
+        assert!(
+            !d.mode_a_mute_local,
+            "「静音本机」 must be opt-in: on by default, the first stream silences a machine \
+             the user never asked to silence"
+        );
+    }
+
+    /// plan §7.1 的两个开关必须真的**落盘并读回**。
+    ///
+    /// 分开断言 true/false 两种取值，而不是只写一次 `true`：把 `load` 写成
+    /// 「永远返回默认值」的实现能通过任何只测一个方向的断言，而默认值恰好
+    /// 就是 false。
+    #[test]
+    fn the_two_mode_a_switches_survive_the_file() {
+        let dir = tmp("modeavol");
+        for (sync, mute) in [(true, false), (false, true), (true, true), (false, false)] {
+            let want = StoredSettings {
+                mode_a_volume_sync: sync,
+                mode_a_mute_local: mute,
+                ..StoredSettings::default()
+            };
+            want.save(&dir).expect("save");
+            let got = StoredSettings::load(&dir);
+            assert_eq!(got.mode_a_volume_sync, sync, "mode_a_volume_sync 没有活过盘");
+            assert_eq!(got.mode_a_mute_local, mute, "mode_a_mute_local 没有活过盘");
+            assert_eq!(got, want, "两个开关之外还有别的字段被这次写入改掉了");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **加字段不许改模式。**
+    ///
+    /// 一个 v3 文件（§15 之后、§7.1 之前）里没有这两个新字段。少了
+    /// `#[serde(default)]`，整条记录反序列化失败、落到默认值，用户的 `mode`
+    /// 就被一次升级重置了——2026-08-04 那次实机事故的成因一模一样，只是触发
+    /// 方式从「版本号比较写错」换成了「加了个字段」。
+    #[test]
+    fn a_v3_file_keeps_its_mode_and_simply_gains_the_new_switches() {
+        let dir = tmp("v71mig");
+        std::fs::write(
+            dir.join("settings.json"),
+            br#"{"version":3,"mode":"b","remove_virtual_on_disconnect":true,
+                 "mark_offline_devices":false}"#,
+        )
+        .expect("write");
+        let got = StoredSettings::load(&dir);
+        assert_eq!(got.mode, Mode::B, "加两个字段把用户的模式重置了");
+        assert!(got.remove_virtual_on_disconnect, "普通开关也必须原样保住");
+        assert!(!got.mark_offline_devices);
+        assert!(!got.mode_a_volume_sync, "缺席的新开关取默认值，不是随机值");
+        assert!(!got.mode_a_mute_local);
+        assert_eq!(got.version, SETTINGS_VERSION, "读回来要按本 build 的版本重写");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

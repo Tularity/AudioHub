@@ -1694,6 +1694,16 @@ fn every_writable_setting_key_is_really_honoured() {
             &|v: &Value| v.get("mark_offline_devices").cloned().unwrap_or(Value::Null),
         ),
         (
+            "mode_a_volume_sync",
+            json!(true),
+            &|v: &Value| v.get("mode_a_volume_sync").cloned().unwrap_or(Value::Null),
+        ),
+        (
+            "mode_a_mute_local",
+            json!(true),
+            &|v: &Value| v.get("mode_a_mute_local").cloned().unwrap_or(Value::Null),
+        ),
+        (
             "latency",
             json!("200"),
             &|v: &Value| v.get("latency").cloned().unwrap_or(Value::Null),

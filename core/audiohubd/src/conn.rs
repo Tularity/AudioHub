@@ -853,16 +853,25 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                          the output device"
                     );
                 } else if e.volume.enabled {
-                    *lk(&e.volume.state) = Some(VolumeState {
+                    let state = VolumeState {
                         scalar: scalar.clamp(0.0, 1.0),
                         muted,
                         adjustable,
-                    });
+                    };
+                    *lk(&e.volume.state) = Some(state);
                     // spec-round2 §B2 reverse direction rides on THIS cell: the
                     // ticker pushes genuine changes into the virtual speaker's
-                    // control. Deliberately not sent from here — a mach send
-                    // can sit for up to its 500ms timeout, and this is the
-                    // thread that reads the peer's control channel.
+                    // control. Deliberately not sent from here — a mach send can
+                    // sit for up to its 500ms timeout, and this is the thread
+                    // that reads the peer's control channel.
+                    //
+                    // plan §7.1 模式 A 「与对端音量同步」 IS applied from here,
+                    // and the distinction is not an inconsistency: this writes
+                    // the OS volume property (the same call `apply_peer_volume`
+                    // already makes on this very thread), not a mach message to
+                    // the driver. Doing it on the 1s ticker instead would make
+                    // 「以对端为准」 lag a second behind the peer's knob.
+                    follow_peer_volume(inner, &e, state);
                 }
             }
         }
@@ -1031,6 +1040,86 @@ fn apply_peer_volume(
     }
     if let Ok(v) = volume::get_default_output_volume() {
         *lk(&e.volume.state) = Some(v);
+    }
+}
+
+/// plan §7.1 模式 A 「与对端音量同步」, the inbound half: copy the peer's real
+/// output reading onto THIS machine's default output.
+///
+/// **Peer authoritative, and that is the whole conflict rule.** §7.1 says
+/// 「双向同时变更冲突时对端值覆盖本机」; writing every inbound reading
+/// unconditionally gives exactly that, with no timestamps and nothing to
+/// arbitrate. The mute half obeys §7.1's exception via `classify_follow`.
+///
+/// Nothing is sent back: `note_peer_apply` is armed BEFORE the write (same
+/// contract as `apply_peer_volume`) so the 1s consumer poll recognises the
+/// resulting reading as an echo even if it races us, and the reading is folded
+/// into the tracker afterwards so a write the device REFUSED cannot be reported
+/// to the peer a moment later as if the local user had made it — which would
+/// invert the authority §7.1 just granted the peer.
+fn follow_peer_volume(inner: &Arc<DaemonInner>, e: &SessionEntry, peer: VolumeState) {
+    let consumer = e.kind == KIND_SPK && e.dir == DIR_SEND;
+    let opt = crate::mode_a_volume(inner);
+    let w = match volume::classify_follow(consumer, crate::mode_a_in_force(inner), opt, peer) {
+        volume::FollowAction::Ignore(_) => return,
+        volume::FollowAction::Apply(w) => w,
+    };
+    // The mute value that will HOLD after this write: the peer's when the mute
+    // half is synced, otherwise whatever the local device already reads. Arming
+    // the tracker with anything else would leave the echo unrecognised.
+    let hold = w
+        .muted
+        .or_else(|| volume::get_default_output_volume().ok().map(|v| v.muted))
+        .unwrap_or(false);
+    lk(&e.volume.sync).note_peer_apply(w.scalar, hold);
+    if let Err(err) = volume::set_default_output_volume(w.scalar) {
+        dlog!(
+            "[audiohubd] stream {}: cannot follow the peer's output volume: {err:#}",
+            e.id
+        );
+    }
+    if let Some(m) = w.muted {
+        if let Err(err) = volume::set_default_output_mute(m) {
+            dlog!(
+                "[audiohubd] stream {}: cannot follow the peer's mute state: {err:#}",
+                e.id
+            );
+        }
+    }
+    if let Ok(cur) = volume::get_default_output_volume() {
+        lk(&e.volume.sync).note_reported(cur);
+    }
+}
+
+/// plan §7.1 模式 A 「静音本机输出」: mute this machine's output ONCE, at the
+/// moment a speaker stream to a peer is established.
+///
+/// **One-shot, deliberately.** §7.1 freezes it as an action, not a state: after
+/// this call nothing maintains the mute, so a user who unmutes has said "this
+/// machine should sound too" and is not argued with until the next stream comes
+/// up. There is therefore no timer, no reconciliation and no place to put one.
+///
+/// `capture_backend` is the CONCRETE backend id this stream resolved to (`None`
+/// when the source is not a system capture at all). §7.1 makes the capture
+/// point the precondition — mute a device whose loopback is read after the mix
+/// and the peer gets silence — and `capture_survives_local_mute` is the single
+/// place that answers it.
+fn mute_local_on_connect(inner: &Arc<DaemonInner>, capture_backend: Option<&str>) {
+    let opt = crate::mode_a_volume(inner);
+    let survives = capture_backend.and_then(sysaudio::capture_survives_local_mute);
+    match volume::classify_mute_on_connect(crate::mode_a_in_force(inner), opt, survives) {
+        volume::MuteOnConnect::Skip(why) => {
+            // Only worth a line when the user actually asked for it: otherwise
+            // every session open on every machine logs a setting being off.
+            if opt.mute_local {
+                dlog!("[audiohubd] 「静音本机」 did not fire: {why}");
+            }
+        }
+        volume::MuteOnConnect::Mute => {
+            if let Err(err) = volume::set_default_output_mute(true) {
+                dlog!("[audiohubd] 「静音本机」 could not mute this machine: {err:#}");
+            }
+        }
     }
 }
 
@@ -1977,19 +2066,38 @@ pub(crate) fn push_transport(inner: &Arc<DaemonInner>, fp: &str) {
     }
 }
 
+/// Why a stream is being opened — orthogonal to [`SessionOrigin`], which says
+/// *whose* session it is and survives a replay unchanged.
+///
+/// It exists for plan §7.1's one-shot mute, and that is the whole of its job.
+/// §7.1 fires 「静音本机」 at 「与对端建立连接的那一刻」 and then respects a later
+/// unmute as "this machine should sound too". A reconnect replay is not that
+/// moment in any sense the user would recognise: the network blipped, or a tier
+/// changed under them, and the mute they deliberately cancelled comes back.
+/// `SessionOrigin` cannot answer this — a replayed user session is still a user
+/// session — so the cause is carried separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenCause {
+    /// A person, or the mode-B device coordinator, asked for this stream now.
+    Fresh,
+    /// The reconnect loop is restoring a stream that already existed.
+    Replay,
+}
+
 /// IPC and CLI entry point. Everything opened this way is a USER session: the
 /// device coordinator may never close one (spec-m5b §5.6).
 pub(crate) fn open_session(
     inner: &Arc<DaemonInner>,
     params: &OpenSessionParams,
 ) -> Result<SessionInfo> {
-    open_session_from(inner, params, SessionOrigin::User)
+    open_session_from(inner, params, SessionOrigin::User, OpenCause::Fresh)
 }
 
 pub(crate) fn open_session_from(
     inner: &Arc<DaemonInner>,
     params: &OpenSessionParams,
     origin: SessionOrigin,
+    cause: OpenCause,
 ) -> Result<SessionInfo> {
     if params.kind != KIND_MIC && params.kind != KIND_SPK {
         bail!("kind must be '{KIND_MIC}' or '{KIND_SPK}'");
@@ -2051,6 +2159,13 @@ pub(crate) fn open_session_from(
             params.backend.as_deref(),
             peer_slot,
         )?)
+    };
+    // The CONCRETE backend id, captured before `spec` is consumed below. plan
+    // §7.1's 「静音本机」 precondition is a property of the backend that actually
+    // got picked, and `"auto"` is a different backend on every host.
+    let capture_backend = match &spec {
+        Some(SourceSpec::SysAudio { backend }) => Some(backend.clone()),
+        _ => None,
     };
     let hal_slot = if params.hal {
         Some(peer_slot.ok_or_else(|| {
@@ -2233,6 +2348,22 @@ pub(crate) fn open_session_from(
             "control channel to {} closed while the stream was being opened",
             conn.fp
         );
+    }
+    // plan §7.1 「静音本机」: the stream is established exactly here — the peer
+    // accepted, the source is running and the entry is in the table. Firing it
+    // any earlier would mute this machine for a session that then failed to
+    // open, leaving it silent with nothing to point at.
+    //
+    // Speaker direction only: the mute exists so this machine and the peer do
+    // not both play the mirror, and a mic session mirrors nothing.
+    //
+    // And never on a replay. §7.1 reads a manual unmute as "this machine should
+    // sound too" and respects it 「直到下一次连接建立」 — a reconnect after a
+    // network blip, an automatic tier downgrade or a tier the user just changed
+    // is not a next connection in any sense they would recognise, and re-muting
+    // there is this switch overruling them from a place they cannot see.
+    if !consuming && params.kind == KIND_SPK && cause == OpenCause::Fresh {
+        mute_local_on_connect(inner, capture_backend.as_deref());
     }
     Ok(build_session_info(inner, &entry, &[], None, None))
 }

@@ -852,6 +852,16 @@ export const zhCN = {
   'settings.transport.colQuality': '音质（目标）',
   'settings.transport.noteLive': '这张表是**只读总览**，也是唯一能一眼看全所有对端档位的地方——「哪一台还停在 AUTO」在别处看不见。点对端名字进详情页去改；改动松手即生效，不需要重启服务，也不需要与对端重新连接。',
 
+  // plan §7.1 模式 A 的两个独立开关。文案里必须说清三件事：以对端为准、
+  // 「静音本机」是一次性动作不是状态、以及两者同时开启时的静音例外。
+  'settings.modeAVolume.title': '模式 A · 音量',
+  'settings.modeAVolume.syncTitle': '与对端音量同步',
+  'settings.modeAVolume.syncDesc': '开启后，本机系统输出的音量与对端真实输出设备互相跟随，以对端为准：刚连上时本机采用对端当前值，两边同时改动时以对端的为准。关闭则两台机器各调各的。',
+  'settings.modeAVolume.syncMuteException': '当前「静音本机输出」也是开启的，因此只同步音量、不同步静音——否则连接时那一次性静音会顺着同步把对端也静掉。',
+  'settings.modeAVolume.muteTitle': '静音本机输出',
+  'settings.modeAVolume.muteDesc': '这是一次性动作，不是持续状态：只在与对端建立扬声器通路的那一刻把本机静音一次，此后不再维持。你随后手动取消静音即被理解为「本机也要出声」，不会被按回去，直到下一次通路建立。捕获点位在音量之后的后端（Windows 设备环回）上不会执行——那样会把送给对端的镜像一起静掉。',
+  'settings.modeAVolume.noteInForce': '当前生效中：本机正在模式 A 下运行，这两个开关作用于本机的默认输出设备。',
+  'settings.modeAVolume.noteIdle': '当前不生效：这两个开关只属于模式 A。模式 B 下音量由虚拟扬声器本身承担，共享模式下本机不使用对端。设置会保留，切到模式 A 即生效。',
   'settings.devices.title': '虚拟设备',
   'settings.devices.removeTitle': '断开后移除虚拟设备',
   'settings.devices.removeDesc': '关闭时：断开仅显示离线，虚拟设备保留在系统设备列表；开启时：断开即移除，重连后以相同 UID 恢复。解除配对总是无条件移除。',

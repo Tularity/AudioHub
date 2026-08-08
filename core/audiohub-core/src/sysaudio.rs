@@ -298,6 +298,36 @@ fn sck_info() -> BackendInfo {
     )
 }
 
+/// Does muting THIS machine's default output leave the CAPTURED stream intact?
+///
+/// This is plan §7.1's stated precondition for 「静音本机输出」: 「捕获点位需在
+/// 音量/静音之前，否则静音连镜像一起无声」. `Some(true)` = safe to mute,
+/// `Some(false)` = muting would take the mirror down with the speakers,
+/// `None` = not established.
+///
+/// ⚠ **Nothing here is measured.** These are plan §7.1's own expectations,
+/// recorded in one place so the probe that settles them
+/// (`probe sysaudio --check-volume-independence`, plan §7.1 — not built yet)
+/// has a single value to overwrite instead of a rule spread across call sites.
+/// `BACKEND_AUTO` is deliberately absent: callers must ask about the id
+/// `resolve_backend` handed them, because "auto" is a different backend on
+/// every host.
+pub fn capture_survives_local_mute(backend_id: &str) -> Option<bool> {
+    match backend_id {
+        // Process-level taps read each process's own render stream, upstream of
+        // the device's volume and mute. plan §7.1: 「预期 mac CATap/SCK 不受
+        // 影响（进程级采集）」.
+        BACKEND_MAC_CATAP | BACKEND_MAC_SCK => Some(true),
+        // plan §7.1: 「win 设备 loopback 受主音量影响（post-mix）」. The one
+        // entry the switch must respect, because the resulting silence looks
+        // like a network fault, not like a mute the user asked for.
+        BACKEND_WIN_DEVICE_LOOPBACK => Some(false),
+        // plan §7.1: 「win 进程排除环回待实测」. Unknown, not assumed either way.
+        BACKEND_WIN_PROC_EXCLUDE => None,
+        _ => None,
+    }
+}
+
 /// Resolves `id` (or BACKEND_AUTO / "") to a concrete backend description.
 /// A known-but-unavailable id still resolves, so callers can report `note`.
 pub fn resolve_backend(id: &str) -> Result<BackendInfo> {
@@ -2123,5 +2153,59 @@ mod tests {
         assert_eq!(out, vec![1.0]);
         front_pair_mono(&[1.0, 1.0], 0, (0, 1), &mut out);
         assert_eq!(out, vec![1.0]);
+    }
+}
+
+#[cfg(test)]
+mod mute_precondition_tests {
+    use super::*;
+
+    /// plan §7.1 records one expectation per backend for 「静音本机」's
+    /// precondition. The values are plan's, not measurements — this test exists
+    /// so a future probe changes them HERE and nowhere else, and so the one
+    /// entry that must block the mute cannot quietly become permissive.
+    #[test]
+    fn the_post_mix_backend_is_the_only_one_that_forbids_a_local_mute() {
+        assert_eq!(
+            capture_survives_local_mute(BACKEND_WIN_DEVICE_LOOPBACK),
+            Some(false),
+            "plan §7.1: win 设备 loopback 受主音量影响（post-mix）——静音会连镜像一起静掉"
+        );
+        assert_eq!(capture_survives_local_mute(BACKEND_MAC_CATAP), Some(true));
+        assert_eq!(capture_survives_local_mute(BACKEND_MAC_SCK), Some(true));
+        assert_eq!(
+            capture_survives_local_mute(BACKEND_WIN_PROC_EXCLUDE),
+            None,
+            "plan §7.1: win 进程排除环回**待实测**——不许假装已知"
+        );
+    }
+
+    /// "auto" is a different backend on every host, so answering for it would
+    /// be answering about a backend nobody picked. Callers must ask about the
+    /// id `resolve_backend` handed them.
+    #[test]
+    fn the_auto_sentinel_has_no_answer_of_its_own() {
+        assert_eq!(capture_survives_local_mute(BACKEND_AUTO), None);
+        assert_eq!(capture_survives_local_mute(""), None);
+    }
+
+    /// Every backend `list_backends` offers has a row above. A backend added
+    /// later without one silently inherits "unknown", and 「静音本机」 would fire
+    /// on it without anyone having decided that it may.
+    #[test]
+    fn every_offered_backend_is_accounted_for() {
+        let known = [
+            BACKEND_WIN_PROC_EXCLUDE,
+            BACKEND_WIN_DEVICE_LOOPBACK,
+            BACKEND_MAC_CATAP,
+            BACKEND_MAC_SCK,
+        ];
+        for b in list_backends() {
+            assert!(
+                known.contains(&b.id.as_str()),
+                "backend '{}' has no 「静音本机」 precondition row (plan §7.1)",
+                b.id
+            );
+        }
     }
 }

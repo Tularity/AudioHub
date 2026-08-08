@@ -2365,6 +2365,7 @@ mod telemetry_tests {
             name: "fake".to_string(),
             available: true,
             excludes_self: true,
+            declined: false,
             note: String::new(),
         }
     }

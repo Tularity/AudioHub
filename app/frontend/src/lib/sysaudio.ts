@@ -51,6 +51,15 @@ interface BackendMeta {
   mac: boolean;
   labelKey: MsgKey;
   noteKey: MsgKey;
+  /**
+   * 本项目**根本没实现、且已裁定不实现**这个后端（core 的 `BackendInfo.declined`）。
+   *
+   * 它与上面那条「不猜可用性」的规矩**不冲突**：那条禁止的是**按本机 OS 版本推断**
+   * 某个后端能不能用——那是关于宿主的猜测。而这里是关于**这份构建产物**的事实：
+   * 代码里没有这条路径，任何 macOS、任何授权、任何设置都开不起来。这是前端唯一
+   * 不需要问 daemon 就确知的一件事，所以它可以（也应该）直接置灰。
+   */
+  declined?: boolean;
 }
 
 // id 必须与 core/audiohub-core/src/sysaudio.rs 的 BACKEND_* 常量逐字相同：
@@ -80,6 +89,10 @@ const BACKENDS: BackendMeta[] = [
     mac: true,
     labelKey: 'sysaudio.backend.macSck.label',
     noteKey: 'sysaudio.backend.macSck.note',
+    // 2026-08-09 裁定不做（plan §6 / §11.2）：ScreenCaptureKit 的音频要「屏幕录制」
+    // 权限，而它比 mac-catap 多覆盖的只有 macOS 13.0–14.1。留在清单里是为了让这个
+    // 裁定看得见——而不是让它变成一个能选、选了永远开不起来的格子。
+    declined: true,
   },
 ];
 
@@ -91,6 +104,8 @@ export interface BackendOption {
   note: string;
   /** true/false = daemon 说的；**null = 无从得知**（daemon 没上报这个字段）。 */
   available: boolean | null;
+  /** 本项目裁定不实现（见 BackendMeta.declined）。available 必然是 false。 */
+  declined: boolean;
 }
 
 /** daemon 是否上报了后端清单。false 时一切 available 都是 null，界面必须如实说。 */
@@ -102,8 +117,12 @@ function fromDaemon(raw: SysAudioBackend): BackendOption | null {
   const id = typeof raw.id === 'string' ? raw.id.trim() : '';
   if (!id) return null;
   const meta = META.get(id);
+  // daemon 说了就听 daemon 的（它跑的才是真正那份 core）；没说才回落到目录。
+  // 顺序不能反：有人把 SCK 实现了、裁定被推翻时，先变的是 daemon，本目录会慢一步。
+  const declined = typeof raw.declined === 'boolean' ? raw.declined : !!(meta && meta.declined);
   return {
     id,
+    declined,
     // daemon 的 name 是英文技术名（"macOS Core Audio process tap"）：它比我们的
     // 目录更权威，但不是给终端用户读的。目录里认得的一律用中文标签，认不出的新后端
     // 才退回 daemon 的原文——总比只显示一个 id 强。
@@ -112,7 +131,9 @@ function fromDaemon(raw: SysAudioBackend): BackendOption | null {
     // 比任何静态说明都值钱，优先用它。
     note: (typeof raw.note === 'string' && raw.note.trim())
       || (meta ? t(meta.noteKey) : ''),
-    available: typeof raw.available === 'boolean' ? raw.available : null,
+    // declined 蕴含不可用：core 侧的不变量（declined ⇒ !available）在这里再钉一次，
+    // 免得一份错乱的上报把一个开不起来的后端画成可选项。
+    available: declined ? false : (typeof raw.available === 'boolean' ? raw.available : null),
   };
 }
 
@@ -132,9 +153,19 @@ export function backendOptions(daemon: DaemonInfo | null | undefined): BackendOp
   // 回落路径按 UI 宿主平台过滤。这条假设成立的前提是 **daemon 一定在本机**
   // （IPC 走 127.0.0.1），今天确实如此；plan §7.5 的网页端一旦落地（浏览器可能在
   //另一台机器上），这里就必须改成读 daemon 上报的清单——也就是下面那条缺口。
+  //
+  // declined 的那些直接给 false（不是 null）：清单没上报时我们确实不知道本机
+  // **能不能**跑某个后端，但「这份构建里压根没有这条路径」与本机无关，是编译期
+  // 就定死的事。给 null 会让它显示成一个可选项，用户选中后只会拿到一句报错。
   return BACKENDS
     .filter((b) => b.mac === IS_MAC)
-    .map((b) => ({ id: b.id, label: t(b.labelKey), note: t(b.noteKey), available: null }));
+    .map((b) => ({
+      id: b.id,
+      label: t(b.labelKey),
+      note: t(b.noteKey),
+      available: b.declined ? false : null,
+      declined: !!b.declined,
+    }));
 }
 
 /**

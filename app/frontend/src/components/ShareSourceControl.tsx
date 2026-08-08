@@ -117,11 +117,15 @@ export function ShareSourceControl({
           onChange={(e) => onBackend(e.currentTarget.value)}
         >
           <option value={BACKEND_AUTO}>{t('share.backend.autoOption')}</option>
+          {/* 「本机不可用」和「本项目不提供」必须分开说：前者换台机器/升个系统就能用，
+              后者谁也修不好。写成同一句话，用户会去折腾一个根本不存在的东西。 */}
           {options.map((b) => (
             <option key={b.id} value={b.id} disabled={b.available === false}>
-              {b.available === false
-                ? t('share.backend.optionUnavailable', { name: b.label })
-                : b.label}
+              {b.declined
+                ? t('share.backend.optionDeclined', { name: b.label })
+                : b.available === false
+                  ? t('share.backend.optionUnavailable', { name: b.label })
+                  : b.label}
             </option>
           ))}
           {stale ? (

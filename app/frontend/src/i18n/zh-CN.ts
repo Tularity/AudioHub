@@ -492,6 +492,7 @@ export const zhCN = {
   'share.backend.stale': '当前服务不认识后端「{id}」：开启时会直接报错。请改回「自动」或另选一个。',
   'share.backend.staleOption': '{id}（当前服务未提供）',
   'share.backend.optionUnavailable': '{name}（本机不可用）',
+  'share.backend.optionDeclined': '{name}（本项目不提供）',
   'share.perm.hint': '共享系统音频需要「系统音频录制」授权：macOS 无法预先查询，首次开启时系统会询问；若此前被拒绝过，需到系统设置里手动打开。',
   'share.perm.goto': '前往授权',
   'share.fault': '⚠ 上次开启失败：{reason}',
@@ -506,7 +507,9 @@ export const zhCN = {
   'sysaudio.backend.macCatap.label': 'macOS 音频进程 Tap',
   'sysaudio.backend.macCatap.note': '首选：纯音频接口，权限归「系统音频录制」而非屏幕录制，且排除本 App 自身的播放。需要 macOS 14.2 及以上。',
   'sysaudio.backend.macSck.label': 'macOS 屏幕捕获音频流',
-  'sysaudio.backend.macSck.note': '备选路线，权限归「屏幕录制」类别。',
+  // 2026-08-09 裁定不做（plan §6 / §11.2）。这句是用户唯一能看到的解释，所以必须说清
+  // 「不做」而不是「还没做」——后者会让人一直等一个不会来的版本。
+  'sysaudio.backend.macSck.note': '本项目不提供这条路线：它的音频要「屏幕录制」权限，而比 macOS 音频进程 Tap 多覆盖的只有 macOS 13.0–14.1。14.2 及以上一律走进程 Tap，权限更小。',
 
   // ---------------------------------------------------------------- 会话
   'session.flow.micRecv': '取对方麦克风',

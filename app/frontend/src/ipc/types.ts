@@ -137,6 +137,12 @@ export interface SysAudioBackend {
   name?: string;
   available?: boolean;
   excludes_self?: boolean;
+  /**
+   * 本项目**已裁定不实现**这个后端：升级系统、给授权、改设置都不会让它变成可用。
+   * `available: false` 表达不了这层——那也是「系统太老」「设备被拔了」的取值，而那些
+   * 是可以补救的。界面必须把「你能修好的灰」和「谁也修不好的灰」画成两回事。
+   */
+  declined?: boolean;
   note?: string;
 }
 

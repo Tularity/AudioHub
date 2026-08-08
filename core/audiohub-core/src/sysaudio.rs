@@ -33,6 +33,17 @@ pub struct BackendInfo {
     /// capture — the hard condition for using it while we also play the peer's
     /// audio (plan §5 feedback loop).
     pub excludes_self: bool,
+    /// True when AudioHub ships no implementation of this backend and has ruled
+    /// that it never will: no OS upgrade, no consent grant and no setting can
+    /// turn `available` on.
+    ///
+    /// `available == false` on its own cannot express that — it is also what a
+    /// backend on the wrong OS, or one whose host is too old, reports, and those
+    /// are worth retrying after an upgrade. A greyed-out row the user could fix
+    /// and a greyed-out row nobody can ever fix must not look the same, which is
+    /// the whole reason this bit is on the wire instead of buried in `note`.
+    #[serde(default)]
+    pub declined: bool,
     pub note: String,
 }
 
@@ -164,13 +175,15 @@ fn entry(id: &str, name: &str, available: bool, excludes_self: bool, note: &str)
         name: name.to_string(),
         available,
         excludes_self,
+        declined: false,
         note: note.to_string(),
     }
 }
 
 /// All known backends in priority order (BACKEND_AUTO takes the first
-/// available one), which on macOS is mac-catap before mac-sck (spec-round2
-/// §A3).
+/// available one), which on macOS is mac-catap and nothing else: mac-sck is
+/// listed so the ruling against it is visible, but it is `declined` and can
+/// never be picked (see `sck_info`).
 ///
 /// Listing must never open a capture: on macOS creating the tap is exactly
 /// what raises the TCC consent dialog, so availability is decided from the
@@ -278,24 +291,48 @@ fn catap_info() -> BackendInfo {
     )
 }
 
-/// Declared, not implemented (spec-round2 §A2 allows this explicitly). A
-/// correct SCStream audio path needs ScreenCaptureKit + CoreMedia + block2 +
-/// a runtime-defined SCStreamOutput delegate class — four crates that are not
-/// in the tree, for a backend nothing could exercise without screen-recording
-/// consent. mac-catap covers every macOS this project targets; an SCK path
-/// that has never run once would be worse than an honest gap.
+/// **Ruled out, permanently** (2026-08-09; plan §6 / §11.2, status-audit §四).
+/// This is not an unfinished task and must not be picked up as one.
+///
+/// The four-cell backend matrix plan §6 asked for has three real cells and this
+/// declined one. What settled it:
+///
+/// * **Permission category.** ScreenCaptureKit audio is gated on the
+///   screen-recording grant; mac-catap is gated on the narrower
+///   system-audio-recording grant. Handing an audio app the right to read the
+///   screen is a strictly larger ask, and macOS re-asks for it periodically.
+///   Note this is a *cost*, not a breach of plan §5/§6's 体验红线 — that line
+///   forbids making the user re-point their output at a virtual device, and a
+///   ScreenCaptureKit tap would not do that either.
+/// * **Coverage bought.** Exactly macOS 13.0–14.1: below 13 SCK has no audio
+///   capture, and from 14.2 up mac-catap already works. Every host that can run
+///   this backend can run the better one.
+/// * **Cost paid.** ScreenCaptureKit + CoreMedia + block2 + a runtime-defined
+///   stream-output delegate class, none of which are in the tree — a second
+///   capture path that would carry the project's entire macOS mirror on a code
+///   path no routine test would ever select.
+///
+/// Reversing this means flipping `declined` here *and* revoking the ruling in
+/// plan §6; `regress/r6_sysaudio.sh` fails the build if only one of those
+/// happens.
 fn sck_info() -> BackendInfo {
-    entry(
-        BACKEND_MAC_SCK,
-        "macOS ScreenCaptureKit system audio",
-        false,
-        true,
-        if cfg!(target_os = "macos") {
-            "not implemented; use mac-catap (macOS 14.2+). ScreenCaptureKit would additionally need screen-recording consent"
-        } else {
-            "macOS only"
-        },
-    )
+    BackendInfo {
+        declined: true,
+        ..entry(
+            BACKEND_MAC_SCK,
+            "macOS ScreenCaptureKit system audio",
+            false,
+            // excludes_self. A backend that cannot start excludes nothing, and
+            // `engine.rs` keys its feedback-loop warning off this bit — the old
+            // `true` here advertised a property of code that will never exist.
+            false,
+            // UI copy: this string is the only thing a user is ever shown about
+            // the greyed-out row, so it has to say "ruled out", not "not yet".
+            "not offered by AudioHub and not planned: ScreenCaptureKit audio needs the \
+             screen-recording permission, while mac-catap covers macOS 14.2 and later with the \
+             narrower system-audio-recording one",
+        )
+    }
 }
 
 /// Does muting THIS machine's default output leave the CAPTURED stream intact?
@@ -307,17 +344,32 @@ fn sck_info() -> BackendInfo {
 ///
 /// ⚠ **Nothing here is measured.** These are plan §7.1's own expectations,
 /// recorded in one place so the probe that settles them
-/// (`probe sysaudio --check-volume-independence`, plan §7.1 — not built yet)
-/// has a single value to overwrite instead of a rule spread across call sites.
+/// (`probe sysaudio --check-volume-independence`, plan §7.1) has a single value
+/// to overwrite instead of a rule spread across call sites. The probe does not
+/// edit this table by itself — it reports agreement or contradiction
+/// (`crate::volindep::judge_volume_independence` fills `table_says` /
+/// `contradicts_table`) and a human moves the row, because one run on one host
+/// is not a platform-wide fact.
 /// `BACKEND_AUTO` is deliberately absent: callers must ask about the id
 /// `resolve_backend` handed them, because "auto" is a different backend on
-/// every host.
+/// every host. **Declined backends are absent for the same class of reason**:
+/// see the `mac-sck` note below.
 pub fn capture_survives_local_mute(backend_id: &str) -> Option<bool> {
     match backend_id {
         // Process-level taps read each process's own render stream, upstream of
-        // the device's volume and mute. plan §7.1: 「预期 mac CATap/SCK 不受
+        // the device's volume and mute. plan §7.1: 「预期 mac CATap 不受
         // 影响（进程级采集）」.
-        BACKEND_MAC_CATAP | BACKEND_MAC_SCK => Some(true),
+        //
+        // `BACKEND_MAC_SCK` used to share this arm and no longer does. It is
+        // declined (`sck_info`, plan §6.1, status-audit §四 #41), so no capture
+        // will ever run through it, and a row here would have been the same
+        // empty promise as the `excludes_self: true` that `sck_info` just gave
+        // up: a stated property of code that does not exist. It was dead in
+        // both senses — unreachable too, because `start_backend` rejects a
+        // declined id before any caller gets far enough to ask this. Falling
+        // through to `None` says the only true thing: nothing is established
+        // about a backend that never runs.
+        BACKEND_MAC_CATAP => Some(true),
         // plan §7.1: 「win 设备 loopback 受主音量影响（post-mix）」. The one
         // entry the switch must respect, because the resulting silence looks
         // like a network fault, not like a mute the user asked for.
@@ -345,6 +397,18 @@ pub fn resolve_backend(id: &str) -> Result<BackendInfo> {
 
 pub fn start_backend(id: &str) -> Result<Box<dyn SysAudioCapture>> {
     let b = resolve_backend(id)?;
+    // Declined first, and worded differently on purpose: "not available" invites
+    // a retry (upgrade the OS, grant consent, plug the device back in) and a
+    // declined backend will never reward one. A caller that surfaces this — the
+    // daemon puts it straight in the session fault the UI shows — has to be able
+    // to tell the user which of the two they are looking at.
+    if b.declined {
+        bail!(
+            "sysaudio backend '{}' is not offered by this build and never will be: {}",
+            b.id,
+            b.note
+        );
+    }
     if !b.available {
         bail!("sysaudio backend '{}' is not available: {}", b.id, b.note);
     }
@@ -2172,12 +2236,43 @@ mod mute_precondition_tests {
             "plan §7.1: win 设备 loopback 受主音量影响（post-mix）——静音会连镜像一起静掉"
         );
         assert_eq!(capture_survives_local_mute(BACKEND_MAC_CATAP), Some(true));
-        assert_eq!(capture_survives_local_mute(BACKEND_MAC_SCK), Some(true));
         assert_eq!(
             capture_survives_local_mute(BACKEND_WIN_PROC_EXCLUDE),
             None,
             "plan §7.1: win 进程排除环回**待实测**——不许假装已知"
         );
+    }
+
+    /// A declined backend never captures a single sample, so this table can
+    /// hold no expectation about what muting the local output would do to a
+    /// capture running through it — `None` is the only honest answer, and it
+    /// is what falling off the end of the match gives.
+    ///
+    /// Derived from `list_backends()` instead of naming `mac-sck`, so a
+    /// backend declined later is covered without anyone remembering to come
+    /// back here. `start_backend` already refuses declined ids, so a row here
+    /// is unreachable as well as untrue — but unreachable code that states a
+    /// falsehood is exactly what gets read as fact by the next person.
+    ///
+    /// Injection check: restoring `BACKEND_MAC_SCK` to the `Some(true)` arm
+    /// turns this RED (`Some(true) != None` for 'mac-sck').
+    #[test]
+    fn a_declined_backend_states_no_mute_expectation() {
+        let declined: Vec<_> = list_backends().into_iter().filter(|b| b.declined).collect();
+        assert!(
+            !declined.is_empty(),
+            "this test is vacuous with no declined backend; mac-sck is declined on \
+             every platform (`sck_info`), so an empty list means the invariant moved"
+        );
+        for b in declined {
+            assert_eq!(
+                capture_survives_local_mute(&b.id),
+                None,
+                "declined backend '{}' never runs, so the 「静音本机」 table must not \
+                 claim to know whether a local mute would survive it",
+                b.id
+            );
+        }
     }
 
     /// "auto" is a different backend on every host, so answering for it would

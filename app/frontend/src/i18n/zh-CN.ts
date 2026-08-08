@@ -369,6 +369,8 @@ export const zhCN = {
   'peers.form.addrPlaceholder': 'IP 或 IP:端口（留空使用最近地址）',
   'peers.form.note': '通过 peers.connect 主动连接已配对对端：daemon 会按指纹校验对端身份，跨网段亦可用。',
   'peers.form.needFingerprint': '请填写对端指纹（可输前缀）',
+  // M8 P6：地址一格现在同时接受 URL 形态（plan §16.2「地址即传输选择」）。
+  'peers.form.addrPlaceholder2': 'IP、IP:端口，或 ws://主机[:端口]/路径（留空使用最近地址）',
   'peers.form.done': '连接请求已完成',
 
   'peers.card.unnamed': '未命名主机',
@@ -604,6 +606,15 @@ export const zhCN = {
   'pair.right.going': '配对中…',
   'pair.right.needAddr': '请填写对方地址（IP 或 IP:端口）',
   'pair.right.needPin': '请填写对方界面上显示的 PIN',
+  // 三条地址形态提示，两处输入框共用。
+  'addr.badUrl.noHost': '这个地址缺少主机名：{addr}',
+  'addr.badUrl.badPort': '这个地址的端口不是 1–65535 之间的数字：{addr}',
+  'addr.badUrl.badIpv6': 'IPv6 字面量少了右方括号：{addr}',
+  // wss:// 认得，但本 build 没有 TLS 客户端——说清楚缺口是什么，而不是把它
+  // 报成「地址无法识别」。
+  'addr.wssUnsupported': '本版本还不支持 wss://（没有内置 TLS 客户端）。请填隧道的明文入口 ws://…，或在本机前面终结 TLS。',
+  // 配对不走 WebSocket：P5 有意没有在复用连接上再开一条配对路径，P6 未改。
+  'addr.pairNotOverWs': '配对暂时不能走 ws:// 隧道。请先用 IP:端口 完成配对，再到该对端的详情里把地址改成隧道 URL。',
   'pair.right.done': '已与「{name}」完成配对',
   'pair.right.failed': '配对失败：{message}。确认对方已开启配对模式、PIN 未过期、地址可达；也可用 CLI 复现：audiohub pair --to {addr} --pin {pin}',
   'pair.right.note': '经 peers.pair 由本机服务发起：配对成功后双向信任立即生效，模式 B 下对方主机会同时作为一对音频设备出现在「系统设置 › 声音」里。',

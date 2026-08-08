@@ -694,13 +694,35 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     )?),
                     None => None,
                 };
+                // P6：URL 形态的对端地址。**与 tier / dial_policy 同一个入口**，
+                // 理由同上：三者一起决定「这台对端怎么连」，分开写就会出现一个
+                // 用户从没要求过的中间态（比如地址已经是 ws:// 而 tier 还是 0）。
+                // 写入口严格校验：`""` 表示清除，其余必须解析得出来——收下一个
+                // 拨不动的字符串再原样回显，正是本仓栽过的那个形状。
+                let endpoint = match params.get("endpoint").and_then(Value::as_str) {
+                    Some("") => Some(String::new()),
+                    Some(u) => {
+                        let parsed = crate::wsshell::WsUrl::parse(u)
+                            .map_err(|e| anyhow::anyhow!("endpoint 解析失败：{e:#}"))?;
+                        // 拒在写入口而不是拨号时：一个存得下、拨不动的地址会在
+                        // 界面上看起来完全正常，直到用户去连它。
+                        parsed.require_plaintext()?;
+                        Some(u.to_string())
+                    }
+                    None => None,
+                };
                 let prev = lk(&inner.peer_transport).tier(&fp);
                 let prev_dial = lk(&inner.peer_transport).dial_policy(&fp);
+                let prev_endpoint = lk(&inner.peer_transport).get(&fp).endpoint;
                 {
                     let mut t = lk(&inner.peer_transport).get(&fp);
                     t.transport_tier = tier.as_wire().to_string();
                     if let Some(d) = dial {
                         t.dial_policy = d.as_wire().to_string();
+                    }
+                    if let Some(u) = &endpoint {
+                        t.endpoint = u.clone();
+                        t.endpoint_reset_from = None;
                     }
                     let mut store = lk(&inner.peer_transport);
                     store.set(&fp, t);
@@ -709,7 +731,9 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     // 带着旧档回来，而用户看到的是新档。
                     store.save(&inner.cfg_dir)?;
                 }
-                let changed = prev != tier || dial.is_some_and(|d| d != prev_dial);
+                let changed = prev != tier
+                    || dial.is_some_and(|d| d != prev_dial)
+                    || endpoint.as_ref().is_some_and(|u| *u != prev_endpoint);
                 let applied = if changed {
                     conn::retier(inner, &fp)
                 } else {
@@ -723,6 +747,7 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     "previous": prev.as_wire(),
                     "dial_policy": dial.unwrap_or(prev_dial).as_wire(),
                     "previous_dial_policy": prev_dial.as_wire(),
+                    "endpoint": endpoint.clone().unwrap_or(prev_endpoint),
                     "applied": applied.as_wire(),
                 })
             }
@@ -789,6 +814,8 @@ fn peer_transport_view(
         tier_reset_from: mine.transport_tier_reset_from.clone(),
         dial_policy: mine.dial_policy().as_wire().to_string(),
         dial_policy_reset_from: mine.dial_policy_reset_from.clone(),
+        endpoint: mine.endpoint.clone(),
+        endpoint_reset_from: mine.endpoint_reset_from.clone(),
     };
     for e in st.sessions.values() {
         if e.conn.fp != fp || e.origin != crate::SessionOrigin::Peer {

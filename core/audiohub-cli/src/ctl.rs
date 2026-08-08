@@ -258,6 +258,18 @@ pub enum CtlCmd {
         /// reconnections and, in between, a combination nobody asked for.
         #[arg(long, value_parser = ["both", "outbound_only", "inbound_only"], requires = "tier")]
         dial_policy: Option<String>,
+        /// M8 P6: a URL-shaped address for this peer, `ws://host[:port][/path]`.
+        ///
+        /// **The address is the transport choice** (plan §16.2): a URL asks for
+        /// the WebSocket carrier the way `192.168.1.5:47810` asks for a direct
+        /// connection, because the premise of tier 2 — an application-layer-only
+        /// tunnel — is a property of the user's network that cannot be observed
+        /// from here. Pass an empty string to clear it.
+        ///
+        /// Set with `--tier` for the same reason `--dial-policy` is: one
+        /// decision about how the peer is reached, one write, one reconnection.
+        #[arg(long, requires = "tier")]
+        endpoint: Option<String>,
     },
     /// pair with a peer that has pairing mode enabled
     Pair {
@@ -575,7 +587,7 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             };
             (method, Value::Object(p))
         }
-        CtlCmd::PeerTransport { peer, dir, latency, quality, tier, dial_policy } => {
+        CtlCmd::PeerTransport { peer, dir, latency, quality, tier, dial_policy, endpoint } => {
             if let Some(t) = tier {
                 // Refused rather than sequenced into two calls: they are two
                 // writes with two failure modes, and one call reporting one
@@ -594,6 +606,9 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
                 p.insert("tier".into(), json!(t));
                 if let Some(d) = dial_policy {
                     p.insert("dial_policy".into(), json!(d));
+                }
+                if let Some(e) = endpoint {
+                    p.insert("endpoint".into(), json!(e));
                 }
                 return Ok((methods::PEERS_SET_TIER, Value::Object(p)));
             }
@@ -917,19 +932,23 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                       its own — plan §13)");
             }
         }
-        CtlCmd::PeerTransport { peer, dir, latency, quality, tier, dial_policy: _ } => {
+        CtlCmd::PeerTransport { peer, dir, latency, quality, tier, dial_policy: _, endpoint: _ } => {
             if tier.is_some() {
                 // `applied` 是这次调用与 `peers.set_transport` 的实质区别：
                 // 换 tier 必然要重新协商传输，而**能不能自己重建那条连接**
                 // 取决于这台机器是不是拨号的那一侧。印出来，别让用户去猜
                 // 一次沉默的等待是成功还是卡住了。
+                let ep = val_str(v, "endpoint");
                 info(&format!(
-                    "{}: tier {} -> {}, dial {} -> {} ({})",
+                    "{}: tier {} -> {}, dial {} -> {}, addr {} ({})",
                     val_str(v, "fingerprint"),
                     val_str(v, "previous"),
                     val_str(v, "tier"),
                     val_str(v, "previous_dial_policy"),
                     val_str(v, "dial_policy"),
+                    // Empty means "reached by host:port"; printing the empty
+                    // string would read as a blanked-out setting.
+                    if ep.is_empty() { "host:port".to_string() } else { ep.to_string() },
                     match &*val_str(v, "applied") {
                         "reconnecting" => "已拆连接，重连后按新档协商（约 1 s）",
                         "awaiting_peer" =>

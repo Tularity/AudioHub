@@ -37,6 +37,7 @@ mod settings;
 mod tcpmedia;
 /// 传输档位在 daemon 侧的活体状态：用户选了什么、媒体面真的在做什么。
 mod transport;
+mod wsshell;
 /// 传输档位的接线测试（两台真 daemon，断言执行器而不是设置字段）。
 #[cfg(test)]
 mod transport_tests;
@@ -910,6 +911,11 @@ fn mux_status(inner: &DaemonInner) -> serde_json::Value {
                     "control_frames_written": l.control_frames_written(),
                     "control_frames_read": l.control_frames_read(),
                     "keepalives_read": l.keepalives_read(),
+                    // `null` on the bare-TCP carrier, and deliberately not
+                    // zeros: "this carrier has no heartbeat" and "this
+                    // carrier's heartbeat has stopped" must not render the
+                    // same (§14's rule against 0 standing in for unknown).
+                    "ws": l.ws_heartbeat(),
                 })
             })
             .collect(),

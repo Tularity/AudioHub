@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Icon } from '../components/Icon';
 import { toast } from '../components/Toasts';
 import { fmt, sleep } from '../lib/fmt';
+import { classifyPeerAddr } from '../lib/peerAddr';
 import { t, joinPhrases } from '../i18n';
 import type { MsgKey } from '../i18n';
 import { useTick } from '../lib/hooks';
@@ -160,6 +161,20 @@ function ConnectOthers() {
     const a = addr.trim();
     const p = pin.trim();
     if (!a) { toast(t('pair.right.needAddr'), 'warn'); addrRef.current?.focus(); return; }
+    // **配对不走 WebSocket**，所以 URL 在这一格里是被拒的，且拒得早。
+    // 让它发出去只会换回一条 daemon 侧的握手报错——用户看到的是「配对失败：
+    // unexpected first frame」，而真正该说的话是「这一步请用 IP:端口」。
+    const shape = classifyPeerAddr(a);
+    if (shape.kind !== 'direct') {
+      toast(
+        shape.kind === 'badUrl'
+          ? t(`addr.badUrl.${shape.reason}`, { addr: a })
+          : t('addr.pairNotOverWs'),
+        'warn',
+      );
+      addrRef.current?.focus();
+      return;
+    }
     if (!p) { toast(t('pair.right.needPin'), 'warn'); pinRef.current?.focus(); return; }
     if (isTauri()) {
       try { await ensureDaemon(); } catch { /* 连接失败会在下一步报出来 */ }

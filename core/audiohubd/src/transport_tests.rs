@@ -486,6 +486,22 @@ fn pair_through(a: &Node, b: &Node, addr: &str) {
     );
 }
 
+/// Set a peer's URL-shaped address (M8 P6), the same way `pin_tier` sets its
+/// tier and for the same reason: the transport is chosen from the store before
+/// the first byte, so it has to be there before the dial.
+fn set_endpoint(n: &Node, fp: &str, url: &str) {
+    let inner = n.h.inner_for_test();
+    let mut store = lk(&inner.peer_transport);
+    let mut t = store.get(fp);
+    t.endpoint = url.to_string();
+    store.set(fp, t);
+    assert!(
+        store.endpoint(fp).is_some(),
+        "the endpoint did not stick, or did not parse; every assertion downstream would be \
+         about a bare TCP mux"
+    );
+}
+
 /// Set a peer's dial policy (M8 P5), the same way `pin_tier` sets its tier and
 /// for the same reason: before the control connection exists.
 fn set_dial_policy(n: &Node, fp: &str, policy: &str) {
@@ -3432,3 +3448,292 @@ fn a_tier_two_stream_sends_no_keepalive_datagrams() {
     );
 }
 
+
+// ---------------------------------------------------------------- M8 P6: WS
+
+/// Bring up a tier 2 pair whose mux runs **inside a WebSocket** (design §6 P6).
+///
+/// One forwarder serves both legs, and that is deliberate rather than
+/// convenient: pairing goes through it as a bare TCP connection and the mux
+/// goes through it as an HTTP upgrade, so the same listener has to route both
+/// by their first four bytes — which is `conn::peek_opening`'s whole job, under
+/// test here rather than only in isolation.
+///
+/// **Pairing does not go over the WebSocket, and that is a real gap.** P5 chose
+/// not to offer pairing on the mux (a second code path for a one-shot exchange
+/// a tunnel forwards on its own connection), and P6 does not revisit it. On a
+/// genuinely HTTP-only tunnel that means a peer has to be paired out of band
+/// first and given its URL afterwards, which is what this helper does. Recorded
+/// here and not only in the report, because the next person to read this test
+/// will otherwise conclude the whole flow is covered.
+fn tier_two_ws_pair(tag: &str) -> (Node, Node, Forwarder, String) {
+    let a = Node::start(&format!("{tag}-a"));
+    let b = Node::start(&format!("{tag}-b"));
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+
+    let fwd = Forwarder::start(
+        format!("127.0.0.1:{}", b.control_port()).parse().expect("B's control addr"),
+    );
+    fwd.assert_not_a_control_port([&a, &b]);
+
+    pin_tier(&a, &b.fingerprint(), "tier2");
+    pin_tier(&b, &a.fingerprint(), "tier2");
+    set_dial_policy(&b, &a.fingerprint(), "inbound_only");
+
+    // Pair over the forwarder as a bare connection...
+    let pin = b.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
+    let pin = pin.get("pin").and_then(Value::as_str).expect("pin").to_string();
+    a.ok(methods::PEERS_PAIR, json!({ "addr": fwd.addr(), "pin": pin }));
+
+    // ...then hand A the URL and let the stored endpoint choose the carrier.
+    // Via the store rather than via an `addr` override on the call, because the
+    // stored path is the one production uses on every reconnect.
+    let url = format!("ws://127.0.0.1:{}/audiohub", fwd.port);
+    set_endpoint(&a, &b.fingerprint(), &url);
+    a.ok(methods::PEERS_CONNECT, json!({ "peer": b.fingerprint() }));
+    (a, b, fwd, url)
+}
+
+/// Read a mux row's WebSocket heartbeat block, which is `null` on bare TCP.
+fn ws_block(link: &Value) -> Option<Value> {
+    link.get("ws").filter(|v| !v.is_null()).cloned()
+}
+
+fn ws_count(link: &Value, key: &str) -> u64 {
+    ws_block(link).and_then(|w| w[key].as_u64()).unwrap_or(0)
+}
+
+/// **Acceptance 1 (design §6, P6): the WebSocket carrier passes the same four
+/// assertions the bare one did**, plus the one that says it really is a
+/// WebSocket.
+///
+/// The four are `a_tier_two_pair_survives_the_source_address_being_lost`'s, in
+/// the same order and for the same reasons:
+///
+///   1. A's route to B is the forwarder and nothing else;
+///   2. B cannot tell where A is — an ephemeral port on loopback;
+///   3. both ends nevertheless hold the other's real fingerprint;
+///   4. control frames rode the media connection, which is what "one
+///      connection" means observably;
+///   5. the audio arrived and the frames account for the packets, so nothing
+///      quietly took UDP.
+///
+/// The fifth assertion here is P6's own, and without it the whole test would
+/// pass unchanged on P5's bare-TCP carrier — the "decorative downgrade" failure
+/// the tier 2 test already warns about, one layer up. `latency_guard.mux[].ws`
+/// is `null` on bare TCP by construction, so it is the discriminator.
+///
+/// Injection controls (run 2026-08-09, both red as described):
+///   - make `conn::connect_peer` ignore the stored endpoint (drop the
+///     `endpoint` binding and fall back to `target_addr`) ⇒ red at (6):
+///     `ws` is null, while (1)–(5) and the tone all still pass;
+///   - delete the `Opening::WebSocket` arm from `conn::peek_opening` ⇒ B reads
+///     `GET ` as a length prefix and refuses with
+///     `first control frame too large: 542393671 bytes`; no mux ever forms.
+#[test]
+fn a_websocket_mux_carries_everything_the_bare_one_did() {
+    let (a, b, fwd, url) = tier_two_ws_pair("t2ws");
+
+    eventually("the ws mux to come up on the dialling side", || {
+        a.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+    eventually("the ws mux to come up on the accepting side", || {
+        b.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+
+    // (1) A's route to B is the tunnel, and only the tunnel.
+    let b_record = a.peer(&b.fingerprint());
+    assert_eq!(
+        b_record["port"].as_u64(),
+        Some(fwd.port as u64),
+        "A recorded something other than the forwarder as B's port: {b_record}"
+    );
+    assert_ne!(fwd.port, b.control_port(), "the forwarder and B's control port coincided");
+
+    // (2) B cannot tell where A is.
+    let seen = b.conn_peer_addr(&a.fingerprint()).expect("B has a live channel to A");
+    assert!(seen.ip().is_loopback(), "the forwarder was expected on loopback, saw {seen}");
+    assert_ne!(seen.port(), a.control_port(), "B saw A's own control port");
+
+    // (3) ...and identity survived anyway, in both directions.
+    assert_eq!(
+        b.peer(&a.fingerprint())["fingerprint"].as_str(),
+        Some(a.fingerprint().as_str()),
+        "B did not end up with A's fingerprint"
+    );
+    assert_eq!(a.peer(&b.fingerprint())["online"], Value::Bool(true));
+
+    // Audio, both directions, on the one connection.
+    for kind in [KIND_SPK, audiohub_ipc::KIND_MIC] {
+        a.ok(
+            methods::SESSION_OPEN,
+            json!({
+                "peer": b.fingerprint(), "kind": kind, "source": SOURCE_TONE,
+                "freq": 1000.0, "verify_freq": 1000.0
+            }),
+        );
+    }
+    eventually_within(Duration::from_secs(25), "B's 1 kHz verdict over the ws mux", || {
+        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
+    });
+    eventually_within(Duration::from_secs(25), "A's 1 kHz verdict over the ws mux", || {
+        a.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
+    });
+    let snr = b.recv_verdict().expect("checked above")["snr_db"]
+        .as_f64()
+        .expect("a detected verdict carries an SNR");
+    assert!(snr >= 40.0, "1 kHz over a loopback ws mux should be clean, got {snr:.1} dB SNR");
+
+    // (4) The control plane rode the same connection.
+    let a_mux = a.mux_link().expect("still up");
+    let b_mux = b.mux_link().expect("still up");
+    for (who, m) in [("A", &a_mux), ("B", &b_mux)] {
+        assert!(
+            m["control_frames_written"].as_u64().unwrap_or(0) > 0,
+            "{who} never wrote a control frame onto the ws mux: {m}"
+        );
+        assert!(
+            m["control_frames_read"].as_u64().unwrap_or(0) > 0,
+            "{who} never read a control frame off the ws mux: {m}"
+        );
+    }
+
+    // (5) ...and so did the media. `received` first, then `frames_read`: both
+    // are still climbing, and reading them the other way round reports a false
+    // failure on a healthy link (measured in P3).
+    let sessions = b.ok(methods::SESSION_LIST, json!({}));
+    let recv = sessions
+        .as_array()
+        .and_then(|ss| ss.iter().find(|s| s["dir"].as_str() == Some("recv")))
+        .expect("B must have a receiving session")
+        .clone();
+    let received = recv["stats"]["received"].as_u64().expect("a received count");
+    let read = b.tcp_link().expect("the mux's media half is a tcp_media row")["frames_read"]
+        .as_u64()
+        .expect("a read count");
+    assert!(received > 0, "the session reports no packets at all");
+    assert!(
+        read >= received,
+        "the session counted {received} packets but only {read} came off the ws mux, so the \
+         rest arrived over UDP — the downgrade is decorative"
+    );
+    assert_eq!(recv["stats"]["lost"].as_u64(), Some(0), "a loopback ws mux lost a packet: {recv}");
+    assert!(fwd.carried() > 0, "the forwarder carried nothing");
+
+    // (6) **P6's own assertion.** Everything above is equally true of P5's
+    // bare-TCP mux; this is the only line that is not.
+    for (who, m) in [("A", &a_mux), ("B", &b_mux)] {
+        let ws = ws_block(m).unwrap_or_else(|| {
+            panic!("{who}'s mux has no ws block, so it is the bare TCP carrier and {url} did \
+                    nothing: {m}")
+        });
+        assert!(
+            ws["messages_written"].as_u64().unwrap_or(0) > 0
+                && ws["messages_read"].as_u64().unwrap_or(0) > 0,
+            "{who}'s ws carrier moved no messages: {ws}"
+        );
+    }
+}
+
+/// **Acceptance 3 (design §6, P6): 90 s with no media, and the heartbeat keeps
+/// running.**
+///
+/// # What this measures, and what it cannot
+///
+/// The criterion names two things: the connection is still alive, and the
+/// `Ping`/`Pong` counts grow. **Only the second has any resolving power here,
+/// and the reason is worth stating rather than leaving for someone to
+/// rediscover.** A loopback connection is never reaped — there is no
+/// intermediary with an idle timeout — so "still alive after 90 s" is true with
+/// the heartbeat deleted, and would be true with the whole WebSocket layer
+/// deleted. Adding an idle-reaping forwarder does not rescue it either: tier 2
+/// carries the control plane on the same connection, and that plane pings at
+/// 1 Hz, so **bytes cross this link every second whatever the WebSocket layer
+/// does**. There is no rig on one machine in which liveness discriminates.
+///
+/// The counters do, exactly and cheaply: they are zero unless
+/// `mux::write_loop` calls `WsWriter::tick`, and `pongs_read` in particular is
+/// zero unless the *peer's* reader surfaced our `Ping` and the *peer's* writer
+/// answered it — a full round trip through both halves of the design.
+///
+/// Injection controls (run 2026-08-09, both red):
+///   - delete the `w.tick()` call from `mux::write_loop` ⇒ every counter stays
+///     0 while the link stays `alive: true` and the peers stay online, which is
+///     precisely the "liveness proves nothing" point above, demonstrated;
+///   - delete the `take_pongs` loop from `WsWriter::tick` ⇒ `pings_written`
+///     still climbs on both sides and `pongs_read` stays 0 on both, i.e. each
+///     side is pinging into a peer that never answers.
+///
+/// # Why `#[ignore]`
+///
+/// Ninety seconds of wall clock, by the criterion's own wording. It runs
+/// deliberately, like P3's and P4's measurements:
+///
+/// ```text
+/// cargo test -p audiohubd --lib ninety_seconds -- --ignored --nocapture
+/// ```
+///
+/// The same properties on a compressed clock are in the default suite as
+/// `wsshell::tests::the_heartbeat_pings_and_answers_pings`.
+#[test]
+#[ignore = "wall-clock measurement: 90 s by the acceptance's own wording (see the doc comment)"]
+fn the_websocket_heartbeat_survives_ninety_seconds_without_media() {
+    let (a, b, _fwd, _url) = tier_two_ws_pair("t2ws-idle");
+    eventually("the ws mux to come up", || {
+        a.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+    });
+    // No session is ever opened: "no media traffic" is the injected condition,
+    // and the way to inject it is not to produce any.
+    assert!(
+        a.ok(methods::SESSION_LIST, json!({})).as_array().is_none_or(|v| v.is_empty()),
+        "this test is about an idle link and something opened a session"
+    );
+
+    let idle = Duration::from_secs(90);
+    let t0 = Instant::now();
+    std::thread::sleep(idle);
+
+    for (who, n, peer) in [("A", &a, b.fingerprint()), ("B", &b, a.fingerprint())] {
+        let m = n.mux_link().unwrap_or_else(|| panic!("{who}'s mux is gone after {idle:?}"));
+        assert_eq!(m["alive"], Value::Bool(true), "{who}'s mux died while idle: {m}");
+        assert_eq!(n.peer(&peer)["online"], Value::Bool(true), "{who} lost the peer while idle");
+        let ws = ws_block(&m).unwrap_or_else(|| panic!("{who} is not on the ws carrier: {m}"));
+
+        // Four counters, and each names a different half of the mechanism.
+        // Expected count at PING_INTERVAL over 90 s is 4; the floor is 3 so a
+        // loaded host cannot fail a working heartbeat on a rounding boundary.
+        let expect = (idle.as_secs_f64() / crate::wsshell::PING_INTERVAL.as_secs_f64()) as u64;
+        for key in ["pings_written", "pongs_read", "pings_read", "pongs_written"] {
+            let got = ws_count(&m, key);
+            assert!(
+                got >= 3,
+                "{who}: {key} = {got} after {idle:?} of no media (about {expect} expected); the \
+                 heartbeat is not running, and on loopback nothing else would have shown it: {ws}"
+            );
+        }
+        // The injected condition, asserted rather than assumed: no *media*
+        // crossed. Without it, a link that had somehow carried traffic would
+        // make the four numbers above meaningless.
+        //
+        // ⚠ **Media frames, not messages.** The first version of this checked
+        // `messages_read == 0` and failed at 177 on a working link — because a
+        // tier 2 control frame is also a binary message, and the control plane
+        // pings at 1 Hz on this very connection. That reading is worth keeping:
+        // it is the same fact that makes liveness undiscriminating here. An
+        // idle tier 2 link is never byte-idle, so nothing downstream of us can
+        // tell the WebSocket heartbeat apart from the control one — only these
+        // counters can.
+        assert_eq!(
+            n.tcp_link().and_then(|l| l["frames_read"].as_u64()),
+            Some(0),
+            "{who} read media frames on a link that was supposed to be idle: {ws}"
+        );
+    }
+    eprintln!(
+        "[P6 acceptance 3] {:?} idle: A {:?} / B {:?}",
+        t0.elapsed(),
+        ws_block(&a.mux_link().unwrap()),
+        ws_block(&b.mux_link().unwrap())
+    );
+}

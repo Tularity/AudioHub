@@ -256,6 +256,30 @@ pub(crate) struct PeerTransport {
     pub dial_policy: String,
     #[serde(skip)]
     pub dial_policy_reset_from: Option<String>,
+    /// P6: a URL-shaped address for this peer (`ws://host[:port][/path]`),
+    /// empty when the peer is reached by `host:port`.
+    ///
+    /// # Why the address decides the transport, and why it lives here
+    ///
+    /// plan §16.2: tier 2 is manual **because its premise cannot be observed**
+    /// — a peer behind an L7-only tunnel and a peer that is switched off look
+    /// identical from here. So the decision is delegated to the one party who
+    /// does know, in the form they already have to supply: the address. A URL
+    /// says "reach me by WebSocket" the way `192.168.1.5:47810` says "reach me
+    /// directly", and neither needs a second setting to agree with.
+    ///
+    /// It sits in this file rather than in `paired_peers.json` for the reason
+    /// the file header gives: `PeerStore::upsert` rebuilds a record from the
+    /// wire and would erase it at the peer's next reconnect — and a peer whose
+    /// tunnel address vanishes on reconnect is exactly the "I pinned it and it
+    /// came back auto" complaint this file exists to prevent.
+    ///
+    /// Loose on the way in like everything else here: an unparseable URL is
+    /// reset and reported rather than left in place to fail at dial time.
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(skip)]
+    pub endpoint_reset_from: Option<String>,
 }
 
 fn auto_tier() -> String {
@@ -275,6 +299,8 @@ impl Default for PeerTransport {
             transport_tier_reset_from: None,
             dial_policy: both_dial(),
             dial_policy_reset_from: None,
+            endpoint: String::new(),
+            endpoint_reset_from: None,
         }
     }
 }
@@ -301,6 +327,9 @@ impl PeerTransport {
         if DialPolicy::parse(&self.dial_policy).is_none() {
             self.dial_policy_reset_from =
                 Some(std::mem::replace(&mut self.dial_policy, both_dial()));
+        }
+        if !self.endpoint.is_empty() && crate::wsshell::WsUrl::parse(&self.endpoint).is_err() {
+            self.endpoint_reset_from = Some(std::mem::replace(&mut self.endpoint, String::new()));
         }
     }
 }
@@ -366,6 +395,12 @@ impl PeerTransportStore {
                              本 build 不认识，已重置为 both"
                         );
                     }
+                    if let Some(old) = &t.endpoint_reset_from {
+                        crate::dlog!(
+                            "[audiohubd] peer_transport.json {fp}: 对端地址 `{old}` \
+                             解析不出来，已清空（该对端改按 host:port 拨号）"
+                        );
+                    }
                     for (dir, d) in [("recv", &t.recv), ("send", &t.send)] {
                         if let Some(old) = &d.latency_reset_from {
                             crate::dlog!(
@@ -424,6 +459,19 @@ impl PeerTransportStore {
     /// is what every peer did before this setting existed.
     pub(crate) fn dial_policy(&self, fp: &str) -> DialPolicy {
         self.map.get(fp).map_or(DialPolicy::Both, PeerTransport::dial_policy)
+    }
+
+    /// The peer's URL-shaped address, if it has one and it parses.
+    ///
+    /// Returns the parsed value rather than the string: every caller wants the
+    /// host, the port and the path, and handing out the string would put a
+    /// second parse (and a second set of accepted spellings) at each of them.
+    pub(crate) fn endpoint(&self, fp: &str) -> Option<crate::wsshell::WsUrl> {
+        let raw = self.map.get(fp).map(|t| t.endpoint.as_str()).unwrap_or("");
+        if raw.is_empty() {
+            return None;
+        }
+        crate::wsshell::WsUrl::parse(raw).ok()
     }
 
     /// 解除配对时清掉。留着的话，重新配对同一台机器会**静默继承**上一段关系的

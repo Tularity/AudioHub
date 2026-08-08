@@ -157,6 +157,77 @@ impl ControlIo for ControlTransport {
     }
 }
 
+// ------------------------------------------------------------------ carriers
+
+/// What the mux's frames travel on.
+///
+/// P5 shipped the left arm; P6 adds the right (design §6 P6). Both are
+/// selected before the first byte, from the **form of the peer's address**
+/// (plan §16.2): a `ws://` URL asks for the shell, a `host:port` pinned to
+/// tier 2 does not. An enum rather than `Box<dyn>` for the same reason
+/// [`ControlTransport`] is one — the set is closed, and the compiler asking
+/// about a new arm at every match is the point.
+pub(crate) enum MuxRx {
+    Tcp(TcpStream),
+    Ws(crate::wsshell::WsReader),
+}
+
+impl Read for MuxRx {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            MuxRx::Tcp(s) => s.read(buf),
+            MuxRx::Ws(w) => w.read(buf),
+        }
+    }
+}
+
+pub(crate) enum MuxTx {
+    Tcp(TcpStream),
+    Ws(crate::wsshell::WsWriter),
+}
+
+impl Write for MuxTx {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            MuxTx::Tcp(s) => s.write(buf),
+            MuxTx::Ws(w) => w.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            MuxTx::Tcp(s) => s.flush(),
+            MuxTx::Ws(w) => w.flush(),
+        }
+    }
+}
+
+/// A carrier's own periodic work, run from the writer's park cycle.
+///
+/// On TCP there is none: tier 0/1/2-over-TCP already have an application-level
+/// `Ping` on the control plane, and a bare TCP connection through a tunnel that
+/// reaps idle connections was never going to survive anyway. On WebSocket this
+/// is the heartbeat plan §16 asks for, and it must run on the writer because
+/// the writer is the only thread allowed to touch the socket's send side.
+pub(crate) trait Heartbeat {
+    fn tick(&mut self) -> std::io::Result<()>;
+}
+
+impl Heartbeat for MuxTx {
+    fn tick(&mut self) -> std::io::Result<()> {
+        match self {
+            MuxTx::Tcp(_) => Ok(()),
+            MuxTx::Ws(w) => w.tick(),
+        }
+    }
+}
+
+// **Deliberately no blanket `impl<T: Write> Heartbeat for T`.** It would apply
+// to `MuxTx` as well, and the compiler would then have two ways to answer
+// `w.tick()` — with the blanket one, which does nothing, being the one autoref
+// picks. The failure mode is a WebSocket carrier whose heartbeat silently
+// stops, i.e. a connection that dies only in tunnels and only after minutes.
+// Every writer sink names its own implementation instead.
+
 // ------------------------------------------------------------------ the link
 
 /// One multiplexed connection: the socket, the control queues and the media
@@ -174,6 +245,13 @@ pub(crate) struct MuxLink {
     /// Kept so teardown can shut the socket down under a thread blocked in
     /// `read` or `write`; a `try_clone` of the one the reader owns.
     sock: TcpStream,
+    /// The WebSocket carrier's counters, or `None` on the raw-TCP carrier.
+    ///
+    /// **An `Option` and not zeros.** A tier 2 link over bare TCP has no
+    /// heartbeat to report, and reporting `0` would put "this carrier has no
+    /// pings" and "this carrier's pings have stopped" in the same cell — the
+    /// one thing §14's telemetry rules forbid outright.
+    ws: Option<Arc<crate::wsshell::WsShared>>,
     alive: AtomicBool,
     keepalives_read: AtomicU64,
     control_frames_written: AtomicU64,
@@ -205,6 +283,24 @@ impl MuxLink {
         self.keepalives_read.load(Ordering::Relaxed)
     }
 
+    /// The WebSocket carrier's heartbeat counters, or `None` on bare TCP.
+    ///
+    /// These four numbers are the **only** observable that separates "the
+    /// keepalive is working" from "the link happens not to have been reaped
+    /// yet", and a loopback link is never reaped — so on any test rig the
+    /// counters are the entire evidence and the liveness is none of it.
+    pub(crate) fn ws_heartbeat(&self) -> Option<serde_json::Value> {
+        let w = self.ws.as_ref()?;
+        Some(serde_json::json!({
+            "pings_written": w.pings_written.load(Ordering::Relaxed),
+            "pongs_read": w.pongs_read.load(Ordering::Relaxed),
+            "pings_read": w.pings_read.load(Ordering::Relaxed),
+            "pongs_written": w.pongs_written.load(Ordering::Relaxed),
+            "messages_written": w.messages_written.load(Ordering::Relaxed),
+            "messages_read": w.messages_read.load(Ordering::Relaxed),
+        }))
+    }
+
     /// A link with no threads behind it, for tests that need a
     /// [`crate::tcpmedia::MediaPath::Framed`] to exist rather than to carry
     /// anything. The socket is a loopback client whose far end the caller keeps
@@ -216,6 +312,7 @@ impl MuxLink {
             io: Arc::new(MuxIo::new(peer)),
             media,
             sock,
+            ws: None,
             alive: AtomicBool::new(true),
             keepalives_read: AtomicU64::new(0),
             control_frames_written: AtomicU64::new(0),
@@ -251,10 +348,23 @@ impl MuxLink {
 pub(crate) fn dial(
     inner: &Arc<DaemonInner>,
     addr: SocketAddr,
+    url: Option<&crate::wsshell::WsUrl>,
 ) -> Result<(Arc<MuxLink>, ControlTransport)> {
     let s = TcpStream::connect_timeout(&addr, crate::conn::CONNECT_TIMEOUT)
         .with_context(|| format!("connect {addr} for a multiplexed (tier 2) connection"))?;
-    start(inner, s)
+    match url {
+        // The shell goes on **before** anything else touches the socket: from
+        // `start`'s point of view the carrier is already a byte stream, which
+        // is what keeps every line below this identical on both carriers.
+        Some(u) => {
+            let (rx, tx) = crate::wsshell::connect(s.try_clone()?, u)?;
+            start(inner, s, MuxRx::Ws(rx), MuxTx::Ws(tx))
+        }
+        None => {
+            let (rx, tx) = (s.try_clone()?, s.try_clone()?);
+            start(inner, s, MuxRx::Tcp(rx), MuxTx::Tcp(tx))
+        }
+    }
 }
 
 /// Take over an accepted socket whose first bytes are a frame header.
@@ -262,18 +372,36 @@ pub(crate) fn accept(
     inner: &Arc<DaemonInner>,
     s: TcpStream,
 ) -> Result<(Arc<MuxLink>, ControlTransport)> {
-    start(inner, s)
+    let (rx, tx) = (s.try_clone()?, s.try_clone()?);
+    start(inner, s, MuxRx::Tcp(rx), MuxTx::Tcp(tx))
+}
+
+/// Take over an accepted socket whose first bytes are an HTTP upgrade request.
+pub(crate) fn accept_ws(
+    inner: &Arc<DaemonInner>,
+    s: TcpStream,
+) -> Result<(Arc<MuxLink>, ControlTransport)> {
+    let (rx, tx) = crate::wsshell::accept(s.try_clone()?)?;
+    start(inner, s, MuxRx::Ws(rx), MuxTx::Ws(tx))
 }
 
 fn start(
     inner: &Arc<DaemonInner>,
-    mut s: TcpStream,
+    s: TcpStream,
+    rx: MuxRx,
+    tx: MuxTx,
 ) -> Result<(Arc<MuxLink>, ControlTransport)> {
     // **Media plane rules apply to the whole connection**, because on tier 2
     // there is only one. Nagle would coalesce 10 ms frames into ACK-bound
     // bursts — ~40 ms of jitter with no visible cause in any of our own
     // numbers — so it is a hard failure here rather than the `let _ =` the
     // control plane can afford at 1 Hz.
+    //
+    // Set on `s` and inherited by every carrier half: `try_clone` duplicates a
+    // descriptor, and these options live on the open file description, so one
+    // call arms all of them. (That sharing is also why the WebSocket carrier
+    // cannot hand the reader a shorter timeout than the writer — see
+    // `wsshell`'s module note.)
     s.set_nodelay(true).context("tier 2 requires TCP_NODELAY")?;
     s.set_nonblocking(false)?;
     s.set_write_timeout(Some(WRITE_SLICE))?;
@@ -286,13 +414,17 @@ fn start(
     // `conn::register_conn` has a name for it. Diagnostics only; nothing
     // dispatches on it.
     let media = Arc::new(TcpMediaLink::new(String::new(), peer, inner.tx_bps));
-    let wsock = s.try_clone().context("clone the mux socket for the writer")?;
     let ksock = s.try_clone().context("clone the mux socket for teardown")?;
+    let ws = match (&rx, &tx) {
+        (MuxRx::Ws(r), MuxTx::Ws(_)) => Some(r.shared().clone()),
+        _ => None,
+    };
 
     let link = Arc::new(MuxLink {
         io: io.clone(),
         media,
         sock: ksock,
+        ws,
         alive: AtomicBool::new(true),
         keepalives_read: AtomicU64::new(0),
         control_frames_written: AtomicU64::new(0),
@@ -301,21 +433,22 @@ fn start(
 
     let wlink = link.clone();
     let winner = inner.clone();
-    let mut wsock = wsock;
+    let mut tx = tx;
     std::thread::Builder::new()
         .name("ahb-mux-tx".into())
         .spawn(move || {
             crate::engine::raise_audio_thread_qos("mux_write_loop");
-            write_loop(&wlink, &mut wsock, &winner.shutdown);
+            write_loop(&wlink, &mut tx, &winner.shutdown);
         })
         .context("spawn the tier 2 writer")?;
 
     let rlink = link.clone();
     let rinner = inner.clone();
+    let mut rx = rx;
     std::thread::Builder::new()
         .name("ahb-mux-rx".into())
         .spawn(move || {
-            read_loop(&rinner, &rlink, &mut s, peer);
+            read_loop(&rinner, &rlink, &mut rx, peer);
             // Whatever ended the reader ends the connection: the control stream
             // and the media path are the same socket, so there is no state in
             // which one of them survives.
@@ -383,7 +516,7 @@ fn control_may_go(link: &MuxLink, last_control: Instant) -> bool {
 ///
 /// Generic over the sink so the starvation property can be exercised against a
 /// writer that blocks on command rather than against a network.
-pub(crate) fn write_loop<W: Write>(link: &MuxLink, w: &mut W, shutdown: &AtomicBool) {
+pub(crate) fn write_loop<W: Write + Heartbeat>(link: &MuxLink, w: &mut W, shutdown: &AtomicBool) {
     link.media.adopt_writer_thread();
     link.io.writer.adopt_current();
     // One bucket for the whole connection, because there is one wire. Charging
@@ -445,6 +578,15 @@ pub(crate) fn write_loop<W: Write>(link: &MuxLink, w: &mut W, shutdown: &AtomicB
         if !link.media.is_alive() || shutdown.load(Ordering::SeqCst) || link.io.is_closed() {
             return;
         }
+        // The carrier's own periodic work, on the one thread allowed to write.
+        // Run before the park rather than after it so a heartbeat that comes
+        // due while the link is busy still goes out on the next lull instead of
+        // waiting for a park slice that a saturated link never reaches.
+        if let Err(e) = w.tick() {
+            dlog!("[audiohubd] tier2 mux {}: carrier heartbeat: {e}", link.media.peer);
+            link.kill();
+            return;
+        }
         // Parked on the media queue's flag, re-checking control in the same
         // breath: both producers wake this thread, so both have to be part of
         // the "is there work?" question or one of them loses its wakeup.
@@ -469,7 +611,7 @@ pub(crate) fn write_loop<W: Write>(link: &MuxLink, w: &mut W, shutdown: &AtomicB
 /// this transport for free. Control goes into the byte queue the control stack
 /// reads from, with no interpretation at all: this layer does not know what a
 /// `ControlMsg` is and must not learn.
-fn read_loop(inner: &Arc<DaemonInner>, link: &MuxLink, s: &mut TcpStream, from: SocketAddr) {
+fn read_loop(inner: &Arc<DaemonInner>, link: &MuxLink, s: &mut MuxRx, from: SocketAddr) {
     let mut dec = FrameDecoder::new();
     let mut scratch = [0u8; 8192];
     loop {
@@ -559,6 +701,15 @@ mod tests {
         dec: FrameDecoder,
     }
 
+    /// Named rather than blanket-derived: see the note next to [`Heartbeat`].
+    /// A recorder has no carrier to keep alive, and saying so explicitly is
+    /// what keeps `MuxTx`'s real implementation from being shadowed.
+    impl Heartbeat for Recorder {
+        fn tick(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     impl Write for Recorder {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             let mut off = 0usize;
@@ -615,6 +766,7 @@ mod tests {
             io: Arc::new(MuxIo::new(peer)),
             media: Arc::new(TcpMediaLink::new("fp".into(), peer, 0)),
             sock: a,
+            ws: None,
             alive: AtomicBool::new(true),
             keepalives_read: AtomicU64::new(0),
             control_frames_written: AtomicU64::new(0),

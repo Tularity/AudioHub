@@ -16,6 +16,7 @@ import { toast } from '../components/Toasts';
 import { bridgeTargets } from '../lib/bridge';
 import { backendParam, normalizeSource, SOURCE_SYSAUDIO } from '../lib/sysaudio';
 import { fmt } from '../lib/fmt';
+import { classifyPeerAddr } from '../lib/peerAddr';
 import { createBusySet, useTick } from '../lib/hooks';
 import { t, joinPhrases } from '../i18n';
 import type { MsgKey } from '../i18n';
@@ -601,6 +602,19 @@ function AddPeerForm({ open, onClose }: { open: boolean; onClose: () => void }) 
       peerRef.current?.focus();
       return;
     }
+    // M8 P6：这一格接受 `ws://…`（Tier 2 over WebSocket），因为地址本身就是
+    // 传输选择。拒的只有两种：解析不出来的 URL，和本 build 拨不动的 `wss://`。
+    // **拒在这里而不是让 daemon 拒**：一个存得下、拨不动的地址在界面上看起来
+    // 完全正常，直到用户去连它。
+    const shape = classifyPeerAddr(a);
+    if (shape.kind === 'badUrl') {
+      toast(t(`addr.badUrl.${shape.reason}`, { addr: a }), 'warn');
+      return;
+    }
+    if (shape.kind === 'wss') {
+      toast(t('addr.wssUnsupported'), 'warn');
+      return;
+    }
     setPending(true);
     try {
       // 超时由 ipc/client.ts 的方法级表给出（daemon 最坏 TCP 5s + 握手 10s）。
@@ -639,7 +653,7 @@ function AddPeerForm({ open, onClose }: { open: boolean; onClose: () => void }) 
           <input
             className="input"
             data-testid="add-peer-input"
-            placeholder={t('peers.form.addrPlaceholder')}
+            placeholder={t('peers.form.addrPlaceholder2')}
             autoComplete="off"
             spellCheck="false"
             value={addr}

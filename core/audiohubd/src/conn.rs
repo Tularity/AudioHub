@@ -141,11 +141,13 @@ fn handle_inbound(
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
 
-    // M8 tier 2: a multiplexed connection announces itself by starting with a
-    // frame header instead of a length prefix, and the two cannot be confused —
-    // see `peek_looks_multiplexed`.
-    if peek_looks_multiplexed(&stream)? {
-        return mux_inbound(inner, stream, addr, preauth);
+    // M8 tier 2: a multiplexed connection announces itself by its first four
+    // bytes, and none of the three openings can be confused for another — see
+    // `peek_opening`.
+    match peek_opening(&stream)? {
+        Opening::Framed => return mux_inbound(inner, stream, addr, preauth, false),
+        Opening::WebSocket => return mux_inbound(inner, stream, addr, preauth, true),
+        Opening::Control => {}
     }
 
     // dispatch on a peeked copy: verify_responder / pair_responder each read
@@ -288,23 +290,42 @@ fn release_pairing_pin(inner: &DaemonInner, pin: &str, ok: bool) {
     }
 }
 
-/// Does this connection speak frames rather than a bare control stream?
+/// What kind of connection is this, judged by its first four bytes?
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Opening {
+    /// Tier 0/1 control: `u32 little-endian length ‖ JSON`.
+    Control,
+    /// Tier 2 over bare TCP: a 40-byte packet header.
+    Framed,
+    /// Tier 2 inside a WebSocket: an HTTP upgrade request (P6).
+    WebSocket,
+}
+
+/// # Why the three can never be confused
 ///
-/// # Why the two can never be confused
+/// A control connection opens with a little-endian length that
+/// [`CONTROL_MAX_FRAME`] caps at 65536. The other two open with values that are
+/// nowhere near it when read as one:
 ///
-/// A tier 0/1 control connection opens with `u32 little-endian length ‖ JSON`.
-/// A multiplexed one opens with a 40-byte packet header, whose first four bytes
-/// are the packet magic — `b"AUHB"`, which read as a little-endian length is
-/// **1_112_036_673**, seventeen thousand times [`CONTROL_MAX_FRAME`]. So the
-/// discriminator is not a heuristic: no legal control frame can ever take that
-/// value, and a build without this branch refuses a mux connection loudly
-/// rather than misreading one. Verified by injection (2026-08-08): deleting
-/// this branch produces `first control frame too large: 1112036673 bytes` and
-/// the pair never forms.
+/// | opening | first four bytes | as a LE u32 |
+/// |---|---|---|
+/// | mux frame | `b"AUHB"` | 1_112_036_673 |
+/// | upgrade   | `b"GET "` | 542_393_671 |
+///
+/// Seventeen thousand and eight thousand times the cap respectively, so the
+/// discriminator is arithmetic rather than heuristic: **no legal control frame
+/// can ever take either value.** A build without a branch refuses that kind of
+/// connection loudly rather than misreading one — verified by injection
+/// (2026-08-08 for the `MAGIC` branch, 2026-08-09 for `GET `): the peer reports
+/// `first control frame too large: …` and no pair forms.
+///
+/// `GET` specifically, and no other method: RFC 6455 §4.1 allows the WebSocket
+/// upgrade on nothing else, so widening this would only widen what a stranger
+/// can steer into the upgrade path.
 ///
 /// The check is a `peek`, so the bytes stay in the socket for whichever path
 /// takes over.
-fn peek_looks_multiplexed(stream: &TcpStream) -> Result<bool> {
+fn peek_opening(stream: &TcpStream) -> Result<Opening> {
     let mut buf = [0u8; 4];
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
@@ -313,7 +334,15 @@ fn peek_looks_multiplexed(stream: &TcpStream) -> Result<bool> {
         }
         match stream.peek(&mut buf) {
             Ok(0) => bail!("peer closed before the first frame"),
-            Ok(n) if n >= 4 => return Ok(buf == audiohub_net::packet::MAGIC),
+            Ok(n) if n >= 4 => {
+                return Ok(if buf == audiohub_net::packet::MAGIC {
+                    Opening::Framed
+                } else if &buf == b"GET " {
+                    Opening::WebSocket
+                } else {
+                    Opening::Control
+                })
+            }
             Ok(_) => {}
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(e) => return Err(e).context("peek the first four bytes"),
@@ -335,8 +364,13 @@ fn mux_inbound(
     stream: TcpStream,
     addr: SocketAddr,
     preauth: PreauthGuard,
+    websocket: bool,
 ) -> Result<()> {
-    let (link, io) = crate::mux::accept(inner, stream)?;
+    let (link, io) = if websocket {
+        crate::mux::accept_ws(inner, stream)?
+    } else {
+        crate::mux::accept(inner, stream)?
+    };
     // Every early return from here on has to take the mux with it: its reader
     // and writer threads are already running, and a `ConnShared` that never
     // gets built is not going to tear them down later.
@@ -1625,6 +1659,10 @@ fn target_addr(peer: &PairedPeer, addr_override: Option<&str>) -> Result<SocketA
             format!("{}:{}", ip, peer.port)
         }
     };
+    resolve(&s)
+}
+
+fn resolve(s: &str) -> Result<SocketAddr> {
     s.to_socket_addrs()
         .with_context(|| format!("resolve {s}"))?
         .next()
@@ -1708,7 +1746,24 @@ pub(crate) fn connect_peer(
             peer.fingerprint
         );
     }
-    let addr = target_addr(&peer, addr_override)?;
+    // P6: a URL-shaped address both *is* the address and *selects* the carrier
+    // (plan §16.2). Taken before `target_addr` because it answers the same
+    // question — where do we dial — from a source `paired_peers.json` cannot
+    // hold (see `peer_transport::PeerTransport::endpoint`).
+    let endpoint = match addr_override {
+        // An explicit URL on the call wins, and is not persisted here: the
+        // caller asked for one connection, not for a setting.
+        Some(a) if crate::wsshell::WsUrl::looks_like_url(a) => Some(crate::wsshell::WsUrl::parse(a)?),
+        Some(_) => None,
+        None => lk(&inner.peer_transport).endpoint(&peer.fingerprint),
+    };
+    if let Some(u) = &endpoint {
+        u.require_plaintext()?;
+    }
+    let addr = match &endpoint {
+        Some(u) => resolve(&u.authority())?,
+        None => target_addr(&peer, addr_override)?,
+    };
     // Never dial ourselves. Measured on 2026-07-31: a peer whose record pointed
     // at this daemon's own control endpoint made the session coordinator open a
     // TCP to us, we answered our own VerifyHello with `Unpaired` (our own
@@ -1728,9 +1783,15 @@ pub(crate) fn connect_peer(
     // to be chosen before the first byte — plan §16.2 makes tier 2 manual
     // precisely because nothing observable distinguishes "the tunnel is L7
     // only" from "the peer is off", so there is nothing to probe for.
+    // A URL is a tier 2 request on its own — it is the only thing the user can
+    // say that means "this peer is behind an application-layer tunnel", and
+    // requiring a second setting to agree with it would only create a state
+    // where the two disagree.
+    let tier2 = endpoint.is_some()
+        || lk(&inner.peer_transport).tier(&peer.fingerprint) == TransportTier::Tier2;
     let (mut trial, mut stream) =
-        if lk(&inner.peer_transport).tier(&peer.fingerprint) == TransportTier::Tier2 {
-            let (link, io) = crate::mux::dial(inner, addr)?;
+        if tier2 {
+            let (link, io) = crate::mux::dial(inner, addr, endpoint.as_ref())?;
             (MuxOnTrial(Some(link)), io)
         } else {
             let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)

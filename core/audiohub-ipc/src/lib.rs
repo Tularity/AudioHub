@@ -349,6 +349,16 @@ pub struct PeerTransportView {
     pub dial_policy: String,
     #[serde(default)]
     pub dial_policy_reset_from: Option<String>,
+    /// P6：URL 形态的对端地址（`ws://host[:port][/path]`），没有则为空串。
+    ///
+    /// **地址即传输选择**（plan §16.2）：填 URL 就是要求走 WebSocket 外壳，
+    /// 与「填 `IP:端口` 就是要求直连」同一条语义，不需要第二个开关来附和它。
+    #[serde(default)]
+    pub endpoint: String,
+    /// 装载时没认出来、已被清空的那个 URL。与其余 `*_reset_from` 同纪律：
+    /// **绝不落盘**，只为让 UI 说得出「你存的这串我读不懂」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_reset_from: Option<String>,
 }
 
 fn default_dial_policy() -> String {

@@ -1071,8 +1071,26 @@ AhCtlDeviceControl(
 
         BOOLEAN input   = (req.flags & AH_NOTIFYFLAG_INPUT) ? TRUE : FALSE;
         BOOLEAN muted   = (req.flags & AH_NOTIFYFLAG_MUTED) ? TRUE : FALSE;
-        LONG    level   = AhScalarQ16ToKsVolume(req.scalar_q16);
         BOOLEAN changed = FALSE;
+
+        //
+        // NORMALISED, like the other writer. Two paths land in this one cell:
+        // basetopo.cpp's KSPROPERTY_TYPE_SET (the user moved this endpoint's
+        // slider), which normalises, and this one (a peer's real device moved),
+        // which did not. The cell is what KSPROPERTY_AUDIO_VOLUMELEVEL GET
+        // answers with, so which path wrote last decided whether the driver
+        // replied on the 0.5 dB grid its own KSPROPERTY_MEMBERSLIST advertises
+        // in kshelper.cpp. The user-visible shape of that disagreement is a
+        // slider that jumps the first time it is touched after a remote change.
+        //
+        // Snapping is safe to add here only because the mapping is idempotent
+        // under it -- push, read back, push again lands on the same level, so
+        // the sync loop still settles instead of ratcheting. That is not an
+        // argument, it is a test: `the_sync_loop_reaches_a_fixed_point_in_one_
+        // settle` in core/audiohubd/src/halbridge_win.rs runs the loop WITH the
+        // grid applied over all 65537 scalars.
+        //
+        LONG level = VOLUME_NORMALIZE_IN_RANGE(AhScalarQ16ToKsVolume(req.scalar_q16));
 
         for (ULONG ch = 0; ch < AH_VOLUME_MAX_CHANNELS; ch++)
         {

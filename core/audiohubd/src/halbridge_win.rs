@@ -1051,6 +1051,469 @@ pub mod wire {
     }
 }
 
+// ---------------------------------------------------------------- volmap
+
+/// The dB <-> scalar mapping the DRIVER performs, mirrored here so it can be
+/// checked on a machine that has no driver on it.
+///
+/// # Why this module exists at all, given the daemon never sees dB
+///
+/// Every user-mode participant carries volume as a 0..1 amplitude scalar:
+/// `audiohub-core`'s Windows backend calls `GetMasterVolumeLevelScalar` /
+/// `SetMasterVolumeLevelScalar`, the IOCTL carries `scalar_q16` (16.16 fixed
+/// point, `AudioHubIoctl.h:482`), and `ControlEvent::scalar` divides by 65536.
+/// KS is the ONLY place dB appears: `KSPROPERTY_AUDIO_VOLUMELEVEL` is a signed
+/// LONG in 1/65536 dB. So the conversion exists at exactly two call sites, both
+/// inside the driver — `ctldevice.cpp` (daemon push -> KS store) and
+/// `basetopo.cpp` (KS store -> event out).
+///
+/// That is a good design and it has one bad consequence: the arithmetic lives
+/// where it can only be run by installing a kernel driver on a machine reached
+/// over SSH behind a Hyper-V checkpoint. It was written from the formula, never
+/// executed, and its own comment said so. When it was finally checked against
+/// the formula it was wrong by up to 39.9 dB — see the tests below, which are
+/// the check that was missing.
+///
+/// This module is therefore a REFERENCE, not a runtime path. Nothing in the
+/// daemon calls it in production; `test/tests/halwire_win.rs` pins the C table
+/// and the C constants against it, so an edit to either side alone fails
+/// `cargo test` on this machine rather than shipping a volume that is silently
+/// several dB off on a machine nobody can attach a debugger to.
+///
+/// # What is still NOT verified, and cannot be from here
+///
+/// The claim these functions make is "20*log10(scalar), in 1/65536 dB". The
+/// claim the FEATURE makes is bigger: "the level the Windows audio engine
+/// derives from our KS node equals the scalar the peer applies to its real
+/// device". That second claim is about the engine's own dB->scalar curve, is
+/// not documented to this precision, and can only be settled by reading
+/// `GetMasterVolumeLevelScalar` back off a real endpoint fed by a real
+/// installed driver. THAT MEASUREMENT HAS NOT BEEN MADE. Everything here
+/// establishes that our half of the conversion is the function it says it is;
+/// it does not establish that the other half agrees.
+pub mod volmap {
+    /// `VOLUME_SIGNED_MINIMUM` (`definitions.h:74`): -96 dB. Also the value
+    /// `KSPROPERTY_MEMBERSLIST` advertises as the endpoint's floor
+    /// (`kshelper.cpp:382`), which is what makes it a CLAMP and not a hint:
+    /// returning anything below it from a GET contradicts the range the same
+    /// driver published.
+    pub const DB_FLOOR_Q16: i32 = -96 * 0x10000;
+
+    /// `VOLUME_SIGNED_MAXIMUM` (`definitions.h:73`): 0 dB, unity gain. The
+    /// endpoint offers no boost, so this is a ceiling as well as a reference.
+    pub const DB_UNITY_Q16: i32 = 0;
+
+    /// `VOLUME_STEPPING_DELTA` (`definitions.h:72`): 0.5 dB, the granularity
+    /// advertised alongside the range at `kshelper.cpp:383`.
+    pub const DB_STEP_Q16: i32 = 0x8000;
+
+    /// 1.0 in the IOCTL's 16.16 scalar.
+    pub const ONE_Q16: u32 = 0x10000;
+
+    /// `20*log10(2) * 65536`, rounded: the dB value of one octave (one halving
+    /// of the scalar). 6.020599913... dB * 65536 = 394566.036.
+    ///
+    /// This constant is what turns the mapping from a table over the scalar
+    /// into a table over the MANTISSA: any scalar is `2^exp * m` with
+    /// `m` in [1,2), so `dB = exp * DB_PER_OCTAVE_Q16 + f(m)` and only `f`
+    /// needs tabulating. That is the whole fix; see the table's own note.
+    pub const DB_PER_OCTAVE_Q16: i32 = 394_566;
+
+    /// `20*log10(1 + i/32) * 65536` for i = 0..32 — the dB contribution of the
+    /// mantissa alone, over exactly one octave.
+    ///
+    /// # Why the mantissa and not the scalar
+    ///
+    /// The obvious table is 33 points spread over the scalar, 0 to 1, with
+    /// linear interpolation between. That is what the driver shipped, and it
+    /// cannot work: `20*log10(s)` goes to negative infinity as s goes to zero,
+    /// so the bottom segment — scalar 0 to 1/32 — has to cover EVERYTHING from
+    /// the -96 dB floor up to -30.1 dB in one straight line. At scalar 0.0042
+    /// (-47.5 dB, an ordinary quiet setting) that line reads -87.3 dB. The
+    /// error is 39.9 dB, and it is worst exactly where the curve is steepest,
+    /// which is where a volume control spends its interesting range.
+    ///
+    /// Splitting off the power of two first removes the singularity: the
+    /// mantissa never leaves [1,2), the function tabulated over it is gentle
+    /// (`|d2/dm2| <= 1/ln2`), and the interpolation error is then UNIFORM in dB
+    /// across the entire range instead of exploding at the bottom. Same 33
+    /// entries, same integer-only arithmetic, worst-case error 0.00104 dB
+    /// instead of 39.9 — pinned by
+    /// [`tests::forward_tracks_twenty_log_ten_within_a_thousandth_of_a_db`].
+    ///
+    /// Integer-only matters for a reason that is not performance: these run
+    /// from a KS property handler, and kernel code must not touch the FPU at
+    /// raised IRQL. There is no `log10` available here at any price.
+    pub const MANTISSA_DB_Q16: [i32; 33] = [
+        0, 17_516, 34_510, 51_011, 67_047, 82_643, 97_824, 112_610, 127_022, 141_078, 154_795,
+        168_190, 181_276, 194_069, 206_580, 218_822, 230_806, 242_544, 254_044, 265_316, 276_370,
+        287_213, 297_853, 308_298, 318_555, 328_630, 338_530, 348_261, 357_828, 367_237, 376_493,
+        385_601, 394_566,
+    ];
+
+    /// Scalar (16.16) -> `KSPROPERTY_AUDIO_VOLUMELEVEL` (1/65536 dB).
+    ///
+    /// Mirrors `AhScalarQ16ToKsVolume` in `perpeer.cpp` operation for
+    /// operation, including the rounding: every shift and divide below has a
+    /// bit-identical counterpart there, because "the same formula" is not the
+    /// same function once integers are involved.
+    ///
+    /// # Silence
+    ///
+    /// Scalar 0 is dB negative infinity, which no LONG holds. It maps to the
+    /// advertised floor, and [`ks_db_to_scalar_q16`] maps the floor back to 0,
+    /// so silence survives a round trip exactly. What it is NOT is silent in
+    /// the analogue sense: -96 dB is amplitude 1.6e-5, not zero. Muting is a
+    /// separate KS property (`KSPROPERTY_AUDIO_MUTE`) carried in its own store
+    /// and its own event flag for exactly this reason; a caller that wants
+    /// silence must set mute, not push scalar 0 and hope.
+    pub fn scalar_q16_to_ks_db(scalar_q16: u32) -> i32 {
+        if scalar_q16 == 0 {
+            return DB_FLOOR_Q16;
+        }
+        if scalar_q16 >= ONE_Q16 {
+            return DB_UNITY_Q16;
+        }
+
+        // scalar = 2^exp * (1 + frac/32768), exp in -16..-1.
+        let bit = 31 - scalar_q16.leading_zeros(); // 0..15
+        let exp = bit as i32 - 16;
+        let norm = scalar_q16 << (15 - bit); // 0x8000..0xFFFF
+        let frac = norm & 0x7FFF;
+
+        let idx = (frac >> 10) as usize; // 0..31
+        let sub = (frac & 0x3FF) as i32; // 0..1023
+        let lo = MANTISSA_DB_Q16[idx];
+        let hi = MANTISSA_DB_Q16[idx + 1];
+        let interp = lo + (((hi - lo) * sub + 512) >> 10);
+
+        let db = exp * DB_PER_OCTAVE_Q16 + interp;
+        if db < DB_FLOOR_Q16 {
+            DB_FLOOR_Q16
+        } else {
+            db
+        }
+    }
+
+    /// `KSPROPERTY_AUDIO_VOLUMELEVEL` (1/65536 dB) -> scalar (16.16).
+    ///
+    /// Mirrors `AhKsVolumeToScalarQ16` in `perpeer.cpp`. Inverts the table by
+    /// searching it rather than carrying a second one: 33 comparisons at
+    /// property-set rate is nothing, and a second table is a second thing that
+    /// can fall out of step with the first.
+    ///
+    /// The final shift ROUNDS rather than truncates, and that is load-bearing
+    /// rather than tidy. Truncating loses a count on every pass, and the two
+    /// ends of volume sync pass values back and forth: driver raises an event,
+    /// daemon relays it, daemon pushes back, driver stores. With truncation
+    /// that loop walks the volume DOWN one LSB per exchange for any scalar
+    /// below about -69 dB — a slider that creeps toward silence on its own.
+    /// [`tests::the_sync_loop_reaches_a_fixed_point_in_one_settle`] is the
+    /// guard, and it fails on the truncating version.
+    pub fn ks_db_to_scalar_q16(level: i32) -> u32 {
+        if level >= DB_UNITY_Q16 {
+            return ONE_Q16;
+        }
+        if level <= DB_FLOOR_Q16 {
+            return 0;
+        }
+
+        // Floor division, not truncation: `level` is negative and the octave
+        // index must round DOWN so the remainder stays in [0, one octave).
+        let mut exp = level / DB_PER_OCTAVE_Q16;
+        let mut rem = level - exp * DB_PER_OCTAVE_Q16;
+        if rem < 0 {
+            exp -= 1;
+            rem += DB_PER_OCTAVE_Q16;
+        }
+
+        let mut f: u32 = 0;
+        for i in (1..=32usize).rev() {
+            if rem >= MANTISSA_DB_Q16[i - 1] {
+                let lo = MANTISSA_DB_Q16[i - 1];
+                let hi = MANTISSA_DB_Q16[i];
+                let mut sub = if hi == lo { 0 } else { ((rem - lo) * 1024 + (hi - lo) / 2) / (hi - lo) };
+                if sub > 1023 {
+                    sub = 1023;
+                }
+                f = (((i - 1) as u32) << 10) + sub as u32;
+                break;
+            }
+        }
+
+        let shift = -1 - exp; // 0..15 over the representable range
+        if shift < 0 {
+            return ONE_Q16;
+        }
+        if shift > 16 {
+            return 0;
+        }
+        let norm = 0x8000u32 + f; // 0x8000..0xFFFF
+        if shift == 0 {
+            norm
+        } else {
+            (norm + (1 << (shift - 1))) >> shift
+        }
+    }
+
+    /// Clamp into `[DB_FLOOR_Q16, DB_UNITY_Q16]` and snap to the advertised
+    /// 0.5 dB grid — the Rust form of the driver's `VOLUME_NORMALIZE_IN_RANGE`
+    /// (`definitions.h:93`), rounding half away from zero exactly as
+    /// `VALUE_NORMALIZE` does.
+    ///
+    /// # Why both driver write paths need this and only one had it
+    ///
+    /// Two writers land in one cell. `basetopo.cpp:181` (the user moved the
+    /// endpoint's slider) normalises; `ctldevice.cpp` (the daemon pushed a
+    /// peer's level) did not. The cell then feeds `KSPROPERTY_AUDIO_VOLUMELEVEL`
+    /// GET, so which path last wrote decided whether the driver answered on the
+    /// grid its own `KSPROPERTY_MEMBERSLIST` advertises. The user-visible shape
+    /// of that is a slider that jumps the first time it is touched after a
+    /// remote change.
+    ///
+    /// Snapping is safe to add because the mapping stays idempotent under it:
+    /// see [`tests::the_sync_loop_reaches_a_fixed_point_in_one_settle`], which
+    /// runs the loop with the grid applied over all 65537 scalars.
+    pub fn quantize_to_step(level: i32) -> i32 {
+        if level > DB_UNITY_Q16 {
+            return DB_UNITY_Q16;
+        }
+        if level < DB_FLOOR_Q16 {
+            return DB_FLOOR_Q16;
+        }
+        if level > 0 {
+            ((level + DB_STEP_Q16 / 2) / DB_STEP_Q16) * DB_STEP_Q16
+        } else {
+            -((((-level) + DB_STEP_Q16 / 2) / DB_STEP_Q16) * DB_STEP_Q16)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The exact curve, in f64, for the tests to measure against. Kept
+        /// deliberately naive: it is the specification, and the point of the
+        /// integer code is to agree with it, not the other way round.
+        fn exact_db(scalar_q16: u32) -> f64 {
+            let s = scalar_q16 as f64 / 65536.0;
+            (20.0 * s.log10()).max(-96.0)
+        }
+
+        /// THE TEST THE DRIVER'S OWN COMMENT ASKED FOR AND NOBODY WROTE.
+        ///
+        /// Every one of the 65535 non-trivial scalars, against `20*log10`. The
+        /// shipped table failed this by 39.9 dB; it also disagreed with the
+        /// dB values written in the comment beside each of its own entries, on
+        /// 31 of 32 rows, by about 2 dB.
+        #[test]
+        fn forward_tracks_twenty_log_ten_within_a_thousandth_of_a_db() {
+            let mut worst = 0.0f64;
+            let mut worst_at = 0u32;
+            for q in 1..ONE_Q16 {
+                let got = scalar_q16_to_ks_db(q) as f64 / 65536.0;
+                let err = (got - exact_db(q)).abs();
+                if err > worst {
+                    worst = err;
+                    worst_at = q;
+                }
+            }
+            assert!(
+                worst < 0.002,
+                "worst error {worst:.5} dB at scalar_q16={worst_at} ({:.4}): the table no longer \
+                 tracks 20*log10(scalar)",
+                worst_at as f64 / 65536.0
+            );
+        }
+
+        /// The table's entries themselves, independent of the interpolation.
+        /// The shipped table's rows were internally inconsistent — the value
+        /// and the comment on the same line described levels ~2 dB apart — and
+        /// no test could see it because no test read the table.
+        #[test]
+        fn every_mantissa_entry_is_its_own_formula_value() {
+            for (i, &v) in MANTISSA_DB_Q16.iter().enumerate() {
+                let m = 1.0 + i as f64 / 32.0;
+                let want = (20.0 * m.log10() * 65536.0).round() as i32;
+                assert_eq!(v, want, "MANTISSA_DB_Q16[{i}] is not 20*log10({m}) in 1/65536 dB");
+            }
+            assert_eq!(
+                MANTISSA_DB_Q16[32], DB_PER_OCTAVE_Q16,
+                "the table's last entry IS one octave; if they disagree the mapping is \
+                 discontinuous at every power of two"
+            );
+            assert_eq!(
+                DB_PER_OCTAVE_Q16,
+                (20.0 * 2.0f64.log10() * 65536.0).round() as i32,
+                "DB_PER_OCTAVE_Q16 must be 20*log10(2) in 1/65536 dB"
+            );
+        }
+
+        /// A volume control that is not monotonic is a volume control where
+        /// turning the knob up can turn the sound down. Checked on every input
+        /// of both directions, not sampled.
+        #[test]
+        fn both_directions_are_monotonic_over_their_whole_domain() {
+            let mut prev = i32::MIN;
+            for q in 0..=ONE_Q16 {
+                let v = scalar_q16_to_ks_db(q);
+                assert!(v >= prev, "forward mapping fell at scalar_q16={q}");
+                prev = v;
+            }
+            let mut prev = 0u32;
+            for l in DB_FLOOR_Q16..=DB_UNITY_Q16 {
+                let v = ks_db_to_scalar_q16(l);
+                assert!(v >= prev, "inverse mapping fell at level={l}");
+                prev = v;
+            }
+        }
+
+        /// The output must stay inside the range the driver publishes through
+        /// `KSPROPERTY_MEMBERSLIST`. Applying `20*log10` straight would not:
+        /// it is unbounded below, and the endpoint's floor is -96 dB.
+        #[test]
+        fn forward_never_leaves_the_advertised_member_range() {
+            for q in 0..=ONE_Q16 + 64 {
+                let v = scalar_q16_to_ks_db(q);
+                assert!(
+                    (DB_FLOOR_Q16..=DB_UNITY_Q16).contains(&v),
+                    "scalar_q16={q} produced {v}, outside the advertised [-96 dB, 0 dB]"
+                );
+            }
+        }
+
+        /// Silence and unity are the two values a user can name, so they are
+        /// the two that must be exact rather than within a tolerance.
+        #[test]
+        fn silence_and_unity_survive_a_round_trip_exactly() {
+            assert_eq!(scalar_q16_to_ks_db(0), DB_FLOOR_Q16, "scalar 0 pins to the KS floor");
+            assert_eq!(ks_db_to_scalar_q16(DB_FLOOR_Q16), 0, "the KS floor comes back as silence");
+            assert_eq!(ks_db_to_scalar_q16(DB_FLOOR_Q16 - 1), 0, "below the floor is still silence");
+
+            assert_eq!(scalar_q16_to_ks_db(ONE_Q16), DB_UNITY_Q16, "scalar 1.0 is 0 dB");
+            assert_eq!(scalar_q16_to_ks_db(ONE_Q16 + 9), DB_UNITY_Q16, "no boost above unity");
+            assert_eq!(ks_db_to_scalar_q16(DB_UNITY_Q16), ONE_Q16, "0 dB is scalar 1.0");
+            assert_eq!(ks_db_to_scalar_q16(1), ONE_Q16, "above 0 dB clamps to unity, not past it");
+        }
+
+        /// Halving the amplitude is -6.0206 dB and quartering it is -12.0412.
+        /// Spot values a human can check by hand, so a wholesale replacement of
+        /// the table cannot pass by redefining what the test measures.
+        #[test]
+        fn hand_checkable_levels_land_where_a_calculator_puts_them() {
+            for (scalar, want) in [(0.5f64, -6.0206f64), (0.25, -12.0412), (0.125, -18.0618)] {
+                let q = (scalar * 65536.0).round() as u32;
+                let got = scalar_q16_to_ks_db(q) as f64 / 65536.0;
+                assert!((got - want).abs() < 0.001, "scalar {scalar} -> {got:.4} dB, want {want}");
+            }
+        }
+
+        /// Scalar -> dB -> scalar must return where it started.
+        #[test]
+        fn the_round_trip_is_within_one_count() {
+            for q in 1..ONE_Q16 {
+                let back = ks_db_to_scalar_q16(scalar_q16_to_ks_db(q));
+                let d = (back as i64 - q as i64).abs();
+                assert!(d <= 1, "scalar_q16={q} came back as {back}");
+            }
+        }
+
+        /// THE RATCHET GUARD.
+        ///
+        /// Volume sync is a loop: the driver raises an event carrying a scalar,
+        /// the daemon relays it to the peer, the peer's level comes back, the
+        /// daemon pushes it in, the driver stores it and — if it changed —
+        /// raises another event. If one pass through that loop does not land on
+        /// a value the next pass leaves alone, the loop never stops, and the
+        /// direction it drifts is the direction the user's volume walks by
+        /// itself.
+        ///
+        /// Run over every scalar, with the 0.5 dB grid applied, because the
+        /// grid is part of the loop on the KS side.
+        #[test]
+        fn the_sync_loop_reaches_a_fixed_point_in_one_settle() {
+            for q in 0..=ONE_Q16 {
+                let l1 = quantize_to_step(scalar_q16_to_ks_db(q));
+                let s1 = ks_db_to_scalar_q16(l1);
+                let l2 = quantize_to_step(scalar_q16_to_ks_db(s1));
+                let s2 = ks_db_to_scalar_q16(l2);
+                assert_eq!(l1, l2, "level moved on the second pass from scalar_q16={q}");
+                assert_eq!(s1, s2, "scalar moved on the second pass from scalar_q16={q}");
+            }
+        }
+
+        /// Same property without the grid, because the two driver write paths
+        /// have historically disagreed about whether to snap and the loop has
+        /// to settle either way.
+        #[test]
+        fn the_sync_loop_settles_without_the_grid_too() {
+            for q in 0..=ONE_Q16 {
+                let s1 = ks_db_to_scalar_q16(scalar_q16_to_ks_db(q));
+                let s2 = ks_db_to_scalar_q16(scalar_q16_to_ks_db(s1));
+                assert_eq!(s1, s2, "scalar moved on the second pass from scalar_q16={q}");
+            }
+        }
+
+        /// `quantize_to_step` must be the C macro, including its rounding of
+        /// exact halves away from zero and its clamp-before-snap order.
+        #[test]
+        fn quantise_matches_the_drivers_normalise_macro() {
+            assert_eq!(quantize_to_step(DB_UNITY_Q16), DB_UNITY_Q16);
+            assert_eq!(quantize_to_step(DB_FLOOR_Q16), DB_FLOOR_Q16, "the floor is on the grid");
+            assert_eq!(quantize_to_step(DB_FLOOR_Q16 - 99), DB_FLOOR_Q16, "clamp, then snap");
+            assert_eq!(quantize_to_step(99), DB_UNITY_Q16, "no boost survives the clamp");
+            assert_eq!(quantize_to_step(-1), 0, "a hair below unity rounds to unity");
+            assert_eq!(quantize_to_step(-16_384), -32_768, "exactly half rounds away from zero");
+            assert_eq!(quantize_to_step(-16_383), 0, "just under half rounds toward zero");
+            for l in DB_FLOOR_Q16..=DB_UNITY_Q16 {
+                let q = quantize_to_step(l);
+                assert_eq!(q % DB_STEP_Q16, 0, "level={l} snapped to {q}, off the 0.5 dB grid");
+                assert!((l - q).abs() <= DB_STEP_Q16 / 2, "level={l} moved further than half a step");
+            }
+        }
+
+        /// The mapping the driver SHIPPED, transcribed from
+        /// `perpeer.cpp` as of commit `d33ddc5`, so the size of the defect this
+        /// module fixes is recorded in a form that runs rather than in prose.
+        ///
+        /// If this ever stops failing its assertion, someone has reintroduced
+        /// the old table.
+        #[test]
+        fn the_replaced_linear_in_scalar_table_really_was_that_wrong() {
+            #[rustfmt::skip]
+            const OLD: [i32; 33] = [
+                DB_FLOOR_Q16,
+                -2097152, -1703936, -1474560, -1310720, -1183744, -1081344, -993280, -917504,
+                -851968, -790528, -737280, -688128, -643072, -602112, -565248, -524288,
+                -495616, -462848, -434176, -405504, -380928, -356352, -331776, -311296,
+                -290816, -270336, -249856, -233472, -212992, -196608, -180224, 0,
+            ];
+            let old_fwd = |q: u32| -> i32 {
+                if q == 0 {
+                    return DB_FLOOR_Q16;
+                }
+                if q >= ONE_Q16 {
+                    return DB_UNITY_Q16;
+                }
+                let scaled = q * 32;
+                let idx = (scaled >> 16) as usize;
+                let frac = (scaled & 0xFFFF) as i64;
+                let (lo, hi) = (OLD[idx], OLD[idx + 1]);
+                lo + (((hi - lo) as i64 * frac) >> 16) as i32
+            };
+            let mut worst = 0.0f64;
+            for q in 1..ONE_Q16 {
+                worst = worst.max((old_fwd(q) as f64 / 65536.0 - exact_db(q)).abs());
+            }
+            assert!(
+                worst > 30.0,
+                "the old table was wrong by {worst:.1} dB; this test exists to keep that number \
+                 attached to the code rather than to a commit message"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------- rings
 
 /// The data plane: the shared-memory audio rings, as pure arithmetic over an

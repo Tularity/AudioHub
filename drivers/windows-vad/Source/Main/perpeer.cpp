@@ -1321,56 +1321,56 @@ AhSlotGeneration(
 //
 // dB = 20*log10(scalar), which cannot be computed here -- kernel code must not
 // touch the FPU at raised IRQL, and these are reachable from the property
-// handler. So the mapping is a 33-entry table over the scalar's top bits, with
-// linear interpolation in between. The error against the true curve is under
-// 0.35 dB everywhere above -60 dB, which is far below what the 1 dB granularity
-// of the Windows volume slider can express.
+// handler. So it is a table with integer interpolation. WHAT the table is over
+// is the part that matters, and the part the first version got wrong.
 //
-// THE TABLE IS A STARTING POINT AND MUST BE CHECKED AGAINST THE REAL SYSTEM.
-// The claim being made is "the number IAudioEndpointVolume::GetMasterVolume-
-// LevelScalar reports equals the scalar the peer applies", and that is a
-// statement about two pieces of software neither of which is documented to
-// this precision. Deriving it from the formula and declaring victory is how a
-// volume that is consistently 3 dB off ships.
+// A table spread over the SCALAR cannot work. 20*log10(s) runs to negative
+// infinity as s approaches zero, so the bottom segment -- scalar 0 to 1/32 --
+// must carry everything from the -96 dB floor up to -30.1 dB on one straight
+// line. At scalar 0.0042 (-47.5 dB, an unremarkable setting) that line reads
+// -87.3 dB: 39.9 dB of error, worst exactly where the curve is steepest, which
+// is where a volume control does its work.
 //
-static const LONG g_AhDbTable[33] = {
-    //
-    // index i corresponds to scalar = i/32; value is round(20*log10(scalar) * 65536),
-    // clamped at the KS floor. Index 0 is silence.
-    //
-    VOLUME_SIGNED_MINIMUM,          // 0.000
-    -2097152,  // 0.03125  -> -30.10 dB
-    -1703936,  // 0.0625   -> -24.08 dB
-    -1474560,  // 0.09375  -> -20.56 dB
-    -1310720,  // 0.125    -> -18.06 dB
-    -1183744,  // 0.15625  -> -16.12 dB
-    -1081344,  // 0.1875   -> -14.54 dB
-    -993280,   // 0.21875  -> -13.20 dB
-    -917504,   // 0.250    -> -12.04 dB
-    -851968,   // 0.28125  -> -11.02 dB
-    -790528,   // 0.3125   -> -10.10 dB
-    -737280,   // 0.34375  ->  -9.27 dB
-    -688128,   // 0.375    ->  -8.52 dB
-    -643072,   // 0.40625  ->  -7.82 dB
-    -602112,   // 0.4375   ->  -7.17 dB
-    -565248,   // 0.46875  ->  -6.57 dB
-    -524288,   // 0.500    ->  -6.02 dB
-    -495616,   // 0.53125  ->  -5.49 dB
-    -462848,   // 0.5625   ->  -5.00 dB
-    -434176,   // 0.59375  ->  -4.53 dB
-    -405504,   // 0.625    ->  -4.08 dB
-    -380928,   // 0.65625  ->  -3.66 dB
-    -356352,   // 0.6875   ->  -3.25 dB
-    -331776,   // 0.71875  ->  -2.86 dB
-    -311296,   // 0.750    ->  -2.50 dB
-    -290816,   // 0.78125  ->  -2.14 dB
-    -270336,   // 0.8125   ->  -1.80 dB
-    -249856,   // 0.84375  ->  -1.47 dB
-    -233472,   // 0.875    ->  -1.16 dB
-    -212992,   // 0.90625  ->  -0.85 dB
-    -196608,   // 0.9375   ->  -0.56 dB
-    -180224,   // 0.96875  ->  -0.28 dB
-    AH_VOLUME_UNITY // 1.000 -> 0 dB
+// Splitting the power of two off first removes the singularity. Every scalar is
+// 2^exp * m with m in [1,2), so dB = exp*AH_DB_PER_OCTAVE_Q16 + f(m), and only
+// f needs tabulating -- over one octave, where it is gentle. Same 33 entries,
+// same integer-only arithmetic, and the error becomes UNIFORM across the whole
+// range instead of exploding at the bottom: worst case 0.00104 dB.
+//
+// WHAT IS NOW CHECKED, AND BY WHAT. The mirror of this mapping lives in
+// core/audiohubd/src/halbridge_win.rs (mod volmap), operation for operation
+// including every rounding step, and its tests measure it against 20*log10 on
+// all 65536 inputs. test/tests/halwire_win.rs reads THIS TABLE out of THIS FILE
+// and asserts it equals the Rust one, so the two cannot drift and neither can
+// be edited alone. That is the check the previous version of this comment asked
+// for and did not get; when it was finally run against the shipped table, 31 of
+// the 32 entries disagreed with the dB value written on their own line.
+//
+// WHAT IS STILL NOT CHECKED. All of the above establishes that this is the
+// function it claims to be. It does NOT establish the bigger claim -- that the
+// level the Windows audio engine derives from this KS node equals the scalar
+// the peer applies to its real device. That is a statement about the engine's
+// own curve, is undocumented to this precision, and can only be settled by
+// reading GetMasterVolumeLevelScalar back off a real endpoint fed by a real
+// installed driver. THAT MEASUREMENT HAS NOT BEEN MADE.
+//
+
+//
+// 20*log10(2) * 65536, rounded. One octave -- one halving of the scalar.
+//
+#define AH_DB_PER_OCTAVE_Q16    394566
+
+//
+// 20*log10(1 + i/32) * 65536 for i = 0..32: the mantissa's contribution alone.
+// Entry 32 is one octave exactly; if it ever stops being AH_DB_PER_OCTAVE_Q16
+// the mapping is discontinuous at every power of two.
+//
+static const LONG g_AhMantissaDbTable[33] = {
+         0,   17516,   34510,   51011,   67047,   82643,   97824,  112610,
+    127022,  141078,  154795,  168190,  181276,  194069,  206580,  218822,
+    230806,  242544,  254044,  265316,  276370,  287213,  297853,  308298,
+    318555,  328630,  338530,  348261,  357828,  367237,  376493,  385601,
+    AH_DB_PER_OCTAVE_Q16
 };
 
 #pragma code_seg()
@@ -1378,7 +1378,29 @@ LONG
 AhScalarQ16ToKsVolume(
     _In_ ULONG ScalarQ16
     )
+/*++
+
+Routine Description:
+
+    Scalar (16.16) -> KSPROPERTY_AUDIO_VOLUMELEVEL (1/65536 dB).
+
+    Silence is the one input the formula cannot express: scalar 0 is dB
+    negative infinity, which no LONG holds. It maps to the advertised floor,
+    and AhKsVolumeToScalarQ16 maps that floor back to 0, so silence survives a
+    round trip. What -96 dB is NOT is silent -- it is amplitude 1.6e-5. Muting
+    is KSPROPERTY_AUDIO_MUTE, a separate store with its own event flag, for
+    exactly this reason.
+
+    The result never leaves [VOLUME_SIGNED_MINIMUM, VOLUME_SIGNED_MAXIMUM],
+    which is the range this driver publishes through KSPROPERTY_MEMBERSLIST in
+    kshelper.cpp. Applying the formula unclamped would not: it is unbounded
+    below and the endpoint's floor is -96 dB.
+
+--*/
 {
+    ULONG bit, norm, frac, idx, sub;
+    LONG  exp, lo, hi, interp, db;
+
     if (ScalarQ16 == 0)
     {
         return VOLUME_SIGNED_MINIMUM;
@@ -1389,16 +1411,34 @@ AhScalarQ16ToKsVolume(
     }
 
     //
-    // 0..65535 -> table index 0..32 plus a fraction, all integer.
+    // scalar = 2^exp * (1 + frac/32768), with exp in -16..-1. The index of the
+    // top set bit, by shifting: at most 15 iterations on a path that runs when
+    // a human moves a slider. BitScanReverse would be one instruction, but it
+    // is an intrinsic this tree does not otherwise use and cannot be confirmed
+    // declared without a WDK build -- not a trade worth making here.
     //
-    ULONG scaled = ScalarQ16 * 32u;         // < 2^21, no overflow
-    ULONG idx    = scaled >> 16;            // 0..31
-    ULONG frac   = scaled & 0xFFFFu;
+    bit = 0;
+    {
+        ULONG v = ScalarQ16 >> 1;               // ScalarQ16 != 0, checked above
+        while (v != 0) { v >>= 1; bit++; }      // 0..15
+    }
+    exp  = (LONG)bit - 16;
+    norm = ScalarQ16 << (15 - bit);             // 0x8000..0xFFFF
+    frac = norm & 0x7FFFu;
 
-    LONG lo = g_AhDbTable[idx];
-    LONG hi = g_AhDbTable[idx + 1];
+    idx = frac >> 10;                           // 0..31
+    sub = frac & 0x3FFu;                        // 0..1023
+    lo  = g_AhMantissaDbTable[idx];
+    hi  = g_AhMantissaDbTable[idx + 1];
 
-    return lo + (LONG)(((LONGLONG)(hi - lo) * (LONGLONG)frac) >> 16);
+    //
+    // Round, not truncate: see the note on the inverse. (hi-lo) <= 17516 and
+    // sub <= 1023, so the product is under 2^25 and stays in a LONG.
+    //
+    interp = lo + (((hi - lo) * (LONG)sub + 512) >> 10);
+
+    db = exp * AH_DB_PER_OCTAVE_Q16 + interp;
+    return (db < VOLUME_SIGNED_MINIMUM) ? VOLUME_SIGNED_MINIMUM : db;
 }
 
 #pragma code_seg()
@@ -1406,7 +1446,30 @@ ULONG
 AhKsVolumeToScalarQ16(
     _In_ LONG Level
     )
+/*++
+
+Routine Description:
+
+    KSPROPERTY_AUDIO_VOLUMELEVEL (1/65536 dB) -> scalar (16.16).
+
+    Inverts the table by searching it rather than carrying a second one: 33
+    comparisons at property-set rate is nothing, and a second table is a second
+    thing that can fall out of step with the first.
+
+    THE FINAL SHIFT ROUNDS. That is load-bearing, not tidiness. Truncating
+    loses a count on every pass, and the two ends of volume sync pass values
+    back and forth: this driver raises an event, the daemon relays it, the
+    daemon pushes a level back, this driver stores it. With truncation that
+    loop walks the volume DOWN one count per exchange for any scalar below
+    about -69 dB -- a slider that creeps toward silence with nobody touching
+    it. The guard is `the_sync_loop_reaches_a_fixed_point_in_one_settle` in
+    the Rust mirror, and it fails on the truncating form.
+
+--*/
 {
+    LONG  exp, rem, lo, hi, sub, shift;
+    ULONG f = 0, i, norm;
+
     if (Level >= AH_VOLUME_UNITY)
     {
         return 0x10000u;
@@ -1417,27 +1480,40 @@ AhKsVolumeToScalarQ16(
     }
 
     //
-    // Inverse of the table, by search. 33 comparisons at property-set rate is
-    // not worth a second table, and a second table is a second thing to keep
-    // in step with the first.
+    // Floor division, not truncation: Level is negative and the octave index
+    // has to round DOWN so the remainder stays in [0, one octave).
     //
-    for (ULONG i = 32; i > 0; i--)
+    exp = Level / AH_DB_PER_OCTAVE_Q16;
+    rem = Level - exp * AH_DB_PER_OCTAVE_Q16;
+    if (rem < 0)
     {
-        if (Level >= g_AhDbTable[i - 1])
+        exp -= 1;
+        rem += AH_DB_PER_OCTAVE_Q16;
+    }
+
+    for (i = 32; i > 0; i--)
+    {
+        if (rem >= g_AhMantissaDbTable[i - 1])
         {
-            LONG lo = g_AhDbTable[i - 1];
-            LONG hi = g_AhDbTable[i];
-            ULONG base = (i - 1) * 2048u;   // (i-1)/32 in Q16
-            if (hi == lo)
-            {
-                return base;
-            }
-            ULONG frac = (ULONG)(((LONGLONG)(Level - lo) << 16) / (LONGLONG)(hi - lo));
-            if (frac > 0xFFFFu) { frac = 0xFFFFu; }
-            return base + ((frac * 2048u) >> 16);
+            lo = g_AhMantissaDbTable[i - 1];
+            hi = g_AhMantissaDbTable[i];
+            sub = (hi == lo) ? 0 : (((rem - lo) * 1024 + (hi - lo) / 2) / (hi - lo));
+            if (sub > 1023) { sub = 1023; }
+            f = ((i - 1) << 10) + (ULONG)sub;
+            break;
         }
     }
-    return 0;
+
+    shift = -1 - exp;                           // 0..15 over the live range
+    if (shift < 0)  { return 0x10000u; }
+    if (shift > 16) { return 0; }
+
+    norm = 0x8000u + f;                         // 0x8000..0xFFFF
+    if (shift == 0)
+    {
+        return norm;
+    }
+    return (norm + (1u << (shift - 1))) >> shift;
 }
 
 //-----------------------------------------------------------------------------

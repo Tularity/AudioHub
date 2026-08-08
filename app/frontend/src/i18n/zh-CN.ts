@@ -917,6 +917,22 @@ export const zhCN = {
   'settings.bridge.noneOffline': '服务未连接，暂无检测结果。',
   'settings.bridge.noneFound': '未检测到任何虚拟声卡。',
 
+  // plan M9「开机自启」。文案要说清三件事：拉起的是 App 而不是服务本身、
+  // 它靠系统的登录项活过重启、以及关掉之后什么都不会留下。
+  'settings.startup.title': '启动',
+  'settings.startup.autostartTitle': '开机时自动启动 AudioHub',
+  'settings.startup.autostartDescMac': '在「登录项」里注册 AudioHub：每次登录时由系统把 AudioHub 拉起来，再由它把音频服务带起来——与你自己双击图标的方式完全一致，已有的麦克风与本地网络授权照旧有效。关掉即删除这条登录项，不留任何东西。',
+  'settings.startup.autostartDescWin': '注册一个登录时触发的计划任务（AudioHubDaemon）：每次登录时由系统把 AudioHub 拉起来，再由它把音频服务带起来。关掉即删除这条任务，不留任何东西。',
+  'settings.startup.target': '登录时启动',
+  'settings.startup.targetDesc': '这条登录项实际指向的程序。',
+  'settings.startup.unsupported': '这台机器的当前形态设置不了开机自启：{reason}',
+  // `supported=false && enabled=true`：登录项是**别的形态**（装好的 App）留下的，
+  // 活得比它长。这句话必须同时说清三件事：它还在生效、当前形态开不了新的、
+  // 但**关得掉**——否则用户看到的是一条自己开过、界面却答不出状况的登录项。
+  'settings.startup.orphaned': '开机自启仍然注册着，每次登录都会把 AudioHub 拉起来。它是由装好的 AudioHub.app 写下的，当前形态改不了它指向哪里（{reason}），但你可以在这里把它关掉。',
+  'settings.startup.unknown': '当前服务不提供开机自启接口（daemon 版本较旧）。',
+  'settings.startup.noteOff': '关闭时，只有你自己打开 AudioHub 之后才会共享或使用音频设备。',
+
   'settings.paths.title': '路径',
   'settings.paths.configDir': '配置目录',
   'settings.paths.configDirDesc': 'daemon 身份、配对表与 ipc.json 所在目录；可用环境变量 AUDIOHUB_CONFIG_DIR 覆盖。',

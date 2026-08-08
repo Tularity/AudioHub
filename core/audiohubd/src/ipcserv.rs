@@ -493,6 +493,18 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 // network refuses), and every `settings.get` on every other IPC
                 // connection takes this same lock.
                 let mut announce_target: Option<bool> = None;
+                // plan M9「开机自启」，**在锁与写盘之前**。
+                //
+                // 它是这一批键里唯一一个把改动落在本进程之外（`~/Library/
+                // LaunchAgents` / 计划任务库）的；做不到就整条调用失败，而失败
+                // 时其余键一个字都还没写下去。反过来排（先写盘、再注册、注册
+                // 失败再报错）会留下一次只成功了一半的 `settings.set`。
+                //
+                // 也**不写进 settings.json**：注册项本身就是状态，见
+                // `crate::autostart`。所以它不参与下面的 `changed` / `save`。
+                if let Some(v) = params.get("autostart").and_then(Value::as_bool) {
+                    crate::autostart::set(v)?;
+                }
                 {
                     let mut s = lk(&inner.settings);
                     if let Some(m) = params.get("mode").and_then(Value::as_str) {
@@ -813,6 +825,9 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
 /// persisted, so the two ends cannot drift apart about which mode is live.
 fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
     let s = lk(&inner.settings).clone();
+    // Probed outside the settings lock: on Windows this spawns `schtasks.exe`,
+    // and every other IPC connection's `settings.get` takes that same lock.
+    let auto = crate::autostart::state();
     let (capacity, used) = {
         let st = lk(&inner.haldev);
         (st.capacity, st.table.used())
@@ -830,6 +845,13 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         // permission not granted yet) and a UI that could only read the wish
         // would insist this machine is discoverable while it is not.
         discovery_announcing: lk(&inner.announce_guard).is_some(),
+        // plan M9「开机自启」。四个字段全部**探测**出来，一个都不存盘：登录项
+        // 活过重启靠的是 plist / 计划任务本身，settings.json 里再放一份就成了
+        // 第二个真值源（见 `crate::autostart` 开头）。
+        autostart: auto.enabled,
+        autostart_supported: auto.supported,
+        autostart_target: auto.target,
+        autostart_reason: auto.reason,
         // 档表随每次 `settings.get` 一起发：前端不许自己写一份。
         // 两边各存一份表，分歧不会有任何报错——只会有一个选不中的档。
         //

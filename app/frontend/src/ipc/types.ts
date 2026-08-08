@@ -780,6 +780,28 @@ export interface DaemonSettings {
    * false。与 `mode` / `effective_mode` 是同一对关系。
    */
   discovery_announcing?: boolean;
+  /**
+   * plan M9「开机自启」：**一个键管两个平台**（macOS 写 LaunchAgent、Windows 写
+   * `AudioHubDaemon` 计划任务，两边拉起的都是 App，再由 App 把服务带起来）。
+   *
+   * 与上面那对不同，这个字段**没有「愿望」那一半**：登录项必须活过重启，而能活
+   * 过重启的东西是 plist / 计划任务本身，所以这里报的是 daemon **探测出来的
+   * 事实**。缺席（旧服务）按 false 读——不认识这个字段的 daemon 从没注册过。
+   */
+  autostart?: boolean;
+  /**
+   * 这台机器的**当前形态**能不能注册登录项。false 时开关置灰，理由见
+   * `autostart_reason`。
+   */
+  autostart_supported?: boolean;
+  /**
+   * 登录时会被拉起的东西。已注册时读自注册项**本身**，所以它与当前 App 路径不
+   * 一致，就是「登录项还指着一个已经被移走的旧版本」——界面上唯一能看见这件事
+   * 的地方。
+   */
+  autostart_target?: string | null;
+  /** `autostart_supported === false` 时的人话理由。置灰而说不出为什么是不行的。 */
+  autostart_reason?: string | null;
   hal_capacity?: number;
   hal_used?: number;
 }

@@ -12,6 +12,7 @@ import { transportCells } from '../components/PeerTransport';
 import { PermissionRow } from '../components/PermissionRow';
 import { toast } from '../components/Toasts';
 import { openExternal } from '../lib/external';
+import { autostartView } from '../lib/autostart';
 import { bridgeCatalog, vendors } from '../lib/bridge';
 import { fmt, IS_MAC } from '../lib/fmt';
 import {
@@ -236,6 +237,66 @@ function ModeAVolumeCard({ writing, noSettings, onPush }: {
       />
       <p className="muted small" data-testid="settings-mode-a-volume-note">
         {inForce ? t('settings.modeAVolume.noteInForce') : t('settings.modeAVolume.noteIdle')}
+      </p>
+    </section>
+  );
+}
+
+// plan M9「开机自启」。**一个开关管两个平台**——daemon 那边也只有一个键
+// （`autostart`），macOS 写 LaunchAgent、Windows 写计划任务。
+//
+// 三态，不是两态：「开着」「关着但能开」「根本开不了」。第三种必须带理由一起
+// 显示——一个点不动、又说不出为什么的开关，是这个项目已经反复付过代价的形状
+// （模式被降级、广播没生效，都有一句话解释）。
+//
+// 不做乐观翻转：daemon 的回包才是权威。这里尤其重要，因为这个开关的「事实」是
+// daemon 探测出来的（登录项在不在），不是某个存盘值的回显——先把开关翻过去、
+// 注册再失败，界面上就会出现一条系统里根本不存在的登录项。
+function StartupCard({ writing, noSettings, onPush }: {
+  writing: number;
+  noSettings: boolean;
+  onPush: (patch: Partial<DaemonSettings>) => Promise<void>;
+}) {
+  const ds = useStore((s) => s.daemonSettings);
+  // 三态判定整个搬进 `lib/autostart.ts`（那里有单测）。这里只负责把结论翻成
+  // 语料。尤其 `v.enabled` 不等于 `v.supported`：一条已注册的登录项无论当前
+  // 形态配不配注册都必须关得掉，否则用户会得到一个点不动的「开着」。
+  const v = autostartView(ds);
+
+  return (
+    <section className="card block" data-testid="settings-startup">
+      <h3 className="block-title">{t('settings.startup.title')}</h3>
+      <SettingRow
+        title={t('settings.startup.autostartTitle')}
+        desc={IS_MAC ? t('settings.startup.autostartDescMac') : t('settings.startup.autostartDescWin')}
+        control={(
+          <Switch
+            testid="settings-autostart"
+            label={t('settings.startup.autostartTitle')}
+            checked={v.on}
+            pending={writing > 0}
+            disabled={noSettings || !v.enabled}
+            onToggle={(want) => void onPush({ autostart: want })}
+          />
+        )}
+      />
+      {/* 装好的登录项指向哪里。它与当前程序不一致，就是「登录项还指着一个已经
+          被移走的旧版本」——界面上唯一能看见这件事的地方，所以只在开着时显示。 */}
+      <div hidden={!v.on || !v.target}>
+        <SettingRow
+          title={t('settings.startup.target')}
+          desc={t('settings.startup.targetDesc')}
+          control={<code className="mono" data-testid="settings-autostart-target">{v.target}</code>}
+        />
+      </div>
+      <p className="muted small" data-testid="settings-autostart-note">
+        {v.note === 'unknown'
+          ? t('settings.startup.unknown')
+          : v.note === 'unsupported'
+            ? t('settings.startup.unsupported', { reason: v.reason || t('common.dash') })
+            : v.note === 'orphaned'
+              ? t('settings.startup.orphaned', { reason: v.reason || t('common.dash') })
+              : v.note === 'off' ? t('settings.startup.noteOff') : ''}
       </p>
     </section>
   );
@@ -731,6 +792,8 @@ export function SettingsView() {
           )}
         />
       </section>
+
+      <StartupCard writing={writing} noSettings={noSettings} onPush={pushSetting} />
 
       <WebAccessCard />
 

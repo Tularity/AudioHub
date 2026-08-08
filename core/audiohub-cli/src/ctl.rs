@@ -221,6 +221,13 @@ pub enum CtlCmd {
         /// passing `true` when it is already true retries a failed announce.
         #[arg(long)]
         discovery_announce: Option<bool>,
+        /// start AudioHub at login (plan M9). ONE flag for both platforms:
+        /// macOS writes a per-user LaunchAgent, Windows writes the
+        /// `AudioHubDaemon` scheduled task; both launch the APP, which brings
+        /// the daemon up itself. Fails loudly when the running layout cannot
+        /// host a login item (a bare binary out of the build tree).
+        #[arg(long)]
+        autostart: Option<bool>,
     },
     /// plan §15：某一台对端、某一个方向的延迟与音质档。
     ///
@@ -617,6 +624,7 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             mode_a_volume_sync,
             mode_a_mute_local,
             discovery_announce,
+            autostart,
         } => {
             let mut p = serde_json::Map::new();
             if let Some(m) = mode {
@@ -636,6 +644,9 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             }
             if let Some(v) = discovery_announce {
                 p.insert("discovery_announce".into(), json!(v));
+            }
+            if let Some(v) = autostart {
+                p.insert("autostart".into(), json!(v));
             }
             // A read and a write are the same call with no fields to change,
             // so `settings` with no flags cannot accidentally write anything.
@@ -978,6 +989,7 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 "mode={} effective_mode={} remove_virtual_on_disconnect={} \
                  mark_offline_devices={} mode_a_volume_sync={} mode_a_mute_local={} \
                  discovery_announce={} discovery_announcing={} \
+                 autostart={} \
                  virtual devices {}/{}",
                 val_str(v, "mode"),
                 val_str(v, "effective_mode"),
@@ -987,9 +999,33 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 val_bool(v, "mode_a_mute_local"),
                 val_bool(v, "discovery_announce"),
                 val_bool(v, "discovery_announcing"),
+                val_bool(v, "autostart"),
                 val_u64(v, "hal_used"),
                 val_u64(v, "hal_capacity"),
             ));
+            // 只在**这台机器注册不了**时说话；能开只是没开、或者开着且一切正常，
+            // 都无需解释。而置灰的开关配上一句「为什么」，是这个项目反复要求的
+            // 那件事——`autostart_supported=false` 的机器在界面上只能看到一个点
+            // 不动的开关。
+            //
+            // 两句话而不是一句：`supported=false` 与 `enabled=true` 同时成立是一个
+            // 真实且完全不同的处境（登录项由装好的 App 写下，活得比它长），
+            // 那时该说的不是「设置不了」，而是「它还在生效，而且你关得掉」。
+            if !val_bool(v, "autostart_supported") {
+                let why = v
+                    .get("autostart_reason")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("原因未知");
+                if val_bool(v, "autostart") {
+                    info(&format!(
+                        "  ⚠ 开机自启仍然注册着（每次登录都会拉起 AudioHub），\
+                         但当前形态改不了它指向哪里：{why}。\
+                         用 `ctl settings --autostart=false` 可以把它关掉。"
+                    ));
+                } else {
+                    info(&format!("  ⚠ 这台机器的当前形态设置不了开机自启：{why}"));
+                }
+            }
             // Printed only when they disagree, and printed as the FACT rather
             // than the wish: 「已开启」 next to a machine nobody can see is the
             // failure this second field exists to make impossible.
@@ -1232,6 +1268,7 @@ mod tests {
             ("mode_a_volume_sync", "--mode-a-volume-sync=true", json!(true)),
             ("mode_a_mute_local", "--mode-a-mute-local=true", json!(true)),
             ("discovery_announce", "--discovery-announce=false", json!(false)),
+            ("autostart", "--autostart=true", json!(true)),
         ];
         for key in audiohub_ipc::SETTINGS_WRITABLE_KEYS {
             let (_, flag, want) = sample

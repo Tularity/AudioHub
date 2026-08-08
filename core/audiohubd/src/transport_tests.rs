@@ -1745,6 +1745,33 @@ fn every_writable_setting_key_is_really_honoured() {
         ),
     ];
     for key in audiohub_ipc::SETTINGS_WRITABLE_KEYS {
+        // plan M9「开机自启」是这张表上唯一一个**没有存盘副本**的键：注册项本身
+        // 就是状态（见 `crate::autostart`），所以「写进去读得回来」这个判据在这里
+        // 不成立，而它真正要被顶住的性质更硬——**测试进程绝不能往用户的登录项里
+        // 写东西**。测试二进制不在 .app 里、旁边也没有 audiohub-app.exe，于是
+        // `settings.set` 必须**报错**，不是静默收下。
+        //
+        // 就地断言而不是 `continue`：跳过一个键会让这张契约表的「逐项覆盖」变成
+        // 一句空话，而那正是它存在的全部理由。
+        if *key == "autostart" {
+            let before = a.ok(methods::SETTINGS_GET, json!({}));
+            assert_eq!(
+                before.get("autostart_supported").and_then(Value::as_bool),
+                Some(false),
+                "测试二进制被判成了可注册登录项的形态——再往下一步就会写进用户的登录项"
+            );
+            let e = a
+                .call(methods::SETTINGS_SET, json!({ "autostart": true }))
+                .expect_err("形态不支持时 settings.set autostart 必须报错，而不是静默收下");
+            assert!(e.contains("无法设置开机自启"), "错误信息说不清是什么挡住了：{e}");
+            let after = a.ok(methods::SETTINGS_GET, json!({}));
+            assert_eq!(
+                after.get("autostart").and_then(Value::as_bool),
+                Some(false),
+                "一次被拒绝的写入之后，daemon 却报告开机自启已开启"
+            );
+            continue;
+        }
         let (_, want, read) = cases
             .iter()
             .find(|(k, _, _)| k == key)
@@ -1755,6 +1782,41 @@ fn every_writable_setting_key_is_really_honoured() {
         let re = a.ok(methods::SETTINGS_GET, json!({}));
         assert_eq!(&read(&re), want, "'{key}' 只体现在回包里，没有真的存下来");
     }
+}
+
+/// **置灰的开机自启开关必须带着理由一起报出来。**
+///
+/// plan M9。`autostart_supported=false` 时界面只能把开关画成点不动的；没有
+/// `autostart_reason`，「为什么点不动」就是一个界面上答不出的问题——这个项目
+/// 已经为同一个形状付过好几次代价（模式降级、广播没生效）。
+///
+/// 判据里带上 `autostart` 与 `autostart_target`，是为了把「字段忘了发」与
+/// 「字段发了但恒为默认值」分开：前者 `.is_none()`，后者才是 `Some(false)`。
+#[test]
+fn the_autostart_switch_reports_why_it_is_greyed_out() {
+    let a = Node::start("autostart");
+    let v = a.ok(methods::SETTINGS_GET, json!({}));
+    assert_eq!(
+        v.get("autostart").and_then(Value::as_bool),
+        Some(false),
+        "settings.get 里没有 autostart 这个字段：{v}"
+    );
+    assert_eq!(
+        v.get("autostart_supported").and_then(Value::as_bool),
+        Some(false),
+        "测试二进制不该被判成可注册登录项的形态：{v}"
+    );
+    let why = v
+        .get("autostart_reason")
+        .and_then(Value::as_str)
+        .expect("autostart_supported=false 却没给理由");
+    assert!(!why.trim().is_empty(), "理由是空串，等于没给");
+    // 不支持时不许报一个「将会启动什么」——那会让界面显示一条根本不会存在的
+    // 登录项目标。
+    assert!(
+        v.get("autostart_target").map(|t| t.is_null()).unwrap_or(true),
+        "形态不支持却报出了启动目标：{v}"
+    );
 }
 
 /// **伺服必须导出「它此刻在做什么」，而且那份读数要随时间前进。**

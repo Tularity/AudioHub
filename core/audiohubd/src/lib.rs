@@ -1,6 +1,9 @@
 //! audiohubd — daemon assembly (spec-m4a §1/§4).
 //! Frozen lib entry: `DaemonCfg` / `DaemonHandle` / `start_daemon`.
 
+/// plan M9「开机自启」：登录时把 App 拉起来（macOS LaunchAgent / Windows 计划
+/// 任务），以及那个开关的探测与撤销。
+mod autostart;
 /// Noticing that UDP does not get through, and moving the peer to tier 1
 /// without being asked (plan §16.2).
 mod autotier;

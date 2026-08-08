@@ -207,6 +207,10 @@ pub const SETTINGS_WRITABLE_KEYS: &[&str] = &[
     "mode_a_volume_sync",
     "mode_a_mute_local",
     "discovery_announce",
+    // plan M9「开机自启」。**一个键管两个平台**：macOS 写 LaunchAgent、Windows
+    // 写计划任务，但契约面上只有这一个名字。两套键会让「开机自启开着吗」这个
+    // 问题在跨平台的界面与文档里各有一个答案。
+    "autostart",
 ];
 
 /// Daemon-owned settings, `settings.get` / `settings.set` (spec-m5b §6.1).
@@ -262,6 +266,35 @@ pub struct DaemonSettings {
     /// nobody can discover it.
     #[serde(default)]
     pub discovery_announcing: bool,
+    /// plan M9「开机自启」：这台机器此刻**真的**注册着登录项吗。
+    ///
+    /// 与它的邻居 `discovery_announce` 不同，这一个**不是存盘的愿望**——它是
+    /// 探测出来的事实。登录项必须活过重启，而能活过重启的东西是 plist / 计划
+    /// 任务本身；再在 `settings.json` 里存一个 bool 就有了两个真值源，且它们的
+    /// 分歧（用户手删了 plist、把配置目录拷去另一台机器）没有任何一处会报错。
+    ///
+    /// 旧 daemon 的回包里没有这个字段，`false` 是那里唯一正确的读法：一个不认识
+    /// 这个字段的 daemon 从来没有注册过任何登录项。
+    #[serde(default)]
+    pub autostart: bool,
+    /// 这台机器的**当前形态**能不能注册登录项。
+    ///
+    /// macOS 要求服务跑在某个 `*.app/Contents/MacOS/` 下，Windows 要求它旁边有
+    /// `audiohub-app.exe`；直接跑构建产物里的裸二进制两个都不满足，因为往登录项
+    /// 里写一条指向构建树的记录，下一次 `cargo build` 就把它变成了一条永远拉不
+    /// 起来、却在界面上显示「已开启」的记录。
+    #[serde(default)]
+    pub autostart_supported: bool,
+    /// 登录时会被拉起的东西（已注册时读自注册项本身，未注册时是「将会写什么」）。
+    ///
+    /// 报的是**注册项里那一个**而不是当前 bundle：两者不同，正是「登录项还指着
+    /// 一个已经被移走的旧 bundle」这件事，而那是界面上唯一能看见它的地方。
+    #[serde(default)]
+    pub autostart_target: Option<String>,
+    /// `autostart_supported == false` 时的人话理由。开关置灰而界面答不出为什么，
+    /// 是本项目反复付过代价的那个形状。
+    #[serde(default)]
+    pub autostart_reason: Option<String>,
     /// 延迟滑条的固定档（毫秒，升序）。**daemon 是唯一真值源**——前端不许自己
     /// 写一份，否则两边的「有哪些档」会各自演化，而分歧不会有任何报错。
     ///
@@ -1275,8 +1308,17 @@ pub struct PeerState {
 /// - "settings.get"      {}                    -> DaemonSettings
 /// - "settings.set"      {mode?, remove_virtual_on_disconnect?,
 ///                        mark_offline_devices?, mode_a_volume_sync?,
-///                        mode_a_mute_local?, discovery_announce?}
+///                        mode_a_mute_local?, discovery_announce?, autostart?}
 ///                                             -> DaemonSettings
+///       `autostart` (plan M9) is ONE key for both platforms: macOS writes a
+///       per-user LaunchAgent, Windows writes the `AudioHubDaemon` scheduled
+///       task, and both launch the APP (which brings the daemon up itself).
+///       It has no stored copy — the registration IS the state, so the reply's
+///       `autostart` is probed rather than echoed. Setting it on a layout that
+///       cannot host one (a bare binary out of the build tree, which is what
+///       every test binary is) FAILS loudly instead of being accepted and
+///       ignored; `autostart_supported` / `autostart_reason` are what the
+///       interface greys the switch out with.
 ///       `discovery_announce` takes effect at once — no restart — and the reply
 ///       carries `discovery_announcing` for whether it actually took. Setting
 ///       it to a value it already has is a deliberate RETRY rather than a

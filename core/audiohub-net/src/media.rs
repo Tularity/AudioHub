@@ -344,7 +344,64 @@ impl JbTuning {
         ncc_retry_ticks: 500,
     };
 
-    /// `AUDIOHUB_JB_*` 覆盖。进程内只读一次（`env::var` 会拿进程级环境锁）。
+    /// Tier 1/2 profile: the same loop, given room to reach a depth a TCP
+    /// retransmission cannot punch through (`docs/design-m8-fallback.md` §3.3).
+    ///
+    /// # The one number this profile exists for: `max_target = 40`
+    ///
+    /// A TCP retransmission timeout is **at least 200 ms** (Linux clamps RTO to
+    /// 200 ms, Windows to 300 ms). [`JbTuning::DEFAULT`]'s `max_target = 12` is
+    /// 120 ms. So under `DEFAULT` *every single retransmission* drains the
+    /// buffer dry — not as a tail risk, as arithmetic. Measured on the real
+    /// mac ↔ 30-win tier 1 link (2026-08-08, 150 s A/B against the same pair of
+    /// counters on tier 0): **+4 underruns and +13 jitter-buffer drops on tier
+    /// 1, +0 and +0 on tier 0**, i.e. ~1.6 underruns/min against a flat
+    /// baseline, with `stale_dropped`, `dropped` and `queued` all zero the
+    /// whole time — so the loss was not the send-side gate, it was delivery
+    /// timing at the receiver, which is exactly what depth buys.
+    ///
+    /// 400 ms covers a Windows RTO (300 ms) with a margin; it is a magnitude
+    /// derived from the RTO floors, not a measured optimum, and §8 item 3 of
+    /// the design says so.
+    ///
+    /// # `extra_max = 36`: without it the ceiling above is decoration
+    ///
+    /// Depth is not set by these numbers, it is *found* by the underrun
+    /// penalty loop — one frame per underrun, one frame back per five clean
+    /// minutes, settling wherever underruns become rarer than that (see
+    /// [`JitterBuffer`]'s "不需要事先知道 R" argument, which is unchanged
+    /// here). `target_effective` is `clamp(target + extra, min, max)`, so
+    /// `extra_max` is what limits how far the loop may climb: `DEFAULT`'s 2
+    /// would pin tier 1 at `min_target + 2` = 60 ms and `max_target = 40` would
+    /// never be reachable at all. 36 = `max_target − min_target` makes the
+    /// ceiling the only clamp, which is the point of raising it.
+    ///
+    /// **`underrun_step` is deliberately left at 1.** Faster convergence is
+    /// tempting (at ~1.6 underruns/min the loop needs tens of minutes to walk
+    /// 36 frames), but the design says the penalty loop itself is unchanged and
+    /// the honest lever for "deep enough immediately" is `min_target`, which is
+    /// a starting depth rather than a learning rate.
+    ///
+    /// # What is *not* raised, and why that is a decision
+    ///
+    /// `min_target` stays at 4. It was measured on the tier 0 link (see the
+    /// long note on [`JbTuning::DEFAULT`]) and nothing about TCP makes the
+    /// *floor* wrong; raising it would add its whole value to the steady-state
+    /// latency of every tier 1 link, including the good tunnels where the
+    /// penalty loop never needs to climb at all. Overridable for measurement
+    /// via `AUDIOHUB_JB_DEGRADED_MIN_TARGET` (see [`JbTuning::from_env`]).
+    pub const DEGRADED: JbTuning = JbTuning {
+        min_target: 4,
+        max_target: 40,
+        extra_max: 36,
+        // The memory ceiling has to clear the latency-control line, exactly as
+        // in `from_env`'s tail: `max_target + hard_slack + 1` = 47.
+        max_frames: 48,
+        ..JbTuning::DEFAULT
+    };
+
+    /// `AUDIOHUB_JB_*` 覆盖 [`JbTuning::DEFAULT`]。进程内只读一次（`env::var`
+    /// 会拿进程级环境锁）。
     ///
     /// | 变量 | 默认 |
     /// |---|---|
@@ -360,37 +417,51 @@ impl JbTuning {
     /// | `AUDIOHUB_JB_XFADE` | 192（= 4 ms） |
     /// | `AUDIOHUB_JB_NCC_FLOOR` | -0.2 |
     /// | `AUDIOHUB_JB_NCC_RETRY_TICKS` | 500（= 5 s） |
+    ///
+    /// [`JbTuning::degraded_from_env`] reads the **same twelve names with an
+    /// `AUDIOHUB_JB_DEGRADED_` prefix** over [`JbTuning::DEGRADED`]. Two
+    /// prefixes and one implementation, so a knob can never exist for one
+    /// profile and quietly do nothing for the other.
     pub fn from_env() -> JbTuning {
-        fn u32v(key: &str, d: u32) -> u32 {
-            std::env::var(key)
+        JbTuning::env_over(JbTuning::DEFAULT, "AUDIOHUB_JB_")
+    }
+
+    /// The tier 1/2 profile with `AUDIOHUB_JB_DEGRADED_*` applied. See
+    /// [`JbTuning::from_env`] for the variable names.
+    pub fn degraded_from_env() -> JbTuning {
+        JbTuning::env_over(JbTuning::DEGRADED, "AUDIOHUB_JB_DEGRADED_")
+    }
+
+    fn env_over(d: JbTuning, prefix: &str) -> JbTuning {
+        let u32v = |key: &str, dv: u32| -> u32 {
+            std::env::var(format!("{prefix}{key}"))
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok())
-                .unwrap_or(d)
-        }
-        fn u64v(key: &str, d: u64) -> u64 {
-            std::env::var(key)
+                .unwrap_or(dv)
+        };
+        let u64v = |key: &str, dv: u64| -> u64 {
+            std::env::var(format!("{prefix}{key}"))
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(d)
-        }
-        let d = JbTuning::DEFAULT;
+                .unwrap_or(dv)
+        };
         let mut t = JbTuning {
-            min_target: u32v("AUDIOHUB_JB_MIN_TARGET", d.min_target).max(1),
-            max_target: u32v("AUDIOHUB_JB_MAX_TARGET", d.max_target).max(1),
-            slack: u32v("AUDIOHUB_JB_SLACK", d.slack),
-            accel_interval_ticks: u64v("AUDIOHUB_JB_ACCEL_INTERVAL_TICKS", d.accel_interval_ticks),
-            hard_slack: u32v("AUDIOHUB_JB_HARD_SLACK", d.hard_slack),
-            max_frames: u32v("AUDIOHUB_JB_MAX_FRAMES", d.max_frames).max(2),
-            underrun_step: u32v("AUDIOHUB_JB_UNDERRUN_STEP", d.underrun_step),
-            extra_max: u32v("AUDIOHUB_JB_EXTRA_MAX", d.extra_max),
-            extra_decay_ticks: u64v("AUDIOHUB_JB_EXTRA_DECAY_TICKS", d.extra_decay_ticks).max(1),
-            xfade: u32v("AUDIOHUB_JB_XFADE", d.xfade as u32) as usize,
-            ncc_floor: std::env::var("AUDIOHUB_JB_NCC_FLOOR")
+            min_target: u32v("MIN_TARGET", d.min_target).max(1),
+            max_target: u32v("MAX_TARGET", d.max_target).max(1),
+            slack: u32v("SLACK", d.slack),
+            accel_interval_ticks: u64v("ACCEL_INTERVAL_TICKS", d.accel_interval_ticks),
+            hard_slack: u32v("HARD_SLACK", d.hard_slack),
+            max_frames: u32v("MAX_FRAMES", d.max_frames).max(2),
+            underrun_step: u32v("UNDERRUN_STEP", d.underrun_step),
+            extra_max: u32v("EXTRA_MAX", d.extra_max),
+            extra_decay_ticks: u64v("EXTRA_DECAY_TICKS", d.extra_decay_ticks).max(1),
+            xfade: u32v("XFADE", d.xfade as u32) as usize,
+            ncc_floor: std::env::var(format!("{prefix}NCC_FLOOR"))
                 .ok()
                 .and_then(|v| v.trim().parse::<f32>().ok())
                 .unwrap_or(d.ncc_floor)
                 .clamp(-1.0, 1.0),
-            ncc_retry_ticks: u32v("AUDIOHUB_JB_NCC_RETRY_TICKS", d.ncc_retry_ticks),
+            ncc_retry_ticks: u32v("NCC_RETRY_TICKS", d.ncc_retry_ticks),
         };
         t.max_target = t.max_target.max(t.min_target);
         // 内存上界永远不许低于延迟控制线，否则内存保护会去抢延迟控制的活，
@@ -404,6 +475,32 @@ impl JbTuning {
         *CACHE.get_or_init(JbTuning::from_env)
     }
 }
+
+/// The invariant `from_env` enforces at runtime, enforced at **compile** time
+/// for the one profile no environment variable has to pass through.
+///
+/// Below this line the hard `len()` trim starts doing the latency controller's
+/// job — and it cuts without a crossfade, by `len()`, so it deletes real audio
+/// that arrived after a hole.
+const _: () = assert!(
+    JbTuning::DEGRADED.max_frames
+        >= JbTuning::DEGRADED.max_target + JbTuning::DEGRADED.hard_slack + 1,
+    "JbTuning::DEGRADED's memory ceiling sits below its latency-control line"
+);
+
+/// Raising `max_target` buys nothing if the penalty loop cannot climb to it:
+/// `target_effective` is `clamp(target + extra, min, max)`, so the reachable
+/// depth is `min_target + extra_max` and *that* would be the real ceiling.
+const _: () = assert!(
+    JbTuning::DEGRADED.min_target + JbTuning::DEGRADED.extra_max >= JbTuning::DEGRADED.max_target,
+    "the underrun penalty cannot reach JbTuning::DEGRADED.max_target"
+);
+
+/// One frame, in milliseconds. `audiohubd`'s `engine::FRAME_MS` is the same
+/// number one layer up and asserts equality with this one at compile time —
+/// this crate cannot reach that constant, and a second literal 10 is how the
+/// two would drift.
+pub const FRAME_MS: u64 = 10;
 
 /// Per-receive-stream jitter buffer holding 48k mono f32 frames (one frame =
 /// one 10ms tick). pop() once per tick after warm-up; missing frames get PLC
@@ -1369,6 +1466,72 @@ pub const LADDER: [WireFormat; 6] = [
 /// ⇒ 改成 `0` 就能让 AUTO 也升到 32 位浮点，代价只有「默认带宽翻倍」这一件事。
 pub const AUTO_TOP_RUNG: u32 = 2;
 
+/// AUTO 在**降级链路**（Tier 1/2）上能升到的最高格。plan §16.3 冻结为 3。
+///
+/// 用户裁定的理由逐字：TCP 上深档更吃亏（协议开销 + 队头阻塞），
+/// **降级链路优先保证有声音，不优先保证深档**。用户明确接受由此产生的语义
+/// 后果：**同一个 AUTO 在不同 tier 上顶档不同**。
+///
+/// 与已否决 #18（「AUTO 不自动升深档」）**方向相同、幅度更保守**：rung 号越大
+/// 码率越低，这是把天花板再压低一格，不是把「自动升深档」端回来。
+pub const AUTO_TOP_RUNG_STREAMED: u32 = 3;
+
+const _: () = assert!(
+    AUTO_TOP_RUNG_STREAMED > AUTO_TOP_RUNG && (AUTO_TOP_RUNG_STREAMED as usize) < LADDER.len(),
+    "the degraded ceiling has to be a real rung and it has to be *lower quality* than tier 0's \
+     (rung numbers count downwards in bitrate): a value above AUTO_TOP_RUNG would make AUTO \
+     spend more bandwidth on the worse transport, which is backwards"
+);
+
+/// Tier 1/2 降档线：发送侧队列积压毫秒数（[`AutoLadder::feed_streamed`] 的主
+/// 信号）。连续 [`STREAMED_HOT_PERIODS`] 个统计周期越线才降一格。
+///
+/// # 为什么是 20 ms，以及它为什么在丢音之前就开火
+///
+/// 队列积压是 `loss_pct` 在 TCP 上的**直接对应物**：UDP 下「跟不上」表现为对端
+/// 丢包，TCP 下表现为字节堆在我们自己的队列里（TCP 把丢包信号擦掉了）。
+/// 20 ms 是一帧的两倍，也是媒体 socket 的 `SO_SNDTIMEO`（一次写阻塞的粒度）
+/// —— 低于它就分不清「积压」与「一次正常的写阻塞」。
+///
+/// 而它远低于陈旧闸门的预算（`tcpmedia::STALE_BUDGET`，几百毫秒量级）：
+/// **AUTO 因此在闸门开始丢音频之前就降档**，这正是这个信号比丢包好的地方
+/// —— 丢包信号只有在音频已经没了之后才存在。
+pub const STREAMED_WRITEQ_HOT_MS: f64 = 20.0;
+
+/// 升档线：积压回到这个数以下才算一个干净周期。取降档线的一半。
+///
+/// # 这个数是实测定的，第一版（2.0 ms）实测**让阶梯永远升不回去**
+///
+/// AUTO 消费的是**每秒的峰值**（`take_writeq_peak_ms`）——峰值是对的选择，
+/// 积压是事件，用均值会把它抹平。但峰值同时意味着这条判据看到的是尾部：
+/// 2026-08-08 本机双 daemon、tier 1、链路完全空闲的 20 s 窗口里，每秒峰值实测
+/// **0.3 / 0.4 / 0.4 / 1.3 / 2.2 ms**。也就是说 2.0 ms 这条线在一条**毫无积压**
+/// 的链路上大约每十几秒就被越过一次，而升档要求**连续 10 个**干净周期
+/// ⇒ 实测 34 秒零积压、`rung_changes` 一次都没动，阶梯钉死在最低档。
+///
+/// 失效形态值得记：它不报错、不掉音、听起来"稳定"，只是永远比链路能给的差
+/// 一到两档。判据用尾部统计量去证明"没有问题"，本来就该给调度器留余量。
+///
+/// 取 `HOT / 2` 而不是另写一个数：两条线之间保持一个明确的死区，谁改降档线
+/// 谁就同时改了升档线，不会只动一半。
+pub const STREAMED_WRITEQ_CLEAN_MS: f64 = STREAMED_WRITEQ_HOT_MS / 2.0;
+
+/// 升档的辅助闸门：接收侧单向时延展布（`stats::SpreadWindow`）。
+///
+/// 干净线取 [`JbTuning::DEGRADED`] 的**最浅**深度：展布小于抖动缓冲在它最浅
+/// 处就能吸收的量 ⇒ 这条链路的交付时序没有让接收端付过代价，可以谈加带宽。
+/// 与 `min_target` 绑定而不是写死一个数：整定一动，这条线跟着动。
+pub const STREAMED_SPREAD_CLEAN_MS: f64 =
+    (JbTuning::DEGRADED.min_target as u64 * FRAME_MS) as f64;
+
+/// 连续几个周期越线才降一格。
+///
+/// 3 而不是 1：TCP 上一次重传就能把一帧压在队列里 200–300 ms，而重传是**正常**
+/// 的（tier 1 存在的前提就是这条链路只能跑 TCP）。一次就降档等于让每一次重传
+/// 都砍一格带宽，几秒钟就踩到阶梯底部——那是 §14「一次抖动尖峰不该直接打到
+/// 最低档」在 TCP 上的同型病。
+pub const STREAMED_HOT_PERIODS: u32 = 3;
+
 /// 格号 → 格式。越界钳到最低档（最差那一格）。
 pub fn rung_format(rung: u32) -> WireFormat {
     LADDER[(rung as usize).min(LADDER.len() - 1)]
@@ -1402,13 +1565,48 @@ pub fn rung_of(rate_hz: u32, depth: WireDepth) -> Option<u32> {
 pub struct AutoLadder {
     rung: u32,
     clean: u32,
+    /// 连续越过 [`STREAMED_WRITEQ_HOT_MS`] 的周期数。**只有
+    /// [`AutoLadder::feed_streamed`] 碰它**；Tier 0 的路径上它恒为 0。
+    hot: u32,
+    /// 这台阶梯的天花板。Tier 0 = [`AUTO_TOP_RUNG`]，降级链路 =
+    /// [`AUTO_TOP_RUNG_STREAMED`]（plan §16.3）。
+    ///
+    /// # 为什么是字段而不是让两条路径各读各的常量
+    ///
+    /// 让 `feed_stats` 继续读常量、只在 `feed_streamed` 里读天花板，会留下
+    /// 一个安静的洞：一台降级阶梯若被喂了 Tier 0 的信号（调用方拿错方法），
+    /// 它会一路升到 rung 2 —— 也就是这条裁定要禁的那件事，而没有任何一处会
+    /// 报错。天花板做成状态之后，**拿错方法最坏只是判据用错，档位边界仍然
+    /// 由构造时那次选择说了算**。
+    ///
+    /// Tier 0 的行为逐位不变：`new()` 把它初始化成 `AUTO_TOP_RUNG`，于是
+    /// `feed_stats` 的比较与改动前是同一个数。
+    top_rung: u32,
     pub rung_changes: u32,
 }
 
 impl AutoLadder {
     pub fn new() -> Self {
         // 从 AUTO 的天花板起步，不是从阶梯顶端起步。
-        AutoLadder { rung: AUTO_TOP_RUNG, clean: 0, rung_changes: 0 }
+        AutoLadder { rung: AUTO_TOP_RUNG, clean: 0, hot: 0, top_rung: AUTO_TOP_RUNG, rung_changes: 0 }
+    }
+
+    /// 降级链路（Tier 1/2）上的阶梯：天花板压到
+    /// [`AUTO_TOP_RUNG_STREAMED`]，判据换成 [`AutoLadder::feed_streamed`]。
+    pub fn new_streamed() -> Self {
+        AutoLadder {
+            rung: AUTO_TOP_RUNG_STREAMED,
+            clean: 0,
+            hot: 0,
+            top_rung: AUTO_TOP_RUNG_STREAMED,
+            rung_changes: 0,
+        }
+    }
+
+    /// 这台阶梯能升到的最高格。UI 上「AUTO 能升到哪」这句话必须按它说，
+    /// **不得照抄 Tier 0 的 2**（plan §16.3 的语义后果）。
+    pub fn top_rung(&self) -> u32 {
+        self.top_rung
     }
 
     pub fn rung(&self) -> u32 {
@@ -1436,8 +1634,64 @@ impl AutoLadder {
         }
         if loss_pct < 0.5 && jitter_ms < 5.0 {
             self.clean = self.clean.saturating_add(1);
-            // `> AUTO_TOP_RUNG` 而不是 `> 0`：AUTO 不许自己走进深档。
-            if self.clean >= 10 && self.rung > AUTO_TOP_RUNG {
+            // `> self.top_rung` 而不是 `> 0`：AUTO 不许自己走进深档。
+            // Tier 0 上 `top_rung == AUTO_TOP_RUNG`，与改动前是同一个比较。
+            if self.clean >= 10 && self.rung > self.top_rung {
+                self.clean = 0;
+                self.rung -= 1;
+                self.rung_changes += 1;
+                return Some(self.rung);
+            }
+            return None;
+        }
+        self.clean = 0;
+        None
+    }
+
+    /// 降级链路（Tier 1/2）上的一个统计周期。**与 [`AutoLadder::feed_stats`]
+    /// 互斥使用**，由构造函数选定：`new()` 配前者，`new_streamed()` 配这个。
+    ///
+    /// # 为什么 TCP 上必须换判据（这是本方法存在的全部理由）
+    ///
+    /// - `loss_pct` 在 TCP 上**恒为 0**。重传把丢包变成延迟，于是 Tier 0 的
+    ///   主判据在这条链路上是一个常数——它不是变迟钝了，是完全没有信号。
+    /// - `jitter_ms` 是 RFC 3550 一阶差分，而 TCP 的失效形态是「停顿一下、
+    ///   然后**成串**送达」：串内相邻差分近似 0，只有停顿后第一个包扛住全部
+    ///   延迟 ⇒ 窗口分位数被**系统性低估**。这与 `engine.rs` 那条「两个半包
+    ///   共用时间戳把一半抖动样本压成 0」的教训完全同型。
+    ///
+    /// # 两个信号的分工
+    ///
+    /// - **主：`writeq_ms`**（发送侧队列积压）。它是 `loss_pct` 在 TCP 上的
+    ///   直接对应物，而且**本地可得**——不必等对端的 `Stats` 回传，所以降档
+    ///   比 Tier 0 早一整个统计周期。
+    /// - **辅：`spread_ms`**（接收侧单向时延展布，p95 − 同窗口最小值）。
+    ///   **只参与升档，不参与降档**：tier 1 上一次重传就会如实推高展布，而
+    ///   重传是这条链路的常态；拿它降档等于每次重传砍一格，几秒钟就到底。
+    ///
+    /// `spread_ms = None`（对端没报 / 窗口还不够长）**按干净处理**。理由与
+    /// 本仓反复吃过的「缺席不等于坏」是同一条：主信号是本地的、永远有值，
+    /// 而让一个沉默的对端把档位永久钉住，是把「没有测量」当成了「测到很糟」。
+    pub fn feed_streamed(&mut self, writeq_ms: f64, spread_ms: Option<f64>) -> Option<u32> {
+        if writeq_ms > STREAMED_WRITEQ_HOT_MS {
+            self.clean = 0;
+            self.hot = self.hot.saturating_add(1);
+            if self.hot >= STREAMED_HOT_PERIODS {
+                self.hot = 0;
+                if self.rung < LADDER.len() as u32 - 1 {
+                    self.rung += 1;
+                    self.rung_changes += 1;
+                    return Some(self.rung);
+                }
+            }
+            return None;
+        }
+        // 一个不越线的周期就把连击清零：判据是「**连续** 3 个」。
+        self.hot = 0;
+        let spread_ok = spread_ms.is_none_or(|s| s < STREAMED_SPREAD_CLEAN_MS);
+        if writeq_ms <= STREAMED_WRITEQ_CLEAN_MS && spread_ok {
+            self.clean = self.clean.saturating_add(1);
+            if self.clean >= 10 && self.rung > self.top_rung {
                 self.clean = 0;
                 self.rung -= 1;
                 self.rung_changes += 1;
@@ -1580,6 +1834,166 @@ mod ladder_tests {
         }
         assert_eq!(l.feed_stats(0.0, 0.0), None, "到天花板之后不该再报变化");
         assert_eq!(l.rung_changes, down_steps * 2, "一降一升，换档次数应当翻倍");
+    }
+
+    /// The tier 0 trajectory is **frozen against the pre-P4 build**, step by
+    /// step.
+    ///
+    /// # Why a recorded sequence and not another set of properties
+    ///
+    /// P4 adds a second judgement path to this state machine, and the risk it
+    /// carries is not "the new path is wrong" — that path has its own tests —
+    /// but "the old path moved a little while nobody was looking". Every
+    /// existing test here asserts a *property* (starts at the ceiling, one step
+    /// per period, floors at the bottom), and a property-shaped test cannot see
+    /// a change in *when* the steps happen. This one can: it is the same 600
+    /// periods fed to both builds, compared element by element.
+    ///
+    /// The expected values were minted by compiling `feed_stats` **as it stood
+    /// at HEAD 5169ab3**, verbatim, into a standalone binary and running this
+    /// exact driver against it (2026-08-08). They are not this build's output
+    /// written down — that would assert only that the code equals itself.
+    ///
+    /// Run-length encoded because 600 integers of which 105 are consecutive
+    /// fives is not more convincing at full length, only longer.
+    #[test]
+    fn the_tier_zero_rung_trajectory_is_unchanged_step_for_step() {
+        #[rustfmt::skip]
+        const GOLDEN_RLE: [(u32, usize); 30] = [
+            (2, 3), (3, 4), (4, 12), (5, 51), (4, 10), (3, 2), (4, 5), (5, 12),
+            (4, 3), (5, 29), (4, 14), (5, 30), (4, 17), (5, 38), (4, 21), (5, 105),
+            (4, 5), (5, 10), (4, 15), (5, 31), (4, 19), (3, 23), (4, 8), (5, 51),
+            (4, 8), (5, 37), (4, 6), (5, 20), (4, 9), (5, 2),
+        ];
+        let want: Vec<u32> =
+            GOLDEN_RLE.iter().flat_map(|&(r, n)| std::iter::repeat_n(r, n)).collect();
+        assert_eq!(want.len(), 600, "the golden sequence lost or gained periods");
+
+        let mut l = AutoLadder::new();
+        let mut x: u64 = 0x5169_A3B3_C4D5_E6F7; // xorshift64, seeded by the HEAD it was minted on
+        for (i, expect) in want.iter().enumerate() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let (loss, jit) = match (x >> 17) % 100 {
+                0..=5 => (20.0, 2.0),  // demotes on loss
+                6..=9 => (1.0, 30.0),  // demotes on jitter
+                10..=19 => (2.0, 8.0), // middling: no move, and resets the streak
+                _ => (0.1, 1.0),       // clean
+            };
+            l.feed_stats(loss, jit);
+            assert_eq!(
+                l.rung(),
+                *expect,
+                "tier 0 AUTO diverged from the pre-P4 build at period {i} \
+                 (loss {loss}, jitter {jit})"
+            );
+        }
+        assert_eq!(l.rung_changes, 29, "tier 0 changed rungs a different number of times");
+    }
+
+    /// The degraded path demotes on backlog and **only after it persists**.
+    #[test]
+    fn a_streamed_ladder_demotes_after_three_consecutive_backlogged_periods() {
+        let mut l = AutoLadder::new_streamed();
+        assert_eq!(l.rung(), AUTO_TOP_RUNG_STREAMED, "degraded AUTO did not start at its ceiling");
+        let hot = STREAMED_WRITEQ_HOT_MS + 1.0;
+        for i in 1..STREAMED_HOT_PERIODS {
+            assert_eq!(l.feed_streamed(hot, None), None, "demoted after only {i} hot period(s)");
+        }
+        assert_eq!(
+            l.feed_streamed(hot, None),
+            Some(AUTO_TOP_RUNG_STREAMED + 1),
+            "three consecutive hot periods must demote exactly one rung"
+        );
+        // A single clean period breaks the run: the criterion is CONSECUTIVE.
+        // Without this the counter is "three hot periods ever", and a link that
+        // hiccups once a minute walks to the bottom of the ladder in an hour.
+        for _ in 0..(STREAMED_HOT_PERIODS - 1) {
+            assert_eq!(l.feed_streamed(hot, None), None);
+        }
+        assert_eq!(l.feed_streamed(0.0, None), None, "a clean period moved the rung by itself");
+        for _ in 0..(STREAMED_HOT_PERIODS - 1) {
+            assert_eq!(l.feed_streamed(hot, None), None, "the hot run was not restarted");
+        }
+    }
+
+    /// Promotion needs ten clean periods **and** a spread the receiver can
+    /// absorb; the ceiling is the degraded one, not tier 0's.
+    #[test]
+    fn a_streamed_ladder_promotes_slowly_and_stops_at_the_degraded_ceiling() {
+        let mut l = AutoLadder::new_streamed();
+        for _ in 0..(STREAMED_HOT_PERIODS * 3) {
+            l.feed_streamed(STREAMED_WRITEQ_HOT_MS + 1.0, None);
+        }
+        let floor = LADDER.len() as u32 - 1;
+        assert_eq!(l.rung(), floor, "setup did not reach the bottom rung");
+
+        // A high spread holds promotion off even with an empty queue: the
+        // backlog says we could send more, the spread says the peer is not
+        // receiving what we already send on time.
+        for i in 0..50 {
+            assert_eq!(
+                l.feed_streamed(0.0, Some(STREAMED_SPREAD_CLEAN_MS + 1.0)),
+                None,
+                "promoted on period {i} while the receiver's delay spread was over the line"
+            );
+        }
+        // Spread clears: ten clean periods, then one rung.
+        for i in 0..9 {
+            assert_eq!(l.feed_streamed(0.0, Some(0.0)), None, "promoted on clean period {i}");
+        }
+        assert_eq!(l.feed_streamed(0.0, Some(0.0)), Some(floor - 1));
+
+        // All the way up, then stop — at 3, not at tier 0's 2.
+        for _ in 0..500 {
+            l.feed_streamed(0.0, None);
+            assert!(
+                l.rung() >= AUTO_TOP_RUNG_STREAMED,
+                "degraded AUTO climbed past its ceiling to rung {} — plan §16.3 caps it at {}",
+                l.rung(),
+                AUTO_TOP_RUNG_STREAMED
+            );
+        }
+        assert_eq!(l.rung(), AUTO_TOP_RUNG_STREAMED);
+    }
+
+    /// A ladder built for the degraded transport keeps its ceiling **even if it
+    /// is fed the other path's signals**.
+    ///
+    /// This is why the ceiling is a field rather than each path reading its own
+    /// constant: picking the wrong method at a call site is a plain mistake,
+    /// and its consequence must not be "AUTO quietly spends 50% more bandwidth
+    /// on the transport that can least afford it".
+    #[test]
+    fn the_ceiling_belongs_to_the_ladder_not_to_the_method() {
+        let mut l = AutoLadder::new_streamed();
+        for _ in 0..500 {
+            l.feed_stats(0.0, 0.0);
+        }
+        assert_eq!(l.rung(), AUTO_TOP_RUNG_STREAMED, "tier 0 signals lifted a degraded ladder");
+        assert_eq!(l.top_rung(), AUTO_TOP_RUNG_STREAMED);
+        assert_eq!(AutoLadder::new().top_rung(), AUTO_TOP_RUNG);
+    }
+
+    /// A missing `spread_ms` is read as clean, deliberately.
+    ///
+    /// Injection control: make `feed_streamed` treat `None` as "over the line"
+    /// and this goes red — which is the behaviour where a peer that never
+    /// reports the field pins the rung for the whole session. Absence of a
+    /// measurement is not a measurement of trouble; the repo has paid for that
+    /// confusion before (`jb_underruns = 0` on a direction that cannot observe).
+    #[test]
+    fn an_unreported_spread_does_not_block_promotion_forever() {
+        let mut l = AutoLadder::new_streamed();
+        for _ in 0..STREAMED_HOT_PERIODS {
+            l.feed_streamed(STREAMED_WRITEQ_HOT_MS + 1.0, None);
+        }
+        assert_eq!(l.rung(), AUTO_TOP_RUNG_STREAMED + 1);
+        for _ in 0..9 {
+            assert_eq!(l.feed_streamed(0.0, None), None);
+        }
+        assert_eq!(l.feed_streamed(0.0, None), Some(AUTO_TOP_RUNG_STREAMED));
     }
 
     /// `rung_of` 不做就近吸附；**采样率单独不再能标识一档**。
@@ -2741,6 +3155,57 @@ mod water_level_tests {
         );
         let t = JbTuning::from_env();
         assert!(t.max_frames >= t.max_target + t.hard_slack + 1);
+    }
+
+    /// The tier 1/2 profile: the documented numbers, and the two invariants
+    /// that make them mean anything.
+    ///
+    /// The compile-time assertions next to `DEGRADED` cover the constant. This
+    /// covers the **constructed** value, because `degraded_from_env` can be
+    /// handed anything: `AUDIOHUB_JB_DEGRADED_MAX_TARGET=200` must still come
+    /// back with a memory ceiling above the latency-control line, exactly as
+    /// `from_env` guarantees for tier 0.
+    #[test]
+    fn the_degraded_profile_is_the_documented_one_and_stays_self_consistent() {
+        let d = JbTuning::DEGRADED;
+        assert_eq!(
+            d.max_target, 40,
+            "400 ms is the whole reason this profile exists: a TCP RTO is >=200 ms (Linux) or \
+             300 ms (Windows), so DEFAULT's 120 ms ceiling means every retransmission underruns"
+        );
+        assert_eq!(
+            d.extra_max, 36,
+            "the underrun penalty is what FINDS the depth; capping it below max_target - \
+             min_target makes the raised ceiling unreachable and therefore decorative"
+        );
+        assert_eq!(d.max_frames, 48, "memory ceiling must clear max_target + hard_slack + 1 = 47");
+        assert_eq!(
+            d.underrun_step,
+            JbTuning::DEFAULT.underrun_step,
+            "the penalty LOOP is unchanged by design; the profile only changes what it may reach"
+        );
+        assert_eq!(
+            (d.min_target, d.slack, d.hard_slack, d.accel_interval_ticks, d.extra_decay_ticks),
+            (
+                JbTuning::DEFAULT.min_target,
+                JbTuning::DEFAULT.slack,
+                JbTuning::DEFAULT.hard_slack,
+                JbTuning::DEFAULT.accel_interval_ticks,
+                JbTuning::DEFAULT.extra_decay_ticks
+            ),
+            "only the three fields above are supposed to differ from DEFAULT"
+        );
+        let t = JbTuning::degraded_from_env();
+        assert!(
+            t.max_frames >= t.max_target + t.hard_slack + 1,
+            "degraded_from_env broke the invariant from_env enforces: {} < {} + {} + 1",
+            t.max_frames,
+            t.max_target,
+            t.hard_slack
+        );
+        // The promotion gate AUTO uses on this transport is derived from this
+        // profile, not written down twice.
+        assert_eq!(STREAMED_SPREAD_CLEAN_MS, d.min_target as f64 * FRAME_MS as f64);
     }
 }
 

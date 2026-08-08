@@ -65,40 +65,48 @@ use crate::{dlog, lk, ConnShared, DaemonInner, TxShared};
 /// How old a queued frame may be when the writer picks it up. Older ⇒ dropped
 /// and counted as [`TcpMediaLink::stale_dropped`].
 ///
-/// # Why 200 ms
+/// # Why 440 ms — and why it moved from 200 in P4
 ///
-/// It is bracketed by two numbers the receiver already lives by
-/// (`media.rs`'s `JbTuning::DEFAULT`):
+/// It is bracketed by two numbers **the receiver of these frames actually lives
+/// by**, and on tier 1 that is `JbTuning::DEGRADED`, not `JbTuning::DEFAULT`:
 ///
-/// - `max_target = 12` frames = **120 ms** is the deepest steady-state target
+/// - `max_target = 40` frames = **400 ms** is the deepest steady-state target
 ///   the jitter buffer will aim for. A frame older than that has already missed
 ///   the slot it was going to be played in, whatever the receiver does.
-/// - `max_frames = 24` frames = **240 ms** is the hard ceiling at which the
+/// - `max_frames = 48` frames = **480 ms** is the hard ceiling at which the
 ///   jitter buffer itself starts discarding the oldest. Dropping *below* that
 ///   keeps the decision — and the counter — on the side that can explain it.
 ///   Above it, the same audio would still be discarded, silently, by the peer.
 ///
-/// 200 ms sits between them, which is also the figure design §3.2 defence 1
-/// names for the tier 1 profile. It is a budget, not a measurement, and it is
-/// stated here rather than derived so that P4's `JbTuning::DEGRADED`
-/// (`max_target = 40`) forces somebody to name which profile this budget
-/// belongs to instead of letting it move underneath them.
-pub(crate) const STALE_BUDGET: Duration = Duration::from_millis(200);
+/// **The profile is the whole argument, so getting it wrong is not a tuning
+/// error, it is a subject error.** P3 bracketed this budget by
+/// `JbTuning::DEFAULT` because tier 1 used `DEFAULT`; P4 gives tier 1 its own
+/// profile, and a 200 ms budget under a 400 ms target would throw away audio
+/// the receiver was going to play — the exact failure the lower bound exists to
+/// prevent. The assertion below reads the profile rather than a literal, so
+/// this cannot drift again without failing to compile.
+pub(crate) const STALE_BUDGET: Duration = Duration::from_millis(440);
 
 /// The two numbers the budget above is bracketed by, **read from the jitter
-/// buffer** rather than copied.
+/// buffer profile tier 1 receivers run** rather than copied.
 ///
 /// The first version of this assertion spelled them `12 * 10` and `24 * 10`.
-/// It went red when `STALE_BUDGET` moved and stayed green when
-/// `JbTuning::DEFAULT` moved — which is backwards, because the failure message
-/// asserts a *relationship* between them, and only one side of that
-/// relationship was actually being read. Verified by mutation on 2026-08-08:
-/// with the literals, dropping `max_frames` to 16 compiled clean; with the
-/// constants below it fails to compile.
-const JB_DEEPEST_TARGET_MS: u64 =
-    audiohub_net::media::JbTuning::DEFAULT.max_target as u64 * crate::engine::FRAME_MS;
-const JB_HARD_CEILING_MS: u64 =
-    audiohub_net::media::JbTuning::DEFAULT.max_frames as u64 * crate::engine::FRAME_MS;
+/// It went red when `STALE_BUDGET` moved and stayed green when the tuning
+/// moved — which is backwards, because the failure message asserts a
+/// *relationship* between them, and only one side of that relationship was
+/// actually being read. Verified by mutation on 2026-08-08: with the literals,
+/// dropping `max_frames` to 16 compiled clean; with the constants below it
+/// fails to compile.
+///
+/// The subject is [`JB_PROFILE`], and that binding is the second half of the
+/// same lesson: P4 introduced `DEGRADED` while this assertion still named
+/// `DEFAULT`, so for one edit the gate was bracketed by a profile nothing on
+/// this transport uses. `tier1_jb_tuning` and this constant now read the same
+/// name, and `the_stale_gate_is_bracketed_by_the_profile_tier_1_receivers_use`
+/// asserts they still do.
+const JB_PROFILE: audiohub_net::media::JbTuning = audiohub_net::media::JbTuning::DEGRADED;
+const JB_DEEPEST_TARGET_MS: u64 = JB_PROFILE.max_target as u64 * crate::engine::FRAME_MS;
+const JB_HARD_CEILING_MS: u64 = JB_PROFILE.max_frames as u64 * crate::engine::FRAME_MS;
 
 const _: () = assert!(
     STALE_BUDGET.as_millis() as u64 > JB_DEEPEST_TARGET_MS
@@ -199,6 +207,20 @@ pub(crate) enum MediaPath {
 }
 
 impl MediaPath {
+    /// The highest rung AUTO may occupy on this transport (plan §16.3).
+    ///
+    /// **AUTO's ceiling is a property of the transport, not a global
+    /// constant.** On a degraded link the deep rungs cost more (protocol
+    /// overhead plus head-of-line blocking) for a difference nobody can hear,
+    /// and the user's ruling is that a degraded link prioritises *having sound*
+    /// over having deep sound.
+    pub(crate) fn auto_top_rung(&self) -> u32 {
+        match self {
+            MediaPath::Udp(_) => audiohub_net::media::AUTO_TOP_RUNG,
+            MediaPath::Tcp(_) => audiohub_net::media::AUTO_TOP_RUNG_STREAMED,
+        }
+    }
+
     /// The UDP destination, or `None` on a transport that has none. Callers use
     /// this to skip UDP-only work; nobody may invent an address for the `None`
     /// case.
@@ -259,6 +281,67 @@ pub(crate) struct TcpMediaLink {
     /// `Media`. Counted rather than tolerated silently: tier 1 carries media
     /// only, so anything else means the peer is running a protocol we do not.
     unexpected_kind: AtomicU64,
+    /// How long the frame the writer most recently picked up had been waiting,
+    /// in microseconds. **This is `writeq_ms`** — AUTO's primary demote signal
+    /// on this transport (design §3.4 signal 1).
+    wait_us_last: AtomicU64,
+    /// The same, running maximum since the link came up. For the status page,
+    /// which needs a number that a 1 Hz poll cannot miss.
+    wait_us_peak: AtomicU64,
+    /// The same, running maximum since the **last read**. `swap(0)` by the
+    /// ticker, once per link per tick.
+    ///
+    /// # Why a peak and not the instantaneous value
+    ///
+    /// AUTO samples at 1 Hz and the queue drains in tens of milliseconds, so an
+    /// instantaneous read is a coin flip about whether it lands on the backlog.
+    /// That is the same mistake `RateWindow` was written to undo, one rung
+    /// down: a measure whose window does not cover the event it is measuring.
+    wait_us_window: AtomicU64,
+    /// The last value [`TcpMediaLink::take_writeq_peak_ms`] handed out, i.e.
+    /// **exactly what AUTO saw** on its last evaluation.
+    ///
+    /// Exposed rather than inferred: the window peak is consumed by the taker,
+    /// so without this the status page could only show a quantity nobody steers
+    /// on, and "why did it not promote" would have no answer anywhere.
+    wait_us_taken: AtomicU64,
+    /// Optional test-only rate limit, bytes per second, 0 = off. See
+    /// [`token_bucket_from_env`].
+    tx_bps: u64,
+}
+
+/// Bytes/second the writer may put on the wire, from `AUDIOHUB_TEST_TX_KBPS`.
+/// `0` (the default, and any unparseable value) = unlimited.
+///
+/// # Why a token bucket in the product binary rather than a real constriction
+///
+/// The acceptance criterion for AUTO on tier 1 is "starve the link and watch
+/// the rung come down". Doing that for real needs a traffic shaper — `dnctl`
+/// on macOS, QoS policy on Windows — which means root, a system-wide
+/// configuration change, and two platform-specific scripts that cannot run
+/// against the daemon serving the user's audio. This is **zero system
+/// configuration**: one environment variable, one process, no privileges, and
+/// identical behaviour on both platforms.
+///
+/// It sits on the writer thread, i.e. **after** the queue and the stale gate,
+/// so everything downstream of it — backlog, `writeq_ms`, the gate firing,
+/// AUTO's reaction — is the production path unmodified. What it does *not*
+/// reproduce is a congested network: no retransmissions, no RTT growth, no
+/// receiver-side spread. That is the honest limit of it, and it is why the
+/// receive-side signal is measured on a real cross-machine link instead.
+///
+/// **Accuracy is approximate and slightly conservative.** It waits with
+/// `thread::sleep`, whose overshoot at a per-frame cost of 4–14 ms is a few
+/// percent; measured 2026-08-08 at a nominal 400 kbps, the link carried
+/// **362.7 kbps** of datagram bytes over a 39 s steady-state window — 91% of
+/// the budget. Tests must therefore compare against a threshold with margin,
+/// never treat the nominal figure as an exact link capacity.
+fn token_bucket_from_env() -> u64 {
+    std::env::var("AUDIOHUB_TEST_TX_KBPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|kbps| kbps * 1000 / 8)
+        .unwrap_or(0)
 }
 
 impl TcpMediaLink {
@@ -279,6 +362,11 @@ impl TcpMediaLink {
             frames_written: AtomicU64::new(0),
             frames_read: AtomicU64::new(0),
             unexpected_kind: AtomicU64::new(0),
+            wait_us_last: AtomicU64::new(0),
+            wait_us_peak: AtomicU64::new(0),
+            wait_us_window: AtomicU64::new(0),
+            wait_us_taken: AtomicU64::new(0),
+            tx_bps: token_bucket_from_env(),
         }
     }
 
@@ -351,6 +439,56 @@ impl TcpMediaLink {
 
     pub(crate) fn unexpected_kind(&self) -> u64 {
         self.unexpected_kind.load(Ordering::Relaxed)
+    }
+
+    /// How long the most recently dequeued frame waited, in milliseconds.
+    ///
+    /// # What this measures, and why it is a wait and not a depth
+    ///
+    /// The design called the quantity `writeq_ms` and the natural reading is
+    /// "queue depth converted to time". That conversion does not exist here:
+    /// [`TcpMediaLink::queued`] counts **wire packets**, and one packet is 10 ms
+    /// of audio on the shallow rungs but 5 ms on the deep ones (they split each
+    /// frame in two), while the queue is shared by **every stream to this
+    /// peer** — so `queued × FRAME_MS` is wrong by a factor of the live stream
+    /// count *and* by a factor of two, and both factors move at runtime. A
+    /// number that silently changes meaning when a second stream opens is worse
+    /// than no number.
+    ///
+    /// The wait needs neither factor. Every slot already carries the instant it
+    /// was queued (the stale gate's input), so the writer knows exactly how long
+    /// the frame it is holding sat in the queue — one subtraction it was already
+    /// performing. That figure is directly comparable to [`STALE_BUDGET`], which
+    /// is the other thing on this transport measured in the same unit.
+    pub(crate) fn writeq_ms(&self) -> f64 {
+        self.wait_us_last.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+
+    /// Peak wait since the link came up, milliseconds. Never reset.
+    pub(crate) fn writeq_peak_ms(&self) -> f64 {
+        self.wait_us_peak.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+
+    /// Peak wait since the previous call, milliseconds. **Consuming** — exactly
+    /// one caller per link per tick (the ticker), and the status page reads
+    /// [`TcpMediaLink::writeq_peak_ms`] instead precisely so that two readers
+    /// never share one consuming counter.
+    pub(crate) fn take_writeq_peak_ms(&self) -> f64 {
+        let us = self.wait_us_window.swap(0, Ordering::Relaxed);
+        self.wait_us_taken.store(us, Ordering::Relaxed);
+        us as f64 / 1000.0
+    }
+
+    /// What AUTO saw last time it looked. Non-consuming.
+    pub(crate) fn writeq_auto_ms(&self) -> f64 {
+        self.wait_us_taken.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+
+    fn note_wait(&self, waited: Duration) {
+        let us = waited.as_micros().min(u64::MAX as u128) as u64;
+        self.wait_us_last.store(us, Ordering::Relaxed);
+        self.wait_us_peak.fetch_max(us, Ordering::Relaxed);
+        self.wait_us_window.fetch_max(us, Ordering::Relaxed);
     }
 
     pub(crate) fn is_alive(&self) -> bool {
@@ -434,6 +572,49 @@ fn write_one_frame<W: Write>(
     WriteOutcome::Sent
 }
 
+/// Test-only rate limit, expressed as "the earliest instant the link could
+/// accept another byte". Off (`bps == 0`) it compiles to two predictable
+/// branches and never touches the clock.
+///
+/// No burst allowance on purpose: a bucket that hands out a second of credit
+/// up front would let the first second of a measurement run at full speed and
+/// the backlog would appear only afterwards, which is precisely the shape that
+/// makes a 60 s acceptance window ambiguous.
+struct TokenBucket {
+    bps: u64,
+    next_at: Option<Instant>,
+}
+
+impl TokenBucket {
+    fn new(bps: u64) -> TokenBucket {
+        TokenBucket { bps, next_at: None }
+    }
+
+    /// Block until the simulated link is free. Sliced so shutdown is still
+    /// noticed promptly; the queue backing up behind this is the point.
+    fn gate(&mut self, shutdown: &AtomicBool) {
+        if self.bps == 0 {
+            return;
+        }
+        while let Some(t) = self.next_at {
+            let now = Instant::now();
+            if now >= t || shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep((t - now).min(WRITE_SLICE));
+        }
+    }
+
+    fn charge(&mut self, bytes: usize) {
+        if self.bps == 0 {
+            return;
+        }
+        let cost = Duration::from_secs_f64(bytes as f64 / self.bps as f64);
+        let base = self.next_at.unwrap_or_else(Instant::now).max(Instant::now());
+        self.next_at = Some(base + cost);
+    }
+}
+
 /// The writer thread's body, generic over the sink so the ratchet property can
 /// be tested against a writer that blocks on command rather than against a
 /// network.
@@ -441,6 +622,7 @@ fn write_one_frame<W: Write>(
 /// Returns when the link is dead or the daemon is shutting down.
 fn write_loop<W: Write>(link: &TcpMediaLink, w: &mut W, shutdown: &AtomicBool) {
     link.thread.get_or_init(std::thread::current);
+    let mut bucket = TokenBucket::new(link.tx_bps);
     loop {
         // Drain everything queued, applying the gate to each frame as it comes
         // off — not once per batch. A batch can span the whole budget.
@@ -448,7 +630,16 @@ fn write_loop<W: Write>(link: &TcpMediaLink, w: &mut W, shutdown: &AtomicBool) {
         while link.q.consume(|slot| {
             let owner = slot.owner.take(); // dropped on THIS thread
             let queued_at = slot.queued_at;
-            let outcome = if queued_at.elapsed() > STALE_BUDGET {
+            // The stale gate's subtraction, reused as the backlog gauge. One
+            // reading per dequeue covers a stalled writer too: with
+            // `SO_SNDTIMEO` at `WRITE_SLICE`, a blocked write returns, the
+            // frame ages out, the gate drops it and the next frame is dequeued
+            // already old — so the gauge climbs towards `STALE_BUDGET` rather
+            // than freezing at whatever it read before the stall.
+            bucket.gate(shutdown);
+            let waited = queued_at.elapsed();
+            link.note_wait(waited);
+            let outcome = if waited > STALE_BUDGET {
                 WriteOutcome::Stale
             } else {
                 write_one_frame(
@@ -461,6 +652,9 @@ fn write_loop<W: Write>(link: &TcpMediaLink, w: &mut W, shutdown: &AtomicBool) {
             };
             match outcome {
                 WriteOutcome::Sent => {
+                    // Only bytes that reached the wire spend the budget: a frame
+                    // the gate dropped never occupied the link.
+                    bucket.charge(slot.buf.len());
                     link.frames_written.fetch_add(1, Ordering::Relaxed);
                     if let Some(o) = owner {
                         o.sent_packets.fetch_add(1, Ordering::Relaxed);
@@ -1596,5 +1790,126 @@ mod tests {
             1,
             "a second consumer on the tier 1 queue voids SpscRing's safety precondition"
         );
+    }
+
+    /// **The gate's bracket and tier 1's jitter buffer must name the same
+    /// profile.**
+    ///
+    /// This is the assertion whose *subject* keeps drifting. P3 bracketed the
+    /// budget by `JbTuning::DEFAULT`, correctly, because tier 1 receivers ran
+    /// `DEFAULT`. P4 gives tier 1 `DEGRADED` — and had this test not existed,
+    /// the compile-time bracket would have gone on comparing against a profile
+    /// nothing on this transport uses, while still reading as rigorous.
+    ///
+    /// So the two sides are read from where they are actually used:
+    /// `engine::jb_tuning_for` on a `MediaPath::Tcp` is what a receiving stream
+    /// is configured with, and [`JB_PROFILE`] is what the budget is bracketed
+    /// by. Injection control: point `JB_PROFILE` back at `DEFAULT` and this
+    /// goes red (the compile-time assertion alone does not — 200 ms sits inside
+    /// `DEFAULT`'s window just as 440 sits inside `DEGRADED`'s).
+    #[test]
+    fn the_stale_gate_is_bracketed_by_the_profile_tier_one_receivers_use() {
+        let link = TcpMediaLink::new_for_test("fp".into(), "127.0.0.1:1".parse().unwrap());
+        let receiver = crate::engine::jb_tuning_for(&MediaPath::Tcp(Arc::new(link)));
+        assert_eq!(
+            (receiver.max_target, receiver.max_frames),
+            (JB_PROFILE.max_target, JB_PROFILE.max_frames),
+            "the stale gate is bracketed by one jitter-buffer profile and tier 1 receivers run              another; the budget's whole justification is the receiver's two numbers, so a gate              derived from a profile nobody uses is a number with no argument behind it"
+        );
+        let ms = STALE_BUDGET.as_millis() as u64;
+        assert!(
+            ms > JB_DEEPEST_TARGET_MS && ms < JB_HARD_CEILING_MS,
+            "{ms} ms is outside ({JB_DEEPEST_TARGET_MS}, {JB_HARD_CEILING_MS})"
+        );
+    }
+
+    /// The backlog gauge reports the **wait**, and it survives a stalled writer.
+    ///
+    /// A gauge sampled only on successful writes would read whatever it read
+    /// before a stall and stay there for the stall's whole duration — i.e. be
+    /// blind precisely when AUTO needs it. The gate's own retry loop is what
+    /// saves it: the frame ages out, gets dropped, and the next dequeue reads a
+    /// wait at least as large.
+    #[test]
+    fn the_backlog_gauge_climbs_while_the_writer_is_stalled() {
+        let l = link();
+        let owner = Arc::new(TxShared::new());
+        assert_eq!(l.writeq_ms(), 0.0, "a fresh link claims a backlog");
+
+        // A sink that never accepts anything, so every frame ages out.
+        struct Wall;
+        impl Write for Wall {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(5));
+                Err(std::io::Error::new(ErrorKind::WouldBlock, "wall"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // Queued as if they had been sitting there for a whole budget already.
+        let old = Instant::now() - STALE_BUDGET - Duration::from_millis(50);
+        for _ in 0..4 {
+            assert!(push(&l, old, &owner, 200));
+        }
+        let shutdown = AtomicBool::new(false);
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                write_loop(&l, &mut Wall, &shutdown);
+                done.store(true, Ordering::SeqCst);
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while l.queued() > 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            l.kill();
+            shutdown.store(true, Ordering::SeqCst);
+        });
+        assert!(done.load(Ordering::SeqCst));
+        assert!(
+            l.writeq_ms() >= STALE_BUDGET.as_millis() as f64,
+            "the gauge read {:.1} ms for frames the gate itself judged stale",
+            l.writeq_ms()
+        );
+        assert!(l.stale_dropped() >= 4, "the gate did not fire on frames it had to");
+        // Peak is retained, window peak is taken.
+        assert!(l.writeq_peak_ms() >= l.writeq_ms() - 0.001);
+        let taken = l.take_writeq_peak_ms();
+        assert!(taken > 0.0, "the window peak was empty right after a stall");
+        assert_eq!(l.take_writeq_peak_ms(), 0.0, "the window peak was not reset by the take");
+        assert!(l.writeq_peak_ms() > 0.0, "taking the window peak also cleared the lifetime peak");
+    }
+
+    /// The test token bucket limits throughput to roughly what it is asked for.
+    ///
+    /// Verified against the mechanism rather than against a link: it is the
+    /// thing standing in for a congested network in the P4 acceptance run, so
+    /// "does it actually shape" cannot be assumed from the fact that the rung
+    /// came down — that would be assuming the conclusion.
+    #[test]
+    fn the_test_token_bucket_shapes_the_writer_to_its_budget() {
+        const BPS: u64 = 100_000; // 800 kbps
+        let mut b = TokenBucket::new(BPS);
+        let shutdown = AtomicBool::new(false);
+        let t0 = Instant::now();
+        for _ in 0..20 {
+            b.gate(&shutdown);
+            b.charge(1_000);
+        }
+        // 20 KB at 100 KB/s is 200 ms; the first one is free (no debt yet).
+        let took = t0.elapsed();
+        assert!(
+            took >= Duration::from_millis(170) && took < Duration::from_millis(400),
+            "20 KB at {BPS} B/s took {took:?}; the bucket is not shaping to its budget"
+        );
+        // Off means off, and means no clock reads at all.
+        let mut off = TokenBucket::new(0);
+        let t1 = Instant::now();
+        for _ in 0..1000 {
+            off.gate(&shutdown);
+            off.charge(100_000);
+        }
+        assert!(t1.elapsed() < Duration::from_millis(50), "a disabled bucket still slept");
     }
 }

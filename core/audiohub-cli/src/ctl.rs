@@ -239,6 +239,14 @@ pub enum CtlCmd {
         /// Opus stops are listed but refused — this build cannot deliver them.
         #[arg(long)]
         quality: Option<String>,
+        /// plan §16.2 connectivity tier: "auto", "tier0" (UDP media) or
+        /// "tier1" (media over a second TCP connection).
+        ///
+        /// **Per peer, so it takes no `--dir`** — both directions share one
+        /// control connection and, after a downgrade, one media transport.
+        /// Applied hot: the daemon re-negotiates on the spot, no restart.
+        #[arg(long, value_parser = ["auto", "tier0", "tier1"])]
+        tier: Option<String>,
     },
     /// pair with a peer that has pairing mode enabled
     Pair {
@@ -555,7 +563,22 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             };
             (method, Value::Object(p))
         }
-        CtlCmd::PeerTransport { peer, dir, latency, quality } => {
+        CtlCmd::PeerTransport { peer, dir, latency, quality, tier } => {
+            if let Some(t) = tier {
+                // Refused rather than sequenced into two calls: they are two
+                // writes with two failure modes, and one call reporting one
+                // result would have to pick which failure to tell the truth
+                // about. The tier write also drops the control connection, so
+                // "the latency went through and the tier did not" is a state a
+                // user would have no way to see.
+                if latency.is_some() || quality.is_some() {
+                    anyhow::bail!(
+                        "--tier 与 --latency/--quality 请分两次下：前者是每对端的连通性档\
+                         （会重新协商传输），后两者是每方向的档位，两者是两个写入口"
+                    );
+                }
+                return Ok((methods::PEERS_SET_TIER, json!({ "peer": peer, "tier": t })));
+            }
             if latency.is_none() && quality.is_none() {
                 // 只读：走 peers.list，回包里挑这一台。写一个「读」的专用方法
                 // 只会多一处可以与 `peers.list` 分歧的地方。
@@ -876,7 +899,26 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                       its own — plan §13)");
             }
         }
-        CtlCmd::PeerTransport { peer, dir, latency, quality } => {
+        CtlCmd::PeerTransport { peer, dir, latency, quality, tier } => {
+            if tier.is_some() {
+                // `applied` 是这次调用与 `peers.set_transport` 的实质区别：
+                // 换 tier 必然要重新协商传输，而**能不能自己重建那条连接**
+                // 取决于这台机器是不是拨号的那一侧。印出来，别让用户去猜
+                // 一次沉默的等待是成功还是卡住了。
+                info(&format!(
+                    "{}: tier {} -> {} ({})",
+                    val_str(v, "fingerprint"),
+                    val_str(v, "previous"),
+                    val_str(v, "tier"),
+                    match &*val_str(v, "applied") {
+                        "reconnecting" => "已拆连接，重连后按新档协商（约 1 s）",
+                        "awaiting_peer" =>
+                            "已拆连接；本机不是拨号方，等对端重连后生效",
+                        _ => "已写盘，下次连接时生效",
+                    }
+                ));
+                return;
+            }
             if latency.is_none() && quality.is_none() {
                 // 回包是 peers.list：挑出这一台，四个档位并排印出来。
                 let row = v
@@ -914,6 +956,13 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                     "  send (this machine sends):    latency={} quality={}",
                     cell("send", "latency"),
                     cell("send", "quality")
+                ));
+                // Per peer, not per direction — printed on its own line for
+                // that reason, so nobody reads it as a fifth stop belonging to
+                // one of the two rows above.
+                info(&format!(
+                    "  connectivity tier (whole peer): {}",
+                    t.get("tier").and_then(Value::as_str).unwrap_or("—")
                 ));
                 // 对端推来的两个：**只有本机是提供者时才有**，而且必须与上面
                 // 四个分开印。合成一栏之后「这个 300 是我设的还是对端要求的」

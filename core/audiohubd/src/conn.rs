@@ -597,7 +597,7 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 teardown_stream(inner, stream_id, false);
             }
         }
-        SessionMsg::Stats { stream_id, received, lost, loss_pct, jitter_ms } => {
+        SessionMsg::Stats { stream_id, received, lost, loss_pct, jitter_ms, spread_ms } => {
             let tx = owned_session(inner, conn, stream_id, "stats").and_then(|e| e.tx);
             if let Some(t) = tx {
                 let mut r = lk(&t.remote);
@@ -608,6 +608,10 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 r.lost = r.lost.saturating_add(lost);
                 r.iv_loss_pct = loss_pct;
                 r.iv_jitter_ms = jitter_ms;
+                // Stored as it arrived, `None` included: overwriting a `None`
+                // with the previous reading would make a peer that stopped
+                // reporting look like a peer that is still fine.
+                r.iv_spread_ms = spread_ms;
             }
         }
         // plan §15：对端（消费者）要求本机把**执行器在本机这一侧**的档位改掉。
@@ -1079,13 +1083,14 @@ fn handle_remote_open(
             // for IT — which is the slot we bound in its name.
             let slot = lk(&inner.haldev).slot_of(&conn.fp);
             let spec = source_spec(source, freq, backend, slot)?;
-            let shared = Arc::new(TxShared::new());
+            let path = conn.current_media_path();
+            let shared = Arc::new(TxShared::new_on(path.auto_top_rung()));
             start_tx_stream(
                 inner,
                 stream_id,
                 conn.tx_key,
                 salt,
-                conn.current_media_path(),
+                path,
                 spec,
                 loss.unwrap_or(0.0),
                 shared.clone(),
@@ -1294,6 +1299,70 @@ pub(crate) fn resolve_fingerprint(inner: &DaemonInner, selector: &str) -> Result
         0 => bail!("no known peer matches '{selector}'"),
         1 => Ok(cands.remove(0)),
         n => bail!("'{selector}' is ambiguous ({n} peers)"),
+    }
+}
+
+/// What [`retier`] did about a stored tier that just changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Retier {
+    /// No live control connection: the new tier is on disk and the next
+    /// connection will negotiate with it.
+    Stored,
+    /// The control connection was dropped and the retry loop owns rebuilding
+    /// it — typically back within the first backoff rung (~1 s), sessions
+    /// replayed onto the new transport.
+    Reconnecting,
+    /// The control connection was dropped, but **this** daemon is not the side
+    /// that dials this peer, so nothing here will rebuild it. The peer's own
+    /// reconnect will, and the new tier applies then.
+    AwaitingPeer,
+}
+
+impl Retier {
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            Retier::Stored => "stored",
+            Retier::Reconnecting => "reconnecting",
+            Retier::AwaitingPeer => "awaiting_peer",
+        }
+    }
+}
+
+/// Apply a changed transport tier to a peer **without restarting the daemon**.
+///
+/// # Why this drops the control connection instead of attaching in place
+///
+/// `tcpmedia::negotiate` runs exactly once per control connection, from inside
+/// `register_conn`, **before `conn_reader` starts** — and that is not an
+/// accident of where it was put. It is synchronous precisely so that no stream
+/// can be opened while the media path is being replaced; P3's review round
+/// reproduced the alternative and found every stream in a ~200 ms window
+/// pinned to UDP for its whole life, on links where UDP is the transport tier 1
+/// exists because it cannot use. Attaching on a live connection would need a
+/// second, differently-ordered version of that dance, and the failure it can
+/// produce is silent by construction.
+///
+/// Dropping the connection re-enters the negotiated path instead. It is not
+/// even expensive relative to what a tier change costs anyway: media never
+/// switches transport inside a live stream (design §5.1), so **every stream has
+/// to be re-opened regardless** — and `teardown_conn` already arms the retry
+/// loop with exactly those streams. This is the same route `tcpmedia::serve`
+/// takes when a media link dies, for the same reason.
+pub(crate) fn retier(inner: &Arc<DaemonInner>, fp: &str) -> Retier {
+    let live = lk(&inner.state)
+        .conns
+        .get(fp)
+        .map_or(false, |c| c.alive.load(Ordering::SeqCst));
+    if !live {
+        return Retier::Stored;
+    }
+    drop_conn(inner, fp, "transport tier changed");
+    // `teardown_conn` only arms peers we dial out to; for the rest there is no
+    // entry and nothing here will bring the connection back.
+    if lk(&inner.recon).contains_key(fp) {
+        Retier::Reconnecting
+    } else {
+        Retier::AwaitingPeer
     }
 }
 
@@ -1848,7 +1917,8 @@ pub(crate) fn open_session_from(
             pushed: Arc::new(crate::PushedTransport::default()),
         }
     } else {
-        let shared = Arc::new(TxShared::new());
+        let path = conn.current_media_path();
+        let shared = Arc::new(TxShared::new_on(path.auto_top_rung()));
         // the peer already accepted, so a local source failure has to be undone
         // on the wire too — never leave it waiting on a stream we cannot feed
         if let Err(e) = start_tx_stream(
@@ -1856,7 +1926,7 @@ pub(crate) fn open_session_from(
             stream_id,
             conn.tx_key,
             salt.to_vec(),
-            conn.current_media_path(),
+            path,
             spec.expect("validated above"),
             params.simulate_loss_pct.unwrap_or(0.0),
             shared.clone(),

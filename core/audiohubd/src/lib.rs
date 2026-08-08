@@ -826,6 +826,19 @@ fn tcp_media_status(inner: &DaemonInner) -> serde_json::Value {
                     "queued": l.queued(),
                     "capacity": l.capacity(),
                     "dropped": l.dropped(),
+                    // **The backlog is reported in milliseconds waited, not in
+                    // queue depth**, and `queued` above is why: it counts wire
+                    // packets, which are 10 ms of audio on the shallow rungs and
+                    // 5 ms on the deep ones, in a queue shared by every stream
+                    // to this peer. `queued x FRAME_MS` is therefore wrong by the
+                    // live stream count and by a factor of two, both of which
+                    // move at runtime. The wait needs neither.
+                    "writeq_ms": l.writeq_ms(),
+                    "writeq_peak_ms": l.writeq_peak_ms(),
+                    // What AUTO steered on last second. Reported separately
+                    // from the instantaneous reading because they answer two
+                    // different questions and only this one explains a rung.
+                    "writeq_auto_ms": l.writeq_auto_ms(),
                     "stale_dropped": l.stale_dropped(),
                     "frames_written": l.frames_written(),
                     "frames_read": l.frames_read(),
@@ -1845,6 +1858,12 @@ pub(crate) struct RxCell {
     /// `received` 之间那道缺口的唯一解释 —— `frames_read` 不看认证结果。
     pub auth_failed: u64,
     pub prev_transit: Option<i64>,
+    /// Rolling one-way-delay window behind `spread_ms` (design §3.4 signal 2).
+    ///
+    /// Lives beside `prev_transit` and is fed from the same line, so the two
+    /// statistics can never be computed off different packet sets — which is
+    /// what would make "they disagree" impossible to interpret.
+    pub spread: audiohub_net::stats::SpreadWindow,
     // per-interval accounting for Stats/AUTO (the cumulative RxStats figures
     // stay untouched for the lifetime display)
     iv_received: u64,
@@ -1859,6 +1878,11 @@ pub(crate) struct IntervalStats {
     pub lost: u64,
     pub loss_pct: f64,
     pub jitter_ms: f64,
+    /// One-way delay spread over the rolling window (`SpreadWindow`).
+    /// `None` = window still too short. **Not windowed per interval** like
+    /// `jitter_ms`: the spread is a dispersion measure and a one-second slice
+    /// of 100 samples is where p95 stops meaning anything.
+    pub spread_ms: Option<f64>,
 }
 
 impl RxCell {
@@ -1894,6 +1918,7 @@ impl RxCell {
             lost,
             loss_pct: lost as f64 * 100.0 / d_expected as f64,
             jitter_ms,
+            spread_ms: self.spread.spread_ms(),
         })
     }
 }
@@ -2006,6 +2031,7 @@ impl RxStream {
                 format_mismatch: 0,
                 auth_failed: 0,
                 prev_transit: None,
+                spread: audiohub_net::stats::SpreadWindow::new(),
                 iv_received: 0,
                 iv_expected: 0,
                 iv_jit_sum: 0.0,
@@ -2032,6 +2058,14 @@ pub(crate) struct RemoteStats {
     // the last reported 1s window; the only figures AUTO is allowed to see
     pub iv_loss_pct: f64,
     pub iv_jitter_ms: f64,
+    /// One-way delay spread the peer measured (design §3.4 signal 2). `None` =
+    /// the peer's window is still too short, or the peer predates the field.
+    ///
+    /// **`None` is read as "clean" by `AutoLadder::feed_streamed`**, on purpose:
+    /// it is an auxiliary gate on *promotion*, and a peer that never reports
+    /// would otherwise pin the rung for the life of the session. Absence is not
+    /// evidence of trouble.
+    pub iv_spread_ms: Option<f64>,
 }
 
 pub(crate) struct TxShared {
@@ -2104,7 +2138,25 @@ pub(crate) struct TxShared {
 }
 
 impl TxShared {
+    /// Tier 0's starting rung. Kept as the bare `new()` because every test that
+    /// builds one wants the ordinary transport.
+    #[cfg(test)]
     pub(crate) fn new() -> TxShared {
+        TxShared::new_on(audiohub_net::media::AUTO_TOP_RUNG)
+    }
+
+    /// Start on the ceiling **this transport's** AUTO may occupy
+    /// ([`tcpmedia::MediaPath::auto_top_rung`]).
+    ///
+    /// Without this, a stream opened on a tier 1 link starts one rung above
+    /// what AUTO will allow it and spends the first ticker second at 813 kbps
+    /// on a link chosen because UDP could not get through. Measured
+    /// 2026-08-08 on the token-bucket rig: that single second was enough on its
+    /// own to drive the send queue into the stale gate — i.e. the overshoot did
+    /// not merely waste bandwidth, it threw audio away before AUTO had ever
+    /// been consulted. Same failure the comment below describes for rung 0,
+    /// one rung further along.
+    pub(crate) fn new_on(top_rung: u32) -> TxShared {
         TxShared {
             // **起步格是 AUTO 的天花板，不是阶梯顶端。**
             //
@@ -2116,7 +2168,7 @@ impl TxShared {
             //
             // 实测：写 0 时 `the_send_latency_lands_on_the_peers_buffer_and_
             // nowhere_local` 从 1.4 s 变成 25 s 甚至超时。
-            rung: AtomicU32::new(audiohub_net::media::AUTO_TOP_RUNG),
+            rung: AtomicU32::new(top_rung),
             rung_changes: AtomicU32::new(0),
             sent_packets: AtomicU64::new(0),
             sent_bytes: AtomicU64::new(0),
@@ -3069,6 +3121,7 @@ fn build_session_info_with(
         lost: 0,
         loss_pct: 0.0,
         jitter_ms: 0.0,
+        spread_ms: None,
         bitrate_kbps: None,
         jb_depth_frames: 0,
         sent_packets: 0,
@@ -3144,6 +3197,11 @@ fn build_session_info_with(
             s.lost = sm.lost;
             s.loss_pct = sm.loss_pct;
             s.jitter_ms = sm.jitter_ms;
+            // Reported **beside** `jitter_ms`, never instead of it: tier 0 still
+            // steers on the RFC 3550 figure (design §3.4 scope rule), and the two
+            // have to be readable side by side for long enough to decide whether
+            // it should keep doing so.
+            s.spread_ms = c.spread.spread_ms();
             // Sliding window, **not** `sm.mean_payload_kbps`. The mean is what
             // made three rungs 2x apart on the wire all read back within 0.34%
             // of each other. Sampling here as well as in the ticker keeps the
@@ -3228,6 +3286,10 @@ fn build_session_info_with(
             0.0
         };
         s.jitter_ms = r.iv_jitter_ms;
+        // The peer's measurement: a send session has no receiver of its own, so
+        // this is the only side that can produce the number at all — the same
+        // asymmetry `peer_quality` exists for.
+        s.spread_ms = r.iv_spread_ms;
         // ---- byte accounting, send side ---------------------------------
         //
         // Both counters get published, and `bitrate_kbps` is derived from the
@@ -3304,6 +3366,12 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
     struct AutoCell {
         ladder: AutoLadder,
         last_seq: u64,
+        /// Which family of signals this ladder was built for. A tier change
+        /// while the stream is live rebuilds the cell — the two paths have
+        /// different ceilings, and a ladder that keeps a tier 0 ceiling on a
+        /// degraded link is exactly the "same AUTO, different ceiling per tier"
+        /// semantics (plan §16.3) failing silently.
+        streamed: bool,
     }
     let mut autos: HashMap<u32, AutoCell> = HashMap::new();
     let mut dev_epoch = inner.dev_out_epoch.load(Ordering::Relaxed);
@@ -3344,6 +3412,10 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
         // 节拍上，是因为线性回归与 `Mutex` 都不允许出现在 10 ms 循环里
         // （规格附录约束 3）。
         sample_telemetry(&inner, &entries);
+        // Per-peer send-queue backlog for this tick, keyed by fingerprint.
+        // Populated lazily and read at most once per link, because the getter
+        // behind it resets its window (see `take_writeq_peak_ms`).
+        let mut writeq: HashMap<String, f64> = HashMap::new();
         for e in &entries {
             let live = e.conn.alive.load(Ordering::SeqCst);
             // P0b：把**本侧**这条流的分项回传给对端，好让它合成总延迟。
@@ -3383,6 +3455,7 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                         lost: iv.lost,
                         loss_pct: iv.loss_pct,
                         jitter_ms: iv.jitter_ms,
+                        spread_ms: iv.spread_ms,
                     });
                 }
             }
@@ -3401,6 +3474,30 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                     autos.remove(&e.id);
                 } else {
                     let r = *lk(&tx.remote);
+                    // Which family of signals this stream's ladder runs on. The
+                    // media path, not the stored tier: the path is what the
+                    // bytes are actually travelling over, and `peers.set_tier`
+                    // can move the stored value while a stream is live without
+                    // the stream itself moving (design §5.1 — no transport
+                    // switch inside a live stream).
+                    let link = match e.conn.current_media_path() {
+                        tcpmedia::MediaPath::Tcp(l) => Some(l),
+                        tcpmedia::MediaPath::Udp(_) => None,
+                    };
+                    let streamed = link.is_some();
+                    // Taken **once per link per tick**, then shared by every
+                    // stream on that peer: `take_writeq_peak_ms` is consuming,
+                    // and reading it per stream would hand the backlog to
+                    // whichever stream happened to be first in the list and a
+                    // clean zero to the rest.
+                    let writeq_ms = link.as_ref().map(|l| {
+                        *writeq
+                            .entry(l.fp.clone())
+                            .or_insert_with(|| l.take_writeq_peak_ms())
+                    });
+                    if autos.get(&e.id).is_some_and(|c| c.streamed != streamed) {
+                        autos.remove(&e.id);
+                    }
                     let cell = autos.entry(e.id).or_insert_with(|| {
                         // 新建一个格子 = 这条流刚从固定档交还给阶梯（或者刚开）。
                         //
@@ -3418,20 +3515,39 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                         // （`AUTO_TOP_RUNG` 的文档写了理由）。写 0 的后果是
                         // 从固定深档切回 AUTO 时带宽**留在**翻倍状态，
                         // 而界面显示的是 AUTO。
-                        tx.rung
-                            .store(audiohub_net::media::AUTO_TOP_RUNG, Ordering::Relaxed);
-                        AutoCell { ladder: AutoLadder::new(), last_seq: 0 }
+                        //
+                        // ⚠ 天花板**按 tier 取**（plan §16.3）：降级链路上是
+                        // rung 3 而不是 2。写 2 的后果是 AUTO 在一条已经扛不住
+                        // 的链路上多花 50% 带宽，而界面照旧显示 AUTO。
+                        let ladder = if streamed {
+                            AutoLadder::new_streamed()
+                        } else {
+                            AutoLadder::new()
+                        };
+                        tx.rung.store(ladder.top_rung(), Ordering::Relaxed);
+                        AutoCell { ladder, last_seq: 0, streamed }
                     });
-                    if r.seq > cell.last_seq {
-                        cell.last_seq = r.seq;
-                        if let Some(new_rung) =
-                            cell.ladder.feed_stats(r.iv_loss_pct, r.iv_jitter_ms)
-                        {
-                            tx.rung.store(new_rung, Ordering::Relaxed);
+                    // Tier 1/2: the primary signal is **local** (our own send
+                    // queue), so it is evaluated on the ticker's own cadence and
+                    // does not wait for the peer's `Stats` to come back. On tier
+                    // 0 the whole judgement lives in the peer's report, so it
+                    // still runs once per report — unchanged, byte for byte.
+                    let moved = match writeq_ms {
+                        Some(q) => {
+                            cell.last_seq = r.seq;
+                            cell.ladder.feed_streamed(q, r.iv_spread_ms)
                         }
-                        tx.rung_changes
-                            .store(cell.ladder.rung_changes, Ordering::Relaxed);
+                        None if r.seq > cell.last_seq => {
+                            cell.last_seq = r.seq;
+                            cell.ladder.feed_stats(r.iv_loss_pct, r.iv_jitter_ms)
+                        }
+                        None => None,
+                    };
+                    if let Some(new_rung) = moved {
+                        tx.rung.store(new_rung, Ordering::Relaxed);
                     }
+                    tx.rung_changes
+                        .store(cell.ladder.rung_changes, Ordering::Relaxed);
                 }
             }
             // spk provider: our real output device is the thing the consumer's

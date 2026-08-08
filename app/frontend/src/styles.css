@@ -1724,6 +1724,37 @@ body.is-tauri .gate-drag {
   border-left: 2px solid var(--warn);
   padding: 4px 0 4px 8px; margin: 8px 0 0;
 }
+/* ---- 连通方式（plan §16.2 的手动覆盖）---------------------------------
+   三个互斥选项做成一排卡片而不是 <select>：每一档都要带一句后果说明
+   （「延迟与抖动明显更差」），而 <option> 里塞不下第二行——塞不下的结果是
+   用户在一个只写着代号的下拉里选一个他不知道会付什么代价的东西。 */
+.transport-tier { margin-top: 14px; }
+.block-subtitle {
+  margin: 0 0 4px; font-size: 12px; font-weight: 650;
+  color: var(--text-dim); letter-spacing: .04em;
+}
+.transport-tier-row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.transport-tier-opt {
+  flex: 1 1 150px; min-width: 0; text-align: left; cursor: pointer;
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 8px 10px; border-radius: 8px; font: inherit;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
+}
+.transport-tier-opt:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.transport-tier-opt:disabled { opacity: .55; cursor: default; }
+.transport-tier-opt.is-on {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.transport-tier-label { font-size: 13px; font-weight: 600; }
+/* 后果说明比标签暗一档，与 `.transport-live` 同一条纪律：两者同字号会让
+   「这一档叫什么」和「选它会怎样」读起来像同一类东西。 */
+.transport-tier-hint { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
+
 /* 两个档位的权威解释。收起态是默认：那两段各有五六行，常驻会把四个控件挤下屏。
    开关做成一条低调的文字按钮而不是图标——「这两个档位是什么？」自己就是标签，
    一个问号图标还得先被认出来。 */

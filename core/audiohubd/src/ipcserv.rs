@@ -656,6 +656,51 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 conn::push_transport(inner, &fp);
                 serde_json::to_value(peer_transport_view(inner, &lk(&inner.state), &fp))?
             }
+            // plan §16.2「手动覆盖恒可用」的执行入口。**热切换**：不重启
+            // daemon，也不要求用户改文件——P3 之前钉一个 tier 要「停 daemon →
+            // 改 peer_transport.json → 起 daemon」，因为活着的 daemon 手里是
+            // 那张表的内存副本，改盘对它无效。
+            methods::PEERS_SET_TIER => {
+                let sel = params
+                    .get("peer")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing 'peer'"))?;
+                let fp = conn::resolve_fingerprint(inner, sel)?;
+                let v = params
+                    .get("tier")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing 'tier' ('auto' | 'tier0' | 'tier1')"))?;
+                // 与 §15 两个档位串同一条纪律：写入口严格校验，未知值**拒绝**
+                // 而不是收下。收下一个执行不了的字符串、写盘、再原样回显，
+                // 正是本仓栽过六次的那个形状。
+                let tier = crate::peer_transport::TransportTier::parse(v).ok_or_else(|| {
+                    anyhow::anyhow!("tier 必须是 'auto'、'tier0' 或 'tier1'，收到 '{v}'")
+                })?;
+                let prev = lk(&inner.peer_transport).tier(&fp);
+                {
+                    let mut t = lk(&inner.peer_transport).get(&fp);
+                    t.transport_tier = tier.as_wire().to_string();
+                    let mut store = lk(&inner.peer_transport);
+                    store.set(&fp, t);
+                    // 落盘在生效之前：这一步之后连接就要被拆掉，而重连会重新
+                    // 读这张表。顺序反过来，一次「改档 + 立刻崩」就会让重连
+                    // 带着旧档回来，而用户看到的是新档。
+                    store.save(&inner.cfg_dir)?;
+                }
+                let applied = if prev == tier {
+                    // 值没变就什么都不做：拆一条健康的连接去应用一个没有变化
+                    // 的设置，是拿一次真实的断流换零收益。
+                    conn::Retier::Stored
+                } else {
+                    conn::retier(inner, &fp)
+                };
+                json!({
+                    "fingerprint": fp,
+                    "tier": tier.as_wire(),
+                    "previous": prev.as_wire(),
+                    "applied": applied.as_wire(),
+                })
+            }
             other => anyhow::bail!("unknown method '{other}'"),
         })
     })();
@@ -715,6 +760,8 @@ fn peer_transport_view(
         },
         peer_rx_latency: None,
         peer_tx_quality: None,
+        tier: mine.tier().as_wire().to_string(),
+        tier_reset_from: mine.transport_tier_reset_from.clone(),
     };
     for e in st.sessions.values() {
         if e.conn.fp != fp || e.origin != crate::SessionOrigin::Peer {

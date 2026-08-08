@@ -222,6 +222,18 @@ pub enum SessionMsg {
         lost: u64,
         loss_pct: f64,
         jitter_ms: f64,
+        /// One-way delay spread, p95 − window minimum, milliseconds
+        /// (`stats::SpreadWindow`). AUTO's auxiliary signal on tier 1/2, where
+        /// `loss_pct` is identically zero and `jitter_ms` — a first difference —
+        /// under-reads a stall-then-burst by construction.
+        ///
+        /// `#[serde(default)]` and `Option`: absent means the sender's window is
+        /// still too short, and that is a different claim from `0.0`. It also
+        /// keeps this variant readable by a peer built before the field existed,
+        /// which matters for exactly one class of deployment mistake — two
+        /// builds that both say `PROTOCOL_VERSION = 4`.
+        #[serde(default)]
+        spread_ms: Option<f64>,
     },
     /// Consumer -> provider: apply this to the provider's real default output
     /// device (spec-m4b §A2). Never applies any gain to the media stream —

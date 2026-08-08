@@ -324,6 +324,26 @@ pub struct PeerTransportView {
     /// 对端推来、**执行器在本机发送侧**的质量档（= 对端的 `recv.quality`）。
     #[serde(default)]
     pub peer_tx_quality: Option<String>,
+    /// 连通性档位（plan §16.2）：`"auto"` | `"tier0"` | `"tier1"`。
+    ///
+    /// **每对端一个，不分方向**——两个方向共用一条控制连接，降级之后也共用一条
+    /// 媒体传输。它与 `recv`/`send` **并列**而不是嵌进去：嵌进去等于在契约表面
+    /// 上宣布「可以一个方向 tier 0、另一个 tier 1」，而那是 `peer_transport.rs`
+    /// 明确要防止后人去实现的一句话。
+    ///
+    /// 这是**用户的选择**，不是链路的现状：`"auto"` 说的是「让 daemon 决定」，
+    /// 不是「现在跑在 tier 0 上」。现状要另一个字段（`transport_tier`，尚未落地，
+    /// plan §16.4），两者**不得互相冒充**——§16.4 第 5 条那条红线就是这个。
+    #[serde(default = "default_tier")]
+    pub tier: String,
+    /// 装载时不被认识、已被重置的连通性档串。`None` = 一切正常。与
+    /// `*_reset_from` 同纪律：静默重置与静默翻译是同一个病。
+    #[serde(default)]
+    pub tier_reset_from: Option<String>,
+}
+
+fn default_tier() -> String {
+    "auto".to_string()
 }
 
 /// One published (or intended) virtual device pair, `hal.devices`.
@@ -709,6 +729,25 @@ pub struct SessionStats {
     pub lost: u64,
     pub loss_pct: f64,
     pub jitter_ms: f64,
+    /// 单向时延**展布**：滚动窗口内 `transit` 的 p95 减同窗口最小值，毫秒。
+    /// `None` = 窗口还不够长（**不是 0**）。
+    ///
+    /// # 它与 `jitter_ms` 并存，不是替代
+    ///
+    /// `jitter_ms` 是 RFC 3550 的一阶差分 EWMA；`media.rs` 的 `update_target`
+    /// 早就自陈要的是另一个量（相对最早到达的离散度高分位，NetEq 的
+    /// relative delay）。在 UDP 上这是精度问题，在 **TCP 上是有无问题**：
+    /// TCP 的失效形态是「停顿一下、然后成串送达」，串内相邻差分近似 0，
+    /// 于是一阶差分的分位数**恰好在链路最糟时系统性低估**。
+    ///
+    /// 所以 Tier 1/2 的 AUTO 用这一个，**Tier 0 继续用 `jitter_ms`**——换掉
+    /// Tier 0 会同时改变今天所有用户的 AUTO 与 JB 定深，而本轮没有对照数据
+    /// （design §3.4 的范围纪律）。两个数并存上报，正是为了攒出那份数据。
+    ///
+    /// 接收会话报本机测的；发送会话报**对端**测的（`SessionMsg::Stats`
+    /// 回传）——纯发送的流本机没有接收侧，与 `peer_quality` 同一条不对称。
+    #[serde(default)]
+    pub spread_ms: Option<f64>,
     /// **Payload** bitrate over the last ~3 s. `None` = not enough window yet.
     ///
     /// # Three things this field used to get wrong
@@ -1109,6 +1148,17 @@ pub mod methods {
     pub const PEERS_UNPAIR: &str = "peers.unpair";
     pub const PEERS_SET_ALIAS: &str = "peers.set_alias";
     pub const PEERS_SET_TRANSPORT: &str = "peers.set_transport";
+    /// 连通性档位（`auto` | `tier0` | `tier1`），**每对端一个**。
+    ///
+    /// # 为什么它不是 `peers.set_transport` 上的第三个字段
+    ///
+    /// 那个方法的 `dir` 是必填的，而 tier **不是每方向的**（两个方向共用同一条
+    /// `ConnShared`：tier 0 下共用一个 UDP socket，tier 1 下共用那条媒体 TCP）。
+    /// 把它塞进一个要求 `dir` 的调用里，等于在协议表面上宣布「可以一个方向
+    /// tier 0、另一个 tier 1」——而 `peer_transport.rs` 上那段注释正是为了防止
+    /// 有人日后去实现这句话才写的。落点仍是同一张表、同一个文件、同一条
+    /// 「修改即生效」的路径，只是不撒这个谎。
+    pub const PEERS_SET_TIER: &str = "peers.set_tier";
 }
 
 #[cfg(test)]

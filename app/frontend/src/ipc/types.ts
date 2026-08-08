@@ -549,6 +549,19 @@ export interface PeerTransportView {
   peer_rx_latency?: string | null;
   /** 对端推来、执行器在**本机发送侧**的音质档（= 对端的 `recv.quality`）。 */
   peer_tx_quality?: string | null;
+  /**
+   * 连通性档位（plan §16.2）：`'auto'` | `'tier0'` | `'tier1'`。
+   *
+   * **每对端一个，不分方向。** 两个方向共用一条控制连接，降级之后也共用一条
+   * 媒体传输；做成每方向的会在界面上宣布一件做不到的事。
+   *
+   * ⚠ 这是**用户的选择**，不是链路的现状。`'auto'` 的意思是「让服务决定」，
+   * 不是「此刻跑在 tier 0 上」。现状是另一件事（plan §16.4 的一级信息，
+   * 尚未落地），两者**不得互相冒充**。
+   */
+  tier?: string;
+  /** 装载时不被认识、已被重置的连通性档串。缺席 = 一切正常。 */
+  tier_reset_from?: string | null;
 }
 
 /** settings.get / settings.set 的回包（daemon 拥有的全局设置）。 */

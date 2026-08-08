@@ -26,6 +26,14 @@ use crate::{dlog, lk, rd, rtlog, DaemonInner, RxStream, TxShared};
 /// 相等——同一个物理量在两处各写一份，漂了之后伺服每一步的换算都会偏，
 /// 而不会有任何一处报错。
 pub(crate) const FRAME_MS: u64 = 10;
+
+const _: () = assert!(
+    FRAME_MS == audiohub_net::media::FRAME_MS,
+    "the frame length disagrees with the one audiohub-net derives its jitter-buffer thresholds \
+     from; every ms<->frame conversion on one side of that boundary would be off and nothing \
+     would report it"
+);
+
 const F48: usize = 480; // 48k @ 10ms
 const RING_CAP: usize = 96000; // 2s @ 48k
 const TONE_AMP: f32 = 0.5;
@@ -1254,6 +1262,20 @@ fn build_source(
 /// Creates a resampler for the new rate that continues from `last`, so a rung
 /// switch mid-stream cannot inject the zero sample (audible click) a fresh
 /// resampler would interpolate from.
+/// The resampler a send stream needs on `rung`, or `None` when it needs none.
+///
+/// **The criterion is the sample RATE, not the rung number**: after the
+/// bit-depth ladder, rungs 0/1/2 are all 48 kHz, so `rung != 0` would build a
+/// pointless 48→48 resampler for two of them. Extracted so that the install
+/// path and the rung-switch path cannot disagree about it — they used to be one
+/// site because a stream always started on a 48 kHz rung, which stopped being
+/// true when AUTO's ceiling became per-transport.
+fn resampler_for(rung: u32, last: f32) -> Option<LinearResampler> {
+    let f = audiohub_net::media::rung_format(rung);
+    (f.rate_hz != MicSource::OUT_RATE)
+        .then(|| seeded_resampler(MicSource::OUT_RATE, f.rate_hz, last))
+}
+
 fn seeded_resampler(src_rate: u32, dst_rate: u32, last: f32) -> LinearResampler {
     let mut rs = LinearResampler::new(src_rate, dst_rate);
     let mut discard = Vec::new();
@@ -1364,14 +1386,33 @@ pub(crate) fn envelope_for(
 /// 还是旧的（比如 4..12 帧），于是它被夹在 12 上。刚把 JB 预置到 50 帧，
 /// 转手就按 12 去执行，等于预置从未发生——实测下来的表现是深度先跳到 50、
 /// 同一拍掉回 12，然后以每秒一帧的限速慢慢爬 37 秒。
+/// The jitter-buffer profile a stream on this media path runs.
+///
+/// Tier 1/2 get `JbTuning::DEGRADED` (`docs/design-m8-fallback.md` §3.3): a TCP
+/// retransmission is ≥200 ms and `DEFAULT`'s deepest target is 120 ms, so under
+/// `DEFAULT` **every** retransmission drains the buffer. Measured on the real
+/// link, tier 1 ran ~1.6 underruns/min against a flat tier 0 baseline.
+///
+/// Keyed off the path rather than off the stored tier: the path is what the
+/// stream is actually using, and the stored tier can be edited while a stream
+/// is live (`peers.set_tier`) without the stream moving — media never changes
+/// transport inside a live stream (design §5.1).
+pub(crate) fn jb_tuning_for(path: &crate::tcpmedia::MediaPath) -> audiohub_net::media::JbTuning {
+    match path {
+        crate::tcpmedia::MediaPath::Udp(_) => audiohub_net::media::JbTuning::from_env(),
+        crate::tcpmedia::MediaPath::Tcp(_) => audiohub_net::media::JbTuning::degraded_from_env(),
+    }
+}
+
 fn reshape_jitter_envelope(
     st: &mut crate::JbState,
     target: audiohub_ipc::LatencyTarget,
+    base: audiohub_net::media::JbTuning,
     stream_id: u32,
 ) -> bool {
     use audiohub_ipc::LatencyTarget;
-    use audiohub_net::media::{JbTuning, JitterBuffer};
-    let cfg = envelope_for(target, JbTuning::from_env());
+    use audiohub_net::media::JitterBuffer;
+    let cfg = envelope_for(target, base);
     let cur_cfg = st.jb.tuning();
     if cfg.min_target == cur_cfg.min_target
         && cfg.max_target == cur_cfg.max_target
@@ -1465,6 +1506,12 @@ impl TxState {
     }
 
     fn install_stream(&mut self, spec: &SourceSpec, add: PendingAdd) {
+        // 钳位与 `tx_loop` 那处同一条理由：加档而不改钳位 = 新档静默不可达。
+        let start_rung = add
+            .shared
+            .rung
+            .load(Ordering::Relaxed)
+            .min(audiohub_net::media::LADDER.len() as u32 - 1);
         self.streams.insert(
             add.stream_id,
             TxStream {
@@ -1476,10 +1523,19 @@ impl TxState {
                 spec: spec.clone(),
                 loss: LossInjector::new(add.stream_id, add.loss_pct),
                 seq: 0,
-                // 与 `TxShared::new` 的起步格一致。两处若分了岔，第一 tick 就会
+                // 与 `TxShared` 的起步格一致。两处若分了岔，第一 tick 就会
                 // 看到 `want != tx.rung`、白重建一次重采样器并跳一个 seq。
-                rung: audiohub_net::media::AUTO_TOP_RUNG,
-                rs: None,
+                //
+                // **读它、不是再算一遍**：起步格现在按传输取值
+                // （`MediaPath::auto_top_rung`），第二次推导就是第二个真值源。
+                //
+                // ⚠ 起步格与 `rs` **必须一起定**。这两行分开写的时候（起步格
+                // 取自 shared、`rs: None` 照旧），tier 1 上的失效形态是：包头
+                // 声明 32 kHz 而载荷仍是 48 kHz 的 960 B，接收侧
+                // `format_mismatch` 每帧递增、整条流一个字都听不见。此前
+                // 之所以没暴露，只是因为起步格恒为 48 kHz 的那一格。
+                rung: start_rung,
+                rs: resampler_for(start_rung, 0.0),
                 rs_last: 0.0,
                 // 一帧最深档 = 480 × 4 B（f32）。容量随格号变（换档同时改帧长度
                 // 与每样本字节数），按最深档预留就不会在音频线程上扩容。
@@ -2075,8 +2131,7 @@ pub(crate) fn tx_loop(
                 // 位深进阶梯之后 rung 0/1/2 全是 48 kHz，写 `want != 0` 会给
                 // 48 kHz/24 bit 和 48 kHz/16 bit 白建一个 48→48 的重采样器。
                 let f = audiohub_net::media::rung_format(want);
-                tx.rs = (f.rate_hz != MicSource::OUT_RATE)
-                    .then(|| seeded_resampler(MicSource::OUT_RATE, f.rate_hz, last));
+                tx.rs = resampler_for(want, last);
                 // **把 seq 对齐到新的分包数。** 接收侧用 `seq / parts` 还原帧
                 // 序号，并靠 `seq % 2` 分前后半；换到深档时若 seq 是奇数，
                 // 整条流的前后半会**永久错位**（每一帧都配不上对），表现是
@@ -2384,6 +2439,15 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
                     c.note_jitter(jit_ms); // feeds the per-interval Stats window
                 }
                 c.prev_transit = Some(transit);
+                // The rolling window `spread_ms` is read off. Fed the raw
+                // `transit`, not the first difference: the window's own minimum
+                // is the reference point, which is what cancels the offset
+                // between two unsynchronised clocks. **Both quantities are kept**
+                // — `jitter_ms` still drives tier 0 (design §3.4 scope rule:
+                // replacing it there would change every existing user's AUTO and
+                // jitter-buffer depth, and this round has no controlled data for
+                // that), `spread_ms` drives tier 1/2 and is reported everywhere.
+                c.spread.push(transit);
             }
             let mut decoded = Vec::new();
             let dec = dsp::decode_pcm_into(&plain, depth, &mut decoded);
@@ -2586,7 +2650,8 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
                 // 拖到 1000 ms 时，默认包络 4..12 帧 = 40..120 ms 根本够不着，
                 // 于是必须重建。每秒问一次、已经对了就立刻返回。
                 let target = rx.transport.latency_target();
-                let reseeded = reshape_jitter_envelope(&mut st, target, h.stream_id);
+                let reseeded =
+                    reshape_jitter_envelope(&mut st, target, jb_tuning_for(&rx.ka_path), h.stream_id);
                 if reseeded {
                     // **把旧的伺服输出一并作废。**
                     //
@@ -4928,6 +4993,66 @@ pub(crate) mod deadline_thread_guards {
 // 深档（48 kHz/24 bit、48 kHz/32f）的整帧明文装不进一个以太网数据报，线上按
 // 5 ms 切成两个包发。这一组守的是那条路径上四件**都不会报错**的事：
 // 分包判据、seq 与时间戳的构造、接收侧的配对、以及搭档缺席时的出路。
+#[cfg(test)]
+mod start_rung_tests {
+    use super::*;
+    use audiohub_net::media::{rung_format, LADDER};
+
+    /// A stream's starting rung and its resampler **must be decided together**.
+    ///
+    /// # The bug this exists for, in full
+    ///
+    /// A send stream used to start on `AUTO_TOP_RUNG` = rung 2, which is
+    /// 48 kHz, which needs no resampler — so `rs: None` at install time was
+    /// correct *by coincidence*. Making the starting rung per-transport
+    /// (rung 3 = 32 kHz on tier 1) broke that coincidence and produced a stream
+    /// whose header declared 32 kHz while its payload was still 48 kHz worth of
+    /// samples. Measured 2026-08-08: `format_mismatch` climbed once per frame,
+    /// 2002 frames in 20 s, the receiver discarded every one, and the only
+    /// symptom above the log line was a tone verdict that never appeared.
+    ///
+    /// So this asserts the rule at every rung, not just the two that happen to
+    /// be reachable today.
+    #[test]
+    fn every_rung_that_needs_a_resampler_gets_one_at_install_time() {
+        for rung in 0..LADDER.len() as u32 {
+            let rate = rung_format(rung).rate_hz;
+            assert_eq!(
+                resampler_for(rung, 0.0).is_some(),
+                rate != MicSource::OUT_RATE,
+                "rung {rung} is {rate} Hz: a stream installed here would put {} samples on the \
+                 wire under a header declaring {rate} Hz",
+                if rate == MicSource::OUT_RATE { "the right number of" } else { "48 kHz" }
+            );
+        }
+    }
+
+    /// The install path may not hand-roll the decision above.
+    ///
+    /// Source text rather than behaviour because `install_stream` needs the
+    /// whole `TxState` machinery plus a real device; what actually failed was
+    /// a literal `rs: None` sitting next to a rung that was no longer always
+    /// 48 kHz, and that is exactly what this reads.
+    #[test]
+    fn the_install_path_derives_the_resampler_from_the_starting_rung() {
+        // Not `tests::fn_body`: that one keys off a top-level `\n}` and this is
+        // a method inside an `impl`, so it would run to the end of the block.
+        let src = tests::code();
+        let at = src.find("fn install_stream(").expect("install_stream is gone");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("no end of method")];
+        let body = tests::strip_comments(body);
+        assert!(
+            body.contains("rs: resampler_for(start_rung"),
+            "install_stream no longer derives the resampler from the rung it installs"
+        );
+        assert!(
+            !body.contains("rs: None"),
+            "install_stream installs a stream with no resampler; that is only correct while the \
+             starting rung is a 48 kHz one, and it is not on tier 1"
+        );
+    }
+}
+
 #[cfg(test)]
 mod wire_split_tests {
     use super::*;

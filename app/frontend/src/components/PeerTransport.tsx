@@ -23,6 +23,7 @@
 import { useMemo, useState } from 'react';
 import { StopSlider } from './StopSlider';
 import { t } from '../i18n';
+import type { MsgKey } from '../i18n';
 import { fmt } from '../lib/fmt';
 import { latencyStops, normLatency, qualityStops, stopLabel } from '../lib/transportStops';
 import { pickWorst, qualityDepthKey, readLatency, readQuality, splitByDirection } from '../lib/metrics';
@@ -221,6 +222,28 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
     }
   }
 
+  /** 连通性档位（plan §16.2）。**另一个动词**，不是 `peers.set_transport`
+   *  的第三个字段——那个方法的 `dir` 是必填的，而 tier 不分方向。 */
+  async function setTier(v: string): Promise<void> {
+    if (busy || v === tier) return;
+    setBusy(true);
+    try {
+      await rpc('peers.set_tier', { peer: fp, tier: v });
+      await refreshPeers();
+    } catch { /* rpc 已 toast */ } finally {
+      setBusy(false);
+    }
+  }
+
+  // 读不到就是 `auto`，与四个档位串同一条理由：daemon 对每台配对过的对端都
+  // 给得出一个值，读不到只可能是旧服务——空着会让整组按钮消失。
+  const tier = typeof tr.tier === 'string' ? tr.tier : 'auto';
+  const TIERS: { id: string; label: MsgKey; hint: MsgKey }[] = [
+    { id: 'auto', label: 'detail.transport.tierAuto', hint: 'detail.transport.tierAutoHint' },
+    { id: 'tier0', label: 'detail.transport.tier0', hint: 'detail.transport.tier0Hint' },
+    { id: 'tier1', label: 'detail.transport.tier1', hint: 'detail.transport.tier1Hint' },
+  ];
+
   return (
     <section className="card block" data-testid="detail-transport">
       <h3 className="block-title">{t('detail.transport.title')}</h3>
@@ -276,6 +299,45 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
           值被推到了哪里（plan §15 裁定 3），但需要知道「一个方向的两个旋钮不在
           同一台机器上执行」。 */}
       <p className="muted small" data-testid="detail-transport-where">{t('detail.transport.where')}</p>
+
+      {/* ---- 连通方式（plan §16.2 的「手动覆盖恒可用」）--------------------
+          放在四个档位**之后**：那四个是日常旋钮，这一个是「网络不让我直连」
+          时才动的。三个互斥选项而不是一个开关——`auto` 与 `tier0` 不是同一件事
+          （前者是「你决定」，后者是「钉住直连，别自己改」），做成开关就必须
+          把其中一个藏起来。
+
+          ⚠ 这里显示的是**用户的选择**，不是链路现在实际跑在哪一档。后者是
+          §16.4 要求的一级信息（贴着延迟数字显示「经 TCP 中转」），它需要
+          `transport_tier` 这个尚不存在的字段。**不得用这一组按钮冒充它**：
+          选「自动」的对端此刻可能正跑在 tier 1 上，而这里仍然显示「自动」。 */}
+      <div className="transport-tier" data-testid="detail-transport-tier">
+        <h4 className="block-subtitle">{t('detail.transport.tierTitle')}</h4>
+        <p className="muted small" data-testid="detail-transport-tier-note">
+          {t('detail.transport.tierNote')}
+        </p>
+        {typeof tr.tier_reset_from === 'string' ? (
+          <p className="transport-reset" data-testid="detail-transport-tier-reset">
+            {t('detail.transport.tierReset', { old: tr.tier_reset_from })}
+          </p>
+        ) : null}
+        <div className="transport-tier-row" role="radiogroup" aria-label={t('detail.transport.tierTitle')}>
+          {TIERS.map((o) => (
+            <button
+              key={o.id}
+              type="button"
+              role="radio"
+              aria-checked={tier === o.id}
+              className={`transport-tier-opt${tier === o.id ? ' is-on' : ''}`}
+              data-testid={`detail-transport-tier-${o.id}`}
+              disabled={busy}
+              onClick={() => void setTier(o.id)}
+            >
+              <span className="transport-tier-label">{t(o.label)}</span>
+              <span className="transport-tier-hint">{t(o.hint)}</span>
+            </button>
+          ))}
+        </div>
+      </div>
 
       {/* ---- 两个档位的权威解释 --------------------------------------------
           `settings.transport.latencyDesc` / `qualityDesc` 是这两个旋钮的**权威

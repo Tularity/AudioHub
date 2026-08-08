@@ -701,6 +701,23 @@ export const zhCN = {
   // 一个真回归：同一个存盘值在详情页和总览里显示成两种写法。静默重置只是把
   // 同一个病换个方向——用户的选择消失了而界面处处自洽。所以：重置照做，说出来。
   'detail.transport.stopReset': '{dir}的{kind}原来存的是「{old}」，这个版本已经没有这一档，已重置为自动。请重新选择。',
+  // ---- 连通性档位（plan §16.2 的手动覆盖入口）----------------------------
+  //
+  // **说人话，不显示内部代号**（§16.4 第 2 条）：`tier1` 对用户不解释任何事，
+  // 而解释正是这一区块存在的全部理由。代号只出现在 IPC 与日志里。
+  //
+  // 这里只做「可切换」这一半。§16.4 要求的另一半——把**当前实际**跑在哪个
+  // tier 提到一级、贴着延迟数字显示——需要 `transport_tier`（链路现状）这个
+  // 字段，它还不存在。两者**不得互相冒充**：下面显示的是用户的选择。
+  'detail.transport.tierTitle': '连通方式',
+  'detail.transport.tierNote': '媒体默认走 UDP（直连，延迟最好）。UDP 被网络挡住时可以改走 TCP：功能一样不少，但**延迟与抖动会明显变差**。「自动」= 由服务判断。改这一项会重新协商一次连接，约一秒内恢复。',
+  'detail.transport.tierAuto': '自动',
+  'detail.transport.tierAutoHint': '由服务判断（默认）',
+  'detail.transport.tier0': '直连（UDP）',
+  'detail.transport.tier0Hint': '钉住直连；UDP 不通时不会自己改走 TCP',
+  'detail.transport.tier1': '经 TCP 中转',
+  'detail.transport.tier1Hint': '钉住 TCP；延迟与抖动明显更差',
+  'detail.transport.tierReset': '连通方式原来存的是「{old}」，这个版本不认识，已重置为「自动」。',
   'detail.transport.noStream': '这个方向当前没有音频流，暂无实测读数。',
   'detail.transport.measuring': '正在测量，暂无读数。',
   'detail.transport.liveMs': '实测 {n} ms',

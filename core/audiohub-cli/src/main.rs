@@ -11,8 +11,8 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 
 use audiohub_core::audio::{
-    default_devices_report, device_name_for_uid, play_samples_blocking, watch_device_list,
-    DeviceEvent, DeviceKind, LiveCapture, LivePlayback,
+    default_devices_report, device_name_for_uid, play_samples_blocking, play_servo_counters,
+    watch_device_list, DeviceEvent, DeviceKind, LiveCapture, LivePlayback,
 };
 use audiohub_core::{dsp, sysaudio};
 use audiohub_net::echo::{run_echo_client, run_echo_server_for, EchoCfg};
@@ -415,6 +415,7 @@ fn cmd_tone(
             Some(LivePlayback::start_on_uid(uid, 48000)?)
         }
     };
+    let opened_servo = opened.is_some();
     match opened {
         Some((guard, mut tx)) => {
             // Pace against an ABSOLUTE clock with a lead, never against a
@@ -453,6 +454,10 @@ fn cmd_tone(
             "device": device,
             "device_uid": device_uid,
             "resolved_name": resolved,
+            // Only the named-device path runs the play-ring servo; the default
+            // path pre-resamples once and is rate-controlled by nothing. Which
+            // one played is exactly what a loopback verdict cannot tell you.
+            "play_servo": opened_servo.then(play_servo_counters),
         }),
     );
     Ok(0)
@@ -799,6 +804,14 @@ fn cmd_sysaudio(
             "played_packets": played,
             "verdict": verdict,
             "absent_verdict": absent_verdict,
+            // Whatever THIS process played (--self-tone / --play-pull) went out
+            // through the play-ring rate servo, so the capture holds the servo's
+            // output, not the tone we asked for. A railed servo bends the pitch
+            // by up to MAX_PPM, which wrecks a coherent-bin SNR verdict while
+            // leaving rms untouched — indistinguishable from "the backend broke"
+            // unless the servo's own reading is on the record next to it.
+            "play_servo": (self_tone.is_some() || play_pull.is_some())
+                .then(play_servo_counters),
             "ok": ok,
         }),
     );

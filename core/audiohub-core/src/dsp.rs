@@ -966,3 +966,121 @@ mod send_gain_tests {
         assert_eq!(g.target, 1.0);
     }
 }
+
+/// 终审 §二.7「Windows 设备回环捕获间歇性失败」的根因判定，钉成断言。
+///
+/// 那条判定把 `control-loopback` 的 FAIL 记成了**采集后端**的毛病，理由是
+/// r6_sysaudio.sh 自己打出来的一句
+///「on an endpoint measured QUIET … so the capture itself is wrong」。
+/// 实测把这个归因推翻了（30-win，2026-08-09）：
+///
+/// | 播放路径 | 采集后端 | 2 kHz 判定 |
+/// |---|---|---|
+/// | `probe tone` 默认设备（`play_samples_blocking`，**无伺服**） | win-device-loopback | **107.96 dB PASS** |
+/// | `probe sysaudio --self-tone`（`LivePlayback` + 播放环伺服） | win-device-loopback | **14.74 dB FAIL**（6/6） |
+///
+/// 同一台机器、同一个端点、同一个后端：采集是**逐样本无损**的。变红的是
+/// **播放**——那一刻 `play_servo` 读数是 `corr_ppm = -500`、
+/// `clamped = 1988 / updates = 1989`，即速率伺服整段贴在 [`MAX_PPM`] 钳位上，
+/// 把自己播出去的音调整体弯了 500 ppm。
+///
+/// 本模块证明的就是最后这一步：**只要弯 [`MAX_PPM`]，`verify_tone` 就会掉到
+/// 20 dB 判据以下，而 rms 一动不动**。于是
+///
+/// > `control-loopback` FAIL ⇏ 采集错了
+///
+/// 因为播放侧一个合法的、听感上无害的（500 ppm = 0.87 音分）速率修正就足以
+/// 单独把它打红。要区分这两者，看的是 probe JSON 里的 `play_servo` 块，
+/// 不是 rms——rms 恰恰是**看不出来**的那个量。
+///
+/// [`MAX_PPM`]: crate::audio::PlayServo::MAX_PPM
+#[cfg(test)]
+mod servo_bend_defeats_the_tone_verdict {
+    use super::*;
+    use crate::audio::PlayServo;
+
+    const SR: u32 = 48_000;
+    const FREQ: f32 = 2000.0;
+    /// 与 r6 step 4 同长：12 s。判据取的是各 100 ms 窗的中位数，所以窗数要够。
+    const SECS: usize = 12;
+
+    fn tone_at(freq: f32) -> Vec<f32> {
+        gen_sine(freq, SR, SR as usize * SECS, 0.5)
+    }
+
+    fn rms(x: &[f32]) -> f64 {
+        (x.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / x.len() as f64).sqrt()
+    }
+
+    /// 基线：没弯速率时判定必须是干净的。这一条先绿，下一条才有意义。
+    ///
+    /// 注入对照：把 `gen_sine` 的相位累加从 f64 改成 f32（正是它自己注释里
+    /// 警告的那件事），这一条变红（−31.6 dB，detected=false）。
+    #[test]
+    fn an_unbent_tone_is_detected_with_a_huge_margin() {
+        let v = verify_tone(&tone_at(FREQ), SR, FREQ);
+        assert!(v.detected, "unbent {FREQ} Hz must be detected, got {v:?}");
+        assert!(
+            v.snr_db > 60.0,
+            "unbent tone should be essentially pure, got {:.2} dB",
+            v.snr_db
+        );
+    }
+
+    /// 主张：把音调弯 `MAX_PPM`（伺服贴钳位时的实际行为）就足以让判定翻红。
+    ///
+    /// 注入对照：把 `verify_tone` 的 `detected` 阈值从 `> 20.0` 放宽到
+    /// `> 10.0`，这一条立刻变红（弯过的音调重新变成 detected，
+    /// 「播放侧的弯速率能单独打红判定」这个主张就不成立了）。
+    #[test]
+    fn bending_the_tone_by_the_servo_clamp_alone_flips_the_verdict_to_fail() {
+        let bent = FREQ * (1.0 - PlayServo::MAX_PPM as f32 * 1e-6);
+        let v = verify_tone(&tone_at(bent), SR, FREQ);
+        assert!(
+            !v.detected,
+            "a {} ppm bend must be enough to fail the 20 dB verdict on its own, \
+             got detected=true at {:.2} dB — if this went green the whole \
+             §二.7 root cause needs re-deriving",
+            PlayServo::MAX_PPM, v.snr_db
+        );
+        // 30-win 实测 14.74 dB；相干性损失只由「弯量 x 窗长」决定，所以这是
+        // 一个可预测的数，不是一个观察到的数。留窄窗，抓住任何改窗长/改核的改动。
+        assert!(
+            (v.snr_db - 14.74).abs() < 0.5,
+            "expected the 30-win figure 14.74 dB from a {} ppm bend, got {:.2} dB",
+            PlayServo::MAX_PPM, v.snr_db
+        );
+    }
+
+    /// 而 rms 看不出任何异常——这正是 r6 的「端点是安静的，所以一定是采集坏了」
+    /// 那句推理失效的地方：它拿能量当证据，而弯速率不动能量。
+    ///
+    /// 两条断言缺一不可：
+    /// 1. 弯前弯后的 rms 相等 —— 「能量证据是瞎的」这个主张本身；
+    /// 2. **两者都等于解析值 `amp/√2`** —— 只比 1 会让任何**共模**改动（给
+    ///    生成器加窗、整体改幅度）从两边同时消掉，测试照绿。r6 的
+    ///    `TONE_RMS = 0.5/sqrt(2)` 与 `LEAK_MIN` 两个常数正是钉在这个绝对值上，
+    ///    所以它必须被断言，不能只断言差。
+    ///
+    /// 注入对照：给 `gen_sine` 加一个 Hann 窗（一个看起来像「减少频谱泄漏」的
+    /// 改进），第 2 条立刻变红；只有第 1 条时它是绿的。
+    #[test]
+    fn the_bend_is_invisible_in_rms_which_is_what_the_regress_used_as_evidence() {
+        let clean = rms(&tone_at(FREQ));
+        let bent = rms(&tone_at(FREQ * (1.0 - PlayServo::MAX_PPM as f32 * 1e-6)));
+        assert!(
+            (clean - bent).abs() < 1e-4,
+            "rms must not move ({clean:.6} vs {bent:.6}): the energy evidence \
+             cannot tell a bent tone from a clean one"
+        );
+        // r6_sysaudio.sh 的 TONE_RMS：amp 0.5 的纯音 = 0.5/sqrt(2)。
+        let want = 0.5 / 2f64.sqrt();
+        for (label, got) in [("clean", clean), ("bent", bent)] {
+            assert!(
+                (got - want).abs() < 1e-3,
+                "{label} rms {got:.6} != the analytic full-scale {want:.6}; \
+                 r6's TONE_RMS/LEAK_MIN thresholds are pinned to this value"
+            );
+        }
+    }
+}

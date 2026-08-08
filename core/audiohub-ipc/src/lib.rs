@@ -60,7 +60,7 @@ pub use audiohub_core::latency::{DevLatency, DropMode, LatSource};
 pub use audiohub_core::permissions::{
     PermissionKind, PermissionState, KIND_LOCAL_NETWORK, KIND_MICROPHONE, KIND_SYSTEM_AUDIO,
 };
-pub use audiohub_core::sysaudio::VirtualCard;
+pub use audiohub_core::sysaudio::{BackendInfo, VirtualCard};
 pub use audiohub_core::volume::VolumeState;
 pub use audiohub_net::identity::PairedPeer;
 /// The machine-wide mode (plan §13). Defined in `audiohub-net` because it is
@@ -101,6 +101,26 @@ pub struct DaemonInfo {
     /// bridge selector is selectable or greyed out (spec-m4b §C / m4c §B).
     #[serde(default)]
     pub virtual_cards: Vec<VirtualCard>,
+    /// 本机的系统音频捕获后端清单（plan §6 / §8 的「后端查询」）。**模式 A 的
+    /// spk 方向选哪个后端，UI 就靠它画**：哪些可用、不可用的原因、哪些已裁定
+    /// 不实现（`BackendInfo.declined`）。
+    ///
+    /// 切换在另一处：`session.open` 的 `backend` 字段（`sysaudio::resolve_backend`）。
+    /// plan §8 把这两半写成了一个 `capture.*` 方法族；实际落成了「查询挂
+    /// `daemon.status`、切换挂 `session.open`」。**能力两半都在**，差的只是方法名。
+    /// 之所以不另起一个 `capture.list`：清单是 daemon 级的、每次 status 本来就要
+    /// 取，另开一个入口只会让同一份 `list_backends()` 有两个真相源，而前端已经
+    /// 按 `daemon.status` 落地。这条口径待 `docs/status-audit.md` §四正式登记。
+    ///
+    /// **每次 status 现算，不缓存**：`available` 与 `note` 都带着本机此刻的实况
+    /// （macOS 上 `note` 会随上一次开启是被批准还是被拒绝而变），缓存住就等于把
+    /// 一个陈旧结论钉在界面上。代价可忽略——`list_backends()` 明文保证不开采集、
+    /// 不弹权限框，只做类存在性与 OS 版本判定。
+    ///
+    /// 缺席 ⇒ 前端必须落到「不知道」（`available: null`），**不得推断成不可用**：
+    /// `app/frontend/src/lib/sysaudio.ts` 的 `backendsReported()` 就是这条判据。
+    #[serde(default)]
+    pub sysaudio_backends: Vec<BackendInfo>,
     /// 站点级混音健康（规格 §3.5 / §4.6）。挂在这里而不是 `SessionStats` 上，
     /// 是因为它是**求和之后**的量：削顶发生在 N 路相加以后，归不到任何一条
     /// 会话头上。`None` = 本窗口内混音器没有输出过。
@@ -1267,6 +1287,10 @@ pub struct PeerState {
 ///       bridge exists. It is added to the DaemonInfo object by the daemon, not
 ///       carried as a DaemonInfo field, so a client that predates it sees
 ///       exactly what it saw before.
+///       This is also where the system-audio backend INVENTORY lives
+///       (`DaemonInfo::sysaudio_backends`); picking one is `session.open`'s
+///       `backend` field. There is deliberately no `capture.list` — see the
+///       field's own doc comment.
 /// - "daemon.shutdown"   {}                    -> {}
 /// - "daemon.simulate_device_change" {kind}    -> {kind, epoch}
 ///       kind = "input" | "output". Drives the same rebuild path a real

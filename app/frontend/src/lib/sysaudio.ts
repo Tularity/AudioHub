@@ -8,9 +8,13 @@
 //   session.open { peer, kind:'spk', source:'sysaudio'|'mic', backend?:string }
 //   backend 缺席 = 'auto'，daemon 按优先级取第一个可用后端（sysaudio.rs resolve_backend）。
 //
-// **缺口（daemon 侧，本轮不动 core）**：`sysaudio::list_backends()` 只经 CLI
-// `probe sysaudio --list --json` 露出来，`DaemonInfo` 里没有对应字段。所以 UI 拿不到
-// 「本机哪个后端可用、为什么不可用」。这里的处理是**承认不知道**，而不是猜：
+// 后端清单的来源：`daemon.status.sysaudio_backends`（daemon 每次 status 现算
+// `sysaudio::list_backends()`，见 core/audiohub-ipc 的 DaemonInfo）。CLI 的
+// `probe sysaudio --list --json` 只是同一份数据的另一个出口。
+//
+// 下面的两条分支**一条都不能删**：daemon 与 UI 是各自独立部署的两份产物，
+// 版本对不上（旧 daemon / 将来 plan §7.5 的网页端连到别的机器）时字段就是会缺席。
+// 缺席时的处理是**承认不知道**，而不是猜：
 //   - daemon 上报了 sysaudio_backends → 照它说的画（含 available / note）；
 //   - 没上报 → 只按平台列出后端 id，available 记 null（未知），并在文案里明说
 //     「是否可用要到真正开启时才知道，不可用会明确报错」。
@@ -152,7 +156,8 @@ export function backendOptions(daemon: DaemonInfo | null | undefined): BackendOp
   }
   // 回落路径按 UI 宿主平台过滤。这条假设成立的前提是 **daemon 一定在本机**
   // （IPC 走 127.0.0.1），今天确实如此；plan §7.5 的网页端一旦落地（浏览器可能在
-  //另一台机器上），这里就必须改成读 daemon 上报的清单——也就是下面那条缺口。
+  // 另一台机器上），这条回落就会按错的平台画——但那时 daemon 也早已在上报清单，
+  // 走的是上面那条分支。真正的风险只剩「新 UI + 旧 daemon + 网页端」这一种组合。
   //
   // declined 的那些直接给 false（不是 null）：清单没上报时我们确实不知道本机
   // **能不能**跑某个后端，但「这份构建里压根没有这条路径」与本机无关，是编译期

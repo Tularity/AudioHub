@@ -127,10 +127,12 @@ export interface VirtualCard {
 /**
  * 系统音频捕获后端（core/audiohub-core/src/sysaudio.rs 的 `BackendInfo`）。
  *
- * **daemon 目前不上报这个字段**：`list_backends()` 只经 CLI `probe sysaudio --list`
- * 露出来，`DaemonInfo` 里没有它。这里先按 core 的形状声明，是为了让 daemon 补上
- * `sysaudio_backends` 的那一天，UI 无需改动就能把「可用/不可用 + 原因」如实画出来
- * （lib/sysaudio.ts 的 backendOptions 已经按「有就用、没有就承认不知道」写好）。
+ * daemon 在 `daemon.status` 上现算上报（`DaemonInfo.sysaudio_backends`），CLI 的
+ * `probe sysaudio --list` 是同一份数据的另一个出口。
+ *
+ * 字段**全部可选**：这是一份跨进程读来的 JSON，daemon 与 UI 各自独立部署，版本
+ * 对不上时字段就是会缺席。lib/sysaudio.ts 的 backendOptions 按「有就用、没有就
+ * 承认不知道」处理每一项。
  */
 export interface SysAudioBackend {
   id?: string;
@@ -163,7 +165,11 @@ export interface DaemonInfo {
   latency_guard?: LatencyGuardStatus;
   output_devices?: string[];
   virtual_cards?: VirtualCard[];
-  /** 见 SysAudioBackend：当前 daemon 一律缺席，UI 必须能在没有它时也说得通。 */
+  /**
+   * 见 SysAudioBackend。daemon 每次 `daemon.status` 现算上报；**仍标为可选**，
+   * 因为旧版 daemon 不带它，UI 必须能在没有它时也说得通（lib/sysaudio.ts 的
+   * `backendsReported()`）。
+   */
   sysaudio_backends?: SysAudioBackend[];
 }
 

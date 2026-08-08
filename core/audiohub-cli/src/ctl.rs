@@ -852,6 +852,30 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                     val_str(&c, "name"),
                 ));
             }
+            // System-audio backends (plan §8 "backend query"). Not run through
+            // val_bool: an absent `available` is "this daemon did not say",
+            // which val_bool would flatten into `false` — the same
+            // absent-means-unavailable lie the UI is written to avoid.
+            for b in v
+                .get("sysaudio_backends")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+            {
+                let avail = match b.get("available").and_then(Value::as_bool) {
+                    Some(true) => "yes",
+                    Some(false) if val_bool(&b, "declined") => "no(declined)",
+                    Some(false) => "no",
+                    None => "unknown",
+                };
+                info(&format!(
+                    "sysaudio backend {:<20} available={:<12} excludes_self={} — {}",
+                    val_str(&b, "id"),
+                    avail,
+                    val_bool(&b, "excludes_self"),
+                    val_str(&b, "note"),
+                ));
+            }
         }
         CtlCmd::Peers => {
             let items = v.as_array().cloned().unwrap_or_default();

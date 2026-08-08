@@ -61,6 +61,13 @@ fn daemon_info(inner: &DaemonInner) -> DaemonInfo {
         uptime_s: inner.start.elapsed().as_secs_f64(),
         output_devices,
         virtual_cards,
+        // NOT behind `device_listing`'s cache, and not behind one of its own.
+        // `list_backends()` is a class-existence + OS-version check that is
+        // contractually forbidden from opening a capture (sysaudio.rs), so it
+        // costs nothing here; what it DOES carry is live state — the macOS note
+        // flips as soon as a start attempt is granted or refused. Caching that
+        // would pin a stale reason under a row the user is staring at.
+        sysaudio_backends: audiohub_core::sysaudio::list_backends(),
         // 站点级混音健康（规格 §3.5）。求和之后的量，归不到任何一条会话头上，
         // 所以走 daemon.status 而不是 SessionStats。
         mix_health: crate::build_mix_health(inner),

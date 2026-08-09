@@ -3462,6 +3462,18 @@ fn add_to_hal_bucket(
 /// verify_tone can't apply here: concurrent probe tones are signal, not
 /// noise, so detection keys on absolute Goertzel power (median of 100ms
 /// windows); snr_db is still reported for diagnostics.
+/// `mix_tone_verdict` 的存在判据：中位单格功率的下限。
+///
+/// amp-0.5 的音调落在 ~0.0625，PLC 衰减与削顶都不会把它拉到这个量级；
+/// 静音与噪声则远在其下。
+///
+/// **两decade 的余量是承重的，不是宽松。** 播放伺服的合法弯速率按 `sinc²(δ)`
+/// 削这一格的功率（终审 §二.14 的根因），2 kHz 上顶到 500 ppm 钳位削掉 3.2 %。
+/// 正是这两个数量级的差距，让本判据**没有**掉进 `verify_tone` 当年那条抛硬币的
+/// 噪声带里。谁想动这个数，先看
+/// `tests::the_mix_verdict_is_not_in_the_same_noise_band_as_the_old_verify_tone`。
+const MIX_TONE_POWER_FLOOR: f32 = 1e-4;
+
 pub(crate) fn mix_tone_verdict(samples: &[f32], rate: u32, freq: f32) -> ToneVerdict {
     let win = (rate / 10) as usize;
     let skip = (rate / 5) as usize;
@@ -3503,9 +3515,7 @@ pub(crate) fn mix_tone_verdict(samples: &[f32], rate: u32, freq: f32) -> ToneVer
     ToneVerdict {
         freq_hz: freq,
         snr_db: snrs[snrs.len() / 2],
-        // amp-0.5 tone lands at ~0.0625; PLC decay and clipping keep a live
-        // tone well above this floor while silence/noise stays far below
-        detected: p_med > 1e-4,
+        detected: p_med > MIX_TONE_POWER_FLOOR,
         samples_analyzed: analyzed,
     }
 }
@@ -3513,6 +3523,64 @@ pub(crate) fn mix_tone_verdict(samples: &[f32], rate: u32, freq: f32) -> ToneVer
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// 终审 §二.14 的**推广检查**：`mix_tone_verdict` 也判音，它是否也坐在
+    /// 量具的噪声带里？
+    ///
+    /// 答案是**否**，而这条测试就是那个「否」的证据，不是一句转述。
+    /// 理由与 `verify_tone` 不同：这里的 `detected` 用的是**绝对功率**
+    /// （`p_med > 1e-4`），而不是单格相干比。播放伺服的弯速率按 `sinc²(δ)`
+    /// 削功率，500 ppm 钳位在 2 kHz 上 δ = 0.1 格 ⇒ 只削掉 3.2 %，
+    /// 而 amp-0.5 的音调落在 0.0625，是判据的 625 倍。
+    ///
+    /// ⚠ 所以这条测试**不是**在测「弯了还检得到」这件容易的事，它钉的是
+    /// **余量本身**：谁把 `1e-4` 抬到 0.05、或者把 `detected` 改回相干比，
+    /// 这条就变红。§二.7 缺的就是这一步（只改了一条断言，没有回头看兄弟量具）。
+    #[test]
+    fn the_mix_verdict_is_not_in_the_same_noise_band_as_the_old_verify_tone() {
+        const SR: u32 = 48_000;
+        // 伺服钳位的两端 + 中间，覆盖它能造成的全部弯量。
+        for ppm in [0.0f32, 250.0, 500.0, -500.0] {
+            for freq in [1000.0f32, 2000.0] {
+                let bent = freq * (1.0 + ppm * 1e-6);
+                let x = dsp::gen_sine(bent, SR, SR as usize * 3, 0.5);
+                let v = mix_tone_verdict(&x, SR, freq);
+                assert!(
+                    v.detected,
+                    "{freq} Hz bent {ppm} ppm went undetected in the mixer tap: {v:?}"
+                );
+            }
+        }
+        // 余量：弯到钳位时，中位功率必须仍然远高于 1e-4 的判据。
+        let bent = 2000.0f32 * (1.0 - 500.0 * 1e-6);
+        let x = dsp::gen_sine(bent, SR, SR as usize * 3, 0.5);
+        let p = mix_median_power(&x, SR, 2000.0);
+        let decades = (p / MIX_TONE_POWER_FLOOR as f64).log10();
+        assert!(
+            decades >= 2.0,
+            "a clamp-bent 2 kHz tone leaves {p:.6} of median bin power, only \
+             {decades:.2} decades above the {MIX_TONE_POWER_FLOOR:e} detection \
+             floor. Below two decades this instrument is drifting toward the \
+             §二.14 failure mode — a legal servo bend would start deciding the \
+             verdict. Fix the instrument, not the floor."
+        );
+        // 反向：静音必须远在判据之下（否则上面的余量断言什么都没证明）。
+        let quiet = vec![0.0f32; SR as usize * 3];
+        assert!(!mix_tone_verdict(&quiet, SR, 2000.0).detected, "silence read as a tone");
+    }
+
+    /// 上一条要用的中位单格功率。与 `mix_tone_verdict` 内部同一口径。
+    fn mix_median_power(samples: &[f32], rate: u32, freq: f32) -> f64 {
+        let win = (rate / 10) as usize;
+        let skip = (rate / 5) as usize;
+        let mut ps: Vec<f64> = samples[skip..]
+            .chunks(win)
+            .filter(|c| c.len() == win)
+            .map(|c| dsp::goertzel_power(c, rate, freq) as f64)
+            .collect();
+        ps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ps[ps.len() / 2]
+    }
 
     /// **调度迟到直方图的分桶必须与 `LATE_EDGES_MS` 声明的语义一致。**
     ///

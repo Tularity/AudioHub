@@ -4385,3 +4385,118 @@ mod rate_servo {
         assert_eq!(d.update(0.0), 1.0, "reset 之后第一次零误差更新必须给出 1.0");
     }
 }
+
+/// 终审 §二.14 的根因，钉在**生产播放路径**上。
+///
+/// # 主张一：48 k ↔ 48 k 也会重采样，而且伺服确实在弯它
+///
+/// `LivePlayback::on_device` 无条件建 `VarResampler`（那一行的注释写得很清楚：
+/// 「弯比率是环路唯一的执行器，没有它环路就没有手」）。这不是一处冗余——
+/// 本模块量到，晶振失配 25 ppm 时伺服稳态就停在 25 ppm 上，也就是说
+/// **48 k↔48 k 的重采样器有实活干，删不得**。§二.14 建议的修法 (a)
+///「让 48 k↔48 k 不走重采样」因此是错的，本模块就是那条结论的证据。
+///
+/// # 主张二：代价原本落在**量具**上，现在不落了
+///
+/// 伺服弯 ppm ⇒ 播出去的音调整体偏移 f·ppm ⇒ 旧的单格 Goertzel 判读按
+/// `sinc²(δ)` 掉下去（δ = f·ppm / 10 Hz）。2 kHz 上 300 ppm 就掉到 19.3 dB，
+/// 低于 20 dB 判据——而 300 ppm 是一块普通声卡的正常晶振误差。
+///
+/// 本模块跑的是真的 `AudioTx::push_at`（真伺服、真重采样器、模拟声卡按 ppm
+/// 取样），不是解析近似。判据是**余量**，与 `dsp` 那边的守卫同一条纪律。
+#[cfg(test)]
+mod the_playback_servo_bends_the_tone_at_48k_to_48k {
+    use super::*;
+    use crate::dsp;
+
+    /// 一个 mixer tick @48k。
+    const F: usize = 480;
+    /// 声卡一次回调的帧数。
+    const CB: usize = 512;
+    /// 与 `dsp` 那边同一个余量要求。
+    const MIN_MARGIN_DB: f32 = 20.0;
+
+    /// 跑生产播放路径，返回「声卡真正取走的样本」与稳态修正量（ppm）。
+    fn play_through_device(ppm: f64, freq: f32, secs: usize) -> (Vec<f32>, f64) {
+        let (mut tx, mut sink) = AudioTx::detached_for_test_with_servo(48_000);
+        let t0 = Instant::now();
+        let (mut now_ns, mut next_cb_ns) = (0u64, 0.0f64);
+        // 声卡的真实周期：晶振失配全部体现在这里。
+        let cb_period_ns = CB as f64 / (48_000.0 * (1.0 + ppm * 1e-6)) * 1e9;
+        let mut out: Vec<f32> = Vec::new();
+        let mut buf = vec![0.0f32; CB];
+        let step = 2.0 * std::f64::consts::PI * freq as f64 / 48_000.0;
+        let mut n_src = 0usize;
+        for _ in 0..(secs * 100) {
+            let end = now_ns + 10_000_000;
+            while next_cb_ns <= end as f64 {
+                let t = t0 + Duration::from_nanos(next_cb_ns as u64);
+                let got = sink.cons.pop_slice(&mut buf);
+                for b in &mut buf[got..] {
+                    *b = 0.0; // 欠载补静音，与真回调一致
+                }
+                sink.dev.note_callback(t, CB, got, None);
+                out.extend_from_slice(&buf[..]);
+                next_cb_ns += cb_period_ns;
+            }
+            now_ns = end;
+            let frame: Vec<f32> = (0..F)
+                .map(|i| (0.5f64 * (step * (n_src + i) as f64).sin()) as f32)
+                .collect();
+            n_src += F;
+            tx.push_at(&frame, t0 + Duration::from_nanos(now_ns));
+        }
+        (out, tx.servo_corr_ppm())
+    }
+
+    /// **主张一。** 伺服在 48 k↔48 k 上有实活：稳态修正量等于晶振失配，
+    /// 不是 0。⇒ 重采样器不能因为「速率相同」就删掉。
+    ///
+    /// 注入对照：把 `AudioTx::detached` 的 `resampler` 改成恒 `None`
+    /// （= §二.14 建议的修法 (a)），这一条变红——伺服再也弯不动任何东西，
+    /// 修正量恒为 0，而播放环会一路漂到欠载。
+    #[test]
+    fn the_servo_has_real_work_to_do_even_when_both_rates_are_48k() {
+        for &ppm in &[25.0f64, -25.0, 100.0, -100.0] {
+            let (_, corr) = play_through_device(ppm, 2000.0, 13);
+            assert!(
+                (corr - ppm).abs() < 5.0,
+                "48k<->48k with a {ppm} ppm crystal: the servo settled at \
+                 {corr:.1} ppm. It is supposed to track the mismatch — if this \
+                 is ~0 the resampler is gone and the play ring has no actuator."
+            );
+        }
+    }
+
+    /// **主张二。** 同一条路径上，判读离 20 dB 判据必须有余量。
+    ///
+    /// 覆盖的 ppm 一路到伺服钳位。300 ppm 那两行是 §二.14 的原始现场：
+    /// 旧量具在那里读 19.30 dB（FAIL），新量具读 57.40 dB。
+    ///
+    /// 注入对照：把 `dsp::LOBE_HALF_BINS` 改成 0（= 旧的单格判读），
+    /// 这一条立刻变红。
+    #[test]
+    fn the_tone_verdict_clears_the_threshold_through_the_real_play_path() {
+        let mut worst = (f32::INFINITY, 0.0f32, 0.0f64);
+        for &freq in &[1200.0f32, 2000.0] {
+            for &ppm in &[0.0f64, 100.0, -100.0, 300.0, -300.0, 500.0, -500.0] {
+                let (out, _) = play_through_device(ppm, freq, 13);
+                let v = dsp::verify_tone(&out, 48_000, freq);
+                if v.snr_db < worst.0 {
+                    worst = (v.snr_db, freq, ppm);
+                }
+            }
+        }
+        let margin = worst.0 - dsp::TONE_DETECT_DB;
+        assert!(
+            margin >= MIN_MARGIN_DB,
+            "through the real play path the verdict has only {margin:.2} dB of \
+             margin (worst {:.2} dB at {} Hz, {:.0} ppm crystal). That is the \
+             §二.14 defect coming back: the instrument is inside its own noise \
+             band and every play-then-verify assertion is a coin flip.",
+            worst.0,
+            worst.1,
+            worst.2
+        );
+    }
+}

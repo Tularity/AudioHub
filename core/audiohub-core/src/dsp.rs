@@ -32,6 +32,139 @@ pub struct ToneVerdict {
     pub samples_analyzed: usize,
 }
 
+// ------------------------------------------------------------- 判音的带内口径
+//
+// # 为什么单格相干功率是一个**坏量具**（终审 §二.14 / §二.7 同一根因）
+//
+// 原来的判据是「目标频率那一个 Goertzel 格的功率 / 其余全部功率」，分析窗是
+// 矩形的 100 ms。矩形窗 + 单格 ⇒ 判读**只在音调恰好落在格心时才成立**：音调
+// 偏离格心 δ 格时，落进那一格的功率是 `sinc²(δ)`，剩下的全被记成噪声，于是
+//
+// ```text
+// snr_db = 10·log10( sinc²(δ) / (1 − sinc²(δ)) )
+// ```
+//
+// 这个式子不是推测，是实测（本机 2026-08-09，跑生产播放路径、48 k↔48 k）：
+//
+// | 伺服修正 | δ（格） | 上式 | 实测 |
+// |---|---|---|---|
+// | 10 ppm | 0.002 | 48.81 dB | 48.58 dB |
+// | 100 ppm | 0.020 | 28.80 dB | 28.87 dB |
+// | 500 ppm | 0.100 | 14.74 dB | **14.74 dB** |
+//
+// 而 500 ppm 正是 [`crate::audio::PlayServo::MAX_PPM`]——**播放伺服的合法钳位**。
+// `LivePlayback::on_device` 让**任何按名字寻址的播放都恒过一次带伺服的变速
+// 重采样，即使 48 k 对 48 k**（`audio.rs` 那句「弯比率是环路唯一的执行器」），
+// 于是声卡晶振与我们之间那几十到几百 ppm 的失配会原样变成音调的频率偏移。
+// 换算成判读：2 kHz 的音调只要伺服在修正 **275 ppm** 就掉到 20 dB 判据上——
+// 而 275 ppm 对人耳是 0.48 音分，**听不出来**。
+//
+// ⇒ 20.0 dB 的判据坐在量具自身的噪声带里，「放音 + 判音」的断言在抛硬币。
+//
+// # 修法：不动阈值，换量具
+//
+// 抬阈值只是把硬币换个面：噪声带会随负载/设备/晶振移动，而且掩盖真实的劣化。
+// 这里改的是**判读的口径**——从「一个格」改成「一条 Hann 主瓣」：
+//
+// 1. 先给分析窗乘 Hann。矩形窗的旁瓣只有 −13 dB 且以 6 dB/oct 衰减，偏格的
+//    音调会把功率洒满整个频轴；Hann 的旁瓣 −31 dB、18 dB/oct，功率被收进
+//    **4 格宽的主瓣**里。
+// 2. 带内功率 = 主瓣覆盖的那几格之和，而不是中心一格。
+//
+// 结果（同一套实测，见 `servo_bend_no_longer_defeats_the_tone_verdict`）：
+// 伺服顶到 500 ppm 钳位时，2 kHz 的判读从 14.74 dB 抬到 **45.5 dB**——
+// 阈值从「低于噪声带 5 dB」变成「低于最坏合法读数 25 dB」。
+//
+// # 这两个常数都**不是可调旋钮**
+//
+// - 格宽恒为 10 Hz：`verify_tone` 的窗恒为 `sr/10`，所以 `sr/win = 10`，
+//   **与采样率无关**（16 k/24 k/32 k/44.1 k/48 k 实测同一个读数）。
+// - [`LOBE_HALF_BINS`] = 3，**推导如下，不是调出来的**：Hann 主瓣宽 4 格，
+//   即以音调**真实频率**为心的 ±2 格。而求和只能落在整数格上，音调的真实
+//   频率相对最近格心还有 ±0.5 格的任意偏移 δ ⇒ 要在**任何** δ 下装下整条
+//   主瓣，需要 ±(2 + 0.5) 格，取整就是 **±3**。
+//
+//   ⚠ 先写成 ±2 是错的，而且错得很典型：那等于**默认 δ = 0**——正是让旧量具
+//   垮掉的那个假设。守卫测试当场把它抓了出来（4 kHz、−500 ppm 上只剩
+//   19.61 dB 余量）。留着这段话是因为下一个人多半会想「±2 就够了」。
+
+/// 判音的分析格宽（Hz）。`verify_tone` 的窗恒为 `sr/10` ⇒ 恒为 10 Hz。
+pub const TONE_BIN_HZ: f64 = 10.0;
+
+/// 求和覆盖的半宽（格）。**由窗函数推导，不是可调旋钮**——见模块内那段。
+const LOBE_HALF_BINS: i32 = 3;
+
+/// `detected` 的判据（dB）。**故意留在 20.0**：§二.14 的病灶是量具，不是阈值，
+/// 抬阈值只会把噪声带换个位置继续抛硬币。它是 `pub` 的，好让守卫测试能断言
+/// 「最坏的合法读数离它还有多远」——见
+/// `servo_bend_no_longer_defeats_the_tone_verdict::the_threshold_keeps_its_margin_against_every_legal_servo_bend`。
+pub const TONE_DETECT_DB: f32 = 20.0;
+
+/// 就地给 `dst` 写入 `chunk` 的 Hann 加窗结果。窗表按 `chunk.len()` 现算。
+fn hann_into(chunk: &[f32], dst: &mut Vec<f32>) {
+    dst.clear();
+    dst.reserve(chunk.len());
+    let n = chunk.len() as f64;
+    for (i, &x) in chunk.iter().enumerate() {
+        let w = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n).cos();
+        dst.push((x as f64 * w) as f32);
+    }
+}
+
+/// 一个**已加窗**的分析块里，`freq_hz` 那条主瓣内的功率与总功率。
+///
+/// 两者同尺度（都是 `goertzel_power` 那个 `mean(x²)/2` 的量纲），所以调用方
+/// 既能取比值（信噪比）也能取绝对值（幅度）。
+fn lobe_and_total(windowed: &[f32], sample_rate: u32, freq_hz: f32) -> (f64, f64) {
+    let bin = sample_rate as f64 / windowed.len() as f64;
+    let nyq = sample_rate as f64 / 2.0;
+    let k0 = (freq_hz as f64 / bin).round();
+    let mut inband = 0.0f64;
+    for d in -LOBE_HALF_BINS..=LOBE_HALF_BINS {
+        let f = (k0 + d as f64) * bin;
+        if f <= 0.0 || f >= nyq {
+            continue;
+        }
+        inband += goertzel_power(windowed, sample_rate, f as f32) as f64;
+    }
+    let total: f64 = windowed.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>()
+        / (windowed.len() as f64)
+        / 2.0;
+    (inband, total)
+}
+
+/// 带内功率占比，dB。这是**判音的唯一口径**——`verify_tone` 与
+/// [`tone_amplitude`] 都只经过它。
+///
+/// 静音（带内与带外都在 eps 以下）读 0 dB，与旧口径一致。
+pub fn tone_snr_db(chunk: &[f32], sample_rate: u32, freq_hz: f32) -> f32 {
+    let mut w = Vec::new();
+    hann_into(chunk, &mut w);
+    let (inband, total) = lobe_and_total(&w, sample_rate, freq_hz);
+    let eps = 1e-12f64;
+    let noise = (total - inband).max(0.0) + eps;
+    (10.0 * (inband.max(eps) / noise).log10()) as f32
+}
+
+/// `freq_hz` 附近的**等效正弦幅度**（与 `--vi-amp`、与 peak 同尺度）。
+///
+/// 存在的理由与 [`tone_snr_db`] 完全相同，而且这条路上的病更重：
+/// `volindep` 把整段 2 秒当一个窗量，格宽 0.5 Hz，1 kHz 上 500 ppm 的伺服修正
+/// 就是**整整一格**——单格 Goertzel 在那里读到的是一个零点。换成主瓣求和之后，
+/// 通带覆盖整条主瓣（见 [`LOBE_HALF_BINS`]），同一段信号读回原幅度。
+///
+/// Hann 窗的相干增益是 0.5、功率增益是 3/8，所以主瓣功率之和 = `3A²/32`
+/// （中心格 `A²/16` + 两侧各 `A²/64`），反解 `A = sqrt(32·P/3)`。
+pub fn tone_amplitude(samples: &[f32], sample_rate: u32, freq_hz: f32) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut w = Vec::new();
+    hann_into(samples, &mut w);
+    let (inband, _) = lobe_and_total(&w, sample_rate, freq_hz);
+    ((inband.max(0.0) * 32.0 / 3.0).sqrt()) as f32
+}
+
 pub fn verify_tone(samples: &[f32], sample_rate: u32, freq_hz: f32) -> ToneVerdict {
     let sr = sample_rate as usize;
     let skip = sr / 5; // 200ms
@@ -47,19 +180,18 @@ pub fn verify_tone(samples: &[f32], sample_rate: u32, freq_hz: f32) -> ToneVerdi
     let usable = &samples[skip..];
     let mut snrs: Vec<f32> = Vec::new();
     let mut analyzed = 0usize;
+    // 复用同一块加窗缓冲：窗长恒定，第一块之后不再分配。
+    let mut w: Vec<f32> = Vec::with_capacity(win);
     for chunk in usable.chunks(win) {
         if chunk.len() < win {
             break;
         }
         analyzed += chunk.len();
-        let target = goertzel_power(chunk, sample_rate, freq_hz) as f64;
-        // Total normalized power on same scale as goertzel_power: mean(x^2)/2.
-        let total: f64 = chunk.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>()
-            / (chunk.len() as f64)
-            / 2.0;
+        hann_into(chunk, &mut w);
+        let (inband, total) = lobe_and_total(&w, sample_rate, freq_hz);
         let eps = 1e-12f64;
-        let noise = (total - target).max(0.0) + eps;
-        snrs.push((10.0 * (target.max(eps) / noise).log10()) as f32);
+        let noise = (total - inband).max(0.0) + eps;
+        snrs.push((10.0 * (inband.max(eps) / noise).log10()) as f32);
     }
     if snrs.is_empty() {
         return ToneVerdict {
@@ -74,7 +206,7 @@ pub fn verify_tone(samples: &[f32], sample_rate: u32, freq_hz: f32) -> ToneVerdi
     ToneVerdict {
         freq_hz,
         snr_db,
-        detected: snr_db > 20.0,
+        detected: snr_db > TONE_DETECT_DB,
         samples_analyzed: analyzed,
     }
 }
@@ -967,14 +1099,16 @@ mod send_gain_tests {
     }
 }
 
-/// 终审 §二.7「Windows 设备回环捕获间歇性失败」的根因判定，钉成断言。
+/// 终审 §二.7 / §二.14 的**同一个**根因，以及它现在被治住了这件事。
 ///
-/// 那条判定把 `control-loopback` 的 FAIL 记成了**采集后端**的毛病，理由是
+/// # 病史
+///
+/// §二.7 把 `control-loopback` 的 FAIL 记成**采集后端**的毛病，理由是
 /// r6_sysaudio.sh 自己打出来的一句
 ///「on an endpoint measured QUIET … so the capture itself is wrong」。
 /// 实测把这个归因推翻了（30-win，2026-08-09）：
 ///
-/// | 播放路径 | 采集后端 | 2 kHz 判定 |
+/// | 播放路径 | 采集后端 | 2 kHz 判定（**旧量具**） |
 /// |---|---|---|
 /// | `probe tone` 默认设备（`play_samples_blocking`，**无伺服**） | win-device-loopback | **107.96 dB PASS** |
 /// | `probe sysaudio --self-tone`（`LivePlayback` + 播放环伺服） | win-device-loopback | **14.74 dB FAIL**（6/6） |
@@ -984,18 +1118,24 @@ mod send_gain_tests {
 /// `clamped = 1988 / updates = 1989`，即速率伺服整段贴在 [`MAX_PPM`] 钳位上，
 /// 把自己播出去的音调整体弯了 500 ppm。
 ///
-/// 本模块证明的就是最后这一步：**只要弯 [`MAX_PPM`]，`verify_tone` 就会掉到
-/// 20 dB 判据以下，而 rms 一动不动**。于是
+/// 那一轮**只在那一条断言上换了判据，没有推广**。代价在 §二.14 兑现：
+/// 20.0 dB 的阈值坐在量具自身的噪声带（19.2–20.8 dB）里，一批「放音 + 判音」
+/// 的断言在抛硬币。
 ///
-/// > `control-loopback` FAIL ⇏ 采集错了
+/// # 现在
 ///
-/// 因为播放侧一个合法的、听感上无害的（500 ppm = 0.87 音分）速率修正就足以
-/// 单独把它打红。要区分这两者，看的是 probe JSON 里的 `play_servo` 块，
-/// 不是 rms——rms 恰恰是**看不出来**的那个量。
+/// 判读换成了 Hann 主瓣带内功率（见本文件「判音的带内口径」那一段），
+/// 于是本模块的主张**整个翻过来**：
+///
+/// > 播放伺服的合法弯速率**不再**能单独把判定打红，而且离阈值有 ≥20 dB 余量。
+///
+/// 三条测试分别钉：干净音调仍然干净、弯到钳位仍然过、**余量可断言**。
+/// 最后一条是 §二.7 当年缺的那一步——噪声带将来漂过来时它会变红，
+/// 而不是又开始抛硬币。
 ///
 /// [`MAX_PPM`]: crate::audio::PlayServo::MAX_PPM
 #[cfg(test)]
-mod servo_bend_defeats_the_tone_verdict {
+mod servo_bend_no_longer_defeats_the_tone_verdict {
     use super::*;
     use crate::audio::PlayServo;
 
@@ -1003,6 +1143,17 @@ mod servo_bend_defeats_the_tone_verdict {
     const FREQ: f32 = 2000.0;
     /// 与 r6 step 4 同长：12 s。判据取的是各 100 ms 窗的中位数，所以窗数要够。
     const SECS: usize = 12;
+
+    /// 判据与**最坏的合法读数**之间必须留的余量。
+    ///
+    /// 20 dB 不是一个凑出来的数：旧量具在钳位上的读数是 14.74 dB，也就是
+    /// **比阈值低 5 dB**；要求新量具反过来高出 20 dB，等于要求这次的修法把
+    /// 判读从「错边 5 dB」搬到「对边 20 dB」。低于这个数就说明修法在退化。
+    const MIN_MARGIN_DB: f32 = 20.0;
+
+    /// 本项目实际用过的探针频率。余量必须在**每一个**上都成立——
+    /// 单格判读的病灶随频率线性放大（δ ∝ f·ppm），只测一个频率会漏掉高频那端。
+    const PROBE_FREQS: [f32; 5] = [440.0, 1000.0, 1200.0, 2000.0, 4000.0];
 
     fn tone_at(freq: f32) -> Vec<f32> {
         gen_sine(freq, SR, SR as usize * SECS, 0.5)
@@ -1015,7 +1166,7 @@ mod servo_bend_defeats_the_tone_verdict {
     /// 基线：没弯速率时判定必须是干净的。这一条先绿，下一条才有意义。
     ///
     /// 注入对照：把 `gen_sine` 的相位累加从 f64 改成 f32（正是它自己注释里
-    /// 警告的那件事），这一条变红（−31.6 dB，detected=false）。
+    /// 警告的那件事），这一条变红。
     #[test]
     fn an_unbent_tone_is_detected_with_a_huge_margin() {
         let v = verify_tone(&tone_at(FREQ), SR, FREQ);
@@ -1027,28 +1178,122 @@ mod servo_bend_defeats_the_tone_verdict {
         );
     }
 
-    /// 主张：把音调弯 `MAX_PPM`（伺服贴钳位时的实际行为）就足以让判定翻红。
+    /// **主张（与本模块旧版相反）**：把音调弯 `MAX_PPM`（伺服贴钳位时的实际
+    /// 行为）**不再**足以让判定翻红。
     ///
-    /// 注入对照：把 `verify_tone` 的 `detected` 阈值从 `> 20.0` 放宽到
-    /// `> 10.0`，这一条立刻变红（弯过的音调重新变成 detected，
-    /// 「播放侧的弯速率能单独打红判定」这个主张就不成立了）。
+    /// 注入对照：把 `LOBE_HALF_BINS` 从 2 改回 0（= 旧的单格判读），
+    /// 这一条立刻变红（2 kHz 掉回 14.74 dB，detected=false）。
     #[test]
-    fn bending_the_tone_by_the_servo_clamp_alone_flips_the_verdict_to_fail() {
-        let bent = FREQ * (1.0 - PlayServo::MAX_PPM as f32 * 1e-6);
-        let v = verify_tone(&tone_at(bent), SR, FREQ);
+    fn bending_the_tone_by_the_servo_clamp_no_longer_flips_the_verdict() {
+        for f in PROBE_FREQS {
+            let bent = f * (1.0 - PlayServo::MAX_PPM as f32 * 1e-6);
+            let v = verify_tone(&tone_at(bent), SR, f);
+            assert!(
+                v.detected,
+                "a {} ppm bend must NOT be able to fail the verdict on its own \
+                 (that was the §二.7 / §二.14 defect), but {f} Hz read {:.2} dB",
+                PlayServo::MAX_PPM,
+                v.snr_db
+            );
+        }
+    }
+
+    /// **本模块存在的理由。** 阈值与最坏合法读数之间的距离必须是一个可断言的
+    /// 数，否则噪声带哪天漂过来又是抛硬币——而没有任何一条断言会先变红。
+    ///
+    /// 扫两个维度，缺一不可：
+    ///
+    /// 1. **伺服弯量** `|corr| ≤ MAX_PPM`——伺服自己声明的合法范围。扫整条而
+    ///    不是只扫端点，才挡得住「换了个插值核，中间某处塌了一块」。
+    /// 2. **探针频率相对格心的位置 δ**。格宽 10 Hz，而 `--freq` 是个自由参数，
+    ///    没有任何一处要求它是 10 的倍数。**旧量具垮掉的根因就是默认 δ = 0**，
+    ///    所以守卫不扫 δ 就等于没守到点子上（`LOBE_HALF_BINS` 第一版写成 2、
+    ///    在 4 kHz 上只剩 19.61 dB 余量，就是漏了这一维的直接后果）。
+    ///
+    /// 注入对照（两个方向都验过，见报告）：
+    /// - 把 `LOBE_HALF_BINS` 改成 0（= 旧的单格判读）⇒ 变红；
+    /// - 把 `PlayServo::MAX_PPM` 从 500 抬到 5000 ⇒ 变红（量具跟不上新钳位）。
+    #[test]
+    fn the_threshold_keeps_its_margin_against_every_legal_servo_bend() {
+        let mut worst = (f32::INFINITY, 0.0f32, 0.0f64);
+        for f0 in PROBE_FREQS {
+            // δ：把标称频率在一格（TONE_BIN_HZ）内平移，覆盖任意的格心相对位置。
+            for d in 0..5 {
+                let f = f0 + TONE_BIN_HZ as f32 * (d as f32 / 5.0);
+                // 11 个点铺满 [−MAX_PPM, +MAX_PPM]。
+                for i in 0..=10 {
+                    let ppm = -PlayServo::MAX_PPM + PlayServo::MAX_PPM * 2.0 * (i as f64 / 10.0);
+                    let bent = f * (1.0 + ppm as f32 * 1e-6);
+                    let v = verify_tone(&tone_at(bent), SR, f);
+                    if v.snr_db < worst.0 {
+                        worst = (v.snr_db, f, ppm);
+                    }
+                }
+            }
+        }
+        let margin = worst.0 - TONE_DETECT_DB;
         assert!(
-            !v.detected,
-            "a {} ppm bend must be enough to fail the 20 dB verdict on its own, \
-             got detected=true at {:.2} dB — if this went green the whole \
-             §二.7 root cause needs re-deriving",
-            PlayServo::MAX_PPM, v.snr_db
+            margin >= MIN_MARGIN_DB,
+            "the {TONE_DETECT_DB} dB verdict has only {margin:.2} dB of margin \
+             against a legal servo bend (worst: {:.2} dB at {} Hz, {:.0} ppm). \
+             Below {MIN_MARGIN_DB} dB the instrument is back inside its own \
+             noise band and every play-then-verify assertion is a coin flip \
+             again — this is exactly the §二.14 failure. Do NOT fix this by \
+             moving TONE_DETECT_DB: fix the instrument.",
+            worst.0,
+            worst.1,
+            worst.2
         );
-        // 30-win 实测 14.74 dB；相干性损失只由「弯量 x 窗长」决定，所以这是
-        // 一个可预测的数，不是一个观察到的数。留窄窗，抓住任何改窗长/改核的改动。
+    }
+
+    /// 放宽通带**不是白拿的**：判读现在容忍 ±3 格，所以「音调确实不在」这个
+    /// 方向必须重新钉一次，否则这次修法就是拿假阳性换假阴性。
+    ///
+    /// 三条：真静音、错频率（探针实际用的那几个两两组合）、白噪声，
+    /// 全部必须**远低于**判据。
+    ///
+    /// 注入对照：把 `LOBE_HALF_BINS` 抬到 40（≈ ±400 Hz 的通带），
+    /// 1000 Hz 当 1200 Hz 判会变成 detected ⇒ 这一条变红。
+    #[test]
+    fn widening_the_band_did_not_cost_the_rejection_side() {
+        let silence = vec![0.0f32; SR as usize * 3];
+        let v = verify_tone(&silence, SR, FREQ);
+        assert!(!v.detected, "digital silence read as a tone: {v:?}");
+
+        for want in PROBE_FREQS {
+            for actual in PROBE_FREQS {
+                if (actual - want).abs() < 1.0 {
+                    continue;
+                }
+                let v = verify_tone(&tone_at(actual), SR, want);
+                assert!(
+                    !v.detected,
+                    "a {actual} Hz tone was accepted as {want} Hz at {:.2} dB — \
+                     the passband is too wide",
+                    v.snr_db
+                );
+                assert!(
+                    v.snr_db < TONE_DETECT_DB - MIN_MARGIN_DB,
+                    "a {actual} Hz tone read {:.2} dB when asked for {want} Hz; \
+                     that is inside {MIN_MARGIN_DB} dB of the verdict, i.e. the \
+                     rejection side is now the coin flip",
+                    v.snr_db
+                );
+            }
+        }
+
+        // 白噪声：功率铺满全谱，带内只该拿到 (2·LOBE_HALF_BINS+1) 格的份额。
+        let mut noise = vec![0.0f32; SR as usize * 3];
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        for n in noise.iter_mut() {
+            r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *n = ((r >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.5;
+        }
+        let v = verify_tone(&noise, SR, FREQ);
         assert!(
-            (v.snr_db - 14.74).abs() < 0.5,
-            "expected the 30-win figure 14.74 dB from a {} ppm bend, got {:.2} dB",
-            PlayServo::MAX_PPM, v.snr_db
+            v.snr_db < TONE_DETECT_DB - MIN_MARGIN_DB,
+            "white noise read {:.2} dB at {FREQ} Hz — too close to the verdict",
+            v.snr_db
         );
     }
 

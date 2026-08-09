@@ -195,6 +195,12 @@ fn pump(src: &mut SysAudioSource, secs: f32, keep: bool) -> Vec<f32> {
     out
 }
 
+/// Keeps `level` on its historical scale: `dsp::tone_amplitude` returns the true
+/// amplitude A, the old whole-leg expression returned A/√2. See `measure`'s
+/// "⚠ `level` is an RMS" note — the two absolute thresholds (`--vi-floor` and
+/// `signal_floor`) are pinned to the old scale.
+const NARROWBAND_SCALE: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
 struct Measured {
     level: f32,
     rms: f32,
@@ -205,6 +211,39 @@ struct Measured {
 /// `tone_hz > 0` measures narrowband amplitude at that frequency; `0` measures
 /// broadband RMS. Narrowband is the default because the alternative counts the
 /// room, the user's music and the fan as signal.
+///
+/// # ⚠ `level` is an RMS, not an amplitude — a pre-existing 3.01 dB discrepancy
+///
+/// The old comment here said `sqrt(2*power)` "puts `level` on the same scale as
+/// --vi-amp and as `peak`". It does not: `goertzel_power` normalises a pure tone
+/// of amplitude A to `A²/4`, so `sqrt(2·A²/4)` is `A/√2` — the tone's **RMS**,
+/// 3.01 dB below the amplitude it claimed to report.
+///
+/// This is **deliberately preserved** by [`NARROWBAND_SCALE`]. Every judgement
+/// in `audiohub_core::volindep` is a dB *ratio* between legs, where a constant
+/// factor cancels — but `--vi-floor` (default 0.002) and the ambient-derived
+/// `signal_floor` are **absolute**, so silently moving the scale 3 dB would
+/// loosen two tuned thresholds as a side effect of a measurement-validity fix.
+/// Correcting it is a separate decision with its own evidence; it is not this
+/// change's to make.
+///
+/// # Why this is windowed per 100 ms and not measured over the whole leg
+///
+/// The tone this reads was played by `probe tone --device`, which goes through
+/// `LivePlayback::on_device` — and that path *always* carries a clock-servoed
+/// variable-rate resampler, even at 48k<->48k. The servo bends the played tone
+/// by however much the card's crystal is off, up to its 500 ppm clamp.
+///
+/// A single Goertzel over a whole 2 s leg has 0.5 Hz bins. 500 ppm on a 1 kHz
+/// tone is 0.5 Hz — **exactly one bin** — so the old whole-leg single-bin read
+/// landed on a null and reported a level near zero for a perfectly good tone.
+/// Against a 3 dB `--vi-tol` that is not a rounding error, it is the whole
+/// measurement. Chopping into 100 ms windows puts the bins at 10 Hz and
+/// [`dsp::tone_amplitude`] sums the Hann main lobe, so a 500 ppm bend costs
+/// nothing measurable. Median over windows also rejects the click at leg
+/// boundaries. Same root cause as the `verify_tone` defect (conformance
+/// §二.14); fixed here at the same time so this instrument does not have to be
+/// rediscovered later.
 fn measure(samples: &[f32], rate: u32, tone_hz: f32) -> Measured {
     let rms = if samples.is_empty() {
         0.0
@@ -214,10 +253,20 @@ fn measure(samples: &[f32], rate: u32, tone_hz: f32) -> Measured {
     };
     let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     let level = if tone_hz > 0.0 && !samples.is_empty() {
-        // goertzel_power returns mean(x^2)/2 in the target bin; the amplitude of
-        // a sine with that power is sqrt(2*power), which puts `level` on the
-        // same scale as --vi-amp and as `peak`.
-        (2.0 * dsp::goertzel_power(samples, rate, tone_hz)).max(0.0).sqrt()
+        let win = (rate / 10) as usize; // 100 ms -> 10 Hz bins
+        let mut levels: Vec<f32> = samples
+            .chunks(win.max(1))
+            .filter(|c| c.len() == win.max(1))
+            .map(|c| dsp::tone_amplitude(c, rate, tone_hz) * NARROWBAND_SCALE)
+            .collect();
+        if levels.is_empty() {
+            // Leg shorter than one window: fall back to the whole buffer. The
+            // CLI rejects `--vi-secs <= 0.5`, so this is unreachable in practice.
+            dsp::tone_amplitude(samples, rate, tone_hz) * NARROWBAND_SCALE
+        } else {
+            levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            levels[levels.len() / 2]
+        }
     } else {
         rms
     };
@@ -482,6 +531,52 @@ pub fn run(args: &ViArgs, backend: &str, json: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    /// Conformance §二.14, generalised to this instrument.
+    ///
+    /// `measure` is the *worst* instance of the single-bin defect in the tree,
+    /// not the mildest: it used to run one Goertzel over a whole `--vi-secs`
+    /// leg, so its bins were `1/secs` Hz wide — 0.5 Hz at the 2 s default.
+    /// The play servo's own clamp (500 ppm) moves a 1 kHz tone by 0.5 Hz, i.e.
+    /// **exactly one bin**, straight onto a null. `--vi-tol` is 3 dB; the error
+    /// this could produce is unbounded.
+    ///
+    /// Injection control: revert `measure`'s `level` arm to
+    /// `(2.0 * dsp::goertzel_power(samples, rate, tone_hz)).max(0.0).sqrt()`
+    /// and this goes red at the 500 ppm row (measured −41 dB of level error).
+    #[test]
+    fn the_measured_level_survives_a_legal_play_servo_bend() {
+        const SR: u32 = 48_000;
+        const AMP: f32 = 0.3; // --vi-amp default
+        let secs = 2.0f32; // --vi-secs default
+        let n = (SR as f32 * secs) as usize;
+        // --vi-tol default is 3 dB and the two hypotheses sit 12 dB apart, so a
+        // full decibel of instrument error is already a third of the budget.
+        const MAX_ERR_DB: f32 = 0.5;
+        for &ppm in &[0.0f32, 100.0, -100.0, 300.0, -300.0, 500.0, -500.0] {
+            let bent = 1000.0f32 * (1.0 + ppm * 1e-6);
+            let m = super::measure(&audiohub_core::dsp::gen_sine(bent, SR, n, AMP), SR, 1000.0);
+            // Historical scale: `level` is the tone's RMS (see NARROWBAND_SCALE).
+            let want = AMP * super::NARROWBAND_SCALE;
+            let err_db = 20.0 * (m.level / want).log10();
+            assert!(
+                err_db.abs() <= MAX_ERR_DB,
+                "a {ppm} ppm bend (a legal play-servo correction) moved the measured \
+                 level by {err_db:.2} dB (read {:.5}, expected {want:.5}). Against a 3 dB \
+                 --vi-tol that is the measurement, not a rounding error — this is \
+                 the §二.14 defect in the volume-independence probe.",
+                m.level
+            );
+        }
+        // The rejection side still has to work, or the above proves nothing:
+        // a tone 200 Hz away must NOT be read as level.
+        let off = super::measure(&audiohub_core::dsp::gen_sine(1200.0, SR, n, AMP), SR, 1000.0);
+        assert!(
+            off.level < AMP * super::NARROWBAND_SCALE * 0.05,
+            "a 1200 Hz tone read {:.5} when asked for 1000 Hz; the passband is too wide",
+            off.level
+        );
+    }
 
     /// Production source only. The `#[cfg(test)]` tail is cut off because these
     /// assertions name the very strings they forbid, and a scan that included

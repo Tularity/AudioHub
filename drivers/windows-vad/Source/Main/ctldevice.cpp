@@ -372,6 +372,35 @@ AhCtlLoadPolicy(
 // The pending (inverted-call) IRP
 //-----------------------------------------------------------------------------
 
+//
+// NOT pageable, and the code_seg() above is the whole reason this is a
+// function at all rather than four lines inline at its one call site.
+//
+// The caller, AhCtlCleanup, lives in the PAGE section -- correctly, it is a
+// dispatch routine that only ever runs at PASSIVE_LEVEL. But KeAcquireSpinLock
+// puts the processor at DISPATCH_LEVEL, and at DISPATCH_LEVEL a page fault is
+// fatal. Pageable instructions between an acquire and a release are therefore a
+// bugcheck waiting for the page to be trimmed:
+//
+//   0xD1 DRIVER_IRQL_NOT_LESS_OR_EQUAL, IRQL=2, read at the instruction pointer
+//   AV_VRF_CODE_AV_PAGED_IP_audiohubvad!AhCtlCleanup+0x60
+//
+// which is what Driver Verifier produced here on 2026-08-09, because Verifier
+// trims pageable code at every opportunity and an ordinary machine almost never
+// does. `regress/audit-pageable-dispatch.py` reads for this pattern so the next
+// one is caught without a bugcheck.
+//
+#pragma code_seg()
+static VOID
+AhCtlDropUncollectedEvents(VOID)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&g_PendLock, &irql);
+    g_EventHead  = 0;
+    g_EventCount = 0;
+    KeReleaseSpinLock(&g_PendLock, irql);
+}
+
 #pragma code_seg()
 static VOID
 AhCtlCancelPend(
@@ -729,13 +758,7 @@ Routine Description:
         // since changed -- and IOSTATE in particular would tell it that streams
         // are running which stopped while nobody was listening.
         //
-        {
-            KIRQL irql;
-            KeAcquireSpinLock(&g_PendLock, &irql);
-            g_EventHead  = 0;
-            g_EventCount = 0;
-            KeReleaseSpinLock(&g_PendLock, irql);
-        }
+        AhCtlDropUncollectedEvents();
 
         //
         // THE ONE PLACE the ring mapping may be torn down. MmUnmapLockedPages

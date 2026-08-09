@@ -830,6 +830,12 @@ Return Value:
 } // PropertyHandler_MicArrayTopology
 
 //=============================================================================
+//
+// NOT pageable. KS delivers PCEVENT_VERB_REMOVE at DISPATCH_LEVEL from
+// ks!FreeEventListSynchronize; pageable code there is a 0xD1 waiting for the
+// page to be trimmed. See the longer note on EventHandler_SpeakerTopology.
+//
+#pragma code_seg()
 NTSTATUS
 EventHandler_MicArrayTopology
 (
@@ -844,8 +850,9 @@ Routine Description:
 
 --*/
 {
-    PAGED_CODE();
-
+    //
+    // No PAGED_CODE(): the REMOVE verb arrives at DISPATCH_LEVEL.
+    //
     ASSERT(EventRequest);
 
     DPF_ENTER(("[EventHandler_MicArrayTopology]"));

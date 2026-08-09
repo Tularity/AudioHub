@@ -46,11 +46,29 @@ typedef struct _AH_RING_TABLE
 static PAH_RING_TABLE volatile g_AhRings = NULL;
 
 //
-// Mapping ownership. Guarded by g_AhMapLock, which is a FAST MUTEX rather than
-// a spin lock precisely because everything it protects is PASSIVE-only work
-// (pool allocation, MmMapLockedPagesSpecifyCache, ObReferenceObjectByHandle).
-// The DPC never takes it and never needs to: it reads g_AhRings and the Base
-// pointers inside it, neither of which changes after publication.
+// Mapping ownership. Guarded by g_AhMapLock, a FAST MUTEX rather than a spin
+// lock because the work it protects blocks: pool allocation and
+// MmMapLockedPagesSpecifyCache with AccessMode=UserMode, both of which require
+// IRQL <= APC_LEVEL. The DPC never takes it and never needs to: it reads
+// g_AhRings and the Base pointers inside it, neither of which changes after
+// publication.
+//
+// WHAT THIS LOCK IS NOT: it does not keep the region at PASSIVE_LEVEL.
+// ExAcquireFastMutex RAISES IRQL to APC_LEVEL -- that is the entire mechanism
+// by which it blocks APC delivery -- so a DDI documented "IRQL == PASSIVE_LEVEL"
+// is ILLEGAL between acquire and release even though the caller entered at
+// PASSIVE. This comment previously claimed the opposite and named
+// ObReferenceObjectByHandle as an example of what the mutex made safe; the
+// reference call sat inside the region and Driver Verifier's DDI compliance
+// checker bugchecked on it three times for three times running:
+//
+//   0xC4 (0x12001B, ...)  IrqlObPassive
+//   "ObReferenceObjectByHandle should only be called at IRQL = PASSIVE_LEVEL."
+//
+// Two things hid it. PAGED_CODE() asserts IRQL < DISPATCH_LEVEL, so it passes
+// happily at APC_LEVEL; and _IRQL_requires_max_(PASSIVE_LEVEL) on AhRingsMap
+// constrains the CALLER, not the body, so static analysis had nothing to say.
+// Anything PASSIVE-only belongs outside the region -- see AhRingsMap.
 //
 static FAST_MUTEX      g_AhMapLock;
 static PVOID           g_AhMapOwner  = NULL;
@@ -273,6 +291,43 @@ AhRingsMap(
 
     NTSTATUS status = STATUS_SUCCESS;
 
+    //
+    // Referenced BEFORE the mutex, and the ordering is the whole fix rather
+    // than a tidiness preference: ExAcquireFastMutex raises IRQL to APC_LEVEL
+    // and ObReferenceObjectByHandle is documented PASSIVE_LEVEL only. See the
+    // g_AhMapLock comment for the bugcheck this cost.
+    //
+    // Referencing eagerly -- before we know whether we are the owner who will
+    // consume it -- is deliberate. The alternative, deferring until the
+    // ownership test has passed, puts the call back inside the region and
+    // recreates the bug. The cost is one reference that the non-owner paths
+    // have to drop, which the single release at the end does for all of them.
+    //
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    PKEVENT wakeRef = NULL;
+    if (WakeEvent != NULL)
+    {
+        NTSTATUS evStatus = ObReferenceObjectByHandle(
+            WakeEvent,
+            EVENT_MODIFY_STATE,
+            *ExEventObjectType,
+            UserMode,
+            (PVOID *)&wakeRef,
+            NULL);
+        if (!NT_SUCCESS(evStatus))
+        {
+            //
+            // NOT a failure. The event is an accelerator; a daemon whose handle
+            // we could not reference still gets its audio, it just waits on its
+            // own tick for it. Refusing the whole mapping over this would trade
+            // a working data plane for a slightly shorter latency.
+            //
+            DPF(D_ERROR, ("[AhRingsMap] wake event ref failed 0x%x; polling only", evStatus));
+            wakeRef = NULL;
+        }
+    }
+
     ExAcquireFastMutex(&g_AhMapLock);
 
     PAH_RING_TABLE table = g_AhRings;
@@ -356,32 +411,11 @@ AhRingsMap(
             AhRingStoreRelease(&hdr->WriteIdx, 0);
         }
 
-        if (WakeEvent != NULL)
+        if (wakeRef != NULL)
         {
-            PKEVENT ev = NULL;
-            NTSTATUS evStatus = ObReferenceObjectByHandle(
-                WakeEvent,
-                EVENT_MODIFY_STATE,
-                *ExEventObjectType,
-                UserMode,
-                (PVOID *)&ev,
-                NULL);
-            if (NT_SUCCESS(evStatus))
-            {
-                PKEVENT old = AhRingsSwapWake(ev);
-                if (old != NULL) { ObDereferenceObject(old); }
-            }
-            else
-            {
-                //
-                // NOT a failure. The event is an accelerator; a daemon whose
-                // handle we could not reference still gets its audio, it just
-                // waits on its own tick for it. Refusing the whole mapping
-                // over this would trade a working data plane for a slightly
-                // shorter latency.
-                //
-                DPF(D_ERROR, ("[AhRingsMap] wake event ref failed 0x%x; polling only", evStatus));
-            }
+            PKEVENT old = AhRingsSwapWake(wakeRef);
+            wakeRef = NULL;             // consumed; the swap owns it now
+            if (old != NULL) { ObDereferenceObject(old); }
         }
 
         g_AhMapOwner = Owner;
@@ -405,6 +439,24 @@ AhRingsMap(
 
 Done:
     ExReleaseFastMutex(&g_AhMapLock);
+
+    //
+    // Still set means nobody took it: an error path bailed, or this was a
+    // re-map by the owner that already has a wake event installed (the swap
+    // deliberately happens only on the FIRST map, so a retried handshake does
+    // not displace a working event). Either way the reference taken above is
+    // ours to drop, and dropping it here rather than at each `goto Done` is
+    // what keeps every one of those paths from leaking it.
+    //
+    // Outside the mutex on purpose: ObDereferenceObject can run at
+    // DISPATCH_LEVEL so the placement is not required for correctness, but a
+    // final dereference can free the object and run its delete routine, and
+    // that is not work to do while holding a lock the next MAP_RINGS wants.
+    //
+    if (wakeRef != NULL)
+    {
+        ObDereferenceObject(wakeRef);
+    }
     return status;
 }
 

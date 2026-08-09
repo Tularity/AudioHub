@@ -116,6 +116,20 @@ Return Value:
 } // PropertyHandler_SpeakerTopology
 
 //=============================================================================
+//
+// NOT pageable, unlike every property handler above it. KS calls event handlers
+// with PCEVENT_VERB_REMOVE from ks!FreeEventListSynchronize, which runs inside
+// ks!PerformLockedOperation -- i.e. at DISPATCH_LEVEL, where the page fault
+// that would fetch a trimmed code page cannot be serviced:
+//
+//   0xD1 AV_VRF_CODE_AV_PAGED_IP_audiohubvad!EventHandler_SpeakerTopology
+//
+// measured under Driver Verifier on 2026-08-09, closing a topology filter.
+// Upstream already knew this: CMiniportWaveRT_EventHandler_PinCapsChange in
+// minwavert.cpp sits in code_seg() for the same reason. The handlers added with
+// the volume-change events did not copy the convention.
+//
+#pragma code_seg()
 NTSTATUS
 EventHandler_SpeakerTopology
 (
@@ -131,8 +145,11 @@ Routine Description:
 
 --*/
 {
-    PAGED_CODE();
-
+    //
+    // No PAGED_CODE() here on purpose: it asserts IRQL < DISPATCH_LEVEL, and
+    // the REMOVE verb legitimately arrives AT DISPATCH_LEVEL. The assertion was
+    // present and was wrong.
+    //
     ASSERT(EventRequest);
 
     DPF_ENTER(("[EventHandler_SpeakerTopology]"));

@@ -222,7 +222,18 @@ Routine Description:
 }
 
 //=============================================================================
-#pragma code_seg("PAGE")
+//
+// NOT pageable, and neither are the two thunks that reach it
+// (EventHandler_SpeakerTopology, EventHandler_MicArrayTopology). The REMOVE
+// verb below is delivered by ks!FreeEventListSynchronize at DISPATCH_LEVEL, so
+// every instruction on that path has to be resident. Verified the hard way:
+// 0xD1 AV_VRF_CODE_AV_PAGED_IP under Driver Verifier, closing a topology
+// filter.
+//
+// The REMOVE arm is deliberately call-free for the same reason -- it returns a
+// constant. If it ever needs to do work, that work must be non-paged too.
+//
+#pragma code_seg()
 NTSTATUS
 CMiniportTopologySimpleAudioSample::AhEventHandlerSlotVolume
 (
@@ -248,8 +259,10 @@ Routine Description:
 
 --*/
 {
-    PAGED_CODE();
-
+    //
+    // No PAGED_CODE(): it asserts IRQL < DISPATCH_LEVEL and REMOVE arrives at
+    // DISPATCH_LEVEL, so the assertion was not merely useless but wrong.
+    //
     ASSERT(EventRequest);
 
     if (EventRequest->Verb & PCEVENT_VERB_SUPPORT)
@@ -268,7 +281,20 @@ Routine Description:
         {
             return STATUS_INVALID_PARAMETER;
         }
-        AddEventToEventList(EventRequest->EventEntry);
+        //
+        // The port's method directly, NOT this class's AddEventToEventList
+        // wrapper, which is pageable. ADD does arrive at PASSIVE_LEVEL so the
+        // wrapper would work today; the point is that no branch of an event
+        // handler should end in pageable code, because the next person to
+        // decide a verb needs work will add it to whichever arm is nearest.
+        // This is also exactly what upstream's non-paged
+        // EventHandler_PinCapsChange does (minwavert.cpp).
+        //
+        if (m_PortEvents == NULL)
+        {
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        m_PortEvents->AddEventToEventList(EventRequest->EventEntry);
         return STATUS_SUCCESS;
     }
 

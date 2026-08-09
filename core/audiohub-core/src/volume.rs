@@ -26,9 +26,23 @@ pub const SRC_LOCAL: &str = "local";
 /// came from a peer. Applied like any other, but it must never travel further.
 pub const SRC_PEER: &str = "peer";
 
-/// Volumes this close count as the same reading. macOS quantises the scalar it
-/// stores (1/16 steps on several built-in outputs), so an exact compare would
-/// report our own write back to the peer as a fresh local change.
+/// Volumes this close count as the same reading, so a value coming back around
+/// the sync loop is not reported to the peer as a fresh local change.
+///
+/// **The 1/16 grid this used to be blamed on is not a grid the device applies
+/// to writes.** Measured 2026-08-09 (`docs/volume-taper-measured.md`, design
+/// §9 P0-b): 16 of 16 programmatic scalar writes read back bit-exact, including
+/// values placed deliberately between grid points (`0.71`, `0.97531`,
+/// `0.500001`); the readback noise floor is 1e-6, not 1/16. The observation
+/// behind the old wording was real but misattributed — 1/16 is the step the
+/// VOLUME KEYS and the UI slider move in, so a device nobody has written
+/// programmatically does sit on k/16.
+///
+/// What still justifies a tolerance is the round trip through the peer's
+/// device, which has a grid of its own and silently clamps (see
+/// [`OutputVolumeGuard::set_volume`]). Note the UNIT: this is slider position,
+/// not dB. Near the quiet end 0.035 of slider is over 10 dB. The dB-domain
+/// threshold is [`SAME_DB`], and neither converts into the other (design §5.1).
 pub const SAME_EPS: f32 = 0.035;
 
 /// How many polls a peer-driven write stays armed for echo suppression. Bounded
@@ -106,6 +120,151 @@ pub fn set_output_mute(dev: Option<&str>, muted: bool) -> Result<()> {
     imp::set_mute(dev, muted)
 }
 
+// ------------------------------------ design §4.2: the native dB (gain) path
+
+/// Two dB readings this close count as the same reading (design §5.4).
+///
+/// 0.75 dB is 1.5× the 0.5 dB grid the Windows endpoint engine quantises to,
+/// and it sits under the ~1 dB loudness JND for a direct A/B comparison — so a
+/// difference this small is at once indistinguishable from the device's own
+/// grid and inaudible. It does **not** need to be device-adaptive: the 1/16
+/// slider grid that would have broken that claim is never applied to
+/// programmatic writes (design §9 P0-b, see [`SAME_EPS`]).
+///
+/// **Not a converted [`SAME_EPS`].** That threshold is in slider position, this
+/// one is in dB, and near the quiet end 0.035 of slider is over 10 dB. Design
+/// §5.1 is named for exactly this substitution.
+pub const SAME_DB: f32 = 0.75;
+
+/// `20·log10(gain)` — the wire→device conversion of design §4.2.
+///
+/// A gain of `0` (or below) is not a level and has no dB: it maps to `-inf`,
+/// which is design §3.2's point that no finite dB expresses a true zero.
+/// Silence is the mute control's job, not the gain's.
+pub fn gain_to_db(gain: f32) -> f32 {
+    if gain > 0.0 {
+        20.0 * gain.log10()
+    } else {
+        f32::NEG_INFINITY
+    }
+}
+
+/// `10^(dB/20)` — the device→wire conversion. `-inf` dB maps back to `0.0`.
+pub fn db_to_gain(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+/// What a device is at, plus — after a write — what it was ASKED for.
+///
+/// # Why this carries two numbers and not one
+///
+/// Measured 2026-08-09 (design §9): **a device clamps an out-of-range write and
+/// still reports success.** Writing −80 dB to an output whose floor is −63.5 dB
+/// returned `noErr` and left the device at −63.5 dB; +6 dB was clamped to 0 dB
+/// the same way. Both devices tested behaved identically, and neither muted
+/// itself at the floor.
+///
+/// So "the call succeeded" and "the device did what you asked" are two
+/// different facts, and reading the property back is the ONLY way to separate
+/// them — there is no status code for it. That makes the readback a
+/// correctness requirement rather than a habit, which is why
+/// [`set_output_gain`] returns this type instead of `Result<()>`: skipping the
+/// readback is not something a caller can do. And it is why both numbers are
+/// kept — reporting only the request would hide that the device refused,
+/// reporting only the result would hide that anything else was ever asked for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GainState {
+    /// The gain that was asked for, clamped to the `0..=1` the wire allows
+    /// (design §3.2 — nothing above unity travels). `None` on a plain read:
+    /// nothing was asked, so there is nothing to have fallen short of.
+    pub requested: Option<f32>,
+    /// The gain the device READ BACK: what actually happened, and what design
+    /// §4.2 sends to the peer. Deliberately **not** clamped to 1.0 — a device
+    /// sitting above unity is a fact, and clamping here would make it
+    /// unreportable.
+    pub applied: f32,
+    /// The dB the device read back, the raw property value `applied` is
+    /// derived from. Kept because dB is the unit the device speaks and the unit
+    /// differences are compared in ([`SAME_DB`]).
+    pub applied_db: f32,
+    /// The device's published dB range (`'vdb#'` on macOS, `GetVolumeRange` on
+    /// Windows), when it publishes one. This is the fact that EXPLAINS a clamp.
+    pub range_db: Option<(f32, f32)>,
+    pub muted: bool,
+    /// Whether the dB property can be written. Decided by the same predicate
+    /// [`set_output_gain`] uses to pick something to write, so the two cannot
+    /// contradict each other about one device — the mistake `volume_writable`
+    /// was introduced to stop, one selector over.
+    ///
+    /// This is about the dB property specifically and may differ from
+    /// [`VolumeState::adjustable`], which is about the scalar. A device that is
+    /// scalar-writable but not dB-writable is the case design §4.4 was written
+    /// for; that fallback is deliberately NOT implemented (measured: no such
+    /// device found), so such a device simply reads `false` here and
+    /// [`set_output_gain`] fails on it.
+    pub adjustable: bool,
+}
+
+impl GainState {
+    /// The dB that was asked for. `Some(-inf)` when the request was `0.0`.
+    pub fn requested_db(&self) -> Option<f32> {
+        self.requested.map(gain_to_db)
+    }
+
+    /// How far the device landed from the request, in dB (`applied −
+    /// requested`; negative means quieter than asked). `None` on a plain read.
+    ///
+    /// A request of `0.0` yields `+inf`, and that is not a defect: gain 0 asks
+    /// for silence, no finite dB is silence, and every device therefore falls
+    /// infinitely short of it. Design §3.2 answers that with the mute control.
+    pub fn shortfall_db(&self) -> Option<f32> {
+        Some(self.applied_db - self.requested_db()?)
+    }
+
+    /// True when the device did something other than what was asked by more
+    /// than a grid step. This is the third state design §4.3 names: not
+    /// "refused" (that is an `Err`) and not "did it", but "reported success and
+    /// landed somewhere else".
+    pub fn clamped(&self) -> bool {
+        // Negated comparison so a NaN shortfall counts as clamped rather than
+        // as compliance.
+        self.shortfall_db().is_some_and(|d| !(d.abs() <= SAME_DB))
+    }
+}
+
+/// Reads a device's native dB volume as a wire gain (design §4.2). `None` = the
+/// system default output, same convention as [`get_output_volume`].
+///
+/// **Errors when the device publishes no dB property at all**, instead of
+/// reporting `gain = 0.0`. [`classify_follow`] documents at length what a
+/// fabricated zero costs: it is an absence, and following it writes silence
+/// onto a working speaker. `Result` has a place to say "this device cannot
+/// answer"; the `applied` field does not.
+pub fn get_output_gain(dev: Option<&str>) -> Result<GainState> {
+    imp::get_gain(dev)
+}
+
+/// Writes `gain` as dB and returns WHAT THE DEVICE READ BACK.
+///
+/// The readback is the return value on purpose: measured, an out-of-range write
+/// is clamped and still reports success (see [`GainState`]), so `Result<()>`
+/// would be a signature that cannot express what happened. Callers get the
+/// clamp handed to them rather than having to remember to look for it.
+///
+/// `gain` is clamped to `0.0..=1.0` — design §3.2 puts nothing above unity on
+/// the wire. `gain == 0.0` asks for silence: it writes the device's own dB
+/// floor, because the device is the one that knows how quiet it can be, and the
+/// returned `applied` says how quiet that turned out to be. **It does not
+/// mute** — measured, a device sitting at its dB floor keeps `mute = 0`, so
+/// §3.2's "also set the mute control" is the caller's explicit action and not a
+/// side effect buried in a gain write.
+pub fn set_output_gain(dev: Option<&str>, gain: f32) -> Result<GainState> {
+    if !gain.is_finite() {
+        bail!("gain must be finite");
+    }
+    imp::set_gain(dev, gain.clamp(0.0, 1.0))
+}
+
 // -------------------------------------------------- borrow-and-return a knob
 
 /// Borrows an output device's volume/mute, and puts them back.
@@ -125,6 +284,16 @@ pub fn set_output_mute(dev: Option<&str>, muted: bool) -> Result<()> {
 /// a verdict) should call it explicitly and surface the error; `Drop` is the
 /// net underneath, and is silent by design because a panicking `Drop` during an
 /// unwind aborts the process.
+///
+/// # It only guards writes made THROUGH IT
+///
+/// The restore is armed by [`Self::set_volume`] / [`Self::set_mute`], not by
+/// holding the guard. Code that captures one and then moves the same device by
+/// another route — [`set_output_volume`], [`set_output_gain`], a shell command
+/// — gets an `Ok(())` from `restore` that did nothing, which looks exactly like
+/// a successful restore. If you need a knob put back no matter who turned it,
+/// capture the state and restore it unconditionally instead of reaching for
+/// this type.
 pub struct OutputVolumeGuard {
     /// `None` = the system default output, same convention as [`get_output_volume`].
     device: Option<String>,
@@ -167,9 +336,17 @@ impl OutputVolumeGuard {
     }
 
     /// Sets the volume and returns what the device READ BACK, which is not
-    /// always what was written: macOS quantises the scalar on several built-in
-    /// outputs (1/16 steps), so a caller that predicts the level change from
-    /// the requested scalar predicts from a number the hardware never used.
+    /// always what was written.
+    ///
+    /// The reason is NOT quantisation — measured 2026-08-09, a programmatic
+    /// scalar write reads back bit-exact (design §9 P0-b, see [`SAME_EPS`]).
+    /// It is that **a device silently CLAMPS and still reports success**: the
+    /// same session wrote −80 dB to an output whose floor is −63.5 dB, got
+    /// `noErr`, and found the device sitting at −63.5 dB; +6 dB clamped to 0 dB
+    /// the same way, on both devices tested. So the status code cannot tell
+    /// "it did what you asked" apart from "it did something else and said
+    /// fine" — only the readback can, which is why this hands back the reading
+    /// instead of `()`. [`set_output_gain`] is the same decision, in dB.
     pub fn set_volume(&mut self, scalar: f32) -> Result<VolumeState> {
         self.outstanding = true;
         set_output_volume(self.dev(), scalar)?;
@@ -514,7 +691,7 @@ mod imp {
     //! A named device resolves through kAudioHardwarePropertyDevices first; the
     //! probing below is identical either way.
 
-    use super::{label, match_by_name, VolumeState};
+    use super::{db_to_gain, gain_to_db, label, match_by_name, GainState, VolumeState};
     use anyhow::{anyhow, bail, Result};
     use std::ffi::c_void;
 
@@ -542,6 +719,14 @@ mod imp {
     const SEL_NAME: u32 = fourcc(b"lnam"); // kAudioObjectPropertyName (= DeviceNameCFString)
     const SEL_STREAMS: u32 = fourcc(b"stm#"); // kAudioDevicePropertyStreams
     const SEL_VOLUME_SCALAR: u32 = fourcc(b"volm"); // kAudioDevicePropertyVolumeScalar
+    /// The device's real dB, and design §4.2's whole point. Not to be confused
+    /// with the TRANSLATION properties `'v2db'` / `'db2v'`, which measurement
+    /// caught lying (a linear curve contradicting the device by 15.6 dB) or
+    /// erroring outright — this one is device STATE, and reads and writes true.
+    const SEL_VOLUME_DB: u32 = fourcc(b"vold"); // kAudioDevicePropertyVolumeDecibels
+    /// Read-only by nature: the range is the device telling us its floor and
+    /// ceiling, and it is what makes a clamp explicable rather than mysterious.
+    const SEL_VOLUME_DB_RANGE: u32 = fourcc(b"vdb#"); // kAudioDevicePropertyVolumeRangeDecibels
     const SEL_MUTE: u32 = fourcc(b"mute"); // kAudioDevicePropertyMute
     const SCOPE_GLOBAL: u32 = fourcc(b"glob");
     const SCOPE_OUTPUT: u32 = fourcc(b"outp");
@@ -636,7 +821,10 @@ mod imp {
         (st == 0 && sz == 4).then_some(v)
     }
 
-    fn set_f32(dev: AudioObjectID, a: &PropAddr, v: f32) -> Result<()> {
+    /// `what` names the selector for the error text only — a failed write says
+    /// which property it was, and `'volm'` and `'vold'` fail for different
+    /// reasons.
+    fn set_f32(dev: AudioObjectID, a: &PropAddr, v: f32, what: &str) -> Result<()> {
         let st = unsafe {
             AudioObjectSetPropertyData(
                 dev,
@@ -648,9 +836,34 @@ mod imp {
             )
         };
         if st != 0 {
-            bail!("AudioObjectSetPropertyData(volm) failed: OSStatus {st}");
+            bail!("AudioObjectSetPropertyData({what}) failed: OSStatus {st}");
         }
         Ok(())
+    }
+
+    /// `AudioValueRange`, the shape `'vdb#'` answers in: two `Float64`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ValueRange {
+        min: f64,
+        max: f64,
+    }
+
+    fn get_range(dev: AudioObjectID, a: &PropAddr) -> Option<(f32, f32)> {
+        let mut r = ValueRange { min: 0.0, max: 0.0 };
+        let want = std::mem::size_of::<ValueRange>() as u32;
+        let mut sz = want;
+        let st = unsafe {
+            AudioObjectGetPropertyData(
+                dev,
+                a,
+                0,
+                std::ptr::null(),
+                &mut sz,
+                &mut r as *mut ValueRange as *mut c_void,
+            )
+        };
+        (st == 0 && sz == want).then(|| (r.min as f32, r.max as f32))
     }
 
     fn set_u32(dev: AudioObjectID, a: &PropAddr, v: u32) -> Result<()> {
@@ -806,32 +1019,37 @@ mod imp {
                 vals.iter().sum::<f32>() / vals.len() as f32
             }
         };
-        let mute = at(SEL_MUTE, SCOPE_OUTPUT, ELEM_MAIN);
-        let muted = if has(dev, &mute) {
-            get_u32(dev, &mute).unwrap_or(0) != 0
-        } else {
-            channel_elements(dev, SEL_MUTE)
-                .iter()
-                .filter_map(|a| get_u32(dev, a))
-                .any(|v| v != 0)
-        };
         Ok(VolumeState {
             scalar: scalar.clamp(0.0, 1.0),
-            muted,
+            muted: read_mute(dev),
             adjustable,
         })
+    }
+
+    /// Master mute if the device has one, else "any channel is muted". Shared
+    /// by the scalar and dB readers so the two cannot come back disagreeing
+    /// about whether one device is muted.
+    fn read_mute(dev: AudioObjectID) -> bool {
+        let master = at(SEL_MUTE, SCOPE_OUTPUT, ELEM_MAIN);
+        if has(dev, &master) {
+            return get_u32(dev, &master).unwrap_or(0) != 0;
+        }
+        channel_elements(dev, SEL_MUTE)
+            .iter()
+            .filter_map(|a| get_u32(dev, a))
+            .any(|v| v != 0)
     }
 
     pub fn set_volume(target: Option<&str>, scalar: f32) -> Result<()> {
         let dev = resolve(target)?;
         let master = at(SEL_VOLUME_SCALAR, SCOPE_OUTPUT, ELEM_MAIN);
         if has(dev, &master) && settable(dev, &master) {
-            return set_f32(dev, &master, scalar);
+            return set_f32(dev, &master, scalar, "volm");
         }
         let mut wrote = 0usize;
         for a in channel_elements(dev, SEL_VOLUME_SCALAR) {
             if settable(dev, &a) {
-                set_f32(dev, &a, scalar)?;
+                set_f32(dev, &a, scalar, "volm")?;
                 wrote += 1;
             }
         }
@@ -860,6 +1078,124 @@ mod imp {
         }
         Ok(())
     }
+
+    // ------------------------------------------- design §4.2 native dB path
+
+    /// A dB far below any real floor, for the one case that has no dB at all:
+    /// `gain == 0` on a device that publishes no range. Measured (design §9),
+    /// an out-of-range write lands on the floor and reports success, so this
+    /// arrives at the same place the published floor would have.
+    const SILENT_DB: f32 = -200.0;
+
+    /// The elements `'vold'` answers on, master first — the same master →
+    /// per-channel order the scalar path probes in. Empty means the device
+    /// publishes no dB reading at all.
+    fn db_elements(dev: AudioObjectID) -> Vec<PropAddr> {
+        let master = at(SEL_VOLUME_DB, SCOPE_OUTPUT, ELEM_MAIN);
+        if has(dev, &master) {
+            return vec![master];
+        }
+        channel_elements(dev, SEL_VOLUME_DB)
+    }
+
+    /// True exactly when `set_gain` would find something to write, so
+    /// `GainState::adjustable` cannot disagree with the setter. Same discipline
+    /// as `volume_writable`, one selector over: a read-only master over
+    /// writable channels must not grey the control out.
+    fn gain_writable(dev: AudioObjectID) -> bool {
+        let master = at(SEL_VOLUME_DB, SCOPE_OUTPUT, ELEM_MAIN);
+        if has(dev, &master) && settable(dev, &master) {
+            return true;
+        }
+        channel_elements(dev, SEL_VOLUME_DB)
+            .iter()
+            .any(|a| settable(dev, a))
+    }
+
+    fn range_of(dev: AudioObjectID, elem: u32) -> Option<(f32, f32)> {
+        get_range(dev, &at(SEL_VOLUME_DB_RANGE, SCOPE_OUTPUT, elem))
+    }
+
+    /// The quietest dB this element can honestly be asked for (design §3.2:
+    /// the device is the one that knows how quiet it can be).
+    fn silence_db(dev: AudioObjectID, elem: u32) -> f32 {
+        range_of(dev, elem).map_or(SILENT_DB, |(min, _)| min)
+    }
+
+    fn read_gain(
+        dev: AudioObjectID,
+        target: Option<&str>,
+        requested: Option<f32>,
+    ) -> Result<GainState> {
+        let elems = db_elements(dev);
+        if elems.is_empty() {
+            bail!(
+                "{} publishes no dB volume ('vold'), so the native dB path does not apply to it",
+                label(target)
+            );
+        }
+        let dbs: Vec<(u32, f32)> = elems
+            .iter()
+            .filter_map(|a| get_f32(dev, a).map(|v| (a.element, v)))
+            .collect();
+        let Some(&(first_elem, first_db)) = dbs.first() else {
+            bail!("{} has a dB volume property that will not read", label(target));
+        };
+        // Averaged in the GAIN domain, not the dB domain. dB is logarithmic,
+        // so averaging it is a geometric mean of amplitude and would call a
+        // {0 dB, −60 dB} pair −30 dB, which is neither channel. Channels we
+        // write we write together, so a spread only shows up on a device
+        // something else set.
+        let applied_db = if dbs.len() == 1 {
+            first_db
+        } else {
+            gain_to_db(dbs.iter().map(|&(_, d)| db_to_gain(d)).sum::<f32>() / dbs.len() as f32)
+        };
+        Ok(GainState {
+            requested,
+            applied: db_to_gain(applied_db),
+            applied_db,
+            range_db: range_of(dev, first_elem),
+            muted: read_mute(dev),
+            adjustable: gain_writable(dev),
+        })
+    }
+
+    pub fn get_gain(target: Option<&str>) -> Result<GainState> {
+        let dev = resolve(target)?;
+        read_gain(dev, target, None)
+    }
+
+    pub fn set_gain(target: Option<&str>, gain: f32) -> Result<GainState> {
+        let dev = resolve(target)?;
+        let master = at(SEL_VOLUME_DB, SCOPE_OUTPUT, ELEM_MAIN);
+        let writable: Vec<PropAddr> = if has(dev, &master) && settable(dev, &master) {
+            vec![master]
+        } else {
+            channel_elements(dev, SEL_VOLUME_DB)
+                .into_iter()
+                .filter(|a| settable(dev, a))
+                .collect()
+        };
+        if writable.is_empty() {
+            bail!("{} has no writable dB volume", label(target));
+        }
+        for a in &writable {
+            // gain 0 has no finite dB, so ask the element for its own floor
+            // instead. This does NOT mute: measured, a device at its floor
+            // keeps mute = 0 (design §9), and §3.2 makes muting an explicit
+            // action of the caller.
+            let db = if gain > 0.0 {
+                gain_to_db(gain)
+            } else {
+                silence_db(dev, a.element)
+            };
+            set_f32(dev, a, db, "vold")?;
+        }
+        // Never `Ok(())`: the write above can be silently clamped and still
+        // return noErr, so the reading is the only truthful answer.
+        read_gain(dev, target, Some(gain))
+    }
 }
 
 // ---------------------------------------------------------------- Windows
@@ -873,7 +1209,7 @@ mod imp {
     //! never call are declared as `usize` so nothing can be invoked through
     //! them by accident.
 
-    use super::{label, match_by_name, VolumeState};
+    use super::{db_to_gain, gain_to_db, label, match_by_name, GainState, VolumeState};
     use anyhow::{bail, Result};
     use std::ffi::c_void;
     use std::ptr;
@@ -1036,10 +1372,16 @@ mod imp {
         register_control_change_notify: usize,
         unregister_control_change_notify: usize,
         get_channel_count: usize,
-        set_master_volume_level: usize,
+        /// `SetMasterVolumeLevel(float dB, LPCGUID ctx)` — design §4.2's write
+        /// end on Windows. Declaring it costs no layout change: the slot was
+        /// always here at this offset, it was only spelled `usize` while
+        /// nothing called it.
+        set_master_volume_level:
+            unsafe extern "system" fn(*mut c_void, f32, *const GUID) -> HRESULT,
         set_master_volume_level_scalar:
             unsafe extern "system" fn(*mut c_void, f32, *const GUID) -> HRESULT,
-        get_master_volume_level: usize,
+        /// `GetMasterVolumeLevel(float *dB)` — the readback half.
+        get_master_volume_level: unsafe extern "system" fn(*mut c_void, *mut f32) -> HRESULT,
         get_master_volume_level_scalar:
             unsafe extern "system" fn(*mut c_void, *mut f32) -> HRESULT,
         set_channel_volume_level: usize,
@@ -1052,7 +1394,12 @@ mod imp {
         volume_step_up: usize,
         volume_step_down: usize,
         query_hardware_support: usize,
-        get_volume_range: usize,
+        /// `GetVolumeRange(float *mindB, float *maxdB, float *incrementdB)` —
+        /// the endpoint's own floor and ceiling, which is what explains a
+        /// clamp. Last slot in the interface, so enabling it cannot shift
+        /// anything above it either.
+        get_volume_range:
+            unsafe extern "system" fn(*mut c_void, *mut f32, *mut f32, *mut f32) -> HRESULT,
     }
 
     /// Balances CoInitializeEx. A thread another library already put in a
@@ -1281,17 +1628,105 @@ mod imp {
             &format!("SetMute on {}", label(target)),
         )
     }
+
+    // ------------------------------------------- design §4.2 native dB path
+
+    /// Same role as the macOS constant: the fallback for `gain == 0` on an
+    /// endpoint that will not say where its floor is.
+    const SILENT_DB: f32 = -200.0;
+
+    /// The published increment is read and discarded. Nothing in the design
+    /// consumes a device-published step, and carrying a field that is always
+    /// `None` on macOS would invite a call site that only works on Windows.
+    fn volume_range_db(ep: &Endpoint) -> Option<(f32, f32)> {
+        let v = unsafe { ep.vol.vtbl::<IAudioEndpointVolumeVtbl>() };
+        let (mut lo, mut hi, mut step) = (0.0f32, 0.0f32, 0.0f32);
+        let hr = unsafe { ((*v).get_volume_range)(ep.vol.0, &mut lo, &mut hi, &mut step) };
+        (hr >= 0).then_some((lo, hi))
+    }
+
+    fn read_gain(
+        ep: &Endpoint,
+        target: Option<&str>,
+        requested: Option<f32>,
+    ) -> Result<GainState> {
+        let v = unsafe { ep.vol.vtbl::<IAudioEndpointVolumeVtbl>() };
+        let mut db: f32 = 0.0;
+        check(
+            unsafe { ((*v).get_master_volume_level)(ep.vol.0, &mut db) },
+            &format!("GetMasterVolumeLevel on {}", label(target)),
+        )?;
+        let mut m: i32 = 0;
+        let muted = match unsafe { ((*v).get_mute)(ep.vol.0, &mut m) } {
+            hr if hr >= 0 => m != 0,
+            _ => false, // endpoint without a mute control: never report muted
+        };
+        Ok(GainState {
+            requested,
+            applied: db_to_gain(db),
+            applied_db: db,
+            range_db: volume_range_db(ep),
+            muted,
+            // Same reason `get` reports `adjustable`: this is the shared-mode
+            // software volume, so an endpoint that activated is by definition
+            // writable.
+            adjustable: true,
+        })
+    }
+
+    pub fn get_gain(target: Option<&str>) -> Result<GainState> {
+        let ep = endpoint_volume(target)?;
+        read_gain(&ep, target, None)
+    }
+
+    pub fn set_gain(target: Option<&str>, gain: f32) -> Result<GainState> {
+        let ep = endpoint_volume(target)?;
+        let range = volume_range_db(&ep);
+        // gain 0 has no finite dB, so ask for the endpoint's own floor.
+        let want = if gain > 0.0 {
+            gain_to_db(gain)
+        } else {
+            range.map_or(SILENT_DB, |(lo, _)| lo)
+        };
+        // Unlike CoreAudio, SetMasterVolumeLevel REJECTS a dB outside the
+        // published range rather than clamping it. Clamping here gives the two
+        // platforms one behaviour — land on the floor, and let the readback
+        // report the shortfall — instead of "macOS clamps, Windows errors",
+        // which would make an out-of-range request mean two different things
+        // depending on which end of the link ran it.
+        let db = match range {
+            Some((lo, hi)) => want.clamp(lo, hi),
+            None => want,
+        };
+        let v = unsafe { ep.vol.vtbl::<IAudioEndpointVolumeVtbl>() };
+        check(
+            unsafe { ((*v).set_master_volume_level)(ep.vol.0, db, ptr::null()) },
+            &format!("SetMasterVolumeLevel on {}", label(target)),
+        )?;
+        read_gain(&ep, target, Some(gain))
+    }
 }
 
 // ---------------------------------------------------------------- other
 
 #[cfg(not(any(target_os = "macos", windows)))]
 mod imp {
-    use super::VolumeState;
+    use super::{GainState, VolumeState};
     use anyhow::{bail, Result};
 
     pub fn get(_target: Option<&str>) -> Result<VolumeState> {
         Ok(VolumeState { scalar: 0.0, muted: false, adjustable: false })
+    }
+
+    /// Errors rather than reporting a level: a platform with no volume backend
+    /// has no dB reading, and `gain = 0.0` would be an absence dressed up as
+    /// silence — see [`super::get_output_gain`].
+    pub fn get_gain(_target: Option<&str>) -> Result<GainState> {
+        bail!("output volume control is not implemented on this platform");
+    }
+
+    pub fn set_gain(_target: Option<&str>, _gain: f32) -> Result<GainState> {
+        bail!("output volume control is not implemented on this platform");
     }
 
     pub fn set_volume(_target: Option<&str>, _scalar: f32) -> Result<()> {
@@ -1506,6 +1941,437 @@ mod send_gain_authority_tests {
             authority_for(Some(VolumeState { scalar: 0.9, muted: true, adjustable: false })),
             VolumeAuthority::SendGain
         );
+    }
+}
+
+/// design §4.2 的原生 dB 支路：单位换算与「夹取必须可见」这条类型级性质。
+#[cfg(test)]
+mod gain_tests {
+    use super::*;
+
+    /// The two conversions are each other's inverse across the wire range, and
+    /// both ends mean what design §3.2 says they mean.
+    ///
+    /// 注入对照：把 `gain_to_db` 的 `20.0` 写成 `10.0`（功率 vs 幅度那个经典
+    /// 错误），第二条断言 −6.02 → −3.01 立刻变红。
+    #[test]
+    fn gain_and_db_are_each_others_inverse() {
+        assert_eq!(gain_to_db(1.0), 0.0, "unity is 0 dB");
+        assert!(
+            (gain_to_db(0.5) - (-6.0206)).abs() < 1e-3,
+            "half amplitude is −6.02 dB, not −3.01: this is amplitude, not power. got {}",
+            gain_to_db(0.5)
+        );
+        assert!((gain_to_db(db_to_gain(-30.0)) - (-30.0)).abs() < 1e-3);
+        // gain 0 is not a level: no finite dB is silence (design §3.2).
+        assert_eq!(gain_to_db(0.0), f32::NEG_INFINITY);
+        assert_eq!(gain_to_db(-1.0), f32::NEG_INFINITY);
+        assert_eq!(db_to_gain(f32::NEG_INFINITY), 0.0);
+        for g in [1.0f32, 0.5, 0.25, 0.1, 0.0316, 1e-4] {
+            let back = db_to_gain(gain_to_db(g));
+            assert!((back - g).abs() <= g * 1e-4, "{g} round-tripped to {back}");
+        }
+    }
+
+    /// ⭐ The property [`GainState`] exists for, and the one design §10 P2a
+    /// calls out by name: a device that clamps and still reports success must
+    /// leave **both** numbers readable. Reporting only the request hides that
+    /// the device refused; reporting only the result hides that anything else
+    /// was ever asked for.
+    ///
+    /// The numbers are the measured ones (design §9, 2026-08-09): −80 dB
+    /// written to `MacBook Pro Speakers`, floor −63.5 dB, `SetPropertyData`
+    /// returned `noErr`, device landed at −63.5 dB and did NOT mute itself.
+    ///
+    /// 注入对照：把 `clamped()` 改成 `false`，或让 `requested_db()` 返回
+    /// `Some(self.applied_db)`，本测试变红。
+    #[test]
+    fn a_silent_clamp_leaves_both_the_request_and_the_result_readable() {
+        let clamped = GainState {
+            requested: Some(db_to_gain(-80.0)),
+            applied: db_to_gain(-63.5),
+            applied_db: -63.5,
+            range_db: Some((-63.5, 0.0)),
+            muted: false,
+            adjustable: true,
+        };
+        let asked = clamped.requested_db().expect("a write must remember what it asked for");
+        assert!(
+            (asked - (-80.0)).abs() <= SAME_DB,
+            "the request was lost, only the result survived: {asked} dB"
+        );
+        assert!(
+            (clamped.applied_db - (-63.5)).abs() <= SAME_DB,
+            "the result was lost, only the request survived: {} dB",
+            clamped.applied_db
+        );
+        assert!(
+            clamped.clamped(),
+            "16.5 dB of clamp reported as compliance — this is the state that has no status code"
+        );
+        assert!((clamped.shortfall_db().expect("a write has a shortfall") - 16.5).abs() <= SAME_DB);
+
+        // ...and a device that DID do what was asked must not look clamped,
+        // or the flag says "clamped" about everything and means nothing.
+        let complied = GainState {
+            requested: Some(db_to_gain(-30.0)),
+            applied: db_to_gain(-30.0),
+            applied_db: -30.0,
+            ..clamped
+        };
+        assert!(!complied.clamped(), "a compliant device must not read as clamped");
+
+        // A plain read asked for nothing, so it cannot have fallen short of it.
+        let read = GainState { requested: None, ..clamped };
+        assert_eq!(read.requested_db(), None);
+        assert_eq!(read.shortfall_db(), None);
+        assert!(!read.clamped());
+    }
+
+    /// design §5.1: [`SAME_EPS`] and [`SAME_DB`] are thresholds in DIFFERENT
+    /// UNITS, and converting one into the other is the mistake that section is
+    /// named for. Near the quiet end a `SAME_EPS`-sized step of slider is more
+    /// than an order of magnitude past `SAME_DB`, so reusing the slider
+    /// tolerance in the dB domain would swallow an 11 dB change as "unchanged".
+    #[test]
+    fn the_slider_tolerance_is_not_the_db_tolerance_in_disguise() {
+        let quiet = 0.01f32;
+        let step_db = gain_to_db(quiet + SAME_EPS) - gain_to_db(quiet);
+        assert!(
+            step_db > SAME_DB * 10.0,
+            "SAME_EPS near the quiet end is {step_db:.2} dB; it is not SAME_DB ({SAME_DB} dB) \
+             in another unit and must never be substituted for it"
+        );
+    }
+}
+
+/// design §10 P2a 的硬件判据：只有真实设备能回答的那几条。
+#[cfg(test)]
+mod output_gain_hardware_tests {
+    //! # Why every test here is `#[ignore]`d, and the interlocks around them
+    //!
+    //! These WRITE a real device's volume. On this machine the system default
+    //! output is a virtual speaker carrying the user's live audio to a peer, so
+    //! a "turn it to −30 dB" test there is not a test, it is an outage. Three
+    //! interlocks, in the order they fire:
+    //!
+    //! 1. **The device is required and read from the environment.** No default,
+    //!    and in particular no fallback to the system default.
+    //! 2. **The named device must not BE the system default output.** Checked
+    //!    against the live default at the start of every test; naming it is a
+    //!    panic, not a warning. This mirrors the hard refusal in
+    //!    `regress/volume-taper/macdbwrite.c`, which is field-proven.
+    //! 3. **[`GainGuard`] holds the knob**, so the early `?` and the panic
+    //!    paths put it back too. It restores the SCALAR, and a dB write moves
+    //!    the scalar with it (measured: −30 dB ⇒ scalar 0.278319 on Apple
+    //!    built-in), so restoring one restores the other.
+    //!
+    //! And every test ends by re-reading the system default output and
+    //! asserting it did not move — the "check the whole table afterwards" half
+    //! of the same contract, aimed at the one device that matters.
+    //!
+    //! **Known gap:** unlike the C tools, there is no SIGINT/SIGTERM handler —
+    //! `Drop` does not run on a signal, so `^C` mid-test leaves the named
+    //! device moved. Same gap as `output_volume_guard_hardware_tests` above,
+    //! accepted for the same reason: the device under test is one that carries
+    //! nothing, by interlock 2.
+    //!
+    //! ```text
+    //! AUDIOHUB_GAIN_DEVICE="BlackHole 2ch" \
+    //!   cargo test -p audiohub-core output_gain_hardware -- --ignored --nocapture --test-threads=1
+    //! ```
+    //!
+    //! `--test-threads=1` matters if `AUDIOHUB_VOLUME_GUARD_DEVICE` names the
+    //! same device: the two suites hold different mutexes.
+
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    const ENV: &str = "AUDIOHUB_GAIN_DEVICE";
+
+    /// One device, and `cargo test` runs these on parallel threads by default.
+    static DEVICE: Mutex<()> = Mutex::new(());
+
+    /// Poison-tolerant: an assertion failure in one test must not turn the
+    /// others into spurious failures about a poisoned lock.
+    fn lock() -> MutexGuard<'static, ()> {
+        DEVICE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn default_output_name() -> Option<String> {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        cpal::default_host().default_output_device().and_then(|d| d.name().ok())
+    }
+
+    fn output_device_names() -> Vec<String> {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        cpal::default_host()
+            .output_devices()
+            .map(|it| it.filter_map(|d| d.name().ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Interlocks 1 and 2.
+    fn device() -> String {
+        let name = std::env::var(ENV).unwrap_or_else(|_| {
+            panic!(
+                "set {ENV} to an OUTPUT DEVICE NAME before running this. There is no default \
+                 on purpose: the system default output is where the user's audio is."
+            )
+        });
+        if default_output_name().as_deref() == Some(name.as_str()) {
+            panic!(
+                "{name:?} is the CURRENT DEFAULT OUTPUT. Refusing to write to it: that device \
+                 is carrying live audio. Point {ENV} at something inaudible."
+            );
+        }
+        name
+    }
+
+    /// Captures a device's volume and puts it back UNCONDITIONALLY on `Drop`.
+    ///
+    /// Deliberately not [`OutputVolumeGuard`]. That one arms its restore inside
+    /// its OWN `set_volume`/`set_mute`, and everything here writes through
+    /// [`set_output_gain`], which it never sees — so every `restore()` returns
+    /// `Ok(())` having done nothing, which is indistinguishable from a restore
+    /// that worked. Measured the hard way: the first draft of this module used
+    /// it, all three tests passed, and two devices were left sitting at their
+    /// dB floor.
+    struct GainGuard {
+        device: String,
+        original: VolumeState,
+        done: bool,
+    }
+
+    impl GainGuard {
+        fn capture(device: &str) -> GainGuard {
+            let original = get_output_volume(Some(device))
+                .unwrap_or_else(|e| panic!("read {device:?} before touching it: {e}"));
+            assert!(
+                original.adjustable,
+                "{device:?} exposes no writable volume, so nothing here could be put back"
+            );
+            GainGuard { device: device.to_string(), original, done: false }
+        }
+
+        /// Puts it back and VERIFIES it landed. `Drop` is the net underneath
+        /// and is silent, because a panicking `Drop` during an unwind aborts
+        /// the process.
+        fn restore(&mut self) -> std::result::Result<(), String> {
+            if self.done {
+                return Ok(());
+            }
+            self.done = true;
+            let d = Some(self.device.as_str());
+            set_output_volume(d, self.original.scalar).map_err(|e| e.to_string())?;
+            let now = get_output_volume(d).map_err(|e| e.to_string())?;
+            // Tight, not `SAME_EPS`: a programmatic scalar write is bit-exact
+            // (design §9 P0-b), so anything looser would let a real failure
+            // through as rounding.
+            if (now.scalar - self.original.scalar).abs() > 1e-4 {
+                return Err(format!(
+                    "{:?} left at {:.6}, was {:.6}",
+                    self.device, now.scalar, self.original.scalar
+                ));
+            }
+            // Nothing here writes the mute control, so a change would mean a
+            // gain write touched it — which design §3.2 says it must not.
+            if now.muted != self.original.muted {
+                return Err(format!(
+                    "{:?} mute went {} -> {} without anyone writing it",
+                    self.device, self.original.muted, now.muted
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for GainGuard {
+        fn drop(&mut self) {
+            let _ = self.restore();
+        }
+    }
+
+    /// Proof that a test which moved some other device did not move THIS one.
+    struct DefaultOutputWitness(Option<VolumeState>);
+
+    impl DefaultOutputWitness {
+        fn take() -> DefaultOutputWitness {
+            DefaultOutputWitness(get_output_volume(None).ok())
+        }
+
+        fn check(&self) {
+            assert_eq!(
+                self.0,
+                get_output_volume(None).ok(),
+                "the SYSTEM DEFAULT OUTPUT changed while this test ran. If you moved it \
+                 yourself, that is what this is reporting; otherwise a write escaped the \
+                 interlocks and landed on the user's live device"
+            );
+        }
+    }
+
+    /// design §10 P2a, first criterion: a −30 dB request lands within 0.75 dB.
+    ///
+    /// The threshold is 1.5× the 0.5 dB grid a device may quantise to, which is
+    /// the physical floor — loosening it further would stop distinguishing "the
+    /// dB property works" from "the dB property is decorative".
+    #[test]
+    #[ignore = "writes a real device's volume; needs AUDIOHUB_GAIN_DEVICE"]
+    fn a_minus_30_db_request_lands_within_the_device_grid() {
+        let _serial = lock();
+        let dev = device();
+        let witness = DefaultOutputWitness::take();
+
+        let before = get_output_gain(Some(&dev)).expect("read the dB volume before touching it");
+        assert!(before.adjustable, "{dev:?} exposes no writable dB volume: {before:?}");
+
+        let after = {
+            let mut g = GainGuard::capture(&dev);
+            let after = set_output_gain(Some(&dev), db_to_gain(-30.0)).expect("write −30 dB");
+            g.restore().expect("restore must report its own failure");
+            after
+        };
+
+        assert!(
+            (after.applied_db - (-30.0)).abs() <= SAME_DB,
+            "asked {dev:?} for −30 dB, it landed at {:.4} dB (threshold {SAME_DB} dB)",
+            after.applied_db
+        );
+        assert!(!after.clamped(), "a −30 dB request should be in range: {after:?}");
+        assert_eq!(
+            after.requested_db().map(f32::round),
+            Some(-30.0),
+            "the write must report what it asked for, not only what happened"
+        );
+        witness.check();
+    }
+
+    /// ⭐ design §10 P2a's extra criterion, straight out of the §9 finding: an
+    /// out-of-range request must come back reporting BOTH numbers. The device
+    /// returns success either way, so this readback is the only place the
+    /// difference exists at all.
+    #[test]
+    #[ignore = "writes a real device's volume; needs AUDIOHUB_GAIN_DEVICE"]
+    fn an_out_of_range_request_reports_both_what_was_asked_and_what_happened() {
+        let _serial = lock();
+        let dev = device();
+        let witness = DefaultOutputWitness::take();
+
+        let before = get_output_gain(Some(&dev)).expect("read the dB volume before touching it");
+        assert!(before.adjustable, "{dev:?} exposes no writable dB volume: {before:?}");
+        let (floor, _) = before.range_db.unwrap_or_else(|| {
+            panic!("{dev:?} publishes no dB range, so \"out of range\" has no meaning on it")
+        });
+        assert!(
+            floor > -80.0,
+            "{dev:?} reaches {floor} dB, so −80 dB is not out of range for it and this test \
+             would assert nothing. Pick a device whose floor is above −80 dB."
+        );
+
+        let got = {
+            let mut g = GainGuard::capture(&dev);
+            let got = set_output_gain(Some(&dev), db_to_gain(-80.0)).expect("write −80 dB");
+            g.restore().expect("restore must report its own failure");
+            got
+        };
+
+        let asked = got.requested_db().expect("a write must remember what it asked for");
+        assert!(
+            (asked - (-80.0)).abs() <= SAME_DB,
+            "the request was lost: −80 dB came back as {asked} dB"
+        );
+        assert!(
+            (got.applied_db - floor).abs() <= SAME_DB,
+            "the result was lost: {dev:?} floor is {floor} dB, readback says {:.4} dB",
+            got.applied_db
+        );
+        assert!(
+            got.clamped(),
+            "{:.2} dB of clamp reported as if the device had complied — the underlying call \
+             returns success, so this flag is the only thing that can say otherwise",
+            got.shortfall_db().unwrap_or(f32::NAN)
+        );
+        // Measured (design §9): a device at its dB floor does NOT mute itself,
+        // so §3.2's "also set the mute control" stays the caller's job and must
+        // not be smuggled in here.
+        assert_eq!(got.muted, before.muted, "a gain write must not touch the mute control");
+        witness.check();
+    }
+
+    /// design §10 P2a, last criterion: `adjustable` and `set_output_gain` must
+    /// not contradict each other on ANY output device.
+    ///
+    /// The write is a NO-OP — each device is written the dB it already reads —
+    /// so "did the setter find something to write" becomes observable without
+    /// moving a single device, which is the only way to run this over a whole
+    /// machine's device list. The default output is skipped outright: even a
+    /// no-op is a write.
+    #[test]
+    #[ignore = "no-op writes across every non-default output device"]
+    fn adjustable_and_the_setter_never_contradict_each_other() {
+        let _serial = lock();
+        let witness = DefaultOutputWitness::take();
+        let default = default_output_name();
+        let mut checked = Vec::new();
+        // Skips are printed, not swallowed: "5 devices agreed" means nothing
+        // without "and here is what was never asked".
+        let mut skipped: Vec<(String, String)> = Vec::new();
+        for name in output_device_names() {
+            if default.as_deref() == Some(name.as_str()) {
+                skipped.push((name, "is the default output (interlock)".into()));
+                continue;
+            }
+            // No dB property at all: not on this path, and `get` says so by
+            // failing rather than by inventing a level.
+            let state = match get_output_gain(Some(&name)) {
+                Ok(state) => state,
+                Err(e) => {
+                    skipped.push((name, format!("{e}")));
+                    continue;
+                }
+            };
+            // A device above unity would be pulled DOWN by the wire's 0..=1
+            // clamp, so the no-op would stop being one. Leave it alone.
+            if state.applied > 1.0 {
+                skipped.push((name, format!("sits above unity ({:.2} dB)", state.applied_db)));
+                continue;
+            }
+            let wrote = set_output_gain(Some(&name), state.applied);
+            assert_eq!(
+                state.adjustable,
+                wrote.is_ok(),
+                "{name:?}: adjustable={} but set_output_gain {}. The two are supposed to be \
+                 the same predicate; one of them is greying out a control that works, or \
+                 promising one that does not",
+                state.adjustable,
+                match &wrote {
+                    Ok(g) => format!("succeeded ({:.2} dB)", g.applied_db),
+                    Err(e) => format!("failed: {e}"),
+                }
+            );
+            // "No-op" is checked, not asserted by construction. The value goes
+            // dB -> gain -> dB, so it is exact only to f32 rounding (~1e-5 dB);
+            // this is what makes running the sweep over a stranger's device
+            // list defensible, so it is verified rather than assumed.
+            if let Ok(g) = &wrote {
+                assert!(
+                    (g.applied_db - state.applied_db).abs() <= SAME_DB,
+                    "{name:?} MOVED: this sweep is only allowed to write devices the value \
+                     they already had, and {:.4} dB became {:.4} dB",
+                    state.applied_db,
+                    g.applied_db
+                );
+            }
+            checked.push((name, state.adjustable));
+        }
+        assert!(
+            !checked.is_empty(),
+            "no non-default output device answered the dB path, so this asserted nothing"
+        );
+        eprintln!("checked {} device(s): {checked:?}", checked.len());
+        eprintln!("skipped {} device(s): {skipped:#?}", skipped.len());
+        witness.check();
     }
 }
 

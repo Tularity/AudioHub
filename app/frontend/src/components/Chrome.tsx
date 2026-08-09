@@ -49,14 +49,37 @@ function useContracted(): boolean {
   return on;
 }
 
-export function Brand() {
+/**
+ * 背景水印。左上角那枚品牌区（logo + 字标 + tagline）已经删掉，标识改由这一枚
+ * **超大、极低对比**的波形承担——它要读作背景纹理，而不是「一枚被放大的 logo」。
+ *
+ * 下面几条是硬约束，不是审美偏好：
+ *
+ * · **`position: fixed`，绝不跟着 `#view-root` 滚。** 跟着内容滚的水印在每一次滚动
+ *   里都是一层会动的噪声，也是这种做法最先被读出「廉价」的地方。它不动，卡片从它
+ *   上面盖过去，于是滚动时只有遮挡关系在变，没有第二个运动的东西。
+ *
+ * · **`z-index: -1`，退到负层。** 于是它画在画布底色之上、所有内容之下。这条成立的
+ *   前提是 `#app` 不建立层叠上下文（它只有 display:flex，没有 z-index/transform/
+ *   filter/opacity），负层才退得到画布那一级；`body` 的 background 被传播到画布，
+ *   所以负层仍在底色之上，不会整个消失。选它而不是给 `#view-root` 加
+ *   `position: relative` + `z-index`：后者会把视图内部**每一个**绝对定位子元素的
+ *   包含块从视口换成滚动容器，是一次波及全站的改动，代价完全不成比例。
+ *
+ * · **右下出血，不放左上。** 左上正是刚删掉的品牌区，把标识画回那个位置等于没删。
+ *
+ * · **一帧动画都不给。** 会呼吸、会漂移的水印就是用户点名要避免的视觉噪声。
+ *
+ * · **矢量。** 复用 Icon.tsx 里那条同一份 path（不新增第四份拷贝，也不缩放
+ *   icons/icon.png），高 DPI 下自然清晰。
+ *
+ * `aria-hidden`：它不承载任何信息——App 的名字与版本在设置页「关于」里，
+ * 读屏用户要的是那个，不是这里一段读不出来的装饰图形。
+ */
+export function Watermark() {
   return (
-    <div className="brand">
-      <span className="brand-logo"><RawIcon name="wave" /></span>
-      <div className="brand-text">
-        <strong>{t('app.name')}</strong>
-        <span>{t('app.tagline')}</span>
-      </div>
+    <div id="watermark" data-testid="app-watermark" aria-hidden="true">
+      <RawIcon name="wave" />
     </div>
   );
 }

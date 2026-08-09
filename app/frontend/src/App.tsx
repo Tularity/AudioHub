@@ -1,5 +1,5 @@
 import { useEffect, useSyncExternalStore } from 'react';
-import { Brand, NavPill, DaemonBadge, Overlay, VIEW_TITLE } from './components/Chrome';
+import { Watermark, NavPill, DaemonBadge, Overlay, VIEW_TITLE } from './components/Chrome';
 import { chromeMouseDown } from './lib/drag';
 import { Toasts } from './components/Toasts';
 import { ConfirmHost } from './components/ConfirmDialog';
@@ -41,6 +41,10 @@ export function App() {
   return (
     <>
       <div id="app">
+        {/* 背景水印。排在最前只是为了读起来像「背景」——它靠 z-index:-1 定位到
+            负层，画在画布底色之上、所有内容之下，DOM 顺序不参与这个决定。 */}
+        <Watermark />
+
         <main id="view-root">
           {/* key 让视图切换重新挂载，从而复现那段淡入 + 上移的动画 */}
           <section className="view" data-testid={`view-${view}`} key={view}>
@@ -50,12 +54,11 @@ export function App() {
 
         {/* 浮动控件层，**排在内容之后**：它盖在内容上，靠 position:fixed 脱离布局，
             所以内容能从它下面穿过去滚动。macOS 的红绿灯（titleBarStyle=Overlay）也
-            浮在这条带子的左上角——`--traffic-w` 给它们留了位置，而三颗按钮本身由
-            系统在 webview 之上绘制，永远先拿到点击，不会被这里挡掉。
+            浮在这条带子的左上角，三颗按钮由系统在 webview 之上绘制，永远先拿到点击，
+            不会被这里挡掉；左上角现在没有任何自绘元素要跟它们抢位置（品牌区已删）。
             onMouseDown 是窗口拖拽：控件与可选文本由 lib/drag.ts 自己排除。 */}
         <header id="topbar" onMouseDown={chromeMouseDown}>
           <h1 id="view-title">{t(VIEW_TITLE[view])}</h1>
-          <Brand />
           <NavPill onNavigate={(v) => actions.navigate(v)} />
           <DaemonBadge />
         </header>

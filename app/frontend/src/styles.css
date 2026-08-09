@@ -59,9 +59,29 @@
   --dur: .22s;
 
   /* 浮动头部。--traffic-w 是 macOS 红绿灯安全区：Windows 上没有红绿灯，但
-     **双平台布局必须逐像素一致**（CLAUDE.md 冻结项），所以两边都照样留出来。 */
+     **双平台布局必须逐像素一致**（CLAUDE.md 冻结项），所以两边都照样留出来。
+     ⚠ 本轮删掉左上品牌区之后，**这个变量当前没有任何消费者**——左上角只剩系统自己
+     画的三颗按钮，没有自绘元素需要避让。留着它是因为 docs/spec-ui.md §79 仍把它写作
+     规格的一部分，而那份文档不在本轮改动范围内；docs/design-ui-chrome.md §4 计划把它
+     和 Windows 侧的标题按钮让位合并成一对 --chrome-lead / --chrome-trail。
+     在那件事落地之前，不要以为改这个数字会挪动任何东西。 */
   --chrome-h: 64px;
   --traffic-w: 88px;
+
+  /* 背景水印（#watermark）。走变量而不是把 rgba 写死在规则里，是为了将来加浅色
+     主题时只换这一个值——浅色底上白色墨迹会整个消失，硬编码的 rgba 到那天才会被
+     发现。`--watermark-ink` 里已经含 alpha：一个旋钮管颜色和强度，不必再去别处
+     找一条 opacity。
+     取值不是挑出来的，是**量出来的**。验收标准来自 docs/design-ui-chrome.md §5.2.1：
+     正文叠在水印上时，WCAG 等级不得比叠加前更低。实测（真 App 截图，DPR 2）：
+       · 纯底色像素 (17,18,21)，--text-dim 在其上对比度 7.36:1 —— 刚过 AAA(7:1)
+       · alpha .055 时水印最亮处 (19,25,27)，对比度掉到 6.98:1 —— **跌出 AAA**
+       · 收到 .042 后最亮处 (17,20,23)，对比度 7.27:1 —— AAA 保住，余量 0.27
+     --text / --accent 同样各自保级（15.36:1 / 8.82:1）。
+     所以是 .042，不是「看着差不多」的 5%。改这个值前请重新量一次。 */
+  --watermark-ink: rgba(49, 200, 176, .042);
+  /* 随窗口短边走，不随长边：宽而矮的窗口里跟着宽度长会让水印压满整屏。 */
+  --watermark-size: clamp(420px, 78vmin, 980px);
 
   --font: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -120,6 +140,52 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   padding: calc(var(--chrome-h) + 20px) 28px 32px;
 }
 
+/* ---- 背景水印（品牌层） ---- */
+
+/* 左上角的品牌区被删掉之后，App 的标识由这一枚超大波形承担。它要读作**背景纹理**，
+   不是一枚被放大的 logo——所以是低对比、出血、静止的。
+
+   `z-index: -1` 是整条规则的地基：负层排在「画布底色」与「所有内容」之间。这条成立
+   靠两件事，改任何一件都会让水印消失或者盖住内容——
+     ① `#app` 不建立层叠上下文（只有 display:flex，没有 z-index/transform/filter/
+        opacity），负层才退得到根那一级；
+     ② `html` 没有 background，于是 `body` 的底色被传播到画布，负层仍画在它之上。
+   选负层而不是给 `#view-root` 补 `position: relative`：后者会把视图内部每一个绝对
+   定位子元素的包含块从视口换成滚动容器，是一次波及全站的副作用。
+
+   `position: fixed` 同样是硬要求：水印**不跟着内容滚**。跟着滚的水印在每一次滚动里
+   都是第二层在动的东西，也正是这种做法最先被读出「廉价」的地方。它钉死，卡片
+   （不透明，见文件头）从它上面盖过去，滚动时变化的只有遮挡关系。 */
+#watermark {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  width: var(--watermark-size);
+  height: var(--watermark-size);
+  z-index: -1;
+  pointer-events: none;
+  color: var(--watermark-ink);
+  /* 百分比位移按**自身**尺寸算，与视口无关，所以出血量在任何窗口尺寸下都一致。
+     波形墨迹在 24 的 viewBox 里只占 y∈[2.1,17.9]，底部天然空着约四分之一——
+     这 17% 正是把那段空白推出视口、让波峰真正贴住窗口下缘所需的量。 */
+  transform: translate(9%, 17%);
+  /* 朝左上淡出。作用不是装饰：水印的左尾会伸到内容列底下，而卡片之间有 16px 缝隙，
+     一条恒定的色带在缝里随滚动忽隐忽现就是用户点名要避免的噪声。让它在够到内容列
+     之前就已经消失，问题从「淡到看不见」变成「根本不在那儿」。
+     315deg = 朝左上，0% 端在右下角。 */
+  -webkit-mask-image: linear-gradient(315deg, #000 12%, rgba(0, 0, 0, .45) 55%, transparent 88%);
+  mask-image: linear-gradient(315deg, #000 12%, rgba(0, 0, 0, .45) 55%, transparent 88%);
+}
+
+/* 100% + viewBox 缩放 ⇒ 描边宽度（1.8 用户单位）跟着一起放大，笔画比例与 16px 的
+   图标完全一致。**不要**加 vector-effect: non-scaling-stroke：那会把描边钉成
+   1.8 设备 px，水印立刻变成一根发丝，也就不再是同一个标记了。 */
+#watermark svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
 /* ---- 浮动头部（控件层） ---- */
 
 /* 不是一条 chrome 带：#topbar 自身完全透明，只承载三个浮起来的元素 +
@@ -151,30 +217,13 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   mask-image: linear-gradient(180deg, #000 0%, #000 56%, transparent 100%);
 }
 
-/* 三个分区都绝对定位：导航胶囊必须相对**窗口**居中，而不是相对「剩下的那点空间」
-   居中——否则左右两侧内容一变宽，居中的胶囊就跟着漂。用 left:0/right:0 + margin
-   auto 做居中，不用 transform：transform 在 WKWebView 上与 backdrop-filter 组合
-   有历史包袱，能不引入就不引入。 */
-.brand {
-  position: absolute;
-  left: var(--traffic-w); top: 50%;
-  margin-top: -17px;
-  display: flex; align-items: center; gap: 10px;
-}
-.brand-logo {
-  width: 30px; height: 30px; flex: none;
-  display: grid; place-items: center;
-  color: var(--accent);
-  background: #31c8b01a;
-  border: 1px solid #31c8b038;
-  border-radius: 9px;
-}
-.brand-logo svg { width: 18px; height: 18px; }
-.brand-text { display: flex; flex-direction: column; line-height: 1.2; }
-.brand-text strong { font-size: 13.5px; font-weight: 650; letter-spacing: .01em; }
-.brand-text span { font-size: 10.5px; color: var(--text-dim); }
-/* 窄窗时字标先走，图标留下：胶囊居中，绝不让两边把它挤偏。 */
-@media (max-width: 960px) { .brand-text { display: none; } }
+/* 头部里的元素都绝对定位：导航胶囊必须相对**窗口**居中，而不是相对「剩下的那点
+   空间」居中——否则左右两侧内容一变宽，居中的胶囊就跟着漂。用 left:0/right:0 +
+   margin auto 做居中，不用 transform：transform 在 WKWebView 上与 backdrop-filter
+   组合有历史包袱，能不引入就不引入。
+
+   左上原来那枚品牌区（.brand / .brand-logo / .brand-text）已删：App 的标识改由
+   背景水印（#watermark）表达，名字与版本改由设置页「关于」承载。 */
 
 /* ---- 导航胶囊（Liquid Glass 本体） ---- */
 

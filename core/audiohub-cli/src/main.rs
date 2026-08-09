@@ -1,3 +1,4 @@
+mod autopick;
 mod ctl;
 mod loopest;
 mod m3;
@@ -176,6 +177,11 @@ enum ProbeCmd {
         /// --check-volume-independence is set the flags above are ignored.
         #[command(flatten)]
         vi: volindep::ViArgs,
+        /// plan §8 backend auto-selection report. Its own mode: when
+        /// --explain-auto is set the capture flags above are ignored, and no
+        /// capture is opened.
+        #[command(flatten)]
+        auto: autopick::AutoArgs,
     },
     Echo {
         #[arg(long)]
@@ -295,8 +301,21 @@ fn dispatch(cmd: ProbeCmd, json: bool) -> Result<i32> {
             play_pull,
             to,
             vi,
+            auto,
         } => {
-            if vi.check_volume_independence {
+            // --explain-auto first: it is the only mode that opens nothing, so
+            // it must not be reachable only after a capture has already started.
+            if auto.explain_auto {
+                autopick::run(&auto, json)
+            } else if !auto.simulate_unavailable.is_empty() {
+                // Refused rather than ignored. --simulate-unavailable is the
+                // falsification lever; silently dropping it on a capture run
+                // would report a real capture as if the injection had been
+                // applied to it.
+                Err(anyhow!(
+                    "--simulate-unavailable is only meaningful with --explain-auto"
+                ))
+            } else if vi.check_volume_independence {
                 volindep::run(&vi, &backend, json)
             } else {
                 cmd_sysaudio(

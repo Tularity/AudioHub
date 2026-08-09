@@ -380,14 +380,143 @@ pub fn capture_survives_local_mute(backend_id: &str) -> Option<bool> {
     }
 }
 
+// --------------------------------------------------------- the auto rule
+//
+// plan §8 originally promised public `capture.*` IPC verbs so a caller could
+// query and override the backend. The user ruled that out on 2026-08-09:
+// selection stays automatic/adaptive and is not part of the IPC surface. That
+// ruling only holds up if the automatic choice is *observable* — an adaptive
+// rule nobody can inspect is indistinguishable from one that silently does the
+// wrong thing. Hence `explain_auto`: the same rule `resolve_backend` runs,
+// exposed as data so `probe sysaudio --explain-auto` can report what was picked,
+// what was passed over, and why, without opening a capture.
+
+/// What `BACKEND_AUTO` did with one candidate while walking the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoOutcome {
+    /// The pick. Exactly one of these exists when `picked` is `Some`.
+    Picked,
+    /// Passed over, and no upgrade/consent/setting will ever change that
+    /// (`declined`). Distinguished from `SkippedUnavailable` for the same
+    /// reason `BackendInfo::declined` exists at all: one is worth retrying and
+    /// the other never is, and a probe that flattened them would report a
+    /// permanently-dead backend as a transient outage.
+    SkippedDeclined,
+    /// Passed over because it is unavailable *here, now* — wrong OS, host too
+    /// old, consent not granted. Worth re-asking after the host changes.
+    SkippedUnavailable,
+    /// Never examined: the pick was already made higher up the priority order.
+    /// Present so the report shows priority, not just the winner.
+    NotConsidered,
+}
+
+/// One candidate's fate, in `list_backends()` priority order.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AutoStep {
+    pub id: String,
+    pub outcome: AutoOutcome,
+    /// The candidate's own `note` — the only text a user is ever shown about a
+    /// backend that lost, so the report carries it verbatim.
+    pub note: String,
+}
+
+/// The decision `BACKEND_AUTO` reaches over `candidates`, with the reasoning.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AutoChoice {
+    /// `None` when nothing was available — the error case `resolve_backend`
+    /// turns into "no system-audio capture backend is available".
+    pub picked: Option<String>,
+    pub steps: Vec<AutoStep>,
+}
+
+/// The auto rule itself: first `available` candidate wins, priority being
+/// `list_backends()` order.
+///
+/// Takes a slice rather than calling `list_backends()` so a caller can feed it
+/// a *hypothetical* inventory — which is how the fallback behaviour gets
+/// tested at all. The real inventory is fixed by the host it runs on: a mac can
+/// never observe the Windows proc-exclude → device-loopback fallback, and
+/// waiting for a host where the preferred backend happens to be broken is not a
+/// test strategy.
+pub fn explain_auto(candidates: &[BackendInfo]) -> AutoChoice {
+    let mut picked = None;
+    let mut steps = Vec::with_capacity(candidates.len());
+    for b in candidates {
+        let outcome = if picked.is_some() {
+            AutoOutcome::NotConsidered
+        } else if b.available {
+            picked = Some(b.id.clone());
+            AutoOutcome::Picked
+        } else if b.declined {
+            AutoOutcome::SkippedDeclined
+        } else {
+            AutoOutcome::SkippedUnavailable
+        };
+        steps.push(AutoStep {
+            id: b.id.clone(),
+            outcome,
+            note: b.note.clone(),
+        });
+    }
+    AutoChoice { picked, steps }
+}
+
+/// `candidates` with `ids` forced unavailable — the falsification lever.
+///
+/// Only clears `available`; `declined` is left alone, because a backend being
+/// unavailable and a backend being ruled out are different states and the
+/// injection must not quietly convert one into the other.
+pub fn with_unavailable(candidates: &[BackendInfo], ids: &[String]) -> Vec<BackendInfo> {
+    candidates
+        .iter()
+        .cloned()
+        .map(|mut b| {
+            if ids.iter().any(|i| i == &b.id) {
+                b.available = false;
+            }
+            b
+        })
+        .collect()
+}
+
+/// Every backend auto would fall through to, in order, as each pick is knocked
+/// out in turn. `["win-proc-exclude", "win-device-loopback"]` on Windows; a
+/// single entry on macOS; empty where nothing is available.
+///
+/// **Bounded by the candidate count, not by "loop until nothing is picked".**
+/// The natural termination argument — each round forces the previous pick
+/// unavailable, so the pool strictly shrinks — holds only if the rule respects
+/// `available`, and that is the very property this surface exists to check. A
+/// rule that ignored it would re-pick the same id forever: the probe would hang
+/// instead of reporting, which is the one failure mode a falsifiable check must
+/// not have. (Observed for real: breaking the guard in `explain_auto` hung this
+/// function until it was capped.) Overrunning the bound surfaces as a repeated
+/// id in the chain, which `probe sysaudio --explain-auto` fails on.
+pub fn auto_fallback_chain(candidates: &[BackendInfo]) -> Vec<String> {
+    let mut pool = candidates.to_vec();
+    let mut chain = Vec::new();
+    for _ in 0..candidates.len() {
+        let Some(id) = explain_auto(&pool).picked else {
+            break;
+        };
+        pool = with_unavailable(&pool, std::slice::from_ref(&id));
+        chain.push(id);
+    }
+    chain
+}
+
 /// Resolves `id` (or BACKEND_AUTO / "") to a concrete backend description.
 /// A known-but-unavailable id still resolves, so callers can report `note`.
 pub fn resolve_backend(id: &str) -> Result<BackendInfo> {
     let all = list_backends();
     if id.is_empty() || id == BACKEND_AUTO {
-        return all
-            .into_iter()
-            .find(|b| b.available)
+        // Routed through `explain_auto` rather than repeating `find(available)`
+        // here, so the probe explains the rule that actually ships instead of a
+        // second copy that could drift from it.
+        let picked = explain_auto(&all).picked;
+        return picked
+            .and_then(|p| all.into_iter().find(|b| b.id == p))
             .ok_or_else(|| anyhow!("no system-audio capture backend is available on this platform"));
     }
     all.into_iter()
@@ -2302,5 +2431,163 @@ mod mute_precondition_tests {
                 b.id
             );
         }
+    }
+
+    // ------------------------------------------------- the auto rule (plan §8)
+    //
+    // Synthetic inventories, on purpose. The host these run on decides the real
+    // one, so a test written against `list_backends()` could only ever assert
+    // the fallback that this host happens to exhibit — and the interesting
+    // fallback (win-proc-exclude → win-device-loopback) never happens on a mac
+    // at all.
+
+    fn fake(id: &str, available: bool, declined: bool) -> BackendInfo {
+        BackendInfo {
+            id: id.to_string(),
+            name: id.to_string(),
+            available,
+            excludes_self: true,
+            declined,
+            note: format!("fake {id}"),
+        }
+    }
+
+    #[test]
+    fn auto_takes_the_first_available_in_priority_order() {
+        let list = [fake("a", false, false), fake("b", true, false), fake("c", true, false)];
+        let choice = explain_auto(&list);
+        assert_eq!(choice.picked.as_deref(), Some("b"));
+        assert_eq!(choice.steps[0].outcome, AutoOutcome::SkippedUnavailable);
+        assert_eq!(choice.steps[1].outcome, AutoOutcome::Picked);
+        // 'c' was available too. Reporting it as skipped would misdescribe the
+        // rule as a comparison; it is a priority walk that stops at the first hit.
+        assert_eq!(choice.steps[2].outcome, AutoOutcome::NotConsidered);
+    }
+
+    /// A loser that can never be fixed and a loser that a consent grant would
+    /// fix must not read the same. This is `BackendInfo::declined`'s whole
+    /// reason for existing, carried into the auto report.
+    #[test]
+    fn auto_says_which_losers_are_permanent() {
+        let list = [fake("gone", false, true), fake("later", false, false), fake("ok", true, false)];
+        let steps = explain_auto(&list).steps;
+        assert_eq!(steps[0].outcome, AutoOutcome::SkippedDeclined);
+        assert_eq!(steps[1].outcome, AutoOutcome::SkippedUnavailable);
+    }
+
+    /// The falsification this whole surface exists for: knock the preferred
+    /// backend out and the rule must move on, not stay put.
+    ///
+    /// Injection check: changing `explain_auto`'s `b.available` guard to `true`
+    /// (i.e. picking regardless of availability) turns this RED — 'pref' would
+    /// still be picked after being forced unavailable.
+    #[test]
+    fn auto_falls_back_when_the_preferred_goes_unavailable() {
+        let list = [fake("pref", true, false), fake("backup", true, false)];
+        assert_eq!(explain_auto(&list).picked.as_deref(), Some("pref"));
+
+        let injected = with_unavailable(&list, &["pref".to_string()]);
+        let after = explain_auto(&injected);
+        assert_eq!(
+            after.picked.as_deref(),
+            Some("backup"),
+            "auto must fall back to the next available backend, not keep the dead one"
+        );
+        assert_eq!(after.steps[0].outcome, AutoOutcome::SkippedUnavailable);
+    }
+
+    /// Losing the last backend is reported as "none", never as a stale pick.
+    /// The daemon turns this into a visible session fault; a silent stale pick
+    /// would instead stream digital silence with a healthy-looking 0% loss.
+    #[test]
+    fn auto_reports_none_when_everything_is_out() {
+        let list = [fake("only", true, false)];
+        let injected = with_unavailable(&list, &["only".to_string()]);
+        assert_eq!(explain_auto(&injected).picked, None);
+    }
+
+    /// The injection must not launder an unavailable backend into a declined
+    /// one: `declined` means "ruled out for good", and a probe flag has no
+    /// authority to assert that.
+    #[test]
+    fn forcing_unavailable_does_not_forge_a_ruling() {
+        let list = [fake("x", true, false)];
+        let injected = with_unavailable(&list, &["x".to_string()]);
+        assert!(!injected[0].available);
+        assert!(!injected[0].declined);
+    }
+
+    #[test]
+    fn the_fallback_chain_is_ordered_terminating_and_repeat_free() {
+        let list = [
+            fake("first", true, false),
+            fake("dead", false, false),
+            fake("second", true, false),
+        ];
+        let chain = auto_fallback_chain(&list);
+        assert_eq!(chain, vec!["first".to_string(), "second".to_string()]);
+        let mut seen = chain.clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), chain.len(), "a repeat means the pool stopped shrinking");
+    }
+
+    /// The chain is capped by the candidate count so a selection rule that
+    /// stopped respecting `available` reports a repeat instead of spinning
+    /// forever. Without the cap, breaking `explain_auto`'s guard hangs the
+    /// probe — which is exactly what happened while building this surface.
+    #[test]
+    fn the_fallback_chain_can_never_outrun_the_candidate_list() {
+        for list in [
+            vec![],
+            vec![fake("a", true, false)],
+            vec![fake("a", true, false), fake("b", true, false)],
+            vec![fake("a", false, false), fake("b", false, true)],
+        ] {
+            let chain = auto_fallback_chain(&list);
+            assert!(
+                chain.len() <= list.len(),
+                "chain {chain:?} is longer than its {} candidates",
+                list.len()
+            );
+        }
+    }
+
+    /// `explain_auto` picks on `available` alone, while `start_backend` refuses
+    /// `declined` ids afterwards. Those two agree only as long as nothing ships
+    /// as available-and-declined at once. If that ever changes, auto would pick
+    /// a backend `start_backend` then rejects — the user gets a hard error where
+    /// a working fallback existed one row down.
+    #[test]
+    fn no_shipped_backend_is_both_available_and_declined() {
+        for b in list_backends() {
+            assert!(
+                !(b.available && b.declined),
+                "backend '{}' is available and declined at once; auto would pick it and \
+                 start_backend would then refuse it",
+                b.id
+            );
+        }
+    }
+
+    /// Drift guard: `resolve_backend(auto)` and `explain_auto` must stay one
+    /// rule. The probe reports the latter and the daemon runs the former, so a
+    /// split here would make the probe's report confidently wrong.
+    #[test]
+    fn resolve_backend_auto_agrees_with_the_explained_pick() {
+        let explained = explain_auto(&list_backends()).picked;
+        match (resolve_backend(BACKEND_AUTO), explained) {
+            (Ok(b), Some(id)) => assert_eq!(b.id, id),
+            (Err(_), None) => {}
+            (got, exp) => panic!(
+                "resolve_backend(auto) and explain_auto disagree: {:?} vs {exp:?}",
+                got.map(|b| b.id)
+            ),
+        }
+        // "" is the other spelling of auto and must resolve identically.
+        assert_eq!(
+            resolve_backend("").map(|b| b.id).ok(),
+            resolve_backend(BACKEND_AUTO).map(|b| b.id).ok()
+        );
     }
 }

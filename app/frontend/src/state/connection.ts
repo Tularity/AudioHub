@@ -11,6 +11,7 @@ import type { DaemonInfo, DaemonSettings, IpcEndpoint, PeerState, SessionInfo } 
 import { actions, getState, setState } from './store';
 import type { ConnError } from './store';
 import { normalizeList, normalizeOne, gateNeeded } from './permissions';
+import { applyChromeDirection } from '../lib/platform';
 import { toast } from '../components/Toasts';
 import { t } from '../i18n';
 
@@ -294,6 +295,9 @@ export function boot(): void {
   const tauri = isTauri();
   setState({ mode: tauri ? 'tauri' : 'browser' });
   document.body.classList.toggle('is-tauri', tauri);
+  // 顶栏让位方向。与上一行同为「一次性、由环境决定」的 body 标记，放在一起是为了
+  // 让「外壳形态取决于什么」这件事只有一个落点。
+  applyChromeDirection();
   window.addEventListener('focus', reprobeOnReturn);
   document.addEventListener('visibilitychange', reprobeOnReturn);
   void connectDaemon();

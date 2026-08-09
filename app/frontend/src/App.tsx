@@ -1,5 +1,6 @@
 import { useEffect, useSyncExternalStore } from 'react';
 import { Watermark, NavPill, DaemonBadge, Overlay, VIEW_TITLE } from './components/Chrome';
+import { CaptionButtons } from './components/CaptionButtons';
 import { chromeMouseDown } from './lib/drag';
 import { Toasts } from './components/Toasts';
 import { ConfirmHost } from './components/ConfirmDialog';
@@ -53,14 +54,18 @@ export function App() {
         </main>
 
         {/* 浮动控件层，**排在内容之后**：它盖在内容上，靠 position:fixed 脱离布局，
-            所以内容能从它下面穿过去滚动。macOS 的红绿灯（titleBarStyle=Overlay）也
-            浮在这条带子的左上角，三颗按钮由系统在 webview 之上绘制，永远先拿到点击，
-            不会被这里挡掉；左上角现在没有任何自绘元素要跟它们抢位置（品牌区已删）。
+            所以内容能从它下面穿过去滚动。
+
+            两个平台在这条带子里的分工不同，但**只差一个方向变量**（lib/platform.ts）：
+            macOS 的红绿灯（titleBarStyle=Overlay）由系统画在前缘、在 webview 之上，
+            永远先拿到点击，不会被这里挡掉；Windows 关掉了系统边框（decorations:false），
+            后缘那三颗由 CaptionButtons 自己画。徽标待在系统没占的那一端。
             onMouseDown 是窗口拖拽：控件与可选文本由 lib/drag.ts 自己排除。 */}
         <header id="topbar" onMouseDown={chromeMouseDown}>
           <h1 id="view-title">{t(VIEW_TITLE[view])}</h1>
           <NavPill onNavigate={(v) => actions.navigate(v)} />
           <DaemonBadge />
+          <CaptionButtons />
         </header>
       </div>
 

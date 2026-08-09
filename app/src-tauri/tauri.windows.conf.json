@@ -1,0 +1,15 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "AudioHub",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 860,
+        "minHeight": 600,
+        "decorations": false,
+        "shadow": true
+      }
+    ]
+  }
+}

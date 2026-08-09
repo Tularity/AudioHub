@@ -41,6 +41,12 @@ export const zhCN = {
 
   // 窗口拖不动时的唯一线索。静默失败正是这个 bug 之前难以定位的原因，所以宁可吵。
   'chrome.dragFailed': '窗口拖拽不可用：{message}。请重启 AudioHub；若持续如此，说明界面与应用外壳版本不一致。',
+  // Windows 自绘标题按钮。三条都用动词，读屏念出来是「最小化 按钮」。
+  'chrome.minimize': '最小化',
+  'chrome.maximize': '最大化',
+  'chrome.restore': '向下还原',
+  'chrome.close': '关闭窗口（音频服务继续运行）',
+  'chrome.captionFailed': '窗口按钮不可用：{message}。请重启 AudioHub；若持续如此，说明界面与应用外壳版本不一致。',
 
   'badge.online': '在线',
   'badge.starting': '启动中',

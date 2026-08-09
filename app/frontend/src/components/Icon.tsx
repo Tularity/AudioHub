@@ -34,6 +34,14 @@ const ICONS = {
   shield: '<path d="M12 3l7 3v5.5c0 4.4-2.9 7.6-7 8.5-4.1-.9-7-4.1-7-8.5V6l7-3z"/><path d="M9 12l2 2 4-4"/>',
   device: '<rect x="5" y="3" width="14" height="18" rx="2.5"/><circle cx="12" cy="14" r="3.2"/><circle cx="12" cy="7" r="1"/>',
   tagname: '<path d="M3 12V5a2 2 0 0 1 2-2h7l9 9-9 9-9-9z"/><circle cx="8" cy="8" r="1.3"/>',
+  refresh: '<path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v4h-4"/>',
+  // Windows caption glyphs. Deliberately squared off (`stroke-linecap: butt`
+  // via `.caption-btn svg` in styles.css) and drawn on a 10x10 box centred in
+  // the 24 viewBox, because that is what Segoe MDL2's chrome glyphs look like
+  // -- a rounded minimise dash next to real Windows chrome reads as a toy.
+  winMin: '<path d="M7 12h10"/>',
+  winMax: '<rect x="7" y="7" width="10" height="10"/>',
+  winRestore: '<rect x="7" y="10" width="7" height="7"/><path d="M10 10V7h7v7h-3"/>',
 } as const;
 
 export type IconName = keyof typeof ICONS;

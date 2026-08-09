@@ -58,15 +58,30 @@
   --ease-out: cubic-bezier(.22, 1, .36, 1);
   --dur: .22s;
 
-  /* 浮动头部。--traffic-w 是 macOS 红绿灯安全区：Windows 上没有红绿灯，但
-     **双平台布局必须逐像素一致**（CLAUDE.md 冻结项），所以两边都照样留出来。
-     ⚠ 本轮删掉左上品牌区之后，**这个变量当前没有任何消费者**——左上角只剩系统自己
-     画的三颗按钮，没有自绘元素需要避让。留着它是因为 docs/spec-ui.md §79 仍把它写作
-     规格的一部分，而那份文档不在本轮改动范围内；docs/design-ui-chrome.md §4 计划把它
-     和 Windows 侧的标题按钮让位合并成一对 --chrome-lead / --chrome-trail。
-     在那件事落地之前，不要以为改这个数字会挪动任何东西。 */
+  /* 浮动头部。系统在顶栏里占掉的那一段——**哪一端被占，取决于平台**：
+     macOS 的红绿灯在前缘，Windows 的最小化/最大化/关闭在后缘。所以不写
+     `--traffic-w`（它把「macOS 的红绿灯」焊死进了变量名），而是一对**方向性**变量，
+     由 body[data-window-controls] 各赋一次值（见 lib/platform.ts）。
+
+     缺省值按「系统不占任何一端」给：浏览器态（网页访问 plan §7.5）没有窗口按钮，
+     两侧都归零，徽标就贴着 20px 的边距走。下面两条平台规则各改其中一个。
+
+     ⚠ 这推翻了 docs/spec-ui.md §2 原先「双平台逐像素一致」的冻结口径，已同步改成
+     「布局结构一致；仅让位方向随平台标题按钮方位镜像」。依据：项目 CLAUDE.md 的原话
+     是「统一布局**优先**」，而这里的差异不是审美选择——是 Apple 和微软把按钮放在了
+     不同的一端。 */
   --chrome-h: 64px;
-  --traffic-w: 88px;
+  --chrome-lead: 0px;
+  --chrome-trail: 0px;
+  /* 顶栏两侧元素与窗口边缘的呼吸距离。徽标与自绘标题按钮共用这一个数。 */
+  --chrome-gap: 20px;
+
+  /* Windows 自绘标题按钮的格子。46×32 是 Win11 系统标题按钮自身的尺寸，照抄它
+     才让这条自绘的顶栏读起来是原生的。**同一组数字在 src-tauri/src/win_chrome.rs
+     里也有一份**（它要在第一帧之前就能回答 WM_NCHITTEST，等不了前端上报布局），
+     lib/caption.test.ts 会读那个文件比对，漂了就红。 */
+  --caption-btn-w: 46px;
+  --caption-btn-h: 32px;
 
   /* 背景水印（#watermark）。走变量而不是把 rgba 写死在规则里，是为了将来加浅色
      主题时只换这一个值——浅色底上白色墨迹会整个消失，硬编码的 rgba 到那天才会被
@@ -217,10 +232,24 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   mask-image: linear-gradient(180deg, #000 0%, #000 56%, transparent 100%);
 }
 
+/* ---- 系统占哪一端 ----
+   一条属性一处分叉，不是两套布局。data-window-controls 由 lib/platform.ts 在启动时
+   写死一次（'left' = macOS 红绿灯，'right' = Windows 自绘标题按钮）。
+
+   --chrome-lead 取 100px 的来历：红绿灯左内缩 20pt（mac_chrome.rs 的 LEADING_INSET）、
+   三颗按钮间距 23pt、直径 14pt ⇒ 绿灯右缘 79.5pt，再留 20pt 呼吸。
+   --chrome-trail 取 138px = 46×3，正好是三颗自绘按钮的宽度。 */
+body[data-window-controls="left"] { --chrome-lead: 100px; }
+body[data-window-controls="right"] { --chrome-trail: calc(var(--caption-btn-w) * 3); }
+/* 浏览器态没有窗口按钮可画（`settings.web`，plan §7.5）——那一端的让位随之收回，
+   否则网页里会凭空空出 138px 给三个不存在的按钮。 */
+body[data-window-controls="right"]:not(.app-captions) { --chrome-trail: 0px; }
+
 /* 头部里的元素都绝对定位：导航胶囊必须相对**窗口**居中，而不是相对「剩下的那点
    空间」居中——否则左右两侧内容一变宽，居中的胶囊就跟着漂。用 left:0/right:0 +
    margin auto 做居中，不用 transform：transform 在 WKWebView 上与 backdrop-filter
-   组合有历史包袱，能不引入就不引入。
+   组合有历史包袱，能不引入就不引入。胶囊的居中式子与 lead/trail 无关，所以两个平台
+   下它都在窗口正中，不会因为让位方向不同而偏。
 
    左上原来那枚品牌区（.brand / .brand-logo / .brand-text）已删：App 的标识改由
    背景水印（#watermark）表达，名字与版本改由设置页「关于」承载。 */
@@ -312,7 +341,10 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
    玻璃会互相打架。所以这里模糊更浅、底色更淡、没有强投影。 */
 .daemon-badge {
   position: absolute;
-  right: 20px; top: 50%;
+  /* 徽标待在**系统没占的那一端**：macOS 按钮在左 ⇒ 徽标在右；Windows 按钮在右
+     ⇒ 徽标在左。两条规则只改 left/right 这一对属性，其余全部共用。 */
+  right: var(--chrome-gap); left: auto;
+  top: 50%;
   margin-top: -14px;
   display: inline-flex; align-items: center; gap: 8px;
   padding: 5px 13px; border-radius: var(--pill);
@@ -351,12 +383,51 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   .daemon-badge:hover .badge-ident { max-width: 0; opacity: 0; margin-left: -8px; }
 }
 
+body[data-window-controls="right"] .daemon-badge {
+  left: var(--chrome-gap); right: auto;
+}
+
 .daemon-badge .badge-status { font-weight: 600; }
 .daemon-badge.online .badge-status { color: var(--ok); }
 .daemon-badge.offline .badge-status { color: var(--danger); }
 .daemon-badge.connecting .badge-status { color: var(--text-dim); }
 .daemon-badge code { color: var(--text); }
 .badge-sep { opacity: .5; }
+
+/* ---- Windows 自绘标题按钮 ---- */
+
+/* 只在 body.app-captions 下渲染（组件自己也会返回 null，这里是第二道保险）。
+   贴住窗口右上角、**不留外边距**：Win11 的标题按钮就是顶到角上的，留一圈缝隙会
+   立刻读出「这不是系统画的」。 */
+.caption-buttons {
+  position: absolute;
+  top: 0; right: 0;
+  display: flex;
+  z-index: 1; /* 压在 #topbar::before 的 scroll edge effect 之上 */
+}
+
+.caption-btn {
+  width: var(--caption-btn-w); height: var(--caption-btn-h);
+  display: flex; align-items: center; justify-content: center;
+  border: none; background: transparent; color: var(--text-dim);
+  cursor: default; /* 系统标题按钮不给手型 */
+  transition: background var(--dur) var(--ease-out), color var(--dur) var(--ease-out);
+}
+/* 10×10 的方角字形。Segoe MDL2 的 chrome 字形是直角细线，圆角的最小化横杠挨着
+   真·系统 UI 会显得像玩具。 */
+.caption-btn svg {
+  width: 24px; height: 24px;
+  stroke-width: 1.2;
+  stroke-linecap: butt;
+  stroke-linejoin: miter;
+}
+.caption-btn:hover, .caption-btn.hover { background: rgba(255, 255, 255, .08); color: var(--text); }
+.caption-btn:active, .caption-btn.press { background: rgba(255, 255, 255, .14); }
+/* 关闭键的红是 Win11 的既定语义，不是我们的强调色。 */
+.caption-btn.danger:hover { background: #c42b1c; color: #fff; }
+.caption-btn.danger:active { background: #b0271a; color: #fff; }
+/* 最大化那颗的 hover/press 由 Rust 经 __audiohubCaption 推进来（那块矩形是非客户区，
+   webview 收不到鼠标）——所以它只认 .hover/.press 类，:hover 对它永远不成立。 */
 
 /* ---- 在线点（呼吸） ---- */
 
@@ -1957,3 +2028,4 @@ body.is-tauri .gate-drag {
   color: var(--accent); font: inherit; text-align: left;
 }
 .linkish:hover { text-decoration: underline; }
+

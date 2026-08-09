@@ -12,7 +12,11 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 
+#[cfg(target_os = "macos")]
+mod mac_chrome;
 mod webui;
+#[cfg(target_os = "windows")]
+mod win_chrome;
 
 /// Must match audiohub_ipc::IPC_VERSION (contract: core/audiohub-ipc/src/lib.rs).
 ///
@@ -427,6 +431,29 @@ fn toggle_window_zoom(window: tauri::Window) -> Result<(), String> {
     if zoomed { window.unmaximize() } else { window.maximize() }.map_err(|e| e.to_string())
 }
 
+/// Windows caption buttons. macOS keeps its real traffic lights, so the
+/// frontend only renders these where the OS puts its controls on the trailing
+/// edge (`lib/platform.ts`); the commands themselves are platform-neutral.
+///
+/// Close means **hide**, matching `CloseRequested` below — the daemon keeps
+/// running and the tray is the way back. Routing it through an app command
+/// rather than `core:window:allow-close` keeps the no-capabilities-file
+/// property that `start_window_drag` explains.
+#[tauri::command]
+fn minimize_window(window: tauri::Window) -> Result<(), String> {
+    window.minimize().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn hide_window(window: tauri::Window) -> Result<(), String> {
+    window.hide().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn is_window_maximized(window: tauri::Window) -> Result<bool, String> {
+    window.is_maximized().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn set_tray_status(app: AppHandle, online: bool, port: Option<u16>) {
     if let Some(s) = app.try_state::<TrayStatus>() {
@@ -550,6 +577,9 @@ fn main() {
             show_main_window,
             start_window_drag,
             toggle_window_zoom,
+            minimize_window,
+            hide_window,
+            is_window_maximized,
             quit_ui,
             stop_daemon_and_quit,
             webui::get_webui_status,
@@ -559,15 +589,43 @@ fn main() {
             build_tray(app.handle())?;
             // 网页访问（plan §7.5）：设置里开着才会真的开监听端口，默认关闭。
             webui::init(app.handle());
+            // `.window()` rather than `Manager::get_window`: the latter is
+            // gated behind tauri's `unstable` feature, and the chrome helpers
+            // take a `Window` because `on_window_event` hands them one.
+            if let Some(_w) = app
+                .get_webview_window(MAIN_WINDOW)
+                .map(|w| AsRef::<tauri::Webview>::as_ref(&w).window())
+            {
+                #[cfg(target_os = "macos")]
+                mac_chrome::apply(&_w);
+                #[cfg(target_os = "windows")]
+                win_chrome::install(app.handle(), &_w);
+            }
             Ok(())
         })
         // Closing the window hides to the menu bar; only the tray quit items
         // really exit. Never destroying the window is also what keeps the app
         // alive after the last close.
         .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+            match event {
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+                // Re-seat the traffic lights. Leaving fullscreen (and a
+                // maximize/restore round trip) rebuilds the title bar at the
+                // system position; tao 0.35.3 only applies the inset from the
+                // host view's `drawRect:`, which a webview-covered view is not
+                // guaranteed to get again. The upstream fix landed in tao
+                // 0.36.0, past the version `tauri-runtime-wry` pins — see
+                // `mac_chrome`. `Resized` is the event both transitions
+                // produce, and re-applying is idempotent, so it is safe to run
+                // on every frame of a live resize.
+                #[cfg(target_os = "macos")]
+                WindowEvent::Resized(_) | WindowEvent::Focused(true) => {
+                    mac_chrome::apply(window);
+                }
+                _ => {}
             }
         })
         .build(tauri::generate_context!())

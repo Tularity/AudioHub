@@ -2029,3 +2029,129 @@ body.is-tauri .gate-drag {
 }
 .linkish:hover { text-decoration: underline; }
 
+/* ---- 快捷键：设置页的录制行 + ⌘/ 速查表 ---- */
+
+/* 键位一律**一个修饰键一枚胶囊**，不拼成 "Cmd+Shift+K" 一整串。整串是给配置文件
+   看的；用户在键盘上找的是「那几个键」，分开摆才对得上手指。 */
+.kbd {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 22px; height: 22px; padding: 0 6px;
+  border-radius: 6px;
+  background: #ffffff0f;
+  border: 1px solid rgba(255, 255, 255, .14);
+  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, .35);
+  font-family: var(--font); font-size: 12px; line-height: 1;
+  color: var(--text);
+}
+
+.sc-list { display: flex; flex-direction: column; }
+
+.sc-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+.sc-row:last-child { border-bottom: 0; }
+.sc-label { font-size: 13px; }
+
+.sc-slot { display: flex; align-items: center; gap: 6px; }
+
+/* 胶囊**就是控件**：点它进入录制，不另设一颗「修改」按钮。 */
+.sc-capsule {
+  display: inline-flex; align-items: center; gap: 4px;
+  min-width: 92px; min-height: 30px;
+  justify-content: center;
+  padding: 3px 8px;
+  border-radius: 8px;
+  background: #ffffff08;
+  border: 1px solid var(--line);
+  color: var(--text); font-family: inherit; font-size: 12px;
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease-out), background var(--dur) var(--ease-out);
+}
+.sc-capsule:hover { border-color: rgba(255, 255, 255, .22); }
+.sc-capsule.unset { color: var(--text-dim); }
+/* 录制态：强调色描边 + 呼吸。呼吸是这里唯一有理由的动画——它说的是「我在听」，
+   而不是装饰；prefers-reduced-motion 下由全局规则掐掉，描边仍在。 */
+.sc-capsule.recording {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  animation: scBreathe 1.6s var(--ease-out) infinite;
+}
+@keyframes scBreathe {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 40%, transparent); }
+  50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent); }
+}
+.sc-prompt, .sc-unset { color: var(--text-dim); }
+.kbd-pending { opacity: .55; }
+
+.sc-mini {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px;
+  border: 0; border-radius: 7px;
+  background: transparent; color: var(--text-dim);
+  cursor: pointer;
+  transition: color var(--dur) var(--ease-out), background var(--dur) var(--ease-out);
+}
+.sc-mini:hover { color: var(--text); background: #ffffff0f; }
+.sc-mini svg { width: 15px; height: 15px; }
+
+/* 一行说明位，四种内容轮流占用（录制提示 / 静默解释 / 错误 / 别名），高度固定
+   为一行——否则每次进出录制整张卡都会跳一下。 */
+.sc-note {
+  grid-column: 1 / -1;
+  margin: 0; min-height: 16px;
+  font-size: 12px; line-height: 1.35; color: var(--text-dim);
+}
+.sc-err { color: var(--danger); }
+.sc-alias { color: var(--text-dim); }
+
+.sc-conflict {
+  grid-column: 1 / -1;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  margin-top: 6px; padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+  font-size: 12px; line-height: 1.5;
+}
+.sc-conflict span { flex: 1 1 260px; }
+
+.sc-freed { margin: 8px 0 0; min-height: 16px; font-size: 12px; color: var(--accent); }
+.sc-actions { display: flex; gap: 8px; margin-top: 10px; }
+
+/* 速查表。盖住全屏，点空白关闭；它是纯只读的一屏，所以没有按钮，只有 Esc。 */
+.sheet-scrim {
+  position: fixed; inset: 0; z-index: 60;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, .45);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  animation: fadeIn .16s var(--ease-out);
+}
+@keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
+
+.sheet-card {
+  width: min(440px, calc(100vw - 64px));
+  max-height: calc(100vh - 96px); overflow-y: auto;
+  padding: 20px 22px;
+  border-radius: var(--radius);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  box-shadow: 0 24px 60px -20px rgba(0, 0, 0, .7);
+  animation: viewIn .22s var(--ease-out);
+}
+.sheet-title { margin: 0 0 12px; font-size: 15px; }
+.sheet-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 7px 0; border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+.sheet-row:last-of-type { border-bottom: 0; }
+.sheet-keys { display: flex; align-items: center; gap: 4px; flex: none; }
+.sheet-alias { display: flex; align-items: center; gap: 4px; opacity: .5; margin-left: 4px; }
+.sheet-unset { color: var(--text-dim); font-size: 12px; }
+.sheet-foot { margin: 12px 0 0; font-size: 12px; color: var(--text-dim); }

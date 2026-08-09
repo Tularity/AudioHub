@@ -1,4 +1,4 @@
-import { useEffect, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import { Watermark, NavPill, DaemonBadge, Overlay, VIEW_TITLE } from './components/Chrome';
 import { CaptionButtons } from './components/CaptionButtons';
 import { chromeMouseDown } from './lib/drag';
@@ -10,7 +10,10 @@ import { PairView } from './views/Pair';
 import { SettingsView } from './views/Settings';
 import { StatsView } from './views/Stats';
 import { OnboardingGate } from './views/Onboarding';
-import { actions, useStore } from './state/store';
+import { ShortcutSheet } from './components/ShortcutSheet';
+import { currentBindings, installShortcuts, subscribeShortcuts } from './lib/shortcutHost';
+import type { ShortcutActionId } from './lib/shortcuts';
+import { actions, getState, useStore } from './state/store';
 import { boot, gateVisible, syncTray } from './state/connection';
 import { t } from './i18n';
 
@@ -30,14 +33,41 @@ function useGateVisible(): boolean {
   return useSyncExternalStore(useStore.subscribe, gateVisible);
 }
 
+/**
+ * 快捷键动作 → 真正做的事。**只有这一处**把动作 id 兑现成行为：`shortcuts.ts` 只
+ * 认识 id 与组合键，不知道有路由这回事，所以那一层能当纯函数测。
+ */
+function useShortcutDispatch(setSheet: (fn: (v: boolean) => boolean) => void) {
+  return useCallback((action: ShortcutActionId) => {
+    switch (action) {
+      case 'view.peers': actions.navigate('peers'); break;
+      case 'view.pair': actions.navigate('pair'); break;
+      case 'view.stats': actions.navigate('stats'); break;
+      case 'view.settings': actions.navigate('settings'); break;
+      // 「返回」只在详情页成立。在别处让它也跳主面板会跟 ⌘1 重复，而一个在多数页面
+      // 上什么都不做的键，比一个含义随页面漂移的键好解释。
+      case 'nav.back':
+        if (getState().route.view === 'detail') actions.navigate('peers');
+        break;
+      case 'help.shortcuts': setSheet((v) => !v); break;
+    }
+  }, [setSheet]);
+}
+
 export function App() {
   const view = useStore((s) => s.route.view);
   const gate = useGateVisible();
   const View = VIEWS[view] || PeersView;
+  const [sheet, setSheet] = useState(false);
+  const dispatch = useShortcutDispatch(setSheet);
+  // 速查表读的是**当前生效**的绑定，所以设置页改完立刻反映，不用重开。
+  const bindings = useSyncExternalStore(subscribeShortcuts, currentBindings);
 
   useEffect(() => { boot(); }, []);
   // 托盘状态跟着连接走；syncTray 自带去重，重复调用无副作用。
   useEffect(() => useStore.subscribe(syncTray), []);
+  // 授权门挡着的时候不派发：那时候导航到别的页面只会得到一屏查不出任何东西的空视图。
+  useEffect(() => (gate ? undefined : installShortcuts(dispatch)), [gate, dispatch]);
 
   return (
     <>
@@ -74,6 +104,8 @@ export function App() {
       <div id="gate" data-testid="gate" hidden={!gate}>
         {gate ? <OnboardingGate /> : null}
       </div>
+
+      {sheet ? <ShortcutSheet bindings={bindings} onClose={() => setSheet(false)} /> : null}
 
       <Overlay />
       <ConfirmHost />

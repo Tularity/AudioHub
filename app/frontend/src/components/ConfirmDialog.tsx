@@ -7,6 +7,7 @@
 
 import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { t } from '../i18n';
+import { isEscape } from '../lib/shortcuts';
 
 export interface ConfirmOpts {
   title: string;
@@ -48,7 +49,7 @@ export function ConfirmHost() {
     if (!live) return;
     okRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { e.preventDefault(); done(false); }
+      if (isEscape(e)) { e.preventDefault(); done(false); }
     };
     document.addEventListener('keydown', onKey, true);
     return () => document.removeEventListener('keydown', onKey, true);

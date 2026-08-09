@@ -939,6 +939,56 @@ export const zhCN = {
   'settings.startup.unknown': '当前服务不提供开机自启接口（daemon 版本较旧）。',
   'settings.startup.noteOff': '关闭时，只有你自己打开 AudioHub 之后才会共享或使用音频设备。',
 
+  // ---- 快捷键（设置页区块 + 录制控件 + 速查表）----------------------------
+  // 落点在「启动」之后、「桥接」之前：它和启动行为同属「这个应用怎么用」，
+  // 再往后几块讲的都是音频/网络语义。
+  'settings.shortcuts.title': '快捷键',
+  'settings.shortcuts.desc': '点按键位胶囊，然后直接按下你想要的组合键。焦点在输入框里时快捷键一律让行，免得在端口框里打个 4 就跳页。',
+  'settings.shortcuts.localOnly': '快捷键存在这台机器的浏览器存储里，只影响你眼前这个界面：从别的机器用网页访问打开时，那边有它自己的一套。',
+  'settings.shortcuts.resetAll': '全部恢复默认',
+  'settings.shortcuts.resetAllDone': '快捷键已全部恢复默认。',
+
+  'shortcuts.action.peers': '主面板',
+  'shortcuts.action.pair': '配对向导',
+  'shortcuts.action.stats': '统计诊断',
+  'shortcuts.action.settings': '打开设置',
+  'shortcuts.action.back': '返回主面板',
+  'shortcuts.action.help': '快捷键速查表',
+
+  // Windows 侧的修饰键读法是文字（macOS 是 ⌘⌥⌃⇧ 符号，写死在代码里，因为那是
+  // Apple 自己的字形约定，不随语种变）。
+  'shortcuts.mod.ctrl': 'Ctrl',
+  'shortcuts.mod.alt': 'Alt',
+  'shortcuts.mod.shift': 'Shift',
+  'shortcuts.mod.win': 'Win',
+
+  'shortcuts.unset': '未设置',
+  'shortcuts.clear': '清除',
+  'shortcuts.clearOne': '清除「{action}」的快捷键',
+  'shortcuts.reset': '恢复默认',
+  'shortcuts.resetOne': '把「{action}」恢复为默认快捷键',
+  'shortcuts.alias': '{accel} 同样可用。',
+  'shortcuts.edit.aria': '{action}，当前快捷键 {accel}，按回车修改',
+  'shortcuts.edit.ariaUnset': '{action}，尚未设置快捷键，按回车修改',
+
+  'shortcuts.record.prompt': '按下组合键…',
+  'shortcuts.record.more': '…',
+  'shortcuts.record.hint': 'Esc 取消 · Delete 清除',
+  // 最糟的失败模式：⌘Q/⌘W/⌘M/⌘H 由 macOS 菜单先行接管，keydown 根本到不了页面，
+  // 控件于是毫无反应——看起来就像坏了。静默一小会儿就把这件事说出来。
+  'shortcuts.record.silent': '没有收到按键？⌘Q、⌘W、⌘M、⌘H 由 macOS 菜单接管，无法重新指派。',
+  'shortcuts.err.system': '{accel} 已被系统占用，按下它时这个界面收不到，请换一组。',
+  'shortcuts.err.noModifier': '需要至少一个修饰键（F1–F12 除外），否则会和页面上的输入抢键。',
+  'shortcuts.warn.webview': '{accel} 可能被内置的网页快捷键拦截，不一定每次生效。',
+  'shortcuts.conflict.desc': '{accel} 当前是「{action}」的快捷键。继续将解除它的绑定。',
+  'shortcuts.conflict.replace': '替换',
+  'shortcuts.conflict.freed': '「{action}」的快捷键已被解除，现在是未设置。',
+
+  'shortcuts.sheet.title': '快捷键',
+  'shortcuts.sheet.unset': '未设置',
+  'shortcuts.sheet.esc': '关闭浮层 / 取消',
+  'shortcuts.sheet.customize': '在「设置 › 快捷键」里可以改。',
+
   'settings.paths.title': '路径',
   'settings.paths.configDir': '配置目录',
   'settings.paths.configDirDesc': 'daemon 身份、配对表与 ipc.json 所在目录；可用环境变量 AUDIOHUB_CONFIG_DIR 覆盖。',

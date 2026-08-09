@@ -4,9 +4,10 @@
 // 等于把「那排开关为什么没了」的答案藏起来）。这里只放一面只读的镜子 + 去主面板
 // 的入口，避免同一个全局状态出现两个可点的控件、两处 pending 态。
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 import type { ReactNode } from 'react';
 import { Icon, RawIcon } from '../components/Icon';
+import { ShortcutRow } from '../components/ShortcutRow';
 import { ExtLink, Switch } from '../components/Controls';
 import { transportCells } from '../components/PeerTransport';
 import { PermissionRow } from '../components/PermissionRow';
@@ -16,6 +17,12 @@ import { openExternal } from '../lib/external';
 import { autostartView } from '../lib/autostart';
 import { bridgeCatalog, vendors } from '../lib/bridge';
 import { fmt, IS_MAC } from '../lib/fmt';
+import { getOverrides, setOverrides, subscribeShortcuts } from '../lib/shortcutHost';
+import {
+  ACTION_LABEL, PLATFORM, SHORTCUT_ACTIONS,
+  applyBinding, clearOverride, isCustomized, resolveBindings,
+} from '../lib/shortcuts';
+import type { ShortcutActionId } from '../lib/shortcuts';
 import {
   getWebUiStatus, inferredStatus, setWebUiSettings, webPortValid, webUiSupported,
   WEB_PORT_MAX, WEB_PORT_MIN,
@@ -299,6 +306,78 @@ function StartupCard({ writing, noSettings, onPush }: {
               ? t('settings.startup.orphaned', { reason: v.reason || t('common.dash') })
               : v.note === 'off' ? t('settings.startup.noteOff') : ''}
       </p>
+    </section>
+  );
+}
+
+/**
+ * 快捷键。
+ *
+ * 落点在「启动」之后：它和启动行为同属「这个应用怎么用」，后面几块讲的都是音频/
+ * 网络语义。
+ *
+ * 状态放在模块级的 `shortcutHost`，不进 `AppState`——它是**纯 UI 偏好，与 daemon
+ * 无关**，塞进 DaemonSettings 就等于改 IPC 契约，还会在下一次 settings 写入时被
+ * 一并发出去。这里只订阅它，改动一律经 setOverrides 回流，所以速查表（⌘/）和这一页
+ * 永远读的是同一份。
+ */
+function ShortcutsCard() {
+  const overrides = useSyncExternalStore(subscribeShortcuts, getOverrides);
+  const bindings = resolveBindings(overrides, PLATFORM);
+  // 冲突提示要说出「被抢走绑定的是谁」，而这一行本身随即变成「未设置」——不高亮
+  // 一下的话，用户看不到自己刚刚拿走了什么。
+  const [freed, setFreed] = useState<ShortcutActionId | null>(null);
+
+  function commit(action: ShortcutActionId, accel: string | null): void {
+    const taken = accel
+      ? SHORTCUT_ACTIONS.find((id) => id !== action && bindings[id] === accel) ?? null
+      : null;
+    setOverrides(applyBinding(overrides, action, accel, bindings));
+    setFreed(taken);
+  }
+
+  return (
+    <section className="card block" data-testid="settings-shortcuts">
+      <h3 className="block-title">{t('settings.shortcuts.title')}</h3>
+      <p className="muted">{t('settings.shortcuts.desc')}</p>
+
+      <div className="sc-list">
+        {SHORTCUT_ACTIONS.map((action) => (
+          <ShortcutRow
+            key={action}
+            action={action}
+            accel={bindings[action]}
+            customized={isCustomized(overrides, action)}
+            bindings={bindings}
+            onCommit={(accel) => commit(action, accel)}
+            onReset={() => { setOverrides(clearOverride(overrides, action)); setFreed(null); }}
+          />
+        ))}
+      </div>
+
+      <p className="sc-freed" aria-live="polite" data-testid="shortcuts-freed">
+        {freed ? t('shortcuts.conflict.freed', { action: t(ACTION_LABEL[freed]) }) : ''}
+      </p>
+
+      <div className="sc-actions">
+        <button
+          type="button"
+          className="btn small"
+          data-testid="shortcuts-reset-all"
+          onClick={() => {
+            setOverrides({});
+            setFreed(null);
+            toast(t('settings.shortcuts.resetAllDone'), 'ok');
+          }}
+        >
+          {t('settings.shortcuts.resetAll')}
+        </button>
+      </div>
+
+      {/* 网页访问模式下 UI 跑在别人的浏览器里，localStorage 按来源隔离——Tauri 内
+          与浏览器内不共享。这是可接受的（快捷键本就是本地体验），但不说清楚，
+          用户会以为「设置没保存」。 */}
+      <p className="muted small">{t('settings.shortcuts.localOnly')}</p>
     </section>
   );
 }
@@ -795,6 +874,7 @@ export function SettingsView() {
       </section>
 
       <StartupCard writing={writing} noSettings={noSettings} onPush={pushSetting} />
+      <ShortcutsCard />
 
       <WebAccessCard />
 

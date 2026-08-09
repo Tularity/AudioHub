@@ -74,7 +74,12 @@ enum
 #define kDevice_RingPeriodCount  32u
 #define kDevice_RingFrameCount   (kDevice_FramesPerPeriod * kDevice_RingPeriodCount)
 
-#define kVolume_MinDB (-64.0f)
+// -63.5 rather than a rounder -64 because that is the floor Apple's own built-in
+// output publishes. Together with the square-root taper below it makes our curve
+// point-for-point identical to the built-in device's, so a user who drags our
+// virtual speaker and then the built-in one feels no seam. This pair is what
+// kAudioLevelControlPropertyDecibelRange reports.
+#define kVolume_MinDB (-63.5f)
 #define kVolume_MaxDB (0.0f)
 
 // Ceiling on what the daemon may make kAudioDevicePropertyLatency say: four
@@ -1430,11 +1435,31 @@ static Float32 AudioHub_ClampScalar(Float32 inValue)
     return inValue;
 }
 
-// NullAudio-style squared taper between scalar and dB.
+// Apple-style square-root taper between slider position and dB:
+//
+//     dB = dbMin + sqrt(s) * (dbMax - dbMin)
+//     s  = ((dB - dbMin) / (dbMax - dbMin))^2
+//
+// This replaces the NullAudio sample's squared taper, whose curvature ran the
+// opposite way from every real device on the machine. At s = 0.375 the old form
+// reported -55.0 dB where the built-in output reports -24.61 dB: anything that
+// read our dB rather than our scalar was told a number 30 dB from what that
+// slider position means everywhere else. The squaring has not been deleted, it
+// has moved to the inverse below, which is exactly what flipping the curvature
+// means.
+//
+// This does NOT change loudness. The HAL never scales samples -- DoIOOperation
+// hands the buffer straight to the ring -- so volumeScalar is a value we publish
+// and forward to the daemon, never a gain we apply. Nor does it move the slider:
+// macOS displays, and the volume keys step, the SCALAR, in 1/16 increments. What
+// it does change is how many dB one key press is worth: 7.75 dB at the top and
+// 0.25 dB at the bottom becomes 2.02 dB at the top and 15.88 dB at the bottom --
+// to the digit what the built-in output does. The coarse steps move from the top
+// of the range, where they made the last few presses unusable, down to the
+// bottom where nobody is listening for a difference.
 static Float32 AudioHub_ScalarToDecibels(Float32 inScalar)
 {
-    Float32 theValue = AudioHub_ClampScalar(inScalar);
-    theValue *= theValue;
+    const Float32 theValue = sqrtf(AudioHub_ClampScalar(inScalar));
     return kVolume_MinDB + (theValue * (kVolume_MaxDB - kVolume_MinDB));
 }
 
@@ -1444,7 +1469,7 @@ static Float32 AudioHub_DecibelsToScalar(Float32 inDecibels)
     if(theValue < kVolume_MinDB) theValue = kVolume_MinDB;
     if(theValue > kVolume_MaxDB) theValue = kVolume_MaxDB;
     theValue = (theValue - kVolume_MinDB) / (kVolume_MaxDB - kVolume_MinDB);
-    return sqrtf(theValue);
+    return theValue * theValue;
 }
 
 // ---------------------------------------------------------------- entry points

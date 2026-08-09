@@ -829,4 +829,30 @@ Return Value:
     return pMiniport->PropertyHandlerGeneric(PropertyRequest);
 } // PropertyHandler_MicArrayTopology
 
+//=============================================================================
+NTSTATUS
+EventHandler_MicArrayTopology
+(
+    _In_ PPCEVENT_REQUEST      EventRequest
+)
+/*++
+
+Routine Description:
+
+  Redirects an event request to the miniport object, exactly as
+  PropertyHandler_MicArrayTopology does for properties.
+
+--*/
+{
+    PAGED_CODE();
+
+    ASSERT(EventRequest);
+
+    DPF_ENTER(("[EventHandler_MicArrayTopology]"));
+
+    PCMicArrayMiniportTopology pMiniport = (PCMicArrayMiniportTopology)EventRequest->MajorTarget;
+
+    return pMiniport->AhEventHandlerSlotVolume(EventRequest);
+} // EventHandler_MicArrayTopology
+
 #pragma code_seg()

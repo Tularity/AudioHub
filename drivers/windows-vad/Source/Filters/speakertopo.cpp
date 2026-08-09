@@ -115,4 +115,31 @@ Return Value:
     return pMiniport->PropertyHandlerGeneric(PropertyRequest);
 } // PropertyHandler_SpeakerTopology
 
+//=============================================================================
+NTSTATUS
+EventHandler_SpeakerTopology
+(
+    _In_ PPCEVENT_REQUEST      EventRequest
+)
+/*++
+
+Routine Description:
+
+  Redirects an event request to the miniport object, exactly as
+  PropertyHandler_SpeakerTopology does for properties. The cast is the same one
+  because MajorTarget is the same pointer portcls passes for both.
+
+--*/
+{
+    PAGED_CODE();
+
+    ASSERT(EventRequest);
+
+    DPF_ENTER(("[EventHandler_SpeakerTopology]"));
+
+    PCMiniportTopology pMiniport = (PCMiniportTopology)EventRequest->MajorTarget;
+
+    return pMiniport->AhEventHandlerSlotVolume(EventRequest);
+} // EventHandler_SpeakerTopology
+
 #pragma code_seg()

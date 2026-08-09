@@ -1590,6 +1590,144 @@ AhTopoLookup(
     return obj;
 }
 
+//-----------------------------------------------------------------------------
+// WaveRT buffer residency (the SECOND buffering stage)
+//-----------------------------------------------------------------------------
+
+//
+// WHY THIS EXISTS AS A SEPARATE NUMBER
+//
+// Windows puts TWO buffers in series where macOS has one: the WaveRT circular
+// buffer the audio engine shares with this driver, and the AudioHub ring the
+// driver shares with the daemon. spec-windows-driver.md:574 forbids reporting
+// them as one figure, and the reason is not tidiness -- the two stages fail
+// differently and are fixed differently. A single "12 ms" cannot say whether
+// the engine is handing us packets late (WaveRT deep, ring empty: nothing the
+// trim algorithm can do) or the daemon is draining slowly (WaveRT shallow, ring
+// deep: exactly what trim exists for). The daemon already measures the ring
+// stage from its own side (halbridge_win.rs spk_readable / mic_occupied); only
+// the driver can see this one.
+//
+// Written from UpdatePosition, which runs at DISPATCH_LEVEL inside the stream's
+// position spin lock, and read from an IOCTL at PASSIVE. That rules out a lock:
+// taking g_AhTopoLock-style protection here would put an IOCTL thread and the
+// DPC on the same lock at audio rate. Each field is a LONG written with
+// InterlockedExchange instead, so a reader sees whole fields; `updates` is
+// bumped last and is what makes a torn or stale SET detectable rather than
+// merely improbable.
+//
+
+typedef struct _AH_WAVERT_SNAPSHOT {
+    volatile LONG present;          // 1 while a stream holds this slot+direction
+    volatile LONG buffer_bytes;     // WaveRT buffer size
+    volatile LONG resident_bytes;   // queued in THIS stage right now
+    volatile LONG frame_bytes;      // so the reader can convert to frames/ms
+    volatile LONG sample_rate;
+    volatile LONG packet_bytes;     // 0 when the client is not packet-driven
+    volatile LONG updates;
+} AH_WAVERT_SNAPSHOT;
+
+static AH_WAVERT_SNAPSHOT g_AhWaveRt[AUDIOHUB_WIN_MAX_SLOTS][2];
+
+#pragma code_seg()
+VOID
+AhWaveRtPublish(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input,
+    _In_ ULONG BufferBytes,
+    _In_ ULONG ResidentBytes,
+    _In_ ULONG FrameBytes,
+    _In_ ULONG SampleRate,
+    _In_ ULONG PacketBytes
+    )
+{
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS)
+    {
+        return;
+    }
+
+    AH_WAVERT_SNAPSHOT *snap = &g_AhWaveRt[Slot][Input ? 1 : 0];
+
+    //
+    // Clamped rather than trusted. ResidentBytes is derived from two positions
+    // that a stream reset can move independently, and a wrapped subtraction
+    // would otherwise publish a residency of nearly 4 GB -- which the daemon
+    // would convert into a latency figure and act on.
+    //
+    if (BufferBytes != 0 && ResidentBytes > BufferBytes)
+    {
+        ResidentBytes = BufferBytes;
+    }
+
+    InterlockedExchange(&snap->buffer_bytes,   (LONG)BufferBytes);
+    InterlockedExchange(&snap->resident_bytes, (LONG)ResidentBytes);
+    InterlockedExchange(&snap->frame_bytes,    (LONG)FrameBytes);
+    InterlockedExchange(&snap->sample_rate,    (LONG)SampleRate);
+    InterlockedExchange(&snap->packet_bytes,   (LONG)PacketBytes);
+    InterlockedExchange(&snap->present,        1);
+    InterlockedIncrement(&snap->updates);
+}
+
+#pragma code_seg()
+VOID
+AhWaveRtClear(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input
+    )
+{
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS)
+    {
+        return;
+    }
+
+    AH_WAVERT_SNAPSHOT *snap = &g_AhWaveRt[Slot][Input ? 1 : 0];
+
+    //
+    // present goes to 0 and the numbers go with it. "No stream" must not read
+    // as "0 ms resident": one is a stage that does not exist right now and the
+    // other is a stage that is empty, and a daemon that confused them would
+    // report a healthy latency for a device nothing is playing to.
+    //
+    InterlockedExchange(&snap->present,        0);
+    InterlockedExchange(&snap->buffer_bytes,   0);
+    InterlockedExchange(&snap->resident_bytes, 0);
+    InterlockedExchange(&snap->packet_bytes,   0);
+    InterlockedIncrement(&snap->updates);
+}
+
+#pragma code_seg()
+BOOLEAN
+AhWaveRtSample(
+    _In_ ULONG Slot,
+    _In_ BOOLEAN Input,
+    _Out_ ULONG *BufferBytes,
+    _Out_ ULONG *ResidentBytes,
+    _Out_ ULONG *FrameBytes,
+    _Out_ ULONG *SampleRate,
+    _Out_ ULONG *PacketBytes,
+    _Out_ ULONG *Updates
+    )
+{
+    *BufferBytes = *ResidentBytes = *FrameBytes = 0;
+    *SampleRate  = *PacketBytes   = *Updates    = 0;
+
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS)
+    {
+        return FALSE;
+    }
+
+    AH_WAVERT_SNAPSHOT *snap = &g_AhWaveRt[Slot][Input ? 1 : 0];
+
+    *Updates       = (ULONG)InterlockedCompareExchange(&snap->updates, 0, 0);
+    *BufferBytes   = (ULONG)InterlockedCompareExchange(&snap->buffer_bytes, 0, 0);
+    *ResidentBytes = (ULONG)InterlockedCompareExchange(&snap->resident_bytes, 0, 0);
+    *FrameBytes    = (ULONG)InterlockedCompareExchange(&snap->frame_bytes, 0, 0);
+    *SampleRate    = (ULONG)InterlockedCompareExchange(&snap->sample_rate, 0, 0);
+    *PacketBytes   = (ULONG)InterlockedCompareExchange(&snap->packet_bytes, 0, 0);
+
+    return InterlockedCompareExchange(&snap->present, 0, 0) != 0;
+}
+
 #pragma code_seg("PAGE")
 VOID
 AhPerPeerDriverInit(VOID)
@@ -1598,6 +1736,7 @@ AhPerPeerDriverInit(VOID)
 
     RtlZeroMemory(g_AhSlots, sizeof(g_AhSlots));
     RtlZeroMemory(g_AhTopoObj, sizeof(g_AhTopoObj));
+    RtlZeroMemory((PVOID)g_AhWaveRt, sizeof(g_AhWaveRt));
     KeInitializeSpinLock(&g_AhTopoLock);
     KeInitializeMutex(&g_AhSlotLock, 0);
     g_AhAdapter = NULL;

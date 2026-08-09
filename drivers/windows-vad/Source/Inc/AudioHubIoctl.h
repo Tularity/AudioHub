@@ -192,6 +192,11 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 // presentation position it reports for a slot's endpoint. See AH_LATENCY_REQUEST.
 //
 #define IOCTL_AUDIOHUB_LATENCY      CTL_CODE(AH_DEVICE_TYPE, 0x807, METHOD_BUFFERED, AH_ACCESS)
+//
+// How deep the WAVERT stage is right now. Read-only telemetry; see
+// AH_STREAMSTAT_REQUEST for why it is a separate number from the ring.
+//
+#define IOCTL_AUDIOHUB_STREAMSTAT   CTL_CODE(AH_DEVICE_TYPE, 0x808, METHOD_BUFFERED, AH_ACCESS)
 
 //=============================================================================
 // Status codes carried INSIDE the reply payload
@@ -334,6 +339,36 @@ typedef struct _AH_HELLO_REPLY {
 //=============================================================================
 // BIND
 //=============================================================================
+#define AH_CAP_STREAMSTAT   0x8u    // IOCTL_AUDIOHUB_STREAMSTAT works, i.e. the
+                                    // driver can report the WaveRT stage's
+                                    // residency. Purely additive telemetry, so
+                                    // it is a CAPABILITY BIT and not a protocol
+                                    // bump, by the same rule spelled out for
+                                    // AH_CAP_LATENCY above: an older driver
+                                    // paired with a newer daemon loses a
+                                    // measurement and nothing else, and the
+                                    // daemon can SAY the stage is unknown
+                                    // instead of pretending it is empty.
+#define AH_CAP_VOLUMEEVENT  0x10u   // the topology nodes declare
+                                    // KSEVENT_CONTROL_CHANGE, so a level pushed
+                                    // in with IOCTL_AUDIOHUB_NOTIFY actually
+                                    // reaches the Windows audio engine and
+                                    // IAudioEndpointVolume follows it.
+                                    //
+                                    // A BIT AND NOT A BUMP, but only just.
+                                    // Every driver before this one raised that
+                                    // event into an empty list -- the nodes
+                                    // carried properties and no events, so no
+                                    // client could subscribe -- which made the
+                                    // whole driver->engine half of volume sync
+                                    // silently dead. That is exactly the shape
+                                    // the bumps above exist for. It is a bit
+                                    // instead because the daemon can DETECT it
+                                    // here and degrade to "this endpoint will
+                                    // not follow the peer's slider", whereas
+                                    // the v3/v4/v5 failures were not
+                                    // expressible at all without refusing to
+                                    // bind.
 
 #define AH_BIND_CLEAR   0u
 #define AH_BIND_SET     1u
@@ -672,6 +707,54 @@ typedef struct _AH_LATENCY_REPLY {
 #define AH_LATENCY_MAX_FRAMES   (48000u * 4u)
 
 //=============================================================================
+// STREAMSTAT (IOCTL_AUDIOHUB_STREAMSTAT)
+//
+// WHY THIS IS A SEPARATE NUMBER FROM THE RING
+//
+// Windows puts two buffers in series where macOS has one: the WaveRT circular
+// buffer shared with the audio engine, and the AudioHub ring shared with the
+// daemon. spec-windows-driver.md:574 requires the two residencies to be
+// reported separately and forbids merging them, because they fail differently:
+// a deep WaveRT stage with an empty ring is the ENGINE handing us packets late
+// and there is nothing trim can do about it, while a shallow WaveRT stage with
+// a deep ring is precisely what trim exists to fix. One combined figure cannot
+// tell an operator which of those is happening.
+//
+// The daemon can already measure the ring stage from its own side (both indices
+// are in shared memory). This stage is visible ONLY here.
+//=============================================================================
+
+#define AH_STATFLAG_INPUT       0x1u    // ask about the virtual MICROPHONE
+#define AH_STATFLAG_PRESENT     0x1u    // (reply) a stream holds this endpoint
+
+typedef struct _AH_STREAMSTAT_REQUEST {
+    UINT64 session_id;
+    UINT32 slot;
+    UINT32 flags;           // AH_STATFLAG_INPUT
+} AH_STREAMSTAT_REQUEST;
+
+typedef struct _AH_STREAMSTAT_REPLY {
+    UINT32 status;
+    UINT32 flags;           // AH_STATFLAG_PRESENT
+    UINT32 buffer_bytes;    // WaveRT buffer size
+    UINT32 resident_bytes;  // queued in the WaveRT stage at the last update
+    UINT32 frame_bytes;     // nBlockAlign; the two directions DIFFER
+    UINT32 sample_rate;
+    UINT32 packet_bytes;    // 0 when the client is not packet-driven
+    UINT32 updates;         // bumped on every publish, so a reader can tell a
+                            // stale sample from a fresh one. Without it a
+                            // stream that stopped updating and a stream that is
+                            // steady report the same numbers forever.
+} AH_STREAMSTAT_REPLY;
+
+//
+// AH_STATFLAG_PRESENT CLEAR means THIS STAGE DOES NOT EXIST RIGHT NOW, which is
+// a different claim from "it is empty". Every other field is zero in that case,
+// and a reader that treats the zero as a measurement will publish a latency
+// figure for a device nothing is playing to.
+//
+
+//=============================================================================
 // Layout assertions. These are the whole point of the file: the Rust mirror
 // asserts the same numbers, and test/tests/halwire_win.rs asserts both against
 // a third, independently transcribed copy.
@@ -690,6 +773,8 @@ C_ASSERT(sizeof(AH_NOTIFY_REQUEST) == 24);
 C_ASSERT(sizeof(AH_NOTIFY_REPLY) == 8);
 C_ASSERT(sizeof(AH_LATENCY_REQUEST) == 24);
 C_ASSERT(sizeof(AH_LATENCY_REPLY) == 8);
+C_ASSERT(sizeof(AH_STREAMSTAT_REQUEST) == 16);
+C_ASSERT(sizeof(AH_STREAMSTAT_REPLY) == 32);
 
 C_ASSERT(AH_FIELD_OFFSET(AH_MAP_REQUEST, wake_event) == 8);
 C_ASSERT(AH_FIELD_OFFSET(AH_MAP_REQUEST, protocol_version) == 16);
@@ -699,6 +784,9 @@ C_ASSERT(AH_FIELD_OFFSET(AH_NOTIFY_REQUEST, slot) == 8);
 C_ASSERT(AH_FIELD_OFFSET(AH_NOTIFY_REQUEST, scalar_q16) == 20);
 C_ASSERT(AH_FIELD_OFFSET(AH_LATENCY_REQUEST, slot) == 8);
 C_ASSERT(AH_FIELD_OFFSET(AH_LATENCY_REQUEST, frames) == 20);
+C_ASSERT(AH_FIELD_OFFSET(AH_STREAMSTAT_REQUEST, flags) == 12);
+C_ASSERT(AH_FIELD_OFFSET(AH_STREAMSTAT_REPLY, resident_bytes) == 12);
+C_ASSERT(AH_FIELD_OFFSET(AH_STREAMSTAT_REPLY, updates) == 28);
 
 C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REPLY, stage) == 16);
 C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REPLY, nt_status) == 20);
@@ -731,5 +819,6 @@ C_ASSERT(IOCTL_AUDIOHUB_CONTROL_PEND == 0x0022E010);
 C_ASSERT(IOCTL_AUDIOHUB_MAP_RINGS    == 0x0022E014);
 C_ASSERT(IOCTL_AUDIOHUB_NOTIFY       == 0x0022E018);
 C_ASSERT(IOCTL_AUDIOHUB_LATENCY      == 0x0022E01C);
+C_ASSERT(IOCTL_AUDIOHUB_STREAMSTAT   == 0x0022E020);
 
 #endif // _AUDIOHUB_IOCTL_H_

@@ -62,6 +62,25 @@ class CMiniportTopologySimpleAudioSample
     //
     NTSTATUS                    AhPropertyHandlerSlotVolume(_In_ PPCPROPERTY_REQUEST PropertyRequest);
 
+    //
+    // KSEVENTSETID_AudioControlChange / KSEVENT_CONTROL_CHANGE on the volume
+    // and mute nodes.
+    //
+    // WITHOUT THIS THE ENTIRE DRIVER->ENGINE VOLUME DIRECTION IS DEAD, and it
+    // is dead SILENTLY. GenerateEventList walks the port's event list; entries
+    // only ever land on that list when a client ENABLES an event; a client can
+    // only enable an event the node's automation table declares. The nodes here
+    // were built with DEFINE_PCAUTOMATION_TABLE_PROP -- properties, no events --
+    // so no client could ever register, the list was always empty, and
+    // AhTopoRaiseVolumeEvent returned having notified nobody.
+    //
+    // Measured on win-audio-debug before this existed: IOCTL_AUDIOHUB_NOTIFY
+    // reported applied=1 for every level in a 20-point sweep (the driver's own
+    // store really was moving) while IAudioEndpointVolume::GetMasterVolumeLevel
+    // stayed at 0 dB throughout, with and without a live stream on the endpoint.
+    //
+    NTSTATUS                    AhEventHandlerSlotVolume(_In_ PPCEVENT_REQUEST EventRequest);
+
     CMiniportTopologySimpleAudioSample(
         _In_        PCFILTER_DESCRIPTOR    *FilterDesc,
         _In_        USHORT                  DeviceMaxChannels

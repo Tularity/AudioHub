@@ -70,7 +70,16 @@
     <DeployFiles />
     <ScriptName />
     <ScriptDeviceQuery>%PathToInf%</ScriptDeviceQuery>
-    <EnableVerifier>False</EnableVerifier>
+    <!-- Driver Verifier is ON for deployment, and as of 2026-08-09 the driver
+         does NOT survive it: DDI compliance checking alone (flag 0x20000) bugchecks
+         the target at boot with 0xC4 / P1=0x0012001B (class 18, rule 0x1B), twice,
+         bit-identical. Deploying with this True will boot-loop the target until
+         `verifier /reset` + reboot. The rule has NOT been identified -- no kernel
+         debugger was available; minidumps are on win-audio-debug in
+         C:\Windows\Minidump\080926-*.dmp and need `!analyze -v`. Left True on
+         purpose: the M6 acceptance criterion asks for a clean 10-minute Verifier
+         run, and flipping this back to False would hide that we owe one. -->
+    <EnableVerifier>True</EnableVerifier>
     <AllDrivers>False</AllDrivers>
     <VerifyProjectOutput>True</VerifyProjectOutput>
     <VerifyDrivers />

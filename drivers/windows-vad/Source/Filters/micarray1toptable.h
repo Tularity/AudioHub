@@ -111,7 +111,41 @@ PCPROPERTY_ITEM MicArray1PropertiesVolume[] =
     }
 };
 
-DEFINE_PCAUTOMATION_TABLE_PROP(AutomationMicArray1Volume, MicArray1PropertiesVolume);
+
+//
+// THE EVENT HALF OF THE VOLUME NODE.
+//
+// A node whose automation table carries properties only can never notify
+// anybody: KsGenerateEvent only reaches clients that ENABLED the event, and a
+// client can only enable an event the node declares. Both nodes below were
+// PROP-only, so AhTopoRaiseVolumeEvent -- the whole driver->engine direction of
+// volume sync -- raised events into an empty list from the day it was written.
+// See CMiniportTopologySimpleAudioSample::AhEventHandlerSlotVolume for the
+// measurement that found it.
+//
+static
+PCEVENT_ITEM MicArray1VolumeEvents[] =
+{
+    {
+        &KSEVENTSETID_AudioControlChange,
+        KSEVENT_CONTROL_CHANGE,
+        KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT,
+        EventHandler_MicArrayTopology
+    }
+};
+
+static
+PCEVENT_ITEM MicArray1MuteEvents[] =
+{
+    {
+        &KSEVENTSETID_AudioControlChange,
+        KSEVENT_CONTROL_CHANGE,
+        KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT,
+        EventHandler_MicArrayTopology
+    }
+};
+
+DEFINE_PCAUTOMATION_TABLE_PROP_EVENT(AutomationMicArray1Volume, MicArray1PropertiesVolume, MicArray1VolumeEvents);
 
 //=============================================================================
 static
@@ -125,7 +159,7 @@ PCPROPERTY_ITEM MicArray1PropertiesMute[] =
   }
 };
 
-DEFINE_PCAUTOMATION_TABLE_PROP(AutomationMicArray1Mute, MicArray1PropertiesMute);
+DEFINE_PCAUTOMATION_TABLE_PROP_EVENT(AutomationMicArray1Mute, MicArray1PropertiesMute, MicArray1MuteEvents);
 
 //=============================================================================
 static

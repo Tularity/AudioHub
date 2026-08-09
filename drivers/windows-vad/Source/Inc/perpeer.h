@@ -486,4 +486,20 @@ PVOID AhTopoLookup(_In_ ULONG Slot, _In_ BOOLEAN Input);
 _IRQL_requires_max_(PASSIVE_LEVEL)
 VOID  AhTopoRaiseVolumeEvent(_In_ ULONG Slot, _In_ BOOLEAN Input);
 
+//
+// WaveRT buffer residency -- the second of the two buffering stages, reported
+// SEPARATELY from the AudioHub ring per spec-windows-driver.md:574. Publish is
+// called from the stream's DISPATCH_LEVEL position update; Sample is called
+// from IOCTL_AUDIOHUB_STREAMSTAT at PASSIVE. Sample returns FALSE when no
+// stream holds that slot+direction, which is NOT the same as zero residency.
+//
+VOID    AhWaveRtPublish(_In_ ULONG Slot, _In_ BOOLEAN Input, _In_ ULONG BufferBytes,
+                        _In_ ULONG ResidentBytes, _In_ ULONG FrameBytes,
+                        _In_ ULONG SampleRate, _In_ ULONG PacketBytes);
+VOID    AhWaveRtClear(_In_ ULONG Slot, _In_ BOOLEAN Input);
+BOOLEAN AhWaveRtSample(_In_ ULONG Slot, _In_ BOOLEAN Input, _Out_ ULONG *BufferBytes,
+                       _Out_ ULONG *ResidentBytes, _Out_ ULONG *FrameBytes,
+                       _Out_ ULONG *SampleRate, _Out_ ULONG *PacketBytes,
+                       _Out_ ULONG *Updates);
+
 #endif // _AUDIOHUB_PERPEER_H_

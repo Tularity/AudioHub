@@ -212,6 +212,9 @@ pub mod wire {
     /// driver cannot know this (it spans a network and another machine's sound
     /// card); the daemon measures the chain stage by stage and sends it here.
     pub const IOCTL_LATENCY: u32 = ah_ioctl(0x807);
+    /// `IOCTL_AUDIOHUB_STREAMSTAT` (`AudioHubIoctl.h`): how deep the WaveRT
+    /// stage is. Read-only telemetry.
+    pub const IOCTL_STREAMSTAT: u32 = ah_ioctl(0x808);
 
     // The two new codes as LITERALS, transcribed from the C_ASSERTs at the
     // bottom of AudioHubIoctl.h. `ah_ioctl` is a macro on both sides, so this
@@ -220,6 +223,7 @@ pub mod wire {
     const _: () = assert!(IOCTL_MAP_RINGS == 0x0022_E014);
     const _: () = assert!(IOCTL_NOTIFY == 0x0022_E018);
     const _: () = assert!(IOCTL_LATENCY == 0x0022_E01C);
+    const _: () = assert!(IOCTL_STREAMSTAT == 0x0022_E020);
 
     // -- status codes -------------------------------------------------------
 
@@ -380,6 +384,8 @@ pub mod wire {
     pub const NOTIFY_REPLY_BYTES: usize = 8;
     pub const LATENCY_REQUEST_BYTES: usize = 24;
     pub const LATENCY_REPLY_BYTES: usize = 8;
+    pub const STREAMSTAT_REQUEST_BYTES: usize = 16;
+    pub const STREAMSTAT_REPLY_BYTES: usize = 32;
 
     const _: () = assert!(QUERY_SLOTS_REPLY_BYTES == 848);
     const _: () = assert!(MAP_REPLY_BYTES == 296);
@@ -413,6 +419,32 @@ pub mod wire {
     /// endpoint disappears from the system, as the price of an addition whose
     /// absence costs nothing that today does not already cost.
     pub const CAP_LATENCY: u32 = 0x4;
+
+    /// `AH_CAP_STREAMSTAT`: [`IOCTL_STREAMSTAT`] works, so the WaveRT stage's
+    /// residency is readable.
+    ///
+    /// Absence is REPORTABLE, not assumable. A driver without this bit leaves
+    /// the second buffering stage unmeasured, and `spec-windows-driver.md:574`
+    /// forbids folding it into the ring's figure — so the daemon says "unknown"
+    /// rather than quietly presenting the ring depth as the whole latency.
+    pub const CAP_STREAMSTAT: u32 = 0x8;
+
+    /// `AH_CAP_VOLUMEEVENT`: the driver's topology nodes declare
+    /// `KSEVENT_CONTROL_CHANGE`, so a level pushed in with [`IOCTL_NOTIFY`]
+    /// actually reaches the Windows audio engine.
+    ///
+    /// Every driver built before 2026-08-09 raised that event into an empty
+    /// list: the volume and mute nodes were built with
+    /// `DEFINE_PCAUTOMATION_TABLE_PROP`, which declares properties and no
+    /// events, and a client can only subscribe to an event the node declares.
+    /// Measured on win-audio-debug: a 20-point sweep of `IOCTL_NOTIFY` reported
+    /// `applied=1` every time — the driver's own store really did move — while
+    /// `IAudioEndpointVolume::GetMasterVolumeLevel` stayed at 0 dB throughout,
+    /// with and without a live stream on the endpoint.
+    ///
+    /// With the bit CLEAR, peer -> this machine volume sync does not work and
+    /// the daemon must say so instead of believing its own `applied` flag.
+    pub const CAP_VOLUMEEVENT: u32 = 0x10;
 
     // -- helpers ------------------------------------------------------------
 
@@ -990,6 +1022,106 @@ pub mod wire {
             return None;
         }
         Some(NotifyReply { status: get_u32(b, 0), applied: get_u32(b, 4) })
+    }
+
+    /// `AH_STATFLAG_INPUT` on the way in, `AH_STATFLAG_PRESENT` on the way
+    /// back. Same bit value, different meanings, in two different structs —
+    /// transcribed as two names so neither reads as the other.
+    pub const STATFLAG_INPUT: u32 = 0x1;
+    pub const STATFLAG_PRESENT: u32 = 0x1;
+
+    pub fn encode_streamstat_request(
+        session_id: u64,
+        slot: u8,
+        input: bool,
+    ) -> [u8; STREAMSTAT_REQUEST_BYTES] {
+        let mut b = [0u8; STREAMSTAT_REQUEST_BYTES];
+        put_u64(&mut b, 0, session_id);
+        put_u32(&mut b, 8, slot as u32);
+        put_u32(&mut b, 12, if input { STATFLAG_INPUT } else { 0 });
+        b
+    }
+
+    /// One sample of the WAVERT stage — the buffer between the Windows audio
+    /// engine and the driver.
+    ///
+    /// This is NOT the AudioHub ring. The ring is measured by
+    /// [`rings::WinRings::spk_readable`] / [`rings::WinRings::mic_occupied`]
+    /// from shared memory on this side; this one is only visible inside the
+    /// driver. `spec-windows-driver.md:574` requires the two to be reported
+    /// separately, because a deep WaveRT stage and a deep ring have different
+    /// causes and different fixes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct StreamStat {
+        pub status: u32,
+        pub flags: u32,
+        pub buffer_bytes: u32,
+        pub resident_bytes: u32,
+        /// `nBlockAlign`. The two directions DIFFER (16-bit stereo render,
+        /// 32-bit stereo capture), so a caller must use this rather than
+        /// assume one frame size for the endpoint pair.
+        pub frame_bytes: u32,
+        pub sample_rate: u32,
+        pub packet_bytes: u32,
+        /// Bumped by the driver on every publish. Two reads with the same
+        /// `updates` are the SAME sample, however much wall time separated
+        /// them — without it a stream that stopped updating is
+        /// indistinguishable from one that is perfectly steady.
+        pub updates: u32,
+    }
+
+    impl StreamStat {
+        /// `false` means THIS STAGE DOES NOT EXIST right now (no stream on the
+        /// endpoint), which is not the same claim as "it is empty". Callers
+        /// must not convert a `false` into 0 ms.
+        pub fn present(&self) -> bool {
+            self.flags & STATFLAG_PRESENT != 0
+        }
+
+        /// Residency in frames, or `None` when the stage is absent or the
+        /// driver reported a frame size of zero. Deliberately not saturating to
+        /// 0: a division that cannot be performed has no answer.
+        pub fn resident_frames(&self) -> Option<u32> {
+            if !self.present() || self.frame_bytes == 0 {
+                return None;
+            }
+            Some(self.resident_bytes / self.frame_bytes)
+        }
+
+        /// Residency in milliseconds, `None` on the same terms.
+        pub fn resident_ms(&self) -> Option<f32> {
+            let frames = self.resident_frames()?;
+            if self.sample_rate == 0 {
+                return None;
+            }
+            Some(frames as f32 * 1000.0 / self.sample_rate as f32)
+        }
+
+        /// Capacity of this stage in frames, `None` on the same terms. Reported
+        /// alongside the residency for the same reason the ring reports its
+        /// capacity: "480 frames deep" means nothing without it.
+        pub fn capacity_frames(&self) -> Option<u32> {
+            if !self.present() || self.frame_bytes == 0 {
+                return None;
+            }
+            Some(self.buffer_bytes / self.frame_bytes)
+        }
+    }
+
+    pub fn decode_streamstat_reply(b: &[u8]) -> Option<StreamStat> {
+        if b.len() != STREAMSTAT_REPLY_BYTES {
+            return None;
+        }
+        Some(StreamStat {
+            status: get_u32(b, 0),
+            flags: get_u32(b, 4),
+            buffer_bytes: get_u32(b, 8),
+            resident_bytes: get_u32(b, 12),
+            frame_bytes: get_u32(b, 16),
+            sample_rate: get_u32(b, 20),
+            packet_bytes: get_u32(b, 24),
+            updates: get_u32(b, 28),
+        })
     }
 
     pub const LATENCYFLAG_INPUT: u32 = 0x1;
@@ -3372,6 +3504,55 @@ pub mod session {
                 ));
             }
             Ok(rep.applied())
+        }
+
+        /// [`wire::CAP_STREAMSTAT`]: this driver can report the WaveRT stage.
+        pub fn has_streamstat(&self) -> bool {
+            self.caps & wire::CAP_STREAMSTAT != 0
+        }
+
+        /// [`wire::CAP_VOLUMEEVENT`]: a level pushed with [`Self::notify`]
+        /// actually reaches the Windows audio engine. Clear on every driver
+        /// built before 2026-08-09.
+        pub fn has_volume_event(&self) -> bool {
+            self.caps & wire::CAP_VOLUMEEVENT != 0
+        }
+
+        /// `IOCTL_STREAMSTAT`: how deep the WAVERT stage is for one endpoint.
+        ///
+        /// SEPARATE FROM THE RING ON PURPOSE. The ring's depth is readable from
+        /// this side out of shared memory; this stage sits between the Windows
+        /// audio engine and the driver and is visible nowhere else.
+        /// `spec-windows-driver.md:574` forbids reporting one number for both.
+        ///
+        /// A driver without [`wire::CAP_STREAMSTAT`] returns `Ok(None)` rather
+        /// than an error: an unmeasurable stage is a fact to report, not a
+        /// failure of the call.
+        pub fn stream_stat(&self, slot: u8, input: bool) -> Result<Option<wire::StreamStat>> {
+            if !self.has_streamstat() {
+                return Ok(None);
+            }
+            let req = wire::encode_streamstat_request(self.session_id, slot, input);
+            let mut out = [0u8; wire::STREAMSTAT_REPLY_BYTES];
+            let n = transport::ioctl(
+                &self.handle,
+                wire::IOCTL_STREAMSTAT,
+                &req,
+                &mut out,
+                IOCTL_TIMEOUT_MS,
+            )?;
+            if n as usize != wire::STREAMSTAT_REPLY_BYTES {
+                return Err(anyhow!("the streamstat reply was {n} bytes"));
+            }
+            let rep = wire::decode_streamstat_reply(&out)
+                .ok_or_else(|| anyhow!("undecodable streamstat reply"))?;
+            if rep.status != wire::STATUS_OK {
+                return Err(anyhow!(
+                    "the driver refused the streamstat query: {}",
+                    wire::status_label(rep.status)
+                ));
+            }
+            Ok(Some(rep))
         }
 
         /// [`wire::CAP_LATENCY`]: this driver understands [`wire::IOCTL_LATENCY`].

@@ -821,7 +821,15 @@ AhCtlDeviceControl(
         // and the daemon can SAY so instead of silently believing it declared
         // something. See AH_CAP_LATENCY in AudioHubIoctl.h.
         //
-        rep->caps             = AH_CAP_DATAPLANE | AH_CAP_VOLUME | AH_CAP_LATENCY;
+        //
+        // AH_CAP_STREAMSTAT and AH_CAP_VOLUMEEVENT are likewise compile-time
+        // facts about this image: the handler is below, and the topology tables
+        // in speakertoptable.h / micarray1toptable.h now carry PCEVENT_ITEMs. A
+        // daemon reads the bits rather than the version because the previous
+        // image is otherwise indistinguishable from this one on the wire.
+        //
+        rep->caps             = AH_CAP_DATAPLANE | AH_CAP_VOLUME | AH_CAP_LATENCY
+                              | AH_CAP_STREAMSTAT | AH_CAP_VOLUMEEVENT;
         rep->sample_rate      = AUDIOHUB_RING_SAMPLE_RATE;
         rep->out_channels     = AUDIOHUB_SPK_CHANNELS;
         rep->in_channels      = AUDIOHUB_MIC_CHANNELS;
@@ -1111,6 +1119,55 @@ AhCtlDeviceControl(
 
         rep->status  = AH_STATUS_OK;
         rep->applied = changed ? 1u : 0u;
+        return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+    }
+
+    case IOCTL_AUDIOHUB_STREAMSTAT:
+    {
+        //
+        // Read-only. The numbers come from a snapshot the stream publishes at
+        // DISPATCH_LEVEL; nothing here takes a lock, so an IOCTL at audio rate
+        // cannot contend with the DPC that produces the audio.
+        //
+        if (inLen != sizeof(AH_STREAMSTAT_REQUEST) || outLen != sizeof(AH_STREAMSTAT_REPLY) || buffer == NULL)
+        {
+            return AhCompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
+        }
+        if (!g_SessionGreeted)
+        {
+            return AhCompleteIrp(Irp, STATUS_INVALID_DEVICE_STATE, 0);
+        }
+
+        AH_STREAMSTAT_REQUEST req = *(AH_STREAMSTAT_REQUEST *)buffer;
+        AH_STREAMSTAT_REPLY  *rep = (AH_STREAMSTAT_REPLY *)buffer;
+
+        RtlZeroMemory(rep, sizeof(*rep));
+
+        if (req.session_id != g_SessionId)
+        {
+            rep->status = AH_STATUS_STALE_SESSION;
+            return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+        }
+        if (req.slot >= AUDIOHUB_WIN_MAX_SLOTS)
+        {
+            rep->status = AH_STATUS_BAD_ARGUMENT;
+            return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+        }
+
+        BOOLEAN input = (req.flags & AH_STATFLAG_INPUT) ? TRUE : FALSE;
+        ULONG   bufferBytes, residentBytes, frameBytes, rate, packetBytes, updates;
+
+        BOOLEAN present = AhWaveRtSample(req.slot, input, &bufferBytes, &residentBytes,
+                                         &frameBytes, &rate, &packetBytes, &updates);
+
+        rep->status         = AH_STATUS_OK;
+        rep->flags          = present ? AH_STATFLAG_PRESENT : 0u;
+        rep->buffer_bytes   = bufferBytes;
+        rep->resident_bytes = residentBytes;
+        rep->frame_bytes    = frameBytes;
+        rep->sample_rate    = rate;
+        rep->packet_bytes   = packetBytes;
+        rep->updates        = updates;
         return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
     }
 

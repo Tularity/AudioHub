@@ -223,6 +223,65 @@ Routine Description:
 
 //=============================================================================
 #pragma code_seg("PAGE")
+NTSTATUS
+CMiniportTopologySimpleAudioSample::AhEventHandlerSlotVolume
+(
+    _In_ PPCEVENT_REQUEST EventRequest
+)
+/*++
+
+Routine Description:
+
+    Lets a client (the Windows audio engine, and anything else holding
+    IAudioEndpointVolume) subscribe to KSEVENT_CONTROL_CHANGE on this
+    endpoint's volume and mute nodes.
+
+    Three verbs arrive here and only one of them does work:
+
+      SUPPORT  portcls asking whether the event exists at all. Answering
+               STATUS_SUCCESS is what makes the node's BASICSUPPORT report it.
+      ADD      a client is enabling the event. The entry must be put on the
+               port's list -- GenerateEventList walks that list and nothing
+               else, so an ADD we drop is an event that is raised into a void.
+      REMOVE   portcls unlinks the entry itself. Doing it here as well would
+               remove it twice.
+
+--*/
+{
+    PAGED_CODE();
+
+    ASSERT(EventRequest);
+
+    if (EventRequest->Verb & PCEVENT_VERB_SUPPORT)
+    {
+        return STATUS_SUCCESS;
+    }
+
+    if (EventRequest->Verb & PCEVENT_VERB_ADD)
+    {
+        //
+        // A node event with no EventEntry is malformed; adding NULL to the
+        // port's list would be a bugcheck at the next GenerateEventList, i.e.
+        // on a machine that has to be recovered from a checkpoint.
+        //
+        if (EventRequest->EventEntry == NULL)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        AddEventToEventList(EventRequest->EventEntry);
+        return STATUS_SUCCESS;
+    }
+
+    if (EventRequest->Verb & PCEVENT_VERB_REMOVE)
+    {
+        return STATUS_SUCCESS;
+    }
+
+    return STATUS_INVALID_PARAMETER;
+}
+
+//=============================================================================
+#pragma code_seg("PAGE")
 VOID
 AhTopoRaiseVolumeEvent
 (
@@ -254,6 +313,14 @@ Routine Description:
         return;
     }
 
+    //
+    // BOTH nodes, because one IOCTL_AUDIOHUB_NOTIFY carries both a level and a
+    // mute state and either may have moved. IAudioEndpointVolume presents them
+    // as one control, but KS keeps them on separate nodes and a client
+    // subscribes per node -- raising only the volume node leaves a remote MUTE
+    // invisible to anything watching the mute node, which is a state a user can
+    // see and we cannot explain.
+    //
     topo->GenerateEventList(
         (GUID *)&KSEVENTSETID_AudioControlChange,
         KSEVENT_CONTROL_CHANGE,
@@ -261,6 +328,14 @@ Routine Description:
         ULONG(-1),
         TRUE,                   // a node event
         KSNODE_TOPO_VOLUME);
+
+    topo->GenerateEventList(
+        (GUID *)&KSEVENTSETID_AudioControlChange,
+        KSEVENT_CONTROL_CHANGE,
+        FALSE,
+        ULONG(-1),
+        TRUE,
+        KSNODE_TOPO_MUTE);
 }
 
 CMiniportTopologySimpleAudioSample::~CMiniportTopologySimpleAudioSample

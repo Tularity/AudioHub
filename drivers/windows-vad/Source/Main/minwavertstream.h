@@ -195,6 +195,12 @@ public:
     }
 
     ULONG     GetAhSlot()         { return m_AhSlot; }
+
+    //
+    // Publishes this stream's WaveRT residency into the per-slot snapshot the
+    // STREAMSTAT ioctl reads. DISPATCH_LEVEL, called from UpdatePosition.
+    //
+    void      AhPublishWaveRtResidency();
     ULONGLONG GetAhFramesMoved()  { return m_AhFramesMoved; }
     ULONGLONG GetAhFramesShort()  { return m_AhFramesShort; }
 

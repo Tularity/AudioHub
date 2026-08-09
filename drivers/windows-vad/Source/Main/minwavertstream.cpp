@@ -1396,6 +1396,16 @@ NTSTATUS CMiniportWaveRTStream::SetState
         if (wasRunning != nowRunning)
         {
             AhCtlRaiseIoState(m_AhSlot, m_bCapture, nowRunning);
+            //
+            // A stopped stream has no WaveRT stage at all. Leaving the last
+            // sample behind would let the daemon keep reporting a residency for
+            // a device nothing is playing to -- stale in exactly the way that
+            // looks healthy.
+            //
+            if (!nowRunning)
+            {
+                AhWaveRtClear(m_AhSlot, m_bCapture ? TRUE : FALSE);
+            }
         }
     }
 
@@ -1529,6 +1539,136 @@ VOID CMiniportWaveRTStream::UpdatePosition
     // Update the DMA time stamp for the next call to GetPosition()
     //
     m_ullDmaTimeStamp = hnsCurrentTime;
+
+    AhPublishWaveRtResidency();
+}
+
+//=============================================================================
+#pragma code_seg()
+void CMiniportWaveRTStream::AhPublishWaveRtResidency()
+/*++
+
+Routine Description:
+
+    Publishes how deep the WAVERT stage is right now, so it can be reported
+    apart from the AudioHub ring (spec-windows-driver.md:574 forbids merging
+    them). Called from UpdatePosition, so it runs at DISPATCH_LEVEL under
+    m_PositionSpinLock and must stay allocation-free and lock-free.
+
+    The two directions measure opposite things and neither expression is the
+    other's mirror:
+
+    RENDER  the audio engine WRITES into the WaveRT buffer and we drain it.
+            Residency is what it has handed us and we have not yet moved into
+            the ring: m_ulCurrentWritePosition (the engine's write cursor, set
+            from SetWritePacket) minus m_ullWritePosition (ours), modulo the
+            buffer.
+
+    CAPTURE we FILL the WaveRT buffer and the engine takes whole packets. There
+            is no engine byte cursor to subtract -- the only thing it tells us
+            is which packet it last collected -- so residency is counted in
+            PACKETS and converted, and is 0 while nothing has been collected
+            yet rather than "the whole buffer".
+
+    Publishing 0 with present=1 is a real and different state from publishing
+    nothing at all, which is why AhWaveRtClear exists separately.
+
+--*/
+{
+    if (m_AhSlot >= AUDIOHUB_WIN_MAX_SLOTS || m_ulDmaBufferSize == 0)
+    {
+        return;
+    }
+
+    ULONG packetBytes = (m_ulNotificationsPerBuffer != 0)
+                            ? (m_ulDmaBufferSize / m_ulNotificationsPerBuffer)
+                            : 0;
+    ULONGLONG resident64 = 0;
+
+    if (packetBytes != 0)
+    {
+        //
+        // PACKET MODE, WHICH IS EVERY REAL CLIENT. Both directions reduce to
+        // one subtraction of two MONOTONIC byte counts:
+        //
+        //   render   filled  = (lastOsWritePacket + 1) * packetBytes
+        //            drained = m_ullLinearPosition
+        //   capture  filled  = m_ullLinearPosition
+        //            drained = (lastOsReadPacket + 1) * packetBytes
+        //
+        // Packets are written and read in order from 0, so "through packet N"
+        // is exactly (N + 1) packets of bytes -- no wrap, no modulo.
+        //
+        // THE FIRST VERSION OF THIS USED THE MODULAR CURSORS
+        // ((m_ulCurrentWritePosition - m_ullWritePosition) mod size) AND
+        // MEASURED A CONSTANT ZERO on the target: m_ulCurrentWritePosition is
+        // the START of the packet the OS last handed over, the timer advances
+        // us a whole packet at a time, so the two cursors were equal at every
+        // sample point. A residency that is always 0 is indistinguishable from
+        // no instrument at all, and it reads as the healthiest possible number.
+        //
+        ULONG lastOs = m_bCapture ? m_ulLastOsReadPacket : m_ulLastOsWritePacket;
+
+        //
+        // ULONG_MAX is the "the OS has not touched a packet yet" sentinel, set
+        // in SetState(STOP). Treating it as a packet NUMBER makes (N+1)
+        // overflow to 0 for capture (residency looks like the whole buffer had
+        // been collected) and makes render claim 0 bytes filled.
+        //
+        if (lastOs != ULONG_MAX)
+        {
+            ULONGLONG osBytes = ((ULONGLONG)lastOs + 1ull) * (ULONGLONG)packetBytes;
+
+            if (m_bCapture)
+            {
+                if (m_ullLinearPosition > osBytes)
+                {
+                    resident64 = m_ullLinearPosition - osBytes;
+                }
+            }
+            else if (osBytes > m_ullLinearPosition)
+            {
+                resident64 = osBytes - m_ullLinearPosition;
+            }
+        }
+    }
+    else if (!m_bCapture)
+    {
+        //
+        // Non-event-driven render: there are no packets, and
+        // m_ulCurrentWritePosition IS a genuine byte cursor here, so the
+        // modular difference is the right thing after all.
+        //
+        ULONG ours   = (ULONG)(m_ullWritePosition % m_ulDmaBufferSize);
+        ULONG theirs = m_ulCurrentWritePosition;
+        resident64 = (theirs >= ours)
+                         ? (ULONGLONG)(theirs - ours)
+                         : (ULONGLONG)(m_ulDmaBufferSize - ours + theirs);
+    }
+
+    //
+    // The stage cannot hold more than the buffer. Clamped here as well as in
+    // AhWaveRtPublish because a 64-bit value is being narrowed: without it a
+    // transient where the OS ran ahead would be truncated rather than capped,
+    // and truncation of a large number can land anywhere, including on a
+    // plausible-looking small one.
+    //
+    if (resident64 > (ULONGLONG)m_ulDmaBufferSize)
+    {
+        resident64 = m_ulDmaBufferSize;
+    }
+    ULONG resident = (ULONG)resident64;
+
+    //
+    // nBlockAlign, not a constant: the two pins do NOT share a frame size (the
+    // render pin is 16-bit stereo, the capture pin 32-bit stereo), so a single
+    // hard-coded 4 would misreport one direction by a factor of two.
+    //
+    ULONG frameBytes = (m_pWfExt != NULL) ? m_pWfExt->Format.nBlockAlign : 0;
+    ULONG rate       = (m_pWfExt != NULL) ? m_pWfExt->Format.nSamplesPerSec : 0;
+
+    AhWaveRtPublish(m_AhSlot, m_bCapture ? TRUE : FALSE, m_ulDmaBufferSize,
+                    resident, frameBytes, rate, packetBytes);
 }
 
 //=============================================================================

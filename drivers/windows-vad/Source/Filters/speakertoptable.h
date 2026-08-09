@@ -139,7 +139,41 @@ PCPROPERTY_ITEM SpeakerPropertiesVolume[] =
     }
 };
 
-DEFINE_PCAUTOMATION_TABLE_PROP(AutomationSpeakerVolume, SpeakerPropertiesVolume);
+
+//
+// THE EVENT HALF OF THE VOLUME NODE.
+//
+// A node whose automation table carries properties only can never notify
+// anybody: KsGenerateEvent only reaches clients that ENABLED the event, and a
+// client can only enable an event the node declares. Both nodes below were
+// PROP-only, so AhTopoRaiseVolumeEvent -- the whole driver->engine direction of
+// volume sync -- raised events into an empty list from the day it was written.
+// See CMiniportTopologySimpleAudioSample::AhEventHandlerSlotVolume for the
+// measurement that found it.
+//
+static
+PCEVENT_ITEM SpeakerVolumeEvents[] =
+{
+    {
+        &KSEVENTSETID_AudioControlChange,
+        KSEVENT_CONTROL_CHANGE,
+        KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT,
+        EventHandler_SpeakerTopology
+    }
+};
+
+static
+PCEVENT_ITEM SpeakerMuteEvents[] =
+{
+    {
+        &KSEVENTSETID_AudioControlChange,
+        KSEVENT_CONTROL_CHANGE,
+        KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT,
+        EventHandler_SpeakerTopology
+    }
+};
+
+DEFINE_PCAUTOMATION_TABLE_PROP_EVENT(AutomationSpeakerVolume, SpeakerPropertiesVolume, SpeakerVolumeEvents);
 
 //=============================================================================
 static
@@ -153,7 +187,7 @@ PCPROPERTY_ITEM SpeakerPropertiesMute[] =
   }
 };
 
-DEFINE_PCAUTOMATION_TABLE_PROP(AutomationSpeakerMute, SpeakerPropertiesMute);
+DEFINE_PCAUTOMATION_TABLE_PROP_EVENT(AutomationSpeakerMute, SpeakerPropertiesMute, SpeakerMuteEvents);
 
 //=============================================================================
 static

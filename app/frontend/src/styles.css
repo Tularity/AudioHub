@@ -1093,6 +1093,35 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 .kv-row { display: flex; gap: 12px; font-size: 13px; align-items: baseline; }
 .kv-k { color: var(--text-dim); width: 72px; flex: none; font-size: 12px; }
 
+/* ---- 设置 › 关于 ---- */
+
+/* 这一行**刻意长得和原来左上角那枚品牌区一模一样**（同样的 30px 圆角标记块、同样的
+   字标 + tagline 两行）。标识从窗口左上角搬到这里，读感上应该是「搬走了」，而不是
+   「删掉了又重画了一个别的」——沿用同一套尺寸与配色是让这次搬迁看起来是一次移动
+   的最省事办法。 */
+.about-row { display: flex; align-items: center; gap: 12px; }
+.about-mark {
+  width: 30px; height: 30px; flex: none;
+  display: grid; place-items: center;
+  color: var(--accent);
+  background: #31c8b01a;
+  border: 1px solid #31c8b038;
+  border-radius: 9px;
+}
+.about-mark svg { width: 18px; height: 18px; }
+.about-text { display: flex; flex-direction: column; line-height: 1.2; }
+.about-text strong { font-size: 13.5px; font-weight: 650; letter-spacing: .01em; }
+.about-text span { font-size: 11px; color: var(--text-dim); }
+/* margin-left:auto 把版本推到行尾。它是这一行里唯一会被复制进 bug 报告的东西，
+   所以给等宽字体 + 可选中——头部整体禁用了选择，这张卡不在头部里，本来就能选。 */
+.about-version {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
 .addr-list { list-style: none; display: flex; flex-direction: column; gap: 6px; }
 .addr-list li { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
 

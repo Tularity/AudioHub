@@ -6,11 +6,12 @@
 
 import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Icon } from '../components/Icon';
+import { Icon, RawIcon } from '../components/Icon';
 import { ExtLink, Switch } from '../components/Controls';
 import { transportCells } from '../components/PeerTransport';
 import { PermissionRow } from '../components/PermissionRow';
 import { toast } from '../components/Toasts';
+import { appVersion } from '../lib/appInfo';
 import { openExternal } from '../lib/external';
 import { autostartView } from '../lib/autostart';
 import { bridgeCatalog, vendors } from '../lib/bridge';
@@ -844,7 +845,46 @@ export function SettingsView() {
           control={<code className="mono" data-testid="settings-config-dir">{cfgDir}</code>}
         />
       </section>
+
+      <AboutCard />
     </>
+  );
+}
+
+/**
+ * 关于。
+ *
+ * 为什么需要它：左上角的品牌区（logo + 字标 + tagline）已经删掉，标识改由背景水印
+ * 承担——而水印**读不出名字**，这是它作为水印的全部意义。于是「这个 App 叫什么、
+ * 是哪个版本」在界面里没有了任何落点。系统那一层并不能兜住：macOS 还有菜单栏与
+ * Dock，Windows 一旦按 docs/design-ui-chrome.md §3 去掉系统顶栏，连窗口标题都不剩，
+ * 只剩任务栏悬停提示。这一块就是那个常驻落点，也是用户报 bug 时能被要求截图的地方。
+ *
+ * 为什么放在整页**最后**：它是唯一一块不改变任何行为的区块，而「关于」在页尾是
+ * macOS 系统设置、VS Code、iOS 一致的位置——用户会往那儿翻。前面每一块都是可操作
+ * 的设置，把一块只读的品牌信息插进它们中间只会打断阅读节奏。
+ *
+ * 它与「本机身份」不重合：那一块说的是**这台机器**（名称、指纹），配对时要核对的东西；
+ * 这一块说的是**这个程序**。两者恰好都叫「身份」，但没有一个字段是共用的。
+ */
+function AboutCard() {
+  // 拿不到版本时显示破折号，不显示 '0.0.0' 之类编出来的号——理由见 lib/appInfo.ts。
+  const version = appVersion();
+
+  return (
+    <section className="card block" data-testid="settings-about">
+      <h3 className="block-title">{t('settings.about.title')}</h3>
+      <div className="about-row">
+        <span className="about-mark" aria-hidden="true"><RawIcon name="wave" /></span>
+        <div className="about-text">
+          <strong data-testid="settings-about-name">{t('app.name')}</strong>
+          <span>{t('app.tagline')}</span>
+        </div>
+        <code className="about-version" data-testid="settings-about-version">
+          {version != null ? t('settings.about.version', { version }) : t('common.dash')}
+        </code>
+      </div>
+    </section>
   );
 }
 

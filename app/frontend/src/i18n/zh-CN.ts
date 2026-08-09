@@ -937,6 +937,11 @@ export const zhCN = {
   'settings.paths.configDir': '配置目录',
   'settings.paths.configDirDesc': 'daemon 身份、配对表与 ipc.json 所在目录；可用环境变量 AUDIOHUB_CONFIG_DIR 覆盖。',
 
+  // 「关于」。左上角的品牌区改成背景水印之后，App 的名字与版本只剩这一处常驻落点。
+  // 版本号整句带进占位符，不在组件里拼 '版本 ' + v——语序在别的语种里会散架。
+  'settings.about.title': '关于',
+  'settings.about.version': '版本 {version}',
+
   'settings.perm.title': '系统权限',
   'settings.perm.desc': 'macOS 的规则是：一项权限被拒绝后，应用无法再次弹窗询问，只能到系统设置里手动打开。这里显示的是本机服务实时探测到的状态，不是记住的旧结果。',
   'settings.perm.recheck': '重新检查',

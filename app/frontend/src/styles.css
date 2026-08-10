@@ -135,6 +135,24 @@
   /* 内容层：不透明。抬升只靠投影，不靠透明度。 */
   --shadow: 0 1px 2px rgba(var(--sh-rgb), .34), 0 10px 28px -6px rgba(var(--sh-rgb), .3);
   --shadow-lift: 0 2px 6px rgba(var(--sh-rgb), .34), 0 18px 44px -10px rgba(var(--sh-rgb), .44);
+  /* 旋钮/滑条拇指的落影。原先在 .vol-slider 的 thumb 与 .stop-thumb 两处各写了一遍
+     `0 1px 3px rgba(var(--sh-rgb), .5)`，绕过了上面这套 --shadow* 家族——深色下看不
+     出来，浅色下就是一档比卡片还重的墨（docs/design-ui-chrome.md §9.3 B2）。
+     单拎一个 token 而不是复用 --shadow：14px 的圆点配不上 28px 的扩散半径。 */
+  --shadow-knob: 0 1px 3px rgba(var(--sh-rgb), .5);
+
+  /* ---- 环与光晕：**与 --accent 分家** ----
+   * 深色下 --accent 是亮青，拿它画焦点环、画状态光晕都成立；浅色下它被压暗成
+   * #0a6d5f（为了做正文对比度，见浅色块的说明），同一笔就变成一圈**黑**——用户报的
+   * 「开关元素外围发光偏黑」正是这一条。判据与修法见 docs §9.3 B1 / §9.4。
+   *
+   * 深色侧这三个 token 的解析值与它们替换掉的字面量**逐字相同**，所以 darkdiff
+   * 对这次拆分恒为绿：--ring → var(--accent)，--halo → rgba(var(--accent-rgb), .2)，
+   * --halo-soft → rgba(var(--accent-rgb), .133)。 */
+  --ring: var(--accent);           /* 实心环（焦点环）的墨色 */
+  --ring-rgb: var(--accent-rgb);   /* 半透明环用的三元组 */
+  --halo: rgba(var(--ring-rgb), .2);        /* 状态光晕：pending / 拖拽中 / 按住 */
+  --halo-soft: rgba(var(--ring-rgb), .133); /* 输入框与下拉的聚焦环 */
 
   /* 控件层：Liquid Glass。三段结构缺一不可——
        ① 顶部径向渐变 = 光从上方打下来的落差（不是平铺的白色蒙版）
@@ -316,6 +334,34 @@
   --shadow-lift: 0 2px 6px rgba(var(--sh-rgb), .08), 0 16px 40px -12px rgba(var(--sh-rgb), .18);
   --shadow-modal: 0 32px 80px -16px rgba(var(--sh-rgb), .24);
   --glass-shadow: 0 2px 6px rgba(var(--sh-rgb), .07), 0 18px 44px -12px rgba(var(--sh-rgb), .18);
+  --shadow-knob: 0 1px 2px rgba(var(--sh-rgb), .16);
+
+  /* ---- 环的墨色：**不复用 --accent** ----
+   * 上面那五个语义色是按**正文对比度**定的，所以在浅色下全部是压暗过的深色。
+   * 拿 #0a6d5f 去画一圈 2px 的焦点环，得到的不是「青色的环」而是「黑色的环」
+   * ——这就是用户看到的「开关外围发光偏黑」。
+   *
+   * 所以这里另取一档：**更亮、更饱和**。它只当线用、不当字用，验收因此走 WCAG 2.2
+   * 的非文本 3:1（SC 1.4.11 / 2.4.13），不走正文的 4.5:1。而且**两侧都要量**——
+   * 焦点环会同时出现在白卡（#ffffff）与画布（#eceef3）上：
+   *   #0e8f7c  对 #ffffff 4.10:1 ／ 对 #eceef3 3.41:1   两侧都过 3:1
+   * 再亮一档（#12a08a）画布那一侧就掉到 2.79:1，所以这是上限附近的取值，
+   * 改它之前请重新量**两列**。
+   *
+   * 半透明的那两档 alpha 是**解出来的**，不是估的。墨色提亮以后同 alpha 会更淡，
+   * 但更亮的墨色叠上去也更不容易变脏，两件事互相抵消，所以取值目标定成：
+   *   **压在白底上的明度差与旧值持平，而彩度尽量高**——「不比以前暗，但明显是青的」。
+   * 白底上 alpha a 的明度差与彩度（都按 sRGB 通道值算）：
+   *   旧墨 #0a6d5f：Δ = −168.1a，chroma = 99a
+   *   新墨 #0e8f7c：Δ = −140.8a，chroma = 129a
+   * 令两者 Δ 相等即可解出 a：
+   *   --halo       .2   → .24   （Δ −33.6 → −33.8，chroma 19.8 → 31.0，+57%）
+   *   --halo-soft  .133 → .16   （Δ −22.4 → −22.5，chroma 13.2 → 20.6，+56%）
+   * 实测值见本轮报告，与这两行算的一致。 */
+  --ring: #0e8f7c;
+  --ring-rgb: 14, 143, 124;
+  --halo: rgba(var(--ring-rgb), .24);
+  --halo-soft: rgba(var(--ring-rgb), .16);
 
   /* 磨砂：底色抬到 .86 且**不叠任何渐变**。深色那条 --glass-fill 的第一层是顶部
      径向白光，在这里必须整条去掉——白光打在白玻璃上不是「有光」，是「有个凸起」。 */
@@ -449,6 +495,100 @@
     inset 0 0 0 .5px rgba(var(--sh-rgb), .12);
 }
 
+/* ════════ ④ 取消「污渍」：在浅底上比背景暗的**外**发光 ════════
+ *
+ * ①②③ 处理的是 A 类——**拟物特征**：inset 高光、inset 暗影、竖向渐变，错在它们
+ * 用几何暗示了一个不存在的曲面。这一节处理的是 B 类——**明暗反转**：
+ *
+ *     深底上「比背景亮」= 光；浅底上「比背景暗」= 脏。
+ *     同一条 `box-shadow: 0 0 12px rgba(accent,.5)` 两边分别落在这两侧。
+ *
+ * 这类在上一轮整个被漏掉了（自查表只列了 A 类），所以用户在浅色下仍然看到
+ * 「开关元素外围发光偏黑」。完整判据（B0–B4）与三条修法通路见
+ * docs/design-ui-chrome.md §9。
+ *
+ * 主力修法**不是**把 alpha 调小——白底上没有比背景更亮的颜色，调小只会得到一团更淡
+ * 的脏。而是换通道：墨色换成亮而饱和的青（--ring / --halo，见浅色 token 块），
+ * 或者干脆换掉表达（呼吸从光晕改成不透明度）。
+ */
+
+/* ---- ④a 上一轮把输入框的焦点态**自己压掉了**（WCAG 2.4.7 A 级失败） ----
+ *
+ * `:root[data-theme="light"] .input` 是 (0,3,0)，`.input:focus` 只有 (0,2,0)：
+ * 那条覆盖里的 `box-shadow: none` 与 `border-color: var(--line)` 把聚焦态的**两笔**
+ * 全吃掉了，于是浅色下聚焦的输入框和没聚焦的**一模一样**。当时留的注释写着
+ * 「聚焦环保留：那是状态，不是材质」——意图是对的，特异度算错了。实测（探针见
+ * docs §9.6）：浅色 `.input:focus` 的环 Δ = 0，即根本没画出来。
+ * `.select` 同病，只是它那条覆盖没写 box-shadow，所以只丢了 border-color。
+ *
+ * 补回来时描边取**实色** --ring 而不是半透明：这两条是**功能性**焦点指示，要按
+ * WCAG 2.2 的非文本 3:1（SC 1.4.11）收，而 3px 的 --halo-soft 只有 1.3:1，独自
+ * 担不起。实色 --ring 对白卡 4.10:1、对输入框自身的底 #eceef3 3.41:1，两侧都过
+ * ——光晕退回它该待的位置：一层烘托，不是指示本身。 */
+:root[data-theme="light"] .input:focus {
+  border-color: var(--ring);
+  box-shadow: 0 0 0 3px var(--halo-soft);
+}
+:root[data-theme="light"] .select:focus { border-color: var(--ring); }
+
+/* ---- ④b 呼吸：浅色下改用不透明度，不用光晕 ----
+ *
+ * `@breathe` / `@breathe-warn` / `@scBreathe` 都是「一圈光晕由内向外散开再消失」。
+ * 深色下成立；浅色下那圈光晕只能比白更暗，散开的过程就是**一圈灰在扩散**。
+ *
+ * 关键帧够不着 `:root[data-theme="light"] .x` 式的覆盖（docs §9.3 B4），但
+ * **animation-name 够得着**：只换名字，时长 / 缓动 / 次数全部继承基线那一条，
+ * 于是这里不必把三条动画的参数抄第二遍。
+ *
+ * 顺带治好一个既有色彩 bug：`@breathe` 的墨色写死了 --ok-rgb（绿），却被 accent 色
+ * 的 `.dot.connecting` 与 `.step-dot` 复用——青点配绿晕。浅色这条新动画**不带颜色**，
+ * 问题在浅色侧自然消失；深色侧照旧（本轮不动深色）。 */
+@keyframes breathe-flat {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .32; }
+}
+:root[data-theme="light"] .dot.online,
+:root[data-theme="light"] .dot.connecting,
+:root[data-theme="light"] .peer-inbound .dot.live,
+:root[data-theme="light"] .pair-steps li.doing .step-dot { animation-name: breathe-flat; }
+
+/* 录制胶囊不能用不透明度呼吸——它内部有字，字跟着闪就没法读了。换成**底色**呼吸：
+   色调填充在轮廓之内，不会在背景上留下一圈渐变的灰（docs §9.4 通路 2）。 */
+@keyframes breathe-tint {
+  0%, 100% { background-color: rgba(var(--ring-rgb), .17); }
+  50% { background-color: rgba(var(--ring-rgb), .04); }
+}
+:root[data-theme="light"] .sc-capsule.recording { animation-name: breathe-tint; }
+
+/* ---- ④c 绕过 --shadow* 家族的两处投影，归队 ----
+ *
+ * `.disc-item:hover` 写的是 `0 10px 26px rgba(--sh-rgb,.3)`（没有负 spread），
+ * `.sheet-card` 写的是 `0 24px 60px -20px rgba(--sh-rgb,.7)`。深色下看不出来，
+ * 浅色下实测边缘 Δ 分别是 −39.9 / −32.9，而同一屏上普通 `.card` 只有 −16
+ * ——也就是重了一倍到一倍半。规矩（docs §9.3 B2）：`--sh-rgb` 只允许出现在
+ * `--shadow*` 这几个 token 的**定义**里，调用点一律用 token。 */
+:root[data-theme="light"] .disc-item:hover { box-shadow: var(--shadow-lift); }
+:root[data-theme="light"] .sheet-card { box-shadow: var(--shadow-modal); }
+
+/* ---- ④d 模式栏顶部那道渐变：A 类（③「上光」）唯一的漏网 ----
+ *
+ * `linear-gradient(180deg, rgba(--accent-rgb,.039), transparent 60%)`：深色下 accent
+ * 是亮青 ⇒ 顶部提亮；浅色下 accent 是压暗过的深青 ⇒ 顶部**压暗**，正是 ③ 里删掉的
+ * 那笔倒角，只是 alpha 小到 3.9% 才没被一眼认出来。留着它的真正代价不是这 3.9%，
+ * 是下一个人会照抄这个写法。
+ * 换成**没有方向**的平铺色调：强调仍在（它与白卡有明度差），但不再有上下之分。 */
+:root[data-theme="light"] .mode-bar { background: color-mix(in srgb, var(--accent) 4%, var(--bg-1)); }
+
+/* ---- ④e 四个模态遮罩，统一到一种墨 ----
+ *
+ * `.confirm-mask` / `#gate` / `#overlay` 走 `rgba(var(--bg-rgb), α)`——浅色下把底下
+ * 的页面洗**亮**；只有速查表的 `.sheet-scrim` 走 `rgba(var(--sh-rgb), .45)`，把页面
+ * 洗**暗**。暗遮罩本身是正统做法（Material 3 的 scrim 就是黑色 32%），问题在于
+ * 同一个应用里四选一必须统一，否则「打开一个浮层」这件事有两种相反的读感。
+ * 三比一，所以让速查表跟大多数走。深色下两种墨色都近黑，本来就看不出区别，
+ * 因此改动只落在浅色侧。 */
+:root[data-theme="light"] .sheet-scrim { background: rgba(var(--bg-rgb), .6); }
+
 /* ---- 「降低透明度」：把磨砂推到底 ----
  * 系统级开关（macOS：辅助功能 > 显示 > 降低透明度；Windows：透明效果）。Apple 对
  * 自己这一档的描述是「makes Liquid Glass **frostier** and obscures more of the
@@ -496,7 +636,29 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 ::-webkit-scrollbar-thumb { background: var(--fill-3); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
 ::-webkit-scrollbar-track { background: transparent; }
 
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+/* 焦点环。墨色走 --ring 而不是 --accent：见 :root 里 --ring 的说明（浅色下 --accent
+   是压暗过的深青，画环就是黑圈）。`outline-offset: 2px` 那道空隙**是结构的一部分**
+   ——它让环与控件本体之间露出一圈底色，于是环读作「一条线」而不是「一团贴着边的影」，
+   与 .stop-thumb 那条两段式焦点环（白环 + 实环）是同一个形状的两种写法。
+
+   ---- `border-radius: 4px` 为什么被挪进 :where() ----
+
+   它原本和 outline 写在同一条 `:focus-visible` 里。作用是给**本身没有圆角**的元素
+   一个不那么方的焦点环（`.link-btn`、裸 <a>、`.caption-btn`、两条 range input 都吃
+   这一档，实测 46 个元素在焦点态靠它拿到 4px），这一点是有用的，不该删。
+
+   有问题的是它的**特异度**：`:focus-visible` 是 (0,1,0)，于是它会**压过**任何用
+   类型选择器 (0,0,1) 定圆角的规则，也会压过任何写在它前面、同特异度的规则——那种
+   元素一聚焦就会被方角化。今天没炸纯属侥幸：本文件里所有控件的圆角都写在这一行
+   之后且同为 (0,1,0)，靠「后来居上」压住了它。
+
+   `:where()` 把特异度归零，两件事同时成立：
+     · 没有任何圆角规则的元素——今天吃这 4px 的那 46 个——仍然拿到 4px（没有竞争者），
+     · 任何声明了圆角的元素，哪怕只用一个类型选择器，都稳赢，与书写顺序无关。
+   即：**解析值一个都没变，埋雷没了**。已用强制 :focus-visible 的逐元素比对验证
+   （darkdiff 不进伪类，这条只能单独量，见 docs §9.5）。 */
+:where(:focus-visible) { border-radius: 4px; }
+:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 
 /* ---- 布局 ---- */
 
@@ -988,7 +1150,7 @@ body[data-window-controls="right"] .chrome-pop {
   transition: border-color var(--dur) var(--ease-out), box-shadow var(--dur) var(--ease-out);
 }
 .input::placeholder { color: var(--placeholder); }
-.input:focus { outline: none; border-color: rgba(var(--accent-rgb), 0.5); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.133); }
+.input:focus { outline: none; border-color: rgba(var(--ring-rgb), 0.5); box-shadow: 0 0 0 3px var(--halo-soft); }
 
 /* 原生 select：只换外壳，箭头交给系统绘制（CSP 禁 data: 以外的图，也没必要自绘） */
 .select {
@@ -998,7 +1160,7 @@ body[data-window-controls="right"] .chrome-pop {
   font-size: 12px; font-family: inherit; max-width: 190px;
   transition: border-color .15s ease-out, box-shadow .15s ease-out, opacity .15s ease-out;
 }
-.select:focus { outline: none; border-color: rgba(var(--accent-rgb), 0.5); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.133); }
+.select:focus { outline: none; border-color: rgba(var(--ring-rgb), 0.5); box-shadow: 0 0 0 3px var(--halo-soft); }
 .select:disabled { opacity: .45; cursor: not-allowed; }
 
 .form-row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
@@ -1042,7 +1204,7 @@ body[data-window-controls="right"] .chrome-pop {
 .switch.pending {
   pointer-events: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.2);
+  box-shadow: 0 0 0 2px var(--halo);
   animation: switch-pending 1.1s ease-in-out infinite;
 }
 .switch.pending .knob { background: var(--accent); }
@@ -1559,11 +1721,11 @@ body[data-window-controls="right"] .chrome-pop {
   -webkit-appearance: none; appearance: none;
   width: 14px; height: 14px; margin-top: -4px;
   border-radius: 50%; background: var(--thumb); border: none;
-  box-shadow: 0 1px 3px rgba(var(--sh-rgb), .5);
+  box-shadow: var(--shadow-knob);
   transition: transform .15s ease-out, box-shadow .15s ease-out, background .15s ease-out;
 }
 .vol-slider:hover:not(:disabled)::-webkit-slider-thumb { transform: scale(1.15); }
-.vol-slider:active:not(:disabled)::-webkit-slider-thumb { transform: scale(1.25); box-shadow: 0 0 0 4px rgba(var(--accent-rgb), 0.2); }
+.vol-slider:active:not(:disabled)::-webkit-slider-thumb { transform: scale(1.25); box-shadow: 0 0 0 4px var(--halo); }
 .vol-slider.muted::-webkit-slider-runnable-track {
   background: linear-gradient(90deg, var(--fill-muted) 0 var(--vol, 0%), var(--track) var(--vol, 0%) 100%);
 }
@@ -1864,7 +2026,7 @@ body[data-window-controls="right"] .chrome-pop {
   position: absolute; top: 2px; width: 14px; height: 14px;
   margin-left: -7px; border-radius: 50%;
   background: var(--thumb);
-  box-shadow: 0 1px 3px rgba(var(--sh-rgb), .5);
+  box-shadow: var(--shadow-knob);
   transition: left var(--dur) var(--ease-spring), transform .15s ease-out,
     box-shadow .15s ease-out, background .15s ease-out;
 }
@@ -1878,13 +2040,13 @@ body[data-window-controls="right"] .chrome-pop {
 .stop-slider-row[data-dragging] .stop-thumb,
 .stop-slider-row[data-dragging] .stop-fill { transition: none; }
 .stop-slider-row[data-dragging] .stop-thumb {
-  transform: scale(1.25); box-shadow: 0 0 0 4px rgba(var(--accent-rgb), 0.2);
+  transform: scale(1.25); box-shadow: 0 0 0 4px var(--halo);
 }
 
 /* 焦点环：原生 input 是透明的，它自己的焦点环看不见，得借 thumb 显示。
    没有这一条，键盘用户完全不知道焦点在哪。 */
 .stop-slider:focus-visible ~ .stop-track .stop-thumb {
-  box-shadow: 0 0 0 3px var(--bg-1), 0 0 0 5px var(--accent);
+  box-shadow: 0 0 0 3px var(--bg-1), 0 0 0 5px var(--ring);
 }
 
 .stop-slider:disabled ~ .stop-track .stop-fill { background: var(--track); }

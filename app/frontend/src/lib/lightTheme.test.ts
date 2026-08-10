@@ -219,6 +219,187 @@ describe('light palette clears WCAG on the surfaces text lands on', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Class B: the inverted glow.
+//
+// Everything above guards class A -- SHAPE errors, where a stroke simulates a
+// curved surface that is not there. It did not catch the bug the user reported
+// next: "the glow around the switch looks blackish in light mode". That is a
+// different failure. The stroke is fine; its INK is wrong.
+//
+//     on a dark surface, "brighter than the background" reads as light;
+//     on a light surface, "darker than the background" reads as dirt.
+//
+// `box-shadow: 0 0 0 2px rgba(var(--accent-rgb), .2)` is a glow in the dark
+// theme and a smudge in the light one, from the same declaration -- because the
+// light theme's --accent is DARKENED on purpose, to clear body-text contrast.
+// A colour tuned to be legible as text is, by construction, wrong as light.
+//
+// Hence the split: --ring / --halo / --halo-soft are the ring inks, free to be
+// brighter than --accent because nothing is ever printed on them, and
+// --shadow-knob joins the --shadow* family so no call site invents its own
+// depth. docs/design-ui-chrome.md §9.3 is the full checklist.
+// ---------------------------------------------------------------------------
+describe('light theme does not paint glows with text-contrast colours', () => {
+  const lightBody = ALL.find((r) => r.selector === LIGHT)?.body ?? '';
+  const darkBody = ALL.find((r) => r.selector === ':root')?.body ?? '';
+  const bare = stripComments(CSS);
+
+  /** Non-inset ring/glow layers: `0 0 0 Npx <ink>` and friends, no blur offset. */
+  const OUTER_GLOW = /box-shadow:[^;]*?(?<!inset\s)\b0\s+0\s+0\s+\d/;
+  /** `@keyframes` stops (`0%, 100%`, `from`, `to`) are not selectors. */
+  const isKeyframeStop = (sel: string) => /^(\d|from\b|to\b)/.test(sel.trim());
+
+  it('routes every outer accent ring through --ring / --halo, not --accent', () => {
+    // The three call sites that used to spell `rgba(var(--accent-rgb), .2)` out
+    // by hand (.switch.pending, the volume thumb, the dragged transport thumb)
+    // plus the two focus rings. Any NEW one will show up here.
+    //
+    // Keyframe stops are exempt HERE and only here: they are dark-only, and the
+    // 're-points every glow keyframe' case below is what holds them to account.
+    // Skipping them in both places would be the hole, so it does not.
+    const offenders = ALL.filter((r) => {
+      if (isKeyframeStop(r.selector)) return false;
+      const sh = decl(r.body, 'box-shadow');
+      if (!sh || !OUTER_GLOW.test(`box-shadow:${sh}`)) return false;
+      return /--accent(-rgb)?\)/.test(sh);
+    }).map((r) => r.selector);
+    expect(offenders).toEqual([]);
+  });
+
+  it('never draws an outline in a colour picked for body text', () => {
+    // `outline: … var(--accent)` is the single worst case measured this round
+    // (the focused control's ring sat 168/255 darker than the white card).
+    const outlines = ALL
+      .map((r) => [r.selector, decl(r.body, 'outline')] as const)
+      .filter(([, v]) => v && /--accent\b/.test(v));
+    expect(outlines).toEqual([]);
+  });
+
+  it('gives --ring an ink of its own in light, and reuses --accent in dark', () => {
+    // Dark must keep resolving to exactly what it resolved to before the split,
+    // or this refactor silently restyled the theme the user said was perfect.
+    expect(decl(darkBody, '--ring')).toBe('var(--accent)');
+    expect(decl(darkBody, '--ring-rgb')).toBe('var(--accent-rgb)');
+    // Light must NOT: pointing --ring back at --accent would undo the whole fix.
+    expect(decl(lightBody, '--ring')).toMatch(/^#[0-9a-f]{6}$/i);
+    expect(decl(lightBody, '--ring')).not.toContain('var(--accent');
+  });
+
+  it('keeps --ring above the 3:1 non-text bar on every surface it lands on', () => {
+    // WCAG 2.2 SC 1.4.11 / 2.4.13. The ceiling this sets is the reason --ring is
+    // not brighter: the watermarked canvas is the tightest of the four.
+    const chan = (v: number) => { const s = v / 255; return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4; };
+    const lum = ([r, g, b]: number[]) => 0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b);
+    const ratio = (a: number[], b: number[]) => {
+      const [hi, lo] = [lum(a), lum(b)].sort((p, q) => q - p);
+      return (hi + 0.05) / (lo + 0.05);
+    };
+    const over = (src: number[], dst: number[], a: number) => src.map((c, i) => Math.round(c * a + dst[i] * (1 - a)));
+    const hex = (v: string | null) => {
+      const m = v?.match(/#([0-9a-f]{6})/i);
+      if (!m) throw new Error(`no hex in ${v}`);
+      return [0, 2, 4].map((i) => parseInt(m[1].slice(i, i + 2), 16));
+    };
+    const ring = hex(decl(lightBody, '--ring'));
+    const bg = hex(decl(lightBody, '--bg'));
+    const inkM = (decl(lightBody, '--watermark-ink') ?? '').match(/rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\.?\d*\.?\d+)\s*\)/)!;
+    const inked = over([+inkM[1], +inkM[2], +inkM[3]], bg, +inkM[4]);
+    for (const [name, surface] of [['--bg-1', hex(decl(lightBody, '--bg-1'))], ['--bg-2', hex(decl(lightBody, '--bg-2'))],
+      ['--bg', bg], ['canvas+watermark', inked]] as const) {
+      expect(ratio(ring, surface), `--ring on ${name}`).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it('gives every hand-rolled outer --sh-rgb shadow a light override', () => {
+    // A call site writing `0 10px 26px rgba(var(--sh-rgb), .3)` invents a depth
+    // step outside the --shadow* family: invisible in dark, and in light it
+    // measured 2.5x the weight of a plain card. Two rules did (.disc-item:hover,
+    // .sheet-card) and two more duplicated a knob shadow (now --shadow-knob).
+    //
+    // Scope: OUTER layers only. An `inset` --sh-rgb stroke is class A -- the
+    // groove -- and the directional-inset case at the top of this file owns it.
+    // The bar here is "has a light override", not "must use a token": the dark
+    // theme is frozen, so the base rule keeps its literal on purpose.
+    const outerSh = (sh: string) => sh.split(/,(?![^(]*\))/)
+      .some((layer) => !layer.includes('inset') && layer.includes('--sh-rgb'));
+    const overridden = new Set(ALL
+      .filter((r) => r.selector.includes(LIGHT) && decl(r.body, 'box-shadow') !== null)
+      .flatMap((r) => parts(r.selector))
+      .map((s) => s.replace(LIGHT, '').trim()));
+    const leaks = ALL.flatMap((r) => {
+      if (r.selector === ':root' || r.selector === LIGHT || r.selector.includes('[data-theme=')) return [];
+      const sh = decl(r.body, 'box-shadow');
+      if (!sh || !outerSh(sh)) return [];
+      return parts(r.selector).filter((s) => !overridden.has(s)).map((s) => `${s}  {${sh.trim()}}`);
+    });
+    expect(leaks).toEqual([]);
+  });
+
+  it('re-points every glow keyframe away from box-shadow in light mode', () => {
+    // @keyframes cannot be reached by a `:root[data-theme=light] .x` override --
+    // it belongs to no selector. `animation-name` CAN be, so each consumer of a
+    // shadow-based breathe is redirected to a colourless one.
+    const glowFrames = [...bare.matchAll(/@keyframes\s+([\w-]+)\s*\{([^}]*\{[^}]*\}\s*)*\}/g)]
+      .filter((m) => m[0].includes('box-shadow'))
+      .map((m) => m[1]);
+    expect(glowFrames.length).toBeGreaterThanOrEqual(3);
+
+    for (const frame of glowFrames) {
+      // Everything that plays this animation…
+      const consumers = ALL.filter((r) => {
+        const a = decl(r.body, 'animation') ?? decl(r.body, 'animation-name');
+        return !!a && new RegExp(`(^|[\\s:])${frame}([\\s,;]|$)`).test(a);
+      }).flatMap((r) => parts(r.selector)).filter((s) => !s.includes('[data-theme='));
+      expect(consumers.length, `nothing plays @${frame}`).toBeGreaterThan(0);
+
+      // …must have a light override renaming the animation.
+      const redirected = new Set(ALL
+        .filter((r) => r.selector.includes(LIGHT) && decl(r.body, 'animation-name'))
+        .flatMap((r) => parts(r.selector))
+        .map((s) => s.replace(LIGHT, '').trim()));
+      for (const c of consumers) {
+        expect(redirected.has(c), `${c} plays @${frame} with no light override`).toBe(true);
+      }
+    }
+  });
+
+  it('has no 180deg accent gradient left un-flattened in light mode', () => {
+    // Class A rule 3 ("no vertical gradient on a solid control") had exactly one
+    // survivor, .mode-bar, because its alpha was 3.9% and nobody looked twice.
+    const gradients = ALL.filter((r) => {
+      if (r.selector.includes('[data-theme=')) return false;
+      const bgv = decl(r.body, 'background') ?? '';
+      return /linear-gradient\(\s*180deg/.test(bgv) && /--accent/.test(bgv);
+    }).flatMap((r) => parts(r.selector));
+    const flattened = new Set(ALL
+      .filter((r) => r.selector.includes(LIGHT) && decl(r.body, 'background'))
+      .flatMap((r) => parts(r.selector))
+      .map((s) => s.replace(LIGHT, '').trim()));
+    expect(gradients.filter((s) => !flattened.has(s))).toEqual([]);
+  });
+
+  it('draws all four modal scrims with the same ink', () => {
+    // Three wash the page lighter (--bg-rgb), one washed it darker (--sh-rgb).
+    // Either is defensible; having both means "a layer opened" has two opposite
+    // readings inside one app.
+    const scrims = ['.confirm-mask', '#gate', '#overlay', '.sheet-scrim'];
+    const inkOf = (sel: string) => {
+      const hits = ALL.filter((r) => parts(r.selector).some((p) => p === sel || p.endsWith(` ${sel}`)))
+        .map((r) => decl(r.body, 'background') ?? decl(r.body, 'background-color'))
+        .filter((v): v is string => !!v && v.includes('-rgb'));
+      return hits[hits.length - 1]?.match(/var\((--[\w-]+-rgb)\)/)?.[1] ?? null;
+    };
+    const light = new Set(scrims.map((s) => {
+      const over = ALL.filter((r) => r.selector.includes(LIGHT) && parts(r.selector).some((p) => p.replace(LIGHT, '').trim() === s))
+        .map((r) => decl(r.body, 'background'))
+        .filter((v): v is string => !!v);
+      return (over[0] ?? '').match(/var\((--[\w-]+-rgb)\)/)?.[1] ?? inkOf(s);
+    }));
+    expect([...light]).toEqual(['--bg-rgb']);
+  });
+});
+
 describe('dead variables stay dead', () => {
   it('has no --chrome-lead left to mislead the next reader', () => {
     // It was declared 0px, re-declared 100px for macOS, and read by nothing:

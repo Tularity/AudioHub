@@ -12,7 +12,55 @@
  * 靠把模糊开大——后者恰好是 2020 年那套 glassmorphism 的做法，也正是廉价感的来源。
  */
 
+/* ---- 主题 ----
+ * 深色仍是**基准**：`:root` 里就是深色的值，浅色只是一层覆盖。这不是偷懒，是让
+ * 「加浅色」不必回头验证深色——凡是浅色块里没提到的属性，深色的读数按定义没动过。
+ *
+ * 落点是 `<html data-theme>`（不是 body）：`::view-transition-*` 那套伪元素挂在根
+ * 元素上，主题切换的圆形揭示动画要与属性变更发生在同一个元素上才好推理。
+ * 缺省（属性缺席）= 深色，所以脚本还没跑起来的第一帧不会闪白。
+ *
+ * 两条支撑整套覆盖的机制：
+ *
+ * ① **rgb 三元组，不是颜色**。`--accent-rgb: 49, 200, 176` 这类变量存的是三个数字，
+ *    调用点写 `rgba(var(--accent-rgb), .2)`。原本散在文件里的 88 处 `#31c8b022` 式
+ *    十六进制带 alpha 全部改成了这个形式——否则每加一个主题就要再抄一份色阶。
+ *    （用逗号式 rgba() 而不是 `rgb(var(--x) / .2)`：后者在 WKWebView 上要 Safari 15+，
+ *    而逗号式到处都能跑，这里没有理由去踩那条线。）
+ *
+ * ② **--fill-* / --edge-* 两条中性阶**。深色界面上的「淡一层」是加白，浅色上是加黑
+ *    ——同一条规则里写死 `rgba(255,255,255,.05)` 的地方，到浅色下会整个消失。所以
+ *    按用途分了两阶：--fill-* 是**填充**（hover 底、标签底、槽），--edge-* 是**描边**。
+ *    原文件里 05/08/0d/0f/14 五档白被并成四档：那五档里相邻两档的肉眼差是 1%，
+ *    为它们各留一个 token 只会让浅色侧多四个要调的旋钮，收益是零。
+ *
+ * ③ **--hl-rgb 例外，两套主题都是白的**。它只用在 `inset 0 1px 0` 那条顶缘高光上，
+ *    表达的是「光从上方打下来」，不是「比底色浅一点」。浅色下它落在白卡上等于隐形
+ *    ——这正确：白色表面本来就没有更亮的顶缘。
+ *
+ * ---- 深色**有没有**被改到：逐元素比对过 ----
+ *
+ * token 化这种规模的改写，最坏的结局是「顺手把深色也改了，但没人发现」。所以做法是
+ * 拿改写前后的两份样式表在同一页上各算一遍 computed style，335 个元素逐个比
+ * （test/ui2/darkdiff.mjs）。剩下的差异只有三类，全部是**有意**的：
+ *
+ *   · `color-scheme: dark` 让 UA 默认前景色从黑翻成白 —— 只影响 <html>/<head> 里
+ *     那些没有显式颜色的节点，可见内容一律继承 body 的 --text，不受影响。
+ *   · 顶栏那簇新控件本来就不存在于旧样式里。
+ *   · 两组**重复色被合并**（下面）。
+ *
+ * 合并掉的重复色，连同它们的实测差值：
+ *   · `#e0574f` → --danger `#e5484d`：两个红只差 5 个单位，出现在 .peer-unusable
+ *     那两处；从来不并排出现，看得出差别的唯一场合是比对截图。
+ *   · `#08221d` → --on-accent `#04211c`：开关旋钮压在强调色上的墨色，两者都是近黑绿。
+ * 判断是这两处属于「同一个语义被写了两遍、其中一遍没跟上」，不是刻意的两档。
+ * 若将来确认它们是有意区分的，加一个 token 即可，别把 rgb 三元组改回十六进制。
+ */
 :root {
+  /* 告诉引擎「这一页是深/浅的」。这不是重复 --bg：滚动条槽、原生 <select> 弹出的
+     菜单、表单控件的默认外观都由它决定，而那些东西 CSS 变量够不着。 */
+  color-scheme: dark;
+
   --bg: #0f1115;
   --bg-1: #171a21;
   --bg-2: #1f242e;
@@ -25,6 +73,53 @@
   --line: #ffffff0d;
   --line-strong: #ffffff14;
 
+  /* 上面五个色相的 rgb 三元组。改颜色要**两处一起改**，色相与它的色阶才不会走散。 */
+  --bg-rgb: 15, 17, 21;
+  --accent-rgb: 49, 200, 176;
+  --danger-rgb: 229, 72, 77;
+  --ok-rgb: 70, 196, 107;
+  --warn-rgb: 224, 168, 63;
+  /* 玻璃底色（比 --bg 略抬一档，见文件头对 .72 的说明）与投影墨色。 */
+  --glass-rgb: 23, 27, 35;
+  --sh-rgb: 0, 0, 0;
+  /* 顶缘高光。见上文 ③：两套主题都是白的。 */
+  --hl-rgb: 255, 255, 255;
+
+  /* 中性阶。--fill-* 填充，--edge-* 描边；浅色下整体翻成黑。 */
+  --fill-1: rgba(255, 255, 255, .03);
+  --fill-2: rgba(255, 255, 255, .055);
+  --fill-3: rgba(255, 255, 255, .085);
+  --fill-4: rgba(255, 255, 255, .14);
+  --edge: rgba(255, 255, 255, .10);
+  --edge-strong: rgba(255, 255, 255, .14);
+  --edge-hover: rgba(255, 255, 255, .22);
+  /* 空档位的环（音质那排「●●●○」里的空心点）。**不并进 --edge-* 那条阶**：
+     .qdot 旁边的注释说明这 18% 是为了让空点不被读成「四颗都亮着」而挑的，
+     并进 22% 那一档正好把它往错的方向推了一步。有理由的值就该有自己的名字。 */
+  --ring-empty: rgba(255, 255, 255, .18);
+
+  /* 具名中性色。名字说的是**用途**不是明度——浅色主题下 --track 会比 --bg 深，
+     深色下比 --bg 浅，只有「它是滑条的轨道」这件事两边一致。 */
+  --track: #2a3140;        /* 滑条轨道、进度底、环形底 */
+  --trough: #242b37;       /* 电平槽（比轨道再暗一档） */
+  --fill-muted: #5a6372;   /* 静音 / 禁用 / 离线的实心填充 */
+  --fill-faint: #3a4353;   /* 空状态大图标、步骤点这类装饰笔画 */
+  --knob: #aab3c2;         /* 开关关闭时的旋钮 */
+  --thumb: #e8eaf0;        /* 滑条拇指 */
+  --placeholder: #5f6979;  /* 输入框占位符 */
+  --on-accent: #04211c;    /* 压在 --accent 实底上的字/图形 */
+  /* 强调色渐变的两个亮端。**它们不是同一个值**：主按钮那道 180° 渐变只抬一档
+     （#3ad6bd），电平条那道 90° 渐变要一路亮到接近青白（#6ee7d2）才有「满格」的读感。
+     token 化时它们一度被合成一个，结果电平条的亮端整个暗下去——computed style 逐元素
+     比对（test/ui2/darkdiff.mjs）把这条抓了出来，所以现在是两个。 */
+  --accent-lift: #3ad6bd;  /* 实底控件的渐变亮端 */
+  --accent-glow: #6ee7d2;  /* 电平/码率条的渐变亮端 */
+  /* 瀑布图/构成条的分类色。它们要互相可分辨，不参与语义配色。 */
+  --hue-net: #6ea8fe;
+  --hue-play: #b48ef0;
+  /* 三处模态浮层共用的同一条投影。浅色下这条最需要单独收，所以提成 token。 */
+  --shadow-modal: 0 32px 80px -16px rgba(var(--sh-rgb), .68);
+
   /* 圆角走 macOS 26 的**同心**规则：内半径 = 外半径 − 内边距。卡片 16 / 内边距 6
      → 内部行 10；内部行 10 / 内边距 2 → 8。胶囊半径 = 高度的一半（Apple 的公式）。 */
   --radius: 16px;
@@ -33,8 +128,8 @@
   --pill: 999px;
 
   /* 内容层：不透明。抬升只靠投影，不靠透明度。 */
-  --shadow: 0 1px 2px rgba(0, 0, 0, .34), 0 10px 28px -6px rgba(0, 0, 0, .3);
-  --shadow-lift: 0 2px 6px rgba(0, 0, 0, .34), 0 18px 44px -10px rgba(0, 0, 0, .44);
+  --shadow: 0 1px 2px rgba(var(--sh-rgb), .34), 0 10px 28px -6px rgba(var(--sh-rgb), .3);
+  --shadow-lift: 0 2px 6px rgba(var(--sh-rgb), .34), 0 18px 44px -10px rgba(var(--sh-rgb), .44);
 
   /* 控件层：Liquid Glass。三段结构缺一不可——
        ① 顶部径向渐变 = 光从上方打下来的落差（不是平铺的白色蒙版）
@@ -43,15 +138,15 @@
        ③ backdrop-filter 的 saturate 补回模糊吃掉的彩度 */
   --glass-fill:
     radial-gradient(130% 150% at 50% 0%,
-      rgba(255, 255, 255, .10) 0%, rgba(255, 255, 255, .038) 46%, rgba(255, 255, 255, .012) 100%),
-    rgba(23, 27, 35, .72);
+      rgba(var(--hl-rgb), .10) 0%, rgba(var(--hl-rgb), .038) 46%, rgba(var(--hl-rgb), .012) 100%),
+    rgba(var(--glass-rgb), .72);
   --glass-blur: blur(20px) saturate(180%);
   /* 高光：顶缘约为底缘的 4 倍，模拟单一上方光源；最后一条 .5px 细环勾出轮廓。 */
   --glass-edge:
-    inset 0 1px 0 rgba(255, 255, 255, .22),
-    inset 0 -1px 0 rgba(255, 255, 255, .05),
-    inset 0 0 0 .5px rgba(255, 255, 255, .07);
-  --glass-shadow: 0 2px 6px rgba(0, 0, 0, .3), 0 18px 44px -12px rgba(0, 0, 0, .58);
+    inset 0 1px 0 rgba(var(--hl-rgb), .22),
+    inset 0 -1px 0 rgba(var(--hl-rgb), .05),
+    inset 0 0 0 .5px rgba(var(--hl-rgb), .07);
+  --glass-shadow: 0 2px 6px rgba(var(--sh-rgb), .3), 0 18px 44px -12px rgba(var(--sh-rgb), .58);
 
   /* 动作短而有回弹。--ease-spring 带一点过冲，用在「出现」；--ease-out 用在状态过渡。 */
   --ease-spring: cubic-bezier(.34, 1.42, .5, 1);
@@ -102,6 +197,96 @@
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
+/* ---- 浅色 ----
+ * 只覆盖颜色，**一条几何都不动**：圆角、间距、时长、平台让位量全部继承自上面。
+ * 于是「浅色下布局跑了」这种 bug 在结构上不可能发生。
+ *
+ * 四个语义色不是把深色那四个拿来直接用。#31c8b0 在 #eceef3 上只有 2.2:1，做正文
+ * 色不合格——而它在本文件里有 25 处是当**文字颜色**用的。所以浅色侧各自压暗一档。
+ *
+ * 取值同样是**量出来的**，而且量的底色不是画布，是**画布叠上水印之后**的最亮处
+ * ——正文有一部分（页脚那两条常驻说明）就落在卡片之外、水印之上，验收标准照抄
+ * docs/design-ui-chrome.md §5.2.1：叠加后的等级不得比叠加前低。
+ * 第一版取了 --text-dim #464e5c，画布上 7.22:1 过 AAA，叠上水印掉到 6.77:1
+ * ——**跌出 AAA**，正是那一节写下来要防的情况。所以整组再压一档：
+ *
+ *   （左：纯画布 #eceef3；右：画布 + .042 水印，即 rgb(227,233,237)）
+ *   --text-dim #3f4756 → 8.05:1 / 7.62:1   AAA 两处都保住
+ *   --accent   #0a6d5f → 5.37:1 / 5.08:1   AA
+ *   --ok       #15743a → 5.85:1 / 4.77:1   AA
+ *   --danger   #b82c34 → 5.25:1 / 4.96:1   AA
+ *   --warn     #7d5a0e → 5.42:1 / 5.13:1   AA
+ *
+ * 改这五个值之前请重新量一次，**并且要量水印那一列**。
+ *
+ * 投影另起一套而不是只换墨色：深色下的 .68 黑放到白底上是一团脏，浅色投影要
+ * **更浅、更散、带一点冷调**（#0f172a 而不是纯黑），这是浅色界面能不能读作干净的
+ * 分水岭。--sh-rgb 与几条复合投影因此一起覆盖。
+ */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #eceef3;
+  --bg-1: #ffffff;
+  --bg-2: #f3f5f9;
+  --text: #171a21;
+  --text-dim: #3f4756;
+  --accent: #0a6d5f;
+  --danger: #b82c34;
+  --ok: #15743a;
+  --warn: #7d5a0e;
+  --line: rgba(15, 23, 42, .09);
+  --line-strong: rgba(15, 23, 42, .14);
+
+  --bg-rgb: 236, 238, 243;
+  --accent-rgb: 10, 109, 95;
+  --danger-rgb: 184, 44, 52;
+  --ok-rgb: 21, 116, 58;
+  --warn-rgb: 125, 90, 14;
+  /* 玻璃在浅色下是**发白**的，不是发暗：底色比画布更亮，模糊后的胶囊才浮得起来。 */
+  --glass-rgb: 252, 253, 255;
+  --sh-rgb: 15, 23, 42;
+  /* --hl-rgb 不覆盖：见 :root 的说明 ③。 */
+
+  --fill-1: rgba(15, 23, 42, .035);
+  --fill-2: rgba(15, 23, 42, .055);
+  --fill-3: rgba(15, 23, 42, .075);
+  --fill-4: rgba(15, 23, 42, .11);
+  --edge: rgba(15, 23, 42, .10);
+  --edge-strong: rgba(15, 23, 42, .16);
+  --edge-hover: rgba(15, 23, 42, .26);
+  --ring-empty: rgba(15, 23, 42, .22);
+
+  --track: #d6dae3;
+  --trough: #e2e6ed;
+  --fill-muted: #98a1b1;
+  --fill-faint: #c3cad6;
+  --knob: #ffffff;
+  --thumb: #ffffff;
+  --placeholder: #8b95a5;
+  --on-accent: #ffffff;
+  --accent-lift: #0f8474;
+  --accent-glow: #1aa892;
+  --hue-net: #3b6fd4;
+  --hue-play: #7c4fc0;
+
+  --shadow: 0 1px 2px rgba(var(--sh-rgb), .06), 0 8px 24px -8px rgba(var(--sh-rgb), .12);
+  --shadow-lift: 0 2px 6px rgba(var(--sh-rgb), .08), 0 16px 40px -12px rgba(var(--sh-rgb), .18);
+  --shadow-modal: 0 32px 80px -16px rgba(var(--sh-rgb), .24);
+  --glass-shadow: 0 2px 6px rgba(var(--sh-rgb), .07), 0 18px 44px -12px rgba(var(--sh-rgb), .18);
+  /* 玻璃描边在浅色下靠**暗环**成形，白色高光在白玻璃上是看不见的。 */
+  --glass-edge:
+    inset 0 1px 0 rgba(var(--hl-rgb), .9),
+    inset 0 0 0 .5px rgba(15, 23, 42, .08);
+
+  /* alpha 与深色侧同为 .042，但**这不是抄过来的**——上面那张表里「叠水印」那一列
+     就是按这个 alpha 算的，五个颜色都是在它之下定的。改 alpha 要连着改那五个值。 */
+  --watermark-ink: rgba(10, 109, 95, .042);
+}
+
+/* 浅色下 hover 不能再「提亮」：往白的方向走等于把按钮擦掉。同一个手势换成压暗。 */
+:root[data-theme="light"] .btn:hover { filter: brightness(.965); }
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 [hidden] { display: none !important; }
@@ -126,7 +311,7 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
 .ok { color: var(--ok); }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: #ffffff14; border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb { background: var(--fill-3); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
 ::-webkit-scrollbar-track { background: transparent; }
 
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
@@ -225,7 +410,7 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   position: absolute; inset: 0; z-index: -1;
   pointer-events: none;
   background: linear-gradient(180deg,
-    rgba(15, 17, 21, .94) 0%, rgba(15, 17, 21, .78) 52%, rgba(15, 17, 21, 0) 100%);
+    rgba(var(--bg-rgb), .94) 0%, rgba(var(--bg-rgb), .78) 52%, rgba(var(--bg-rgb), 0) 100%);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   -webkit-mask-image: linear-gradient(180deg, #000 0%, #000 56%, transparent 100%);
@@ -285,7 +470,7 @@ body[data-window-controls="right"]:not(.app-captions) { --chrome-trail: 0px; }
   background: var(--glass-fill);
   backdrop-filter: var(--glass-blur);
   -webkit-backdrop-filter: var(--glass-blur);
-  border: 1px solid rgba(255, 255, 255, .10);
+  border: 1px solid var(--edge);
   box-shadow: var(--glass-shadow), var(--glass-edge);
   transition: top var(--dur) var(--ease-out), padding var(--dur) var(--ease-out);
 }
@@ -302,10 +487,10 @@ body[data-window-controls="right"]:not(.app-captions) { --chrome-trail: 0px; }
   top: 5px; bottom: 5px; left: 5px;
   width: calc((100% - 10px) / var(--nav-count, 4));
   border-radius: var(--pill);
-  background: linear-gradient(180deg, #31c8b02e, #31c8b01a);
+  background: linear-gradient(180deg, rgba(var(--accent-rgb), 0.18), rgba(var(--accent-rgb), 0.102));
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, .16),
-    inset 0 0 0 1px #31c8b040;
+    inset 0 1px 0 rgba(var(--hl-rgb), .16),
+    inset 0 0 0 1px rgba(var(--accent-rgb), 0.25);
   transform: translateX(calc(var(--nav-index, 0) * 100%));
   transition: transform .34s var(--ease-spring);
   pointer-events: none;
@@ -364,14 +549,14 @@ body[data-window-controls="right"]:not(.app-captions) { --chrome-trail: 0px; }
   margin-top: -14px;
   display: inline-flex; align-items: center; gap: 8px;
   padding: 5px 13px; border-radius: var(--pill);
-  background: rgba(23, 27, 35, .6);
+  background: rgba(var(--glass-rgb), .6);
   backdrop-filter: blur(16px) saturate(170%);
   -webkit-backdrop-filter: blur(16px) saturate(170%);
-  border: 1px solid rgba(255, 255, 255, .09);
+  border: 1px solid var(--edge);
   box-shadow:
-    0 6px 18px -6px rgba(0, 0, 0, .5),
-    inset 0 1px 0 rgba(255, 255, 255, .16),
-    inset 0 -1px 0 rgba(255, 255, 255, .04);
+    0 6px 18px -6px rgba(var(--sh-rgb), .5),
+    inset 0 1px 0 rgba(var(--hl-rgb), .16),
+    inset 0 -1px 0 rgba(var(--hl-rgb), .04);
   font-size: 12px; color: var(--text-dim);
   /* 指纹是要能选中复制的，头部整体禁用了选择，这里单独放开。 */
   -webkit-user-select: text;
@@ -437,8 +622,8 @@ body[data-window-controls="right"] .daemon-badge {
   stroke-linecap: butt;
   stroke-linejoin: miter;
 }
-.caption-btn:hover, .caption-btn.hover { background: rgba(255, 255, 255, .08); color: var(--text); }
-.caption-btn:active, .caption-btn.press { background: rgba(255, 255, 255, .14); }
+.caption-btn:hover, .caption-btn.hover { background: var(--fill-3); color: var(--text); }
+.caption-btn:active, .caption-btn.press { background: var(--fill-4); }
 /* 关闭键的红是 Win11 的既定语义，不是我们的强调色。 */
 .caption-btn.danger:hover { background: #c42b1c; color: #fff; }
 .caption-btn.danger:active { background: #b0271a; color: #fff; }
@@ -449,14 +634,14 @@ body[data-window-controls="right"] .daemon-badge {
 
 .dot {
   width: 8px; height: 8px; border-radius: 50%;
-  background: #5a6372; display: inline-block; flex: none;
+  background: var(--fill-muted); display: inline-block; flex: none;
 }
 .dot.online { background: var(--ok); animation: breathe 2.4s ease-in-out infinite; }
-.dot.offline { background: #5a6372; }
+.dot.offline { background: var(--fill-muted); }
 .dot.connecting { background: var(--accent); animation: breathe 1.2s ease-in-out infinite; }
 @keyframes breathe {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(70, 196, 107, .45); }
-  50% { box-shadow: 0 0 0 5px rgba(70, 196, 107, 0); }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(var(--ok-rgb), .45); }
+  50% { box-shadow: 0 0 0 5px rgba(var(--ok-rgb), 0); }
 }
 
 /* ---- 卡片 ---- */
@@ -468,7 +653,7 @@ body[data-window-controls="right"] .daemon-badge {
   background: var(--bg-1);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  box-shadow: var(--shadow), inset 0 1px 0 rgba(255, 255, 255, .045);
+  box-shadow: var(--shadow), inset 0 1px 0 rgba(var(--hl-rgb), .045);
   padding: 18px;
 }
 
@@ -476,7 +661,7 @@ body[data-window-controls="right"] .daemon-badge {
 .block > .btn { align-self: flex-start; }
 .block-title { font-size: 13px; font-weight: 650; color: var(--text-dim); letter-spacing: .06em; }
 .danger-title { color: var(--danger); }
-.danger-block { border-color: #e5484d2e; }
+.danger-block { border-color: rgba(var(--danger-rgb), 0.18); }
 
 /* ---- 按钮 ---- */
 
@@ -487,7 +672,7 @@ body[data-window-controls="right"] .daemon-badge {
   padding: 8px 16px; border-radius: var(--pill);
   background: var(--bg-2); color: var(--text);
   border: 1px solid var(--line-strong);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06);
+  box-shadow: inset 0 1px 0 rgba(var(--hl-rgb), .06);
   font-size: 13px; cursor: pointer; white-space: nowrap;
   transition: filter var(--dur) var(--ease-out), transform .12s var(--ease-out),
     background var(--dur) var(--ease-out), border-color var(--dur) var(--ease-out);
@@ -495,14 +680,14 @@ body[data-window-controls="right"] .daemon-badge {
 .btn:hover { filter: brightness(1.18); }
 .btn:active { transform: scale(.96); }
 .btn.primary {
-  background: linear-gradient(180deg, #3ad6bd, var(--accent));
-  color: #04211c; border-color: transparent; font-weight: 650;
-  box-shadow: 0 4px 14px -4px #31c8b066, inset 0 1px 0 rgba(255, 255, 255, .3);
+  background: linear-gradient(180deg, var(--accent-lift), var(--accent));
+  color: var(--on-accent); border-color: transparent; font-weight: 650;
+  box-shadow: 0 4px 14px -4px rgba(var(--accent-rgb), 0.4), inset 0 1px 0 rgba(var(--hl-rgb), .3);
 }
-.btn.danger { background: transparent; color: var(--danger); border-color: #e5484d55; }
-.btn.danger:hover { background: #e5484d1a; filter: none; }
+.btn.danger { background: transparent; color: var(--danger); border-color: rgba(var(--danger-rgb), 0.333); }
+.btn.danger:hover { background: rgba(var(--danger-rgb), 0.102); filter: none; }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--text-dim); }
-.btn.ghost:hover { color: var(--text); background: #ffffff08; filter: none; }
+.btn.ghost:hover { color: var(--text); background: var(--fill-1); filter: none; }
 .btn.big { padding: 12px 24px; font-size: 14px; }
 .btn.small { padding: 5px 10px; font-size: 12px; }
 .btn:disabled { opacity: .45; cursor: not-allowed; filter: none; transform: none; }
@@ -518,12 +703,12 @@ body[data-window-controls="right"] .daemon-badge {
   padding: 8px 13px; border-radius: var(--radius-sm);
   background: var(--bg); color: var(--text);
   border: 1px solid var(--line-strong);
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, .28);
+  box-shadow: inset 0 1px 2px rgba(var(--sh-rgb), .28);
   font-size: 13px; font-family: inherit; min-width: 0;
   transition: border-color var(--dur) var(--ease-out), box-shadow var(--dur) var(--ease-out);
 }
-.input::placeholder { color: #5f6979; }
-.input:focus { outline: none; border-color: #31c8b080; box-shadow: 0 0 0 3px #31c8b022; }
+.input::placeholder { color: var(--placeholder); }
+.input:focus { outline: none; border-color: rgba(var(--accent-rgb), 0.5); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.133); }
 
 /* 原生 select：只换外壳，箭头交给系统绘制（CSP 禁 data: 以外的图，也没必要自绘） */
 .select {
@@ -533,7 +718,7 @@ body[data-window-controls="right"] .daemon-badge {
   font-size: 12px; font-family: inherit; max-width: 190px;
   transition: border-color .15s ease-out, box-shadow .15s ease-out, opacity .15s ease-out;
 }
-.select:focus { outline: none; border-color: #31c8b080; box-shadow: 0 0 0 3px #31c8b022; }
+.select:focus { outline: none; border-color: rgba(var(--accent-rgb), 0.5); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.133); }
 .select:disabled { opacity: .45; cursor: not-allowed; }
 
 .form-row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
@@ -547,37 +732,37 @@ body[data-window-controls="right"] .daemon-badge {
 
 .tag {
   font-size: 10px; padding: 2px 8px; border-radius: 999px;
-  background: #ffffff0d; color: var(--text-dim);
+  background: var(--fill-2); color: var(--text-dim);
   border: 1px solid var(--line); white-space: nowrap; flex: none;
 }
-.tag.ok { color: var(--ok); background: #46c46b14; border-color: #46c46b33; }
-.tag.warn { color: var(--warn); background: #e0a83f14; border-color: #e0a83f33; }
-.tag.danger { color: var(--danger); background: #e5484d14; border-color: #e5484d33; }
-.tag.accent { color: var(--accent); background: #31c8b014; border-color: #31c8b033; }
+.tag.ok { color: var(--ok); background: rgba(var(--ok-rgb), 0.078); border-color: rgba(var(--ok-rgb), 0.2); }
+.tag.warn { color: var(--warn); background: rgba(var(--warn-rgb), 0.078); border-color: rgba(var(--warn-rgb), 0.2); }
+.tag.danger { color: var(--danger); background: rgba(var(--danger-rgb), 0.078); border-color: rgba(var(--danger-rgb), 0.2); }
+.tag.accent { color: var(--accent); background: rgba(var(--accent-rgb), 0.078); border-color: rgba(var(--accent-rgb), 0.2); }
 
 /* ---- 开关（真实滑块） ---- */
 
 .switch {
   position: relative; width: 38px; height: 22px; flex: none;
   border-radius: 11px; padding: 0;
-  background: #2a3140; border: 1px solid var(--line-strong);
+  background: var(--track); border: 1px solid var(--line-strong);
   cursor: pointer;
   transition: background .18s ease-out, border-color .18s ease-out;
 }
 .switch .knob {
   position: absolute; top: 2px; left: 2px;
   width: 16px; height: 16px; border-radius: 50%;
-  background: #aab3c2;
+  background: var(--knob);
   transition: transform .18s ease-out, background .18s ease-out;
 }
 .switch.on { background: var(--accent); border-color: transparent; }
-.switch.on .knob { transform: translateX(16px); background: #08221d; }
+.switch.on .knob { transform: translateX(16px); background: var(--on-accent); }
 /* 请求在飞行中（session.open 最坏 ~25s）：动画 + 静态描边双保险，
    prefers-reduced-motion 下动画被全局禁用，描边仍然看得见 */
 .switch.pending {
   pointer-events: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px #31c8b033;
+  box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.2);
   animation: switch-pending 1.1s ease-in-out infinite;
 }
 .switch.pending .knob { background: var(--accent); }
@@ -622,7 +807,7 @@ body[data-window-controls="right"] .daemon-badge {
 }
 .peer-card:hover {
   transform: translateY(-2px);
-  box-shadow: var(--shadow-lift), inset 0 1px 0 rgba(255, 255, 255, .07);
+  box-shadow: var(--shadow-lift), inset 0 1px 0 rgba(var(--hl-rgb), .07);
   border-color: var(--line-strong);
 }
 
@@ -819,12 +1004,12 @@ body[data-window-controls="right"] .daemon-badge {
   flex-basis: 0; flex-shrink: 1;
   transition: flex-grow .4s var(--ease-out);
 }
-.band-network { background: #6ea8fe; }
+.band-network { background: var(--hue-net); }
 .band-capture { background: var(--accent); }
 .band-buffer { background: var(--warn); }
-.band-playback { background: #b48ef0; }
+.band-playback { background: var(--hue-play); }
 /* 读不到时四段等宽且几乎透明：那是「还没测到」的形状，不是「四段一样长」的结论。 */
-.metric-band[data-empty] .band-seg { background: #ffffff14; }
+.metric-band[data-empty] .band-seg { background: var(--fill-3); }
 
 .metric-segs { display: flex; gap: 8px; }
 /* flex-basis 取 auto 而不是 0：网络那一段常常只有 0.3 ms，按比例分宽度会把「网络 0.3」
@@ -856,10 +1041,10 @@ body[data-window-controls="right"] .daemon-badge {
    （12 行 × 4 条边框在小尺寸下会糊成一片网格）。 */
 .stage-chip {
   font-size: 10px; line-height: 1.6; color: var(--text-dim);
-  background: #ffffff0f; border-radius: 4px; padding: 0 5px;
+  background: var(--fill-2); border-radius: 4px; padding: 0 5px;
   font-variant-numeric: tabular-nums; cursor: help;
 }
-.stage-chip.warn { color: var(--warn); background: #e0a83f22; }
+.stage-chip.warn { color: var(--warn); background: rgba(var(--warn-rgb), 0.133); }
 .stage-name { font-size: 12px; }
 .stage-host {
   font-size: 10px; color: var(--text-dim);
@@ -877,7 +1062,7 @@ body[data-window-controls="right"] .daemon-badge {
 /* 音质的「●●●○」：点数由等级定，空点保持在位，避免整行随质量变化左右抖。
    空点画成**空心环**而不是灰实心——四颗灰实心点在小尺寸下读起来像「四颗都亮着」。 */
 .quality-dots { display: inline-flex; align-items: center; gap: 3px; flex: none; }
-.qdot { width: 7px; height: 7px; border-radius: 50%; background: none; box-shadow: inset 0 0 0 1px #ffffff2e; }
+.qdot { width: 7px; height: 7px; border-radius: 50%; background: none; box-shadow: inset 0 0 0 1px var(--ring-empty); }
 .qdot.on { box-shadow: none; }
 .qdot.on.tone-ok { background: var(--ok); }
 .qdot.on.tone-accent { background: var(--accent); }
@@ -908,15 +1093,15 @@ body[data-window-controls="right"] .daemon-badge {
 .peer-inbound {
   display: flex; align-items: center; gap: 8px;
   font-size: 13px; color: var(--warn);
-  background: #e0a83f12; border: 1px solid #e0a83f33;
+  background: rgba(var(--warn-rgb), 0.07); border: 1px solid rgba(var(--warn-rgb), 0.2);
   border-radius: var(--radius-sm); padding: 6px 10px;
 }
 .peer-inbound .ico svg { width: 14px; height: 14px; }
 .peer-inbound .dot.live { background: var(--warn); animation: breathe-warn 1.6s ease-in-out infinite; }
 .inbound-text { flex: 1; min-width: 0; }
 @keyframes breathe-warn {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(224, 168, 63, .5); }
-  50% { box-shadow: 0 0 0 5px rgba(224, 168, 63, 0); }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(var(--warn-rgb), .5); }
+  50% { box-shadow: 0 0 0 5px rgba(var(--warn-rgb), 0); }
 }
 
 /* 对端处于使用端模式、无法被本机调取（plan §13 推论 1）。
@@ -924,12 +1109,12 @@ body[data-window-controls="right"] .daemon-badge {
    在**对面那台机器**上——徽章负责一眼可见，下面那行负责说清去哪儿改。 */
 .peer-unusable-badge {
   flex: none; font-size: 11px; font-weight: 650; letter-spacing: .02em;
-  color: var(--danger); background: #e0574f14; border: 1px solid #e0574f33;
+  color: var(--danger); background: rgba(var(--danger-rgb), 0.078); border: 1px solid rgba(var(--danger-rgb), 0.2);
   border-radius: 999px; padding: 2px 8px; white-space: nowrap;
 }
 .peer-unusable {
   font-size: 12px; color: var(--danger); line-height: 1.6;
-  background: #e0574f0d; border: 1px solid #e0574f26;
+  background: rgba(var(--danger-rgb), 0.05); border: 1px solid rgba(var(--danger-rgb), 0.15);
   border-radius: var(--radius-sm); padding: 6px 10px;
 }
 
@@ -937,7 +1122,7 @@ body[data-window-controls="right"] .daemon-badge {
 .peer-reconnect {
   display: flex; align-items: center; gap: 8px;
   font-size: 12px; color: var(--accent);
-  background: #31c8b010; border: 1px solid #31c8b02e;
+  background: rgba(var(--accent-rgb), 0.063); border: 1px solid rgba(var(--accent-rgb), 0.18);
   border-radius: var(--radius-sm); padding: 6px 10px;
   animation: reconnectIn .2s ease-out;
 }
@@ -966,10 +1151,10 @@ body[data-window-controls="right"] .daemon-badge {
 }
 .stream-rate { font-size: 11px; color: var(--text-dim); width: 72px; text-align: right; flex: none; font-variant-numeric: tabular-nums; }
 
-.meter { flex: 1; height: 6px; border-radius: 3px; background: #242b37; overflow: hidden; }
+.meter { flex: 1; height: 6px; border-radius: 3px; background: var(--trough); overflow: hidden; }
 .meter-fill {
   height: 100%; width: 100%; border-radius: 3px;
-  background: linear-gradient(90deg, var(--accent), #6ee7d2);
+  background: linear-gradient(90deg, var(--accent), var(--accent-glow));
   transform-origin: left center;
   transform: scaleX(0);
   will-change: transform;
@@ -988,7 +1173,7 @@ body[data-window-controls="right"] .daemon-badge {
   from { opacity: 0; transform: translateY(-4px); }
   to { opacity: 1; transform: none; }
 }
-.volume-box.unadjustable { border-color: #e0a83f2e; }
+.volume-box.unadjustable { border-color: rgba(var(--warn-rgb), 0.18); }
 .volume-row { display: flex; align-items: center; gap: 10px; }
 .vol-val {
   font-size: 11px; color: var(--text-dim); width: 46px;
@@ -1047,10 +1232,10 @@ body[data-window-controls="right"] .daemon-badge {
   display: inline-flex; align-items: center; gap: 5px;
   font-size: 11px; color: var(--accent); text-decoration: none;
   padding: 3px 8px; border-radius: 999px;
-  border: 1px solid #31c8b033; background: #31c8b010;
+  border: 1px solid rgba(var(--accent-rgb), 0.2); background: rgba(var(--accent-rgb), 0.063);
   transition: background .15s ease-out, border-color .15s ease-out;
 }
-.ext-link:hover { background: #31c8b01f; border-color: #31c8b055; }
+.ext-link:hover { background: rgba(var(--accent-rgb), 0.122); border-color: rgba(var(--accent-rgb), 0.333); }
 .ext-link .ico svg { width: 12px; height: 12px; }
 
 /* 设置页的检测结果清单 */
@@ -1075,9 +1260,9 @@ body[data-window-controls="right"] .daemon-badge {
   border: 1px solid var(--line-strong);
   transition: color .15s ease-out, background .15s ease-out, border-color .15s ease-out;
 }
-.icon-btn:hover:not(:disabled) { color: var(--text); background: #ffffff08; }
+.icon-btn:hover:not(:disabled) { color: var(--text); background: var(--fill-1); }
 .icon-btn:disabled { opacity: .45; cursor: not-allowed; }
-.icon-btn.on { color: var(--danger); border-color: #e5484d55; background: #e5484d14; }
+.icon-btn.on { color: var(--danger); border-color: rgba(var(--danger-rgb), 0.333); background: rgba(var(--danger-rgb), 0.078); }
 .icon-btn .ico svg { width: 15px; height: 15px; }
 
 /* 滑块：轨道左侧用主色填充到当前值（--vol 由 JS 写入） */
@@ -1088,34 +1273,34 @@ body[data-window-controls="right"] .daemon-badge {
 }
 .vol-slider::-webkit-slider-runnable-track {
   height: 6px; border-radius: 3px;
-  background: linear-gradient(90deg, var(--accent) 0 var(--vol, 0%), #2a3140 var(--vol, 0%) 100%);
+  background: linear-gradient(90deg, var(--accent) 0 var(--vol, 0%), var(--track) var(--vol, 0%) 100%);
 }
 .vol-slider::-webkit-slider-thumb {
   -webkit-appearance: none; appearance: none;
   width: 14px; height: 14px; margin-top: -4px;
-  border-radius: 50%; background: #e8eaf0; border: none;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, .5);
+  border-radius: 50%; background: var(--thumb); border: none;
+  box-shadow: 0 1px 3px rgba(var(--sh-rgb), .5);
   transition: transform .15s ease-out, box-shadow .15s ease-out, background .15s ease-out;
 }
 .vol-slider:hover:not(:disabled)::-webkit-slider-thumb { transform: scale(1.15); }
-.vol-slider:active:not(:disabled)::-webkit-slider-thumb { transform: scale(1.25); box-shadow: 0 0 0 4px #31c8b033; }
+.vol-slider:active:not(:disabled)::-webkit-slider-thumb { transform: scale(1.25); box-shadow: 0 0 0 4px rgba(var(--accent-rgb), 0.2); }
 .vol-slider.muted::-webkit-slider-runnable-track {
-  background: linear-gradient(90deg, #5a6372 0 var(--vol, 0%), #2a3140 var(--vol, 0%) 100%);
+  background: linear-gradient(90deg, var(--fill-muted) 0 var(--vol, 0%), var(--track) var(--vol, 0%) 100%);
 }
 .vol-slider:disabled { cursor: not-allowed; }
-.vol-slider:disabled::-webkit-slider-runnable-track { background: #2a3140; }
-.vol-slider:disabled::-webkit-slider-thumb { background: #5a6372; box-shadow: none; }
+.vol-slider:disabled::-webkit-slider-runnable-track { background: var(--track); }
+.vol-slider:disabled::-webkit-slider-thumb { background: var(--fill-muted); box-shadow: none; }
 /* Firefox（浏览器测试形态可能用到；Tauri 走 WebKit） */
-.vol-slider::-moz-range-track { height: 6px; border-radius: 3px; background: #2a3140; }
+.vol-slider::-moz-range-track { height: 6px; border-radius: 3px; background: var(--track); }
 .vol-slider::-moz-range-progress { height: 6px; border-radius: 3px; background: var(--accent); }
 .vol-slider::-moz-range-thumb {
   width: 14px; height: 14px; border-radius: 50%;
-  background: #e8eaf0; border: none;
+  background: var(--thumb); border: none;
   transition: transform .15s ease-out;
 }
-.vol-slider.muted::-moz-range-progress { background: #5a6372; }
-.vol-slider:disabled::-moz-range-progress { background: #2a3140; }
-.vol-slider:disabled::-moz-range-thumb { background: #5a6372; }
+.vol-slider.muted::-moz-range-progress { background: var(--fill-muted); }
+.vol-slider:disabled::-moz-range-progress { background: var(--track); }
+.vol-slider:disabled::-moz-range-thumb { background: var(--fill-muted); }
 
 /* 只读回显（统计诊断 / 详情表） */
 .vol-readout {
@@ -1126,14 +1311,14 @@ body[data-window-controls="right"] .daemon-badge {
 .vol-readout .ico { color: var(--accent); }
 .vol-readout.muted .ico { color: var(--text-dim); }
 .vol-readout-label { letter-spacing: .04em; }
-.vol-bar { flex: 1; max-width: 220px; height: 6px; border-radius: 3px; background: #242b37; overflow: hidden; }
+.vol-bar { flex: 1; max-width: 220px; height: 6px; border-radius: 3px; background: var(--trough); overflow: hidden; }
 .vol-bar-fill {
   height: 100%; width: 100%; border-radius: 3px;
-  background: linear-gradient(90deg, var(--accent), #6ee7d2);
+  background: linear-gradient(90deg, var(--accent), var(--accent-glow));
   transform-origin: left center; transform: scaleX(0);
   transition: transform .2s ease-out;
 }
-.vol-readout.muted .vol-bar-fill { background: #5a6372; }
+.vol-readout.muted .vol-bar-fill { background: var(--fill-muted); }
 .vol-cell { display: inline-flex; align-items: center; gap: 6px; }
 .vol-cell.muted { color: var(--text-dim); }
 
@@ -1157,9 +1342,9 @@ body[data-window-controls="right"] .daemon-badge {
   width: 20px; height: 20px; flex: none;
   display: grid; place-items: center;
   border-radius: 50%; font-size: 11px; font-weight: 650;
-  color: var(--accent); background: #31c8b01a; border: 1px solid #31c8b033;
+  color: var(--accent); background: rgba(var(--accent-rgb), 0.102); border: 1px solid rgba(var(--accent-rgb), 0.2);
 }
-.empty-ico { color: #3a4353; }
+.empty-ico { color: var(--fill-faint); }
 .empty-ico svg { width: 36px; height: 36px; }
 
 /* ---- 详情 ---- */
@@ -1191,8 +1376,8 @@ body[data-window-controls="right"] .daemon-badge {
   width: 30px; height: 30px; flex: none;
   display: grid; place-items: center;
   color: var(--accent);
-  background: #31c8b01a;
-  border: 1px solid #31c8b038;
+  background: rgba(var(--accent-rgb), 0.102);
+  border: 1px solid rgba(var(--accent-rgb), 0.22);
   border-radius: 9px;
 }
 .about-mark svg { width: 18px; height: 18px; }
@@ -1224,7 +1409,7 @@ body[data-window-controls="right"] .daemon-badge {
 .table tr:last-child td { border-bottom: none; }
 
 /* 对端发起的会话（取用本机麦克风 / 送入本机扬声器）在表格里高亮一档 */
-.table tr.inbound td { background: #e0a83f0a; }
+.table tr.inbound td { background: rgba(var(--warn-rgb), 0.039); }
 .table td .tag { margin-left: 6px; }
 
 /* ---- 配对向导 ---- */
@@ -1245,7 +1430,7 @@ body[data-window-controls="right"] .daemon-badge {
   color: var(--accent);
   background: var(--bg-2); border: 1px solid var(--line-strong);
   border-radius: var(--radius-sm);
-  box-shadow: inset 0 -14px 22px rgba(0, 0, 0, .28);
+  box-shadow: inset 0 -14px 22px rgba(var(--sh-rgb), .28);
   animation: digitFlip .35s ease-out backwards;
   animation-delay: calc(var(--i) * 70ms);
 }
@@ -1257,7 +1442,7 @@ body[data-window-controls="right"] .daemon-badge {
 .ring-wrap { display: flex; justify-content: center; }
 .ring { width: 96px; height: 96px; }
 .ring circle { fill: none; stroke-width: 5; }
-.ring-bg { stroke: #2a3140; }
+.ring-bg { stroke: var(--track); }
 .ring-fg {
   stroke: var(--accent); stroke-linecap: round;
   transform: rotate(-90deg); transform-origin: 50% 50%;
@@ -1270,7 +1455,7 @@ body[data-window-controls="right"] .daemon-badge {
   display: inline-block;
   width: 14px; height: 14px; flex: none;
   border-radius: 50%;
-  border: 2px solid #31c8b033; border-top-color: var(--accent);
+  border: 2px solid rgba(var(--accent-rgb), 0.2); border-top-color: var(--accent);
   animation: spin .8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -1282,7 +1467,7 @@ body[data-window-controls="right"] .daemon-badge {
   background: var(--bg-2); color: var(--text); font-family: inherit;
   transition: transform .18s ease-out, box-shadow .18s ease-out, border-color .18s ease-out;
 }
-.disc-item:hover { transform: translateY(-2px); border-color: var(--line-strong); box-shadow: 0 10px 26px rgba(0, 0, 0, .3); }
+.disc-item:hover { transform: translateY(-2px); border-color: var(--line-strong); box-shadow: 0 10px 26px rgba(var(--sh-rgb), .3); }
 .disc-main { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; }
 .disc-sub { font-size: 12px; color: var(--text-dim); font-family: var(--mono); }
 
@@ -1291,7 +1476,7 @@ body[data-window-controls="right"] .daemon-badge {
 .manual-pair { display: flex; flex-direction: column; gap: 12px; }
 .cli-hint {
   font-size: 12px; color: var(--warn);
-  background: #e0a83f12; border: 1px solid #e0a83f33;
+  background: rgba(var(--warn-rgb), 0.07); border: 1px solid rgba(var(--warn-rgb), 0.2);
   border-radius: var(--radius-sm); padding: 10px 12px;
   font-family: var(--mono); word-break: break-all;
 }
@@ -1301,8 +1486,8 @@ body[data-window-controls="right"] .daemon-badge {
   font-size: 11px; color: var(--text-dim); flex-wrap: wrap;
 }
 .pair-steps li { display: flex; align-items: center; gap: 6px; padding: 4px 8px; }
-.pair-steps li:not(:last-child)::after { content: ""; width: 16px; height: 1px; background: #ffffff1f; margin-left: 8px; }
-.step-dot { width: 7px; height: 7px; border-radius: 50%; background: #3a4353; flex: none; }
+.pair-steps li:not(:last-child)::after { content: ""; width: 16px; height: 1px; background: var(--edge-strong); margin-left: 8px; }
+.step-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--fill-faint); flex: none; }
 
 /* ---- 设置 ---- */
 
@@ -1322,7 +1507,7 @@ body[data-window-controls="right"] .daemon-badge {
   display: inline-flex; gap: 3px; padding: 3px;
   background: var(--bg); border: 1px solid var(--line-strong);
   border-radius: var(--pill);
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, .32);
+  box-shadow: inset 0 1px 3px rgba(var(--sh-rgb), .32);
 }
 .seg {
   border: none; background: transparent; color: var(--text-dim);
@@ -1332,9 +1517,9 @@ body[data-window-controls="right"] .daemon-badge {
 }
 .seg:hover { color: var(--text); }
 .seg.on {
-  background: linear-gradient(180deg, #31c8b02e, #31c8b016);
+  background: linear-gradient(180deg, rgba(var(--accent-rgb), 0.18), rgba(var(--accent-rgb), 0.086));
   color: var(--accent);
-  box-shadow: inset 0 0 0 1px #31c8b040, inset 0 1px 0 rgba(255, 255, 255, .14);
+  box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.25), inset 0 1px 0 rgba(var(--hl-rgb), .14);
 }
 /* 置灰仍然可见、可聚焦读屏，只是点不动——用户得能看到「有这么个模式」，
    否则驱动没装时 B 直接消失，反而不知道自己缺什么。title 说明原因。 */
@@ -1388,7 +1573,7 @@ body[data-window-controls="right"] .daemon-badge {
 /* 轨道底色 */
 .stop-track::before {
   content: ''; position: absolute; left: 0; right: 0; top: 6px;
-  height: 6px; border-radius: 3px; background: #2a3140;
+  height: 6px; border-radius: 3px; background: var(--track);
 }
 .stop-fill {
   position: absolute; left: 0; top: 6px; height: 6px;
@@ -1398,8 +1583,8 @@ body[data-window-controls="right"] .daemon-badge {
 .stop-thumb {
   position: absolute; top: 2px; width: 14px; height: 14px;
   margin-left: -7px; border-radius: 50%;
-  background: #e8eaf0;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, .5);
+  background: var(--thumb);
+  box-shadow: 0 1px 3px rgba(var(--sh-rgb), .5);
   transition: left var(--dur) var(--ease-spring), transform .15s ease-out,
     box-shadow .15s ease-out, background .15s ease-out;
 }
@@ -1413,7 +1598,7 @@ body[data-window-controls="right"] .daemon-badge {
 .stop-slider-row[data-dragging] .stop-thumb,
 .stop-slider-row[data-dragging] .stop-fill { transition: none; }
 .stop-slider-row[data-dragging] .stop-thumb {
-  transform: scale(1.25); box-shadow: 0 0 0 4px #31c8b033;
+  transform: scale(1.25); box-shadow: 0 0 0 4px rgba(var(--accent-rgb), 0.2);
 }
 
 /* 焦点环：原生 input 是透明的，它自己的焦点环看不见，得借 thumb 显示。
@@ -1422,8 +1607,8 @@ body[data-window-controls="right"] .daemon-badge {
   box-shadow: 0 0 0 3px var(--bg-1), 0 0 0 5px var(--accent);
 }
 
-.stop-slider:disabled ~ .stop-track .stop-fill { background: #2a3140; }
-.stop-slider:disabled ~ .stop-track .stop-thumb { background: #5a6372; box-shadow: none; }
+.stop-slider:disabled ~ .stop-track .stop-fill { background: var(--track); }
+.stop-slider:disabled ~ .stop-track .stop-thumb { background: var(--fill-muted); box-shadow: none; }
 /* 请求还在路上：thumb 已经回弹到目标档，但要看得出「尚未落定」——旁边的值
    标签同时仍停在 daemon 确认过的那一档上。 */
 .stop-slider[aria-busy="true"] ~ .stop-track .stop-thumb { background: var(--accent); }
@@ -1432,7 +1617,7 @@ body[data-window-controls="right"] .daemon-badge {
 .stop-tick {
   position: absolute; bottom: 1px; width: 2px; height: 4px;
   margin-left: -1px; border-radius: 1px;
-  background: #3a4353;
+  background: var(--fill-faint);
   transition: background .15s ease-out;
 }
 /* 亮起的是「此刻这个滑条代表哪一档」：拖动中是**松手会落到的那一档**，
@@ -1441,7 +1626,7 @@ body[data-window-controls="right"] .daemon-badge {
 .stop-tick.on { background: var(--accent); }
 /* 不可用档照画不误，只是明显更暗：不画出来，用户就无从知道「本机缺了什么」。
    title（由 JS 给）说明原因，但刻度不接指针事件，所以滑条本身也带一份 title。 */
-.stop-tick.off { background: #2a3140; height: 3px; bottom: 2px; }
+.stop-tick.off { background: var(--track); height: 3px; bottom: 2px; }
 
 .stop-slider-val {
   align-self: flex-end;
@@ -1472,7 +1657,7 @@ body[data-window-controls="right"] .daemon-badge {
 
 /* 模式决定了下面每张卡片的含义，所以它是这一页最重的一块：给它主色描边，
    让「现在是哪种模式」在扫一眼时就成立。 */
-.mode-bar { border-color: #31c8b02e; background: linear-gradient(180deg, #31c8b00a, transparent 60%), var(--bg-1); }
+.mode-bar { border-color: rgba(var(--accent-rgb), 0.18); background: linear-gradient(180deg, rgba(var(--accent-rgb), 0.039), transparent 60%), var(--bg-1); }
 .mode-head { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
 .mode-title-wrap { flex: 1; min-width: 220px; }
 .mode-sub { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
@@ -1483,7 +1668,7 @@ body[data-window-controls="right"] .daemon-badge {
 .mode-note.tone-danger { color: var(--danger); }
 .mode-warn {
   font-size: 12px; color: var(--warn);
-  background: #e0a83f0f; border: 1px solid #e0a83f2e; border-radius: 8px;
+  background: rgba(var(--warn-rgb), 0.06); border: 1px solid rgba(var(--warn-rgb), 0.18); border-radius: 8px;
   padding: 8px 12px;
 }
 /* settings.set 在飞：整组禁用，避免连点发出两次写、回包乱序停在错的档上 */
@@ -1492,8 +1677,8 @@ body[data-window-controls="right"] .daemon-badge {
   font-size: 13px; font-weight: 650; padding: 4px 10px; border-radius: 7px;
   background: var(--bg-2); border: 1px solid var(--line-strong);
 }
-.mode-mirror.mode-b { color: var(--accent); border-color: #31c8b03d; }
-.mode-mirror.mode-share { color: var(--ok); border-color: #4fbf7d3d; }
+.mode-mirror.mode-b { color: var(--accent); border-color: rgba(var(--accent-rgb), 0.24); }
+.mode-mirror.mode-share { color: var(--ok); border-color: rgba(var(--ok-rgb), .24); }
 
 /* 互斥提示（plan §13）：常驻一行，说明「选了这个，另一件事本机就不做了」。
    刻意比 .mode-desc 弱一档——它是约束的注脚，不该跟结果句抢注意力。 */
@@ -1510,7 +1695,7 @@ body[data-window-controls="right"] .daemon-badge {
    而不是又一行灰色小字——那种提示的存在感等于没有。 */
 .web-warn {
   margin-top: 14px; padding: 12px 14px; border-radius: var(--radius-sm);
-  background: #e5484d12; border: 1px solid #e5484d40;
+  background: rgba(var(--danger-rgb), 0.07); border: 1px solid rgba(var(--danger-rgb), 0.25);
   display: flex; flex-direction: column; gap: 6px;
 }
 .web-warn[hidden] { display: none; }
@@ -1534,10 +1719,10 @@ body[data-window-controls="right"] .daemon-badge {
 .dev-row {
   display: flex; align-items: center; gap: 10px;
   padding: 8px 10px; border-radius: 8px;
-  background: #ffffff05; border: 1px solid transparent;
+  background: var(--fill-1); border: 1px solid transparent;
   transition: border-color .18s ease-out, background .18s ease-out;
 }
-.dev-row.active { border-color: #31c8b03d; background: #31c8b00f; }
+.dev-row.active { border-color: rgba(var(--accent-rgb), 0.24); background: rgba(var(--accent-rgb), 0.06); }
 .dev-ico { color: var(--text-dim); }
 .dev-row.active .dev-ico { color: var(--accent); }
 .dev-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
@@ -1572,7 +1757,7 @@ body[data-window-controls="right"] .daemon-badge {
 .dev-inv-head .block-title { margin-right: auto; }
 .dev-inv-row {
   display: flex; align-items: center; gap: 10px;
-  padding: 6px 8px; border-radius: 8px; background: #ffffff05;
+  padding: 6px 8px; border-radius: 8px; background: var(--fill-1);
 }
 
 /* ---- 配对进度 ---- */
@@ -1589,7 +1774,7 @@ body[data-window-controls="right"] .daemon-badge {
   position: fixed; inset: 0; z-index: 55;
   display: flex; align-items: center; justify-content: center;
   padding: 24px;
-  background: rgba(15, 17, 21, .72);
+  background: rgba(var(--bg-rgb), .72);
   backdrop-filter: blur(6px);
   animation: fadeIn .18s ease-out;
 }
@@ -1600,9 +1785,9 @@ body[data-window-controls="right"] .daemon-badge {
   width: 440px; max-width: 100%;
   padding: 26px;
   background: var(--glass-fill);
-  border: 1px solid rgba(255, 255, 255, .1);
+  border: 1px solid var(--edge);
   border-radius: 20px;
-  box-shadow: 0 32px 80px -16px rgba(0, 0, 0, .68), var(--glass-edge);
+  box-shadow: var(--shadow-modal), var(--glass-edge);
   display: flex; flex-direction: column; gap: 12px;
   animation: sheetIn .32s var(--ease-spring);
 }
@@ -1677,14 +1862,14 @@ canvas.spark { width: 160px; height: 36px; display: block; }
 }
 .wf-bar {
   flex: 1; min-width: 0; height: 12px; display: flex; gap: 2px;
-  border-radius: 3px; background: #ffffff08;
+  border-radius: 3px; background: var(--fill-1);
 }
 .wf-seg { flex-basis: 0; border-radius: 2px; transition: flex-grow .4s var(--ease-out); }
-.wf-network { background: #6ea8fe; }
+.wf-network { background: var(--hue-net); }
 .wf-capture { background: var(--accent); }
 .wf-buffer { background: var(--warn); }
-.wf-playback { background: #b48ef0; }
-.wf-residual { background: #5a6372; }
+.wf-playback { background: var(--hue-play); }
+.wf-residual { background: var(--fill-muted); }
 /* 分项全未知：**不画任何比例**——随手给一组比例等于宣称测到了它们。 */
 .wf-bar[data-empty] .wf-seg { flex-grow: 0; }
 .wf-total { font-size: 12px; color: var(--text-dim); width: 76px; text-align: right; flex: none; font-variant-numeric: tabular-nums; }
@@ -1710,7 +1895,7 @@ canvas.spark { width: 160px; height: 36px; display: block; }
   display: flex; align-items: flex-start; justify-content: center;
   padding: 40px 24px;
   overflow-y: auto;
-  background: rgba(15, 17, 21, .92);
+  background: rgba(var(--bg-rgb), .92);
   backdrop-filter: blur(6px);
   animation: fadeIn .2s ease-out;
 }
@@ -1733,9 +1918,9 @@ body.is-tauri .gate-drag {
   margin: auto;
   padding: 30px;
   background: var(--glass-fill);
-  border: 1px solid rgba(255, 255, 255, .1);
+  border: 1px solid var(--edge);
   border-radius: 22px;
-  box-shadow: 0 32px 80px -16px rgba(0, 0, 0, .68), var(--glass-edge);
+  box-shadow: var(--shadow-modal), var(--glass-edge);
   gap: 20px;
   animation: sheetIn .34s var(--ease-spring);
 }
@@ -1745,7 +1930,7 @@ body.is-tauri .gate-drag {
   width: 40px; height: 40px; flex: none;
   display: grid; place-items: center;
   color: var(--accent);
-  background: #31c8b01a; border: 1px solid #31c8b033;
+  background: rgba(var(--accent-rgb), 0.102); border: 1px solid rgba(var(--accent-rgb), 0.2);
   border-radius: var(--radius-sm);
 }
 .gate-logo svg { width: 22px; height: 22px; }
@@ -1761,14 +1946,14 @@ body.is-tauri .gate-drag {
   border-radius: var(--radius-sm);
   transition: border-color .18s ease-out, background .18s ease-out;
 }
-.perm-row.granted { border-color: #46c46b2e; }
+.perm-row.granted { border-color: rgba(var(--ok-rgb), 0.18); }
 /* 正挡着门的那一项要一眼认出来——不是报错，是「还差这个」。 */
-.perm-row.blocking { border-color: #e0a83f3d; background: #e0a83f0a; }
+.perm-row.blocking { border-color: rgba(var(--warn-rgb), 0.24); background: rgba(var(--warn-rgb), 0.039); }
 .perm-ico {
   width: 30px; height: 30px; flex: none;
   display: grid; place-items: center;
   color: var(--text-dim);
-  background: #ffffff08; border: 1px solid var(--line);
+  background: var(--fill-1); border: 1px solid var(--line);
   border-radius: 8px;
 }
 .perm-row.granted .perm-ico { color: var(--ok); }
@@ -1796,7 +1981,7 @@ body.is-tauri .gate-drag {
 #overlay {
   position: fixed; inset: 0; z-index: 50;
   display: flex; align-items: center; justify-content: center;
-  background: rgba(15, 17, 21, .78);
+  background: rgba(var(--bg-rgb), .78);
   backdrop-filter: blur(6px);
   animation: fadeIn .2s ease-out;
 }
@@ -1807,14 +1992,14 @@ body.is-tauri .gate-drag {
   width: 400px; max-width: calc(100vw - 48px);
   padding: 34px;
   background: var(--glass-fill);
-  border: 1px solid rgba(255, 255, 255, .1);
+  border: 1px solid var(--edge);
   border-radius: 22px;
-  box-shadow: 0 32px 80px -16px rgba(0, 0, 0, .68), var(--glass-edge);
+  box-shadow: var(--shadow-modal), var(--glass-edge);
   text-align: center;
   display: flex; flex-direction: column; gap: 12px; align-items: center;
   animation: sheetIn .34s var(--ease-spring);
 }
-.overlay-ico { color: #3a4353; }
+.overlay-ico { color: var(--fill-faint); }
 .overlay-ico svg { width: 40px; height: 40px; }
 .overlay-card h2 { font-size: 17px; }
 .overlay-card p { color: var(--text-dim); font-size: 13px; white-space: pre-line; }
@@ -1854,15 +2039,15 @@ body.is-tauri .gate-drag {
   background: var(--glass-fill);
   backdrop-filter: var(--glass-blur);
   -webkit-backdrop-filter: var(--glass-blur);
-  border: 1px solid rgba(255, 255, 255, .1);
+  border: 1px solid var(--edge);
   box-shadow: var(--glass-shadow), var(--glass-edge);
   font-size: 13px; max-width: 380px;
   animation: toastIn .3s var(--ease-spring);
   transition: opacity .3s var(--ease-out), transform .3s var(--ease-out);
 }
-.toast.ok { border-color: #46c46b55; color: var(--ok); }
-.toast.error { border-color: #e5484d55; color: var(--danger); }
-.toast.warn { border-color: #e0a83f55; color: var(--warn); }
+.toast.ok { border-color: rgba(var(--ok-rgb), 0.333); color: var(--ok); }
+.toast.error { border-color: rgba(var(--danger-rgb), 0.333); color: var(--danger); }
+.toast.warn { border-color: rgba(var(--warn-rgb), 0.333); color: var(--warn); }
 .toast.out { opacity: 0; transform: translateY(6px); }
 @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
@@ -1874,6 +2059,34 @@ body.is-tauri .gate-drag {
     transition: none !important;
   }
 }
+
+/* ---- 主题切换的圆形揭示（View Transitions） ----
+ *
+ * 只有三条声明，但每一条都是**关掉浏览器默认行为**，而不是加效果。真正的动画在
+ * lib/reveal.ts 里用 Web Animations API 打在 `::view-transition-new(root)` 上
+ * ——圆心是按钮的视口坐标，只有点击那一刻才知道，CSS 写不出来。
+ *
+ * ① `animation: none` —— 默认过渡是新旧两帧交叉淡入淡出。留着它，圆形揭示会在一层
+ *    正在变淡的旧界面上扩张，读起来是「糊了一下」而不是「新表面扫过来」。
+ *
+ * ② `mix-blend-mode: normal` —— 默认是 plus-lighter（为真交叉淡入准备的）。两层
+ *    都不透明时相加，被揭示的区域会**发白过曝**，浅色主题下尤其明显。
+ *
+ * ③ 旧帧留在原地不动，新帧在它上面被裁出一个圆。这也是 `::view-transition-old` 不
+ *    需要任何 clip 的原因：它整帧都在，只是被逐渐盖住。
+ *
+ * ⚠ 这里**不**写 `@media (prefers-reduced-motion)` 的分支：减弱动态时 reveal.ts
+ *    根本不会调用 startViewTransition，这几条伪元素连创建都不会发生。
+ */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+/* 新帧压在旧帧之上。规范里同一 image-pair 内 new 本就画在 old 之后，写出来是为了
+   不依赖那条隐含次序——它一旦被别处的 z-index 破坏，症状是圆圈里什么都不变。 */
+::view-transition-new(root) { z-index: 1; }
+::view-transition-old(root) { z-index: 0; }
 
 
 /* ---- plan §15：对端详情页的传输档位（2 行 × 2 列） ---- */
@@ -2053,9 +2266,9 @@ body.is-tauri .gate-drag {
   display: inline-flex; align-items: center; justify-content: center;
   min-width: 22px; height: 22px; padding: 0 6px;
   border-radius: 6px;
-  background: #ffffff0f;
-  border: 1px solid rgba(255, 255, 255, .14);
-  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, .35);
+  background: var(--fill-2);
+  border: 1px solid var(--edge-strong);
+  box-shadow: inset 0 -1px 0 rgba(var(--sh-rgb), .35);
   font-family: var(--font); font-size: 12px; line-height: 1;
   color: var(--text);
 }
@@ -2082,13 +2295,13 @@ body.is-tauri .gate-drag {
   justify-content: center;
   padding: 3px 8px;
   border-radius: 8px;
-  background: #ffffff08;
+  background: var(--fill-1);
   border: 1px solid var(--line);
   color: var(--text); font-family: inherit; font-size: 12px;
   cursor: pointer;
   transition: border-color var(--dur) var(--ease-out), background var(--dur) var(--ease-out);
 }
-.sc-capsule:hover { border-color: rgba(255, 255, 255, .22); }
+.sc-capsule:hover { border-color: var(--edge-hover); }
 .sc-capsule.unset { color: var(--text-dim); }
 /* 录制态：强调色描边 + 呼吸。呼吸是这里唯一有理由的动画——它说的是「我在听」，
    而不是装饰；prefers-reduced-motion 下由全局规则掐掉，描边仍在。 */
@@ -2112,7 +2325,7 @@ body.is-tauri .gate-drag {
   cursor: pointer;
   transition: color var(--dur) var(--ease-out), background var(--dur) var(--ease-out);
 }
-.sc-mini:hover { color: var(--text); background: #ffffff0f; }
+.sc-mini:hover { color: var(--text); background: var(--fill-2); }
 .sc-mini svg { width: 15px; height: 15px; }
 
 /* 一行说明位，四种内容轮流占用（录制提示 / 静默解释 / 错误 / 别名），高度固定
@@ -2143,7 +2356,7 @@ body.is-tauri .gate-drag {
 .sheet-scrim {
   position: fixed; inset: 0; z-index: 60;
   display: flex; align-items: center; justify-content: center;
-  background: rgba(0, 0, 0, .45);
+  background: rgba(var(--sh-rgb), .45);
   backdrop-filter: blur(3px);
   -webkit-backdrop-filter: blur(3px);
   animation: fadeIn .16s var(--ease-out);
@@ -2157,7 +2370,7 @@ body.is-tauri .gate-drag {
   border-radius: var(--radius);
   background: var(--bg-1);
   border: 1px solid var(--line);
-  box-shadow: 0 24px 60px -20px rgba(0, 0, 0, .7);
+  box-shadow: 0 24px 60px -20px rgba(var(--sh-rgb), .7);
   animation: viewIn .22s var(--ease-out);
 }
 .sheet-title { margin: 0 0 12px; font-size: 15px; }

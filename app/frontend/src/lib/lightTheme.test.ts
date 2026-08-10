@@ -217,6 +217,172 @@ describe('light palette clears WCAG on the surfaces text lands on', () => {
       expect(ratio(token(name), inked), `${name} on watermark`).toBeGreaterThanOrEqual(4.5);
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Class C: the right ink, on the wrong kind of object.
+  //
+  // A and B were about strokes. This one is about which TIER a colour comes
+  // from. The four semantic tokens are tuned for body text, which in the light
+  // theme forces them to L* 41-44. They were also painting things that are not
+  // text at all -- 7px status dots, the quality pips, the segments of the
+  // latency band, the 3px rule down the side of the tier callout. Those are
+  // graphical objects: SC 1.4.11 asks 3:1 of them, not 4.5:1, and holding them
+  // to the text bar cost 11-14 L* of brightness each. On a light canvas that is
+  // the difference between "a status colour" and "a black speck".
+  //
+  // The proof that it mattered is the latency band, whose four segments came
+  // from four different places: three fill-tuned --hue-* tokens and one text-
+  // tuned --accent. In the dark theme all four happen to sit at L* 66-73 and
+  // nothing shows. In the light theme they measured 48.3 / 40.9 / 62.4 / 43.8.
+  //
+  // So: --*-mark is the graphics tier, and these assertions keep marks off the
+  // text tier. Use `ratio(x, white)` as a lightness proxy throughout -- a lower
+  // ratio against white means a lighter colour.
+  // -------------------------------------------------------------------------
+  const darkBodyC = ALL.find((r) => r.selector === ':root')?.body ?? '';
+  const MARKS = ['--ok-mark', '--accent-mark', '--warn-mark', '--danger-mark'] as const;
+
+  it('defines the dark mark tier as the semantic token itself', () => {
+    // This is what makes test/ui2/darkdiff.mjs green BY CONSTRUCTION rather
+    // than by care: in the dark theme every mark resolves to the exact literal
+    // it replaced, so swapping a call site over cannot move a dark pixel. Give
+    // dark its own mark value and that guarantee is gone -- which is fine, but
+    // it has to be a decision, not an accident.
+    for (const m of MARKS) {
+      const semantic = m.replace('-mark', '');
+      expect(decl(darkBodyC, m)?.trim(), `dark ${m}`).toBe(`var(${semantic})`);
+    }
+    expect(decl(darkBodyC, '--hue-capture')?.trim()).toBe('var(--accent)');
+  });
+
+  it('keeps the light mark tier above the 3:1 non-text bar, and lighter than its text twin', () => {
+    for (const m of MARKS) {
+      expect(ratio(token(m), card), `${m} on card`).toBeGreaterThanOrEqual(3);
+      expect(ratio(token(m), inked), `${m} on watermark`).toBeGreaterThanOrEqual(3);
+      // Lighter than the text tier, or the split bought nothing at all.
+      expect(ratio(token(m), card), `${m} vs its text twin`)
+        .toBeLessThan(ratio(token(m.replace('-mark', '')), card));
+    }
+  });
+
+  it('gives --accent-mark and --ring the same ink', () => {
+    // Same question -- "the accent, drawn as a graphic, at 3:1 on a light
+    // surface" -- so it must not have two answers that drift apart.
+    expect(decl(lightBody, '--accent-mark')?.trim()).toBe(decl(lightBody, '--ring')?.trim());
+  });
+
+  it('holds the four latency-band fills in one lightness band', () => {
+    const band = ['--hue-net', '--hue-capture', '--hue-buffer', '--hue-play'].map((n) => ratio(token(n), card));
+    for (const r of band) expect(r, 'band fill on card').toBeGreaterThanOrEqual(3);
+    // Before this round the spread was 2.93 .. 6.24 -- one segment read as a
+    // black bar between three coloured ones. Contrast-against-white is a
+    // monotone proxy for lightness, so bounding its spread bounds theirs.
+    expect(Math.max(...band) / Math.min(...band), 'band lightness spread').toBeLessThan(1.35);
+  });
+
+  it('keeps text legible on a wash of its own colour', () => {
+    // The trap this round very nearly shipped. A callout is usually "coloured
+    // text on a faint wash of the same colour" -- .metric-tier, .stage-chip.warn,
+    // every .tag. Brightening the text token brightens the WASH by exactly the
+    // same amount, so the pair can move DOWN while every measurement against
+    // the page background moves up. Lifting --warn from #7d5a0e to #955802 took
+    // .metric-tier from 4.87 to 4.44 and .stage-chip.warn from 4.77 to 4.36 --
+    // both out of AA -- while --warn on the canvas got better. Nothing that
+    // measures a token against the page can see this; it has to be measured
+    // pair by pair, at the call site.
+    //
+    // The fix is to draw the wash with the MARK tier: a lighter ink makes a
+    // lighter wash under the same dark text.
+    const SEM = ['ok', 'accent', 'warn', 'danger'];
+    // Conservative surface: the darker of the two a callout can sit on.
+    const surface = token('--bg-2');
+
+    // A base rule's background is not necessarily what the LIGHT theme paints.
+    // `.seg.on` is the case in point: the base sheet gives it an 18% -> 8.6%
+    // accent gradient, and the light block replaces the whole thing with a flat
+    // 10% tint. Reading the base rule there would charge the light theme for a
+    // wash it never draws (18% would read 4.42; the 10% it actually uses is
+    // 4.67). So index the light overrides first and prefer them.
+    const lightBg = new Map<string, string>();
+    for (const r of ALL) {
+      if (!r.selector.includes(LIGHT)) continue;
+      const bg = decl(r.body, 'background') ?? decl(r.body, 'background-color');
+      if (!bg) continue;
+      for (const part of r.selector.split(',')) {
+        const sel = part.trim().replace(`${LIGHT} `, '').trim();
+        if (sel && sel !== LIGHT) lightBg.set(sel, bg);
+      }
+    }
+
+    /** Two idioms in this file: rgba(var(--X-rgb), A), color-mix(--X P%). */
+    function wash(bgDecl: string | null): { tok: string; alpha: number } | null {
+      if (!bgDecl) return null;
+      const m = bgDecl.match(/rgba\(\s*var\(--(\w+)-rgb\)\s*,\s*([\d.]+)\s*\)/)
+        ?? bgDecl.match(/color-mix\(in srgb,\s*var\(--([\w-]+)\)\s*([\d.]+)%/);
+      if (!m) return null;
+      const n = Number(m[2]);
+      return { tok: m[1], alpha: n > 1 ? n / 100 : n };
+    }
+    const bgOf = (r: Rule) => lightBg.get(r.selector.replace(/\s+/g, ' ').trim())
+      ?? decl(r.body, 'background') ?? decl(r.body, 'background-color');
+    const base = ALL.filter((r) => !r.selector.includes(LIGHT) && !r.selector.startsWith('@'));
+
+    // The wash and the text are not always in the same rule. `.metric-tier`
+    // carries the 12% background while `.metric-tier-label` carries the colour,
+    // and it was precisely that pair that fell out of AA. There is no
+    // structural relation a stylesheet parser can see between those two
+    // selectors -- only the naming convention, which this file follows
+    // throughout: a block is `.x`, its parts are `.x-*`. So pair them by that.
+    const pairs: { label: string; fg: string; tok: string; alpha: number }[] = [];
+    for (const r of base) {
+      const w = wash(bgOf(r) ?? null);
+      if (!w || !SEM.includes(w.tok.replace(/-mark$/, ''))) continue;
+      const sel = r.selector.replace(/\s+/g, ' ').trim();
+      // (a) same rule
+      const own = decl(r.body, 'color')?.match(/var\(--(ok|accent|warn|danger)\)/);
+      if (own) pairs.push({ label: sel, fg: own[1], ...w });
+      // (b) `.x-*` parts of the block `.x`
+      if (!/^\.[\w-]+$/.test(sel)) continue;
+      for (const c of base) {
+        const csel = c.selector.replace(/\s+/g, ' ').trim();
+        if (!csel.startsWith(`${sel}-`)) continue;
+        const cfg = decl(c.body, 'color')?.match(/var\(--(ok|accent|warn|danger)\)/);
+        if (cfg) pairs.push({ label: `${csel} on ${sel}`, fg: cfg[1], ...w });
+      }
+    }
+    let checked = 0;
+    for (const p of pairs) {
+      if (p.tok.replace(/-mark$/, '') !== p.fg) continue;      // same-hue washes only
+      const r = ratio(token(`--${p.fg}`), over(token(`--${p.tok}`), surface, p.alpha));
+      expect(r, `${p.label}: text on its own ${(p.alpha * 100).toFixed(1)}% wash`)
+        .toBeGreaterThanOrEqual(4.5);
+      checked++;
+    }
+    // Guard the guard: if the parse stops matching, this must not read green.
+    expect(checked, 'same-hue text-on-wash pairs found').toBeGreaterThanOrEqual(8);
+  });
+
+  it('paints no small mark with a text-tier colour', () => {
+    // The rule a future contributor will break. Each of these draws a solid
+    // shape a few pixels across; none has text on it.
+    const MARK_RULES = [
+      '.dot.online', '.dot.connecting', '.peer-inbound .dot.live',
+      '.qdot.on.tone-ok', '.qdot.on.tone-accent', '.qdot.on.tone-warn', '.qdot.on.tone-danger',
+      '.pair-steps li.done .step-dot', '.pair-steps li.doing .step-dot', '.pair-steps li.failed .step-dot',
+      '.band-capture', '.wf-capture', '.stop-tick.on', '.switch.pending .knob',
+    ];
+    const seen = new Set<string>();
+    for (const r of ALL) {
+      const sel = r.selector.replace(/\s+/g, ' ').trim();
+      if (!MARK_RULES.includes(sel)) continue;
+      seen.add(sel);
+      // `--accent-mark` contains `--accent`, so match the closing paren too.
+      const bare = r.body.match(/var\(--(ok|accent|warn|danger)\)/g);
+      expect(bare, `${sel} still paints itself with a text-tier token`).toBeNull();
+    }
+    // Guard the guard: a renamed selector must not silently drop out.
+    expect([...seen].sort(), 'mark rules found in the stylesheet').toEqual([...MARK_RULES].sort());
+  });
 });
 
 // ---------------------------------------------------------------------------

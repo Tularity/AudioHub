@@ -118,10 +118,46 @@
      --hue-buffer 原先直接用 --warn，那是把「警示」和「第三种分类」混成了一个值：
      语义色是按**文字对比度**定的，而这里它只做**填充**，没有字压在上面。深色下两者
      恰好同值所以看不出来；浅色下 --warn 压暗成 #7d5a0e（为了做正文合规），当填充
-     就是一团发闷的橄榄色——30-win 的落地验证点名了这一条。拆开之后深色一字未变。 */
+     就是一团发闷的橄榄色——30-win 的落地验证点名了这一条。拆开之后深色一字未变。
+
+     **--hue-capture 是同一条错误的最后一段。** 上面那次拆分只拆了 buffer，而这条带
+     一共四段，capture 那段一直直接用 --accent——也就是**四段里三段是填充色、一段是
+     正文色**。深色下四段都在 L* 66–73，看不出来；浅色下实测 L* 依次是
+     48.3 / **40.9** / 62.4 / 43.8，capture 又暗又灰（C* 29.5，其余三段 56–71），
+     在白卡上读成一段黑。用户报的「延迟条颜色不对」指的就是这一段。 */
   --hue-net: #6ea8fe;
   --hue-play: #b48ef0;
   --hue-buffer: #e0a83f;
+  --hue-capture: var(--accent);
+
+  /* ---- 标记层（mark tier）：语义色**当图形画**时的那一档 ----
+   *
+   * 四个语义色（--ok / --accent / --warn / --danger）的取值是按**正文对比度**定的。
+   * 浅色下这条约束把它们全压到 L* 41–44，而它们同时还在给一批**非文字**的小图形上色：
+   * 音质的 7px 圆点、在线/离线点、延迟条、步骤点、归因条左边那道 3px 竖线。
+   * 结果是浅色下每一枚状态点都比它需要的暗 13 个 L*，读成「一粒黑渣」而不是「状态色」。
+   *
+   * 这不是新发明的分层，是这份文件已经做过两次的同一件事：--ring 从 --accent 里拆出来
+   * （环是线，按 WCAG 非文字 3:1 收，不按正文 4.5:1），--hue-buffer 从 --warn 里拆出来
+   * （填充没有字压在上面）。标记层只是把它收敛成一条**有名字的规则**，省得下一处再各拆各的。
+   *
+   * 判据：SC 1.4.11 / 2.4.13 的非文字 3:1，量的是**画布叠水印**那一列（最差的一面）。
+   *
+   * 外部参照（本轮实测，来源见报告）：
+   *   · IBM Carbon 的 status 色板把同一件事叫 fill 与 outline。`$support-warning`
+   *     在 light 与 dark 下**是同一个值**（Yellow 30 #f1c21b，白底 1.68:1），浅色主题
+   *     另配 Yellow 60 #8e6a00 / Orange 60 #ba4e00 两个**只用来描边**的深色。
+   *     也就是说：填充亮、描边/文字深，两档分工与这里一致。
+   *   · 我们的填充比 Carbon 保守（3:1 而不是 1.68:1），因为 Carbon 的状态指示器带图标
+   *     形状，靠「符号/形状/颜色/文字四要素至少三样」兜可访问性；我们的 .qdot 是 7px
+   *     纯圆点，形状这一路走不通，只能把对比度留在颜色上。
+   *
+   * 深色侧四个 token 解析出来与它们替换掉的字面量**逐字相同**，所以 darkdiff 对这次
+   * 拆分恒为绿——与 --ring 当初那次拆分是同一个手法，不是靠自觉。 */
+  --ok-mark: var(--ok);
+  --accent-mark: var(--accent);
+  --warn-mark: var(--warn);
+  --danger-mark: var(--danger);
   /* 三处模态浮层共用的同一条投影。浅色下这条最需要单独收，所以提成 token。 */
   --shadow-modal: 0 32px 80px -16px rgba(var(--sh-rgb), .68);
 
@@ -239,12 +275,45 @@
  *
  *   （左：纯画布 #eceef3；右：画布 + .042 水印，即 rgb(227,233,237)）
  *   --text-dim #3f4756 → 8.05:1 / 7.62:1   AAA 两处都保住
- *   --accent   #0a6d5f → 5.37:1 / 5.08:1   AA
- *   --ok       #15743a → 5.85:1 / 4.77:1   AA
- *   --danger   #b82c34 → 5.25:1 / 4.96:1   AA
- *   --warn     #7d5a0e → 5.42:1 / 5.13:1   AA
+ *   --accent   #0a6d5f → 5.38:1 / 5.09:1   AA
+ *   --ok       #18763a → 4.90:1 / 4.64:1   AA
+ *   --danger   #c12e35 → 4.88:1 / 4.62:1   AA
+ *   --warn     #955802 → 4.92:1 / 4.67:1   AA
  *
  * 改这五个值之前请重新量一次，**并且要量水印那一列**。
+ *
+ * ---- 为什么这三个值又动了一次：色相本身站不住 ----
+ *
+ * 上一版把它们压到 5.0–5.4，比 AA 的 4.5 多留了将近一档余量。省下来的不是安全边际，
+ * 是**明度**：整组落在 L* 40.7–42.7，而画布是 L* 93。四个语义色于是在浅底上读成
+ * 四团一样重的深色块，彼此只靠色相区分——其中 --warn 的 h=80° 在 L* 41 上根本不是
+ * 「琥珀」，是**橄榄褐**。用户点名的「延迟数字」正是这一个：延迟落在 120–300 ms
+ * 时数字取 --warn，22px 的「≥143 ms」在白卡上是一行泥。
+ *
+ * 参照物（本轮实测，来源见报告）——所有权威的浅色语义色都落在 L* 47–50：
+ *   Apple HIG（Increased Contrast, light）  Yellow #a16a00 L*49.4 · Orange #c55300 L*49.6
+ *                                          Green  #008932 L*49.6 · Red    #e9152d L*49.6
+ *   IBM Carbon（light status）              Yellow60 #8e6a00 L*47.1 · Orange60 #ba4e00 L*46.8
+ *                                          Red60    #da1e28 L*47.0
+ *   本文件（改前）                          L* 40.7 – 42.7   ← 比两家都暗 5–9 个 L*
+ *
+ * 差距的来源可以算清楚，不必猜：Apple / Carbon 是按 **4.5:1 对纯白**定的，我们是按
+ * **4.5:1 对画布叠水印**（rgb 227,233,237）定的。同一个 #a16a00 在白底上 4.59:1，
+ * 在我们的画布上只有 3.95:1——**够不着我们的线**。所以「比 Apple 暗」这件事有一半是
+ * 结构性的（画布不是白的），不是调错了。
+ *
+ * ⇒ 于是本轮的做法是分两头：
+ *   ① 文字这一档**守住原判据不放宽**（4.5:1 对叠水印画布），只把余量花光：
+ *      从 5.0–5.4 收到 4.6–4.7，换回 2.0–2.9 个 L* 和更高的彩度，并把 --warn 的色相
+ *      从 80°（橄榄）拉到 69°（琥珀）。能拿的只有这么多，这是这条判据下的上限。
+ *   ② 真正的位移交给**标记层**（:root 里的 --*-mark）：那些点、条、竖线不是文字，
+ *      按 3:1 收就能站到 L* 53–55，比文字档亮 11–14 个 L*。
+ * 用户看到的「颜色偏深」，大头在 ②，不在 ①。
+ *
+ * ⚠ 三个语义色的 4.5:1 判据**没有**放宽，因此浅色下 22px 的延迟数字仍然只有 4.6:1
+ *   附近。若将来愿意承认 `.metric-val`（22px / 650）属于 WCAG 的大号文本（判据 3:1），
+ *   它就能直接用标记层，那才是让这个数字真正亮起来的做法。650 不等于 CSS 的 bold(700)，
+ *   22px 也不到 24px，所以本轮**不**去主张它是大号文本。
  *
  * 投影另起一套而不是只换墨色：深色下的 .68 黑放到白底上是一团脏，浅色投影要
  * **更浅、更散、带一点冷调**（#0f172a 而不是纯黑），这是浅色界面能不能读作干净的
@@ -282,17 +351,17 @@
   --text: #171a21;
   --text-dim: #3f4756;
   --accent: #0a6d5f;
-  --danger: #b82c34;
-  --ok: #15743a;
-  --warn: #7d5a0e;
+  --danger: #c12e35;
+  --ok: #18763a;
+  --warn: #955802;
   --line: rgba(15, 23, 42, .09);
   --line-strong: rgba(15, 23, 42, .14);
 
   --bg-rgb: 236, 238, 243;
   --accent-rgb: 10, 109, 95;
-  --danger-rgb: 184, 44, 52;
-  --ok-rgb: 21, 116, 58;
-  --warn-rgb: 125, 90, 14;
+  --danger-rgb: 193, 46, 53;
+  --ok-rgb: 24, 118, 58;
+  --warn-rgb: 149, 88, 2;
   /* 玻璃在浅色下是**发白**的，不是发暗：底色比画布更亮，模糊后的胶囊才浮得起来。 */
   --glass-rgb: 252, 253, 255;
   --sh-rgb: 15, 23, 42;
@@ -309,7 +378,12 @@
 
   --track: #d6dae3;
   --trough: #e2e6ed;
-  --fill-muted: #98a1b1;
+  /* 「静音 / 禁用 / 离线」的实心填充。原值 #98a1b1 对画布只有 2.24:1——**禁用**控件
+     可以这样（WCAG 把 inactive component 排除在外），但同一个 token 还画着
+     `.dot.offline`，而「离线」是一个**要被读出来的状态**，归 SC 1.4.11 的 3:1 管。
+     #7a8393 → 对叠水印画布 3.12:1、对白卡 3.82:1。顺带把静音滑条的填充也带出来了：
+     L* 66 的灰压在 L* 87 的轨道上原本几乎看不见「填到哪儿了」。 */
+  --fill-muted: #7a8393;
   --fill-faint: #c3cad6;
   --knob: #ffffff;
   --thumb: #ffffff;
@@ -325,10 +399,39 @@
   --on-accent: #ffffff;
   --accent-lift: #0f8474;
   --accent-glow: #1aa892;
-  --hue-net: #3b6fd4;
-  --hue-play: #7c4fc0;
-  /* 只需与上面两色可分辨，不需要满足正文对比度——所以比 --warn 亮得多。 */
-  --hue-buffer: #d18700;
+  /* ---- 延迟条 / 瀑布图的四段分类色：**按一条明度带定，不各调各的** ----
+   * 它们只做填充，不需要满足正文对比度；判据是 SC 1.4.11 的 3:1（量叠水印画布）
+   * 加上「四段互相可分辨」。
+   *
+   * 改前这四段是各自长出来的，实测 L* 是 48.3 / 40.9 / 62.4 / 43.8——**跨度 21.5**，
+   * 其中 capture 段直接借用 --accent（正文色，L* 40.9、C* 29.5）而另外三段是填充色
+   * （C* 56–71）。深色下四段同在 L* 66–73 看不出来；浅色下它就是「三段彩色 + 一段黑」，
+   * 外加 --hue-buffer 亮到对白卡只剩 2.93:1（跌破非文字 3:1）。
+   *
+   * 现在四段一起放在 L* 49.6–52.8（**跨度 2.9**），最小两两 ΔE00 = 20.6（改前 17.5）。
+   * capture 段从 --accent 换成自己的 --hue-capture，深色侧 `var(--accent)` 解析后
+   * 逐字不变。 */
+  --hue-net: #3977d6;
+  --hue-play: #905fc3;
+  --hue-buffer: #bc6803;
+  --hue-capture: #0b8a73;
+
+  /* ---- 标记层：语义色当图形画的那一档（说明见 :root） ----
+   * 判据 3:1 对**画布叠水印**（最差的一面）；实测 3.09–3.27，对白卡 3.79–4.01。
+   * 四个都落在 L* 53.2–54.8，比文字档整整亮 11–14 个 L*——那正是「状态点终于是个
+   * 颜色，而不是一粒黑渣」的差额。
+   *
+   * 与各自的文字档 ΔE00 = 10.8–14.1：够远，一眼看得出更亮；又够近，仍读作**同一个
+   * 语义**，不会被当成第五、第六种状态色。
+   *
+   * --accent-mark 与 --ring **是同一个值，这是故意的**：两者要回答的是同一道题
+   * ——「强调色当图形画、对浅底 3:1」——同一道题不该有两个答案。--ring 那一档已经
+   * 在上一轮量过两列（白卡 4.10:1 / 画布 3.41:1，见下面 --ring 的说明），直接复用它
+   * 就不必再解一次，也堵死了两个 token 将来各飘各的。改其中一个请连带改另一个。 */
+  --ok-mark: #349448;
+  --accent-mark: #0e8f7c;
+  --warn-mark: #ba7301;
+  --danger-mark: #e9484e;
 
   --shadow: 0 1px 2px rgba(var(--sh-rgb), .06), 0 8px 24px -8px rgba(var(--sh-rgb), .12);
   --shadow-lift: 0 2px 6px rgba(var(--sh-rgb), .08), 0 16px 40px -12px rgba(var(--sh-rgb), .18);
@@ -1078,9 +1181,9 @@ body[data-window-controls="right"] .chrome-pop {
   width: 8px; height: 8px; border-radius: 50%;
   background: var(--fill-muted); display: inline-block; flex: none;
 }
-.dot.online { background: var(--ok); animation: breathe 2.4s ease-in-out infinite; }
+.dot.online { background: var(--ok-mark); animation: breathe 2.4s ease-in-out infinite; }
 .dot.offline { background: var(--fill-muted); }
-.dot.connecting { background: var(--accent); animation: breathe 1.2s ease-in-out infinite; }
+.dot.connecting { background: var(--accent-mark); animation: breathe 1.2s ease-in-out infinite; }
 @keyframes breathe {
   0%, 100% { box-shadow: 0 0 0 0 rgba(var(--ok-rgb), .45); }
   50% { box-shadow: 0 0 0 5px rgba(var(--ok-rgb), 0); }
@@ -1228,11 +1331,14 @@ body[data-window-controls="right"] .chrome-pop {
    prefers-reduced-motion 下动画被全局禁用，描边仍然看得见 */
 .switch.pending {
   pointer-events: none;
-  border-color: var(--accent);
+  /* 描边与它外面那圈 --halo 是同一件事的两层，墨色因此走同一档（标记层，浅色下
+     与 --ring 同值）。写 --accent 时浅色下是一圈深到发黑的边配一圈亮青的晕，
+     两层对不上。 */
+  border-color: var(--accent-mark);
   box-shadow: 0 0 0 2px var(--halo);
   animation: switch-pending 1.1s ease-in-out infinite;
 }
-.switch.pending .knob { background: var(--accent); }
+.switch.pending .knob { background: var(--accent-mark); }
 /* 真禁用必须看得出来：网页端只读、旧服务没有 settings.* 时这些开关点了不会有任何
    反应，而在此之前它们和能点的开关长得一模一样——用户只会以为是坏的。
    pending 除外：请求在飞不是"不可用"，它有自己的呼吸动画。 */
@@ -1425,8 +1531,12 @@ body[data-window-controls="right"] .chrome-pop {
 .metric-tier {
   display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
   margin: 0; padding: 5px 8px; border-radius: 6px;
-  background: color-mix(in srgb, var(--warn) 12%, transparent);
-  border-left: 3px solid var(--warn);
+  /* 底色也走标记层。它与左边那道竖线是同一件事的两层，本来就该同墨；而且**必须**
+     同墨：浅色下把 --warn 提亮以后，用 --warn 自己刷 12% 的底会把标签压在一层同色
+     的暗底上，文字与底一起变亮，对比度反而从 4.87 掉到 4.44（跌出 AA）。用更亮的
+     标记层刷底，底更浅、字更深，回到 4.57。深色下 --warn-mark 解析即 --warn，无变化。 */
+  background: color-mix(in srgb, var(--warn-mark) 12%, transparent);
+  border-left: 3px solid var(--warn-mark);
 }
 /* 传输形态本身：与「未含对方主机」同一套语言（warn 色小字），比它重一档字重
    ——那句是对读数范围的警告，这一句是读数为什么变差的**原因**。 */
@@ -1472,7 +1582,7 @@ body[data-window-controls="right"] .chrome-pop {
   transition: flex-grow .4s var(--ease-out);
 }
 .band-network { background: var(--hue-net); }
-.band-capture { background: var(--accent); }
+.band-capture { background: var(--hue-capture); }
 .band-buffer { background: var(--hue-buffer); }
 .band-playback { background: var(--hue-play); }
 /* 读不到时四段等宽且几乎透明：那是「还没测到」的形状，不是「四段一样长」的结论。 */
@@ -1511,7 +1621,8 @@ body[data-window-controls="right"] .chrome-pop {
   background: var(--fill-2); border-radius: 4px; padding: 0 5px;
   font-variant-numeric: tabular-nums; cursor: help;
 }
-.stage-chip.warn { color: var(--warn); background: rgba(var(--warn-rgb), 0.133); }
+/* 底色同 .metric-tier：自己刷自己的底会把 4.77 压到 4.36。 */
+.stage-chip.warn { color: var(--warn); background: color-mix(in srgb, var(--warn-mark) 13.3%, transparent); }
 .stage-name { font-size: 12px; }
 .stage-host {
   font-size: 10px; color: var(--text-dim);
@@ -1531,10 +1642,10 @@ body[data-window-controls="right"] .chrome-pop {
 .quality-dots { display: inline-flex; align-items: center; gap: 3px; flex: none; }
 .qdot { width: 7px; height: 7px; border-radius: 50%; background: none; box-shadow: inset 0 0 0 1px var(--ring-empty); }
 .qdot.on { box-shadow: none; }
-.qdot.on.tone-ok { background: var(--ok); }
-.qdot.on.tone-accent { background: var(--accent); }
-.qdot.on.tone-warn { background: var(--warn); }
-.qdot.on.tone-danger { background: var(--danger); }
+.qdot.on.tone-ok { background: var(--ok-mark); }
+.qdot.on.tone-accent { background: var(--accent-mark); }
+.qdot.on.tone-warn { background: var(--warn-mark); }
+.qdot.on.tone-danger { background: var(--danger-mark); }
 /* 「还没测出来」的四颗点必须与「差」的一颗点分得开。等级不成立时点数是 0，而
    「四颗空心」和「一颗亮 + 三颗空心」在 7px 尺寸下几乎是同一个形状——用户于是把
    「不知道」读成「测出来很差」。呼吸动画给它一个「在进行」的读感；
@@ -1564,7 +1675,7 @@ body[data-window-controls="right"] .chrome-pop {
   border-radius: var(--radius-sm); padding: 6px 10px;
 }
 .peer-inbound .ico svg { width: 14px; height: 14px; }
-.peer-inbound .dot.live { background: var(--warn); animation: breathe-warn 1.6s ease-in-out infinite; }
+.peer-inbound .dot.live { background: var(--warn-mark); animation: breathe-warn 1.6s ease-in-out infinite; }
 .inbound-text { flex: 1; min-width: 0; }
 @keyframes breathe-warn {
   0%, 100% { box-shadow: 0 0 0 0 rgba(var(--warn-rgb), .5); }
@@ -1922,7 +2033,7 @@ body[data-window-controls="right"] .chrome-pop {
   display: inline-block;
   width: 14px; height: 14px; flex: none;
   border-radius: 50%;
-  border: 2px solid rgba(var(--accent-rgb), 0.2); border-top-color: var(--accent);
+  border: 2px solid rgba(var(--accent-rgb), 0.2); border-top-color: var(--accent-mark);
   animation: spin .8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -2090,7 +2201,7 @@ body[data-window-controls="right"] .chrome-pop {
 /* 亮起的是「此刻这个滑条代表哪一档」：拖动中是**松手会落到的那一档**，
    其余时候是已落定的那一档（plan §14 裁定 4）。它与值标签同源，所以两者
    不可能各说各话。 */
-.stop-tick.on { background: var(--accent); }
+.stop-tick.on { background: var(--accent-mark); }
 /* 不可用档照画不误，只是明显更暗：不画出来，用户就无从知道「本机缺了什么」。
    title（由 JS 给）说明原因，但刻度不接指针事件，所以滑条本身也带一份 title。 */
 .stop-tick.off { background: var(--track); height: 3px; bottom: 2px; }
@@ -2229,9 +2340,9 @@ body[data-window-controls="right"] .chrome-pop {
 
 /* ---- 配对进度 ---- */
 
-.pair-steps li.doing .step-dot { background: var(--accent); animation: breathe 1.2s ease-in-out infinite; }
-.pair-steps li.done .step-dot { background: var(--ok); }
-.pair-steps li.failed .step-dot { background: var(--danger); }
+.pair-steps li.doing .step-dot { background: var(--accent-mark); animation: breathe 1.2s ease-in-out infinite; }
+.pair-steps li.done .step-dot { background: var(--ok-mark); }
+.pair-steps li.failed .step-dot { background: var(--danger-mark); }
 
 /* ---- 确认框 ---- */
 
@@ -2333,7 +2444,7 @@ canvas.spark { width: 160px; height: 36px; display: block; }
 }
 .wf-seg { flex-basis: 0; border-radius: 2px; transition: flex-grow .4s var(--ease-out); }
 .wf-network { background: var(--hue-net); }
-.wf-capture { background: var(--accent); }
+.wf-capture { background: var(--hue-capture); }
 .wf-buffer { background: var(--hue-buffer); }
 .wf-playback { background: var(--hue-play); }
 .wf-residual { background: var(--fill-muted); }
@@ -2607,7 +2718,7 @@ body.is-tauri .gate-drag {
    像一句普通的出处说明。 */
 .transport-reset {
   font-size: 12px; color: var(--warn);
-  border-left: 2px solid var(--warn);
+  border-left: 2px solid var(--warn-mark);
   padding: 4px 0 4px 8px; margin: 8px 0 0;
 }
 /* ---- 连通方式（plan §16.2 的手动覆盖）---------------------------------

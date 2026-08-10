@@ -16,7 +16,8 @@ import { currentBindings, installShortcuts, subscribeShortcuts } from './lib/sho
 import type { ShortcutActionId } from './lib/shortcuts';
 import { actions, getState, useStore } from './state/store';
 import { boot, gateVisible, syncTray } from './state/connection';
-import { t } from './i18n';
+import { subscribeLocale } from './lib/appearanceHost';
+import { getLocale, t } from './i18n';
 
 const VIEWS = {
   peers: PeersView,
@@ -58,6 +59,15 @@ function useShortcutDispatch(setSheet: (fn: (v: boolean) => boolean) => void) {
 export function App() {
   const view = useStore((s) => s.route.view);
   const gate = useGateVisible();
+  // 语种订阅在**根组件**上，而且刻意不用它的值。
+  //
+  // `t()` 是纯函数调用，读的是 i18n 模块里那个模块级的 `current`——换语种改了它，
+  // 但没有任何组件因此重渲，界面会原地不动。今天看不出来（只有一门语言，选择器
+  // 无论怎么选都落回 zh-CN），可加第二门语言的那天，语言选择器就是一个点了没反应
+  // 的控件，而排查方向会指向 i18n 层而不是这里。
+  //
+  // 挂在根上并且不 memo 任何子树，一次订阅就让整棵树跟着重渲，够了。
+  useSyncExternalStore(subscribeLocale, getLocale);
   const View = VIEWS[view] || PeersView;
   const [sheet, setSheet] = useState(false);
   const dispatch = useShortcutDispatch(setSheet);

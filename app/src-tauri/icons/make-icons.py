@@ -7,9 +7,26 @@ machine. Output is deterministic, so re-running never churns the tree.
   icon.png   1024x1024 RGBA app master (sips/iconutil turn it into icon.icns)
   tray.png   44x44 macOS *template* image -- AppKit ignores RGB and keeps only
              alpha, so the glyph must carry the whole shape. For eyeballing.
-  tray.rgba  the same pixels raw, include_bytes!'d by src-tauri/src/main.rs so
-             the shell needs no PNG decoder (tauri's image-png feature would
-             drag in the whole `image` crate for one 44x44 glyph).
+             This is the `idle` state; the other three are .rgba only.
+
+  tray-<state>.rgba    44x44 raw RGBA, one per STATES entry, include_bytes!'d by
+             src-tauri/src/icon.rs. Raw so the shell needs no PNG decoder
+             (tauri's image-png feature would drag the whole `image` crate in
+             for one 44x44 glyph).
+
+  dock-bg-<theme>.rgba   256x256 raw RGBA, the rounded-square plate only.
+  dock-wave-<state>.a8   256x256 raw single-byte alpha, the mark only.
+
+The dock tile ships as plate + mask rather than eight pre-composited images
+because the two vary independently -- 2 plates + 4 masks is 786 KB embedded
+where 8 composites would be 2 MB. src-tauri/src/icon.rs does the source-over.
+
+# Why the states are amplitudes
+
+Every state glyph is the same eight-point mark with its vertical excursion
+scaled. Loud/quiet is the one visual axis an audio tool can spend without
+inventing a vocabulary, and it survives being a pure alpha mask -- which the
+macOS menu bar requires (see `TEMPLATE` note in src-tauri/src/icon.rs).
 """
 
 import math
@@ -23,6 +40,26 @@ ACCENT = (0x31, 0xC8, 0xB0)
 # The brand mark, in the 24x24 viewBox shared with ui/index.html.
 WAVE = [(3, 12), (5, 12), (7, 7), (10, 17), (13, 3), (16, 15), (18, 12), (21, 12)]
 WAVE_STROKE = 1.8  # viewBox units
+
+# (name, amplitude, alpha). Order is the wire order: it must match the
+# `IconState` discriminants in src-tauri/src/icon.rs, which are const-asserted
+# against the byte lengths but *not* against the ordering -- keep them aligned
+# by hand.
+STATES = [
+    ("offline", 0.00, 0.55),
+    ("connecting", 0.35, 0.80),
+    ("idle", 0.70, 0.95),
+    ("active", 1.00, 1.00),
+]
+
+# Dock plate gradients: (top, bottom). Dark matches the UI shell's --bg-1 ->
+# --bg; light matches the light theme's equivalent pair.
+THEMES = {
+    "dark": ((0x1F, 0x24, 0x2E), (0x0F, 0x11, 0x15)),
+    "light": ((0xF7, 0xF9, 0xFB), (0xE4, 0xE8, 0xEE)),
+}
+
+DOCK_PX = 256
 
 
 def write_png(path, w, h, px):
@@ -82,14 +119,21 @@ def blend(px, w, idx, rgb, a):
     px[idx + 3] = int(round(na * 255))
 
 
-def wave_points(size, pad):
-    """Map the 24-unit mark into a `size` canvas, vertically centred on its bbox."""
+def wave_points(size, pad, amp=1.0):
+    """Map the 24-unit mark into a `size` canvas, vertically centred on its bbox.
+
+    `amp` scales the vertical excursion about that centre: 1.0 is the brand
+    mark as drawn, 0.0 collapses it to a flat line. Horizontal extent and
+    stroke width never change, so every state occupies the same box.
+    """
     inner = size - 2 * pad
     scale = inner / 24.0
     ys = [p[1] for p in WAVE]
     cy = (min(ys) + max(ys)) / 2.0
     half = size / 2.0
-    return [(half + (x - 12.0) * scale, half + (y - cy) * scale) for x, y in WAVE], scale
+    return [
+        (half + (x - 12.0) * scale, half + (y - cy) * amp * scale) for x, y in WAVE
+    ], scale
 
 
 def render_app_icon(size=1024):
@@ -128,10 +172,15 @@ def render_app_icon(size=1024):
     return px
 
 
-def render_tray(size=44):
-    """Glyph only: a background would render as a solid block in the menu bar."""
+def render_tray(size=44, amp=1.0, alpha=1.0):
+    """Glyph only: a background would render as a solid block in the menu bar.
+
+    RGB is forced to zero and the whole shape lives in alpha, which is what a
+    macOS template image is. Windows has no template concept, so icon.rs tints
+    the same mask at runtime instead of shipping a second polarity.
+    """
     px = bytearray(size * size * 4)
-    pts, scale = wave_points(size, 4)
+    pts, scale = wave_points(size, 4, amp)
     rad = max(1.15, WAVE_STROKE * scale / 2.0)
     for y in range(size):
         row = y * size * 4
@@ -140,20 +189,67 @@ def render_tray(size=44):
             if c > 0:
                 i = row + x * 4
                 px[i] = px[i + 1] = px[i + 2] = 0
-                px[i + 3] = int(round(c * 255))
+                px[i + 3] = int(round(c * alpha * 255))
     return px
 
 
-TRAY_PX = 44  # keep in sync with TRAY_PX in src-tauri/src/main.rs (const-asserted)
+def render_dock_plate(size, top, bottom):
+    """The rounded-square gradient plate, no mark. Same geometry as the master."""
+    px = bytearray(size * size * 4)
+    m = size * 100 // 1024
+    x0, y0, x1, y1 = m, m, size - m, size - m
+    r = size * 185 / 1024.0
+    for y in range(max(0, y0 - 2), min(size, y1 + 2)):
+        yy = y + 0.5
+        t = max(0.0, min(1.0, (yy - y0) / float(y1 - y0)))
+        bg = tuple(int(top[k] + (bottom[k] - top[k]) * t) for k in range(3))
+        row = y * size * 4
+        for x in range(max(0, x0 - 2), min(size, x1 + 2)):
+            c = rrect_coverage(x + 0.5, yy, x0, y0, x1, y1, r)
+            if c > 0:
+                blend(px, size, row + x * 4, bg, c)
+    return px
+
+
+def render_dock_wave(size, amp):
+    """Single-byte alpha mask of the mark, positioned as in the app master."""
+    a = bytearray(size * size)
+    pts, scale = wave_points(size, size * 220 // 1024, amp)
+    rad = WAVE_STROKE * scale / 2.0
+    for y in range(size):
+        row = y * size
+        for x in range(size):
+            c = stroke_coverage(pts, rad, x + 0.5, y + 0.5)
+            if c > 0:
+                a[row + x] = int(round(c * 255))
+    return a
+
+
+TRAY_PX = 44  # keep in sync with TRAY_PX in src-tauri/src/icon.rs (const-asserted)
 
 
 def main():
     here = Path(__file__).resolve().parent
     write_png(here / "icon.png", 1024, 1024, render_app_icon(1024))
-    tray = render_tray(TRAY_PX)
-    write_png(here / "tray.png", TRAY_PX, TRAY_PX, tray)
-    (here / "tray.rgba").write_bytes(bytes(tray))
-    print(f"icon.png 1024x1024, tray.png/tray.rgba {TRAY_PX}x{TRAY_PX} -> {here}")
+
+    for name, amp, alpha in STATES:
+        tray = render_tray(TRAY_PX, amp, alpha)
+        (here / f"tray-{name}.rgba").write_bytes(bytes(tray))
+        if name == "idle":
+            write_png(here / "tray.png", TRAY_PX, TRAY_PX, tray)
+        (here / f"dock-wave-{name}.a8").write_bytes(
+            bytes(render_dock_wave(DOCK_PX, amp))
+        )
+
+    for theme, (top, bottom) in THEMES.items():
+        plate = render_dock_plate(DOCK_PX, top, bottom)
+        (here / f"dock-bg-{theme}.rgba").write_bytes(bytes(plate))
+
+    states = " ".join(n for n, _, _ in STATES)
+    print(
+        f"icon.png 1024x1024; tray-*.rgba {TRAY_PX}x{TRAY_PX} [{states}]; "
+        f"dock-bg-*/dock-wave-* {DOCK_PX}x{DOCK_PX} -> {here}"
+    )
 
 
 if __name__ == "__main__":

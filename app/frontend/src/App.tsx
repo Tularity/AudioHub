@@ -16,7 +16,7 @@ import { currentBindings, installShortcuts, subscribeShortcuts } from './lib/sho
 import type { ShortcutActionId } from './lib/shortcuts';
 import { actions, getState, useStore } from './state/store';
 import { boot, gateVisible, syncTray } from './state/connection';
-import { subscribeLocale } from './lib/appearanceHost';
+import { subscribeLocale, subscribeTheme } from './lib/appearanceHost';
 import { getLocale, t } from './i18n';
 
 const VIEWS = {
@@ -77,6 +77,9 @@ export function App() {
   useEffect(() => { boot(); }, []);
   // 托盘状态跟着连接走；syncTray 自带去重，重复调用无副作用。
   useEffect(() => useStore.subscribe(syncTray), []);
+  // 主题不在 store 里（它是 localStorage + matchMedia，见 lib/appearanceHost），
+  // 所以上面那条订阅看不见它变。Dock 图标要跟着深浅走，就得单独订一份。
+  useEffect(() => subscribeTheme(syncTray), []);
   // 授权门挡着的时候不派发：那时候导航到别的页面只会得到一屏查不出任何东西的空视图。
   useEffect(() => (gate ? undefined : installShortcuts(dispatch)), [gate, dispatch]);
 

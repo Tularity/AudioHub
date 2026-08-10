@@ -12,6 +12,7 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 
+mod icon;
 #[cfg(target_os = "macos")]
 mod mac_chrome;
 mod webui;
@@ -32,12 +33,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(8);
 
 const MAIN_WINDOW: &str = "main";
 
-/// Menu bar glyph, raw RGBA straight from icons/make-icons.py. Raw instead of
-/// PNG so the shell does not need tauri's image-png feature (which pulls the
-/// whole `image` crate in for one 44x44 icon).
-const TRAY_RGBA: &[u8] = include_bytes!("../icons/tray.rgba");
-const TRAY_PX: u32 = 44;
-const _: () = assert!(TRAY_RGBA.len() == (TRAY_PX * TRAY_PX * 4) as usize);
+/// Tray id, so `set_tray_status` can find the icon again to re-skin it.
+const TRAY_ID: &str = "main";
 
 fn warn(msg: &str) {
     eprintln!("[audiohub] {msg}");
@@ -470,8 +467,24 @@ fn is_window_maximized(window: tauri::Window) -> Result<bool, String> {
     window.is_maximized().map_err(|e| e.to_string())
 }
 
+/// One call carries everything the chrome shows about connection state: the
+/// tray menu's status line, the tray glyph, and the dock tile.
+///
+/// They are deliberately not three commands. The frontend dedupes on a single
+/// key covering all of it (`syncTray` in `state/connection.ts`), so splitting
+/// them would mean three round trips per transition and three chances for the
+/// three surfaces to disagree mid-flight.
+///
+/// `state` and `theme` are optional so that a frontend built before this change
+/// still updates the status line instead of failing argument deserialisation.
 #[tauri::command]
-fn set_tray_status(app: AppHandle, online: bool, port: Option<u16>) {
+fn set_tray_status(
+    app: AppHandle,
+    online: bool,
+    port: Option<u16>,
+    state: Option<String>,
+    theme: Option<String>,
+) {
     if let Some(s) = app.try_state::<TrayStatus>() {
         let text = match (online, port) {
             (true, Some(p)) => format!("状态：在线 · 端口 {p}"),
@@ -480,6 +493,34 @@ fn set_tray_status(app: AppHandle, online: bool, port: Option<u16>) {
         };
         let _ = s.0.set_text(text);
     }
+
+    let Some(state) = state else { return };
+    let st = icon::IconState::parse(&state);
+    let th = theme
+        .as_deref()
+        .map(icon::IconTheme::parse)
+        .unwrap_or(icon::IconTheme::Dark);
+
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        // set_icon + set_icon_as_template as two calls renders twice and
+        // flickers on macOS; the combined setter is there for exactly this.
+        #[cfg(target_os = "macos")]
+        let _ = tray.set_icon_with_as_template(Some(icon::tray_image(st, th)), true);
+        #[cfg(not(target_os = "macos"))]
+        let _ = tray.set_icon(Some(icon::tray_image(st, th)));
+    }
+
+    // The Windows taskbar shows the *window* icon, so the equivalent of the
+    // macOS dock tile is set here rather than through AppKit. macOS ignores the
+    // window icon entirely — `set_dock_icon` above is the only path that works
+    // there, which is why this is not one branch for both.
+    #[cfg(target_os = "windows")]
+    if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
+        let px = icon::dock_rgba(st, th);
+        let _ = w.set_icon(tauri::image::Image::new_owned(px, icon::DOCK_PX, icon::DOCK_PX));
+    }
+
+    icon::set_dock_icon(st, th);
 }
 
 /// Quit the window only. The daemon is deliberately left running so audio keeps
@@ -560,10 +601,16 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
     app.manage(TrayStatus(status));
 
-    TrayIconBuilder::with_id("main")
-        .icon(tauri::image::Image::new(TRAY_RGBA, TRAY_PX, TRAY_PX))
+    // Before the first frontend report, claim nothing: `Connecting` is what the
+    // store starts at too (`ConnState` initial is 'connecting').
+    TrayIconBuilder::with_id(TRAY_ID)
+        .icon(icon::tray_image(
+            icon::IconState::Connecting,
+            icon::IconTheme::Dark,
+        ))
         // macOS template image: AppKit keeps only the alpha channel and recolours
-        // it for the current menu bar appearance.
+        // it for the current menu bar appearance. See icon.rs on why this is the
+        // right answer for the menu bar and the wrong one for the dock.
         .icon_as_template(true)
         .tooltip("AudioHub")
         .menu(&menu)

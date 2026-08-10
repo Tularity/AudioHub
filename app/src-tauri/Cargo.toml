@@ -19,10 +19,13 @@ serde_json = "1"
 anyhow = "1"
 
 # src/mac_chrome.rs moves the traffic lights onto the app's own top-strip centre
-# line. Both crates are already in the lock file at these versions (tao and wry
-# pull them in), so this adds compile units, not dependencies.
+# line; src/icon.rs replaces the dock tile, which tauri 2.11 exposes no API for
+# (AppHandle::default_window_icon is a getter and there is nothing else). All
+# three crates are already in the lock file at these versions (tao and wry pull
+# them in), so this adds compile units, not dependencies.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+objc2-foundation = "0.3"
 objc2-app-kit = { version = "0.3", features = [
   "NSWindow",
   "NSView",
@@ -30,6 +33,13 @@ objc2-app-kit = { version = "0.3", features = [
   "NSControl",
   "NSResponder",
   "NSToolbar",
+  # icon.rs: NSApplication.applicationIconImage, fed an NSImage built from raw
+  # RGBA. NSGraphics carries NSDeviceRGBColorSpace.
+  "NSApplication",
+  "NSImage",
+  "NSImageRep",
+  "NSBitmapImageRep",
+  "NSGraphics",
 ] }
 
 # src/win_chrome.rs subclasses the window to hand Snap Layouts back after

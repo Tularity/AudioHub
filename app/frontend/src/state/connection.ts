@@ -12,6 +12,8 @@ import { actions, getState, setState } from './store';
 import type { ConnError } from './store';
 import { normalizeList, normalizeOne, gateNeeded } from './permissions';
 import { applyChromeDirection } from '../lib/platform';
+import { activeTheme } from '../lib/appearanceHost';
+import { iconStateFrom } from '../lib/trayIcon';
 import { toast } from '../components/Toasts';
 import { t } from '../i18n';
 
@@ -266,10 +268,20 @@ export function syncTray(): void {
   if (s.mode !== 'tauri') return;
   const online = s.conn === 'online';
   const port = s.endpoint ? s.endpoint.port : null;
-  const key = `${online}|${port}`;
+  const state = iconStateFrom({ conn: s.conn, sessionCount: s.sessions.length });
+  // 传 activeTheme() 而不是系统深浅：用户把主题钉成浅色时，窗口是浅色的，
+  // Dock 图标就该跟着窗口，而不是跟着系统。
+  const theme = activeTheme();
+  // 去重键必须覆盖每一个进了参数表的量，否则新维度的变化会被这一行悄悄吃掉。
+  const key = `${online}|${port}|${state}|${theme}`;
   if (key === trayKey) return;
   trayKey = key;
-  tauriInvoke('set_tray_status', { online, port: online ? port : null }).catch(() => {});
+  tauriInvoke('set_tray_status', {
+    online,
+    port: online ? port : null,
+    state,
+    theme,
+  }).catch(() => {});
 }
 
 // ---- 启动 ----

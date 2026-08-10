@@ -13,25 +13,27 @@
 //!   `container_height - 16`, with no residual across all 16 samples. The 16
 //!   decomposes as `9 + BUTTON_DIAMETER / 2`.
 //!
-//! Two consequences worth stating, because an earlier revision of this comment
-//! got both wrong.
+//! The same holds on the other axis: the button's `origin.x` inside the
+//! container is 9.0pt too, and it stays there when the *container* is moved
+//! (`probe4.m`), so insetting the container's left edge carries the whole
+//! group with it.
 //!
+//! **So this module writes no button coordinate at all.** It sets the
+//! container's frame — height for the vertical placement, `origin.x` for the
+//! horizontal — and lets AppKit put the buttons where its own arithmetic says.
+//! That is the robust shape of the fix: a layout pass cannot undo it, because
+//! the result *is* what a layout pass computes. An earlier revision set the
+//! container to 66pt and then forced each `origin.y` to 26pt; that second write
+//! was load-bearing (left alone, AppKit puts the centre at `66 - 16 = 50`, 17pt
+//! low), which is exactly the fragility being removed here.
+//!
+//! For the record, since an earlier revision of this comment got it wrong:
 //! **tao's `trafficLightPosition.y` does have a defined meaning.**
 //! `inset_traffic_lights` (`tao-0.35.3/src/platform_impl/macos/view.rs:1152`)
 //! sets the container height to `button_height + y` and then writes only each
 //! button's `origin.x` — the loop at `:1177` never touches `origin.y`. Feeding
 //! the measured rule through that gives `centre = (14 + y) - 16 = y - 2`, so
 //! the config field would land the centre on 33.0 at `y = 35`.
-//!
-//! **Our explicit `origin.y` is load-bearing, not belt-and-braces.** This
-//! module sets the container to `button_height + 2 * TOP_INSET` (66pt) *and*
-//! each `origin.y` to `TOP_INSET` (26pt). Only the second write produces the
-//! result: left to itself AppKit would put the centre at `66 - 16 = 50`, 17pt
-//! below target. Setting the container to **49pt and writing no `origin.y` at
-//! all** reaches the same centre of 33.0 through AppKit's own arithmetic, and
-//! is the more robust shape of this fix — it cannot be undone by a layout pass,
-//! because it is what a layout pass computes. It is written up rather than
-//! adopted here so the change is a deliberate one rather than a drive-by.
 //!
 //! # Why this is not `tauri.macos.conf.json`'s `trafficLightPosition`
 //!
@@ -57,14 +59,12 @@
 //! | daemon badge         | 18.0 .. 48.0 | **33.0** |
 //! | traffic lights, stock | 9.0 .. 23.0 | 16.0 |
 //!
-//! That ~17pt disagreement is the thing being fixed. `TOP_INSET` is therefore
-//! `33 - 14/2`, where 14pt is the measured button diameter — written as the
-//! arithmetic rather than as `26` so the intent survives a change to either
-//! number. (A first pass used 32.5, the estimate in `docs/design-ui-chrome.md`
-//! §1.2; measuring the built app put both elements at 33.0 instead, so the
-//! guess was half a point low. Verified afterwards: button top lands at exactly
-//! `TOP_INSET` and the close button's left edge at exactly `LEADING_INSET`, so
-//! the two constants mean what they say.)
+//! That ~17pt disagreement is the thing being fixed. `NAV_CENTRE_Y` is the
+//! target; `CONTAINER_HEIGHT` is what has to be set to reach it, written as the
+//! arithmetic of the measured rule rather than as `49` so the intent survives a
+//! change to any of its terms. (A first pass used 32.5, the estimate in
+//! `docs/design-ui-chrome.md` §1.2; measuring the built app put both elements at
+//! 33.0 instead, so the guess was half a point low.)
 //!
 //! # The corner radius is a separate knob, and it is inert here
 //!
@@ -98,14 +98,28 @@
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSWindow, NSWindowButton};
 
-/// Distance from the window's top edge to the top of the buttons, in points.
-///
-/// `NAV_CENTRE_Y` is the app's own top-strip centre line; `BUTTON_DIAMETER` is
-/// the measured traffic-light size. Keeping the subtraction visible is the
-/// point — the target is "share the nav pill's centre line", not "26".
+/// The app's own top-strip centre line, in points down from the window's top
+/// edge — what the traffic lights have to share. See the table above.
 const NAV_CENTRE_Y: f64 = 33.0;
+
+/// Measured traffic-light diameter.
 const BUTTON_DIAMETER: f64 = 14.0;
-const TOP_INSET: f64 = NAV_CENTRE_Y - BUTTON_DIAMETER / 2.0;
+
+/// AppKit's own inset for the buttons inside `NSTitlebarContainerView`, the
+/// same on both axes: `origin` is `(9.0, 9.0)` and stays there at every
+/// container height sampled from 24pt to 80pt (`probe3.m`, 16 samples) and at
+/// every container `origin.x` tried (`probe4.m`). This is the constant the
+/// whole module leans on — nothing here writes a button coordinate, so every
+/// placement is AppKit's own arithmetic applied to a container we sized.
+const APPKIT_BUTTON_INSET: f64 = 9.0;
+
+/// Container height that lands the buttons on `NAV_CENTRE_Y`.
+///
+/// AppKit hangs the buttons from the container's *bottom* edge, so measured
+/// down from the window's top the centre is `height - (APPKIT_BUTTON_INSET +
+/// BUTTON_DIAMETER / 2)` — i.e. `height - 16`, exactly, with no residual across
+/// all 16 samples. Inverting that for a 33.0 centre gives 49.0.
+const CONTAINER_HEIGHT: f64 = NAV_CENTRE_Y + APPKIT_BUTTON_INSET + BUTTON_DIAMETER / 2.0;
 
 /// Distance from the window's left edge to the close button's left edge.
 ///
@@ -116,6 +130,14 @@ const TOP_INSET: f64 = NAV_CENTRE_Y - BUTTON_DIAMETER / 2.0;
 /// centred nav pill (the group then ends at 79.5pt, and `--chrome-lead` in
 /// `styles.css` reserves 100pt).
 const LEADING_INSET: f64 = 20.0;
+
+/// Container `origin.x` that lands the close button on `LEADING_INSET`.
+///
+/// The buttons keep their local `origin.x` of `APPKIT_BUTTON_INSET` when the
+/// container moves, so the container has to start that much further left than
+/// the edge we actually want. Idempotent for the same reason: re-running never
+/// changes the local origin, so this never accumulates.
+const CONTAINER_X: f64 = LEADING_INSET - APPKIT_BUTTON_INSET;
 
 /// Move the traffic lights onto the app's top-strip centre line.
 ///
@@ -151,41 +173,24 @@ pub fn apply(window: &tauri::Window) {
 }
 
 unsafe fn apply_to(ns_window: &NSWindow) {
-    let (Some(close), Some(mini), Some(zoom)) = (
-        ns_window.standardWindowButton(NSWindowButton::CloseButton),
-        ns_window.standardWindowButton(NSWindowButton::MiniaturizeButton),
-        ns_window.standardWindowButton(NSWindowButton::ZoomButton),
-    ) else {
+    let Some(close) = ns_window.standardWindowButton(NSWindowButton::CloseButton) else {
         return;
     };
 
     // Button -> NSTitlebarView -> NSTitlebarContainerView. Two hops, same as
-    // tao; the container is the one whose height AppKit centres within.
+    // tao; the container is the one whose frame decides where AppKit puts the
+    // buttons. Nothing below touches a button — that is the whole point.
     let Some(titlebar) = close.superview() else { return };
     let Some(container) = titlebar.superview() else { return };
 
-    let close_rect = close.frame();
-    let button_h = close_rect.size.height;
-
-    // Read the spacing before moving anything, and derive it rather than
-    // hard-coding 23pt: this runs again on every resize, and by then close is
-    // already at LEADING_INSET, so the difference is still the true gap.
-    let spacing = mini.frame().origin.x - close_rect.origin.x;
-
-    let container_h = button_h + 2.0 * TOP_INSET;
+    let window_size = ns_window.frame().size;
     let mut rect = container.frame();
-    rect.size.height = container_h;
+    rect.origin.x = CONTAINER_X;
+    // Keep the right edge on the window's, so the strip does not overhang.
+    rect.size.width = window_size.width - CONTAINER_X;
+    rect.size.height = CONTAINER_HEIGHT;
     // Views are bottom-left origin: pinning the container's top to the window's
     // top means its origin sits a full height down from there.
-    rect.origin.y = ns_window.frame().size.height - container_h;
+    rect.origin.y = window_size.height - CONTAINER_HEIGHT;
     container.setFrame(rect);
-
-    for (i, button) in [&close, &mini, &zoom].into_iter().enumerate() {
-        let mut origin = button.frame().origin;
-        origin.x = LEADING_INSET + i as f64 * spacing;
-        // Explicit, so the result does not depend on whether AppKit re-centres
-        // after the frame change. See the module docs.
-        origin.y = TOP_INSET;
-        button.setFrameOrigin(origin);
-    }
 }

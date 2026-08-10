@@ -27,6 +27,7 @@ import type { PermissionState } from './permissions';
 import { parseMode } from './mode';
 import type { AppMode } from './mode';
 import { readLatency, readQuality } from '../lib/metrics';
+import { capResults, discoverKey } from '../lib/discovery';
 
 const SETTINGS_KEY = 'audiohub.ui.settings';
 
@@ -384,18 +385,29 @@ export const actions = {
   mergeDiscover(list: DiscoverResult[] | unknown): void {
     if (!Array.isArray(list)) return;
     setState((s) => {
-      const key = (d: DiscoverResult) => d.fingerprint || `${d.instance || 'unknown'}-${d.port}`;
+      const now = Date.now();
       const results = s.discover.results.slice();
       for (const d of list as DiscoverResult[]) {
-        const k = key(d);
-        const i = results.findIndex((x) => key(x) === k);
-        const entry = { ...d, lastSeen: Date.now() };
+        const k = discoverKey(d);
+        const i = results.findIndex((x) => discoverKey(x) === k);
+        const entry = { ...d, lastSeen: now };
         if (i >= 0) results[i] = entry;
         else results.push(entry);
       }
-      if (results.length > 50) results.length = 50;
-      return { discover: { ...s.discover, results } };
+      // 先清过期、按 lastSeen 排序，**再**截断。原来这里是 `results.length = 50`，
+      // 截的是插入序的尾部——缓存一满，此后每一台新发现的主机都被直接丢掉，
+      // 而它恰恰是最该留下的那条。
+      return { discover: { ...s.discover, results: capResults(results, now) } };
     });
+  },
+
+  /** 过期清理（lib/discovery 的两级年龄）。没有东西要清就不写 store。 */
+  pruneDiscover(): void {
+    const s = getState();
+    const now = Date.now();
+    const next = capResults(s.discover.results, now);
+    if (next.length === s.discover.results.length) return;
+    setState({ discover: { ...s.discover, results: next } });
   },
 };
 

@@ -607,22 +607,27 @@ export const zhCN = {
 
   // ---------------------------------------------------------------- 配对
   // 单栏之后只剩一个板块，标题就是这一页在做的事。
+  'pair.title': '配对',
   // 「让对方找到我」是二级菜单的入口按钮，也是那个面板的标题。
-  'pair.left.title': '接受配对',
+  'pair.left.open': '让对方找到我',
+  'pair.left.title': '让对方找到我',
   // **后果句**，不是描述句：开着这扇窗户期间会发生什么。§3.1 允许留在界面上的
   // 三类之一，所以它不搬 wiki。
-  'pair.left.desc': '启用后本机在局域网内可被发现，并生成一次性 PIN 供对方输入。',
+  'pair.left.desc': '开启期间，局域网内任意主机都可向本机发起配对。',
   'pair.left.enable': '开启配对模式',
   'pair.left.disable': '停止配对',
   'pair.left.expired': '配对模式已到期',
   // 配对窗口开着时入口按钮的样子。一个悄悄开着的窗口必须在一级界面上看得见。
+  'pair.armed': '配对中 · 剩余 {n} 秒',
   'pair.right.scan': '开始扫描',
   'pair.right.stopScan': '停止扫描',
   // 扫描窗口会自己到点收工，剩余时间是状态。
+  'pair.right.remain': '剩余 {n} 秒',
   // 「陈旧」= 有一阵子没再答复了。地址多半还有效，所以仍可点，只是不许和刚刚
   // 答复过的长成同一个样子。
+  'pair.right.stale': '陈旧',
   // 进页面即自动开扫，所以这里不再指路去按那个按钮。
-  'pair.right.empty': '尚未发现主机。点击「开始扫描」在局域网内查找。',
+  'pair.right.empty': '尚未发现主机。也可直接填写对方地址发起配对。',
   'pair.right.unknownHost': '未知主机',
   'pair.right.paired': '已配对',
   'pair.right.unpaired': '未配对',
@@ -1222,9 +1227,6 @@ export const zhCN = {
   'time.uptime': '{hh}:{mm}:{ss}',
   'time.uptimeDays': '{d} 天 {hh}:{mm}:{ss}',
   'mode.title': '运行模式',
-  'pair.left.tip': '请对方在其配对界面输入上述 PIN，以建立双向信任。',
-  'pair.right.title': '发起配对',
-  'pair.right.note': '配对成功后双向信任立即生效；模式 B 下对端将同时以一对音频设备出现在系统中。',
   'settings.mode.rowTitle': '当前模式',
   'settings.mode.goto': '前往主面板切换',
   'settings.mode.downgraded': '当前选定为「{mode}」，但该模式不可用，已临时按模式 A 运行。{hint}',

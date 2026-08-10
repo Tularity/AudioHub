@@ -8,7 +8,7 @@ import { useEffect, useState, useSyncExternalStore } from 'react';
 import type { ReactNode } from 'react';
 import { Icon, RawIcon } from '../components/Icon';
 import { ShortcutRow } from '../components/ShortcutRow';
-import { ExtLink, Switch } from '../components/Controls';
+import { ExtLink, Help, Switch } from '../components/Controls';
 import { transportCells } from '../components/PeerTransport';
 import { PermissionRow } from '../components/PermissionRow';
 import { toast } from '../components/Toasts';
@@ -49,8 +49,19 @@ export const MODE_LABEL_KEY: Record<AppMode, MsgKey> = {
   b: 'mode.b.label',
 };
 
-function SettingRow({ title, desc, control, badge }: {
-  title: string; desc: string; control: ReactNode; badge?: string;
+/**
+ * 一行设置：**标题 + 值/状态 + 一枚 `?`**，没有第四样东西。
+ *
+ * `desc` 已经没有了。用户 2026-08-10 裁定「为了简化而简化」（docs/plan.md §3.1）：
+ * 每一行原本挂着的两三行说明全部搬进 wiki，界面上只留一个入口。这里因此**刻意
+ * 不留 desc 形参**——留着它，下一个人会顺手再写一段进来，而这一整轮改动就是为了
+ * 把那些段落清出去。
+ *
+ * `note` 是给**状态**用的（「当前不生效」「广播没建立」这类随运行时变化的事实），
+ * 不是描述的后门：它渲染在标题下方，写成一句短话就行。
+ */
+function SettingRow({ title, control, badge, help, note }: {
+  title: string; control: ReactNode; badge?: string; help?: ReactNode; note?: string;
 }) {
   return (
     <div className="setting-row">
@@ -58,10 +69,23 @@ function SettingRow({ title, desc, control, badge }: {
         <div className="setting-title">
           {title}
           {badge ? <span className="tag warn">{badge}</span> : null}
+          {help}
         </div>
-        <p className="setting-desc">{desc}</p>
+        {note ? <p className="setting-desc">{note}</p> : null}
       </div>
       <div className="setting-ctl">{control}</div>
+    </div>
+  );
+}
+
+/** 区块标题 + `?`。同一个形状出现十几次，抽出来省得每处各写各的间距。 */
+function BlockTitle({ text, url, label, testid, danger = false }: {
+  text: string; url: string; label: string; testid: string; danger?: boolean;
+}) {
+  return (
+    <div className="title-row">
+      <h3 className={`block-title${danger ? ' danger-title' : ''}`}>{text}</h3>
+      <Help label={label} url={url} testid={testid} />
     </div>
   );
 }
@@ -98,8 +122,10 @@ function PermissionsCard() {
 
   return (
     <section className="card block" data-testid="settings-permissions">
-      <h3 className="block-title">{t('settings.perm.title')}</h3>
-      <p className="muted">{IS_MAC ? t('settings.perm.descMac') : t('settings.perm.descWin')}</p>
+      <BlockTitle
+        text={t('settings.perm.title')} url={WIKI.permissions}
+        label={t('wiki.permissions')} testid="settings-perm-help"
+      />
       <div className="perm-list" data-testid="settings-perm-list" hidden={perms.list.length === 0}>
         {perms.list.map((p) => (
           <PermissionRow key={p.id} perm={p} prefix="settings-perm" busy={perms.busy} onAction={onAction} />
@@ -125,7 +151,10 @@ function IdentityCard() {
 
   return (
     <section className="card block" data-testid="settings-identity">
-      <h3 className="block-title">{t('settings.identity.title')}</h3>
+      <BlockTitle
+          text={t('settings.identity.title')} url={WIKI.fingerprint}
+          label={t('wiki.discovery')} testid="settings-identity-help"
+        />
       <div className="kv">
         <div className="kv-row">
           <span className="kv-k">{t('settings.identity.name')}</span>
@@ -150,7 +179,6 @@ function IdentityCard() {
           <Icon name="copy" />{t('common.copy')}
         </button>
       </div>
-      <p className="muted small">{t('settings.identity.note')}</p>
     </section>
   );
 }
@@ -165,10 +193,12 @@ function ModeMirrorCard() {
 
   return (
     <section className="card block" data-testid="settings-mode">
-      <h3 className="block-title">{t('settings.mode.title')}</h3>
+      <BlockTitle
+          text={t('settings.mode.title')} url={WIKI.modes}
+          label={t('wiki.modes')} testid="settings-mode-help"
+        />
       <SettingRow
         title={t('settings.mode.rowTitle')}
-        desc={t('settings.mode.rowDesc')}
         control={(
           <div className="field-btn">
             <span className={`mode-mirror mode-${eff}`} data-testid="settings-mode-current">
@@ -184,9 +214,6 @@ function ModeMirrorCard() {
         )}
       />
       <p className={`muted small tone-${hs.tone}`} data-testid="settings-mode-note">{note}</p>
-      <p className="muted small">
-        <ExtLink text={t('wiki.modes')} url={WIKI.modes} testid="settings-mode-wiki" />
-      </p>
     </section>
   );
 }
@@ -211,16 +238,12 @@ function ModeAVolumeCard({ writing, noSettings, onPush }: {
 
   return (
     <section className="card block" data-testid="settings-mode-a-volume">
-      <h3 className="block-title">{t('settings.modeAVolume.title')}</h3>
+      <BlockTitle
+          text={t('settings.modeAVolume.title')} url={WIKI.volumeModes}
+          label={t('wiki.volume')} testid="settings-volume-help"
+        />
       <SettingRow
         title={t('settings.modeAVolume.syncTitle')}
-        // 例外必须写在界面上，不能只活在代码注释里：开着「静音本机」时这个
-        // 开关**只同步音量、不同步静音**，而两个开关分列两行，用户没有任何
-        // 其它地方能读到这条互相作用。
-        desc={joinPhrases([
-          t('settings.modeAVolume.syncDesc'),
-          muteLocal ? t('settings.modeAVolume.syncMuteException') : '',
-        ])}
         control={(
           <Switch
             testid="settings-mode-a-volume-sync"
@@ -234,7 +257,6 @@ function ModeAVolumeCard({ writing, noSettings, onPush }: {
       />
       <SettingRow
         title={t('settings.modeAVolume.muteTitle')}
-        desc={t('settings.modeAVolume.muteDesc')}
         control={(
           <Switch
             testid="settings-mode-a-mute-local"
@@ -276,10 +298,13 @@ function StartupCard({ writing, noSettings, onPush }: {
 
   return (
     <section className="card block" data-testid="settings-startup">
-      <h3 className="block-title">{t('settings.startup.title')}</h3>
+      <BlockTitle
+          text={t('settings.startup.title')} url={WIKI.startup}
+          label={t('wiki.startup')} testid="settings-startup-help"
+        />
       <SettingRow
         title={t('settings.startup.autostartTitle')}
-        desc={IS_MAC ? t('settings.startup.autostartDescMac') : t('settings.startup.autostartDescWin')}
+        note={IS_MAC ? t('settings.startup.autostartDescMac') : t('settings.startup.autostartDescWin')}
         control={(
           <Switch
             testid="settings-autostart"
@@ -296,7 +321,6 @@ function StartupCard({ writing, noSettings, onPush }: {
       <div hidden={!v.on || !v.target}>
         <SettingRow
           title={t('settings.startup.target')}
-          desc={t('settings.startup.targetDesc')}
           control={<code className="mono" data-testid="settings-autostart-target">{v.target}</code>}
         />
       </div>
@@ -307,7 +331,7 @@ function StartupCard({ writing, noSettings, onPush }: {
             ? t('settings.startup.unsupported', { reason: v.reason || t('common.dash') })
             : v.note === 'orphaned'
               ? t('settings.startup.orphaned', { reason: v.reason || t('common.dash') })
-              : v.note === 'off' ? t('settings.startup.noteOff') : ''}
+              : ''}
       </p>
     </section>
   );
@@ -341,9 +365,10 @@ function ShortcutsCard() {
 
   return (
     <section className="card block" data-testid="settings-shortcuts">
-      <h3 className="block-title">{t('settings.shortcuts.title')}</h3>
-      <p className="muted">{t('settings.shortcuts.desc')}</p>
-
+      <BlockTitle
+          text={t('settings.shortcuts.title')} url={WIKI.shortcuts}
+          label={t('wiki.shortcuts')} testid="settings-shortcuts-help"
+        />
       <div className="sc-list">
         {SHORTCUT_ACTIONS.map((action) => (
           <ShortcutRow
@@ -377,10 +402,6 @@ function ShortcutsCard() {
         </button>
       </div>
 
-      {/* 网页访问模式下 UI 跑在别人的浏览器里，localStorage 按来源隔离——Tauri 内
-          与浏览器内不共享。这是可接受的（快捷键本就是本地体验），但不说清楚，
-          用户会以为「设置没保存」。 */}
-      <p className="muted small">{t('settings.shortcuts.localOnly')}</p>
     </section>
   );
 }
@@ -393,8 +414,10 @@ function DeviceInventory() {
   const cap = ds ? ds.hal_capacity : (hal ? 16 : 0);
   const used = ds ? ds.hal_used : list.length;
 
+  // 只在**没有设备**时说话。有设备时那一行清单自己就是答案，再补一句
+  // 「已发布 = …」是把定义写在结论旁边——正是这一轮要清掉的东西。
   const note = list.length
-    ? t('settings.devices.noteHas')
+    ? ''
     : !hal ? t('settings.devices.noteNoDriver')
       : isModeB(s) ? t('settings.devices.noteModeB') : t('settings.devices.noteModeA');
 
@@ -473,8 +496,10 @@ function BridgeCard() {
 
   return (
     <section className="card block" data-testid="settings-bridge" hidden={hidden}>
-      <h3 className="block-title">{t('settings.bridge.title')}</h3>
-      <p className="muted">{t('settings.bridge.desc')}</p>
+      <BlockTitle
+          text={t('settings.bridge.title')} url={WIKI.bridge}
+          label={t('wiki.bridge')} testid="settings-bridge-help"
+        />
       <div className="bridge-status" data-testid="settings-bridge-status">
         {catalog == null ? (
           <p className="muted small" data-testid="settings-bridge-none">
@@ -500,7 +525,6 @@ function BridgeCard() {
           </div>
         ))}
       </div>
-      <p className="muted small">{t('settings.bridge.foot')}</p>
       <div className="bridge-links" data-testid="settings-bridge-links">
         {vendors().map((v) => (
           <ExtLink key={v.id} text={v.label} url={v.url} testid={`settings-bridge-link-${v.id}`} />
@@ -582,12 +606,13 @@ function WebAccessCard() {
 
   return (
     <section className="card block" data-testid="settings-web">
-      <h3 className="block-title">{t('settings.web.title')}</h3>
-      <p className="muted">{t('settings.web.desc')}</p>
+      <BlockTitle
+          text={t('settings.web.title')} url={WIKI.web}
+          label={t('wiki.web')} testid="settings-web-help"
+        />
 
       <SettingRow
         title={t('settings.web.enabledTitle')}
-        desc={t('settings.web.enabledDesc')}
         control={(
           <Switch
             testid="settings-web-enabled"
@@ -602,7 +627,6 @@ function WebAccessCard() {
 
       <SettingRow
         title={t('settings.web.portTitle')}
-        desc={t('settings.web.portDesc')}
         control={(
           <div className="field-btn">
             <input
@@ -634,8 +658,13 @@ function WebAccessCard() {
           服务端，前端不自己写死——解锁那天只改 webui.rs 一处。 */}
       <SettingRow
         title={t('settings.web.localOnlyTitle')}
-        desc={t('settings.web.localOnlyDesc')}
         badge={locked ? t('settings.web.localOnlyBadge') : undefined}
+        help={(
+          <Help
+            label={t('wiki.webLocalOnly')} url={WIKI.webLocalOnly}
+            testid="settings-web-local-only-help"
+          />
+        )}
         control={(
           <Switch
             testid="settings-web-local-only"
@@ -647,15 +676,14 @@ function WebAccessCard() {
           />
         )}
       />
-      <p className="muted small" data-testid="settings-web-local-only-note" hidden={!locked}>
-        {t('settings.web.localOnlyLocked')}
-      </p>
-
       {/* 关掉「仅允许本机」= 把一个无鉴权的控制界面连同 IPC 令牌一起交给局域网。
           plan §7.5 要求这条警告存在，且该选项永不为默认值。 */}
       <div className="web-warn" data-testid="settings-web-warning" hidden={localOnly}>
         <strong className="web-warn-title">{t('settings.web.warnTitle')}</strong>
-        <p className="web-warn-body">{t('settings.web.warnBody')}</p>
+        <Help
+          label={t('wiki.webLocalOnly')} url={WIKI.webLocalOnly}
+          testid="settings-web-warning-help"
+        />
       </div>
 
       <div className="web-urls" data-testid="settings-web-url">
@@ -671,10 +699,6 @@ function WebAccessCard() {
                 {st?.lan_url
                   ? <p className="muted small mono">{t('settings.web.urlLan', { url: st.lan_url })}</p>
                   : <p className="muted small">{t('settings.web.urlLanUnknown')}</p>}
-                {/* 实测（本机 ↔ 30-win）：页面与令牌都能过局域网，但 daemon 的 IPC
-                    只监听回环，所以远端页面连不上服务。不写出来，用户只会看到一个
-                    永远停在「连接中」的界面，而怀疑的是自己的网络。 */}
-                <p className="muted small" data-testid="settings-web-lan-note">{t('settings.web.lanIpcNote')}</p>
               </>
             ) : null}
             {editable && st?.url ? <ExtLink text={st.url} url={st.url} testid="settings-web-open" /> : null}
@@ -697,7 +721,6 @@ function WebAccessCard() {
           editable ? null : t('settings.web.browserOnly'),
           running && st?.source === 'disk' ? t('settings.web.sourceDisk', { root: st.root || '' }) : null,
           running && st?.source === 'embedded' ? t('settings.web.sourceEmbedded') : null,
-          t('settings.web.quitNote'),
         ])}
       </p>
     </section>
@@ -727,31 +750,10 @@ function WebAccessCard() {
 function TransportCard() {
   const ds = useStore((s) => s.daemonSettings);
   const peers = useStore((s) => s.peers);
-  // 迁移说明是一次性的：读过就收起来。**只存在 localStorage 里**，因为它是
-  // 「这台机器上这个人已经知道了」这一件事，不是 daemon 的状态。
-  const [dismissed, setDismissed] = useState(() => {
-    try { return localStorage.getItem('ahb.transportMigrated') === '1'; } catch { return false; }
-  });
 
   return (
     <section className="card block" data-testid="settings-transport">
       <h3 className="block-title">{t('settings.transport.title')}</h3>
-      {dismissed ? null : (
-        <div className="notice" data-testid="settings-transport-migrated">
-          <p>{t('settings.transport.migrated')}</p>
-          <button
-            className="btn ghost small"
-            type="button"
-            data-testid="settings-transport-migrated-ok"
-            onClick={() => {
-              setDismissed(true);
-              try { localStorage.setItem('ahb.transportMigrated', '1'); } catch { /* 私有模式 */ }
-            }}
-          >
-            {t('common.gotIt')}
-          </button>
-        </div>
-      )}
       {peers.length === 0 ? (
         <p className="muted small" data-testid="settings-transport-empty">
           {t('settings.transport.noPeers')}
@@ -762,8 +764,24 @@ function TransportCard() {
             <tr>
               <th>{t('settings.transport.colPeer')}</th>
               <th>{t('settings.transport.colDir')}</th>
-              <th>{t('settings.transport.colLatency')}</th>
-              <th>{t('settings.transport.colQuality')}</th>
+              <th>
+                <span className="title-row">
+                  {t('settings.transport.colLatency')}
+                  <Help
+                    label={t('wiki.latency')} url={WIKI.latencyTarget}
+                    testid="settings-transport-latency-help"
+                  />
+                </span>
+              </th>
+              <th>
+                <span className="title-row">
+                  {t('settings.transport.colQuality')}
+                  <Help
+                    label={t('wiki.quality')} url={WIKI.qualityLadder}
+                    testid="settings-transport-quality-help"
+                  />
+                </span>
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -789,7 +807,6 @@ function TransportCard() {
           </tbody>
         </table>
       )}
-      <p className="muted small">{t('settings.transport.noteLive')}</p>
     </section>
   );
 }
@@ -821,7 +838,10 @@ export function SettingsView() {
       <IdentityCard />
 
       <section className="card block" data-testid="settings-net">
-        <h3 className="block-title">{t('settings.net.title')}</h3>
+        <BlockTitle
+          text={t('settings.net.title')} url={WIKI.discovery}
+          label={t('wiki.discovery')} testid="settings-net-help"
+        />
         {/*
           plan M3「同网段互见」的开关，以及它的隐私那一半。
           放在网络这一格而不是配对页：它是这台机器的一个持续属性（关掉之后
@@ -829,7 +849,12 @@ export function SettingsView() {
         */}
         <SettingRow
           title={t('settings.net.announceTitle')}
-          desc={t('settings.net.announceDesc')}
+          help={(
+            <Help
+              label={t('wiki.discovery')} url={WIKI.announce}
+              testid="settings-net-announce-help"
+            />
+          )}
           control={(
             <Switch
               testid="settings-discovery-announce"
@@ -857,7 +882,7 @@ export function SettingsView() {
         </p>
         <SettingRow
           title={t('settings.net.controlPort')}
-          desc={t('settings.net.controlPortDesc')}
+          help={<Help label={t('wiki.discovery')} url={WIKI.ports} testid="settings-net-port-help" />}
           badge={t('settings.net.controlPortBadge')}
           control={(
             <code className="mono" data-testid="settings-port">
@@ -867,7 +892,6 @@ export function SettingsView() {
         />
         <SettingRow
           title={t('settings.net.ipcPort')}
-          desc={t('settings.net.ipcPortDesc')}
           control={(
             <code className="mono" data-testid="settings-ipc-port">
               {s.endpoint ? String(s.endpoint.port) : t('common.dash')}
@@ -888,10 +912,12 @@ export function SettingsView() {
       <ModeAVolumeCard writing={writing} noSettings={noSettings} onPush={pushSetting} />
 
       <section className="card block" data-testid="settings-devices">
-        <h3 className="block-title">{t('settings.devices.title')}</h3>
+        <BlockTitle
+          text={t('settings.devices.title')} url={WIKI.deviceOptions}
+          label={t('wiki.devices')} testid="settings-devices-help"
+        />
         <SettingRow
           title={t('settings.devices.removeTitle')}
-          desc={t('settings.devices.removeDesc')}
           control={(
             <Switch
               testid="settings-remove-virtual"
@@ -905,7 +931,6 @@ export function SettingsView() {
         />
         <SettingRow
           title={t('settings.devices.markOfflineTitle')}
-          desc={t('settings.devices.markOfflineDesc')}
           control={(
             <Switch
               testid="settings-mark-offline"
@@ -921,10 +946,12 @@ export function SettingsView() {
       </section>
 
       <section className="card block">
-        <h3 className="block-title">{t('settings.paths.title')}</h3>
+        <BlockTitle
+          text={t('settings.paths.title')} url={WIKI.paths}
+          label={t('wiki.paths')} testid="settings-paths-help"
+        />
         <SettingRow
           title={t('settings.paths.configDir')}
-          desc={t('settings.paths.configDirDesc')}
           control={<code className="mono" data-testid="settings-config-dir">{cfgDir}</code>}
         />
       </section>
@@ -969,7 +996,6 @@ function AboutCard() {
       </div>
       {/* 文档的常驻入口。散落在各区块旁的深链解释的是**那一块**；这一条是目录
           本身——用户想「从头读一遍」时，不该只能靠碰巧点开某个深链再往回爬。 */}
-      <p className="muted small" data-testid="settings-about-docs">{t('wiki.desc')}</p>
       <p className="muted small">
         <ExtLink text={t('wiki.open')} url={WIKI.home} testid="settings-about-wiki" />
       </p>

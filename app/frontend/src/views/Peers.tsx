@@ -6,7 +6,8 @@
 
 import { useCallback, useRef, useState } from 'react';
 import { Icon } from '../components/Icon';
-import { Segmented, Switch } from '../components/Controls';
+import { Help, Segmented, Switch } from '../components/Controls';
+import { WIKI } from '../lib/external';
 import { VolumeControl } from '../components/VolumeControl';
 import { BridgeControl } from '../components/BridgeControl';
 import { ShareSourceControl } from '../components/ShareSourceControl';
@@ -248,12 +249,6 @@ const SWITCHED_KEY: Record<AppMode, MsgKey> = {
   b: 'mode.switched.toB',
 };
 
-const RESULT_KEY: Record<AppMode, MsgKey> = {
-  share: 'mode.share.result',
-  a: 'mode.a.result',
-  b: 'mode.b.result',
-};
-
 function ModeBanner() {
   const daemon = useStore((s) => s.daemon);
   const mode = useStore(effectiveMode);
@@ -271,9 +266,12 @@ function ModeBanner() {
   return (
     <section className="card block mode-bar" data-testid="consumer-mode">
       <div className="mode-head">
-        <div className="mode-title-wrap">
+        {/* 标题 + `?`，没有第三样东西。三种模式的说明、互斥的成因、每一档选完
+            之后去哪里操作——原先全都印在这张卡上，现在整段在 wiki（用户
+            2026-08-10 裁定「为了简化而简化」，docs/plan.md §3.1）。 */}
+        <div className="mode-title-wrap title-row">
           <h3 className="block-title">{t('mode.title')}</h3>
-          <p className="mode-sub">{t('mode.sub')}</p>
+          <Help label={t('wiki.modes')} url={WIKI.modes} testid="consumer-mode-help" />
         </div>
         {/* testid 沿用旧名 `settings-consumer-mode`（回归已依赖），外层另给别名 */}
         <Segmented<AppMode>
@@ -294,22 +292,6 @@ function ModeBanner() {
           ]}
         />
       </div>
-      {/* 长文（mode.a.desc / mode.b.desc）下沉到设置页——那里本来就有一份更完整的。
-          一级只留一句结果句：读完就知道「现在去哪里选对端」。 */}
-      <p className="mode-desc" data-testid="consumer-mode-desc">
-        {t(RESULT_KEY[mode])}
-        <button
-          className="link-btn" type="button" data-testid="consumer-mode-more"
-          onClick={() => actions.navigate('settings')}
-        >
-          {t('mode.learnMore')}
-        </button>
-      </p>
-      {/* 互斥是这次改动的**全部意义**，必须常驻一行：用户在切换前就该知道
-          「选了这个，另一件事本机就不做了」。两句互为反面，各自只在对应侧出现。 */}
-      <p className="mode-exclusive" data-testid="mode-exclusive">
-        {mode === MODE_SHARE ? t('mode.exclusive.share') : t('mode.exclusive.consumer')}
-      </p>
       {/* 「驱动就绪」是常态，不是消息：只有出问题时这行才值得占一行。 */}
       <p
         className={`mode-note tone-${st.tone}`}
@@ -670,7 +652,6 @@ function AddPeerForm({ open, onClose }: { open: boolean; onClose: () => void }) 
           {pending ? t('common.connecting') : t('common.connect')}
         </button>
       </div>
-      <p className="form-note">{t('peers.form.note')}</p>
     </form>
   );
 }
@@ -691,7 +672,6 @@ export function PeersView() {
     offline ? t('peers.summary.offline', { n: offline }) : null,
     retrying ? t('peers.summary.retrying', { n: retrying }) : null,
   ]);
-  const hasDevices = modeB && peers.some((p) => p.hal_device);
 
   return (
     <>
@@ -713,28 +693,18 @@ export function PeersView() {
         ))}
       </div>
 
-      {/* 从每张卡片上收拢来的两条常驻脚注：一句怎么用虚拟设备（只在模式 B 有意义），
-          一句延迟数字的口径。它们对整份列表说的是同一件事，所以只说一次。 */}
-      <div className="peer-list-foot" data-testid="peers-foot" hidden={peers.length === 0}>
-        <p className="foot-line" data-testid="peers-devices-foot" hidden={!hasDevices}>
-          {t('peers.devices.footOnce')}
-        </p>
-        <p className="foot-line" data-testid="peers-latency-foot">{t('metric.latency.footnote')}</p>
-      </div>
-
       {/* 首次启动的空态：不能是一片空白，必须把「两台设备先配对」这件事说清楚。 */}
       <div className="empty card" data-testid="peers-empty" hidden={peers.length > 0}>
         <Icon name="pair" cls="empty-ico" />
-        <h3>{t('peers.empty.title')}</h3>
-        <p>{t('peers.empty.desc')}</p>
+        <span className="title-row">
+          <h3>{t('peers.empty.title')}</h3>
+          <Help label={t('wiki.discovery')} url={WIKI.discovery} testid="peers-empty-help" />
+        </span>
         <ol className="empty-steps">
           <li>{t('peers.empty.step1')}</li>
           <li>{t('peers.empty.step2')}</li>
           <li>{t('peers.empty.step3')}</li>
         </ol>
-        <p className="empty-mode-b" data-testid="peers-empty-mode-b" hidden={!modeB}>
-          {t('peers.empty.modeB')}
-        </p>
         <button
           className="btn primary" type="button" data-testid="peers-empty-pair"
           onClick={() => actions.navigate('pair')}

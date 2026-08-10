@@ -19,7 +19,6 @@ export const zhCN = {
   'common.clear': '清除',
   'common.close': '关闭',
   'common.copy': '复制',
-  'common.gotIt': '知道了',
   // 复制失败在详情页与设置页是同一件事，一条键服务两处——分成两条早晚会各自漂移。
   'common.copyFailed': '复制失败，请手动选择文本',
   'common.retry': '重试',
@@ -40,13 +39,13 @@ export const zhCN = {
   'nav.detail': '对端详情',
 
   // 窗口拖不动时的唯一线索。静默失败正是这个 bug 之前难以定位的原因，所以宁可吵。
-  'chrome.dragFailed': '窗口拖拽不可用：{message}。请重启 AudioHub；若持续如此，说明界面与应用外壳版本不一致。',
+  'chrome.dragFailed': '窗口拖拽不可用：{message}。请重启 AudioHub。',
   // Windows 自绘标题按钮。三条都用动词，读屏念出来是「最小化 按钮」。
   'chrome.minimize': '最小化',
   'chrome.maximize': '最大化',
   'chrome.restore': '向下还原',
   'chrome.close': '关闭窗口（音频服务继续运行）',
-  'chrome.captionFailed': '窗口按钮不可用：{message}。请重启 AudioHub；若持续如此，说明界面与应用外壳版本不一致。',
+  'chrome.captionFailed': '窗口按钮不可用：{message}。请重启 AudioHub。',
 
   'badge.online': '在线',
   'badge.starting': '启动中',
@@ -88,22 +87,22 @@ export const zhCN = {
   'overlay.connecting.desc': '正在连接本机端口 {port} …',
   'overlay.connecting.descNoPort': '正在获取本机服务连接信息…',
   'overlay.version.title': 'AudioHub 服务版本不兼容',
-  'overlay.version.desc': '{message}。本界面只能与 IPC 协议 v{version} 的服务通信，请把服务与界面更新到同一次构建。',
+  'overlay.version.desc': '{message}。本界面只能与 IPC 协议 v{version} 的服务通信，请更新到同一次构建。',
   'overlay.version.hint': '提示：确认 audiohub 与本界面来自同一次构建。',
   'overlay.noEndpoint.title': '缺少连接参数',
-  'overlay.noEndpoint.desc': '请以 ?port=<端口>&token=<令牌> 打开本页面，或直接访问本机服务自身提供的界面地址。',
+  'overlay.noEndpoint.desc': '请以 ?port=<端口>&token=<令牌> 打开本页面，或直接访问本机服务提供的界面地址。',
   'overlay.noEndpoint.hint': '浏览器模式无法启动服务：请在终端运行 audiohub daemon 后等待自动重连。',
   'overlay.noBinary.title': '找不到 AudioHub 服务程序',
-  'overlay.noBinary.desc': '应用内缺少 audiohub 服务程序，无法启动音频服务。请重新安装 AudioHub；若在开发环境运行，可设置环境变量 AUDIOHUB_BIN 指向已编译的 audiohub。',
+  'overlay.noBinary.desc': '应用内缺少 audiohub 服务程序。请重新安装 AudioHub；开发环境可设 AUDIOHUB_BIN 指向已编译的 audiohub。',
   'overlay.noBinary.hint': '重装后再点「重试」。',
   'overlay.spawnFailed.title': '无法启动 AudioHub 服务',
-  'overlay.spawnFailed.desc': '已定位到服务程序，但进程启动失败——通常源于文件权限或系统隔离属性（quarantine）。可重新安装，或在终端执行一次 audiohub daemon 以获取完整错误输出。',
+  'overlay.spawnFailed.desc': '已定位到服务程序，但进程启动失败——多为文件权限或系统隔离属性。可重新安装，或在终端执行 audiohub daemon 查看完整错误。',
   'overlay.portBusy.title': 'AudioHub 服务端口被占用',
-  'overlay.portBusy.desc': '所需端口已被其它程序占用（多为仍在运行的旧实例）。请先结束该进程，或在终端执行 audiohub ctl shutdown，然后重试。',
+  'overlay.portBusy.desc': '所需端口已被其它程序占用（多为仍在运行的旧实例）。请结束该进程，或执行 audiohub ctl shutdown 后重试。',
   'overlay.timeout.title': 'AudioHub 服务启动超时',
-  'overlay.timeout.desc': '服务进程已启动，但未在预期时间内就绪。请稍候重试；若持续失败，在终端执行 audiohub daemon 观察启动日志。',
+  'overlay.timeout.desc': '服务已启动但未在预期时间内就绪。请稍候重试；持续失败可在终端运行 audiohub daemon 观察日志。',
   'overlay.startFailed.title': '无法启动 AudioHub 服务',
-  'overlay.startFailed.desc': '启动服务时发生未预期的错误。请重试；若持续失败，在终端运行 audiohub daemon 查看报错。',
+  'overlay.startFailed.desc': '启动服务时发生未预期的错误。请重试；持续失败可在终端运行 audiohub daemon 查看报错。',
   'overlay.internal.title': '无法启动 AudioHub 服务',
   'overlay.internal.desc': '界面与本机服务管理器之间的调用失败。请重试，或重启 AudioHub。',
   'overlay.disconnected.title': 'AudioHub 服务已断开',
@@ -116,37 +115,30 @@ export const zhCN = {
   // plan §13：三种模式**互斥**，共享模式与两种使用端模式并列。标题因此不再是
   // 「使用端模式」——那个名字把三选一说成了二选一，而被砍掉的那一档恰恰是默认值。
   'mode.title': '运行模式',
-  'mode.sub': '全局设置，三者互斥：本机或对外提供自身的音频设备，或使用某台对端的设备，不可兼任。',
   'mode.share.label': '共享 · 供他人使用',
   'mode.a.label': 'A · 免驱动',
   'mode.b.label': 'B · 虚拟设备',
   // 一级界面只留一句**结果句**：读完这一行就知道「现在选谁、在哪里选」，剩下的由
   // 「了解更多」带到设置页——那里的 settings.mode.rowDesc 本来就是同一段话的完整版，
   // 原先主面板上的 mode.a.desc / mode.b.desc 与它逐句重复，已随本次重整一并删除。
-  'mode.share.result': '已配对主机可采集本机麦克风、向本机输出设备送流；本机不占用对端设备。',
-  'mode.a.result': '在下方对端卡片上选择目标；本机与对端输出设备并行发声。',
-  'mode.b.result': '在「系统设置 › 声音」或任意应用中选择该对端的设备即可使用。',
-  'mode.learnMore': '了解更多',
   'mode.downgraded': '当前选定为模式 B，但该模式不可用，已临时按模式 A 运行。',
-  'mode.switched.toShare': '已切换到共享模式：本机改为供其它主机使用，本机发起的会话已全部关闭，全部 AudioHub 虚拟设备已从系统移除。',
-  'mode.switched.toB': '已切换到模式 B：已配对主机将作为音频设备出现在系统里。正在使用本机的对端已被断开并收到通知。',
-  'mode.switched.toA': '已切换到模式 A：全部 AudioHub 虚拟设备已从系统移除。正在使用本机的对端已被断开并收到通知。',
+  'mode.switched.toShare': '已切换到共享模式：本机发起的会话已全部关闭，全部 AudioHub 虚拟设备已移除。',
+  'mode.switched.toB': '已切换到模式 B：已配对主机将作为音频设备出现在系统里。正在使用本机的对端已被断开。',
+  'mode.switched.toA': '已切换到模式 A：全部 AudioHub 虚拟设备已移除。正在使用本机的对端已被断开。',
   // 互斥这件事必须在切换处说清楚，而不只在文档里：用户点下去之前就该知道
   // 「选了这个，另一件事就不做了」。
-  'mode.exclusive.share': '共享模式下本机不使用其它主机的设备，因此下方卡片上的通路开关不予显示。',
-  'mode.exclusive.consumer': '使用端模式下其它主机无法采集本机麦克风或向本机输出设备送流。',
 
   'hal.unknown': '服务未连接，暂时无法判断驱动是否可用。',
   'hal.absent': '未检测到 AudioHub 驱动，模式 B 不可用；安装驱动并重启本应用后即可选择。',
   'hal.absent.why': '未检测到 AudioHub 驱动，无法使用模式 B',
-  'hal.mismatch': '已安装的 AudioHub 驱动版本与本机服务不匹配{versions}：不会有任何虚拟设备出现在系统中。请安装与当前服务版本配套的驱动——重启应用或继续等待均无法恢复。',
+  'hal.mismatch': '驱动版本与本机服务不匹配{versions}：不会有任何虚拟设备出现。请安装配套版本的驱动。',
   'hal.mismatch.versions': '（服务 v{mine} / 驱动 v{theirs}）',
-  'hal.detached': '驱动已注册，但桥接通道尚未建立（通常发生在 coreaudiod 重启期间）：已发布的虚拟设备保留在系统中，当前不处理音频。请稍候，或重启 AudioHub 服务后重试。',
+  'hal.detached': '驱动已注册，但桥接通道尚未建立：已发布的设备保留在系统中，当前不处理音频。请稍候或重启服务。',
   'hal.ready': '已连接 AudioHub 驱动，模式 B 可用。',
 
-  'halReason.capacity': '虚拟设备数量已达上限（16 台），该对端暂无对应设备。解除其它配对后可用。',
+  'halReason.capacity': '虚拟设备数量已达上限（16 台）。解除其它配对后可用。',
   'halReason.noDriver': '本机未安装 AudioHub 驱动，无法为该对端创建虚拟设备。',
-  'halReason.removedWhileOffline': '已按「断开后移除虚拟设备」将该对端的设备从系统中移除；对端重新连接后以相同 UID 恢复。',
+  'halReason.removedWhileOffline': '已按「断开后移除虚拟设备」移除；对端重连后以相同 UID 恢复。',
   'halReason.modeA': '当前为模式 A：虚拟设备仅存在于模式 B。',
   'halReason.modeShare': '当前为共享模式：本机对外提供设备而不使用对端设备，因此不存在虚拟设备。',
   'halReason.other': '暂无虚拟设备（{reason}）。',
@@ -180,7 +172,7 @@ export const zhCN = {
   'metric.latency.grade.conversational': '可用于对话',
   'metric.latency.grade.noticeable': '明显延迟',
   'metric.latency.grade.unusable': '不适合互动',
-  'metric.latency.footnote': '系统链路延迟，不含蓝牙 / HDMI 等外部音频链路的附加缓冲。',
+  'metric.latency.footnote': '系统链路延迟，不含蓝牙 / HDMI 等外部链路的附加缓冲。',
   'metric.latency.lowerBoundWhy': '未含声卡固有缓冲，实际略高于此值。',
   'metric.latency.expand': '查看分段',
   'metric.latency.collapse': '收起分段',
@@ -189,7 +181,7 @@ export const zhCN = {
   // **对方整整一半管线**，量级无上界。只给「≥474 ms」而不说缺了谁，用户会把它
   // 读成端到端总延迟——那正是这次要消灭的误读。文案直说缺的是什么，不说黑话。
   'metric.latency.scopeLocal': '未含对方主机',
-  'metric.latency.scopeLocalWhy': '该读数仅统计本机侧的排队时长。对端尚未上报其管线分段，端到端实际延迟高于此值，超出量目前无法估计。',
+  'metric.latency.scopeLocalWhy': '该读数仅统计本机侧。对端尚未上报其管线分段，端到端实际延迟高于此值。',
 
   // 无会话、只连着控制通道时的读数（PeerState.net_ms = 控制面 min-RTT / 2）。
   //
@@ -201,10 +193,10 @@ export const zhCN = {
   'metric.latency.netOnlyLabel': '网络单程',
   'metric.latency.netOnlyValue': '{ms} ms（仅此一段）',
   'metric.latency.netOnlyScope': '不是总延迟',
-  'metric.latency.netOnlyNote': '不含缓冲与声卡固有延迟，而这两段占主要比重——它们需在音频实际流动时才可测得。',
-  'metric.latency.netOnlyWhy': '此处仅为数据包在两台主机之间的单程传输时延。占主要比重的缓冲与声卡固有延迟尚无读数——它们需在音频实际流动时才可测得。通路建立后，此处将替换为端到端总延迟。',
+  'metric.latency.netOnlyNote': '不含缓冲与声卡固有延迟，而这两段占主要比重。',
+  'metric.latency.netOnlyWhy': '仅为数据包在两台主机之间的单程传输时延。占大头的缓冲与声卡延迟要等音频真正流动才测得到。',
   'metric.latency.netOnlyRtt': '最近一次往返时延 {ms} ms（供交叉校验）。',
-  'metric.latency.netOnlyMeasuringWhy': '正在采集最小往返时延的样本（约十余秒）。样本量不足时不给出读数，而非以未经滤波的单次往返值代替。',
+  'metric.latency.netOnlyMeasuringWhy': '正在采集最小往返时延的样本（约十余秒）；样本不足时不给出读数。',
 
   // 一级四段：面向用户的说法，不出现 FIFO / JitterBuffer 这类内部词。
   // 没有第五段「设备」：色带是按音频流向排的时间轴，而两个声卡固有延迟分别落在
@@ -255,9 +247,9 @@ export const zhCN = {
   'latency.stage.playDev.name': '声卡播放缓冲',
   // 「常常是最大的一段」不是修辞：30-win 实测 41.9 毫秒（写进系统到真正出声），
   // 其中 30 毫秒是 Windows 共享音频引擎与 KS 传输，换一块声卡也一样。
-  'latency.stage.playDev.desc': '音频提交给系统到声卡实际发声之间的固有延迟，计入总延迟。Windows 实测约 42 ms，通常是整条链路中最大的一段。',
+  'latency.stage.playDev.desc': '音频提交给系统到声卡实际发声之间的固有延迟，计入总延迟；通常是最大的一段。',
   'latency.stage.residual.name': '未归属',
-  'latency.stage.residual.desc': '实测总延迟与各分段之和的差值。持续偏大表明链路中仍有未纳入统计的缓冲。',
+  'latency.stage.residual.desc': '实测总延迟与各分段之和的差值。持续偏大表明仍有未纳入统计的缓冲。',
   'latency.stage.ms': '{ms} ms',
   'latency.stage.unknown': '未知',
   'latency.stage.onPeer': '对方主机',
@@ -277,11 +269,11 @@ export const zhCN = {
   'latency.stage.dropNone': '该级不丢弃音频（有界但从不饱和，或不存在队列）。',
   'latency.stage.droppedN': '已丢弃 {n} 个样本',
   'latency.stage.droppedNone': '未丢弃',
-  'latency.stage.droppedWhy': '本条会话的累计值。数值停滞表明该级仅曾饱和一次；持续增长表明生产与消费速率长期失配。',
+  'latency.stage.droppedWhy': '本条会话的累计值。停滞表明仅曾饱和一次；持续增长表明生产与消费速率长期失配。',
   // `dropped: null` 与 `0` 是两个结论，界面必须分开讲——混为一谈就等于替驱动
   // 宣布「它一个样本都没丢」，而我们根本数不到那一侧。
   'latency.stage.droppedUnknown': '丢弃数不可见',
-  'latency.stage.droppedUnknownWhy': '该级的丢弃发生在另一侧（音频驱动或对端进程）内，本机无法计数。**不等同于未发生丢弃。**',
+  'latency.stage.droppedUnknownWhy': '该级的丢弃发生在另一侧（驱动或对端进程）内，本机数不到。不等同于未发生丢弃。',
   'latency.stage.fill': '{pct}% 满',
   'latency.stage.fullAt': '已满（{pct}%）',
   'latency.stage.fillWhy': '{n} / {cap} 个样本；达到 95% 判定为已满。',
@@ -290,7 +282,7 @@ export const zhCN = {
   'latency.stage.driftFlat': '深度稳定',
   'latency.stage.driftWhy': '最近 30 秒的深度斜率（{sps} 样本/秒）。持续上升表明该级最终会饱和。',
   'latency.stage.driftUnknown': '趋势未知',
-  'latency.stage.driftUnknownWhy': '样本量不足以判定趋势（少于 3 个采样点，或跨度不足 5 秒）。**不等同于无漂移。**',
+  'latency.stage.driftUnknownWhy': '样本量不足以判定趋势（少于 3 个采样点，或跨度不足 5 秒）。不等同于无漂移。',
 
   'latency.conf.full': '各分段完整',
   // 接线之前这里写的是「缺声卡缓冲」——那时两级设备延迟根本没查。现在查了，
@@ -301,10 +293,10 @@ export const zhCN = {
   'latency.conf.lowerBound': '下限（声卡延迟未取得精确值）',
   'latency.conf.converging': '时钟对齐中，约 {s} 秒后可用',
   // 说人话版：原文「仅本机分段，对端未上报」是照着字段名写的，用户读不出后果。
-  'latency.conf.localOnly': '以上仅为本机侧的分段。对端尚未上报其另一半管线，因此该值不是端到端总延迟。',
+  'latency.conf.localOnly': '以上仅为本机侧的分段，对端尚未上报另一半，因此不是端到端总延迟。',
   'latency.conf.deviceUnreliable': '输出设备（蓝牙 / HDMI）的延迟被系统低报，实际值更高',
   // 只在两台声卡都给出平台真值时才显示（confidence = full）。
-  'latency.conf.fullWhy': '两端声卡固有延迟均已取得平台真值；该读数覆盖自对端采集至本机发声的完整链路。',
+  'latency.conf.fullWhy': '两端声卡固有延迟均已取得平台真值，该读数覆盖完整链路。',
   'latency.conf.peerStale': '对端分段为 {s} 秒前的读数',
   'latency.detail.e2e': '实测采样年龄 {ms} ms（与各分段之和的差值计入「未归属」）',
 
@@ -330,7 +322,7 @@ export const zhCN = {
   'metric.quality.depth.s16': '16 bit',
   'metric.quality.depth.s24': '24 bit',
   'metric.quality.depth.f32': '32 bit 浮点',
-  'metric.quality.rateWhy': '线上采样率与位深，与详情页所设音质档同源。可用带宽为采样率的一半（见「音质构成」）；位深决定每个采样点的量化精度，不影响带宽。',
+  'metric.quality.rateWhy': '线上采样率与位深，与详情页所设音质档同源。带宽为采样率的一半。',
   'metric.quality.grade.excellent': '优',
   'metric.quality.grade.good': '良好',
   'metric.quality.grade.fair': '一般',
@@ -347,9 +339,9 @@ export const zhCN = {
   // 一个还没测出结论的通路被读成质量最差，是这套遥测最不该犯的错：它把「不知道」
   // 伪装成了一个具体且悲观的结论，方向虽反，性质与用 0 填补缺失分项完全相同。
   'metric.quality.measuring': '测量中…',
-  'metric.quality.measuringWhy': '仍有分量未积满统计窗口（通常为通路建立后的十余秒）。此时对已有分量取最小值只能得到上界而非等级，故暂不给出。',
+  'metric.quality.measuringWhy': '仍有分量未积满统计窗口（通常十余秒）。此时取最小值只能得到上界，故暂不给出。',
   // grade 成立、但仍缺一块板：等级已经触底，缺席改不了结论，两件事都要说。
-  'metric.quality.partial': '该等级在缺少一个分量的条件下判定；分量补齐后只会下调，不会上调。',
+  'metric.quality.partial': '该等级在缺少一个分量的条件下判定；补齐后只会下调，不会上调。',
 
   // 这一格来自对端的测量（SessionStats.peer_quality）。
   //
@@ -358,10 +350,10 @@ export const zhCN = {
   // 现在由对端把它那侧测到的回传过来。必须标：数是真的，但量它的人在对面，
   // 不标就等于让本机宣称了一个它没有测点的结论。
   'metric.quality.fromPeer': '对端测得',
-  'metric.quality.fromPeerWhy': '本条通路由本机发送，而音质三分量（补偿、削顶、带宽）仅接收端可测，因此该读数由对端在其侧测得后回传。',
+  'metric.quality.fromPeerWhy': '音质三分量仅接收端可测，而本条通路由本机发送，故读数由对端测得后回传。',
 
   'quality.part.continuity.name': '连续性',
-  'quality.part.continuity.desc': '输出中非由对端原始采样构成的时长占比（补偿帧与静音）。',
+  'quality.part.continuity.desc': '输出中非由对端原始采样构成的时长占比。',
   'quality.part.continuity.value': '{pct}% 被补偿',
   'quality.part.level.name': '电平',
   'quality.part.level.desc': '波形被削顶压缩的采样占比与压缩深度。',
@@ -370,7 +362,7 @@ export const zhCN = {
   // desc 必须说清它是**由采样率推出来的标称上限**，不是对实际频谱内容的测量。
   // 旧文案「还保留了多少高频成分」把它说成了一个实测量——而树里没有任何频谱
   // 分析，这个数恒等于采样率的一半。把推导值说成测量值，比单位混淆更难查。
-  'quality.part.bandwidth.desc': '可传输的最高音频频率，等于线上采样率的一半（奈奎斯特上限）。该值由采样率推导得出，并非对实际频谱内容的测量。链路劣化时采样率自动降档，此值随之下降。',
+  'quality.part.bandwidth.desc': '可传输的最高音频频率，等于线上采样率的一半；由采样率推导，并非频谱测量。',
   // 两个数并排：带宽是本分量本身，采样率是它的来源，也是用户在设置里设的那个数。
   // 只写带宽 ⇒ 复现一级界面那次误读；只写采样率 ⇒ 丢掉 Q3 本身。
   'quality.part.bandwidth.valueWithRate': '{khz} kHz（采样率 {rate} kHz）',
@@ -385,7 +377,7 @@ export const zhCN = {
   'mix.health.title': '本机混音',
   'mix.health.clip': '{pct}% 的采样被削顶',
   'mix.health.contrib': '同时混入 {n} 路',
-  'mix.health.duplicate': '检测到两路内容高度相似的音频叠加（相关度 {r}）：叠加后幅度翻倍并导致削顶。',
+  'mix.health.duplicate': '检测到两路内容高度相似的音频叠加（相关度 {r}），叠加后幅度翻倍导致削顶。',
   'mix.health.ok': '正常',
 
   // ---------------------------------------------------------------- 主面板
@@ -397,7 +389,6 @@ export const zhCN = {
   'peers.form.fingerprintPlaceholder': '对端指纹（可输前缀）',
   'peers.form.addr': '地址',
   'peers.form.addrPlaceholder': 'IP 或 IP:端口（留空使用最近地址）',
-  'peers.form.note': '经 peers.connect 主动连接已配对对端：服务按指纹校验对端身份，跨网段同样适用。',
   'peers.form.needFingerprint': '请填写对端指纹（可输前缀）',
   // M8 P6：地址一格现在同时接受 URL 形态（plan §16.2「地址即传输选择」）。
   'peers.form.addrPlaceholder2': 'IP、IP:端口，或 ws://主机[:端口]/路径（留空使用最近地址）',
@@ -430,7 +421,7 @@ export const zhCN = {
   // **让每一个数字前面都先有方向。**
   'peers.card.dirIdle': '未开通',
   'peers.card.dirMulti': '{n} 路 · 显示最慢的一条',
-  'peers.card.dirMultiWhy': '该方向存在多条并发通路。一级界面显示其中最慢的一条——并发时的实际表现由最差的一路决定。逐条明细见详情页。',
+  'peers.card.dirMultiWhy': '该方向有多条并发通路，此处显示最慢的一条——并发时的表现由最差的一路决定。',
   // 延迟档的**作用对象**按方向不对称，这两句是它的界面化。
   //
   // daemon 的 `servo_pass` 只遍历本机的接收流：发送方向那半条链路的抖动缓冲
@@ -438,10 +429,10 @@ export const zhCN = {
   // 使用端拖了延迟滑条会看到「两栏里只有一栏在动」，唯一自然的结论是
   // 「设置只生效了一半」——而系统是对的。设置页早已为此开了一条文案
   // （settings.transport.noRecvStream），这两句是把同一条教训搬到卡片上。
-  'peers.card.dirGovLocal': '本机为接收端。延迟档在该方向生效，其调节对象是本机的抖动缓冲。',
+  'peers.card.dirGovLocal': '本机为接收端，延迟档在该方向生效，调节的是本机的抖动缓冲。',
   // ⚠ 语料里不许出现 Markdown 记号：这两句会直接进 `title` 与 `.metric-foot` 的
   // 纯文本节点，`**…**` 会原样显示成四个星号。第一版写了，实测截图里就是那样。
-  'peers.card.dirGovPeer': '本机为发送端。该半程的缓冲位于对端，由对端自身的延迟档决定；本机的延迟档在此方向没有作用对象。',
+  'peers.card.dirGovPeer': '本机为发送端，该半程的缓冲位于对端，由对端自己的延迟档决定。',
 
   // 模式 B 下，虚拟麦克风已经真的出现在系统设备列表里、但还没有任何应用打开它。
   //
@@ -451,27 +442,24 @@ export const zhCN = {
   // 只有 hal_device.observed 为真（设备确实在系统里）且对端在线时才敢这么说。
   'peers.card.micReadyShort': '就绪',
   'peers.card.micReady': '通路就绪 · 暂无应用占用',
-  'peers.card.micReadyWhy': '虚拟麦克风已列入系统设备列表，且对端在线。任意应用（会议、录音、浏览器）选中该设备即开始传输，此处随即显示实时码率。',
+  'peers.card.micReadyWhy': '虚拟麦克风已列入系统设备列表，且对端在线。任意应用选中它即开始传输。',
 
   // plan §13 推论 1：对端处于使用端模式时无法被本机调取。三条分开写，因为
   // 「它在模式 A」和「它在模式 B」对用户的意义不同（后者说明对面正把本机之外的
   // 某台主机当设备用），而「认不出的模式」只能含糊其辞、绝不能冒充前两者。
-  'peers.unusable.modeA': '该主机当前不可被使用：它处于模式 A（免驱动使用端），正在使用其它主机的音频设备。请在该主机上切换到共享模式。',
-  'peers.unusable.modeB': '该主机当前不可被使用：它处于模式 B（虚拟设备使用端），正在使用其它主机的音频设备。请在该主机上切换到共享模式。',
-  'peers.unusable.unknownMode': '该主机当前不可被使用：它上报了本版本无法识别的运行模式。',
+  'peers.unusable.modeA': '该主机正处于模式 A，在使用其它主机的设备。请在该主机上切换到共享模式。',
+  'peers.unusable.modeB': '该主机正处于模式 B，在使用其它主机的设备。请在该主机上切换到共享模式。',
+  'peers.unusable.unknownMode': '该主机上报了本版本无法识别的运行模式。',
   'peers.unusable.badge': '不可被使用',
 
   // 原来每张卡片各印一遍（同一句话在 N 张卡上重复 N 次）：现在只在卡片列表底部渲染一次。
-  'peers.devices.footOnce': '在「系统设置 › 声音」或任意应用的音频设备菜单中选中即可使用；在系统内调节音量将同步至该主机的真实设备。',
   'peers.devices.offline': '⚠ 对端离线：设备仍列于系统中可供选择，但不处理任何音频。',
-  'peers.devices.settling': '设备已下发，正在等待系统刷新设备列表（最长 1 秒）。',
+  'peers.devices.settling': '设备已下发，正在等待系统刷新设备列表。',
 
   'peers.empty.title': '请先在两台设备上完成配对',
-  'peers.empty.desc': 'AudioHub 以配对在两台设备之间建立双向信任，此后方可共享麦克风与扬声器。',
   'peers.empty.step1': '在两台设备上都打开 AudioHub',
   'peers.empty.step2': '在本机打开「配对向导」生成 6 位 PIN',
   'peers.empty.step3': '另一台设备发现本机后输入同一 PIN',
-  'peers.empty.modeB': '配对完成后，对端主机随即以一对音频设备的形式出现在「系统设置 › 声音」中；将输出切换至该设备，或在任意应用中选中它，即为使用该主机。',
   'peers.empty.openPair': '打开配对向导',
 
   'peers.bridgeUnavailable': '虚拟声卡「{name}」当前不可用，本次不桥接。',
@@ -497,13 +485,11 @@ export const zhCN = {
   'bridge.undetected': '未检测到虚拟声卡',
   'bridge.notReported': '服务未上报',
   'bridge.staleOption': '{name}（未检测到）',
-  'bridge.stale.reselect': '「{name}」当前未检测到：启用「取对方麦克风」时不会桥接。请另行选择一张可用的声卡。',
-  'bridge.stale.reinstall': '「{name}」当前未检测到：启用「取对方麦克风」时不会桥接。重新安装该声卡并重启本应用即可恢复。',
+  'bridge.stale.reselect': '「{name}」当前未检测到，本次不桥接。请另选一张可用的声卡。',
+  'bridge.stale.reinstall': '「{name}」当前未检测到，本次不桥接。重新安装该声卡并重启本应用即可恢复。',
   'bridge.noField': '当前服务未上报虚拟声卡信息，无法桥接。',
   'bridge.presentUnusable': '已检测到 {names}，但它不在系统输出设备列表中，无法写入。',
-  'bridge.nothing': '未检测到虚拟声卡。AudioHub 不代为安装任何驱动——如需此功能，请自行安装下列任一款并重启本应用。',
-  'bridge.selected': '对端麦克风将写入「{name}」的播放端；任意应用选中它的输入端即等同于使用对端麦克风。',
-  'bridge.pick': '选择一张虚拟声卡后，对端麦克风将写入它的播放端，供其它应用作为输入设备使用。',
+  'bridge.nothing': '未检测到虚拟声卡。AudioHub 不代为安装驱动——请自行安装下列任一款并重启本应用。',
 
   // ---------------------------------------------------------------- 共享来源（模式 A 的 spk 方向）
   // plan §7.1：模式 A 的「送对方扬声器」= 捕获本机系统音频送对方默认输出播放。
@@ -511,18 +497,16 @@ export const zhCN = {
   'share.label': '共享来源',
   'share.source.sysaudio': '系统音频',
   'share.source.mic': '麦克风',
-  'share.mic.note': '发送源为本机默认麦克风。若需让对端听到本机正在播放的声音，请改选「系统音频」。',
-  'share.sys.none': '本机无可用的系统音频捕获后端，仅能共享麦克风。AudioHub 不要求变更系统输出设备。',
+  'share.sys.none': '本机无可用的系统音频捕获后端，仅能共享麦克风。',
   'share.backend.label': '捕获后端',
   'share.backend.autoOption': '自动',
-  'share.backend.auto': '由服务按优先级自动选择可用的捕获后端。捕获为旁路读取，本机输出设备与音量保持原状。',
-  'share.backend.selected': '已指定「{name}」：{note}',
-  'share.backend.unknown': '当前服务未上报可用后端清单，支持情况需在实际启用时才能确定；启用失败将给出明确原因，不会静默失败。',
-  'share.backend.stale': '当前服务不识别后端「{id}」：启用时将直接报错。请改回「自动」或另行选择。',
+  'share.backend.selected': '「{name}」：{note}',
+  'share.backend.unknown': '当前服务未上报可用后端清单。',
+  'share.backend.stale': '当前服务不识别后端「{id}」，启用时将直接报错。请改回「自动」。',
   'share.backend.staleOption': '{id}（当前服务未提供）',
   'share.backend.optionUnavailable': '{name}（本机不可用）',
   'share.backend.optionDeclined': '{name}（本项目不提供）',
-  'share.perm.hint': '共享系统音频需「系统音频录制」授权。macOS 不支持预先查询该状态，首次启用时由系统询问；若此前已被拒绝，需在系统设置中手动开启。',
+  'share.perm.hint': '需「系统音频录制」授权，首次启用时由系统询问。',
   'share.perm.goto': '前往授权',
   'share.fault': '⚠ 上次开启失败：{reason}',
   'share.fault.unknown': '服务未说明原因',
@@ -530,15 +514,15 @@ export const zhCN = {
   // 后端目录。id 必须与 core/audiohub-core/src/sysaudio.rs 的 BACKEND_* 常量一致。
   // 服务上报了自己的 note 时优先用它（它带本机实际版本号 / 上次被拒绝的事实）。
   'sysaudio.backend.winProcExclude.label': 'Windows 进程环回（排除自身）',
-  'sysaudio.backend.winProcExclude.note': '天然排除 AudioHub 自身的播放输出，不会将对端音频回送。需 Windows 10 2004 及以上。',
+  'sysaudio.backend.winProcExclude.note': '排除 AudioHub 自身的播放输出，不会把对端音频回送。需 Windows 10 2004 及以上。',
   'sysaudio.backend.winDeviceLoopback.label': 'Windows 设备环回',
-  'sysaudio.backend.winDeviceLoopback.note': '兼容较旧系统的回退方案；它会一并采集 AudioHub 自身的播放输出，双向互送时可能形成回授。',
+  'sysaudio.backend.winDeviceLoopback.note': '兼容较旧系统的回退方案；它会一并采集本应用的输出，双向互送时可能形成回授。',
   'sysaudio.backend.macCatap.label': 'macOS 音频进程 Tap',
-  'sysaudio.backend.macCatap.note': '首选方案：纯音频接口，所需权限为「系统音频录制」而非屏幕录制，且排除本应用自身的播放输出。需 macOS 14.2 及以上。',
+  'sysaudio.backend.macCatap.note': '首选方案：只需「系统音频录制」权限，且排除本应用自身的输出。需 macOS 14.2 及以上。',
   'sysaudio.backend.macSck.label': 'macOS 屏幕捕获音频流',
   // 2026-08-09 裁定不做（plan §6 / §11.2）。这句是用户唯一能看到的解释，所以必须说清
   // 「不做」而不是「还没做」——后者会让人一直等一个不会来的版本。
-  'sysaudio.backend.macSck.note': '本项目不提供该路线：其音频采集需「屏幕录制」权限，而相对 macOS 音频进程 Tap 仅多覆盖 macOS 13.0–14.1。14.2 及以上一律采用进程 Tap，所需权限更小。',
+  'sysaudio.backend.macSck.note': '本项目不提供该路线：它需要「屏幕录制」权限，而进程 Tap 只需「系统音频录制」。',
 
   // ---------------------------------------------------------------- 会话
   'session.flow.micRecv': '取对方麦克风',
@@ -573,12 +557,10 @@ export const zhCN = {
   'detail.alias.placeholder': '对端主机名',
   'detail.alias.renamed': '已改名为「{name}」',
   'detail.alias.restored': '已恢复为对端主机名',
-  'detail.alias.noteSet': '虚拟设备名称采用别名「{alias}」；清除后恢复为对端上报的主机名「{name}」。',
-  'detail.alias.noteEmpty': '设置别名将改写该对端在系统设备列表中的显示名。重命名在同一 UID 上就地完成：设备身份不变，应用已记住的设备选择不受影响。',
 
   'detail.devices.title': '虚拟设备',
-  'detail.devices.modeA': '当前为模式 A：虚拟设备仅存在于模式 B。在主面板顶部切换模式后，该对端将以一对设备的形式出现在系统音频设备列表中。',
-  'detail.devices.published': '两台设备已列入系统音频设备列表，可供任意应用直接选用。',
+  'detail.devices.modeA': '当前为模式 A，没有虚拟设备。',
+  'detail.devices.published': '两台设备已列入系统音频设备列表，可供任意应用选用。',
   'detail.devices.offline': '⚠ 对端离线：设备仍列于系统中可供选择，但不处理任何音频。',
   'detail.devices.stateListed': '驱动状态「{state}」，系统设备列表已列出这两台设备。',
   'detail.devices.stateUnlisted': '驱动状态「{state}」，系统设备列表尚未列出这两台设备。',
@@ -587,7 +569,6 @@ export const zhCN = {
   'detail.addrs.empty': '暂无地址记录',
   'detail.addrs.seenAt': ' 最近见于 {time}',
   'detail.addrs.fromDaemon': ' daemon 记录',
-  'detail.addrs.note': '来自服务记录的最近地址，以及本次界面会话内观察到的变化。',
 
   'detail.sessions.title': '活跃会话',
   'detail.sessions.empty': '与该对端当前无活跃会话。',
@@ -607,18 +588,16 @@ export const zhCN = {
   'detail.verdict.fail': '未通过',
 
   'detail.danger.title': '危险操作',
-  'detail.danger.desc': '解除配对将撤销双向信任、立即关闭全部会话，并无条件从系统移除该对端的虚拟设备。对端同时收到通知并移除本机对应的设备，其系统设备列表中不会残留一对永久离线的设备。',
-  'detail.danger.foot': '如需再次使用该主机，须重新执行一次配对流程。',
   'detail.unpair': '解除配对',
   'detail.unpair.confirmTitle': '解除配对？',
   'detail.unpair.confirmLead': '将解除与「{name}」的配对，并撤销双向信任。',
-  'detail.unpair.confirmDevices': '解除配对将立即从系统移除「{out}」与「{in}」。若其中之一为当前默认设备，系统将自动切换到其它设备。',
-  'detail.unpair.confirmNoDevices': '该对端当前没有虚拟设备，仅会移除信任关系与已建立的会话。',
+  'detail.unpair.confirmDevices': '将立即从系统移除「{out}」与「{in}」。若其中之一为当前默认设备，系统会自动切换。',
+  'detail.unpair.confirmNoDevices': '该对端当前没有虚拟设备，仅移除信任关系与已建立的会话。',
   'detail.unpair.done': '已解除配对',
 
   // ---------------------------------------------------------------- 配对
   'pair.left.title': '接受配对',
-  'pair.left.desc': '启用后本机在局域网内可被发现（pairing.enable），并生成一次性 PIN 供对方输入。',
+  'pair.left.desc': '启用后本机在局域网内可被发现，并生成一次性 PIN 供对方输入。',
   'pair.left.enable': '开启配对模式',
   'pair.left.disable': '停止配对',
   'pair.left.tip': '请对方在其配对界面输入上述 PIN，以建立双向信任。',
@@ -626,7 +605,7 @@ export const zhCN = {
   'pair.right.title': '发起配对',
   'pair.right.scan': '开始扫描',
   'pair.right.stopScan': '停止扫描',
-  'pair.right.empty': '尚未发现主机。点击「开始扫描」在局域网内查找（discover.run）。',
+  'pair.right.empty': '尚未发现主机。点击「开始扫描」在局域网内查找。',
   'pair.right.unknownHost': '未知主机',
   'pair.right.paired': '已配对',
   'pair.right.unpaired': '未配对',
@@ -645,18 +624,18 @@ export const zhCN = {
   'addr.badUrl.badIpv6': 'IPv6 字面量少了右方括号：{addr}',
   // wss:// 认得，但本 build 没有 TLS 客户端——说清楚缺口是什么，而不是把它
   // 报成「地址无法识别」。
-  'addr.wssUnsupported': '本版本不支持 wss://（未内置 TLS 客户端）。请填写隧道的明文入口 ws://…，或在本机前端终结 TLS。',
+  'addr.wssUnsupported': '本版本不支持 wss://（未内置 TLS 客户端）。请填写隧道的明文入口 ws://…。',
   // 配对不走 WebSocket：P5 有意没有在复用连接上再开一条配对路径，P6 未改。
   // ⚠ 这句话指的路（「到该对端的详情里把地址改成隧道 URL」）现在**真的存在**了，
   // 就是详情页「连通方式」下面那一格；在它落地之前这是一句做不到的指路。
-  'addr.pairNotOverWs': '配对暂不支持经 ws:// 隧道进行。请先以 IP:端口 完成配对，再在该对端详情页将地址改为隧道 URL。',
+  'addr.pairNotOverWs': '配对暂不支持经 ws:// 隧道。请先以 IP:端口 完成配对，再在详情页改为隧道地址。',
   // 隧道地址那一格独有的一条：`192.168.1.9:47810` 在「添加对端」里完全正常，
   // 在那一格里却等于没填（daemon 读不出 WsUrl）。所以要点明「直连 = 留空」，
   // 而不是把它报成一句泛泛的「地址无法识别」。
-  'addr.endpointNeedsUrl': '隧道地址必须以 ws:// 开头。使用直连请将此项留空——直连采用配对时记录的地址。',
+  'addr.endpointNeedsUrl': '隧道地址必须以 ws:// 开头。直连请留空。',
   'pair.right.done': '已与「{name}」完成配对',
-  'pair.right.failed': '配对失败：{message}。请确认对端已启用配对模式、PIN 未过期、地址可达；亦可用 CLI 复现：audiohub pair --to {addr} --pin {pin}',
-  'pair.right.note': '经 peers.pair 由本机服务发起：配对成功后双向信任立即生效；模式 B 下对端主机将同时以一对音频设备的形式出现在「系统设置 › 声音」中。',
+  'pair.right.failed': '配对失败：{message}。请确认对端已启用配对模式、PIN 未过期、地址可达。',
+  'pair.right.note': '配对成功后双向信任立即生效；模式 B 下对端将同时以一对音频设备出现在系统中。',
   'pair.step.connect': '建立连接',
   'pair.step.verifyPin': '校验 PIN',
   'pair.step.exchangeKeys': '交换密钥',
@@ -665,7 +644,6 @@ export const zhCN = {
   // ---------------------------------------------------------------- 设置
   'settings.mode.title': '运行模式',
   'settings.mode.rowTitle': '当前模式',
-  'settings.mode.rowDesc': '三种模式互斥，同一时刻只能处于其中一种。\n\n共享：本机将自身的默认麦克风与默认输出提供给已配对主机使用，可同时服务多台；本机不使用任何对端设备。\n\nA（免驱动）：无需安装驱动，默认捕获本机系统音频送往对端播放——本机与对端并行发声；捕获为旁路读取，本机输出设备无需任何变更。每张对端卡片上的「共享来源」可改为发送本机麦克风，也可指定捕获后端。采集对端麦克风需借助已安装的第三方虚拟声卡（见下方「虚拟声卡桥接」）。\n\nB（虚拟设备）：每台已配对主机以一对设备的形式出现在系统音频设备列表中，任意应用可直接选用；调节该设备音量即调节对端真实设备。\n\n互斥的原因：一台同时共享与使用的主机，其对外共享的「默认麦克风」可能正是另一台主机的虚拟麦克风，于是它在无感知的情况下成为中继；若该主机反向也在使用它，即构成环路，延迟将持续累积直至某一级缓冲饱和。\n\n运行模式为全局设置，由本机服务持有；切换入口位于主面板顶部，切换无需确认。',
   'settings.mode.goto': '前往主面板切换',
   'settings.mode.downgraded': '当前选定为「{mode}」，但该模式不可用，已临时按模式 A 运行。{hint}',
 
@@ -675,35 +653,26 @@ export const zhCN = {
   'settings.identity.fingerprint': '本机指纹',
   'settings.identity.name': '本机名称',
   'settings.identity.copied': '已复制本机指纹',
-  'settings.identity.note': '对端在配对时核对的即为此指纹。',
 
   'settings.net.title': '网络',
   'settings.net.announceTitle': '在局域网内广播本机',
-  'settings.net.announceDesc': '启用后，同网段的其它 AudioHub 在扫描时可直接发现本机，双方无需手动输入 IP。广播内容仅三项：本机名称、控制端口，以及本机身份指纹——指纹为公钥摘要，任何能连上控制端口的主机在握手时本就会取得它，此处公开仅用于让扫描列表区分「本机」与「已配对」。关闭后本机不再被扫描到，但手动输入 IP 配对、接受入站连接、扫描其它主机均不受影响。',
-  'settings.net.announceNotInForce': '⚠ 已启用，但广播未能建立：同网段的其它主机无法扫描到本机。macOS 首次运行需在「系统设置 › 隐私与安全性 › 本地网络」中允许 AudioHub；授权后将此开关关闭再启用即可重试，无需重启。手动输入 IP 配对、接受入站连接、扫描其它主机不受影响。',
+  'settings.net.announceNotInForce': '⚠ 已启用但广播未建立，其它主机扫描不到本机。macOS 需在「系统设置 › 隐私与安全性 › 本地网络」中允许 AudioHub，然后把本开关关掉再打开。',
   'settings.net.controlPort': '控制端口',
-  'settings.net.controlPortDesc': '服务对外的 TCP 控制端口（TLS + 指纹校验）。当前版本为只读展示，暂不支持修改。',
   'settings.net.controlPortBadge': '只读',
   'settings.net.ipcPort': 'IPC 端口',
-  'settings.net.ipcPortDesc': '本机回环 WebSocket 端口，随服务启动随机分配，写入 ipc.json。',
 
   // 网页访问（plan §7.5）。文案有两条硬要求：一是必须说清「仅允许本机」关掉之后
   // **实际会发生什么**（无鉴权 + 令牌明文），二是不得把它写成一句泛泛的「请注意
   // 安全」——那种话没人会当真。
   'settings.web.title': '网页访问',
-  'settings.web.desc': '由本应用在独立端口上提供同一套界面，通过浏览器即可操作——手机、平板或另一台计算机均可，无需安装任何组件。该端口与对外控制端口无关，也不影响音频通路。',
   'settings.web.enabledTitle': '启用网页访问',
-  'settings.web.enabledDesc': '默认关闭：未启用时该端口不会被监听。启用后本应用开始提供该界面，页面自行向本机服务获取连接参数（同源 GET /ipc-endpoint），URL 中不携带任何令牌。',
   'settings.web.portTitle': '端口',
-  'settings.web.portDesc': '本应用自身的网页端口（默认 47800），与服务的对外控制端口、IPC 端口均不相同。取值范围 1024–65535，修改后按回车或点击「应用」立即重新监听。',
   'settings.web.portApply': '应用',
   'settings.web.portInvalid': '端口需在 1024–65535 之间。',
   'settings.web.localOnlyTitle': '仅允许本机',
-  'settings.web.localOnlyDesc': '启用时仅监听 127.0.0.1——并非「监听全部网卡后按来源过滤」，而是根本不在对外地址上监听，局域网内无法连接该端口。',
-  'settings.web.localOnlyBadge': '尚不可用',
+  'settings.web.localOnlyBadge': '已锁定',
   // 「为什么不可用」必须说到底：只写「暂不支持」，下一个读到的人（包括半年后的自己）
   // 只会以为是没做完的开关，而不是一个有确定前提条件的设计裁定。
-  'settings.web.localOnlyLocked': '此开关暂不可关闭：关闭它并不能得到一个可用的远程界面。实测（本机 ↔ 另一台主机）显示，对端可以取得页面，也能从 /ipc-endpoint 取得本机服务的 IPC 令牌，但无法连上服务——本机服务的 IPC 仅监听回环，远端不可达；即便在本机改用局域网地址打开，浏览器也会依据「私有网络访问」规则拦截由局域网页面指向回环的连接。也就是说，关闭它的净效果仅剩「将令牌对外发出」。要使其真正可用，需由本应用另行提供一条将 IPC 转发出去的通路；而该通路一旦存在，「暂不做鉴权」便无法同时成立——远程可操作与无鉴权只能二选一。在此之前，配置文件中即使写为 false，也一律按仅本机处理（启动日志会记录一行）。',
   'settings.web.urlLabel': '访问地址',
   'settings.web.urlLocal': '本机：{url}',
   'settings.web.urlLan': '局域网：{url}',
@@ -713,27 +682,22 @@ export const zhCN = {
   'settings.web.error': '没能开始监听：{message}',
   'settings.web.errorHint': '设置已保存，但端口未能绑定——最常见的原因是该端口已被其它程序占用。请更换端口后重试。',
   'settings.web.warnTitle': '关闭此开关后，本机服务的令牌将以明文提供给任何访问者',
-  'settings.web.warnBody': '「仅允许本机」已关闭：同一局域网内任何人只要知道本机的 IP 与端口，即可打开该界面，且页面获取连接参数的接口（/ipc-endpoint）会将本机服务的 IPC 令牌**以明文**交付——本应用目前不提供任何鉴权。该令牌等同于本机音频服务的完全控制凭据：持有它且能访问本机回环者（例如本机上的另一个登录会话，或本机上任何可发起请求的程序），即可执行配对、开关音频通路、解除配对等操作。请仅在可信网络中临时启用，使用完毕后立即恢复。',
-  'settings.web.lanIpcNote': '实测：以局域网地址打开时页面可以显示，但无法连上本机服务——服务的 IPC 仅监听回环，其它主机不可达；即便在本机以局域网地址打开，浏览器也会依据「私有网络访问」规则拦截由局域网页面指向回环的连接。因此该开关目前只是将页面与连接参数对外暴露，界面在远端尚不能真正操作；要使其可用，需另行增加一条将 IPC 转发出去的通路（尚未实现）。',
   'settings.web.sourceDisk': '页面文件来自磁盘目录 {root}。',
-  'settings.web.sourceEmbedded': '页面文件来自应用内嵌资源，与窗口里显示的是同一份。',
-  'settings.web.quitNote': '网页入口由本应用提供：从托盘选择「退出界面（音频服务继续运行）」后该入口随之关闭，音频不受影响；重新打开本应用即可恢复。',
-  'settings.web.browserOnly': '当前正经网页端查看本页。以下三项只能在应用窗口内修改——否则一次误操作即可关闭你正在使用的这个入口。此处显示的是依据当前访问地址推断出的状态。',
+  'settings.web.sourceEmbedded': '页面文件来自应用内嵌资源，与窗口里是同一份。',
+  'settings.web.browserOnly': '你正经网页端查看本页。以下三项只能在应用窗口内修改，否则一次误操作即可关掉你正在用的入口。',
 
   // ---- plan §15：对端详情页的传输档位 ----
   // 卡片上那一行「这个数是目标不是能力」。措辞必须让用户一眼分出两件事：
   // 「我设的」与「对方要求的」。共享模式的机器只会看到后者。
-  'peers.card.targetMine': '目标 {ms} ms（由本机设定，服务将主动填充至该值）',
+  'peers.card.targetMine': '目标 {ms} ms（由本机设定）',
   'peers.card.targetByPeer': '目标 {ms} ms（由使用方设定）',
 
   'detail.transport.title': '传输档位',
   // §14 裁定 4：**常驻**，不是 tooltip。用户看到 300 ms 时必须能分辨
   // 「这是我自己设的目标」而非「系统只能做到这样」——当前界面对此一个字都没说，
   // 正是本次误判的直接成因。
-  'detail.transport.note': '此处设定的是**目标值**，而非实测值。延迟档是端到端总延迟的目标：设为 300 ms 时服务会主动将缓冲填充至 300 ms，而不表示「本链路仅能达到 300 ms」。各档下方一行才是实测读数。',
   // 交叉的那半边要说出来，否则「我改了发送音质，为什么没反应」在界面上无解。
   // 措辞按用户视角，不提「推给对端」——那是实现细节（plan §15 裁定 3）。
-  'detail.transport.where': '两个方向均由本机单方决定，对端执行。延迟由**接收端**执行、音质由**发送端**执行，因此同一行的两个档位分别落在两台主机上——这不影响设置方式，只影响读数从哪一侧先发生变化。',
   'detail.transport.colLatency': '延迟（目标）',
   'detail.transport.colQuality': '音质（目标）',
   'detail.transport.latencyIn': '接收方向的延迟目标',
@@ -743,7 +707,7 @@ export const zhCN = {
   // 共享模式：显示对端推来的值 + 出处。**不隐藏、不置灰成空壳**——
   // 本机真的有执行器在跑，只是被远程指挥；隐藏会让共享侧永远看不到自己
   // 机器上正在被执行什么，而本次事故里缺的正是这个视图。
-  'detail.transport.sharedBy': '本机处于共享模式：收发档位由使用方（{name}）决定，此处仅显示其当前要求的值。',
+  'detail.transport.sharedBy': '本机处于共享模式：收发档位由使用方（{name}）决定，此处只显示其当前要求的值。',
   // 「未设定」≠ 0，也 ≠ auto。对端没表态时按自动跑，但那与「对端明确选了
   // AUTO」是两件事，混成一个值会让共享侧读出一个对方从未做过的决定。
   'detail.transport.unset': '未设定 · 按自动运行',
@@ -753,7 +717,7 @@ export const zhCN = {
   // 这一格的前身是一层静默翻译（旧 id `pcm32k` → `pcm32k16`），它自己制造了
   // 一个真回归：同一个存盘值在详情页和总览里显示成两种写法。静默重置只是把
   // 同一个病换个方向——用户的选择消失了而界面处处自洽。所以：重置照做，说出来。
-  'detail.transport.stopReset': '{dir}的{kind}原存储值为「{old}」，本版本已无该档，已重置为自动。请重新选择。',
+  'detail.transport.stopReset': '{dir}的{kind}原为「{old}」，本版本已无该档，已重置为自动。请重新选择。',
   // ---- 连通性档位（plan §16.2 的手动覆盖入口）----------------------------
   //
   // **说人话，不显示内部代号**（§16.4 第 2 条）：`tier1` 对用户不解释任何事，
@@ -764,8 +728,6 @@ export const zhCN = {
   // 两者**不得互相冒充**——选「自动」的对端此刻可能正跑在 TCP 上，而这一组
   // 仍然、并且应当显示「自动」。
   'detail.transport.tierTitle': '连通方式',
-  'detail.transport.tierPickNote': '以下为**用户选择**，而非当前实际使用的通路——选择「自动」时，上方一行才是链路现状。',
-  'detail.transport.tierNote': '媒体默认走 UDP（直连，延迟表现最佳）。UDP 被网络阻断时可改走 TCP：功能不减，但**延迟与抖动会明显变差**。两者均不通、仅存应用层隧道时，可将控制与两个方向的音频全部复用到同一条连接（最后一档）。「自动」= 由服务判定。修改该项将重新协商一次连接，约一秒内恢复。',
   'detail.transport.tierAuto': '自动',
   'detail.transport.tierAutoHint': '由服务判断（默认）',
   'detail.transport.tier0': '直连（UDP）',
@@ -776,8 +738,8 @@ export const zhCN = {
   // 不填是「裸 TCP 上的复用」，两者都是单连接复用。所以这句提示不许写成
   // 「需要隧道地址」——那会把一个此刻就生效的选择说成一个前置条件没满足的选择。
   'detail.transport.tier2': '单连接复用',
-  'detail.transport.tier2Hint': '控制与两个方向的音频复用同一条连接；延迟最差，且双向互相干扰。仅在直连与 TCP 均不可用时使用。如需经 HTTP 隧道，请在下方填写 ws:// 地址。',
-  'detail.transport.tierReset': '连通方式原存储值为「{old}」，本版本不识别，已重置为「自动」。',
+  'detail.transport.tier2Hint': '控制与两个方向的音频复用同一条连接，延迟最差。经 HTTP 隧道时在下方填 ws:// 地址。',
+  'detail.transport.tierReset': '连通方式原为「{old}」，本版本不识别，已重置为「自动」。',
   // ---- 隧道地址（plan §16.2「地址即传输选择」）-----------------------------
   //
   // 这一格是**能存住**隧道地址的唯一界面入口。「添加对端」那一格也收 ws://，
@@ -785,11 +747,10 @@ export const zhCN = {
   'detail.transport.endpointTitle': '隧道地址',
   'detail.transport.endpointField': '对端地址（ws://）',
   'detail.transport.endpointPlaceholder': 'ws://隧道主机[:端口][/路径]',
-  'detail.transport.endpointNote': '留空 = 使用配对时记录的 IP:端口 直连。填写 ws:// = 将连接封装进 WebSocket，用于仅放行 HTTP 的隧道；此时无论上方选择哪一档，本机主动发起的连接一律走单连接复用。该项会持久化，重连后仍然有效。**本版本不支持 wss://**（未内置 TLS 客户端）：请填写隧道的明文入口，或在本机前端终结 TLS。',
   'detail.transport.endpointSaved': '已保存隧道地址：{addr}',
   'detail.transport.endpointCleared': '已清除隧道地址，恢复为按配对时记录的地址直连。',
-  'detail.transport.endpointShadow': '已填写隧道地址：本机主动连接它时一律走单连接复用，上方所选的「{tier}」对出站连接不生效。如需恢复该档，请先清空此项。',
-  'detail.transport.endpointReset': '隧道地址原存储值为「{old}」，本版本无法解析，已清空。',
+  'detail.transport.endpointShadow': '已填写隧道地址：本机主动连接一律走单连接复用，上方的「{tier}」对出站不生效。',
+  'detail.transport.endpointReset': '隧道地址原为「{old}」，本版本无法解析，已清空。',
   // ---- 链路**现状**（plan §16.4）------------------------------------------
   //
   // 与上面那一组（用户的选择）是两个量。这一组回答「此刻字节实际走在哪条路上」。
@@ -804,7 +765,7 @@ export const zhCN = {
   // 差不多快，初始延迟不一定高；变差的是抖动下的表现——一次 RTO 就是 200–300 ms。
   // 跨机实测 150 s 增量：Tier 1 上 jb_underruns +4 / jb_dropped +13，Tier 0 上都是 0。
   // 写成「延迟更高」会让用户去盯一个可能根本没动的毫秒数，然后判定这句提示是假的。
-  'tier.now.title': '这台对端的媒体此刻实际走的通路。它由服务按连接的真实传输判定，与你在详情页里选的那一档是两回事。',
+  'tier.now.title': '这台对端的媒体此刻实际走的通路，由服务按真实传输判定。',
   'tier.now.cap': '当前连接方式',
   'tier.now.tier0': '直连（UDP）',
   'tier.now.tier0Why': '延迟与抖动最好',
@@ -824,7 +785,7 @@ export const zhCN = {
   'tier.now.muxFrames': '控制帧 发 {w} / 收 {r}',
   // §16.4 第 4 条点名要二级页面给出「原因」与「判定时间」，而 daemon 还不上报
   // 这两项。明说出来，不留白——留白会被读成「没有原因」。
-  'tier.now.reasonGap': '当前服务不上报降级的原因与判定时间，上面这些是能拿到的全部现场数据。',
+  'tier.now.reasonGap': '当前服务不上报降级的原因与判定时间，以上是能拿到的全部现场数据。',
   'detail.transport.noStream': '该方向当前没有音频流，暂无实测读数。',
   'detail.transport.measuring': '正在测量，暂无读数。',
   'detail.transport.liveMs': '实测 {n} ms',
@@ -841,8 +802,6 @@ export const zhCN = {
   // 展开开关。§15 把档位搬到详情页时那两条语料的渲染点留在了设置页 ⇒ 成了死键，
   // 于是「位深是什么、为什么带宽翻倍、AUTO 为什么不会自己上去」界面上没有一处
   // 说得出。收起态是因为那两段很长，而这张卡的主角是四个控件。
-  'detail.transport.helpShow': '这两个档位的含义',
-  'detail.transport.helpHide': '收起说明',
 
   'settings.transport.title': '传输',
   'settings.transport.auto': 'AUTO',
@@ -850,7 +809,6 @@ export const zhCN = {
   'settings.transport.latency': '延迟档',
   // 「这是总延迟的目标，不是某一级缓冲的大小」必须写死在文案里：把它读成缓冲大小的
   // 人，会以为调到 200 ms 就是「多缓冲 200 ms」，于是永远不明白为什么读数不听话。
-  'settings.transport.latencyDesc': '此处设定的是端到端总延迟的目标值——自对端采集至本机发声的全程，包含两端之间的网络时延，而非某一级缓冲的容量。服务会在链路允许的范围内朝该目标调节缓冲深度：目标低于物理下限时贴着下限运行，高于上限时贴着上限运行。「尽可能低」= 不设目标值，持续压至下限；AUTO = 依据实测网络质量自适应。',
   'settings.transport.latencyLowest': '尽可能低',
   'settings.transport.ms': '{n} ms',
 
@@ -858,7 +816,6 @@ export const zhCN = {
   // ⚠ 这句话是「采样率 / 带宽」这一对的**权威解释**，措辞不能再把两者说成一回事。
   // 旧版写「可调的是采样率，也就是能传过去的音频带宽（上限为采样率的一半）」——
   // 一句里先说「就是」再说「一半」，正是界面上那次 48/24 误读的文字版。
-  'settings.transport.qualityDesc': '此处选择的是**线上格式**，一档同时确定两个参数：**采样率**（kHz）与**位深**（bit）。\n\n采样率决定可传输的最高音频频率——上限为采样率的**一半**（48 kHz 采样率 ⇒ 24 kHz 带宽）。因此卡片上的「音质」显示采样率，带宽在展开明细中给出，两者相差一倍属正常。16 kHz 可满足清晰语音，48 kHz 为全带宽。\n\n位深决定每个采样点的量化精度：16 bit 为 CD 规格，24 bit 为专业音频设备之间的标准交换精度，32 bit 浮点与本机内部管线同格式，线路段不再做任何量化。**位深不影响带宽，只影响本底噪声**，通常不可辨；提供该维度是为了可选，而非必选。\n\n⚠ 两个数值易混淆：`16 kHz` 是**采样率**，`16 bit` 才是**位深**。因此每一档的标签均写全两个维度。\n\n档位按码率升序排列：先将采样率提升至 48 kHz，再提升位深——低采样率配高位深无意义，那等于用更多字节描述一段已被截去高频的信号。\n\n三档 Opus 尚未实现，仍绘制在滑条上但不可选中，以使「本机为何没有该档」可见。\n\nAUTO 依据丢包与抖动在质量阶梯上自动升降，其**上限为 48 kHz · 16 bit**：更深的档位带宽翻倍而听感差异不可辨，不应在未经请求时自动启用。',
   'settings.transport.q.auto': 'AUTO',
   // 「64k」→「64 kbps」：**同一条滑条上 Opus 档是码率、PCM 档是采样率**，两种量纲
   // 并排。这是编解码器的惯例（Opus 按码率参数化、PCM 按采样率），改不了，但
@@ -903,46 +860,36 @@ export const zhCN = {
   // plan §15：全局滑条下线，这个位置换成只读总览 + 一次性迁移说明。
   // **位置不许留空**——区块凭空消失 = 用户找不到、也没被告知搬去哪了，
   // 正是 §15 那个病根（「界面对此一个字都没说」）换个位置复发。
-  'settings.transport.migrated': '延迟与音质已改为**按对端**设定：收、发两个方向各有独立的延迟档与音质档。原全局档位不再生效，请到各对端的详情页重新设定。',
-  'settings.transport.noPeers': '尚无已配对的对端。配对完成后，每台对端的四个传输档位将列于此处。',
+  'settings.transport.noPeers': '尚无已配对的对端。配对后，每台对端的四个传输档位将列于此处。',
   'settings.transport.colPeer': '对端',
   'settings.transport.colDir': '方向',
   'settings.transport.colLatency': '延迟（目标）',
   'settings.transport.colQuality': '音质（目标）',
-  'settings.transport.noteLive': '本表为**只读总览**，也是唯一可一次查看全部对端档位的位置——「哪台仍停留在 AUTO」在别处无法看到。点击对端名称进入详情页修改；改动在释放控件时立即生效，无需重启服务，也无需与对端重新建立连接。',
 
   // plan §7.1 模式 A 的两个独立开关。文案里必须说清三件事：以对端为准、
   // 「静音本机」是一次性动作不是状态、以及两者同时开启时的静音例外。
   'settings.modeAVolume.title': '模式 A · 音量',
   'settings.modeAVolume.syncTitle': '与对端音量同步',
-  'settings.modeAVolume.syncDesc': '启用后，本机系统输出音量与对端真实输出设备互相跟随，以对端为准：连接建立时本机采用对端当前值；两端同时改动时以对端值为准。关闭后两台主机各自独立调节。',
-  'settings.modeAVolume.syncMuteException': '当前「静音本机输出」同时处于启用状态，因此仅同步音量、不同步静音——否则连接建立时的一次性静音会经同步链路一并静音对端。',
   'settings.modeAVolume.muteTitle': '静音本机输出',
-  'settings.modeAVolume.muteDesc': '这是一次性动作，而非持续状态：仅在与对端建立扬声器通路的时刻将本机静音一次，此后不再维持。你随后手动取消静音即视为「本机同时发声」，在下一次通路建立前不会被再次静音。在捕获点位于音量之后的后端（Windows 设备环回）上不执行此动作——否则会一并静音送往对端的镜像流。',
-  'settings.modeAVolume.noteInForce': '当前生效：本机正运行于模式 A，这两项作用于本机的默认输出设备。',
-  'settings.modeAVolume.noteIdle': '当前不生效：这两项仅属于模式 A。模式 B 下音量由虚拟扬声器本身承担，共享模式下本机不使用对端设备。设置将被保留，切换到模式 A 后即生效。',
+  'settings.modeAVolume.noteInForce': '当前生效（本机正运行于模式 A）。',
+  'settings.modeAVolume.noteIdle': '当前不生效：这两项仅属于模式 A，设置会保留。',
   'settings.devices.title': '虚拟设备',
   'settings.devices.removeTitle': '断开后移除虚拟设备',
-  'settings.devices.removeDesc': '关闭时：断开仅显示为离线，虚拟设备保留在系统设备列表中；启用时：断开即移除，重连后以相同 UID 恢复。解除配对总是无条件移除。',
   'settings.devices.markOfflineTitle': '离线时标注设备名',
-  'settings.devices.markOfflineDesc': '启用时，对端断开期间在设备名后追加「（离线）」——在同一 UID 上就地重命名，不影响应用已记住的设备选择。关闭则设备名恒定，代价是无法在系统中区分「无声音」的成因。',
   'settings.devices.inventory': '设备清单',
   'settings.devices.count': '已用 {used} / {cap}',
   'settings.devices.countNa': '不可用',
   'settings.devices.tagPublished': '已发布',
   'settings.devices.tagMissing': '未出现在系统中',
-  'settings.devices.noteHas': '「已发布」= 驱动确认绑定，且系统设备列表中确实可查到这两个 UID。',
-  'settings.devices.noteNoDriver': '本机未安装 AudioHub 驱动（或服务未加载桥接），因此没有虚拟设备。',
-  'settings.devices.noteModeB': '当前没有任何虚拟设备：配对一台对端后，它将立即出现在系统音频设备列表中。',
-  'settings.devices.noteModeA': '当前为模式 A：虚拟设备仅存在于模式 B。',
+  'settings.devices.noteNoDriver': '本机未安装 AudioHub 驱动，因此没有虚拟设备。',
+  'settings.devices.noteModeB': '配对一台对端后，它将出现在系统音频设备列表中。',
+  'settings.devices.noteModeA': '当前为模式 A，没有虚拟设备。',
 
   'settings.bridge.title': '虚拟声卡桥接',
-  'settings.bridge.desc': '采集对端麦克风时，可将音频写入本机已安装的第三方虚拟声卡的播放端；任意应用选中该声卡的输入端，即等同于选中对端麦克风。',
-  'settings.bridge.foot': 'AudioHub 不代为安装任何驱动：这些虚拟声卡由第三方签名与维护，安装后重启本应用即可被检测到。具体使用哪一张卡在主面板的对端卡片上单独设定。',
   'settings.bridge.detected': '已检测到',
   'settings.bridge.notInOutputs': '不在输出列表',
   'settings.bridge.notDetected': '未检测到',
-  'settings.bridge.noneReported': '当前服务未上报虚拟声卡信息（daemon.status 中无 virtual_cards）。',
+  'settings.bridge.noneReported': '当前服务不上报虚拟声卡信息。',
   'settings.bridge.noneOffline': '服务未连接，暂无检测结果。',
   'settings.bridge.noneFound': '未检测到任何虚拟声卡。',
 
@@ -950,24 +897,20 @@ export const zhCN = {
   // 它靠系统的登录项活过重启、以及关掉之后什么都不会留下。
   'settings.startup.title': '启动',
   'settings.startup.autostartTitle': '开机时自动启动 AudioHub',
-  'settings.startup.autostartDescMac': '在「登录项」中注册 AudioHub：每次登录时由系统启动 AudioHub，再由它拉起音频服务——与手动启动应用完全一致，已有的麦克风与本地网络授权继续有效。关闭即删除该登录项，不留残余。',
-  'settings.startup.autostartDescWin': '注册一个登录时触发的计划任务（AudioHubDaemon）：每次登录时由系统启动 AudioHub，再由它拉起音频服务。关闭即删除该任务，不留残余。',
+  'settings.startup.autostartDescMac': '在「登录项」中注册 AudioHub：每次登录时自动启动，已有的授权继续有效。关闭即删除，不留残余。',
+  'settings.startup.autostartDescWin': '注册一个登录时触发的计划任务（AudioHubDaemon），每次登录时自动启动 AudioHub。关闭即删除，不留残余。',
   'settings.startup.target': '登录时启动',
-  'settings.startup.targetDesc': '该登录项实际指向的程序。',
   'settings.startup.unsupported': '当前形态无法设置开机自启：{reason}',
   // `supported=false && enabled=true`：登录项是**别的形态**（装好的 App）留下的，
   // 活得比它长。这句话必须同时说清三件事：它还在生效、当前形态开不了新的、
   // 但**关得掉**——否则用户看到的是一条自己开过、界面却答不出状况的登录项。
-  'settings.startup.orphaned': '开机自启仍处于注册状态，每次登录都会启动 AudioHub。该登录项由已安装的 AudioHub.app 写入，当前形态无法修改其指向（{reason}），但可在此将其关闭。',
+  'settings.startup.orphaned': '开机自启仍在注册状态，由已安装的 AudioHub.app 写入。当前形态改不了它的指向（{reason}），但可在此关闭。',
   'settings.startup.unknown': '当前服务不提供开机自启接口（服务版本较旧）。',
-  'settings.startup.noteOff': '关闭后，仅在手动启动 AudioHub 之后才会共享或使用音频设备。',
 
   // ---- 快捷键（设置页区块 + 录制控件 + 速查表）----------------------------
   // 落点在「启动」之后、「桥接」之前：它和启动行为同属「这个应用怎么用」，
   // 再往后几块讲的都是音频/网络语义。
   'settings.shortcuts.title': '快捷键',
-  'settings.shortcuts.desc': '点击键位胶囊后直接按下目标组合键。焦点位于输入框内时快捷键一律让行，避免在端口输入框中键入数字触发页面切换。',
-  'settings.shortcuts.localOnly': '快捷键保存在本机的浏览器存储中，仅作用于当前界面：从其它主机经网页访问打开时，该端使用独立的一套配置。',
   'settings.shortcuts.resetAll': '全部恢复默认',
   'settings.shortcuts.resetAllDone': '快捷键已全部恢复默认。',
 
@@ -1014,7 +957,6 @@ export const zhCN = {
 
   'settings.paths.title': '路径',
   'settings.paths.configDir': '配置目录',
-  'settings.paths.configDirDesc': '服务身份、配对表与 ipc.json 所在目录；可用环境变量 AUDIOHUB_CONFIG_DIR 覆盖。',
 
   // 「关于」。左上角的品牌区改成背景水印之后，App 的名字与版本只剩这一处常驻落点。
   // 版本号整句带进占位符，不在组件里拼 '版本 ' + v——语序在别的语种里会散架。
@@ -1022,13 +964,11 @@ export const zhCN = {
   'settings.about.version': '版本 {version}',
 
   'settings.perm.title': '系统权限',
-  'settings.perm.descMac': 'macOS 的约束是：一项权限被拒绝后，应用无法再次弹窗申请，只能在系统设置中手动开启。此处显示的是本机服务实时探测的结果，而非缓存的历史状态。',
   // Windows 侧 daemon 对每一项都回「本平台无需授权」（core/audiohub-core/src/
   // permissions.rs 的 not(macos) 分支），所以开头这句不能照抄 macOS 的规矩——
   // 那会让整段说明与它下面每一行自相矛盾。
-  'settings.perm.descWin': '本平台不按应用逐项授予音频权限，下列各项通常可直接使用。此处显示的是本机服务实时探测的结果，而非缓存的历史状态。',
   'settings.perm.recheck': '重新检查',
-  'settings.perm.unsupported': '当前服务不提供权限查询接口（服务版本较旧），无法在此显示或申请权限。',
+  'settings.perm.unsupported': '当前服务不提供权限查询接口，无法在此显示或申请权限。',
   'settings.perm.error': '权限探测失败：{message}',
   'settings.perm.probing': '正在探测系统权限…',
   'settings.perm.offline': '服务未连接，暂无法探测权限状态。',
@@ -1038,8 +978,8 @@ export const zhCN = {
   'stats.rtt': 'IPC 往返延迟',
   'stats.sessionCount': '活跃会话',
   'stats.empty.title': '暂无活跃会话',
-  'stats.empty.hintModeB': '在「系统设置 › 声音」或任意应用中选中某台对端的 AudioHub 设备后，此处将出现对应的实时指标。',
-  'stats.empty.hintModeA': '在主面板打开对端卡片上的通路开关，或经 CLI 发起会话后，此处将实时显示指标。',
+  'stats.empty.hintModeB': '在「系统设置 › 声音」或任意应用中选中某台对端的 AudioHub 设备后，此处将出现实时指标。',
+  'stats.empty.hintModeA': '在主面板打开对端卡片上的通路开关后，此处将显示指标。',
   'stats.session': '会话 #{id}',
   // 诊断页从「会话导向」改为「先按对端聚合、再按会话展开」（spec §2.5）。
   'stats.groupBy.peer': '按对端',
@@ -1053,11 +993,10 @@ export const zhCN = {
   // 链路而不是会话（同一台对端的所有流共用一条），所以既进不了会话卡也进不了
   // 对端卡片，只能在这一页有自己的位置。
   'stats.degraded.title': '降级链路',
-  'stats.degraded.note': '媒体切换到 TCP（或隧道复用）后才存在的链路。以下两项是判断卡顿成因的唯一依据，其它页面不提供。',
   'stats.degraded.writeq': '发送积压',
-  'stats.degraded.writeqWhy': '帧在发送队列中的等待时长（毫秒，非队列深度）。该值上升表明写线程被 TCP 阻塞——这是降级链路上最直接的卡顿来源，也是 AUTO 降档的主要依据。',
+  'stats.degraded.writeqWhy': '帧在发送队列中的等待时长（毫秒，非深度）。上升表明写线程被 TCP 阻塞，是最直接的卡顿来源。',
   'stats.degraded.stale': '超时丢弃',
-  'stats.degraded.staleWhy': '出队时已超过 200 ms 预算而被主动丢弃的帧数。这不是一个新增的丢包源：TCP 会抹除丢包信号，主动丢弃留下的空洞才能让对端的抖动缓冲正确隐藏。该值上升且对端出现欠载 ⇒ 问题定位在本条链路；该值与「队列丢弃」均为 0 而对端仍在欠载 ⇒ 问题不在发送侧。',
+  'stats.degraded.staleWhy': '出队时已超过 200 ms 预算而被主动丢弃的帧数。它不是新增的丢包源——主动留下空洞，对端的抖动缓冲才隐藏得住。',
   'stats.degraded.writeqPeak': '积压峰值 {v} ms',
   'stats.degraded.writeqAuto': 'AUTO 上次依据 {v} ms',
   'stats.degraded.queued': '队列 {n} / {cap}',
@@ -1067,8 +1006,8 @@ export const zhCN = {
   // 「空数组」与「键缺席」是两条不同的结论，**不合并**：前者是「确实没有对端在
   // 降级链路上」，后者是「这一版服务说不出来」。合并等于用一个缺席的字段去证明
   // 一切正常。
-  'stats.degraded.empty': '当前没有对端运行在降级链路上（这是一条结论，而非「读不到」）。',
-  'stats.degraded.unsupported': '当前服务不上报降级链路，无法判断是否有对端已降级。',
+  'stats.degraded.empty': '当前没有对端运行在降级链路上（这是结论，不是「读不到」）。',
+  'stats.degraded.unsupported': '当前服务不上报降级链路。',
   'stats.metric.loss': '丢包率',
   'stats.metric.jitter': '抖动',
   'stats.metric.bitrate': '码率',
@@ -1076,7 +1015,7 @@ export const zhCN = {
   // 这个裸数字**需要一句解释**：位深进阶梯之后阶梯从四档变六档，含义静默换了
   // ——改动前 AUTO 稳态是 0，现在是 2，而 0 成了最高的 48 kHz/32 位浮点。
   // 同一个位置的同一个数字改了意思，界面上必须有一处说出来。
-  'stats.metric.rungWhy': '质量阶梯上的格号，0 = 最高（48 kHz · 32 bit 浮点），数值越大档位越低。AUTO 的上限为 2（48 kHz · 16 bit），更深的两档仅在手动选择时使用。',
+  'stats.metric.rungWhy': '质量阶梯上的格号，0 = 最高（48 kHz · 32 bit 浮点），数值越大档位越低；AUTO 上限为 2。',
   'stats.metric.latency': '延迟',
   'stats.metric.intact': '完整度',
   'stats.unit.pct': '%',
@@ -1123,16 +1062,16 @@ export const zhCN = {
   // 信息」）。
   'stats.extra.transport': '连接方式 {v}',
   'stats.extra.transportUnknown': '连接方式 —',
-  'stats.extra.transportWhy': '本条会话的音频实际所走的通路，由服务依据该流绑定的传输判定——**而非**你在对端详情页中所选的那一档。两者可能不一致：当本机钉住「经 TCP 中转」而对端钉住「直连」时，中转链路无法建立，音频仍走直连。',
-  'stats.extra.transportUnknownWhy': '当前服务不上报每条会话所走的通路。这**不等同于**其处于直连——需将两端升级至同一版本，此处才会有读数。',
+  'stats.extra.transportWhy': '本条会话实际所走的通路，由服务按该流绑定的传输判定，未必等于你在详情页选的那一档。',
+  'stats.extra.transportUnknownWhy': '当前服务不上报每条会话的通路。这不等同于处于直连——需两端升级至同一版本。',
   // 位深进阶梯带来的两个**静默降级**。两者的共同点：JB 的丢包率 / 抖动 /
   // 五个计数器全部一片正常，而声音已经坏了 —— 所以它们各有自己的一格，
   // 挂在别人身上就等于没有。非零才显示：两个恒为 0 的数占住位置只会训练
   // 用户忽略这一行。
   'stats.extra.halfConceal': '半帧补偿 {n} 次',
-  'stats.extra.halfConcealWhy': '高位深档在线上以 5 ms 为单位拆分为两个包发送。该计数为「仅到达其中一半」的次数——该帧的后半由补偿生成。偶发数次不可辨；持续增长表明本链路存在丢包，可将音质档下调一格（48 kHz · 16 bit 及以下不拆包）。',
+  'stats.extra.halfConcealWhy': '高位深档在线上拆成两个 5 ms 包发送，该计数为「只到达一半」的次数。持续增长表明有丢包，可将音质档下调一格。',
   'stats.extra.formatMismatch': '格式不符 {n} 包',
-  'stats.extra.formatMismatchWhy': '对端在包头中声明的线上格式与其实际发送的字节数不符，此类包已被丢弃。**非零无良性解释**：通常源于两端版本不一致，请将两台主机升级至同一版本。',
+  'stats.extra.formatMismatchWhy': '对端声明的线上格式与其实际发送的字节数不符，此类包已丢弃。非零无良性解释：请将两端升级至同一版本。',
   'stats.extra.verdictPass': '校验通过 {snr} dB',
   'stats.extra.verdictFail': '校验未通过',
   'stats.extra.mixProbes': '混音探针 {n} 路',
@@ -1140,17 +1079,16 @@ export const zhCN = {
 
   // ---------------------------------------------------------------- 授权门
   'onboarding.title': '开始之前，请先完成授权',
-  'onboarding.sub': 'AudioHub 需在两台设备之间传输音频，因此需要下列系统权限。macOS 的约束是：一项权限被拒绝后，应用无法再次弹窗申请，只能在系统设置中手动开启——建议在此一次性授予。',
   'onboarding.grantAll': '全部授权',
   'onboarding.recheck': '重新检查',
   'onboarding.enter': '进入主界面',
   'onboarding.skip': '跳过（部分功能不可用）',
   'onboarding.skipToast': '已跳过授权：未授权的功能在调用时将直接失败。可在「设置 › 系统权限」中重新授权。',
   'onboarding.hint.busy': '正在等待系统授权对话框…请在弹出的窗口中选择「允许」。',
-  'onboarding.hint.blocking': '尚缺 {n} 项必需权限：{names}。授权后即可进入主界面；若你在系统设置中做过修改，返回本窗口时会自动重新检查。',
-  'onboarding.hint.ready': '必需权限已就绪，可以进入主界面。可选权限亦可稍后在「设置 › 系统权限」中补充。',
-  'onboarding.skipNote.blocking': '跳过后界面仍可使用，但{names}相关功能在调用时将直接报错，而非静默失败。此选择不会被记住——下次启动仍将进入本页。',
-  'onboarding.skipNote.optional': '可选权限（{names}）未授权：对应的共享来源在选用时将报错，其余功能不受影响。',
+  'onboarding.hint.blocking': '尚缺 {n} 项必需权限：{names}。授权后即可进入主界面。',
+  'onboarding.hint.ready': '必需权限已就绪。可选权限可稍后在「设置 › 系统权限」中补充。',
+  'onboarding.skipNote.blocking': '跳过后界面仍可使用，但{names}相关功能在调用时将直接报错。此选择不会被记住。',
+  'onboarding.skipNote.optional': '可选权限（{names}）未授权：对应的共享来源在选用时将报错。',
   'onboarding.noRequestable': '已无可直接弹窗申请的权限，请通过「打开系统设置」逐项开启。',
   'onboarding.stillMissing': '仍有 {n} 项必需权限未授权：{names}',
   'onboarding.allGranted': '必需权限已全部授权',
@@ -1178,14 +1116,14 @@ export const zhCN = {
   'perm.settingsFallback': '若系统设置没有自动打开：{manual}',
 
   'perm.microphone.name': '麦克风',
-  'perm.microphone.why': '将本机麦克风的音频共享给已配对设备（例如让 Windows 主机使用本机的麦克风）。仅在主动启用共享时进行采集。',
+  'perm.microphone.why': '将本机麦克风共享给已配对设备；仅在主动启用共享时采集。',
   'perm.microphone.manual': '系统设置 → 隐私与安全性 → 麦克风 → 打开 AudioHub',
   'perm.localNetwork.name': '本地网络',
-  'perm.localNetwork.why': '在同一局域网内发现其它 AudioHub 主机，并与已配对设备直接传输音频。音频不经互联网传输。',
+  'perm.localNetwork.why': '在同一局域网内发现其它 AudioHub 主机，并与已配对设备直接传输音频。',
   'perm.localNetwork.manual': '系统设置 → 隐私与安全性 → 本地网络 → 打开 AudioHub',
-  'perm.localNetwork.unknownNote': '系统不提供查询接口，首次使用时会询问。若此前已拒绝，需在系统设置中重新允许。',
+  'perm.localNetwork.unknownNote': '系统不提供查询接口，首次使用时会询问；此前已拒绝的需手动开启。',
   'perm.systemAudio.name': '系统音频录制',
-  'perm.systemAudio.why': '将本机正在播放的音频共享给对端；仅在共享来源选为「系统音频」时需要。',
+  'perm.systemAudio.why': '把本机正在播放的音频共享给对端；仅在共享来源选为「系统音频」时需要。',
   'perm.systemAudio.manual': '系统设置 → 隐私与安全性 → 系统音频录制 → 打开 AudioHub',
   'perm.unknown.name': '未知权限',
   'perm.unknown.why': '该权限由本机服务上报，界面暂无对应说明。',
@@ -1211,19 +1149,38 @@ export const zhCN = {
 
   // ---- 公开文档（GitHub wiki）------------------------------------------------
   //
-  // 界面上留结论，成因与实测数据留在 wiki（plan §3.1：**不为简约而简约**——
-  // 把长解释搬走，不是把它删掉）。所以每一条深链都挂在它所解释的那一块旁边，
-  // 而不是集中在「关于」里做一个没人会去翻的目录。
+  // 这一组不是「附加阅读」，是**界面上唯一的解释出口**。用户 2026-08-10 裁定
+  // 「为了简化而简化」（docs/plan.md §3.1）：功能描述一律不留在界面上，全部移进
+  // wiki，界面上只剩标题、值/状态，以及一枚 `?`。
+  //
+  // 因此每一条都是那枚 `?` 的**无障碍名称**（aria-label + title），不是段落。
+  // 写法固定为「这一块讲的是什么（英文）」——读屏念出来是一句完整的话，而
+  // 「更多信息」那种写法在一页十几枚 `?` 的地方等于什么都没说。
   //
   // ⚠ wiki 是**英文**的，与界面语种无关。这些文案里因此明写「英文」——
   // 点开一个语言与预期不符的页面，是一次很容易避免的意外。
-  'wiki.title': '项目文档',
-  'wiki.desc': '完整的技术说明、实测数据与术语表在公开文档中（英文）。',
-  'wiki.open': '打开项目文档',
-  'wiki.modes': '三种运行模式的完整说明（英文）',
+  // ⚠ 地址不在这里，在 lib/external.ts 的 WIKI 表：翻译一门语言不该有机会改掉
+  // 一个地址，而每条地址都带章节锚点。
+  'wiki.open': '打开项目文档（英文）',
+  'wiki.modes': '运行模式详解（英文）',
   'wiki.transport': '连通方式与降级代价（英文）',
-  'wiki.quality': '音质阶梯与 AUTO 的行为（英文）',
-  'wiki.latency': '延迟的构成与测量方法（英文）',
+  'wiki.quality': '音质阶梯与 AUTO（英文）',
+  'wiki.latency': '延迟的构成与测量（英文）',
+  'wiki.volume': '两端音量如何取舍（英文）',
+  'wiki.permissions': '各项系统权限的用途（英文）',
+  'wiki.discovery': '发现、配对与端口（英文）',
+  'wiki.web': '网页访问及其边界（英文）',
+  'wiki.webLocalOnly': '「仅允许本机」为何锁定（英文）',
+  'wiki.devices': '虚拟设备的行为（英文）',
+  'wiki.deviceNaming': '虚拟设备的命名（英文）',
+  'wiki.bridge': '虚拟声卡桥接（英文）',
+  'wiki.capture': '系统音频捕获后端（英文）',
+  'wiki.startup': '开机自启的实现（英文）',
+  'wiki.shortcuts': '快捷键（英文）',
+  'wiki.paths': '配置目录（英文）',
+  'wiki.tunnel': '隧道地址（英文）',
+  'wiki.unpair': '解除配对会发生什么（英文）',
+  'wiki.degraded': '降级链路的代价（英文）',
 
   // ---------------------------------------------------------------- 外链 / 时间
   'vendor.blackhole': 'BlackHole（macOS）',

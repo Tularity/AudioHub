@@ -21,7 +21,7 @@
 // 置灰成空壳 ⇒ 把一个正在生效的真实值画成「没有值」，撞 §14 裁定 2 的红线。
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ExtLink } from './Controls';
+import { Help } from './Controls';
 import { StopSlider } from './StopSlider';
 import { toast } from './Toasts';
 import { t } from '../i18n';
@@ -310,7 +310,10 @@ function EndpointField({ fp, tier, endpoint, reset }: {
 
   return (
     <div className="transport-endpoint" data-testid="detail-transport-endpoint">
-      <h4 className="block-subtitle">{t('detail.transport.endpointTitle')}</h4>
+      <div className="title-row">
+        <h4 className="block-subtitle">{t('detail.transport.endpointTitle')}</h4>
+        <Help label={t('wiki.tunnel')} url={WIKI.tunnel} testid="detail-transport-endpoint-help" />
+      </div>
       {/* 盘上那串读不懂、已被 daemon 清空 ⇒ 说出来。与档位重置同一条纪律：
           静默清除等于用户的设置消失了，而界面处处自洽。 */}
       {typeof reset === 'string' ? (
@@ -360,9 +363,6 @@ function EndpointField({ fp, tier, endpoint, reset }: {
           {t('detail.transport.endpointShadow', { tier: t(tierPickLabel(tier)) })}
         </p>
       ) : null}
-      <p className="muted small" data-testid="detail-transport-endpoint-note">
-        {t('detail.transport.endpointNote')}
-      </p>
     </div>
   );
 }
@@ -372,7 +372,6 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
   const ds = useStore((s) => s.daemonSettings);
   const sessions = useStore((s) => s.sessions);
   const [busy, setBusy] = useState(false);
-  const [help, setHelp] = useState(false);
 
   const lStops = useMemo(() => latencyStops(ds), [ds]);
   const qStops = useMemo(() => qualityStops(ds), [ds]);
@@ -468,9 +467,6 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
   return (
     <section className="card block" data-testid="detail-transport">
       <h3 className="block-title">{t('detail.transport.title')}</h3>
-      {/* §14 裁定 4：**常驻**，不是 tooltip。不悬停鼠标的人拿到的仍然只有一个
-          孤零零的毫秒数，而这句话正是本次误判缺的那一句。 */}
-      <p className="muted small" data-testid="detail-transport-note">{t('detail.transport.note')}</p>
       {shared ? (
         <p className="transport-provenance" data-testid="detail-transport-shared">
           {t('detail.transport.sharedBy', { name: peer.display_name || peer.name || fp.slice(0, 8) })}
@@ -490,8 +486,17 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
       ) : null}
       <div className="transport-grid" data-testid="detail-transport-grid">
         <span className="transport-corner" aria-hidden="true" />
-        <span className="transport-col">{t('detail.transport.colLatency')}</span>
-        <span className="transport-col">{t('detail.transport.colQuality')}</span>
+        {/* 「这是目标不是实测」「延迟由接收端执行、音质由发送端执行」两段说明
+            都搬进了 wiki（用户 2026-08-10 裁定，docs/plan.md §3.1）。两枚 `?` 挂在
+            列头而不是卡片标题上：这张卡有两个**不同**的旋钮，一个入口指不了两处。 */}
+        <span className="transport-col title-row">
+          {t('detail.transport.colLatency')}
+          <Help label={t('wiki.latency')} url={WIKI.latencyTarget} testid="detail-transport-latency-help" />
+        </span>
+        <span className="transport-col title-row">
+          {t('detail.transport.colQuality')}
+          <Help label={t('wiki.quality')} url={WIKI.qualityLadder} testid="detail-transport-quality-help" />
+        </span>
         {ROWS.map((dir) => (
           <div className="transport-row" key={dir} data-dir={dir} data-testid={`detail-transport-row-${dir}`}>
             <span className="transport-rowname">
@@ -515,12 +520,6 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
           </div>
         ))}
       </div>
-      {/* 交叉的那半边**必须说出来**，否则「我改的是发送音质，为什么对端的采样率
-          没动」这个问题在界面上无解。措辞按用户视角，不按执行器：用户不需要知道
-          值被推到了哪里（plan §15 裁定 3），但需要知道「一个方向的两个旋钮不在
-          同一台机器上执行」。 */}
-      <p className="muted small" data-testid="detail-transport-where">{t('detail.transport.where')}</p>
-
       {/* ---- 连通方式（plan §16.2 的「手动覆盖恒可用」）--------------------
           放在四个档位**之后**：那四个是日常旋钮，这一个是「网络不让我直连」
           时才动的。四个互斥选项而不是一个开关——`auto` 与 `tier0` 不是同一件事
@@ -536,22 +535,18 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
           它的二级完整版）。**两者不得互相冒充**：选「自动」的对端此刻可能正跑在
           tier 1 上，而这一组按钮仍然、并且应当显示「自动」。 */}
       <div className="transport-tier" data-testid="detail-transport-tier">
-        <h4 className="block-subtitle">{t('detail.transport.tierTitle')}</h4>
+        <div className="title-row">
+          <h4 className="block-subtitle">{t('detail.transport.tierTitle')}</h4>
+          <Help label={t('wiki.transport')} url={WIKI.transport} testid="detail-transport-tier-help" />
+        </div>
         {/* 现状在选择之前：用户点进这一节最常见的问题是「我现在到底走的哪条路」，
-            而不是「我上次选了什么」。 */}
+            而不是「我上次选了什么」。
+
+            ⚠ 这一行是**状态**，不是描述，所以它留下了（§16.4：「已判定为直连」与
+            「未判定」不得渲染成同一个样子）。下面那一组按钮是**选择**——把「以下
+            是你的选择」那句提示搬进 wiki 之后，两者靠 `TierNow` 自带的「当前连接
+            方式」标签区分，那个标签本身就是状态语。 */}
         <TierNow peer={peer} />
-        <p className="muted small" data-testid="detail-transport-tier-note">
-          {t('detail.transport.tierNote')}
-        </p>
-        <p className="muted small" data-testid="detail-transport-tier-pick-note">
-          {t('detail.transport.tierPickNote')}
-        </p>
-        <p className="muted small">
-          <ExtLink
-            text={t('wiki.transport')} url={WIKI.transport}
-            testid="detail-transport-tier-wiki"
-          />
-        </p>
         {typeof tr.tier_reset_from === 'string' ? (
           <p className="transport-reset" data-testid="detail-transport-tier-reset">
             {t('detail.transport.tierReset', { old: tr.tier_reset_from })}
@@ -587,29 +582,6 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
           所以接在这里。**收起态**是因为这两段很长，而这张卡的主角是四个控件；
           常驻会把控件挤下屏。留一段没人读的「权威解释」在语料里，下一个人会
           以为它在线上——那比没有更坏。 */}
-      <button
-        type="button"
-        className="transport-help-toggle"
-        data-testid="detail-transport-help-toggle"
-        aria-expanded={help}
-        aria-controls="detail-transport-help"
-        onClick={() => setHelp((v) => !v)}
-      >
-        {t(help ? 'detail.transport.helpHide' : 'detail.transport.helpShow')}
-      </button>
-      <div
-        className="transport-help"
-        id="detail-transport-help"
-        data-testid="detail-transport-help"
-        hidden={!help}
-      >
-        <h4>{t('settings.transport.latency')}</h4>
-        <p>{t('settings.transport.latencyDesc')}</p>
-        <p><ExtLink text={t('wiki.latency')} url={WIKI.latency} testid="detail-transport-wiki-latency" /></p>
-        <h4>{t('settings.transport.quality')}</h4>
-        <p>{t('settings.transport.qualityDesc')}</p>
-        <p><ExtLink text={t('wiki.quality')} url={WIKI.quality} testid="detail-transport-wiki-quality" /></p>
-      </div>
     </section>
   );
 }

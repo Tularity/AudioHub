@@ -14,7 +14,8 @@
 // 保持原样。任何文案都不得出现「请把系统输出切到某某虚拟设备」。
 
 import { Icon } from './Icon';
-import { Segmented } from './Controls';
+import { Help, Segmented } from './Controls';
+import { WIKI } from '../lib/external';
 import {
   BACKEND_AUTO, SOURCE_MIC, SOURCE_SYSAUDIO,
   backendKnown, backendOptions, backendsReported, noBackendAvailable,
@@ -60,9 +61,11 @@ export function ShareSourceControl({
   const denied = !!perm && (perm.status === 'denied' || perm.status === 'restricted');
   const grantText = (denied && perm && perm.note) || t('share.perm.hint');
 
+  // 与 BridgeControl 同一条纪律：正常态不说话。选中哪个后端的**特性**由 daemon
+  // 的 note 带（版本号、上次被拒绝这类本机事实），静态解释在 wiki。
   let note: string;
   if (!sys) {
-    note = t('share.mic.note');
+    note = '';
   } else if (dead) {
     note = t('share.sys.none');
   } else if (stale) {
@@ -72,8 +75,7 @@ export function ShareSourceControl({
     note = t('share.backend.unknown');
   } else {
     const cur = options.find((b) => b.id === backend);
-    note = cur ? t('share.backend.selected', { name: cur.label, note: cur.note })
-      : t('share.backend.auto');
+    note = cur ? t('share.backend.selected', { name: cur.label, note: cur.note }) : '';
   }
 
   return (
@@ -86,6 +88,7 @@ export function ShareSourceControl({
       <div className="share-row">
         <Icon name="wave" />
         <span className="share-label">{t('share.label')}</span>
+        <Help label={t('wiki.capture')} url={WIKI.captureSource} testid={`${testid}-help`} />
         <Segmented<string>
           testid={testid}
           value={sys ? SOURCE_SYSAUDIO : SOURCE_MIC}

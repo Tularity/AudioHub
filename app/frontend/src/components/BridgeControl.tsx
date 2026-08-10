@@ -1,7 +1,8 @@
 // 每对端的「桥接到虚拟声卡」选择器。检测到才可选，未检测到置灰并给官网链接。
 
 import { Icon } from './Icon';
-import { ExtLink } from './Controls';
+import { ExtLink, Help } from './Controls';
+import { WIKI } from '../lib/external';
 import { bridgeCatalog, vendors } from '../lib/bridge';
 import type { DaemonInfo } from '../ipc/types';
 import { t, listFormat } from '../i18n';
@@ -27,6 +28,8 @@ export function BridgeControl({
   // 拦下来），文案必须说明白，不能继续讲「将写入…」。
   const stale = !!value && !list.some((c) => c.name === value);
 
+  // 一切正常时**不说话**：「将写入…的播放端」是对这个功能的描述，已经搬进 wiki，
+  // 由标签旁那枚 `?` 指过去。留在这里的只有出了问题时的那几句。
   let note: string;
   if (stale) {
     note = has
@@ -40,7 +43,7 @@ export function BridgeControl({
         ? t('bridge.presentUnusable', { names: listFormat(known.map((c) => c.name)) })
         : t('bridge.nothing');
   } else {
-    note = value ? t('bridge.selected', { name: value }) : t('bridge.pick');
+    note = '';
   }
 
   return (
@@ -53,6 +56,7 @@ export function BridgeControl({
       <label className="bridge-row">
         <Icon name="cable" />
         <span className="bridge-label">{boxLabel}</span>
+        <Help label={t('wiki.bridge')} url={WIKI.bridge} testid={`${testid}-help`} />
         <select
           className="select"
           data-testid={testid}

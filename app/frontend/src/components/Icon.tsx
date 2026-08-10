@@ -35,6 +35,11 @@ const ICONS = {
   device: '<rect x="5" y="3" width="14" height="18" rx="2.5"/><circle cx="12" cy="14" r="3.2"/><circle cx="12" cy="7" r="1"/>',
   tagname: '<path d="M3 12V5a2 2 0 0 1 2-2h7l9 9-9 9-9-9z"/><circle cx="8" cy="8" r="1.3"/>',
   refresh: '<path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v4h-4"/>',
+  // 「?」——界面上每一处解释的唯一出口（用户 2026-08-10 裁定「为了简化而简化」，
+  // 说明一律移到 wiki）。画成描边圆圈而不是实心徽标：它挨着标题排，实心块会先于
+  // 标题被眼睛抓住，而它只是一个次要入口。问号的点画成 0.1 半径的圆弧而不是
+  // `stroke-linecap: round` 的零长度线段——后者在 Windows 的 WebView2 上不渲染。
+  help: '<circle cx="12" cy="12" r="8.6"/><path d="M9.7 9.5a2.4 2.4 0 1 1 3.1 2.5c-.6.2-.9.7-.9 1.3v.5"/><path d="M12 16.6a.1.1 0 1 0 0-.2.1.1 0 0 0 0 .2z"/>',
   // Appearance controls. Each preference gets its *own* glyph rather than one
   // glyph plus a state dot: these buttons carry no label, so the icon is the
   // only thing telling you which of the three states you are in.

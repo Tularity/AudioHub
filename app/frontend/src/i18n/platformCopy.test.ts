@@ -45,10 +45,19 @@ describe('per-platform copy', () => {
     }
   });
 
-  it('still tells Windows users where the states come from', () => {
-    // The half that changed must keep the sentence that carries the actual
-    // information -- the statuses are probed live, not remembered.
-    expect(zhCN['settings.perm.descWin']).toContain('实时探测');
-    expect(zhCN['settings.perm.descMac']).toContain('实时探测');
+  it('names the mechanism this platform actually uses', () => {
+    // The pair that survives is the autostart one, and its whole reason for
+    // being split is that the two platforms register the login item in
+    // different places. A half that does not name its own mechanism has
+    // nothing left to justify the split -- it would be one string wearing two
+    // keys, and the next edit would silently make it wrong on one platform
+    // again (which is the bug this file was written for).
+    //
+    // The permission-block intro that used to be checked here is gone: it was
+    // a description, and descriptions moved to the wiki (docs/plan.md §3.1,
+    // user ruling 2026-08-10). The `?` beside the block title points at
+    // Platform-Notes#permissions instead.
+    expect(zhCN['settings.startup.autostartDescMac']).toContain('登录项');
+    expect(zhCN['settings.startup.autostartDescWin']).toContain('计划任务');
   });
 });

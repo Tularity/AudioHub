@@ -220,6 +220,38 @@ export function Spark({ testid, points }: { testid: string; points: number[] | u
 
 // ---- 外链 ----
 
+/**
+ * 标题旁边那枚 `?`。
+ *
+ * 用户 2026-08-10 裁定「为了简化而简化」（docs/plan.md §3.1）：界面上不再留任何
+ * 功能描述，全部移进 wiki。这个组件就是那次搬迁留下的**唯一入口**，所以它有三条
+ * 硬要求，少一条它就白搬了——
+ *
+ *   1. **点击唤起系统浏览器**，不是在 webview 里导航（`openExternal` 现在真的做得到，
+ *      见 lib/external.ts 顶部那段说明）。
+ *   2. **不做悬浮解释**。`title` 写的是这条链接**去哪儿**，不是它要解释的内容；
+ *      把说明塞回 tooltip 等于把文本又搬回界面上，只是换了个触发方式。
+ *   3. **键盘可达**：真 `<button>`，带 aria-label —— 一个只有鼠标能碰到的
+ *      「唯一解释入口」对读屏用户就是不存在。
+ *
+ * `label` 走语料（`wiki.*`），URL 走 lib/external.ts 的 WIKI 表：地址不进语料，
+ * 翻译一门语言不该有机会改掉一个地址。
+ */
+export function Help({ label, url, testid }: { label: string; url: string; testid: string }) {
+  return (
+    <button
+      type="button"
+      className="help-dot"
+      aria-label={label}
+      title={label}
+      data-testid={testid}
+      onClick={(e) => { e.preventDefault(); e.stopPropagation(); void openExternal(url); }}
+    >
+      <Icon name="help" cls="ico" />
+    </button>
+  );
+}
+
 export function ExtLink({ text, url, testid }: { text: string; url: string; testid: string }) {
   return (
     <a

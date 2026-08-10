@@ -1103,6 +1103,31 @@ body[data-window-controls="right"] .chrome-pop {
 .block > .btn { align-self: flex-start; }
 .block-title { font-size: 13px; font-weight: 650; color: var(--text-dim); letter-spacing: .06em; }
 .danger-title { color: var(--danger); }
+
+/* 标题 + `?` 一行。gap 比字距略大一点点，好让那枚圆圈读作**标题旁边的东西**，
+   而不是标题的最后一个字。 */
+.title-row { display: flex; align-items: center; gap: 7px; }
+.title-row > .block-title, .title-row > h4 { margin: 0; }
+
+/* 那枚 `?`（components/Controls.tsx 的 <Help/>）。界面上每一处解释的唯一出口。
+
+   形态守则：**它不能比它旁边的标题更显眼**。所以是描边圆圈、跟随 --text-dim、
+   常态半透明，只在 hover/focus 时才亮到强调色。两个主题各自成立，靠的是全程只
+   动 color 与 opacity —— 没有背景块、没有阴影、没有发光，也就不存在浅色下那种
+   「用文字色画出来的辉光」（见 :root 里 --ring 的说明）。
+
+   `flex: none` 是承重的：它常和 flex-wrap 的标题行同处，可伸缩会让圆圈被压成
+   椭圆。 */
+.help-dot {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; padding: 0;
+  border: 0; border-radius: 999px; background: none;
+  color: var(--text-dim); opacity: .5; cursor: pointer;
+  transition: opacity .15s ease-out, color .15s ease-out;
+}
+.help-dot:hover { opacity: 1; color: var(--accent); }
+.help-dot:focus-visible { opacity: 1; color: var(--accent); }
+.help-dot .ico svg { width: 14px; height: 14px; }
 .danger-block { border-color: rgba(var(--danger-rgb), 0.18); }
 
 /* ---- 按钮 ---- */

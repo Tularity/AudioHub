@@ -578,11 +578,17 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
         <p className="metric-idle-text" data-testid={`peer-dir-idle-${dir}-${fp}`}>
           {idleReady ? t('peers.card.micReady') : t('peers.card.dirIdle')}
         </p>
-        {/* 就绪那句的理由。`mic-idle-<fp>` 这个 testid 保持不变：它标的是
-            「虚拟麦克风通了但没人用」这个**状态**，与分栏无关。 */}
-        <p className="stream-ready" data-testid={`mic-idle-${fp}`} hidden={!idleReady}>
-          {idleReady ? t('peers.card.micReadyWhy') : ''}
-        </p>
+        {/* 状态一句就够：「通路就绪·暂无应用占用」上面已经说完了。原先跟在它下面
+            解释「选中该设备即开始传输」的那一句是功能描述，已随 2026-08-10 的裁定
+            移进 wiki（docs/plan.md §3.1）；这里只留 title，不占版面。
+            `mic-idle-<fp>` 这个 testid 保持不变：它标的是「虚拟麦克风通了但没人用」
+            这个状态，回归依赖它。 */}
+        <p
+          className="stream-ready"
+          data-testid={`mic-idle-${fp}`}
+          hidden={!idleReady}
+          title={t('peers.card.micReadyWhy')}
+        />
       </div>
     );
   }

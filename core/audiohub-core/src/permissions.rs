@@ -180,12 +180,13 @@ fn probe_impl(kind: PermissionKind) -> (Option<bool>, String) {
             if localnet::seen() {
                 "本次运行已收到局域网内的 mDNS 响应，权限可用。".to_string()
             } else {
-                concat!(
-                    "macOS 没有提供查询接口，状态无法预先确认：首次访问局域网时系统会询问。",
-                    "点击授权会发一次 mDNS 查询来触发弹窗；若此前已被拒绝，系统不会再弹，",
-                    "需要到「系统设置 > 隐私与安全性 > 本地网络」手动开启。"
-                )
-                .to_string()
+                // Short on purpose: the UI stopped carrying explanations on
+                // 2026-08-10 (docs/plan.md §3.1) and this string lands in it
+                // verbatim. What survives is the one fact the row cannot show
+                // by itself -- the status is unknowable, not un-probed. The
+                // manual System Settings path is already carried separately by
+                // `perm.localNetwork.manual`, and only when it is actionable.
+                "状态无法预先确认：首次访问局域网时系统会询问。".to_string()
             },
         ),
         PermissionKind::SystemAudio => sysaudio_consent(),
@@ -209,19 +210,16 @@ fn sysaudio_consent() -> (Option<bool>, String) {
         Some(Some(true)) => (Some(true), "已授权系统音频录制。".to_string()),
         Some(Some(false)) => (
             Some(false),
-            concat!(
-                "上一次尝试被拒绝：请到「系统设置 > 隐私与安全性 > 屏幕录制与系统录音」",
-                "勾选本 App 后重试。"
-            )
-            .to_string(),
+            // Denied is the one case that keeps its path: macOS will not ask
+            // again, so the only way forward is the manual toggle, and a note
+            // that omits where it lives leaves the user stuck.
+            "上一次尝试被拒绝：请到「系统设置 > 隐私与安全性 > 屏幕录制与系统录音」勾选本 App。"
+                .to_string(),
         ),
         _ => (
             None,
-            concat!(
-                "macOS 没有提供查询接口，状态无法预先确认：首次创建音频进程 Tap 时系统会询问。",
-                "点击授权会真的去建一次 Tap（随即关闭）来触发弹窗。"
-            )
-            .to_string(),
+            // Same rule as the local-network note above.
+            "状态无法预先确认：首次创建音频进程 Tap 时系统会询问。".to_string(),
         ),
     }
 }

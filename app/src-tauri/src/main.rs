@@ -444,6 +444,56 @@ fn show_window_menu(window: tauri::Window) -> Result<(), String> {
     Ok(())
 }
 
+/// Hand a URL to the user's default browser.
+///
+/// Every explanatory link in the UI ends up here, so it has to actually leave
+/// the app. It previously did not: `lib/external.ts` reached for
+/// `window.__TAURI__.opener` / `.shell`, and neither plugin is a dependency of
+/// this crate — so every wiki link fell through to `window.open`, which the
+/// webview refuses, and then to "copied to clipboard". A link that silently
+/// becomes a clipboard write is worse than no link, and the UI now leans on
+/// these links for everything it no longer explains inline.
+///
+/// An app command rather than `tauri-plugin-opener` for the reason
+/// `start_window_drag` gives: commands registered in `invoke_handler` are not
+/// subject to the plugin ACL, so the bundle keeps working without a
+/// capabilities file. The scheme allow-list that the plugin would have given us
+/// is therefore written out here — this hands an arbitrary string to the
+/// platform's URL dispatcher, and `file://` or a custom scheme registered by
+/// some other installed app is not something a documentation link may reach.
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(format!("refused non-http url: {url}"));
+    }
+    // No shell on either platform: `cmd /C start` would need the URL quoted
+    // against `&`, and `rundll32 url.dll,FileProtocolHandler` takes it verbatim.
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("/usr/bin/open");
+        c.arg(&url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("rundll32.exe");
+        c.arg("url.dll,FileProtocolHandler").arg(&url);
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(&url);
+        c
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Windows caption buttons. macOS keeps its real traffic lights, so the
 /// frontend only renders these where the OS puts its controls on the trailing
 /// edge (`lib/platform.ts`); the commands themselves are platform-neutral.
@@ -641,6 +691,7 @@ fn main() {
             start_window_drag,
             toggle_window_zoom,
             show_window_menu,
+            open_external_url,
             minimize_window,
             hide_window,
             is_window_maximized,

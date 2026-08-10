@@ -6,7 +6,8 @@
 
 import { useState } from 'react';
 import { Icon } from '../components/Icon';
-import { Segmented, Spark } from '../components/Controls';
+import { Help, Segmented, Spark } from '../components/Controls';
+import { WIKI } from '../lib/external';
 import { volumeText } from '../components/VolumeControl';
 import { fmt, sessionFlow, dirLabel } from '../lib/fmt';
 import { useTick } from '../lib/hooks';
@@ -246,8 +247,10 @@ function DegradedLinks() {
 
   return (
     <section className="card block" data-testid="stats-degraded">
-      <h3 className="block-title">{t('stats.degraded.title')}</h3>
-      <p className="muted small" data-testid="stats-degraded-note">{t('stats.degraded.note')}</p>
+      <div className="title-row">
+        <h3 className="block-title">{t('stats.degraded.title')}</h3>
+        <Help label={t('wiki.degraded')} url={WIKI.degraded} testid="stats-degraded-help" />
+      </div>
       <div className="degraded-list" hidden={!supported || list!.length === 0}>
         {(supported ? list! : []).map((l, i) => {
           // Tier 2 的对端**同时**出现在两张表里（媒体半边在 tcp_media，控制帧计数

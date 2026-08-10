@@ -114,11 +114,15 @@ describe('the notes the view can ask for all exist in the catalogue', () => {
   // `t()` returns the key itself when a string is missing, so comparing against
   // the key catches a note branch whose message was never written -- the
   // failure mode is a machine token rendered at the user.
+  // `off` and `on` deliberately render nothing: the switch already says which
+  // one you are in, and the paragraph that used to sit under `off` was a
+  // description of the feature -- it lives in the wiki now (docs/plan.md §3.1,
+  // user ruling 2026-08-10). The three below are the ones that carry a fact the
+  // switch cannot show by itself.
   for (const key of [
     'settings.startup.unknown',
     'settings.startup.unsupported',
     'settings.startup.orphaned',
-    'settings.startup.noteOff',
   ] as const) {
     it(`has a string for ${key}`, () => {
       const s = t(key, { reason: 'x' });

@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Icon } from '../components/Icon';
 import { confirmDialog } from '../components/ConfirmDialog';
+import { Help } from '../components/Controls';
+import { WIKI } from '../lib/external';
 import { toast } from '../components/Toasts';
 import { volumeText } from '../components/VolumeControl';
 import { fmt, sessionFlow, dirLabel } from '../lib/fmt';
@@ -62,7 +64,13 @@ function AliasCard({ peer }: { peer: PeerState }) {
 
   return (
     <section className="card block" data-testid="detail-alias">
-      <h3 className="block-title">{t('detail.alias.title')}</h3>
+      {/* 改名走「同 UID 就地更新」（spec-m5b §3.5）：AudioObjectID 不变，任何应用
+          已记住的设备选择完全不受影响。这件事必须能查到，否则用户会因为怕搞乱
+          Zoom 里的选择而不敢改名——现在它在 wiki，由这枚 `?` 指过去。 */}
+      <div className="title-row">
+        <h3 className="block-title">{t('detail.alias.title')}</h3>
+        <Help label={t('wiki.deviceNaming')} url={WIKI.deviceNaming} testid="detail-alias-help" />
+      </div>
       <div className="form-row">
         <label className="field grow">
           <span className="field-label">{t('detail.alias.field')}</span>
@@ -98,14 +106,6 @@ function AliasCard({ peer }: { peer: PeerState }) {
           </button>
         </span>
       </div>
-      {/* 改名走「同 UID 就地更新」（spec-m5b §3.5）：AudioObjectID 不变、设备列表不变，
-          任何应用已记住的设备选择完全不受影响。这一点必须在界面上说出来，否则用户会
-          因为怕搞乱 Zoom 里的选择而不敢改名。 */}
-      <p className="muted small" data-testid="detail-alias-note">
-        {peer.alias
-          ? t('detail.alias.noteSet', { alias: peer.alias ?? '', name: peer.name || t('common.dash') })
-          : t('detail.alias.noteEmpty')}
-      </p>
     </section>
   );
 }
@@ -135,7 +135,10 @@ function DevicesCard({ peer }: { peer: PeerState }) {
   return (
     <section className="card block" data-testid="detail-hal-devices">
       <div className="dev-inv-head">
-        <h3 className="block-title">{t('detail.devices.title')}</h3>
+        <div className="title-row">
+          <h3 className="block-title">{t('detail.devices.title')}</h3>
+          <Help label={t('wiki.devices')} url={WIKI.modeB} testid="detail-devices-help" />
+        </div>
         <code className="mono dim" data-testid="detail-hal-meta">
           {info ? t('device.slotGen', { slot: String(info.slot ?? ''), gen: String(info.generation ?? '') }) : ''}
         </code>
@@ -310,7 +313,6 @@ export function DetailView() {
             ))
             : <li className="muted">{t('detail.addrs.empty')}</li>}
         </ul>
-        <p className="muted small">{t('detail.addrs.note')}</p>
       </section>
 
       <section className="card block">
@@ -385,8 +387,10 @@ export function DetailView() {
       </section>
 
       <section className="card block danger-block">
-        <h3 className="block-title danger-title">{t('detail.danger.title')}</h3>
-        <p className="muted">{t('detail.danger.desc')}</p>
+        <div className="title-row">
+          <h3 className="block-title danger-title">{t('detail.danger.title')}</h3>
+          <Help label={t('wiki.unpair')} url={WIKI.unpair} testid="detail-danger-help" />
+        </div>
         <div className="field-btn">
           <button
             className="btn danger" type="button" data-testid="detail-unpair"
@@ -395,7 +399,6 @@ export function DetailView() {
             {t('detail.unpair')}
           </button>
         </div>
-        <p className="muted small">{t('detail.danger.foot')}</p>
       </section>
     </>
   );

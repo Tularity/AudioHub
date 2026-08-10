@@ -9,9 +9,10 @@
 
 import { useState } from 'react';
 import { Icon } from '../components/Icon';
+import { Help } from '../components/Controls';
 import { PermissionRow } from '../components/PermissionRow';
 import { toast } from '../components/Toasts';
-import { openExternal } from '../lib/external';
+import { openExternal, WIKI } from '../lib/external';
 import { chromeContextMenu, chromeMouseDown } from '../lib/drag';
 import { t, listFormat } from '../i18n';
 import { actions, getState, useStore } from '../state/store';
@@ -108,8 +109,13 @@ export function OnboardingGate() {
         <div className="gate-head">
           <span className="gate-logo"><Icon name="shield" /></span>
           <div>
-            <h2 className="gate-title">{t('onboarding.title')}</h2>
-            <p className="gate-sub">{t('onboarding.sub')}</p>
+            <span className="title-row">
+              <h2 className="gate-title">{t('onboarding.title')}</h2>
+              <Help
+                label={t('wiki.permissions')} url={WIKI.permissions}
+                testid="onboarding-help"
+              />
+            </span>
           </div>
         </div>
 

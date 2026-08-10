@@ -53,6 +53,30 @@ export const zhCN = {
   'badge.connecting': '连接中',
   'badge.offline': '离线',
 
+  // 顶栏右上（Windows 侧在左上）那一组图标按钮。三枚都没有文字标签，所以
+  // aria-label 与 title 承担全部说明责任——它们不是「顺手加的无障碍属性」，
+  // 是这三个按钮唯一的文字出口。
+  'chrome.status.title': '服务连接',
+  'chrome.status.menu': '服务连接详情',
+  'chrome.status.fingerprint': '本机指纹',
+  'chrome.status.port': '控制端口',
+  'chrome.status.name': '本机名称',
+  'chrome.status.more': '完整信息在「设置 › 本机身份」。',
+
+  'chrome.locale.title': '界面语言',
+  'chrome.locale.system': '跟随系统',
+  // 「跟随系统」当前落在哪一门语言上，括号里补出来——否则用户无从知道系统被识别成了什么。
+  'chrome.locale.systemAs': '跟随系统（{name}）',
+  'chrome.locale.current': '界面语言：{name}',
+
+  'chrome.theme.title': '外观',
+  'chrome.theme.system': '跟随系统',
+  'chrome.theme.light': '浅色',
+  'chrome.theme.dark': '深色',
+  // 点击即切换，所以提示要同时说「现在是什么」和「点下去会变成什么」。
+  'chrome.theme.current': '外观：{now}（点击切换到{next}）',
+  'chrome.theme.systemAs': '跟随系统（当前{resolved}）',
+
   // foot.* 七条已删（规格 §2.4）：左下角那条注脚说的四种状态与上面四条 badge.* 逐一
   // 重合，端口在设置页「网络 › IPC 端口」，「你正在用网页端查看」由 settings.web.browserOnly
   // 常驻说明。

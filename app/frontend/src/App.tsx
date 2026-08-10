@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
-import { Watermark, NavPill, DaemonBadge, Overlay, VIEW_TITLE } from './components/Chrome';
+import { Watermark, NavPill, Overlay, VIEW_TITLE } from './components/Chrome';
+import { ChromeControls } from './components/TopControls';
 import { CaptionButtons } from './components/CaptionButtons';
 import { chromeContextMenu, chromeMouseDown } from './lib/drag';
 import { Toasts } from './components/Toasts';
@@ -94,7 +95,7 @@ export function App() {
         <header id="topbar" onMouseDown={chromeMouseDown} onContextMenu={chromeContextMenu}>
           <h1 id="view-title">{t(VIEW_TITLE[view])}</h1>
           <NavPill onNavigate={(v) => actions.navigate(v)} />
-          <DaemonBadge />
+          <ChromeControls />
           <CaptionButtons />
         </header>
       </div>

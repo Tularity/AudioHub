@@ -125,36 +125,9 @@ export function NavPill({ onNavigate }: { onNavigate: (v: ViewName) => void }) {
 // 也已经由设置页的 settings.web.browserOnly 常驻说明。留着它的代价是整页下内边距要
 // 多留 24px 去避让一枚重复信息的浮层——那恰好压住主面板新加的两条常驻脚注。
 
-export function DaemonBadge() {
-  const conn = useStore((s) => s.conn);
-  const fp = useStore((s) => s.daemon?.fingerprint ?? null);
-  const ctlPort = useStore((s) => s.daemon?.control_port ?? null);
-  const cls = conn === 'online' ? 'online'
-    : (conn === 'connecting' || conn === 'starting') ? 'connecting' : 'offline';
-  const label = conn === 'online' ? t('badge.online')
-    : conn === 'starting' ? t('badge.starting')
-      : conn === 'connecting' ? t('badge.connecting') : t('badge.offline');
-
-  // 本机指纹与控制端口**悬停才展开**（plan §7.6 补充裁定）：它们的使用场景是多实例
-  // 调试，不是配对校验——常驻显示只会在每一屏的右上角挂两串谁也不看的十六进制。
-  // 但悬停在触摸屏上不存在、截图排障也拿不到，所以设置页有一个常驻的「本机身份」区块。
-  // 这里保持元素**始终在 DOM 里**（只做视觉折叠），自动化仍能读到值。
-  return (
-    <div id="daemon-badge" className={`daemon-badge ${cls}`} data-testid="daemon-badge">
-      <span className={`dot ${cls}`} />
-      <span className="badge-status">{label}</span>
-      {fp ? (
-        <span className="badge-ident" data-testid="daemon-badge-ident">
-          {/* 独立展示的间隔点走 common.bullet，不是把连接符 phraseSep trim 出来用：
-              后者两侧的留白是它的契约，某个语种把它设成「，」这里就会冒出一个悬空逗号。 */}
-          <span className="badge-sep">{t('common.bullet')}</span>
-          <code className="badge-fp" title={fp}>{fp.slice(0, 8)}</code>
-          <span className="badge-port">{`:${ctlPort ?? t('common.dash')}`}</span>
-        </span>
-      ) : null}
-    </div>
-  );
-}
+// DaemonBadge 已搬到 components/TopControls.tsx 并改了形态：文字标签去掉、只剩圆点，
+// 指纹/端口/主机名从「原地展开」改成一枚悬停浮层，并与新增的语言、外观两枚图标按钮
+// 组成同一簇（`ChromeControls`）。testid `daemon-badge` / `daemon-badge-ident` 原样保留。
 
 // 每一种失败原因都要给出**不同的**下一步动作；kind 与 src-tauri/src/main.rs
 // 的 DaemonError::kind 一一对应，那边加一种这里就要加一条。

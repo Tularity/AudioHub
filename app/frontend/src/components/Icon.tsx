@@ -35,6 +35,21 @@ const ICONS = {
   device: '<rect x="5" y="3" width="14" height="18" rx="2.5"/><circle cx="12" cy="14" r="3.2"/><circle cx="12" cy="7" r="1"/>',
   tagname: '<path d="M3 12V5a2 2 0 0 1 2-2h7l9 9-9 9-9-9z"/><circle cx="8" cy="8" r="1.3"/>',
   refresh: '<path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v4h-4"/>',
+  // Appearance controls. Each preference gets its *own* glyph rather than one
+  // glyph plus a state dot: these buttons carry no label, so the icon is the
+  // only thing telling you which of the three states you are in.
+  themeLight: '<circle cx="12" cy="12" r="4.2"/><path d="M12 2.4v2.5M12 19.1v2.5M4.4 4.4l1.8 1.8M17.8 17.8l1.8 1.8M2.4 12h2.5M19.1 12h2.5M4.4 19.6l1.8-1.8M17.8 6.2l1.8-1.8"/>',
+  themeDark: '<path d="M20.2 14.4A8.6 8.6 0 0 1 9.6 3.8a8.6 8.6 0 1 0 10.6 10.6z"/>',
+  // "Auto" is the half-filled disc macOS uses for the system appearance
+  // setting. The filled half needs its own fill/stroke because the shared
+  // SVG_ATTRS below are stroke-only.
+  themeAuto: '<circle cx="12" cy="12" r="8.4"/><path d="M12 3.6a8.4 8.4 0 0 1 0 16.8z" fill="currentColor" stroke="none"/>',
+  // Globe = "whichever language the system is in". Deliberately not a flag:
+  // languages are not countries, and the follow-system state has no country.
+  langAuto: '<circle cx="12" cy="12" r="8.6"/><path d="M3.7 9.4h16.6M3.7 14.6h16.6"/><path d="M12 3.4c2.3 2.3 3.5 5.2 3.5 8.6s-1.2 6.3-3.5 8.6c-2.3-2.3-3.5-5.2-3.5-8.6S9.7 5.7 12 3.4z"/>',
+  // Translate glyph = "a language was picked". Not a CJK character and not a
+  // flag, so it still reads correctly the day a second catalogue is added.
+  langPinned: '<path d="M3.4 6.3h8.8M7.8 4.2v2.1"/><path d="M10.1 6.3c0 4-2.7 7.4-6.7 8.9"/><path d="M5.5 10.7c1.4 2.3 3.4 4 5.9 4.9"/><path d="M12.5 20.4l4.1-9.3 4.1 9.3"/><path d="M13.9 17.1h5.4"/>',
   // Windows caption glyphs. Deliberately squared off (`stroke-linecap: butt`
   // via `.caption-btn svg` in styles.css) and drawn on a 10x10 box centred in
   // the 24 viewBox, because that is what Segoe MDL2's chrome glyphs look like

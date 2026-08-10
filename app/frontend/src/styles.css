@@ -536,19 +536,25 @@ body[data-window-controls="right"]:not(.app-captions) { --chrome-trail: 0px; }
   to { opacity: 1; transform: none; }
 }
 
-/* ---- daemon 徽标 ---- */
+/* ---- 顶栏图标簇（状态点 / 语言 / 外观） ---- */
 
-/* 第二块玻璃，但**刻意比胶囊轻**：Apple 反复说「少用」，一屏上两块同等重量的
-   玻璃会互相打架。所以这里模糊更浅、底色更淡、没有强投影。 */
-.daemon-badge {
+/* 原来这里是一枚写着「● 在线」的玻璃胶囊，指纹在它内部原地展开。现在是三枚图标
+   按钮，共用一层浮层机制。改动的理由不是审美：那三个字与圆点的颜色说的是同一件事，
+   而腾出来的宽度正好是新增两个控件要用的。
+
+   **只有一块玻璃**。三枚按钮不是三块——它们共处一枚 `#chrome-controls` 胶囊里，
+   按钮本身透明。一屏上已经有导航胶囊那块主玻璃了，Apple 的原话是「少用」，
+   三块并排的小玻璃会互相打架，也会把顶栏读成一条工具条。 */
+#chrome-controls {
   position: absolute;
-  /* 徽标待在**系统没占的那一端**：macOS 按钮在左 ⇒ 徽标在右；Windows 按钮在右
-     ⇒ 徽标在左。两条规则只改 left/right 这一对属性，其余全部共用。 */
+  /* 图标簇待在**系统没占的那一端**：macOS 按钮在左 ⇒ 簇在右；Windows 按钮在右
+     ⇒ 簇在左。整条规则里只有 left/right 这一对与 flex-direction 随平台分叉。 */
   right: var(--chrome-gap); left: auto;
   top: 50%;
-  margin-top: -14px;
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 5px 13px; border-radius: var(--pill);
+  margin-top: -17px;
+  /* row-reverse 在 macOS 侧，不是 Windows 侧——见下面那条规则的说明。 */
+  display: flex; flex-direction: row-reverse; align-items: center; gap: 2px;
+  padding: 3px; border-radius: var(--pill);
   background: rgba(var(--glass-rgb), .6);
   backdrop-filter: blur(16px) saturate(170%);
   -webkit-backdrop-filter: blur(16px) saturate(170%);
@@ -557,43 +563,132 @@ body[data-window-controls="right"]:not(.app-captions) { --chrome-trail: 0px; }
     0 6px 18px -6px rgba(var(--sh-rgb), .5),
     inset 0 1px 0 rgba(var(--hl-rgb), .16),
     inset 0 -1px 0 rgba(var(--hl-rgb), .04);
+}
+/* 簇在左，于是视觉顺序**正过来**。
+   这一对 flex-direction 的作用是让**状态点始终落在靠窗口外缘的那一格**：
+   macOS 簇贴右，row-reverse 把 DOM 里第一个（状态）推到最右；Windows 簇贴左，
+   正序把它留在最左。它是这一簇的锚——颜色一眼可读、也是唯一一直在变的东西，
+   固定在角上两个平台的肌肉记忆才一致；顺带让它的悬停浮层与簇的外缘对齐。
+   DOM 顺序两边都不动（读屏与 tab 序恒为 状态 → 语言 → 外观）。 */
+body[data-window-controls="right"] #chrome-controls {
+  left: var(--chrome-gap); right: auto;
+  flex-direction: row;
+}
+
+.chrome-ctl { position: relative; display: flex; }
+
+.chrome-btn {
+  width: 28px; height: 28px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0; border: none; border-radius: 50%;
+  background: transparent; color: var(--text-dim);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease-out), color var(--dur) var(--ease-out),
+    transform .12s var(--ease-out);
+}
+.chrome-btn svg { width: 15px; height: 15px; display: block; }
+.chrome-btn:hover { background: var(--fill-3); color: var(--text); }
+.chrome-btn.open { background: var(--fill-4); color: var(--text); }
+/* 与导航项同一条 gel 反馈。 */
+.chrome-btn:active { transform: scale(.9); }
+/* 状态那一枚只装一个圆点，没有图标笔画可以变色，hover 的反馈只剩底色。 */
+.chrome-btn.status:hover { color: var(--text-dim); }
+
+/* ---- 浮层（状态详情 / 语言菜单） ---- */
+
+/* 第三块玻璃，但只在打开时存在，所以不违反「一屏少用」——它与导航胶囊不会长期共存。
+   收起状态用 visibility 而不是 display:none：节点留在无障碍树与自动化的可读范围里
+   （plan §7.6 的老约定，形态变了但约定没变），同时 visibility 又是可过渡的，
+   淡出走完才真正撤掉命中区域。 */
+.chrome-pop {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0; left: auto;
+  /* 240 是量出来的：主机名那一行最长的真实样本「Score's MacBook Pro」在 12px 下
+     刚好一行放得下，再窄它就会折行，而折行的 dd 会把两列的基线对齐搞乱。 */
+  min-width: 240px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--glass-fill);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--edge);
+  box-shadow: var(--glass-shadow), var(--glass-edge);
   font-size: 12px; color: var(--text-dim);
-  /* 指纹是要能选中复制的，头部整体禁用了选择，这里单独放开。 */
+  text-align: left;
+  /* 指纹要能选中复制；顶栏整体禁用了选择，这里单独放开。 */
   -webkit-user-select: text;
   user-select: text;
+  /* 起手略缩、略上——「从按钮里长出来」，不是「从天上掉下来」。 */
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-6px) scale(.96);
+  transform-origin: top right;
+  transition: opacity var(--dur) var(--ease-out), transform var(--dur) var(--ease-spring),
+    visibility 0s linear var(--dur);
 }
-/* 指纹与控制端口**悬停才展开**（plan §7.6 补充裁定）：平时右上角只有「● 在线」。
-   用 max-width 而不是 display:none 收起来，是为了让它保持在 DOM 与无障碍树里——
-   自动化与读屏仍读得到，只是不占视觉带宽。常驻落点在设置页「本机身份」。 */
-.badge-ident {
-  display: inline-flex; align-items: center; gap: 8px;
-  max-width: 0; opacity: 0; overflow: hidden; white-space: nowrap;
-  transition: max-width var(--dur) var(--ease-out), opacity var(--dur) var(--ease-out),
-    margin-left var(--dur) var(--ease-out);
-  margin-left: -8px; /* 抵消父级 gap，收起时不留空档 */
+body[data-window-controls="right"] .chrome-pop {
+  left: 0; right: auto;
+  transform-origin: top left;
 }
-/* 只有 hover 一条路：徽标里没有任何可聚焦元素，写 :focus-within 是条死规则，而给
-   一枚纯状态徽标插一个 tab 停靠点只会让键盘序里多一个不可操作的空位。键盘 / 触摸屏
-   / 截图排障的落点是设置页的「本机身份」区块（plan §7.6 补充裁定就是这么安排的）。 */
-.daemon-badge:hover .badge-ident { max-width: 200px; opacity: 1; margin-left: 0; }
+/* 状态浮层：悬停即出，键盘聚焦也出——:focus-within 是触摸屏与键盘用户唯一的入口，
+   而按钮现在**是**可聚焦的（它开一枚浮层，不再是一枚纯装饰徽标），所以这条规则
+   有实体可依，不像老版那样是条死规则。常驻兜底仍在设置页「本机身份」。
 
-/* 胶囊是相对窗口居中的，两侧元素**不能**把它挤走——只能自己让位。窗口最小宽度是
-   860（tauri.macos.conf.json），那时胶囊占 222–638，徽标从 640 起，刚好擦过；
-   低于 900 连悬停展开也不给，避免展开时把胶囊顶掉。 */
-@media (max-width: 900px) {
-  .daemon-badge:hover .badge-ident { max-width: 0; opacity: 0; margin-left: -8px; }
+   ⚠ 两条 hover/focus 规则都限定在 `.hoverable` 上，**不能**放宽到所有 .chrome-ctl。
+   语言菜单是点击驱动的：按 Esc 关掉之后焦点仍留在它的按钮上，一条不限定的
+   :focus-within 会立刻把刚关掉的菜单又打开——真机上就是这么发现的（截图
+   chrome2-31 里语言菜单与状态浮层同时挂着）。菜单只认 .open 这一条通路。 */
+.chrome-ctl.hoverable:hover > .chrome-pop,
+.chrome-ctl.hoverable:focus-within > .chrome-pop,
+.chrome-pop.open {
+  opacity: 1;
+  visibility: visible;
+  transform: none;
+  transition: opacity var(--dur) var(--ease-out), transform var(--dur) var(--ease-spring),
+    visibility 0s;
 }
 
-body[data-window-controls="right"] .daemon-badge {
-  left: var(--chrome-gap); right: auto;
-}
+.pop-head { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; }
+.pop-status { font-weight: 600; font-size: 12px; }
+.pop-status.online { color: var(--ok); }
+.pop-status.offline { color: var(--danger); }
+.pop-status.connecting { color: var(--text-dim); }
 
-.daemon-badge .badge-status { font-weight: 600; }
-.daemon-badge.online .badge-status { color: var(--ok); }
-.daemon-badge.offline .badge-status { color: var(--danger); }
-.daemon-badge.connecting .badge-status { color: var(--text-dim); }
-.daemon-badge code { color: var(--text); }
-.badge-sep { opacity: .5; }
+/* 两列键值。dt/dd 而不是两个 span：这是一组「名称—值」，语义上就是定义列表，
+   读屏会把它念成成对的。 */
+.pop-kv {
+  display: grid; grid-template-columns: auto 1fr; gap: 4px 12px;
+  margin: 0; align-items: baseline;
+}
+.pop-kv dt { color: var(--text-dim); white-space: nowrap; }
+/* overflow-wrap 而不是 word-break: break-all——主机名是词，断在词边界；
+   只有指纹那串十六进制没有词边界可断，break-all 单独给它。 */
+.pop-kv dd { margin: 0; color: var(--text); text-align: right; overflow-wrap: anywhere; }
+.pop-kv code { font-size: 11px; word-break: break-all; }
+.pop-note { margin: 9px 0 0; font-size: 11px; color: var(--text-dim); opacity: .8; }
+
+/* ---- 菜单式浮层 ---- */
+
+.menu-pop { min-width: 180px; padding: 6px; }
+.pop-title {
+  margin: 2px 8px 6px; font-size: 11px; font-weight: 650;
+  color: var(--text-dim); letter-spacing: .05em;
+}
+.pop-item {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  width: 100%; padding: 7px 9px;
+  border: none; border-radius: var(--radius-xs);
+  background: transparent; color: var(--text);
+  font: inherit; font-size: 12px; text-align: left; cursor: pointer;
+  transition: background var(--dur) var(--ease-out);
+}
+.pop-item:hover { background: var(--fill-3); }
+/* 选中项走**三个通道**：强调色 + 加粗 + 一层底色。只靠颜色一条在色觉障碍下会消失，
+   而 aria-checked 已经把状态告诉了读屏，这里补的是视觉侧的冗余。 */
+.pop-item.on { color: var(--accent); font-weight: 600; background: rgba(var(--accent-rgb), .102); }
+.pop-item.on .pop-item-sub { color: var(--accent); opacity: .75; }
+.pop-item-sub { font-size: 11px; color: var(--text-dim); }
 
 /* ---- Windows 自绘标题按钮 ---- */
 

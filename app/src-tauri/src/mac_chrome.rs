@@ -1,196 +1,122 @@
-//! Where macOS draws the traffic lights, and keeping them there.
+//! Where macOS 26 draws the traffic lights, and letting it.
 //!
-//! # The rule AppKit actually follows
+//! # The rule AppKit actually follows on macOS 26
 //!
-//! Measured on macOS 26.5.2 (`test/mac-corner-probe/probe3.m`): sweep the
-//! `NSTitlebarContainerView`'s height from 24pt to 80pt, writing no button
-//! origin of our own, and read the close button back at each step.
+//! On Tahoe the window's corner radius and the traffic lights are not two
+//! things — they are one. Measured on 26.5.2
+//! (`test/mac-corner-probe/probe5.m`, `probe7.m`), writing no coordinate of our
+//! own and reading both back:
 //!
-//! * Its `origin.y` **inside the container** is 9.0pt at every height tested.
-//!   AppKit does not centre the buttons in the container — it hangs them from
-//!   the container's bottom edge at a fixed offset.
-//! * So the centre, measured down from the window's top edge, is exactly
-//!   `container_height - 16`, with no residual across all 16 samples. The 16
-//!   decomposes as `9 + BUTTON_DIAMETER / 2`.
+//! | window style | radius | close centre y | close left x |
+//! |---|---|---|---|
+//! | titlebar only (no toolbar) | 16 | **16.00** | 9.00 |
+//! | toolbar, `unifiedCompact`   | 20 | **20.00** | 12.00 |
+//! | toolbar, `unified`          | 26 | **26.00** | 19.00 |
 //!
-//! The same holds on the other axis: the button's `origin.x` inside the
-//! container is 9.0pt too, and it stays there when the *container* is moved
-//! (`probe4.m`), so insetting the container's left edge carries the whole
-//! group with it.
+//! The button's centre lands on the corner radius exactly, at every step. That
+//! is the literal meaning of the design Apple describes in the WWDC 2025
+//! session *Build an AppKit app with the new design*:
 //!
-//! **So this module writes no button coordinate at all.** It sets the
-//! container's frame — height for the vertical placement, `origin.x` for the
-//! horizontal — and lets AppKit put the buttons where its own arithmetic says.
-//! That is the robust shape of the fix: a layout pass cannot undo it, because
-//! the result *is* what a layout pass computes. An earlier revision set the
-//! container to 66pt and then forced each `origin.y` to 26pt; that second write
-//! was load-bearing (left alone, AppKit puts the centre at `66 - 16 = 50`, 17pt
-//! low), which is exactly the fragility being removed here.
+//! > In the new design system, windows now have a softer, more generous corner
+//! > radius, **which varies based on the style of window**. Windows with
+//! > toolbars now use a larger radius, which is designed to wrap concentrically
+//! > around the glass toolbar elements, scaling to match the size of the
+//! > toolbar. Titlebar-only windows retain a smaller corner radius, **wrapping
+//! > compactly around the window controls**.
 //!
-//! For the record, since an earlier revision of this comment got it wrong:
-//! **tao's `trafficLightPosition.y` does have a defined meaning.**
-//! `inset_traffic_lights` (`tao-0.35.3/src/platform_impl/macos/view.rs:1152`)
-//! sets the container height to `button_height + y` and then writes only each
-//! button's `origin.x` — the loop at `:1177` never touches `origin.y`. Feeding
-//! the measured rule through that gives `centre = (14 + y) - 16 = y - 2`, so
-//! the config field would land the centre on 33.0 at `y = 35`.
+//! So the causality runs style → radius → button placement. The radius is not
+//! an input you set; it is what AppKit derives from the kind of window you
+//! declared, and the buttons are then placed concentrically inside it.
 //!
-//! # Why this is not `tauri.macos.conf.json`'s `trafficLightPosition`
+//! # Which is why this module sets a window *style*, and no geometry
 //!
-//! Meaning aside, the config field is applied once, from `drawRect:`. tao's
-//! only call site is `view.rs:348`, inside the host view's `drawRect:` — a view
-//! the WKWebView covers completely, so it may never be asked to draw again.
-//! Leaving fullscreen rebuilds the title bar and puts the buttons back at the
-//! system position; the upstream fix for that (tao#1254) first shipped in tao
-//! 0.36.0, and `tauri-runtime-wry-2.11.4` pins `tao = "0.35.0"`, so we cannot
-//! have it without patching the dependency tree. Re-applying from our own
-//! window-event handler costs a dozen lines and moves nothing else.
+//! Everything below is two property writes: attach an `NSToolbar`, and ask for
+//! the `unified` style. No frame, no origin, no height — not for a button, and
+//! not for the container that holds them. The placement that results is the one
+//! AppKit computes for a standard document window, the same as Finder, Safari,
+//! Mail and Notes.
 //!
-//! # The geometry, and where the numbers come from
+//! That is also why there is no re-apply hook any more. The previous revision
+//! resized `NSTitlebarContainerView` and had to redo it on every `Resized` and
+//! `Focused`, because a layout pass would recompute what we had overwritten. A
+//! toolbar is a persistent property of the window, not a geometry write that
+//! layout can undo, so applying it once at startup is the whole of it.
+//! `probe7.m` confirms the placement is untouched across resizes from 860 to
+//! 1160 wide with nothing re-applied.
 //!
-//! Measured off a real screenshot of the running app (2000x1400 device px for a
-//! 1000x700pt window, so DPR is exactly 2; cross-checked against `#nav`'s
-//! `top: 11px` landing exactly 22 device rows below the window's top edge).
-//! The app's own top-strip elements share one centre line:
+//! # There is no public "set the corner radius" on 26.5 — and none is needed
 //!
-//! | element | top..bottom (pt) | centre |
-//! |---|---|---|
-//! | nav pill `#nav`      | 11.0 .. 55.0 | **33.0** |
-//! | daemon badge         | 18.0 .. 48.0 | **33.0** |
-//! | traffic lights, stock | 9.0 .. 23.0 | 16.0 |
+//! Worth recording, because setting the radius directly is the obvious first
+//! guess. Checked against the installed 26.5 SDK headers: the only public
+//! `cornerRadius` in AppKit is on `NSGlassEffectView` and `NSBox`. `NSWindow.h`
+//! declares no corner or shape property at all. The `NSViewCornerConfiguration`
+//! family that the online documentation shows is marked macOS 27.0+ Beta and is
+//! absent from this SDK.
 //!
-//! That ~17pt disagreement is the thing being fixed. `NAV_CENTRE_Y` is the
-//! target; `CONTAINER_HEIGHT` is what has to be set to reach it, written as the
-//! arithmetic of the measured rule rather than as `49` so the intent survives a
-//! change to any of its terms. (A first pass used 32.5, the estimate in
-//! `docs/design-ui-chrome.md` §1.2; measuring the built app put both elements at
-//! 33.0 instead, so the guess was half a point low.)
+//! The private `-[NSWindow _setCornerRadius:]` does exist and does change the
+//! rendered radius (`probe2.m` drove it over 8..100pt), but it is inert with
+//! respect to the buttons: across that whole range the close button stayed at
+//! `x = 9.00, centre_y = 16.00`, unchanged to the hundredth. Which fits the
+//! rule above rather than contradicting it — `_setCornerRadius:` repaints the
+//! corner, it does not re-declare the window's style, so nothing re-runs the
+//! placement. The supported lever is the style, and the style is public.
 //!
-//! # The corner radius is a separate knob, and it is inert here
+//! # What the app's own top strip has to match
 //!
-//! Worth recording because it is the obvious guess — bigger radius, buttons
-//! pushed clear of the curve — and because on macOS 26 the radius really is
-//! reachable, so the guess cannot be dismissed on "you can't change it".
+//! The native line is **26.0pt** down from the window top, with the button
+//! group spanning x 19.0 .. 79.0 (`probe7.m`). `styles.css` centres the nav
+//! pill and the daemon badge on that line and reserves `--chrome-lead: 100px`
+//! for the group. The strip is `--chrome-h: 52px`, which is the height AppKit
+//! reserves for a unified toolbar (`contentLayoutRect`, `probe8.m`) — so both
+//! our elements and the traffic lights are centred in the same native band.
 //!
-//! *Reachable, but only privately.* The 26.5 SDK has no `cornerRadius` on
-//! `NSWindow`; the only public ones are `NSGlassEffectView`, `NSBox` and
-//! `CALayer`. `-[NSWindow _setCornerRadius:]` exists and works: driven over
-//! 8/16/26/40/60/100pt it tracks 1:1 in a window-server capture
-//! (`test/mac-corner-probe/probe2.m`). `CGSSetWindowCornerRadius` — the usual
-//! third-party route — is simply absent from the dylib on this release.
+//! # Cost of adopting the toolbar: none measured
 //!
-//! *Inert with respect to the buttons.* Across that whole range the close
-//! button stayed at `x = 9.00, centre_y = 16.00`, unchanged to the hundredth:
-//! set before the window was first ordered in (so the first layout pass saw
-//! it), set at runtime, and set with `tileAndSetWindowShape:`,
-//! `_updateCornerInsets` and `windowCornerMaskChanged` forced afterwards.
-//! `_setEffectiveCornerRadius:` likewise. The same harness's positive control —
-//! the container height above — moved the centre from 16.00 to 50.00, so the
-//! measurement can see movement when there is movement to see.
-//!
-//! So: two things in the same corner, one cause each, and this one is not it.
-//! The radius is 16pt by default (`_cornerRadius` reports it, and a circular
-//! fit off a screenshot agrees at 0.44 device-px RMS) — a number to design
-//! against, not a lever to pull.
+//! `probe8.m` rendered the frame view before and after attaching the toolbar
+//! and compared a column of pixels down the top 70pt: identical. With
+//! `titlebarAppearsTransparent` (which tao's `Overlay` title-bar style already
+//! sets) the toolbar paints nothing. Hit-testing at the window's centre-x
+//! reaches the content view at every depth from 6pt to 80pt both before and
+//! after, so it steals no clicks; at the far left it now correctly reports
+//! `_NSThemeCloseWidget` at y=26, which is the button actually being there.
 
 #![cfg(target_os = "macos")]
 
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSWindow, NSWindowButton};
+use objc2_app_kit::{NSToolbar, NSWindow, NSWindowToolbarStyle};
 
-/// The app's own top-strip centre line, in points down from the window's top
-/// edge — what the traffic lights have to share. See the table above.
-const NAV_CENTRE_Y: f64 = 33.0;
-
-/// Measured traffic-light diameter.
-const BUTTON_DIAMETER: f64 = 14.0;
-
-/// AppKit's own inset for the buttons inside `NSTitlebarContainerView`, the
-/// same on both axes: `origin` is `(9.0, 9.0)` and stays there at every
-/// container height sampled from 24pt to 80pt (`probe3.m`, 16 samples) and at
-/// every container `origin.x` tried (`probe4.m`). This is the constant the
-/// whole module leans on — nothing here writes a button coordinate, so every
-/// placement is AppKit's own arithmetic applied to a container we sized.
-const APPKIT_BUTTON_INSET: f64 = 9.0;
-
-/// Container height that lands the buttons on `NAV_CENTRE_Y`.
+/// Give the window the standard macOS 26 document-window style, so AppKit
+/// places the traffic lights — and rounds the corners — the way it does for
+/// every system app.
 ///
-/// AppKit hangs the buttons from the container's *bottom* edge, so measured
-/// down from the window's top the centre is `height - (APPKIT_BUTTON_INSET +
-/// BUTTON_DIAMETER / 2)` — i.e. `height - 16`, exactly, with no residual across
-/// all 16 samples. Inverting that for a 33.0 centre gives 49.0.
-const CONTAINER_HEIGHT: f64 = NAV_CENTRE_Y + APPKIT_BUTTON_INSET + BUTTON_DIAMETER / 2.0;
-
-/// Distance from the window's left edge to the close button's left edge.
-///
-/// The stock value is 9pt, which after the vertical correction reads as
-/// noticeably tighter to the window edge than any content: `#view-root` pads to
-/// 28pt. 20pt puts the button group past the corner radius' curved segment and
-/// inside the same breathing room the content lives in, without crowding the
-/// centred nav pill (the group then ends at 79.5pt, and `--chrome-lead` in
-/// `styles.css` reserves 100pt).
-const LEADING_INSET: f64 = 20.0;
-
-/// Container `origin.x` that lands the close button on `LEADING_INSET`.
-///
-/// The buttons keep their local `origin.x` of `APPKIT_BUTTON_INSET` when the
-/// container moves, so the container has to start that much further left than
-/// the edge we actually want. Idempotent for the same reason: re-running never
-/// changes the local origin, so this never accumulates.
-const CONTAINER_X: f64 = LEADING_INSET - APPKIT_BUTTON_INSET;
-
-/// Move the traffic lights onto the app's top-strip centre line.
-///
-/// Silently does nothing when the window has no standard buttons (which is the
-/// state during a fullscreen transition, among others) — this runs on every
-/// resize, so a failure must be a no-op rather than a log flood.
+/// Idempotent: if the window already has a toolbar this returns without
+/// touching anything, so calling it twice cannot stack up state.
 ///
 /// # Thread
-/// Must run on the main thread. Every caller is either Tauri's `setup` or a
-/// window-event callback, both of which the event loop dispatches on main;
-/// `MainThreadMarker::new()` returns `None` anywhere else and we bail.
+/// Must run on the main thread. The only caller is Tauri's `setup`, which the
+/// event loop dispatches on main; `MainThreadMarker::new()` returns `None`
+/// anywhere else and we bail rather than message AppKit off-main.
 pub fn apply(window: &tauri::Window) {
-    if MainThreadMarker::new().is_none() {
+    let Some(mtm) = MainThreadMarker::new() else {
         return;
-    }
-    // Fullscreen hands the buttons to the menu-bar overlay; the container we
-    // would resize is not the one on screen. The `Resized` that follows the
-    // transition back is what puts them right.
-    if window.is_fullscreen().unwrap_or(false) {
-        return;
-    }
+    };
     let Ok(ptr) = window.ns_window() else { return };
     if ptr.is_null() {
         return;
     }
-    // SAFETY: `ns_window()` hands back the `NSWindow` this window is backed by,
+    // SAFETY: `ns_window()` hands back the `NSWindow` backing this window,
     // alive for as long as the window is; we only borrow it for this call, and
-    // the main-thread requirement of every message below is checked above.
+    // the main-thread requirement of both messages below is checked above.
     unsafe {
         let ns_window: &NSWindow = &*(ptr as *const NSWindow);
-        apply_to(ns_window);
+        if ns_window.toolbar().is_some() {
+            return;
+        }
+        // An item-less toolbar is enough: the style is what AppKit reads to
+        // pick the radius, not the contents. Verified with a nil delegate and
+        // zero items in `probe9.m` — radius 26, close button at (19.0, 26.0).
+        let toolbar = NSToolbar::new(mtm);
+        ns_window.setToolbar(Some(&toolbar));
+        ns_window.setToolbarStyle(NSWindowToolbarStyle::Unified);
     }
-}
-
-unsafe fn apply_to(ns_window: &NSWindow) {
-    let Some(close) = ns_window.standardWindowButton(NSWindowButton::CloseButton) else {
-        return;
-    };
-
-    // Button -> NSTitlebarView -> NSTitlebarContainerView. Two hops, same as
-    // tao; the container is the one whose frame decides where AppKit puts the
-    // buttons. Nothing below touches a button — that is the whole point.
-    let Some(titlebar) = close.superview() else { return };
-    let Some(container) = titlebar.superview() else { return };
-
-    let window_size = ns_window.frame().size;
-    let mut rect = container.frame();
-    rect.origin.x = CONTAINER_X;
-    // Keep the right edge on the window's, so the strip does not overhang.
-    rect.size.width = window_size.width - CONTAINER_X;
-    rect.size.height = CONTAINER_HEIGHT;
-    // Views are bottom-left origin: pinning the container's top to the window's
-    // top means its origin sits a full height down from there.
-    rect.origin.y = window_size.height - CONTAINER_HEIGHT;
-    container.setFrame(rect);
 }

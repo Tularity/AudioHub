@@ -236,10 +236,27 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
    一条属性一处分叉，不是两套布局。data-window-controls 由 lib/platform.ts 在启动时
    写死一次（'left' = macOS 红绿灯，'right' = Windows 自绘标题按钮）。
 
-   --chrome-lead 取 100px 的来历：红绿灯左内缩 20pt（mac_chrome.rs 的 LEADING_INSET）、
-   三颗按钮间距 23pt、直径 14pt ⇒ 绿灯右缘 79.5pt，再留 20pt 呼吸。
+   --chrome-lead 取 100px 的来历：macOS 26 把红绿灯放在 x 19.0..79.0（原生值，
+   src-tauri/src/mac_chrome.rs 不写任何坐标，见那里的实测表），再留 21px 呼吸。
    --chrome-trail 取 138px = 46×3，正好是三颗自绘按钮的宽度。 */
 body[data-window-controls="left"] { --chrome-lead: 100px; }
+
+/* ---- macOS 26：顶栏对齐系统自己的那条线 ----
+   Tahoe 的窗口圆角与红绿灯是同一个量：AppKit 依窗口**样式**定圆角，再把按钮按同心
+   关系放在圆角上。带 unified 工具栏的标准文档窗（Finder / Safari / 邮件都是这个）
+   圆角 26pt，红绿灯中心线就在 26.0pt，工具栏带高 52pt。实测见 mac_chrome.rs。
+
+   所以这里是**顶栏去迁就系统**，不是反过来：把 chrome 带高改成系统真正预留的 52px，
+   胶囊与徽标的中心线一并落到 26px——三者于是共用 AppKit 那条中心线。
+   只挂在 [data-window-controls="left"] 上：Windows 侧的 64px 带与 33px 中心线不动。 */
+body[data-window-controls="left"] { --chrome-h: 52px; }
+/* 胶囊高 44px（5px 内边距 ×2 + 32px 行 + 1px 描边 ×2）⇒ top = 26 − 22。 */
+body[data-window-controls="left"] #nav { top: 4px; }
+/* 收拢态高 40px（内边距与行各收 1px）⇒ top = 26 − 20。中心线保持 26 不动：
+   系统按钮不会因为页面滚动而挪窝，胶囊也就只该原地收，不该再往上抬。 */
+body[data-window-controls="left"] #nav.contracted { top: 6px; }
+/* 徽标高 30px，top:50% 已经是 26px（52 的一半）⇒ 负 margin 取半高 15px 正好居中。 */
+body[data-window-controls="left"] .daemon-badge { margin-top: -15px; }
 body[data-window-controls="right"] { --chrome-trail: calc(var(--caption-btn-w) * 3); }
 /* 浏览器态没有窗口按钮可画（`settings.web`，plan §7.5）——那一端的让位随之收回，
    否则网页里会凭空空出 138px 给三个不存在的按钮。 */

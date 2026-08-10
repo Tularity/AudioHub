@@ -629,19 +629,13 @@ fn main() {
                     api.prevent_close();
                     let _ = window.hide();
                 }
-                // Re-seat the traffic lights. Leaving fullscreen (and a
-                // maximize/restore round trip) rebuilds the title bar at the
-                // system position; tao 0.35.3 only applies the inset from the
-                // host view's `drawRect:`, which a webview-covered view is not
-                // guaranteed to get again. The upstream fix landed in tao
-                // 0.36.0, past the version `tauri-runtime-wry` pins — see
-                // `mac_chrome`. `Resized` is the event both transitions
-                // produce, and re-applying is idempotent, so it is safe to run
-                // on every frame of a live resize.
-                #[cfg(target_os = "macos")]
-                WindowEvent::Resized(_) | WindowEvent::Focused(true) => {
-                    mac_chrome::apply(window);
-                }
+                // No macOS arm here on purpose. `mac_chrome` no longer writes
+                // any geometry — it declares the window's *style* once, and
+                // AppKit derives the corner radius and the traffic-light
+                // placement from it. A style is a persistent property of the
+                // window rather than something a layout pass recomputes, so
+                // there is nothing to re-seat after a resize or a fullscreen
+                // round trip. See `mac_chrome` for the measurements.
                 _ => {}
             }
         })

@@ -29,6 +29,7 @@ objc2-app-kit = { version = "0.3", features = [
   "NSButton",
   "NSControl",
   "NSResponder",
+  "NSToolbar",
 ] }
 
 # src/win_chrome.rs subclasses the window to hand Snap Layouts back after

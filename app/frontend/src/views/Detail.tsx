@@ -1,17 +1,25 @@
-// 对端详情：完整指纹、别名、虚拟设备、地址历史、会话列表、解除配对。
+// 对端详情：连接（档位 / 连通方式 / 虚拟设备 / 隧道地址）、活跃会话、地址历史、身份。
+//
+// # 2026-08-10 的重排（用户 22 条指令的 C 组）
+//
+// 顶部那一行现在带**两枚图标按钮**：别名（✎）与危险操作（⚠），各自开一个 Sheet。
+// 它们从前是页面中段的一整张卡和页尾的一整块红色区域。搬上去的收益是页面主体只剩
+// 「这台对端此刻怎么样」——连接、会话、地址、身份四块自上而下就是一条读下来的线；
+// 代价是危险操作的**可发现性减弱**了，补偿是它多了一层 Sheet 再加原有的确认框，
+// 误触反而更难。
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Icon } from '../components/Icon';
 import { confirmDialog } from '../components/ConfirmDialog';
 import { Help } from '../components/Controls';
+import { Sheet } from '../components/Sheet';
 import { WIKI } from '../lib/external';
 import { toast } from '../components/Toasts';
 import { volumeText } from '../components/VolumeControl';
 import { fmt, sessionFlow, dirLabel } from '../lib/fmt';
-import { t, joinPhrases } from '../i18n';
+import { t } from '../i18n';
 import { actions, useStore } from '../state/store';
 import { PeerTransportCard } from '../components/PeerTransport';
-import { peerDeviceRows, halReasonText, halDeviceOf, deviceStateLabel, isModeB } from '../state/mode';
 import { refreshPeers, rpc } from '../state/connection';
 import type { PeerState, SessionInfo, VolumeState } from '../ipc/types';
 
@@ -37,7 +45,8 @@ function VerdictCell({ v }: { v: { detected?: boolean; snr_db?: number } | null 
     : <span className="tag danger">{t('detail.verdict.fail')}</span>;
 }
 
-function AliasCard({ peer }: { peer: PeerState }) {
+/** 别名的二级菜单（用户第 16 条）。入口是详情头上那枚 ✎。 */
+function AliasSheet({ peer, onClose }: { peer: PeerState; onClose: () => void }) {
   const fp = peer.fingerprint;
   const [busy, setBusy] = useState(false);
   const ref = useRef<HTMLInputElement>(null);
@@ -63,14 +72,15 @@ function AliasCard({ peer }: { peer: PeerState }) {
   }
 
   return (
-    <section className="card block" data-testid="detail-alias">
-      {/* 改名走「同 UID 就地更新」（spec-m5b §3.5）：AudioObjectID 不变，任何应用
-          已记住的设备选择完全不受影响。这件事必须能查到，否则用户会因为怕搞乱
-          Zoom 里的选择而不敢改名——现在它在 wiki，由这枚 `?` 指过去。 */}
-      <div className="title-row">
-        <h3 className="block-title">{t('detail.alias.title')}</h3>
-        <Help label={t('wiki.deviceNaming')} url={WIKI.deviceNaming} testid="detail-alias-help" />
-      </div>
+    <Sheet
+      testid="detail-alias-sheet"
+      title={t('detail.alias.title')}
+      /* 改名走「同 UID 就地更新」（spec-m5b §3.5）：AudioObjectID 不变，任何应用
+         已记住的设备选择完全不受影响。这件事必须能查到，否则用户会因为怕搞乱
+         Zoom 里的选择而不敢改名——细节在 wiki，由这枚 `?` 指过去。 */
+      help={<Help label={t('wiki.deviceNaming')} url={WIKI.deviceNaming} testid="detail-alias-help" />}
+      onClose={onClose}
+    >
       <div className="form-row">
         <label className="field grow">
           <span className="field-label">{t('detail.alias.field')}</span>
@@ -106,65 +116,11 @@ function AliasCard({ peer }: { peer: PeerState }) {
           </button>
         </span>
       </div>
-    </section>
-  );
-}
-
-function DevicesCard({ peer }: { peer: PeerState }) {
-  const daemon = useStore((s) => s.daemon);
-  const modeB = useStore(isModeB);
-  const fp = peer.fingerprint;
-  const rows = peerDeviceRows(peer, daemon);
-  const info = halDeviceOf(daemon, fp);
-  const dev = peer.hal_device;
-  const published = !!dev && dev.state === 'bound' && !!dev.observed;
-
-  let note: string;
-  if (!rows.length) {
-    note = modeB ? halReasonText(peer.hal_reason) : t('detail.devices.modeA');
-  } else if (published) {
-    note = peer.online ? t('detail.devices.published') : t('detail.devices.offline');
-  } else {
-    // 「已列出 / 尚未列出」是两句独立的话，不是一句里换一个词：别的语言可能整句改写。
-    const state = deviceStateLabel(dev?.state) || t('common.dash');
-    note = dev && dev.observed
-      ? t('detail.devices.stateListed', { state })
-      : t('detail.devices.stateUnlisted', { state });
-  }
-
-  return (
-    <section className="card block" data-testid="detail-hal-devices">
-      <div className="dev-inv-head">
-        <div className="title-row">
-          <h3 className="block-title">{t('detail.devices.title')}</h3>
-          <Help label={t('wiki.devices')} url={WIKI.modeB} testid="detail-devices-help" />
-        </div>
-        <code className="mono dim" data-testid="detail-hal-meta">
-          {info ? t('device.slotGen', { slot: String(info.slot ?? ''), gen: String(info.generation ?? '') }) : ''}
-        </code>
-      </div>
-      <div className="dev-list" hidden={rows.length === 0}>
-        {rows.map((r) => (
-          <div key={r.dir} className="dev-row" data-testid={`detail-device-${r.dir}`}>
-            <Icon name={r.icon} cls="ico dev-ico" />
-            <div className="dev-text">
-              <span className="dev-name">{r.name || t('common.dash')}</span>
-              <code className="dev-uid mono">{r.uid || ''}</code>
-            </div>
-            <span className="dev-frames mono">
-              {joinPhrases([
-                t('device.frames', { n: fmt.count(r.frames) }),
-                r.dropped ? t('device.dropped', { n: fmt.count(r.dropped) }) : null,
-              ])}
-            </span>
-            <span className={`dev-state ${r.io ? 'live' : published ? 'idle' : 'pending'}`}>
-              {r.io ? t('device.inUse') : published ? t('device.idle') : t('device.awaiting')}
-            </span>
-          </div>
-        ))}
-      </div>
-      <p className="muted small" data-testid="detail-hal-note">{note}</p>
-    </section>
+      {/* 后果句。plan §3.1 第 4 类（后果）允许留在界面上——这个名字不只影响本页，
+          它会改掉这台对端在系统设备列表里那两台设备的名字，而那正是用户不敢按
+          「保存」的原因。 */}
+      <p className="muted small sheet-effect" data-testid="detail-alias-effect">{t('detail.alias.effect')}</p>
+    </Sheet>
   );
 }
 
@@ -174,6 +130,10 @@ export function DetailView() {
   const sessions = useStore((s) => s.sessions);
   const addrHistory = useStore((s) => (fp ? s.addrHistory[fp] : undefined));
   const [unpairing, setUnpairing] = useState(false);
+  // 详情头那两枚图标各开一个 Sheet。**同层只允许一个**（Sheet 的契约），所以这里
+  // 是一个三态而不是两个布尔——两个布尔迟早会同时为真，叠出两层遮罩。
+  const [sheet, setSheet] = useState<'alias' | 'danger' | null>(null);
+  const closeSheet = useCallback(() => setSheet(null), []);
 
   const back = (
     <button className="btn ghost" type="button" data-testid="detail-back" onClick={() => actions.navigate('peers')}>
@@ -250,70 +210,35 @@ export function DetailView() {
         <div className="detail-title">
           <span className={`dot ${peer.online ? 'online' : reconnecting ? 'connecting' : 'offline'}`} />
           <h2 className="detail-name">{peer.display_name || peer.name || t('peers.card.unnamed')}</h2>
+          {/* 这两枚按钮没有文字，`aria-label` 是它们唯一说得出的话——而 §3.1 已经
+              把 tooltip 当描述禁掉了，所以 `title` 只写「这按钮做什么」。 */}
+          <button
+            className="icon-btn" type="button"
+            data-testid="detail-alias-open"
+            aria-label={t('detail.alias.openLabel')} title={t('detail.alias.openLabel')}
+            onClick={() => setSheet('alias')}
+          >
+            <Icon name="pencil" />
+          </button>
+          {/* 危险色不是装饰：这枚图标从一整块红色区域降级成了标题栏上的一枚小图标，
+              不带色的话它读起来就是又一枚设置图标。 */}
+          <button
+            className="icon-btn danger" type="button"
+            data-testid="detail-danger-open"
+            aria-label={t('detail.danger.openLabel')} title={t('detail.danger.openLabel')}
+            onClick={() => setSheet('danger')}
+          >
+            <Icon name="unlink" />
+          </button>
           <span className={`detail-online ${peer.online ? 'ok' : 'dim'}`} data-testid="detail-online">
             {peer.online ? t('common.online') : reconnecting ? t('detail.reconnecting') : t('common.offline')}
           </span>
         </div>
       </div>
 
-      <section className="card block">
-        <h3 className="block-title">{t('detail.identity')}</h3>
-        <div className="fp-row">
-          <code className="fp-full" data-testid="detail-fingerprint">{fp}</code>
-          <button
-            className="btn ghost small" type="button" data-testid="detail-copy-fp"
-            onClick={async () => {
-              try {
-                await navigator.clipboard.writeText(fp);
-                toast(t('detail.fpCopied'), 'ok');
-              } catch {
-                toast(t('common.copyFailed'), 'warn');
-              }
-            }}
-          >
-            <Icon name="copy" />{t('common.copy')}
-          </button>
-        </div>
-        <div className="kv">
-          <div className="kv-row">
-            <span className="kv-k">{t('detail.defaultPort')}</span>
-            <span>{peer.port != null ? String(peer.port) : t('common.dash')}</span>
-          </div>
-          <div className="kv-row">
-            <span className="kv-k">{t('detail.pairedAt')}</span><span>{fmt.date(peer.added_unix)}</span>
-          </div>
-          <div className="kv-row">
-            <span className="kv-k">{t('detail.publicKey')}</span>
-            <code className="mono dim" title={pk}>
-              {pk ? pk.slice(0, 24) + (pk.length > 24 ? '…' : '') : t('common.dash')}
-            </code>
-          </div>
-        </div>
-      </section>
-
-      {/* plan §15：传输档位紧跟身份之后、会话列表之前。
-          控件在只读表格之前；且用户点进详情页最常见的两个意图是「这是谁」与
-          「调它」。 */}
+      {/* 「连接」在最前：用户点进详情页最常见的意图是「它现在怎么样、我能不能调」。
+          「这是谁」（身份）搬到了页尾——核对指纹是配对当天的事，之后再也用不到。 */}
       <PeerTransportCard peer={peer} />
-
-      <AliasCard peer={peer} />
-      <DevicesCard peer={peer} />
-
-      <section className="card block">
-        <h3 className="block-title">{t('detail.addrs.title')}</h3>
-        <ul className="addr-list" data-testid="detail-addrs">
-          {addrs.length
-            ? addrs.map((h) => (
-              <li key={h.addr}>
-                <code className="mono">{h.addr}</code>
-                <span className="dim small">
-                  {h.seenAt ? t('detail.addrs.seenAt', { time: fmt.clock(h.seenAt) }) : t('detail.addrs.fromDaemon')}
-                </span>
-              </li>
-            ))
-            : <li className="muted">{t('detail.addrs.empty')}</li>}
-        </ul>
-      </section>
 
       <section className="card block">
         <h3 className="block-title">{t('detail.sessions.title')}</h3>
@@ -386,20 +311,82 @@ export function DetailView() {
         </p>
       </section>
 
-      <section className="card block danger-block">
-        <div className="title-row">
-          <h3 className="block-title danger-title">{t('detail.danger.title')}</h3>
-          <Help label={t('wiki.unpair')} url={WIKI.unpair} testid="detail-danger-help" />
-        </div>
-        <div className="field-btn">
+      {/* 地址历史紧跟会话之后（用户第 21 条）：两者都是「这条链路最近发生了什么」，
+          而它从前夹在设备与会话之间，把那条线截成了两段。 */}
+      <section className="card block">
+        <h3 className="block-title">{t('detail.addrs.title')}</h3>
+        <ul className="addr-list" data-testid="detail-addrs">
+          {addrs.length
+            ? addrs.map((h) => (
+              <li key={h.addr}>
+                <code className="mono">{h.addr}</code>
+                <span className="dim small">
+                  {h.seenAt ? t('detail.addrs.seenAt', { time: fmt.clock(h.seenAt) }) : t('detail.addrs.fromDaemon')}
+                </span>
+              </li>
+            ))
+            : <li className="muted">{t('detail.addrs.empty')}</li>}
+        </ul>
+      </section>
+
+      {/* 身份在页尾（用户第 20 条）。§7.6 裁定 2「指纹保留」说的是**对端卡片**上那一段，
+          它没有规定位置；核对指纹是配对当天的动作，之后这一块只是存档。 */}
+      <section className="card block">
+        <h3 className="block-title">{t('detail.identity')}</h3>
+        <div className="fp-row">
+          <code className="fp-full" data-testid="detail-fingerprint">{fp}</code>
           <button
-            className="btn danger" type="button" data-testid="detail-unpair"
-            disabled={unpairing} onClick={() => void unpair()}
+            className="btn ghost small" type="button" data-testid="detail-copy-fp"
+            onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(fp);
+                toast(t('detail.fpCopied'), 'ok');
+              } catch {
+                toast(t('common.copyFailed'), 'warn');
+              }
+            }}
           >
-            {t('detail.unpair')}
+            <Icon name="copy" />{t('common.copy')}
           </button>
         </div>
+        <div className="kv">
+          <div className="kv-row">
+            <span className="kv-k">{t('detail.defaultPort')}</span>
+            <span>{peer.port != null ? String(peer.port) : t('common.dash')}</span>
+          </div>
+          <div className="kv-row">
+            <span className="kv-k">{t('detail.pairedAt')}</span><span>{fmt.date(peer.added_unix)}</span>
+          </div>
+          <div className="kv-row">
+            <span className="kv-k">{t('detail.publicKey')}</span>
+            <code className="mono dim" title={pk}>
+              {pk ? pk.slice(0, 24) + (pk.length > 24 ? '…' : '') : t('common.dash')}
+            </code>
+          </div>
+        </div>
       </section>
+
+      {sheet === 'alias' ? <AliasSheet peer={peer} onClose={closeSheet} /> : null}
+      {/* 危险操作的二级菜单（用户第 17 条）。按下「解除配对」**仍然**走原来那道
+          确认框——两道不是冗余：Sheet 挡的是误触，确认框挡的是误判（它逐条列出
+          会从系统里消失的那两台设备）。 */}
+      {sheet === 'danger' ? (
+        <Sheet
+          testid="detail-danger-sheet"
+          title={t('detail.danger.title')}
+          help={<Help label={t('wiki.unpair')} url={WIKI.unpair} testid="detail-danger-help" />}
+          onClose={closeSheet}
+        >
+          <div className="field-btn">
+            <button
+              className="btn danger" type="button" data-testid="detail-unpair"
+              disabled={unpairing} onClick={() => void unpair()}
+            >
+              {t('detail.unpair')}
+            </button>
+          </div>
+        </Sheet>
+      ) : null}
     </>
   );
 }

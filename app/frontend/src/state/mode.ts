@@ -249,3 +249,48 @@ export function halReasonText(reason: string | null | undefined): string {
     default: return reason ? t('halReason.other', { reason }) : t('halReason.none');
   }
 }
+
+/**
+ * 详情页那块设备清单底下的**那一句**。
+ *
+ * # 为什么它是一个纯函数
+ *
+ * 它是一棵四叉的分支树，而在 2026-08-10 的重排里那块清单换了宿主组件
+ * （`Detail.tsx` 的独立卡 → `PeerTransport.tsx` 的「连通方式」之下），同时换掉了
+ * 「没有设备」那一支的判据。搬家改判据是本仓反复栽跟头的组合，而组件接线层零覆盖
+ * 正是 `regress/transport-per-peer.mjs` 开头记的那次事故的形状。抽出来才测得到。
+ *
+ * # 四支各自在说什么
+ *
+ * | 条件 | 说什么 |
+ * |---|---|
+ * | 一台设备都没有 | `hal_reason` 那句「为什么没有」 |
+ * | 两台都已发布 | 对端在线 ⇒ 可选用；离线 ⇒ 仍在列表里但不出声 |
+ * | 尚未发布、系统已列出 | 驱动状态 + 已列出 |
+ * | 尚未发布、系统未列出 | 驱动状态 + 尚未列出 |
+ *
+ * ⚠ 「没有设备」那一支**不再分模式**。它从前是
+ * `modeB ? halReasonText(...) : t('detail.devices.modeA')`，而现在整块只在
+ * **请求了模式 B** 时渲染，于是那句「当前为模式 A，没有虚拟设备」没有任何时刻
+ * 说得出口——语料里那个键已经删掉，再写它会在屏幕上印出键名本身。
+ *
+ * ⚠ 这一支绝不能返回空串：`halReasonText()` 的 `default` 兜住了缺席与不认识的
+ * reason，所以「请求了 B 却一台设备都没有」的那一刻屏幕上一定有话说。那正是
+ * 用户最需要解释的一刻。
+ */
+export function peerDevicesNote(
+  peer: PeerState | null | undefined,
+  daemon: DaemonInfo | null | undefined,
+): string {
+  const dev = peer?.hal_device;
+  const published = !!dev && dev.state === 'bound' && !!dev.observed;
+  if (!peerDeviceRows(peer, daemon).length) return halReasonText(peer?.hal_reason);
+  if (published) {
+    return peer?.online ? t('detail.devices.published') : t('detail.devices.offline');
+  }
+  // 「已列出 / 尚未列出」是两句独立的话，不是一句里换一个词：别的语言可能整句改写。
+  const state = deviceStateLabel(dev?.state) || t('common.dash');
+  return dev && dev.observed
+    ? t('detail.devices.stateListed', { state })
+    : t('detail.devices.stateUnlisted', { state });
+}

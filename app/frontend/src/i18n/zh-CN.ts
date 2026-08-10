@@ -114,7 +114,8 @@ export const zhCN = {
   // ---------------------------------------------------------------- 运行模式
   // plan §13：三种模式**互斥**，共享模式与两种使用端模式并列。标题因此不再是
   // 「使用端模式」——那个名字把三选一说成了二选一，而被砍掉的那一档恰恰是默认值。
-  'mode.title': '运行模式',
+  // ⚠ 块标题走 `settings.mode.title`：模式栏 2026-08-10 整块搬进设置页之后，
+  // 同一个「运行模式」留两条键就是两条早晚会漂开的键。
   'mode.share.label': '共享 · 供他人使用',
   'mode.a.label': 'A · 免驱动',
   'mode.b.label': 'B · 虚拟设备',
@@ -553,13 +554,20 @@ export const zhCN = {
   // 失败提示改走 common.copyFailed（设置页「本机身份」也复制指纹，两处必须同一条）。
 
   'detail.alias.title': '别名',
+  // 详情头那枚 ✎ 的 aria-label / title。按钮没有文字，这就是它唯一说得出的话。
+  'detail.alias.openLabel': '编辑别名',
+  // 后果句（plan §3.1 第 4 类）。改名不只影响本页——它会就地改掉系统设备列表里
+  // 那两台设备的名字，而那正是用户不敢按「保存」的原因。
+  'detail.alias.effect': '会一并改掉这台对端在系统设备列表里那两台设备的名字。',
   'detail.alias.field': '显示名称',
   'detail.alias.placeholder': '对端主机名',
   'detail.alias.renamed': '已改名为「{name}」',
   'detail.alias.restored': '已恢复为对端主机名',
 
   'detail.devices.title': '虚拟设备',
-  'detail.devices.modeA': '当前为模式 A，没有虚拟设备。',
+  // `detail.devices.modeA`（「当前为模式 A，没有虚拟设备。」）在 2026-08-10 的
+  // 重整里删除：那一块现在只在**请求了模式 B** 时渲染，于是这句话没有任何时刻
+  // 说得出口——它恰好是 plan §3.1 禁掉的那种纯描述句。
   'detail.devices.published': '两台设备已列入系统音频设备列表，可供任意应用选用。',
   'detail.devices.offline': '⚠ 对端离线：设备仍列于系统中可供选择，但不处理任何音频。',
   'detail.devices.stateListed': '驱动状态「{state}」，系统设备列表已列出这两台设备。',
@@ -588,6 +596,8 @@ export const zhCN = {
   'detail.verdict.fail': '未通过',
 
   'detail.danger.title': '危险操作',
+  // 详情头那枚断链图标的 aria-label / title。
+  'detail.danger.openLabel': '危险操作',
   'detail.unpair': '解除配对',
   'detail.unpair.confirmTitle': '解除配对？',
   'detail.unpair.confirmLead': '将解除与「{name}」的配对，并撤销双向信任。',
@@ -596,15 +606,22 @@ export const zhCN = {
   'detail.unpair.done': '已解除配对',
 
   // ---------------------------------------------------------------- 配对
+  // 单栏之后只剩一个板块，标题就是这一页在做的事。
+  // 「让对方找到我」是二级菜单的入口按钮，也是那个面板的标题。
   'pair.left.title': '接受配对',
+  // **后果句**，不是描述句：开着这扇窗户期间会发生什么。§3.1 允许留在界面上的
+  // 三类之一，所以它不搬 wiki。
   'pair.left.desc': '启用后本机在局域网内可被发现，并生成一次性 PIN 供对方输入。',
   'pair.left.enable': '开启配对模式',
   'pair.left.disable': '停止配对',
-  'pair.left.tip': '请对方在其配对界面输入上述 PIN，以建立双向信任。',
   'pair.left.expired': '配对模式已到期',
-  'pair.right.title': '发起配对',
+  // 配对窗口开着时入口按钮的样子。一个悄悄开着的窗口必须在一级界面上看得见。
   'pair.right.scan': '开始扫描',
   'pair.right.stopScan': '停止扫描',
+  // 扫描窗口会自己到点收工，剩余时间是状态。
+  // 「陈旧」= 有一阵子没再答复了。地址多半还有效，所以仍可点，只是不许和刚刚
+  // 答复过的长成同一个样子。
+  // 进页面即自动开扫，所以这里不再指路去按那个按钮。
   'pair.right.empty': '尚未发现主机。点击「开始扫描」在局域网内查找。',
   'pair.right.unknownHost': '未知主机',
   'pair.right.paired': '已配对',
@@ -635,7 +652,6 @@ export const zhCN = {
   'addr.endpointNeedsUrl': '隧道地址必须以 ws:// 开头。直连请留空。',
   'pair.right.done': '已与「{name}」完成配对',
   'pair.right.failed': '配对失败：{message}。请确认对端已启用配对模式、PIN 未过期、地址可达。',
-  'pair.right.note': '配对成功后双向信任立即生效；模式 B 下对端将同时以一对音频设备出现在系统中。',
   'pair.step.connect': '建立连接',
   'pair.step.verifyPin': '校验 PIN',
   'pair.step.exchangeKeys': '交换密钥',
@@ -643,16 +659,22 @@ export const zhCN = {
 
   // ---------------------------------------------------------------- 设置
   'settings.mode.title': '运行模式',
-  'settings.mode.rowTitle': '当前模式',
-  'settings.mode.goto': '前往主面板切换',
-  'settings.mode.downgraded': '当前选定为「{mode}」，但该模式不可用，已临时按模式 A 运行。{hint}',
 
   // 本机指纹在右上徽标里改成了**悬停才显示**（plan §7.6 补充裁定）。悬停在触摸屏上
   // 不存在、在截图排障时也拿不到，所以必须有一个常驻落点——就是这一块。
-  'settings.identity.title': '本机身份',
   'settings.identity.fingerprint': '本机指纹',
   'settings.identity.name': '本机名称',
   'settings.identity.copied': '已复制本机指纹',
+  // 点框即复制（无障碍红线：整框是真 <button>，这条是它的 aria-label）。
+  // AUTOHUB_NAME 生效时这一行代替下面那条后果句：改不动的值配一个能编辑的框，
+  // 用户只会以为自己保存失败了。
+  // §3.1 第 4 类「后果」，获准留在界面上：改名会改掉每台对端系统里那两台虚拟
+  // 设备的名字，而对端要等下一次连接才看得到。
+  // 两条对应回包里 `restart_required` 的两个分支。**当前的 daemon 恒返回 true**
+  // （`LocalIdentity` 被广播、监听与每条控制通道持有，本进程换不掉它），所以线上
+  // 只会看到下面那条；上面这条留着是因为那个 bool 是契约的一部分，哪天热替换做得
+  // 到了，UI 不必跟着改。不许把它删掉再让界面无条件说「已生效」——那是替 daemon
+  // 说了它没说过的话。
 
   'settings.net.title': '网络',
   'settings.net.announceTitle': '在局域网内广播本机',
@@ -664,7 +686,7 @@ export const zhCN = {
   // 网页访问（plan §7.5）。文案有两条硬要求：一是必须说清「仅允许本机」关掉之后
   // **实际会发生什么**（无鉴权 + 令牌明文），二是不得把它写成一句泛泛的「请注意
   // 安全」——那种话没人会当真。
-  'settings.web.title': '网页访问',
+  // ⚠ `settings.web.title` 已删：这一块 2026-08-10 并进了「网络」，不再有块标题。
   'settings.web.enabledTitle': '启用网页访问',
   'settings.web.portTitle': '端口',
   'settings.web.portApply': '应用',
@@ -692,7 +714,9 @@ export const zhCN = {
   'peers.card.targetMine': '目标 {ms} ms（由本机设定）',
   'peers.card.targetByPeer': '目标 {ms} ms（由使用方设定）',
 
-  'detail.transport.title': '传输档位',
+  // 这张卡在 2026-08-10 的重整后装着**四类**东西（档位 / 连通方式 / 虚拟设备 /
+  // 隧道地址），叫「传输档位」就只说中了第一类。键名不动：全仓只有一个渲染点。
+  'detail.transport.title': '连接',
   // §14 裁定 4：**常驻**，不是 tooltip。用户看到 300 ms 时必须能分辨
   // 「这是我自己设的目标」而非「系统只能做到这样」——当前界面对此一个字都没说，
   // 正是本次误判的直接成因。
@@ -866,14 +890,15 @@ export const zhCN = {
   'settings.transport.colLatency': '延迟（目标）',
   'settings.transport.colQuality': '音质（目标）',
 
-  // plan §7.1 模式 A 的两个独立开关。文案里必须说清三件事：以对端为准、
-  // 「静音本机」是一次性动作不是状态、以及两者同时开启时的静音例外。
-  'settings.modeAVolume.title': '模式 A · 音量',
+  // 「模式选项」（用户 2026-08-10 第 2 条）：模式 A 与模式 B 各自的配置项合并成
+  // 一块，按选中的模式整组出现。
+  //
+  // ⚠ `modeAVolume.title` / `devices.title` / `bridge.title` 三条**块标题**随这次
+  // 合并一并消失：三组内容已经按模式分开，组标题只剩装饰作用。
+  // `modeAVolume.noteInForce` / `.noteIdle`（「当前不生效」）同理是死键——按模式
+  // 显示之后它们出现即生效，那句话恒为假。
   'settings.modeAVolume.syncTitle': '与对端音量同步',
   'settings.modeAVolume.muteTitle': '静音本机输出',
-  'settings.modeAVolume.noteInForce': '当前生效（本机正运行于模式 A）。',
-  'settings.modeAVolume.noteIdle': '当前不生效：这两项仅属于模式 A，设置会保留。',
-  'settings.devices.title': '虚拟设备',
   'settings.devices.removeTitle': '断开后移除虚拟设备',
   'settings.devices.markOfflineTitle': '离线时标注设备名',
   'settings.devices.inventory': '设备清单',
@@ -885,7 +910,6 @@ export const zhCN = {
   'settings.devices.noteModeB': '配对一台对端后，它将出现在系统音频设备列表中。',
   'settings.devices.noteModeA': '当前为模式 A，没有虚拟设备。',
 
-  'settings.bridge.title': '虚拟声卡桥接',
   'settings.bridge.detected': '已检测到',
   'settings.bridge.notInOutputs': '不在输出列表',
   'settings.bridge.notDetected': '未检测到',
@@ -893,12 +917,12 @@ export const zhCN = {
   'settings.bridge.noneOffline': '服务未连接，暂无检测结果。',
   'settings.bridge.noneFound': '未检测到任何虚拟声卡。',
 
-  // plan M9「开机自启」。文案要说清三件事：拉起的是 App 而不是服务本身、
-  // 它靠系统的登录项活过重启、以及关掉之后什么都不会留下。
-  'settings.startup.title': '启动',
+  // plan M9「开机自启」。2026-08-10 起这几行住在「杂项」里，所以没有块标题。
+  //
+  // ⚠ `autostartDescMac` / `...Win` 一并删除：它们是当时仅存的两条挂在
+  // `SettingRow.note` 上的**描述文本**（讲的是「注册在哪里、关闭即删除不留残余」），
+  // 里面没有用户需要立刻执行的动作，整段进 wiki，界面上只留那枚 `?`。
   'settings.startup.autostartTitle': '开机时自动启动 AudioHub',
-  'settings.startup.autostartDescMac': '在「登录项」中注册 AudioHub：每次登录时自动启动，已有的授权继续有效。关闭即删除，不留残余。',
-  'settings.startup.autostartDescWin': '注册一个登录时触发的计划任务（AudioHubDaemon），每次登录时自动启动 AudioHub。关闭即删除，不留残余。',
   'settings.startup.target': '登录时启动',
   'settings.startup.unsupported': '当前形态无法设置开机自启：{reason}',
   // `supported=false && enabled=true`：登录项是**别的形态**（装好的 App）留下的，
@@ -907,10 +931,9 @@ export const zhCN = {
   'settings.startup.orphaned': '开机自启仍在注册状态，由已安装的 AudioHub.app 写入。当前形态改不了它的指向（{reason}），但可在此关闭。',
   'settings.startup.unknown': '当前服务不提供开机自启接口（服务版本较旧）。',
 
-  // ---- 快捷键（设置页区块 + 录制控件 + 速查表）----------------------------
-  // 落点在「启动」之后、「桥接」之前：它和启动行为同属「这个应用怎么用」，
-  // 再往后几块讲的都是音频/网络语义。
-  'settings.shortcuts.title': '快捷键',
+  // ---- 快捷键（二级菜单：⌘/ 与「设置 › 杂项 › 快捷键」开的是同一个面板）------
+  // ⚠ `settings.shortcuts.title` 已删：编辑器与速查表合并成一个面板之后，
+  // 它的标题统一走 `shortcuts.sheet.title`——两条键说同一个词就会漂。
   'settings.shortcuts.resetAll': '全部恢复默认',
   'settings.shortcuts.resetAllDone': '快捷键已全部恢复默认。',
 
@@ -953,9 +976,15 @@ export const zhCN = {
   'shortcuts.sheet.title': '快捷键',
   'shortcuts.sheet.unset': '未设置',
   'shortcuts.sheet.esc': '关闭浮层 / 取消',
-  'shortcuts.sheet.customize': '可在「设置 › 快捷键」中修改。',
 
-  'settings.paths.title': '路径',
+  // ⚠ `shortcuts.sheet.customize`（「可在设置 › 快捷键中修改」）已删：速查表与
+  // 编辑器合并成同一个面板之后，那句指路指的是它自己。
+
+  // 「杂项」（用户 2026-08-10 第 3/5/7/8 条）：与音频链路无关的本机事务全收在
+  // 这一块——身份、启动、路径，以及权限与快捷键两个二级菜单入口。
+  // ⚠ 它**只**收这一类。任何与模式 / 网络 / 设备 / 传输相关的东西都不许进，
+  // 否则「杂项」会变成每一个没想清楚归属的开关的去处。
+  // ⚠ `settings.paths.title`（「路径」）已删：那一块并进杂项，只剩下面这一行。
   'settings.paths.configDir': '配置目录',
 
   // 「关于」。左上角的品牌区改成背景水印之后，App 的名字与版本只剩这一处常驻落点。
@@ -1094,6 +1123,8 @@ export const zhCN = {
   'onboarding.allGranted': '必需权限已全部授权',
 
   // ---------------------------------------------------------------- 权限
+  // 首次运行自动弹出这块面板时多的那一行（用户 2026-08-10 第 22 条）。
+  // 用户自己点开的那次不显示——他知道自己点了。判据见 lib/permIntro.ts。
   'perm.defer': '稍后再说',
   'perm.requesting': '请求中…',
   'perm.action.request': '授权',
@@ -1190,4 +1221,24 @@ export const zhCN = {
 
   'time.uptime': '{hh}:{mm}:{ss}',
   'time.uptimeDays': '{d} 天 {hh}:{mm}:{ss}',
+  'mode.title': '运行模式',
+  'pair.left.tip': '请对方在其配对界面输入上述 PIN，以建立双向信任。',
+  'pair.right.title': '发起配对',
+  'pair.right.note': '配对成功后双向信任立即生效；模式 B 下对端将同时以一对音频设备出现在系统中。',
+  'settings.mode.rowTitle': '当前模式',
+  'settings.mode.goto': '前往主面板切换',
+  'settings.mode.downgraded': '当前选定为「{mode}」，但该模式不可用，已临时按模式 A 运行。{hint}',
+  'settings.identity.title': '本机身份',
+  'settings.web.title': '网页访问',
+  'settings.modeAVolume.title': '模式 A · 音量',
+  'settings.modeAVolume.noteInForce': '当前生效（本机正运行于模式 A）。',
+  'settings.modeAVolume.noteIdle': '当前不生效：这两项仅属于模式 A，设置会保留。',
+  'settings.devices.title': '虚拟设备',
+  'settings.bridge.title': '虚拟声卡桥接',
+  'settings.startup.title': '启动',
+  'settings.startup.autostartDescMac': '在「登录项」中注册 AudioHub：每次登录时自动启动，已有的授权继续有效。关闭即删除，不留残余。',
+  'settings.startup.autostartDescWin': '注册一个登录时触发的计划任务（AudioHubDaemon），每次登录时自动启动 AudioHub。关闭即删除，不留残余。',
+  'settings.shortcuts.title': '快捷键',
+  'shortcuts.sheet.customize': '可在「设置 › 快捷键」中修改。',
+  'settings.paths.title': '路径',
 } as const;

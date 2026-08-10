@@ -16,7 +16,7 @@ import { describe, it, expect } from 'vitest';
 import { t } from '../i18n';
 import {
   TIER_CHOICES, TIER_PICK_HINT, TIER_PICK_LABEL,
-  dialsMultiplexed, endpointShadowsTier, hasEndpoint, tierPickLabel,
+  dialsMultiplexed, endpointShadowsTier, endpointVisible, hasEndpoint, tierPickLabel,
 } from './tier';
 
 describe('TIER_CHOICES: every tier the daemon accepts is offered', () => {
@@ -112,6 +112,80 @@ describe('endpointShadowsTier: the selector must not be left lying', () => {
   it('stays quiet with no endpoint at all', () => {
     expect(endpointShadowsTier('tier0', '')).toBe(false);
     expect(endpointShadowsTier('auto', undefined)).toBe(false);
+  });
+});
+
+// C.19 (user instruction 19, 2026-08-10): the tunnel-address field is only
+// shown when it is relevant. Taken literally -- `tier === 'tier2'` -- that
+// instruction produces a setting that can be stored, cannot be seen, and cannot
+// be cleared: the daemon picks the carrier with an OR, so a peer pinned to
+// "direct (UDP)" that has a `ws://` on disk is *already* multiplexing, and the
+// only warning about that (plus the only Clear button) lives inside the field
+// being hidden.
+//
+// The visibility rule therefore reuses `dialsMultiplexed()` rather than
+// restating it. These tests exist to keep it reusing it.
+describe('endpointVisible: nothing in force may be off-screen', () => {
+  it('shows the field whenever tier2 is the pick, URL or not', () => {
+    expect(endpointVisible('tier2', '', undefined)).toBe(true);
+    expect(endpointVisible('tier2', 'ws://h/', undefined)).toBe(true);
+  });
+
+  // The case the literal reading would have broken.
+  it('shows the field when a URL is stored under a non-tier2 pick', () => {
+    expect(endpointVisible('tier0', 'ws://h/', undefined)).toBe(true);
+    expect(endpointVisible('auto', 'ws://h/', undefined)).toBe(true);
+    expect(endpointVisible('tier1', 'ws://h/', undefined)).toBe(true);
+  });
+
+  // `endpoint_reset_from` is the daemon saying "the URL you stored was
+  // unreadable, I dropped it". At that moment `endpoint` is the empty string,
+  // so the first two criteria are both false and the sentence would have no
+  // surface to appear on.
+  it('shows the field for a reset notice even with an empty endpoint', () => {
+    expect(endpointVisible('auto', '', 'ws://old/')).toBe(true);
+    expect(endpointVisible('tier0', '', '')).toBe(true);
+  });
+
+  it('hides the field only when no tier2, no URL and no reset notice', () => {
+    expect(endpointVisible('auto', '', undefined)).toBe(false);
+    expect(endpointVisible('tier0', undefined, null)).toBe(false);
+    expect(endpointVisible('tier1', '   ', undefined)).toBe(false);
+    expect(endpointVisible(undefined, undefined, undefined)).toBe(false);
+  });
+
+  // The invariant, stated as an implication over the whole truth table rather
+  // than as a spot check: if the next dial multiplexes, the field that causes
+  // it must be reachable. Any future edit that stops deriving visibility from
+  // `dialsMultiplexed` has to keep this true or fail here.
+  it('is implied by dialsMultiplexed for every tier/endpoint pair', () => {
+    const tiers = ['auto', 'tier0', 'tier1', 'tier2', 'tier9', undefined, ''];
+    const endpoints = ['', '   ', 'ws://h/', undefined, null];
+    for (const tier of tiers) {
+      for (const endpoint of endpoints) {
+        if (!dialsMultiplexed(tier, endpoint)) continue;
+        expect(
+          endpointVisible(tier, endpoint, undefined),
+          `multiplexing but hidden: tier=${String(tier)} endpoint=${String(endpoint)}`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  // The mirror of the shadow warning: whenever `endpointShadowsTier` wants to
+  // print a line, there has to be a field for it to print into.
+  it('is implied by endpointShadowsTier for every tier/endpoint pair', () => {
+    const tiers = ['auto', 'tier0', 'tier1', 'tier2', undefined];
+    const endpoints = ['', 'ws://h/', undefined];
+    for (const tier of tiers) {
+      for (const endpoint of endpoints) {
+        if (!endpointShadowsTier(tier, endpoint)) continue;
+        expect(
+          endpointVisible(tier, endpoint, undefined),
+          `shadow warning with nowhere to show: tier=${String(tier)}`,
+        ).toBe(true);
+      }
+    }
   });
 });
 

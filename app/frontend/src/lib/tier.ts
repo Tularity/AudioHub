@@ -316,3 +316,29 @@ export function endpointShadowsTier(
 ): boolean {
   return hasEndpoint(endpoint) && tier !== 'tier2';
 }
+
+/**
+ * 隧道地址那一格**显不显示**（用户 2026-08-10 第 19 条：「隧道地址属于单连接复用」）。
+ *
+ * # 为什么判据不是照字面的 `tier === 'tier2'`
+ *
+ * 照字面写会造出一个**存得下、看不见、删不掉**的设置。daemon 选承载的判据是
+ * 「或」（[`dialsMultiplexed`] 逐字镜像的那一行）：一个选着「直连（UDP）」却存了
+ * `ws://` 的对端**此刻已经在走复用**。按 tier 隐藏，会把 [`endpointShadowsTier`]
+ * 那条专为这一态写的警告、连同唯一的「清除」按钮一起藏掉——用户既看不见它生效，
+ * 也没有地方撤销它。
+ *
+ * 所以第一条判据直接取 [`dialsMultiplexed`] 而不是另写一遍：**只要下一次拨号会
+ * 走复用，这一格就必须在屏幕上**。两者共用一个函数，就不可能再分岔成两套判据。
+ *
+ * 第三条是 `endpoint_reset_from`——daemon 清掉一个读不懂的地址之后 `endpoint`
+ * 恰好是空串，而那句「你存的地址被清掉了」必须还有地方说得出口。静默隐藏它
+ * 等于用户的设置消失了，而界面处处自洽。
+ */
+export function endpointVisible(
+  tier: string | null | undefined,
+  endpoint: string | null | undefined,
+  resetFrom: unknown,
+): boolean {
+  return dialsMultiplexed(tier, endpoint) || typeof resetFrom === 'string';
+}

@@ -22,9 +22,10 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Help } from './Controls';
+import { Icon } from './Icon';
 import { StopSlider } from './StopSlider';
 import { toast } from './Toasts';
-import { t } from '../i18n';
+import { t, joinPhrases } from '../i18n';
 import { WIKI } from '../lib/external';
 import { fmt } from '../lib/fmt';
 import { checkEndpoint } from '../lib/peerAddr';
@@ -33,10 +34,13 @@ import { pickWorst, qualityDepthKey, readLatency, readQuality, splitByDirection 
 import type { Dir } from '../lib/metrics';
 import {
   TIER_CHOICES, TIER_LABEL, TIER_PICK_HINT, TIER_PICK_LABEL, TIER_WHY,
-  effectiveTier, endpointShadowsTier, isDegradedTier, muxLink, tcpMediaLink,
+  effectiveTier, endpointShadowsTier, endpointVisible, isDegradedTier, muxLink, tcpMediaLink,
   tierPickLabel, tierUnknownWhy,
 } from '../lib/tier';
 import { rpc, refreshPeers } from '../state/connection';
+import {
+  MODE_B, halDeviceOf, peerDeviceRows, peerDevicesNote, requestedMode,
+} from '../state/mode';
 import { useStore } from '../state/store';
 import type { PeerState, SessionInfo } from '../ipc/types';
 
@@ -367,6 +371,72 @@ function EndpointField({ fp, tier, endpoint, reset }: {
   );
 }
 
+/**
+ * 这台对端的两台虚拟设备（用户 2026-08-10 第 18 条：并入「连通方式」下面）。
+ *
+ * 它此前是详情页上一张独立的卡（`Detail.tsx` 的 `DevicesCard`）。搬进来是因为
+ * 「这台对端怎么连的」与「它在我系统里长成哪两台设备」是同一个问题的两半，
+ * 而分成两张卡时中间隔着别的板块。
+ *
+ * # 为什么渲染判据取 `requestedMode` 而不是 `effectiveMode`
+ *
+ * 请求了模式 B、驱动却没起来的机器，这一块**照样要出现**：用户此刻要的正是
+ * 「我的设备呢」那个答案，而它由下面 `halReasonText()` 那一行给出（`hal_reason`
+ * 的每个取值在那里都有一句能照做的话，缺席也有 `halReason.none` 兜底，不会
+ * 渲染成空串）。判据若取 `effectiveMode`，降级的那一刻整块消失——最需要解释的
+ * 时候界面上一个字都没有。
+ *
+ * 模式 A / 共享模式下整块**不渲染**：那两个模式下它唯一的内容是一句
+ * 「当前为模式 A，没有虚拟设备」，而 plan §3.1 恰好禁止这种纯描述句。
+ * 调用点负责判据，本组件只管画——两处都判会分岔。
+ */
+function PeerDevices({ peer }: { peer: PeerState }) {
+  const daemon = useStore((s) => s.daemon);
+  const fp = peer.fingerprint;
+  const rows = peerDeviceRows(peer, daemon);
+  const info = halDeviceOf(daemon, fp);
+  const dev = peer.hal_device;
+  const published = !!dev && dev.state === 'bound' && !!dev.observed;
+  // 那一句是四叉分支，住在 `state/mode.ts` 里并有单测——它在这次搬家里换了判据，
+  // 而「搬家 + 改判据」正是本仓反复栽跟头的组合。
+  const note = peerDevicesNote(peer, daemon);
+
+  return (
+    <div className="transport-devices" data-testid="detail-hal-devices">
+      <div className="dev-inv-head">
+        <div className="title-row">
+          <h4 className="block-subtitle">{t('detail.devices.title')}</h4>
+          <Help label={t('wiki.devices')} url={WIKI.modeB} testid="detail-devices-help" />
+        </div>
+        <code className="mono dim" data-testid="detail-hal-meta">
+          {info ? t('device.slotGen', { slot: String(info.slot ?? ''), gen: String(info.generation ?? '') }) : ''}
+        </code>
+      </div>
+      <div className="dev-list" hidden={rows.length === 0}>
+        {rows.map((r) => (
+          <div key={r.dir} className="dev-row" data-testid={`detail-device-${r.dir}`}>
+            <Icon name={r.icon} cls="ico dev-ico" />
+            <div className="dev-text">
+              <span className="dev-name">{r.name || t('common.dash')}</span>
+              <code className="dev-uid mono">{r.uid || ''}</code>
+            </div>
+            <span className="dev-frames mono">
+              {joinPhrases([
+                t('device.frames', { n: fmt.count(r.frames) }),
+                r.dropped ? t('device.dropped', { n: fmt.count(r.dropped) }) : null,
+              ])}
+            </span>
+            <span className={`dev-state ${r.io ? 'live' : published ? 'idle' : 'pending'}`}>
+              {r.io ? t('device.inUse') : published ? t('device.idle') : t('device.awaiting')}
+            </span>
+          </div>
+        ))}
+      </div>
+      <p className="muted small" data-testid="detail-hal-note">{note}</p>
+    </div>
+  );
+}
+
 export function PeerTransportCard({ peer }: { peer: PeerState }) {
   const fp = peer.fingerprint;
   const ds = useStore((s) => s.daemonSettings);
@@ -380,6 +450,8 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
   // 判据取 `effective_mode`（真的在跑的那个），不取 `mode`（用户请求的）——
   // 请求了模式 B 但驱动没起来的机器实际跑在别的模式上。
   const shared = (ds?.effective_mode || ds?.mode) === 'share';
+  // 虚拟设备那一块的判据。取**请求**的模式，不取生效的——理由在 `PeerDevices` 上。
+  const wantsModeB = useStore(requestedMode) === MODE_B;
   const tr = peer.transport || {};
 
   // 卡片指标区按 `dir`（本机视角）分栏，这里用**同一个函数**——
@@ -569,7 +641,18 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
             </button>
           ))}
         </div>
-        <EndpointField fp={fp} tier={tier} endpoint={endpoint} reset={tr.endpoint_reset_from} />
+        {/* ---- 虚拟设备（用户第 18 条）----------------------------------
+            接在四个档位按钮**之后**：先说这条链路怎么连，再说它在系统里长成
+            哪两台设备。判据 `requestedMode === 'b'` 见 `PeerDevices` 的注释——
+            这里判、组件不判，两处都判会分岔。 */}
+        {wantsModeB ? <PeerDevices peer={peer} /> : null}
+        {/* ---- 隧道地址（用户第 19 条：属于「单连接复用」，按条件显示）------
+            判据**不是**照字面的 `tier === 'tier2'`：那会造出一个存得下、看不见、
+            删不掉的设置（daemon 选承载的判据是「或」）。三条判据收在
+            `endpointVisible()` 里，理由与真值表都在那个函数上。 */}
+        {endpointVisible(tier, endpoint, tr.endpoint_reset_from)
+          ? <EndpointField fp={fp} tier={tier} endpoint={endpoint} reset={tr.endpoint_reset_from} />
+          : null}
       </div>
 
       {/* ---- 两个档位的权威解释 --------------------------------------------
@@ -587,7 +670,11 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
 }
 
 /**
- * 设置页那张只读总览用得到：一台对端四个档的文本形态。
+ * **统计诊断页**那张只读总览用得到：一台对端四个档的文本形态。
+ *
+ * （它曾经在设置页。用户 2026-08-10 第 10 条把它搬去了统计诊断页——那一页的分工
+ * 就是「跨对端的只读汇总」，而设置页是「本机的全局配置」，可这四个值从 §15 起
+ * 已经不是全局的了。见 docs/plan.md §17。）
  *
  * # 这里为什么不再有「规范化」这一步
  *

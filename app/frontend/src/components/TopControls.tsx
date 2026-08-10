@@ -122,7 +122,11 @@ function StatusControl() {
         data-testid="chrome-status"
         aria-label={`${t('chrome.status.title')}: ${label}`}
         aria-describedby={panelId}
-        title={label}
+        /* No `title`, unlike the other two buttons. Both it and the popover
+           open on hover, so Windows draws its native tooltip on top of the
+           panel -- covering the panel's own first line, which says the same
+           word. Found on 30-win. The other two keep their titles: their
+           popovers are click-driven, so the two never appear together. */
       >
         <span className={`dot ${cls}`} aria-hidden="true" />
       </button>

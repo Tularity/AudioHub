@@ -114,9 +114,14 @@
      比对（test/ui2/darkdiff.mjs）把这条抓了出来，所以现在是两个。 */
   --accent-lift: #3ad6bd;  /* 实底控件的渐变亮端 */
   --accent-glow: #6ee7d2;  /* 电平/码率条的渐变亮端 */
-  /* 瀑布图/构成条的分类色。它们要互相可分辨，不参与语义配色。 */
+  /* 瀑布图/构成条的分类色。它们要互相可分辨，**不参与语义配色**。
+     --hue-buffer 原先直接用 --warn，那是把「警示」和「第三种分类」混成了一个值：
+     语义色是按**文字对比度**定的，而这里它只做**填充**，没有字压在上面。深色下两者
+     恰好同值所以看不出来；浅色下 --warn 压暗成 #7d5a0e（为了做正文合规），当填充
+     就是一团发闷的橄榄色——30-win 的落地验证点名了这一条。拆开之后深色一字未变。 */
   --hue-net: #6ea8fe;
   --hue-play: #b48ef0;
+  --hue-buffer: #e0a83f;
   /* 三处模态浮层共用的同一条投影。浅色下这条最需要单独收，所以提成 token。 */
   --shadow-modal: 0 32px 80px -16px rgba(var(--sh-rgb), .68);
 
@@ -269,6 +274,8 @@
   --accent-glow: #1aa892;
   --hue-net: #3b6fd4;
   --hue-play: #7c4fc0;
+  /* 只需与上面两色可分辨，不需要满足正文对比度——所以比 --warn 亮得多。 */
+  --hue-buffer: #d18700;
 
   --shadow: 0 1px 2px rgba(var(--sh-rgb), .06), 0 8px 24px -8px rgba(var(--sh-rgb), .12);
   --shadow-lift: 0 2px 6px rgba(var(--sh-rgb), .08), 0 16px 40px -12px rgba(var(--sh-rgb), .18);
@@ -1107,7 +1114,7 @@ body[data-window-controls="right"] .chrome-pop {
 }
 .band-network { background: var(--hue-net); }
 .band-capture { background: var(--accent); }
-.band-buffer { background: var(--warn); }
+.band-buffer { background: var(--hue-buffer); }
 .band-playback { background: var(--hue-play); }
 /* 读不到时四段等宽且几乎透明：那是「还没测到」的形状，不是「四段一样长」的结论。 */
 .metric-band[data-empty] .band-seg { background: var(--fill-3); }
@@ -1968,7 +1975,7 @@ canvas.spark { width: 160px; height: 36px; display: block; }
 .wf-seg { flex-basis: 0; border-radius: 2px; transition: flex-grow .4s var(--ease-out); }
 .wf-network { background: var(--hue-net); }
 .wf-capture { background: var(--accent); }
-.wf-buffer { background: var(--warn); }
+.wf-buffer { background: var(--hue-buffer); }
 .wf-playback { background: var(--hue-play); }
 .wf-residual { background: var(--fill-muted); }
 /* 分项全未知：**不画任何比例**——随手给一组比例等于宣称测到了它们。 */

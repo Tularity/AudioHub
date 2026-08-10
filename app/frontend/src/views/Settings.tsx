@@ -99,7 +99,7 @@ function PermissionsCard() {
   return (
     <section className="card block" data-testid="settings-permissions">
       <h3 className="block-title">{t('settings.perm.title')}</h3>
-      <p className="muted">{t('settings.perm.desc')}</p>
+      <p className="muted">{IS_MAC ? t('settings.perm.descMac') : t('settings.perm.descWin')}</p>
       <div className="perm-list" data-testid="settings-perm-list" hidden={perms.list.length === 0}>
         {perms.list.map((p) => (
           <PermissionRow key={p.id} perm={p} prefix="settings-perm" busy={perms.busy} onAction={onAction} />

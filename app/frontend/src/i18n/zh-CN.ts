@@ -1023,7 +1023,11 @@ export const zhCN = {
   'settings.about.version': '版本 {version}',
 
   'settings.perm.title': '系统权限',
-  'settings.perm.desc': 'macOS 的规则是：一项权限被拒绝后，应用无法再次弹窗询问，只能到系统设置里手动打开。这里显示的是本机服务实时探测到的状态，不是记住的旧结果。',
+  'settings.perm.descMac': 'macOS 的规则是：一项权限被拒绝后，应用无法再次弹窗询问，只能到系统设置里手动打开。这里显示的是本机服务实时探测到的状态，不是记住的旧结果。',
+  // Windows 侧 daemon 对每一项都回「本平台无需授权」（core/audiohub-core/src/
+  // permissions.rs 的 not(macos) 分支），所以开头这句不能照抄 macOS 的规矩——
+  // 那会让整段说明与它下面每一行自相矛盾。
+  'settings.perm.descWin': '本平台不按应用逐项授予音频权限，下面各项通常直接可用。这里显示的是本机服务实时探测到的状态，不是记住的旧结果。',
   'settings.perm.recheck': '重新检查',
   'settings.perm.unsupported': '当前服务不提供权限查询接口（daemon 版本较旧），无法在此显示或申请权限。',
   'settings.perm.error': '权限探测失败：{message}',

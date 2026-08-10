@@ -160,18 +160,22 @@
 
   /* 浮动头部。系统在顶栏里占掉的那一段——**哪一端被占，取决于平台**：
      macOS 的红绿灯在前缘，Windows 的最小化/最大化/关闭在后缘。所以不写
-     `--traffic-w`（它把「macOS 的红绿灯」焊死进了变量名），而是一对**方向性**变量，
-     由 body[data-window-controls] 各赋一次值（见 lib/platform.ts）。
+     `--traffic-w`（它把「macOS 的红绿灯」焊死进了变量名），而是一个**方向性**变量，
+     由 body[data-window-controls] 赋值（见 lib/platform.ts）。
 
      缺省值按「系统不占任何一端」给：浏览器态（网页访问 plan §7.5）没有窗口按钮，
-     两侧都归零，徽标就贴着 20px 的边距走。下面两条平台规则各改其中一个。
+     让位归零。
 
      ⚠ 这推翻了 docs/spec-ui.md §2 原先「双平台逐像素一致」的冻结口径，已同步改成
      「布局结构一致；仅让位方向随平台标题按钮方位镜像」。依据：项目 CLAUDE.md 的原话
      是「统一布局**优先**」，而这里的差异不是审美选择——是 Apple 和微软把按钮放在了
-     不同的一端。 */
+     不同的一端。
+
+     **--chrome-lead 已删**（原为 0px / macOS 下 100px）：它是给左上角那枚品牌区
+     让位用的，而品牌区改成背景水印之后就没有任何元素落在前缘了——红绿灯 x∈19..79，
+     离它最近的导航胶囊在窗口正中（最窄 860px 窗口下起于 x≈211），中间隔着 132px，
+     没有可让的位。留着一个没有消费者的变量，只会让下一个人以为前缘的间距归它管。 */
   --chrome-h: 64px;
-  --chrome-lead: 0px;
   --chrome-trail: 0px;
   /* 顶栏两侧元素与窗口边缘的呼吸距离。徽标与自绘标题按钮共用这一个数。 */
   --chrome-gap: 20px;
@@ -227,6 +231,29 @@
  * 投影另起一套而不是只换墨色：深色下的 .68 黑放到白底上是一团脏，浅色投影要
  * **更浅、更散、带一点冷调**（#0f172a 而不是纯黑），这是浅色界面能不能读作干净的
  * 分水岭。--sh-rgb 与几条复合投影因此一起覆盖。
+ *
+ * ---- 玻璃：浅色走**磨砂**，不走通透 ----
+ *
+ * Apple 自己在 26.1 把这件事变成了用户可选项，两档的官方名字是 **Clear / Tinted**
+ * （iOS/iPadOS：设置 > 显示与亮度 > Liquid Glass；macOS：系统设置 > 外观 >
+ * Liquid Glass）。Apple 对 Tinted 的原话是 "more contrast and increased opacity"。
+ * 本项目**固定走 Tinted 那一档的读感**——不是去对齐系统当前的设定（系统也没有开放
+ * 任何 API 让人读到这个偏好，Apple DTS 明确不建议按它调 UI），而是因为浅色底下
+ * 透出来的是**亮的内容**，通透一分就多一分花字。
+ *
+ *   · .72 → .86   透过去的还剩一点位置感，但已经不参与前景的对比度
+ *   · blur 20 → 13px  底色都快不透明了，模糊再开大只是在烧 GPU：
+ *     backdrop-filter 的开销随**被模糊的面积**走，而这层是常驻的
+ *   · saturate 180% → 115%  那 180% 是补深色下模糊吃掉的彩度；这里只剩 14% 的
+ *     底透得过来，补彩度已经没有对象
+ *   · 顶部那道白色径向高光**整条删掉**——见下面「为什么浅色不能用光影」
+ *
+ * 与 Apple 自家浅色玻璃的实测对照（apple.com 的 nav.globalnav，2026-08 实测）：
+ * 它是 `rgba(255,255,255,.8)` + `blur(20px) saturate(1.8)`，而且**零边框、零投影**。
+ * 不透明度这一档我们比它还厚一点（.86），方向一致；模糊按上面的理由收窄；
+ * 边框我们**保留**一条发丝——Apple 那条 nav 是网页，不必考虑 Windows 的
+ * forced-colors：那个模式会把 backdrop-filter 与 box-shadow 全部剥掉，届时这条
+ * 1px 实边是胶囊唯一还看得见的轮廓。它是可访问性兜底，不是装饰。
  */
 :root[data-theme="light"] {
   color-scheme: light;
@@ -268,7 +295,15 @@
   --fill-faint: #c3cad6;
   --knob: #ffffff;
   --thumb: #ffffff;
-  --placeholder: #8b95a5;
+  /* 占位符也是**要读的字**（「IP 或 IP:端口」「对方 PIN」告诉用户该填什么），
+     不是装饰，所以它归 WCAG 1.4.3 管。原值 #8b95a5 压在输入框底色 #eceef3 上只有
+     2.61:1，连 AA 都够不着——这一条是这次做输入框材质时量出来的，不是新引入的。
+     #616a7a → 4.70:1（AA）。明度阶仍然分得开：--text 15.00 > --text-dim 8.05 >
+     占位符 4.70，占位符一眼还是「浅一档的提示」，不会被误读成已填内容。
+     ⚠ 与深色侧的 --placeholder 不是同一个值也不该被合并：那边是 #5f6979 压在
+     #0f1115 上（3.40:1，见 test/ui2/contrast.mjs 的输出，**深色这条仍未达标**，
+     属于既有问题，本轮不动深色故未修）。 */
+  --placeholder: #616a7a;
   --on-accent: #ffffff;
   --accent-lift: #0f8474;
   --accent-glow: #1aa892;
@@ -281,18 +316,158 @@
   --shadow-lift: 0 2px 6px rgba(var(--sh-rgb), .08), 0 16px 40px -12px rgba(var(--sh-rgb), .18);
   --shadow-modal: 0 32px 80px -16px rgba(var(--sh-rgb), .24);
   --glass-shadow: 0 2px 6px rgba(var(--sh-rgb), .07), 0 18px 44px -12px rgba(var(--sh-rgb), .18);
-  /* 玻璃描边在浅色下靠**暗环**成形，白色高光在白玻璃上是看不见的。 */
-  --glass-edge:
-    inset 0 1px 0 rgba(var(--hl-rgb), .9),
-    inset 0 0 0 .5px rgba(15, 23, 42, .08);
+
+  /* 磨砂：底色抬到 .86 且**不叠任何渐变**。深色那条 --glass-fill 的第一层是顶部
+     径向白光，在这里必须整条去掉——白光打在白玻璃上不是「有光」，是「有个凸起」。 */
+  --glass-fill: rgba(var(--glass-rgb), .86);
+  --glass-blur: blur(13px) saturate(115%);
+  /* 描边只剩一条**均匀**的暗环：四边同权重，因此读作「边界」而不是「光从上边来」。
+     上一版这里是 `inset 0 1px 0 rgba(255,255,255,.9)` —— 一道 90% 的白色顶缘，
+     正是它把胶囊和按钮推成了塑料件。 */
+  --glass-edge: inset 0 0 0 .5px rgba(var(--sh-rgb), .12);
 
   /* alpha 与深色侧同为 .042，但**这不是抄过来的**——上面那张表里「叠水印」那一列
      就是按这个 alpha 算的，五个颜色都是在它之下定的。改 alpha 要连着改那五个值。 */
   --watermark-ink: rgba(10, 109, 95, .042);
 }
 
+/* ════════════ 浅色的材质语言 ════════════
+ *
+ * ---- 为什么浅色不能沿用深色的光影 ----
+ *
+ * 上面那一整块只换了**颜色**。颜色换完，浅色下的按钮和输入框仍然是错的——因为错的
+ * 不是色值，是**材质**：同一笔光影在深底上读作「材质」，在浅底上读作「立体零件」。
+ *
+ *   · 顶缘一道白线，在深色上是「玻璃的高光边」；在白卡上是**倒角（bevel）**。
+ *   · 内侧一圈暗影，在深色上几乎看不见；在浅色上是**被抠进去的槽**。
+ *   · 竖向双色渐变，在深色上是「上面亮一点」；在浅色上是 Aqua 时代的**塑料按钮**。
+ *
+ * 前两条不是我们的发挥。NN/g 在总结「扁平化之前的可点击信号」时点的正是这两样：
+ *   "obvious — but often ugly — signifiers of clickability (such as **glossy,
+ *    raised effects on buttons**, or **inset shadows that made input fields
+ *    appear empty**)"   —— nngroup.com/articles/flat-design-long-exposure/
+ * 也就是说：用户指着按钮和输入框说「奇怪」，指到的就是这条判据的两个原型。
+ *
+ * 三样都是拟物（skeuomorphism）的判定特征，而且它们的强度不是线性的：把 alpha 调
+ * 小并不能让「凸起」变成「平的」，只能让它变成「不明显的凸起」。所以浅色这一侧不是
+ * 把深色的参数按比例缩放，而是**换一套表达层次的手段**：
+ *
+ *     深色：用光（高光 / 内阴影 / 渐变）表达上下关系
+ *     浅色：用**色阶与留白**表达上下关系，光影只留「真实投影」这一种
+ *
+ * 「真实投影」指 --shadow / --shadow-lift 这类**外投影**：那是物体挡住光留下的，
+ * 浅色界面里合法且必要（卡片要浮起来）。被删掉的是**模拟表面曲率**的那几笔。
+ *
+ * 这条分工不是这里发明的，两边都有出处：
+ *   · Apple（WWDC25 "Get to know the new design system"）："We've all added extra
+ *     backgrounds or borders to give buttons the right weight… **Instead of
+ *     relying on decoration, hierarchy should be expressed through layout and
+ *     grouping.**"
+ *   · Material 3 把同一件事写成了 M2→M3 的差异："**Using color instead of shadows
+ *     to communicate elevation**"，并要求「只在需要与花哨背景分离时才用阴影」。
+ * 顺带一提，Apple 对浅色底的投影也有明确口径——玻璃元素「**lowers the opacity of
+ * its shadow when it is over a solid light background**」，这正是上面那三条
+ * --shadow* 在浅色侧整体压淡的依据（那一版已经做了，这里只是补上它的来历）。
+ *
+ * ---- 这一节为什么是覆盖规则，而不是再加一批 token ----
+ *
+ * 因为深色侧每一处高光的 alpha 都是各自调出来的（.045 / .06 / .07 / .14 / .16 /
+ * .3），没有两处相同；做成 token 等于一个站点一个 token，读起来更差。而写成
+ * `:root[data-theme="light"] …` 的覆盖，**深色在结构上不可能被改到**——选择器根本
+ * 匹配不上。darkdiff（test/ui2/darkdiff.mjs）因此对这一节恒为绿，不是靠自觉。
+ *
+ * 增删控件时的规矩：新控件若在深色下用了 inset 高光或 inset 暗影，**必须**在这一节
+ * 里补一条把它关掉，否则它在浅色下会是这一屏里唯一的塑料件。
+ */
+
 /* 浅色下 hover 不能再「提亮」：往白的方向走等于把按钮擦掉。同一个手势换成压暗。 */
 :root[data-theme="light"] .btn:hover { filter: brightness(.965); }
+
+/* ---- ① 取消「倒角」：所有模拟凸起的顶缘高光 ---- */
+
+/* 卡片只留外投影。原本那条 inset 白线在 #ffffff 的卡上本来就看不见，删掉是为了
+   让「浅色不用高光」这条规则没有例外——留一个看不见的例外，下一个人就会照抄它。 */
+:root[data-theme="light"] .card { box-shadow: var(--shadow); }
+:root[data-theme="light"] .peer-card:hover { box-shadow: var(--shadow-lift); }
+:root[data-theme="light"] .btn { box-shadow: none; }
+
+/* 主按钮：**扁平实底**。深色下它是 180° 渐变 + 顶缘 30% 白 + 一圈强调色辉光，
+   三样叠在一起在白底上就是一枚上世纪的塑料胶囊（用户点名的那两枚）。
+   浅色下只保留「一块颜色」——层次由它与白卡之间 5.4:1 的明度差承担，不由光承担。 */
+:root[data-theme="light"] .btn.primary {
+  background: var(--accent);
+  box-shadow: none;
+}
+
+/* ---- ② 取消「凹槽」：所有模拟内凹的 inset 暗影 ---- */
+
+/* 输入框是这次最刺眼的一处：深色下 `inset 0 1px 2px` 只是让边缘沉一点，浅色下
+   同一笔变成了**被凿进白卡里的坑**。改法不是把它调淡，是整条去掉，改用
+   iOS 浅色搜索框那一路：**一块比容器略深的实底 + 一条发丝描边**，零光影。
+   描边同时降一档到 --line：底已经有色差了，再压一条 .16 的黑边就成了双重轮廓。 */
+:root[data-theme="light"] .input {
+  box-shadow: none;
+  border-color: var(--line);
+}
+/* 聚焦环保留：那是**状态**，不是材质——而且它是外环，本来就不模拟曲率。 */
+
+:root[data-theme="light"] .select { border-color: var(--line); }
+
+/* 分段控件同理。它原本是「凹槽 + 里面一枚发亮的凸起」，两条拟物特征齐活，
+   在浅色下读起来像一枚物理拨档开关。 */
+:root[data-theme="light"] .segmented {
+  box-shadow: none;
+  border-color: var(--line);
+}
+
+/* PIN 数字块：`inset 0 -14px 22px` 是一笔很重的底部内阴影，在深色下是「凹面」，
+   在浅色下是「一块被压出坑的塑料牌」。换成纯色块，数字本身已经是强调色，够醒目。 */
+:root[data-theme="light"] .pin-digit { box-shadow: none; }
+
+/* 键帽：底缘那条 35% 黑是在画**键盘上真实键帽的下沿**，是本文件里最字面意义的
+   拟物。浅色下换成一条整圈的发丝描边——仍然一眼是「一个键」，但不再假装有厚度。 */
+:root[data-theme="light"] .kbd {
+  box-shadow: none;
+  border-color: var(--edge-strong);
+}
+
+/* ---- ③ 取消「上光」：实底控件上的竖向渐变 ---- */
+
+/* 选中态一律换成**单层色调填充 + 同色发丝环**。渐变的两端在浅色下差得出「上亮
+   下暗」的读感，而这正是塑料按钮的定义。环留下来是因为它承担的是「选中」这个
+   状态的可辨识度，不是立体感——它四边等宽。 */
+:root[data-theme="light"] .nav-marker,
+:root[data-theme="light"] .seg.on {
+  background: rgba(var(--accent-rgb), .10);
+  box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), .22);
+}
+
+/* 顶栏右上那一簇（外观 / 语言 / 状态）也是玻璃，同样只留暗环。 */
+:root[data-theme="light"] #chrome-controls {
+  box-shadow:
+    0 6px 18px -6px rgba(var(--sh-rgb), .16),
+    inset 0 0 0 .5px rgba(var(--sh-rgb), .12);
+}
+
+/* ---- 「降低透明度」：把磨砂推到底 ----
+ * 系统级开关（macOS：辅助功能 > 显示 > 降低透明度；Windows：透明效果）。Apple 对
+ * 自己这一档的描述是「makes Liquid Glass **frostier** and obscures more of the
+ * content behind it」——注意方向：不是把玻璃换成别的东西，是**同一条轴推到底**。
+ * 本文件浅色侧已经站在这条轴的磨砂端（.86），所以这里只需再走完最后一段：
+ * 底色取满、模糊撤掉。
+ *
+ * 撤模糊不只是省电：backdrop-filter 会把元素变成**包含块**，其中 position:fixed
+ * 的后代会被困在里面。少一个 backdrop root，少一类将来才会撞上的定位怪事。
+ *
+ * 两个选择器都要写：`:root[data-theme="light"]`（0,2,0）压得过 `:root`（0,1,0），
+ * 只写后者的话浅色主题下这一整条是哑的。 */
+@media (prefers-reduced-transparency: reduce) {
+  :root,
+  :root[data-theme="light"] {
+    --glass-fill: rgb(var(--glass-rgb));
+    --glass-blur: none;
+  }
+}
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -428,10 +603,7 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
    一条属性一处分叉，不是两套布局。data-window-controls 由 lib/platform.ts 在启动时
    写死一次（'left' = macOS 红绿灯，'right' = Windows 自绘标题按钮）。
 
-   --chrome-lead 取 100px 的来历：macOS 26 把红绿灯放在 x 19.0..79.0（原生值，
-   src-tauri/src/mac_chrome.rs 不写任何坐标，见那里的实测表），再留 21px 呼吸。
    --chrome-trail 取 138px = 46×3，正好是三颗自绘按钮的宽度。 */
-body[data-window-controls="left"] { --chrome-lead: 100px; }
 
 /* ---- 为什么 macOS 这一侧**不再**去对齐红绿灯的中心线 ----
    上一版把 --chrome-h 收到 52px、胶囊与徽标的中心线一并挪到 26px，为的是与 AppKit

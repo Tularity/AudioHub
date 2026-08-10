@@ -24,7 +24,18 @@ const CATALOGUES: Record<Locale, Record<string, string>> = {
   'zh-CN': zhCN,
 };
 
-const DEFAULT_LOCALE: Locale = 'zh-CN';
+/**
+ * 已发布的语种，**顺序即菜单顺序**。加一门语言只该动这一处 + 一个语料文件：
+ * 语言选择器读的就是这个数组，不再另存一份清单。
+ */
+export const LOCALES = Object.keys(CATALOGUES) as readonly Locale[];
+
+export const DEFAULT_LOCALE: Locale = 'zh-CN';
+
+/** 每个语种在选择器里的自称（endonym）——用英文写「Chinese」的菜单是选不动的。 */
+export const LOCALE_ENDONYM: Record<Locale, string> = {
+  'zh-CN': '简体中文',
+};
 
 let current: Locale = DEFAULT_LOCALE;
 

@@ -1,6 +1,8 @@
-//! Giving Windows back the two things `decorations: false` takes away that the
-//! app cannot draw for itself: **Snap Layouts** and the non-client mouse
-//! messages that come with them.
+//! Giving Windows back the things `decorations: false` takes away that the app
+//! cannot draw for itself: **Snap Layouts**, the non-client mouse messages that
+//! come with them, and the **system window menu** on right-click. It also turns
+//! off the one thing `decorations: false` *adds* and should not:
+//! WebView2's browser context menu (see `silence_webview_context_menu`).
 //!
 //! # What this is for
 //!
@@ -41,6 +43,48 @@
 //! `window.__audiohubCaption(kind, value)`; when the frontend has not installed
 //! it yet the eval is a no-op by construction.
 //!
+//! # Snap Layouts does not actually work yet, and the reason is not in this file
+//!
+//! Measured on 30-win (Windows 11 24H2, build 26100, 150% scale) with the code
+//! as it stands. Recorded here because everything on our side now looks right,
+//! so the next reader would otherwise re-derive it:
+//!
+//! * `WM_NCHITTEST` sent straight to our window at the maximize button's centre
+//!   answers **9 = HTMAXBUTTON**. The rectangle below is correct.
+//! * The window has `WS_MAXIMIZEBOX`, `WS_SYSMENU`, `WS_CAPTION` and is not
+//!   `WS_POPUP` — every style prerequisite holds.
+//! * The window is genuinely foreground when tested, and Notepad on the same
+//!   desktop pops the flyout, so the feature is on.
+//! * And the flyout still does not appear.
+//!
+//! `WindowFromPoint` at that same point is what explains it. It does not return
+//! our window:
+//!
+//! ```text
+//! TOP   class='Tauri Window'                pid=142840 (audiohub-app)
+//! MID   class='Chrome_WidgetWin_1'          pid=114384 (msedgewebview2)
+//! LEAF  class='Chrome_RenderWidgetHostHWND' pid=114384 (msedgewebview2)
+//! ```
+//!
+//! WebView2's windowed hosting puts child HWNDs over the whole client area,
+//! including the strip we draw caption buttons on, and **they belong to
+//! `msedgewebview2.exe`, a different process**. Real mouse input is routed to
+//! the deepest child under the cursor, so the OS asks *those* windows to hit
+//! test and never consults ours — our HTMAXBUTTON is only ever seen by someone
+//! who sends `WM_NCHITTEST` directly. The usual escape hatch, subclassing the
+//! child to return `HTTRANSPARENT` over that rectangle, needs a callback inside
+//! the owning process, and `SetWindowSubclass` cannot cross a process boundary.
+//!
+//! So the remaining fix is not a message-handling tweak; it is one of:
+//! stop the webview covering the top strip (costs the design), or move wry off
+//! windowed hosting onto `ICoreWebView2CompositionController`, where the host
+//! owns input routing. Both are larger than this module.
+//!
+//! What is kept here is still necessary: the `WM_NCMOUSEMOVE` handler below
+//! must not swallow the message, because the flyout timer lives in
+//! `DefWindowProc`. That was a second, independent blocker, and any future fix
+//! needs it gone too.
+//!
 //! # Geometry
 //!
 //! The maximize button's rectangle is computed here rather than pushed from the
@@ -56,6 +100,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::OnceLock;
 
 use tauri::{AppHandle, Manager};
+use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -64,8 +109,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, IsZoomed, ShowWindow, HTCLIENT, HTMAXBUTTON, SW_MAXIMIZE, SW_RESTORE, WM_NCHITTEST,
-    WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_SIZE,
+    EnableMenuItem, GetClientRect, GetCursorPos, GetSystemMenu, IsZoomed, PostMessageW,
+    SetForegroundWindow, ShowWindow, TrackPopupMenu, HTCLIENT, HTMAXBUTTON, MENU_ITEM_FLAGS,
+    MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE,
+    SC_SIZE, SW_MAXIMIZE, SW_RESTORE, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN,
+    WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_SIZE,
+    WM_SYSCOMMAND,
 };
 
 /// Caption button box, in logical pixels. **Mirrored in `styles.css` as
@@ -98,6 +147,129 @@ pub fn install(app: &AppHandle, window: &tauri::Window) {
     unsafe {
         let _ = SetWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID, 0);
     }
+}
+
+/// Turn off WebView2's own context menu.
+///
+/// Right-clicking anywhere in the page — including the title strip, which is
+/// client area here — otherwise pops Edge's browser menu: Back, Refresh, Save
+/// as, Print, *Send tab to your devices*. In a desktop app that menu is not a
+/// rough edge, it is a category error: half its entries act on a "page" the
+/// user has no model of, and `Save as` writes the app's own UI to disk.
+///
+/// There is no Tauri setting for it. `WindowConfig` has `devtools`,
+/// `browser_extensions_enabled`, `zoom_hotkeys_enabled` and
+/// `additional_browser_args` (`tauri-utils-2.9.3/src/config.rs:2083-2257`) but
+/// nothing for context menus, and the Windows attribute translation in
+/// `tauri-runtime-wry-2.11.4/src/lib.rs:5053` never calls the wry builder
+/// method that would do it (`WebViewBuilderExtWindows::with_default_context_menus`,
+/// `wry-0.55.1/src/lib.rs:1728`). Tauri owns the builder, so the only way in is
+/// the live settings object behind `with_webview` — which is what wry's own
+/// builder ends up touching anyway (`wry-0.55.1/src/webview2/mod.rs:571`).
+///
+/// `devtools: false` is not a substitute: it removes *Inspect* and leaves the
+/// rest.
+///
+/// The trade-off, stated because it is a real one: this also removes the
+/// cut/copy/paste menu inside text inputs. The keyboard shortcuts are
+/// unaffected, and a browser menu on a text field is a much smaller wrong than
+/// a browser menu on the title bar.
+pub fn silence_webview_context_menu(window: &tauri::WebviewWindow) {
+    let _ = window.with_webview(|webview| {
+        // SAFETY: every call below is an inherent method on a live COM
+        // interface handed to us by Tauri, on the thread that owns the
+        // webview; each returns a `Result` we check before going deeper.
+        unsafe {
+            let Ok(core) = webview.controller().CoreWebView2() else {
+                return;
+            };
+            let Ok(settings) = core.Settings() else { return };
+            let settings: ICoreWebView2Settings = settings;
+            let _ = settings.SetAreDefaultContextMenusEnabled(false);
+        }
+    });
+}
+
+/// Pop the real system window menu (Restore / Move / Size / Minimize /
+/// Maximize / Close) at the cursor.
+///
+/// `decorations: false` means Windows never does this for us: the standard
+/// right-click-the-title-bar gesture reaches a caption we draw ourselves, in
+/// client area, so no `WM_NCRBUTTONUP` is ever generated. The frontend's
+/// `contextmenu` handler on the title strip calls this instead.
+///
+/// `GetSystemMenu(hwnd, false)` — `false` matters: `true` means *revert*, which
+/// destroys the window's copy and hands back null.
+pub fn show_system_menu(window: &tauri::Window) {
+    let Ok(hwnd) = window.hwnd() else { return };
+    // SAFETY: `hwnd` is this window's live handle; see the per-call notes.
+    unsafe { show_system_menu_at(hwnd) }
+}
+
+unsafe fn show_system_menu_at(hwnd: HWND) {
+    // SAFETY: plain query on a live handle. `false` = do not revert.
+    let menu = unsafe { GetSystemMenu(hwnd, false) };
+    if menu.is_invalid() {
+        return;
+    }
+
+    // Windows keeps these in sync for a window with a real frame. Ours has
+    // none, so an unmanaged menu would offer Maximize while already maximized.
+    // SAFETY: plain query on a live handle.
+    let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
+    let state = |enabled: bool| -> MENU_ITEM_FLAGS {
+        MF_BYCOMMAND | if enabled { MF_ENABLED } else { MF_GRAYED }
+    };
+    // SAFETY: `menu` is the window's live system menu, checked above.
+    unsafe {
+        let _ = EnableMenuItem(menu, SC_RESTORE, state(zoomed));
+        let _ = EnableMenuItem(menu, SC_MOVE, state(!zoomed));
+        let _ = EnableMenuItem(menu, SC_SIZE, state(!zoomed));
+        let _ = EnableMenuItem(menu, SC_MINIMIZE, state(true));
+        let _ = EnableMenuItem(menu, SC_MAXIMIZE, state(!zoomed));
+        let _ = EnableMenuItem(menu, SC_CLOSE, state(true));
+    }
+
+    let mut pt = POINT::default();
+    // SAFETY: `pt` is initialised; the call fills it with screen coordinates.
+    if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        return;
+    }
+
+    // Required by `TrackPopupMenu`'s contract: without it the menu does not
+    // dismiss when the user clicks away. muda and tray-icon both do this.
+    // SAFETY: plain command on a live handle.
+    let _ = unsafe { SetForegroundWindow(hwnd) };
+
+    // SAFETY: live menu and window handle; `TPM_RETURNCMD` makes this return
+    // the chosen command instead of posting `WM_COMMAND`.
+    let chosen = unsafe {
+        TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        )
+    };
+    // With `TPM_RETURNCMD` the return value is the command id, not a success
+    // flag; 0 means the user dismissed without choosing.
+    if chosen.0 == 0 {
+        return;
+    }
+    // Post rather than send: `SC_MOVE` and `SC_SIZE` start their own modal
+    // loops, and they must not begin until `TrackPopupMenu` has unwound.
+    // SAFETY: plain message post to a live handle.
+    let _ = unsafe {
+        PostMessageW(
+            Some(hwnd),
+            WM_SYSCOMMAND,
+            WPARAM(chosen.0 as usize),
+            LPARAM(0),
+        )
+    };
 }
 
 /// Push one piece of caption state into the page.
@@ -211,11 +383,14 @@ unsafe extern "system" fn subclass_proc(
         }
 
         WM_NCMOUSEMOVE => {
-            let over = wparam.0 == HTMAXBUTTON as usize;
-            set_hovered(hwnd, over);
-            if over {
-                return LRESULT(0);
-            }
+            set_hovered(hwnd, wparam.0 == HTMAXBUTTON as usize);
+            // Must reach the default window procedure, including — especially —
+            // while the pointer is over the maximize button. The snap-layout
+            // flyout is on a timer that `DefWindowProc` starts from this
+            // message; an earlier revision returned 0 here to keep the default
+            // handling out of the way, and the cost was the entire feature this
+            // module exists for. Hover state is ours to push, but the message
+            // is not ours to eat.
             unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
         }
 

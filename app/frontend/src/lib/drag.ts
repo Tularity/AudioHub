@@ -29,7 +29,7 @@ const INTERACTIVE = [
 // 命令不通时只吼一次：拖不动的时候用户会反复试，每次弹一条 toast 只会更吵。
 let reported = false;
 
-async function call(cmd: 'start_window_drag' | 'toggle_window_zoom'): Promise<void> {
+async function call(cmd: 'start_window_drag' | 'toggle_window_zoom' | 'show_window_menu'): Promise<void> {
   try {
     await tauriInvoke(cmd);
   } catch (err) {
@@ -50,6 +50,27 @@ export function chromeMouseDown(e: { button: number; detail: number; target: Eve
   const el = e.target as Element | null;
   if (el && typeof el.closest === 'function' && el.closest(INTERACTIVE)) return;
   void call(e.detail >= 2 ? 'toggle_window_zoom' : 'start_window_drag');
+}
+
+/**
+ * 右键顶栏。Windows 上这个手势出的应该是**系统窗口菜单**（还原/移动/大小/最小化/
+ * 最大化/关闭）；`decorations: false` 之后顶栏是客户区，系统不会自己弹，得由
+ * `show_window_menu` 命令去 `TrackPopupMenu`。
+ *
+ * `preventDefault()` 是**第二道**防线，不是唯一一道：真正把 Edge 那套浏览器菜单
+ * （后退/刷新/另存为/打印/发送到你的设备）关掉的是 Rust 侧的
+ * `AreDefaultContextMenusEnabled=false`（见 `win_chrome.rs`）。留着这一行是因为它
+ * 在 macOS 的 WKWebView 上同样有效——那边没有对应的 settings 开关。
+ *
+ * macOS 上命令是空操作：AppKit 原生窗口右键标题栏也不出菜单，行为一致。
+ */
+export function chromeContextMenu(e: { preventDefault: () => void; target: EventTarget | null }): void {
+  if (!isTauri()) return;
+  const el = e.target as Element | null;
+  // 输入框/代码块上的右键留给平台自己处理，不抢：那里用户想要的是文本操作。
+  if (el && typeof el.closest === 'function' && el.closest('input,textarea,[contenteditable]')) return;
+  e.preventDefault();
+  void call('show_window_menu');
 }
 
 // 关于「滚轮划过浮动头部那 64px 时不滚动」——这是**有意为之**，不是漏掉的。

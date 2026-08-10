@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import { Watermark, NavPill, DaemonBadge, Overlay, VIEW_TITLE } from './components/Chrome';
 import { CaptionButtons } from './components/CaptionButtons';
-import { chromeMouseDown } from './lib/drag';
+import { chromeContextMenu, chromeMouseDown } from './lib/drag';
 import { Toasts } from './components/Toasts';
 import { ConfirmHost } from './components/ConfirmDialog';
 import { PeersView } from './views/Peers';
@@ -91,7 +91,7 @@ export function App() {
             永远先拿到点击，不会被这里挡掉；Windows 关掉了系统边框（decorations:false），
             后缘那三颗由 CaptionButtons 自己画。徽标待在系统没占的那一端。
             onMouseDown 是窗口拖拽：控件与可选文本由 lib/drag.ts 自己排除。 */}
-        <header id="topbar" onMouseDown={chromeMouseDown}>
+        <header id="topbar" onMouseDown={chromeMouseDown} onContextMenu={chromeContextMenu}>
           <h1 id="view-title">{t(VIEW_TITLE[view])}</h1>
           <NavPill onNavigate={(v) => actions.navigate(v)} />
           <DaemonBadge />

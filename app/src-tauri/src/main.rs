@@ -431,6 +431,22 @@ fn toggle_window_zoom(window: tauri::Window) -> Result<(), String> {
     if zoomed { window.unmaximize() } else { window.maximize() }.map_err(|e| e.to_string())
 }
 
+/// Right-click on the title strip. Windows shows the system window menu there;
+/// with `decorations: false` the strip is client area, so no `WM_NCRBUTTONUP`
+/// is ever generated and the app has to raise the menu itself.
+///
+/// A no-op on macOS, which has no equivalent gesture — the frontend suppresses
+/// the browser menu on that strip either way, so right-clicking the title bar
+/// does nothing there, exactly as it does in a stock AppKit window.
+#[tauri::command]
+fn show_window_menu(window: tauri::Window) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    win_chrome::show_system_menu(&window);
+    #[cfg(not(target_os = "windows"))]
+    let _ = window;
+    Ok(())
+}
+
 /// Windows caption buttons. macOS keeps its real traffic lights, so the
 /// frontend only renders these where the OS puts its controls on the trailing
 /// edge (`lib/platform.ts`); the commands themselves are platform-neutral.
@@ -577,6 +593,7 @@ fn main() {
             show_main_window,
             start_window_drag,
             toggle_window_zoom,
+            show_window_menu,
             minimize_window,
             hide_window,
             is_window_maximized,
@@ -592,10 +609,10 @@ fn main() {
             // `.window()` rather than `Manager::get_window`: the latter is
             // gated behind tauri's `unstable` feature, and the chrome helpers
             // take a `Window` because `on_window_event` hands them one.
-            if let Some(_w) = app
-                .get_webview_window(MAIN_WINDOW)
-                .map(|w| AsRef::<tauri::Webview>::as_ref(&w).window())
-            {
+            if let Some(_wv) = app.get_webview_window(MAIN_WINDOW) {
+                #[cfg(target_os = "windows")]
+                win_chrome::silence_webview_context_menu(&_wv);
+                let _w = AsRef::<tauri::Webview>::as_ref(&_wv).window();
                 #[cfg(target_os = "macos")]
                 mac_chrome::apply(&_w);
                 #[cfg(target_os = "windows")]

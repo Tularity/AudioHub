@@ -43,3 +43,8 @@ windows = { version = "0.61", features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
+# Reaching `ICoreWebView2Settings` to turn off the Edge context menu, which
+# Tauri exposes no setting for — see `win_chrome::silence_webview_context_menu`.
+# Already in the lock at 0.38.2 via tauri / tauri-runtime-wry / wry, and its
+# `windows-core` matches the `windows` line above, so the COM types unify.
+webview2-com = "0.38"

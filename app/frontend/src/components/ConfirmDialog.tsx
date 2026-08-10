@@ -25,6 +25,18 @@ const listeners = new Set<() => void>();
 const emit = () => { for (const fn of [...listeners]) fn(); };
 const subscribe = (fn: () => void) => { listeners.add(fn); return () => listeners.delete(fn); };
 
+/**
+ * 此刻有没有确认框开着。
+ *
+ * 给二级菜单层（`components/Sheet.tsx`）问的：确认框可以开在 Sheet **之上**
+ * （重置指纹、解除配对都是这个形状），而两者的 Esc 监听都在 capture 阶段、
+ * Sheet 注册得更早。Sheet 不问这一句的话，一次 Esc 会把确认框和它底下那整面
+ * 板子一起关掉，用户看到的是自己莫名其妙离开了刚才那一页。
+ */
+export function isConfirmOpen(): boolean {
+  return current !== null;
+}
+
 export function confirmDialog(opts: ConfirmOpts): Promise<boolean> {
   if (current) return Promise.resolve(false); // 同时只允许一个，避免叠层
   return new Promise<boolean>((resolve) => {

@@ -1890,6 +1890,16 @@ body[data-window-controls="right"] .chrome-pop {
 .icon-btn:hover:not(:disabled) { color: var(--text); background: var(--fill-1); }
 .icon-btn:disabled { opacity: .45; cursor: not-allowed; }
 .icon-btn.on { color: var(--danger); border-color: rgba(var(--danger-rgb), 0.333); background: rgba(var(--danger-rgb), 0.078); }
+/* 常驻危险色的图标按钮（详情头那枚「解除配对」入口）。与 `.on` 分开是因为那是
+   一个**状态**（静音开着），这是一个**语气**——它永远是这个颜色。
+   底色留白、只给描边与字色：这枚按钮从一整块红色区域降级而来，可发现性已经减弱
+   一档，再加一块实底会让它反过来比页面上任何正常动作都抢眼。`--danger` 与
+   `--danger-rgb` 在深浅两套里各自成立，所以这里不写死颜色。 */
+.icon-btn.danger { color: var(--danger); border-color: rgba(var(--danger-rgb), 0.333); }
+/* hover 的底色取 0.078 而不是 `.btn.danger:hover` 的 0.102：同色文字压在自己的
+   10.2% 淡底上，浅色主题下对比度是 4.46，差 0.04 到 AA。`.icon-btn.on` 早就用的
+   0.078，这里跟它——`lightTheme.test.ts` 那条「文字压在自己颜色的淡底上」会算。 */
+.icon-btn.danger:hover:not(:disabled) { color: var(--danger); background: rgba(var(--danger-rgb), 0.078); }
 .icon-btn .ico svg { width: 15px; height: 15px; }
 
 /* 滑块：轨道左侧用主色填充到当前值（--vol 由 JS 写入） */
@@ -1977,9 +1987,17 @@ body[data-window-controls="right"] .chrome-pop {
 /* ---- 详情 ---- */
 
 .detail-top { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
-.detail-title { display: flex; align-items: center; gap: 12px; }
-.detail-name { font-size: 20px; font-weight: 700; }
-.detail-online { font-size: 12px; }
+/* 2026-08-10 起这一行挂着两枚图标按钮（别名 ✎ / 危险操作），右边还跟着「重连中…」
+   这种较长的状态文字。gap 从 12 收到 8：两枚按钮之间 12px 会读成两个不相干的东西，
+   而它们是同一族「对这台对端做点什么」的入口。
+   `max-width: 100%` + 下面那条省略号是承重的——长主机名配上两枚按钮，窄窗下会把
+   在线指示挤出可视区，而在线指示恰好是这一行最要紧的一个字。 */
+.detail-title { display: flex; align-items: center; gap: 8px; max-width: 100%; }
+.detail-name {
+  font-size: 20px; font-weight: 700;
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.detail-online { font-size: 12px; flex: none; }
 
 .fp-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .fp-full {
@@ -2041,13 +2059,10 @@ body[data-window-controls="right"] .chrome-pop {
 
 /* ---- 配对向导 ---- */
 
-.pair-grid { display: grid; grid-template-columns: 1fr 1.2fr; gap: 16px; align-items: start; }
-@media (max-width: 900px) { .pair-grid { grid-template-columns: 1fr; } }
-
-.pair-col { min-height: 260px; }
-.pair-idle { display: flex; flex-direction: column; gap: 16px; align-items: flex-start; }
+/* 单栏。原来这里有 `.pair-grid` / `.pair-col` / `.pair-idle` / `.pair-tip` 四条规则，
+   服务的是左右两栏那版布局；「让对方找到我」收进二级菜单之后它们再没有宿主，
+   一并删掉——留着的死规则下一次改版会被当成还在用的东西读。 */
 .pair-active { display: flex; flex-direction: column; gap: 16px; align-items: center; padding: 8px 0; }
-.pair-tip { font-size: 12px; color: var(--text-dim); }
 
 .pin-display { display: flex; gap: 8px; justify-content: center; perspective: 500px; }
 .pin-digit {
@@ -2077,7 +2092,11 @@ body[data-window-controls="right"] .chrome-pop {
 }
 .ring-text { fill: var(--text); font-size: 16px; font-weight: 650; font-family: var(--font); }
 
-.scan-row { display: flex; align-items: center; gap: 12px; }
+.scan-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+/* 扫描窗口的剩余秒数。等宽数字，免得倒数时整行左右抖。 */
+.scan-remain { font-size: 12px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+/* 「让对方找到我」推到行尾：它和扫描不是一回事，隔开读起来才不像同一组操作。 */
+.scan-armed { margin-left: auto; }
 .spinner {
   display: inline-block;
   width: 14px; height: 14px; flex: none;
@@ -2096,7 +2115,19 @@ body[data-window-controls="right"] .chrome-pop {
 }
 .disc-item:hover { transform: translateY(-2px); border-color: var(--line-strong); box-shadow: 0 10px 26px rgba(var(--sh-rgb), .3); }
 .disc-main { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; }
+.disc-tags { display: flex; align-items: center; gap: 6px; flex: none; }
 .disc-sub { font-size: 12px; color: var(--text-dim); font-family: var(--mono); }
+
+/* 「陈旧」的那一行：有一阵子没再答复了，但地址多半还有效，所以**仍然可点**——
+   只是不许和两秒前刚答复过的长成同一个样子。
+
+   退法只动 color 与 opacity：不碰背景、不碰阴影。浅色下用文字色去画出一层底或一圈
+   辉光，正是刚清理掉的那类脏发光；而整块 `opacity` 会把「陈旧」这枚标记本身也一起
+   洗淡，那恰恰是这一行现在最该读到的字。悬停时主名回到正常色，因为那一刻它就是
+   用户正要按下去的目标。 */
+.disc-item.stale strong { color: var(--text-dim); font-weight: 600; }
+.disc-item.stale .disc-sub { opacity: .68; }
+.disc-item.stale:hover strong { color: var(--text); }
 
 .divider { border-top: 1px solid var(--line); margin: 4px 0; }
 
@@ -2395,10 +2426,12 @@ body[data-window-controls="right"] .chrome-pop {
 
 /* ---- 确认框 ---- */
 
-/* z-index 55：压过授权门(40)，但仍在 #overlay(50) 之上——确认框是用户刚按下的
-   那个动作的直接回应，任何东西盖住它都会变成「点了没反应」。 */
+/* z-index 62：压过授权门(40)、#overlay(50) 与二级菜单 .sheet-scrim(60)——确认框是
+   用户刚按下的那个动作的直接回应，任何东西盖住它都会变成「点了没反应」。
+   原值 55 只压得过前两者；2026-08-10 之后「重置指纹」「解除配对」这类危险按钮开在
+   Sheet **里面**，55 会让它们弹出的确认框整个被 Sheet 的遮罩盖住。 */
 .confirm-mask {
-  position: fixed; inset: 0; z-index: 55;
+  position: fixed; inset: 0; z-index: 62;
   display: flex; align-items: center; justify-content: center;
   padding: 24px;
   background: rgba(var(--bg-rgb), .72);
@@ -2834,6 +2867,17 @@ body.is-tauri .gate-drag {
   margin-top: 12px; padding-top: 10px;
   border-top: 1px dashed var(--line);
 }
+/* 虚拟设备清单（用户 2026-08-10 第 18 条：并入「连通方式」下面）。曾经是详情页
+   上一张独立的 `.card.block`，所以这里要把那张卡的纵向节奏补回来——同一条虚线
+   分隔与隧道地址那一格对齐，两者是「连通方式」之下并列的两小节。 */
+.transport-devices {
+  display: flex; flex-direction: column; gap: 10px;
+  margin-top: 12px; padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
+/* 槽位/代号那串靠右。原先靠 `.dev-inv-head .block-title { margin-right: auto }`
+   实现，而标题在这里降成了 h4，所以把「吃掉空白」的活儿交给标题行本身。 */
+.transport-devices .dev-inv-head .title-row { margin-right: auto; }
 
 /* 两个档位的权威解释。收起态是默认：那两段各有五六行，常驻会把四个控件挤下屏。
    开关做成一条低调的文字按钮而不是图标——「这两个档位是什么？」自己就是标签，
@@ -3011,3 +3055,45 @@ body.is-tauri .gate-drag {
 .sheet-alias { display: flex; align-items: center; gap: 4px; opacity: .5; margin-left: 4px; }
 .sheet-unset { color: var(--text-dim); font-size: 12px; }
 .sheet-foot { margin: 12px 0 0; font-size: 12px; color: var(--text-dim); }
+
+/* ---- 二级菜单（components/Sheet.tsx） ---- */
+
+/* 只在 Sheet 内部生效，速查表原有的 `.sheet-row` 一行行的形状不受影响。
+   `.sheet-scrim` 的 z-index 仍是 60；开在它之上的 `.confirm-mask` 是 62。 */
+.sheet-head { display: flex; align-items: center; gap: 7px; margin-bottom: 12px; }
+.sheet-head .sheet-title { margin: 0; }
+.sheet-body { display: flex; flex-direction: column; gap: 2px; }
+.sheet-actions {
+  display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+  margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line);
+}
+/* 危险动作靠左推开，与「关闭」拉出距离：两枚按钮并排且只差一个词的时候，
+   点错的代价完全不对等。 */
+.sheet-actions > .danger-slot { margin-right: auto; }
+/* Sheet 里放整块设置行时给它一点呼吸，不然行与行贴在一起读不出边界。 */
+.sheet-body .setting-row { padding: 8px 0; }
+/* Sheet 里那句**后果**（plan §3.1 第 4 类，界面上仅存的四处之一）。`.sheet-body`
+   的 2px 行距是给一行行的设置行用的；一段解释贴在输入框下方 2px 处会被读成输入框
+   自己的提示，而它说的是按下「保存」之后会发生什么。 */
+.sheet-effect { margin-top: 10px; line-height: 1.6; }
+/* 卡片自己的 focus 环不另写：全局那条 `:focus-visible { outline: … var(--ring) }`
+   已经管到它，而重写一条 `var(--accent)` 的会在浅色下把环画成正文墨色
+   （`lib/lightTheme.test.ts` 逐字挡着这件事）。 */
+/* 权限面板比速查表宽：每行右侧还挂着一枚动作按钮。 */
+.sheet-card.wide { width: min(560px, calc(100vw - 64px)); }
+
+/* ---- 设置 › 杂项 ---- */
+
+/* 指纹框本身就是复制按钮（不是 <code> 上挂 onClick——那对键盘与读屏用户等于
+   删掉了复制入口）。外观沿用 .fp-full，只补按钮才需要的那几条。 */
+.fp-copy {
+  font-family: var(--mono); font-size: .92em;
+  text-align: left; cursor: pointer;
+  transition: border-color .14s var(--ease-out), background .14s var(--ease-out);
+}
+.fp-copy:hover:not(:disabled) { border-color: rgba(var(--accent-rgb), .45); }
+.fp-copy:disabled { cursor: default; color: var(--text-dim); }
+
+/* 名称输入 + 两枚按钮。窄窗下换行而不是把输入框压成一条缝。 */
+.name-field { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.name-field .input { width: 200px; max-width: 100%; }

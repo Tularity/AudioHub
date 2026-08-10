@@ -84,12 +84,16 @@ const STATUS_LABEL: Record<string, MsgKey> = {
  *
  * The detail (fingerprint, control port, host name) moved from an inline
  * expansion to a floating panel, which is what makes room for it to be *more*
- * than the two values it used to show. It opens on hover and on focus:
- * `:focus-within` in CSS is what gives keyboard and touch users a way in, since
- * hover exists for neither. The values also stay in the DOM whether the panel
- * is shown or not, so automation and screen readers reach them regardless --
- * and `docs/plan.md` §7.6 already put a permanent copy in Settings › 本机身份
- * as the real fallback, which is still there.
+ * than the two values it used to show.
+ *
+ * It opens on hover and on focus. `:focus-within` is the keyboard path, and it
+ * is a real path now rather than the dead rule the old badge would have had --
+ * this is an actual `<button>` because it actually opens something. Note it is
+ * *not* a click path on macOS: WebKit does not focus a button on click unless
+ * Full Keyboard Access is on. The permanent, always-reachable copy of all
+ * three values is the Settings › 本机身份 block (`docs/plan.md` §7.6), which
+ * is what the touch and screen-reader story rests on; the values here also
+ * stay in the DOM either way, so automation reads them regardless.
  */
 function StatusControl() {
   const conn = useStore((s) => s.conn);

@@ -597,9 +597,15 @@ body[data-window-controls="right"] #chrome-controls {
 /* ---- 浮层（状态详情 / 语言菜单） ---- */
 
 /* 第三块玻璃，但只在打开时存在，所以不违反「一屏少用」——它与导航胶囊不会长期共存。
-   收起状态用 visibility 而不是 display:none：节点留在无障碍树与自动化的可读范围里
-   （plan §7.6 的老约定，形态变了但约定没变），同时 visibility 又是可过渡的，
-   淡出走完才真正撤掉命中区域。 */
+
+   收起状态用 visibility 而不是 display:none，理由是 visibility **可过渡**：
+   透明度淡完之后才真正撤掉命中区域，中途不会出现「看得见但点不到」的一帧。
+
+   ⚠ 与老 `.badge-ident` 的差别要说清楚：那一版用 `max-width:0` 收，节点留在
+   **无障碍树**里；`visibility:hidden` 会把节点移出无障碍树。这是**更好**的行为
+   而不是退步——读屏用户不该在每一屏都被念一串十六进制指纹，他们的通路是
+   **聚焦即展开**（下面的 :focus-within），以及设置页那块常驻的「本机身份」。
+   自动化不受影响：节点仍在 DOM 里，textContent 照常可读。 */
 .chrome-pop {
   position: absolute;
   top: calc(100% + 8px);

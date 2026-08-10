@@ -1069,7 +1069,7 @@ fn claim_ticket(inner: &Arc<DaemonInner>, ticket_b64: &str) -> Option<String> {
 /// proved `us → them` works and said nothing about the reverse. Dialling the
 /// other way would produce a failure indistinguishable from a peer that is off.
 fn we_dialled(inner: &DaemonInner, conn: &ConnShared) -> bool {
-    conn.initiator_fp == inner.id.fingerprint
+    conn.initiator_fp == inner.identity().fingerprint
 }
 
 /// Called once per connection, right after it is registered — and it **blocks

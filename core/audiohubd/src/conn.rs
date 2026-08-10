@@ -155,7 +155,7 @@ fn handle_inbound(
     match peek_first(&stream)? {
         ControlMsg::VerifyHello { .. } => {
             let store = PeerStore::load_at(Some(&inner.cfg_dir))?;
-            let mut peer = verify_responder(&mut stream, &inner.id, &store)?;
+            let mut peer = verify_responder(&mut stream, &inner.identity(), &store)?;
             // The peer just told us its computer name (spec-m5b §5.3). Both
             // verify paths refresh it, so a peer that renames its Mac is
             // renamed on ITS virtual devices here at the next connection —
@@ -163,7 +163,7 @@ fn handle_inbound(
             // where a reconnect would have to look.
             peer.last_addr = Some(addr.ip().to_string());
             persist_peer(inner, peer.clone())?;
-            let chan = SecureChannel::establish_responder(stream.into(), &inner.id, &peer)?;
+            let chan = SecureChannel::establish_responder(stream.into(), &inner.identity(), &peer)?;
             // we are the responder, so the peer is the initiator of this TCP
             let initiator_fp = chan.peer().fingerprint.clone();
             let Some(conn) = register_conn(inner, chan, addr.ip(), initiator_fp, None) else {
@@ -182,7 +182,7 @@ fn handle_inbound(
                 );
                 bail!("pairing attempt while pairing not enabled");
             };
-            let outcome = pair_responder(&mut stream, &pin, &inner.id);
+            let outcome = pair_responder(&mut stream, &pin, &inner.identity());
             release_pairing_pin(inner, &pin, outcome.is_ok());
             let mut outcome = outcome?;
             outcome.peer.last_addr = Some(addr.ip().to_string());
@@ -389,7 +389,7 @@ fn mux_handshake(
     preauth: PreauthGuard,
 ) -> Result<()> {
     let store = PeerStore::load_at(Some(&inner.cfg_dir))?;
-    let mut peer = verify_responder(&mut io, &inner.id, &store)?;
+    let mut peer = verify_responder(&mut io, &inner.identity(), &store)?;
     // **The address is the tunnel's, and it is recorded anyway.** On tier 2
     // every peer arrives from the same place — `127.0.0.1` in the local
     // forwarder, the tunnel's exit anywhere else — so this field stops being an
@@ -398,7 +398,7 @@ fn mux_handshake(
     // what plan §4 settled: "身份基于指纹不基于源地址".
     peer.last_addr = Some(addr.ip().to_string());
     persist_peer(inner, peer.clone())?;
-    let chan = SecureChannel::establish_responder(io, &inner.id, &peer)?;
+    let chan = SecureChannel::establish_responder(io, &inner.identity(), &peer)?;
     let initiator_fp = chan.peer().fingerprint.clone();
     let Some(conn) = register_conn(inner, chan, addr.ip(), initiator_fp, Some(link.clone())) else {
         link.kill(); // lost the simultaneous-connect tie-break
@@ -1775,7 +1775,7 @@ pub(crate) fn pair_with(inner: &Arc<DaemonInner>, addr: &str, pin: &str) -> Resu
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     // We advertise the port WE listen on, which for a daemon is its real one —
     // the CLI had to guess the default here because it has no listener at all.
-    let mut outcome = pair_initiator(&mut stream, pin, &inner.id, inner.control_port)?;
+    let mut outcome = pair_initiator(&mut stream, pin, &inner.identity(), inner.control_port)?;
     outcome.peer.last_addr = Some(sa.ip().to_string());
     outcome.peer.port = sa.port();
     let fp = outcome.peer.fingerprint.clone();
@@ -2001,7 +2001,7 @@ pub(crate) fn connect_peer(
             s.set_write_timeout(Some(WRITE_TIMEOUT))?;
             (MuxOnTrial(None), s.into())
         };
-    let verified = match verify_initiator(&mut stream, &inner.id, &store) {
+    let verified = match verify_initiator(&mut stream, &inner.identity(), &store) {
         Ok(v) => v,
         Err(e) => {
             // The peer has removed us. Keeping the pairing would leave a pair
@@ -2059,9 +2059,9 @@ pub(crate) fn connect_peer(
             peer.fingerprint
         );
     }
-    let chan = SecureChannel::establish_initiator(stream, &inner.id, &verified)?;
+    let chan = SecureChannel::establish_initiator(stream, &inner.identity(), &verified)?;
     // we opened this TCP, so our own fingerprint is the tie-break key
-    let initiator_fp = inner.id.fingerprint.clone();
+    let initiator_fp = inner.identity().fingerprint.clone();
     let link = trial.0.clone();
     // From here the mux's fate belongs to `register_conn` and the reader thread
     // below, both of which handle it explicitly.

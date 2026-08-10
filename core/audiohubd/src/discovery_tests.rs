@@ -241,7 +241,7 @@ fn a_startup_override_does_not_rewrite_the_stored_preference() {
 #[test]
 fn a_scan_never_returns_this_machine() {
     let n = Node::start_at(tmpdir("selfscan"), Some(false), /*fault=*/ true);
-    let my_fp = n.h.inner_for_test().id.fingerprint.clone();
+    let my_fp = n.h.inner_for_test().identity().fingerprint.clone();
     let found = n.ok(methods::DISCOVER_RUN, json!({ "secs": 0.5 }));
     let list = found.as_array().expect("discover.run 应当返回一个数组");
     for p in list {

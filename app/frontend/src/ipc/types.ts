@@ -810,6 +810,26 @@ export interface DaemonSettings {
   autostart_reason?: string | null;
   hal_capacity?: number;
   hal_used?: number;
+  /**
+   * 本机名称的**用户覆盖**（用户 2026-08-10 第 9 条）。
+   *
+   * 可写：空串 = 清除覆盖，回到 daemon 的 `local_hostname()`。当前**生效**的名字
+   * 读 `DaemonInfo.name`，不是这个字段——这里存的是「用户要求过什么」，那里是
+   * 「实际叫什么」，`AUDIOHUB_NAME` 生效时两者不一样。
+   *
+   * ⚠ 这个字符串会成为每一台对端系统设备列表里那两台虚拟设备的名字（plan §7.1），
+   * 所以前端与 daemon 各拒一次：前端管长度与空白（`lib/identityName.ts`），
+   * daemon 管它自己的合法性。
+   */
+  name?: string;
+  /**
+   * 生效的那个名字**从哪儿来**：`env`（AUDIOHUB_NAME）/ `custom`（用户覆盖）/
+   * `hostname`（跟随本机）。
+   *
+   * 没有它就分不出「用户设过一个恰好等于主机名的名字」与「跟随主机名」——而这两种
+   * 情况下「恢复默认」一个该亮、一个不该亮。缺席（旧服务）按 `hostname` 读。
+   */
+  name_source?: 'env' | 'custom' | 'hostname' | string;
 }
 
 export interface DiscoverResult {

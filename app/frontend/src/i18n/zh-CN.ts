@@ -18,6 +18,7 @@ export const zhCN = {
   'common.save': '保存',
   'common.clear': '清除',
   'common.close': '关闭',
+  'common.open': '打开',
   'common.copy': '复制',
   // 复制失败在详情页与设置页是同一件事，一条键服务两处——分成两条早晚会各自漂移。
   'common.copyFailed': '复制失败，请手动选择文本',
@@ -671,15 +672,26 @@ export const zhCN = {
   'settings.identity.name': '本机名称',
   'settings.identity.copied': '已复制本机指纹',
   // 点框即复制（无障碍红线：整框是真 <button>，这条是它的 aria-label）。
+  'settings.identity.copyHint': '点击复制本机指纹',
+  'settings.identity.namePlaceholder': '留空则跟随本机名称',
+  'settings.identity.nameDefault': '恢复默认',
   // AUTOHUB_NAME 生效时这一行代替下面那条后果句：改不动的值配一个能编辑的框，
   // 用户只会以为自己保存失败了。
+  'settings.identity.nameEnv': '由环境变量 AUDIOHUB_NAME 指定，此处只读。',
   // §3.1 第 4 类「后果」，获准留在界面上：改名会改掉每台对端系统里那两台虚拟
   // 设备的名字，而对端要等下一次连接才看得到。
+  'settings.identity.renameEffect': '会改掉每台对端系统里那两台设备的名字，对端下次连接时生效。',
+  'settings.identity.reset': '重置',
+  'settings.identity.resetTitle': '重置本机指纹',
+  'settings.identity.pairedCount': '已配对对端',
+  'settings.identity.resetConsequence': '换一对新密钥：现有 {n} 台配对全部失效，需要重新配对。',
   // 两条对应回包里 `restart_required` 的两个分支。**当前的 daemon 恒返回 true**
   // （`LocalIdentity` 被广播、监听与每条控制通道持有，本进程换不掉它），所以线上
   // 只会看到下面那条；上面这条留着是因为那个 bool 是契约的一部分，哪天热替换做得
   // 到了，UI 不必跟着改。不许把它删掉再让界面无条件说「已生效」——那是替 daemon
   // 说了它没说过的话。
+  'settings.identity.resetDone': '本机指纹已重置，全部配对已解除。',
+  'settings.identity.resetRestart': '新指纹已写入，需重启 AudioHub 服务后生效。',
 
   'settings.net.title': '网络',
   'settings.net.announceTitle': '在局域网内广播本机',
@@ -902,6 +914,8 @@ export const zhCN = {
   // 合并一并消失：三组内容已经按模式分开，组标题只剩装饰作用。
   // `modeAVolume.noteInForce` / `.noteIdle`（「当前不生效」）同理是死键——按模式
   // 显示之后它们出现即生效，那句话恒为假。
+  'settings.modeOptions.title': '模式选项',
+  'settings.modeOptions.shareNone': '共享模式没有本机侧的选项：由对端决定怎么用这台机器。',
   'settings.modeAVolume.syncTitle': '与对端音量同步',
   'settings.modeAVolume.muteTitle': '静音本机输出',
   'settings.devices.removeTitle': '断开后移除虚拟设备',
@@ -989,6 +1003,9 @@ export const zhCN = {
   // 这一块——身份、启动、路径，以及权限与快捷键两个二级菜单入口。
   // ⚠ 它**只**收这一类。任何与模式 / 网络 / 设备 / 传输相关的东西都不许进，
   // 否则「杂项」会变成每一个没想清楚归属的开关的去处。
+  'settings.misc.title': '杂项',
+  'settings.misc.permsSummary': '{n} 项 · {pending} 项待授权',
+  'settings.misc.shortcutsSummary': '{n} 个动作 · {custom} 个已自定义',
   // ⚠ `settings.paths.title`（「路径」）已删：那一块并进杂项，只剩下面这一行。
   'settings.paths.configDir': '配置目录',
 
@@ -1130,6 +1147,7 @@ export const zhCN = {
   // ---------------------------------------------------------------- 权限
   // 首次运行自动弹出这块面板时多的那一行（用户 2026-08-10 第 22 条）。
   // 用户自己点开的那次不显示——他知道自己点了。判据见 lib/permIntro.ts。
+  'perm.intro': '这几项决定 AudioHub 能做什么。未授权的功能在调用时会直接失败。',
   'perm.defer': '稍后再说',
   'perm.requesting': '请求中…',
   'perm.action.request': '授权',
@@ -1226,21 +1244,4 @@ export const zhCN = {
 
   'time.uptime': '{hh}:{mm}:{ss}',
   'time.uptimeDays': '{d} 天 {hh}:{mm}:{ss}',
-  'mode.title': '运行模式',
-  'settings.mode.rowTitle': '当前模式',
-  'settings.mode.goto': '前往主面板切换',
-  'settings.mode.downgraded': '当前选定为「{mode}」，但该模式不可用，已临时按模式 A 运行。{hint}',
-  'settings.identity.title': '本机身份',
-  'settings.web.title': '网页访问',
-  'settings.modeAVolume.title': '模式 A · 音量',
-  'settings.modeAVolume.noteInForce': '当前生效（本机正运行于模式 A）。',
-  'settings.modeAVolume.noteIdle': '当前不生效：这两项仅属于模式 A，设置会保留。',
-  'settings.devices.title': '虚拟设备',
-  'settings.bridge.title': '虚拟声卡桥接',
-  'settings.startup.title': '启动',
-  'settings.startup.autostartDescMac': '在「登录项」中注册 AudioHub：每次登录时自动启动，已有的授权继续有效。关闭即删除，不留残余。',
-  'settings.startup.autostartDescWin': '注册一个登录时触发的计划任务（AudioHubDaemon），每次登录时自动启动 AudioHub。关闭即删除，不留残余。',
-  'settings.shortcuts.title': '快捷键',
-  'shortcuts.sheet.customize': '可在「设置 › 快捷键」中修改。',
-  'settings.paths.title': '路径',
 } as const;

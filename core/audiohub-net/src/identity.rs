@@ -86,11 +86,98 @@ pub struct LocalIdentity {
     signing_key: SigningKey,
 }
 
+/// Where the name in force came from. Reported to the UI so 「恢复默认」 can be
+/// armed only when there is actually something to restore, and so the field can
+/// be locked when `AUDIOHUB_NAME` is what is being displayed.
+///
+/// Without it the interface cannot tell "the user set a name that happens to
+/// equal the host name" apart from "following the host name" — two states in
+/// which that button must behave differently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NameSource {
+    /// `AUDIOHUB_NAME` is set. Read-only in the UI.
+    Env,
+    /// `identity.json` carries a `name_override` the user typed.
+    Custom,
+    /// Following `local_hostname()`.
+    Hostname,
+}
+
+impl NameSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NameSource::Env => "env",
+            NameSource::Custom => "custom",
+            NameSource::Hostname => "hostname",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct IdentityFile {
     version: u32,
     name: String,
     secret_b64: String,
+    /// The user's chosen name (plan §7.1 / user instruction 2026-08-10 #9).
+    ///
+    /// `serde(default)` so an identity.json written before this field existed
+    /// still loads — a daemon that cannot read its own identity file is a
+    /// daemon that generates a new key and silently breaks every pairing.
+    ///
+    /// `skip_serializing_if` keeps the file byte-identical to the old shape
+    /// when no override is set, so nothing downgrades badly either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name_override: Option<String>,
+}
+
+/// Reads `identity.json` if it is there and parseable. `None` covers both "no
+/// file yet" and "unreadable", because every caller here treats them the same:
+/// there is no stored override to honour.
+fn read_identity_file(path: &Path) -> Option<IdentityFile> {
+    let bytes = std::fs::read(path).ok()?;
+    let file: IdentityFile = serde_json::from_slice(&bytes).ok()?;
+    (file.version == 1).then_some(file)
+}
+
+/// Trims, drops control characters, and clamps to 48 chars; empty means "no
+/// override".
+///
+/// The UI does this too (`app/frontend/src/lib/identityName.ts`), and that is
+/// deliberate rather than duplicated work: this string becomes the name of two
+/// virtual audio devices in **every peer's** system sound settings, and the CLI,
+/// an older frontend and a hand-edited config file all reach this function
+/// without passing through the UI's copy.
+/// The name-priority rule, as a pure function so it can be tested without
+/// touching the process environment.
+///
+/// `AUDIOHUB_NAME` > stored override > computer name > the file's own copy.
+///
+/// ⚠ **The env var must stay at the top.** regress runs several daemons on one
+/// host and tells them apart with it; letting a value stored in identity.json
+/// outrank it puts every one of those runs on whatever name happened to be
+/// saved, and the misattribution is silent — every log line, every device name
+/// and every peer list entry agrees on the wrong machine.
+fn resolve_name(env: &str, stored: Option<&str>, hostname: &str, file_name: &str) -> String {
+    for candidate in [
+        sanitize_name(env),
+        stored.and_then(sanitize_name),
+        sanitize_name(hostname),
+        sanitize_name(file_name),
+    ] {
+        if let Some(n) = candidate {
+            return n;
+        }
+    }
+    String::new()
+}
+
+fn sanitize_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(48).collect())
 }
 
 impl LocalIdentity {
@@ -111,19 +198,18 @@ impl LocalIdentity {
             if file.version != 1 {
                 bail!("unsupported identity.json version {}", file.version);
             }
-            // The name is read FRESH, not taken from the file: it is what peers
-            // put on the virtual devices they publish for this machine, so a
-            // Mac renamed after AudioHub first ran must announce the new name.
-            // The file's copy is only the fallback. `AUDIOHUB_NAME` overrides
-            // both, which is what lets several test daemons on one host be
-            // told apart.
-            let mut name = std::env::var("AUDIOHUB_NAME").unwrap_or_default();
-            if name.trim().is_empty() {
-                name = local_hostname();
-            }
-            if name.trim().is_empty() {
-                name = file.name.clone();
-            }
+            // The name is NOT simply taken from the file: it is what peers put
+            // on the virtual devices they publish for this machine, so a Mac
+            // renamed after AudioHub first ran must announce the new name. The
+            // file's `name` is only the last fallback.
+            //
+            // Priority lives in `resolve_name` (pure, and tested there).
+            let name = resolve_name(
+                &std::env::var("AUDIOHUB_NAME").unwrap_or_default(),
+                file.name_override.as_deref(),
+                &local_hostname(),
+                &file.name,
+            );
             return Self::from_parts(&name, &file.secret_b64);
         }
         let signing_key = SigningKey::generate(&mut rand_core::OsRng);
@@ -135,9 +221,93 @@ impl LocalIdentity {
             version: 1,
             name: name.clone(),
             secret_b64: BASE64_STANDARD.encode(signing_key.to_bytes()),
+            name_override: None,
         };
         write_atomic(&path, serde_json::to_string_pretty(&file)?.as_bytes(), true)?;
         Ok(Self::from_key(name, signing_key))
+    }
+
+    /// Where the name currently in force came from.
+    ///
+    /// Recomputed from the environment and the file rather than cached on the
+    /// struct: `AUDIOHUB_NAME` is read at load time, but the override can be
+    /// rewritten by `settings.set` while the daemon runs, and a cached copy on
+    /// a value that lives inside an `Arc<DaemonInner>` cannot be updated.
+    pub fn name_source_at(dir: Option<&Path>) -> NameSource {
+        if !std::env::var("AUDIOHUB_NAME").unwrap_or_default().trim().is_empty() {
+            return NameSource::Env;
+        }
+        let base = dir.map(Path::to_path_buf).unwrap_or_else(Self::config_dir);
+        match read_identity_file(&base.join("identity.json"))
+            .and_then(|f| f.name_override)
+            .as_deref()
+            .and_then(sanitize_name)
+        {
+            Some(_) => NameSource::Custom,
+            None => NameSource::Hostname,
+        }
+    }
+
+    /// The stored override as the UI's input box should show it: the user's own
+    /// text when there is one, otherwise the name actually in force.
+    pub fn name_override_at(dir: Option<&Path>) -> Option<String> {
+        let base = dir.map(Path::to_path_buf).unwrap_or_else(Self::config_dir);
+        read_identity_file(&base.join("identity.json"))?
+            .name_override
+            .as_deref()
+            .and_then(sanitize_name)
+    }
+
+    /// Writes (or clears, with `None` / blank) the user's chosen machine name
+    /// and returns the name that is now in force.
+    ///
+    /// The signing key is read back and written out unchanged — this rewrites
+    /// identity.json, and identity.json is where the private key lives, so the
+    /// `secret = true` (0600) argument to `write_atomic` is not optional.
+    ///
+    /// Note what this does NOT do: it does not reconnect to anybody. A peer
+    /// refreshes its copy of this name from the next `VerifyResponse`, so the
+    /// rename lands on its virtual devices when it next connects. The UI states
+    /// that consequence rather than pretending it is instant.
+    pub fn set_name_at(dir: Option<&Path>, name: Option<&str>) -> Result<String> {
+        let base = dir.map(Path::to_path_buf).unwrap_or_else(Self::config_dir);
+        let path = base.join("identity.json");
+        let mut file = read_identity_file(&path)
+            .ok_or_else(|| anyhow!("no usable identity.json at {}", path.display()))?;
+        file.name_override = name.and_then(sanitize_name);
+        write_atomic(&path, serde_json::to_string_pretty(&file)?.as_bytes(), true)?;
+        Ok(Self::load_or_create_at(dir)?.name)
+    }
+
+    /// Throws away this machine's signing key and writes a fresh one, returning
+    /// the new fingerprint.
+    ///
+    /// ⚠ **Every existing pairing dies with the old key.** The caller must have
+    /// already told each paired peer (`SessionMsg::Unpaired`) and cleared the
+    /// trust store: a peer that is not told keeps a pair of virtual devices
+    /// bearing this machine's name, permanently offline and permanently
+    /// redialling, and nothing in its interface can explain them. plan §7.1
+    /// names that exact failure for ordinary unpairing, and swapping the key is
+    /// worse than unpairing — the peer cannot even recognise us afterwards.
+    ///
+    /// The chosen name (`name_override`) is deliberately preserved: the user
+    /// asked to reset an identity key, not to rename their computer.
+    pub fn reset_key_at(dir: Option<&Path>) -> Result<String> {
+        let base = dir.map(Path::to_path_buf).unwrap_or_else(Self::config_dir);
+        let path = base.join("identity.json");
+        let signing_key = SigningKey::generate(&mut rand_core::OsRng);
+        let previous = read_identity_file(&path);
+        let file = IdentityFile {
+            version: 1,
+            name: previous
+                .as_ref()
+                .map(|f| f.name.clone())
+                .unwrap_or_else(local_hostname),
+            secret_b64: BASE64_STANDARD.encode(signing_key.to_bytes()),
+            name_override: previous.and_then(|f| f.name_override),
+        };
+        write_atomic(&path, serde_json::to_string_pretty(&file)?.as_bytes(), true)?;
+        Ok(fingerprint_of(&signing_key.verifying_key().to_bytes()))
     }
 
     pub fn from_parts(name: &str, secret_b64: &str) -> Result<Self> {
@@ -346,4 +516,149 @@ fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
     }
     std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let p = std::env::temp_dir().join(format!("ahb-name-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).expect("mkdir");
+        p
+    }
+
+    #[test]
+    fn the_environment_variable_outranks_everything_including_a_stored_override() {
+        // The rule regress depends on. Tested through the pure function rather
+        // than by setting the variable: `std::env::set_var` is process-global
+        // and cargo runs these tests on threads, so a test that set it would
+        // rename every daemon the other tests in this binary create.
+        assert_eq!(
+            resolve_name("from-env", Some("stored"), "host", "file"),
+            "from-env"
+        );
+        // Blank / whitespace-only is "unset", not "an empty name".
+        assert_eq!(resolve_name("   ", Some("stored"), "host", "file"), "stored");
+        assert_eq!(resolve_name("", None, "host", "file"), "host");
+        assert_eq!(resolve_name("", None, "", "file"), "file");
+        assert_eq!(resolve_name("", None, "", ""), "");
+    }
+
+    #[test]
+    fn the_priority_sanitises_whichever_candidate_wins() {
+        // Every level reaches a peer's device list, so no level may skip the
+        // scrub — including the env var, which regress sets by hand.
+        assert_eq!(resolve_name("a\nb", Some("stored"), "host", "file"), "ab");
+        assert_eq!(resolve_name("", Some(" pad "), "host", "file"), "pad");
+    }
+
+    #[test]
+    fn a_fresh_identity_follows_the_computer_name() {
+        let dir = scratch("fresh");
+        let id = LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
+        assert_eq!(id.name, local_hostname());
+        assert_eq!(
+            LocalIdentity::name_source_at(Some(&dir)),
+            NameSource::Hostname,
+            "nothing was overridden yet"
+        );
+        assert_eq!(LocalIdentity::name_override_at(Some(&dir)), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stored_override_outranks_the_computer_name_and_survives_a_reload() {
+        let dir = scratch("override");
+        LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
+        let now = LocalIdentity::set_name_at(Some(&dir), Some("客厅 Mac")).expect("set");
+        assert_eq!(now, "客厅 Mac");
+        // Reloaded from disk, not from the value we just returned: the whole
+        // point of the field is that it outlives the process.
+        let again = LocalIdentity::load_or_create_at(Some(&dir)).expect("reload");
+        assert_eq!(again.name, "客厅 Mac");
+        assert_eq!(LocalIdentity::name_source_at(Some(&dir)), NameSource::Custom);
+        assert_eq!(
+            LocalIdentity::name_override_at(Some(&dir)),
+            Some("客厅 Mac".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_the_override_goes_back_to_the_computer_name() {
+        let dir = scratch("clear");
+        LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
+        LocalIdentity::set_name_at(Some(&dir), Some("temporary")).expect("set");
+        // Blank means "clear the override", NOT "set the name to empty" — an
+        // empty machine name would reach the peer as two nameless audio devices.
+        let back = LocalIdentity::set_name_at(Some(&dir), Some("   ")).expect("clear");
+        assert_eq!(back, local_hostname());
+        assert_eq!(LocalIdentity::name_source_at(Some(&dir)), NameSource::Hostname);
+        assert_eq!(LocalIdentity::name_override_at(Some(&dir)), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_stored_name_is_stripped_of_control_characters_and_clamped() {
+        let dir = scratch("sanitize");
+        LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
+        let got = LocalIdentity::set_name_at(Some(&dir), Some("  living\nroom\u{7f}  ")).expect("set");
+        assert_eq!(got, "livingroom", "a pasted newline reaches every peer's device list");
+        let long = "x".repeat(80);
+        let clamped = LocalIdentity::set_name_at(Some(&dir), Some(&long)).expect("set");
+        assert_eq!(clamped.chars().count(), 48);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renaming_keeps_the_signing_key_and_therefore_the_fingerprint() {
+        // Rename must not be a quiet re-pairing. Rewriting identity.json is how
+        // the key gets lost, so this asserts the one property that makes the
+        // rewrite safe.
+        let dir = scratch("keeps-key");
+        let before = LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
+        LocalIdentity::set_name_at(Some(&dir), Some("renamed")).expect("set");
+        let after = LocalIdentity::load_or_create_at(Some(&dir)).expect("reload");
+        assert_eq!(after.fingerprint, before.fingerprint);
+        assert_eq!(after.public_key_b64(), before.public_key_b64());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resetting_the_key_changes_the_fingerprint_but_keeps_the_chosen_name() {
+        // The user asked to reset an identity key, not to rename their computer.
+        let dir = scratch("reset");
+        let before = LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
+        LocalIdentity::set_name_at(Some(&dir), Some("studio")).expect("set");
+        let fresh_fp = LocalIdentity::reset_key_at(Some(&dir)).expect("reset");
+        assert_ne!(fresh_fp, before.fingerprint);
+        let after = LocalIdentity::load_or_create_at(Some(&dir)).expect("reload");
+        assert_eq!(after.fingerprint, fresh_fp, "the returned fingerprint is the one on disk");
+        assert_eq!(after.name, "studio");
+        assert_ne!(after.public_key_b64(), before.public_key_b64());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_identity_file_written_before_the_override_existed_still_loads() {
+        // `name_override` is `serde(default)`. Without it, upgrading AudioHub
+        // would fail to parse identity.json, generate a new key, and silently
+        // break every pairing this machine had.
+        let dir = scratch("legacy");
+        let path = dir.join("identity.json");
+        let key = SigningKey::generate(&mut rand_core::OsRng);
+        let legacy = serde_json::json!({
+            "version": 1,
+            "name": "old-host",
+            "secret_b64": BASE64_STANDARD.encode(key.to_bytes()),
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).expect("json")).expect("write");
+        let id = LocalIdentity::load_or_create_at(Some(&dir)).expect("legacy identity loads");
+        assert_eq!(id.fingerprint, fingerprint_of(&key.verifying_key().to_bytes()));
+        assert_eq!(LocalIdentity::name_source_at(Some(&dir)), NameSource::Hostname);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -446,3 +446,24 @@ export function clearOverride(overrides: ShortcutOverrides, action: ShortcutActi
 export function isCustomized(overrides: ShortcutOverrides, action: ShortcutActionId): boolean {
   return Object.prototype.hasOwnProperty.call(overrides, action);
 }
+
+/**
+ * 有几个动作的键位**与出厂不同**（设置 › 杂项那一行的值）。
+ *
+ * 判据取「解析结果 ≠ 该平台默认值」，而不是「overrides 里有没有这个键」。两者会
+ * 分岔，而分岔的方向恰好是骗人的那一边：
+ *
+ *   · 用户把某个动作改回它原本的键，`ShortcutRow` 照样会写一条 override —— 按
+ *     键数算就成了「1 个已自定义」，而屏幕上四个键位与出厂一模一样；
+ *   · 用户**清掉**一个键（`null`，与默认不同）是真的改过，必须算进去。
+ *
+ * 这一行是给用户估「我动过多少」的，不是给存储层做统计的。
+ */
+export function customizedCount(
+  overrides: ShortcutOverrides,
+  platform: ShortcutPlatform,
+): number {
+  const defaults = DEFAULTS[platform];
+  const resolved = resolveBindings(overrides, platform);
+  return SHORTCUT_ACTIONS.filter((id) => resolved[id] !== defaults[id]).length;
+}

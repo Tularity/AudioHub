@@ -9,6 +9,7 @@ import { Icon } from '../components/Icon';
 import { Help, Segmented, Spark } from '../components/Controls';
 import { WIKI } from '../lib/external';
 import { volumeText } from '../components/VolumeControl';
+import { transportCells } from '../components/PeerTransport';
 import { fmt, sessionFlow, dirLabel } from '../lib/fmt';
 import { useTick } from '../lib/hooks';
 import {
@@ -18,7 +19,7 @@ import {
 import { isDegradedTier, sessionTier, TIER_LABEL, TIER_WHY } from '../lib/tier';
 import { t, joinPhrases } from '../i18n';
 import type { MsgKey } from '../i18n';
-import { useStore } from '../state/store';
+import { actions, useStore } from '../state/store';
 import { isModeB } from '../state/mode';
 import type { MetricHistory } from '../state/store';
 import type { SessionInfo } from '../ipc/types';
@@ -322,6 +323,96 @@ function DegradedLinks() {
   );
 }
 
+// ---------------------------------------------------------------- 传输档位
+
+/**
+ * 每对端 × 每方向的**目标档**，一屏看全。
+ *
+ * # 它为什么在这一页（而不是设置页）
+ *
+ * 它原先在设置页，被 plan §15 特意留在那里当「区块不许凭空消失」的补偿。用户
+ * 2026-08-10 第 10 条把它搬来这里，理由不是它没用了，恰恰相反——
+ *
+ * 它是全应用**唯一**能一眼看全所有对端四个档位的地方。详情页一次只看一台，而
+ * 「哪台还停在 auto / 停在 min」正是 §15 那次事故里没人看得见的东西：30-win 的
+ * 档位是 `min` 且从未被设过，这件事在两台机器的任何一个界面上都不可见，只能靠
+ * `ctl status --json` 挖出来。移除它 = 让那件事重新变成不可见。
+ *
+ * 该搬的理由是**位置**：`docs/spec-telemetry-ia.md` §2.1 冻结的分工是「设置页 ＝
+ * 本机的全局配置」「统计诊断页 ＝ 跨对端的实时指标」，而 §15 已经把这四个值从
+ * 全局设置里移出去了——它留在设置页本身就在暗示这些是全局的，正是 §15 要消灭的
+ * 那个误解。`DegradedLinks` 是同一页里同形的先例：跨对端、纯只读、不随会话收起。
+ *
+ * # 设置页那边为什么不留一句「已移至统计诊断页」
+ *
+ * §3.1 禁止在界面上留说明文字，而这次搬的是**只读总览**、不是控件——用户去设置页
+ * 找的是「能调的旋钮」，那个旋钮从 §15 起就在详情页，与本次搬迁无关。记在
+ * docs/plan.md §17，免得下一个人照 §15 的原文把它搬回去。
+ */
+function TransportLevels() {
+  const ds = useStore((s) => s.daemonSettings);
+  const peers = useStore((s) => s.peers);
+
+  return (
+    <section className="card block" data-testid="stats-transport">
+      <h3 className="block-title">{t('settings.transport.title')}</h3>
+      {peers.length === 0 ? (
+        <p className="muted small" data-testid="stats-transport-empty">
+          {t('settings.transport.noPeers')}
+        </p>
+      ) : (
+        <table className="transport-table" data-testid="stats-transport-table">
+          <thead>
+            <tr>
+              <th>{t('settings.transport.colPeer')}</th>
+              <th>{t('settings.transport.colDir')}</th>
+              <th>
+                <span className="title-row">
+                  {t('settings.transport.colLatency')}
+                  <Help
+                    label={t('wiki.latency')} url={WIKI.latencyTarget}
+                    testid="stats-transport-latency-help"
+                  />
+                </span>
+              </th>
+              <th>
+                <span className="title-row">
+                  {t('settings.transport.colQuality')}
+                  <Help
+                    label={t('wiki.quality')} url={WIKI.qualityLadder}
+                    testid="stats-transport-quality-help"
+                  />
+                </span>
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {peers.map((p) => transportCells(ds, p).map((row, i) => (
+              <tr key={`${p.fingerprint}-${row.dir}`} data-testid={`stats-transport-row-${row.dir}-${p.fingerprint}`}>
+                {i === 0 ? (
+                  <th rowSpan={2} scope="rowgroup" className="transport-peer">
+                    <button
+                      className="linkish"
+                      type="button"
+                      data-testid={`stats-transport-open-${p.fingerprint}`}
+                      onClick={() => actions.navigate('detail', p.fingerprint)}
+                    >
+                      {p.display_name || p.name || p.fingerprint.slice(0, 8)}
+                    </button>
+                  </th>
+                ) : null}
+                <td>{t(row.dir === 'out' ? 'peers.card.streamOut' : 'peers.card.streamIn')}</td>
+                <td data-testid={`stats-transport-cell-latency-${row.dir}-${p.fingerprint}`}>{row.latency}</td>
+                <td data-testid={`stats-transport-cell-quality-${row.dir}-${p.fingerprint}`}>{row.quality}</td>
+              </tr>
+            )))}
+          </tbody>
+        </table>
+      )}
+    </section>
+  );
+}
+
 // ---------------------------------------------------------------- 会话卡
 
 function SessionCard({ info, hist }: { info: SessionInfo; hist: MetricHistory | undefined }) {
@@ -571,6 +662,10 @@ export function StatsView() {
       {/* 降级链路的两个数字（design §5.2 第 4 条）。**不随会话数收起**：一条链路
           可以在没有任何会话时仍然存在并积压，而那正是需要被看见的时刻。 */}
       <DegradedLinks />
+
+      {/* 每对端 × 每方向的目标档。**不随会话数收起**，与上面那块同理：一台对端可以
+          在没有任何会话时停在一个错的档上，而那正是需要被看见的时刻。 */}
+      <TransportLevels />
 
       {/* 工具条只留分段选择器：这里原先复用了「活跃会话」那条 key 当标签，可上面
           已经有一张带数字的同名 tile，而这里既没数字也不说明分组维度——正是本次

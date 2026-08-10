@@ -231,6 +231,11 @@ pub const SETTINGS_WRITABLE_KEYS: &[&str] = &[
     // 写计划任务，但契约面上只有这一个名字。两套键会让「开机自启开着吗」这个
     // 问题在跨平台的界面与文档里各有一个答案。
     "autostart",
+    // 本机名称的用户覆盖（用户 2026-08-10 第 9 条）。空串 = 清除覆盖。
+    //
+    // 它落在 `identity.json` 而不是 `settings.json`：名字与签名密钥是同一份
+    // 身份，分开存就会有一份能被单独拷走、单独删掉的半截身份。
+    "name",
 ];
 
 /// Daemon-owned settings, `settings.get` / `settings.set` (spec-m5b §6.1).
@@ -327,6 +332,24 @@ pub struct DaemonSettings {
     /// Virtual-device slots the attached driver offers, and how many are bound.
     pub hal_capacity: u8,
     pub hal_used: u8,
+    /// 这台机器**此刻叫什么**（用户 2026-08-10 第 9 条：本机名称可自定义）。
+    ///
+    /// 写：空串 = 清除覆盖，回到 `local_hostname()`。读：这里报的是**生效值**，
+    /// 与 `DaemonInfo::name` 一致；「用户存了什么」由 `name_source` 区分。
+    ///
+    /// ⚠ 这个字符串会成为**每一台对端**系统设备列表里那两台虚拟设备的名字
+    /// （plan §7.1），所以 daemon 侧也要清一遍控制字符与长度——CLI、旧前端、
+    /// 手改配置文件三条路都到得了这里，而它们都不经过前端那一层校验。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 生效的那个名字从哪儿来：`env` | `custom` | `hostname`。
+    ///
+    /// 没有它，界面分不出「用户设了一个恰好等于主机名的名字」与「跟随主机名」，
+    /// 而这两种状态下「恢复默认」一个该亮、一个不该亮。`env` 时输入框只读——
+    /// `AUDIOHUB_NAME` 优先级最高，给一个改不动的值配一个能编辑的框，用户只会
+    /// 以为自己保存失败了。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_source: Option<String>,
 }
 
 /// 一台对端 × 一个方向的两个**目标**档位（plan §15）。
@@ -1332,8 +1355,17 @@ pub struct PeerState {
 /// - "settings.get"      {}                    -> DaemonSettings
 /// - "settings.set"      {mode?, remove_virtual_on_disconnect?,
 ///                        mark_offline_devices?, mode_a_volume_sync?,
-///                        mode_a_mute_local?, discovery_announce?, autostart?}
+///                        mode_a_mute_local?, discovery_announce?, autostart?,
+///                        name?}
 ///                                             -> DaemonSettings
+///       `name` (user instruction 2026-08-10 #9) is this machine's display
+///       name; `""` clears the override and follows the host name again. It is
+///       stored in identity.json beside the signing key, not in settings.json —
+///       the name and the key are one identity, and splitting them creates half
+///       an identity that can be copied or deleted on its own. `AUDIOHUB_NAME`
+///       still outranks it (regress tells several daemons on one host apart
+///       with that variable), in which case the reply's `name_source` is `env`
+///       and the write is refused rather than silently shadowed.
 ///       `autostart` (plan M9) is ONE key for both platforms: macOS writes a
 ///       per-user LaunchAgent, Windows writes the `AudioHubDaemon` scheduled
 ///       task, and both launch the APP (which brings the daemon up itself).
@@ -1356,6 +1388,21 @@ pub struct PeerState {
 ///       on us and tells those peers why; switching TO `share`, or to `a`,
 ///       removes every virtual device; switching to `b` recreates them under
 ///       the same UIDs. No confirmation dialog (plan §7.1, frozen).
+/// - "daemon.reset_identity" {}                -> {fingerprint, restart_required}
+///       Throws away this machine's ed25519 key and writes a fresh one. The
+///       order is not negotiable: **every paired peer is told first**
+///       (`SessionMsg::Unpaired`, the same path `peers.unpair` uses), then the
+///       sessions and virtual devices go, then the trust store is cleared, and
+///       only then is the new key written. A peer that is not told keeps a pair
+///       of virtual devices bearing this machine's name — permanently offline,
+///       permanently redialling, and unexplainable from its interface. plan §7.1
+///       names that failure for ordinary unpairing; swapping the key is worse,
+///       because afterwards the peer cannot even recognise us.
+///       `restart_required` is honest, not decorative: `LocalIdentity` is a
+///       plain field of `DaemonInner` held behind an `Arc` and read by the
+///       announcer, the listener and every control channel, so this build
+///       writes the new key to disk and says it needs a restart rather than
+///       pretending the running process already uses it.
 /// - "peers.pair"        {addr, pin}           -> PeerState
 ///       The initiator half of M3 pairing, moved out of the CLI so a pairing
 ///       done anywhere is visible to the device coordinator immediately.
@@ -1376,6 +1423,7 @@ pub mod methods {
     pub const DAEMON_SIMULATE_DEVICE_CHANGE: &str = "daemon.simulate_device_change";
     pub const DAEMON_PERMISSIONS: &str = "daemon.permissions";
     pub const DAEMON_REQUEST_PERMISSION: &str = "daemon.request_permission";
+    pub const DAEMON_RESET_IDENTITY: &str = "daemon.reset_identity";
     pub const PEERS_LIST: &str = "peers.list";
     pub const PEERS_CONNECT: &str = "peers.connect";
     pub const PEERS_DISCONNECT: &str = "peers.disconnect";

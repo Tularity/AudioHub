@@ -90,10 +90,16 @@ const STATUS_LABEL: Record<string, MsgKey> = {
  * is a real path now rather than the dead rule the old badge would have had --
  * this is an actual `<button>` because it actually opens something. Note it is
  * *not* a click path on macOS: WebKit does not focus a button on click unless
- * Full Keyboard Access is on. The permanent, always-reachable copy of all
- * three values is the Settings › 本机身份 block (`docs/plan.md` §7.6), which
- * is what the touch and screen-reader story rests on; the values here also
- * stay in the DOM either way, so automation reads them regardless.
+ * Full Keyboard Access is on. The permanent, always-reachable copy of the
+ * three values is on the settings page (`docs/plan.md` §7.6), which is what the
+ * touch and screen-reader story rests on. Since the 2026-08-10 restructure it
+ * is **two blocks, not one**: the machine name and fingerprint live in
+ * 设置 › 杂项 (an editable field and a click-to-copy button), while the control
+ * port stayed with the rest of the network facts in 设置 › 网络. Split across
+ * two blocks of one page still satisfies §7.6 — all three are permanently
+ * readable without hover — but a comment naming a block that no longer exists
+ * would send the next reader looking for it. The values here also stay in the
+ * DOM either way, so automation reads them regardless.
  */
 function StatusControl() {
   const conn = useStore((s) => s.conn);

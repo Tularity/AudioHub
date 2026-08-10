@@ -228,6 +228,14 @@ pub enum CtlCmd {
         /// host a login item (a bare binary out of the build tree).
         #[arg(long)]
         autostart: Option<bool>,
+        /// this machine's display name (user instruction 2026-08-10 #9). An
+        /// empty string clears the override and follows the computer name
+        /// again. It ends up as the name of two virtual audio devices in every
+        /// paired peer's system sound settings, so control characters are
+        /// stripped and it is clamped to 48 characters daemon-side. Refused
+        /// while `AUDIOHUB_NAME` is set — that variable outranks it.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// plan §15：某一台对端、某一个方向的延迟与音质档。
     ///
@@ -625,6 +633,7 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             mode_a_mute_local,
             discovery_announce,
             autostart,
+            name,
         } => {
             let mut p = serde_json::Map::new();
             if let Some(m) = mode {
@@ -647,6 +656,12 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             }
             if let Some(v) = autostart {
                 p.insert("autostart".into(), json!(v));
+            }
+            // `Some("")` 是**清除覆盖**，不是「没传」：`--name=` 必须能把名字还给
+            // 主机名。这也是这一条不能写成 `if let Some(v) = name.filter(...)`
+            // 的原因——一个过滤掉空串的写法会让「恢复默认」在命令行上无路可走。
+            if let Some(v) = name {
+                p.insert("name".into(), json!(v));
             }
             // A read and a write are the same call with no fields to change,
             // so `settings` with no flags cannot accidentally write anything.
@@ -1293,6 +1308,7 @@ mod tests {
             ("mode_a_mute_local", "--mode-a-mute-local=true", json!(true)),
             ("discovery_announce", "--discovery-announce=false", json!(false)),
             ("autostart", "--autostart=true", json!(true)),
+            ("name", "--name=客厅 Mac", json!("客厅 Mac")),
         ];
         for key in audiohub_ipc::SETTINGS_WRITABLE_KEYS {
             let (_, flag, want) = sample

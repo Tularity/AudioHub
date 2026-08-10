@@ -434,7 +434,7 @@ pub(crate) fn apply_announce(inner: &Arc<DaemonInner>, want: bool) -> bool {
     // daemon for up to 3s, and two other paths take this lock: `settings_view`
     // (every `settings.get`, on any other IPC connection) and `begin_shutdown`,
     // whose own comment promises that dropping mDNS "cannot block".
-    let fresh = start_announce(inner.announce_fault, &inner.id, inner.control_port);
+    let fresh = start_announce(inner.announce_fault, &inner.identity(), inner.control_port);
     let ok = fresh.is_some();
     if inner.shutdown.load(Ordering::SeqCst) {
         // Shutdown ran while we were on the wire; its cleanup already emptied
@@ -527,7 +527,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     let (built_send, built_recv) = mpsc::channel::<engine::BuildDone>();
     let cfg_dir_for_state = cfg_dir.clone();
     let inner = Arc::new(DaemonInner {
-        id: id.clone(),
+        id: RwLock::new(id.clone()),
         cfg_dir,
         control_port,
         ipc_port,
@@ -719,7 +719,16 @@ pub(crate) struct DaemonState {
 }
 
 pub(crate) struct DaemonInner {
-    pub id: LocalIdentity,
+    /// 本机身份（名字 + 签名密钥）。
+    ///
+    /// `RwLock` 而不是一个裸字段：用户 2026-08-10 第 9 条让**本机名称可以在运行期
+    /// 改**，而这个名字正是对端在 `VerifyResponse` 里读到、随后印在它系统里那两台
+    /// 虚拟设备上的字符串。裸字段意味着改完之后要重启整个服务才能生效，界面上却
+    /// 只能显示一个已经改了、线上还没改的名字——这个项目最不能要的那种分歧。
+    ///
+    /// 读多写极少（写只有一次改名），所以是 `RwLock` 不是 `Mutex`；一律走
+    /// `identity()` 拿一份克隆，不要把读锁跨到网络调用上去。
+    pub id: RwLock<LocalIdentity>,
     pub cfg_dir: PathBuf,
     pub control_port: u16,
     /// Written to ipc.json so clients can find us; nothing in the daemon reads
@@ -906,6 +915,23 @@ fn device_watch_loop(inner: Arc<DaemonInner>) {
 }
 
 impl DaemonInner {
+    /// 当前身份的一份克隆。
+    ///
+    /// 克隆而不是把读锁交出去：调用点几乎全是握着它去做握手/建通道的网络调用，
+    /// 一个跨越 I/O 的读锁会把一次改名堵在一条卡住的 TCP 连接后面。克隆的代价是
+    /// 两个 String 加 32 字节密钥。
+    pub(crate) fn identity(&self) -> LocalIdentity {
+        rd(&self.id).clone()
+    }
+
+    /// 改名之后把新身份换进来，让**下一次**连接握手就报新名字。
+    ///
+    /// 只换名字、不换密钥：密钥换掉等于换了一台机器（见 `daemon.reset_identity`），
+    /// 而那条路必须先逐台通知对端，不能从这里顺手做掉。
+    pub(crate) fn set_identity_name(&self, name: String) {
+        wr(&self.id).name = name;
+    }
+
     pub(crate) fn begin_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         self.cleanup.call_once(|| {

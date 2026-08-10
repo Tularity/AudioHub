@@ -17,7 +17,7 @@ use audiohub_ipc::{
     PermissionKind, QualityTarget, IPC_VERSION, LATENCY_AUTO, LATENCY_STOPS_MS, MODE_A, MODE_B,
     MODE_SHARE,
 };
-use audiohub_net::identity::{random_pin, PeerStore};
+use audiohub_net::identity::{random_pin, LocalIdentity, NameSource, PeerStore};
 
 use crate::{conn, dlog, haldev, lk, DaemonInner, PairingMode, DIR_RECV, DIR_SEND};
 
@@ -55,8 +55,8 @@ fn daemon_info(inner: &DaemonInner) -> DaemonInfo {
     let (output_devices, virtual_cards) = crate::device_listing(inner);
     DaemonInfo {
         ipc_version: IPC_VERSION,
-        name: inner.id.name.clone(),
-        fingerprint: inner.id.fingerprint.clone(),
+        name: inner.identity().name.clone(),
+        fingerprint: inner.identity().fingerprint.clone(),
         control_port: inner.control_port,
         uptime_s: inner.start.elapsed().as_secs_f64(),
         output_devices,
@@ -444,7 +444,7 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 serde_json::to_value(audiohub_net::discovery::browse(
                     secs,
                     &store,
-                    &inner.id.fingerprint,
+                    &inner.identity().fingerprint,
                 )?)?
             }
             methods::SESSION_OPEN => {
@@ -511,6 +511,24 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 // `crate::autostart`。所以它不参与下面的 `changed` / `save`。
                 if let Some(v) = params.get("autostart").and_then(Value::as_bool) {
                     crate::autostart::set(v)?;
+                }
+                // 本机名称（用户 2026-08-10 第 9 条）。与 autostart 同理放在设置锁
+                // **之外**：它落的是 identity.json，不是 settings.json。
+                //
+                // `AUDIOHUB_NAME` 生效时**拒绝**而不是收下：收下会写进文件、原样
+                // 回显，而生效值一个字都没变——「写进去了、读回来了、什么都没发生」
+                // 正是本项目栽过六次的那个形状。
+                if let Some(v) = params.get("name").and_then(Value::as_str) {
+                    if LocalIdentity::name_source_at(Some(&inner.cfg_dir)) == NameSource::Env {
+                        anyhow::bail!(
+                            "本机名称由环境变量 AUDIOHUB_NAME 指定，settings.set 改不动它"
+                        );
+                    }
+                    let now = LocalIdentity::set_name_at(Some(&inner.cfg_dir), Some(v))?;
+                    // 换进运行中的身份，**下一次握手**就报新名字。不做这一步，
+                    // 界面显示的是新名字、线上报给对端的还是旧的，而对端系统里
+                    // 那两台设备会一直挂着旧名——界面与线上分歧，且没有一处会报错。
+                    inner.set_identity_name(now);
                 }
                 {
                     let mut s = lk(&inner.settings);
@@ -610,6 +628,53 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     conn::announce_mode(inner, haldev::effective_mode(inner));
                 }
                 serde_json::to_value(settings_view(inner))?
+            }
+            // 换掉本机的签名密钥（用户 2026-08-10 第 9 条）。全应用破坏力最大的
+            // 一个调用，所以这里的顺序**一步都不能省**：
+            //
+            //   1. **先**逐台通知已配对对端（`forget_peer` 里那条 `Unpaired`），
+            //      顺带关会话、撤虚拟设备、停重拨、清档位；
+            //   2. 清空信任库（`forget_peer` 已逐条删过，这一句兜住残留）；
+            //   3. 最后才写新密钥。
+            //
+            // 先换钥匙再通知是做不到的：换完之后对端连我们是谁都认不出来，那条
+            // `Unpaired` 会被它当作陌生人的噪音丢掉，于是它系统里永久留下一对署着
+            // 本机名字的设备——永远离线、后台永远在重拨。plan §7.1 为普通的解除
+            // 配对点名过这个病，换钥匙比解除配对更彻底。
+            methods::DAEMON_RESET_IDENTITY => {
+                let fps: Vec<String> = {
+                    let _g = lk(&inner.store_lock);
+                    PeerStore::load_at(Some(&inner.cfg_dir))
+                        .map(|s| s.list().iter().map(|p| p.fingerprint.clone()).collect())
+                        .unwrap_or_default()
+                };
+                for fp in &fps {
+                    conn::forget_peer(inner, fp);
+                }
+                {
+                    let _g = lk(&inner.store_lock);
+                    if let Ok(mut st) = PeerStore::load_at(Some(&inner.cfg_dir)) {
+                        st.clear();
+                        let _ = st.save();
+                    }
+                }
+                let fingerprint = LocalIdentity::reset_key_at(Some(&inner.cfg_dir))?;
+                dlog!(
+                    "[audiohubd] identity reset: {} pairing(s) revoked, new fingerprint {}",
+                    fps.len(),
+                    fingerprint
+                );
+                // `restart_required` 如实报 true，不许假装已经生效。
+                //
+                // 注意**不是**「改不动」：`inner.id` 是 `RwLock<LocalIdentity>`，
+                // 改名那条路（`set_identity_name`）就是就地换进去的。密钥不能照办，
+                // 是因为指纹已经**发出去**了——mDNS 的 TXT 记录里挂着它，每条已建立
+                // 的控制通道也都是拿旧钥匙握完手的。就地换掉只会让本进程一半新
+                // 一半旧：广播说新指纹，连着的对端仍按旧身份认我们。要真做到热生效，
+                // 得连广播带监听带全部会话一起重起，那与重启进程已无区别。
+                //
+                // 谎报一次 false，用户会拿着一个界面上是新的、线上还是旧的指纹去配对。
+                json!({ "fingerprint": fingerprint, "restart_required": true })
             }
             // The initiator half of M3 pairing, moved out of the CLI: a pairing
             // done in another process wrote paired_peers.json behind the
@@ -868,6 +933,15 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         quality_stops: audiohub_ipc::transport::quality_stops(),
         hal_capacity: capacity as u8,
         hal_used: used as u8,
+        // 报的是**生效值**（与 daemon.status 的 name 同一个），不是存盘的覆盖：
+        // `AUDIOHUB_NAME` 生效时两者不一样，而界面显示的必须是这台机器现在真的
+        // 叫什么。「用户存过什么」由下面那个 source 区分。
+        name: Some(inner.identity().name.clone()),
+        name_source: Some(
+            LocalIdentity::name_source_at(Some(&inner.cfg_dir))
+                .as_str()
+                .to_string(),
+        ),
     }
 }
 

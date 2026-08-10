@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useSyncExternalStore } from 'react';
 import { Watermark, NavPill, Overlay, VIEW_TITLE } from './components/Chrome';
 import { ChromeControls } from './components/TopControls';
 import { CaptionButtons } from './components/CaptionButtons';
@@ -11,8 +11,10 @@ import { PairView } from './views/Pair';
 import { SettingsView } from './views/Settings';
 import { StatsView } from './views/Stats';
 import { OnboardingGate } from './views/Onboarding';
-import { ShortcutSheet } from './components/ShortcutSheet';
-import { currentBindings, installShortcuts, subscribeShortcuts } from './lib/shortcutHost';
+import { ShortcutSheetHost, toggleShortcutSheet } from './components/ShortcutSheet';
+import { PermissionsSheetHost, isPermissionsSheetOpen, openPermissionsSheet } from './components/PermissionsSheet';
+import { installShortcuts } from './lib/shortcutHost';
+import { pendingSignature, readPermSeen, shouldAutoOpenPermissions } from './lib/permIntro';
 import type { ShortcutActionId } from './lib/shortcuts';
 import { actions, getState, useStore } from './state/store';
 import { boot, gateVisible, syncTray } from './state/connection';
@@ -36,10 +38,40 @@ function useGateVisible(): boolean {
 }
 
 /**
+ * 首次运行时自动弹一次系统权限面板（用户 2026-08-10 第 22 条）。
+ *
+ * 挂在**根层**而不是设置页：用户首次启动落在主面板，那时设置页根本没挂载，而这块
+ * 面板要能在任何页面上弹。
+ *
+ * 判据是 `lib/permIntro.ts` 的纯函数（有单测），这里只负责把 store 的当下喂给它。
+ * ⚠ 它读写一份 localStorage 签名，那份东西**不参与 `gateVisible()`**——授权门仍然
+ * 每次启动重新探测、不落任何「已看过」标记。两者的边界写在 permIntro.ts 顶部，
+ * 改这里之前先读那一段。
+ */
+function usePermissionIntro(gate: boolean): void {
+  const perms = useStore((s) => s.permissions);
+  const conn = useStore((s) => s.conn);
+  const mode = useStore((s) => s.mode);
+
+  useEffect(() => {
+    if (isPermissionsSheetOpen()) return;
+    const ok = shouldAutoOpenPermissions({
+      online: conn === 'online',
+      probed: perms.probed,
+      gateVisible: gate,
+      tauri: mode === 'tauri',
+      signature: pendingSignature(perms.list),
+      seen: readPermSeen(),
+    });
+    if (ok) openPermissionsSheet(true);
+  }, [conn, gate, mode, perms]);
+}
+
+/**
  * 快捷键动作 → 真正做的事。**只有这一处**把动作 id 兑现成行为：`shortcuts.ts` 只
  * 认识 id 与组合键，不知道有路由这回事，所以那一层能当纯函数测。
  */
-function useShortcutDispatch(setSheet: (fn: (v: boolean) => boolean) => void) {
+function useShortcutDispatch() {
   return useCallback((action: ShortcutActionId) => {
     switch (action) {
       case 'view.peers': actions.navigate('peers'); break;
@@ -51,9 +83,9 @@ function useShortcutDispatch(setSheet: (fn: (v: boolean) => boolean) => void) {
       case 'nav.back':
         if (getState().route.view === 'detail') actions.navigate('peers');
         break;
-      case 'help.shortcuts': setSheet((v) => !v); break;
+      case 'help.shortcuts': toggleShortcutSheet(); break;
     }
-  }, [setSheet]);
+  }, []);
 }
 
 export function App() {
@@ -69,10 +101,8 @@ export function App() {
   // 挂在根上并且不 memo 任何子树，一次订阅就让整棵树跟着重渲，够了。
   useSyncExternalStore(subscribeLocale, getLocale);
   const View = VIEWS[view] || PeersView;
-  const [sheet, setSheet] = useState(false);
-  const dispatch = useShortcutDispatch(setSheet);
-  // 速查表读的是**当前生效**的绑定，所以设置页改完立刻反映，不用重开。
-  const bindings = useSyncExternalStore(subscribeShortcuts, currentBindings);
+  const dispatch = useShortcutDispatch();
+  usePermissionIntro(gate);
 
   useEffect(() => { boot(); }, []);
   // 托盘状态跟着连接走；syncTray 自带去重，重复调用无副作用。
@@ -119,7 +149,10 @@ export function App() {
         {gate ? <OnboardingGate /> : null}
       </div>
 
-      {sheet ? <ShortcutSheet bindings={bindings} onClose={() => setSheet(false)} /> : null}
+      {/* 二级菜单层。两块都自带模块级开合状态：它们各有两个入口（⌘/ 与设置页；
+          设置页与首启 effect），而那些入口不在同一棵子树上。 */}
+      <ShortcutSheetHost />
+      <PermissionsSheetHost />
 
       <Overlay />
       <ConfirmHost />

@@ -1,12 +1,15 @@
-// 主面板：全局模式栏 + 对端卡片列表 + 手动添加对端。
+// 主面板：对端卡片列表 + 手动添加对端。
 //
-// 模式栏放在这里而不是设置页，是 plan §7.1 的直接后果：模式决定了下面每张卡片的
-// 含义（模式 A 在卡片上选对端，模式 B 在系统声音设置里选设备），把它藏进设置页
-// 就等于把「这些开关为什么消失了」的答案藏起来。
+// 模式栏**不在这里**。它曾经在，理由是 plan §7.1：模式决定了下面每张卡片的含义
+// （模式 A 在卡片上选对端，模式 B 在系统声音设置里选设备），所以那个选择器该和
+// 它决定的东西待在一起。**用户 2026-08-10 的第 1 条指令推翻了这条裁定**——模式
+// 是一项全局配置，全局配置的落点是设置页（`views/Settings.tsx` 第一块，记在
+// docs/plan.md §17）。这一页因此没有任何模式入口；「那排开关为什么变了」的答案
+// 退到导航胶囊 + 切换时的 toast。搬回来之前请先读 §17。
 
-import { useCallback, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { Icon } from '../components/Icon';
-import { Help, Segmented, Switch } from '../components/Controls';
+import { Help, Switch } from '../components/Controls';
 import { WIKI } from '../lib/external';
 import { VolumeControl } from '../components/VolumeControl';
 import { BridgeControl } from '../components/BridgeControl';
@@ -20,15 +23,12 @@ import { fmt } from '../lib/fmt';
 import { classifyPeerAddr } from '../lib/peerAddr';
 import { createBusySet, useTick } from '../lib/hooks';
 import { t, joinPhrases } from '../i18n';
-import type { MsgKey } from '../i18n';
 import { actions, getState, useStore } from '../state/store';
 import type { AppState } from '../state/store';
 import {
-  MODE_SHARE, MODE_A, MODE_B, halState, requestedMode, effectiveMode, isModeB,
-  isShareMode, modeDowngraded, peerDeviceRows, halReasonText, peerUnusableText,
+  isModeB, isShareMode, peerDeviceRows, halReasonText, peerUnusableText,
 } from '../state/mode';
-import type { AppMode } from '../state/mode';
-import { applySettings, refreshPeers, refreshSessions, rpc } from '../state/connection';
+import { refreshPeers, refreshSessions, rpc } from '../state/connection';
 import type { PeerState, SessionInfo } from '../ipc/types';
 
 // 进行中的通路操作（`${fp}:mic` / `${fp}:spk`），也是开关 pending 态的唯一判据。
@@ -237,75 +237,6 @@ function setBridge(fp: string, want: string): void {
   if (want === prev) return;
   actions.setBridgePref(fp, want);
   void reopenMic(fp, 'bridge', () => actions.setBridgePref(fp, prev));
-}
-
-// ---------------------------------------------------------------- 模式栏
-
-// 切换后的提示语。三档各一条：模式切换会**真的关掉正在跑的会话**（plan §13
-// 推论 2），用户必须从这句话里读到发生了什么，而不是从「对端怎么突然没声了」。
-const SWITCHED_KEY: Record<AppMode, MsgKey> = {
-  share: 'mode.switched.toShare',
-  a: 'mode.switched.toA',
-  b: 'mode.switched.toB',
-};
-
-function ModeBanner() {
-  const daemon = useStore((s) => s.daemon);
-  const mode = useStore(effectiveMode);
-  const downgraded = useStore(modeDowngraded);
-  const st = halState(daemon);
-
-  const setMode = useCallback(async (v: AppMode) => {
-    if (v === requestedMode(getState())) return;
-    try {
-      await applySettings({ mode: v });
-      toast(t(SWITCHED_KEY[v]), 'ok');
-    } catch { /* rpc 已 toast */ }
-  }, []);
-
-  return (
-    <section className="card block mode-bar" data-testid="consumer-mode">
-      <div className="mode-head">
-        {/* 标题 + `?`，没有第三样东西。三种模式的说明、互斥的成因、每一档选完
-            之后去哪里操作——原先全都印在这张卡上，现在整段在 wiki（用户
-            2026-08-10 裁定「为了简化而简化」，docs/plan.md §3.1）。 */}
-        <div className="mode-title-wrap title-row">
-          <h3 className="block-title">{t('mode.title')}</h3>
-          <Help label={t('wiki.modes')} url={WIKI.modes} testid="consumer-mode-help" />
-        </div>
-        {/* testid 沿用旧名 `settings-consumer-mode`（回归已依赖），外层另给别名 */}
-        <Segmented<AppMode>
-          testid="settings-consumer-mode"
-          value={mode}
-          onSelect={setMode}
-          options={[
-            // 共享模式排第一：它是默认值，也是「本机被别人使用」这条唯一的路。
-            { value: MODE_SHARE, label: t('mode.share.label') },
-            { value: MODE_A, label: t('mode.a.label') },
-            {
-              value: MODE_B,
-              label: t('mode.b.label'),
-              // 置灰必须是**真禁用**（点击不改变任何状态），判据见 state/mode.ts halState()。
-              disabled: !st.available,
-              why: st.why || '',
-            },
-          ]}
-        />
-      </div>
-      {/* 「驱动就绪」是常态，不是消息：只有出问题时这行才值得占一行。 */}
-      <p
-        className={`mode-note tone-${st.tone}`}
-        data-testid="settings-mode-note"
-        hidden={st.tone === 'ok'}
-      >
-        {st.text}
-      </p>
-      {/* 用户存的是 B、daemon 只能给 A：这是**降级**，不是「他选了 A」。 */}
-      <p className="mode-warn" data-testid="consumer-mode-downgraded" hidden={!downgraded}>
-        {t('mode.downgraded')}
-      </p>
-    </section>
-  );
 }
 
 // ---------------------------------------------------------------- 对端卡片
@@ -675,7 +606,6 @@ export function PeersView() {
 
   return (
     <>
-      <ModeBanner />
       <div className="toolbar">
         <div className="toolbar-note warn" data-testid="peers-summary" hidden={!summary}>{summary}</div>
         <button

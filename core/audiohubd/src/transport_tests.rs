@@ -1743,6 +1743,15 @@ fn every_writable_setting_key_is_really_honoured() {
             json!("pcm32k16"),
             &|v: &Value| v.get("quality").cloned().unwrap_or(Value::Null),
         ),
+        // 本机名称（用户 2026-08-10 第 9 条）。回读的是**生效值**，所以这条同时
+        // 顶住了「写进了 identity.json，但运行中的 daemon 还报着旧名字」——那正是
+        // 改名这件事最容易只做一半的地方，而它做一半的时候没有任何一处会报错：
+        // 界面上名字变了，对端系统里那两台设备一直挂着旧名。
+        (
+            "name",
+            json!("ahb-renamed"),
+            &|v: &Value| v.get("name").cloned().unwrap_or(Value::Null),
+        ),
     ];
     for key in audiohub_ipc::SETTINGS_WRITABLE_KEYS {
         // plan M9「开机自启」是这张表上唯一一个**没有存盘副本**的键：注册项本身

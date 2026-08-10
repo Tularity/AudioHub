@@ -61,14 +61,25 @@
 //! corner, it does not re-declare the window's style, so nothing re-runs the
 //! placement. The supported lever is the style, and the style is public.
 //!
-//! # What the app's own top strip has to match
+//! # What the app's own top strip does *not* do
 //!
 //! The native line is **26.0pt** down from the window top, with the button
-//! group spanning x 19.0 .. 79.0 (`probe7.m`). `styles.css` centres the nav
-//! pill and the daemon badge on that line and reserves `--chrome-lead: 100px`
-//! for the group. The strip is `--chrome-h: 52px`, which is the height AppKit
-//! reserves for a unified toolbar (`contentLayoutRect`, `probe8.m`) — so both
-//! our elements and the traffic lights are centred in the same native band.
+//! group spanning x 19.0 .. 79.0 (`probe7.m`), and `styles.css` reserves
+//! `--chrome-lead: 100px` for the group.
+//!
+//! It deliberately does **not** centre the nav pill and the daemon badge on
+//! that 26pt line. A previous revision did, by shrinking the strip to the 52px
+//! AppKit reserves for a unified toolbar; the result pinned the pill 4px from
+//! the window's top edge, spending the pill's own breathing room to line it up
+//! with a control group it never sits beside — the lights occupy x 19..79 and
+//! the pill is centred at roughly x 211..649, so the two never share a row and
+//! nobody can see the mismatch. Both platforms are back on the shared 64px
+//! strip and 33px centre line; macOS reads 7px below the lights, exactly as
+//! Windows reads below its own caption buttons.
+//!
+//! What this module does is still worth doing, and is unaffected: it changes
+//! *where the system puts its buttons* (radius 16 → 26 moves them off the
+//! window edge), rather than bending the app's chrome around them.
 //!
 //! # Cost of adopting the toolbar: none measured
 //!

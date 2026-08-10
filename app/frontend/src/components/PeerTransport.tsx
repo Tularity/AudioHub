@@ -21,9 +21,11 @@
 // 置灰成空壳 ⇒ 把一个正在生效的真实值画成「没有值」，撞 §14 裁定 2 的红线。
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { ExtLink } from './Controls';
 import { StopSlider } from './StopSlider';
 import { toast } from './Toasts';
 import { t } from '../i18n';
+import { WIKI } from '../lib/external';
 import { fmt } from '../lib/fmt';
 import { checkEndpoint } from '../lib/peerAddr';
 import { latencyStops, normLatency, qualityStops, stopLabel } from '../lib/transportStops';
@@ -544,6 +546,12 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
         <p className="muted small" data-testid="detail-transport-tier-pick-note">
           {t('detail.transport.tierPickNote')}
         </p>
+        <p className="muted small">
+          <ExtLink
+            text={t('wiki.transport')} url={WIKI.transport}
+            testid="detail-transport-tier-wiki"
+          />
+        </p>
         {typeof tr.tier_reset_from === 'string' ? (
           <p className="transport-reset" data-testid="detail-transport-tier-reset">
             {t('detail.transport.tierReset', { old: tr.tier_reset_from })}
@@ -597,8 +605,10 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
       >
         <h4>{t('settings.transport.latency')}</h4>
         <p>{t('settings.transport.latencyDesc')}</p>
+        <p><ExtLink text={t('wiki.latency')} url={WIKI.latency} testid="detail-transport-wiki-latency" /></p>
         <h4>{t('settings.transport.quality')}</h4>
         <p>{t('settings.transport.qualityDesc')}</p>
+        <p><ExtLink text={t('wiki.quality')} url={WIKI.quality} testid="detail-transport-wiki-quality" /></p>
       </div>
     </section>
   );

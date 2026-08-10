@@ -132,7 +132,7 @@ describe('the notes the view can ask for all exist in the catalogue', () => {
   // greyed-out explanation would leave them where they started.
   it('tells the orphaned user they can still switch it off', () => {
     const s = t('settings.startup.orphaned', { reason: 'not a bundle' });
-    expect(s).toContain('关掉');
+    expect(s).toContain('关闭');
     expect(s).toContain('not a bundle');
   });
 });

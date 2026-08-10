@@ -5,6 +5,21 @@
 import { toast } from '../components/Toasts';
 import { t } from '../i18n';
 
+// 公开 wiki 的深链。**URL 不进语料**：它们不是文案，翻译一门语言不该有机会改
+// 掉一个地址。语料里只有那句可点的话（`wiki.*`），指向哪里由这里决定。
+//
+// wiki 是英文的，与界面语种无关——这是项目的既定语言约束，不是遗漏。
+const WIKI_BASE = 'https://github.com/Tularity/AudioHub/wiki';
+
+export const WIKI = {
+  home: WIKI_BASE,
+  modes: `${WIKI_BASE}/Operating-Modes`,
+  transport: `${WIKI_BASE}/Transport-Tiers`,
+  quality: `${WIKI_BASE}/Audio-Quality`,
+  latency: `${WIKI_BASE}/Latency`,
+  volume: `${WIKI_BASE}/Volume`,
+} as const;
+
 export async function openExternal(url: string): Promise<boolean> {
   const tauri = window.__TAURI__ || {};
   for (const mod of [tauri.opener, tauri.shell]) {

@@ -13,7 +13,7 @@ import { transportCells } from '../components/PeerTransport';
 import { PermissionRow } from '../components/PermissionRow';
 import { toast } from '../components/Toasts';
 import { appVersion } from '../lib/appInfo';
-import { openExternal } from '../lib/external';
+import { openExternal, WIKI } from '../lib/external';
 import { autostartView } from '../lib/autostart';
 import { bridgeCatalog, vendors } from '../lib/bridge';
 import { fmt, IS_MAC } from '../lib/fmt';
@@ -184,6 +184,9 @@ function ModeMirrorCard() {
         )}
       />
       <p className={`muted small tone-${hs.tone}`} data-testid="settings-mode-note">{note}</p>
+      <p className="muted small">
+        <ExtLink text={t('wiki.modes')} url={WIKI.modes} testid="settings-mode-wiki" />
+      </p>
     </section>
   );
 }
@@ -964,6 +967,12 @@ function AboutCard() {
           {version != null ? t('settings.about.version', { version }) : t('common.dash')}
         </code>
       </div>
+      {/* 文档的常驻入口。散落在各区块旁的深链解释的是**那一块**；这一条是目录
+          本身——用户想「从头读一遍」时，不该只能靠碰巧点开某个深链再往回爬。 */}
+      <p className="muted small" data-testid="settings-about-docs">{t('wiki.desc')}</p>
+      <p className="muted small">
+        <ExtLink text={t('wiki.open')} url={WIKI.home} testid="settings-about-wiki" />
+      </p>
     </section>
   );
 }

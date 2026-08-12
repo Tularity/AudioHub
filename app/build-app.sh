@@ -102,7 +102,8 @@ BUNDLE="$TAURI_DIR/target/release/bundle/macos/AudioHub.app"
 # 65)` on every LAN connect while `nc` from a shell reached the same host:port.
 # Skipped with a warning when the identity does not exist, so a fresh clone
 # still builds.
-if security find-identity -p codesigning 2>/dev/null | grep -q '"AudioHub Dev"'; then
+if security find-identity -p codesigning 2>/dev/null | grep -q '"AudioHub Dev"' || \
+   codesign --dryrun --force --sign 'AudioHub Dev' "$BUNDLE" >/dev/null 2>&1; then
   zsh "$APP_DIR/../scripts/sign-dev.sh" || die "signing failed"
 else
   print -u2 -- "[audiohub] WARNING: no 'AudioHub Dev' identity — bundle stays ad-hoc,"

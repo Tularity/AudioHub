@@ -48,7 +48,20 @@ sign_one() {  # $1 binary  $2 pinned identifier
   print -- "[audiohub]   $(codesign -d -r- "$1" 2>&1 | grep -o 'designated =>.*')"
 }
 
-if ! security find-identity -p codesigning 2>/dev/null | grep -q "\"$IDENTITY\""; then
+identity_usable() {
+  security find-identity -p codesigning 2>/dev/null | grep -q "\"$IDENTITY\"" && return 0
+  # A locally trusted self-signed Code Signing certificate can be usable by
+  # codesign while `security find-identity` reports zero valid identities
+  # (observed on this machine after the macOS 26.5 keychain update). Ask the
+  # actual signer before declaring it absent. --dryrun resolves the key and
+  # performs all signing checks without rewriting the image.
+  local probe="$BUNDLE"
+  [[ -e "$probe" ]] || probe="$ROOT/target/release/audiohub"
+  [[ -e "$probe" ]] || probe="/usr/bin/true"
+  codesign --dryrun --force --sign "$IDENTITY" "$probe" >/dev/null 2>&1
+}
+
+if ! identity_usable; then
   print -u2 -- "[audiohub] no code-signing identity named '$IDENTITY'."
   print -u2 -- "[audiohub] create one: Keychain Access > Certificate Assistant >"
   print -u2 -- "[audiohub]   Create a Certificate…  name '$IDENTITY',"
@@ -85,4 +98,3 @@ if (( signed == 0 )); then
   print -u2 -- "[audiohub] nothing to sign; run cargo build --release first"
   exit 1
 fi
-

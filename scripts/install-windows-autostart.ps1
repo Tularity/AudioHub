@@ -42,7 +42,11 @@ $User = "$env:COMPUTERNAME\$env:USERNAME"
 
 $SrcD = Join-Path $SrcDir 'audiohubd.exe'
 $SrcC = Join-Path $SrcDir 'audiohub.exe'
-$SrcA = 'C:\Users\Administrator\audiohub-src\app\src-tauri\target\release\audiohub-app.exe'
+# The Windows app build deliberately uses an explicit MSVC target. Cargo
+# therefore places the executable under the target-triple directory;
+# `target\release` can contain an older host/default-toolchain build and must
+# never be installed just because it happens to exist.
+$SrcA = 'C:\Users\Administrator\audiohub-src\app\src-tauri\target\x86_64-pc-windows-msvc\release\audiohub-app.exe'
 if (-not (Test-Path $SrcD)) { throw "build output not found: $SrcD" }
 if (-not (Test-Path $SrcA)) { throw "app not built: $SrcA (build it with the msvc toolchain)" }
 

@@ -52,6 +52,7 @@ impl Node {
             tx_throttle_kbps: None,
             block_udp: None,
             announce_fault: false,
+            airplay_advertise: false,
         })
         .expect("start daemon");
         Node { h, dir }

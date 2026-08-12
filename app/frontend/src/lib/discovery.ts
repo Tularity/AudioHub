@@ -155,13 +155,13 @@ export function shouldAutoScan(i: AutoScanInput): boolean {
 }
 
 /**
- * 「用户按过停止」这个标志什么时候作废：离开配对页超过一个冷却期。
+ * 「用户按过停止」这个标志什么时候作废：关掉配对面板超过一个冷却期。
  *
- * 不用「切页面就清」是因为那等于没有这个标志（切走再切回就自动重扫）；
- * 也不用「永远不清」是因为下一次特意走进配对向导的人，要的就是扫描。
+ * 不用「关掉就清」是因为那等于没有这个标志（关掉再开就自动重扫）；
+ * 也不用「永远不清」是因为下一次特意打开「添加对端」的人，要的就是扫描。
  */
-export function shouldClearUserStop(leftPairViewAt: number, now: number): boolean {
-  return leftPairViewAt > 0 && now - leftPairViewAt >= SCAN_COOLDOWN_MS;
+export function shouldClearUserStop(leftPairPanelAt: number, now: number): boolean {
+  return leftPairPanelAt > 0 && now - leftPairPanelAt >= SCAN_COOLDOWN_MS;
 }
 
 /** 一次循环迭代该不该继续，不继续是因为什么。 */

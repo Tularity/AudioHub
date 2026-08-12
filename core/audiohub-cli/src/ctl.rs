@@ -221,6 +221,17 @@ pub enum CtlCmd {
         /// passing `true` when it is already true retries a failed announce.
         #[arg(long)]
         discovery_announce: Option<bool>,
+        /// run the audio-only AirPlay receiver
+        #[arg(long)]
+        airplay_enabled: Option<bool>,
+        /// advertised receiver name; an empty value follows this machine name
+        #[arg(long)]
+        airplay_name: Option<String>,
+        /// replace the AirPlay password. An empty value removes it. Prefer the
+        /// App on multi-user machines because command-line arguments can be
+        /// visible to other local processes while this command is running.
+        #[arg(long)]
+        airplay_password: Option<String>,
         /// start AudioHub at login (plan M9). ONE flag for both platforms:
         /// macOS writes a per-user LaunchAgent, Windows writes the
         /// `AudioHubDaemon` scheduled task; both launch the APP, which brings
@@ -434,6 +445,7 @@ fn cmd_daemon(
         tx_throttle_kbps: None, // production: AUDIOHUB_TEST_TX_KBPS decides (normally unlimited)
         block_udp: None, // production: AUDIOHUB_TEST_BLOCK_UDP decides (normally nothing)
         announce_fault: false, // test-only knob; there is no production value for it
+        airplay_advertise: true,
     })?;
     info(&format!(
         "daemon running: control_port={port} ipc_port={} config_dir={}",
@@ -632,6 +644,9 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             mode_a_volume_sync,
             mode_a_mute_local,
             discovery_announce,
+            airplay_enabled,
+            airplay_name,
+            airplay_password,
             autostart,
             name,
         } => {
@@ -653,6 +668,15 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             }
             if let Some(v) = discovery_announce {
                 p.insert("discovery_announce".into(), json!(v));
+            }
+            if let Some(v) = airplay_enabled {
+                p.insert("airplay_enabled".into(), json!(v));
+            }
+            if let Some(v) = airplay_name {
+                p.insert("airplay_name".into(), json!(v));
+            }
+            if let Some(v) = airplay_password {
+                p.insert("airplay_password".into(), json!(v));
             }
             if let Some(v) = autostart {
                 p.insert("autostart".into(), json!(v));
@@ -1028,6 +1052,8 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 "mode={} effective_mode={} remove_virtual_on_disconnect={} \
                  mark_offline_devices={} mode_a_volume_sync={} mode_a_mute_local={} \
                  discovery_announce={} discovery_announcing={} \
+                 airplay_enabled={} airplay_listening={} airplay_name={:?} \
+                 airplay_password_set={} \
                  autostart={} \
                  virtual devices {}/{}",
                 val_str(v, "mode"),
@@ -1038,6 +1064,10 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 val_bool(v, "mode_a_mute_local"),
                 val_bool(v, "discovery_announce"),
                 val_bool(v, "discovery_announcing"),
+                val_bool(v, "airplay_enabled"),
+                val_bool(v, "airplay_listening"),
+                val_str(v, "airplay_effective_name"),
+                val_bool(v, "airplay_password_set"),
                 val_bool(v, "autostart"),
                 val_u64(v, "hal_used"),
                 val_u64(v, "hal_capacity"),
@@ -1307,6 +1337,9 @@ mod tests {
             ("mode_a_volume_sync", "--mode-a-volume-sync=true", json!(true)),
             ("mode_a_mute_local", "--mode-a-mute-local=true", json!(true)),
             ("discovery_announce", "--discovery-announce=false", json!(false)),
+            ("airplay_enabled", "--airplay-enabled=true", json!(true)),
+            ("airplay_name", "--airplay-name=AudioHub Test", json!("AudioHub Test")),
+            ("airplay_password", "--airplay-password=secret", json!("secret")),
             ("autostart", "--autostart=true", json!(true)),
             ("name", "--name=客厅 Mac", json!("客厅 Mac")),
         ];
@@ -1373,19 +1406,35 @@ mod tests {
         }
     }
 
-    /// **plan §15：`settings` 上的两个旧 flag 必须真的消失。**
+    /// Removed `settings` flags must really disappear.
     ///
     /// 留着一个「收下但不发」的 flag 会让旧脚本继续跑、继续报成功、
     /// 什么都不发生——本项目栽过六次的那个形状。判据是 argv **解析失败**，
     /// 不是 params 里没有那个键：后者一个「解析了再丢掉」的实现照样通过。
     #[test]
-    fn the_global_stop_flags_are_gone_from_settings() {
-        for bad in ["--latency=200", "--quality=pcm32k16"] {
+    fn removed_flags_are_gone_from_settings() {
+        for bad in [
+            "--latency=200",
+            "--quality=pcm32k16",
+            "--airplay-route=both",
+        ] {
             assert!(
                 crate::Cli::try_parse_from(["audiohub", "ctl", "settings", bad]).is_err(),
                 "`ctl settings {bad}` 还能解析：旧脚本会继续对着空气说话"
             );
         }
+    }
+
+    #[test]
+    fn airplay_is_not_a_peer_source_cli_value() {
+        assert!(
+            crate::Cli::try_parse_from([
+                "audiohub", "ctl", "open", "--peer", "ab12", "--kind", "mic", "--source",
+                "airplay",
+            ])
+            .is_err(),
+            "the CLI still advertises the removed AirPlay peer source"
+        );
     }
 
     /// **写档位必须点名方向。** 两个方向的执行器在不同的机器上，挑一个默认

@@ -1,4 +1,9 @@
-// 主面板：对端卡片列表 + 手动添加对端。
+// 主面板：对端卡片列表 + 配对入口。
+//
+// 配对**曾经是一整页**（导航第二格「配对向导」）。用户 2026-08-11 的第 1 条指令
+// 撤掉了那一页：这里本来就有一枚「添加对端」按钮，配对却要先切走到另一页去做。
+// 现在它开的是二级菜单（`components/PairSheet.tsx`），版式照搬原页；配对的另一半
+// 「让对方找到我」在它旁边单独一枚按钮。
 //
 // 模式栏**不在这里**。它曾经在，理由是 plan §7.1：模式决定了下面每张卡片的含义
 // （模式 A 在卡片上选对端，模式 B 在系统声音设置里选设备），所以那个选择器该和
@@ -7,7 +12,7 @@
 // docs/plan.md §17）。这一页因此没有任何模式入口；「那排开关为什么变了」的答案
 // 退到导航胶囊 + 切换时的 toast。搬回来之前请先读 §17。
 
-import { useRef, useState } from 'react';
+import { useState } from 'react';
 import { Icon } from '../components/Icon';
 import { Help, Switch } from '../components/Controls';
 import { WIKI } from '../lib/external';
@@ -15,12 +20,12 @@ import { VolumeControl } from '../components/VolumeControl';
 import { BridgeControl } from '../components/BridgeControl';
 import { ShareSourceControl } from '../components/ShareSourceControl';
 import { PeerMetrics } from '../components/PeerMetrics';
+import { AddPeerSheet, BeDiscoveredSheet } from '../components/PairSheet';
 import { splitByDirection } from '../lib/metrics';
 import { toast } from '../components/Toasts';
 import { bridgeTargets } from '../lib/bridge';
 import { backendParam, normalizeSource, SOURCE_SYSAUDIO } from '../lib/sysaudio';
 import { fmt } from '../lib/fmt';
-import { classifyPeerAddr } from '../lib/peerAddr';
 import { createBusySet, useTick } from '../lib/hooks';
 import { t, joinPhrases } from '../i18n';
 import { actions, getState, useStore } from '../state/store';
@@ -28,7 +33,7 @@ import type { AppState } from '../state/store';
 import {
   isModeB, isShareMode, peerDeviceRows, halReasonText, peerUnusableText,
 } from '../state/mode';
-import { refreshPeers, refreshSessions, rpc } from '../state/connection';
+import { refreshSessions, rpc } from '../state/connection';
 import type { PeerState, SessionInfo } from '../ipc/types';
 
 // 进行中的通路操作（`${fp}:mic` / `${fp}:spk`），也是开关 pending 态的唯一判据。
@@ -99,7 +104,8 @@ function reconnectLabel(fp: string, reported: number | undefined): string {
   return remain >= 1 ? t('peers.card.reconnectingIn', { s: Math.ceil(remain) }) : t('peers.card.reconnecting');
 }
 
-// 本机发起的会话：mic = 取对方麦克风（媒体 对方→我，dir recv）；spk = 送对方扬声器（dir send）。
+// 本机发起的会话：mic = 取对方麦克风（媒体 对方→我，dir recv）；
+// spk = 送对方扬声器（dir send）。
 // 必须 (kind,dir) 联合过滤：daemon 存的 kind 是发起方视角，对端发起的 mic 会话 dir 是 send
 // （= 对方在取用本机麦克风），只按 kind 匹配会把它误当成本机的通路。
 function matching(state: AppState, fp: string, kind: string): SessionInfo[] {
@@ -429,7 +435,8 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
       {/* 模式 A 专属的一整排通路控件。模式 B 下它们全部**下线**（不是变灰）：
           取谁的麦克风、送谁的扬声器由 App 在系统里选设备决定，这些开关既不反映那个
           选择、也无法表达它；留着只会让用户以为自己在这里做了什么。
-          monitorPref / bridgePref 在模式 B 下**不读不写**（数据保留，切回 A 复用）。
+          monitorPref / bridgePref 在模式 B 下**不读不写**
+          （数据保留，切回 A 复用）。
 
           共享模式下同样全部下线，理由更硬（plan §13）：本机在这个模式里**根本不
           使用**别的主机，daemon 会直接拒掉 `session.open`。留着它们等于摆一排必然
@@ -503,97 +510,19 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
   );
 }
 
-// ---------------------------------------------------------------- 手动添加
-
-function AddPeerForm({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const peers = useStore((s) => s.peers);
-  const peerRef = useRef<HTMLInputElement>(null);
-  const [addr, setAddr] = useState('');
-  const [peerVal, setPeerVal] = useState('');
-  const [pending, setPending] = useState(false);
-
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const peer = peerVal.trim();
-    const a = addr.trim();
-    if (!peer) {
-      toast(t('peers.form.needFingerprint'), 'warn');
-      peerRef.current?.focus();
-      return;
-    }
-    // M8 P6：这一格接受 `ws://…`（Tier 2 over WebSocket），因为地址本身就是
-    // 传输选择。拒的只有两种：解析不出来的 URL，和本 build 拨不动的 `wss://`。
-    // **拒在这里而不是让 daemon 拒**：一个存得下、拨不动的地址在界面上看起来
-    // 完全正常，直到用户去连它。
-    const shape = classifyPeerAddr(a);
-    if (shape.kind === 'badUrl') {
-      toast(t(`addr.badUrl.${shape.reason}`, { addr: a }), 'warn');
-      return;
-    }
-    if (shape.kind === 'wss') {
-      toast(t('addr.wssUnsupported'), 'warn');
-      return;
-    }
-    setPending(true);
-    try {
-      // 超时由 ipc/client.ts 的方法级表给出（daemon 最坏 TCP 5s + 握手 10s）。
-      await rpc('peers.connect', a ? { peer, addr: a } : { peer });
-      toast(t('peers.form.done'), 'ok');
-      setAddr('');
-      onClose();
-      void refreshPeers();
-    } catch { /* rpc 已 toast */ } finally {
-      setPending(false);
-    }
-  };
-
-  return (
-    <form className="card add-peer-form" hidden={!open} data-testid="add-peer-form" onSubmit={submit}>
-      <div className="form-row">
-        <label className="field">
-          <span className="field-label">{t('peers.form.fingerprint')}</span>
-          <input
-            ref={peerRef}
-            className="input"
-            data-testid="add-peer-peer"
-            list="ah-peer-fps"
-            placeholder={t('peers.form.fingerprintPlaceholder')}
-            autoComplete="off"
-            spellCheck="false"
-            value={peerVal}
-            onChange={(e) => setPeerVal(e.currentTarget.value)}
-          />
-          <datalist id="ah-peer-fps">
-            {peers.map((p) => <option key={p.fingerprint} value={p.fingerprint}>{p.name || ''}</option>)}
-          </datalist>
-        </label>
-        <label className="field grow">
-          <span className="field-label">{t('peers.form.addr')}</span>
-          <input
-            className="input"
-            data-testid="add-peer-input"
-            placeholder={t('peers.form.addrPlaceholder2')}
-            autoComplete="off"
-            spellCheck="false"
-            value={addr}
-            onChange={(e) => setAddr(e.currentTarget.value)}
-          />
-        </label>
-        <button className="btn primary" type="submit" data-testid="add-peer-connect" disabled={pending}>
-          {pending ? t('common.connecting') : t('common.connect')}
-        </button>
-      </div>
-    </form>
-  );
-}
-
 // ---------------------------------------------------------------- 视图
 
 export function PeersView() {
   const peers = useStore((s) => s.peers);
+  const pairing = useStore((s) => s.pairing);
   const modeB = useStore(isModeB);
   const share = useStore(isShareMode);
-  const [formOpen, setFormOpen] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [armedOpen, setArmedOpen] = useState(false);
+
+  // 「配对中 · 剩余 N 秒」是按钮上的活数字，需要一个节拍。
+  useTick(1000, !!pairing);
+  const armedRemain = pairing ? Math.max(0, Math.ceil((pairing.expiresAt - Date.now()) / 1000)) : 0;
 
   const retrying = peers.filter((p) => !p.online && p.reconnecting).length;
   const offline = peers.filter((p) => !p.online && !p.reconnecting).length;
@@ -606,16 +535,28 @@ export function PeersView() {
 
   return (
     <>
+      {/* 配对的两半各占一枚按钮：「添加对端」= 我去找别人（扫描 + 发起），
+          「让对方找到我」= 我等别人来。后者开启期间必须在主面板上一眼可见——
+          它是一扇允许局域网内任意主机发起配对的窗口，不该藏在菜单背后，所以
+          按钮自己带激活态与倒计时。 */}
       <div className="toolbar">
         <div className="toolbar-note warn" data-testid="peers-summary" hidden={!summary}>{summary}</div>
-        <button
-          className="btn primary" type="button" data-testid="add-peer-btn"
-          onClick={() => setFormOpen((v) => !v)}
-        >
-          <Icon name="plus" />{t('peers.addManual')}
-        </button>
+        <div className="toolbar-actions">
+          <button
+            className={`btn${pairing ? ' primary' : ''}`} type="button" data-testid="pair-armed-open"
+            onClick={() => setArmedOpen(true)}
+          >
+            <Icon name="pair" />
+            {pairing ? t('pair.armed', { n: fmt.int(armedRemain) }) : t('pair.left.open')}
+          </button>
+          <button
+            className="btn primary" type="button" data-testid="add-peer-btn"
+            onClick={() => setAddOpen(true)}
+          >
+            <Icon name="plus" />{t('peers.addManual')}
+          </button>
+        </div>
       </div>
-      <AddPeerForm open={formOpen} onClose={() => setFormOpen(false)} />
 
       <div className={`peer-grid${modeB ? ' mode-b' : ''}`}>
         {peers.map((p) => (
@@ -637,11 +578,14 @@ export function PeersView() {
         </ol>
         <button
           className="btn primary" type="button" data-testid="peers-empty-pair"
-          onClick={() => actions.navigate('pair')}
+          onClick={() => setAddOpen(true)}
         >
           <Icon name="pair" />{t('peers.empty.openPair')}
         </button>
       </div>
+
+      {addOpen ? <AddPeerSheet onClose={() => setAddOpen(false)} /> : null}
+      {armedOpen ? <BeDiscoveredSheet onClose={() => setArmedOpen(false)} /> : null}
     </>
   );
 }

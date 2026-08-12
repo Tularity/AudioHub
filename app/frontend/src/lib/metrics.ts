@@ -365,10 +365,12 @@ export function qualityTone(g: QualityGrade): string {
 /**
  * **有读数、但等级不成立**（daemon 报 `grade: "unknown"`：某个分量还没攒够窗口）。
  *
- * 这个状态必须在界面上有自己的样子。没有它的时候，它长成「有 kHz 数、没有等级词、
- * 四颗点全空」——而「四颗空心点」与「一颗亮点 = 差」在 7px 尺寸下几乎是同一个形状，
- * 用户只能读成**测出来很差**。把「还不知道」呈现成一个具体且悲观的结论，与用 0
- * 填补缺失分项是同一类错误，只是方向相反。
+ * 这个状态必须在界面上有自己的样子。四点指示撤掉之后（用户 2026-08-11 第 1 条），
+ * 它的载体只剩等级位那一个词——而等级位为空时，剩下的就是一个**不带任何色阶的
+ * kHz · bit 读数**，与「测出来很差」在形状上并无区别。所以 `qualityGradeTextKey`
+ * 必须为它返回「测量中…」，并由 `.metric-grade.measuring` 的斜体把它与四个真等级
+ * 分开。把「还不知道」呈现成一个具体且悲观的结论，与用 0 填补缺失分项是同一类
+ * 错误，只是方向相反。
  */
 export function isQualityMeasuring(q: QualityReading | undefined): boolean {
   return !!q && !q.grade;
@@ -413,13 +415,17 @@ export function qualityDepthKey(d: string | null | undefined): MsgKey | undefine
   }
 }
 
-/** 一级的「●●●○」：四点，点数由等级定。读不到时 0 点全空。 */
-export const QUALITY_DOTS = 4;
-
-export function qualityDots(g: QualityGrade | undefined): number {
-  if (!g) return 0;
-  return g === 'excellent' ? 4 : g === 'good' ? 3 : g === 'fair' ? 2 : 1;
-}
+/* `QUALITY_DOTS` / `qualityDots()` 已删（用户 2026-08-11 第 1 条）。
+ *
+ * 那四颗点是一个**凭空造出来的第二把尺**：它把四个等级重新编码成 0–4 的点数，
+ * 而等级本身已经有等级词与色阶两种编码了。用户的原话是「真正让音质因网络发生
+ * 变化直接改变 kHz 或 bit 标识显得下降即可」——线上采样率与位深本来就随质量档
+ * 实时变（阶梯六档，48k/f32 → 16k/s16），那才是**会跟着网络动的真读数**；
+ * 四颗点只是它的影子，而影子占的还是这一行里最紧张的那点横向空间。
+ *
+ * 色阶没有丢：`qualityTone()` 仍然给 `.metric-val.small` 上色（优/良好/一般/差
+ * ⇒ ok/accent/warn/danger），所以「变差」在数字自己身上同时以**字面值**和
+ * **颜色**两种方式呈现。 */
 
 // ---------------------------------------------------------------- 读取入口
 
@@ -801,7 +807,7 @@ const QUALITY_GRADES: readonly string[] = ['excellent', 'good', 'fair', 'poor'];
  * 2. **`grade: "unknown"` 不许回退成一个具体等级。** 分量缺席时在场分量的 min
  *    只是**上界**（`Grade::Excellent` 是最大值，`min(q1, Excellent, q3)` 与
  *    `min(q1, q3)` 逐值相同），真实等级落在 `[差, 上界]` 这个区间里。区间不是
- *    等级 ⇒ `grade` 留空，`qualityDots()` 因此给 0 颗点、等级词整段隐藏。
+ *    等级 ⇒ `grade` 留空，值那格因此不上色阶、等级位改写「测量中…」。
  *    这一条是「流开头 10~20 秒里一条正在爆音的流报『良好』」的正面防线。
  * 3. **不拿 `stats.loss_pct` 顶替。** 丢包率是**网口上的量**，音质是**扬声器上的
  *    量**，中间差一整条流水线（规格 §4.1）。丢包 2% 在 PLC 修得住时几乎不可闻；

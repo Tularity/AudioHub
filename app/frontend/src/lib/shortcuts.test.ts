@@ -134,12 +134,25 @@ describe('defaults', () => {
   });
 
   it('opens settings with the platform-conventional chord', () => {
-    // Apple's convention, not a preference. The number-row ⌘4 survives as an
+    // Apple's convention, not a preference. The number-row ⌘3 survives as an
     // alias so that family stays complete.
     expect(defaultBindings('mac')['view.settings']).toBe('Meta+,');
     expect(defaultBindings('win')['view.settings']).toBe('Ctrl+,');
-    expect(aliasFor('view.settings', 'mac')).toBe('Meta+4');
+    expect(aliasFor('view.settings', 'mac')).toBe('Meta+3');
     expect(aliasFor('view.peers', 'mac')).toBeNull();
+  });
+
+  it('leaves no hole in the number row after an action is retired', () => {
+    // `view.pair` was dropped when the pairing wizard stopped being a view.
+    // Its ⌘2 went to the action that followed it rather than staying vacant:
+    // a gap in ⌘1/⌘3 reads as a broken key, not as a removed feature.
+    for (const platform of ['mac', 'win'] as const) {
+      const mod = platform === 'mac' ? 'Meta' : 'Ctrl';
+      const b = defaultBindings(platform);
+      expect(b['view.peers']).toBe(`${mod}+1`);
+      expect(b['view.stats']).toBe(`${mod}+2`);
+      expect(aliasFor('view.settings', platform)).toBe(`${mod}+3`);
+    }
   });
 });
 
@@ -147,27 +160,36 @@ describe('resolveBindings', () => {
   it('treats "cleared" and "never set" as different states', () => {
     // The single most likely regression in the module: fold `null` into
     // "absent" and a cleared shortcut silently comes back on next launch.
-    const cleared = resolveBindings({ 'view.pair': null }, 'mac');
-    expect(cleared['view.pair']).toBeNull();
+    const cleared = resolveBindings({ 'view.stats': null }, 'mac');
+    expect(cleared['view.stats']).toBeNull();
     expect(cleared['view.peers']).toBe('Meta+1');
 
     const absent = resolveBindings({}, 'mac');
-    expect(absent['view.pair']).toBe('Meta+2');
+    expect(absent['view.stats']).toBe('Meta+2');
   });
 
   it('survives a corrupt or hand-edited store one entry at a time', () => {
     const raw = JSON.stringify({
       'view.peers': 'Meta+9',     // valid override
-      'view.pair': null,          // deliberately cleared
-      'view.stats': 'Nonsense++', // unparseable -> dropped, falls back to default
+      'view.stats': null,         // deliberately cleared
+      'nav.back': 'Nonsense++',   // unparseable -> dropped, falls back to default
       'not.an.action': 'Meta+8',  // unknown id -> dropped
     });
     const o = decodeOverrides(raw);
-    expect(o).toEqual({ 'view.peers': 'Meta+9', 'view.pair': null });
+    expect(o).toEqual({ 'view.peers': 'Meta+9', 'view.stats': null });
     const b = resolveBindings(o, 'mac');
     expect(b['view.peers']).toBe('Meta+9');
-    expect(b['view.pair']).toBeNull();
-    expect(b['view.stats']).toBe('Meta+3');
+    expect(b['view.stats']).toBeNull();
+    expect(b['nav.back']).toBe('Meta+[');
+  });
+
+  it('drops an override left behind by a retired action', () => {
+    // A user who customised ⌘2 back when it opened the pairing wizard still has
+    // `view.pair` in localStorage. It must not resurface as an unmatched key in
+    // the resolved table -- every consumer indexes that table by action id.
+    const o = decodeOverrides(JSON.stringify({ 'view.pair': 'Meta+8', 'view.peers': 'Meta+9' }));
+    expect(o).toEqual({ 'view.peers': 'Meta+9' });
+    expect(Object.keys(resolveBindings(o, 'mac'))).toEqual([...SHORTCUT_ACTIONS]);
   });
 
   it('decodes nothing at all rather than throwing', () => {
@@ -193,17 +215,17 @@ describe('lookupAction', () => {
   });
 
   it('honours the alias, but lets a real binding shadow it', () => {
-    expect(lookupAction('Meta+4', mac, 'mac')).toBe('view.settings');
-    const stolen = resolveBindings({ 'view.stats': 'Meta+4' }, 'mac');
-    expect(lookupAction('Meta+4', stolen, 'mac')).toBe('view.stats');
+    expect(lookupAction('Meta+3', mac, 'mac')).toBe('view.settings');
+    const stolen = resolveBindings({ 'view.stats': 'Meta+3' }, 'mac');
+    expect(lookupAction('Meta+3', stolen, 'mac')).toBe('view.stats');
   });
 
   it('stays silent for an action whose binding was cleared', () => {
-    // Clearing settings must also silence its alias -- otherwise ⌘4 keeps
+    // Clearing settings must also silence its alias -- otherwise ⌘3 keeps
     // opening the page the user just unbound.
     const cleared = resolveBindings({ 'view.settings': null }, 'mac');
     expect(lookupAction('Meta+,', cleared, 'mac')).toBeNull();
-    expect(lookupAction('Meta+4', cleared, 'mac')).toBeNull();
+    expect(lookupAction('Meta+3', cleared, 'mac')).toBeNull();
   });
 });
 
@@ -261,23 +283,23 @@ describe('applyBinding', () => {
   });
 
   it('clearing a binding leaves the others alone', () => {
-    const next = applyBinding({}, 'view.pair', null, mac);
-    expect(next).toEqual({ 'view.pair': null });
+    const next = applyBinding({}, 'view.stats', null, mac);
+    expect(next).toEqual({ 'view.stats': null });
   });
 
   it('restoring a default removes the override rather than writing it in', () => {
     // Writing the default value in would pin today's default forever; a later
     // change to the table would never reach a user who once pressed "reset".
-    const custom = applyBinding({}, 'view.pair', 'Meta+8', mac);
-    expect(isCustomized(custom, 'view.pair')).toBe(true);
-    const back = clearOverride(custom, 'view.pair');
-    expect(isCustomized(back, 'view.pair')).toBe(false);
+    const custom = applyBinding({}, 'view.stats', 'Meta+8', mac);
+    expect(isCustomized(custom, 'view.stats')).toBe(true);
+    const back = clearOverride(custom, 'view.stats');
+    expect(isCustomized(back, 'view.stats')).toBe(false);
     expect(back).toEqual({});
-    expect(resolveBindings(back, 'mac')['view.pair']).toBe('Meta+2');
+    expect(resolveBindings(back, 'mac')['view.stats']).toBe('Meta+2');
   });
 
   it('counts a cleared action as customised', () => {
     // Otherwise the row offers no way back to its default.
-    expect(isCustomized(applyBinding({}, 'view.pair', null, mac), 'view.pair')).toBe(true);
+    expect(isCustomized(applyBinding({}, 'view.stats', null, mac), 'view.stats')).toBe(true);
   });
 });

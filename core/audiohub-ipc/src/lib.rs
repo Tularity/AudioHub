@@ -47,12 +47,18 @@ pub use transport::{
 /// 24 bit、界面上没有任何一处提到位深」的界面与 v3/v4 那两次是同一种病，
 /// 所以同样拒连。
 ///
+/// **6（AirPlay 固定本机播放）：不兼容变更。**
+/// `DaemonSettings.airplay_route` 与 `session.open.source="airplay"` 被移除。
+/// 必须拒绝新界面连接仍在运行的 v5 daemon：旧 daemon 可能仍持有
+/// `airplay_route="peers"`，而新界面已经没有入口能看见或改回本机播放；不升版会
+/// 形成「界面承诺本机播放、实际无声」的静默错配。
+///
 /// ⚠ **必须同步改的两处**（不在本 crate，改这里就得改它们，否则 App 拒连）：
 ///   - `app/src-tauri/src/main.rs` 的 `const IPC_VERSION: u32`
 ///   - `app/frontend/src/ipc/client.ts` 的 `export const IPC_VERSION`
 /// 两处都做**严格相等**校验（`main.rs` 的 `port_alive` 分支会直接报版本不符），
 /// 所以它们与本常量是一个原子的三件套。
-pub const IPC_VERSION: u32 = 5;
+pub const IPC_VERSION: u32 = 6;
 
 pub use audiohub_core::audio::DevicesReport;
 pub use audiohub_core::dsp::ToneVerdict;
@@ -227,6 +233,9 @@ pub const SETTINGS_WRITABLE_KEYS: &[&str] = &[
     "mode_a_volume_sync",
     "mode_a_mute_local",
     "discovery_announce",
+    "airplay_enabled",
+    "airplay_name",
+    "airplay_password",
     // plan M9「开机自启」。**一个键管两个平台**：macOS 写 LaunchAgent、Windows
     // 写计划任务，但契约面上只有这一个名字。两套键会让「开机自启开着吗」这个
     // 问题在跨平台的界面与文档里各有一个答案。
@@ -291,6 +300,37 @@ pub struct DaemonSettings {
     /// nobody can discover it.
     #[serde(default)]
     pub discovery_announcing: bool,
+    /// Whether the user wants the audio-only AirPlay receiver running.
+    #[serde(default)]
+    pub airplay_enabled: bool,
+    /// Optional advertised-name override. Empty means
+    /// `AudioHub — <current daemon name>` and therefore follows later renames.
+    #[serde(default)]
+    pub airplay_name: String,
+    /// The name currently advertised (or that will be advertised when enabled).
+    /// Derived; never stored.
+    #[serde(default)]
+    pub airplay_effective_name: String,
+    /// Actual receiver state, deliberately separate from `airplay_enabled` so
+    /// bind/mDNS failures cannot be presented as a working switch.
+    #[serde(default)]
+    pub airplay_listening: bool,
+    #[serde(default)]
+    pub airplay_error: Option<String>,
+    /// Non-fatal playback/control warning. The listener may still be healthy;
+    /// callers must not label this as a receiver startup failure.
+    #[serde(default)]
+    pub airplay_warning: Option<String>,
+    /// Only the presence bit crosses IPC. The secret itself is write-only and
+    /// must never enter frontend state or diagnostic snapshots.
+    #[serde(default)]
+    pub airplay_password_set: bool,
+    /// Actual dynamically selected ports. macOS commonly already owns 7000 for
+    /// its built-in Receiver, so these are facts, not fixed defaults.
+    #[serde(default)]
+    pub airplay_raop_port: Option<u16>,
+    #[serde(default)]
+    pub airplay_airplay2_port: Option<u16>,
     /// plan M9「开机自启」：这台机器此刻**真的**注册着登录项吗。
     ///
     /// 与它的邻居 `discovery_announce` 不同，这一个**不是存盘的愿望**——它是
@@ -350,6 +390,27 @@ pub struct DaemonSettings {
     /// 以为自己保存失败了。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_source: Option<String>,
+}
+
+/// One currently connected audio-only AirPlay sender. Artwork and raw metadata
+/// stay inside the receiver; this small view is safe for the UI state snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AirPlaySessionInfo {
+    pub id: u64,
+    pub protocol: String,
+    pub peer: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub album: Option<String>,
+    /// How long this sender has been connected, in milliseconds.
+    pub connected_ms: u64,
 }
 
 /// 一台对端 × 一个方向的两个**目标**档位（plan §15）。
@@ -1141,8 +1202,21 @@ pub struct SessionInfo {
     pub id: u32,
     pub peer_fingerprint: String,
     pub peer_name: String,
-    pub kind: String,               // KIND_MIC | KIND_SPK
-    pub dir: String,                // "send" | "recv"
+    pub kind: String, // KIND_MIC | KIND_SPK
+    pub dir: String,  // "send" | "recv"
+    /// Source selected by this daemon when it opened the session. `None`
+    /// means this is a peer-originated/provider-side entry, so this daemon has
+    /// no local [`OpenSessionParams`] to report.
+    ///
+    /// A locally opened session always reports a value: an omitted
+    /// `OpenSessionParams::source` is the daemon contract's `"mic"` default.
+    /// `#[serde(default)]` keeps snapshots from older daemons readable.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Capture backend requested by this daemon for a locally opened session.
+    /// `None` means automatic/not applicable, or a peer-originated entry.
+    #[serde(default)]
+    pub backend: Option<String>,
     /// 这条流**线上的采样率**（Hz）。`0` = 两侧都报不出。
     pub sample_rate: u32,
     /// 这条流**线上的位深**：`"s16" | "s24" | "f32"`；`""` = 报不出。
@@ -1356,8 +1430,13 @@ pub struct PeerState {
 /// - "settings.set"      {mode?, remove_virtual_on_disconnect?,
 ///                        mark_offline_devices?, mode_a_volume_sync?,
 ///                        mode_a_mute_local?, discovery_announce?, autostart?,
+///                        airplay_enabled?, airplay_name?, airplay_password?,
 ///                        name?}
 ///                                             -> DaemonSettings
+///       `airplay_password` is write-only. The reply contains only
+///       `airplay_password_set`; the secret never enters a frontend store or
+///       diagnostic state snapshot. Empty clears it.
+/// - "airplay.sessions.list" {}                -> Vec<AirPlaySessionInfo>
 ///       `name` (user instruction 2026-08-10 #9) is this machine's display
 ///       name; `""` clears the override and follows the host name again. It is
 ///       stored in identity.json beside the signing key, not in settings.json —
@@ -1382,6 +1461,8 @@ pub struct PeerState {
 ///       `latency` / `quality` **不再在这里**（plan §15）：它们是每对端 × 每
 ///       方向的选择，走 "peers.set_transport"。旧客户端传这两个键会被拒绝，
 ///       而不是被静默收下——静默收下正是本项目栽过六次的那个形状。
+///       `airplay_route` 同样会被明确拒绝：AirPlay 音频始终在接收端本机播放，
+///       不再存在可写的去向或可供对端打开的 AirPlay source。
 ///       The mode is DAEMON-owned global state (plan §7.1/§13) and the three
 ///       modes are mutually exclusive, so setting it is never only a display
 ///       change. Switching AWAY from `share` closes every session a peer opened
@@ -1437,6 +1518,7 @@ pub mod methods {
     pub const STATS_SUBSCRIBE: &str = "stats.subscribe";
     pub const SETTINGS_GET: &str = "settings.get";
     pub const SETTINGS_SET: &str = "settings.set";
+    pub const AIRPLAY_SESSIONS_LIST: &str = "airplay.sessions.list";
     pub const PEERS_PAIR: &str = "peers.pair";
     pub const PEERS_UNPAIR: &str = "peers.unpair";
     pub const PEERS_SET_ALIAS: &str = "peers.set_alias";

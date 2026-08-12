@@ -1,4 +1,4 @@
-// 简体中文语料。**唯一发布语种**，也是缺省回退语种。
+// 简体中文语料，也是缺省回退语种。
 //
 // 键的命名规矩：`<视图或模块>.<语义>`，稳定不变；改文案只动值，绝不动键。
 // 值里的 `{name}` 是具名占位符——一条文案永远是**一句完整的话**，变量插进去，
@@ -34,7 +34,10 @@ export const zhCN = {
   'app.name': 'AudioHub',
   'app.tagline': '网络音频共享',
   'nav.peers': '主面板',
-  'nav.pair': '配对向导',
+  // 「配对向导」那一格已删（用户 2026-08-11 第 1 条）：配对搬进了主面板上的二级菜单。
+  // 「共享协议」只在共享模式下出现（同一条指令第 3 段），见 components/Chrome.tsx
+  // 的 navEntries()——它是这排格子里唯一的条件项。
+  'nav.share': '共享协议',
   'nav.stats': '统计诊断',
   'nav.settings': '设置',
   'nav.detail': '对端详情',
@@ -319,11 +322,19 @@ export const zhCN = {
   // ⚠ 排版塞不下时**优先保住位深写全**，把等级词移进 title；
   // 绝不许为了短而只写一个维度——那正好回到本次要消灭的那个歧义。
   'metric.quality.rateDepth': '{khz} kHz · {depth}',
-  // 位深的三个拼写。**`f32` 写成「32 bit 浮点」而不是「32 bit」**：
-  // 裸的 32 与 32 位整数无法区分，而线上根本没有 32 位整数这一档。
+  // 位深的三个拼写。
+  //
+  // `f32` 曾写作「32 bit 浮点」，理由是「裸的 32 与 32 位整数无法区分」——用户
+  // 2026-08-11 第 1 条把那两个字撤了。撤得成立，因为**这三条只用在读数位**：
+  // 读数位写的是这条流此刻在线上跑的格式，而线上根本没有 32 位整数那一档，
+  // 于是「与谁区分」这个问题在这里不存在。
+  //
+  // ⚠ 需要区分的是**滑条**：那里六档并列、用户在挑一档，所以
+  // `settings.transport.q.pcm48k32f` 仍然写「PCM 48 kHz · 32 bit 浮点」，
+  // regress/metrics-units.mjs 对它有一条专门的断言。两处不是同一件事，别去对齐。
   'metric.quality.depth.s16': '16 bit',
   'metric.quality.depth.s24': '24 bit',
-  'metric.quality.depth.f32': '32 bit 浮点',
+  'metric.quality.depth.f32': '32 bit',
   'metric.quality.rateWhy': '线上采样率与位深，与详情页所设音质档同源。带宽为采样率的一半。',
   'metric.quality.grade.excellent': '优',
   'metric.quality.grade.good': '良好',
@@ -336,10 +347,12 @@ export const zhCN = {
   'metric.quality.collapse': '收起构成',
   // daemon 报 `grade: "unknown"`（某个分量还没攒够窗口）时的等级位文案。
   //
-  // 没有它的时候，这个状态在界面上长成「有 kHz 数、没有等级词、四颗点全空」——
-  // 而「四颗点全空」在视觉上与「一颗点 = 差」几乎分不开，用户只能读成**测出来很差**。
-  // 一个还没测出结论的通路被读成质量最差，是这套遥测最不该犯的错：它把「不知道」
-  // 伪装成了一个具体且悲观的结论，方向虽反，性质与用 0 填补缺失分项完全相同。
+  // 没有它的时候，这个状态在界面上长成「有 kHz 数、没有等级词、什么标记都没有」，
+  // 与「测出来很差」在形状上分不开。一个还没测出结论的通路被读成质量最差，是这套
+  // 遥测最不该犯的错：它把「不知道」伪装成了一个具体且悲观的结论，方向虽反，
+  // 性质与用 0 填补缺失分项完全相同。
+  //
+  // 四点指示撤掉之后（2026-08-11）这条的地位更重了：它是这一态**唯一**的载体。
   'metric.quality.measuring': '测量中…',
   'metric.quality.measuringWhy': '仍有分量未积满统计窗口（通常十余秒）。此时取最小值只能得到上界，故暂不给出。',
   // grade 成立、但仍缺一块板：等级已经触底，缺席改不了结论，两件事都要说。
@@ -386,7 +399,12 @@ export const zhCN = {
   // 汇总条只在**异常**时出现：正常态下「已配对 N 台 · 在线 N 台」是一句谁都不会读的话。
   'peers.summary.offline': '离线 {n} 台',
   'peers.summary.retrying': '重连中 {n} 台',
-  'peers.addManual': '添加手动对端',
+  // 按钮开的是二级菜单（`components/PairSheet.tsx`），里面既能扫也能手填，
+  // 「手动」两个字因此不再成立。
+  'peers.addManual': '添加对端',
+  // 那扇面板下半截那张表单的小标题。它与上半截是**两条不同的 RPC**（`peers.connect`
+  // vs `peers.pair`），标题就是用户区分自己属于哪一类的唯一线索。
+  'peers.form.reconnectTitle': '已配对主机重连',
   'peers.form.fingerprint': '对端指纹',
   'peers.form.fingerprintPlaceholder': '对端指纹（可输前缀）',
   'peers.form.addr': '地址',
@@ -460,9 +478,11 @@ export const zhCN = {
 
   'peers.empty.title': '请先在两台设备上完成配对',
   'peers.empty.step1': '在两台设备上都打开 AudioHub',
-  'peers.empty.step2': '在本机打开「配对向导」生成 6 位 PIN',
+  // 两步各指一枚**主面板上真实存在的按钮**（用户 2026-08-11 第 1 条之后，配对的
+  // 两半各自成钮）。写「打开配对向导」的那一版现在会让用户去找一页已经不存在的界面。
+  'peers.empty.step2': '在本机点「让对方找到我」生成 6 位 PIN',
   'peers.empty.step3': '另一台设备发现本机后输入同一 PIN',
-  'peers.empty.openPair': '打开配对向导',
+  'peers.empty.openPair': '开始配对',
 
   'peers.bridgeUnavailable': '虚拟声卡「{name}」当前不可用，本次不桥接。',
   'peers.reopenFailed': '旧会话 #{id} 未能关闭，请在对端详情页手动关闭。',
@@ -607,8 +627,9 @@ export const zhCN = {
   'detail.unpair.done': '已解除配对',
 
   // ---------------------------------------------------------------- 配对
-  // 单栏之后只剩一个板块，标题就是这一页在做的事。
-  'pair.title': '配对',
+  // `pair.title`（那一页的页标题）随「配对向导」整页一起删（用户 2026-08-11 第 1 条）。
+  // 下面这些键**原样保留**：宿主从 `view` 换成了两扇 `Sheet`，文案一个字没变，
+  // 改键名只会让所有相关的 testid 与回归脚本一起返工。
   // 「让对方找到我」是二级菜单的入口按钮，也是那个面板的标题。
   'pair.left.open': '让对方找到我',
   'pair.left.title': '让对方找到我',
@@ -662,6 +683,53 @@ export const zhCN = {
   'pair.step.verifyPin': '校验 PIN',
   'pair.step.exchangeKeys': '交换密钥',
   'pair.step.done': '完成配对',
+
+  // ---------------------------------------------------------------- 共享协议
+  // 只在共享模式下存在的一页（用户 2026-08-11 第 1 条第 3 段）。
+
+  'share.proto.airplay.title': 'AirPlay 接收',
+  'share.proto.airplay.enable': '接受 AirPlay 投送',
+  'share.proto.airplay.name': '广播名称',
+  'share.proto.airplay.namePlaceholder': '跟随本机名称',
+  'share.proto.airplay.nameDefault': '跟随本机',
+  'share.proto.airplay.effectiveName': '当前广播名称：{name}',
+  'share.proto.airplay.password': '投送密码',
+  'share.proto.airplay.passwordPlaceholderUnset': '未设置；输入密码以启用',
+  'share.proto.airplay.passwordPlaceholderSet': '已设置；输入新密码以替换',
+  'share.proto.airplay.settings': '接收设置',
+  'share.proto.airplay.settingsTitle': 'AirPlay 接收设置',
+  'share.proto.airplay.passwordSet': '已设密码',
+  'share.proto.airplay.passwordUnset': '无密码',
+  // 后果句（§3.1 允许留在界面上的三类之一）：开着这扇窗户期间会发生什么。
+  'share.proto.airplay.consequence': '开启后，同一网络内的设备可向本机投送；投送音量更新本机系统音量，本机变化会经客户端支持的 AirPlay 控制路径回传。需要限制访问时请设置密码。',
+  'share.proto.airplay.state': '状态',
+  'share.proto.airplay.stateLoading': '正在读取…',
+  'share.proto.airplay.stateStarting': '正在启动…',
+  'share.proto.airplay.stateListening': '正在监听',
+  'share.proto.airplay.stateError': '启动失败：{message}',
+  'share.proto.airplay.stateWarning': '接收仍在运行；{message}',
+  'share.proto.airplay.stateUnsupported': '当前服务不支持 AirPlay 接收',
+  'share.proto.airplay.raopPort': 'RAOP 端口 {port}',
+  'share.proto.airplay.airplay2Port': 'AirPlay 2 端口 {port}',
+
+  'share.proto.active.title': '当前接入',
+  'share.proto.active.empty': '还没有任何外部来源接入。',
+  'share.proto.active.unknownTrack': '未提供曲目信息',
+  'share.proto.active.unknownPeer': '未知发送端',
+  'share.proto.active.protocolUnknown': 'AirPlay',
+  'share.proto.active.transportConnected': '已连接',
+  'share.proto.active.playing': '播放中',
+  'share.proto.active.paused': '已暂停',
+  'share.proto.active.peer': '来源 {peer}',
+  'share.proto.active.rate': '{rate} Hz',
+  'share.proto.active.channels': '{channels} 声道',
+  'share.proto.active.connected': '已连接 {time}',
+
+  'share.proto.planned.title': '计划中的协议',
+  'share.proto.planned.tag': '计划中',
+  'share.proto.planned.cast': 'Google Cast',
+  'share.proto.planned.dlna': 'DLNA / UPnP',
+  'share.proto.planned.rtsp': 'RTSP 裸流',
 
   // ---------------------------------------------------------------- 设置
   'settings.mode.title': '运行模式',
@@ -918,6 +986,7 @@ export const zhCN = {
   'settings.modeOptions.shareNone': '共享模式没有本机侧的选项：由对端决定怎么用这台机器。',
   'settings.modeAVolume.syncTitle': '与对端音量同步',
   'settings.modeAVolume.muteTitle': '静音本机输出',
+  'settings.modeAVolume.syncMuteException': '两项同时开启时只同步音量；本机静音状态不会同步给对端。',
   'settings.devices.removeTitle': '断开后移除虚拟设备',
   'settings.devices.markOfflineTitle': '离线时标注设备名',
   'settings.devices.inventory': '设备清单',
@@ -957,7 +1026,8 @@ export const zhCN = {
   'settings.shortcuts.resetAllDone': '快捷键已全部恢复默认。',
 
   'shortcuts.action.peers': '主面板',
-  'shortcuts.action.pair': '配对向导',
+  // `shortcuts.action.pair` 随「配对向导」那一页一并删（用户 2026-08-11 第 1 条）：
+  // 动作 id `view.pair` 已从 SHORTCUT_ACTIONS 里退役，⌘2 让给了统计诊断。
   'shortcuts.action.stats': '统计诊断',
   'shortcuts.action.settings': '打开设置',
   'shortcuts.action.back': '返回主面板',
@@ -1208,33 +1278,31 @@ export const zhCN = {
   // wiki，界面上只剩标题、值/状态，以及一枚 `?`。
   //
   // 因此每一条都是那枚 `?` 的**无障碍名称**（aria-label + title），不是段落。
-  // 写法固定为「这一块讲的是什么（英文）」——读屏念出来是一句完整的话，而
+  // 写法固定为「这一块讲的是什么」——读屏念出来是一句完整的话，而
   // 「更多信息」那种写法在一页十几枚 `?` 的地方等于什么都没说。
-  //
-  // ⚠ wiki 是**英文**的，与界面语种无关。这些文案里因此明写「英文」——
-  // 点开一个语言与预期不符的页面，是一次很容易避免的意外。
   // ⚠ 地址不在这里，在 lib/external.ts 的 WIKI 表：翻译一门语言不该有机会改掉
   // 一个地址，而每条地址都带章节锚点。
-  'wiki.open': '打开项目文档（英文）',
-  'wiki.modes': '运行模式详解（英文）',
-  'wiki.transport': '连通方式与降级代价（英文）',
-  'wiki.quality': '音质阶梯与 AUTO（英文）',
-  'wiki.latency': '延迟的构成与测量（英文）',
-  'wiki.volume': '两端音量如何取舍（英文）',
-  'wiki.permissions': '各项系统权限的用途（英文）',
-  'wiki.discovery': '发现、配对与端口（英文）',
-  'wiki.web': '网页访问及其边界（英文）',
-  'wiki.webLocalOnly': '「仅允许本机」为何锁定（英文）',
-  'wiki.devices': '虚拟设备的行为（英文）',
-  'wiki.deviceNaming': '虚拟设备的命名（英文）',
-  'wiki.bridge': '虚拟声卡桥接（英文）',
-  'wiki.capture': '系统音频捕获后端（英文）',
-  'wiki.startup': '开机自启的实现（英文）',
-  'wiki.shortcuts': '快捷键（英文）',
-  'wiki.paths': '配置目录（英文）',
-  'wiki.tunnel': '隧道地址（英文）',
-  'wiki.unpair': '解除配对会发生什么（英文）',
-  'wiki.degraded': '降级链路的代价（英文）',
+  'wiki.open': '打开项目文档',
+  'wiki.modes': '运行模式详解',
+  'wiki.transport': '连通方式与降级代价',
+  'wiki.quality': '音质阶梯与 AUTO',
+  'wiki.latency': '延迟的构成与测量',
+  'wiki.volume': '两端音量如何取舍',
+  'wiki.permissions': '各项系统权限的用途',
+  'wiki.discovery': '发现、配对与端口',
+  'wiki.shareProtocols': '外部来源如何接入',
+  'wiki.web': '网页访问及其边界',
+  'wiki.webLocalOnly': '「仅允许本机」为何锁定',
+  'wiki.devices': '虚拟设备的行为',
+  'wiki.deviceNaming': '虚拟设备的命名',
+  'wiki.bridge': '虚拟声卡桥接',
+  'wiki.capture': '系统音频捕获后端',
+  'wiki.startup': '开机自启的实现',
+  'wiki.shortcuts': '快捷键',
+  'wiki.paths': '配置目录',
+  'wiki.tunnel': '隧道地址',
+  'wiki.unpair': '解除配对会发生什么',
+  'wiki.degraded': '降级链路的代价',
 
   // ---------------------------------------------------------------- 外链 / 时间
   'vendor.blackhole': 'BlackHole（macOS）',

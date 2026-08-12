@@ -1,13 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
+    "core/audiohub-airplay",
     "core/audiohub-core",
     "core/audiohub-net",
     "core/audiohub-ipc",
     "core/audiohub-cli",
     "core/audiohubd",
 ]
-exclude = ["test"]
+exclude = ["test", "third_party/openairplay1"]
 
 [profile.release]
 opt-level = 3

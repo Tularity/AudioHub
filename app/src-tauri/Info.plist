@@ -29,13 +29,15 @@
   <string>AudioHub 需要录制本机的系统音频，才能把这台 Mac 正在播放的声音共享给已配对的另一台设备（例如让 Windows 电脑播放这台 Mac 的音乐）。仅在你主动开启共享时采集，音频只在局域网内点对点加密传输。</string>
 
   <key>NSLocalNetworkUsageDescription</key>
-  <string>AudioHub 需要访问本地网络，才能通过 mDNS 发现同一局域网内的其他 AudioHub 设备，并与已配对的设备直接传输音频。音频不会上传到互联网。</string>
+  <string>AudioHub 需要访问本地网络，才能发现同一局域网内的 AudioHub 设备、发布 AirPlay 音频接收器，并直接传输音频。音频不会上传到互联网。</string>
 
   <!-- macOS 15+ pairs the local-network prompt with the Bonjour service types
        actually browsed; audiohub_net::discovery::SERVICE_TYPE. -->
   <key>NSBonjourServices</key>
   <array>
     <string>_audiohub._udp</string>
+    <string>_raop._tcp</string>
+    <string>_airplay._tcp</string>
   </array>
 </dict>
 </plist>

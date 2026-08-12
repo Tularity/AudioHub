@@ -8,16 +8,29 @@ import { useEffect, useState } from 'react';
 import { RawIcon } from './Icon';
 import { useStore } from '../state/store';
 import type { AppState, ViewName } from '../state/store';
+import { isShareMode } from '../state/mode';
 import { connectDaemon, IPC_VERSION } from '../state/connection';
 import { t } from '../i18n';
 import type { MsgKey } from '../i18n';
 
-const NAV: { view: ViewName; labelKey: MsgKey; icon: 'peers' | 'pair' | 'stats' | 'settings' }[] = [
+type NavEntry = { view: ViewName; labelKey: MsgKey; icon: 'peers' | 'cable' | 'stats' | 'settings' };
+
+// 「配对向导」那一格已删（用户 2026-08-11 第 1 条）：配对搬进主面板上的二级菜单。
+//
+// 「共享协议」**只在共享模式下出现**（用户同一条指令的第 3 段）。它是这排格子里
+// 唯一一个条件项，代价是格数会在 3/4 之间变——而 `--nav-count` / `--nav-index`
+// 本来就是按当前这张表算的，指示块照样滑得对。
+const NAV_BASE: NavEntry[] = [
   { view: 'peers', labelKey: 'nav.peers', icon: 'peers' },
-  { view: 'pair', labelKey: 'nav.pair', icon: 'pair' },
   { view: 'stats', labelKey: 'nav.stats', icon: 'stats' },
   { view: 'settings', labelKey: 'nav.settings', icon: 'settings' },
 ];
+const NAV_SHARE: NavEntry = { view: 'share', labelKey: 'nav.share', icon: 'cable' };
+
+export function navEntries(share: boolean): NavEntry[] {
+  if (!share) return NAV_BASE;
+  return [NAV_BASE[0]!, NAV_SHARE, ...NAV_BASE.slice(1)];
+}
 
 // 详情页高亮主面板
 const NAV_OF: Partial<Record<ViewName, ViewName>> = { detail: 'peers' };
@@ -25,7 +38,7 @@ const NAV_OF: Partial<Record<ViewName, ViewName>> = { detail: 'peers' };
 export const VIEW_TITLE: Record<ViewName, MsgKey> = {
   peers: 'nav.peers',
   detail: 'nav.detail',
-  pair: 'nav.pair',
+  share: 'nav.share',
   settings: 'nav.settings',
   stats: 'nav.stats',
 };
@@ -91,18 +104,20 @@ export function Watermark() {
  */
 export function NavPill({ onNavigate }: { onNavigate: (v: ViewName) => void }) {
   const view = useStore((s) => s.route.view);
+  const share = useStore(isShareMode);
+  const nav = navEntries(share);
   const active = NAV_OF[view] || view;
-  const index = Math.max(0, NAV.findIndex((n) => n.view === active));
+  const index = Math.max(0, nav.findIndex((n) => n.view === active));
   const contracted = useContracted();
 
   return (
     <nav
       id="nav"
       className={contracted ? 'contracted' : undefined}
-      style={{ '--nav-count': NAV.length, '--nav-index': index } as React.CSSProperties}
+      style={{ '--nav-count': nav.length, '--nav-index': index } as React.CSSProperties}
     >
       <span className="nav-marker" aria-hidden="true" />
-      {NAV.map((n) => (
+      {nav.map((n) => (
         <button
           key={n.view}
           className={`nav-item${active === n.view ? ' active' : ''}`}

@@ -93,10 +93,8 @@
   --edge: rgba(255, 255, 255, .10);
   --edge-strong: rgba(255, 255, 255, .14);
   --edge-hover: rgba(255, 255, 255, .22);
-  /* 空档位的环（音质那排「●●●○」里的空心点）。**不并进 --edge-* 那条阶**：
-     .qdot 旁边的注释说明这 18% 是为了让空点不被读成「四颗都亮着」而挑的，
-     并进 22% 那一档正好把它往错的方向推了一步。有理由的值就该有自己的名字。 */
-  --ring-empty: rgba(255, 255, 255, .18);
+  /* `--ring-empty`（音质那排「●●●○」里空心点的环）随四点指示一并删除，
+     2026-08-11。它只有那一个消费者，留着就是一个没人用的 18%。 */
 
   /* 具名中性色。名字说的是**用途**不是明度——浅色主题下 --track 会比 --bg 深，
      深色下比 --bg 浅，只有「它是滑条的轨道」这件事两边一致。 */
@@ -142,7 +140,7 @@
    *
    * 四个语义色（--ok / --accent / --warn / --danger）的取值是按**正文对比度**定的。
    * 浅色下这条约束把它们全压到 L* 41–44，而它们同时还在给一批**非文字**的小图形上色：
-   * 音质的 7px 圆点、在线/离线点、延迟条、步骤点、归因条左边那道 3px 竖线。
+   * 在线/离线点、延迟条、步骤点、归因条左边那道 3px 竖线。
    * 结果是浅色下每一枚状态点都比它需要的暗 13 个 L*，读成「一粒黑渣」而不是「状态色」。
    *
    * 这不是新发明的分层，是这份文件已经做过两次的同一件事：--ring 从 --accent 里拆出来
@@ -157,8 +155,8 @@
    *     另配 Yellow 60 #8e6a00 / Orange 60 #ba4e00 两个**只用来描边**的深色。
    *     也就是说：填充亮、描边/文字深，两档分工与这里一致。
    *   · 我们的填充比 Carbon 保守（3:1 而不是 1.68:1），因为 Carbon 的状态指示器带图标
-   *     形状，靠「符号/形状/颜色/文字四要素至少三样」兜可访问性；我们的 .qdot 是 7px
-   *     纯圆点，形状这一路走不通，只能把对比度留在颜色上。
+   *     形状，靠「符号/形状/颜色/文字四要素至少三样」兜可访问性；我们的 `.dot.online`
+   *     一类是纯圆点，形状这一路走不通，只能把对比度留在颜色上。
    *
    * 深色侧四个 token 解析出来与它们替换掉的字面量**逐字相同**，所以 darkdiff 对这次
    * 拆分恒为绿——与 --ring 当初那次拆分是同一个手法，不是靠自觉。 */
@@ -383,7 +381,6 @@
   --edge: rgba(15, 23, 42, .10);
   --edge-strong: rgba(15, 23, 42, .16);
   --edge-hover: rgba(15, 23, 42, .26);
-  --ring-empty: rgba(15, 23, 42, .22);
 
   --track: #d6dae3;
   --trough: #e2e6ed;
@@ -790,9 +787,18 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
+  /* 右侧主内容保留滚轮、触控板和键盘滚动，但不常驻一条装饰性滑槽。
+     只隐藏这一个容器：授权门、Sheet 和横向表格各自的滚动条仍是可见的。 */
+  scrollbar-width: none;
   /* 上内边距让内容起点落在胶囊下方；滚动时内容从胶囊底下穿过去。
      左下角那枚固定注脚（#conn-hint）已删，下内边距不必再为它多留 24px 避让。 */
   padding: calc(var(--chrome-h) + 20px) 28px 32px;
+}
+
+#view-root::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
 /* ---- 背景水印（品牌层） ---- */
@@ -1287,6 +1293,9 @@ body[data-window-controls="right"] .chrome-pop {
 }
 .input::placeholder { color: var(--placeholder); }
 .input:focus { outline: none; border-color: rgba(var(--ring-rgb), 0.5); box-shadow: 0 0 0 3px var(--halo-soft); }
+/* 禁用的输入框必须**看得出**点不动，与 `.seg.off` 同一条理由：一个和能用的框长得
+   一模一样、却拒绝接收光标的输入框，只会被读成坏了。 */
+.input:disabled { opacity: .5; cursor: not-allowed; }
 
 /* 原生 select：只换外壳，箭头交给系统绘制（CSP 禁 data: 以外的图，也没必要自绘） */
 .select {
@@ -1357,9 +1366,14 @@ body[data-window-controls="right"] .chrome-pop {
 
 .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 /* 汇总条现在会整条隐藏，而控件**不能**跟着从右边跳到左边：位置比信息更该稳定。
-   （统计页的工具条只剩一个分段选择器，同理靠右。） */
+   （统计页的工具条只剩一个分段选择器，同理靠右。）
+   `.toolbar-actions` 是主面板那一簇按钮的包裹层——配对的两半各成一钮之后
+   （用户 2026-08-11 第 1 条），`.toolbar > .btn` 这条选择器对它们不再成立：
+   `margin-left: auto` 只对**第一枚**生效，两枚之间会被 justify-content 撑开。 */
 .toolbar > .btn,
-.toolbar > .segmented { margin-left: auto; }
+.toolbar > .segmented,
+.toolbar-actions { margin-left: auto; }
+.toolbar-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
 .toolbar-note { font-size: 13px; color: var(--text-dim); }
 /* 汇总条只在异常时出现，所以它出现时就该有异常的颜色——否则和过去那条谁也不读的
    「已配对 N 台」长得一样，等于白改。 */
@@ -1442,17 +1456,21 @@ body[data-window-controls="right"] .chrome-pop {
 .dir-block.ready { opacity: .75; }
 .dir-block.active { opacity: 1; }
 
-/* 标题行。有会话时它是按钮（点开该方向的明细），无会话时是普通行。 */
+/* 指标行：延迟（最左）+ 音质（最右）。有会话时它是按钮（点开该方向的明细），
+   无会话时是普通行。方向词**不在这里**——见 .dir-stream。 */
 .dir-head {
-  display: flex; align-items: center; gap: 8px; overflow: hidden;
+  display: flex; align-items: center; gap: 2px; overflow: hidden;
   background: none; border: 0; padding: 0; margin: 0;
   color: inherit; text-align: left; cursor: pointer; width: 100%;
 }
 .dir-head.idle { cursor: default; }
-/* 方向词 + 箭头。**整个方案的要害**：数字前面永远先有方向，物理上不可能再把
-   接收方向的 170 读成「全部」。箭头是冗余编码，中文两字是无障碍主体。 */
+/* 方向词 + 箭头。**整个方案的要害**：码率条前面永远先有方向，物理上不可能再把
+   接收方向的那条读成「全部」。箭头是冗余编码，中文两字是无障碍主体。
+   width 是承重的、不是对齐洁癖：两块的码率条必须从同一个 x 起画，否则「发送」
+   与「接收」两个词一样长而两条条子错开，会被读成两条条子量的不是同一件事。
+   （中文两字 22px + gap 4px + 箭头 12px ≈ 40px，留 44px 给字体差异。） */
 .dir-name {
-  flex: none; display: inline-flex; align-items: center; gap: 4px;
+  flex: none; width: 44px; display: inline-flex; align-items: center; gap: 4px;
   font-size: 11px; color: var(--text-dim); letter-spacing: .04em; white-space: nowrap;
 }
 .dir-arrow { font-size: 12px; opacity: .8; }
@@ -1461,8 +1479,13 @@ body[data-window-controls="right"] .chrome-pop {
   flex: none; font-size: 10px; color: var(--text-dim);
   border: 1px solid var(--line); border-radius: 999px; padding: 1px 6px; white-space: nowrap;
 }
-/* 流量行：码率条 + 码率数字。⚠ 那条不是电平，是 kbps/900 的另一种画法。 */
+/* 流量行：方向词 + 码率条 + 码率数字。⚠ 那条不是电平，是 kbps/900 的另一种画法。
+   无会话时这一行仍然存在，只是码率条那一格换成状态文字（「暂无通路」/「通路就绪」）
+   ——方向词在两态里必须落在同一个位置，那正是「两态等高」这条规矩要护的东西。 */
 .dir-stream { display: flex; align-items: center; gap: 10px; }
+/* 方向词与它右边那格之间收窄：10px 的 gap 是给「条 / 数字」这类等重元素定的，
+   而方向词是这一行的标签，贴紧它所标的东西才读得出从属关系。 */
+.dir-stream > .dir-name { margin-right: -4px; }
 .dir-detail { display: flex; flex-direction: column; gap: 6px; padding-top: 4px; }
 /* 延迟档主导权那一句：它是**警告性的补充**（本机滑条对这个方向有没有作用对象），
    不是普通脚注，所以比 .metric-foot 亮一档。 */
@@ -1489,7 +1512,10 @@ body[data-window-controls="right"] .chrome-pop {
    载体见 `.dir-head`。 */
 /* 指标格本身是按钮（点开就地展开明细）：按钮外观全部清掉，只留下光标与焦点环。 */
 .metric-cell {
-  display: flex; align-items: baseline; gap: 6px;
+  /* Four English tokens can share the quality cell (label, format, grade, origin).
+     Two pixels keeps each token distinct while preserving the complete grade
+     at the compact window width; 6px made even "Good" collapse to an ellipsis. */
+  display: flex; align-items: baseline; gap: 2px;
   background: none; border: 0; padding: 0; margin: 0;
   color: inherit; text-align: left; cursor: pointer;
   flex: 1 1 auto; min-width: 0;
@@ -1566,7 +1592,7 @@ body[data-window-controls="right"] .chrome-pop {
    像一枚标签而不是又一段正文，否则它会被当成等级词的下半句。 */
 .metric-origin {
   flex: none; font-size: 10px; color: var(--text-dim);
-  border: 1px solid var(--line); border-radius: 999px; padding: 1px 6px;
+  border: 1px solid var(--line); border-radius: 999px; padding: 1px 5px;
   white-space: nowrap; align-self: center;
 }
 
@@ -1604,7 +1630,12 @@ body[data-window-controls="right"] .chrome-pop {
    两格照旧占位（灰色的「—」），这一行降到它们下面说明「为什么是空的」。
    状态是状态、数据是数据，两者不该互相顶替——顶替之后用户就没法在同一个
    位置对比两个方向了。 */
-.metric-idle-text { font-size: 11px; color: var(--text-dim); margin: 0; }
+/* 它现在住在 `.dir-stream` 里，占的是码率条那一格（方向词右边）——所以要
+   `flex: 1` 把那一格吃满，否则它会缩成内容宽、右边空一大片。 */
+.metric-idle-text {
+  font-size: 11px; color: var(--text-dim); margin: 0;
+  flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 /* 这条流此刻的**延迟目标**（§14 附）。比读数再暗一档、字更小：它不是测量
    结果，它是那个测量结果的解释。 */
 .metric-target { font-size: 10px; color: var(--text-dim); opacity: .85; margin: 0; }
@@ -1686,30 +1717,12 @@ body[data-window-controls="right"] .chrome-pop {
 .stage-ms.unknown { color: var(--text-dim); }
 .metric-foot { font-size: 10.5px; color: var(--text-dim); line-height: 1.5; margin-top: 4px; }
 
-/* 音质的「●●●○」：点数由等级定，空点保持在位，避免整行随质量变化左右抖。
-   空点画成**空心环**而不是灰实心——四颗灰实心点在小尺寸下读起来像「四颗都亮着」。 */
-.quality-dots { display: inline-flex; align-items: center; gap: 3px; flex: none; }
-.qdot { width: 7px; height: 7px; border-radius: 50%; background: none; box-shadow: inset 0 0 0 1px var(--ring-empty); }
-.qdot.on { box-shadow: none; }
-.qdot.on.tone-ok { background: var(--ok-mark); }
-.qdot.on.tone-accent { background: var(--accent-mark); }
-.qdot.on.tone-warn { background: var(--warn-mark); }
-.qdot.on.tone-danger { background: var(--danger-mark); }
-/* 「还没测出来」的四颗点必须与「差」的一颗点分得开。等级不成立时点数是 0，而
-   「四颗空心」和「一颗亮 + 三颗空心」在 7px 尺寸下几乎是同一个形状——用户于是把
-   「不知道」读成「测出来很差」。呼吸动画给它一个「在进行」的读感；
-   prefers-reduced-motion 下动画被全局关掉，靠 opacity 仍然静态可辨。 */
-.quality-dots[data-state='measuring'] .qdot {
-  opacity: .45;
-  animation: qdot-breathe 1.6s ease-in-out infinite;
-}
-.quality-dots[data-state='measuring'] .qdot:nth-child(2) { animation-delay: .2s; }
-.quality-dots[data-state='measuring'] .qdot:nth-child(3) { animation-delay: .4s; }
-.quality-dots[data-state='measuring'] .qdot:nth-child(4) { animation-delay: .6s; }
-@keyframes qdot-breathe {
-  0%, 100% { opacity: .25; }
-  50% { opacity: .8; }
-}
+/* 音质的「●●●○」四点指示、它的 measuring 呼吸动画、以及 @keyframes qdot-breathe
+   一并删除（用户 2026-08-11 第 1 条）。
+   撤掉的是**编码**不是信息：等级仍由 `.metric-val.small.tone-*` 的色阶承担，
+   而随网络实时变的那个真读数（kHz · bit）本来就写在同一个 span 里。
+   「测量中」这一态的载体也还在——`.metric-grade.measuring` 的斜体，它比一排
+   呼吸的点更直白，且不占横向空间。 */
 
 /* 从每张卡片上收拢来的常驻脚注：整份列表只说一次。 */
 .peer-list-foot { display: flex; flex-direction: column; gap: 4px; padding: 0 4px; }
@@ -2057,11 +2070,22 @@ body[data-window-controls="right"] .chrome-pop {
 .table tr.inbound td { background: rgba(var(--warn-rgb), 0.039); }
 .table td .tag { margin-left: 6px; }
 
-/* ---- 配对向导 ---- */
+/* ---- 配对（主面板上的两扇二级菜单） ---- */
 
 /* 单栏。原来这里有 `.pair-grid` / `.pair-col` / `.pair-idle` / `.pair-tip` 四条规则，
    服务的是左右两栏那版布局；「让对方找到我」收进二级菜单之后它们再没有宿主，
    一并删掉——留着的死规则下一次改版会被当成还在用的东西读。 */
+
+/* 「添加对端」面板的整块内容（扫描行 → 发现列表 → 手动地址 + PIN → 重连表单）。
+   面板本身（`.sheet-body`）不排版它的子元素，纵向节奏由这一条给。 */
+.pair-panel { display: flex; flex-direction: column; gap: 14px; }
+/* 面板下半截那张表单的小标题。比 `.block-title` 轻一档：它是**一扇面板里的**
+   第二个小节，不是一整块的标题，压过上半截会让人以为面板从这里才开始。 */
+.pair-sub-title { font-size: 12px; font-weight: 650; color: var(--text-dim); letter-spacing: .04em; }
+/* 「已配对主机重连」。它此前是一张 `.card`，靠卡片的内边距成形；收进面板之后
+   卡中卡会在同一块玻璃上叠出第二圈边框，所以只留纵向间距。 */
+.add-peer-form { display: flex; flex-direction: column; gap: 10px; }
+
 .pair-active { display: flex; flex-direction: column; gap: 16px; align-items: center; padding: 8px 0; }
 
 .pin-display { display: flex; gap: 8px; justify-content: center; perspective: 500px; }
@@ -2095,8 +2119,8 @@ body[data-window-controls="right"] .chrome-pop {
 .scan-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 /* 扫描窗口的剩余秒数。等宽数字，免得倒数时整行左右抖。 */
 .scan-remain { font-size: 12px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
-/* 「让对方找到我」推到行尾：它和扫描不是一回事，隔开读起来才不像同一组操作。 */
-.scan-armed { margin-left: auto; }
+/* `.scan-armed` 已删：「让对方找到我」不再是扫描行尾的附属动作，它升成了主面板上
+   自己的一枚按钮（`.toolbar-actions`）。 */
 .spinner {
   display: inline-block;
   width: 14px; height: 14px; flex: none;
@@ -2146,6 +2170,64 @@ body[data-window-controls="right"] .chrome-pop {
 .pair-steps li { display: flex; align-items: center; gap: 6px; padding: 4px 8px; }
 .pair-steps li:not(:last-child)::after { content: ""; width: 16px; height: 1px; background: var(--edge-strong); margin-left: 8px; }
 .step-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--fill-faint); flex: none; }
+
+/* ---- 共享协议（仅共享模式） ---- */
+
+/* 输入与保存/清除动作同组；窄窗时在组内换行，不把输入框压成一条缝。 */
+.proto-field {
+  display: flex; align-items: center; justify-content: flex-end;
+  gap: 8px; flex-wrap: wrap;
+}
+.proto-input { width: 220px; max-width: 100%; }
+.proto-settings-summary {
+  display: block; max-width: 260px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.proto-state {
+  max-width: 460px; color: var(--text-dim); font-size: 13px;
+  line-height: 1.5; text-align: right; overflow-wrap: anywhere;
+}
+.proto-state.listening { color: var(--ok); }
+.proto-state.error { color: var(--danger); }
+
+/* 「当前接入」的空态：这一行就是投送有没有抵达的落点，空着本身也是答案。 */
+.proto-empty {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 13px; color: var(--text-dim);
+  padding: 14px 16px;
+  border: 1px dashed var(--line-strong); border-radius: var(--radius-sm);
+}
+.proto-empty .ico { color: var(--fill-faint); }
+
+.proto-session-list {
+  list-style: none; display: flex; flex-direction: column; gap: 8px;
+}
+.proto-session {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--fill-faint);
+}
+.proto-session-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.proto-session-head strong {
+  min-width: 0; margin-right: auto; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.proto-session-media { color: var(--text-dim); font-size: 12px; }
+.proto-session-meta {
+  display: flex; align-items: center; gap: 6px 14px; flex-wrap: wrap;
+  color: var(--text-dim); font-size: 11px;
+}
+
+.proto-list { list-style: none; display: flex; flex-direction: column; gap: 2px; }
+.proto-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 2px; font-size: 13px;
+}
+.proto-item + .proto-item { border-top: 1px solid var(--line); }
+/* 名字**不上主文本色**：它们是还没做的东西，和上面那张真的会有开关的卡片之间
+   必须有一档可见的色差。 */
+.proto-name { color: var(--text-dim); margin-right: auto; }
 
 /* ---- 设置 ---- */
 

@@ -76,13 +76,13 @@ describe('the focusable selector', () => {
 //
 // `Sheet` opens by moving focus into the card and closes by handing focus back
 // to whatever opened it. Both live in one `useEffect`. If that effect ever
-// lists `onClose` as a dependency, a caller passing an inline arrow -- two of
-// the six call sites do, and it is the obvious way to write it -- makes the
-// effect tear down and re-run on **every render**: focus goes back to the
-// opener, then straight into the card's first focusable. `PairView` re-renders
-// at 1 Hz while the pairing countdown runs, so the pairing sheet yanks focus to
-// the `?` beside its title once a second and the 停止配对 button cannot be
-// reached with the keyboard at all.
+// lists `onClose` as a dependency, a caller passing an inline arrow -- three of
+// the seven call sites end up with one, and it is the obvious way to write it --
+// makes the effect tear down and re-run on **every render**: focus goes back to
+// the opener, then straight into the card's first focusable. `BeDiscoveredSheet`
+// re-renders at 1 Hz while the pairing countdown runs, so it yanks focus to the
+// `?` beside its title once a second and the 停止配对 button cannot be reached
+// with the keyboard at all.
 //
 // This is a wiring bug, not a decision, so there is no pure function to pin it
 // to; and vitest runs with `environment: 'node'` on purpose, so it cannot be

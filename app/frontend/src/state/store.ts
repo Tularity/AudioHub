@@ -18,7 +18,7 @@
 import { create } from 'zustand';
 import { useStoreWithEqualityFn } from 'zustand/traditional';
 import type {
-  DaemonInfo, DaemonSettings, DiscoverResult, PeerState, SessionInfo,
+  AirPlaySessionInfo, DaemonInfo, DaemonSettings, DiscoverResult, PeerState, SessionInfo,
 } from '../ipc/types';
 import type { EndpointSource } from '../ipc/endpoint';
 import type { PermissionState } from './permissions';
@@ -28,12 +28,13 @@ import { parseMode } from './mode';
 import type { AppMode } from './mode';
 import { readLatency, readQuality } from '../lib/metrics';
 import { capResults, discoverKey } from '../lib/discovery';
+import { sanitizeDaemonSettings } from '../lib/airplay';
 
 const SETTINGS_KEY = 'audiohub.ui.settings';
 
 export type ConnState = 'connecting' | 'starting' | 'online' | 'offline';
 export type RunMode = 'tauri' | 'browser';
-export type ViewName = 'peers' | 'detail' | 'pair' | 'settings' | 'stats';
+export type ViewName = 'peers' | 'detail' | 'share' | 'settings' | 'stats';
 
 export interface ConnError {
   kind: string;
@@ -87,6 +88,9 @@ export interface AppState {
   ipcRttMs: number | null;
   peers: PeerState[];
   sessions: SessionInfo[];
+  airplaySessions: AirPlaySessionInfo[];
+  /** null = 尚未探测；false = 旧服务没有 airplay.sessions.list。 */
+  airplaySessionsSupported: boolean | null;
   history: Record<string, MetricHistory>;
   addrHistory: Record<string, AddrSeen[]>;
   pairing: PairingState | null;
@@ -144,6 +148,8 @@ const initial: AppState = {
   ipcRttMs: null,
   peers: [],
   sessions: [],
+  airplaySessions: [],
+  airplaySessionsSupported: null,
   history: {},
   addrHistory: {},
   pairing: null,
@@ -231,7 +237,8 @@ export const actions = {
         nextAddr[p.fingerprint] = arr;
       }
       return {
-        peers, monitorPref, bridgePref, spkSourcePref, spkBackendPref, spkFault,
+        peers, monitorPref, bridgePref,
+        spkSourcePref, spkBackendPref, spkFault,
         addrHistory: nextAddr,
       };
     });
@@ -285,6 +292,17 @@ export const actions = {
     });
   },
 
+  setAirPlaySessions(list: AirPlaySessionInfo[] | unknown): void {
+    if (!Array.isArray(list)) return;
+    const airplaySessions = list.filter((entry) =>
+      !!entry && typeof entry === 'object') as AirPlaySessionInfo[];
+    setState({ airplaySessions, airplaySessionsSupported: true });
+  },
+
+  setAirPlaySessionsUnsupported(): void {
+    setState({ airplaySessions: [], airplaySessionsSupported: false });
+  },
+
   setPermissions(list: PermissionState[]): void {
     setState((s) => ({
       permissions: {
@@ -322,15 +340,18 @@ export const actions = {
   // settings.get / settings.set 的回包。本地缓存跟着写一份，纯粹为了下次启动的首帧
   // ——绝不反过来覆盖 daemon。
   setDaemonSettings(d: DaemonSettings | null | undefined): void {
-    if (!d || typeof d !== 'object') return;
+    const clean = sanitizeDaemonSettings(d);
+    if (!clean) return;
     let saved: LocalSettings | null = null;
     setState((s) => {
       const settings = { ...s.settings };
-      const m = parseMode(d.mode);
+      const m = parseMode(clean.mode);
       if (m) settings.mode = m;
-      if (typeof d.remove_virtual_on_disconnect === 'boolean') settings.removeVirtual = d.remove_virtual_on_disconnect;
+      if (typeof clean.remove_virtual_on_disconnect === 'boolean') {
+        settings.removeVirtual = clean.remove_virtual_on_disconnect;
+      }
       saved = settings;
-      return { daemonSettings: d, settingsSupported: true, settings };
+      return { daemonSettings: clean, settingsSupported: true, settings };
     });
     if (saved) persist(saved);
   },
@@ -420,8 +441,12 @@ let snapCache: { src: AppState | null; snap: unknown } = { src: null, snap: null
 function snapshot(): unknown {
   const state = getState();
   if (snapCache.src === state) return snapCache.snap;
-  const snap = JSON.parse(JSON.stringify(state)) as { endpoint?: { token?: string } };
+  const snap = JSON.parse(JSON.stringify(state)) as {
+    endpoint?: { token?: string };
+    daemonSettings?: Record<string, unknown>;
+  };
   if (snap.endpoint && 'token' in snap.endpoint) snap.endpoint.token = '<redacted>';
+  if (snap.daemonSettings) delete snap.daemonSettings.airplay_password;
   snapCache = { src: state, snap };
   return snap;
 }

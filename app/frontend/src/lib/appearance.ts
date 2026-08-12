@@ -113,10 +113,9 @@ export const LOCALE_PREFS: readonly LocalePref[] = ['system', ...LOCALES];
 /**
  * Which catalogue a preference lands on.
  *
- * The `system` branch is written out properly even though there is exactly one
- * catalogue today and it therefore always returns `zh-CN`. The matching order
- * -- exact tag first, then primary subtag -- is the part that would otherwise
- * be reinvented, badly, on the day a second language lands.
+ * Matching is exact tag first, then primary subtag, so `en-GB` can use the
+ * available `en-US` catalogue without overriding an exact match later in the
+ * system preference list.
  *
  * Subtag comparison rather than `startsWith` because `startsWith` only works in
  * one direction: a `zh-CN` catalogue does start with a `zh` system tag, but an

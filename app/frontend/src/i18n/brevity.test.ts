@@ -60,7 +60,8 @@ describe('the catalogue stays out of the way', () => {
     const labels = entries.filter(([k]) => k.startsWith('wiki.'));
     expect(labels.length).toBeGreaterThan(10);
     for (const [k, v] of labels) {
-      expect(v, `${k} should say it leads somewhere English`).toMatch(/（英文）$/);
+      expect(v, `${k} should not name a language`).not.toMatch(/英文|English/i);
+      expect(v.trim(), `${k} should not be an empty accessible name`).not.toBe('');
     }
   });
 });

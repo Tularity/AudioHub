@@ -764,11 +764,14 @@ pub(crate) fn udp_send_loop(inner: Arc<DaemonInner>) {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SourceSpec {
-    Tone { freq_bits: u32 },
+    Tone { freq_bits: u32,
+    },
     Mic,
     /// What this machine is playing (spec-m4b §B2). The backend id is part of
     /// the dedup key: two streams naming different backends are two captures.
-    SysAudio { backend: String },
+    SysAudio {
+        backend: String,
+    },
     /// What an application played into ONE peer's virtual speaker (spec-m5b
     /// §5.4). The slot is part of the dedup key, so each speaker ring gets
     /// exactly one consumer entry — which is what keeps the halbridge SPSC rule
@@ -778,12 +781,14 @@ pub(crate) enum SourceSpec {
     /// simplification available here: every peer's audio would come out of one
     /// ring, every positive test would still pass, and the only symptom would
     /// be one peer hearing another's audio.
-    HalSpeaker { slot: u8 },
+    HalSpeaker { slot: u8,
+    },
 }
 
 impl SourceSpec {
     pub(crate) fn tone(freq: f32) -> SourceSpec {
-        SourceSpec::Tone { freq_bits: freq.to_bits() }
+        SourceSpec::Tone { freq_bits: freq.to_bits(),
+        }
     }
 
     fn label(&self) -> String {
@@ -910,7 +915,8 @@ pub(crate) fn open_bridge(inner: &DaemonInner, device: &str) -> Result<String> {
 }
 
 pub(crate) fn release_bridge(inner: &DaemonInner, device: &str) {
-    let _ = lk(&inner.mix_cmds).send(MixCmd::ReleaseBridge { device: device.to_string() });
+    let _ = lk(&inner.mix_cmds).send(MixCmd::ReleaseBridge { device: device.to_string(),
+    });
 }
 
 struct TxStream {
@@ -1104,6 +1110,7 @@ static SELF_CAPTURE_WARNED: AtomicBool = AtomicBool::new(false);
 /// True while some received stream is routed to this machine's real output.
 fn playing_remote_audio(inner: &DaemonInner) -> bool {
     rd(&inner.rx_table).values().any(|r| r.is_spk || r.monitor)
+        || inner.airplay.has_active_session()
 }
 
 fn warn_feedback_risk(inner: &DaemonInner, backend: &str) {
@@ -1147,7 +1154,8 @@ pub(crate) enum BuildReq {
     /// 把一个源的**尸体**交过来析构。带 `gen` 是为了丢掉配套的那个
     /// `LiveCapture`：设备变更重建期间同一个 spec 会短暂有新旧两份，
     /// 按 spec 删就会误杀刚开好的那一个。
-    Retire { spec: SourceSpec, gen: u64, src: Src },
+    Retire { spec: SourceSpec, gen: u64, src: Src,
+    },
 }
 
 /// 建源线程的产出。
@@ -1272,7 +1280,8 @@ fn build_source(
                     keep / per_ms,
                 );
             }
-            Src::Frame(Box::new(crate::halbridge::HalSpeakerSource::new(&hal, *slot)))
+            Src::Frame(Box::new(crate::halbridge::HalSpeakerSource::new(&hal, *slot,
+            )))
         }
     })
 }
@@ -1531,7 +1540,9 @@ impl TxState {
 
     fn request_build(&mut self, spec: SourceSpec) -> u64 {
         let gen = self.new_gen();
-        self.pending.insert(spec.clone(), PendingBuild { gen, waiters: Vec::new() });
+        self.pending.insert(spec.clone(), PendingBuild { gen, waiters: Vec::new(),
+            },
+        );
         let _ = self.builder.send(BuildReq::Build { spec, gen });
         gen
     }
@@ -1707,8 +1718,10 @@ impl TxState {
 /// 现在它只做三件常数时间的事：查表、推一条请求进通道、（源已在时）装流。
 fn apply_txcmd(st: &mut TxState, cmd: TxCmd) {
     match cmd {
-        TxCmd::Add { stream_id, key, salt, path, spec, loss_pct, shared, ack } => {
-            let add = PendingAdd { stream_id, key, salt, path, loss_pct, shared, ack };
+        TxCmd::Add { stream_id, key, salt, path, spec, loss_pct, shared, ack,
+        } => {
+            let add = PendingAdd { stream_id, key, salt, path, loss_pct, shared, ack,
+            };
             // 源已经在跑：扇出一份就行，和搬家前一样是**同步**完成的。
             if let Some(ent) = st.sources.get_mut(&spec) {
                 ent.refs += 1;
@@ -1721,7 +1734,9 @@ fn apply_txcmd(st: &mut TxState, cmd: TxCmd) {
                 return;
             }
             let gen = st.new_gen();
-            st.pending.insert(spec.clone(), PendingBuild { gen, waiters: vec![add] });
+            st.pending.insert(spec.clone(), PendingBuild { gen, waiters: vec![add],
+                },
+            );
             let _ = st.builder.send(BuildReq::Build { spec, gen });
         }
         TxCmd::Remove { stream_id } => st.remove_stream(stream_id),
@@ -1879,7 +1894,8 @@ fn request_mic_rebuild(st: &mut TxState) {
 /// flow. The `match` is what makes that skip structural rather than a rule
 /// somebody has to remember (design §4.2 item 3).
 fn refresh_dest(tx: &mut TxStream) {
-    let MediaPath::Udp(dest) = &mut tx.path else { return };
+    let MediaPath::Udp(dest) = &mut tx.path else { return;
+    };
     let epoch = tx.shared.dest_epoch.load(Ordering::Acquire);
     if epoch == tx.dest_epoch_seen {
         return;
@@ -2238,7 +2254,8 @@ pub(crate) fn tx_loop(
             // `tx.gain` 每条流一份。`apply` 的入参是 `&[f32]`，所以「就地把共享
             // 帧乘掉」在这里连写都写不出来 —— 那个 bug 的形状是逐帧复利
             //（0.5ᵏ）而不是一次串台，且全线指标不动。
-            tx.gain.set_target(TxShared::gain_of(tx.shared.send_gain.load(Ordering::Relaxed)));
+            tx.gain.set_target(TxShared::gain_of(tx.shared.send_gain.load(Ordering::Relaxed),
+            ));
             let samples: &[f32] = tx.gain.apply(samples, rate, fmt.depth, &mut gained);
             // 线上一帧拆成几个数据报。深档（48k/24、48k/32f）的整帧明文超过
             // 一个以太网数据报装得下的量，按 **5 ms** 切成两个包发。
@@ -2426,7 +2443,8 @@ pub(crate) struct UdpBlock {
 }
 
 impl UdpBlock {
-    pub(crate) const OFF: UdpBlock = UdpBlock { out: false, inbound: false };
+    pub(crate) const OFF: UdpBlock = UdpBlock { out: false, inbound: false,
+    };
 
     /// Parse the hook's value. **An unrecognised value blocks both
     /// directions.**
@@ -2438,9 +2456,12 @@ impl UdpBlock {
     /// somebody investigates.
     pub(crate) fn parse(v: &str) -> UdpBlock {
         match v {
-            "out" => UdpBlock { out: true, inbound: false },
-            "in" => UdpBlock { out: false, inbound: true },
-            _ => UdpBlock { out: true, inbound: true },
+            "out" => UdpBlock { out: true, inbound: false,
+            },
+            "in" => UdpBlock { out: false, inbound: true,
+            },
+            _ => UdpBlock { out: true, inbound: true,
+            },
         }
     }
 
@@ -2576,7 +2597,8 @@ fn conceal_missing_half(held: &[f32], held_is_second: bool, full: usize) -> Vec<
 }
 
 pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
-    let Ok((h, _payload)) = Header::parse(dg) else { return };
+    let Ok((h, _payload)) = Header::parse(dg) else { return;
+    };
     match h.kind {
         Kind::Media => {
             let rx = rd(&inner.rx_table).get(&h.stream_id).cloned();
@@ -2850,7 +2872,8 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
                 // 于是必须重建。每秒问一次、已经对了就立刻返回。
                 let target = rx.transport.latency_target();
                 let reseeded =
-                    reshape_jitter_envelope(&mut st, target, jb_tuning_for(&rx.ka_path), h.stream_id);
+                    reshape_jitter_envelope(&mut st, target, jb_tuning_for(&rx.ka_path), h.stream_id,
+                );
                 if reseeded {
                     // **把旧的伺服输出一并作废。**
                     //
@@ -2884,9 +2907,7 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
                     None => {
                         if !st.jit_win.is_empty() {
                             let mut v = st.jit_win.clone();
-                            v.sort_by(|a, b| {
-                                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                            });
+                            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                             let p95 = v[(v.len() * 95 / 100).min(v.len() - 1)] as f64;
                             st.jb.update_target(p95, FRAME_MS as f64);
                         }
@@ -2949,7 +2970,8 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
 /// nowhere to address the datagram — which is why the early return reads it out
 /// of the path rather than off a tier flag somebody has to keep in sync.
 pub(crate) fn send_pullreq(inner: &DaemonInner, rx: &RxStream) {
-    let Some(dest) = rx.ka_path.udp_dest() else { return };
+    let Some(dest) = rx.ka_path.udp_dest() else { return;
+    };
     let h = Header {
         kind: Kind::PullReq,
         codec: Codec::PcmS16le,
@@ -2979,6 +3001,19 @@ fn soft_clip(s: f32) -> f32 {
         s
     } else {
         (0.8 + 0.2 * ((a - 0.8) / 0.2).tanh()).copysign(s)
+    }
+}
+
+/// A single AirPlay source must remain amplitude-transparent: its sender dB is
+/// represented by the receiver's native output control, not by a second
+/// sample-domain gain or limiter. Multiple local contributors still use the
+/// site's frozen soft-knee protection. Clamp is only a final malformed-sample
+/// guard; decoded RAOP i16 and the linear resampler are already in this range.
+fn protect_output_sample(sample: f32, sole_airplay: bool) -> f32 {
+    if sole_airplay {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        soft_clip(sample)
     }
 }
 
@@ -3070,7 +3105,8 @@ fn apply_mixcmd(cmd: MixCmd, bridges: &mut HashMap<String, BridgeOut>) {
             } else {
                 LivePlayback::start_on(&device, 48000)
                     .map(|(pb, tx)| {
-                        Some(BridgeOut { _pb: pb, tx, refs: 0, buf: [0.0; F48], depth: None })
+                        Some(BridgeOut { _pb: pb, tx, refs: 0, buf: [0.0; F48], depth: None,
+                        })
                     })
                     .map_err(|e| format!("open bridge device '{device}': {e:#}"))
             };
@@ -3120,6 +3156,8 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
     let mut mix = [0.0f32; F48];
     let mut mon = [0.0f32; F48];
     let mut frame = [0.0f32; F48];
+    let mut airplay_frame = [0.0f32; F48];
+    let mut airplay = inner.airplay.local_reader();
     // spec-m5b §5.4 microphone direction. Lifted out of the daemon mutex once,
     // here, so the tick itself never touches that lock; the bridge is installed
     // before any thread starts and is never replaced.
@@ -3198,7 +3236,9 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
         // 之后**：`margin` 买的是「醒来晚了多少」，不是「整 tick 丢没丢」。
         MIX_LATE.record(sleep_until(deadline));
         let streams: Vec<Arc<RxStream>> = rd(&inner.rx_table).values().cloned().collect();
-        if streams.is_empty() {
+        let airplay_read = airplay.read_into(&mut airplay_frame);
+        let airplay_local = airplay_read.session_id.is_some();
+        if streams.is_empty() && !airplay_local {
             // an open bridge keeps being written to even before its stream's
             // first frame arrives: a virtual card that is never written to may
             // not spin up its IO cycle at all, and the first real audio would
@@ -3285,7 +3325,23 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
                 }
             }
         }
+        if airplay_local {
+            // AirPlay samples stay full-scale. The sender's dB event is
+            // applied to the system output control in `airplay.rs`, never
+            // multiplied into this frame.
+            contrib += 1;
+            if contrib == 1 {
+                corr_a.copy_from_slice(&airplay_frame);
+            } else if contrib == 2 {
+                corr = crate::quality::correlation(&corr_a, &airplay_frame);
+            }
+            any_spk = true;
+            for i in 0..F48 {
+                mix[i] += airplay_frame[i];
+            }
+        }
         inner.mix_meter.feed(now_ms, contrib, corr);
+        let sole_airplay = airplay_local && contrib == 1;
         for b in bridges.values_mut() {
             // 站点级削顶计入点 1/3：桥接到第三方虚拟声卡（规格 §4.6）。
             // 喂的是**削顶之前**的 buf——削顶之后再量就永远量不到越界。
@@ -3342,7 +3398,8 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
                 // ⚠ 这一读**移出了 `hal_dirty` 分支**。此前只有「本 tick 真有
                 // 音频要写」时才读，于是排空段（我们故意不写的那些 tick）里
                 // 这一级在遥测上**整个消失**——正好是最需要看见它的时候。
-                let Some(depth) = h.mic_depth(slot as u8) else { continue };
+                let Some(depth) = h.mic_depth(slot as u8) else { continue;
+                };
                 hal_mic_depth[slot] = Some(depth);
                 let plan = mic_gates[slot].decide(depth.samples, F48 as u32);
                 h.record_mic_gate(slot as u8, &plan, depth.samples);
@@ -3370,7 +3427,7 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
             // ⚠ 这个 soft_clip **不计入**站点级削顶统计（规格 §0.6）：
             // `mix_ring` 是 probe 的旁路 tap，不在送扬声器的路径上。把它算进去
             // 会让每一路 spk 流的削顶被重复计数一次，凭空虚增一倍。
-            let clipped: Vec<f32> = mix.iter().map(|&v| soft_clip(v)).collect();
+            let clipped: Vec<f32> = mix.iter().map(|&sample| protect_output_sample(sample, sole_airplay)).collect();
             push_mix(inner.as_ref(), &clipped);
         } else {
             clear_mix(inner.as_ref());
@@ -3398,8 +3455,8 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
                 // 站点级削顶计入点 3/3：真实默认输出。这是最重要的一个——
                 // 「两路重复流相加」的破音就出现在这里。同样喂削顶**之前**的和。
                 inner.mix_clip.feed(now_ms, &out);
-                for o in out.iter_mut() {
-                    *o = soft_clip(*o);
+                for sample in &mut out {
+                    *sample = protect_output_sample(*sample, sole_airplay);
                 }
                 // 播放环深度（规格 §3.2 的级 8）。**`push` 之前**读：读到的是
                 // 排在这一帧前面的样本数，也就是这一帧的驻留时间。之前这里是
@@ -3428,7 +3485,8 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
                     .and_then(|b| b.depth),
             );
             s.hal_mic
-                .store(s.hal_slot.and_then(|slot| hal_mic_depth.get(slot as usize).copied().flatten()));
+                .store(s.hal_slot.and_then(|slot| hal_mic_depth.get(slot as usize).copied().flatten()),
+            );
         }
         tick += 1;
     }
@@ -3523,6 +3581,20 @@ pub(crate) fn mix_tone_verdict(samples: &[f32], rate: u32, freq: f32) -> ToneVer
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn sole_airplay_is_amplitude_transparent_but_mixed_output_stays_protected() {
+        for sample in [-1.0f32, -0.95, 0.0, 0.95, 1.0] {
+            assert_eq!(protect_output_sample(sample, true), sample);
+        }
+        assert_eq!(protect_output_sample(1.2, true), 1.0);
+        assert_eq!(protect_output_sample(-1.2, true), -1.0);
+
+        let protected = protect_output_sample(1.0, false);
+        assert_eq!(protected, soft_clip(1.0));
+        assert!(protected < 1.0);
+        assert_ne!(protect_output_sample(0.95, false), 0.95);
+    }
 
     /// 终审 §二.14 的**推广检查**：`mix_tone_verdict` 也判音，它是否也坐在
     /// 量具的噪声带里？
@@ -4410,8 +4482,12 @@ pub(crate) mod tests {
     fn the_skip_branch_hands_the_dll_over_properly() {
         let branch = skip_branch(fn_body("pub(crate) fn tx_loop("));
         for (needle, why) in [
-            ("next_time = Instant::now()", "计划时刻没有重锚，循环会空转到追平"),
-            ("dll.resync()", "积分器没复位，跳变之后会按旧误差继续修正 ⇒ 过冲"),
+            ("next_time = Instant::now()", "计划时刻没有重锚，循环会空转到追平",
+            ),
+            (
+                "dll.resync()",
+                "积分器没复位，跳变之后会按旧误差继续修正 ⇒ 过冲",
+            ),
             ("dll_win.invalidate()", "排空当拍的水位仍会被当成有效观测"),
         ] {
             assert!(branch.contains(needle), "跳 tick 之后少了 `{needle}`：{why}\n{branch}");
@@ -4716,10 +4792,12 @@ pub(crate) mod deadline_thread_guards {
     /// 忘一行的时候静默失去覆盖，而那正是本条注释在讲的病。
     pub(crate) const BANNED_ON_THE_DEADLINE_THREAD: &[(&str, &str)] = &[
         ("send_to(", "sendto 进内核网络栈，单次耗时上界不可预知"),
-        ("write(", "write 进内核网络栈；TCP 媒体（tier 1）就是靠它发的"),
+        ("write(", "write 进内核网络栈；TCP 媒体（tier 1）就是靠它发的",
+        ),
         ("write_all(", "同上，而且它会一直重试到写完，上界更差"),
         ("flush(", "flush 会把攒着的字节推进内核，与 write 同级"),
-        ("write_frame(", "控制帧写在截止期线程上：JSON 序列化 + 阻塞 write"),
+        ("write_frame(", "控制帧写在截止期线程上：JSON 序列化 + 阻塞 write",
+        ),
     ];
 
     // ------------------------------------------------- 0. 守卫自己的守卫
@@ -4779,7 +4857,8 @@ pub(crate) mod deadline_thread_guards {
     #[test]
     fn the_send_tick_never_touches_the_socket_itself() {
         // 每一项：(被禁的子串, 它一旦出现在截止期线程上会发生什么)
-        for f in ["pub(crate) fn tx_loop(", "fn apply_txcmd(", "fn refresh_dest("] {
+        for f in ["pub(crate) fn tx_loop(", "fn apply_txcmd(", "fn refresh_dest(",
+        ] {
             let body = fn_body(f);
             for (needle, why) in BANNED_ON_THE_DEADLINE_THREAD {
                 assert!(
@@ -4791,8 +4870,9 @@ pub(crate) mod deadline_thread_guards {
             }
         }
         let body = fn_body("pub(crate) fn tx_loop(");
+        let compact: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(
-            body.contains("inner.media_send.enqueue("),
+            compact.contains("inner.media_send.enqueue("),
             "tx_loop 不再往 UDP 发送队列里投递了 —— 那它是怎么把音频发出去的？"
         );
         assert!(
@@ -4961,18 +5041,27 @@ pub(crate) mod deadline_thread_guards {
     #[test]
     fn the_send_queue_has_exactly_one_producer_and_one_consumer() {
         let src = code();
+        let compact: String = src.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert_eq!(
-            src.matches("media_send.enqueue(").count(),
+            compact.matches("media_send.enqueue(").count(),
             1,
             "发送队列有了第二个生产者 —— SpscRing 的 unsafe 前提当场作废"
         );
         assert_eq!(
-            src.matches("media_send.q.consume(").count(),
+            compact.matches("media_send.q.consume(").count(),
             1,
             "发送队列有了第二个消费者 —— 同上"
         );
-        assert!(fn_body("pub(crate) fn tx_loop(").contains("media_send.enqueue("));
-        assert!(fn_body("pub(crate) fn udp_send_loop(").contains("media_send.q.consume("));
+        let tx: String = fn_body("pub(crate) fn tx_loop(")
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        let udp: String = fn_body("pub(crate) fn udp_send_loop(")
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(tx.contains("media_send.enqueue("));
+        assert!(udp.contains("media_send.q.consume("));
         let ka = fn_body("pub(crate) fn send_pullreq(");
         assert!(ka.contains("inner.udp.send_to("), "keepalive 不再直接发了");
         assert!(!ka.contains("media_send"), "keepalive 走进了发送队列 = 第二个生产者");
@@ -5156,7 +5245,8 @@ pub(crate) mod deadline_thread_guards {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let peer = listener.local_addr().expect("addr");
-        let link = Arc::new(crate::tcpmedia::TcpMediaLink::new_for_test("fp".into(), peer));
+        let link = Arc::new(crate::tcpmedia::TcpMediaLink::new_for_test("fp".into(), peer,
+        ));
         assert_eq!(
             count_updates(MediaPath::Framed(crate::mux::MuxLink::new_for_test(link, peer))),
             0,
@@ -5209,7 +5299,8 @@ pub(crate) mod deadline_thread_guards {
             );
         }
         // 截止期线程上也不许**析构**一个源：关设备和开设备一样慢。
-        for f in ["pub(crate) fn tx_loop(", "fn apply_txcmd(", "fn reap_dead_sources("] {
+        for f in ["pub(crate) fn tx_loop(", "fn apply_txcmd(", "fn reap_dead_sources(",
+        ] {
             assert!(
                 !fn_body(f).contains("drop(src)"),
                 "{f} 里就地丢了一个源 —— 关设备也要走建源线程（BuildReq::Retire）"
@@ -5222,7 +5313,8 @@ pub(crate) mod deadline_thread_guards {
     }
 
     fn tone() -> Src {
-        Src::Frame(Box::new(ToneSource::new(440.0, TONE_AMP, 48000, FRAME_MS as u32)))
+        Src::Frame(Box::new(ToneSource::new(440.0, TONE_AMP, 48000, FRAME_MS as u32,
+        )))
     }
 
     fn add_cmd(id: u32, spec: SourceSpec) -> (TxCmd, mpsc::Receiver<Result<(), String>>) {
@@ -5262,7 +5354,8 @@ pub(crate) mod deadline_thread_guards {
         assert!(br.try_recv().is_err(), "同一个源发了两次 Build = 开两次设备");
         // 谁都还没被 ack（设备还没开出来）。
         assert!(ack1.try_recv().is_err() && ack2.try_recv().is_err());
-        st.on_build_done(BuildDone { spec: SourceSpec::Mic, gen, result: Ok(tone()) });
+        st.on_build_done(BuildDone { spec: SourceSpec::Mic, gen, result: Ok(tone()),
+        });
         assert_eq!(st.streams.len(), 2);
         assert_eq!(st.sources[&SourceSpec::Mic].refs, 2, "引用数不等于等的人数");
         assert_eq!(ack1.try_recv().unwrap(), Ok(()));
@@ -5298,7 +5391,8 @@ pub(crate) mod deadline_thread_guards {
         apply_txcmd(&mut st, c1);
         let BuildReq::Build { gen, .. } = br.try_recv().unwrap() else { panic!() };
         apply_txcmd(&mut st, TxCmd::Remove { stream_id: 1 });
-        st.on_build_done(BuildDone { spec: SourceSpec::Mic, gen, result: Ok(tone()) });
+        st.on_build_done(BuildDone { spec: SourceSpec::Mic, gen, result: Ok(tone()),
+        });
         assert!(st.sources.is_empty(), "没人要的源被装上了");
         assert!(st.streams.is_empty());
         assert!(
@@ -5318,7 +5412,8 @@ pub(crate) mod deadline_thread_guards {
         let (c1, _a) = add_cmd(1, SourceSpec::Mic);
         apply_txcmd(&mut st, c1);
         let BuildReq::Build { gen: g0, .. } = br.try_recv().unwrap() else { panic!() };
-        st.on_build_done(BuildDone { spec: SourceSpec::Mic, gen: g0, result: Ok(tone()) });
+        st.on_build_done(BuildDone { spec: SourceSpec::Mic, gen: g0, result: Ok(tone()),
+        });
         assert_eq!(st.sources[&SourceSpec::Mic].gen, g0);
 
         request_mic_rebuild(&mut st);
@@ -5329,7 +5424,8 @@ pub(crate) mod deadline_thread_guards {
         assert_eq!(st.sources[&SourceSpec::Mic].gen, g0, "重建还没回来就把老的换掉了");
         assert!(br.try_recv().is_err(), "重建在途还发了第二条请求");
 
-        st.on_build_done(BuildDone { spec: SourceSpec::Mic, gen: g1, result: Ok(tone()) });
+        st.on_build_done(BuildDone { spec: SourceSpec::Mic, gen: g1, result: Ok(tone()),
+        });
         assert_eq!(st.sources[&SourceSpec::Mic].gen, g1, "没换成新的");
         assert_eq!(st.sources[&SourceSpec::Mic].refs, 1, "换芯把引用数弄丢了");
         assert!(
@@ -5346,7 +5442,8 @@ pub(crate) mod deadline_thread_guards {
         let (c1, _a) = add_cmd(1, SourceSpec::Mic);
         apply_txcmd(&mut st, c1);
         let BuildReq::Build { gen: g0, .. } = br.try_recv().unwrap() else { panic!() };
-        st.on_build_done(BuildDone { spec: SourceSpec::Mic, gen: g0, result: Ok(tone()) });
+        st.on_build_done(BuildDone { spec: SourceSpec::Mic, gen: g0, result: Ok(tone()),
+        });
         request_mic_rebuild(&mut st);
         let BuildReq::Build { gen: g1, .. } = br.try_recv().unwrap() else { panic!() };
         st.on_build_done(BuildDone {
@@ -5398,7 +5495,8 @@ pub(crate) mod deadline_thread_guards {
         apply_txcmd(&mut st, c1);
         apply_txcmd(&mut st, c2);
         let BuildReq::Build { gen, .. } = br.try_recv().unwrap() else { panic!() };
-        st.on_build_done(BuildDone { spec: SourceSpec::Mic, gen, result: Ok(tone()) });
+        st.on_build_done(BuildDone { spec: SourceSpec::Mic, gen, result: Ok(tone()),
+        });
         apply_txcmd(&mut st, TxCmd::Remove { stream_id: 1 });
         assert!(br.try_recv().is_err(), "还有一条流在用，不该收尸");
         assert_eq!(st.sources[&SourceSpec::Mic].refs, 1);

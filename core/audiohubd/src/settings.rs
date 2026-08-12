@@ -7,13 +7,25 @@
 //! that can actually publish or remove virtual devices — was never told. It is
 //! daemon state now, and the UI's copy is a cache of what this file says.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use audiohub_ipc::Mode;
 
+/// Bumped to 6 for the audio-only AirPlay receiver wish/name. The password is
+/// intentionally not part of this record; it has a separate restricted file
+/// and only a presence bit crosses IPC.
+///
+/// Version 6 originally also carried `airplay_route`. AirPlay is now always
+/// played on the receiving machine, so that field was deleted without another
+/// settings-version bump: serde ignores the old unknown key, and keeping v6
+/// lets an older daemon read a file rewritten by this build without treating
+/// it as a future version and resetting `mode` to `share`.
+///
 /// Bumped to 5 by plan M3 「同网段互见」: `discovery_announce` arrived.
 ///
 /// It is the first field here whose absent value is **not** the `bool` default.
@@ -55,7 +67,7 @@ use audiohub_ipc::Mode;
 /// a provider AND a consumer at once, so both `"a"` and `"b"` are half of the
 /// answer and neither is the whole one. Choosing for the user here would
 /// silently decide which half of their setup keeps working.
-pub(crate) const SETTINGS_VERSION: u32 = 5;
+pub(crate) const SETTINGS_VERSION: u32 = 6;
 
 /// `discovery_announce` defaults ON — see `StoredSettings::discovery_announce`.
 /// A named function rather than `#[serde(default)]` on purpose; the comment on
@@ -109,6 +121,13 @@ pub(crate) struct StoredSettings {
     /// record contains and why the fingerprint is in it.
     #[serde(default = "announce_by_default")]
     pub discovery_announce: bool,
+    /// Audio-only AirPlay receiver. Disabled by default because enabling it
+    /// opens unauthenticated LAN listeners unless a password is configured.
+    #[serde(default)]
+    pub airplay_enabled: bool,
+    /// Empty follows the daemon identity (`AudioHub — <name>`).
+    #[serde(default)]
+    pub airplay_name: String,
 }
 
 impl Default for StoredSettings {
@@ -156,6 +175,8 @@ impl Default for StoredSettings {
             // 「同网段互见」 — off by default, the acceptance criterion is a
             // feature nobody finds.
             discovery_announce: announce_by_default(),
+            airplay_enabled: false,
+            airplay_name: String::new(),
             // **AUTO，不是「最低」**，尽管 plan §5 写的是「默认建议延迟固定取
             // 最低」。理由是行为守恒，不是偏好：
             //
@@ -258,6 +279,126 @@ impl StoredSettings {
         Ok(())
     }
 
+}
+
+const AIRPLAY_SECRET_FILE: &str = "airplay-password";
+static AIRPLAY_SECRET_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Exact on-disk state used to compensate a failed multi-file settings commit.
+///
+/// Bytes, rather than `Option<String>`, are intentional: an invalid UTF-8
+/// secret makes the receiver fail closed, but the settings page must still be
+/// able to replace it. If a later settings write fails, rollback has to restore
+/// that fail-closed file byte-for-byte instead of failing while trying to read
+/// it as a password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AirPlayPasswordSnapshot(Option<Vec<u8>>);
+
+pub(crate) fn snapshot_airplay_password(dir: &Path) -> Result<AirPlayPasswordSnapshot> {
+    let path = dir.join(AIRPLAY_SECRET_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(AirPlayPasswordSnapshot(Some(bytes))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(AirPlayPasswordSnapshot(None))
+        }
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Read the write-only AirPlay secret. It deliberately lives outside
+/// `settings.json`: that file is routinely returned over IPC, while this value
+/// must never enter a settings view or frontend state snapshot.
+pub(crate) fn load_airplay_password(dir: &Path) -> Result<Option<String>> {
+    let path = dir.join(AIRPLAY_SECRET_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(secret) if secret.is_empty() => Ok(None),
+        Ok(secret) => Ok(Some(secret)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+pub(crate) fn airplay_password_is_set(dir: &Path) -> bool {
+    // This field is only a presence bit. A present-but-unreadable file still
+    // means the user configured protection; reconcile reports the read error
+    // and refuses to start instead of presenting an open receiver.
+    dir.join(AIRPLAY_SECRET_FILE).exists()
+}
+
+pub(crate) fn validate_airplay_password(password: &str) -> Result<()> {
+    anyhow::ensure!(
+        password.chars().count() <= 128,
+        "AirPlay password must be at most 128 characters"
+    );
+    anyhow::ensure!(
+        !password.chars().any(char::is_control),
+        "AirPlay password cannot contain control characters"
+    );
+    Ok(())
+}
+
+fn clear_airplay_password(dir: &Path) -> Result<()> {
+    let path = dir.join(AIRPLAY_SECRET_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn replace_airplay_password_bytes(dir: &Path, contents: &[u8]) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(AIRPLAY_SECRET_FILE);
+    let seq = AIRPLAY_SECRET_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        ".airplay-password.{}.{}.tmp",
+        std::process::id(),
+        seq
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let result = (|| -> Result<()> {
+        let mut file = opts
+            .open(&tmp)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", tmp.display()))?;
+        drop(file);
+        std::fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+pub(crate) fn restore_airplay_password(
+    dir: &Path,
+    snapshot: &AirPlayPasswordSnapshot,
+) -> Result<()> {
+    match &snapshot.0 {
+        Some(contents) => replace_airplay_password_bytes(dir, contents),
+        None => clear_airplay_password(dir),
+    }
+}
+
+/// Replace (or explicitly clear) the AirPlay password using an atomic rename.
+/// On Unix the file is created 0600; on Windows `%APPDATA%` supplies the
+/// per-user ACL inherited by new files in the AudioHub directory.
+pub(crate) fn save_airplay_password(dir: &Path, password: &str) -> Result<()> {
+    validate_airplay_password(password)?;
+    if password.is_empty() {
+        return clear_airplay_password(dir);
+    }
+    replace_airplay_password_bytes(dir, password.as_bytes())
 }
 
 #[cfg(test)]
@@ -549,6 +690,124 @@ mod tests {
         let json = serde_json::to_string(&got).expect("serialize");
         assert!(!json.contains("\"latency\""), "latency 还在 settings.json 里：{json}");
         assert!(!json.contains("\"quality\""), "quality 还在 settings.json 里：{json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn airplay_defaults_are_closed() {
+        let s = StoredSettings::default();
+        assert!(
+            !s.airplay_enabled,
+            "a fresh install must not open a LAN listener"
+        );
+        assert_eq!(s.airplay_name, "", "empty follows the daemon identity");
+    }
+
+    #[test]
+    fn legacy_v6_airplay_route_is_ignored_and_dropped_on_next_save() {
+        let dir = tmp("airplay-route-v6");
+        std::fs::write(
+            dir.join("settings.json"),
+            br#"{"version":6,"mode":"b","remove_virtual_on_disconnect":true,
+                 "mark_offline_devices":false,"airplay_enabled":true,
+                 "airplay_name":"Legacy receiver","airplay_route":"both"}"#,
+        )
+        .expect("write legacy settings");
+
+        let got = StoredSettings::load(&dir);
+        assert_eq!(got.version, SETTINGS_VERSION);
+        assert_eq!(got.mode, Mode::B, "removing AirPlay routing changed mode");
+        assert!(got.remove_virtual_on_disconnect);
+        assert!(!got.mark_offline_devices);
+        assert!(got.airplay_enabled);
+        assert_eq!(got.airplay_name, "Legacy receiver");
+
+        got.save(&dir).expect("rewrite settings");
+        let body = std::fs::read_to_string(dir.join("settings.json")).expect("read rewrite");
+        assert!(
+            !body.contains("airplay_route"),
+            "the removed route survived a settings rewrite: {body}"
+        );
+        assert_eq!(StoredSettings::load(&dir), got);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn airplay_password_is_separate_write_only_state() {
+        let dir = tmp("airplay-secret");
+        assert!(!airplay_password_is_set(&dir));
+        save_airplay_password(&dir, "correct horse battery staple").expect("save secret");
+        assert_eq!(
+            load_airplay_password(&dir).expect("load secret").as_deref(),
+            Some("correct horse battery staple")
+        );
+        let ordinary = std::fs::read_to_string(dir.join("settings.json")).unwrap_or_default();
+        assert!(
+            !ordinary.contains("correct horse"),
+            "secret leaked into settings.json"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(AIRPLAY_SECRET_FILE))
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        save_airplay_password(&dir, "").expect("clear secret");
+        assert!(!airplay_password_is_set(&dir));
+        assert!(!dir.join(AIRPLAY_SECRET_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_airplay_secret_is_an_error_not_an_open_receiver() {
+        let dir = tmp("airplay-secret-invalid");
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(dir.join(AIRPLAY_SECRET_FILE), [0xff]).expect("write invalid UTF-8");
+        assert!(
+            airplay_password_is_set(&dir),
+            "the configured-secret bit must remain true"
+        );
+        assert!(
+            load_airplay_password(&dir).is_err(),
+            "an unreadable/invalid secret must not be mistaken for no password"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_secret_replacements_never_share_a_temp_file() {
+        let dir = tmp("airplay-secret-concurrent");
+        let values: Vec<String> = (0..12).map(|n| format!("secret-{n}")).collect();
+        let joins: Vec<_> = values
+            .iter()
+            .cloned()
+            .map(|value| {
+                let dir = dir.clone();
+                std::thread::spawn(move || save_airplay_password(&dir, &value))
+            })
+            .collect();
+        for join in joins {
+            join.join()
+                .expect("secret writer panicked")
+                .expect("secret write");
+        }
+        let final_value = load_airplay_password(&dir)
+            .expect("load final secret")
+            .expect("secret exists");
+        assert!(
+            values.contains(&final_value),
+            "torn secret: {final_value:?}"
+        );
+        let leftovers = std::fs::read_dir(&dir)
+            .expect("read config dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0, "unique temp files must be cleaned or renamed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

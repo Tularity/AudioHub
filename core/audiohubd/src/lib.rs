@@ -1,6 +1,12 @@
 //! audiohubd — daemon assembly (spec-m4a §1/§4).
 //! Frozen lib entry: `DaemonCfg` / `DaemonHandle` / `start_daemon`.
 
+/// Audio-only AirPlay/RAOP receiver lifecycle, mDNS and PCM routing.
+mod airplay;
+/// AirPlay lifecycle contracts use ephemeral listeners with mDNS disabled and
+/// never send a volume event, so they cannot touch the user's LAN or output.
+#[cfg(test)]
+mod airplay_tests;
 /// plan M9「开机自启」：登录时把 App 拉起来（macOS LaunchAgent / Windows 计划
 /// 任务），以及那个开关的探测与撤销。
 mod autostart;
@@ -12,27 +18,30 @@ mod conn;
 mod devdecl;
 /// 设备固有延迟（规格 §3.2 的级 2 `cap_dev` / 级 9 `play_dev`）接进遥测的地方。
 mod devlats;
+/// plan M3 「同网段互见」：mDNS 广播的开关、持久化与诚实上报。
+#[cfg(test)]
+mod discovery_tests;
 mod engine;
-pub mod haldev;
 pub mod halbridge;
 /// The Windows control-plane contract and transport. The `wire` half is
 /// compiled EVERYWHERE so its encoding is tested on the machine this is
 /// developed on, not only on the target.
 pub mod halbridge_win;
+pub mod haldev;
 mod ipcserv;
 /// `hal_mic` 生产侧水位闸门（纯状态机 + 一条不变式）。
 pub mod micgate;
-/// plan §15：每对端 × 每方向的传输档位（持久化 + 失效隔离）。
-mod peer_transport;
-/// plan §13 三模式互斥的接线测试（两台真 daemon 跑回环）。
-#[cfg(test)]
-mod mode_tests;
 /// plan §7.1 模式 A 两个音量开关的接线测试（执行器是本机真设备，故守卫调用点）。
 #[cfg(test)]
 mod mode_a_volume_tests;
+/// plan §13 三模式互斥的接线测试（两台真 daemon 跑回环）。
+#[cfg(test)]
+mod mode_tests;
 /// Tier 2（M8 降级链路）：控制流与两个方向的媒体复用在**一条**连接上。
 /// 读线程分发、写调度与控制信用额度。
 mod mux;
+/// plan §15：每对端 × 每方向的传输档位（持久化 + 失效隔离）。
+mod peer_transport;
 mod quality;
 pub mod reconnect;
 /// 截止期线程的延迟落盘日志（阻塞 write + Stderr 全局锁不许上音频线程）。
@@ -46,13 +55,10 @@ mod settings;
 mod tcpmedia;
 /// 传输档位在 daemon 侧的活体状态：用户选了什么、媒体面真的在做什么。
 mod transport;
-mod wsshell;
 /// 传输档位的接线测试（两台真 daemon，断言执行器而不是设置字段）。
 #[cfg(test)]
 mod transport_tests;
-/// plan M3 「同网段互见」：mDNS 广播的开关、持久化与诚实上报。
-#[cfg(test)]
-mod discovery_tests;
+mod wsshell;
 
 /// Public for the deviceless test that pins the "one device = one bridge
 /// refcount" rule: a raw selector and its resolved name must key the same
@@ -72,11 +78,9 @@ use base64::prelude::*;
 
 use audiohub_core::audio::{self, DeviceChangeWatcher, DeviceKind};
 use audiohub_core::dsp::{self, LinearResampler};
-use audiohub_core::latency::{
-    DevLatency, DriftTracker, DropMode, StageDepth, StageId, StageSlot,
-};
 #[cfg(test)]
 use audiohub_core::latency::LatSource;
+use audiohub_core::latency::{DevLatency, DriftTracker, DropMode, StageDepth, StageId, StageSlot};
 use audiohub_core::sysaudio::{self, VirtualCard};
 use audiohub_core::volume::{self, VolumeState, VolumeSync};
 use audiohub_ipc::{
@@ -282,6 +286,11 @@ pub struct DaemonCfg {
     /// off the live guard rather than copied from the wish: with real mDNS
     /// working, the two agree and a copy is indistinguishable from a reading.
     pub announce_fault: bool,
+    /// Whether an enabled AirPlay receiver may publish its `_raop._tcp`
+    /// service. `true` in production; every in-process test daemon passes
+    /// `false` so a settings contract test cannot leak a transient receiver
+    /// onto the user's real LAN.
+    pub airplay_advertise: bool,
     /// `None` = whatever `AUDIOHUB_HAL_BRIDGE` says (the production path).
     ///
     /// Tests must pass `Some(HalBridgeMode::Off)`. The driver hands its rings to
@@ -455,6 +464,7 @@ pub(crate) fn apply_announce(inner: &Arc<DaemonInner>, want: bool) -> bool {
 }
 
 pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
+    airplay::init_logging();
     let cfg_dir = cfg
         .config_dir
         .clone()
@@ -526,6 +536,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     let (build_send, build_recv) = mpsc::channel::<engine::BuildReq>();
     let (built_send, built_recv) = mpsc::channel::<engine::BuildDone>();
     let cfg_dir_for_state = cfg_dir.clone();
+    let airplay = airplay::AirPlayController::new(cfg.airplay_advertise);
     let inner = Arc::new(DaemonInner {
         id: RwLock::new(id.clone()),
         cfg_dir,
@@ -550,15 +561,16 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         mix_cmds: Mutex::new(mix_send),
         mix_ring: Mutex::new(VecDeque::new()),
         store_lock: Mutex::new(()),
+        settings_write_lock: Mutex::new(()),
         shutdown: AtomicBool::new(false),
         cleanup: Once::new(),
         announce_guard: Mutex::new(announce_guard),
         announce_fault: cfg.announce_fault,
+        airplay,
         halbridge: Mutex::new(hal_bridge),
         settings: Mutex::new(stored),
         peer_transport: Mutex::new(peer_transport::PeerTransportStore::load(
-            &cfg_dir_for_state,
-        )),
+            &cfg_dir_for_state)),
         servo_site: Mutex::new(servo::ServoSite::default()),
         haldev: Mutex::new(haldev::HalDevState::new(haldev::SlotTable::load(
             &cfg_dir_for_state,
@@ -569,7 +581,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         preauth: AtomicUsize::new(0),
         recon: Mutex::new(HashMap::new()),
         dev_in_epoch: AtomicU64::new(0),
-        dev_out_epoch: AtomicU64::new(0),
+        dev_out_epoch: Arc::new(AtomicU64::new(0)),
         devices: Mutex::new(None),
         dev_lat: devlats::DevLatCache::new(),
         play_ring: StageSlot::new(),
@@ -577,6 +589,11 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         mix_clip: quality::ClipMeter::new(),
         mix_meter: quality::MixMeter::new(),
     });
+
+    // Stored AirPlay state is daemon-owned just like discovery announcing.
+    // Reconcile before the mixer starts so it cannot observe an uninitialised
+    // route/runtime pair on its first tick.
+    airplay::reconcile(&inner, false);
 
     // plan §15 之前这里有一句「把盘上的档位推给音频线程」。**现在不需要，
     // 而且不能有**：档位是每对端 × 每方向的，作用对象是流，而开机这一刻一条
@@ -685,8 +702,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         let i = inner.clone();
         threads.push(spawn(
             "ahb-signal",
-            Box::new(move || signal_watch_loop(i)),
-        )?);
+            Box::new(move || signal_watch_loop(i)))?);
     }
 
     Ok(DaemonHandle {
@@ -759,11 +775,18 @@ pub(crate) struct DaemonInner {
     pub mix_cmds: Mutex<mpsc::Sender<engine::MixCmd>>,
     pub mix_ring: Mutex<VecDeque<f32>>, // last 2s of post-clip mixer output @48k
     pub store_lock: Mutex<()>,          // serializes peer-store read/modify/write
+    /// Serializes the settings.json + write-only-secret mutation as one IPC
+    /// operation. Multiple IPC connections may call settings.set concurrently.
+    pub settings_write_lock: Mutex<()>,
     pub shutdown: AtomicBool,
     cleanup: Once,
     pub announce_guard: Mutex<Option<AnnounceGuard>>,
     /// See [`DaemonCfg::announce_fault`]. `false` in every real run.
     pub announce_fault: bool,
+    /// Audio-only receiver controller. The protocol runtime may be replaced
+    /// on rename/password changes; its local and peer readers each keep an
+    /// independent cursor and follow/fail according to their contract.
+    pub airplay: Arc<airplay::AirPlayController>,
     /// macOS HAL bridge. `None` is the normal case (no LaunchAgent, mode off,
     /// or another platform) — the daemon must behave exactly as before then.
     /// Behind an `Arc` so the 10ms loops can lift a handle out with one short
@@ -822,7 +845,7 @@ pub(crate) struct DaemonInner {
     /// `daemon.simulate_device_change`; the tx/mixer/ticker loops each compare
     /// against their own last-seen value, so one event drives every rebuild.
     pub dev_in_epoch: AtomicU64,
-    pub dev_out_epoch: AtomicU64,
+    pub dev_out_epoch: Arc<AtomicU64>,
     pub devices: Mutex<Option<DeviceCache>>,
     /// 规格 §3.2 的级 2 `cap_dev` 与级 9 `play_dev`：两个**默认设备**的固有延迟。
     ///
@@ -935,11 +958,12 @@ impl DaemonInner {
     pub(crate) fn begin_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         self.cleanup.call_once(|| {
-            // Order matters: dropping mDNS and removing ipc.json cannot block,
-            // so they run before any peer I/O. A wedged peer must never strand
-            // ipc.json (that would leave `ctl` and wait() waiting forever).
-            *lk(&self.announce_guard) = None;
+            // Ownership must disappear before any protocol teardown that can
+            // wait on a sender or on mDNS. A wedged AirPlay client must never
+            // strand ipc.json and make the next daemon look already alive.
             remove_ipc_json_if_ours(&self.cfg_dir);
+            *lk(&self.announce_guard) = None;
+            self.airplay.stop();
             let conns: Vec<Arc<ConnShared>> = lk(&self.state).conns.values().cloned().collect();
             let deadline = Instant::now() + BYE_BUDGET;
             for c in conns {
@@ -1134,7 +1158,8 @@ fn declared_status(inner: &DaemonInner) -> serde_json::Value {
         if rec.fingerprint.is_empty() {
             continue;
         }
-        lines.push(devdecl::line(&format!("slot {slot} spk ({})", rec.fingerprint), &rec.decl_out));
+        lines.push(devdecl::line(&format!("slot {slot} spk ({})", rec.fingerprint), &rec.decl_out,
+        ));
     }
     serde_json::json!({
         // 每台虚拟扬声器一行。麦克风方向刻意不在这里：它根本不声明
@@ -1637,7 +1662,8 @@ pub(crate) enum PongOutcome {
 
 impl ClockFilter {
     pub(crate) fn new() -> ClockFilter {
-        ClockFilter { win: VecDeque::new() }
+        ClockFilter { win: VecDeque::new(),
+        }
     }
 
     /// 收到一条 `Pong`。三个时戳的含义见结构体文档。
@@ -1951,7 +1977,8 @@ pub(crate) struct PeerLatCell {
 
 impl PeerLatCell {
     pub(crate) fn new() -> PeerLatCell {
-        PeerLatCell { win: Mutex::new(VecDeque::new()), mismatch_warned: AtomicBool::new(false) }
+        PeerLatCell { win: Mutex::new(VecDeque::new()), mismatch_warned: AtomicBool::new(false),
+        }
     }
 
     /// 落一条对端上报。返回 `Some(说明)` 表示两端求和口径对不上，值得记一条日志
@@ -1997,7 +2024,8 @@ impl PeerLatCell {
         if win.len() == PEER_REPORT_WINDOW {
             win.pop_front();
         }
-        win.push_back(PeerReport { at, seq_us, stages, local_ms, dev, quality });
+        win.push_back(PeerReport { at, seq_us, stages, local_ms, dev, quality,
+        });
         drop(win);
 
         match (claimed_ms, local_ms) {
@@ -2395,7 +2423,8 @@ impl RxStream {
                 half_conceal: 0,
                 conceal: quality::ConcealWindow::new(),
             }),
-            post: Mutex::new(PostMix { fifo: VecDeque::new(), dropped: 0 }),
+            post: Mutex::new(PostMix { fifo: VecDeque::new(), dropped: 0,
+            }),
             ring: verify_freq.map(|_| Mutex::new(VecDeque::new())),
             stats: Mutex::new(RxCell {
                 rx: RxStats::new(),
@@ -3784,12 +3813,34 @@ fn build_session_info_with(
     if let Some(pq) = e.peer_lat.snapshot().and_then(|p| p.quality) {
         s.peer_quality = Some(grade_peer_quality(&pq));
     }
+    // `replay` is the daemon-owned record of a session WE opened. It is the
+    // only source/backend authority that survives UI restarts and reconnects;
+    // peer-originated provider entries deliberately have no such record.
+    //
+    // `source_spec` treats an omitted source as `mic`, so reporting `None` for
+    // a local session would make the IPC snapshot less precise than the
+    // executor that is already running. Normalize it at the same boundary.
+    let (source, backend) = match e.replay.as_deref() {
+        Some(replay) => (
+            Some(
+                replay
+                    .source
+                    .as_deref()
+                    .unwrap_or(audiohub_ipc::SOURCE_MIC)
+                    .to_string(),
+            ),
+            replay.backend.clone(),
+        ),
+        None => (None, None),
+    };
     SessionInfo {
         id: e.id,
         peer_fingerprint: e.conn.peer.fingerprint.clone(),
         peer_name: e.conn.peer.name.clone(),
         kind: e.kind.clone(),
         dir: e.dir.clone(),
+        source,
+        backend,
         // **线上**采样率，与设置里的质量档同量纲（`pcm48k` ⇒ 48000）。
         // 本机管线恒为 48 kHz（收端非 48k 必然重采样），那是另一个量；界面上
         // 这一格的措辞必须说清是哪一个，否则又是一处 24/48 式的误读。
@@ -3829,6 +3880,11 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
     let mut stale_seen: HashMap<String, u64> = HashMap::new();
     let mut dev_epoch = inner.dev_out_epoch.load(Ordering::Relaxed);
     loop {
+        // Peer volume reporting still runs on the 1 s body below, so remember
+        // whether any of the five sub-ticks saw a replacement. AirPlay must
+        // react on the sub-tick itself: polling the untouched new output first
+        // would incorrectly push its old volume into the sender UI.
+        let mut renegotiate = false;
         for _ in 0..5 {
             if inner.shutdown.load(Ordering::SeqCst) {
                 return;
@@ -3846,16 +3902,24 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
             // for the reason above — that thread's 200 ms cadence is spoken
             // for.
             autotier::watchdog_pass(&inner);
+            let epoch = inner.dev_out_epoch.load(Ordering::Relaxed);
+            let output_changed = epoch != dev_epoch;
+            dev_epoch = epoch;
+            renegotiate |= output_changed;
+            // Native system volume is not event-driven on both supported
+            // platforms yet. Poll only while an active AirPlay sender has
+            // supplied its first volume; the controller is otherwise a cheap
+            // no-op. 200 ms also bounds sender-UI feedback without putting
+            // any network I/O on this ticker thread (DACP has its own worker).
+            // A replacement output is reapplied before reverse polling, so its
+            // unrelated pre-existing volume can never become sender authority.
+            inner
+                .airplay
+                .volume_tick(&inner.dev_out_epoch, epoch, output_changed);
         }
         // spec-m4c §D: the output device the consumer's slider drives is a
         // different device now, so every volume_sync'd spk session must be told
         // what the NEW device reads (and whether it is adjustable at all).
-        let renegotiate = {
-            let e = inner.dev_out_epoch.load(Ordering::Relaxed);
-            let changed = e != dev_epoch;
-            dev_epoch = e;
-            changed
-        };
         conn::ping_and_reap(&inner);
         {
             let mut st = lk(&inner.state);
@@ -4019,7 +4083,8 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                             AutoLadder::new()
                         };
                         tx.rung.store(ladder.top_rung(), Ordering::Relaxed);
-                        AutoCell { ladder, last_seq: 0, streamed }
+                        AutoCell { ladder, last_seq: 0, streamed,
+                        }
                     });
                     // Tier 1/2: the primary signal is **local** (our own send
                     // queue), so it is evaluated on the ticker's own cadence and
@@ -4144,9 +4209,7 @@ fn declare_pass(
             let fresh = entries
                 .iter()
                 .zip(pipelines)
-                .find(|(e, _)| {
-                    e.conn.fp == fp && e.kind == KIND_SPK && e.dir == DIR_SEND
-                })
+                .find(|(e, _)| e.conn.fp == fp && e.kind == KIND_SPK && e.dir == DIR_SEND)
                 .and_then(|(_, p)| p.as_ref())
                 .and_then(devdecl::frames_for);
             let rec = &mut st.slots[slot];
@@ -4163,7 +4226,8 @@ fn declare_pass(
             // 没有 `fresh` 时**什么都不做**，而不是把 `want` 清成 0：
             // 一次测不到（对端刚断、某一级读不到）不是「这条路变成零延迟了」。
             // 驱动保持它上一个测出来的值，那仍然是一个测出来的值。
-            let Some(want) = rec.decl_out.want else { continue };
+            let Some(want) = rec.decl_out.want else { continue;
+            };
             if !devdecl::should_send(&rec.decl_out, want) {
                 continue;
             }
@@ -4533,7 +4597,8 @@ fn owner_alive(ep: &IpcEndpoint) -> bool {
 /// Refuse to overwrite a live daemon's endpoint file: two daemons sharing a
 /// config dir silently hijack each other's ipc.json and either exit deletes it.
 fn ensure_endpoint_unowned(dir: &Path) -> Result<()> {
-    let Some(ep) = read_ipc_json(dir) else { return Ok(()) };
+    let Some(ep) = read_ipc_json(dir) else { return Ok(());
+    };
     if owner_alive(&ep) {
         bail!(
             "another audiohubd (pid {}, ipc port {}) already owns {}; stop it first \
@@ -4721,7 +4786,8 @@ mod telemetry_tests {
     /// 丢弃行为本身与改动前逐字相同（`drain(..excess)`）。
     #[test]
     fn post_mix_overflow_drops_oldest_and_counts_it() {
-        let mut pm = PostMix { fifo: VecDeque::new(), dropped: 0 };
+        let mut pm = PostMix { fifo: VecDeque::new(), dropped: 0,
+        };
         let mut out = [0.0f32; 480];
         // 灌进远超 100 ms 上限的音频：6000 样本 -> 取走 480 -> 剩 5520 > 4800
         pm.advance(Some(vec![0.5; 6000]), &mut out);
@@ -4738,7 +4804,8 @@ mod telemetry_tests {
     /// 没溢出时不能凭空记丢弃。
     #[test]
     fn post_mix_within_budget_drops_nothing() {
-        let mut pm = PostMix { fifo: VecDeque::new(), dropped: 0 };
+        let mut pm = PostMix { fifo: VecDeque::new(), dropped: 0,
+        };
         let mut out = [0.0f32; 480];
         pm.advance(Some(vec![0.5; 960]), &mut out);
         assert_eq!(pm.dropped, 0);
@@ -5704,13 +5771,16 @@ mod telemetry_tests {
     /// ⇒ 第二个断言红，且红出来的差值就是被吞掉的那一段。
     #[test]
     fn wiring_the_device_stages_raises_the_total_by_exactly_those_two_stages() {
-        let cap = DevLatency { frames: 480, rate: 48_000, source: LatSource::Api };
+        let cap = DevLatency { frames: 480, rate: 48_000, source: LatSource::Api,
+        };
         // 30-win 实测的那 2012 帧：`written − IAudioClock::GetPosition()`
-        let play = DevLatency { frames: 2_012, rate: 48_000, source: LatSource::Assumed };
+        let play = DevLatency { frames: 2_012, rate: 48_000, source: LatSource::Assumed,
+        };
 
         let before = {
             let mut p = send_pipeline(9_600);
-            attach_peer_and_net(&mut p, cell_reporting(&[180.0]).snapshot(), Some(clock(580)));
+            attach_peer_and_net(&mut p, cell_reporting(&[180.0]).snapshot(), Some(clock(580)),
+            );
             p
         };
         let after = {
@@ -5753,7 +5823,8 @@ mod telemetry_tests {
     /// 那条管「总数算不算得出来」，这条管「算出来的总数敢不敢自称精确」。
     #[test]
     fn full_confidence_needs_two_api_readings_and_nothing_less() {
-        let api = DevLatency { frames: 480, rate: 48_000, source: LatSource::Api };
+        let api = DevLatency { frames: 480, rate: 48_000, source: LatSource::Api,
+        };
         let full = |local: Option<DevLatency>, peer_dev: Option<DevLatency>| {
             let mut p = send_pipeline_with_dev(9_600, local);
             let mut peer = cell_reporting(&[180.0]).snapshot().expect("对端有读数");
@@ -5763,7 +5834,8 @@ mod telemetry_tests {
         };
         assert_eq!(full(Some(api), Some(api)), LatConfidence::Full, "两侧都是平台真值");
         for degraded in [LatSource::Assumed, LatSource::Unreliable] {
-            let d = DevLatency { frames: 480, rate: 48_000, source: degraded };
+            let d = DevLatency { frames: 480, rate: 48_000, source: degraded,
+            };
             assert_eq!(full(Some(d), Some(api)), LatConfidence::LowerBound, "{degraded:?} 在本侧");
             assert_eq!(full(Some(api), Some(d)), LatConfidence::LowerBound, "{degraded:?} 在对端");
         }
@@ -5858,8 +5930,10 @@ mod telemetry_tests {
     fn every_one_of_the_five_terms_can_veto_the_total() {
         let (l, n, pe) = (Some(205.0), Some(0.29), Some(180.0));
         // 两台声卡：本侧 10 ms（480 帧 @48k），对端 41.92 ms（2012 帧，30-win 实测）
-        let ld = Some(DevLatency { frames: 480, rate: 48_000, source: LatSource::Api });
-        let pd = Some(DevLatency { frames: 2_012, rate: 48_000, source: LatSource::Assumed });
+        let ld = Some(DevLatency { frames: 480, rate: 48_000, source: LatSource::Api,
+        });
+        let pd = Some(DevLatency { frames: 2_012, rate: 48_000, source: LatSource::Assumed,
+        });
         let dead = Some(DevLatency::unavailable());
         assert!(
             (compose_sum_ms(l, n, pe, ld, pd).unwrap() - 437.2066).abs() < 1e-3,
@@ -5953,12 +6027,14 @@ mod telemetry_tests {
         let now = Instant::now();
 
         let fresh = PeerLatCell::new();
-        fresh.accept_at(now - Duration::from_secs(4), 1, peer_stage_ms(180.0), None, None, None);
+        fresh.accept_at(now - Duration::from_secs(4), 1, peer_stage_ms(180.0), None, None, None,
+        );
         let s = fresh.snapshot().expect("4 秒前的读数仍可用");
         assert!(s.age_s > 3.0, "但要标成陈旧：age_s={}", s.age_s);
 
         let dead = PeerLatCell::new();
-        dead.accept_at(now - Duration::from_secs(20), 1, peer_stage_ms(180.0), None, None, None);
+        dead.accept_at(now - Duration::from_secs(20), 1, peer_stage_ms(180.0), None, None, None,
+        );
         assert!(dead.snapshot().is_none(), "20 秒前的读数不再是关于「现在」的证据");
 
         let mut p = send_pipeline(9_600);
@@ -6042,8 +6118,11 @@ mod telemetry_tests {
         tx
     }
 
-    fn send_lat<'a>(tx: &'a TxShared, peer: Option<PeerLatSnapshot>, clock: Option<ClockEstimate>) -> StreamLat<'a> {
-        StreamLat { is_send: true, tx: Some(tx), rx: None, peer, clock, dev: None }
+    fn send_lat<'a>(
+        tx: &'a TxShared, peer: Option<PeerLatSnapshot>, clock: Option<ClockEstimate>,
+    ) -> StreamLat<'a> {
+        StreamLat { is_send: true, tx: Some(tx), rx: None, peer, clock, dev: None,
+        }
     }
 
     /// **装配层：N 条流进，N 条读数出，谁的深度都不许流进别人的读数。**
@@ -6065,7 +6144,8 @@ mod telemetry_tests {
     fn the_assembly_layer_gives_each_stream_its_own_depth_never_the_fleet_sum() {
         // 扇出：a、b 共用一个源（物理队列只有一份 ⇒ 报同一个数是**正确的**）。
         let shared: audiohub_core::latency::SourceDepths = [
-            Some(StageDepth::new(StageId::SrcFifo, 48_000, 48_000, 48_000, DropMode::Oldest)),
+            Some(StageDepth::new(StageId::SrcFifo, 48_000, 48_000, 48_000, DropMode::Oldest,
+            )),
             None,
         ];
         let a = TxShared::new();
@@ -6082,7 +6162,8 @@ mod telemetry_tests {
         let out = assemble_pipelines(
             &play_ring,
             &play_drift,
-            vec![send_lat(&a, None, None), send_lat(&b, None, None), send_lat(&c, None, None)],
+            vec![send_lat(&a, None, None), send_lat(&b, None, None), send_lat(&c, None, None),
+            ],
         );
 
         assert_eq!(out.len(), 3, "N 条流进，必须 N 条读数出，一一对应");
@@ -6164,8 +6245,10 @@ mod telemetry_tests {
             &play_ring,
             &play_drift,
             vec![
-                StreamLat { is_send: false, tx: None, rx: Some(&r1), peer: None, clock: None, dev: None },
-                StreamLat { is_send: false, tx: None, rx: Some(&r2), peer: None, clock: None, dev: None },
+                StreamLat { is_send: false, tx: None, rx: Some(&r1), peer: None, clock: None, dev: None,
+                },
+                StreamLat { is_send: false, tx: None, rx: Some(&r2), peer: None, clock: None, dev: None,
+                },
             ],
         );
         let ring_ms = |p: &Option<PipelineLatency>| {
@@ -6269,7 +6352,8 @@ mod telemetry_tests {
         };
 
         let cell = PeerLatCell::new();
-        let why = cell.accept(seq_us, stages.iter().map(from_wire_stage).collect(), local_ms, dev, None);
+        let why = cell.accept(seq_us, stages.iter().map(from_wire_stage).collect(), local_ms, dev, None,
+        );
         assert!(
             why.is_none(),
             "同一份分项走了一圈回来，两端求和口径必须一致，实得分歧：{why:?}"
@@ -6386,7 +6470,8 @@ mod fault_injection {
     }
 
     /// 走完整条生产汇总链路，返回这条会话此刻上报的 `PipelineLatency`。
-    fn report(play_ring: &StageSlot, play_drift: &Mutex<DriftTracker>, rx: &RxStream) -> PipelineLatency {
+    fn report(play_ring: &StageSlot, play_drift: &Mutex<DriftTracker>, rx: &RxStream,
+    ) -> PipelineLatency {
         let mut p = build_pipeline_from(false, None, Some(rx), None).expect("这条流有可读的级");
         attach_output_tails(play_ring, play_drift, rx, &mut p);
         p
@@ -6396,7 +6481,9 @@ mod fault_injection {
         p.stages
             .iter()
             .find(|s| s.id == id)
-            .unwrap_or_else(|| panic!("分项里没有 {id}，实际有 {:?}", p.stages.iter().map(|s| &s.id).collect::<Vec<_>>()))
+            .unwrap_or_else(|| {
+            panic!("分项里没有 {id}，实际有 {:?}", p.stages.iter().map(|s| &s.id).collect::<Vec<_>>())
+        })
     }
 
     /// 一个 tick 的**真实**播放路径：声卡取走 480（上一个 10 ms 里发生的），
@@ -6752,7 +6839,8 @@ mod fault_injection {
         // 灌爆这张桥的环，再按 mixer 的相位发布（推之前读）。
         bridge_tx.push(&vec![0.25f32; 60_000]);
         rx.bridge_ring
-            .store(Some(engine::ring_depth_before_push(StageId::BridgeRing, &bridge_tx)));
+            .store(Some(engine::ring_depth_before_push(StageId::BridgeRing, &bridge_tx,
+        )));
 
         let p = report(&empty_site, &no_drift, &rx);
         let br = stage_of(&p, "bridge_ring");
@@ -6828,7 +6916,8 @@ mod fault_injection {
         for tick in 0..secs * 100 {
             drift_tick(&mut sink, &mut tx, &slot, t0, tick, &mut cb, &mut next);
             if (tick + 1) % 3_000 == 0 {
-                out.push(stage_of(&report(&slot, &drift, &rx), "play_ring").ms.expect("有读数"));
+                out.push(stage_of(&report(&slot, &drift, &rx), "play_ring").ms.expect("有读数"),
+                );
             }
         }
         out
@@ -6927,7 +7016,8 @@ mod fault_injection {
         let slot = StageSlot::new();
         engine::publish_play_ring(&slot, &site);
         rx.bridge_ring
-            .store(Some(engine::ring_depth_before_push(StageId::BridgeRing, &bridge)));
+            .store(Some(engine::ring_depth_before_push(StageId::BridgeRing, &bridge,
+        )));
         rx.hal_mic.store(Some(StageDepth {
             id: StageId::HalMic,
             samples: 24_000,

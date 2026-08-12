@@ -18,8 +18,6 @@ import { tauriInvoke, isTauri } from '../ipc/endpoint';
 // 掉一个地址。语料里只有那句可点的话（`wiki.*`，现在多半只作为 `?` 的无障碍
 // 名称），指向哪里由这里决定。
 //
-// wiki 是英文的，与界面语种无关——这是项目的既定语言约束，不是遗漏。
-//
 // ⚠ 每一条都指向**具体章节**。界面上已经不再解释任何功能（用户 2026-08-10 裁定
 // 「为了简化而简化」，见 docs/plan.md §3.1），所以一个落在页顶、要用户自己往下
 // 找的链接等于没有把话说完。锚点由 GitHub 从标题生成，改标题就要改这里。
@@ -56,6 +54,10 @@ export const WIKI = {
   fingerprint: `${WIKI_BASE}/Discovery-and-Pairing#fingerprints`,
   ports: `${WIKI_BASE}/Discovery-and-Pairing#ports`,
   unpair: `${WIKI_BASE}/Discovery-and-Pairing#unpairing`,
+
+  // —— 共享协议（外部来源接入；仅共享模式）
+  shareProtocols: `${WIKI_BASE}/Share-Protocols`,
+  airplay: `${WIKI_BASE}/Share-Protocols#airplay`,
 
   // —— 网页访问
   web: `${WIKI_BASE}/Web-Access`,

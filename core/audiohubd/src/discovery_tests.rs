@@ -65,9 +65,11 @@ impl Node {
             tx_throttle_kbps: None,
             block_udp: None,
             announce_fault: fault,
+            airplay_advertise: false,
         })
         .expect("start daemon");
-        Node { h, dir, keep_dir: false }
+        Node { h, dir, keep_dir: false,
+        }
     }
 
     fn ok(&self, method: &str, params: Value) -> Value {

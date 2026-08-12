@@ -7,7 +7,7 @@ import { Toasts } from './components/Toasts';
 import { ConfirmHost } from './components/ConfirmDialog';
 import { PeersView } from './views/Peers';
 import { DetailView } from './views/Detail';
-import { PairView } from './views/Pair';
+import { ShareProtocolsView } from './views/ShareProtocols';
 import { SettingsView } from './views/Settings';
 import { StatsView } from './views/Stats';
 import { OnboardingGate } from './views/Onboarding';
@@ -17,6 +17,7 @@ import { installShortcuts } from './lib/shortcutHost';
 import { pendingSignature, readPermSeen, shouldAutoOpenPermissions } from './lib/permIntro';
 import type { ShortcutActionId } from './lib/shortcuts';
 import { actions, getState, useStore } from './state/store';
+import { isShareMode } from './state/mode';
 import { boot, gateVisible, syncTray } from './state/connection';
 import { subscribeLocale, subscribeTheme } from './lib/appearanceHost';
 import { getLocale, t } from './i18n';
@@ -24,7 +25,7 @@ import { getLocale, t } from './i18n';
 const VIEWS = {
   peers: PeersView,
   detail: DetailView,
-  pair: PairView,
+  share: ShareProtocolsView,
   settings: SettingsView,
   stats: StatsView,
 } as const;
@@ -75,7 +76,6 @@ function useShortcutDispatch() {
   return useCallback((action: ShortcutActionId) => {
     switch (action) {
       case 'view.peers': actions.navigate('peers'); break;
-      case 'view.pair': actions.navigate('pair'); break;
       case 'view.stats': actions.navigate('stats'); break;
       case 'view.settings': actions.navigate('settings'); break;
       // 「返回」只在详情页成立。在别处让它也跳主面板会跟 ⌘1 重复，而一个在多数页面
@@ -88,15 +88,27 @@ function useShortcutDispatch() {
   }, []);
 }
 
+/**
+ * 「共享协议」只属于共享模式。模式在设置页被切走时，停在这一页的用户必须被带回
+ * 主面板——导航胶囊里那一格同时消失，留在原地等于停在一页当前模式下并不存在的界面
+ * 上，而且没有任何一格是高亮的。
+ */
+function useViewModeGuard(view: string, share: boolean): void {
+  useEffect(() => {
+    if (view === 'share' && !share) actions.navigate('peers');
+  }, [view, share]);
+}
+
 export function App() {
   const view = useStore((s) => s.route.view);
+  const share = useStore(isShareMode);
   const gate = useGateVisible();
+  useViewModeGuard(view, share);
   // 语种订阅在**根组件**上，而且刻意不用它的值。
   //
   // `t()` 是纯函数调用，读的是 i18n 模块里那个模块级的 `current`——换语种改了它，
-  // 但没有任何组件因此重渲，界面会原地不动。今天看不出来（只有一门语言，选择器
-  // 无论怎么选都落回 zh-CN），可加第二门语言的那天，语言选择器就是一个点了没反应
-  // 的控件，而排查方向会指向 i18n 层而不是这里。
+  // 但没有任何组件因此重渲，界面会原地不动。语言选择器现在有多个实际语种，
+  // 所以这条根订阅是实际切换整棵组件树的必需接线。
   //
   // 挂在根上并且不 memo 任何子树，一次订阅就让整棵树跟着重渲，够了。
   useSyncExternalStore(subscribeLocale, getLocale);

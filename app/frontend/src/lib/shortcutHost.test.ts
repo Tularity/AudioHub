@@ -30,10 +30,10 @@ describe('binding snapshot', () => {
 
   it('is a new object after an override changes', () => {
     const before = currentBindings();
-    setOverrides({ 'view.pair': null });
+    setOverrides({ 'view.stats': null });
     const after = currentBindings();
     expect(after).not.toBe(before);
-    expect(after['view.pair']).toBeNull();
+    expect(after['view.stats']).toBeNull();
   });
 
   it('starts from the platform defaults', () => {

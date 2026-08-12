@@ -117,9 +117,10 @@ describe('light theme cancels the dark theme lighting model', () => {
   });
 
   it('treats a uniform ring as a border, not as lighting', () => {
-    // .qdot draws its empty state with `inset 0 0 0 1px`; that is the ring, and
-    // requiring a light override for it would be noise.
-    expect(directionalInsets('inset 0 0 0 1px var(--ring-empty)')).toEqual([]);
+    // `.field:focus-within` and friends draw a ring with `inset 0 0 0 1px`, all
+    // four offsets zero; that is a border, and requiring a light override for it
+    // would be noise. Only an *offset* inset is lighting.
+    expect(directionalInsets('inset 0 0 0 1px rgba(var(--accent-rgb), .22)')).toEqual([]);
     expect(directionalInsets('inset 0 1px 0 rgba(255,255,255,.3)')).toHaveLength(1);
     expect(directionalInsets('inset 0 -14px 22px rgba(0,0,0,.28)')).toHaveLength(1);
   });
@@ -366,8 +367,11 @@ describe('light palette clears WCAG on the surfaces text lands on', () => {
     // The rule a future contributor will break. Each of these draws a solid
     // shape a few pixels across; none has text on it.
     const MARK_RULES = [
+      // `.qdot.on.tone-*` were four of these until 2026-08-11, when the quality
+      // dots were removed outright. Their replacement -- the kHz/bit readout
+      // tinted by `.metric-val.small.tone-*` -- is *text*, so it belongs to the
+      // 4.5:1 tier and is guarded above, not here.
       '.dot.online', '.dot.connecting', '.peer-inbound .dot.live',
-      '.qdot.on.tone-ok', '.qdot.on.tone-accent', '.qdot.on.tone-warn', '.qdot.on.tone-danger',
       '.pair-steps li.done .step-dot', '.pair-steps li.doing .step-dot', '.pair-steps li.failed .step-dot',
       '.band-capture', '.wf-capture', '.stop-tick.on', '.switch.pending .knob',
     ];

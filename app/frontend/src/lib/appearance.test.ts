@@ -90,15 +90,18 @@ describe('state icons', () => {
 describe('locale resolution', () => {
   it('takes an exact tag match first', () => {
     expect(resolveLocale('system', ['zh-CN', 'en-US'])).toBe('zh-CN');
+    expect(resolveLocale('system', ['en-US', 'zh-CN'])).toBe('en-US');
   });
 
   it('matches tags case-insensitively', () => {
     // Real navigators report `zh-cn` in some configurations.
     expect(resolveLocale('system', ['zh-cn'])).toBe('zh-CN');
+    expect(resolveLocale('system', ['EN-us'])).toBe('en-US');
   });
 
   it('falls back to the primary subtag', () => {
     expect(resolveLocale('system', ['zh'])).toBe('zh-CN');
+    expect(resolveLocale('system', ['en-GB'])).toBe('en-US');
   });
 
   it('prefers an exact match further down the list over a near match higher up', () => {
@@ -121,9 +124,14 @@ describe('locale resolution', () => {
     expect(resolveLocale('xx-YY' as never, ['zh-CN'])).toBe(DEFAULT_LOCALE);
   });
 
+  it('keeps an explicitly pinned English catalogue independent of the system', () => {
+    expect(resolveLocale('en-US', ['zh-CN'])).toBe('en-US');
+  });
+
   it('offers follow-system plus every published catalogue, in that order', () => {
     expect(LOCALE_PREFS[0]).toBe('system');
     expect(LOCALE_PREFS.slice(1)).toEqual([...LOCALES]);
+    expect(LOCALE_PREFS).toEqual(['system', 'zh-CN', 'en-US']);
   });
 });
 

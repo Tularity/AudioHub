@@ -587,13 +587,26 @@ export interface SessionInfo {
   channels?: number;
   stats?: SessionStats | null;
   /**
-   * **daemon 目前不回这两个字段**（`SessionInfo` 里只有 kind/dir）。UI 因此无法从
-   * 会话列表反推「这条 spk 流送的是系统音频还是麦克风」，只能记本地偏好——CLI/probe
-   * 开的会话就会显示成本地偏好的样子。补上后这里立刻变成权威来源，见 Peers.tsx
-   * 的 sessionSource()。
+   * 本机发起会话的 daemon 权威来源。有活动会话时 UI 必须读它，
+   * localStorage 只是没有活动会话时的下次偏好。对端发起的 provider 会话，
+   * 以及旧 daemon 的快照，可能不带这两个字段。
    */
   source?: string | null;
   backend?: string | null;
+}
+
+/** 外部 AirPlay 发送端的一条接入会话。 */
+export interface AirPlaySessionInfo {
+  id?: string | number;
+  protocol?: string;
+  peer?: string;
+  sample_rate?: number;
+  channels?: number;
+  paused?: boolean;
+  title?: string | null;
+  artist?: string | null;
+  album?: string | null;
+  connected_ms?: number;
 }
 
 /**
@@ -748,6 +761,24 @@ export interface DaemonSettings {
    */
   mode?: 'share' | 'a' | 'b' | string;
   effective_mode?: 'share' | 'a' | 'b' | string;
+  /** 是否接受外部 AirPlay 音频。 */
+  airplay_enabled?: boolean;
+  /** 广播名称覆盖；空串 = 跟随本机名称。 */
+  airplay_name?: string;
+  /** daemon 结合覆盖与本机名后，实际广播出去的名称。 */
+  airplay_effective_name?: string;
+  /** 接收服务此刻是否真的在监听。 */
+  airplay_listening?: boolean;
+  /** 启动或监听失败的原因；没有错误时为空。 */
+  airplay_error?: string | null;
+  /** 接收器仍在监听时的非致命播放/系统音量警告。 */
+  airplay_warning?: string | null;
+  /** classic RAOP 控制端口。 */
+  airplay_raop_port?: number | null;
+  /** AirPlay 2 控制端口；当前里程碑不启用时为空。 */
+  airplay_airplay2_port?: number | null;
+  /** 只报告是否设过密码，绝不返回密码本身。 */
+  airplay_password_set?: boolean;
   /**
    * 延迟档滑条的固定档（毫秒，升序），`0` = 「尽可能低」。
    *
@@ -831,6 +862,11 @@ export interface DaemonSettings {
    */
   name_source?: 'env' | 'custom' | 'hostname' | string;
 }
+
+/** settings.set 的写入形状；密码是只写字段，不属于 DaemonSettings。 */
+export type DaemonSettingsPatch = Partial<DaemonSettings> & {
+  airplay_password?: string;
+};
 
 export interface DiscoverResult {
   fingerprint?: string;

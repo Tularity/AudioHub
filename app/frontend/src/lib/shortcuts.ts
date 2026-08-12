@@ -31,22 +31,30 @@
 import type { MsgKey } from '../i18n';
 import { IS_MAC } from './fmt';
 
-/** The set of things a shortcut can do. Stable ids: they are persisted. */
+/**
+ * The set of things a shortcut can do. Stable ids: they are persisted.
+ *
+ * `view.pair` is gone (2026-08-11): the pairing wizard is no longer a view, it
+ * is a sheet on the main panel. A stale `view.pair` entry left in a user's
+ * localStorage is dropped by `decodeOverrides`, which only keeps known ids.
+ *
+ * The "share protocols" page deliberately gets **no** shortcut. It exists only
+ * in share mode, so a binding for it would be a listed key that does nothing
+ * half the time -- worse than not offering one.
+ */
 export type ShortcutActionId =
   | 'view.peers'
-  | 'view.pair'
   | 'view.stats'
   | 'view.settings'
   | 'nav.back'
   | 'help.shortcuts';
 
 export const SHORTCUT_ACTIONS: readonly ShortcutActionId[] = [
-  'view.peers', 'view.pair', 'view.stats', 'view.settings', 'nav.back', 'help.shortcuts',
+  'view.peers', 'view.stats', 'view.settings', 'nav.back', 'help.shortcuts',
 ] as const;
 
 export const ACTION_LABEL: Record<ShortcutActionId, MsgKey> = {
   'view.peers': 'shortcuts.action.peers',
-  'view.pair': 'shortcuts.action.pair',
   'view.stats': 'shortcuts.action.stats',
   'view.settings': 'shortcuts.action.settings',
   'nav.back': 'shortcuts.action.back',
@@ -223,10 +231,9 @@ export function acceleratorTokens(
 const DEFAULTS: Record<ShortcutPlatform, Record<ShortcutActionId, string>> = {
   mac: {
     'view.peers': 'Meta+1',
-    'view.pair': 'Meta+2',
-    'view.stats': 'Meta+3',
+    'view.stats': 'Meta+2',
     // ⌘, is an Apple platform convention, not a preference -- it is the
-    // default here rather than ⌘4 for that reason. ⌘4 still works, as a
+    // default here rather than ⌘3 for that reason. ⌘3 still works, as a
     // built-in alias below, so the number row stays complete.
     'view.settings': 'Meta+,',
     'nav.back': 'Meta+[',
@@ -234,8 +241,7 @@ const DEFAULTS: Record<ShortcutPlatform, Record<ShortcutActionId, string>> = {
   },
   win: {
     'view.peers': 'Ctrl+1',
-    'view.pair': 'Ctrl+2',
-    'view.stats': 'Ctrl+3',
+    'view.stats': 'Ctrl+2',
     'view.settings': 'Ctrl+,',
     'nav.back': 'Alt+ArrowLeft',
     'help.shortcuts': 'Ctrl+/',
@@ -245,13 +251,13 @@ const DEFAULTS: Record<ShortcutPlatform, Record<ShortcutActionId, string>> = {
 /**
  * Fixed extra accelerators that are not user-editable and not listed as rows.
  *
- * They exist so that ⌘1–⌘4 reads as one complete family even though settings'
+ * They exist so that ⌘1–⌘3 reads as one complete family even though settings'
  * primary binding is the platform-conventional ⌘,. An alias only fires when no
- * user binding claims the same chord, so rebinding ⌘4 elsewhere wins.
+ * user binding claims the same chord, so rebinding ⌘3 elsewhere wins.
  */
 const ALIASES: Record<ShortcutPlatform, Partial<Record<ShortcutActionId, string>>> = {
-  mac: { 'view.settings': 'Meta+4' },
-  win: { 'view.settings': 'Ctrl+4' },
+  mac: { 'view.settings': 'Meta+3' },
+  win: { 'view.settings': 'Ctrl+3' },
 };
 
 export function defaultBindings(platform: ShortcutPlatform): Record<ShortcutActionId, string> {

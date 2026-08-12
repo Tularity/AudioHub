@@ -9,7 +9,7 @@
 
 import { describe, it, expect } from 'vitest';
 import type { PeerState, SessionInfo } from '../ipc/types';
-import { readPeerNet, readQuality, medianOf5, qualityDots } from './metrics';
+import { readPeerNet, readQuality, medianOf5, qualityTone } from './metrics';
 
 function sess(stats: SessionInfo['stats']): SessionInfo {
   return { id: 1, peer_fingerprint: 'aa:bb', kind: 'spk', dir: 'recv', stats };
@@ -116,7 +116,7 @@ describe('readQuality: absent components stay absent', () => {
   });
 });
 
-describe('medianOf5 / qualityDots: empty input yields no reading, not zero', () => {
+describe('medianOf5 / qualityTone: empty input yields no reading, not zero', () => {
   it('returns undefined for an empty sample list', () => {
     expect(medianOf5([])).toBeUndefined();
     expect(medianOf5([])).not.toBe(0);
@@ -131,11 +131,14 @@ describe('medianOf5 / qualityDots: empty input yields no reading, not zero', () 
     expect(medianOf5([999, 1, 2, 3, 4, 5])).toBe(3);
   });
 
-  // No grade must not light up any dots -- that is what makes an ungraded
-  // stream visibly ungraded rather than merely bad.
-  it('gives an ungraded stream zero dots', () => {
-    expect(qualityDots(undefined)).toBe(0);
-    expect(qualityDots('poor')).toBe(1);
-    expect(qualityDots('excellent')).toBe(4);
+  // The four quality dots were removed on 2026-08-11; the grade's only visual
+  // encoding left on the card is the tone class on the kHz/bit readout. Which
+  // makes this mapping load-bearing in a way it was not before: if two adjacent
+  // grades ever resolve to the same tone, a stream that just dropped a rung
+  // looks exactly like one that did not.
+  it('gives every grade its own tone', () => {
+    const tones = (['excellent', 'good', 'fair', 'poor'] as const).map(qualityTone);
+    expect(tones).toEqual(['ok', 'accent', 'warn', 'danger']);
+    expect(new Set(tones).size).toBe(4);
   });
 });

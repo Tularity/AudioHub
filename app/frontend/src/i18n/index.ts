@@ -1,5 +1,4 @@
-// i18n。**中文是唯一发布语种，也是默认语种**；这一层存在的目的不是「现在就多语」，
-// 而是让将来加一门语言是一次翻译工作，而不是一次重构。
+// i18n。简体中文与美式英语都是完整发布语种，中文仍是默认回退。
 //
 // 为什么手写而不是 i18next：这里需要的全部能力是「按稳定键查一条整句 + 具名占位符
 // 插值」。i18next 为此要带进 ~40KB 运行时、一套异步加载/命名空间/后端插件的生命周期，
@@ -16,12 +15,14 @@
 //      真的是「若干短语并列」（比如摘要行）就显式走 joinPhrases()，由语料决定分隔符。
 
 import { zhCN } from './zh-CN';
+import { enUS } from './en-US';
 
-export type Locale = 'zh-CN';
+export type Locale = 'zh-CN' | 'en-US';
 export type MsgKey = keyof typeof zhCN;
 
-const CATALOGUES: Record<Locale, Record<string, string>> = {
+const CATALOGUES: Record<Locale, Record<MsgKey, string>> = {
   'zh-CN': zhCN,
+  'en-US': enUS,
 };
 
 /**
@@ -35,6 +36,7 @@ export const DEFAULT_LOCALE: Locale = 'zh-CN';
 /** 每个语种在选择器里的自称（endonym）——用英文写「Chinese」的菜单是选不动的。 */
 export const LOCALE_ENDONYM: Record<Locale, string> = {
   'zh-CN': '简体中文',
+  'en-US': 'English (US)',
 };
 
 let current: Locale = DEFAULT_LOCALE;
@@ -44,8 +46,7 @@ export function getLocale(): Locale {
 }
 
 /**
- * 切换语种。目前只有一门语言，所以它总是回到 zh-CN——留着这个入口是为了让
- * `<html lang>` 与 Intl 的调用点从一开始就读同一个来源，而不是散落的硬编码。
+ * 切换语种，并让 `<html lang>` 与 Intl 的调用点读同一个来源。
  */
 export function setLocale(loc: string): Locale {
   current = (Object.prototype.hasOwnProperty.call(CATALOGUES, loc) ? loc : DEFAULT_LOCALE) as Locale;

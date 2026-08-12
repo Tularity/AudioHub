@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use audiohub_ipc::{methods, Mode, KIND_SPK, SOURCE_TONE};
+use audiohub_ipc::{methods, Mode, KIND_SPK, SOURCE_MIC, SOURCE_TONE};
 
 use crate::halbridge::HalBridgeMode;
 use crate::{ipcserv, lk, start_daemon, DaemonCfg, DaemonHandle};
@@ -87,6 +87,7 @@ impl Node {
             tx_throttle_kbps: tx_kbps,
             block_udp,
             announce_fault: false,
+            airplay_advertise: false,
         })
         .expect("start daemon");
         Node { h, dir }
@@ -571,6 +572,92 @@ fn linked(tag: &str) -> (Node, Node) {
     (a, b)
 }
 
+/// The opener's `SessionEntry.replay` is the source/backend authority exposed
+/// by both the immediate `session.open` reply and later `session.list`
+/// snapshots. Provider-side entries have no replay record and must not invent
+/// one. This is a real two-daemon control connection; the final replay mutation
+/// is a fixture for the omitted-source compatibility case.
+#[test]
+fn local_session_source_and_backend_round_trip_from_daemon_replay() {
+    let (a, b) = linked("session-source");
+    let opened = a.ok(
+        methods::SESSION_OPEN,
+        json!({
+            "peer": b.fingerprint(),
+            "kind": KIND_SPK,
+            "source": SOURCE_TONE,
+            "freq": 1000.0,
+            // Irrelevant to a tone executor, but intentionally retained in
+            // OpenSessionParams so this test covers backend readback too.
+            "backend": "fixture-backend"
+        }),
+    );
+    let id = opened["id"].as_u64().expect("session id") as u32;
+    assert_eq!(opened["source"], SOURCE_TONE);
+    assert_eq!(opened["backend"], "fixture-backend");
+
+    let listed = || {
+        a.ok(methods::SESSION_LIST, json!({}))
+            .as_array()
+            .expect("session.list array")
+            .iter()
+            .find(|session| session["id"].as_u64() == Some(id as u64))
+            .expect("opened session in session.list")
+            .clone()
+    };
+    assert_eq!(listed()["source"], SOURCE_TONE);
+    assert_eq!(listed()["backend"], "fixture-backend");
+
+    let provider = b
+        .ok(methods::SESSION_LIST, json!({}))
+        .as_array()
+        .expect("provider session.list array")
+        .iter()
+        .find(|session| session["id"].as_u64() == Some(id as u64))
+        .expect("provider-side session")
+        .clone();
+    assert!(
+        provider["source"].is_null(),
+        "provider entry invented a local source"
+    );
+    assert!(
+        provider["backend"].is_null(),
+        "provider entry invented a local backend"
+    );
+
+    // `source_spec` resolves an omitted source to mic. The IPC snapshot must
+    // expose that same effective value rather than an ambiguous null.
+    {
+        let inner = a.h.inner_for_test();
+        let mut state = lk(&inner.state);
+        let entry = state.sessions.get_mut(&id).expect("local session entry");
+        let replay = std::sync::Arc::make_mut(entry.replay.as_mut().expect("local replay"));
+        replay.source = None;
+    }
+    assert_eq!(listed()["source"], SOURCE_MIC);
+
+    // Older snapshots omitted the new fields. Their absence remains readable
+    // and means "not reported", never an invented source/backend.
+    let mut legacy = listed();
+    legacy
+        .as_object_mut()
+        .expect("session object")
+        .remove("source");
+    legacy
+        .as_object_mut()
+        .expect("session object")
+        .remove("backend");
+    let decoded: audiohub_ipc::SessionInfo =
+        serde_json::from_value(legacy).expect("legacy SessionInfo shape");
+    assert!(decoded.source.is_none());
+    assert!(decoded.backend.is_none());
+
+    // Do not leave the fixture-mutated replay armed while the two test daemons
+    // shut down; a teardown reconnect must never turn this reporting test into
+    // an attempt to open the host's real microphone.
+    a.ok(methods::SESSION_CLOSE, json!({ "id": id }));
+}
+
 // --------------------------------------------------------------- 质量档
 
 /// **接线 ①：把质量滑条拖到某一档，发送侧真的换了采样率格号。**
@@ -654,9 +741,8 @@ fn the_number_in_the_quality_stop_id_is_the_number_ipc_reports() {
     ] {
         a.set_transport(&b.fingerprint(), "send", "quality", id);
         let want = khz * 1000;
-        eventually(&format!("session.list 的 sample_rate 变成 {want} （档 {id}）"), || {
-            a.session_wire_rate() == Some(want)
-        });
+        eventually(&format!("session.list 的 sample_rate 变成 {want} （档 {id}）"), || a.session_wire_rate() == Some(want),
+        );
         // 正向对照：上面那条 `eventually` 若因为**根本没有会话**而恒为 None，
         // 它会超时而不是通过；这里再取一次并断言，好让失败信息带上实际值。
         assert_eq!(
@@ -724,9 +810,8 @@ fn the_bit_depth_really_travels_on_the_wire() {
         ("pcm48k32f", "f32", 1920.0),
     ] {
         a.set_transport(&b.fingerprint(), "send", "quality", id);
-        eventually(&format!("b 从包头读出的位深变成 {want_depth}（档 {id}）"), || {
-            b.session_wire_depth().as_deref() == Some(want_depth)
-        });
+        eventually(&format!("b 从包头读出的位深变成 {want_depth}（档 {id}）"), || b.session_wire_depth().as_deref() == Some(want_depth),
+        );
         assert_eq!(
             b.session_wire_rate(),
             Some(48_000),
@@ -814,9 +899,8 @@ fn the_send_side_reports_the_payload_bytes_it_put_on_the_wire() {
         let depth = audiohub_core::dsp::WireDepth::parse(want_depth).expect("known depth");
         let want_rung = audiohub_net::media::rung_of(48_000, depth).expect("48 kHz rung");
         a.set_transport(&b.fingerprint(), "send", "quality", id);
-        eventually(&format!("the wire to settle on {want_depth} for {id}"), || {
-            a.tx_rung() == Some(want_rung)
-        });
+        eventually(&format!("the wire to settle on {want_depth} for {id}"), || a.tx_rung() == Some(want_rung),
+        );
 
         // ±4%, not the ±15% the receive-side test uses. The three rungs are
         // 1.5x apart so a loose band still separates them — but framing
@@ -830,7 +914,8 @@ fn the_send_side_reports_the_payload_bytes_it_put_on_the_wire() {
         eventually(&format!("the send-side byte account to settle for {id}"), || {
             got = a.tx_wire_bytes_per_frame(Duration::from_millis(1500));
             got.is_some_and(|v| (v - want_bytes).abs() < want_bytes * TOL)
-        });
+        },
+        );
         let got = got.expect("the window must contain audio, or this asserts nothing");
         assert!(
             (got - want_bytes).abs() < want_bytes * TOL,
@@ -864,8 +949,10 @@ fn the_two_ends_agree_on_what_a_wire_byte_is() {
             && b.stat_u64("wire_bytes").is_some_and(|v| v > 100_000)
     });
 
-    let (tx_pay, tx_dg) = (a.stat_u64("wire_bytes").unwrap(), a.stat_u64("datagram_bytes").unwrap());
-    let (rx_pay, rx_dg) = (b.stat_u64("wire_bytes").unwrap(), b.stat_u64("datagram_bytes").unwrap());
+    let (tx_pay, tx_dg) = (a.stat_u64("wire_bytes").unwrap(), a.stat_u64("datagram_bytes").unwrap(),
+    );
+    let (rx_pay, rx_dg) = (b.stat_u64("wire_bytes").unwrap(), b.stat_u64("datagram_bytes").unwrap(),
+    );
 
     // Same numerator on both sides: whatever the sender calls payload, the
     // receiver decrypts the same count. Loss is possible, so the receiver may
@@ -920,7 +1007,8 @@ fn the_reported_bitrate_follows_the_rung_in_both_directions() {
     eventually("the priming rung to take", || a.tx_rung() == Some(RUNG_16K));
     std::thread::sleep(Duration::from_secs(3));
 
-    for (id, want_kbps) in [("pcm48k16", 768.0f64), ("pcm48k24", 1152.0), ("pcm48k32f", 1536.0)] {
+    for (id, want_kbps) in [("pcm48k16", 768.0f64), ("pcm48k24", 1152.0), ("pcm48k32f", 1536.0),
+    ] {
         a.set_transport(&b.fingerprint(), "send", "quality", id);
         for (who, node) in [("sender", &a), ("receiver", &b)] {
             eventually_within(
@@ -1277,7 +1365,8 @@ fn a_latency_value_off_the_ladder_is_refused() {
 
     // **方向必须说清楚。** 缺 `dir` 时挑一个默认方向去写，就是替用户决定了
     // 「他改的是收还是发」——而那两件事的执行器在不同的机器上。
-    a.call(methods::PEERS_SET_TRANSPORT, json!({ "peer": &fp, "latency": "100" }))
+    a.call(methods::PEERS_SET_TRANSPORT, json!({ "peer": &fp, "latency": "100" }),
+    )
         .expect_err("缺 dir 必须报错，不许挑一个默认方向");
     a.call(
         methods::PEERS_SET_TRANSPORT,
@@ -1315,6 +1404,51 @@ fn the_old_global_stops_are_refused_rather_than_silently_ignored() {
     // 档**表**留下——档表是能力，档位是选择，两件事不该一起搬。
     assert!(view["latency_stops_ms"].is_array(), "档表被误删了");
     assert!(view["quality_stops"].is_array(), "档表被误删了");
+}
+
+/// AirPlay no longer has a destination setting. Rejecting the old key is
+/// important twice over: a stale client must learn that its command has no
+/// effect, and validation must happen before a password in the same request is
+/// written to the separate secret file.
+#[test]
+fn the_removed_airplay_route_is_refused_without_side_effects() {
+    let a = Node::start("gone-airplay-route");
+    let err = a
+        .call(
+            methods::SETTINGS_SET,
+            json!({ "airplay_route": "both", "airplay_password": "must-not-stick" }),
+        )
+        .expect_err("the removed AirPlay route must not be silently ignored");
+    assert!(
+        err.contains("始终在接收端本机播放"),
+        "the error does not explain the replacement behaviour: {err}"
+    );
+
+    let view = a.ok(methods::SETTINGS_GET, json!({}));
+    assert!(
+        view.get("airplay_route").is_none(),
+        "settings.get still exposes the removed route: {view}"
+    );
+    assert_eq!(
+        view.get("airplay_password_set").and_then(Value::as_bool),
+        Some(false),
+        "route validation happened after the password side effect"
+    );
+}
+
+#[test]
+fn the_removed_airplay_peer_source_is_refused_before_dialling() {
+    let a = Node::start("gone-airplay-source");
+    let err = a
+        .call(
+            methods::SESSION_OPEN,
+            json!({ "peer": "not-a-peer", "kind": "mic", "source": "airplay" }),
+        )
+        .expect_err("AirPlay must not remain an AudioHub peer source");
+    assert!(
+        err.contains("不能作为 AudioHub peer source"),
+        "the removed source did not fail at the compatibility boundary: {err}"
+    );
 }
 
 /// `settings.get` 必须把**档位表**发出去：前端不许自己写一份。
@@ -1423,7 +1557,9 @@ fn the_peers_own_quality_measurement_crosses_the_wire_to_the_sender() {
         || {
             b.ok(methods::SESSION_LIST, json!({}))
                 .as_array()
-                .map_or(false, |v| v.iter().any(|s| !s["stats"]["quality"].is_null()))
+                .map_or(false, |v| {
+                    v.iter().any(|s| !s["stats"]["quality"].is_null())
+                })
         },
     );
 
@@ -1613,6 +1749,7 @@ fn a_fixed_choice_is_still_in_force_after_a_restart() {
         tx_throttle_kbps: None,
         block_udp: None,
         announce_fault: false,
+        airplay_advertise: false,
     };
 
     // 一台真对端：`peers.set_transport` 要解析指纹，没有配对就没有指纹。
@@ -1628,7 +1765,8 @@ fn a_fixed_choice_is_still_in_force_after_a_restart() {
     call(&first, methods::SETTINGS_SET, &json!({ "mode": "a" }));
     let pin = peer.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
     let pin = pin["pin"].as_str().expect("pin").to_string();
-    call(&first, methods::PEERS_PAIR, &json!({ "addr": peer_addr, "pin": pin }));
+    call(&first, methods::PEERS_PAIR, &json!({ "addr": peer_addr, "pin": pin }),
+    );
     call(
         &first,
         methods::PEERS_SET_TRANSPORT,
@@ -1707,23 +1845,27 @@ fn every_writable_setting_key_is_really_honoured() {
         (
             "remove_virtual_on_disconnect",
             json!(true),
-            &|v: &Value| v.get("remove_virtual_on_disconnect").cloned().unwrap_or(Value::Null),
-        ),
+            &|v: &Value| {
+            v.get("remove_virtual_on_disconnect").cloned().unwrap_or(Value::Null)
+        }),
         (
             "mark_offline_devices",
             json!(false),
-            &|v: &Value| v.get("mark_offline_devices").cloned().unwrap_or(Value::Null),
-        ),
+            &|v: &Value| {
+            v.get("mark_offline_devices").cloned().unwrap_or(Value::Null)
+        }),
         (
             "mode_a_volume_sync",
             json!(true),
-            &|v: &Value| v.get("mode_a_volume_sync").cloned().unwrap_or(Value::Null),
-        ),
+            &|v: &Value| {
+            v.get("mode_a_volume_sync").cloned().unwrap_or(Value::Null)
+        }),
         (
             "mode_a_mute_local",
             json!(true),
-            &|v: &Value| v.get("mode_a_mute_local").cloned().unwrap_or(Value::Null),
-        ),
+            &|v: &Value| {
+            v.get("mode_a_mute_local").cloned().unwrap_or(Value::Null)
+        }),
         // `false` is the away-from-default value here — this is the one setting
         // that ships ON — and it is also the only value a test may write: a
         // test daemon that turned announcing ON would put itself on the user's
@@ -1731,18 +1873,28 @@ fn every_writable_setting_key_is_really_honoured() {
         (
             "discovery_announce",
             json!(false),
-            &|v: &Value| v.get("discovery_announce").cloned().unwrap_or(Value::Null),
-        ),
+            &|v: &Value| {
+            v.get("discovery_announce").cloned().unwrap_or(Value::Null)
+        }),
+        ("airplay_enabled", json!(true), &|v: &Value| {
+            v.get("airplay_enabled").cloned().unwrap_or(Value::Null)
+        }),
         (
-            "latency",
-            json!("200"),
-            &|v: &Value| v.get("latency").cloned().unwrap_or(Value::Null),
+            "airplay_name",
+            json!("AudioHub contract test"),
+            &|v: &Value| v.get("airplay_name").cloned().unwrap_or(Value::Null),
         ),
+        ("latency",
+            json!("200"),
+            &|v: &Value| {
+            v.get("latency").cloned().unwrap_or(Value::Null)
+        }),
         (
             "quality",
             json!("pcm32k16"),
-            &|v: &Value| v.get("quality").cloned().unwrap_or(Value::Null),
-        ),
+            &|v: &Value| {
+            v.get("quality").cloned().unwrap_or(Value::Null)
+        }),
         // 本机名称（用户 2026-08-10 第 9 条）。回读的是**生效值**，所以这条同时
         // 顶住了「写进了 identity.json，但运行中的 daemon 还报着旧名字」——那正是
         // 改名这件事最容易只做一半的地方，而它做一半的时候没有任何一处会报错：
@@ -1750,8 +1902,9 @@ fn every_writable_setting_key_is_really_honoured() {
         (
             "name",
             json!("ahb-renamed"),
-            &|v: &Value| v.get("name").cloned().unwrap_or(Value::Null),
-        ),
+            &|v: &Value| {
+            v.get("name").cloned().unwrap_or(Value::Null)
+        }),
     ];
     for key in audiohub_ipc::SETTINGS_WRITABLE_KEYS {
         // plan M9「开机自启」是这张表上唯一一个**没有存盘副本**的键：注册项本身
@@ -1778,6 +1931,34 @@ fn every_writable_setting_key_is_really_honoured() {
                 after.get("autostart").and_then(Value::as_bool),
                 Some(false),
                 "一次被拒绝的写入之后，daemon 却报告开机自启已开启"
+            );
+            continue;
+        }
+        if *key == "airplay_password" {
+            let got = a.ok(
+                methods::SETTINGS_SET,
+                json!({ "airplay_password": "secret" }),
+            );
+            assert_eq!(
+                got.get("airplay_password_set").and_then(Value::as_bool),
+                Some(true),
+                "write-only AirPlay password was not recorded"
+            );
+            assert!(
+                got.get("airplay_password").is_none(),
+                "AirPlay password leaked into the settings response"
+            );
+            let re = a.ok(methods::SETTINGS_GET, json!({}));
+            assert_eq!(
+                re.get("airplay_password_set").and_then(Value::as_bool),
+                Some(true)
+            );
+            assert!(re.get("airplay_password").is_none());
+            let cleared = a.ok(methods::SETTINGS_SET, json!({ "airplay_password": "" }));
+            assert_eq!(
+                cleared.get("airplay_password_set").and_then(Value::as_bool),
+                Some(false),
+                "empty password must explicitly clear the secret"
             );
             continue;
         }
@@ -1841,9 +2022,8 @@ fn the_servo_exports_a_heartbeat_even_with_no_sessions() {
     let a = Node::start("obs-idle");
     let first = a.servo();
     let t0 = first["ticks"].as_u64().expect("ticks 必须是个数");
-    eventually_within(Duration::from_secs(6), "the servo tick counter to advance", || {
-        a.servo()["ticks"].as_u64().unwrap_or(0) > t0
-    });
+    eventually_within(Duration::from_secs(6), "the servo tick counter to advance", || a.servo()["ticks"].as_u64().unwrap_or(0) > t0,
+    );
     let now = a.servo();
     assert_eq!(
         now["streams"].as_u64(),
@@ -1857,7 +2037,8 @@ fn the_servo_exports_a_heartbeat_even_with_no_sessions() {
     // **顶层不许再有 `target_ms` / `sum_ms` / `jb_frames`。** 留一个「代表值」
     // 就是 plan §14 裁定 1 那个「每卡一个数字、不管取哪条都在替另一条撒谎」
     // 的 JSON 版本。读旧路径的人应当拿到 null 而不是一个静默错误的数。
-    for gone in ["target", "target_ms", "sum_ms", "jb_frames", "want_frames", "closed_loop"] {
+    for gone in ["target", "target_ms", "sum_ms", "jb_frames", "want_frames", "closed_loop",
+    ] {
         assert!(
             now.get(gone).is_none(),
             "站点级 servo 还在报 `{gone}`：它在双向、多流下没有指代对象"
@@ -2077,9 +2258,8 @@ fn auto_is_distinguishable_from_a_dead_loop_in_the_readout() {
 
     a.set_transport(&b.fingerprint(), "send", "latency", "auto");
     let t0 = b.servo()["ticks"].as_u64().expect("ticks");
-    eventually_within(Duration::from_secs(6), "the loop to keep ticking under AUTO", || {
-        b.servo()["ticks"].as_u64().unwrap_or(0) > t0
-    });
+    eventually_within(Duration::from_secs(6), "the loop to keep ticking under AUTO", || b.servo()["ticks"].as_u64().unwrap_or(0) > t0,
+    );
     let now = b.rx_servo();
     assert_eq!(now["target"].as_str(), Some(audiohub_ipc::LATENCY_AUTO));
     assert_eq!(
@@ -2129,9 +2309,8 @@ fn the_two_stops_report_the_streams_they_can_actually_act_on() {
     );
     assert_eq!(sa["target_from"].as_str(), Some("local"), "a 是消费者，档位是自己设的");
 
-    eventually("b's receive stream to carry the pushed latency target", || {
-        stats(&b)["latency_target"].as_str() == Some("200")
-    });
+    eventually("b's receive stream to carry the pushed latency target", || stats(&b)["latency_target"].as_str() == Some("200"),
+    );
     let sb = stats(&b);
     assert!(
         sb["quality_target"].is_null(),
@@ -2249,7 +2428,9 @@ fn the_send_quality_acts_on_the_local_sender_only() {
     eventually("a to have a sending stream", || a.tx_rung().is_some());
 
     a.set_transport(&b.fingerprint(), "send", "quality", "pcm16k16");
-    eventually("the local sender to move to the 16 kHz rung", || a.tx_rung() == Some(RUNG_16K));
+    eventually("the local sender to move to the 16 kHz rung", || {
+        a.tx_rung() == Some(RUNG_16K)
+    });
     assert_eq!(a.tx_quality_rung(), Some(RUNG_16K));
     assert_eq!(b.tx_quality_rung(), None, "对端没有发送流，档位却落到了它身上");
     assert_eq!(b.servo()["bad_transport_targets"].as_u64(), Some(0));
@@ -2269,7 +2450,9 @@ fn the_recv_quality_lands_on_the_peers_sender() {
     eventually("b to have a sending stream", || b.tx_rung().is_some());
 
     a.set_transport(&b.fingerprint(), "recv", "quality", "pcm16k16");
-    eventually("the peer's sender to move to the 16 kHz rung", || b.tx_rung() == Some(RUNG_16K));
+    eventually("the peer's sender to move to the 16 kHz rung", || {
+        b.tx_rung() == Some(RUNG_16K)
+    });
     assert_eq!(b.tx_quality_rung(), Some(RUNG_16K));
     assert_eq!(
         a.tx_quality_rung(),
@@ -2306,12 +2489,12 @@ fn a_stream_opened_after_the_stops_were_set_starts_with_them_in_force() {
     );
     tone_session(&a, &b);
 
-    eventually("the freshly opened receive stream to carry the stored target", || {
-        a.rx_servo()["target_ms"].as_u64() == Some(300)
-    });
-    eventually("the freshly opened send stream to carry the stored quality", || {
-        a.tx_quality_rung() == Some(RUNG_16K)
-    });
+    eventually("the freshly opened receive stream to carry the stored target", || a.rx_servo()["target_ms"].as_u64() == Some(300),
+    );
+    eventually(
+        "the freshly opened send stream to carry the stored quality",
+        || a.tx_quality_rung() == Some(RUNG_16K),
+    );
 }
 
 /// **多对端隔离：改 A 的档位不许碰 B 的伺服输出。**
@@ -2342,8 +2525,9 @@ fn changing_one_peers_stops_leaves_the_other_peers_loop_untouched() {
         eventually_within(
             Duration::from_secs(25),
             "both peers to adopt 200",
-            || p.rx_servo()["target_ms"].as_u64() == Some(200),
-        );
+            || {
+            p.rx_servo()["target_ms"].as_u64() == Some(200)
+        });
     }
     // **等 p2 收敛完再取基线。** 收敛途中 `moves` 每拍都在涨，那时取的基线只是
     // 「它还在走」，底下的比较测不出任何东西（负载高时更是随机通过 / 随机失败）。
@@ -2453,7 +2637,9 @@ fn a_consumer_mode_machine_refuses_pushed_stops_and_counts_them() {
     consumer.set_mode(Mode::A);
     pair(&consumer, &provider);
     let sid = tone_session(&consumer, &provider) as u32;
-    eventually("the consumer to have a sending stream", || consumer.tx_rung().is_some());
+    eventually("the consumer to have a sending stream", || {
+        consumer.tx_rung().is_some()
+    });
     // 正向对照：这条流此刻跑在 AUTO 上（阶梯当家），固定档为 None。
     assert_eq!(consumer.tx_quality_rung(), None);
     let before = consumer.servo()["bad_transport_targets"].as_u64().unwrap_or(0);
@@ -2613,7 +2799,8 @@ fn a_peer_pinned_to_tier_zero_refuses_the_attach() {
     );
     eventually_within(Duration::from_secs(20), "B's 1 kHz verdict over UDP", || {
         b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    });
+    },
+    );
 
     // Checked after the tone, not before: a link that takes a moment to appear
     // would make an immediate assertion pass for the wrong reason.
@@ -2685,7 +2872,9 @@ fn a_stream_opened_without_waiting_for_the_link_still_goes_over_tcp() {
     let received = b
         .ok(methods::SESSION_LIST, json!({}))
         .as_array()
-        .and_then(|ss| ss.iter().find(|s| s["dir"].as_str() == Some("recv")).cloned())
+        .and_then(|ss| {
+            ss.iter().find(|s| s["dir"].as_str() == Some("recv")).cloned()
+        })
         .and_then(|s| s["stats"]["received"].as_u64())
         .expect("a received count");
     let read = b.tcp_link().and_then(|l| l["frames_read"].as_u64()).unwrap_or(0);
@@ -2795,7 +2984,9 @@ fn a_session_on_a_tier_one_link_reports_tier_one() {
     });
 
     tone_session(&a, &b);
-    eventually("the provider to have its receiving session", || !session_tiers(&b).is_empty());
+    eventually("the provider to have its receiving session", || {
+        !session_tiers(&b).is_empty()
+    });
 
     assert_all_sessions_report(&a, "the consumer", "tier1");
     assert_all_sessions_report(&b, "the provider", "tier1");
@@ -2837,7 +3028,9 @@ fn the_session_transport_names_the_link_not_the_setting() {
     );
 
     tone_session(&a, &b);
-    eventually("the provider to have its receiving session", || !session_tiers(&b).is_empty());
+    eventually("the provider to have its receiving session", || {
+        !session_tiers(&b).is_empty()
+    });
 
     // The premise, restated as an assertion: the SETTING still says tier 1.
     let setting = a.peer(&b.fingerprint())["transport"]["tier"].as_str().map(str::to_string);
@@ -2942,7 +3135,9 @@ fn a_media_frame_that_fails_aead_is_counted() {
     eventually("B to be receiving the tone", || {
         b.ok(methods::SESSION_LIST, json!({}))
             .as_array()
-            .is_some_and(|ss| ss.iter().any(|s| s["stats"]["received"].as_u64().unwrap_or(0) > 0))
+            .is_some_and(|ss| {
+                ss.iter().any(|s| s["stats"]["received"].as_u64().unwrap_or(0) > 0)
+            })
     });
 
     // A well-formed header for a stream that exists, over a payload that is
@@ -2981,7 +3176,9 @@ fn a_media_frame_that_fails_aead_is_counted() {
     let recv = b
         .ok(methods::SESSION_LIST, json!({}))
         .as_array()
-        .and_then(|ss| ss.iter().find(|s| s["dir"].as_str() == Some("recv")).cloned())
+        .and_then(|ss| {
+            ss.iter().find(|s| s["dir"].as_str() == Some("recv")).cloned()
+        })
         .expect("a receiving session");
     assert_eq!(
         recv["stats"]["lost"].as_u64(),
@@ -3041,7 +3238,8 @@ impl Forwarder {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                let Ok(up) = std::net::TcpStream::connect(to) else { continue };
+                let Ok(up) = std::net::TcpStream::connect(to) else { continue;
+                };
                 // Nagle off on both legs. With it on, the forwarder itself
                 // would add up to 40 ms to every small frame and the round-trip
                 // figure this rig exists to measure would be measuring the rig.
@@ -3051,7 +3249,8 @@ impl Forwarder {
                     (down.try_clone(), up.try_clone()),
                     (up.try_clone(), down.try_clone()),
                 ] {
-                    let (Ok(mut from), Ok(mut to)) = (from, to) else { continue };
+                    let (Ok(mut from), Ok(mut to)) = (from, to) else { continue;
+                    };
                     let (s, c) = (s.clone(), c.clone());
                     std::thread::spawn(move || {
                         let _ = from.set_read_timeout(Some(Duration::from_millis(50)));
@@ -3085,7 +3284,8 @@ impl Forwarder {
                 }
             }
         });
-        Forwarder { port, stop, carried }
+        Forwarder { port, stop, carried,
+        }
     }
 
     fn addr(&self) -> String {
@@ -3232,10 +3432,12 @@ fn a_tier_two_pair_survives_the_source_address_being_lost() {
 
     eventually_within(Duration::from_secs(25), "B's 1 kHz verdict over the mux", || {
         b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    });
+    },
+    );
     eventually_within(Duration::from_secs(25), "A's 1 kHz verdict over the mux", || {
         a.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    });
+    },
+    );
     let snr = b
         .recv_verdict()
         .expect("checked above")["snr_db"]
@@ -3424,7 +3626,8 @@ fn media_at_full_rate_does_not_starve_the_control_plane() {
     // symptom of it.
     eventually_within(Duration::from_secs(25), "the media queue to back up", || {
         a.tcp_link().is_some_and(|l| l["writeq_ms"].as_f64().unwrap_or(0.0) > 50.0)
-    });
+    },
+    );
 
     // Sample distinct round trips. `rtt_ms` is the last `Pong`'s, refreshed by
     // the 1 Hz ticker, so the same reading appearing twice is one sample.
@@ -3513,7 +3716,8 @@ fn an_inbound_only_peer_is_awaited_rather_than_dialled() {
     );
 
     // Now drop it from A's side, so B loses the channel it never dials.
-    a.ok(methods::PEERS_DISCONNECT, json!({ "peer": b.fingerprint() }));
+    a.ok(methods::PEERS_DISCONNECT, json!({ "peer": b.fingerprint() }),
+    );
     eventually("B to notice A is gone", || {
         b.peer(&a.fingerprint())["online"] == Value::Bool(false)
     });
@@ -3574,9 +3778,8 @@ fn a_policy_flip_after_the_retry_was_armed_disarms_it() {
     // Now the policy changes under the armed entry.
     set_dial_policy(&a, &b.fingerprint(), "inbound_only");
 
-    eventually_within(Duration::from_secs(20), "A to stop retrying a peer it may not dial", || {
-        a.peer(&b.fingerprint())["reconnecting"] == Value::Bool(false)
-    });
+    eventually_within(Duration::from_secs(20), "A to stop retrying a peer it may not dial", || a.peer(&b.fingerprint())["reconnecting"] == Value::Bool(false),
+    );
 
     // And it is reported as the third state, not as a fault: reporting both
     // `awaiting_inbound` and `reconnecting` would leave the UI to choose.
@@ -3729,7 +3932,8 @@ fn tier_two_ws_pair(tag: &str) -> (Node, Node, Forwarder, String) {
     // Pair over the forwarder as a bare connection...
     let pin = b.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
     let pin = pin.get("pin").and_then(Value::as_str).expect("pin").to_string();
-    a.ok(methods::PEERS_PAIR, json!({ "addr": fwd.addr(), "pin": pin }));
+    a.ok(methods::PEERS_PAIR, json!({ "addr": fwd.addr(), "pin": pin }),
+    );
 
     // ...then hand A the URL and let the stored endpoint choose the carrier.
     // Via the store rather than via an `addr` override on the call, because the
@@ -3821,10 +4025,12 @@ fn a_websocket_mux_carries_everything_the_bare_one_did() {
     }
     eventually_within(Duration::from_secs(25), "B's 1 kHz verdict over the ws mux", || {
         b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    });
+    },
+    );
     eventually_within(Duration::from_secs(25), "A's 1 kHz verdict over the ws mux", || {
         a.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    });
+    },
+    );
     let snr = b.recv_verdict().expect("checked above")["snr_db"]
         .as_f64()
         .expect("a detected verdict carries an SNR");
@@ -4095,7 +4301,8 @@ fn a_verdict_older_than_the_retry_window_is_retired_and_udp_is_probed_again() {
     a.set_mode(Mode::A);
     b.set_mode(Mode::Share);
     // Two hours old, against a one hour window. UDP works on this link.
-    seed_verdict(&a, &b.fingerprint(), 2 * crate::autotier::AUTO_TIER_RETRY_SECS);
+    seed_verdict(&a, &b.fingerprint(), 2 * crate::autotier::AUTO_TIER_RETRY_SECS,
+    );
     pair(&a, &b);
 
     eventually("the stale verdict to be retired", || {
@@ -4114,7 +4321,8 @@ fn a_verdict_older_than_the_retry_window_is_retired_and_udp_is_probed_again() {
     );
     eventually_within(Duration::from_secs(20), "B's 1 kHz verdict over UDP", || {
         b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    });
+    },
+    );
     assert!(
         a.tcp_link().is_none(),
         "media went to TCP on a link whose only reason to do so had just expired"
@@ -4170,7 +4378,9 @@ fn a_receiver_that_gets_no_udp_downgrades_the_link_by_itself() {
         }),
     );
 
-    eventually("B to notice that no UDP is arriving", || verdict(&b, &afp).0.is_some());
+    eventually("B to notice that no UDP is arriving", || {
+        verdict(&b, &afp).0.is_some()
+    });
     let (tier, why) = verdict(&b, &afp);
     assert_eq!(tier.as_deref(), Some("tier1"));
     let why = why.expect("a verdict without a reason cannot be explained to anyone");
@@ -4188,10 +4398,12 @@ fn a_receiver_that_gets_no_udp_downgrades_the_link_by_itself() {
     // about who decided gets all the way here and fails only below.
     eventually_within(Duration::from_secs(40), "a tier 1 link after the downgrade", || {
         a.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
-    });
+    },
+    );
     eventually_within(Duration::from_secs(40), "B's 1 kHz verdict over TCP", || {
         b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    });
+    },
+    );
 
     // THE RED LINE (plan §16.4 rule 5). The daemon decided; the user did not.
     assert_eq!(
@@ -4375,7 +4587,8 @@ fn a_peer_pinned_to_tier_zero_records_the_verdict_but_does_not_act_on_it() {
         // replay to arrive somewhere B does not allow it to go. A pin binds what
         // this machine asks of the peer, not only what it does itself.
         assert!(
-            !verdict(&a, &bfp).1.is_some_and(|w| w.contains("the peer reported")),
+            !verdict(&a, &bfp).1
+                .is_some_and(|w| w.contains("the peer reported")),
             "a machine pinned to tier 0 announced a downgrade it will not take part in"
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -4430,6 +4643,7 @@ fn set_tier_over_ipc_takes_tier2_and_a_persistent_ws_endpoint() {
         tx_throttle_kbps: None,
         block_udp: None,
         announce_fault: false,
+        airplay_advertise: false,
     };
 
     // A real peer: `peers.set_tier` resolves a fingerprint, and there is no
@@ -4445,10 +4659,12 @@ fn set_tier_over_ipc_takes_tier2_and_a_persistent_ws_endpoint() {
     ok(&first, methods::SETTINGS_SET, &json!({ "mode": "a" }));
     let pin = peer.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
     let pin = pin["pin"].as_str().expect("pin").to_string();
-    ok(&first, methods::PEERS_PAIR, &json!({ "addr": peer_addr, "pin": pin }));
+    ok(&first, methods::PEERS_PAIR, &json!({ "addr": peer_addr, "pin": pin }),
+    );
 
     // (1) tier 2 on a peer reachable at a plain address. No endpoint anywhere.
-    let r = ok(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier2" }));
+    let r = ok(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier2" }),
+    );
     assert_eq!(r["tier"].as_str(), Some("tier2"), "tier2 was not accepted: {r}");
     assert_eq!(r["previous"].as_str(), Some("auto"), "the previous tier is misreported: {r}");
     assert_eq!(
@@ -4461,19 +4677,22 @@ fn set_tier_over_ipc_takes_tier2_and_a_persistent_ws_endpoint() {
     // Every tier this build knows has to survive the same round trip, or the
     // selector offers a button the daemon will reject at click time.
     for t in ["auto", "tier0", "tier1", "tier2"] {
-        let r = ok(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": t }));
+        let r = ok(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": t }),
+        );
         assert_eq!(r["tier"].as_str(), Some(t), "{t} did not round-trip: {r}");
     }
     // ...and one this build does not know is refused rather than stored and
     // echoed back, which is the shape this repo has been caught in six times.
-    let e = call(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier9" }))
+    let e = call(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier9" }),
+    )
         .expect_err("an unknown tier must be refused at the write");
     assert!(e.contains("tier9"), "the refusal does not name the value it refused: {e}");
 
     // (3) wss:// is refused, and the refusal names the real gap (no TLS client)
     // rather than reporting the address as unparseable.
     let stored = "ws://tunnel.example:8080/audio";
-    ok(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "auto", "endpoint": stored }));
+    ok(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "auto", "endpoint": stored }),
+    );
     let e = call(
         &first,
         methods::PEERS_SET_TIER,
@@ -4507,14 +4726,16 @@ fn set_tier_over_ipc_takes_tier2_and_a_persistent_ws_endpoint() {
 
     // (4) An empty string clears it -- distinct from omitting the parameter,
     // which leaves the stored value alone.
-    ok(&second, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier1" }));
+    ok(&second, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier1" }),
+    );
     let p = peer_row(&second, &fp);
     assert_eq!(
         p["transport"]["endpoint"].as_str(),
         Some(stored),
         "omitting `endpoint` cleared it; then no caller could change only the tier: {p}"
     );
-    ok(&second, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier1", "endpoint": "" }));
+    ok(&second, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier1", "endpoint": "" }),
+    );
     let p = peer_row(&second, &fp);
     assert_eq!(p["transport"]["endpoint"].as_str(), Some(""), "the endpoint did not clear: {p}");
     assert_eq!(p["transport"]["tier"].as_str(), Some("tier1"), "clearing the endpoint moved the tier: {p}");

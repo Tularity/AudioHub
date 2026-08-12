@@ -74,6 +74,17 @@ fn daemon_info(inner: &DaemonInner) -> DaemonInfo {
     }
 }
 
+fn with_rollback_error(
+    primary: anyhow::Error,
+    action: &str,
+    rollback: anyhow::Result<()>,
+) -> anyhow::Error {
+    match rollback {
+        Ok(()) => primary,
+        Err(error) => anyhow::anyhow!("{primary:#}; additionally failed to {action}: {error:#}"),
+    }
+}
+
 /// The IPC endpoint is loopback-only but a page in a browser can still reach it
 /// (WebSocket ignores same-origin policy), so a remote page the user happens to
 /// visit must not be able to drive the daemon. The token is the real defense;
@@ -178,7 +189,8 @@ fn client_thread(inner: Arc<DaemonInner>, stream: TcpStream) {
     {
         return;
     }
-    let Some(mut ws) = accept_ws(stream) else { return };
+    let Some(mut ws) = accept_ws(stream) else { return;
+    };
 
     let authed = read_text(&mut ws, Duration::from_secs(5))
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -229,7 +241,8 @@ fn client_thread(inner: Arc<DaemonInner>, stream: TcpStream) {
         }
         match ws.read() {
             Ok(Message::Text(t)) => {
-                let Ok(req) = serde_json::from_str::<Value>(&t) else { continue };
+                let Ok(req) = serde_json::from_str::<Value>(&t) else { continue;
+                };
                 let id = req.get("id").cloned().unwrap_or(Value::Null);
                 let method = req
                     .get("method")
@@ -449,6 +462,14 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
             }
             methods::SESSION_OPEN => {
                 let p: OpenSessionParams = serde_json::from_value(params.clone())?;
+                // Compatibility boundary for IPC v5 callers.  This must run
+                // before the mode gate below so every legacy AirPlay-source
+                // request gets the same actionable removal error.
+                if p.source.as_deref() == Some("airplay") {
+                    anyhow::bail!(
+                        "AirPlay 音频始终在接收端本机播放，不能作为 AudioHub peer source"
+                    );
+                }
                 // The structural half of mode B (spec-m5b §6.1): in mode B the
                 // SYSTEM's device selection is what opens sessions. A UI that
                 // could also open one by peer would have put the peer picker
@@ -469,6 +490,7 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 json!({})
             }
             methods::SESSION_LIST => serde_json::to_value(crate::build_session_infos(inner))?,
+            methods::AIRPLAY_SESSIONS_LIST => serde_json::to_value(inner.airplay.sessions())?,
             methods::SESSION_SET_VOLUME => {
                 let id = params
                     .get("id")
@@ -490,16 +512,105 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
             }
             methods::SETTINGS_GET => serde_json::to_value(settings_view(inner))?,
             methods::SETTINGS_SET => {
-                let mut changed = false;
+                let _settings_write = lk(&inner.settings_write_lock);
+                // Validate every AirPlay value before touching either the
+                // ordinary settings file or the separate write-only secret.
+                // A removed key must not leave a newly written password behind
+                // after returning an error.
+                if params.get("airplay_route").is_some() {
+                    anyhow::bail!("'airplay_route' 已移除：AirPlay 音频始终在接收端本机播放");
+                }
+                let airplay_enabled = params
+                    .get("airplay_enabled")
+                    .map(|v| {
+                        v.as_bool()
+                            .ok_or_else(|| anyhow::anyhow!("airplay_enabled must be a boolean"))
+                    })
+                    .transpose()?;
+                let airplay_name = params.get("airplay_name").map(|v| {
+                    let raw = v
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("airplay_name must be a string"))?;
+                    anyhow::ensure!(
+                        raw.chars().count() <= 48 && !raw.chars().any(char::is_control),
+                        "airplay_name must be at most 48 characters and contain no control characters"
+                    );
+                    Ok::<String, anyhow::Error>(raw.trim().to_string())
+                }).transpose()?;
+                let airplay_password = params
+                    .get("airplay_password")
+                    .map(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| anyhow::anyhow!("airplay_password must be a string"))
+                    })
+                    .transpose()?;
+                if let Some(password) = airplay_password.as_deref() {
+                    crate::settings::validate_airplay_password(password)?;
+                }
+                // plan §15：`latency` / `quality` **不再在这里**。
+                //
+                // Validate this before touching autostart, identity, settings or
+                // the password. Otherwise an obsolete key can return an error
+                // after a new AirPlay secret was already committed.
+                for gone in ["latency", "quality"] {
+                    if params.get(gone).is_some() {
+                        anyhow::bail!(
+                            "'{gone}' 已改为每对端 × 每方向的设置（plan §15）：\
+                             请用 '{}'（参数 peer / dir / latency / quality）",
+                            audiohub_ipc::methods::PEERS_SET_TRANSPORT
+                        );
+                    }
+                }
+
+                // Stage every daemon-owned setting in a clone. The live record
+                // is swapped only after all required files have committed, so a
+                // failed save cannot make settings.get report values the running
+                // receiver and the next daemon start do not share.
+                let current = lk(&inner.settings).clone();
+                let mut next = current.clone();
+                if let Some(m) = params.get("mode").and_then(Value::as_str) {
+                    next.mode = Mode::parse(m).ok_or_else(|| {
+                        anyhow::anyhow!("mode must be '{MODE_SHARE}', '{MODE_A}' or '{MODE_B}'")
+                    })?;
+                }
+                macro_rules! set_bool {
+                    ($key:literal, $field:ident) => {
+                        if let Some(v) = params.get($key).and_then(Value::as_bool) {
+                            next.$field = v;
+                        }
+                    };
+                }
+                set_bool!("remove_virtual_on_disconnect", remove_virtual_on_disconnect);
+                set_bool!("mark_offline_devices", mark_offline_devices);
+                set_bool!("mode_a_volume_sync", mode_a_volume_sync);
+                set_bool!("mode_a_mute_local", mode_a_mute_local);
+                if let Some(v) = params.get("discovery_announce").and_then(Value::as_bool) {
+                    next.discovery_announce = v;
+                }
+                if let Some(v) = airplay_enabled {
+                    next.airplay_enabled = v;
+                }
+                if let Some(v) = airplay_name.as_ref() {
+                    next.airplay_name = v.clone();
+                }
+                let changed = next != current;
                 // Set only when the MODE moved, which is what drives the §13
                 // transition below. Any other setting changing must not close
                 // anybody's sessions.
-                let mut mode_changed = false;
-                // Applied AFTER the settings lock is released: starting an
-                // announcement waits on the mDNS daemon (up to 3s when the
-                // network refuses), and every `settings.get` on every other IPC
-                // connection takes this same lock.
-                let mut announce_target: Option<bool> = None;
+                let mode_changed = next.mode != current.mode;
+                let mut airplay_changed = airplay_enabled.is_some()
+                    || next.airplay_name != current.airplay_name
+                    || airplay_password.is_some();
+                let announce_target = params.get("discovery_announce").and_then(Value::as_bool);
+                // Capture bytes before any external side effect. Invalid UTF-8
+                // is a legitimate fail-closed old state and must still be
+                // restorable if the ordinary settings file later fails.
+                let secret_snapshot = if airplay_password.is_some() {
+                    Some(crate::settings::snapshot_airplay_password(&inner.cfg_dir)?)
+                } else {
+                    None
+                };
                 // plan M9「开机自启」，**在锁与写盘之前**。
                 //
                 // 它是这一批键里唯一一个把改动落在本进程之外（`~/Library/
@@ -529,74 +640,101 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     // 界面显示的是新名字、线上报给对端的还是旧的，而对端系统里
                     // 那两台设备会一直挂着旧名——界面与线上分歧，且没有一处会报错。
                     inner.set_identity_name(now);
+                    // An empty AirPlay override follows the daemon identity;
+                    // re-advertise it in the same call as the rename.
+                    airplay_changed = true;
                 }
-                {
-                    let mut s = lk(&inner.settings);
-                    if let Some(m) = params.get("mode").and_then(Value::as_str) {
-                        let m = Mode::parse(m).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "mode must be '{MODE_SHARE}', '{MODE_A}' or '{MODE_B}'"
-                            )
-                        })?;
-                        mode_changed = s.mode != m;
-                        changed |= mode_changed;
-                        s.mode = m;
-                    }
-                    for (key, field) in [
-                        ("remove_virtual_on_disconnect", 0u8),
-                        ("mark_offline_devices", 1u8),
-                        // plan §7.1 模式 A 的两个独立开关。
-                        ("mode_a_volume_sync", 2u8),
-                        ("mode_a_mute_local", 3u8),
-                        // plan M3 「同网段互见」 / its privacy off switch.
-                        ("discovery_announce", 4u8),
-                    ] {
-                        if let Some(v) = params.get(key).and_then(Value::as_bool) {
-                            let slot = match field {
-                                0 => &mut s.remove_virtual_on_disconnect,
-                                1 => &mut s.mark_offline_devices,
-                                2 => &mut s.mode_a_volume_sync,
-                                3 => &mut s.mode_a_mute_local,
-                                _ => &mut s.discovery_announce,
-                            };
-                            changed |= *slot != v;
-                            *slot = v;
-                            if field == 4 {
-                                // Unconditional, not `if changed`: a machine
-                                // whose announcement failed at startup has the
-                                // setting already true, so "set it to true
-                                // again" is precisely the retry a user reaches
-                                // for after granting the permission. Treating
-                                // it as a no-op would leave the one machine
-                                // that needs the retry unable to ask for it.
-                                announce_target = Some(v);
+
+                // Two-file commit order is security-sensitive:
+                //
+                // * adding/replacing a password: secret -> settings. A crash in
+                //   between leaves the old enable bit protected by a non-empty
+                //   secret;
+                // * clearing a password: settings -> secret. In particular,
+                //   disable+clear can crash between either atomic rename/remove
+                //   and still never leave `enabled=true` with no password.
+                let clearing_password = airplay_password.as_deref() == Some("");
+                if clearing_password {
+                    let settings_committed = if changed {
+                        next.save(&inner.cfg_dir)?;
+                        true
+                    } else {
+                        false
+                    };
+                    if let Some(password) = airplay_password.as_deref() {
+                        if let Err(primary) =
+                            crate::settings::save_airplay_password(&inner.cfg_dir, password)
+                        {
+                            let snapshot = secret_snapshot
+                                .as_ref()
+                                .expect("a password mutation always captured a snapshot");
+                            let restored =
+                                crate::settings::restore_airplay_password(&inner.cfg_dir, snapshot);
+                            let secret_restored = restored.is_ok();
+                            let mut error = with_rollback_error(
+                                primary,
+                                "restore the previous AirPlay password",
+                                restored,
+                            );
+                            if settings_committed {
+                                if secret_restored || !current.airplay_enabled {
+                                    error = with_rollback_error(
+                                        error,
+                                        "restore the previous settings",
+                                        current.save(&inner.cfg_dir),
+                                    );
+                                } else {
+                                    // Never re-enable a persisted receiver after
+                                    // losing the old secret. This is only the
+                                    // rollback-of-rollback path, but it is the
+                                    // exact place fail-closed matters most.
+                                    let mut safe = next.clone();
+                                    safe.airplay_enabled = false;
+                                    error = with_rollback_error(
+                                        error,
+                                        "persist fail-closed AirPlay settings",
+                                        safe.save(&inner.cfg_dir),
+                                    );
+                                }
                             }
+                            return Err(error);
                         }
                     }
-                    // plan §15：`latency` / `quality` **不再在这里**。
-                    //
-                    // 不是「忽略」而是**拒绝**：一个旧客户端（或旧脚本）传
-                    // `{"latency":"300"}` 过来时，静默收下再什么都不做，正是
-                    // 本项目栽过六次的那个形状——那次的原话是「`settings.latency`
-                    // 从未被读过」。这里让它报错，调用方立刻知道要改用
-                    // `peers.set_transport`。
-                    for gone in ["latency", "quality"] {
-                        if params.get(gone).is_some() {
-                            anyhow::bail!(
-                                "'{gone}' 已改为每对端 × 每方向的设置（plan §15）：\
-                                 请用 '{}'（参数 peer / dir / latency / quality）",
-                                audiohub_ipc::methods::PEERS_SET_TRANSPORT
-                            );
+                } else {
+                    if let Some(password) = airplay_password.as_deref() {
+                        if let Err(primary) =
+                            crate::settings::save_airplay_password(&inner.cfg_dir, password)
+                        {
+                            let snapshot = secret_snapshot
+                                .as_ref()
+                                .expect("a password mutation always captured a snapshot");
+                            return Err(with_rollback_error(
+                                primary,
+                                "restore the previous AirPlay password",
+                                crate::settings::restore_airplay_password(&inner.cfg_dir, snapshot),
+                            ));
                         }
                     }
                     if changed {
-                        // Persisted before it is answered: a UI that reads back
-                        // what it just wrote must never see the old value, and
-                        // a daemon killed a moment later must come back in the
-                        // mode the user chose.
-                        s.save(&inner.cfg_dir)?;
+                        if let Err(primary) = next.save(&inner.cfg_dir) {
+                            let error = if let Some(snapshot) = secret_snapshot.as_ref() {
+                                with_rollback_error(
+                                    primary,
+                                    "restore the previous AirPlay password",
+                                    crate::settings::restore_airplay_password(
+                                        &inner.cfg_dir,
+                                        snapshot,
+                                    ),
+                                )
+                            } else {
+                                primary
+                            };
+                            return Err(error);
+                        }
                     }
                 }
+                // Publish the staged state only after both files are durable.
+                *lk(&inner.settings) = next;
                 if let Some(want) = announce_target {
                     let now = crate::apply_announce(inner, want);
                     if want && !now {
@@ -613,6 +751,16 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 }
                 if changed {
                     dlog!("[audiohubd] settings changed; the device coordinator will reconcile");
+                }
+                if airplay_changed {
+                    dlog!("[audiohubd] AirPlay settings changed; receiver will reconcile");
+                }
+                // The AirPlay page only exists in Share mode. Reconcile mode
+                // changes even when no AirPlay field moved: leaving Share
+                // closes the listener/local route in this same settings call;
+                // returning restores the persisted wish.
+                if airplay_changed || mode_changed {
+                    crate::airplay::reconcile(inner, airplay_password.is_some());
                 }
                 if mode_changed {
                     // plan §13 推论 2/3, run BEFORE the reply so a client that
@@ -694,7 +842,9 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     peer_states(inner)?
                         .into_iter()
                         .find(|p| p.peer.fingerprint == fp)
-                        .ok_or_else(|| anyhow::anyhow!("paired peer {fp} vanished from the store"))?,
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("paired peer {fp} vanished from the store")
+                        })?,
                 )?
             }
             methods::PEERS_UNPAIR => {
@@ -819,14 +969,15 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 // **并列而不是从 tier 推**：tier 2 的隧道不一定单向，单向的通路
                 // 也不一定是 tier 2。
                 let dial = match params.get("dial_policy").and_then(Value::as_str) {
-                    Some(d) => Some(crate::peer_transport::DialPolicy::parse(d).ok_or_else(
+                    Some(d) => {
+                        Some(crate::peer_transport::DialPolicy::parse(d).ok_or_else(
                         || {
                             anyhow::anyhow!(
                                 "dial_policy 必须是 'both'、'outbound_only' 或 \
                                  'inbound_only'，收到 '{d}'"
                             )
-                        },
-                    )?),
+                        })?)
+                    }
                     None => None,
                 };
                 // P6：URL 形态的对端地址。**与 tier / dial_policy 同一个入口**，
@@ -897,6 +1048,8 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
 /// persisted, so the two ends cannot drift apart about which mode is live.
 fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
     let s = lk(&inner.settings).clone();
+    let airplay_effective_name =
+        crate::airplay::effective_name(&s.airplay_name, &inner.identity().name);
     // Probed outside the settings lock: on Windows this spawns `schtasks.exe`,
     // and every other IPC connection's `settings.get` takes that same lock.
     let auto = crate::autostart::state();
@@ -904,6 +1057,7 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         let st = lk(&inner.haldev);
         (st.capacity, st.table.used())
     };
+    let airplay_live = inner.airplay.live_status();
     DaemonSettings {
         mode: s.mode,
         effective_mode: haldev::effective_mode(inner),
@@ -917,6 +1071,15 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         // permission not granted yet) and a UI that could only read the wish
         // would insist this machine is discoverable while it is not.
         discovery_announcing: lk(&inner.announce_guard).is_some(),
+        airplay_enabled: s.airplay_enabled,
+        airplay_name: s.airplay_name.clone(),
+        airplay_effective_name,
+        airplay_listening: airplay_live.listening,
+        airplay_error: airplay_live.error,
+        airplay_warning: airplay_live.warning,
+        airplay_password_set: crate::settings::airplay_password_is_set(&inner.cfg_dir),
+        airplay_raop_port: airplay_live.raop_port,
+        airplay_airplay2_port: airplay_live.airplay2_port,
         // plan M9「开机自启」。四个字段全部**探测**出来，一个都不存盘：登录项
         // 活过重启靠的是 plist / 计划任务本身，settings.json 里再放一份就成了
         // 第二个真值源（见 `crate::autostart` 开头）。

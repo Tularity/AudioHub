@@ -61,6 +61,7 @@ fn main() {
         tx_throttle_kbps: None, // production: AUDIOHUB_TEST_TX_KBPS decides (normally unlimited)
         block_udp: None, // production: AUDIOHUB_TEST_BLOCK_UDP decides (normally nothing)
         announce_fault: false, // test-only knob; there is no production value for it
+        airplay_advertise: true,
     }) {
         Ok(h) => Arc::new(h),
         Err(e) => {

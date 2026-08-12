@@ -42,10 +42,10 @@ import { t, joinPhrases } from '../i18n';
 import { stageChips } from '../lib/stagefacts';
 import { Meter } from './Controls';
 import {
-  LATENCY_SEGMENTS, LATENCY_STAGES, SEGMENT_LABEL, QUALITY_DOTS, QUALITY_PARTS,
+  LATENCY_SEGMENTS, LATENCY_STAGES, SEGMENT_LABEL, QUALITY_PARTS,
   QUALITY_PART_DESC, QUALITY_PART_NAME,
   confidenceKey, coversWholeChain, isLowerBound, isQualityMeasuring, latencyGrade,
-  latencyGradeKey, latencyTone, latencyValueKey, medianOf5, qualityDots,
+  latencyGradeKey, latencyTone, latencyValueKey, medianOf5,
   qualityDepthKey, qualityGradeTextKey, qualityTone, qualityWorstKey,
   pickWorst, readLatency, readPeerNet, readQuality, segmentDominantStage, stageHost,
 } from '../lib/metrics';
@@ -260,7 +260,6 @@ function depthLabel(d: string | undefined): string | undefined {
 
 function QualityCell({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading | undefined }) {
   const grade = q ? q.grade : undefined;
-  const dots = qualityDots(grade);
   const khz = q ? q.wireRateKhz : undefined;
   // 位深进阶梯之后**两个维度一起写**：`48 kHz` 单独说不出它是 16 位还是 24 位，
   // 而这两档现在都存在、码率差 50 %。位深读不到（旧 daemon）就只写采样率——
@@ -288,16 +287,9 @@ function QualityCell({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading |
   return (
     <span className="metric-cell" data-testid={`metric-quality-${dir}-${fp}`}>
       <span className="metric-cap">{t('metric.quality.label')}</span>
-      <span
-        className="quality-dots"
-        data-testid={`metric-quality-dots-${dir}-${fp}`}
-        data-state={measuring ? 'measuring' : undefined}
-        aria-hidden="true"
-      >
-        {Array.from({ length: QUALITY_DOTS }, (_, i) => (
-          <span key={i} className={`qdot${i < dots ? ` on tone-${grade ? qualityTone(grade) : 'ok'}` : ''}`} />
-        ))}
-      </span>
+      {/* 四点指示已删（用户 2026-08-11 第 1 条）——理由记在 lib/metrics.ts 里
+          `qualityDots` 原先的位置上。要点：那四颗点是等级的**影子**，而下面这个
+          kHz · bit 才是随网络实时变的真读数，且它已经同时带着色阶。 */}
       {/* 与延迟那格同一条规矩：`.unknown` 的暗色只表示**读不到**。采样率在「测量中」
           这一态里是**已经读到的真值**，把它调暗等于说它也没读到——而那正是
           这次要修的那种「让不知道和坏消息长得一样」的呈现。
@@ -313,9 +305,10 @@ function QualityCell({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading |
       {/* `title` 是 `metric.quality.rateDepth` 那条注释里承诺的兜底，必须真的存在。
           这一行的宽度账：`.dir-head` 是 `overflow:hidden`，`.metric-val` 是
           `white-space:nowrap; flex:none` ⇒ **等级词是这一行里唯一可收缩的元素**。
-          值从「48 kHz」变成「48 kHz · 32 bit 浮点」之后，多出来的宽度全部从这里
-          扣，而 styles.css 里已经记载过「18px 的 gap 就会把两个等级词全挤成省略号」
-          ——余量本来就是零。被截断时至少还能悬停读回来。 */}
+          值从「48 kHz」变成「48 kHz · 32 bit」之后，多出来的宽度全部从这里扣，
+          而 styles.css 里已经记载过「18px 的 gap 就会把两个等级词全挤成省略号」。
+          本轮往回找补了三笔：四颗点连同它的 gap（约 40px）、「浮点」两字、以及
+          方向词（挪去了下面的流量行）——余量第一次不是零。被截断时仍可悬停读回。 */}
       <span
         className={`metric-grade${measuring ? ' measuring' : ''}`}
         data-testid={`metric-quality-grade-${dir}-${fp}`}
@@ -501,8 +494,17 @@ function TierBanner({ fp, tier }: { fp: string; tier: EffectiveTier }) {
 // ---------------------------------------------------------------- 一个方向
 
 /**
- * 一个方向的完整呈现：标题行（方向 + 延迟 + 音质）、流量行（电平 + 码率）、
+ * 一个方向的完整呈现：指标行（延迟 + 音质）、流量行（方向 + 码率条 + 码率）、
  * 可展开的明细（该方向的分段 + 逐级 + 音质三分量 + 主导权说明）。
+ *
+ * ## 方向词为什么在第二行（用户 2026-08-11 第 1 条）
+ *
+ * 它原先是指标行的第一个元素，于是那一行是「方向 延迟 音质」——延迟被顶到中间，
+ * 而它是这一行的头条。挪走之后指标行只剩两格、一左一右，延迟拿回最左的锚点，
+ * 音质靠右，中间那段空白正好吃掉窄卡片上「等级词被挤成省略号」的老账。
+ *
+ * 方向词落到流量行的最左，与它描述的那条码率条贴在一起。**两态必须放在同一行位置**
+ * ——无会话时那一行同样是 `.dir-stream`，只是码率条换成状态文字。
  *
  * ## 「未开通」与「读不到」必须长得不一样
  *
@@ -568,16 +570,22 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
     return (
       <div className={`dir-block idle${idleReady ? ' ready' : ''}`} data-dir={dir} data-testid={`metric-dir-${dir}-${fp}`}>
         <div className="dir-head idle">
+          <LatencyCell fp={fp} dir={dir} lat={undefined} series={EMPTY} />
+          <QualityCell fp={fp} dir={dir} q={undefined} />
+        </div>
+        {/* 方向词与有会话时**落在同一行位置**（码率行的最左），否则两态一比就是
+            「上面那块的方向词在第一行、下面那块在第二行」，而两态等高的全部意义
+            就是让人在同一位置对比两个方向。这里码率条没有对象，那一格由状态文字
+            顶上——它本来就在这个位置，只是过去自己独占一行。 */}
+        <div className="dir-stream">
           <span className="dir-name" title={t(govKey)}>
             <span className="dir-arrow" aria-hidden="true">{dir === 'out' ? '↑' : '↓'}</span>
             {dirLabel}
           </span>
-          <LatencyCell fp={fp} dir={dir} lat={undefined} series={EMPTY} />
-          <QualityCell fp={fp} dir={dir} q={undefined} />
+          <p className="metric-idle-text" data-testid={`peer-dir-idle-${dir}-${fp}`}>
+            {idleReady ? t('peers.card.micReady') : t('peers.card.dirIdle')}
+          </p>
         </div>
-        <p className="metric-idle-text" data-testid={`peer-dir-idle-${dir}-${fp}`}>
-          {idleReady ? t('peers.card.micReady') : t('peers.card.dirIdle')}
-        </p>
         {/* 状态一句就够：「通路就绪·暂无应用占用」上面已经说完了。原先跟在它下面
             解释「选中该设备即开始传输」的那一句是功能描述，已随 2026-08-10 的裁定
             移进 wiki（docs/plan.md §3.1）；这里只留 title，不占版面。
@@ -607,10 +615,7 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
         title={joinPhrases([t(govKey), t('metric.latency.footnote')])}
         onClick={(e) => { e.stopPropagation(); onToggle(); }}
       >
-        <span className="dir-name">
-          <span className="dir-arrow" aria-hidden="true">{dir === 'out' ? '↑' : '↓'}</span>
-          {dirLabel}
-        </span>
+        <LatencyCell fp={fp} dir={dir} lat={lat} series={series} />
         {/* 同方向 N 条会话：把「一共几路、显示的是哪一路」说出来。不说的话，
             一个不标来源的数字背后站着 N 个候选——正是这次事故的形态。 */}
         <span
@@ -621,7 +626,6 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
         >
           {list.length > 1 ? t('peers.card.dirMulti', { n: list.length }) : ''}
         </span>
-        <LatencyCell fp={fp} dir={dir} lat={lat} series={series} />
         <QualityCell fp={fp} dir={dir} q={q} />
         <span className={`metric-chev${open ? ' open' : ''}`} aria-hidden="true" />
       </button>
@@ -636,6 +640,16 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
         {targetText}
       </p>
       <div className="dir-stream" data-testid={`stream-${dir}-${fp}`}>
+        {/* 方向词在**码率条左边**（用户 2026-08-11 第 1 条）。它原先占着指标行的
+            最左，把延迟顶到了中间——而延迟是这一行的头条，靠最左才读得快。挪到
+            这里之后：指标行是「延迟 … 音质」（一左一右），流量行是「方向 条 kbps」，
+            两行各自有一个稳定的左锚点。
+            方向语义没有变弱：`.dir-block` 的 `data-dir` 与按钮的 aria-label 都还在，
+            而这个词与它描述的那条码率条现在贴在一起，反而更近了。 */}
+        <span className="dir-name" title={t(govKey)}>
+          <span className="dir-arrow" aria-hidden="true">{dir === 'out' ? '↑' : '↓'}</span>
+          {dirLabel}
+        </span>
         {/* ⚠ 这条不是电平，是**码率除以 900**（`Meter` 只接一个标量）。所以它与
             右边那个 kbps 是同一个数的两种画法，不是「一件事的两个尺度」。
             别在文案里把它讲成电平——那会让用户以为静音时它会掉下去。 */}

@@ -178,7 +178,8 @@ fn handle_inbound(
             let Some(pin) = pin else {
                 let _ = write_frame(
                     &mut stream,
-                    &ControlMsg::Error { message: "pairing not enabled".into() },
+                    &ControlMsg::Error { message: "pairing not enabled".into(),
+                    },
                 );
                 bail!("pairing attempt while pairing not enabled");
             };
@@ -234,7 +235,8 @@ fn handle_inbound(
         other => {
             let _ = write_frame(
                 &mut stream,
-                &ControlMsg::Error { message: "expected verify_hello or pair_init".into() },
+                &ControlMsg::Error { message: "expected verify_hello or pair_init".into(),
+                },
             );
             bail!("unexpected first frame: {other:?}");
         }
@@ -619,7 +621,8 @@ pub(crate) fn announce_mode(inner: &Arc<DaemonInner>, mode: Mode) {
     // After the teardown, so a peer that reads both in order sees the closes
     // explained rather than announced in advance and then contradicted.
     for c in conns {
-        let _ = c.send_msg(&SessionMsg::ModeState { mode: mode.as_str().to_string() });
+        let _ = c.send_msg(&SessionMsg::ModeState { mode: mode.as_str().to_string(),
+        });
     }
 }
 
@@ -730,7 +733,8 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 tx_quality.as_deref(),
             ) {
                 Ok(()) => SessionMsg::AcceptStream { stream_id },
-                Err(e) => SessionMsg::RejectStream { stream_id, reason: format!("{e:#}") },
+                Err(e) => SessionMsg::RejectStream { stream_id, reason: format!("{e:#}"),
+                },
             };
             let _ = conn.send_msg(&reply);
         }
@@ -765,7 +769,8 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 teardown_stream(inner, stream_id, false);
             }
         }
-        SessionMsg::Stats { stream_id, received, lost, loss_pct, jitter_ms, spread_ms } => {
+        SessionMsg::Stats { stream_id, received, lost, loss_pct, jitter_ms, spread_ms,
+        } => {
             let tx = owned_session(inner, conn, stream_id, "stats").and_then(|e| e.tx);
             if let Some(t) = tx {
                 let mut r = lk(&t.remote);
@@ -794,7 +799,8 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
         //   C §13 互斥：只有共享模式的机器接受外来档位。判据取**本机**的
         //     `effective_mode`，不取对端自报的 `ModeState`——把通告当权威会把
         //     防中继的闸门放到线的错误一侧。
-        SessionMsg::SetTransport { stream_id, rx_latency, tx_quality } => {
+        SessionMsg::SetTransport { stream_id, rx_latency, tx_quality,
+        } => {
             // 断言 C **先于**断言 A：§13 问的是「这台机器此刻允不允许被指挥」，
             // 与是哪一条流无关。放在归属校验之后的话，一台处于使用端模式的机器
             // 收到一个陌生 stream_id 时会先撞归属校验，于是那条互斥线**永远不会
@@ -842,10 +848,14 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 crate::publish_targets(inner, std::slice::from_ref(&e));
             }
         }
-        SessionMsg::VolumeSet { stream_id, scalar, muted, src } => {
-            apply_peer_volume(inner, conn, stream_id, scalar, muted, &src)
-        }
-        SessionMsg::VolumeState { stream_id, scalar, muted, adjustable } => {
+        SessionMsg::VolumeSet { stream_id, scalar, muted, src,
+        } => apply_peer_volume(inner, conn, stream_id, scalar, muted, &src),
+        SessionMsg::VolumeState {
+            stream_id,
+            scalar,
+            muted,
+            adjustable,
+        } => {
             // consumer side: the provider told us what its device really reads.
             // The direction check is the mirror of apply_peer_volume's: on a
             // stream where WE are the provider this cell holds our OWN device's
@@ -947,7 +957,8 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
         // `owned_session` 是这里的安全边界：stream id 在媒体头里是明文，任何
         // 另一个已配对的对端都可以对它喊话。分项决定用户看到的那个延迟数字，
         // 不属于这条连接的流一律不收。
-        SessionMsg::StageReport { stream_id, stages, local_ms, dev, quality, seq_us } => {
+        SessionMsg::StageReport { stream_id, stages, local_ms, dev, quality, seq_us,
+        } => {
             if let Some(e) = owned_session(inner, conn, stream_id, "stage_report") {
                 let ipc: Vec<_> = stages.iter().map(crate::from_wire_stage).collect();
                 // 落在**这一条流**的格子里（`SessionEntry::peer_lat`），不是一张
@@ -1029,7 +1040,8 @@ fn apply_peer_volume(
     muted: Option<bool>,
     src: &str,
 ) {
-    let Some(e) = owned_session(inner, conn, stream_id, "volume_set") else { return };
+    let Some(e) = owned_session(inner, conn, stream_id, "volume_set") else { return;
+    };
     let provider = e.kind == KIND_SPK && e.dir == DIR_RECV;
     if let SetAction::Ignore(why) = volume::classify_set(provider, e.volume.enabled, src) {
         dlog!("[audiohubd] ignoring volume_set for stream {stream_id}: {why}");
@@ -1052,9 +1064,7 @@ fn apply_peer_volume(
     let s = scalar.clamp(0.0, 1.0);
     // Arm echo suppression with the mute state that will actually hold after
     // this write, so a poll racing us still recognises the reading as an echo.
-    let m = muted.unwrap_or_else(|| {
-        volume::get_default_output_volume().map_or(false, |v| v.muted)
-    });
+    let m = muted.unwrap_or_else(|| volume::get_default_output_volume().map_or(false, |v| v.muted));
     lk(&e.volume.sync).note_peer_apply(s, m);
     if let Err(err) = volume::set_default_output_volume(s) {
         dlog!("[audiohubd] stream {stream_id}: set output volume: {err:#}");
@@ -1198,7 +1208,8 @@ pub(crate) fn set_session_volume(
     let last = *lk(&e.volume.state);
     let adjustable = last.map_or(true, |v| v.adjustable);
     let shown = muted.or_else(|| last.map(|v| v.muted)).unwrap_or(false);
-    *lk(&e.volume.state) = Some(VolumeState { scalar: s, muted: shown, adjustable });
+    *lk(&e.volume.state) = Some(VolumeState { scalar: s, muted: shown, adjustable,
+    });
     Ok(())
 }
 
@@ -1216,7 +1227,12 @@ fn apply_send_gain(e: &SessionEntry, scalar: f32, muted: Option<bool>) -> Result
     let tx = e
         .tx
         .as_ref()
-        .ok_or_else(|| anyhow!("session {} has no send stream to carry the software gain", e.id))?;
+        .ok_or_else(|| {
+        anyhow!(
+            "session {} has no send stream to carry the software gain",
+            e.id
+        )
+    })?;
     let last = *lk(&e.volume.state);
     // `None` = 不动静音态，与 `SessionMsg::VolumeSet` 的语义一致。
     let m = muted.or_else(|| last.map(|v| v.muted)).unwrap_or(false);
@@ -1224,7 +1240,8 @@ fn apply_send_gain(e: &SessionEntry, scalar: f32, muted: Option<bool>) -> Result
         TxShared::gain_bits(if m { 0.0 } else { scalar }),
         Ordering::Relaxed,
     );
-    *lk(&e.volume.state) = Some(VolumeState { scalar, muted: m, adjustable: false });
+    *lk(&e.volume.state) = Some(VolumeState { scalar, muted: m, adjustable: false,
+    });
     Ok(())
 }
 
@@ -1243,7 +1260,8 @@ fn engage_send_gain(e: &SessionEntry) {
     if let Some(tx) = e.tx.as_ref() {
         tx.send_gain.store(TxShared::gain_bits(1.0), Ordering::Relaxed);
     }
-    *lk(&e.volume.state) = Some(VolumeState { scalar: 1.0, muted: false, adjustable: false });
+    *lk(&e.volume.state) = Some(VolumeState { scalar: 1.0, muted: false, adjustable: false,
+    });
     dlog!(
         "[audiohubd] stream {}: the peer's output device has no volume we can drive; this side \
          takes the volume over as send-side software gain (plan §7.2)",
@@ -1504,6 +1522,7 @@ fn source_spec(
             let info = sysaudio::resolve_backend(want)?;
             Ok(SourceSpec::SysAudio { backend: info.id })
         }
+        Some("airplay") => bail!("AirPlay 音频始终在接收端本机播放，不能作为 AudioHub peer source"),
         // spec-m5b §5.4: whatever an app played into THIS PEER's virtual
         // speaker. The bridge check belongs to build_source (it is the thread
         // that owns the ring), and a missing bridge fails the open there with
@@ -1841,9 +1860,7 @@ fn target_addr(peer: &PairedPeer, addr_override: Option<&str>) -> Result<SocketA
         Some(a) if a.contains(':') => a.to_string(),
         Some(a) => format!("{}:{}", a, peer.port),
         None => {
-            let ip = peer.last_addr.as_deref().ok_or_else(|| {
-                anyhow!("no known address for {} (pass addr)", peer.fingerprint)
-            })?;
+            let ip = peer.last_addr.as_deref().ok_or_else(|| anyhow!("no known address for {} (pass addr)", peer.fingerprint))?;
             // Port 0 is how the store records "this peer never told us a port we
             // could believe" (see the PairInit arm of handle_inbound). Dialling
             // it is meaningless, and the message has to say so: the peer is
@@ -1953,7 +1970,9 @@ pub(crate) fn connect_peer(
     let endpoint = match addr_override {
         // An explicit URL on the call wins, and is not persisted here: the
         // caller asked for one connection, not for a setting.
-        Some(a) if crate::wsshell::WsUrl::looks_like_url(a) => Some(crate::wsshell::WsUrl::parse(a)?),
+        Some(a) if crate::wsshell::WsUrl::looks_like_url(a) => {
+            Some(crate::wsshell::WsUrl::parse(a)?)
+        }
         Some(_) => None,
         None => lk(&inner.peer_transport).endpoint(&peer.fingerprint),
     };
@@ -2212,6 +2231,9 @@ pub(crate) fn open_session_from(
 ) -> Result<SessionInfo> {
     if params.kind != KIND_MIC && params.kind != KIND_SPK {
         bail!("kind must be '{KIND_MIC}' or '{KIND_SPK}'");
+    }
+    if params.source.as_deref() == Some("airplay") {
+        bail!("AirPlay 音频始终在接收端本机播放，不能作为 AudioHub peer source");
     }
     let consuming = params.kind == KIND_MIC; // media flows peer -> us
     // Volume sync is a spk-only property: it drives the output device of

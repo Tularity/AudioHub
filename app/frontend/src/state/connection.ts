@@ -7,13 +7,17 @@
 
 import { IpcClient, VersionMismatchError, IPC_VERSION } from '../ipc/client';
 import { resolveEndpoint, isTauri, tauriInvoke } from '../ipc/endpoint';
-import type { DaemonInfo, DaemonSettings, IpcEndpoint, PeerState, SessionInfo } from '../ipc/types';
+import type {
+  AirPlaySessionInfo, DaemonInfo, DaemonSettings, DaemonSettingsPatch,
+  IpcEndpoint, PeerState, SessionInfo,
+} from '../ipc/types';
 import { actions, getState, setState } from './store';
 import type { ConnError } from './store';
 import { normalizeList, normalizeOne, gateNeeded } from './permissions';
 import { applyChromeDirection } from '../lib/platform';
 import { activeTheme } from '../lib/appearanceHost';
 import { iconStateFrom } from '../lib/trayIcon';
+import { isUnknownMethod, sanitizeDaemonSettings } from '../lib/airplay';
 import { toast } from '../components/Toasts';
 import { t } from '../i18n';
 
@@ -23,6 +27,7 @@ export const client = new IpcClient();
 
 let statusTimer: ReturnType<typeof setInterval> | null = null;
 let peersTimer: ReturnType<typeof setInterval> | null = null;
+let airplayTimer: ReturnType<typeof setInterval> | null = null;
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let connecting = false;
 let booted = false;
@@ -129,7 +134,10 @@ export async function connectDaemon(): Promise<void> {
   setState({ conn: 'connecting', connError: null });
   try {
     const daemon = await withTimeout(attemptConnect(), CONNECT_ATTEMPT_TIMEOUT_MS, t('error.connectTimeout'));
-    setState({ conn: 'online', daemon, connError: null, lastStatusAt: Date.now() });
+    setState({
+      conn: 'online', daemon, connError: null, lastStatusAt: Date.now(),
+      airplaySessions: [], airplaySessionsSupported: null,
+    });
     afterConnect();
   } catch (e) {
     client.close(); // 放弃可能仍在挂起的 socket
@@ -144,6 +152,7 @@ function afterConnect(): void {
   void refreshStatus();
   void refreshPeers();
   void refreshSessions();
+  void refreshAirPlaySessions();
   void refreshSettings();
   void refreshPermissions({ force: true });
   rpc('stats.subscribe', { interval_ms: 1000 }, { silent: true }).catch(() => {});
@@ -151,6 +160,8 @@ function afterConnect(): void {
   statusTimer = setInterval(() => void refreshStatus(), 5000);
   if (peersTimer) clearInterval(peersTimer);
   peersTimer = setInterval(() => void refreshPeers(), 10000);
+  if (airplayTimer) clearInterval(airplayTimer);
+  airplayTimer = setInterval(() => void refreshAirPlaySessions(), 3000);
 }
 
 export async function refreshStatus(): Promise<void> {
@@ -182,11 +193,18 @@ export async function refreshSettings(): Promise<void> {
  * 写设置。回包就是新的权威值，直接落库——不做乐观翻转：模式切换在 daemon 侧要
  * 增删虚拟设备，失败时界面若已经翻过去，用户会以为设备该出现却没出现。
  */
-export async function applySettings(patch: Partial<DaemonSettings>): Promise<DaemonSettings> {
-  const res = await rpc<DaemonSettings>('settings.set', patch);
+export async function applySettings(patch: DaemonSettingsPatch): Promise<DaemonSettings> {
+  const raw = await rpc<unknown>('settings.set', patch);
+  const res = sanitizeDaemonSettings(raw);
+  if (!res) {
+    const error = new Error(t('error.requestFailed'));
+    toast(error.message, 'error');
+    throw error;
+  }
   actions.setDaemonSettings(res);
   void refreshPeers();   // 模式变了，每个对端的 hal_device 跟着变
   void refreshStatus();
+  void refreshAirPlaySessions();
   return res;
 }
 
@@ -198,6 +216,18 @@ export async function refreshPeers(): Promise<void> {
 export async function refreshSessions(): Promise<void> {
   if (!client.connected) return;
   try { actions.pushStats(await client.request<SessionInfo[]>('session.list', {})); } catch { /* ignore */ }
+}
+
+/** 外部 AirPlay 来源不走 stats 订阅，连接后立即取一次，并以短轮询保持权威。 */
+export async function refreshAirPlaySessions(): Promise<void> {
+  if (!client.connected || getState().airplaySessionsSupported === false) return;
+  try {
+    const list = await client.request<AirPlaySessionInfo[]>('airplay.sessions.list', {});
+    actions.setAirPlaySessions(list);
+  } catch (error) {
+    // 旧 daemon 没有这个方法不是运行故障；本次连接不再重试，重连时重新探测。
+    if (isUnknownMethod(error)) actions.setAirPlaySessionsUnsupported();
+  }
 }
 
 // ---- 系统权限探测 ----
@@ -289,7 +319,10 @@ export function syncTray(): void {
 client.on('close', () => {
   if (statusTimer) clearInterval(statusTimer);
   if (peersTimer) clearInterval(peersTimer);
-  setState({ conn: 'offline' });
+  if (airplayTimer) clearInterval(airplayTimer);
+  setState({
+    conn: 'offline', airplaySessions: [], airplaySessionsSupported: null,
+  });
   scheduleRetry();
 });
 

@@ -15,9 +15,8 @@
 // 权限入口、快捷键入口。任何与模式 / 网络 / 设备 / 传输相关的东西都不许进。
 
 import { useEffect, useState, useSyncExternalStore } from 'react';
-import type { ReactNode } from 'react';
 import { Icon, RawIcon } from '../components/Icon';
-import { ExtLink, Help, Segmented, Switch } from '../components/Controls';
+import { BlockTitle, ExtLink, Help, Segmented, SettingRow, Switch } from '../components/Controls';
 import { confirmDialog } from '../components/ConfirmDialog';
 import { openPermissionsSheet } from '../components/PermissionsSheet';
 import { openShortcutSheet } from '../components/ShortcutSheet';
@@ -68,46 +67,8 @@ const SWITCHED_KEY: Record<AppMode, MsgKey> = {
   b: 'mode.switched.toB',
 };
 
-/**
- * 一行设置：**标题 + 值/状态 + 一枚 `?`**，没有第四样东西。
- *
- * `desc` 已经没有了。用户 2026-08-10 裁定「为了简化而简化」（docs/plan.md §3.1）：
- * 每一行原本挂着的两三行说明全部搬进 wiki，界面上只留一个入口。这里因此**刻意
- * 不留 desc 形参**——留着它，下一个人会顺手再写一段进来，而这一整轮改动就是为了
- * 把那些段落清出去。
- *
- * `note` 是给**状态**用的（「广播没建立」这类随运行时变化的事实），不是描述的
- * 后门：它渲染在标题下方，写成一句短话就行。
- */
-function SettingRow({ title, control, badge, help, note }: {
-  title: string; control: ReactNode; badge?: string; help?: ReactNode; note?: string;
-}) {
-  return (
-    <div className="setting-row">
-      <div className="setting-text">
-        <div className="setting-title">
-          {title}
-          {badge ? <span className="tag warn">{badge}</span> : null}
-          {help}
-        </div>
-        {note ? <p className="setting-desc">{note}</p> : null}
-      </div>
-      <div className="setting-ctl">{control}</div>
-    </div>
-  );
-}
-
-/** 区块标题 + `?`。同一个形状出现十几次，抽出来省得每处各写各的间距。 */
-function BlockTitle({ text, url, label, testid, danger = false }: {
-  text: string; url: string; label: string; testid: string; danger?: boolean;
-}) {
-  return (
-    <div className="title-row">
-      <h3 className={`block-title${danger ? ' danger-title' : ''}`}>{text}</h3>
-      <Help label={label} url={url} testid={testid} />
-    </div>
-  );
-}
+// `SettingRow` / `BlockTitle` 已搬去 components/Controls.tsx：「共享协议」那一页
+// 用的是同一个版式，而 `.setting-row` 的间距规则只有一套，抄第二份必然漂。
 
 // ---------------------------------------------------------------- ① 运行模式
 
@@ -242,6 +203,9 @@ function ModeAOptions({ writing, noSettings, onPush }: {
       />
       <SettingRow
         title={t('settings.modeAVolume.muteTitle')}
+        note={ds?.mode_a_volume_sync && ds.mode_a_mute_local
+          ? t('settings.modeAVolume.syncMuteException')
+          : undefined}
         control={(
           <Switch
             testid="settings-mode-a-mute-local"

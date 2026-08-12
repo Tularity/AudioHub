@@ -22,7 +22,7 @@ import { toast } from './Toasts';
 import { openExternal, WIKI } from '../lib/external';
 import { pendingSignature, writePermSeen } from '../lib/permIntro';
 import { t } from '../i18n';
-import { actionOf } from '../state/permissions';
+import { actionOf, permissionManual } from '../state/permissions';
 import type { PermissionState } from '../state/permissions';
 import { actions, getState, useStore } from '../state/store';
 import { refreshPermissions, rpc } from '../state/connection';
@@ -78,11 +78,12 @@ function PermissionsSheet({ auto }: { auto: boolean }) {
       }
       return;
     }
+    const manual = permissionManual(p);
     if (p.settingsUrl) {
       void openExternal(p.settingsUrl);
-      if (p.manual) toast(t('perm.settingsFallback', { manual: p.manual }), 'info');
+      if (manual) toast(t('perm.settingsFallback', { manual }), 'info');
     } else {
-      toast(p.manual ? t('perm.openManual', { manual: p.manual }) : t('perm.noSettingsUrl'), 'warn');
+      toast(manual ? t('perm.openManual', { manual }) : t('perm.noSettingsUrl'), 'warn');
     }
   }
 

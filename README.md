@@ -61,6 +61,7 @@ The wiki is the real documentation. Each page is written to be read on its own.
 | [Audio Quality](https://github.com/Tularity/AudioHub/wiki/Audio-Quality) | The six-rung quality ladder and how AUTO moves along it |
 | [Latency](https://github.com/Tularity/AudioHub/wiki/Latency) | Measured end-to-end latency and where the milliseconds actually go |
 | [Volume](https://github.com/Tularity/AudioHub/wiki/Volume) | Why loudness and slider positions cannot both match across two machines |
+| [Share Protocols](https://github.com/Tularity/AudioHub/wiki/Share-Protocols) | Audio-only AirPlay reception, local playback, password and bidirectional volume behaviour |
 | [Platform Notes](https://github.com/Tularity/AudioHub/wiki/Platform-Notes) | macOS permissions, Windows driver status |
 | [Glossary](https://github.com/Tularity/AudioHub/wiki/Glossary) | Jitter buffer, underrun, PLC, tier, taper, and friends |
 
@@ -103,8 +104,9 @@ Plugin, and ordinary code signing is enough.
 This section exists so nobody is misled by the fact that the rest of it works.
 
 **What works:** share mode both directions; mode A; mode B on macOS; pairing and
-discovery; the quality ladder and AUTO; volume synchronisation; the CLI and its
-probes.
+discovery; the quality ladder and AUTO; volume synchronisation; audio-only
+AirPlay reception with fixed local playback and a classic-DACP reverse-volume
+request path; the CLI and its probes.
 
 **What does not, or is not proven:**
 
@@ -120,7 +122,12 @@ probes.
   users, as above. Its microphone direction has no cross-machine evidence yet.
 - **No release, no packaging, no notarisation.** Local builds are ad-hoc signed.
   There are no downloadable binaries.
-- Real-world listening and UI walkthroughs on both platforms are still pending.
+- Real iOS playback and sender-to-receiver AirPlay volume have been exercised.
+  Receiver-to-sender volume requests reach the macOS 26 AirPlaySender's internal
+  DACP notification, but that sender does not update its Control Center slider;
+  current iOS consumption of the reverse direction still needs final device
+  re-verification. Broader UI walkthroughs on both desktop platforms remain
+  pending.
 
 Measured figures throughout the wiki are dated and scoped: they are what was
 observed on specific machines on a specific date, not a specification anyone
@@ -194,6 +201,7 @@ directly, bypassing both the service and the network. Run any of them with
 
 ```
 core/audiohub-core    device I/O, resampling, mixing, volume
+core/audiohub-airplay audio-only AirPlay/RAOP ingress and local playback
 core/audiohub-net     transport, tiers, crypto, discovery
 core/audiohub-ipc     the local IPC contract shared by UI and CLI
 core/audiohubd        the background service

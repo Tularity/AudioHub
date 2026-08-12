@@ -16,7 +16,9 @@ import { openExternal, WIKI } from '../lib/external';
 import { chromeContextMenu, chromeMouseDown } from '../lib/drag';
 import { t, listFormat } from '../i18n';
 import { actions, getState, useStore } from '../state/store';
-import { actionOf, isBlocking, requestQueue } from '../state/permissions';
+import {
+  actionOf, isBlocking, permissionManual, permissionName, requestQueue,
+} from '../state/permissions';
 import type { PermissionState } from '../state/permissions';
 import { refreshPermissions, rpc } from '../state/connection';
 
@@ -64,21 +66,22 @@ export function OnboardingGate() {
     await refreshPermissions({ force: true });
     const left = getState().permissions.list.filter(isBlocking);
     if (left.length) {
-      toast(t('onboarding.stillMissing', { n: left.length, names: listFormat(left.map((p) => p.name)) }), 'warn');
+      toast(t('onboarding.stillMissing', { n: left.length, names: listFormat(left.map(permissionName)) }), 'warn');
     } else {
       toast(t('onboarding.allGranted'), 'ok');
     }
   }
 
   function openSettings(p: PermissionState) {
+    const manual = permissionManual(p);
     if (!p.settingsUrl) {
-      toast(p.manual ? t('perm.openManual', { manual: p.manual }) : t('perm.noSettingsUrl'), 'warn');
+      toast(manual ? t('perm.openManual', { manual }) : t('perm.noSettingsUrl'), 'warn');
       return;
     }
     void openExternal(p.settingsUrl);
     // 深链能否打开取决于 webview 与系统，所以路径文案照给不误——
     // 用户不该因为一个链接没反应就无路可走。
-    if (p.manual) toast(t('perm.settingsFallback', { manual: p.manual }), 'info');
+    if (manual) toast(t('perm.settingsFallback', { manual }), 'info');
   }
 
   function onAction(p: PermissionState) {
@@ -89,12 +92,12 @@ export function OnboardingGate() {
   const hint = busy
     ? t('onboarding.hint.busy')
     : blocking.length
-      ? t('onboarding.hint.blocking', { n: blocking.length, names: listFormat(blocking.map((p) => p.name)) })
+      ? t('onboarding.hint.blocking', { n: blocking.length, names: listFormat(blocking.map(permissionName)) })
       : t('onboarding.hint.ready');
 
-  const optionalLeft = items.filter((p) => !p.required && p.status !== 'granted').map((p) => p.name);
+  const optionalLeft = items.filter((p) => !p.required && p.status !== 'granted').map(permissionName);
   const skipNote = blocking.length
-    ? t('onboarding.skipNote.blocking', { names: listFormat(blocking.map((p) => p.name)) })
+    ? t('onboarding.skipNote.blocking', { names: listFormat(blocking.map(permissionName)) })
     : optionalLeft.length
       ? t('onboarding.skipNote.optional', { names: listFormat(optionalLeft) })
       : '';

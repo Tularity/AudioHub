@@ -39,12 +39,12 @@ let deadlineAt = 0;
 let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
 /** 连续失败计数，成功一次即清零。 */
 let failures = 0;
-/** 用户按过「停止扫描」。切页面不清，离开配对页超过一个冷却期才清。 */
+/** 用户按过「停止扫描」。关面板不清，关掉配对面板超过一个冷却期才清。 */
 let userStopped = false;
 /** 上一次停止的时刻（任何原因），冷却期从这里算。 */
 let lastStopAt = 0;
-/** 上一次离开配对页的时刻。 */
-let leftPairViewAt = 0;
+/** 上一次关掉配对面板的时刻。 */
+let leftPairPanelAt = 0;
 
 export type StopReason = 'user' | 'deadline' | 'offline' | 'error';
 
@@ -96,12 +96,12 @@ export function pruneResults(): void {
 }
 
 /**
- * 进入配对页时试着自动起扫（B.11）。判据全在 `lib/discovery.ts` 的纯函数里，
+ * 打开配对面板时试着自动起扫（B.11）。判据全在 `lib/discovery.ts` 的纯函数里，
  * 这里只负责把模块状态喂进去。
  */
 export function maybeAutoScan(): void {
   const now = Date.now();
-  if (userStopped && shouldClearUserStop(leftPairViewAt, now)) userStopped = false;
+  if (userStopped && shouldClearUserStop(leftPairPanelAt, now)) userStopped = false;
   pruneResults();
   if (!shouldAutoScan({
     conn: getState().conn,
@@ -113,9 +113,9 @@ export function maybeAutoScan(): void {
   startScan();
 }
 
-/** 配对页卸载时记一笔。**不停扫描**——那正是本轮要治的病。 */
-export function notePairViewLeft(): void {
-  leftPairViewAt = Date.now();
+/** 配对面板关闭时记一笔。**不停扫描**——那正是当初要治的病。 */
+export function notePairPanelLeft(): void {
+  leftPairPanelAt = Date.now();
 }
 
 async function scanLoop(mine: number): Promise<void> {
@@ -174,7 +174,8 @@ function watchPairing(p: PairingState | null): void {
   if (p) schedulePinExpiry(p);
 }
 
-// 模块级订阅，随本模块被导入而生效（`views/Pair.tsx` 是静态导入，所以它在应用
-// 启动时就装好了）。配对窗口是一个「局域网内任意主机都能来配对」的窗口——它到期
-// 与否，不该取决于用户此刻正开着哪一页。
+// 模块级订阅，随本模块被导入而生效（`components/PairSheet.tsx` 是静态导入，而它
+// 又被 `views/Peers.tsx` 静态导入，所以它在应用启动时就装好了）。配对窗口是一个
+// 「局域网内任意主机都能来配对」的窗口——它到期与否，不该取决于用户此刻开着哪一页、
+// 有没有把那扇面板关掉。
 useStore.subscribe((s) => watchPairing(s.pairing));

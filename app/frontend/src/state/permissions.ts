@@ -23,8 +23,10 @@ export type PermStatus = 'granted' | 'denied' | 'undetermined' | 'restricted' | 
 
 export interface PermissionState {
   id: string;
+  /** Render known permissions through permissionName(); this is the unknown-item fallback. */
   name: string;
   icon: IconName;
+  /** Render known permissions through permissionWhy(); this is the unknown-item fallback. */
   why: string;
   status: PermStatus;
   required: boolean;
@@ -95,6 +97,32 @@ export const CATALOG: CatalogEntry[] = [
 ];
 
 const BY_ID = new Map(CATALOG.map((c) => [c.id, c]));
+
+/**
+ * Known permissions are product vocabulary, not daemon-authored prose. Resolve
+ * them at render time so switching locale also updates an already-open sheet.
+ * Unknown future permissions still retain the service text as a compatibility
+ * fallback instead of disappearing from the UI.
+ */
+export function permissionName(p: PermissionState): string {
+  const meta = BY_ID.get(p.id);
+  return meta ? t(meta.nameKey) : p.name;
+}
+
+export function permissionWhy(p: PermissionState): string {
+  const meta = BY_ID.get(p.id);
+  return meta ? t(meta.whyKey) : p.why;
+}
+
+export function permissionManual(p: PermissionState): string | null {
+  const meta = BY_ID.get(p.id);
+  return IS_MAC && meta ? t(meta.manualKey) : p.manual;
+}
+
+export function permissionUnknownNote(p: PermissionState): string | null {
+  const meta = BY_ID.get(p.id);
+  return meta?.unknownNoteKey ? t(meta.unknownNoteKey) : p.unknownNote;
+}
 
 // daemon/系统各家的写法都收敛到同一套 id 上；认不出来的 id 原样保留（照样渲染，
 // 只是用通用文案），绝不丢弃——丢一项等于让用户永远不知道还差这个权限。
@@ -188,14 +216,18 @@ export function normalizeOne(raw: unknown, fallbackId: string | null): Permissio
   const status = pickStatus(raw);
   const queryable = bool(src.queryable) ?? meta.queryable ?? true;
   const canRequest = bool(src.can_request) ?? bool(src.canRequest) ?? meta.canRequest ?? true;
+  const inCatalog = BY_ID.has(id);
   return {
     id,
-    // daemon 给的 name/why/note 原样渲染：那是**服务端产出的中文**，前端无从翻译。
-    // 已在报告中列出，待 daemon 侧改用稳定的代码位再本地化。
-    name: str(src.name) || (meta.nameKey ? t(meta.nameKey) : null) || id || t('perm.unknown.name'),
+    // 已知 id 必须走本地目录：daemon 的 name/why/note 是服务端自然语言，
+    // 可能与当前 UI 语种不同。只有目录外的未知权限才保留它们作兼容回退。
+    name: inCatalog && meta.nameKey
+      ? t(meta.nameKey)
+      : str(src.name) || id || t('perm.unknown.name'),
     icon: meta.icon || 'plug',
-    why: str(src.why) || str(src.description) || (meta.whyKey ? t(meta.whyKey) : null)
-      || t('perm.unknown.why'),
+    why: inCatalog && meta.whyKey
+      ? t(meta.whyKey)
+      : str(src.why) || str(src.description) || t('perm.unknown.why'),
     status,
     required: bool(src.required) ?? meta.required ?? false,
     queryable,
@@ -204,9 +236,9 @@ export function normalizeOne(raw: unknown, fallbackId: string | null): Permissio
     knowable: queryable && status !== 'unknown',
     settingsUrl: str(src.settings_url) || str(src.settingsUrl) || meta.settingsUrl || null,
     manual: IS_MAC && meta.manualKey ? t(meta.manualKey) : null,
-    note: str(src.note),
+    note: inCatalog ? null : str(src.note),
     unknownNote: meta.unknownNoteKey ? t(meta.unknownNoteKey) : null,
-    inCatalog: BY_ID.has(id),
+    inCatalog,
   };
 }
 

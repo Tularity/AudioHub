@@ -12,6 +12,7 @@ name = "audiohubd"
 path = "src/main.rs"
 
 [dependencies]
+audiohub-airplay = { path = "../audiohub-airplay" }
 audiohub-core = { path = "../audiohub-core" }
 audiohub-net = { path = "../audiohub-net" }
 audiohub-ipc = { path = "../audiohub-ipc" }
@@ -22,6 +23,8 @@ tungstenite = "0.24"
 rand_core = { version = "0.6", features = ["getrandom"] }
 base64 = "0.22"
 subtle = "2" # constant-time IPC token compare
+mdns-sd = "0.13"
+log = "0.4"
 
 # unix only: pid liveness for ipc.json ownership + SIGTERM/SIGINT handling.
 # NOTE: gated so the windows-gnu build keeps its raw-dylib-free dep graph.

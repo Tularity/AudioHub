@@ -7,3 +7,5 @@
 # 与 regress/r4_app.sh 的静态服务器都直接指着它，换路径会当场打断回归。
 /app/frontend/node_modules
 /app/ui
+
+.DS_Store

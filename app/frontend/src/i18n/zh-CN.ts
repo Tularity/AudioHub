@@ -709,7 +709,6 @@ export const zhCN = {
   'share.proto.airplay.stateError': '启动失败：{message}',
   'share.proto.airplay.stateWarning': '接收仍在运行；{message}',
   'share.proto.airplay.stateUnsupported': '当前服务不支持 AirPlay 接收',
-  'share.proto.airplay.raopPort': 'RAOP 端口 {port}',
   'share.proto.airplay.airplay2Port': 'AirPlay 2 端口 {port}',
 
   'share.proto.active.title': '当前接入',
@@ -717,7 +716,6 @@ export const zhCN = {
   'share.proto.active.unknownTrack': '未提供曲目信息',
   'share.proto.active.unknownPeer': '未知发送端',
   'share.proto.active.protocolUnknown': 'AirPlay',
-  'share.proto.active.transportConnected': '已连接',
   'share.proto.active.playing': '播放中',
   'share.proto.active.paused': '已暂停',
   'share.proto.active.peer': '来源 {peer}',

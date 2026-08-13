@@ -325,10 +325,8 @@ pub struct DaemonSettings {
     /// must never enter frontend state or diagnostic snapshots.
     #[serde(default)]
     pub airplay_password_set: bool,
-    /// Actual dynamically selected ports. macOS commonly already owns 7000 for
-    /// its built-in Receiver, so these are facts, not fixed defaults.
-    #[serde(default)]
-    pub airplay_raop_port: Option<u16>,
+    /// Actual dynamically selected port. macOS commonly already owns 7000 for
+    /// its built-in Receiver, so this is a fact, not a fixed default.
     #[serde(default)]
     pub airplay_airplay2_port: Option<u16>,
     /// plan M9「开机自启」：这台机器此刻**真的**注册着登录项吗。

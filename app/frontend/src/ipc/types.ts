@@ -773,9 +773,7 @@ export interface DaemonSettings {
   airplay_error?: string | null;
   /** 接收器仍在监听时的非致命播放/系统音量警告。 */
   airplay_warning?: string | null;
-  /** classic RAOP 控制端口。 */
-  airplay_raop_port?: number | null;
-  /** AirPlay 2 控制端口；当前里程碑不启用时为空。 */
+  /** 当前 AirPlay 2 接收器实际选择的控制端口。 */
   airplay_airplay2_port?: number | null;
   /** 只报告是否设过密码，绝不返回密码本身。 */
   airplay_password_set?: boolean;

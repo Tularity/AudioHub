@@ -15,6 +15,7 @@ path = "src/main.rs"
 audiohub-airplay = { path = "../audiohub-airplay" }
 audiohub-core = { path = "../audiohub-core" }
 audiohub-net = { path = "../audiohub-net" }
+audiohub-security = { path = "../audiohub-security" }
 audiohub-ipc = { path = "../audiohub-ipc" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -5,21 +5,24 @@
 //!
 //! - the stored switch is a wish; the listener only runs while this daemon is
 //!   in Share mode;
-//! - production starts classic RAOP/AirPlay 1 only, on an automatically chosen
-//!   port, and advertises exactly the TXT records produced by the protocol
-//!   implementation;
+//! - production starts only the AudioHub-owned AirPlay 2 listener, reusing its
+//!   persisted control port when available, and advertises exactly the TXT
+//!   records produced by that implementation;
 //! - the daemon always plays incoming AirPlay on this machine; [`PcmReader`]
 //!   keeps the realtime mixer decoupled from the protocol thread;
 //! - AirPlay volume never scales PCM. Its linear `-30..=0 dB` slider protocol
 //!   maps to the default output's `0..=1` system slider (with readback), while
-//!   `-144 dB` maps to the explicit mute control;
-//! - native output changes are sent back to the active sender over its
-//!   authenticated DACP capability; senders that consume that property can
-//!   converge their effective volume, but request delivery alone is not a UI claim.
+//!   `-144 dB` maps to system slider zero plus the explicit mute control, so a
+//!   sender whose zero-percent endpoint uses the mute sentinel still directly
+//!   synchronizes the visible system slider;
+//! - native output changes are sent back over the authenticated AirPlay 2
+//!   event channel as an exact `0..=1` slider plus an independent mute flag;
+//!   authenticated DACP remains a compatibility fallback for older senders.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -27,19 +30,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use audiohub_airplay::{
-    AirPlayConfig, AirPlayEvent, AirPlayRuntime, MdnsService, PcmBus, PcmRead, PcmReader, Protocol,
-    RemoteControlInfo, RemoteControlSnapshot, RuntimePhase, SenderVolumeSnapshot,
-    SessionInfo as RuntimeSessionInfo,
+    is_control_port_bind_error, AirPlayConfig, AirPlayEvent, AirPlayRuntime, MdnsService, PcmBus,
+    PcmRead, PcmReader, Protocol, ReceiverVolumeControlSnapshot, RemoteControlInfo,
+    RemoteControlSnapshot, RuntimePhase, SenderVolumeSnapshot, SessionInfo as RuntimeSessionInfo,
 };
 use audiohub_ipc::AirPlaySessionInfo;
-use mdns_sd::{DaemonEvent, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{DaemonEvent, IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use crate::{dlog, lk, DaemonInner};
 
 const MDNS_CONFIRM_TIMEOUT: Duration = Duration::from_secs(3);
 const DNS_LABEL_MAX_BYTES: usize = 63;
-// `<12 uppercase MAC hex>@` occupies 13 bytes in the RAOP instance label.
-const PICKER_NAME_MAX_BYTES: usize = DNS_LABEL_MAX_BYTES - 13;
+const AIRPLAY_PICKER_NAME_MAX_BYTES: usize = DNS_LABEL_MAX_BYTES;
 const VOLUME_RETRY_LIMIT: u8 = 3;
 const DACP_VOLUME_RETRY_LIMIT: u8 = 3;
 const DACP_SERVICE_TYPE: &str = "_dacp._tcp.local.";
@@ -65,12 +67,302 @@ const AIRPLAY_VOLUME_MUTE_DB: f32 = -144.0;
 // local 1% change is a real command, not sender-write echo.
 const SYSTEM_VOLUME_SCALAR_EPSILON: f32 = 0.000_1;
 const MODE_REASON: &str = "AirPlay 接收仅在共享模式运行；切回共享模式后会按已保存的开关自动恢复";
+const AIRPLAY2_PORT_FILE: &str = "airplay2-port";
+const AIRPLAY2_PORT_FILE_MAX_BYTES: u64 = 16;
+const AIRPLAY2_PORT_TMP_ATTEMPTS: usize = 16;
+static AIRPLAY2_PORT_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn load_airplay2_port(path: &Path) -> io::Result<Option<u16>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() > AIRPLAY2_PORT_FILE_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted AirPlay control port is oversized",
+        ));
+    }
+
+    let mut encoded = String::new();
+    file.read_to_string(&mut encoded)?;
+    let encoded = encoded.strip_suffix('\n').unwrap_or(&encoded);
+    if encoded.is_empty() || !encoded.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted AirPlay control port is not a decimal integer",
+        ));
+    }
+    let port = encoded.parse::<u16>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted AirPlay control port is outside the u16 range",
+        )
+    })?;
+    if port == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted AirPlay control port must be nonzero",
+        ));
+    }
+    Ok(Some(port))
+}
+
+fn persist_airplay2_port(path: &Path, port: u16) -> io::Result<()> {
+    persist_airplay2_port_with_sequences(path, port, || {
+        AIRPLAY2_PORT_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    })
+}
+
+fn persist_airplay2_port_with_sequences(
+    path: &Path,
+    port: u16,
+    mut next_sequence: impl FnMut() -> u64,
+) -> io::Result<()> {
+    if port == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "AirPlay control port must be nonzero",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "AirPlay control port path has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // A unique same-directory staging file keeps concurrent test daemons from
+    // sharing a fixed `.tmp` name and keeps the final rename on one volume.
+    // A crashed prior incarnation may leave the same PID/sequence name behind;
+    // skip only create_new collisions and propagate every other I/O failure.
+    let (tmp, mut file) = (0..AIRPLAY2_PORT_TMP_ATTEMPTS)
+        .find_map(|_| {
+            let sequence = next_sequence();
+            let tmp = parent.join(format!(
+                ".{AIRPLAY2_PORT_FILE}.{}.{}.tmp",
+                std::process::id(),
+                sequence
+            ));
+            match options.open(&tmp) {
+                Ok(file) => Some(Ok((tmp, file))),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "cannot allocate a unique AirPlay control port staging file",
+            )
+        })?;
+    let result = (|| -> io::Result<()> {
+        file.write_all(format!("{port}\n").as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        atomic_replace_file(&tmp, path)?;
+        sync_parent_directory(parent)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let source = windows_verbatim_path(source)?;
+    let destination = windows_verbatim_path(destination)?;
+    // SAFETY: both path buffers are NUL-terminated and remain alive for the
+    // call. The files are in the same directory, so this is an atomic replace
+    // rather than a cross-volume copy.
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn windows_verbatim_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    // `canonicalize` supplies the std path normalization and extended-length
+    // prefix that raw Win32 calls do not. Resolve only the existing parent:
+    // resolving the leaf would follow a destination reparse point and replace
+    // its target instead of this state-file directory entry.
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Windows path has no parent"))?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Windows path has no file name")
+    })?;
+    let normalized = std::fs::canonicalize(parent)?.join(name);
+
+    // On Windows `canonicalize` returns an extended-length (`\\?\`) path.
+    // Check that contract before handing the buffer to raw Win32 rather than
+    // rebuilding it through a lossy UTF-8 intermediary.
+    let verbatim = matches!(
+        normalized.components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(
+                prefix.kind(),
+                Prefix::Verbatim(_) | Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _)
+            )
+    );
+    if !verbatim {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows AirPlay state path is not verbatim absolute",
+        ));
+    }
+    let encoded: Vec<u16> = normalized.as_os_str().encode_wide().collect();
+    if encoded.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows AirPlay state path contains NUL",
+        ));
+    }
+    Ok(encoded.into_iter().chain(Some(0)).collect())
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
+    // MoveFileExW's WRITE_THROUGH flag provides the Windows durability edge.
+    Ok(())
+}
+
+fn persisted_port_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AddrInUse
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::PermissionDenied
+    )
+}
+
+fn is_control_port_bind_failure(error: &io::Error) -> bool {
+    is_control_port_bind_error(error)
+}
+
+fn start_airplay_runtime(
+    base_config: AirPlayConfig,
+    port_path: &Path,
+) -> io::Result<AirPlayRuntime> {
+    start_airplay_runtime_after_port_load(base_config, port_path, load_airplay2_port(port_path))
+}
+
+fn start_airplay_runtime_after_port_load(
+    base_config: AirPlayConfig,
+    port_path: &Path,
+    loaded_port: io::Result<Option<u16>>,
+) -> io::Result<AirPlayRuntime> {
+    let persisted_port = match loaded_port {
+        Ok(port) => port,
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            // The file contains no secret and its contents are deliberately
+            // absent from this diagnostic. A corrupt record is repaired only
+            // after a replacement listener has started successfully.
+            dlog!("[audiohubd] ignoring invalid AirPlay control port record: {error}");
+            None
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("cannot read persisted AirPlay control port: {error}"),
+            ))
+        }
+    };
+
+    let mut requested = base_config.clone();
+    requested.airplay2_port = persisted_port.unwrap_or(0);
+    let runtime = match AirPlayRuntime::start(requested) {
+        Ok(runtime) => runtime,
+        Err(error)
+            if persisted_port.is_some()
+                && is_control_port_bind_failure(&error)
+                && persisted_port_unavailable(&error) =>
+        {
+            dlog!(
+                "[audiohubd] persisted AirPlay control port {} is unavailable; selecting a replacement",
+                persisted_port.unwrap_or(0)
+            );
+            let mut fallback = base_config;
+            fallback.airplay2_port = 0;
+            AirPlayRuntime::start(fallback).map_err(|fallback_error| {
+                io::Error::new(
+                    fallback_error.kind(),
+                    format!(
+                        "AirPlay fallback listener failed after the persisted port was unavailable: {fallback_error}"
+                    ),
+                )
+            })?
+        }
+        Err(error) => return Err(error),
+    };
+
+    let selected_port = runtime
+        .status()
+        .airplay2_port
+        .filter(|port| *port != 0)
+        .ok_or_else(|| io::Error::other("AirPlay runtime reported no control port"))?;
+    if persisted_port != Some(selected_port) {
+        if let Err(error) = persist_airplay2_port(port_path, selected_port) {
+            let _ = runtime.stop();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("cannot persist AirPlay control port: {error}"),
+            ));
+        }
+    }
+    Ok(runtime)
+}
 
 struct AirPlayNetworkLogger;
 
 impl log::Log for AirPlayNetworkLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Warn && metadata.target().starts_with("openairplay1")
+        metadata.target().starts_with("audiohub_airplay") && metadata.level() <= log::Level::Info
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -93,7 +385,7 @@ static AIRPLAY_NETWORK_LOGGER: AirPlayNetworkLogger = AirPlayNetworkLogger;
 /// existing one wins.
 pub(crate) fn init_logging() {
     if log::set_logger(&AIRPLAY_NETWORK_LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Warn);
+        log::set_max_level(log::LevelFilter::Info);
     }
 }
 
@@ -225,6 +517,24 @@ impl DacpWriteGate {
             });
     }
 
+    /// Re-arm the same logical flight after an event-channel attempt proved
+    /// that no bytes were written. This is used only for the authenticated
+    /// DACP fallback, and only while every session/output lease is still
+    /// current. A concurrent invalidation wins through `still_current` before
+    /// the fallback can commit its own write.
+    fn retry_after_unwritten(&self, still_current: impl FnOnce() -> bool) -> bool {
+        still_current()
+            && self
+                .phase
+                .compare_exchange(
+                    DACP_WRITE_AUTHORIZED,
+                    DACP_WRITE_PENDING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+    }
+
     fn may_have_written(&self) -> bool {
         self.phase.load(Ordering::Acquire) == DACP_WRITE_FULL_REQUEST
     }
@@ -302,10 +612,13 @@ struct DacpJob {
     serial: u64,
     generation: u64,
     session_id: u64,
-    endpoint: DacpEndpointSnapshot,
-    remote_control: RemoteControlSnapshot,
+    endpoint: Option<DacpEndpointSnapshot>,
+    remote_control: Option<RemoteControlSnapshot>,
+    event_control: Option<ReceiverVolumeControlSnapshot>,
     output_epoch: OutputEpochLease,
     db: f32,
+    scalar: f32,
+    muted: bool,
     write_gate: DacpWriteGate,
 }
 
@@ -317,15 +630,23 @@ struct DacpOutcome {
     write_gate: DacpWriteGate,
     /// Carries the exact revocable lease used by the worker so a refresh
     /// after worker classification but before ticker drain is still noticed.
-    remote_control: RemoteControlSnapshot,
+    remote_control: Option<RemoteControlSnapshot>,
+    event_control: Option<ReceiverVolumeControlSnapshot>,
     /// The native value belongs to exactly one default-output epoch. Keep the
     /// lease through outcome consumption so a replacement can never count an
     /// old read as sender convergence.
     output_epoch: OutputEpochLease,
     /// Endpoint is independently mutable through mDNS even when DACP-ID and
     /// Active-Remote remain unchanged. Re-resolve it before accepting 2xx.
-    endpoint: DacpEndpointSnapshot,
+    endpoint: Option<DacpEndpointSnapshot>,
+    route: ReverseVolumeRoute,
     result: DacpOutcomeResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReverseVolumeRoute {
+    Event,
+    Dacp,
 }
 
 enum DacpOutcomeResult {
@@ -364,66 +685,125 @@ impl DacpWorker {
         let current_serial = Arc::new(AtomicU64::new(0));
         let worker_serial = Arc::clone(&current_serial);
         let thread = thread::Builder::new()
-            .name("ahb-airplay-dacp".to_string())
+            .name("ahb-airplay-volume".to_string())
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
-                    let result = if worker_serial.load(Ordering::Acquire) != job.serial
-                        || !job.remote_control.is_current()
-                        || !job.output_epoch.is_current()
-                        || !job.endpoint.is_current()
-                    {
+                    let mut route = if event_job_authority_current(&job, &worker_serial) {
+                        Some(ReverseVolumeRoute::Event)
+                    } else if dacp_job_authority_current(&job, &worker_serial) {
+                        Some(ReverseVolumeRoute::Dacp)
+                    } else {
+                        None
+                    };
+                    let result = if route.is_none() {
                         DacpOutcomeResult::Superseded
                     } else {
-                        let attempt = send_dacp_volume_guarded(
-                            job.endpoint.address,
-                            &job.remote_control.info().active_remote,
-                            job.db,
-                            &job.write_gate,
-                            || {
-                                worker_serial.load(Ordering::Acquire) == job.serial
-                                    && job.remote_control.is_current()
-                                    && job.output_epoch.is_current()
-                                    && job.endpoint.is_current()
-                            },
-                        );
+                        let attempt: Result<bool> = match route {
+                            Some(ReverseVolumeRoute::Event) => {
+                                let event = job
+                                    .event_control
+                                    .as_ref()
+                                    .expect("event route has a control lease");
+                                if !job.write_gate.commit(|| {
+                                    event_job_authority_current(&job, &worker_serial)
+                                }) {
+                                    Ok(false)
+                                } else {
+                                    match event.send_device_volume(job.scalar, job.muted) {
+                                        Ok(()) => {
+                                            job.write_gate.mark_full_request_written();
+                                            Ok(true)
+                                        }
+                                        Err(event_error) if event_error.may_have_written() => {
+                                            // The sender can already have applied this value even
+                                            // when its RTSP acknowledgement is lost. Preserve the
+                                            // existing echo/tombstone semantics and never double-send
+                                            // through DACP in this ambiguous state.
+                                            job.write_gate.mark_full_request_written();
+                                            Err(anyhow::Error::from(event_error))
+                                        }
+                                        Err(event_error)
+                                            if job.write_gate.retry_after_unwritten(|| {
+                                                dacp_job_authority_current(&job, &worker_serial)
+                                            }) =>
+                                        {
+                                            route = Some(ReverseVolumeRoute::Dacp);
+                                            let endpoint = job
+                                                .endpoint
+                                                .as_ref()
+                                                .expect("DACP fallback has an endpoint");
+                                            let remote = job
+                                                .remote_control
+                                                .as_ref()
+                                                .expect("DACP fallback has credentials");
+                                            send_dacp_volume_guarded(
+                                                endpoint.address,
+                                                &remote.info().active_remote,
+                                                job.db,
+                                                &job.write_gate,
+                                                || {
+                                                    dacp_job_authority_current(
+                                                        &job,
+                                                        &worker_serial,
+                                                    )
+                                                },
+                                            )
+                                            .with_context(|| {
+                                                format!(
+                                                    "AP2 event command was not written ({event_error}); DACP fallback failed"
+                                                )
+                                            })
+                                        }
+                                        Err(event_error) => Err(anyhow::Error::from(event_error)),
+                                    }
+                                }
+                            }
+                            Some(ReverseVolumeRoute::Dacp) => {
+                                let endpoint = job
+                                    .endpoint
+                                    .as_ref()
+                                    .expect("DACP route has an endpoint");
+                                let remote = job
+                                    .remote_control
+                                    .as_ref()
+                                    .expect("DACP route has credentials");
+                                send_dacp_volume_guarded(
+                                    endpoint.address,
+                                    &remote.info().active_remote,
+                                    job.db,
+                                    &job.write_gate,
+                                    || dacp_job_authority_current(&job, &worker_serial),
+                                )
+                            }
+                            None => unreachable!("route absence was handled above"),
+                        };
                         match attempt {
                             Ok(false) => DacpOutcomeResult::Superseded,
                             Ok(true)
-                                if worker_serial.load(Ordering::Acquire) != job.serial
-                                    || !job.remote_control.is_current() =>
+                                if !reverse_job_authority_current(
+                                    &job,
+                                    &worker_serial,
+                                    route.expect("attempt selected a route"),
+                                ) =>
                             {
                                 DacpOutcomeResult::RevokedAfterPossibleWrite
                             }
-                            Ok(true) if !job.output_epoch.is_current() => {
-                                DacpOutcomeResult::RevokedAfterPossibleWrite
-                            }
-                            Ok(true) if !job.endpoint.is_current() => {
-                                DacpOutcomeResult::RevokedAfterPossibleWrite
-                            }
                             Err(_)
-                                if (worker_serial.load(Ordering::Acquire) != job.serial
-                                    || !job.remote_control.is_current())
+                                if !reverse_job_authority_current(
+                                    &job,
+                                    &worker_serial,
+                                    route.expect("attempt selected a route"),
+                                )
                                     && job.write_gate.may_have_written() =>
                             {
                                 DacpOutcomeResult::RevokedAfterPossibleWrite
                             }
                             Err(_)
-                                if !job.output_epoch.is_current()
-                                    && job.write_gate.may_have_written() =>
-                            {
-                                DacpOutcomeResult::RevokedAfterPossibleWrite
-                            }
-                            Err(_)
-                                if !job.endpoint.is_current()
-                                    && job.write_gate.may_have_written() =>
-                            {
-                                DacpOutcomeResult::RevokedAfterPossibleWrite
-                            }
-                            Err(_)
-                                if worker_serial.load(Ordering::Acquire) != job.serial
-                                    || !job.remote_control.is_current()
-                                    || !job.output_epoch.is_current()
-                                    || !job.endpoint.is_current() =>
+                                if !reverse_job_authority_current(
+                                    &job,
+                                    &worker_serial,
+                                    route.expect("attempt selected a route"),
+                                ) =>
                             {
                                 DacpOutcomeResult::Superseded
                             }
@@ -441,6 +821,8 @@ impl DacpWorker {
                             remote_control: job.remote_control,
                             output_epoch: job.output_epoch,
                             endpoint: job.endpoint,
+                            event_control: job.event_control,
+                            route: route.unwrap_or(ReverseVolumeRoute::Event),
                             result,
                         })
                         .is_err()
@@ -449,7 +831,7 @@ impl DacpWorker {
                     }
                 }
             })
-            .expect("spawn AirPlay DACP worker");
+            .expect("spawn AirPlay reverse-volume worker");
         Self {
             jobs: Some(job_tx),
             outcomes: Mutex::new(outcome_rx),
@@ -487,6 +869,41 @@ impl DacpWorker {
 
     fn drain_outcomes(&self) -> Vec<DacpOutcome> {
         lk(&self.outcomes).try_iter().collect()
+    }
+}
+
+fn reverse_job_base_authority_current(job: &DacpJob, current_serial: &AtomicU64) -> bool {
+    current_serial.load(Ordering::Acquire) == job.serial && job.output_epoch.is_current()
+}
+
+fn event_job_authority_current(job: &DacpJob, current_serial: &AtomicU64) -> bool {
+    reverse_job_base_authority_current(job, current_serial)
+        && job
+            .event_control
+            .as_ref()
+            .is_some_and(ReceiverVolumeControlSnapshot::is_current)
+}
+
+fn dacp_job_authority_current(job: &DacpJob, current_serial: &AtomicU64) -> bool {
+    reverse_job_base_authority_current(job, current_serial)
+        && job
+            .remote_control
+            .as_ref()
+            .is_some_and(RemoteControlSnapshot::is_current)
+        && job
+            .endpoint
+            .as_ref()
+            .is_some_and(DacpEndpointSnapshot::is_current)
+}
+
+fn reverse_job_authority_current(
+    job: &DacpJob,
+    current_serial: &AtomicU64,
+    route: ReverseVolumeRoute,
+) -> bool {
+    match route {
+        ReverseVolumeRoute::Event => event_job_authority_current(job, current_serial),
+        ReverseVolumeRoute::Dacp => dacp_job_authority_current(job, current_serial),
     }
 }
 
@@ -935,11 +1352,22 @@ impl VolumeSync {
         }
     }
 
+    #[cfg(test)]
     fn plan_remote(
         &mut self,
         active: Option<u64>,
         current: SystemVolumeState,
         serial: u64,
+    ) -> Option<RemoteInFlight> {
+        self.plan_remote_for_route(active, current, serial, false)
+    }
+
+    fn plan_remote_for_route(
+        &mut self,
+        active: Option<u64>,
+        current: SystemVolumeState,
+        serial: u64,
+        preserve_muted_scalar: bool,
     ) -> Option<RemoteInFlight> {
         self.prune_completed_remote_echoes(Instant::now());
         let target = self.target?;
@@ -953,14 +1381,13 @@ impl VolumeSync {
             return None;
         }
         let known = self.sender_known_system?;
-        if same_system_volume(known, current) && !self.force_remote {
+        if same_reverse_volume(known, current, preserve_muted_scalar) && !self.force_remote {
             self.remote_retry = None;
             return None;
         }
-        if self
-            .remote_retry
-            .is_some_and(|retry| !same_system_volume(retry.desired, current))
-        {
+        if self.remote_retry.is_some_and(|retry| {
+            !same_reverse_volume(retry.desired, current, preserve_muted_scalar)
+        }) {
             self.remote_retry = None;
         }
         let attempts = self.remote_retry.map_or(0, |retry| retry.attempts);
@@ -978,10 +1405,20 @@ impl VolumeSync {
         })
     }
 
+    #[cfg(test)]
     fn settle_remote_if_converged(
         &mut self,
         active: Option<u64>,
         current: SystemVolumeState,
+    ) -> bool {
+        self.settle_remote_if_converged_for_route(active, current, false)
+    }
+
+    fn settle_remote_if_converged_for_route(
+        &mut self,
+        active: Option<u64>,
+        current: SystemVolumeState,
+        preserve_muted_scalar: bool,
     ) -> bool {
         let Some(target) = self.target else {
             return false;
@@ -991,7 +1428,7 @@ impl VolumeSync {
             || self.force_remote
             || !self
                 .sender_known_system
-                .is_some_and(|known| same_system_volume(known, current))
+                .is_some_and(|known| same_reverse_volume(known, current, preserve_muted_scalar))
         {
             return false;
         }
@@ -1275,6 +1712,28 @@ fn reject_revoked_dacp_outcome(
     true
 }
 
+fn reverse_outcome_authority_current(outcome: &DacpOutcome) -> bool {
+    if !outcome.output_epoch.is_current() {
+        return false;
+    }
+    match outcome.route {
+        ReverseVolumeRoute::Event => outcome
+            .event_control
+            .as_ref()
+            .is_some_and(ReceiverVolumeControlSnapshot::is_current),
+        ReverseVolumeRoute::Dacp => {
+            outcome
+                .remote_control
+                .as_ref()
+                .is_some_and(RemoteControlSnapshot::is_current)
+                && outcome
+                    .endpoint
+                    .as_ref()
+                    .is_some_and(DacpEndpointSnapshot::is_current)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Desired {
     effective_enabled: bool,
@@ -1312,7 +1771,6 @@ pub(crate) struct LiveStatus {
     pub listening: bool,
     pub error: Option<String>,
     pub warning: Option<String>,
-    pub raop_port: Option<u16>,
     pub airplay2_port: Option<u16>,
 }
 
@@ -1320,6 +1778,14 @@ pub(crate) struct LiveStatus {
 /// `settings.set` is served by one thread per IPC connection.
 pub(crate) struct AirPlayController {
     advertise: bool,
+    /// Stable AP2 identity is kept under the exact daemon config root (which
+    /// may be test- or environment-overridden), never under a second platform
+    /// default and never in the daemon's unrelated peer identity file.
+    airplay2_identity_path: PathBuf,
+    /// The AP2 control endpoint is persisted beside the identity so sender
+    /// discovery caches do not retain a now-dead ephemeral port after a daemon
+    /// restart or an in-place app redeploy.
+    airplay2_port_path: PathBuf,
     // Changes whenever `state.bus` is replaced. The 10 ms mixer path checks
     // this atomic first and only takes the controller mutex on a replacement.
     bus_epoch: AtomicU64,
@@ -1333,9 +1799,11 @@ pub(crate) struct AirPlayController {
 }
 
 impl AirPlayController {
-    pub(crate) fn new(advertise: bool) -> Arc<Self> {
+    pub(crate) fn new(advertise: bool, config_dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             advertise,
+            airplay2_identity_path: config_dir.join("airplay2-identity"),
+            airplay2_port_path: config_dir.join(AIRPLAY2_PORT_FILE),
             bus_epoch: AtomicU64::new(1),
             volume_apply_lock: Mutex::new(()),
             dacp_serial: AtomicU64::new(1),
@@ -1439,21 +1907,30 @@ impl AirPlayController {
             return;
         }
 
-        // AirPlay 1 only is deliberate. The optional AP2 engine implements a
-        // buffered AAC subset, not macOS's system-wide realtime RAOP path.
+        // The legacy receiver is preserved by the archive branch/tag, not
+        // advertised beside the AudioHub-owned implementation. Keeping this
+        // deployment AP2-only makes every device test an unambiguous test of
+        // our own listener and prevents a sender from silently falling back.
         let mut config = AirPlayConfig::new(desired.effective_name.clone());
         // The protocol library's cross-platform fallback MAC is intentionally
         // constant. Supplying the daemon identity derivative is therefore not
         // optional: two AudioHub receivers on one LAN must not advertise the
-        // same RAOP identity.
+        // same protocol identity.
         config.mac = Some(desired.mac);
         config.password = password;
-        config.enable_airplay1 = true;
-        config.enable_airplay2 = false;
-        config.airplay1_port = 0;
-        config.airplay2_port = 0;
+        config.enable_airplay2 = true;
+        config.airplay2_identity_path = Some(self.airplay2_identity_path.clone());
+        config.initial_volume_db = match read_system_volume() {
+            Ok(volume) => Some(volume.airplay_db()),
+            Err(error) => {
+                dlog!("[audiohubd] AirPlay initial system volume unavailable: {error:#}");
+                None
+            }
+        };
+        #[cfg(test)]
+        config.use_ephemeral_ptp_ports_for_tests();
 
-        let runtime = match AirPlayRuntime::start(config) {
+        let runtime = match start_airplay_runtime(config, &self.airplay2_port_path) {
             Ok(runtime) => runtime,
             Err(e) => {
                 lk(&self.state).error = Some(format!("AirPlay 接收器启动失败：{e}"));
@@ -1519,9 +1996,9 @@ impl AirPlayController {
         }
         let status = self.live_status();
         dlog!(
-            "[audiohubd] AirPlay 1 receiver listening name={:?} port={:?} advertised={}",
+            "[audiohubd] AirPlay 2 receiver listening name={:?} port={:?} advertised={}",
             desired.effective_name,
-            status.raop_port,
+            status.airplay2_port,
             self.advertise
         );
     }
@@ -1785,7 +2262,6 @@ impl AirPlayController {
                 .native_volume_warning
                 .clone()
                 .or_else(|| state.dacp_warning.clone()),
-            raop_port: runtime_status.as_ref().and_then(|s| s.airplay1_port),
             airplay2_port: runtime_status.as_ref().and_then(|s| s.airplay2_port),
         }
     }
@@ -1800,6 +2276,7 @@ impl AirPlayController {
             .status()
             .sessions
             .into_iter()
+            .filter(|session| session.protocol == Protocol::AirPlay2)
             .map(|session| session_view(session, now))
             .collect()
     }
@@ -1918,19 +2395,23 @@ impl AirPlayController {
     fn refresh_dacp_authority(&self) {
         let mut state = lk(&self.state);
         let active = state.bus.as_ref().and_then(PcmBus::active_session);
-        let remote = state
-            .runtime
-            .as_ref()
-            .and_then(AirPlayRuntime::active_remote_control_snapshot)
-            .filter(|snapshot| snapshot.is_current())
-            .and_then(|snapshot| {
-                let endpoint = state.mdns.as_ref()?.dacp_endpoint(snapshot.info())?;
-                Some((
-                    snapshot.info().session_id,
-                    snapshot.revision(),
-                    endpoint.revision,
-                ))
-            });
+        let remote = state.runtime.as_ref().and_then(|runtime| {
+            runtime
+                .receiver_volume_control_snapshot()
+                .filter(ReceiverVolumeControlSnapshot::is_current)
+                .map(|snapshot| (snapshot.session_id(), snapshot.revision(), u64::MAX))
+                .or_else(|| {
+                    let snapshot = runtime
+                        .active_remote_control_snapshot()
+                        .filter(RemoteControlSnapshot::is_current)?;
+                    let endpoint = state.mdns.as_ref()?.dacp_endpoint(snapshot.info())?;
+                    Some((
+                        snapshot.info().session_id,
+                        snapshot.revision(),
+                        endpoint.revision,
+                    ))
+                })
+        });
         if state.volume.observe_remote_revision(active, remote) {
             // Jobs queued under any previous revision must fail their serial
             // guard even if the secret refresh raced between network return
@@ -1960,9 +2441,7 @@ impl AirPlayController {
                 outcome.serial,
                 &outcome.result,
                 &outcome.write_gate,
-                outcome.remote_control.is_current()
-                    && outcome.output_epoch.is_current()
-                    && outcome.endpoint.is_current(),
+                reverse_outcome_authority_current(&outcome),
             ) {
                 continue;
             }
@@ -2030,8 +2509,12 @@ impl AirPlayController {
             match result {
                 Ok(()) => {
                     state.dacp_warning = None;
+                    let route = match outcome.route {
+                        ReverseVolumeRoute::Event => "AP2 event",
+                        ReverseVolumeRoute::Dacp => "DACP",
+                    };
                     dlog!(
-                        "[audiohubd] AirPlay DACP volume request accepted session={} db={:.2}",
+                        "[audiohubd] AirPlay {route} volume request accepted session={} db={:.2}",
                         outcome.session_id,
                         outcome.db
                     );
@@ -2099,36 +2582,60 @@ impl AirPlayController {
         }
         let generation = state.generation;
         let active = state.bus.as_ref().and_then(PcmBus::active_session);
-        if state.volume.settle_remote_if_converged(active, current) {
+        let event_control = state
+            .runtime
+            .as_ref()
+            .and_then(AirPlayRuntime::receiver_volume_control_snapshot)
+            .filter(|control| active == Some(control.session_id()) && control.is_current());
+        let dacp_route = state
+            .runtime
+            .as_ref()
+            .and_then(AirPlayRuntime::active_remote_control_snapshot)
+            .filter(|remote| active == Some(remote.info().session_id) && remote.is_current())
+            .and_then(|remote| {
+                let endpoint = state
+                    .mdns
+                    .as_ref()
+                    .and_then(|mdns| mdns.dacp_endpoint(remote.info()))?;
+                Some((remote, endpoint))
+            });
+        let (remote_control, endpoint) = match dacp_route {
+            Some((remote, endpoint)) => (Some(remote), Some(endpoint)),
+            None => (None, None),
+        };
+        if event_control.is_none() && remote_control.is_none() {
+            return None;
+        }
+        let preserve_muted_scalar = event_control.is_some();
+        if state
+            .volume
+            .settle_remote_if_converged_for_route(active, current, preserve_muted_scalar)
+        {
             // A failed reverse write is no longer a pending user action once
             // the native endpoint naturally returns to the value the sender
             // already represents.
             state.dacp_warning = None;
             return None;
         }
-        let remote = state
-            .runtime
-            .as_ref()
-            .and_then(AirPlayRuntime::active_remote_control_snapshot);
-        let remote = remote
-            .filter(|remote| active == Some(remote.info().session_id) && remote.is_current())?;
-        let endpoint = state
-            .mdns
-            .as_ref()
-            .and_then(|mdns| mdns.dacp_endpoint(remote.info()))?;
         let serial = self.dacp_serial.fetch_add(1, Ordering::Relaxed).max(1);
-        let flight = state.volume.plan_remote(active, current, serial)?;
+        let flight =
+            state
+                .volume
+                .plan_remote_for_route(active, current, serial, preserve_muted_scalar)?;
         if !output_epoch.is_current() {
             return Some(output_epoch.observed());
         }
         let job = DacpJob {
             serial,
             generation,
-            session_id: remote.info().session_id,
+            session_id: active.expect("reverse volume plan requires an active session"),
             endpoint,
-            remote_control: remote,
+            remote_control,
+            event_control,
             output_epoch,
             db: flight.db,
+            scalar: current.scalar,
+            muted: current.muted,
             write_gate: flight.write_gate.clone(),
         };
         match self.dacp.try_send(job) {
@@ -2178,7 +2685,7 @@ pub(crate) fn reconcile(inner: &Arc<DaemonInner>, secret_changed: bool) {
     let stored = lk(&inner.settings).clone();
     let identity = inner.identity();
     let name = effective_name(&stored.airplay_name, &identity.name);
-    let mac = raop_mac_from_fingerprint(&identity.fingerprint)
+    let mac = airplay_mac_from_fingerprint(&identity.fingerprint)
         .expect("LocalIdentity fingerprints are always 16 lowercase hex digits");
     let share_mode = crate::haldev::effective_mode(inner).serves_peers();
     let mut effective_enabled = stored.airplay_enabled && share_mode;
@@ -2207,11 +2714,11 @@ pub(crate) fn reconcile(inner: &Arc<DaemonInner>, secret_changed: bool) {
     });
 }
 
-/// Derive a stable, per-installation locally-administered unicast MAC from the
-/// daemon's persisted Ed25519 fingerprint. RAOP embeds this value in the DNS-SD
-/// instance and challenge response, so it is receiver identity rather than a
+/// Derive a stable, per-installation locally-administered unicast identifier
+/// from the daemon's persisted Ed25519 fingerprint. Protocol discovery and
+/// authentication use this as receiver identity rather than as a
 /// network-interface discovery hint.
-fn raop_mac_from_fingerprint(fingerprint: &str) -> Option<[u8; 6]> {
+fn airplay_mac_from_fingerprint(fingerprint: &str) -> Option<[u8; 6]> {
     if fingerprint.len() < 12 {
         return None;
     }
@@ -2226,18 +2733,18 @@ fn raop_mac_from_fingerprint(fingerprint: &str) -> Option<[u8; 6]> {
     Some(mac)
 }
 
-/// Name the sender really sees. A DNS label is at most 63 octets and RAOP
-/// reserves 13 of them for `<MAC>@`; truncating by Unicode scalar count would
-/// still let 48 CJK characters become 144 octets and be truncated elsewhere.
-/// Both runtime config and `settings.get.airplay_effective_name` call this one
-/// helper, so the UI never promises a longer name than the picker receives.
+/// Name the sender really sees. An AirPlay 2 DNS label is at most 63 octets;
+/// truncating by Unicode scalar count would still let 48 CJK characters become
+/// 144 octets and be truncated elsewhere. Both runtime config and
+/// `settings.get.airplay_effective_name` call this one helper, so the UI never
+/// promises a longer name than the picker receives.
 pub(crate) fn effective_name(custom: &str, daemon_name: &str) -> String {
     let requested = if custom.trim().is_empty() {
         format!("AudioHub — {daemon_name}")
     } else {
         custom.trim().to_string()
     };
-    let fitted = utf8_prefix(&requested, PICKER_NAME_MAX_BYTES)
+    let fitted = utf8_prefix(&requested, AIRPLAY_PICKER_NAME_MAX_BYTES)
         .trim()
         .to_string();
     if fitted.is_empty() {
@@ -2275,13 +2782,10 @@ fn authoritative_volume_target(
 }
 
 fn session_view(session: RuntimeSessionInfo, now_unix_ms: u64) -> AirPlaySessionInfo {
+    debug_assert_eq!(session.protocol, Protocol::AirPlay2);
     AirPlaySessionInfo {
         id: session.id,
-        protocol: match session.protocol {
-            Protocol::AirPlay1 => "airplay1",
-            Protocol::AirPlay2 => "airplay2",
-        }
-        .to_string(),
+        protocol: "airplay2".to_string(),
         peer: session
             .peer
             .map(|peer| peer.to_string())
@@ -2395,23 +2899,38 @@ impl VolumeBackend for SystemVolume {
 fn apply_volume_with(backend: &mut impl VolumeBackend, db: f32) -> Result<f32> {
     match volume_plan(db)? {
         VolumePlan::Mute => {
-            // AirPlay's -144 dB is an explicit mute sentinel, not a slider
-            // coordinate. Preserve the underlying slider so an unmute can
-            // resume at the same level, including when this is a delayed RTSP
-            // echo of a receiver-originated DACP mute.
-            let setter = backend.set_mute(true);
+            // Native Music uses -144 dB for the visible zero-percent endpoint,
+            // not just for a separate mute button. Move the receiver's visible
+            // slider to zero as well as muting it; otherwise sender 0% leaves
+            // (for example) a 50% system slider behind and violates AudioHub's
+            // direct-sync contract. A receiver-originated mute is different:
+            // its reflected -144 dB RTSP value is consumed by VolumeSync as a
+            // DACP echo before it reaches this function, preserving the local
+            // slider for an explicit native mute/unmute cycle.
+            let scalar_setter = backend.set_scalar(0.0);
+            let mute_setter = backend.set_mute(true);
             let state = backend
                 .read_state()
-                .context("read system output state after mute")?;
-            if state.muted {
-                Ok(state.scalar)
-            } else if let Err(error) = setter {
-                Err(error).context("mute default output")
-            } else {
-                Err(anyhow!(
-                    "default output mute setter succeeded without muting the endpoint"
-                ))
+                .context("read system output state after zero and mute")?;
+            if state.scalar > SYSTEM_VOLUME_SCALAR_EPSILON {
+                return if let Err(error) = scalar_setter {
+                    Err(error).context("set default output slider to zero")
+                } else {
+                    Err(anyhow!(
+                        "default output volume setter succeeded without moving the endpoint to zero"
+                    ))
+                };
             }
+            if !state.muted {
+                return if let Err(error) = mute_setter {
+                    Err(error).context("mute default output")
+                } else {
+                    Err(anyhow!(
+                        "default output mute setter succeeded without muting the endpoint"
+                    ))
+                };
+            }
+            Ok(state.scalar)
         }
         VolumePlan::Level { scalar } => {
             // Set the level before unmuting, avoiding a transient at the old
@@ -2487,9 +3006,20 @@ fn read_system_volume() -> Result<SystemVolumeState> {
     })
 }
 
-fn same_system_volume(left: SystemVolumeState, right: SystemVolumeState) -> bool {
-    if left.muted || right.muted {
-        return left.muted == right.muted;
+/// Event-channel `dvlc` carries the slider and mute flag independently, so a
+/// muted slider movement remains observable and must be synchronized. Legacy
+/// DACP can express only the `-144 dB` mute sentinel and deliberately ignores
+/// scalar changes while both sides are muted to avoid an endless no-op loop.
+fn same_reverse_volume(
+    left: SystemVolumeState,
+    right: SystemVolumeState,
+    preserve_muted_scalar: bool,
+) -> bool {
+    if left.muted != right.muted {
+        return false;
+    }
+    if left.muted && !preserve_muted_scalar {
+        return true;
     }
     left.scalar.is_finite()
         && right.scalar.is_finite()
@@ -2672,19 +3202,27 @@ impl AirPlayMdnsGuard {
         if services.is_empty() {
             return Err(anyhow!("receiver returned no DNS-SD services"));
         }
-        // Production is AP1-only. Refusing an accidental AP2 record here keeps
-        // the user-visible promise stronger than a config default that a later
-        // refactor could flip.
-        if services.iter().any(|s| s.protocol != Protocol::AirPlay1) {
-            return Err(anyhow!("experimental AirPlay 2 advertisement is disabled"));
-        }
         let host = local_host_name();
         let mut registrations = Vec::with_capacity(services.len());
+        let mut protocols = HashSet::with_capacity(services.len());
         for service in services {
-            if service.service_type != "_raop._tcp.local." {
+            if service.protocol != Protocol::AirPlay2 {
                 return Err(anyhow!(
-                    "unexpected AirPlay service type {:?}",
-                    service.service_type
+                    "receiver returned unsupported AirPlay protocol {:?}",
+                    service.protocol
+                ));
+            }
+            if service.service_type != "_airplay._tcp.local." {
+                return Err(anyhow!(
+                    "AirPlay protocol {:?} returned mismatched DNS-SD type {:?}",
+                    service.protocol,
+                    service.service_type,
+                ));
+            }
+            if !protocols.insert(service.protocol) {
+                return Err(anyhow!(
+                    "receiver returned duplicate {:?} DNS-SD service",
+                    service.protocol
                 ));
             }
             let props = txt_pairs(&service.txt_records)?;
@@ -2702,6 +3240,15 @@ impl AirPlayMdnsGuard {
         }
 
         let daemon = ServiceDaemon::new().context("start AirPlay mDNS daemon")?;
+        // The native receiver currently binds an IPv4 control socket and its
+        // PTP/media path is likewise IPv4-only. Keep address auto-refresh, but
+        // restrict this dedicated daemon before registering or browsing so it
+        // cannot publish an unreachable AAAA record (or resolve an IPv6-only
+        // DACP route for a control session that necessarily arrived over IPv4).
+        if let Err(error) = daemon.disable_interface(IfKind::IPv6) {
+            let _ = daemon.shutdown();
+            return Err(error).context("restrict AirPlay mDNS to reachable IPv4 interfaces");
+        }
         let monitor = match daemon.monitor() {
             Ok(monitor) => monitor,
             Err(error) => {
@@ -2986,11 +3533,279 @@ fn txt_pairs(records: &[String]) -> Result<Vec<(String, String)>> {
 mod tests {
     use super::*;
 
+    struct PortTestDir(PathBuf);
+
+    impl PortTestDir {
+        fn new(label: &str) -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let sequence = AIRPLAY2_PORT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "audiohub-airplay-port-{label}-{}-{stamp}-{sequence}",
+                std::process::id()
+            )))
+        }
+
+        fn port_path(&self) -> PathBuf {
+            self.0.join(AIRPLAY2_PORT_FILE)
+        }
+
+        fn runtime_config(&self) -> AirPlayConfig {
+            let mut config = AirPlayConfig::new("AudioHub port test");
+            config.mac = Some([0x02, 0, 0, 0, 0, 1]);
+            config.airplay2_identity_path = Some(self.0.join("airplay2-identity"));
+            config.use_ephemeral_ptp_ports_for_tests();
+            config
+        }
+    }
+
+    impl Drop for PortTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn running_port(runtime: &AirPlayRuntime) -> u16 {
+        runtime
+            .status()
+            .airplay2_port
+            .filter(|port| *port != 0)
+            .expect("test runtime must expose its nonzero control port")
+    }
+
+    #[test]
+    fn missing_airplay2_port_is_selected_and_persisted() {
+        let dir = PortTestDir::new("missing");
+        let path = dir.port_path();
+        assert_eq!(load_airplay2_port(&path).unwrap(), None);
+
+        let runtime = start_airplay_runtime(dir.runtime_config(), &path).unwrap();
+        let port = running_port(&runtime);
+        assert_eq!(load_airplay2_port(&path).unwrap(), Some(port));
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn invalid_airplay2_port_is_replaced_after_successful_start() {
+        let dir = PortTestDir::new("invalid");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.port_path();
+        std::fs::write(&path, b"not-a-port\n").unwrap();
+        assert_eq!(
+            load_airplay2_port(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let runtime = start_airplay_runtime(dir.runtime_config(), &path).unwrap();
+        let port = running_port(&runtime);
+        assert_eq!(load_airplay2_port(&path).unwrap(), Some(port));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{port}\n"));
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn airplay2_port_persistence_atomically_replaces_the_record() {
+        let dir = PortTestDir::new("persist");
+        let path = dir.port_path();
+        persist_airplay2_port(&path, 49_152).unwrap();
+        assert_eq!(load_airplay2_port(&path).unwrap(), Some(49_152));
+        persist_airplay2_port(&path, 49_153).unwrap();
+        assert_eq!(load_airplay2_port(&path).unwrap(), Some(49_153));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "49153\n");
+        assert!(std::fs::read_dir(&dir.0).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+    }
+
+    #[test]
+    fn stale_airplay2_port_staging_collision_is_skipped_without_deletion() {
+        let dir = PortTestDir::new("stale-stage");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let collision = 41;
+        let fresh = 42;
+        let stale = dir.0.join(format!(
+            ".{AIRPLAY2_PORT_FILE}.{}.{}.tmp",
+            std::process::id(),
+            collision
+        ));
+        std::fs::write(&stale, b"crash residue").unwrap();
+        let mut sequences = [collision, fresh].into_iter();
+
+        persist_airplay2_port_with_sequences(&dir.port_path(), 49_154, || {
+            sequences.next().expect("allocator used at most two names")
+        })
+        .unwrap();
+        assert_eq!(load_airplay2_port(&dir.port_path()).unwrap(), Some(49_154));
+        assert_eq!(
+            std::fs::read(&stale).unwrap(),
+            b"crash residue",
+            "a create_new collision belongs to an older process incarnation"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_long_config_path_atomically_replaces_airplay2_port() {
+        let dir = PortTestDir::new("windows-long-path");
+        let mut long_dir = dir.0.clone();
+        for index in 0..4 {
+            long_dir.push(format!("segment-{index}-{}", "x".repeat(72)));
+        }
+        std::fs::create_dir_all(&long_dir).unwrap();
+        let path = long_dir.join(AIRPLAY2_PORT_FILE);
+        assert!(path.as_os_str().len() > 260);
+
+        persist_airplay2_port(&path, 49_152).unwrap();
+        persist_airplay2_port(&path, 49_153).unwrap();
+        assert_eq!(load_airplay2_port(&path).unwrap(), Some(49_153));
+    }
+
+    #[test]
+    fn airplay2_runtime_reuses_its_persisted_control_port() {
+        let dir = PortTestDir::new("reuse");
+        let path = dir.port_path();
+        let first = start_airplay_runtime(dir.runtime_config(), &path).unwrap();
+        let first_port = running_port(&first);
+        first.stop().unwrap();
+
+        let second = start_airplay_runtime(dir.runtime_config(), &path).unwrap();
+        assert_eq!(running_port(&second), first_port);
+        assert_eq!(load_airplay2_port(&path).unwrap(), Some(first_port));
+        second.stop().unwrap();
+    }
+
+    #[test]
+    fn accepted_control_connection_does_not_rotate_port_on_immediate_restart() {
+        let dir = PortTestDir::new("accepted-restart");
+        let path = dir.port_path();
+        let first = start_airplay_runtime(dir.runtime_config(), &path).unwrap();
+        let first_port = running_port(&first);
+
+        let mut sender = TcpStream::connect(("127.0.0.1", first_port)).unwrap();
+        sender
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        for (request, status) in [
+            (
+                b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n".as_slice(),
+                b"RTSP/1.0 200".as_slice(),
+            ),
+            // A duplicate CSeq is rejected with close-after-response. This
+            // makes the receiver, rather than the test client, actively close
+            // a real accepted connection before the listener is restarted.
+            (
+                b"OPTIONS * RTSP/1.0\r\nCSeq: 2\r\nCSeq: 3\r\nContent-Length: 0\r\n\r\n".as_slice(),
+                b"RTSP/1.0 400".as_slice(),
+            ),
+        ] {
+            sender.write_all(request).unwrap();
+            let mut response = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = sender.read(&mut chunk).unwrap();
+                assert_ne!(count, 0, "receiver closed before its RTSP response");
+                response.extend_from_slice(&chunk[..count]);
+            }
+            assert!(response.starts_with(status));
+        }
+        let mut eof = [0u8; 1];
+        assert_eq!(
+            sender.read(&mut eof).unwrap(),
+            0,
+            "receiver-authored RTSP rejection must close"
+        );
+        drop(sender);
+        first.stop().unwrap();
+
+        let second = start_airplay_runtime(dir.runtime_config(), &path).unwrap();
+        assert_eq!(running_port(&second), first_port);
+        assert_eq!(load_airplay2_port(&path).unwrap(), Some(first_port));
+        second.stop().unwrap();
+    }
+
+    #[test]
+    fn occupied_persisted_airplay2_port_falls_back_and_replaces_record() {
+        let dir = PortTestDir::new("conflict");
+        let path = dir.port_path();
+        let occupied = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        persist_airplay2_port(&path, occupied_port).unwrap();
+
+        let runtime = start_airplay_runtime(dir.runtime_config(), &path).unwrap();
+        let replacement = running_port(&runtime);
+        assert_ne!(replacement, occupied_port);
+        assert_eq!(load_airplay2_port(&path).unwrap(), Some(replacement));
+        runtime.stop().unwrap();
+        drop(occupied);
+    }
+
+    #[test]
+    fn only_explicit_control_bind_errors_are_rotation_eligible() {
+        for kind in [io::ErrorKind::AddrInUse, io::ErrorKind::PermissionDenied] {
+            let later_startup = io::Error::new(kind, "identity or PTP startup failed");
+            assert!(persisted_port_unavailable(&later_startup));
+            assert!(!is_control_port_bind_failure(&later_startup));
+        }
+
+        let occupied = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let dir = PortTestDir::new("bind-classification");
+        let mut config = dir.runtime_config();
+        config.airplay2_port = occupied.local_addr().unwrap().port();
+        let marked = AirPlayRuntime::start(config).unwrap_err();
+        assert_eq!(marked.kind(), io::ErrorKind::AddrInUse);
+        assert!(is_control_port_bind_failure(&marked));
+    }
+
+    #[test]
+    fn unreadable_airplay2_port_record_never_starts_or_rotates() {
+        let dir = PortTestDir::new("unreadable");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.port_path();
+        std::fs::write(&path, b"49152\n").unwrap();
+
+        let error = start_airplay_runtime_after_port_load(
+            dir.runtime_config(),
+            &path,
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated sharing or permission failure",
+            )),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&path).unwrap(), b"49152\n");
+        assert!(
+            !dir.0.join("airplay2-identity").exists(),
+            "an unreadable port record must fail before receiver startup"
+        );
+    }
+
     fn full_write_gate() -> DacpWriteGate {
         let gate = DacpWriteGate::new();
         assert!(gate.commit(|| true));
         gate.mark_full_request_written();
         gate
+    }
+
+    #[test]
+    fn guaranteed_unwritten_event_attempt_can_rearm_the_dacp_write_gate() {
+        let gate = DacpWriteGate::new();
+        assert!(gate.commit(|| true));
+        assert!(gate.retry_after_unwritten(|| true));
+        assert!(gate.commit(|| true));
+        gate.mark_full_request_written();
+        assert!(gate.may_have_written());
+
+        let stale = DacpWriteGate::new();
+        assert!(stale.commit(|| true));
+        assert!(!stale.retry_after_unwritten(|| false));
+        assert!(!stale.may_have_written());
     }
 
     struct FakeVolume {
@@ -3052,9 +3867,12 @@ mod tests {
         assert_eq!(applied, scalar);
 
         volume.actions.clear();
-        let preserved = apply_volume_with(&mut volume, -144.0).unwrap();
-        assert_eq!(volume.actions, vec![("mute".into(), 1.0)]);
-        assert_eq!(preserved, scalar);
+        let muted_zero = apply_volume_with(&mut volume, -144.0).unwrap();
+        assert_eq!(
+            volume.actions,
+            vec![("scalar".into(), 0.0), ("mute".into(), 1.0)]
+        );
+        assert_eq!(muted_zero, 0.0);
     }
 
     #[test]
@@ -3073,8 +3891,11 @@ mod tests {
 
         volume.actions.clear();
         assert!(apply_volume_with(&mut volume, -144.0).is_err());
-        assert_eq!(volume.actions, vec![("mute".into(), 1.0)]);
-        assert_eq!(volume.scalar, 0.5);
+        assert_eq!(
+            volume.actions,
+            vec![("scalar".into(), 0.0), ("mute".into(), 1.0)]
+        );
+        assert_eq!(volume.scalar, 0.0);
 
         volume.actions.clear();
         volume.muted = true;
@@ -3091,6 +3912,7 @@ mod tests {
         };
         assert!(apply_volume_with(&mut silent_mute, -144.0).is_err());
         assert!(!silent_mute.muted);
+        assert_eq!(silent_mute.scalar, 0.0);
 
         let mut silent_unmute = FakeVolume {
             scalar: 0.5,
@@ -3147,6 +3969,34 @@ mod tests {
         assert_eq!(mute.scalar, 0.0);
         assert!(mute.muted);
         assert_eq!(mute.airplay_db(), -144.0);
+    }
+
+    #[test]
+    fn event_volume_preserves_muted_slider_changes_while_dacp_does_not_loop() {
+        let target = SessionVolume {
+            session_id: 9,
+            db: -144.0,
+        };
+        let changed_while_muted = SystemVolumeState {
+            scalar: 0.2,
+            muted: true,
+        };
+
+        let mut dacp = VolumeSync::default();
+        dacp.remember(target);
+        dacp.succeeded(target);
+        assert!(dacp
+            .plan_remote(Some(target.session_id), changed_while_muted, 1)
+            .is_none());
+
+        let mut event = VolumeSync::default();
+        event.remember(target);
+        event.succeeded(target);
+        let flight = event
+            .plan_remote_for_route(Some(target.session_id), changed_while_muted, 2, true)
+            .expect("dvlc carries scalar and mute independently");
+        assert_eq!(flight.desired, changed_while_muted);
+        assert_eq!(flight.db, -144.0);
     }
 
     #[test]
@@ -5291,39 +6141,38 @@ mod tests {
     fn effective_picker_name_is_one_shared_utf8_byte_bounded_value() {
         let custom = "客".repeat(48);
         let fitted = effective_name(&custom, "ignored");
-        assert_eq!(fitted.as_bytes().len(), 48);
-        assert_eq!(fitted.chars().count(), 16);
-        assert!(13 + fitted.len() <= DNS_LABEL_MAX_BYTES);
+        assert_eq!(fitted.as_bytes().len(), DNS_LABEL_MAX_BYTES);
+        assert_eq!(fitted.chars().count(), 21);
 
         let followed = effective_name("", &"房".repeat(48));
-        assert!(followed.len() <= PICKER_NAME_MAX_BYTES);
+        assert!(followed.len() <= AIRPLAY_PICKER_NAME_MAX_BYTES);
         assert!(followed.starts_with("AudioHub — "));
     }
 
     #[test]
-    fn raop_mac_is_stable_unique_material_with_local_unicast_bits() {
-        let mac = raop_mac_from_fingerprint("59857220d4b67e6e").expect("valid fingerprint");
+    fn airplay_mac_is_stable_unique_material_with_local_unicast_bits() {
+        let mac = airplay_mac_from_fingerprint("59857220d4b67e6e").expect("valid fingerprint");
         assert_eq!(mac, [0x5a, 0x85, 0x72, 0x20, 0xd4, 0xb6]);
-        assert_eq!(mac[0] & 0x01, 0, "RAOP identity must be unicast");
+        assert_eq!(mac[0] & 0x01, 0, "AirPlay identity must be unicast");
         assert_eq!(
             mac[0] & 0x02,
             0x02,
-            "RAOP identity must be locally administered"
+            "AirPlay identity must be locally administered"
         );
         assert_eq!(
-            raop_mac_from_fingerprint("58857220d4b67e6e"),
+            airplay_mac_from_fingerprint("58857220d4b67e6e"),
             Some([0x5a, 0x85, 0x72, 0x20, 0xd4, 0xb6]),
             "hardware multicast/local bits are identity metadata, not entropy"
         );
-        assert!(raop_mac_from_fingerprint("short").is_none());
-        assert!(raop_mac_from_fingerprint("zz857220d4b67e6e").is_none());
+        assert!(airplay_mac_from_fingerprint("short").is_none());
+        assert!(airplay_mac_from_fingerprint("zz857220d4b67e6e").is_none());
     }
 
     #[test]
     fn session_connected_ms_is_elapsed_duration_and_never_a_daemon_timestamp() {
         let session = RuntimeSessionInfo {
             id: 7,
-            protocol: Protocol::AirPlay1,
+            protocol: Protocol::AirPlay2,
             peer: Some("192.0.2.4".parse().unwrap()),
             sample_rate: 44_100,
             channels: 2,

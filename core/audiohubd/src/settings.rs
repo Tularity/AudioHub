@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
+use audiohub_security::{secure_private_directory, secure_private_file};
 use serde::{Deserialize, Serialize};
 
 use audiohub_ipc::Mode;
@@ -295,7 +296,16 @@ static AIRPLAY_SECRET_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct AirPlayPasswordSnapshot(Option<Vec<u8>>);
 
 pub(crate) fn snapshot_airplay_password(dir: &Path) -> Result<AirPlayPasswordSnapshot> {
+    secure_private_directory(dir)
+        .with_context(|| format!("secure private directory {}", dir.display()))?;
     let path = dir.join(AIRPLAY_SECRET_FILE);
+    match secure_private_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AirPlayPasswordSnapshot(None))
+        }
+        Err(error) => return Err(error).with_context(|| format!("secure {}", path.display())),
+    }
     match std::fs::read(&path) {
         Ok(bytes) => Ok(AirPlayPasswordSnapshot(Some(bytes))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -309,7 +319,14 @@ pub(crate) fn snapshot_airplay_password(dir: &Path) -> Result<AirPlayPasswordSna
 /// `settings.json`: that file is routinely returned over IPC, while this value
 /// must never enter a settings view or frontend state snapshot.
 pub(crate) fn load_airplay_password(dir: &Path) -> Result<Option<String>> {
+    secure_private_directory(dir)
+        .with_context(|| format!("secure private directory {}", dir.display()))?;
     let path = dir.join(AIRPLAY_SECRET_FILE);
+    match secure_private_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("secure {}", path.display())),
+    }
     match std::fs::read_to_string(&path) {
         Ok(secret) if secret.is_empty() => Ok(None),
         Ok(secret) => Ok(Some(secret)),
@@ -347,7 +364,8 @@ fn clear_airplay_password(dir: &Path) -> Result<()> {
 }
 
 fn replace_airplay_password_bytes(dir: &Path, contents: &[u8]) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    secure_private_directory(dir)
+        .with_context(|| format!("secure private directory {}", dir.display()))?;
     let path = dir.join(AIRPLAY_SECRET_FILE);
     let seq = AIRPLAY_SECRET_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(
@@ -366,12 +384,14 @@ fn replace_airplay_password_bytes(dir: &Path, contents: &[u8]) -> Result<()> {
         let mut file = opts
             .open(&tmp)
             .with_context(|| format!("write {}", tmp.display()))?;
+        secure_private_file(&tmp).with_context(|| format!("secure {}", tmp.display()))?;
         file.write_all(contents)
             .with_context(|| format!("write {}", tmp.display()))?;
         file.sync_all()
             .with_context(|| format!("sync {}", tmp.display()))?;
         drop(file);
         std::fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
+        secure_private_file(&path).with_context(|| format!("secure {}", path.display()))?;
         Ok(())
     })();
     if result.is_err() {
@@ -391,8 +411,9 @@ pub(crate) fn restore_airplay_password(
 }
 
 /// Replace (or explicitly clear) the AirPlay password using an atomic rename.
-/// On Unix the file is created 0600; on Windows `%APPDATA%` supplies the
-/// per-user ACL inherited by new files in the AudioHub directory.
+/// On Unix the file is created 0600. On Windows its DACL is protected from
+/// inheritance and grants access only to the current user, Administrators and
+/// SYSTEM; persistence never shells out to PowerShell.
 pub(crate) fn save_airplay_password(dir: &Path, password: &str) -> Result<()> {
     validate_airplay_password(password)?;
     if password.is_empty() {
@@ -749,12 +770,27 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.join(AIRPLAY_SECRET_FILE))
+            let path = dir.join(AIRPLAY_SECRET_FILE);
+            let mode = std::fs::metadata(&path)
                 .expect("metadata")
                 .permissions()
                 .mode()
                 & 0o777;
             assert_eq!(mode, 0o600);
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("loosen file for upgrade test");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                .expect("loosen directory for upgrade test");
+            load_airplay_password(&dir).expect("reload repairs permissions");
+            assert_eq!(
+                std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&dir).expect("metadata").permissions().mode() & 0o777,
+                0o700
+            );
         }
         save_airplay_password(&dir, "").expect("clear secret");
         assert!(!airplay_password_is_set(&dir));

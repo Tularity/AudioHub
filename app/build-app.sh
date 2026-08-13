@@ -27,6 +27,15 @@ die()  { print -ru2 -- "[audiohub] ERROR: $*"; exit 1; }
 TRIPLE="$(rustc -vV | awk '/^host: /{print $2}')"
 [[ -n "$TRIPLE" ]] || die "could not determine host triple from rustc -vV"
 
+# Keep the binary-distribution notices tied to the exact locked dependency
+# graphs being built. The generator is deterministic and refuses unresolved
+# licenses, unpinned cargo-about versions, and accidental local path leakage.
+step "license inventory (locked Cargo graphs)"
+command -v node >/dev/null 2>&1 || die "node not found — required to generate third-party notices"
+node "$ROOT/scripts/generate-third-party-licenses.mjs"
+[[ -s "$ROOT/THIRD-PARTY-LICENSES.html" ]] \
+  || die "third-party license report was not generated"
+
 # ---------------------------------------------------------------- 0) frontend
 # The UI is Vite + React (source: app/frontend, output: app/ui). It is built
 # FIRST and explicitly, not left to Tauri's beforeBuildCommand, for two reasons:
@@ -125,6 +134,13 @@ SIDE="$BUNDLE/Contents/MacOS/audiohub"
 [[ -x "$SIDE" ]] || die "daemon not bundled next to the executable ($SIDE) — the .app cannot self-bootstrap"
 [[ ! "$EXE" -ef "$SIDE" ]] || die "app executable and daemon resolve to the SAME file — nothing was bundled"
 [[ -f "$BUNDLE/Contents/Resources/icon.icns" ]] || die "icon.icns not in the bundle"
+LICENSES="$BUNDLE/Contents/Resources/licenses"
+cmp -s "$ROOT/LICENSE" "$LICENSES/AudioHub-LICENSE.txt" \
+  || die "AudioHub license is missing or changed in the bundle"
+cmp -s "$ROOT/NOTICE.md" "$LICENSES/AudioHub-NOTICE.md" \
+  || die "AudioHub notices are missing or changed in the bundle"
+cmp -s "$ROOT/THIRD-PARTY-LICENSES.html" "$LICENSES/THIRD-PARTY-LICENSES.html" \
+  || die "third-party license report is missing or changed in the bundle"
 # Throwaway config dir: `id` would otherwise materialise a key in the real one.
 PROBE="$(mktemp -d)"
 AUDIOHUB_CONFIG_DIR="$PROBE" "$SIDE" id --json 2>/dev/null | python3 -c \

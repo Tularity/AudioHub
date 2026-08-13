@@ -143,8 +143,8 @@ impl PcmBus {
         }
     }
 
-    /// Session whose samples currently own the bus. When AirPlay 1 and the
-    /// opt-in AirPlay 2 listener overlap, the most recently created sink wins.
+    /// Session whose samples currently own the bus. When protocol sessions
+    /// overlap, the most recently created sink wins.
     pub fn active_session(&self) -> Option<u64> {
         session_from_wire(self.inner.active_session.load(Ordering::Acquire))
     }
@@ -301,8 +301,8 @@ impl PcmReader {
         };
         let active_session_hint = session_from_wire(inner.active_session.load(Ordering::Acquire));
         // This reader runs on AudioHub's 10 ms deadline thread. A concurrent
-        // RAOP packet write must never park that thread: retain the cursor and
-        // emit one silent frame, then catch up on the next tick.
+        // A network-media write must never park that thread: retain the cursor
+        // and emit one silent frame, then catch up on the next tick.
         let mut state = match inner.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::WouldBlock) => {

@@ -22,9 +22,6 @@ function stateText(
   if (supported == null) return t('share.proto.airplay.stateLoading');
   if (!supported) return t('share.proto.airplay.stateUnsupported');
   const ports = [
-    settings?.airplay_raop_port
-      ? t('share.proto.airplay.raopPort', { port: settings.airplay_raop_port })
-      : null,
     settings?.airplay_airplay2_port
       ? t('share.proto.airplay.airplay2Port', {
         port: settings.airplay_airplay2_port,
@@ -319,7 +316,6 @@ function ActiveSession({ session, index }: {
   const connected = typeof session.connected_ms === 'number'
     ? fmt.uptime(session.connected_ms / 1000)
     : null;
-  const classicRaop = session.protocol === 'airplay1';
 
   return (
     <li
@@ -329,10 +325,8 @@ function ActiveSession({ session, index }: {
       <div className="proto-session-head">
         <strong>{title}</strong>
         <span className="tag">{protocol}</span>
-        <span className={`tag ${classicRaop ? '' : session.paused ? 'warn' : 'ok'}`}>
-          {classicRaop
-            ? t('share.proto.active.transportConnected')
-            : session.paused
+        <span className={`tag ${session.paused ? 'warn' : 'ok'}`}>
+          {session.paused
             ? t('share.proto.active.paused')
             : t('share.proto.active.playing')}
         </span>

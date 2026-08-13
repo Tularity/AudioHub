@@ -1,0 +1,31 @@
+<div class="graph-report">
+  <h3>Resolved package inventory</h3>
+  <table>
+    <thead>
+      <tr><th>Package</th><th>Version</th><th>Resolved license</th></tr>
+    </thead>
+    <tbody>
+      {{#each crates}}
+      <tr>
+        <td>{{#if package.repository}}<a href="{{package.repository}}">{{package.name}}</a>{{else}}{{package.name}}{{/if}}</td>
+        <td>{{package.version}}</td>
+        <td><code>{{license}}</code></td>
+      </tr>
+      {{/each}}
+    </tbody>
+  </table>
+
+  <h3>License texts</h3>
+  {{#each licenses}}
+  <article class="license-block">
+    <h4>{{name}} <code>{{id}}</code></h4>
+    <p>Used by:</p>
+    <ul>
+      {{#each used_by}}
+      <li>{{crate.name}} {{crate.version}}</li>
+      {{/each}}
+    </ul>
+    <pre>{{text}}</pre>
+  </article>
+  {{/each}}
+</div>

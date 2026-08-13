@@ -1,0 +1,68 @@
+# cargo-about 0.9.1 configuration for the core release Cargo graph.
+#
+# The workspace invocation covers the core, daemon, CLI, and self-developed
+# AirPlay 2 runtime dependency graph. The standalone Tauri graph has its
+# matching config in `app/src-tauri/about.toml`.
+
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+]
+
+# AudioHub currently releases native macOS arm64 and Windows x64 binaries.
+# cargo-about treats this as the union of both target-specific graphs.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Build tools and test-only libraries are not linked into or distributed with
+# the release binaries. Transitive runtime dependencies must remain included.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# The first-party manifests predate consistent `license` / `publish` metadata.
+# These checksum-pinned clarifications keep cargo-about strict without changing
+# the runtime graph. They can be removed after every first-party manifest sets
+# `license = "Apache-2.0"` (and `publish = false`, if appropriate).
+[audiohub-cli.clarify]
+license = "Apache-2.0"
+
+[[audiohub-cli.clarify.files]]
+path = "../../LICENSE"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+
+[audiohub-core.clarify]
+license = "Apache-2.0"
+
+[[audiohub-core.clarify.files]]
+path = "../../LICENSE"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+
+[audiohub-ipc.clarify]
+license = "Apache-2.0"
+
+[[audiohub-ipc.clarify.files]]
+path = "../../LICENSE"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+
+[audiohub-net.clarify]
+license = "Apache-2.0"
+
+[[audiohub-net.clarify.files]]
+path = "../../LICENSE"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+
+[audiohubd.clarify]
+license = "Apache-2.0"
+
+[[audiohubd.clarify.files]]
+path = "../../LICENSE"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"

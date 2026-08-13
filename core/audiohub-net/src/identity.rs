@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use audiohub_security::{secure_private_directory, secure_private_file};
 use base64::prelude::*;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -134,6 +135,7 @@ struct IdentityFile {
 /// file yet" and "unreadable", because every caller here treats them the same:
 /// there is no stored override to honour.
 fn read_identity_file(path: &Path) -> Option<IdentityFile> {
+    secure_private_file(path).ok()?;
     let bytes = std::fs::read(path).ok()?;
     let file: IdentityFile = serde_json::from_slice(&bytes).ok()?;
     (file.version == 1).then_some(file)
@@ -189,28 +191,34 @@ impl LocalIdentity {
     /// (lets one process host several isolated daemon instances).
     pub fn load_or_create_at(dir: Option<&Path>) -> Result<Self> {
         let base = dir.map(Path::to_path_buf).unwrap_or_else(Self::config_dir);
+        secure_private_directory(&base)
+            .with_context(|| format!("secure private directory {}", base.display()))?;
         let path = base.join("identity.json");
-        if path.exists() {
-            let bytes =
-                std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-            let file: IdentityFile = serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse {}", path.display()))?;
-            if file.version != 1 {
-                bail!("unsupported identity.json version {}", file.version);
+        match secure_private_file(&path) {
+            Ok(()) => {
+                let bytes =
+                    std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+                let file: IdentityFile = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse {}", path.display()))?;
+                if file.version != 1 {
+                    bail!("unsupported identity.json version {}", file.version);
+                }
+                // The name is NOT simply taken from the file: it is what peers put
+                // on the virtual devices they publish for this machine, so a Mac
+                // renamed after AudioHub first ran must announce the new name. The
+                // file's `name` is only the last fallback.
+                //
+                // Priority lives in `resolve_name` (pure, and tested there).
+                let name = resolve_name(
+                    &std::env::var("AUDIOHUB_NAME").unwrap_or_default(),
+                    file.name_override.as_deref(),
+                    &local_hostname(),
+                    &file.name,
+                );
+                return Self::from_parts(&name, &file.secret_b64);
             }
-            // The name is NOT simply taken from the file: it is what peers put
-            // on the virtual devices they publish for this machine, so a Mac
-            // renamed after AudioHub first ran must announce the new name. The
-            // file's `name` is only the last fallback.
-            //
-            // Priority lives in `resolve_name` (pure, and tested there).
-            let name = resolve_name(
-                &std::env::var("AUDIOHUB_NAME").unwrap_or_default(),
-                file.name_override.as_deref(),
-                &local_hostname(),
-                &file.name,
-            );
-            return Self::from_parts(&name, &file.secret_b64);
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("secure {}", path.display())),
         }
         let signing_key = SigningKey::generate(&mut rand_core::OsRng);
         let mut name = local_hostname();
@@ -496,25 +504,26 @@ impl PeerStore {
     }
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
 fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| anyhow!("no parent dir for {}", path.display()))?;
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    secure_private_directory(dir)
+        .with_context(|| format!("secure private directory {}", dir.display()))?;
     let tmp = path.with_extension("json.tmp");
     {
         let mut f = std::fs::File::create(&tmp)
             .with_context(|| format!("create {}", tmp.display()))?;
+        if secret {
+            secure_private_file(&tmp).with_context(|| format!("secure {}", tmp.display()))?;
+        }
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    #[cfg(unix)]
-    if secret {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
     std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+    if secret {
+        secure_private_file(path).with_context(|| format!("secure {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -659,6 +668,39 @@ mod name_tests {
         let id = LocalIdentity::load_or_create_at(Some(&dir)).expect("legacy identity loads");
         assert_eq!(id.fingerprint, fingerprint_of(&key.verifying_key().to_bytes()));
         assert_eq!(LocalIdentity::name_source_at(Some(&dir)), NameSource::Hostname);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_repairs_permissive_identity_and_directory_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("private-mode");
+        LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
+        let path = dir.join("identity.json");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("file mode");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("dir mode");
+
+        LocalIdentity::load_or_create_at(Some(&dir)).expect("reload");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&dir)
+                .expect("dir metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -23,12 +23,13 @@
 
 import { execFileSync } from 'node:child_process';
 import { readdirSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const frontendDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const project = process.argv[2] ?? 'tsconfig.test.json';
 const srcDir = join(frontendDir, 'src');
+const tscEntry = join(frontendDir, 'node_modules', 'typescript', 'bin', 'tsc');
 
 /** Every `*.test.ts` actually sitting on disk under `src/`. */
 function testFilesOnDisk(dir) {
@@ -52,8 +53,8 @@ function testFilesOnDisk(dir) {
 function listedFiles() {
   try {
     return execFileSync(
-      'npx',
-      ['tsc', '-p', project, '--listFiles', '--noEmit'],
+      process.execPath,
+      [tscEntry, '-p', project, '--listFiles', '--noEmit'],
       { cwd: frontendDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
   } catch (err) {
@@ -67,7 +68,7 @@ const listed = new Set(
     .split('\n')
     .map((line) => line.trim())
     // Diagnostics share this stream; real entries are absolute paths.
-    .filter((line) => line.startsWith('/') && /\.tsx?$/.test(line))
+    .filter((line) => isAbsolute(line) && /\.tsx?$/.test(line))
     .map((line) => resolve(line)),
 );
 

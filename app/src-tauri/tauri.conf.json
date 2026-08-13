@@ -25,6 +25,12 @@
   },
   "bundle": {
     "active": true,
+    "licenseFile": "../../LICENSE",
+    "resources": {
+      "../../LICENSE": "licenses/AudioHub-LICENSE.txt",
+      "../../NOTICE.md": "licenses/AudioHub-NOTICE.md",
+      "../../THIRD-PARTY-LICENSES.html": "licenses/THIRD-PARTY-LICENSES.html"
+    },
     "targets": [
       "app"
     ],

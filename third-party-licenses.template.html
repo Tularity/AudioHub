@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AudioHub Third-Party Licenses</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { margin: 0 auto; max-width: 1000px; padding: 2rem; line-height: 1.45; }
+    h1, h2, h3, h4 { line-height: 1.2; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #8888; padding: .4rem .55rem; text-align: left; }
+    tr:nth-child(even) { background: #8881; }
+    .scope { border-top: 3px solid #8886; margin-top: 3rem; padding-top: 1rem; }
+    .license-block { border-top: 1px solid #8886; margin-top: 2rem; padding-top: .75rem; }
+    pre { border: 1px solid #8886; border-radius: .4rem; padding: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <h1>AudioHub Third-Party Licenses</h1>
+  <p>
+    This file contains notices for Cargo and frontend runtime dependencies
+    distributed with AudioHub's native macOS and Windows applications. It was
+    generated from the repository's locked Cargo dependency graphs (using
+    cargo-about 0.9.1) and locked npm production graph. Cargo targets are
+    aarch64-apple-darwin and x86_64-pc-windows-msvc. AudioHub's own license and
+    additional source provenance are provided separately in LICENSE and NOTICE.md.
+  </p>
+
+  <section class="scope" id="core-runtime">
+    <h2>Core, daemon, CLI, and AirPlay runtime</h2>
+    <p>
+      This graph includes the self-developed AirPlay 2 runtime and its generic
+      codec, cryptography, networking, and asynchronous-runtime dependencies.
+    </p>
+    <!-- AUDIOHUB_CORE_LICENSES -->
+  </section>
+
+  <section class="scope" id="desktop-runtime">
+    <h2>Tauri desktop application runtime</h2>
+    <!-- AUDIOHUB_APP_LICENSES -->
+  </section>
+
+  <section class="scope" id="frontend-runtime">
+    <h2>Embedded frontend runtime</h2>
+    <p>
+      This graph contains production JavaScript packages embedded by Vite in
+      AudioHub's desktop user interface. Development-only tools are excluded.
+    </p>
+    <!-- AUDIOHUB_FRONTEND_LICENSES -->
+  </section>
+
+  <section class="scope" id="additional-notices">
+    <h2>Additional notices and attribution files</h2>
+    <p>
+      These top-level NOTICE, COPYRIGHT, and AUTHORS files accompanied packages
+      in the resolved runtime graphs. They are retained in addition to the
+      license texts above.
+    </p>
+    <!-- AUDIOHUB_ADDITIONAL_NOTICES -->
+  </section>
+</body>
+</html>

@@ -1,7 +1,7 @@
 //! audiohubd — daemon assembly (spec-m4a §1/§4).
 //! Frozen lib entry: `DaemonCfg` / `DaemonHandle` / `start_daemon`.
 
-/// Audio-only AirPlay/RAOP receiver lifecycle, mDNS and PCM routing.
+/// Audio-only AirPlay 2 receiver lifecycle, mDNS and PCM routing.
 mod airplay;
 /// AirPlay lifecycle contracts use ephemeral listeners with mDNS disabled and
 /// never send a volume event, so they cannot touch the user's LAN or output.
@@ -286,7 +286,7 @@ pub struct DaemonCfg {
     /// off the live guard rather than copied from the wish: with real mDNS
     /// working, the two agree and a copy is indistinguishable from a reading.
     pub announce_fault: bool,
-    /// Whether an enabled AirPlay receiver may publish its `_raop._tcp`
+    /// Whether an enabled AirPlay receiver may publish its `_airplay._tcp`
     /// service. `true` in production; every in-process test daemon passes
     /// `false` so a settings contract test cannot leak a transient receiver
     /// onto the user's real LAN.
@@ -536,7 +536,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     let (build_send, build_recv) = mpsc::channel::<engine::BuildReq>();
     let (built_send, built_recv) = mpsc::channel::<engine::BuildDone>();
     let cfg_dir_for_state = cfg_dir.clone();
-    let airplay = airplay::AirPlayController::new(cfg.airplay_advertise);
+    let airplay = airplay::AirPlayController::new(cfg.airplay_advertise, cfg_dir.clone());
     let inner = Arc::new(DaemonInner {
         id: RwLock::new(id.clone()),
         cfg_dir,

@@ -201,7 +201,7 @@ directly, bypassing both the service and the network. Run any of them with
 
 ```
 core/audiohub-core    device I/O, resampling, mixing, volume
-core/audiohub-airplay audio-only AirPlay/RAOP ingress and local playback
+core/audiohub-airplay AudioHub-owned AirPlay 2 audio ingress and local playback
 core/audiohub-net     transport, tiers, crypto, discovery
 core/audiohub-ipc     the local IPC contract shared by UI and CLI
 core/audiohubd        the background service
@@ -218,6 +218,12 @@ scripts/              build and safety wrappers
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
+
+The AirPlay compatibility path includes separately identified Apple-derived
+material, including a widely leaked AirPort Express RSA private key. That asset
+is not AudioHub-authored Apache-2.0 source, clean-room material, an Apple
+license, or MFi approval. Review [NOTICE.md](NOTICE.md) and
+`core/audiohub-airplay/PROVENANCE.md` before redistribution.
 
 ## Contributing
 

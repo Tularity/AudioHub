@@ -1,0 +1,32 @@
+# cargo-about 0.9.1 configuration for AudioHub's standalone Tauri crate.
+# Keep the policy aligned with the repository-root `about.toml`; this separate
+# file prevents each graph from warning about first-party crates it cannot see.
+
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+]
+
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# Remove this clarification after the first-party manifest declares its own
+# Apache-2.0 license. The checksum pins it to the repository's actual LICENSE.
+[audiohub-app.clarify]
+license = "Apache-2.0"
+
+[[audiohub-app.clarify.files]]
+path = "../../LICENSE"
+checksum = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"

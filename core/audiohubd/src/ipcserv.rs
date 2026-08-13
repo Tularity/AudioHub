@@ -1078,7 +1078,6 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         airplay_error: airplay_live.error,
         airplay_warning: airplay_live.warning,
         airplay_password_set: crate::settings::airplay_password_is_set(&inner.cfg_dir),
-        airplay_raop_port: airplay_live.raop_port,
         airplay_airplay2_port: airplay_live.airplay2_port,
         // plan M9「开机自启」。四个字段全部**探测**出来，一个都不存盘：登录项
         // 活过重启靠的是 plist / 计划任务本身，settings.json 里再放一份就成了

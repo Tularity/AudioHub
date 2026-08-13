@@ -36,7 +36,6 @@
   <key>NSBonjourServices</key>
   <array>
     <string>_audiohub._udp</string>
-    <string>_raop._tcp</string>
     <string>_airplay._tcp</string>
   </array>
 </dict>

@@ -6,15 +6,32 @@ rust-version = "1.88"
 license = "Apache-2.0"
 description = "AudioHub's cross-platform, audio-only AirPlay receiver adapter"
 
-[features]
-default = []
-experimental-airplay2 = ["dep:openairplay2"]
-
 [dependencies]
-openairplay1 = { path = "../../third_party/openairplay1" }
-openairplay2 = { version = "=0.5.0", optional = true }
+alac = { version = "0.5", default-features = false }
+audiohub-security = { path = "../audiohub-security" }
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hex = "0.4"
+hkdf = "0.12"
+log = "0.4"
+num-bigint = "0.4"
+num-traits = "0.2"
+plist = "1"
+rand = "0.8"
+rsa = "0.9.8"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
+sha2 = "0.10"
+subtle = "2"
+symphonia = { version = "0.5.5", default-features = false, features = ["aac"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1"
 
 [dev-dependencies]
 serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+if-addrs = "0.13"
+libc = "0.2"

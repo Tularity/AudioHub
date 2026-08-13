@@ -1,35 +1,57 @@
 # audiohub-airplay
 
-Cross-platform, audio-only AirPlay ingress for AudioHub.
+Cross-platform, audio-only AirPlay 2 ingress for AudioHub.
 
-The production default is AirPlay 1 (RAOP) only. That is the protocol used by
-macOS system-wide audio output today. AirPlay 2 support is present behind the
-non-default Cargo feature `experimental-airplay2` and a runtime opt-in because
-`openairplay2` 0.5 supports buffered AAC but not the realtime ALAC/type-96
-stream selected by macOS system output. Production builds therefore do not
-even compile the incomplete AP2 engine.
+The receiver under `src/protocol` is implemented and owned by AudioHub. It does
+not link or vendor another AirPlay receiver engine. The implementation was
+written from protocol observations and documented behavioural references;
+source influences and opaque interoperability data are recorded in
+`PROVENANCE.md` and the repository-level `NOTICE.md`.
 
-This crate never advertises through mDNS itself. It returns complete service
-descriptors to the daemon, which owns the independent `_raop._tcp` and
-`_airplay._tcp` registrations. Both control ports default to `0`; startup
-selects currently free ephemeral ports and reports the concrete ports to the
-caller before it returns.
+The current discovery profile advertises independently implemented realtime
+type-96 ALAC and buffered type-103 AAC-LC paths. Real macOS Music capability
+tests established that its native transient-pairing route requires the PTP
+capability combination. The receiver binds the standard UDP 319/320 ports and
+passively observes the sender's two-step Sync/Follow_Up timeline on Windows.
+On macOS those sockets belong to the system, so AudioHub registers the
+authenticated peer and IEEE 1588 logical port with the system TimeSync service
+through a dynamically resolved CoreMedia adapter. Buffered RTP timestamps are
+mapped through the authenticated rate anchor onto the local monotonic clock.
+This is a single-receiver path, not a BMCA participant or a claim of multiroom
+precision. Grouping, screen/video, metadata, persistent pairing, and
+remote-control streams remain unadvertised.
+
+This crate never advertises through mDNS itself. It returns a complete
+`_airplay._tcp` service descriptor to the daemon, which owns registration. The
+control port defaults to `0`; startup selects a free ephemeral port and reports
+the concrete port to the caller before it returns.
 
 Decoded PCM stays full-scale. The only sample-domain operations are stereo to
-mono format conversion and streaming 44.1 kHz to 48 kHz resampling. AirPlay
-volume arrives as a dB event for the daemon to map to the receiver machine's
-real system output control; it is deliberately never multiplied into PCM.
-The protocol sink blocks against a wall-clock 48 kHz pacer (as required by the
-upstream sink contract); the bounded multi-reader bus itself drops old history
-for a stale reader and never lets that reader stall reception.
+mono conversion and streaming 44.1 kHz to 48 kHz resampling. AirPlay volume
+arrives as a dB event for the daemon to map to the receiver machine's real
+system output control; it is deliberately never multiplied into PCM.
 
-## Upstream protocol engines
+Realtime media uses a bounded UDP jitter/retransmission engine, validates NTP
+timing, and delivers ordered ALAC PCM into the existing clock-servo bus.
+Buffered media owns a separate bounded TCP framer, authenticated AAC decoder,
+pause/flush state machine, and bounded PTP-to-RTP presentation mapper. The
+bounded multi-reader bus drops old history for a stale reader and never lets
+that reader stall reception. Kernel receive timestamps, output-device clock
+feedback, BMCA, delay measurement, and multiroom drift servo remain future
+precision work and are not advertised as implemented.
 
-- `openairplay1`, pinned to upstream commit
-  `797837d69d7fe33cb7af6cd7460931599079eaf2` for RAOP Digest password support
-  (MIT for its own code; its Apple-derived AirPort Express key is separately
-  identified in the vendored `NOTICE.md` and is not covered by that grant).
-- `openairplay2` 0.5.0 for experimental buffered AirPlay 2 support (MIT).
+## Protocol implementation and provenance
 
-The open-source dependency licenses are compatible with AudioHub's Apache-2.0
-license. The AirPort key remains separately attributed third-party material.
+The AirPlay 2 engine is AudioHub source. Behavioural references, fixed
+revisions, acquisition methods, and separately attributed opaque FairPlay
+compatibility records are listed in `PROVENANCE.md` and the root `NOTICE.md`.
+
+Generic cryptography, plist, integer, async-runtime, and codec crates are
+ordinary package dependencies under their own licenses; none is an AirPlay
+receiver engine. Apple-derived compatibility material remains separately
+identified and is not represented as AudioHub-authored Apache-2.0 source. In
+particular, the receiver bundles a leaked AirPort Express RSA key behind an
+isolated `AppleResponseProvider` because current Apple Music verifies an
+`Apple-Response` before entering the AirPlay 2 control flow; this makes the
+complete receiver not clean-room and carries the distribution risks stated in
+the root `NOTICE.md`.

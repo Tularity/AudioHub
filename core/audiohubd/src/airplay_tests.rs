@@ -81,14 +81,13 @@ fn listener_follows_share_mode_and_shutdown_joins_events() {
         enabled.get("airplay_listening").and_then(Value::as_bool),
         Some(true)
     );
-    let port = enabled
-        .get("airplay_raop_port")
-        .and_then(Value::as_u64)
-        .expect("actual ephemeral RAOP port");
-    assert!(port > 0);
-    assert!(enabled
+    let ap2_port = enabled
         .get("airplay_airplay2_port")
-        .is_some_and(Value::is_null));
+        .and_then(Value::as_u64)
+        .expect("actual ephemeral AirPlay 2 port");
+    assert!(ap2_port > 0);
+    let identity_before = std::fs::read(daemon.config.join("airplay2-identity"))
+        .expect("persisted AirPlay 2 identity");
     assert!(daemon
         .handle
         .inner_for_test()
@@ -124,9 +123,15 @@ fn listener_follows_share_mode_and_shutdown_joins_events() {
         Some(true)
     );
     assert!(restored
-        .get("airplay_raop_port")
+        .get("airplay_airplay2_port")
         .and_then(Value::as_u64)
         .is_some_and(|port| port > 0));
+    assert_eq!(
+        std::fs::read(daemon.config.join("airplay2-identity"))
+            .expect("reloaded AirPlay 2 identity"),
+        identity_before,
+        "listener restarts must not rotate the advertised AP2 identity"
+    );
     assert!(daemon
         .handle
         .inner_for_test()
@@ -159,7 +164,9 @@ fn configured_but_unreadable_password_fails_closed() {
         .get("airplay_error")
         .and_then(Value::as_str)
         .is_some_and(|error| error.contains("密码读取失败")));
-    assert!(view.get("airplay_raop_port").is_some_and(Value::is_null));
+    assert!(view
+        .get("airplay_airplay2_port")
+        .is_some_and(Value::is_null));
 }
 
 #[test]
@@ -176,10 +183,11 @@ fn failed_password_commit_cannot_persist_an_enabled_open_receiver() {
             json!({ "airplay_enabled": true, "airplay_password": "must-not-open" }),
         )
         .expect_err("secret commit must fail");
-    assert!(
-        error.contains("rename") || error.contains("directory"),
-        "{error}"
-    );
+    // Unix reports the directory collision at read/rename time as EISDIR;
+    // Windows rejects the snapshot read earlier with AccessDenied. The phase
+    // is platform-specific, but both must identify the write-only secret path
+    // and leave the receiver disabled below.
+    assert!(error.contains("airplay-password"), "{error}");
 
     let view = daemon.ok(methods::SETTINGS_GET, json!({}));
     assert_eq!(

@@ -16,9 +16,11 @@ use super::media::engine::{
 };
 use super::media::ptp::{PtpClockSource, PtpObserver, PtpRemoteMatch};
 use super::media::setup::{self, STREAM_TYPE_REALTIME_AUDIO};
+use super::metadata::{self, Artwork, MergePolicy, NowPlayingUpdate, PatchField, TrackMetadata};
 use super::pairing::PairSetupServer;
 use super::rtsp::{Header, Request, RequestDecoder, RequestLimits, Response};
 use super::tlv8::{self, Tlv8Field, Tlv8Limits};
+use crate::runtime::{ReceiverVolumeProvider, ReceiverVolumeSnapshot};
 use plist::{Dictionary, Value};
 use rand::{rngs::OsRng, RngCore};
 use std::collections::HashMap;
@@ -49,6 +51,9 @@ const ACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_EVENT_ACCEPT_ATTEMPTS: usize = 4;
 const READ_CHUNK_BYTES: usize = 4 * 1024;
 const MAX_CONTROL_BODY_BYTES: usize = 64 * 1024;
+const MAX_METADATA_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ARTWORK_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_NOW_PLAYING_BODY_BYTES: usize = 5 * 1024 * 1024;
 const MAX_PAIRING_BODY_BYTES: usize = 4 * 1024;
 const PAIRING_TLV8_CONTENT_TYPE: &str = "application/pairing+tlv8";
 const BINARY_PLIST_CONTENT_TYPE: &str = "application/x-apple-binary-plist";
@@ -86,7 +91,7 @@ pub(crate) struct ServerConfig {
     ptp_clock: OnceLock<PtpClockSource>,
     ptp_test_ephemeral: bool,
     features: u64,
-    initial_volume_db: Option<f32>,
+    receiver_volume: Option<ReceiverVolumeProvider>,
 }
 
 impl ServerConfig {
@@ -96,7 +101,7 @@ impl ServerConfig {
         password: Option<String>,
         identity_path: PathBuf,
         ptp_test_ephemeral: bool,
-        initial_volume_db: Option<f32>,
+        receiver_volume: Option<ReceiverVolumeProvider>,
     ) -> io::Result<Self> {
         let identity = ReceiverIdentity::load_or_create(&identity_path)?;
         let mac = mac.unwrap_or_else(|| stable_mac(&identity));
@@ -111,35 +116,45 @@ impl ServerConfig {
             ptp_clock: OnceLock::new(),
             ptp_test_ephemeral,
             features: FEATURES,
-            initial_volume_db,
+            receiver_volume,
         })
     }
 
     pub(crate) fn txt_records(&self) -> Vec<String> {
-        self.profile().txt_records()
+        self.profile(None).txt_records()
     }
 
     pub(crate) fn info_body(&self) -> io::Result<Vec<u8>> {
-        self.profile().binary_plist()
+        let volume = self.current_receiver_volume()?;
+        self.profile(volume).binary_plist()
     }
 
-    fn profile(&self) -> InfoProfile<'_> {
+    fn current_receiver_volume(&self) -> io::Result<Option<ReceiverVolumeSnapshot>> {
+        self.receiver_volume
+            .as_ref()
+            .map(ReceiverVolumeProvider::current)
+            .transpose()
+    }
+
+    fn profile(&self, volume: Option<ReceiverVolumeSnapshot>) -> InfoProfile<'_> {
         InfoProfile {
             name: &self.name,
             mac: self.mac,
             password_required: self.password.is_some(),
             identity: &self.identity,
             features: self.features,
-            initial_volume_db: self.initial_volume_db,
+            initial_volume_db: volume.map(|volume| volume.slider_db),
+            is_muted: volume.map(|volume| volume.is_muted),
         }
     }
 
     fn event_update_info_body(&self) -> io::Result<Vec<u8>> {
+        let volume = self.current_receiver_volume()?;
         let mut command = Dictionary::new();
         command.insert("type".into(), Value::String("updateInfo".into()));
         command.insert(
             "value".into(),
-            Value::Dictionary(self.profile().dictionary()?),
+            Value::Dictionary(self.profile(volume).dictionary()?),
         );
         let mut body = Vec::new();
         Value::Dictionary(command)
@@ -245,7 +260,7 @@ impl EventCommandSender {
 
     pub(crate) fn send_device_volume(
         &self,
-        volume: f32,
+        volume_scalar: f32,
         is_muted: bool,
     ) -> Result<(), EventCommandSendError> {
         if !self.supports_device_volume() {
@@ -260,7 +275,7 @@ impl EventCommandSender {
                 "AirPlay event channel is not ready",
             ));
         }
-        let body = encode_device_volume_command(volume, is_muted).map_err(|_| {
+        let body = encode_device_volume_command(volume_scalar, is_muted).map_err(|_| {
             EventCommandSendError::before_write(
                 io::ErrorKind::InvalidInput,
                 "invalid AirPlay event volume command",
@@ -503,6 +518,30 @@ pub(crate) enum ProbeEvent {
         peer: IpAddr,
         stream_id: u64,
     },
+    Metadata {
+        peer: IpAddr,
+        stream_id: u64,
+        title: Option<String>,
+        artist: Option<String>,
+        album: Option<String>,
+    },
+    Artwork {
+        peer: IpAddr,
+        stream_id: u64,
+        content_type: String,
+        data: Vec<u8>,
+    },
+    Progress {
+        peer: IpAddr,
+        stream_id: u64,
+        elapsed_ms: Option<u64>,
+        duration_ms: Option<u64>,
+    },
+    Paused {
+        peer: IpAddr,
+        stream_id: u64,
+        paused: bool,
+    },
 }
 
 /// Run the control accept loop on a listener already reserved by the runtime.
@@ -599,6 +638,188 @@ pub(crate) async fn serve(
     }
 }
 
+enum NowPlayingWireUpdate {
+    Metadata(TrackMetadata),
+    Artwork(Option<Artwork>),
+    Progress { elapsed_ms: u64, duration_ms: u64 },
+    Rich(NowPlayingUpdate),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeardownScope {
+    /// A valid plist with a `streams` array ends only the current media stream.
+    Stream,
+    /// A valid plist without `streams` ends the complete control session.
+    Session,
+    /// Missing, malformed, or mistyped decorative input is acknowledged but
+    /// cannot be allowed to tear down an authenticated connection.
+    Ignore,
+}
+
+#[derive(Default)]
+struct ConnectionNowPlaying {
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    metadata_known: bool,
+    artwork: Option<Artwork>,
+    artwork_known: bool,
+    elapsed_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    progress_known: bool,
+    paused: Option<bool>,
+}
+
+#[derive(Default)]
+struct NowPlayingChanges {
+    metadata: bool,
+    artwork: bool,
+    progress: bool,
+    paused: bool,
+}
+
+impl ConnectionNowPlaying {
+    fn apply(&mut self, update: NowPlayingWireUpdate) -> NowPlayingChanges {
+        let mut changed = NowPlayingChanges::default();
+        match update {
+            NowPlayingWireUpdate::Metadata(metadata) => {
+                self.title = metadata.title;
+                self.artist = metadata.artist;
+                self.album = metadata.album;
+                self.metadata_known = true;
+                changed.metadata = true;
+            }
+            NowPlayingWireUpdate::Artwork(artwork) => {
+                self.artwork = artwork;
+                self.artwork_known = true;
+                changed.artwork = true;
+            }
+            NowPlayingWireUpdate::Progress {
+                elapsed_ms,
+                duration_ms,
+            } => {
+                self.elapsed_ms = Some(elapsed_ms);
+                self.duration_ms = Some(duration_ms);
+                self.progress_known = true;
+                changed.progress = true;
+            }
+            NowPlayingWireUpdate::Rich(update) => {
+                let replace = update.merge_policy == MergePolicy::Replace;
+                changed.metadata = replace
+                    || !matches!(update.title, PatchField::Missing)
+                    || !matches!(update.artist, PatchField::Missing)
+                    || !matches!(update.album, PatchField::Missing);
+                if changed.metadata {
+                    apply_patch_field(&mut self.title, update.title, replace);
+                    apply_patch_field(&mut self.artist, update.artist, replace);
+                    apply_patch_field(&mut self.album, update.album, replace);
+                    self.metadata_known = true;
+                }
+
+                changed.artwork = replace || !matches!(update.artwork, PatchField::Missing);
+                if changed.artwork {
+                    apply_patch_field(&mut self.artwork, update.artwork, replace);
+                    self.artwork_known = true;
+                }
+
+                changed.progress = replace
+                    || !matches!(update.elapsed_time, PatchField::Missing)
+                    || !matches!(update.duration, PatchField::Missing);
+                if changed.progress {
+                    apply_seconds_patch(&mut self.elapsed_ms, update.elapsed_time, replace);
+                    apply_seconds_patch(&mut self.duration_ms, update.duration, replace);
+                    self.progress_known = true;
+                }
+
+                changed.paused = replace || !matches!(update.playback_rate, PatchField::Missing);
+                if changed.paused {
+                    let mut rate = self.paused.map(|paused| if paused { 0.0 } else { 1.0 });
+                    apply_patch_field(&mut rate, update.playback_rate, replace);
+                    self.paused = Some(rate.is_some_and(|rate| rate == 0.0));
+                }
+            }
+        }
+        changed
+    }
+
+    fn events(&self, peer: IpAddr, stream_id: u64, changed: &NowPlayingChanges) -> Vec<ProbeEvent> {
+        let mut events = Vec::with_capacity(4);
+        if changed.metadata && self.metadata_known {
+            events.push(ProbeEvent::Metadata {
+                peer,
+                stream_id,
+                title: self.title.clone(),
+                artist: self.artist.clone(),
+                album: self.album.clone(),
+            });
+        }
+        if changed.artwork && self.artwork_known {
+            let (content_type, data) = self
+                .artwork
+                .as_ref()
+                .map(|artwork| (artwork.content_type.clone(), artwork.data.clone()))
+                .unwrap_or_else(|| ("image/none".to_string(), Vec::new()));
+            events.push(ProbeEvent::Artwork {
+                peer,
+                stream_id,
+                content_type,
+                data,
+            });
+        }
+        if changed.progress && self.progress_known {
+            events.push(ProbeEvent::Progress {
+                peer,
+                stream_id,
+                elapsed_ms: self.elapsed_ms,
+                duration_ms: self.duration_ms,
+            });
+        }
+        if changed.paused {
+            if let Some(paused) = self.paused {
+                events.push(ProbeEvent::Paused {
+                    peer,
+                    stream_id,
+                    paused,
+                });
+            }
+        }
+        events
+    }
+
+    fn all_events(&self, peer: IpAddr, stream_id: u64) -> Vec<ProbeEvent> {
+        self.events(
+            peer,
+            stream_id,
+            &NowPlayingChanges {
+                metadata: self.metadata_known,
+                artwork: self.artwork_known,
+                progress: self.progress_known,
+                paused: self.paused.is_some(),
+            },
+        )
+    }
+}
+
+fn apply_patch_field<T>(slot: &mut Option<T>, patch: PatchField<T>, replace: bool) {
+    match patch {
+        PatchField::Missing if replace => *slot = None,
+        PatchField::Missing => {}
+        PatchField::Clear => *slot = None,
+        PatchField::Value(value) => *slot = Some(value),
+    }
+}
+
+fn apply_seconds_patch(slot: &mut Option<u64>, patch: PatchField<f64>, replace: bool) {
+    let patch = match patch {
+        PatchField::Value(seconds) => {
+            PatchField::Value((seconds * 1000.0).round().clamp(0.0, u64::MAX as f64) as u64)
+        }
+        PatchField::Missing => PatchField::Missing,
+        PatchField::Clear => PatchField::Clear,
+    };
+    apply_patch_field(slot, patch, replace);
+}
+
 struct ConnectionState {
     requests: RequestDecoder,
     pairing: Option<PairSetupServer>,
@@ -608,8 +829,13 @@ struct ConnectionState {
     event_commands: Option<EventCommandSender>,
     phase_one: Option<PhaseOneState>,
     media: Option<ActiveMedia>,
+    /// One global receiver slot owned by this control connection while it has
+    /// an active or prepared media stream. Keeping the permit outside the
+    /// concrete stream lets the same connection replace a stream atomically.
+    media_permit: Option<OwnedSemaphorePermit>,
     remote_control: RemoteControlAccumulator,
     pending_volume_db: Option<f32>,
+    now_playing: ConnectionNowPlaying,
     plaintext_apple_response_sent: bool,
     latest_remote_control: watch::Sender<Option<RemoteControlState>>,
 }
@@ -618,10 +844,9 @@ impl ConnectionState {
     fn new(
         latest_remote_control: watch::Sender<Option<RemoteControlState>>,
     ) -> Result<Self, ConnectionError> {
-        let limits = RequestLimits {
-            default_max_body_bytes: MAX_CONTROL_BODY_BYTES,
-            ..RequestLimits::default()
-        };
+        // Plaintext pairing/control stays at the small default body budget.
+        // `install_control_after_m4` raises it only after authentication.
+        let limits = RequestLimits::default();
         Ok(Self {
             requests: RequestDecoder::new(limits).map_err(|_| ConnectionError::Framing)?,
             pairing: None,
@@ -631,8 +856,10 @@ impl ConnectionState {
             event_commands: None,
             phase_one: None,
             media: None,
+            media_permit: None,
             remote_control: RemoteControlAccumulator::default(),
             pending_volume_db: None,
+            now_playing: ConnectionNowPlaying::default(),
             plaintext_apple_response_sent: false,
             latest_remote_control,
         })
@@ -702,12 +929,10 @@ enum PreparedMedia {
     Type96 {
         stream_id: u64,
         media: PreparedType96,
-        _permit: OwnedSemaphorePermit,
     },
     Type103 {
         stream_id: u64,
         media: PreparedType103,
-        _permit: OwnedSemaphorePermit,
     },
 }
 
@@ -720,23 +945,13 @@ impl PreparedMedia {
 
     fn start(self, output: Box<dyn PcmOutput>) -> ActiveMedia {
         match self {
-            Self::Type96 {
-                stream_id,
-                media,
-                _permit,
-            } => ActiveMedia::Type96 {
+            Self::Type96 { stream_id, media } => ActiveMedia::Type96 {
                 stream_id,
                 handle: media.start(output),
-                _permit,
             },
-            Self::Type103 {
-                stream_id,
-                media,
-                _permit,
-            } => ActiveMedia::Type103 {
+            Self::Type103 { stream_id, media } => ActiveMedia::Type103 {
                 stream_id,
                 handle: media.start(output),
-                _permit,
             },
         }
     }
@@ -746,12 +961,10 @@ enum ActiveMedia {
     Type96 {
         stream_id: u64,
         handle: Type96MediaHandle,
-        _permit: OwnedSemaphorePermit,
     },
     Type103 {
         stream_id: u64,
         handle: Type103MediaHandle,
-        _permit: OwnedSemaphorePermit,
     },
 }
 
@@ -901,8 +1114,8 @@ async fn run_connection(
                     .send(Some(RemoteControlState::Ended { stream_id }));
                 drop(media);
             }
-            state.phase_one = None;
-            state.pending_volume_db = None;
+            state.media_permit = None;
+            state.now_playing = ConnectionNowPlaying::default();
         }
         let request_timeout = if state.media.is_some() {
             ACTIVE_REQUEST_TIMEOUT
@@ -997,9 +1210,9 @@ async fn process_one_request(
                 &mut state.event_keys,
                 state.event_task.is_some(),
                 &mut state.phase_one,
+                state.media_permit.is_some(),
                 active_stream_id,
                 active_media_kind,
-                state.pending_volume_db,
                 next_stream_id,
             )
             .await
@@ -1132,6 +1345,9 @@ async fn process_one_request(
     if let Some(phase_one) = outcome.install_phase_one {
         state.phase_one = Some(phase_one);
     }
+    if let Some(permit) = outcome.install_media_permit {
+        state.media_permit = Some(permit);
+    }
     if let Some(prepared) = outcome.start_media {
         if let Some(previous) = state.media.take() {
             previous.abort().await;
@@ -1162,6 +1378,12 @@ async fn process_one_request(
             peer: peer.ip(),
             stream_id,
         });
+        for event in state.now_playing.all_events(peer.ip(), stream_id) {
+            // Descriptive state is authoritative UI data and may carry the
+            // only copy of a cover. Backpressure this connection briefly
+            // rather than dropping it through the milestone queue.
+            let _ = event_tx.send(event).await;
+        }
     }
     if let Some(db) = outcome.volume_db {
         state.pending_volume_db = Some(db);
@@ -1172,6 +1394,14 @@ async fn process_one_request(
                 stream_id,
                 db,
             });
+        }
+    }
+    if let Some(update) = outcome.now_playing {
+        let changed = state.now_playing.apply(update);
+        if let Some(stream_id) = state.active_stream_id() {
+            for event in state.now_playing.events(peer.ip(), stream_id, &changed) {
+                let _ = event_tx.send(event).await;
+            }
         }
     }
     if let Some(stream_id) = flushed_stream_id {
@@ -1193,7 +1423,9 @@ async fn process_one_request(
                 }));
             media.abort().await;
         }
-        state.phase_one = None;
+        state.media_permit = None;
+        state.pending_volume_db = None;
+        state.now_playing = ConnectionNowPlaying::default();
     }
 
     Ok(if outcome.close_after {
@@ -1242,6 +1474,10 @@ fn install_control_after_m4(
     // bytes, so move them across the exact plaintext/encrypted boundary
     // instead of ever parsing them as a plaintext request.
     let trailing = state.requests.take_buffered();
+    state
+        .requests
+        .set_default_max_body_bytes(MAX_NOW_PLAYING_BODY_BYTES)
+        .map_err(|_| ConnectionError::Framing)?;
     if !trailing.is_empty() {
         let plaintext = control
             .inbound
@@ -1263,9 +1499,12 @@ async fn read_next_request(
     state: &mut ConnectionState,
 ) -> Result<Option<Request>, ConnectionError> {
     loop {
+        let authenticated = state.control.is_some();
         if let Some(request) = state
             .requests
-            .next_request(max_body_for_method)
+            .next_request(|method, target, headers| {
+                max_body_for_request(method, target, headers, authenticated)
+            })
             .map_err(|_| ConnectionError::Framing)?
         {
             return Ok(Some(request));
@@ -1299,7 +1538,23 @@ async fn read_next_request(
     }
 }
 
-fn max_body_for_method(method: &str) -> Option<usize> {
+fn max_body_for_request(
+    method: &str,
+    target: &str,
+    headers: &[Header],
+    authenticated: bool,
+) -> Option<usize> {
+    if authenticated && method == "SET_PARAMETER" {
+        let content_type = unique_content_type_from_headers(headers);
+        return Some(match content_type.as_deref() {
+            Some("application/x-dmap-tagged") => MAX_METADATA_BODY_BYTES,
+            Some("image/jpeg" | "image/png") => MAX_ARTWORK_BODY_BYTES,
+            _ => MAX_CONTROL_BODY_BYTES,
+        });
+    }
+    if authenticated && method == "POST" && target == "/command" {
+        return Some(MAX_NOW_PLAYING_BODY_BYTES);
+    }
     Some(match method {
         // Stock senders attach a small binary-plist qualifier to GET /info.
         // Keep GET bounded, but do not reject that request before dispatch.
@@ -1309,6 +1564,18 @@ fn max_body_for_method(method: &str) -> Option<usize> {
         "POST" | "SETUP" | "SET_PARAMETER" | "GET_PARAMETER" => MAX_CONTROL_BODY_BYTES,
         _ => MAX_CONTROL_BODY_BYTES,
     })
+}
+
+fn unique_content_type_from_headers(headers: &[Header]) -> Option<String> {
+    let mut values = headers
+        .iter()
+        .filter(|header| header.name().eq_ignore_ascii_case("Content-Type"));
+    let value = values.next()?.value();
+    if values.next().is_some() {
+        return None;
+    }
+    let value = std::str::from_utf8(value).ok()?;
+    Some(value.split(';').next()?.trim().to_ascii_lowercase())
 }
 
 async fn write_response(
@@ -1335,8 +1602,10 @@ struct DispatchOutcome {
     install_event_keys: Option<ChannelKeys>,
     install_event_endpoint: Option<PreparedEventEndpoint>,
     install_phase_one: Option<PhaseOneState>,
+    install_media_permit: Option<OwnedSemaphorePermit>,
     start_media: Option<PreparedMedia>,
     volume_db: Option<f32>,
+    now_playing: Option<NowPlayingWireUpdate>,
     flush_media: Option<FlushRequest>,
     set_media_rate: Option<BufferedRateAnchor>,
     teardown_media: bool,
@@ -1352,8 +1621,10 @@ impl DispatchOutcome {
             install_event_keys: None,
             install_event_endpoint: None,
             install_phase_one: None,
+            install_media_permit: None,
             start_media: None,
             volume_db: None,
+            now_playing: None,
             flush_media: None,
             set_media_rate: None,
             teardown_media: false,
@@ -1369,8 +1640,10 @@ impl DispatchOutcome {
             install_event_keys: None,
             install_event_endpoint: None,
             install_phase_one: None,
+            install_media_permit: None,
             start_media: None,
             volume_db: None,
+            now_playing: None,
             flush_media: None,
             set_media_rate: None,
             teardown_media: false,
@@ -1391,9 +1664,9 @@ async fn dispatch_request(
     event_keys: &mut Option<ChannelKeys>,
     event_endpoint_installed: bool,
     phase_one: &mut Option<PhaseOneState>,
+    has_media_permit: bool,
     active_stream_id: Option<u64>,
     active_media_kind: Option<MediaKind>,
-    current_volume_db: Option<f32>,
     next_stream_id: &AtomicU64,
 ) -> DispatchOutcome {
     if has_ambiguous_cseq(request) {
@@ -1409,9 +1682,9 @@ async fn dispatch_request(
             event_keys,
             event_endpoint_installed,
             phase_one,
+            has_media_permit,
             active_stream_id,
             active_media_kind,
-            current_volume_db,
             next_stream_id,
         )
         .await
@@ -1466,20 +1739,19 @@ async fn dispatch_encrypted(
     event_keys: &mut Option<ChannelKeys>,
     event_endpoint_installed: bool,
     phase_one: &mut Option<PhaseOneState>,
+    has_media_permit: bool,
     active_stream_id: Option<u64>,
     active_media_kind: Option<MediaKind>,
-    current_volume_db: Option<f32>,
     next_stream_id: &AtomicU64,
 ) -> DispatchOutcome {
     match (request.method(), request.target()) {
         ("OPTIONS", _) => options_response(request),
         ("GET", "/info") => info_response(request, config),
         ("POST", "/fp-setup") => fairplay_response(request, peer.ip(), config),
-        ("POST", "/feedback" | "/command" | "/audioMode") => {
-            // These are authenticated keep-alive/configuration messages. The
-            // narrow audio profile advertises neither metadata nor grouping,
-            // so acknowledging and ignoring their bounded bodies is the
-            // compatible behavior.
+        ("POST", "/command") => now_playing_command_response(request),
+        ("POST", "/feedback" | "/audioMode") => {
+            // Authenticated keep-alive/configuration messages outside the
+            // audio-only now-playing profile are acknowledged and ignored.
             DispatchOutcome::reply(response_for(request, 200, "OK"))
         }
         ("SETUP", _) => {
@@ -1494,6 +1766,7 @@ async fn dispatch_encrypted(
                 event_keys,
                 event_endpoint_installed,
                 phase_one,
+                has_media_permit,
                 next_stream_id,
             )
             .await;
@@ -1511,7 +1784,10 @@ async fn dispatch_encrypted(
             }
             outcome
         }
-        ("GET_PARAMETER", _) => get_parameter_response(request, current_volume_db),
+        ("GET_PARAMETER", _) => match config.current_receiver_volume() {
+            Ok(volume) => get_parameter_response(request, volume),
+            Err(_) => DispatchOutcome::reply(response_for(request, 503, "Service Unavailable")),
+        },
         ("SET_PARAMETER", _) => set_parameter_response(request),
         ("RECORD", _) => record_response(request),
         ("SETPEERS" | "SETPEERSX", _) => DispatchOutcome::reply(response_for(request, 200, "OK")),
@@ -1570,8 +1846,19 @@ async fn dispatch_encrypted(
         }
         ("TEARDOWN", _) => {
             let mut outcome = DispatchOutcome::reply(response_for(request, 200, "OK"));
-            outcome.teardown_media = active_stream_id.is_some();
-            outcome.close_after = true;
+            match teardown_scope(request) {
+                TeardownScope::Stream => {
+                    outcome.teardown_media = true;
+                }
+                TeardownScope::Session => {
+                    outcome.teardown_media = true;
+                    outcome.close_after = true;
+                    if let Ok(header) = Header::new("Connection", "close") {
+                        outcome.response.headers.push(header);
+                    }
+                }
+                TeardownScope::Ignore => {}
+            }
             outcome
         }
         (_, "/info" | "/fp-setup") => {
@@ -1638,6 +1925,7 @@ async fn setup_response(
     event_keys: &mut Option<ChannelKeys>,
     event_endpoint_installed: bool,
     phase_one: &mut Option<PhaseOneState>,
+    connection_has_media_permit: bool,
     next_stream_id: &AtomicU64,
 ) -> DispatchOutcome {
     if !has_content_type(request, BINARY_PLIST_CONTENT_TYPE) {
@@ -1669,6 +1957,7 @@ async fn setup_response(
             let timing_matches_stream = matches!(
                 (stream_type, phase_one.as_ref()),
                 (STREAM_TYPE_REALTIME_AUDIO, Some(PhaseOneState::Ntp(_)))
+                    | (STREAM_TYPE_REALTIME_AUDIO, Some(PhaseOneState::Ptp(_)))
                     | (STREAM_TYPE_BUFFERED_AUDIO, Some(PhaseOneState::Ptp(_)))
             );
             if !timing_matches_stream {
@@ -1679,19 +1968,24 @@ async fn setup_response(
                 ));
             }
 
-            let media_permit = match Arc::clone(media_permits).try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    log::info!(
-                        target: "audiohub_airplay::airplay2",
-                        "AirPlay 2 media SETUP refused: active-stream limit reached"
-                    );
-                    return DispatchOutcome::reply(response_for(
-                        request,
-                        453,
-                        "Not Enough Bandwidth",
-                    ));
-                }
+            let new_media_permit = if connection_has_media_permit {
+                None
+            } else {
+                let permit = match Arc::clone(media_permits).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        log::info!(
+                            target: "audiohub_airplay::airplay2",
+                            "AirPlay 2 media SETUP refused: active-stream limit reached"
+                        );
+                        return DispatchOutcome::reply(response_for(
+                            request,
+                            453,
+                            "Not Enough Bandwidth",
+                        ));
+                    }
+                };
+                Some(permit)
             };
 
             let stream_id = next_stream_id.fetch_add(1, Ordering::Relaxed);
@@ -1707,26 +2001,48 @@ async fn setup_response(
                             ));
                         }
                     };
-                    let Some(PhaseOneState::Ntp(timing)) = phase_one.take() else {
+                    let Some(timing) = phase_one.as_ref() else {
                         return DispatchOutcome::close(response_for(
                             request,
                             500,
                             "Internal Server Error",
                         ));
                     };
-                    let media =
-                        match PreparedType96::prepare_with_timing(local_addr, peer, timing, setup)
+                    let media = match timing {
+                        // An NTP timing socket is owned by one classic stream
+                        // and cannot be duplicated safely. PTP, in contrast,
+                        // is a connection-level cloneable clock source.
+                        PhaseOneState::Ntp(_) => {
+                            let Some(PhaseOneState::Ntp(timing)) = phase_one.take() else {
+                                unreachable!("phase-one variant was just matched")
+                            };
+                            PreparedType96::prepare_with_timing(local_addr, peer, timing, setup)
+                                .await
+                        }
+                        PhaseOneState::Ptp(ptp_clock) => {
+                            PreparedType96::prepare_with_ptp(
+                                local_addr,
+                                peer,
+                                ptp_clock.clone(),
+                                setup,
+                            )
                             .await
-                        {
-                            Ok(media) => media,
-                            Err(_) => {
-                                return DispatchOutcome::close(response_for(
-                                    request,
-                                    500,
-                                    "Internal Server Error",
-                                ));
-                            }
-                        };
+                        }
+                    };
+                    let media = match media {
+                        Ok(media) => media,
+                        Err(error) => {
+                            log::warn!(
+                                target: "audiohub_airplay::airplay2",
+                                "AirPlay 2 realtime SETUP could not prepare local media resources: {error}"
+                            );
+                            return DispatchOutcome::close(response_for(
+                                request,
+                                500,
+                                "Internal Server Error",
+                            ));
+                        }
+                    };
                     let body = match setup_type96_phase_two_body(media.ports()) {
                         Ok(body) => body,
                         Err(_) => {
@@ -1737,14 +2053,7 @@ async fn setup_response(
                             ));
                         }
                     };
-                    (
-                        PreparedMedia::Type96 {
-                            stream_id,
-                            media,
-                            _permit: media_permit,
-                        },
-                        body,
-                    )
+                    (PreparedMedia::Type96 { stream_id, media }, body)
                 }
                 STREAM_TYPE_BUFFERED_AUDIO => {
                     let setup = match buffered::parse_phase2(request.body()) {
@@ -1760,15 +2069,20 @@ async fn setup_response(
                             ));
                         }
                     };
-                    let Some(PhaseOneState::Ptp(ptp_clock)) = phase_one.take() else {
+                    let Some(PhaseOneState::Ptp(ptp_clock)) = phase_one.as_ref() else {
                         return DispatchOutcome::close(response_for(
                             request,
                             500,
                             "Internal Server Error",
                         ));
                     };
-                    let media = match PreparedType103::prepare(local_addr, peer, setup, ptp_clock)
-                        .await
+                    let media = match PreparedType103::prepare(
+                        local_addr,
+                        peer,
+                        setup,
+                        ptp_clock.clone(),
+                    )
+                    .await
                     {
                         Ok(media) => media,
                         Err(error) => {
@@ -1792,14 +2106,7 @@ async fn setup_response(
                             ));
                         }
                     };
-                    (
-                        PreparedMedia::Type103 {
-                            stream_id,
-                            media,
-                            _permit: media_permit,
-                        },
-                        body,
-                    )
+                    (PreparedMedia::Type103 { stream_id, media }, body)
                 }
                 _ => unreachable!("stream type was validated above"),
             };
@@ -1810,6 +2117,7 @@ async fn setup_response(
             response.body = body;
             let mut outcome = DispatchOutcome::reply(response);
             outcome.start_media = Some(prepared);
+            outcome.install_media_permit = new_media_permit;
             outcome.probe_event = Some(ProbeEvent::SetupPhase2 {
                 peer: peer.ip(),
                 stream_type: Some(stream_type),
@@ -2593,6 +2901,17 @@ fn parse_control_binary_plist(request: &Request) -> Result<Dictionary, ()> {
         .ok_or(())
 }
 
+fn teardown_scope(request: &Request) -> TeardownScope {
+    let Ok(dictionary) = parse_control_binary_plist(request) else {
+        return TeardownScope::Ignore;
+    };
+    match dictionary.get("streams") {
+        Some(Value::Array(_)) => TeardownScope::Stream,
+        Some(_) => TeardownScope::Ignore,
+        None => TeardownScope::Session,
+    }
+}
+
 fn safe_control_plist_shape(request: &Request) -> String {
     let Ok(dictionary) = parse_control_binary_plist(request) else {
         return "invalid-binary-plist".to_owned();
@@ -2619,7 +2938,10 @@ fn safe_control_plist_shape(request: &Request) -> String {
         .join(",")
 }
 
-fn get_parameter_response(request: &Request, current_volume_db: Option<f32>) -> DispatchOutcome {
+fn get_parameter_response(
+    request: &Request,
+    current_volume: Option<ReceiverVolumeSnapshot>,
+) -> DispatchOutcome {
     if !has_content_type(request, TEXT_PARAMETERS_CONTENT_TYPE) {
         return DispatchOutcome::reply(response_for(request, 400, "Bad Request"));
     }
@@ -2629,48 +2951,129 @@ fn get_parameter_response(request: &Request, current_volume_db: Option<f32>) -> 
     if body.trim() != "volume" {
         return DispatchOutcome::reply(response_for(request, 200, "OK"));
     }
+    let Some(current_volume) = current_volume else {
+        return DispatchOutcome::reply(response_for(request, 503, "Service Unavailable"));
+    };
     let mut response = response_for(request, 200, "OK");
     if add_content_type(&mut response, TEXT_PARAMETERS_CONTENT_TYPE).is_err() {
         return DispatchOutcome::close(response_for(request, 500, "Internal Server Error"));
     }
-    response.body = format!("volume: {:.6}\r\n", current_volume_db.unwrap_or(0.0)).into_bytes();
+    response.body = format!("volume: {:.6}\r\n", current_volume.legacy_text_db()).into_bytes();
     DispatchOutcome::reply(response)
+}
+
+fn now_playing_command_response(request: &Request) -> DispatchOutcome {
+    let mut outcome = DispatchOutcome::reply(response_for(request, 200, "OK"));
+    if !has_content_type(request, BINARY_PLIST_CONTENT_TYPE) || request.body().is_empty() {
+        return outcome;
+    }
+    match metadata::parse_now_playing_command(request.body()) {
+        Ok(Some(update)) => outcome.now_playing = Some(NowPlayingWireUpdate::Rich(update)),
+        Ok(None) => {}
+        Err(error) => log::debug!(
+            target: "audiohub_airplay::airplay2",
+            "AirPlay 2 ignored malformed now-playing command: {error}"
+        ),
+    }
+    outcome
 }
 
 fn set_parameter_response(request: &Request) -> DispatchOutcome {
     if request.body().is_empty() {
         return DispatchOutcome::reply(response_for(request, 200, "OK"));
     }
+    if has_content_type(request, "application/x-dmap-tagged") {
+        let mut outcome = DispatchOutcome::reply(response_for(request, 200, "OK"));
+        match metadata::parse_dmap(request.body()) {
+            Ok(Some(metadata)) => {
+                outcome.now_playing = Some(NowPlayingWireUpdate::Metadata(metadata));
+            }
+            Ok(None) => {}
+            Err(error) => log::debug!(
+                target: "audiohub_airplay::airplay2",
+                "AirPlay 2 ignored malformed DMAP metadata: {error}"
+            ),
+        }
+        return outcome;
+    }
+    if has_content_type(request, "image/none") {
+        let mut outcome = DispatchOutcome::reply(response_for(request, 200, "OK"));
+        outcome.now_playing = Some(NowPlayingWireUpdate::Artwork(None));
+        return outcome;
+    }
+    for content_type in ["image/jpeg", "image/png"] {
+        if has_content_type(request, content_type) {
+            let mut outcome = DispatchOutcome::reply(response_for(request, 200, "OK"));
+            match metadata::parse_artwork_bytes(content_type, request.body()) {
+                Ok(artwork) => {
+                    outcome.now_playing = Some(NowPlayingWireUpdate::Artwork(Some(artwork)));
+                }
+                Err(error) => {
+                    log::debug!(
+                        target: "audiohub_airplay::airplay2",
+                        "AirPlay 2 ignored malformed {content_type} artwork: {error}"
+                    );
+                }
+            }
+            return outcome;
+        }
+    }
     if !has_content_type(request, TEXT_PARAMETERS_CONTENT_TYPE) {
-        // Metadata and artwork are not claimed by the discovery profile. Keep
-        // them harmlessly unsupported instead of parsing opaque media here.
-        return DispatchOutcome::reply(response_for(request, 501, "Not Implemented"));
+        // Decorative metadata is not allowed to tear down an otherwise valid
+        // audio stream merely because a sender uses an extension we do not
+        // understand.
+        return DispatchOutcome::reply(response_for(request, 200, "OK"));
     }
     let Ok(body) = std::str::from_utf8(request.body()) else {
         return DispatchOutcome::reply(response_for(request, 400, "Bad Request"));
     };
     let mut volume = None;
+    let mut progress = None;
     for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let Some(value) = line.strip_prefix("volume:") else {
-            continue;
-        };
-        if volume.is_some() {
-            return DispatchOutcome::reply(response_for(request, 400, "Bad Request"));
+        if let Some(value) = line.strip_prefix("volume:") {
+            if volume.is_some() {
+                return DispatchOutcome::reply(response_for(request, 400, "Bad Request"));
+            }
+            let Ok(db) = value.trim().parse::<f32>() else {
+                return DispatchOutcome::reply(response_for(request, 400, "Bad Request"));
+            };
+            if !db.is_finite()
+                || (db != AIRPLAY_VOLUME_MUTE_DB
+                    && !(AIRPLAY_VOLUME_MIN_DB..=AIRPLAY_VOLUME_MAX_DB).contains(&db))
+            {
+                return DispatchOutcome::reply(response_for(request, 400, "Bad Request"));
+            }
+            volume = Some(db);
+        } else if let Some(value) = line.strip_prefix("progress:") {
+            if progress.is_none() {
+                progress = parse_progress_parameter(value.trim());
+            }
         }
-        let Ok(db) = value.trim().parse::<f32>() else {
-            return DispatchOutcome::reply(response_for(request, 400, "Bad Request"));
-        };
-        if !db.is_finite()
-            || (db != AIRPLAY_VOLUME_MUTE_DB
-                && !(AIRPLAY_VOLUME_MIN_DB..=AIRPLAY_VOLUME_MAX_DB).contains(&db))
-        {
-            return DispatchOutcome::reply(response_for(request, 400, "Bad Request"));
-        }
-        volume = Some(db);
     }
     let mut outcome = DispatchOutcome::reply(response_for(request, 200, "OK"));
     outcome.volume_db = volume;
+    outcome.now_playing =
+        progress.map(|(elapsed_ms, duration_ms)| NowPlayingWireUpdate::Progress {
+            elapsed_ms,
+            duration_ms,
+        });
     outcome
+}
+
+fn parse_progress_parameter(value: &str) -> Option<(u64, u64)> {
+    let mut fields = value.split('/');
+    let start = fields.next()?.trim().parse::<u64>().ok()?;
+    let current = fields.next()?.trim().parse::<u64>().ok()?;
+    let end = fields.next()?.trim().parse::<u64>().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let elapsed_frames = current.saturating_sub(start);
+    let duration_frames = end.saturating_sub(start);
+    Some((
+        elapsed_frames.saturating_mul(1000) / 44_100,
+        duration_frames.saturating_mul(1000) / 44_100,
+    ))
 }
 
 struct PreparedEventEndpoint {
@@ -3212,8 +3615,10 @@ fn pairing_response(request: &Request, body: Vec<u8>, close_after: bool) -> Disp
         install_event_keys: None,
         install_event_endpoint: None,
         install_phase_one: None,
+        install_media_permit: None,
         start_media: None,
         volume_db: None,
+        now_playing: None,
         flush_media: None,
         set_media_rate: None,
         teardown_media: false,
@@ -3535,7 +3940,9 @@ mod tests {
             ptp_clock: OnceLock::new(),
             ptp_test_ephemeral: true,
             features: FEATURES,
-            initial_volume_db: Some(-18.0),
+            receiver_volume: Some(ReceiverVolumeProvider::fixed(
+                ReceiverVolumeSnapshot::new(-18.0, false).unwrap(),
+            )),
         }
     }
 
@@ -3558,7 +3965,9 @@ mod tests {
         let mut decoder = RequestDecoder::new(RequestLimits::default()).unwrap();
         decoder.feed(wire).unwrap();
         decoder
-            .next_request(max_body_for_method)
+            .next_request(|method, target, headers| {
+                max_body_for_request(method, target, headers, true)
+            })
             .unwrap()
             .expect("complete test request")
     }
@@ -3643,7 +4052,11 @@ mod tests {
         decoder
             .feed(b"OPTIONS * RTSP/1.0\r\nContent-Length: 1\r\n\r\nx")
             .unwrap();
-        assert!(decoder.next_request(max_body_for_method).is_err());
+        assert!(decoder
+            .next_request(|method, target, headers| {
+                max_body_for_request(method, target, headers, true)
+            })
+            .is_err());
     }
 
     #[test]
@@ -3679,6 +4092,77 @@ mod tests {
             assert!(
                 !public.split(',').any(|entry| entry.trim() == unsupported),
                 "must not advertise unsupported method {unsupported}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_distinguishes_stream_session_and_malformed_bodies() {
+        let stream_body = binary_plist({
+            let mut root = Dictionary::new();
+            root.insert("streams".into(), Value::Array(Vec::new()));
+            root
+        });
+        let session_body = binary_plist(Dictionary::new());
+        let requests = [
+            (
+                make_request(
+                    "TEARDOWN",
+                    "/stream",
+                    Some(BINARY_PLIST_CONTENT_TYPE),
+                    &stream_body,
+                ),
+                true,
+                false,
+            ),
+            (
+                make_request(
+                    "TEARDOWN",
+                    "/session",
+                    Some(BINARY_PLIST_CONTENT_TYPE),
+                    &session_body,
+                ),
+                true,
+                true,
+            ),
+            (
+                make_request(
+                    "TEARDOWN",
+                    "/stream",
+                    Some(BINARY_PLIST_CONTENT_TYPE),
+                    b"malformed",
+                ),
+                false,
+                false,
+            ),
+        ];
+
+        for (request, teardown_media, close_after) in requests {
+            let mut event_keys = None;
+            let mut phase_one = None;
+            let outcome = dispatch_encrypted(
+                &request,
+                "127.0.0.1:6000".parse().unwrap(),
+                "127.0.0.1:7000".parse().unwrap(),
+                &config(),
+                &mut event_keys,
+                false,
+                &mut phase_one,
+                true,
+                Some(7),
+                Some(MediaKind::Realtime),
+                &AtomicU64::new(8),
+            )
+            .await;
+            assert_eq!(outcome.response.status, 200);
+            assert_eq!(outcome.teardown_media, teardown_media);
+            assert_eq!(outcome.close_after, close_after);
+            assert_eq!(
+                outcome.response.headers.iter().any(|header| {
+                    header.name().eq_ignore_ascii_case("Connection")
+                        && header.value().eq_ignore_ascii_case(b"close")
+                }),
+                close_after
             );
         }
     }
@@ -3759,7 +4243,7 @@ mod tests {
             &mut event_keys,
             false,
             &mut phase_one,
-            None,
+            false,
             None,
             None,
             &next_stream_id,
@@ -4259,7 +4743,9 @@ mod tests {
         install_control_after_m4(&mut state, keys).unwrap();
         let parsed = state
             .requests
-            .next_request(max_body_for_method)
+            .next_request(|method, target, headers| {
+                max_body_for_request(method, target, headers, true)
+            })
             .unwrap()
             .unwrap();
         assert_eq!(parsed.method(), "GET");
@@ -4347,6 +4833,7 @@ mod tests {
             &mut event_keys,
             false,
             &mut phase_one_state,
+            false,
             &next_stream_id,
         )
         .await;
@@ -4819,6 +5306,7 @@ mod tests {
             &mut event_keys,
             false,
             &mut phase_one,
+            false,
             &AtomicU64::new(1),
         )
         .await;
@@ -5052,6 +5540,7 @@ mod tests {
             &mut event_keys,
             false,
             &mut phase_one_state,
+            false,
             &next_stream_id,
         )
         .await;
@@ -5106,6 +5595,7 @@ mod tests {
             &mut event_keys,
             true,
             &mut phase_one,
+            false,
             &AtomicU64::new(41),
         )
         .await;
@@ -5192,11 +5682,12 @@ mod tests {
             &mut event_keys,
             true,
             &mut phase_one,
+            false,
             &AtomicU64::new(51),
         )
         .await;
         assert_eq!(outcome.response.status, 200);
-        assert!(phase_one.is_none());
+        assert!(matches!(phase_one, Some(PhaseOneState::Ptp(_))));
         let prepared = outcome.start_media.expect("successful setup owns media");
         assert_eq!(prepared.stream_id(), 51);
         let ports = match &prepared {
@@ -5280,7 +5771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_media_gate_rejects_a_second_stream_and_releases_on_drop() {
+    async fn media_gate_allows_same_connection_replacement_and_rejects_competitors() {
         let peer: SocketAddr = "127.0.0.1:6000".parse().unwrap();
         let local: SocketAddr = "127.0.0.1:7000".parse().unwrap();
         let permits = media_permits();
@@ -5314,7 +5805,7 @@ mod tests {
         let (_observer, clock) = PtpObserver::bind_ephemeral().await.unwrap();
         let mut first_phase = Some(PhaseOneState::Ptp(clock));
         let mut event_keys = None;
-        let first = setup_response(
+        let mut first_outcome = setup_response(
             &request,
             peer,
             local,
@@ -5324,22 +5815,27 @@ mod tests {
             &mut event_keys,
             true,
             &mut first_phase,
+            false,
             &AtomicU64::new(1),
         )
         .await;
-        assert_eq!(first.response.status, 200);
-        let first = first
+        assert_eq!(first_outcome.response.status, 200);
+        let first_permit = first_outcome
+            .install_media_permit
+            .take()
+            .expect("first stream acquires the connection permit");
+        let first = first_outcome
             .start_media
+            .take()
             .unwrap()
             .start(null_output_factory()(1, peer));
         assert_eq!(permits.available_permits(), 0);
 
-        // Phase two consumed this connection's timing resource. A repeated
-        // phase-two SETUP on the same control state is therefore rejected as
-        // invalid state before the global media gate is consulted; it cannot
-        // accidentally report a competing-stream 453 or disturb the old flow.
-        assert!(first_phase.is_none());
-        let repeated = setup_response(
+        // PTP timing and the connection-owned permit survive a stream-only
+        // TEARDOWN, so the sender can immediately prepare a replacement media
+        // stream on this same RTSP connection.
+        assert!(matches!(first_phase, Some(PhaseOneState::Ptp(_))));
+        let mut repeated = setup_response(
             &request,
             peer,
             local,
@@ -5349,14 +5845,18 @@ mod tests {
             &mut event_keys,
             true,
             &mut first_phase,
+            true,
             &AtomicU64::new(2),
         )
         .await;
-        assert_eq!(repeated.response.status, 455);
-        assert!(repeated.start_media.is_none());
+        assert_eq!(repeated.response.status, 200);
+        assert!(repeated.install_media_permit.is_none());
+        assert!(repeated.start_media.take().is_some());
+        assert!(matches!(first_phase, Some(PhaseOneState::Ptp(_))));
         assert!(!first.is_finished());
         assert_eq!(permits.available_permits(), 0);
 
+        // A different connection still cannot exceed the global media limit.
         let (_observer, clock) = PtpObserver::bind_ephemeral().await.unwrap();
         let mut second_phase = Some(PhaseOneState::Ptp(clock));
         let second = setup_response(
@@ -5369,6 +5869,7 @@ mod tests {
             &mut event_keys,
             true,
             &mut second_phase,
+            false,
             &AtomicU64::new(2),
         )
         .await;
@@ -5378,6 +5879,8 @@ mod tests {
 
         first.abort().await;
         drop(first);
+        assert_eq!(permits.available_permits(), 0);
+        drop(first_permit);
         assert_eq!(permits.available_permits(), 1);
 
         let retry = setup_response(
@@ -5390,21 +5893,28 @@ mod tests {
             &mut event_keys,
             true,
             &mut second_phase,
+            false,
             &AtomicU64::new(3),
         )
         .await;
         assert_eq!(retry.response.status, 200);
-        drop(retry.start_media);
+        assert!(retry.install_media_permit.is_some());
+        drop(retry);
         assert_eq!(permits.available_permits(), 1);
     }
 
     #[tokio::test]
-    async fn phase_two_rejects_a_stream_timing_protocol_mismatch_without_consuming_phase_one() {
+    async fn ptp_phase_two_prepares_realtime_udp_ports_without_an_ntp_timing_port() {
         let mut stream = Dictionary::new();
         stream.insert(
             "type".into(),
             Value::Integer(STREAM_TYPE_REALTIME_AUDIO.into()),
         );
+        stream.insert("audioFormat".into(), Value::Integer(0x0004_0000u64.into()));
+        stream.insert("ct".into(), Value::Integer(2u64.into()));
+        stream.insert("spf".into(), Value::Integer(352u64.into()));
+        stream.insert("sr".into(), Value::Integer(44_100u64.into()));
+        stream.insert("shk".into(), Value::Data(vec![0x59; 32]));
         let mut root = Dictionary::new();
         root.insert(
             "streams".into(),
@@ -5429,13 +5939,39 @@ mod tests {
             &mut event_keys,
             true,
             &mut phase_one,
+            false,
             &AtomicU64::new(1),
         )
         .await;
 
-        assert_eq!(outcome.response.status, 455);
-        assert!(outcome.start_media.is_none());
+        assert_eq!(outcome.response.status, 200);
         assert!(matches!(phase_one, Some(PhaseOneState::Ptp(_))));
+        let prepared = outcome
+            .start_media
+            .expect("PTP realtime SETUP owns both UDP endpoints");
+        let PreparedMedia::Type96 { media, .. } = prepared else {
+            panic!("PTP realtime SETUP must prepare type-96 media");
+        };
+        let ports = media.ports();
+        assert_ne!(ports.data_port, 0);
+        assert_ne!(ports.control_port, 0);
+        assert_ne!(ports.data_port, ports.control_port);
+
+        let response = Value::from_reader(Cursor::new(&outcome.response.body)).unwrap();
+        let response_stream = response
+            .as_dictionary()
+            .unwrap()
+            .get("streams")
+            .and_then(Value::as_array)
+            .and_then(|streams| streams.first())
+            .and_then(Value::as_dictionary)
+            .unwrap();
+        assert_eq!(
+            response_stream
+                .get("controlPort")
+                .and_then(Value::as_unsigned_integer),
+            Some(u64::from(ports.control_port))
+        );
     }
 
     #[test]
@@ -5447,8 +5983,8 @@ mod tests {
             b"volume\r\n",
         );
         let get = get_parameter_response(&get, None);
-        assert_eq!(get.response.status, 200);
-        assert_eq!(get.response.body, b"volume: 0.000000\r\n");
+        assert_eq!(get.response.status, 503);
+        assert!(get.response.body.is_empty());
 
         let get = make_request(
             "GET_PARAMETER",
@@ -5456,8 +5992,22 @@ mod tests {
             Some(TEXT_PARAMETERS_CONTENT_TYPE),
             b"volume\r\n",
         );
-        let get = get_parameter_response(&get, Some(-17.25));
+        let get = get_parameter_response(
+            &get,
+            Some(ReceiverVolumeSnapshot::new(-17.25, false).unwrap()),
+        );
         assert_eq!(get.response.body, b"volume: -17.250000\r\n");
+
+        let muted = get_parameter_response(
+            &make_request(
+                "GET_PARAMETER",
+                "/stream",
+                Some(TEXT_PARAMETERS_CONTENT_TYPE),
+                b"volume\r\n",
+            ),
+            Some(ReceiverVolumeSnapshot::new(-17.25, true).unwrap()),
+        );
+        assert_eq!(muted.response.body, b"volume: -144.000000\r\n");
 
         let record = make_request("RECORD", "/stream", None, b"");
         let record = record_response(&record);
@@ -5502,6 +6052,112 @@ mod tests {
             );
             assert_eq!(set_parameter_response(&request).response.status, 400);
         }
+    }
+
+    #[test]
+    fn authenticated_metadata_artwork_and_progress_are_accepted_and_latched() {
+        fn dmap(tag: &[u8; 4], value: &[u8]) -> Vec<u8> {
+            let mut encoded = Vec::with_capacity(8 + value.len());
+            encoded.extend_from_slice(tag);
+            encoded.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(value);
+            encoded
+        }
+
+        let listing = [
+            dmap(b"minm", b"Song"),
+            dmap(b"asar", b"Artist"),
+            dmap(b"asal", b"Album"),
+        ]
+        .concat();
+        let metadata = dmap(b"mlit", &listing);
+        let outcome = set_parameter_response(&make_request(
+            "SET_PARAMETER",
+            "/stream",
+            Some("application/x-dmap-tagged; charset=binary"),
+            &metadata,
+        ));
+        assert_eq!(outcome.response.status, 200);
+
+        let mut latched = ConnectionNowPlaying::default();
+        let changed = latched.apply(outcome.now_playing.unwrap());
+        assert!(changed.metadata);
+        assert!(latched
+            .all_events(IpAddr::V4(Ipv4Addr::LOCALHOST), 9)
+            .iter()
+            .any(|event| matches!(
+                event,
+                ProbeEvent::Metadata {
+                    stream_id: 9,
+                    title: Some(title),
+                    artist: Some(artist),
+                    album: Some(album),
+                    ..
+                } if title == "Song" && artist == "Artist" && album == "Album"
+            )));
+
+        let progress = set_parameter_response(&make_request(
+            "SET_PARAMETER",
+            "/stream",
+            Some(TEXT_PARAMETERS_CONTENT_TYPE),
+            b"progress: 44100/88200/176400\r\n",
+        ));
+        let changed = latched.apply(progress.now_playing.unwrap());
+        assert!(changed.progress);
+        assert_eq!(latched.elapsed_ms, Some(1_000));
+        assert_eq!(latched.duration_ms, Some(3_000));
+
+        let clear = set_parameter_response(&make_request(
+            "SET_PARAMETER",
+            "/stream",
+            Some("image/none"),
+            b"none",
+        ));
+        let changed = latched.apply(clear.now_playing.unwrap());
+        assert!(changed.artwork);
+        assert!(latched.artwork.is_none());
+
+        let malformed = set_parameter_response(&make_request(
+            "SET_PARAMETER",
+            "/stream",
+            Some("application/x-dmap-tagged"),
+            b"truncated",
+        ));
+        assert_eq!(malformed.response.status, 200);
+        assert!(malformed.now_playing.is_none());
+    }
+
+    #[test]
+    fn artwork_body_budget_is_large_only_for_authenticated_known_media_types() {
+        let content_length = 2_393_210usize;
+        let header = format!(
+            "SET_PARAMETER /stream RTSP/1.0\r\nContent-Type: image/png\r\nContent-Length: {content_length}\r\n\r\n"
+        );
+        let limits = RequestLimits {
+            default_max_body_bytes: MAX_NOW_PLAYING_BODY_BYTES,
+            ..RequestLimits::default()
+        };
+
+        let mut authenticated = RequestDecoder::new(limits).unwrap();
+        authenticated.feed(header.as_bytes()).unwrap();
+        assert!(authenticated
+            .next_request(|method, target, headers| {
+                max_body_for_request(method, target, headers, true)
+            })
+            .unwrap()
+            .is_none());
+
+        let mut plaintext = RequestDecoder::new(limits).unwrap();
+        plaintext.feed(header.as_bytes()).unwrap();
+        assert!(matches!(
+            plaintext.next_request(|method, target, headers| {
+                max_body_for_request(method, target, headers, false)
+            }),
+            Err(super::super::rtsp::RtspError::BodyTooLarge {
+                actual: 2_393_210,
+                max: MAX_CONTROL_BODY_BYTES,
+            })
+        ));
     }
 
     #[test]
@@ -5723,6 +6379,7 @@ mod tests {
             &mut event_keys,
             false,
             &mut phase_one_state,
+            false,
             &next_stream_id,
         )
         .await;
@@ -5747,6 +6404,7 @@ mod tests {
             &mut event_keys,
             false,
             &mut phase_one_state,
+            false,
             &next_stream_id,
         )
         .await;
@@ -5773,6 +6431,7 @@ mod tests {
             &mut event_keys,
             false,
             &mut phase_one_state,
+            false,
             &next_stream_id,
         )
         .await;
@@ -5888,7 +6547,7 @@ mod tests {
                 &mut event_keys,
                 false,
                 &mut phase_one,
-                None,
+                false,
                 None,
                 None,
                 &AtomicU64::new(1),

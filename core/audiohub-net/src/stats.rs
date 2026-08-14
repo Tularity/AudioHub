@@ -34,7 +34,11 @@ impl RateWindow {
     /// span that still yields a number; below it [`RateWindow::kbps`] reports
     /// `None` rather than a figure computed from a denominator near zero.
     pub fn new(window: Duration, min_span: Duration) -> RateWindow {
-        RateWindow { pts: VecDeque::new(), window, min_span }
+        RateWindow {
+            pts: VecDeque::new(),
+            window,
+            min_span,
+        }
     }
 
     /// Append a reading of the cumulative byte counter and drop points that
@@ -46,7 +50,9 @@ impl RateWindow {
         // has none, do not trim — a `unwrap_or(now)` here would set the cutoff
         // to "now", collapse the window to a single point, and make every
         // subsequent read return `None` until the window refilled.
-        let Some(cutoff) = now.checked_sub(self.window) else { return };
+        let Some(cutoff) = now.checked_sub(self.window) else {
+            return;
+        };
         // Keep the newest point at or before the cutoff as the baseline;
         // deleting strictly by cutoff empties the window under sparse sampling.
         while self.pts.len() >= 2 && self.pts[1].0 <= cutoff {
@@ -140,7 +146,10 @@ pub const SPREAD_MIN_SAMPLES: usize = 32;
 
 impl SpreadWindow {
     pub fn new() -> SpreadWindow {
-        SpreadWindow { samples: VecDeque::with_capacity(SPREAD_WINDOW), cap: SPREAD_WINDOW }
+        SpreadWindow {
+            samples: VecDeque::with_capacity(SPREAD_WINDOW),
+            cap: SPREAD_WINDOW,
+        }
     }
 
     /// `transit_us` = `arrival_us − timestamp_us`, the same quantity
@@ -179,7 +188,6 @@ impl SpreadWindow {
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
-
 }
 
 impl Default for SpreadWindow {
@@ -334,7 +342,11 @@ mod spread_tests {
             a.push(*t);
             b.push(*t + 3_600_000_000); // one hour of offset
         }
-        assert_eq!(a.spread_ms(), b.spread_ms(), "the spread moved with the clock offset");
+        assert_eq!(
+            a.spread_ms(),
+            b.spread_ms(),
+            "the spread moved with the clock offset"
+        );
     }
 
     /// **The point of the whole statistic.** A stall-then-burst — TCP's failure
@@ -401,7 +413,10 @@ mod spread_tests {
             assert_eq!(w.spread_ms(), None, "answered with only {} samples", i + 1);
         }
         w.push(0);
-        assert!(w.spread_ms().is_some(), "still no answer at the minimum sample count");
+        assert!(
+            w.spread_ms().is_some(),
+            "still no answer at the minimum sample count"
+        );
     }
 
     /// The window is bounded and forgets: a spike must not sit in the answer
@@ -414,7 +429,10 @@ mod spread_tests {
         for _ in 0..(SPREAD_WINDOW - 1) {
             w.push(0);
         }
-        assert!(w.spread_ms().unwrap() < 1.0, "the p95 is holding a single outlier");
+        assert!(
+            w.spread_ms().unwrap() < 1.0,
+            "the p95 is holding a single outlier"
+        );
         assert_eq!(w.len(), SPREAD_WINDOW);
         for _ in 0..SPREAD_WINDOW {
             w.push(0);

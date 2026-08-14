@@ -98,23 +98,24 @@ pub(crate) fn accept_loop(inner: Arc<DaemonInner>, listener: TcpListener) {
                 over_warned = false;
                 inner.preauth.fetch_add(1, Ordering::SeqCst);
                 let i = inner.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("ahb-conn".into())
-                    .spawn(move || {
-                        let guard = PreauthGuard(i.clone());
-                        // spec §8: one connection thread may not take the
-                        // daemon with it — catch, log, drop the connection
-                        let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            handle_inbound(&i, stream, addr, guard)
-                        }));
-                        match r {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => dlog!("[audiohubd] control conn {addr}: {e:#}"),
-                            Err(_) => {
-                                dlog!("[audiohubd] control conn {addr}: panicked, dropped")
+                let spawned =
+                    std::thread::Builder::new()
+                        .name("ahb-conn".into())
+                        .spawn(move || {
+                            let guard = PreauthGuard(i.clone());
+                            // spec §8: one connection thread may not take the
+                            // daemon with it — catch, log, drop the connection
+                            let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                handle_inbound(&i, stream, addr, guard)
+                            }));
+                            match r {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => dlog!("[audiohubd] control conn {addr}: {e:#}"),
+                                Err(_) => {
+                                    dlog!("[audiohubd] control conn {addr}: panicked, dropped")
+                                }
                             }
-                        }
-                    });
+                        });
                 if spawned.is_err() {
                     inner.preauth.fetch_sub(1, Ordering::SeqCst);
                 }
@@ -178,7 +179,8 @@ fn handle_inbound(
             let Some(pin) = pin else {
                 let _ = write_frame(
                     &mut stream,
-                    &ControlMsg::Error { message: "pairing not enabled".into(),
+                    &ControlMsg::Error {
+                        message: "pairing not enabled".into(),
                     },
                 );
                 bail!("pairing attempt while pairing not enabled");
@@ -235,7 +237,8 @@ fn handle_inbound(
         other => {
             let _ = write_frame(
                 &mut stream,
-                &ControlMsg::Error { message: "expected verify_hello or pair_init".into(),
+                &ControlMsg::Error {
+                    message: "expected verify_hello or pair_init".into(),
                 },
             );
             bail!("unexpected first frame: {other:?}");
@@ -279,9 +282,7 @@ fn release_pairing_pin(inner: &DaemonInner, pin: &str, ok: bool) {
             } else {
                 p.fails += 1;
                 if p.fails >= MAX_PAIR_FAILURES {
-                    dlog!(
-                        "[audiohubd] pairing disabled after {MAX_PAIR_FAILURES} failed attempts"
-                    );
+                    dlog!("[audiohubd] pairing disabled after {MAX_PAIR_FAILURES} failed attempts");
                     disable = true;
                 }
             }
@@ -504,6 +505,7 @@ fn register_conn(
         clock: Mutex::new(ClockFilter::new()),
         clock_warned: AtomicBool::new(false),
         peer_mode: Mutex::new(crate::PeerModeCell::Unheard),
+        peer_audio_capabilities: Mutex::new(crate::PeerAudioCapabilitiesCell::Unheard),
     });
     let mut st = lk(&inner.state);
     let keep_existing = st.conns.get(&conn.fp).map_or(false, |old| {
@@ -543,6 +545,7 @@ fn register_conn(
     let _ = conn.send_msg(&SessionMsg::ModeState {
         mode: haldev::effective_mode(inner).as_str().to_string(),
     });
+    let _ = conn.send_msg(&local_audio_capabilities_msg());
     // M8: if this peer is pinned to tier 1, start the media link now — before
     // any stream exists, so the first stream opens straight onto it. A stream
     // that opened first would be pinned to UDP for its whole life (design §5.1
@@ -558,6 +561,177 @@ fn register_conn(
         crate::tcpmedia::negotiate(inner, &conn);
     }
     Some(conn)
+}
+
+fn local_audio_capabilities_msg() -> SessionMsg {
+    let presence = audiohub_core::audio::default_device_presence();
+    audio_capabilities_msg(presence)
+}
+
+fn audio_capabilities_msg(presence: audiohub_core::audio::DefaultDevicePresence) -> SessionMsg {
+    SessionMsg::AudioCapabilities {
+        default_input: presence.input,
+        default_output: presence.output,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingLocalEndpoint {
+    DefaultInput,
+    DefaultOutput,
+}
+
+impl MissingLocalEndpoint {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DefaultInput => "default input",
+            Self::DefaultOutput => "default output",
+        }
+    }
+
+    fn epoch(self, inner: &DaemonInner) -> u64 {
+        match self {
+            Self::DefaultInput => inner.dev_in_epoch.load(Ordering::Acquire),
+            Self::DefaultOutput => inner.dev_out_epoch.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// The real local endpoint a valid peer open depends on, if any. `dir` is from
+/// the opener's wire perspective here (the mirror of the stored local `dir`).
+fn required_local_endpoint_for_remote_open(
+    kind: &str,
+    dir: &str,
+    source: Option<&str>,
+) -> Option<MissingLocalEndpoint> {
+    match (kind, dir) {
+        (KIND_SPK, DIR_SEND) => Some(MissingLocalEndpoint::DefaultOutput),
+        (KIND_MIC, DIR_RECV) if source.is_none() || source == Some(SOURCE_MIC) => {
+            Some(MissingLocalEndpoint::DefaultInput)
+        }
+        _ => None,
+    }
+}
+
+/// Return the real local endpoint which this peer-originated session needs but
+/// the machine no longer has.
+///
+/// `dir` is local: a peer's `spk/send` request is stored as `spk/recv`, while a
+/// peer's `mic/recv` request is stored as `mic/send`. Only the latter needs its
+/// source inspected because an alternate mic source replaces the real default
+/// input entirely.
+fn missing_local_endpoint_for_peer_session(
+    origin: SessionOrigin,
+    kind: &str,
+    dir: &str,
+    source: Option<&str>,
+    presence: audiohub_core::audio::DefaultDevicePresence,
+) -> Option<MissingLocalEndpoint> {
+    if origin != SessionOrigin::Peer {
+        return None;
+    }
+    match (kind, dir) {
+        (KIND_SPK, DIR_RECV) if !presence.output => Some(MissingLocalEndpoint::DefaultOutput),
+        (KIND_MIC, DIR_SEND)
+            if !presence.input && (source.is_none() || source == Some(SOURCE_MIC)) =>
+        {
+            Some(MissingLocalEndpoint::DefaultInput)
+        }
+        _ => None,
+    }
+}
+
+/// Close peer-opened sessions whose owned real endpoint just disappeared.
+///
+/// The state lock is used only to take the immutable decision snapshot. It is
+/// released before `teardown_stream` removes entries and, critically, before
+/// `send_msg(CloseStream)` takes the connection's write mutex. This function
+/// therefore remains safe if capability observation and a control reader are
+/// active at the same time.
+pub(crate) fn close_peer_sessions_missing_local_endpoints(
+    inner: &Arc<DaemonInner>,
+    presence: audiohub_core::audio::DefaultDevicePresence,
+) {
+    let doomed: Vec<(u32, MissingLocalEndpoint)> = {
+        let st = lk(&inner.state);
+        st.sessions
+            .values()
+            .filter_map(|entry| {
+                missing_local_endpoint_for_peer_session(
+                    entry.origin,
+                    &entry.kind,
+                    &entry.dir,
+                    entry.source.as_deref(),
+                    presence,
+                )
+                .map(|endpoint| (entry.id, endpoint))
+            })
+            .collect()
+    };
+
+    for (stream_id, endpoint) in doomed {
+        dlog!(
+            "[audiohubd] stream {stream_id}: local {} disappeared; closing peer-originated stream",
+            endpoint.label()
+        );
+        teardown_stream(inner, stream_id, true);
+    }
+}
+
+/// Commit a peer open only if the endpoint generation sampled before media
+/// construction is still current. Media construction can wait seconds for a
+/// real capture device, so the watcher may already have advertised capability
+/// loss while this open is not yet visible in `state.sessions`.
+///
+/// The epoch check and insertion share the state lock with the watcher's
+/// session snapshot. Therefore either the watcher runs after the insertion and
+/// sees it, or it ran first and this check rejects the stale open. A callback
+/// racing after the check is also safe: its watcher pass necessarily takes the
+/// state lock after this insertion.
+fn insert_remote_session_if_endpoint_unchanged(
+    inner: &DaemonInner,
+    stream_id: u32,
+    entry: SessionEntry,
+    endpoint_guard: Option<(MissingLocalEndpoint, u64)>,
+) -> Result<()> {
+    let mut st = lk(&inner.state);
+    if let Some((endpoint, started_epoch)) = endpoint_guard {
+        endpoint_epoch_still_current_at_commit(endpoint, started_epoch, endpoint.epoch(inner))?;
+    }
+    st.sessions.insert(stream_id, entry);
+    Ok(())
+}
+
+fn endpoint_epoch_still_current_at_commit(
+    endpoint: MissingLocalEndpoint,
+    started_epoch: u64,
+    current_epoch: u64,
+) -> Result<()> {
+    if current_epoch != started_epoch {
+        bail!(
+            "local {} changed while the peer stream was opening; retry the stream",
+            endpoint.label()
+        );
+    }
+    Ok(())
+}
+
+/// Re-advertise the current real endpoint facts after a platform device epoch
+/// changes. Discovery happens once per fan-out and sends happen after the state
+/// lock is released, so a slow peer cannot block connection bookkeeping.
+pub(crate) fn announce_audio_capabilities(inner: &Arc<DaemonInner>) {
+    let presence = audiohub_core::audio::default_device_presence();
+    close_peer_sessions_missing_local_endpoints(inner, presence);
+    let msg = audio_capabilities_msg(presence);
+    let conns: Vec<_> = lk(&inner.state)
+        .conns
+        .values()
+        .filter(|c| c.alive.load(Ordering::SeqCst))
+        .cloned()
+        .collect();
+    for conn in conns {
+        let _ = conn.send_msg(&msg);
+    }
 }
 
 /// Tell every live peer what mode we are in now, and stop whatever the new mode
@@ -621,7 +795,8 @@ pub(crate) fn announce_mode(inner: &Arc<DaemonInner>, mode: Mode) {
     // After the teardown, so a peer that reads both in order sees the closes
     // explained rather than announced in advance and then contradicted.
     for c in conns {
-        let _ = c.send_msg(&SessionMsg::ModeState { mode: mode.as_str().to_string(),
+        let _ = c.send_msg(&SessionMsg::ModeState {
+            mode: mode.as_str().to_string(),
         });
     }
 }
@@ -667,7 +842,10 @@ pub(crate) fn conn_reader(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
         }
     }));
     if r.is_err() {
-        dlog!("[audiohubd] control conn {}: reader panicked, tearing down", conn.fp);
+        dlog!(
+            "[audiohubd] control conn {}: reader panicked, tearing down",
+            conn.fp
+        );
     }
     teardown_conn(inner, conn);
 }
@@ -733,7 +911,9 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 tx_quality.as_deref(),
             ) {
                 Ok(()) => SessionMsg::AcceptStream { stream_id },
-                Err(e) => SessionMsg::RejectStream { stream_id, reason: format!("{e:#}"),
+                Err(e) => SessionMsg::RejectStream {
+                    stream_id,
+                    reason: format!("{e:#}"),
                 },
             };
             let _ = conn.send_msg(&reply);
@@ -769,7 +949,13 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 teardown_stream(inner, stream_id, false);
             }
         }
-        SessionMsg::Stats { stream_id, received, lost, loss_pct, jitter_ms, spread_ms,
+        SessionMsg::Stats {
+            stream_id,
+            received,
+            lost,
+            loss_pct,
+            jitter_ms,
+            spread_ms,
         } => {
             let tx = owned_session(inner, conn, stream_id, "stats").and_then(|e| e.tx);
             if let Some(t) = tx {
@@ -799,7 +985,10 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
         //   C §13 互斥：只有共享模式的机器接受外来档位。判据取**本机**的
         //     `effective_mode`，不取对端自报的 `ModeState`——把通告当权威会把
         //     防中继的闸门放到线的错误一侧。
-        SessionMsg::SetTransport { stream_id, rx_latency, tx_quality,
+        SessionMsg::SetTransport {
+            stream_id,
+            rx_latency,
+            tx_quality,
         } => {
             // 断言 C **先于**断言 A：§13 问的是「这台机器此刻允不允许被指挥」，
             // 与是哪一条流无关。放在归属校验之后的话，一台处于使用端模式的机器
@@ -848,7 +1037,11 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 crate::publish_targets(inner, std::slice::from_ref(&e));
             }
         }
-        SessionMsg::VolumeSet { stream_id, scalar, muted, src,
+        SessionMsg::VolumeSet {
+            stream_id,
+            scalar,
+            muted,
+            src,
         } => apply_peer_volume(inner, conn, stream_id, scalar, muted, &src),
         SessionMsg::VolumeState {
             stream_id,
@@ -957,7 +1150,13 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
         // `owned_session` 是这里的安全边界：stream id 在媒体头里是明文，任何
         // 另一个已配对的对端都可以对它喊话。分项决定用户看到的那个延迟数字，
         // 不属于这条连接的流一律不收。
-        SessionMsg::StageReport { stream_id, stages, local_ms, dev, quality, seq_us,
+        SessionMsg::StageReport {
+            stream_id,
+            stages,
+            local_ms,
+            dev,
+            quality,
+            seq_us,
         } => {
             if let Some(e) = owned_session(inner, conn, stream_id, "stage_report") {
                 let ipc: Vec<_> = stages.iter().map(crate::from_wire_stage).collect();
@@ -999,11 +1198,32 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
             // that actually has to stop is already stopped by the machine that
             // owns the devices.
         }
+        SessionMsg::AudioCapabilities {
+            default_input,
+            default_output,
+        } => {
+            let cell = crate::PeerAudioCapabilitiesCell::Known {
+                default_input,
+                default_output,
+            };
+            let prev = std::mem::replace(&mut *lk(&conn.peer_audio_capabilities), cell);
+            if prev != cell {
+                dlog!(
+                    "[audiohubd] peer {} audio capabilities: default_input={}, default_output={}",
+                    conn.fp,
+                    default_input,
+                    default_output
+                );
+            }
+        }
         SessionMsg::Unpaired {} => {
             // The peer removed us. Its virtual devices here are now a pair of
             // ghosts — permanently offline, permanently silent, redialling a
             // machine that has blacklisted us — so they go with the pairing.
-            dlog!("[audiohubd] peer {} unpaired from us; removing it here too", conn.fp);
+            dlog!(
+                "[audiohubd] peer {} unpaired from us; removing it here too",
+                conn.fp
+            );
             let fp = conn.fp.clone();
             let i = inner.clone();
             // Off-thread: forget_peer tears this very connection down, and
@@ -1040,7 +1260,8 @@ fn apply_peer_volume(
     muted: Option<bool>,
     src: &str,
 ) {
-    let Some(e) = owned_session(inner, conn, stream_id, "volume_set") else { return;
+    let Some(e) = owned_session(inner, conn, stream_id, "volume_set") else {
+        return;
     };
     let provider = e.kind == KIND_SPK && e.dir == DIR_RECV;
     if let SetAction::Ignore(why) = volume::classify_set(provider, e.volume.enabled, src) {
@@ -1208,7 +1429,10 @@ pub(crate) fn set_session_volume(
     let last = *lk(&e.volume.state);
     let adjustable = last.map_or(true, |v| v.adjustable);
     let shown = muted.or_else(|| last.map(|v| v.muted)).unwrap_or(false);
-    *lk(&e.volume.state) = Some(VolumeState { scalar: s, muted: shown, adjustable,
+    *lk(&e.volume.state) = Some(VolumeState {
+        scalar: s,
+        muted: shown,
+        adjustable,
     });
     Ok(())
 }
@@ -1224,10 +1448,7 @@ pub(crate) fn set_session_volume(
 /// 显示值里的 `adjustable` 仍然是 `false`：那是关于**对端设备**的事实，没有变。
 /// 「旋钮此刻是真的」由 `SessionStats::volume_software_gain` 单独说。
 fn apply_send_gain(e: &SessionEntry, scalar: f32, muted: Option<bool>) -> Result<()> {
-    let tx = e
-        .tx
-        .as_ref()
-        .ok_or_else(|| {
+    let tx = e.tx.as_ref().ok_or_else(|| {
         anyhow!(
             "session {} has no send stream to carry the software gain",
             e.id
@@ -1240,7 +1461,10 @@ fn apply_send_gain(e: &SessionEntry, scalar: f32, muted: Option<bool>) -> Result
         TxShared::gain_bits(if m { 0.0 } else { scalar }),
         Ordering::Relaxed,
     );
-    *lk(&e.volume.state) = Some(VolumeState { scalar, muted: m, adjustable: false,
+    *lk(&e.volume.state) = Some(VolumeState {
+        scalar,
+        muted: m,
+        adjustable: false,
     });
     Ok(())
 }
@@ -1258,9 +1482,13 @@ fn engage_send_gain(e: &SessionEntry) {
         return; // 已经在兜底里了
     }
     if let Some(tx) = e.tx.as_ref() {
-        tx.send_gain.store(TxShared::gain_bits(1.0), Ordering::Relaxed);
+        tx.send_gain
+            .store(TxShared::gain_bits(1.0), Ordering::Relaxed);
     }
-    *lk(&e.volume.state) = Some(VolumeState { scalar: 1.0, muted: false, adjustable: false,
+    *lk(&e.volume.state) = Some(VolumeState {
+        scalar: 1.0,
+        muted: false,
+        adjustable: false,
     });
     dlog!(
         "[audiohubd] stream {}: the peer's output device has no volume we can drive; this side \
@@ -1290,7 +1518,10 @@ fn decode_media_salt(b64: &str) -> Result<Vec<u8>> {
         .decode(b64)
         .map_err(|e| anyhow!("media_salt_b64 is not base64: {e}"))?;
     if salt.len() != MEDIA_SALT_LEN {
-        bail!("media_salt_b64 must decode to {MEDIA_SALT_LEN} bytes, got {}", salt.len());
+        bail!(
+            "media_salt_b64 must decode to {MEDIA_SALT_LEN} bytes, got {}",
+            salt.len()
+        );
     }
     Ok(salt)
 }
@@ -1398,6 +1629,20 @@ fn handle_remote_open(
     if kind != KIND_MIC && kind != KIND_SPK {
         bail!("unknown kind {kind}");
     }
+    let endpoint = required_local_endpoint_for_remote_open(kind, dir, source);
+    let endpoint_guard = loop {
+        // Bracket the property query with the relevant epoch. This prevents a
+        // disappearance between "present" and sampling the guard from being
+        // accidentally blessed as part of the newer generation.
+        let before = endpoint.map(|e| e.epoch(inner));
+        let presence = audiohub_core::audio::default_device_presence();
+        let after = endpoint.map(|e| e.epoch(inner));
+        if before != after {
+            continue;
+        }
+        require_local_audio_endpoint(kind, dir, source, presence)?;
+        break endpoint.zip(after);
+    };
     let salt = decode_media_salt(media_salt_b64)?;
     claim_stream_id(inner, conn, stream_id)?;
     // plan §15：档位的初值随 `OpenStream` 一起到，于是从第一个媒体包起对端要的
@@ -1433,26 +1678,33 @@ fn handle_remote_open(
                 path,
             ));
             wr(&inner.rx_table).insert(stream_id, rx.clone());
-            lk(&inner.state).sessions.insert(
-                stream_id,
-                SessionEntry {
-                    id: stream_id,
-                    conn: conn.clone(),
-                    kind: kind.to_string(),
-                    dir: DIR_RECV.to_string(),
-                    rx: Some(rx),
-                    tx: None,
-                    // we play this stream out of our own default output, so we
-                    // are the provider the peer's slider drives
-                    volume: Arc::new(VolumeCell::new(volume_sync && kind == KIND_SPK)),
-                    replay: None, // the opener re-opens it after a reconnect
-                    origin: SessionOrigin::Peer,
-                    peer_lat: Arc::new(PeerLatCell::new()),
-                    pushed: pushed.clone(),
-                    armed_conn_ms: conn.clock_ms(),
-                    media_tier,
-                },
-            );
+            let entry = SessionEntry {
+                id: stream_id,
+                conn: conn.clone(),
+                kind: kind.to_string(),
+                dir: DIR_RECV.to_string(),
+                source: source.map(str::to_string),
+                rx: Some(rx),
+                tx: None,
+                // we play this stream out of our own default output, so we
+                // are the provider the peer's slider drives
+                volume: Arc::new(VolumeCell::new(volume_sync && kind == KIND_SPK)),
+                replay: None, // the opener re-opens it after a reconnect
+                origin: SessionOrigin::Peer,
+                peer_lat: Arc::new(PeerLatCell::new()),
+                pushed: pushed.clone(),
+                armed_conn_ms: conn.clock_ms(),
+                media_tier,
+            };
+            if let Err(e) =
+                insert_remote_session_if_endpoint_unchanged(inner, stream_id, entry, endpoint_guard)
+            {
+                // This receive stream became externally reachable when it was
+                // put in rx_table. Undo that publication before rejecting the
+                // OpenStream; no SessionEntry exists for teardown_stream yet.
+                wr(&inner.rx_table).remove(&stream_id);
+                return Err(e);
+            }
         }
         // opener receives -> we are the media source (provider side)
         DIR_RECV => {
@@ -1473,30 +1725,296 @@ fn handle_remote_open(
                 loss.unwrap_or(0.0),
                 shared.clone(),
             )?;
-            lk(&inner.state).sessions.insert(
-                stream_id,
-                SessionEntry {
-                    id: stream_id,
-                    conn: conn.clone(),
-                    kind: kind.to_string(),
-                    dir: DIR_SEND.to_string(),
-                    rx: None,
-                    tx: Some(shared),
-                    // mic provider: the opener consumes OUR source, no output
-                    // device of ours is involved
-                    volume: Arc::new(VolumeCell::new(false)),
-                    replay: None,
-                    origin: SessionOrigin::Peer,
-                    peer_lat: Arc::new(PeerLatCell::new()),
-                    pushed: pushed.clone(),
-                    armed_conn_ms: conn.clock_ms(),
-                    media_tier,
-                },
-            );
+            let entry = SessionEntry {
+                id: stream_id,
+                conn: conn.clone(),
+                kind: kind.to_string(),
+                dir: DIR_SEND.to_string(),
+                source: source.map(str::to_string),
+                rx: None,
+                tx: Some(shared),
+                // mic provider: the opener consumes OUR source, no output
+                // device of ours is involved
+                volume: Arc::new(VolumeCell::new(false)),
+                replay: None,
+                origin: SessionOrigin::Peer,
+                peer_lat: Arc::new(PeerLatCell::new()),
+                pushed: pushed.clone(),
+                armed_conn_ms: conn.clock_ms(),
+                media_tier,
+            };
+            if let Err(e) =
+                insert_remote_session_if_endpoint_unchanged(inner, stream_id, entry, endpoint_guard)
+            {
+                // start_tx_stream already installed the source/stream in the
+                // media engine. No SessionEntry exists yet, so remove it via
+                // the engine command directly before rejecting the open.
+                let _ = lk(&inner.tx_cmds).send(TxCmd::Remove { stream_id });
+                return Err(e);
+            }
         }
         other => bail!("unknown dir {other}"),
     }
     Ok(())
+}
+
+/// Enforce the endpoint on the machine that owns it, independently of what it
+/// advertised earlier. `kind` is the OpenStream sender's intent and `dir` is
+/// media flow relative to that sender: mic/recv consumes our input, while
+/// spk/send renders to our output. A synthetic/alternate mic source explicitly
+/// replaces the default input and therefore does not require one.
+fn require_local_audio_endpoint(
+    kind: &str,
+    dir: &str,
+    source: Option<&str>,
+    presence: audiohub_core::audio::DefaultDevicePresence,
+) -> Result<()> {
+    match (kind, dir) {
+        (KIND_MIC, DIR_RECV) => {
+            let uses_default_input = source.is_none() || source == Some(SOURCE_MIC);
+            if uses_default_input && !presence.input {
+                bail!("this machine has no default input audio device");
+            }
+        }
+        (KIND_SPK, DIR_SEND) => {
+            if !presence.output {
+                bail!("this machine has no default output audio device");
+            }
+        }
+        (KIND_MIC, other) => {
+            bail!("kind '{KIND_MIC}' requires dir '{DIR_RECV}', received '{other}'");
+        }
+        (KIND_SPK, other) => {
+            bail!("kind '{KIND_SPK}' requires dir '{DIR_SEND}', received '{other}'");
+        }
+        (other, _) => bail!("unknown kind {other}"),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod audio_endpoint_capability_tests {
+    use super::*;
+    use audiohub_core::audio::DefaultDevicePresence;
+
+    #[test]
+    fn remote_open_requires_the_real_endpoint_selected_by_kind_and_direction() {
+        let output_only = DefaultDevicePresence {
+            input: false,
+            output: true,
+        };
+        assert!(require_local_audio_endpoint(KIND_SPK, DIR_SEND, None, output_only).is_ok());
+        let err = require_local_audio_endpoint(KIND_MIC, DIR_RECV, None, output_only)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("default input"), "{err}");
+
+        let input_only = DefaultDevicePresence {
+            input: true,
+            output: false,
+        };
+        assert!(require_local_audio_endpoint(KIND_MIC, DIR_RECV, None, input_only).is_ok());
+        let err = require_local_audio_endpoint(KIND_SPK, DIR_SEND, None, input_only)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("default output"), "{err}");
+    }
+
+    #[test]
+    fn alternate_mic_sources_stay_deviceless_but_direction_cannot_be_forged() {
+        let none = DefaultDevicePresence::default();
+        for source in [SOURCE_TONE, SOURCE_SYSAUDIO, SOURCE_HAL_SPEAKER] {
+            assert!(require_local_audio_endpoint(KIND_MIC, DIR_RECV, Some(source), none).is_ok());
+        }
+        let err = require_local_audio_endpoint(KIND_MIC, DIR_SEND, Some(SOURCE_TONE), none)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires dir 'recv'"), "{err}");
+        let err = require_local_audio_endpoint(KIND_SPK, DIR_RECV, None, none)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires dir 'send'"), "{err}");
+    }
+
+    #[test]
+    fn capability_loss_closes_only_the_exact_peer_originated_default_endpoint_matrix() {
+        let none = DefaultDevicePresence::default();
+        let input_only = DefaultDevicePresence {
+            input: true,
+            output: false,
+        };
+        let output_only = DefaultDevicePresence {
+            input: false,
+            output: true,
+        };
+        let both = DefaultDevicePresence {
+            input: true,
+            output: true,
+        };
+
+        // Peer-opened speaker receive is backed by this machine's output.
+        assert_eq!(
+            missing_local_endpoint_for_peer_session(
+                SessionOrigin::Peer,
+                KIND_SPK,
+                DIR_RECV,
+                None,
+                none,
+            ),
+            Some(MissingLocalEndpoint::DefaultOutput)
+        );
+        assert_eq!(
+            missing_local_endpoint_for_peer_session(
+                SessionOrigin::Peer,
+                KIND_SPK,
+                DIR_RECV,
+                None,
+                input_only,
+            ),
+            Some(MissingLocalEndpoint::DefaultOutput)
+        );
+        assert_eq!(
+            missing_local_endpoint_for_peer_session(
+                SessionOrigin::Peer,
+                KIND_SPK,
+                DIR_RECV,
+                None,
+                output_only,
+            ),
+            None
+        );
+
+        // Peer-opened mic send uses the default input only for omitted/`mic`
+        // source. Every alternate source survives input capability loss.
+        for source in [None, Some(SOURCE_MIC)] {
+            assert_eq!(
+                missing_local_endpoint_for_peer_session(
+                    SessionOrigin::Peer,
+                    KIND_MIC,
+                    DIR_SEND,
+                    source,
+                    none,
+                ),
+                Some(MissingLocalEndpoint::DefaultInput)
+            );
+            assert_eq!(
+                missing_local_endpoint_for_peer_session(
+                    SessionOrigin::Peer,
+                    KIND_MIC,
+                    DIR_SEND,
+                    source,
+                    output_only,
+                ),
+                Some(MissingLocalEndpoint::DefaultInput)
+            );
+        }
+        for source in [SOURCE_TONE, SOURCE_SYSAUDIO, SOURCE_HAL_SPEAKER] {
+            assert_eq!(
+                missing_local_endpoint_for_peer_session(
+                    SessionOrigin::Peer,
+                    KIND_MIC,
+                    DIR_SEND,
+                    Some(source),
+                    none,
+                ),
+                None,
+                "alternate source {source} must not depend on the default input"
+            );
+        }
+
+        // Direction and origin are part of the safety boundary: malformed
+        // pairings and locally opened/HAL sessions are not owned by this path.
+        for (origin, kind, dir, source) in [
+            (SessionOrigin::Peer, KIND_SPK, DIR_SEND, None),
+            (SessionOrigin::Peer, KIND_MIC, DIR_RECV, None),
+            (SessionOrigin::User, KIND_SPK, DIR_RECV, None),
+            (SessionOrigin::User, KIND_MIC, DIR_SEND, None),
+            (SessionOrigin::Hal { slot: 0 }, KIND_SPK, DIR_RECV, None),
+            (SessionOrigin::Hal { slot: 0 }, KIND_MIC, DIR_SEND, None),
+        ] {
+            assert_eq!(
+                missing_local_endpoint_for_peer_session(origin, kind, dir, source, none),
+                None,
+                "origin={origin:?} kind={kind} dir={dir}"
+            );
+        }
+
+        assert_eq!(
+            missing_local_endpoint_for_peer_session(
+                SessionOrigin::Peer,
+                KIND_MIC,
+                DIR_SEND,
+                None,
+                input_only,
+            ),
+            None
+        );
+        assert_eq!(
+            missing_local_endpoint_for_peer_session(
+                SessionOrigin::Peer,
+                KIND_SPK,
+                DIR_RECV,
+                None,
+                both,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn endpoint_epoch_change_during_media_start_rejects_the_final_commit() {
+        // `started_epoch` is sampled before `start_tx_stream`, which may wait
+        // for SOURCE_ACK_TIMEOUT. A watcher callback during that wait bumps the
+        // endpoint epoch. The final commit must reject even though its earlier
+        // presence query succeeded and the watcher could not yet see a
+        // SessionEntry in the table.
+        let epoch = Arc::new(AtomicU64::new(41));
+        let started_epoch = epoch.load(Ordering::Relaxed);
+        let (media_started_tx, media_started_rx) = mpsc::channel();
+        let (release_media_tx, release_media_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker_epoch = Arc::clone(&epoch);
+        let worker = std::thread::spawn(move || {
+            media_started_tx.send(()).expect("media-start barrier");
+            release_media_rx.recv().expect("source ack barrier");
+            result_tx
+                .send(endpoint_epoch_still_current_at_commit(
+                    MissingLocalEndpoint::DefaultInput,
+                    started_epoch,
+                    worker_epoch.load(Ordering::Relaxed),
+                ))
+                .expect("commit result");
+        });
+        media_started_rx.recv().expect("media construction started");
+        epoch.fetch_add(1, Ordering::Relaxed); // watcher callback during the wait
+        release_media_tx
+            .send(())
+            .expect("let source construction finish");
+        let err = result_rx
+            .recv()
+            .expect("commit result")
+            .unwrap_err()
+            .to_string();
+        worker.join().expect("media-start worker");
+        assert!(
+            err.contains("changed while the peer stream was opening"),
+            "{err}"
+        );
+
+        assert!(
+            endpoint_epoch_still_current_at_commit(MissingLocalEndpoint::DefaultInput, 41, 41,)
+                .is_ok()
+        );
+
+        let err = endpoint_epoch_still_current_at_commit(
+            MissingLocalEndpoint::DefaultOutput,
+            u64::MAX,
+            0,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("default output"), "{err}");
+    }
 }
 
 /// `peer_slot` is the slot whose virtual devices belong to the peer at the
@@ -1513,7 +2031,9 @@ fn source_spec(
         Some(SOURCE_TONE) => Ok(SourceSpec::tone(freq.unwrap_or(1000.0))),
         Some(SOURCE_MIC) | None => Ok(SourceSpec::Mic),
         Some(SOURCE_SYSAUDIO) => {
-            let want = backend.filter(|b| !b.is_empty()).unwrap_or(sysaudio::BACKEND_AUTO);
+            let want = backend
+                .filter(|b| !b.is_empty())
+                .unwrap_or(sysaudio::BACKEND_AUTO);
             // Resolved here, not in the tx thread: an unknown/absent backend
             // must be an OpenStream rejection with a reason, not a stream that
             // is accepted and then fails its source ack five seconds later.
@@ -1607,7 +2127,11 @@ fn teardown_conn(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
     }
     let replaced = {
         let mut st = lk(&inner.state);
-        if st.conns.get(&conn.fp).map_or(false, |c| Arc::ptr_eq(c, conn)) {
+        if st
+            .conns
+            .get(&conn.fp)
+            .map_or(false, |c| Arc::ptr_eq(c, conn))
+        {
             st.conns.remove(&conn.fp);
         }
         // a newer conn to the same peer already took over
@@ -1860,7 +2384,10 @@ fn target_addr(peer: &PairedPeer, addr_override: Option<&str>) -> Result<SocketA
         Some(a) if a.contains(':') => a.to_string(),
         Some(a) => format!("{}:{}", a, peer.port),
         None => {
-            let ip = peer.last_addr.as_deref().ok_or_else(|| anyhow!("no known address for {} (pass addr)", peer.fingerprint))?;
+            let ip = peer
+                .last_addr
+                .as_deref()
+                .ok_or_else(|| anyhow!("no known address for {} (pass addr)", peer.fingerprint))?;
             // Port 0 is how the store records "this peer never told us a port we
             // could believe" (see the PairInit arm of handle_inbound). Dialling
             // it is meaningless, and the message has to say so: the peer is
@@ -2008,18 +2535,17 @@ pub(crate) fn connect_peer(
     // where the two disagree.
     let tier2 = endpoint.is_some()
         || lk(&inner.peer_transport).tier(&peer.fingerprint) == TransportTier::Tier2;
-    let (mut trial, mut stream) =
-        if tier2 {
-            let (link, io) = crate::mux::dial(inner, addr, endpoint.as_ref())?;
-            (MuxOnTrial(Some(link)), io)
-        } else {
-            let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-                .with_context(|| format!("connect {addr}"))?;
-            let _ = s.set_nodelay(true);
-            s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-            s.set_write_timeout(Some(WRITE_TIMEOUT))?;
-            (MuxOnTrial(None), s.into())
-        };
+    let (mut trial, mut stream) = if tier2 {
+        let (link, io) = crate::mux::dial(inner, addr, endpoint.as_ref())?;
+        (MuxOnTrial(Some(link)), io)
+    } else {
+        let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+            .with_context(|| format!("connect {addr}"))?;
+        let _ = s.set_nodelay(true);
+        s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        s.set_write_timeout(Some(WRITE_TIMEOUT))?;
+        (MuxOnTrial(None), s.into())
+    };
     let verified = match verify_initiator(&mut stream, &inner.identity(), &store) {
         Ok(v) => v,
         Err(e) => {
@@ -2036,7 +2562,9 @@ pub(crate) fn connect_peer(
             // that fingerprint is the peer we set out to reach. Without it a
             // refusal legitimately signed by peer X, replayed or misdirected on
             // the connection we opened toward peer Y, would delete Y.
-            let signed_by = e.downcast_ref::<UnpairedByPeer>().map(|u| u.fingerprint.clone());
+            let signed_by = e
+                .downcast_ref::<UnpairedByPeer>()
+                .map(|u| u.fingerprint.clone());
             match signed_by {
                 Some(fp) if fp == peer.fingerprint => {
                     dlog!(
@@ -2236,8 +2764,8 @@ pub(crate) fn open_session_from(
         bail!("AirPlay 音频始终在接收端本机播放，不能作为 AudioHub peer source");
     }
     let consuming = params.kind == KIND_MIC; // media flows peer -> us
-    // Volume sync is a spk-only property: it drives the output device of
-    // whoever PLAYS the stream, and on a mic stream that is us, not the peer.
+                                             // Volume sync is a spk-only property: it drives the output device of
+                                             // whoever PLAYS the stream, and on a mic stream that is us, not the peer.
     let vol_sync = params.volume_sync && params.kind == KIND_SPK;
     if params.volume_sync && !vol_sync {
         dlog!("[audiohubd] volume_sync ignored: only spk sessions carry it");
@@ -2473,6 +3001,7 @@ pub(crate) fn open_session_from(
             conn: conn.clone(),
             kind: params.kind.clone(),
             dir: DIR_RECV.to_string(),
+            source: params.source.clone(),
             rx: rx_arc,
             tx: None,
             volume: Arc::new(VolumeCell::new(false)), // mic: no remote output
@@ -2489,6 +3018,7 @@ pub(crate) fn open_session_from(
             conn: conn.clone(),
             kind: params.kind.clone(),
             dir: DIR_SEND.to_string(),
+            source: params.source.clone(),
             rx: None,
             // Built above, before `OpenStream` went out.
             tx: Some(tx_shared.expect("the send side is built before OpenStream")),
@@ -2511,7 +3041,10 @@ pub(crate) fn open_session_from(
     let inserted = {
         let mut st = lk(&inner.state);
         let live = conn.alive.load(Ordering::SeqCst)
-            && st.conns.get(&conn.fp).map_or(false, |c| Arc::ptr_eq(c, &conn));
+            && st
+                .conns
+                .get(&conn.fp)
+                .map_or(false, |c| Arc::ptr_eq(c, &conn));
         if live {
             st.sessions.insert(stream_id, entry.clone());
         }

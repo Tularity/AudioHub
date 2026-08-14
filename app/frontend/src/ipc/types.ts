@@ -12,6 +12,9 @@ export interface HalDeviceInfo {
   generation?: number;
   state?: 'bound' | 'pending' | 'delisted' | 'free' | string;
   observed?: boolean;
+  requested_directions?: number;
+  published_directions?: number;
+  observed_directions?: number;
   peer_connected?: boolean;
   out_name?: string;
   out_uid?: string;
@@ -35,6 +38,31 @@ export interface HalStatus {
   mic_dropped?: number;
   spk_frames?: number;
   last_driver_msg_secs?: number;
+}
+
+/** Native App-owned lifecycle state for its bundled daemon sidecar. */
+export interface DaemonServiceStatus {
+  payload_present: boolean;
+  canonical: boolean;
+  installed: boolean;
+  registration: 'missing' | 'current' | 'stale' | string;
+  target?: string | null;
+  running: boolean;
+}
+
+export interface DriverInstallerStatus {
+  platform: 'macos' | 'windows' | 'other' | string;
+  supported: boolean;
+  bundled: boolean;
+  installed: boolean;
+  reboot_required: boolean;
+  daemon_image_configured: boolean;
+  state: 'absent' | 'installed' | 'installed_unavailable' | 'reboot_required' | 'ready' | 'unsupported' | string;
+}
+
+export interface DriverInstallResult {
+  state: 'installed' | 'installed_unavailable' | 'ready' | string;
+  reboot_required: boolean;
 }
 
 /**
@@ -181,6 +209,9 @@ export interface PeerHalDevice {
   in_uid?: string;
   state?: string;
   observed?: boolean;
+  requested_directions?: number;
+  published_directions?: number;
+  observed_directions?: number;
 }
 
 export interface PeerState {
@@ -205,6 +236,9 @@ export interface PeerState {
    * 只用来决定此刻能不能用它）。
    */
   peer_mode?: 'share' | 'a' | 'b' | string | null;
+  /** Live peer endpoint facts. null/absent means not advertised yet. */
+  peer_default_input?: boolean | null;
+  peer_default_output?: boolean | null;
   /**
    * 对端明确告诉我们它现在不能被使用。与 `peer_mode` 分开由 daemon 给，是因为
    * `peer_mode == null` 有两种成因、需要相反的处理：还没上报（什么都别说）vs
@@ -606,7 +640,19 @@ export interface AirPlaySessionInfo {
   title?: string | null;
   artist?: string | null;
   album?: string | null;
+  /** 单调递增的封面版本；列表本身不携带大块图片。 */
+  artwork_revision?: number | null;
+  /** 当前封面 MIME；null 表示该版本清除了封面。 */
+  artwork_content_type?: string | null;
   connected_ms?: number;
+}
+
+/** 按版本单独取得的 AirPlay 封面，避免每次会话轮询重复传输图片。 */
+export interface AirPlayArtwork {
+  session_id: number;
+  revision: number;
+  content_type: string;
+  data_base64: string;
 }
 
 /**
@@ -790,6 +836,8 @@ export interface DaemonSettings {
   quality_stops?: QualityStop[];
   remove_virtual_on_disconnect?: boolean;
   mark_offline_devices?: boolean;
+  /** 原生系统表面使用的已解析语种；仅本地 Tauri App 写入。 */
+  native_locale?: 'zh-CN' | 'en-US' | string;
   /**
    * plan §7.1 模式 A「与对端音量同步」：本机系统输出与对端真实输出设备互相
    * 跟随，**以对端为准**。

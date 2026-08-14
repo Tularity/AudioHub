@@ -43,7 +43,10 @@ use audiohub_ipc::{
 };
 use audiohub_net::identity::{PairedPeer, PeerStore};
 
-use crate::halbridge::{self, HalBindRequest, HalControlEvent, HalEndpoint, HalSlotState};
+use crate::halbridge::{
+    self, HalBindRequest, HalControlEvent, HalEndpoint, HalSlotState, HAL_PUBLISH_BOTH,
+    HAL_PUBLISH_IN, HAL_PUBLISH_OUT,
+};
 use crate::{conn, dlog, lk, DaemonInner, SessionOrigin};
 
 pub const HAL_MAX_SLOTS: usize = halbridge::HAL_MAX_SLOTS;
@@ -56,9 +59,8 @@ pub const UID_PREFIX: &str = "AudioHub:";
 
 /// U+2013 EN DASH, as spec-m5b §3.5 spells it. Not a hyphen.
 const NAME_PREFIX: &str = "AudioHub – ";
-const NAME_OUT: &str = " 扬声器";
-const NAME_IN: &str = " 麦克风";
-const NAME_OFFLINE: &str = "（离线）";
+const NAME_OFFLINE_ZH_CN: &str = "（离线）";
+const NAME_OFFLINE_EN_US: &str = " (Offline)";
 
 /// `char[128]` on the wire, and the driver rejects a name that does not fit.
 const MAX_NAME_BYTES: usize = 127;
@@ -78,10 +80,9 @@ pub fn uid_in(fingerprint: &str) -> String {
 /// (Not to be confused with [`base_name`] below, which is the peer's own label
 /// — alias or host name — before any of this is put around it.)
 ///
-/// The single spelling of the prefix, and both platforms go through it: macOS
-/// via [`device_names`], which appends " 扬声器" / " 麦克风" here, and Windows
-/// via `halbridge_win::wire::encode_bind_request`, which sends this and lets
-/// the driver append the direction word it read from the INF.
+/// The single spelling of the complete visible name, and both platforms go
+/// through it: output and input deliberately share this label. The operating
+/// system's device class and icon already distinguish their direction.
 ///
 /// It is a function rather than a `pub const` so the two callers cannot end up
 /// composing it two slightly different ways — which is exactly what happened:
@@ -91,17 +92,33 @@ pub fn device_name_stem(display: &str) -> String {
     format!("{NAME_PREFIX}{display}")
 }
 
-/// The two device names for one peer. The daemon builds the whole string
-/// because the driver runs inside coreaudiod's sandbox: it can read neither the
-/// computer name nor any localisation, and putting half the naming logic there
-/// would mean two places to disambiguate (spec-m5b §3.5).
-pub fn device_names(display: &str, offline: bool) -> (String, String) {
-    let mark = if offline { NAME_OFFLINE } else { "" };
-    let stem = device_name_stem(display);
-    (
-        clamp_utf8(&format!("{stem}{NAME_OUT}{mark}"), MAX_NAME_BYTES),
-        clamp_utf8(&format!("{stem}{NAME_IN}{mark}"), MAX_NAME_BYTES),
-    )
+/// The two device names for one peer.  They intentionally have the same visible
+/// text: input/output is already a structural property in both operating
+/// systems and the UI uses distinct icons.  Identity and routing remain the
+/// direction-specific UIDs below, never the display string.
+fn offline_mark(locale: &str) -> &'static str {
+    if locale == "en-US" {
+        NAME_OFFLINE_EN_US
+    } else {
+        NAME_OFFLINE_ZH_CN
+    }
+}
+
+/// The peer label carried across the Windows bind wire. It is deliberately
+/// prefix-free because the encoder adds `AudioHub – `, but it already contains
+/// the localized offline suffix so macOS and Windows receive the same name.
+pub fn device_display_name(display: &str, offline: bool, locale: &str) -> String {
+    let mark = if offline { offline_mark(locale) } else { "" };
+    let available = MAX_NAME_BYTES
+        .saturating_sub(NAME_PREFIX.len())
+        .saturating_sub(mark.len());
+    format!("{}{mark}", clamp_utf8(display, available))
+}
+
+pub fn device_names(display: &str, offline: bool, locale: &str) -> (String, String) {
+    let shown = device_display_name(display, offline, locale);
+    let name = device_name_stem(&shown);
+    (name.clone(), name)
 }
 
 /// Truncates on a CHARACTER boundary. A name cut mid-codepoint is invalid UTF-8
@@ -184,6 +201,11 @@ pub fn base_name(peer: &PairedPeer) -> String {
 struct SlotEntry {
     slot: u8,
     fingerprint: String,
+    /// Last direction mask advertised by this peer. `None` is deliberately
+    /// distinct from `Some(0)`: the former has not answered yet, while the
+    /// latter explicitly has neither endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directions: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,11 +224,19 @@ struct SlotFile {
 pub struct SlotTable {
     /// slot -> fingerprint.
     assign: Vec<Option<String>>,
+    /// Last known publication mask for the same slot. Unknown must survive a
+    /// restart as `None`; collapsing it into zero would permanently turn a
+    /// peer that disconnected before its first capability advert into an
+    /// explicit "has neither endpoint" peer.
+    directions: Vec<Option<u8>>,
 }
 
 impl SlotTable {
     pub fn new() -> SlotTable {
-        SlotTable { assign: vec![None; HAL_MAX_SLOTS] }
+        SlotTable {
+            assign: vec![None; HAL_MAX_SLOTS],
+            directions: vec![None; HAL_MAX_SLOTS],
+        }
     }
 
     fn path(dir: &Path) -> PathBuf {
@@ -224,10 +254,19 @@ impl SlotTable {
             dlog!("[audiohubd] hal_slots.json is unreadable; slots will be re-assigned");
             return t;
         };
+        let file_version = file.version;
         for e in file.slots {
             let s = e.slot as usize;
             if s < HAL_MAX_SLOTS && !e.fingerprint.is_empty() && t.assign[s].is_none() {
                 t.assign[s] = Some(e.fingerprint);
+                t.directions[s] = match e.directions {
+                    Some(mask) => Some(mask & HAL_PUBLISH_BOTH),
+                    // v1 never stored capabilities. Keep its incumbent pair
+                    // visible in both directions until it reconnects rather
+                    // than making an upgrade remove a selected system device.
+                    None if file_version <= 1 => Some(HAL_PUBLISH_BOTH),
+                    None => None,
+                };
             }
         }
         t
@@ -235,13 +274,17 @@ impl SlotTable {
 
     pub fn save(&self, dir: &Path) -> Result<()> {
         let file = SlotFile {
-            version: 1,
+            version: 3,
             slots: self
                 .assign
                 .iter()
                 .enumerate()
                 .filter_map(|(s, fp)| {
-                    fp.as_ref().map(|fp| SlotEntry { slot: s as u8, fingerprint: fp.clone() })
+                    fp.as_ref().map(|fp| SlotEntry {
+                        slot: s as u8,
+                        fingerprint: fp.clone(),
+                        directions: self.directions[s].map(|mask| mask & HAL_PUBLISH_BOTH),
+                    })
                 })
                 .collect(),
         };
@@ -272,12 +315,30 @@ impl SlotTable {
             .iter()
             .position(Option::is_none)?;
         self.assign[free] = Some(fingerprint.to_string());
+        self.directions[free] = None;
         Some(free as u8)
+    }
+
+    pub fn directions_of(&self, fingerprint: &str) -> Option<u8> {
+        self.slot_of(fingerprint)
+            .and_then(|s| self.directions[s as usize].map(|mask| mask & HAL_PUBLISH_BOTH))
+    }
+
+    pub fn set_directions(&mut self, fingerprint: &str, directions: u8) -> bool {
+        let Some(slot) = self.slot_of(fingerprint) else {
+            return false;
+        };
+        let directions = directions & HAL_PUBLISH_BOTH;
+        let cell = &mut self.directions[slot as usize];
+        let changed = *cell != Some(directions);
+        *cell = Some(directions);
+        changed
     }
 
     pub fn release(&mut self, fingerprint: &str) -> Option<u8> {
         let s = self.slot_of(fingerprint)?;
         self.assign[s as usize] = None;
+        self.directions[s as usize] = None;
         Some(s)
     }
 
@@ -286,10 +347,11 @@ impl SlotTable {
     /// `paired_peers.json` directly) still frees its slot.
     pub fn retain(&mut self, paired: &HashSet<String>) -> bool {
         let mut changed = false;
-        for slot in self.assign.iter_mut() {
+        for (index, slot) in self.assign.iter_mut().enumerate() {
             if let Some(fp) = slot.as_ref() {
                 if !paired.contains(fp.as_str()) {
                     *slot = None;
+                    self.directions[index] = None;
                     changed = true;
                 }
             }
@@ -306,7 +368,7 @@ impl SlotTable {
     /// written back is one that comes back different after a restart — which is
     /// the single failure this whole persistence exists to prevent.
     fn same_as(&self, other: &SlotTable) -> bool {
-        self.assign == other.assign
+        self.assign == other.assign && self.directions == other.directions
     }
 }
 
@@ -321,16 +383,18 @@ pub struct DesiredDevice {
     pub in_uid: String,
     pub out_name: String,
     pub in_name: String,
-    /// The disambiguated display name WITHOUT a direction suffix — what
-    /// `display_names` produced, before `device_names` appended " 扬声器" /
-    /// " 麦克风". macOS ignores it; Windows uses only it, because there the
-    /// system composes the endpoint name as "<pin name> (<this>)".
+    /// The disambiguated peer label WITHOUT the shared `AudioHub – ` prefix or
+    /// a direction suffix. It may already include the localized offline marker.
+    /// macOS ignores it; the Windows wire encoder adds the shared prefix before
+    /// handing the complete endpoint label to the driver.
     ///
     /// Carried as a plain extra field rather than behind a platform
     /// conditional: this file has none at all, and keeping it that way is worth
     /// more than saving one `String` per slot. `halwire_win.rs` asserts the
     /// count stays zero.
     pub display: String,
+    /// Virtual directions this peer can actually serve.
+    pub directions: u8,
     pub online: bool,
 }
 
@@ -344,6 +408,7 @@ impl DesiredDevice {
             out_name: self.out_name.clone(),
             in_name: self.in_name.clone(),
             display: self.display.clone(),
+            directions: self.directions,
             online: self.online,
         }
     }
@@ -368,6 +433,8 @@ pub struct SlotRec {
     /// remembered selection is untouched.
     pub sent_out_name: String,
     pub sent_in_name: String,
+    /// Direction mask carried by the last successful send attempt.
+    pub sent_directions: u8,
     pub sent_online: bool,
     /// A `Set` with those strings has been put on the wire.
     pub sent: bool,
@@ -381,7 +448,13 @@ pub struct SlotRec {
     pub state: Option<HalSlotState>,
     /// A `BindState` has arrived for the binding we last sent.
     pub acked: bool,
-    /// The system's device list really contains both UIDs.
+    /// What the driver last acknowledged as actually published.
+    pub published_directions: u8,
+    /// Directions the operating system's own device list currently contains.
+    pub observed_directions: u8,
+    /// Every direction requested in `sent_directions` is both acknowledged and
+    /// visible. Kept as the legacy pair-level IPC summary; new callers use the
+    /// masks above.
     pub observed: bool,
     pub peer_connected: bool,
     pub io_out: bool,
@@ -438,11 +511,22 @@ pub fn plan_binds(
         }
         wanted[s] = true;
         let rec = &slots[s];
-        let identity = rec.fingerprint == d.fingerprint
-            && rec.out_uid == d.out_uid
-            && rec.in_uid == d.in_uid;
-        // "Published" needs BOTH halves: the driver acknowledged the binding
-        // AND the system really lists it. Either one alone has a failure mode
+        let identity =
+            rec.fingerprint == d.fingerprint && rec.out_uid == d.out_uid && rec.in_uid == d.in_uid;
+        let observed_directions = observed.map(|o| {
+            (if o.contains(&d.out_uid) {
+                HAL_PUBLISH_OUT
+            } else {
+                0
+            }) | (if o.contains(&d.in_uid) {
+                HAL_PUBLISH_IN
+            } else {
+                0
+            })
+        });
+        // "Published" needs every REQUESTED half and no stale extra half: the
+        // driver acknowledged the exact mask AND the system really lists it.
+        // Either one alone has a failure mode
         // that is completely silent — an ack without publication is the
         // Initialize race, publication without an ack is a slot we would
         // happily hand to somebody else.
@@ -450,7 +534,8 @@ pub fn plan_binds(
             && rec.sent
             && rec.acked
             && rec.state == Some(HalSlotState::Bound)
-            && observed.map_or(true, |o| o.contains(&d.out_uid) && o.contains(&d.in_uid));
+            && rec.published_directions == d.directions
+            && observed_directions.map_or(true, |m| m == d.directions);
         if !published {
             // The idempotent upsert. This is also the ONLY thing sent after a
             // daemon restart — never a Clear first, which would take the user's
@@ -460,6 +545,7 @@ pub fn plan_binds(
         }
         if rec.sent_out_name != d.out_name
             || rec.sent_in_name != d.in_name
+            || rec.sent_directions != d.directions
             || rec.sent_online != d.online
         {
             // Same UID, new name: an in-place rename on the driver's side.
@@ -496,7 +582,10 @@ pub fn plan_binds(
             continue;
         }
         if rec.claimed() || (orphan && rec.state.is_none()) {
-            actions.push(BindAction::Clear { slot: s as u8, generation: rec.generation });
+            actions.push(BindAction::Clear {
+                slot: s as u8,
+                generation: rec.generation,
+            });
         }
     }
     actions
@@ -569,7 +658,10 @@ impl HalDevState {
     fn published_mask(&self) -> u16 {
         let mut m = 0u16;
         for (s, rec) in self.slots.iter().enumerate() {
-            if rec.state == Some(HalSlotState::Bound) && !rec.fingerprint.is_empty() {
+            if rec.state == Some(HalSlotState::Bound)
+                && rec.published_directions & HAL_PUBLISH_OUT != 0
+                && !rec.fingerprint.is_empty()
+            {
                 m |= 1 << s;
             }
         }
@@ -577,7 +669,10 @@ impl HalDevState {
     }
 
     /// `hal.devices` for `daemon.status`.
-    pub(crate) fn device_infos(&self, counters: &[halbridge::HalSlotCounters]) -> Vec<HalDeviceInfo> {
+    pub(crate) fn device_infos(
+        &self,
+        counters: &[halbridge::HalSlotCounters],
+    ) -> Vec<HalDeviceInfo> {
         self.slots
             .iter()
             .enumerate()
@@ -594,6 +689,9 @@ impl HalDevState {
                     generation: r.generation,
                     state: r.state_label().to_string(),
                     observed: r.observed,
+                    requested_directions: Some(r.sent_directions),
+                    published_directions: Some(r.published_directions),
+                    observed_directions: Some(r.observed_directions),
                     peer_connected: r.peer_connected,
                     io_out: r.io_out,
                     io_in: r.io_in,
@@ -618,6 +716,9 @@ impl HalDevState {
             in_uid: r.in_uid.clone(),
             state: r.state_label().to_string(),
             observed: r.observed,
+            requested_directions: Some(r.sent_directions),
+            published_directions: Some(r.published_directions),
+            observed_directions: Some(r.observed_directions),
         })
     }
 }
@@ -626,8 +727,16 @@ impl HalDevState {
 /// synchronously (TCP + verify + secure handshake), and an offline peer would
 /// otherwise stall the device reconcile and the volume relay behind it.
 pub(crate) enum SessCmd {
-    Open { slot: u8, fingerprint: String, kind: &'static str },
-    Close { slot: u8, out: bool, id: u32 },
+    Open {
+        slot: u8,
+        fingerprint: String,
+        kind: &'static str,
+    },
+    Close {
+        slot: u8,
+        out: bool,
+        id: u32,
+    },
 }
 
 // ---------------------------------------------------------------- mode
@@ -668,7 +777,7 @@ pub(crate) fn effective_mode(inner: &DaemonInner) -> Mode {
 ///     the peer or the device selection will change that; the fix is to pick a
 ///     consumer mode, which is a decision, not a retry.
 ///   - `B` (spec-m5b §6.1): the system's device selection is the session
-///     control. An app selects "AudioHub – X 扬声器" and the daemon opens the
+///     control. An app selects the output-class device "AudioHub – X" and the daemon opens the
 ///     stream behind it. A UI that could also open sessions by peer would be
 ///     mode A wearing mode B's labels, and every mode-B property (one device =
 ///     one peer, the selection living in the system) would quietly stop
@@ -786,9 +895,13 @@ pub(crate) fn compute_desired(
     table: &mut SlotTable,
 ) -> PassInputs {
     let mode = effective_mode(inner);
-    let (remove_offline, mark_offline) = {
+    let (remove_offline, mark_offline, native_locale) = {
         let s = lk(&inner.settings);
-        (s.remove_virtual_on_disconnect, s.mark_offline_devices)
+        (
+            s.remove_virtual_on_disconnect,
+            s.mark_offline_devices,
+            s.native_locale.clone(),
+        )
     };
     let peers = PeerStore::load_at(Some(&inner.cfg_dir))
         .map(|s| s.list().to_vec())
@@ -800,6 +913,26 @@ pub(crate) fn compute_desired(
             .iter()
             .filter(|(_, c)| c.alive.load(Ordering::SeqCst))
             .map(|(fp, _)| fp.clone())
+            .collect()
+    };
+    // A live capability advertisement is the newest fact.  When the channel
+    // is gone, the persisted slot mask is deliberately retained: offline
+    // devices keep the user's selection, and "disconnected" is not evidence
+    // that a microphone or speaker ceased to exist.
+    let live_capabilities: HashMap<String, u8> = {
+        let st = lk(&inner.state);
+        st.conns
+            .iter()
+            .filter(|(_, c)| c.alive.load(Ordering::SeqCst))
+            .filter_map(|(fp, c)| {
+                crate::lk(&c.peer_audio_capabilities)
+                    .known()
+                    .map(|(input, output)| {
+                        let mask = (if output { HAL_PUBLISH_OUT } else { 0 })
+                            | (if input { HAL_PUBLISH_IN } else { 0 });
+                        (fp.clone(), mask)
+                    })
+            })
             .collect()
     };
     // Names are resolved over EVERY paired peer, not just the ones that get a
@@ -838,8 +971,15 @@ pub(crate) fn compute_desired(
             reasons.insert(fp.clone(), "capacity".to_string());
             continue;
         };
+        if let Some(&mask) = live_capabilities.get(fp) {
+            table.set_directions(fp, mask);
+        }
+        // An old/not-yet-advertised peer stays backward compatible until its
+        // first exact answer. An explicit Some(0) still publishes neither.
+        let directions = table.directions_of(fp).unwrap_or(HAL_PUBLISH_BOTH);
         let name = display.get(fp).cloned().unwrap_or_else(|| fp.clone());
-        let (out_name, in_name) = device_names(&name, mark_offline && !online);
+        let marked_offline = mark_offline && !online;
+        let (out_name, in_name) = device_names(&name, marked_offline, &native_locale);
         desired.push(DesiredDevice {
             slot,
             fingerprint: fp.clone(),
@@ -847,11 +987,17 @@ pub(crate) fn compute_desired(
             in_uid: uid_in(fp),
             out_name,
             in_name,
-            display: name,
+            display: device_display_name(&name, marked_offline, &native_locale),
+            directions,
             online,
         });
     }
-    PassInputs { desired, display, reasons, paired }
+    PassInputs {
+        desired,
+        display,
+        reasons,
+        paired,
+    }
 }
 
 /// One reconcile pass. `observed` is passed in so the enumeration (a few dozen
@@ -883,8 +1029,12 @@ fn reconcile(inner: &DaemonInner, hal: &halbridge::HalBridge, observed: Option<&
     // that do not have one yet, and an assignment that is not written back is
     // an assignment that comes back different after a restart.
     let table_before = st.table.clone();
-    let PassInputs { desired, display, reasons, paired } =
-        compute_desired(inner, capacity, &mut st.table);
+    let PassInputs {
+        desired,
+        display,
+        reasons,
+        paired,
+    } = compute_desired(inner, capacity, &mut st.table);
     st.table.retain(&paired);
     let table_changed = !st.table.same_as(&table_before);
     st.display = display;
@@ -904,9 +1054,21 @@ fn reconcile(inner: &DaemonInner, hal: &halbridge::HalBridge, observed: Option<&
             };
         }
         rec.peer_connected = d.online;
-        rec.observed = observed.map_or(rec.observed, |o| {
-            o.contains(&d.out_uid) && o.contains(&d.in_uid)
-        });
+        if let Some(o) = observed {
+            rec.observed_directions = (if o.contains(&d.out_uid) {
+                HAL_PUBLISH_OUT
+            } else {
+                0
+            }) | (if o.contains(&d.in_uid) {
+                HAL_PUBLISH_IN
+            } else {
+                0
+            });
+            rec.observed = rec.acked
+                && rec.state == Some(HalSlotState::Bound)
+                && rec.published_directions == d.directions
+                && rec.observed_directions == d.directions;
+        }
     }
 
     let now = Instant::now();
@@ -938,7 +1100,8 @@ fn reconcile(inner: &DaemonInner, hal: &halbridge::HalBridge, observed: Option<&
                 // that ignores us is not flooded (each Set costs it a
                 // device-list announcement).
                 let renaming = st.slots[s].sent_out_name != req.out_name
-                    || st.slots[s].sent_in_name != req.in_name;
+                    || st.slots[s].sent_in_name != req.in_name
+                    || st.slots[s].sent_directions != req.directions;
                 renaming || now.duration_since(t) >= SET_COOLDOWN
             }
             BindAction::Clear { .. } => true,
@@ -961,6 +1124,7 @@ fn reconcile(inner: &DaemonInner, hal: &halbridge::HalBridge, observed: Option<&
                 rec.in_uid = req.in_uid.clone();
                 rec.sent_out_name = req.out_name.clone();
                 rec.sent_in_name = req.in_name.clone();
+                rec.sent_directions = req.directions;
                 rec.sent_online = req.online;
                 rec.sent = true;
                 rec.acked = false;
@@ -1003,7 +1167,10 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
     let mut latest: HashMap<u8, (f32, bool)> = HashMap::new();
     for ev in events {
         match ev {
-            HalControlEvent::Attached { session_id, slot_count } => {
+            HalControlEvent::Attached {
+                session_id,
+                slot_count,
+            } => {
                 dlog!("[audiohubd] hal: attached, session {session_id}, {slot_count} slots");
             }
             HalControlEvent::Detached => {
@@ -1011,6 +1178,8 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
                 for rec in st.slots.iter_mut() {
                     rec.acked = false;
                     rec.state = None;
+                    rec.published_directions = 0;
+                    rec.observed_directions = 0;
                     rec.observed = false;
                     rec.io_out = false;
                     rec.io_in = false;
@@ -1033,19 +1202,41 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
                     inner.hal_mic_io[s].store(true, Ordering::Relaxed);
                 }
             }
-            HalControlEvent::BindState { slot, generation, state } => {
+            HalControlEvent::BindState {
+                slot,
+                generation,
+                state,
+                published,
+            } => {
                 let mut st = lk(&inner.haldev);
-                let Some(rec) = st.slots.get_mut(slot as usize) else { continue };
+                let Some(rec) = st.slots.get_mut(slot as usize) else {
+                    continue;
+                };
+                let mic_withdrawn = apply_published_directions(rec, published);
                 rec.generation = generation;
                 rec.state = Some(state);
+                if mic_withdrawn {
+                    // This endpoint was explicitly withdrawn, not handed to a
+                    // new tenant. Keep the data plane shut until a restored
+                    // microphone sends a fresh StartIO event.
+                    inner.hal_mic_io[slot as usize].store(false, Ordering::Relaxed);
+                }
                 match state {
-                    HalSlotState::Bound => rec.acked = true,
+                    HalSlotState::Bound => {
+                        rec.acked = true;
+                        rec.observed = rec.observed_directions == rec.sent_directions
+                            && published == rec.sent_directions;
+                    }
                     HalSlotState::Free => {
                         // The slot is genuinely retired now, so it may be
                         // handed to another peer. Everything about the previous
                         // tenant goes with it — a stale vol_echo would suppress
                         // the first volume the NEXT peer should have received.
-                        *rec = SlotRec { generation, state: Some(state), ..SlotRec::default() };
+                        *rec = SlotRec {
+                            generation,
+                            state: Some(state),
+                            ..SlotRec::default()
+                        };
                         st.clear_at[slot as usize] = None;
                         st.last_set[slot as usize] = None;
                         // Back to the "not told yet" default. Leaving it false
@@ -1058,7 +1249,9 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
             }
             HalControlEvent::IoState { at, running, .. } => {
                 let mut st = lk(&inner.haldev);
-                let Some(rec) = st.slots.get_mut(at.slot as usize) else { continue };
+                let Some(rec) = st.slots.get_mut(at.slot as usize) else {
+                    continue;
+                };
                 let now = Instant::now();
                 if at.input {
                     rec.io_in = running;
@@ -1077,7 +1270,12 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
                     if fp.is_empty() { "-" } else { &fp }
                 );
             }
-            HalControlEvent::LatencyState { at, frames, pending, .. } => {
+            HalControlEvent::LatencyState {
+                at,
+                frames,
+                pending,
+                ..
+            } => {
                 // The driver's account of what its latency property NOW says.
                 // Recorded, never compared against what we asked for here: the
                 // decision to re-send belongs to the one place that also knows
@@ -1096,11 +1294,15 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
                     continue;
                 }
                 let mut st = lk(&inner.haldev);
-                let Some(rec) = st.slots.get_mut(at.slot as usize) else { continue };
+                let Some(rec) = st.slots.get_mut(at.slot as usize) else {
+                    continue;
+                };
                 rec.decl_out.acked = Some(frames);
                 rec.decl_out.pending = pending;
             }
-            HalControlEvent::Volume { at, scalar, muted, .. } => {
+            HalControlEvent::Volume {
+                at, scalar, muted, ..
+            } => {
                 if at.input {
                     // The virtual microphone's own slider. The capture gain
                     // belongs to the peer (plan §7.2) and driving it from here
@@ -1121,6 +1323,28 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
     }
 }
 
+/// Apply the driver's exact publication mask and forget IO intent for any
+/// endpoint it actually withdrew. A later capability restore is a new device
+/// availability event and must wait for a fresh StartIO rather than inheriting
+/// the selection/linger state of an endpoint that ceased to exist.
+///
+/// Returns whether the microphone direction was withdrawn, so the caller can
+/// reset the lock-free mic-IO mirror alongside the slot record.
+fn apply_published_directions(rec: &mut SlotRec, published: u8) -> bool {
+    let withdrawn = rec.published_directions & !published;
+    rec.published_directions = published;
+    if withdrawn & HAL_PUBLISH_OUT != 0 {
+        rec.io_out = false;
+        rec.io_out_off_since = None;
+    }
+    let mic_withdrawn = withdrawn & HAL_PUBLISH_IN != 0;
+    if mic_withdrawn {
+        rec.io_in = false;
+        rec.io_in_off_since = None;
+    }
+    mic_withdrawn
+}
+
 /// Volume values this close are the same value: the driver stores a float the
 /// user dragged, the peer's device snaps to its own step grid, and neither is
 /// allowed to look like a change and start another round trip.
@@ -1135,7 +1359,9 @@ fn vol_same(a: (f32, bool), b: (f32, bool)) -> bool {
 fn relay_volume_to_peer(inner: &Arc<DaemonInner>, slot: u8, scalar: f32, muted: bool) {
     let fp = {
         let mut st = lk(&inner.haldev);
-        let Some(rec) = st.slots.get_mut(slot as usize) else { return };
+        let Some(rec) = st.slots.get_mut(slot as usize) else {
+            return;
+        };
         if rec.fingerprint.is_empty() {
             return;
         }
@@ -1259,15 +1485,18 @@ fn coordinate_sessions(inner: &Arc<DaemonInner>, tx: &mpsc::Sender<SessCmd>) {
         if rec.fingerprint.is_empty() {
             continue;
         }
-        let lingering = |off: Option<Instant>, d: Duration| {
-            off.map_or(false, |t| now.duration_since(t) < d)
-        };
+        let lingering =
+            |off: Option<Instant>, d: Duration| off.map_or(false, |t| now.duration_since(t) < d);
         // A retired or delisted slot does not linger: the device is on its way
         // out of the system and holding somebody's microphone open for it would
         // be exactly backwards.
         let alive = rec.state == Some(HalSlotState::Bound);
-        let want_out = alive && (rec.io_out || lingering(rec.io_out_off_since, LINGER_OUT));
-        let want_in = alive && (rec.io_in || lingering(rec.io_in_off_since, LINGER_IN));
+        let want_out = alive
+            && rec.published_directions & HAL_PUBLISH_OUT != 0
+            && (rec.io_out || lingering(rec.io_out_off_since, LINGER_OUT));
+        let want_in = alive
+            && rec.published_directions & HAL_PUBLISH_IN != 0
+            && (rec.io_in || lingering(rec.io_in_off_since, LINGER_IN));
         let fp = rec.fingerprint.clone();
 
         for (want, have, opening, kind, out) in [
@@ -1290,10 +1519,18 @@ fn coordinate_sessions(inner: &Arc<DaemonInner>, tx: &mpsc::Sender<SessCmd>) {
                 } else {
                     st.opening_in[slot] = true;
                 }
-                cmds.push(SessCmd::Open { slot: slot as u8, fingerprint: fp.clone(), kind });
+                cmds.push(SessCmd::Open {
+                    slot: slot as u8,
+                    fingerprint: fp.clone(),
+                    kind,
+                });
             } else if !want {
                 if let Some(id) = have {
-                    cmds.push(SessCmd::Close { slot: slot as u8, out, id });
+                    cmds.push(SessCmd::Close {
+                        slot: slot as u8,
+                        out,
+                        id,
+                    });
                 }
             }
         }
@@ -1326,7 +1563,11 @@ pub(crate) fn session_worker(inner: Arc<DaemonInner>, rx: mpsc::Receiver<SessCmd
             return;
         }
         match cmd {
-            SessCmd::Open { slot, fingerprint, kind } => {
+            SessCmd::Open {
+                slot,
+                fingerprint,
+                kind,
+            } => {
                 let out = kind == KIND_SPK;
                 let params = OpenSessionParams {
                     peer: fingerprint.clone(),
@@ -1459,7 +1700,9 @@ pub(crate) fn coordinator_loop(inner: Arc<DaemonInner>, tx: mpsc::Sender<SessCmd
 pub(crate) fn release_peer(inner: &Arc<DaemonInner>, fingerprint: &str) {
     let ids: Vec<u32> = {
         let mut st = lk(&inner.haldev);
-        let Some(slot) = st.table.slot_of(fingerprint) else { return };
+        let Some(slot) = st.table.slot_of(fingerprint) else {
+            return;
+        };
         let rec = &mut st.slots[slot as usize];
         let ids: Vec<u32> = [rec.sess_out.take(), rec.sess_in.take()]
             .into_iter()
@@ -1485,11 +1728,15 @@ mod tests {
     use super::*;
 
     fn peer(fp: &str, name: &str, added: u64) -> NameInput {
-        NameInput { fingerprint: fp.to_string(), base: name.to_string(), added_unix: added }
+        NameInput {
+            fingerprint: fp.to_string(),
+            base: name.to_string(),
+            added_unix: added,
+        }
     }
 
     fn want(slot: u8, fp: &str, name: &str) -> DesiredDevice {
-        let (out_name, in_name) = device_names(name, false);
+        let (out_name, in_name) = device_names(name, false, "zh-CN");
         DesiredDevice {
             slot,
             fingerprint: fp.to_string(),
@@ -1498,6 +1745,7 @@ mod tests {
             out_name,
             in_name,
             display: name.to_string(),
+            directions: HAL_PUBLISH_BOTH,
             online: true,
         }
     }
@@ -1510,11 +1758,14 @@ mod tests {
             in_uid: d.in_uid.clone(),
             sent_out_name: d.out_name.clone(),
             sent_in_name: d.in_name.clone(),
+            sent_directions: d.directions,
             sent_online: d.online,
             sent: true,
             acked: true,
+            published_directions: d.directions,
             generation,
             state: Some(HalSlotState::Bound),
+            observed_directions: d.directions,
             observed: true,
             ..SlotRec::default()
         }
@@ -1523,7 +1774,14 @@ mod tests {
     fn seen(ds: &[&DesiredDevice]) -> HashSet<String> {
         let mut s: HashSet<String> = ds
             .iter()
-            .flat_map(|d| [d.out_uid.clone(), d.in_uid.clone()])
+            .flat_map(|d| {
+                [
+                    (d.directions & HAL_PUBLISH_OUT != 0).then(|| d.out_uid.clone()),
+                    (d.directions & HAL_PUBLISH_IN != 0).then(|| d.in_uid.clone()),
+                ]
+                .into_iter()
+                .flatten()
+            })
             .collect();
         // a real Mac always has some device of its own
         s.insert("BuiltInSpeakerDevice".to_string());
@@ -1562,17 +1820,25 @@ mod tests {
 
     #[test]
     fn device_names_are_the_frozen_shape() {
-        let (out, mic) = device_names("客厅 Mac", false);
-        assert_eq!(out, "AudioHub – 客厅 Mac 扬声器");
-        assert_eq!(mic, "AudioHub – 客厅 Mac 麦克风");
-        let (out, _) = device_names("客厅 Mac", true);
-        assert_eq!(out, "AudioHub – 客厅 Mac 扬声器（离线）");
+        let (out, mic) = device_names("客厅 Mac", false, "zh-CN");
+        assert_eq!(out, "AudioHub – 客厅 Mac");
+        assert_eq!(mic, "AudioHub – 客厅 Mac");
+        let (out, _) = device_names("客厅 Mac", true, "zh-CN");
+        assert_eq!(out, "AudioHub – 客厅 Mac（离线）");
+        let (out, _) = device_names("Living Room Mac", true, "en-US");
+        assert_eq!(out, "AudioHub – Living Room Mac (Offline)");
         // ...and a name that would not fit the driver's char[128] is cut on a
         // character boundary, because invalid UTF-8 makes the driver reject the
         // whole Bind — losing the device, not just the tail of its name.
-        let (out, _) = device_names(&"漢".repeat(200), false);
+        let (out, _) = device_names(&"漢".repeat(200), false, "zh-CN");
         assert!(out.len() <= MAX_NAME_BYTES, "{}", out.len());
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        let (out, _) = device_names(&"漢".repeat(200), true, "en-US");
+        assert!(out.len() <= MAX_NAME_BYTES, "{}", out.len());
+        assert!(
+            out.ends_with(" (Offline)"),
+            "offline marker was truncated: {out}"
+        );
     }
 
     #[test]
@@ -1588,9 +1854,17 @@ mod tests {
         };
         assert_eq!(base_name(&p), "MacBook Pro");
         p.alias = Some("  书房  ".into());
-        assert_eq!(base_name(&p), "书房", "an alias is trimmed, not taken literally");
+        assert_eq!(
+            base_name(&p),
+            "书房",
+            "an alias is trimmed, not taken literally"
+        );
         p.alias = Some("   ".into());
-        assert_eq!(base_name(&p), "MacBook Pro", "a blank alias is not an alias");
+        assert_eq!(
+            base_name(&p),
+            "MacBook Pro",
+            "a blank alias is not an alias"
+        );
     }
 
     // ------------------------------------------------------- slot table
@@ -1608,6 +1882,8 @@ mod tests {
         assert_eq!(t.assign("aaaa", 16), Some(0));
         assert_eq!(t.assign("bbbb", 16), Some(1));
         assert_eq!(t.assign("aaaa", 16), Some(0), "assignment is idempotent");
+        assert!(t.set_directions("aaaa", HAL_PUBLISH_OUT));
+        assert!(t.set_directions("bbbb", HAL_PUBLISH_IN));
         t.save(&dir).expect("save");
 
         // What a restart sees. If this ever came back different, every device
@@ -1616,12 +1892,63 @@ mod tests {
         let t2 = SlotTable::load(&dir);
         assert_eq!(t2.slot_of("aaaa"), Some(0));
         assert_eq!(t2.slot_of("bbbb"), Some(1));
+        assert_eq!(t2.directions_of("aaaa"), Some(HAL_PUBLISH_OUT));
+        assert_eq!(t2.directions_of("bbbb"), Some(HAL_PUBLISH_IN));
         assert_eq!(t2.used(), 2);
 
         // A released slot is the LOWEST free one again, not the next one up.
         let mut t3 = t2.clone();
         assert_eq!(t3.release("aaaa"), Some(0));
         assert_eq!(t3.assign("cccc", 16), Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_v1_slot_file_migrates_to_both_directions_until_the_peer_reconnects() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ahb-slots-v1-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            SlotTable::path(&dir),
+            br#"{"version":1,"slots":[{"slot":4,"fingerprint":"old-peer"}]}"#,
+        )
+        .expect("write legacy file");
+
+        let table = SlotTable::load(&dir);
+        assert_eq!(table.slot_of("old-peer"), Some(4));
+        assert_eq!(
+            table.directions_of("old-peer"),
+            Some(HAL_PUBLISH_BOTH),
+            "an upgrade must not make an offline incumbent's selected device disappear"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_and_explicitly_empty_capabilities_remain_distinct_on_disk() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ahb-slots-v3-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mut table = SlotTable::new();
+        assert_eq!(table.assign("unknown-peer", 16), Some(0));
+        assert_eq!(table.assign("empty-peer", 16), Some(1));
+        assert!(table.set_directions("empty-peer", 0));
+        table.save(&dir).expect("save");
+
+        let json = std::fs::read_to_string(SlotTable::path(&dir)).expect("read");
+        assert!(json.contains("\"version\": 3"));
+        let restored = SlotTable::load(&dir);
+        assert_eq!(restored.slot_of("unknown-peer"), Some(0));
+        assert_eq!(restored.directions_of("unknown-peer"), None);
+        assert_eq!(restored.directions_of("empty-peer"), Some(0));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1651,7 +1978,11 @@ mod tests {
         let mut t = SlotTable::new();
         assert_eq!(t.assign("aaaa", 2), Some(0));
         assert_eq!(t.assign("bbbb", 2), Some(1));
-        assert_eq!(t.assign("cccc", 2), None, "the third peer gets no slot at all");
+        assert_eq!(
+            t.assign("cccc", 2),
+            None,
+            "the third peer gets no slot at all"
+        );
         // ...and the two that fit are untouched by the refusal.
         assert_eq!(t.slot_of("aaaa"), Some(0));
         assert_eq!(t.slot_of("bbbb"), Some(1));
@@ -1720,6 +2051,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn one_direction_is_a_complete_binding_and_an_extra_endpoint_is_repaired() {
+        let mut output_only = want(0, "aaaa", "Output-only host");
+        output_only.directions = HAL_PUBLISH_OUT;
+        let mut slots = empty_slots();
+        slots[0] = published(&output_only, 7);
+
+        assert!(
+            plan_binds(&[output_only.clone()], &slots, Some(&seen(&[&output_only]))).is_empty(),
+            "the absent microphone is the intended steady state, not half a failed pair"
+        );
+
+        let mut stale_extra = seen(&[&output_only]);
+        stale_extra.insert(output_only.in_uid.clone());
+        assert_eq!(
+            plan_binds(&[output_only.clone()], &slots, Some(&stale_extra)),
+            vec![BindAction::Set(output_only.to_bind())],
+            "a driver that left the unrequested microphone visible must be corrected"
+        );
+    }
+
+    #[test]
+    fn changing_capability_is_an_in_place_set_not_a_clear() {
+        let both = want(2, "aaaa", "Laptop");
+        let mut output_only = both.clone();
+        output_only.directions = HAL_PUBLISH_OUT;
+        let mut slots = empty_slots();
+        slots[2] = published(&both, 11);
+
+        let acts = plan_binds(&[output_only.clone()], &slots, Some(&seen(&[&both])));
+        assert_eq!(acts, vec![BindAction::Set(output_only.to_bind())]);
+        assert!(
+            !acts.iter().any(|a| matches!(a, BindAction::Clear { .. })),
+            "removing one direction must preserve the surviving endpoint identity"
+        );
+    }
+
+    #[test]
+    fn a_peer_with_no_endpoints_has_a_valid_invisible_binding() {
+        let mut none = want(5, "aaaa", "Headless host");
+        none.directions = 0;
+        let mut slots = empty_slots();
+        slots[5] = published(&none, 3);
+        let observed = seen(&[&none]);
+
+        assert!(plan_binds(&[none.clone()], &slots, Some(&observed)).is_empty());
+        let mut state = HalDevState::new(SlotTable::new());
+        state.slots = slots;
+        // `peer_device` is keyed through the persistent slot table, so install
+        // the same stable assignment before asking for its IPC projection.
+        state.table.assign[5] = Some("aaaa".to_string());
+        let device = state
+            .peer_device("aaaa")
+            .expect("the slot itself stays assigned");
+        assert_eq!(device.requested_directions, Some(0));
+        assert_eq!(device.published_directions, Some(0));
+    }
+
+    #[test]
+    fn withdrawing_then_restoring_a_direction_does_not_reuse_old_io_intent() {
+        let mut rec = SlotRec {
+            published_directions: HAL_PUBLISH_BOTH,
+            io_out: true,
+            io_in: true,
+            io_out_off_since: Some(Instant::now()),
+            io_in_off_since: Some(Instant::now()),
+            ..SlotRec::default()
+        };
+        assert!(apply_published_directions(&mut rec, HAL_PUBLISH_OUT));
+        assert!(
+            rec.io_out,
+            "the surviving endpoint keeps its current IO state"
+        );
+        assert!(!rec.io_in, "the withdrawn endpoint loses its old selection");
+        assert!(
+            rec.io_in_off_since.is_none(),
+            "its linger must be cancelled too"
+        );
+
+        assert!(!apply_published_directions(&mut rec, HAL_PUBLISH_BOTH));
+        assert!(
+            !rec.io_in && rec.io_in_off_since.is_none(),
+            "republishing is not a fresh StartIO and must not reopen a session"
+        );
+    }
+
     /// The closed loop. An acknowledged binding whose device the system does
     /// NOT list is a lost notification, an Initialize race or a coreaudiod
     /// restart — all of which look identical from here, and all of which are
@@ -1752,7 +2169,9 @@ mod tests {
         slots[0] = published(&old, 7);
         let acts = plan_binds(&[new.clone()], &slots, Some(&seen(&[&old])));
         assert_eq!(acts, vec![BindAction::Set(new.to_bind())]);
-        let BindAction::Set(req) = &acts[0] else { panic!() };
+        let BindAction::Set(req) = &acts[0] else {
+            panic!()
+        };
         assert_eq!(req.out_uid, old.out_uid, "a rename must not move the UID");
         assert!(!acts.iter().any(|a| matches!(a, BindAction::Clear { .. })));
     }
@@ -1762,7 +2181,7 @@ mod tests {
         let online = want(0, "aaaa", "Mac mini");
         let mut offline = online.clone();
         offline.online = false;
-        let (o, i) = device_names("Mac mini", true);
+        let (o, i) = device_names("Mac mini", true, "zh-CN");
         offline.out_name = o;
         offline.in_name = i;
         let mut slots = empty_slots();
@@ -1772,22 +2191,70 @@ mod tests {
     }
 
     #[test]
+    fn changing_native_locale_is_an_in_place_rename_and_reconnect_removes_the_mark() {
+        let online = want(0, "aaaa", "Mac mini");
+        let mut zh = online.clone();
+        zh.online = false;
+        (zh.out_name, zh.in_name) = device_names("Mac mini", true, "zh-CN");
+        zh.display = device_display_name("Mac mini", true, "zh-CN");
+        let mut slots = empty_slots();
+        slots[0] = published(&zh, 7);
+
+        let mut en = zh.clone();
+        (en.out_name, en.in_name) = device_names("Mac mini", true, "en-US");
+        en.display = device_display_name("Mac mini", true, "en-US");
+        let acts = plan_binds(&[en.clone()], &slots, Some(&seen(&[&zh])));
+        assert_eq!(acts, vec![BindAction::Set(en.to_bind())]);
+        let BindAction::Set(req) = &acts[0] else {
+            panic!()
+        };
+        assert_eq!(
+            req.out_uid, zh.out_uid,
+            "language changes must preserve the device UID"
+        );
+        assert_eq!(
+            req.display, "Mac mini (Offline)",
+            "Windows receives the localized suffix"
+        );
+
+        slots[0] = published(&en, 7);
+        let acts = plan_binds(&[online.clone()], &slots, Some(&seen(&[&en])));
+        assert_eq!(acts, vec![BindAction::Set(online.to_bind())]);
+        assert_eq!(
+            online.out_uid, en.out_uid,
+            "reconnect must restore the same selected device"
+        );
+    }
+
+    #[test]
     fn unpairing_retires_the_slot_at_its_current_generation() {
         let d = want(2, "aaaa", "Mac mini");
         let mut slots = empty_slots();
         slots[2] = published(&d, 9);
         let acts = plan_binds(&[], &slots, Some(&seen(&[&d])));
-        assert_eq!(acts, vec![BindAction::Clear { slot: 2, generation: 9 }]);
+        assert_eq!(
+            acts,
+            vec![BindAction::Clear {
+                slot: 2,
+                generation: 9
+            }]
+        );
     }
 
     #[test]
     fn a_clear_already_in_flight_is_not_repeated() {
         let d = want(2, "aaaa", "Mac mini");
         let mut slots = empty_slots();
-        slots[2] = SlotRec { clearing: true, ..published(&d, 9) };
+        slots[2] = SlotRec {
+            clearing: true,
+            ..published(&d, 9)
+        };
         assert!(plan_binds(&[], &slots, Some(&seen(&[&d]))).is_empty());
         // ...and once the driver says Free, there is nothing left to do either.
-        slots[2] = SlotRec { state: Some(HalSlotState::Free), ..SlotRec::default() };
+        slots[2] = SlotRec {
+            state: Some(HalSlotState::Free),
+            ..SlotRec::default()
+        };
         assert!(plan_binds(&[], &slots, Some(&seen(&[]))).is_empty());
     }
 
@@ -1801,7 +2268,13 @@ mod tests {
         slots[0] = published(&a, 3);
         slots[1] = published(&b, 4);
         let acts = plan_binds(&[b.clone()], &slots, Some(&seen(&[&a, &b])));
-        assert_eq!(acts, vec![BindAction::Clear { slot: 0, generation: 3 }]);
+        assert_eq!(
+            acts,
+            vec![BindAction::Clear {
+                slot: 0,
+                generation: 3
+            }]
+        );
     }
 
     /// A device we did not ask for, published under our own UID prefix: the
@@ -1871,7 +2344,10 @@ mod tests {
             "share and mode B refuse for unrelated reasons; one message for both would send \
              half the users to look for a device selection that does not apply to them"
         );
-        assert!(refuse_using_others(Mode::Share, true).is_none(), "probes still drive us");
+        assert!(
+            refuse_using_others(Mode::Share, true).is_none(),
+            "probes still drive us"
+        );
     }
 
     /// The enforcement half of plan §13, and the one that actually prevents the
@@ -1885,7 +2361,10 @@ mod tests {
         for m in [Mode::A, Mode::B] {
             let why = refuse_being_used(m)
                 .unwrap_or_else(|| panic!("{m} is a consumer mode and must refuse to be used"));
-            assert!(why.contains(m.as_str()), "the refusal must name the mode: {why}");
+            assert!(
+                why.contains(m.as_str()),
+                "the refusal must name the mode: {why}"
+            );
         }
     }
 
@@ -1909,7 +2388,11 @@ mod tests {
     /// being a consumer would keep publishing consumer devices.
     #[test]
     fn only_mode_b_desires_virtual_devices() {
-        assert_eq!(no_device_reason(Mode::B), None, "mode B is where devices live");
+        assert_eq!(
+            no_device_reason(Mode::B),
+            None,
+            "mode B is where devices live"
+        );
         let share = no_device_reason(Mode::Share).expect("share mode must not desire devices");
         let a = no_device_reason(Mode::A).expect("mode A must not desire devices");
         assert_ne!(

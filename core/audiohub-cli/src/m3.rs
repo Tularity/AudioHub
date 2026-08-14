@@ -92,7 +92,11 @@ pub fn dispatch(cmd: M3Cmd, json: bool) -> Result<i32> {
             pin,
             announce,
         } => cmd_pair_listen(port, secs, pin, announce, json),
-        M3Cmd::Pair { to, pin, listen_port } => cmd_pair(&to, &pin, listen_port, json),
+        M3Cmd::Pair {
+            to,
+            pin,
+            listen_port,
+        } => cmd_pair(&to, &pin, listen_port, json),
         M3Cmd::Peers => cmd_peers(json),
         M3Cmd::Unpair { fingerprint, all } => cmd_unpair(fingerprint, all, json),
         M3Cmd::VerifyListen { port, secs } => cmd_verify_listen(port, secs, json),
@@ -131,7 +135,10 @@ fn parse_target(to: &str) -> Result<SocketAddr> {
 }
 
 /// Nonblocking accept loop, 100ms poll ticks until deadline.
-fn accept_until(listener: &TcpListener, deadline: Instant) -> Result<Option<(TcpStream, SocketAddr)>> {
+fn accept_until(
+    listener: &TcpListener,
+    deadline: Instant,
+) -> Result<Option<(TcpStream, SocketAddr)>> {
     loop {
         if Instant::now() >= deadline {
             return Ok(None);

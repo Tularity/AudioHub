@@ -68,7 +68,10 @@ impl Node {
             airplay_advertise: false,
         })
         .expect("start daemon");
-        Node { h, dir, keep_dir: false,
+        Node {
+            h,
+            dir,
+            keep_dir: false,
         }
     }
 
@@ -187,10 +190,7 @@ fn turning_announcing_off_persists_and_the_next_start_honours_it() {
         // no. A daemon that ignored the setting here would put the machine back
         // on the network the user took it off.
         let n2 = Node::start_at(dir.clone(), None, /*fault=*/ false);
-        assert!(
-            !n2.flag("discovery_announce"),
-            "重启后隐私开关自己弹回去了"
-        );
+        assert!(!n2.flag("discovery_announce"), "重启后隐私开关自己弹回去了");
         assert!(
             !n2.flag("discovery_announcing"),
             "用户关掉了广播，重启之后这台机器又开始广播自己"

@@ -122,17 +122,17 @@ impl fmt::Debug for Request {
     }
 }
 
-/// Read exactly one request. The callback selects a body cap after the method
-/// is known, allowing small pairing endpoints and larger media setup payloads
-/// to use different resource budgets.
+/// Read exactly one request. The callback selects a body cap after the request
+/// line and headers are known, allowing authenticated metadata/artwork
+/// endpoints and small pairing messages to use different resource budgets.
 pub async fn read_request<R, F>(
     reader: &mut R,
     limits: RequestLimits,
-    max_body_for_method: F,
+    max_body_for_request: F,
 ) -> Result<Option<Request>, RtspError>
 where
     R: AsyncRead + Unpin,
-    F: FnOnce(&str) -> Option<usize>,
+    F: FnOnce(&str, &str, &[Header]) -> Option<usize>,
 {
     validate_limits(limits)?;
     let mut head = Vec::with_capacity(1024);
@@ -170,7 +170,8 @@ where
 
     let (method, target, version, headers, content_length) =
         parse_head(&head[..header_end], limits)?;
-    let body_cap = max_body_for_method(&method).unwrap_or(limits.default_max_body_bytes);
+    let body_cap =
+        max_body_for_request(&method, &target, &headers).unwrap_or(limits.default_max_body_bytes);
     if content_length > body_cap {
         return Err(RtspError::BodyTooLarge {
             actual: content_length,
@@ -204,7 +205,7 @@ where
 /// it consumes exactly one request from the front and retains both incomplete
 /// prefixes and pipelined requests. Callers should set
 /// `default_max_body_bytes` to the largest endpoint body they will ever accept
-/// and use `max_body_for_method` only to select stricter per-method limits.
+/// and use the request-aware callback to select stricter per-endpoint limits.
 #[derive(Debug)]
 pub struct RequestDecoder {
     limits: RequestLimits,
@@ -237,6 +238,33 @@ impl RequestDecoder {
         std::mem::take(&mut self.buffered)
     }
 
+    /// Change the aggregate body budget after a transport/authentication
+    /// boundary. This lets callers keep unauthenticated plaintext at the
+    /// small control limit and permit larger metadata only after pairing.
+    pub fn set_default_max_body_bytes(&mut self, maximum: usize) -> Result<(), RtspError> {
+        if self.poisoned {
+            return Err(RtspError::PoisonedDecoder);
+        }
+        let limits = RequestLimits {
+            default_max_body_bytes: maximum,
+            ..self.limits
+        };
+        validate_limits(limits)?;
+        let max = limits
+            .max_header_bytes
+            .checked_add(maximum)
+            .ok_or(RtspError::InvalidLimits)?;
+        if self.buffered.len() > max {
+            self.poisoned = true;
+            return Err(RtspError::BufferedDataTooLarge {
+                actual: self.buffered.len(),
+                max,
+            });
+        }
+        self.limits = limits;
+        Ok(())
+    }
+
     /// Append one arbitrary plaintext chunk. The aggregate allocation remains
     /// bounded even if a peer sends a body before its header has been parsed.
     pub fn feed(&mut self, input: &[u8]) -> Result<(), RtspError> {
@@ -265,14 +293,14 @@ impl RequestDecoder {
     /// Return the next complete request, retaining an incomplete prefix or any
     /// pipelined remainder. A framing error poisons this connection decoder;
     /// continuing after an ambiguous parse would risk request smuggling.
-    pub fn next_request<F>(&mut self, max_body_for_method: F) -> Result<Option<Request>, RtspError>
+    pub fn next_request<F>(&mut self, max_body_for_request: F) -> Result<Option<Request>, RtspError>
     where
-        F: FnOnce(&str) -> Option<usize>,
+        F: FnOnce(&str, &str, &[Header]) -> Option<usize>,
     {
         if self.poisoned {
             return Err(RtspError::PoisonedDecoder);
         }
-        match parse_buffered_request(&self.buffered, self.limits, max_body_for_method) {
+        match parse_buffered_request(&self.buffered, self.limits, max_body_for_request) {
             Ok(Some((request, consumed))) => {
                 self.buffered.drain(..consumed);
                 Ok(Some(request))
@@ -289,10 +317,10 @@ impl RequestDecoder {
 fn parse_buffered_request<F>(
     buffered: &[u8],
     limits: RequestLimits,
-    max_body_for_method: F,
+    max_body_for_request: F,
 ) -> Result<Option<(Request, usize)>, RtspError>
 where
-    F: FnOnce(&str) -> Option<usize>,
+    F: FnOnce(&str, &str, &[Header]) -> Option<usize>,
 {
     let Some(header_start_end) = buffered.windows(4).position(|window| window == b"\r\n\r\n")
     else {
@@ -323,7 +351,8 @@ where
     }
     let (method, target, version, headers, content_length) =
         parse_head(&buffered[..header_end], limits)?;
-    let body_cap = max_body_for_method(&method).unwrap_or(limits.default_max_body_bytes);
+    let body_cap =
+        max_body_for_request(&method, &target, &headers).unwrap_or(limits.default_max_body_bytes);
     if content_length > body_cap {
         return Err(RtspError::BodyTooLarge {
             actual: content_length,
@@ -720,14 +749,14 @@ mod tests {
     }
 
     async fn parse(bytes: &[u8]) -> Result<Option<Request>, RtspError> {
-        read_request(&mut reader(bytes), RequestLimits::default(), |_| None).await
+        read_request(&mut reader(bytes), RequestLimits::default(), |_, _, _| None).await
     }
 
     #[tokio::test]
     async fn parses_binary_body_and_leaves_pipelined_request_unread() {
         let bytes = b"POST /pair-setup HTTP/1.1\r\nContent-Length: 3\r\nCSeq: 7\r\n\r\n\x00\xff\x01OPTIONS * RTSP/1.0\r\n\r\n";
         let mut input = reader(bytes);
-        let first = read_request(&mut input, RequestLimits::default(), |_| None)
+        let first = read_request(&mut input, RequestLimits::default(), |_, _, _| None)
             .await
             .unwrap()
             .unwrap();
@@ -736,7 +765,7 @@ mod tests {
         assert_eq!(first.version(), "HTTP/1.1");
         assert_eq!(first.header("cseq"), Some(&b"7"[..]));
         assert_eq!(first.body(), b"\x00\xff\x01");
-        let second = read_request(&mut input, RequestLimits::default(), |_| None)
+        let second = read_request(&mut input, RequestLimits::default(), |_, _, _| None)
             .await
             .unwrap()
             .unwrap();
@@ -749,15 +778,15 @@ mod tests {
         for split in 0..=wire.len() {
             let mut decoder = RequestDecoder::new(RequestLimits::default()).unwrap();
             decoder.feed(&wire[..split]).unwrap();
-            let first = decoder.next_request(|_| None).unwrap();
+            let first = decoder.next_request(|_, _, _| None).unwrap();
             decoder.feed(&wire[split..]).unwrap();
             let first = match first {
                 Some(request) => request,
-                None => decoder.next_request(|_| None).unwrap().unwrap(),
+                None => decoder.next_request(|_, _, _| None).unwrap().unwrap(),
             };
             assert_eq!(first.target(), "/pair-setup", "split={split}");
             assert_eq!(first.body(), b"\x00\xff\x01", "split={split}");
-            let second = decoder.next_request(|_| None).unwrap().unwrap();
+            let second = decoder.next_request(|_, _, _| None).unwrap().unwrap();
             assert_eq!(second.method(), "OPTIONS", "split={split}");
             assert_eq!(second.header("CSeq"), Some(&b"8"[..]), "split={split}");
             assert_eq!(decoder.buffered_len(), 0, "split={split}");
@@ -772,22 +801,26 @@ mod tests {
         decoder
             .feed(b"POST /x RTSP/1.0\r\nContent-Length: 4\r\n\r\n12")
             .unwrap();
-        assert!(decoder.next_request(|_| None).unwrap().is_none());
+        assert!(decoder.next_request(|_, _, _| None).unwrap().is_none());
         assert!(decoder.buffered_len() > 2);
         decoder.feed(b"34").unwrap();
         assert_eq!(
-            decoder.next_request(|_| None).unwrap().unwrap().body(),
+            decoder
+                .next_request(|_, _, _| None)
+                .unwrap()
+                .unwrap()
+                .body(),
             b"1234"
         );
 
         let mut malformed = RequestDecoder::new(limits).unwrap();
         malformed.feed(b"GET / HTTP/1.1\n\n").unwrap();
         assert_eq!(
-            malformed.next_request(|_| None).unwrap_err(),
+            malformed.next_request(|_, _, _| None).unwrap_err(),
             RtspError::MalformedLineEnding
         );
         assert_eq!(
-            malformed.next_request(|_| None).unwrap_err(),
+            malformed.next_request(|_, _, _| None).unwrap_err(),
             RtspError::PoisonedDecoder
         );
     }
@@ -798,7 +831,7 @@ mod tests {
         decoder
             .feed(b"POST /pair-setup RTSP/1.0\r\nContent-Length: 0\r\n\r\n\x11\x22")
             .unwrap();
-        assert!(decoder.next_request(|_| None).unwrap().is_some());
+        assert!(decoder.next_request(|_, _, _| None).unwrap().is_some());
         assert_eq!(decoder.take_buffered(), vec![0x11, 0x22]);
         assert_eq!(decoder.buffered_len(), 0);
     }
@@ -823,13 +856,36 @@ mod tests {
         assert_eq!(decoder.feed(b"x").unwrap_err(), RtspError::PoisonedDecoder);
     }
 
+    #[test]
+    fn incremental_decoder_body_budget_can_be_promoted_after_authentication() {
+        let large = vec![0u8; 128 * 1024];
+
+        let mut plaintext = RequestDecoder::new(RequestLimits::default()).unwrap();
+        assert!(matches!(
+            plaintext.feed(&large),
+            Err(RtspError::BufferedDataTooLarge { .. })
+        ));
+
+        let mut authenticated = RequestDecoder::new(RequestLimits::default()).unwrap();
+        authenticated
+            .set_default_max_body_bytes(5 * 1024 * 1024)
+            .unwrap();
+        authenticated.feed(&large).unwrap();
+        assert_eq!(authenticated.buffered_len(), large.len());
+    }
+
     #[tokio::test]
     async fn applies_method_specific_body_cap_before_allocation() {
         let bytes = b"POST /x RTSP/1.0\r\nContent-Length: 9\r\n\r\n123456789";
         assert_eq!(
-            read_request(&mut reader(bytes), RequestLimits::default(), |method| {
-                (method == "POST").then_some(8)
-            })
+            read_request(
+                &mut reader(bytes),
+                RequestLimits::default(),
+                |method, target, _| {
+                    assert_eq!(target, "/x");
+                    (method == "POST").then_some(8)
+                },
+            )
             .await
             .unwrap_err(),
             RtspError::BodyTooLarge { actual: 9, max: 8 }
@@ -874,9 +930,13 @@ mod tests {
         limits.max_request_line_bytes = 8;
         limits.max_header_bytes = 64;
         assert_eq!(
-            read_request(&mut reader(b"OPTIONS * RTSP/1.0\r\n\r\n"), limits, |_| None)
-                .await
-                .unwrap_err(),
+            read_request(
+                &mut reader(b"OPTIONS * RTSP/1.0\r\n\r\n"),
+                limits,
+                |_, _, _| None,
+            )
+            .await
+            .unwrap_err(),
             RtspError::RequestLineTooLarge { max: 8 }
         );
 
@@ -886,7 +946,7 @@ mod tests {
             read_request(
                 &mut reader(b"GET / RTSP/1.0\r\nLong: 12345678901234567890\r\n\r\n"),
                 limits,
-                |_| None,
+                |_, _, _| None,
             )
             .await
             .unwrap_err(),
@@ -899,7 +959,7 @@ mod tests {
             read_request(
                 &mut reader(b"GET / RTSP/1.0\r\nA: 1\r\nB: 2\r\n\r\n"),
                 limits,
-                |_| None,
+                |_, _, _| None,
             )
             .await
             .unwrap_err(),

@@ -264,7 +264,10 @@ pub(crate) fn watchdog_pass(inner: &Arc<DaemonInner>) {
             age_ms: e.conn.clock_ms().saturating_sub(e.armed_conn_ms),
             heard_since_arm: e.conn.heard_since_ms(e.armed_conn_ms),
             control_silent_ms: e.conn.silent_for().as_millis() as u64,
-            media_seen: e.rx.as_ref().map(|rx| rx.media_seen.load(Ordering::Relaxed)),
+            media_seen: e
+                .rx
+                .as_ref()
+                .map(|rx| rx.media_seen.load(Ordering::Relaxed)),
             sent_and_ka: e.tx.as_ref().map(|tx| {
                 (
                     tx.sent_packets.load(Ordering::Relaxed),
@@ -362,7 +365,10 @@ fn downgrade(inner: &Arc<DaemonInner>, fp: &str, reason: &str, announce: bool) {
     // every stream has to be re-opened regardless, and `teardown_conn` already
     // arms the retry loop with exactly those streams.
     let applied = conn::retier(inner, fp);
-    dlog!("[audiohubd] peer {fp}: automatic downgrade to tier 1 applied ({})", applied.as_wire());
+    dlog!(
+        "[audiohubd] peer {fp}: automatic downgrade to tier 1 applied ({})",
+        applied.as_wire()
+    );
 }
 
 /// A peer told us it has decided this link cannot carry UDP.
@@ -470,8 +476,14 @@ mod tests {
 
     #[test]
     fn the_two_signals_each_reach_a_verdict_on_their_own() {
-        assert_eq!(look_at(blocked_receiver()), Look::Blocked(REASON_NO_INBOUND));
-        assert_eq!(look_at(blocked_sender()), Look::Blocked(REASON_NO_KEEPALIVE));
+        assert_eq!(
+            look_at(blocked_receiver()),
+            Look::Blocked(REASON_NO_INBOUND)
+        );
+        assert_eq!(
+            look_at(blocked_sender()),
+            Look::Blocked(REASON_NO_KEEPALIVE)
+        );
     }
 
     /// The peer was never heard from after this stream armed, so "no media
@@ -482,7 +494,10 @@ mod tests {
     /// `transport_tests::` suite green.
     #[test]
     fn a_peer_that_has_not_spoken_since_the_stream_armed_is_not_evidence() {
-        let e = Evidence { heard_since_arm: false, ..blocked_receiver() };
+        let e = Evidence {
+            heard_since_arm: false,
+            ..blocked_receiver()
+        };
         assert_eq!(
             look_at(e),
             Look::Quiet,
@@ -490,7 +505,10 @@ mod tests {
              the verdict persists for an hour"
         );
         assert_eq!(
-            look_at(Evidence { heard_since_arm: false, ..blocked_sender() }),
+            look_at(Evidence {
+                heard_since_arm: false,
+                ..blocked_sender()
+            }),
             Look::Quiet,
             "the health clause gates BOTH signals; it is not a 'not yet' for one and a verdict \
              for the other"
@@ -506,19 +524,28 @@ mod tests {
     fn a_control_channel_that_has_gone_quiet_is_not_healthy_any_more() {
         let dead = conn::CONTROL_SILENCE_LIMIT.as_millis() as u64;
         assert_eq!(
-            look_at(Evidence { control_silent_ms: dead, ..blocked_receiver() }),
+            look_at(Evidence {
+                control_silent_ms: dead,
+                ..blocked_receiver()
+            }),
             Look::Quiet,
             "the peer's whole network had just died and the link was blamed on UDP"
         );
         assert_eq!(
-            look_at(Evidence { control_silent_ms: dead, ..blocked_sender() }),
+            look_at(Evidence {
+                control_silent_ms: dead,
+                ..blocked_sender()
+            }),
             Look::Quiet
         );
         // One millisecond inside the limit is still healthy: the bound matches
         // `conn::ping_and_reap` exactly, so this clause never refuses a verdict
         // on a connection the daemon still considers alive.
         assert_eq!(
-            look_at(Evidence { control_silent_ms: dead - 1, ..blocked_receiver() }),
+            look_at(Evidence {
+                control_silent_ms: dead - 1,
+                ..blocked_receiver()
+            }),
             Look::Blocked(REASON_NO_INBOUND)
         );
     }
@@ -528,18 +555,42 @@ mod tests {
     /// either as a verdict re-downgrades an already downgraded link for ever.
     #[test]
     fn a_stream_that_left_udp_is_not_evidence_about_udp() {
-        assert_eq!(look_at(Evidence { on_udp: false, ..blocked_receiver() }), Look::Quiet);
-        assert_eq!(look_at(Evidence { on_udp: false, ..blocked_sender() }), Look::Quiet);
+        assert_eq!(
+            look_at(Evidence {
+                on_udp: false,
+                ..blocked_receiver()
+            }),
+            Look::Quiet
+        );
+        assert_eq!(
+            look_at(Evidence {
+                on_udp: false,
+                ..blocked_sender()
+            }),
+            Look::Quiet
+        );
         // Same for a peer already at tier 1 by any route: that is what stops the
         // sweep re-announcing a verdict it reached ten minutes ago.
-        assert_eq!(look_at(Evidence { tier0: false, ..blocked_receiver() }), Look::Quiet);
+        assert_eq!(
+            look_at(Evidence {
+                tier0: false,
+                ..blocked_receiver()
+            }),
+            Look::Quiet
+        );
     }
 
     #[test]
     fn neither_signal_fires_before_its_window() {
-        let e = Evidence { age_ms: T_UDP_SILENCE.as_millis() as u64 - 1, ..blocked_receiver() };
+        let e = Evidence {
+            age_ms: T_UDP_SILENCE.as_millis() as u64 - 1,
+            ..blocked_receiver()
+        };
         assert_eq!(look_at(e), Look::Quiet);
-        let e = Evidence { age_ms: T_KEEPALIVE_SILENCE.as_millis() as u64 - 1, ..blocked_sender() };
+        let e = Evidence {
+            age_ms: T_KEEPALIVE_SILENCE.as_millis() as u64 - 1,
+            ..blocked_sender()
+        };
         assert_eq!(look_at(e), Look::Quiet);
     }
 
@@ -547,7 +598,13 @@ mod tests {
     /// that delivered anything at all is not the link this feature is about.
     #[test]
     fn a_single_datagram_settles_the_question() {
-        assert_eq!(look_at(Evidence { media_seen: Some(1), ..blocked_receiver() }), Look::Quiet);
+        assert_eq!(
+            look_at(Evidence {
+                media_seen: Some(1),
+                ..blocked_receiver()
+            }),
+            Look::Quiet
+        );
     }
 
     /// With nothing sent there is nothing for a keepalive to be a reply to, so
@@ -555,9 +612,18 @@ mod tests {
     /// to the control channel.
     #[test]
     fn a_sender_that_has_sent_nothing_cannot_complain_about_the_silence() {
-        assert_eq!(look_at(Evidence { sent_and_ka: Some((0, 0)), ..blocked_sender() }), Look::Quiet);
         assert_eq!(
-            look_at(Evidence { sent_and_ka: Some((400, 1)), ..blocked_sender() }),
+            look_at(Evidence {
+                sent_and_ka: Some((0, 0)),
+                ..blocked_sender()
+            }),
+            Look::Quiet
+        );
+        assert_eq!(
+            look_at(Evidence {
+                sent_and_ka: Some((400, 1)),
+                ..blocked_sender()
+            }),
             Look::Quiet,
             "one keepalive came back, so the reverse direction works"
         );
@@ -606,8 +672,12 @@ mod tests {
              an always-true assertion",
         );
         let body = &src[open..];
-        let start = body.find("start_tx_stream(").expect("the send side is built somewhere");
-        let send = body.find("conn.send_msg(&open)").expect("OpenStream is sent somewhere");
+        let start = body
+            .find("start_tx_stream(")
+            .expect("the send side is built somewhere");
+        let send = body
+            .find("conn.send_msg(&open)")
+            .expect("OpenStream is sent somewhere");
         assert!(
             start < send,
             "open_session_from sends OpenStream before starting its media source. The peer arms \

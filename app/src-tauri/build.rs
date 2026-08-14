@@ -34,8 +34,113 @@
 //   2. tauri-build 自己会发 cargo:rerun-if-changed（至少对 tauri.conf.json），这已经关掉了
 //      cargo「包内任意文件变动就重跑」的默认行为。所以清单文件必须自己声明一条，
 //      否则改了清单不会触发重新构建。
+use std::io::Read;
+use std::path::Path;
+
+use sha2::{Digest, Sha256};
+
+fn file_digest(path: &Path) -> String {
+    let mut file = std::fs::File::open(path)
+        .unwrap_or_else(|error| panic!("cannot hash {}: {error}", path.display()));
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .unwrap_or_else(|error| panic!("cannot hash {}: {error}", path.display()));
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn macos_driver_pkg_digest() -> String {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return String::new();
+    }
+
+    let manifest = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
+    );
+    let package = manifest.join("../../drivers/macos-hal/build/AudioHubDriver.pkg");
+    println!("cargo:rerun-if-changed={}", package.display());
+    if !package.is_file() {
+        // A plain `cargo check` must work in a fresh checkout. The official
+        // app build creates the package before compiling this crate; an empty
+        // digest deliberately makes the runtime installer report "not
+        // bundled" in developer layouts that skipped that step.
+        return String::new();
+    }
+
+    file_digest(&package)
+}
+
+fn macos_daemon_installer_digest() -> String {
+    let manifest = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
+    );
+    let installer = manifest.join("../installer/macos/install-daemon.sh");
+    println!("cargo:rerun-if-changed={}", installer.display());
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") || !installer.is_file() {
+        return String::new();
+    }
+
+    file_digest(&installer)
+}
+
+fn emit_windows_payload_digests() {
+    let manifest = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
+    );
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let entries = [
+        (
+            "AUDIOHUB_WIN_HELPER_SHA256",
+            manifest.join("windows/driver-payload/audiohub-vad-helper.exe"),
+        ),
+        (
+            "AUDIOHUB_WIN_INF_SHA256",
+            manifest.join("windows/driver-payload/AudioHubVad.inf"),
+        ),
+        (
+            "AUDIOHUB_WIN_SYS_SHA256",
+            manifest.join("windows/driver-payload/AudioHubVad.sys"),
+        ),
+        (
+            "AUDIOHUB_WIN_CAT_SHA256",
+            manifest.join("windows/driver-payload/AudioHubVad.cat"),
+        ),
+        (
+            "AUDIOHUB_WIN_DAEMON_SHA256",
+            manifest.join(format!("binaries/audiohubd-{target}.exe")),
+        ),
+    ];
+    let windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    for (name, path) in entries {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let value = if windows && path.is_file() {
+            file_digest(&path)
+        } else {
+            String::new()
+        };
+        println!("cargo:rustc-env={name}={value}");
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=windows-app-manifest.xml");
+    println!(
+        "cargo:rustc-env=AUDIOHUB_DRIVER_PKG_SHA256={}",
+        macos_driver_pkg_digest()
+    );
+    println!(
+        "cargo:rustc-env=AUDIOHUB_DAEMON_INSTALLER_SHA256={}",
+        macos_daemon_installer_digest()
+    );
+    emit_windows_payload_digests();
 
     let attributes = tauri_build::Attributes::new().windows_attributes(
         tauri_build::WindowsAttributes::new()

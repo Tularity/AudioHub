@@ -37,7 +37,8 @@ async function call(cmd: 'start_window_drag' | 'toggle_window_zoom' | 'show_wind
     // 之前难以定位的原因。宁可弹一条，把「壳没接上」变成看得见的事实。
     if (reported) return;
     reported = true;
-    toast(t('chrome.dragFailed', { message: err instanceof Error ? err.message : String(err) }), 'error');
+    console.error('[audiohub] native window command failed', err);
+    toast(t('chrome.dragFailed'), 'error');
   }
 }
 

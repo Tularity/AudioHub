@@ -134,7 +134,6 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// default and not a claim.
 pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(20);
 
-
 // ------------------------------------------------------------------ addresses
 
 /// A peer address that says what transport it is (`plan.md` §16.2).
@@ -197,7 +196,9 @@ impl WsUrl {
         }
         // IPv6 literals are bracketed, and the colon rule differs inside them.
         let (host, port) = if let Some(close) = authority.strip_prefix('[') {
-            let Some(i) = close.find(']') else { bail!("unterminated IPv6 literal in {s}") };
+            let Some(i) = close.find(']') else {
+                bail!("unterminated IPv6 literal in {s}")
+            };
             let h = &close[..i];
             let tail = &close[i + 1..];
             let p = match tail.strip_prefix(':') {
@@ -208,16 +209,22 @@ impl WsUrl {
             (format!("[{h}]"), p)
         } else {
             match authority.rsplit_once(':') {
-                Some((h, p)) => {
-                    (h.to_string(), p.parse::<u16>().with_context(|| format!("port in {s}"))?)
-                }
+                Some((h, p)) => (
+                    h.to_string(),
+                    p.parse::<u16>().with_context(|| format!("port in {s}"))?,
+                ),
                 None => (authority.to_string(), default_port(tls)),
             }
         };
         if host.is_empty() || host == "[]" {
             bail!("WebSocket URL has no host: {s}");
         }
-        Ok(WsUrl { tls, host, port, path })
+        Ok(WsUrl {
+            tls,
+            host,
+            port,
+            path,
+        })
     }
 
     /// What to hand `TcpStream::connect`, before resolution.
@@ -347,7 +354,12 @@ struct HeaderOnly {
 
 impl HeaderOnly {
     fn new(sock: TcpStream) -> HeaderOnly {
-        HeaderOnly { sock, matched: 0, done: false, total: 0 }
+        HeaderOnly {
+            sock,
+            matched: 0,
+            done: false,
+            total: 0,
+        }
     }
 }
 
@@ -468,7 +480,10 @@ pub(crate) fn connect(sock: TcpStream, url: &WsUrl) -> Result<(WsReader, WsWrite
     assert_no_deflate("the upgrade request we were about to send", req.headers())?;
 
     arm_handshake_timeouts(&sock)?;
-    let hs = HeaderOnly::new(sock.try_clone().context("clone the socket for the upgrade")?);
+    let hs = HeaderOnly::new(
+        sock.try_clone()
+            .context("clone the socket for the upgrade")?,
+    );
     let deadline = Instant::now() + UPGRADE_TIMEOUT;
     let mut attempt = tungstenite::client::client_with_config(req, hs, Some(ws_config()));
     let (done, resp) = loop {
@@ -493,15 +508,21 @@ pub(crate) fn connect(sock: TcpStream, url: &WsUrl) -> Result<(WsReader, WsWrite
 /// Run the server upgrade on an accepted socket, then split it.
 pub(crate) fn accept(sock: TcpStream) -> Result<(WsReader, WsWriter)> {
     arm_handshake_timeouts(&sock)?;
-    let hs = HeaderOnly::new(sock.try_clone().context("clone the socket for the upgrade")?);
+    let hs = HeaderOnly::new(
+        sock.try_clone()
+            .context("clone the socket for the upgrade")?,
+    );
     let deadline = Instant::now() + UPGRADE_TIMEOUT;
-    let mut attempt = tungstenite::accept_hdr_with_config(hs, decline_extensions, Some(ws_config()));
+    let mut attempt =
+        tungstenite::accept_hdr_with_config(hs, decline_extensions, Some(ws_config()));
     let done = loop {
         match attempt {
             Ok(v) => break v,
             Err(tungstenite::handshake::HandshakeError::Interrupted(mid)) => {
                 if Instant::now() >= deadline {
-                    bail!("an inbound WebSocket upgrade did not complete within {UPGRADE_TIMEOUT:?}");
+                    bail!(
+                        "an inbound WebSocket upgrade did not complete within {UPGRADE_TIMEOUT:?}"
+                    );
                 }
                 attempt = mid.handshake();
             }
@@ -564,8 +585,12 @@ fn arm_handshake_timeouts(sock: &TcpStream) -> Result<()> {
 /// Called only after a handshake that left no tail (see [`HeaderOnly`]), so
 /// `from_raw_socket` is exact rather than approximate.
 fn split(sock: TcpStream, role: Role) -> Result<(WsReader, WsWriter)> {
-    let rd = sock.try_clone().context("clone the socket for the ws reader")?;
-    let wr = sock.try_clone().context("clone the socket for the ws writer")?;
+    let rd = sock
+        .try_clone()
+        .context("clone the socket for the ws reader")?;
+    let wr = sock
+        .try_clone()
+        .context("clone the socket for the ws writer")?;
     let shared = Arc::new(WsShared::default());
     let reader = WsReader {
         ws: WebSocket::from_raw_socket(RecvHalf { sock: rd }, role, Some(ws_config())),
@@ -618,7 +643,10 @@ impl Read for SendHalf {
     fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
         // Not EOF: `WebSocketContext` treats a closed read as a terminated
         // connection, and this half is simply not the one that reads.
-        Err(io::Error::new(ErrorKind::WouldBlock, "the ws writer half does not read"))
+        Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            "the ws writer half does not read",
+        ))
     }
 }
 
@@ -847,7 +875,6 @@ impl Write for WsWriter {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,12 +888,18 @@ mod tests {
         let u = WsUrl::parse("ws://tunnel.example.com/audiohub").expect("parse");
         assert!(!u.tls);
         assert_eq!(u.host, "tunnel.example.com");
-        assert_eq!(u.port, 80, "ws:// defaults to 80, like every other HTTP client");
+        assert_eq!(
+            u.port, 80,
+            "ws:// defaults to 80, like every other HTTP client"
+        );
         assert_eq!(u.path, "/audiohub");
         assert_eq!(u.authority(), "tunnel.example.com:80");
 
         let u = WsUrl::parse("ws://127.0.0.1:47899").expect("parse");
-        assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("127.0.0.1", 47899, "/"));
+        assert_eq!(
+            (u.host.as_str(), u.port, u.path.as_str()),
+            ("127.0.0.1", 47899, "/")
+        );
 
         let u = WsUrl::parse("wss://x.example/a/b?c=d").expect("parse");
         assert!(u.tls);
@@ -876,7 +909,10 @@ mod tests {
         // IPv6 literals: the colon rule inside the brackets is not the colon
         // rule outside them, and getting that wrong turns `::1` into a port.
         let u = WsUrl::parse("ws://[::1]:9000/p").expect("parse");
-        assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("[::1]", 9000, "/p"));
+        assert_eq!(
+            (u.host.as_str(), u.port, u.path.as_str()),
+            ("[::1]", 9000, "/p")
+        );
         let u = WsUrl::parse("ws://[::1]").expect("parse");
         assert_eq!((u.host.as_str(), u.port), ("[::1]", 80));
     }
@@ -892,7 +928,10 @@ mod tests {
         for s in ["ws://", "ws:///path", "ws://host:notaport", "ws://[::1/p"] {
             assert!(WsUrl::parse(s).is_err(), "{s} parsed and should not have");
         }
-        assert!(WsUrl::looks_like_url("WS://Host/p"), "the scheme is case-insensitive");
+        assert!(
+            WsUrl::looks_like_url("WS://Host/p"),
+            "the scheme is case-insensitive"
+        );
         assert!(!WsUrl::looks_like_url("192.168.1.5:47810"));
         assert!(!WsUrl::looks_like_url("wsx://host/p"));
     }
@@ -902,9 +941,18 @@ mod tests {
     #[test]
     fn wss_is_understood_and_then_declined_with_the_real_reason() {
         let u = WsUrl::parse("wss://gate.example/p").expect("wss:// must parse");
-        let e = format!("{:#}", u.require_plaintext().expect_err("wss:// must be refused"));
-        assert!(e.contains("no TLS client"), "the refusal does not name the gap: {e}");
-        WsUrl::parse("ws://gate.example/p").unwrap().require_plaintext().expect("ws:// is fine");
+        let e = format!(
+            "{:#}",
+            u.require_plaintext().expect_err("wss:// must be refused")
+        );
+        assert!(
+            e.contains("no TLS client"),
+            "the refusal does not name the gap: {e}"
+        );
+        WsUrl::parse("ws://gate.example/p")
+            .unwrap()
+            .require_plaintext()
+            .expect("ws:// is fine");
     }
 
     // ------------------------------------------------------------ the carrier
@@ -1019,7 +1067,11 @@ mod tests {
         c.flush().expect("flush");
 
         let (mut sr, _sw) = h.join().expect("server thread");
-        assert_eq!(read_one(&mut sr), frame, "the first frame did not survive the handshake");
+        assert_eq!(
+            read_one(&mut sr),
+            frame,
+            "the first frame did not survive the handshake"
+        );
     }
 
     // -------------------------------------------------------- no compression
@@ -1045,9 +1097,20 @@ mod tests {
         // itself. Without it the assertion above would only prove that today's
         // tungstenite does not add the header.
         let mut h = tungstenite::http::HeaderMap::new();
-        h.insert(EXTENSIONS, "permessage-deflate; client_max_window_bits".parse().unwrap());
-        let e = format!("{:#}", assert_no_deflate("the response", &h).expect_err("must refuse"));
-        assert!(e.contains(DEFLATE), "the refusal does not name the extension: {e}");
+        h.insert(
+            EXTENSIONS,
+            "permessage-deflate; client_max_window_bits"
+                .parse()
+                .unwrap(),
+        );
+        let e = format!(
+            "{:#}",
+            assert_no_deflate("the response", &h).expect_err("must refuse")
+        );
+        assert!(
+            e.contains(DEFLATE),
+            "the refusal does not name the extension: {e}"
+        );
 
         // A different extension is still refused only if it is deflate — the
         // check must not be "any extension at all", or a future negotiation of
@@ -1136,7 +1199,10 @@ mod tests {
             Ok(_) => panic!("a response accepting {DEFLATE} was allowed through"),
             Err(e) => format!("{e:#}"),
         };
-        assert!(e.contains(DEFLATE), "the refusal does not name the extension: {e}");
+        assert!(
+            e.contains(DEFLATE),
+            "the refusal does not name the extension: {e}"
+        );
         let _ = h.join();
     }
 
@@ -1176,15 +1242,30 @@ mod tests {
             {
                 break;
             }
-            assert!(Instant::now() < deadline, "the heartbeat did not complete two round trips");
+            assert!(
+                Instant::now() < deadline,
+                "the heartbeat did not complete two round trips"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
 
         let c = cr.shared();
-        assert!(c.pings_written.load(Ordering::Relaxed) >= 2, "we never sent a ping");
-        assert!(c.pongs_read.load(Ordering::Relaxed) >= 2, "the peer never answered our pings");
-        assert!(c.pings_read.load(Ordering::Relaxed) >= 2, "the peer never pinged us");
-        assert!(c.pongs_written.load(Ordering::Relaxed) >= 2, "we never answered the peer's pings");
+        assert!(
+            c.pings_written.load(Ordering::Relaxed) >= 2,
+            "we never sent a ping"
+        );
+        assert!(
+            c.pongs_read.load(Ordering::Relaxed) >= 2,
+            "the peer never answered our pings"
+        );
+        assert!(
+            c.pings_read.load(Ordering::Relaxed) >= 2,
+            "the peer never pinged us"
+        );
+        assert!(
+            c.pongs_written.load(Ordering::Relaxed) >= 2,
+            "we never answered the peer's pings"
+        );
     }
 
     /// Protocol traffic must not look like data, and must not look like EOF.
@@ -1252,6 +1333,9 @@ mod tests {
         // A lone CR restarts the match rather than continuing it.
         let (_, m3, d3) = scan_header_end(0, b"\r\n\r\rx");
         assert!(!d3);
-        assert_eq!(m3, 0, "a CR followed by a non-LF must not leave the machine armed");
+        assert_eq!(
+            m3, 0,
+            "a CR followed by a non-LF must not leave the machine armed"
+        );
     }
 }

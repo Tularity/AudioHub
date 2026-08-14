@@ -28,6 +28,14 @@
 
 use anyhow::Result;
 
+/// `probe winvad set` predates direction-aware endpoint publication and its
+/// established contract is to exercise the complete device pair. Keep that
+/// default explicit here: the production daemon supplies a peer capability
+/// mask, while the driver probe continues to request both directions unless a
+/// future CLI option deliberately says otherwise.
+#[cfg(any(windows, test))]
+const SET_DIRECTIONS: u8 = audiohubd::halbridge::HAL_PUBLISH_BOTH;
+
 #[derive(clap::Subcommand)]
 pub enum WinvadCmd {
     /// Handshake and dump the driver's own account of its slots.
@@ -172,6 +180,22 @@ fn volmap_json(scalar: Option<f32>, steps: u32) -> serde_json::Value {
     })
 }
 
+/// Whether a slot's publication mask is coherent with its state.
+///
+/// Protocol v6 permits a bound peer to request any subset of the two endpoint
+/// directions, including no endpoint at all. Non-bound states must still hold
+/// no endpoint, and unknown state or direction bits are never coherent.
+#[cfg(any(windows, test))]
+fn slot_publication_is_coherent(state: u32, published: u32) -> bool {
+    use audiohubd::halbridge_win::wire;
+
+    match state {
+        wire::SLOT_BOUND => published & !wire::PUB_BOTH == 0,
+        wire::SLOT_FREE | wire::SLOT_DELISTED => published == 0,
+        _ => false,
+    }
+}
+
 #[cfg(not(windows))]
 pub fn dispatch(cmd: WinvadCmd, json: bool) -> Result<i32> {
     // `volmap` is pure arithmetic and is the ONE arm that must answer here:
@@ -271,8 +295,10 @@ pub fn dispatch(cmd: WinvadCmd, json: bool) -> Result<i32> {
             if fail_endpoint_name {
                 flags |= wire::BINDFLAG_FAIL_ENDPOINT_NAME;
             }
-            let r = session.bind_set_with(slot, peer_key, display, online, flags)?;
-            gate = Some(wire::bind_outcome(true, &r));
+            let wanted = wire::requested_publication(SET_DIRECTIONS);
+            let r =
+                session.bind_set_with(slot, peer_key, display, online, SET_DIRECTIONS, flags)?;
+            gate = Some(wire::bind_outcome(Some(wanted), &r));
             serde_json::json!({
                 "op": "set",
                 "slot": slot,
@@ -293,7 +319,7 @@ pub fn dispatch(cmd: WinvadCmd, json: bool) -> Result<i32> {
                 0
             };
             let r = session.bind_clear_with(slot, generation, flags)?;
-            gate = Some(wire::bind_outcome(false, &r));
+            gate = Some(wire::bind_outcome(None, &r));
             serde_json::json!({
                 "op": "clear",
                 "slot": slot,
@@ -380,7 +406,12 @@ pub fn dispatch(cmd: WinvadCmd, json: bool) -> Result<i32> {
 
     let slots = session.query_slots()?;
     let mut arr = Vec::new();
-    for (i, s) in slots.slots.iter().enumerate().take(slots.slot_count as usize) {
+    for (i, s) in slots
+        .slots
+        .iter()
+        .enumerate()
+        .take(slots.slot_count as usize)
+    {
         if s.state == wire::SLOT_FREE && s.peer_key.is_empty() && s.published == 0 {
             continue;
         }
@@ -391,18 +422,12 @@ pub fn dispatch(cmd: WinvadCmd, json: bool) -> Result<i32> {
             "peer_key": s.peer_key,
             "published": s.published,
             "published_label": wire::published_label(s.published),
-            // "The slot's published mask matches the state it claims": BOUND
-            // must mean both halves, FREE must mean neither. Anything else is
-            // the defect being guarded against, and it gets its own flag so a
-            // shell harness does not have to reimplement the comparison.
-            //
-            // Deliberately NOT `state != BOUND || published == BOTH`: that
-            // reads `true` for a FREE slot the driver is still holding filters
-            // for, which is exactly one of the states worth catching.
-            "whole": match s.state {
-                wire::SLOT_BOUND => s.published == wire::PUB_BOTH,
-                _ => s.published == 0,
-            },
+            // Compatibility field consumed by the Windows regression harness:
+            // in v6 "whole" means the state and exact publication mask are
+            // coherent, not that every bound peer necessarily has both
+            // directions. A FREE/DELISTED slot holding filters, an unknown
+            // state, or an unknown publication bit still makes it false.
+            "whole": slot_publication_is_coherent(s.state, s.published),
         }));
     }
 
@@ -446,4 +471,56 @@ fn bind_reply_json(r: &audiohubd::halbridge_win::wire::BindReply) -> serde_json:
         // absence.
         "endpoint_name_fallback": r.endpoint_name_fell_back(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use audiohubd::halbridge_win::wire;
+
+    /// Existing regression scripts invoke `probe winvad set` without a
+    /// direction argument. The v6 driver gained one-direction publication,
+    /// but the probe's legacy/default operation must continue to publish and
+    /// validate the complete speaker+microphone pair.
+    #[test]
+    fn set_keeps_its_both_directions_default() {
+        assert_eq!(wire::requested_publication(SET_DIRECTIONS), wire::PUB_BOTH);
+        assert_eq!(
+            wire::bind_direction_flags(SET_DIRECTIONS),
+            wire::BINDFLAG_WANT_MASK
+        );
+    }
+
+    #[test]
+    fn status_accepts_every_legal_v6_bound_publication_mask() {
+        for published in [0, wire::PUB_RENDER, wire::PUB_CAPTURE, wire::PUB_BOTH] {
+            assert!(
+                slot_publication_is_coherent(wire::SLOT_BOUND, published),
+                "legal bound mask 0x{published:x} was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn status_rejects_unknown_bits_and_non_bound_leftovers() {
+        for published in [0x4, wire::PUB_BOTH | 0x4, u32::MAX] {
+            assert!(
+                !slot_publication_is_coherent(wire::SLOT_BOUND, published),
+                "unknown bound mask 0x{published:x} was accepted"
+            );
+        }
+        for state in [wire::SLOT_FREE, wire::SLOT_DELISTED] {
+            assert!(slot_publication_is_coherent(state, 0));
+            for published in [wire::PUB_RENDER, wire::PUB_CAPTURE, wire::PUB_BOTH] {
+                assert!(
+                    !slot_publication_is_coherent(state, published),
+                    "non-bound state {state} accepted leftover 0x{published:x}"
+                );
+            }
+        }
+        assert!(
+            !slot_publication_is_coherent(u32::MAX, 0),
+            "an unknown state is never coherent"
+        );
+    }
 }

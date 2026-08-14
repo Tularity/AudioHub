@@ -18,8 +18,11 @@ authenticated peer and IEEE 1588 logical port with the system TimeSync service
 through a dynamically resolved CoreMedia adapter. Buffered RTP timestamps are
 mapped through the authenticated rate anchor onto the local monotonic clock.
 This is a single-receiver path, not a BMCA participant or a claim of multiroom
-precision. Grouping, screen/video, metadata, persistent pairing, and
-remote-control streams remain unadvertised.
+precision. Classic now-playing metadata, progress and JPEG/PNG artwork are
+advertised and accepted on the authenticated control channel; the AP2 rich
+now-playing command and its feature bit are implemented as well. Grouping,
+screen/video, persistent pairing, and remote-control streams remain
+unadvertised.
 
 This crate never advertises through mDNS itself. It returns a complete
 `_airplay._tcp` service descriptor to the daemon, which owns registration. The
@@ -31,8 +34,9 @@ mono conversion and streaming 44.1 kHz to 48 kHz resampling. AirPlay volume
 arrives as a dB event for the daemon to map to the receiver machine's real
 system output control; it is deliberately never multiplied into PCM.
 
-Realtime media uses a bounded UDP jitter/retransmission engine, validates NTP
-timing, and delivers ordered ALAC PCM into the existing clock-servo bus.
+Realtime media uses a bounded UDP jitter/retransmission engine. NTP sessions
+preserve the ordered ALAC path, while PTP sessions consume the realtime d7
+anchor and release PCM on the authenticated PTP/RTP timeline.
 Buffered media owns a separate bounded TCP framer, authenticated AAC decoder,
 pause/flush state machine, and bounded PTP-to-RTP presentation mapper. The
 bounded multi-reader bus drops old history for a stale reader and never lets

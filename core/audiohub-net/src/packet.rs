@@ -310,17 +310,29 @@ mod codec_depth_tests {
         assert_eq!(Codec::PcmS16le as u8, 0);
         assert_eq!(Codec::PcmF32le as u8, 1);
         assert_eq!(Codec::Opus as u8, 2);
-        assert_eq!(Codec::PcmS24le as u8, 3, "改这个值 = 换线格式，两端会各说各话");
+        assert_eq!(
+            Codec::PcmS24le as u8,
+            3,
+            "改这个值 = 换线格式，两端会各说各话"
+        );
         assert_eq!(Codec::Passthrough as u8, 255);
 
         for (byte, want) in assigned {
-            assert_eq!(Codec::from_u8(byte), Some(want), "codec byte {byte} must decode to {want:?}");
+            assert_eq!(
+                Codec::from_u8(byte),
+                Some(want),
+                "codec byte {byte} must decode to {want:?}"
+            );
         }
         for bad in 0u8..=255 {
             if assigned.iter().any(|(b, _)| *b == bad) {
                 continue;
             }
-            assert_eq!(Codec::from_u8(bad), None, "unassigned codec byte {bad} must not be recognised");
+            assert_eq!(
+                Codec::from_u8(bad),
+                None,
+                "unassigned codec byte {bad} must not be recognised"
+            );
         }
     }
 
@@ -356,17 +368,33 @@ mod codec_depth_tests {
         assert_eq!(Kind::EchoResp as u8, 2);
         assert_eq!(Kind::PullReq as u8, 3);
         assert_eq!(Kind::Bye as u8, 4);
-        assert_eq!(Kind::Control as u8, 5, "changing this splits the framed transport in two");
-        assert_eq!(Kind::MuxKeepalive as u8, 6, "changing this splits the framed transport in two");
+        assert_eq!(
+            Kind::Control as u8,
+            5,
+            "changing this splits the framed transport in two"
+        );
+        assert_eq!(
+            Kind::MuxKeepalive as u8,
+            6,
+            "changing this splits the framed transport in two"
+        );
 
         for (byte, want) in assigned {
-            assert_eq!(Kind::from_u8(byte), Some(want), "byte {byte} must decode to {want:?}");
+            assert_eq!(
+                Kind::from_u8(byte),
+                Some(want),
+                "byte {byte} must decode to {want:?}"
+            );
         }
         for bad in 0u8..=255 {
             if assigned.iter().any(|(b, _)| *b == bad) {
                 continue;
             }
-            assert_eq!(Kind::from_u8(bad), None, "unassigned kind byte {bad} must not be recognised");
+            assert_eq!(
+                Kind::from_u8(bad),
+                None,
+                "unassigned kind byte {bad} must not be recognised"
+            );
         }
     }
 

@@ -40,6 +40,55 @@ static void ExpectTrue(int inCondition, const char* inWhat)
     }
 }
 
+static AudioObjectID gRelatedNotifications[16];
+static UInt32 gRelatedNotificationCount = 0;
+
+static OSStatus TestHostPropertiesChanged(AudioServerPlugInHostRef inHost,
+                                          AudioObjectID inObjectID,
+                                          UInt32 inNumberAddresses,
+                                          const AudioObjectPropertyAddress* inAddresses)
+{
+    ExpectTrue(inHost == gPlugIn_Host, "RelatedDevices notification uses the current host");
+    ExpectTrue(inNumberAddresses == 1, "RelatedDevices notification carries one address");
+    ExpectTrue(inAddresses != NULL, "RelatedDevices notification carries an address");
+    if((inNumberAddresses == 1) && (inAddresses != NULL))
+    {
+        ExpectTrue(inAddresses[0].mSelector == kAudioDevicePropertyRelatedDevices,
+                   "capability change announces RelatedDevices");
+        ExpectTrue(inAddresses[0].mScope == kAudioObjectPropertyScopeGlobal,
+                   "RelatedDevices notification uses global scope");
+        ExpectTrue(inAddresses[0].mElement == kAudioObjectPropertyElementMain,
+                   "RelatedDevices notification uses the main element");
+    }
+
+    const int theLockResult = pthread_mutex_trylock(&gPlugIn_StateMutex);
+    ExpectTrue(theLockResult == 0, "PropertiesChanged is called outside the HAL state lock");
+    if(theLockResult == 0)
+    {
+        Boolean theObjectIsListed = false;
+        for(uint32_t theSlotIndex = 0; theSlotIndex < kAudioHubMaxSlots; ++theSlotIndex)
+        {
+            for(uint32_t theDir = 0; theDir < kAudioHubDevsPerSlot; ++theDir)
+            {
+                const AudioHubDevice* theDevice = &gSlots[theSlotIndex].dev[theDir];
+                if(theDevice->listed && (AudioHub_ID(&theDevice->deviceID) == inObjectID))
+                {
+                    theObjectIsListed = true;
+                }
+            }
+        }
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        ExpectTrue(theObjectIsListed, "RelatedDevices notification targets only a currently listed device");
+    }
+
+    if(gRelatedNotificationCount < (sizeof(gRelatedNotifications) / sizeof(gRelatedNotifications[0])))
+    {
+        gRelatedNotifications[gRelatedNotificationCount] = inObjectID;
+    }
+    ++gRelatedNotificationCount;
+    return kAudioHardwareNoError;
+}
+
 // Apple's built-in output, as measured in docs/volume-taper-measured.md.
 static double AppleReferenceDecibels(double inScalar)
 {
@@ -138,6 +187,119 @@ static void TestMonotonicAndClamped(void)
     ExpectNear(AudioHub_DecibelsToScalar(60.0f), 1.0, 0.0001, "dB above the ceiling clamps to scalar 1");
 }
 
+// A slot always reserves two device records, but capability flags may publish
+// either, both, or neither. RelatedDevices must describe the published topology,
+// never leak the id of a delisted sibling, and cached relationships on visible
+// devices must be invalidated when those flags change.
+static void TestRelatedDevicesCapabilityTopology(void)
+{
+    AudioHub_InitSlots();
+    AudioHubSlot* theSlot = &gSlots[0];
+    AudioHubDevice* theOutput = &theSlot->dev[kAudioHubDir_Out];
+    AudioHubDevice* theInput = &theSlot->dev[kAudioHubDir_In];
+    const AudioObjectID theOutputID = 4100;
+    const AudioObjectID theInputID = 4200;
+    theSlot->state = kSlotBound;
+    theSlot->generation = 17;
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    atomic_store(&theOutput->deviceID, theOutputID);
+    atomic_store(&theInput->deviceID, theInputID);
+    atomic_store(&theOutput->live, 1);
+    atomic_store(&theInput->live, 1);
+    theOutput->listed = true;
+    theInput->listed = true;
+    AudioHub_RebuildDeviceListLocked();
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    AudioObjectPropertyAddress theAddress;
+    theAddress.mSelector = kAudioDevicePropertyRelatedDevices;
+    theAddress.mScope    = kAudioObjectPropertyScopeGlobal;
+    theAddress.mElement  = kAudioObjectPropertyElementMain;
+
+    UInt32 theDataSize = 0;
+    ExpectTrue(AudioHub_GetDevicePropertyDataSize(theOutput, &theAddress, &theDataSize) == kAudioHardwareNoError,
+               "RelatedDevices size succeeds for a fully listed pair");
+    ExpectTrue(theDataSize == (2 * sizeof(AudioObjectID)), "a fully listed pair reports two related ids");
+
+    AudioObjectID theIDs[2] = { 0, 0 };
+    ExpectTrue(AudioHub_GetDevicePropertyData(theOutput, &theAddress, sizeof(theIDs), &theDataSize, theIDs) ==
+                   kAudioHardwareNoError,
+               "RelatedDevices data succeeds for a fully listed pair");
+    ExpectTrue(theDataSize == sizeof(theIDs), "a fully listed pair returns two related ids");
+    ExpectTrue((theIDs[0] == theOutputID) && (theIDs[1] == theInputID),
+               "the fully listed pair returns output then input ids");
+
+    AudioObjectID thePartial = 0;
+    ExpectTrue(AudioHub_GetDevicePropertyData(theOutput, &theAddress, sizeof(thePartial), &theDataSize, &thePartial) ==
+                   kAudioHardwareNoError,
+               "RelatedDevices supports a one-id caller buffer");
+    ExpectTrue((theDataSize == sizeof(AudioObjectID)) && (thePartial == theOutputID),
+               "a short RelatedDevices read is truncated without leaking a sibling");
+
+    static const AudioServerPlugInHostInterface kTestHost = {
+        .PropertiesChanged = TestHostPropertiesChanged,
+    };
+    gRelatedNotificationCount = 0;
+    memset(gRelatedNotifications, 0, sizeof(gRelatedNotifications));
+    gPlugIn_Host = &kTestHost;
+    atomic_store(&gHostReady, 1);
+
+    AudioHub_UpdateSlotDirections(theSlot, kAudioHubBindFlag_Out);
+    ExpectTrue(gRelatedNotificationCount == 1, "removing one direction notifies the remaining device once");
+    ExpectTrue(gRelatedNotifications[0] == theOutputID, "removing input notifies only the listed output");
+
+    ExpectTrue(AudioHub_GetDevicePropertyDataSize(theOutput, &theAddress, &theDataSize) == kAudioHardwareNoError,
+               "RelatedDevices size succeeds after one direction is removed");
+    ExpectTrue(theDataSize == sizeof(AudioObjectID), "an output-only slot reports one related id");
+    theIDs[0] = 0;
+    theIDs[1] = 0xFFFFFFFFu;
+    ExpectTrue(AudioHub_GetDevicePropertyData(theInput, &theAddress, sizeof(theIDs), &theDataSize, theIDs) ==
+                   kAudioHardwareNoError,
+               "a delisted sibling still answers RelatedDevices during retirement grace");
+    ExpectTrue((theDataSize == sizeof(AudioObjectID)) && (theIDs[0] == theOutputID),
+               "a delisted sibling reports only the slot's currently listed output");
+    ExpectTrue(theIDs[1] == 0xFFFFFFFFu, "RelatedDevices does not write an unlisted sibling id");
+
+    AudioHub_UpdateSlotDirections(theSlot, kAudioHubBindFlag_Out);
+    ExpectTrue(gRelatedNotificationCount == 1, "an idempotent capability update sends no notification");
+
+    AudioHub_UpdateSlotDirections(theSlot, kAudioHubBindFlag_In);
+    ExpectTrue(gRelatedNotificationCount == 2, "swapping directions notifies the newly visible topology once");
+    ExpectTrue(gRelatedNotifications[1] == theInputID, "an input-only topology notifies only the listed input");
+
+    AudioHub_UpdateSlotDirections(theSlot, kAudioHubBindFlag_Out | kAudioHubBindFlag_In);
+    ExpectTrue(gRelatedNotificationCount == 4, "adding the sibling notifies both visible devices");
+    ExpectTrue((gRelatedNotifications[2] == theOutputID) && (gRelatedNotifications[3] == theInputID),
+               "a restored pair notifies its output and input ids");
+
+    AudioHub_UpdateSlotDirections(theSlot, 0);
+    ExpectTrue(gRelatedNotificationCount == 4, "removing every direction does not notify delisted objects");
+    ExpectTrue(AudioHub_GetDevicePropertyDataSize(theOutput, &theAddress, &theDataSize) == kAudioHardwareNoError,
+               "RelatedDevices size succeeds for a fully delisted slot");
+    ExpectTrue(theDataSize == 0, "a fully delisted slot exposes no related ids");
+
+    AudioHub_AnnounceRelatedDevices(theSlot, theSlot->generation - 1, &theOutputID, 1);
+    ExpectTrue(gRelatedNotificationCount == 4, "a stale generation cannot notify a recycled object id");
+    theSlot->state = kSlotDelisted;
+    AudioHub_AnnounceRelatedDevices(theSlot, theSlot->generation, &theOutputID, 1);
+    ExpectTrue(gRelatedNotificationCount == 4, "a retiring slot cannot emit RelatedDevices notifications");
+
+    gPlugIn_Host = NULL;
+    atomic_store(&gHostReady, 0);
+    atomic_store(&gDeviceListDirty, 0);
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    theOutput->listed = false;
+    theInput->listed = false;
+    atomic_store(&theOutput->live, 0);
+    atomic_store(&theInput->live, 0);
+    atomic_store(&theOutput->deviceID, kAudioObjectUnknown);
+    atomic_store(&theInput->deviceID, kAudioObjectUnknown);
+    AudioHub_RebuildDeviceListLocked();
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    theSlot->state = kSlotFree;
+}
+
 // ------------------------------------------------- exhaustive mutual inversion
 
 // Every float32 in [0, 1] -- all 1,065,353,217 of them -- through
@@ -202,6 +364,7 @@ int main(int argc, char** argv)
         { "PublishedRange",           TestPublishedRange },
         { "VolumeKeyStepSizes",       TestVolumeKeyStepSizes },
         { "MonotonicAndClamped",      TestMonotonicAndClamped },
+        { "RelatedDevicesCapabilityTopology", TestRelatedDevicesCapabilityTopology },
         { "ExhaustiveScalarRoundTrip",  TestExhaustiveScalarRoundTrip },
         { "ExhaustiveDecibelRoundTrip", TestExhaustiveDecibelRoundTrip },
     };

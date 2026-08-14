@@ -131,10 +131,11 @@ function fromDaemon(raw: SysAudioBackend): BackendOption | null {
     // 目录更权威，但不是给终端用户读的。目录里认得的一律用中文标签，认不出的新后端
     // 才退回 daemon 的原文——总比只显示一个 id 强。
     label: meta ? t(meta.labelKey) : (typeof raw.name === 'string' && raw.name.trim()) || id,
-    // note 反过来：daemon 的 note 带着**本机实际情况**（版本号、上次被拒绝），
-    // 比任何静态说明都值钱，优先用它。
-    note: (typeof raw.note === 'string' && raw.note.trim())
-      || (meta ? t(meta.noteKey) : ''),
+    // 已知后端的用户说明同样必须走当前 UI 语种。可用性仍完全听 daemon 的
+    // `available` / `declined` 事实；它附带的自然语言只供未知后端兼容回退。
+    note: meta
+      ? t(meta.noteKey)
+      : (typeof raw.note === 'string' && raw.note.trim()) || '',
     // declined 蕴含不可用：core 侧的不变量（declined ⇒ !available）在这里再钉一次，
     // 免得一份错乱的上报把一个开不起来的后端画成可选项。
     available: declined ? false : (typeof raw.available === 'boolean' ? raw.available : null),

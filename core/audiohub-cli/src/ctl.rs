@@ -204,9 +204,13 @@ pub enum CtlCmd {
         /// remove a peer's virtual devices while it is disconnected
         #[arg(long)]
         remove_virtual_on_disconnect: Option<bool>,
-        /// append "（离线）" to a disconnected peer's device names
+        /// append the localized offline marker to disconnected device names
         #[arg(long)]
         mark_offline_devices: Option<bool>,
+        /// language for native OS surfaces such as the virtual-device offline
+        /// suffix (normally synchronized by the local App)
+        #[arg(long, value_parser = ["zh-CN", "en-US"])]
+        native_locale: Option<String>,
         /// mode A: make this machine's system output follow the peer's output
         /// device, peer authoritative (plan §7.1)
         #[arg(long)]
@@ -352,11 +356,20 @@ pub fn dispatch(cmd: M4Cmd, json: bool) -> Result<i32> {
             announce,
             no_announce,
             secs,
-        } => cmd_daemon(port, ipc_port, announce_override(announce, no_announce), secs, json),
+        } => cmd_daemon(
+            port,
+            ipc_port,
+            announce_override(announce, no_announce),
+            secs,
+            json,
+        ),
         M4Cmd::Ctl { cmd } => cmd_ctl(cmd, json),
-        M4Cmd::Volume { device, set, mute, unmute } => {
-            cmd_volume(device, set, mute, unmute, json)
-        }
+        M4Cmd::Volume {
+            device,
+            set,
+            mute,
+            unmute,
+        } => cmd_volume(device, set, mute, unmute, json),
     }
 }
 
@@ -441,10 +454,10 @@ fn cmd_daemon(
         ipc_port,
         config_dir: None, // resolve via AUDIOHUB_CONFIG_DIR / platform default, same as ctl
         announce,
-        hal_bridge: None, // production: AUDIOHUB_HAL_BRIDGE decides
+        hal_bridge: None,       // production: AUDIOHUB_HAL_BRIDGE decides
         tx_throttle_kbps: None, // production: AUDIOHUB_TEST_TX_KBPS decides (normally unlimited)
-        block_udp: None, // production: AUDIOHUB_TEST_BLOCK_UDP decides (normally nothing)
-        announce_fault: false, // test-only knob; there is no production value for it
+        block_udp: None,        // production: AUDIOHUB_TEST_BLOCK_UDP decides (normally nothing)
+        announce_fault: false,  // test-only knob; there is no production value for it
         airplay_advertise: true,
     })?;
     info(&format!(
@@ -566,7 +579,9 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             volume_sync,
         } => {
             if backend.is_some() && !matches!(source, Some(CtlSource::Sysaudio)) {
-                return Err(anyhow!("--backend is only meaningful with --source sysaudio"));
+                return Err(anyhow!(
+                    "--backend is only meaningful with --source sysaudio"
+                ));
             }
             if bridge.is_some() && !matches!(kind, CtlKind::Mic) {
                 return Err(anyhow!("--bridge is only meaningful with --kind mic"));
@@ -606,7 +621,12 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             (methods::SESSION_OPEN, serde_json::to_value(params)?)
         }
         CtlCmd::Close { id } => (methods::SESSION_CLOSE, json!({ "id": id })),
-        CtlCmd::SetVolume { id, scalar, mute, unmute } => {
+        CtlCmd::SetVolume {
+            id,
+            scalar,
+            mute,
+            unmute,
+        } => {
             if !(0.0..=1.0).contains(scalar) {
                 return Err(anyhow!("--scalar must be within 0.0..=1.0"));
             }
@@ -641,6 +661,7 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             mode,
             remove_virtual_on_disconnect,
             mark_offline_devices,
+            native_locale,
             mode_a_volume_sync,
             mode_a_mute_local,
             discovery_announce,
@@ -659,6 +680,9 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             }
             if let Some(v) = mark_offline_devices {
                 p.insert("mark_offline_devices".into(), json!(v));
+            }
+            if let Some(v) = native_locale {
+                p.insert("native_locale".into(), json!(v));
             }
             if let Some(v) = mode_a_volume_sync {
                 p.insert("mode_a_volume_sync".into(), json!(v));
@@ -696,7 +720,15 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             };
             (method, Value::Object(p))
         }
-        CtlCmd::PeerTransport { peer, dir, latency, quality, tier, dial_policy, endpoint } => {
+        CtlCmd::PeerTransport {
+            peer,
+            dir,
+            latency,
+            quality,
+            tier,
+            dial_policy,
+            endpoint,
+        } => {
             if let Some(t) = tier {
                 // Refused rather than sequenced into two calls: they are two
                 // writes with two failure modes, and one call reporting one
@@ -744,9 +776,7 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
                 (methods::PEERS_SET_TRANSPORT, Value::Object(p))
             }
         }
-        CtlCmd::Pair { addr, pin } => {
-            (methods::PEERS_PAIR, json!({ "addr": addr, "pin": pin }))
-        }
+        CtlCmd::Pair { addr, pin } => (methods::PEERS_PAIR, json!({ "addr": addr, "pin": pin })),
         CtlCmd::Unpair { peer } => (methods::PEERS_UNPAIR, json!({ "peer": peer })),
         CtlCmd::Alias { peer, alias } => (
             methods::PEERS_SET_ALIAS,
@@ -773,8 +803,8 @@ impl IpcClient {
         let path = LocalIdentity::config_dir().join("ipc.json");
         let bytes = std::fs::read(&path)
             .with_context(|| format!("read {} (is the daemon running?)", path.display()))?;
-        let ep: IpcEndpoint = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let ep: IpcEndpoint =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
         if ep.ipc_version != audiohub_ipc::IPC_VERSION {
             bail!(
                 "ipc.json version {} != supported {}",
@@ -983,9 +1013,9 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
             val_u64(v, "channels"),
         )),
         CtlCmd::Close { id } => info(&format!("closed session {id}")),
-        CtlCmd::SetVolume { id, scalar, .. } => {
-            info(&format!("session {id} volume request sent (scalar {scalar:.3})"))
-        }
+        CtlCmd::SetVolume { id, scalar, .. } => info(&format!(
+            "session {id} volume request sent (scalar {scalar:.3})"
+        )),
         CtlCmd::Sessions => {
             let items = v.as_array().cloned().unwrap_or_default();
             for s in &items {
@@ -1011,7 +1041,11 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                     let parts: Vec<String> = mv
                         .iter()
                         .map(|vd| {
-                            format!("{:.0}Hz:{}", val_f64(vd, "freq_hz"), val_bool(vd, "detected"))
+                            format!(
+                                "{:.0}Hz:{}",
+                                val_f64(vd, "freq_hz"),
+                                val_bool(vd, "detected")
+                            )
                         })
                         .collect();
                     extra.push_str(&format!(" mix[{}]", parts.join(",")));
@@ -1050,7 +1084,8 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
         CtlCmd::Settings { .. } => {
             info(&format!(
                 "mode={} effective_mode={} remove_virtual_on_disconnect={} \
-                 mark_offline_devices={} mode_a_volume_sync={} mode_a_mute_local={} \
+                 mark_offline_devices={} native_locale={} \
+                 mode_a_volume_sync={} mode_a_mute_local={} \
                  discovery_announce={} discovery_announcing={} \
                  airplay_enabled={} airplay_listening={} airplay_name={:?} \
                  airplay_password_set={} \
@@ -1060,6 +1095,7 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 val_str(v, "effective_mode"),
                 val_bool(v, "remove_virtual_on_disconnect"),
                 val_bool(v, "mark_offline_devices"),
+                val_str(v, "native_locale"),
                 val_bool(v, "mode_a_volume_sync"),
                 val_bool(v, "mode_a_mute_local"),
                 val_bool(v, "discovery_announce"),
@@ -1109,19 +1145,31 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
             // plan §15：延迟与音质**不再是全局设置**，所以这里不再印它们。
             // 印一个「代表值」正是 §14 裁定 1 那个「不管取哪条都在替另一条
             // 撒谎」的命令行版本——每对端两个方向，一共四个，它们互不相等。
-            info("  (延迟与音质已改为每对端 × 每方向：`ctl peer-transport --peer <fp>` 读，\
-                  加 --dir recv|send --latency/--quality 写)");
+            info(
+                "  (延迟与音质已改为每对端 × 每方向：`ctl peer-transport --peer <fp>` 读，\
+                  加 --dir recv|send --latency/--quality 写)",
+            );
             if val_str(v, "mode") == "b" && val_str(v, "effective_mode") != "b" {
                 info("  (mode B is not in force: no HAL bridge on this daemon)");
             }
             // The one fact a `share`-mode reader most needs and cannot infer
             // from the line above: this machine will refuse `ctl open`.
             if val_str(v, "effective_mode") == "share" {
-                info("  (share mode: this machine serves peers and does not open sessions of \
-                      its own — plan §13)");
+                info(
+                    "  (share mode: this machine serves peers and does not open sessions of \
+                      its own — plan §13)",
+                );
             }
         }
-        CtlCmd::PeerTransport { peer, dir, latency, quality, tier, dial_policy: _, endpoint: _ } => {
+        CtlCmd::PeerTransport {
+            peer,
+            dir,
+            latency,
+            quality,
+            tier,
+            dial_policy: _,
+            endpoint: _,
+        } => {
             if tier.is_some() {
                 // `applied` 是这次调用与 `peers.set_transport` 的实质区别：
                 // 换 tier 必然要重新协商传输，而**能不能自己重建那条连接**
@@ -1137,11 +1185,14 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                     val_str(v, "dial_policy"),
                     // Empty means "reached by host:port"; printing the empty
                     // string would read as a blanked-out setting.
-                    if ep.is_empty() { "host:port".to_string() } else { ep.to_string() },
+                    if ep.is_empty() {
+                        "host:port".to_string()
+                    } else {
+                        ep.to_string()
+                    },
                     match &*val_str(v, "applied") {
                         "reconnecting" => "已拆连接，重连后按新档协商（约 1 s）",
-                        "awaiting_peer" =>
-                            "已拆连接；本机不是拨号方，等对端重连后生效",
+                        "awaiting_peer" => "已拆连接；本机不是拨号方，等对端重连后生效",
                         _ => "已写盘，下次连接时生效",
                     }
                 ));
@@ -1152,9 +1203,8 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 let row = v
                     .as_array()
                     .and_then(|a| {
-                        a.iter().find(|p| {
-                            val_str(p, "fingerprint").starts_with(peer.as_str())
-                        })
+                        a.iter()
+                            .find(|p| val_str(p, "fingerprint").starts_with(peer.as_str()))
                     })
                     .cloned()
                     .unwrap_or(Value::Null);
@@ -1195,9 +1245,7 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 // 对端推来的两个：**只有本机是提供者时才有**，而且必须与上面
                 // 四个分开印。合成一栏之后「这个 300 是我设的还是对端要求的」
                 // 就再也答不出来。
-                let pushed = |k: &str| {
-                    t.get(k).and_then(Value::as_str).map(str::to_string)
-                };
+                let pushed = |k: &str| t.get(k).and_then(Value::as_str).map(str::to_string);
                 match (pushed("peer_rx_latency"), pushed("peer_tx_quality")) {
                     (None, None) => {}
                     (l, q) => info(&format!(
@@ -1259,8 +1307,8 @@ mod tests {
     /// 可以带一个 `latency` 字段，而用户在终端里拿到的是 `unexpected argument`。
     /// 只有从 `argv` 出发才测得到那个缺口。
     fn req(args: &[&str]) -> (&'static str, Value) {
-        let cli = crate::Cli::try_parse_from(args)
-            .unwrap_or_else(|e| panic!("{args:?} 解析不了：{e}"));
+        let cli =
+            crate::Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?} 解析不了：{e}"));
         let crate::TopCmd::M4(M4Cmd::Ctl { cmd }) = cli.cmd else {
             panic!("{args:?} 没有落到 ctl 子命令上")
         };
@@ -1293,7 +1341,12 @@ mod tests {
         fn parse(args: &[&str]) -> Option<bool> {
             let cli = crate::Cli::try_parse_from(args)
                 .unwrap_or_else(|e| panic!("{args:?} 解析不了：{e}"));
-            let crate::TopCmd::M4(M4Cmd::Daemon { announce, no_announce, .. }) = cli.cmd else {
+            let crate::TopCmd::M4(M4Cmd::Daemon {
+                announce,
+                no_announce,
+                ..
+            }) = cli.cmd
+            else {
                 panic!("{args:?} 没有落到 daemon 子命令上")
             };
             announce_override(announce, no_announce)
@@ -1333,26 +1386,44 @@ mod tests {
                 "--remove-virtual-on-disconnect=true",
                 json!(true),
             ),
-            ("mark_offline_devices", "--mark-offline-devices=false", json!(false)),
-            ("mode_a_volume_sync", "--mode-a-volume-sync=true", json!(true)),
+            (
+                "mark_offline_devices",
+                "--mark-offline-devices=false",
+                json!(false),
+            ),
+            ("native_locale", "--native-locale=en-US", json!("en-US")),
+            (
+                "mode_a_volume_sync",
+                "--mode-a-volume-sync=true",
+                json!(true),
+            ),
             ("mode_a_mute_local", "--mode-a-mute-local=true", json!(true)),
-            ("discovery_announce", "--discovery-announce=false", json!(false)),
+            (
+                "discovery_announce",
+                "--discovery-announce=false",
+                json!(false),
+            ),
             ("airplay_enabled", "--airplay-enabled=true", json!(true)),
-            ("airplay_name", "--airplay-name=AudioHub Test", json!("AudioHub Test")),
-            ("airplay_password", "--airplay-password=secret", json!("secret")),
+            (
+                "airplay_name",
+                "--airplay-name=AudioHub Test",
+                json!("AudioHub Test"),
+            ),
+            (
+                "airplay_password",
+                "--airplay-password=secret",
+                json!("secret"),
+            ),
             ("autostart", "--autostart=true", json!(true)),
             ("name", "--name=客厅 Mac", json!("客厅 Mac")),
         ];
         for key in audiohub_ipc::SETTINGS_WRITABLE_KEYS {
-            let (_, flag, want) = sample
-                .iter()
-                .find(|(k, _, _)| k == key)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "settings.set 收得下 '{key}'，但命令行没有对应的 flag —— \
+            let (_, flag, want) = sample.iter().find(|(k, _, _)| k == key).unwrap_or_else(|| {
+                panic!(
+                    "settings.set 收得下 '{key}'，但命令行没有对应的 flag —— \
                          这正是 `--latency` 消失了整整一轮的那个缺口"
-                    )
-                });
+                )
+            });
             let (method, params) = settings(&[flag]);
             assert_eq!(method, methods::SETTINGS_SET, "{flag} 没走写入路径");
             assert_eq!(
@@ -1442,10 +1513,18 @@ mod tests {
     #[test]
     fn writing_a_stop_without_a_direction_is_refused() {
         let cli = crate::Cli::try_parse_from([
-            "audiohub", "ctl", "peer-transport", "--peer", "ab12", "--latency", "200",
+            "audiohub",
+            "ctl",
+            "peer-transport",
+            "--peer",
+            "ab12",
+            "--latency",
+            "200",
         ])
         .expect("argv 本身是合法的");
-        let crate::TopCmd::M4(M4Cmd::Ctl { cmd }) = cli.cmd else { panic!() };
+        let crate::TopCmd::M4(M4Cmd::Ctl { cmd }) = cli.cmd else {
+            panic!()
+        };
         assert!(request_for(&cmd).is_err(), "缺 --dir 却被放行了");
     }
 
@@ -1477,7 +1556,10 @@ mod tests {
         let (method, params) = pt(&["--dir=recv", "--latency=auto", "--quality=pcm48k24"]);
         assert_eq!(method, methods::PEERS_SET_TRANSPORT);
         assert_eq!(params.get("latency").and_then(Value::as_str), Some("auto"));
-        assert_eq!(params.get("quality").and_then(Value::as_str), Some("pcm48k24"));
+        assert_eq!(
+            params.get("quality").and_then(Value::as_str),
+            Some("pcm48k24")
+        );
         assert_eq!(params.get("dir").and_then(Value::as_str), Some("recv"));
         assert_eq!(params.get("peer").and_then(Value::as_str), Some("ab12"));
         // 没给的字段一个都不许出现：这是 patch 语义，凭空补一个键就是替用户

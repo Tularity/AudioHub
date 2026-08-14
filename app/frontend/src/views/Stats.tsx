@@ -9,7 +9,7 @@ import { Icon } from '../components/Icon';
 import { Help, Segmented, Spark } from '../components/Controls';
 import { WIKI } from '../lib/external';
 import { volumeText } from '../components/VolumeControl';
-import { transportCells } from '../components/PeerTransport';
+import { selectIsShareMode, transportCells } from '../state/mode';
 import { fmt, sessionFlow, dirLabel } from '../lib/fmt';
 import { useTick } from '../lib/hooks';
 import {
@@ -83,7 +83,7 @@ const METRICS: {
     // 这一格现在也可能来自**对端**的测量（纯发送的流本机量不到音质，
     // 见 `readQuality`）。数字本身是诚实的——连续性是「样本落地那一端」的
     // 属性——但**谁量的**必须说出来，否则页面就在不声不响地换信源。
-    // 卡片上是一枚「对端测得」徽章，这里没有徽章的位置，就进 title。
+    // 主卡一级行为了宽度不再放出处徽章；详细页仍没有独立的出处行，所以说明进 title。
     titleOf: (info) => {
       const q = readQuality(info);
       const base = t('quality.part.continuity.desc');
@@ -352,6 +352,13 @@ function DegradedLinks() {
 function TransportLevels() {
   const ds = useStore((s) => s.daemonSettings);
   const peers = useStore((s) => s.peers);
+  const shared = useStore(selectIsShareMode);
+  const groups = peers.map((peer) => ({ peer, rows: transportCells(ds, peer, shared) }))
+    .filter((group) => group.rows.length > 0);
+
+  // 已配对、但所有对端都明确零音频能力时，这张「每方向」总览没有任何对象。
+  // 整块不渲染，而不是留一张只有表头的空表；真正没配对时仍保留既有空态。
+  if (peers.length > 0 && groups.length === 0) return null;
 
   return (
     <section className="card block" data-testid="stats-transport">
@@ -387,10 +394,10 @@ function TransportLevels() {
             </tr>
           </thead>
           <tbody>
-            {peers.map((p) => transportCells(ds, p).map((row, i) => (
+            {groups.map(({ peer: p, rows }) => rows.map((row, i) => (
               <tr key={`${p.fingerprint}-${row.dir}`} data-testid={`stats-transport-row-${row.dir}-${p.fingerprint}`}>
                 {i === 0 ? (
-                  <th rowSpan={2} scope="rowgroup" className="transport-peer">
+                  <th rowSpan={rows.length} scope="rowgroup" className="transport-peer">
                     <button
                       className="linkish"
                       type="button"

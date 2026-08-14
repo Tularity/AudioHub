@@ -102,7 +102,7 @@ export interface AppState {
   /** 同上的系统音频捕获后端 id，'' / 'auto' = 交给 daemon 自动选。 */
   spkBackendPref: Record<string, string>;
   /**
-   * 上一次 spk 会话开启失败的原因（daemon 原话）。
+   * 上一次 spk 会话开启失败的本地化说明。
    *
    * 存进 store 而不是只弹一条 toast：系统音频捕获在某台机器上不可用时，toast 三秒
    * 就没了，用户看到的只是一个自己弹回去的开关——那正是 plan §6 不许出现的「静默

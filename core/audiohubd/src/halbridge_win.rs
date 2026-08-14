@@ -95,7 +95,10 @@ pub mod wire {
     /// same factor. Nothing errors and no device list looks wrong; the audio
     /// is simply quieter than it should be by the SQUARE of the setting, and
     /// the only place that shows is a level meter nobody is looking at.
-    pub const PROTOCOL_VERSION: u32 = 5;
+    /// v6 adds explicit render/capture intent bits to `AH_BIND_REQUEST.flags`.
+    /// A v5 driver would ignore them and publish both endpoints, so accepting
+    /// it would silently recreate devices the peer cannot serve.
+    pub const PROTOCOL_VERSION: u32 = 6;
 
     /// `AudioHubIoctl.h:AUDIOHUB_WIN_MAX_SLOTS`, and equal to
     /// `halbridge::HAL_MAX_SLOTS`. The driver's `PcAddAdapterDevice` budget is
@@ -235,12 +238,10 @@ pub mod wire {
     pub const STATUS_CAPACITY: u32 = 5;
     pub const STATUS_INTERNAL: u32 = 6;
     pub const STATUS_NOT_BOUND: u32 = 7;
-    /// A bind failed AND the rollback that should have made it "nothing at
-    /// all" also failed, so one half of a device pair is still published.
-    ///
-    /// The ONLY status under which `published` may be neither 0 nor
-    /// [`PUB_BOTH`]. It exists so that "the driver said OK but only the
-    /// microphone appeared" stops being expressible.
+    /// A SET did not converge on its exact requested direction mask. This can
+    /// mean an install failed, a removal failed, or a rollback left something
+    /// behind. A one-bit `published` value is not itself partial in v6: it is a
+    /// valid success when that was the requested capability.
     pub const STATUS_PARTIAL: u32 = 8;
 
     pub fn status_label(v: u32) -> &'static str {
@@ -253,7 +254,7 @@ pub mod wire {
             STATUS_CAPACITY => "slot out of range",
             STATUS_INTERNAL => "driver internal error",
             STATUS_NOT_BOUND => "slot not bound",
-            STATUS_PARTIAL => "one half of the device pair is still published",
+            STATUS_PARTIAL => "published directions differ from the request",
             _ => "unknown status",
         }
     }
@@ -269,21 +270,24 @@ pub mod wire {
     pub const BIND_CLEAR: u32 = 0;
     pub const BIND_SET: u32 = 1;
     pub const BINDFLAG_ONLINE: u32 = 0x1;
+    pub const BINDFLAG_WANT_RENDER: u32 = 0x2;
+    pub const BINDFLAG_WANT_CAPTURE: u32 = 0x4;
+    pub const BINDFLAG_WANT_MASK: u32 = BINDFLAG_WANT_RENDER | BINDFLAG_WANT_CAPTURE;
 
     // -- fault injection ----------------------------------------------------
     //
     // NEVER set by the daemon. `audiohub probe winvad` and the regression
     // harness set them; the driver logs every use at D_ERROR.
     //
-    // They exist because "the driver must report a half-failed install
-    // honestly" cannot be tested without a way to MAKE one half fail — and a
-    // test that can only walk the happy path is how the original defect
+    // They exist because "the driver must report a failed requested direction
+    // honestly" cannot be tested without a way to MAKE that install fail — and
+    // a test that can only walk the happy path is how the original defect
     // survived a full acceptance run.
 
     /// SET: fail the speaker half.
     pub const BINDFLAG_FAIL_RENDER: u32 = 0x100;
-    /// SET: fail the microphone half (after the speaker half succeeded, so
-    /// this is the rollback test).
+    /// SET: fail the microphone install (after the speaker when both were
+    /// requested, so that case exercises rollback).
     pub const BINDFLAG_FAIL_CAPTURE: u32 = 0x200;
     /// SET: leave the partial install in place so `published` can be observed.
     pub const BINDFLAG_SKIP_ROLLBACK: u32 = 0x400;
@@ -347,14 +351,46 @@ pub mod wire {
     pub const PUB_CAPTURE: u32 = 0x2;
     pub const PUB_BOTH: u32 = PUB_RENDER | PUB_CAPTURE;
 
-    /// "render+capture" / "render only" / "capture only" / "nothing".
+    /// Human-readable form of one exact publication mask.
     pub fn published_label(v: u32) -> &'static str {
-        match v & PUB_BOTH {
+        match v {
             0 => "nothing",
             PUB_RENDER => "the speaker only",
             PUB_CAPTURE => "the microphone only",
-            _ => "both",
+            PUB_BOTH => "both",
+            _ => "an invalid direction mask",
         }
+    }
+
+    /// Converts the coordinator's cross-platform direction mask into the two
+    /// v6 intent bits sent to the Windows driver. Keep this in the all-platform
+    /// wire module so OUT-only, IN-only and zero are tested on the development
+    /// Mac instead of first being exercised by an installed kernel driver.
+    pub fn bind_direction_flags(directions: u8) -> u32 {
+        (if directions & crate::halbridge::HAL_PUBLISH_OUT != 0 {
+            BINDFLAG_WANT_RENDER
+        } else {
+            0
+        }) | (if directions & crate::halbridge::HAL_PUBLISH_IN != 0 {
+            BINDFLAG_WANT_CAPTURE
+        } else {
+            0
+        })
+    }
+
+    /// The publication mask a reply must carry for those same coordinator
+    /// directions. This is deliberately explicit even though today's bit
+    /// values happen to align.
+    pub fn requested_publication(directions: u8) -> u32 {
+        (if directions & crate::halbridge::HAL_PUBLISH_OUT != 0 {
+            PUB_RENDER
+        } else {
+            0
+        }) | (if directions & crate::halbridge::HAL_PUBLISH_IN != 0 {
+            PUB_CAPTURE
+        } else {
+            0
+        })
     }
 
     // -- caller-identity levels --------------------------------------------
@@ -596,6 +632,8 @@ pub mod wire {
     pub struct BindRequest<'a> {
         pub op: u32,
         pub slot: u8,
+        /// [`BINDFLAG_ONLINE`] plus the exact v6 render/capture intent bits;
+        /// debug bits are admitted only by the probe path.
         pub flags: u32,
         pub generation: u32,
         pub session_id: u64,
@@ -670,12 +708,10 @@ pub mod wire {
     }
 
     impl BindReply {
-        /// The invariant a successful SET must satisfy. Checked on this side
-        /// too: the point of the field is that BOTH ends can assert it, so a
-        /// driver that regresses is caught by the daemon rather than by a
-        /// human looking at the system's device list.
-        pub fn set_is_whole(&self) -> bool {
-            self.status == STATUS_OK && self.published == PUB_BOTH
+        /// The v6 SET invariant: success means exact equality with the
+        /// requested mask, including valid one-direction and zero masks.
+        pub fn publishes_exactly(&self, wanted: u32) -> bool {
+            self.status == STATUS_OK && wanted & !PUB_BOTH == 0 && self.published == wanted
         }
 
         /// The bind worked, but the devices carry the INF's generic direction
@@ -698,8 +734,9 @@ pub mod wire {
 
     /// Did this bind actually do what it claimed?
     ///
-    /// `Ok(())` means the daemon may believe the reply. `Err(text)` means it
-    /// must not, and carries the sentence to log and to publish over IPC.
+    /// `wanted == Some(mask)` is a SET; `None` is a CLEAR and therefore wants
+    /// zero. `Ok(())` means the daemon may believe the reply. `Err(text)` means
+    /// it must not, and carries the sentence to log and to publish over IPC.
     ///
     /// THIS IS THE PRODUCTION DECISION, not a description of it. `bind_call`
     /// on Windows calls exactly this function, so the tests below exercise the
@@ -707,15 +744,19 @@ pub mod wire {
     /// it — which is the failure mode that let the original defect through:
     /// the encoder was tested with a well-formed input while the PRODUCER of
     /// that input was never checked.
-    pub fn bind_outcome(is_set: bool, r: &BindReply) -> Result<(), String> {
+    pub fn bind_outcome(wanted: Option<u32>, r: &BindReply) -> Result<(), String> {
         if r.status != STATUS_OK {
             return Err(r.failure_text());
         }
-        let want = if is_set { PUB_BOTH } else { 0 };
-        if r.published != want {
+        let want = wanted.unwrap_or(0);
+        if !r.publishes_exactly(want) {
             return Err(format!(
-                "the driver reported success but published {} — treating it as a failure",
-                published_label(r.published)
+                "the driver reported success but published {} (0x{:x}), expected {} (0x{:x}) — \
+                 treating it as a failure",
+                published_label(r.published),
+                r.published,
+                published_label(want),
+                want,
             ));
         }
         Ok(())
@@ -744,9 +785,9 @@ pub mod wire {
         /// Empty when the slot is free.
         pub peer_key: String,
         /// [`PUB_RENDER`] | [`PUB_CAPTURE`] — the driver's own account of the
-        /// filters it currently holds for this slot. A slot that says
-        /// [`SLOT_BOUND`] with anything but [`PUB_BOTH`] is the failure this
-        /// field was added to make detectable from user mode.
+        /// filters it currently holds for this slot. In v6 any mask is valid;
+        /// reconciliation compares it with that peer's requested capability
+        /// rather than assuming every bound slot must publish both.
         pub published: u32,
     }
 
@@ -882,7 +923,9 @@ pub mod wire {
         if b.len() != MAP_REPLY_BYTES {
             return None;
         }
-        let va = (0..RING_SLOTS_MAX).map(|i| get_u64(b, 40 + i * 8)).collect();
+        let va = (0..RING_SLOTS_MAX)
+            .map(|i| get_u64(b, 40 + i * 8))
+            .collect();
         Some(MapReply {
             status: get_u32(b, 0),
             ring_count: get_u32(b, 4),
@@ -910,11 +953,31 @@ pub mod wire {
         /// fixed at 48 kHz / 2ch out / 1ch in all the way to the socket.
         pub fn geometry_error(&self) -> Option<String> {
             let want = [
-                ("data_offset", self.data_offset as u64, RING_DATA_OFFSET as u64),
-                ("capacity_frames", self.capacity_frames as u64, RING_FRAMES as u64),
-                ("sample_rate", self.sample_rate as u64, RING_SAMPLE_RATE as u64),
-                ("spk_channels", self.spk_channels as u64, SPK_CHANNELS as u64),
-                ("mic_channels", self.mic_channels as u64, MIC_CHANNELS as u64),
+                (
+                    "data_offset",
+                    self.data_offset as u64,
+                    RING_DATA_OFFSET as u64,
+                ),
+                (
+                    "capacity_frames",
+                    self.capacity_frames as u64,
+                    RING_FRAMES as u64,
+                ),
+                (
+                    "sample_rate",
+                    self.sample_rate as u64,
+                    RING_SAMPLE_RATE as u64,
+                ),
+                (
+                    "spk_channels",
+                    self.spk_channels as u64,
+                    SPK_CHANNELS as u64,
+                ),
+                (
+                    "mic_channels",
+                    self.mic_channels as u64,
+                    MIC_CHANNELS as u64,
+                ),
                 ("spk_bytes", self.spk_bytes as u64, SPK_BYTES as u64),
                 ("mic_bytes", self.mic_bytes as u64, MIC_BYTES as u64),
             ];
@@ -1021,7 +1084,10 @@ pub mod wire {
         if b.len() != NOTIFY_REPLY_BYTES {
             return None;
         }
-        Some(NotifyReply { status: get_u32(b, 0), applied: get_u32(b, 4) })
+        Some(NotifyReply {
+            status: get_u32(b, 0),
+            applied: get_u32(b, 4),
+        })
     }
 
     /// `AH_STATFLAG_INPUT` on the way in, `AH_STATFLAG_PRESENT` on the way
@@ -1174,7 +1240,10 @@ pub mod wire {
         if b.len() != LATENCY_REPLY_BYTES {
             return None;
         }
-        Some(LatencyReply { status: get_u32(b, 0), frames: get_u32(b, 4) })
+        Some(LatencyReply {
+            status: get_u32(b, 0),
+            frames: get_u32(b, 4),
+        })
     }
 
     /// `\\.\AudioHubVadCtl` as a NUL-terminated UTF-16 path for `CreateFileW`.
@@ -1364,7 +1433,11 @@ pub mod volmap {
             if rem >= MANTISSA_DB_Q16[i - 1] {
                 let lo = MANTISSA_DB_Q16[i - 1];
                 let hi = MANTISSA_DB_Q16[i];
-                let mut sub = if hi == lo { 0 } else { ((rem - lo) * 1024 + (hi - lo) / 2) / (hi - lo) };
+                let mut sub = if hi == lo {
+                    0
+                } else {
+                    ((rem - lo) * 1024 + (hi - lo) / 2) / (hi - lo)
+                };
                 if sub > 1023 {
                     sub = 1023;
                 }
@@ -1467,7 +1540,10 @@ pub mod volmap {
             for (i, &v) in MANTISSA_DB_Q16.iter().enumerate() {
                 let m = 1.0 + i as f64 / 32.0;
                 let want = (20.0 * m.log10() * 65536.0).round() as i32;
-                assert_eq!(v, want, "MANTISSA_DB_Q16[{i}] is not 20*log10({m}) in 1/65536 dB");
+                assert_eq!(
+                    v, want,
+                    "MANTISSA_DB_Q16[{i}] is not 20*log10({m}) in 1/65536 dB"
+                );
             }
             assert_eq!(
                 MANTISSA_DB_Q16[32], DB_PER_OCTAVE_Q16,
@@ -1518,14 +1594,42 @@ pub mod volmap {
         /// the two that must be exact rather than within a tolerance.
         #[test]
         fn silence_and_unity_survive_a_round_trip_exactly() {
-            assert_eq!(scalar_q16_to_ks_db(0), DB_FLOOR_Q16, "scalar 0 pins to the KS floor");
-            assert_eq!(ks_db_to_scalar_q16(DB_FLOOR_Q16), 0, "the KS floor comes back as silence");
-            assert_eq!(ks_db_to_scalar_q16(DB_FLOOR_Q16 - 1), 0, "below the floor is still silence");
+            assert_eq!(
+                scalar_q16_to_ks_db(0),
+                DB_FLOOR_Q16,
+                "scalar 0 pins to the KS floor"
+            );
+            assert_eq!(
+                ks_db_to_scalar_q16(DB_FLOOR_Q16),
+                0,
+                "the KS floor comes back as silence"
+            );
+            assert_eq!(
+                ks_db_to_scalar_q16(DB_FLOOR_Q16 - 1),
+                0,
+                "below the floor is still silence"
+            );
 
-            assert_eq!(scalar_q16_to_ks_db(ONE_Q16), DB_UNITY_Q16, "scalar 1.0 is 0 dB");
-            assert_eq!(scalar_q16_to_ks_db(ONE_Q16 + 9), DB_UNITY_Q16, "no boost above unity");
-            assert_eq!(ks_db_to_scalar_q16(DB_UNITY_Q16), ONE_Q16, "0 dB is scalar 1.0");
-            assert_eq!(ks_db_to_scalar_q16(1), ONE_Q16, "above 0 dB clamps to unity, not past it");
+            assert_eq!(
+                scalar_q16_to_ks_db(ONE_Q16),
+                DB_UNITY_Q16,
+                "scalar 1.0 is 0 dB"
+            );
+            assert_eq!(
+                scalar_q16_to_ks_db(ONE_Q16 + 9),
+                DB_UNITY_Q16,
+                "no boost above unity"
+            );
+            assert_eq!(
+                ks_db_to_scalar_q16(DB_UNITY_Q16),
+                ONE_Q16,
+                "0 dB is scalar 1.0"
+            );
+            assert_eq!(
+                ks_db_to_scalar_q16(1),
+                ONE_Q16,
+                "above 0 dB clamps to unity, not past it"
+            );
         }
 
         /// Halving the amplitude is -6.0206 dB and quartering it is -12.0412.
@@ -1536,7 +1640,10 @@ pub mod volmap {
             for (scalar, want) in [(0.5f64, -6.0206f64), (0.25, -12.0412), (0.125, -18.0618)] {
                 let q = (scalar * 65536.0).round() as u32;
                 let got = scalar_q16_to_ks_db(q) as f64 / 65536.0;
-                assert!((got - want).abs() < 0.001, "scalar {scalar} -> {got:.4} dB, want {want}");
+                assert!(
+                    (got - want).abs() < 0.001,
+                    "scalar {scalar} -> {got:.4} dB, want {want}"
+                );
             }
         }
 
@@ -1570,7 +1677,10 @@ pub mod volmap {
                 let l2 = quantize_to_step(scalar_q16_to_ks_db(s1));
                 let s2 = ks_db_to_scalar_q16(l2);
                 assert_eq!(l1, l2, "level moved on the second pass from scalar_q16={q}");
-                assert_eq!(s1, s2, "scalar moved on the second pass from scalar_q16={q}");
+                assert_eq!(
+                    s1, s2,
+                    "scalar moved on the second pass from scalar_q16={q}"
+                );
             }
         }
 
@@ -1582,7 +1692,10 @@ pub mod volmap {
             for q in 0..=ONE_Q16 {
                 let s1 = ks_db_to_scalar_q16(scalar_q16_to_ks_db(q));
                 let s2 = ks_db_to_scalar_q16(scalar_q16_to_ks_db(s1));
-                assert_eq!(s1, s2, "scalar moved on the second pass from scalar_q16={q}");
+                assert_eq!(
+                    s1, s2,
+                    "scalar moved on the second pass from scalar_q16={q}"
+                );
             }
         }
 
@@ -1591,16 +1704,47 @@ pub mod volmap {
         #[test]
         fn quantise_matches_the_drivers_normalise_macro() {
             assert_eq!(quantize_to_step(DB_UNITY_Q16), DB_UNITY_Q16);
-            assert_eq!(quantize_to_step(DB_FLOOR_Q16), DB_FLOOR_Q16, "the floor is on the grid");
-            assert_eq!(quantize_to_step(DB_FLOOR_Q16 - 99), DB_FLOOR_Q16, "clamp, then snap");
-            assert_eq!(quantize_to_step(99), DB_UNITY_Q16, "no boost survives the clamp");
-            assert_eq!(quantize_to_step(-1), 0, "a hair below unity rounds to unity");
-            assert_eq!(quantize_to_step(-16_384), -32_768, "exactly half rounds away from zero");
-            assert_eq!(quantize_to_step(-16_383), 0, "just under half rounds toward zero");
+            assert_eq!(
+                quantize_to_step(DB_FLOOR_Q16),
+                DB_FLOOR_Q16,
+                "the floor is on the grid"
+            );
+            assert_eq!(
+                quantize_to_step(DB_FLOOR_Q16 - 99),
+                DB_FLOOR_Q16,
+                "clamp, then snap"
+            );
+            assert_eq!(
+                quantize_to_step(99),
+                DB_UNITY_Q16,
+                "no boost survives the clamp"
+            );
+            assert_eq!(
+                quantize_to_step(-1),
+                0,
+                "a hair below unity rounds to unity"
+            );
+            assert_eq!(
+                quantize_to_step(-16_384),
+                -32_768,
+                "exactly half rounds away from zero"
+            );
+            assert_eq!(
+                quantize_to_step(-16_383),
+                0,
+                "just under half rounds toward zero"
+            );
             for l in DB_FLOOR_Q16..=DB_UNITY_Q16 {
                 let q = quantize_to_step(l);
-                assert_eq!(q % DB_STEP_Q16, 0, "level={l} snapped to {q}, off the 0.5 dB grid");
-                assert!((l - q).abs() <= DB_STEP_Q16 / 2, "level={l} moved further than half a step");
+                assert_eq!(
+                    q % DB_STEP_Q16,
+                    0,
+                    "level={l} snapped to {q}, off the 0.5 dB grid"
+                );
+                assert!(
+                    (l - q).abs() <= DB_STEP_Q16 / 2,
+                    "level={l} moved further than half a step"
+                );
             }
         }
 
@@ -1823,7 +1967,11 @@ pub mod rings {
             let start = (w % cap as u64) as usize;
             let first = (cap - start).min(count);
             unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), self.data().add(start * ch), first * ch);
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    self.data().add(start * ch),
+                    first * ch,
+                );
                 if count > first {
                     std::ptr::copy_nonoverlapping(
                         src.as_ptr().add(first * ch),
@@ -1997,7 +2145,9 @@ pub mod rings {
 
     impl WinRings {
         pub fn new() -> WinRings {
-            WinRings { inner: RwLock::new(None) }
+            WinRings {
+                inner: RwLock::new(None),
+            }
         }
 
         /// Takes the whole reply and installs every pair it describes.
@@ -2091,7 +2241,12 @@ pub mod rings {
         }
 
         /// 只窥不取. `None` = no driver attached / no such slot.
-        pub fn peek_spk(&self, slot: usize, dst: &mut [f32], frames: usize) -> Option<(usize, u64)> {
+        pub fn peek_spk(
+            &self,
+            slot: usize,
+            dst: &mut [f32],
+            frames: usize,
+        ) -> Option<(usize, u64)> {
             rd(&self.inner)
                 .as_ref()
                 .and_then(|p| p.get(slot))
@@ -2169,7 +2324,10 @@ pub mod rings {
 
         impl FakeRing {
             fn new(channels: u32, bytes: usize) -> FakeRing {
-                let mut me = FakeRing { buf: vec![0u64; bytes / 8], channels };
+                let mut me = FakeRing {
+                    buf: vec![0u64; bytes / 8],
+                    channels,
+                };
                 let h = me.hdr();
                 h.magic = wire::RING_MAGIC;
                 h.version = wire::RING_VERSION;
@@ -2216,7 +2374,10 @@ pub mod rings {
 
             fn indices(&mut self) -> (u64, u64) {
                 let h = self.hdr();
-                (h.write_idx.load(Ordering::SeqCst), h.read_idx.load(Ordering::SeqCst))
+                (
+                    h.write_idx.load(Ordering::SeqCst),
+                    h.read_idx.load(Ordering::SeqCst),
+                )
             }
         }
 
@@ -2273,8 +2434,12 @@ pub mod rings {
 
         #[test]
         fn attach_installs_one_pair_per_slot_and_detach_takes_them_all_away() {
-            let (s0, m0, s1, m1) =
-                (FakeRing::spk(), FakeRing::mic(), FakeRing::spk(), FakeRing::mic());
+            let (s0, m0, s1, m1) = (
+                FakeRing::spk(),
+                FakeRing::mic(),
+                FakeRing::spk(),
+                FakeRing::mic(),
+            );
             let rep = good_reply(&[&s0, &m0, &s1, &m1]);
 
             let r = WinRings::new();
@@ -2301,8 +2466,12 @@ pub mod rings {
         /// which ring the data came out of, not merely that some data did.
         #[test]
         fn each_slot_reads_and_writes_its_own_pair_of_rings() {
-            let (s0, m0, s1, m1) =
-                (FakeRing::spk(), FakeRing::mic(), FakeRing::spk(), FakeRing::mic());
+            let (s0, m0, s1, m1) = (
+                FakeRing::spk(),
+                FakeRing::mic(),
+                FakeRing::spk(),
+                FakeRing::mic(),
+            );
             let rep = good_reply(&[&s0, &m0, &s1, &m1]);
             let r = WinRings::new();
             r.attach(&rep).unwrap();
@@ -2334,7 +2503,10 @@ pub mod rings {
         #[test]
         fn attach_refuses_a_ring_whose_header_disagrees_with_the_contract() {
             for (what, mutate) in [
-                ("magic", (|h: &mut RingHeader| h.magic = 0x4148_5232) as fn(&mut RingHeader)),
+                (
+                    "magic",
+                    (|h: &mut RingHeader| h.magic = 0x4148_5232) as fn(&mut RingHeader),
+                ),
                 ("version", |h| h.version = 2),
                 ("channels", |h| h.channels = 1),
                 ("capacity", |h| h.capacity_frames = wire::RING_FRAMES - 1),
@@ -2351,7 +2523,10 @@ pub mod rings {
                     format!("{e:#}").contains("speaker"),
                     "the error must name the ring: {e:#}"
                 );
-                assert!(!r.attached(), "a refused attach must install nothing ({what})");
+                assert!(
+                    !r.attached(),
+                    "a refused attach must install nothing ({what})"
+                );
             }
         }
 
@@ -2364,7 +2539,9 @@ pub mod rings {
             mic.hdr().magic = 0;
             let rep = good_reply(&[&spk, &mic]);
             let r = WinRings::new();
-            let e = r.attach(&rep).expect_err("a bad microphone ring is still a bad ring");
+            let e = r
+                .attach(&rep)
+                .expect_err("a bad microphone ring is still a bad ring");
             assert!(format!("{e:#}").contains("microphone"), "{e:#}");
             assert!(!r.attached());
         }
@@ -2377,11 +2554,16 @@ pub mod rings {
 
             let mut rep = good_reply(&[&spk, &mic]);
             rep.va[1] = 0;
-            assert!(WinRings::new().attach(&rep).is_err(), "va = 0 is not an address");
+            assert!(
+                WinRings::new().attach(&rep).is_err(),
+                "va = 0 is not an address"
+            );
 
             let mut rep = good_reply(&[&spk, &mic]);
             rep.va[0] += 4; // 4-aligned, not 8: an unaligned AtomicU64.
-            let e = WinRings::new().attach(&rep).expect_err("unaligned is UB, not a slow path");
+            let e = WinRings::new()
+                .attach(&rep)
+                .expect_err("unaligned is UB, not a slow path");
             assert!(format!("{e:#}").contains("aligned"), "{e:#}");
         }
 
@@ -2393,8 +2575,11 @@ pub mod rings {
             let base = good_reply(&[&spk, &mic]);
 
             for (what, mutate) in [
-                ("capacity_frames", (|r: &mut wire::MapReply| r.capacity_frames = 12_000)
-                    as fn(&mut wire::MapReply)),
+                (
+                    "capacity_frames",
+                    (|r: &mut wire::MapReply| r.capacity_frames = 12_000)
+                        as fn(&mut wire::MapReply),
+                ),
                 ("sample_rate", |r| r.sample_rate = 44_100),
                 ("data_offset", |r| r.data_offset = 40),
                 ("spk_channels", |r| r.spk_channels = 1),
@@ -2588,11 +2773,19 @@ pub mod rings {
             let (n, base) = r.peek_spk(0, &mut a, 100).expect("attached");
             assert_eq!(n, 100);
             assert_stereo_ramp(&a, 0, 100);
-            assert_eq!(r.spk_readable(0), Some((300, wire::RING_FRAMES)), "peek consumed nothing");
+            assert_eq!(
+                r.spk_readable(0),
+                Some((300, wire::RING_FRAMES)),
+                "peek consumed nothing"
+            );
 
             let mut b = vec![0.0f32; 100 * 2];
             let (n2, base2) = r.peek_spk(0, &mut b, 100).unwrap();
-            assert_eq!((n2, base2), (100, base), "a second peek sees the same window");
+            assert_eq!(
+                (n2, base2),
+                (100, base),
+                "a second peek sees the same window"
+            );
             assert_eq!(a, b);
 
             // The producer pushes MORE between the peek and the advance. The
@@ -2647,7 +2840,10 @@ pub mod rings {
             let mut buf = vec![0.0f32; 480 * 2];
             let (n, base) = r.peek_spk(0, &mut buf, 480).expect("attached");
             assert_eq!(n, 480);
-            assert_eq!(base, 4_000, "the peek jumped, so the base is NOT read_idx (which is 0)");
+            assert_eq!(
+                base, 4_000,
+                "the peek jumped, so the base is NOT read_idx (which is 0)"
+            );
             assert_stereo_ramp(&buf, 4_000, 480);
             assert_eq!(spk.indices().1, 0, "peek still consumed nothing");
 
@@ -2679,7 +2875,7 @@ pub mod rings {
 
             let mut dst = vec![0.0f32; 140 * 2];
             assert_eq!(r.read_spk(0, &mut dst, 140), 140);
-            assert_stereo_ramp(&dst, 60, 140, /* the first 60 are gone */);
+            assert_stereo_ramp(&dst, 60, 140 /* the first 60 are gone */);
 
             // Asking for more than is there drops only what is there.
             spk.view(&rep).write(&stereo_ramp(200, 10), 10);
@@ -2706,7 +2902,7 @@ pub mod rings {
             driver.write(&stereo_ramp(9000, 64), 64);
             let mut dst = vec![0.0f32; 64 * 2];
             assert_eq!(r.read_spk(0, &mut dst, 64), 64);
-            assert_stereo_ramp(&dst, 9000, 64, /* not the flushed 0..500 */);
+            assert_stereo_ramp(&dst, 9000, 64 /* not the flushed 0..500 */);
         }
 
         /// Depth is REPORTED, never consumed. Reading it a hundred times must
@@ -2900,7 +3096,9 @@ pub mod transport {
         fn new() -> Result<Event> {
             let h = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
             if h == 0 {
-                return Err(anyhow!("CreateEventW failed: {}", unsafe { GetLastError() }));
+                return Err(anyhow!("CreateEventW failed: {}", unsafe {
+                    GetLastError()
+                }));
             }
             Ok(Event(h))
         }
@@ -2933,7 +3131,9 @@ pub mod transport {
         pub fn new() -> Result<WakeEvent> {
             let h = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) };
             if h == 0 {
-                return Err(anyhow!("CreateEventW failed: {}", unsafe { GetLastError() }));
+                return Err(anyhow!("CreateEventW failed: {}", unsafe {
+                    GetLastError()
+                }));
             }
             Ok(WakeEvent(h))
         }
@@ -3043,7 +3243,13 @@ pub mod transport {
     /// makes concurrent requests on one handle safe — and what keeps this
     /// looking synchronous to the layer above while the long-pending
     /// `CONTROL_PEND` stays outstanding beside it.
-    pub fn ioctl(h: &Handle, code: u32, input: &[u8], output: &mut [u8], timeout_ms: u32) -> Result<u32> {
+    pub fn ioctl(
+        h: &Handle,
+        code: u32,
+        input: &[u8],
+        output: &mut [u8],
+        timeout_ms: u32,
+    ) -> Result<u32> {
         let ev = Event::new()?;
         let mut ov = Overlapped {
             event: ev.0,
@@ -3166,7 +3372,12 @@ pub mod transport {
             if err != ERROR_IO_PENDING {
                 return Err(anyhow!("IOCTL_CONTROL_PEND failed: error {err}"));
             }
-            Ok(Some(PendingCall { _event: ev, ov, buf, h: h.raw() }))
+            Ok(Some(PendingCall {
+                _event: ev,
+                ov,
+                buf,
+                h: h.raw(),
+            }))
         }
 
         /// Non-blocking poll. `Ok(None)` = still pending.
@@ -3197,7 +3408,6 @@ pub mod transport {
                 .map(Some)
                 .ok_or_else(|| anyhow!("undecodable control event"))
         }
-
     }
 }
 
@@ -3307,7 +3517,9 @@ pub mod session {
             let n = transport::ioctl(&handle, wire::IOCTL_HELLO, &req, &mut out, IOCTL_TIMEOUT_MS)
                 .map_err(|e| SessionError::Handshake(format!("{e:#}")))?;
             if n as usize != wire::HELLO_REPLY_BYTES {
-                return Err(SessionError::Handshake(format!("hello reply was {n} bytes")));
+                return Err(SessionError::Handshake(format!(
+                    "hello reply was {n} bytes"
+                )));
             }
             let rep = wire::decode_hello_reply(&out)
                 .ok_or_else(|| SessionError::Handshake("undecodable hello reply".into()))?;
@@ -3614,17 +3826,18 @@ pub mod session {
             self.client_check < wire::CLIENT_CHECK_IMAGEPATH
         }
 
-        /// `peer_display` is the BARE disambiguated peer name ("WIN-30"). The
-        /// `AudioHub – ` prefix is added by `wire::encode_bind_request`; adding
-        /// it here as well would double it.
+        /// `peer_display` is the prefix-free disambiguated peer label
+        /// ("WIN-30" or "WIN-30 (Offline)"). The `AudioHub – ` prefix is added
+        /// by `wire::encode_bind_request`; adding it here as well would double it.
         pub fn bind_set(
             &self,
             slot: u8,
             peer_key: &str,
             peer_display: &str,
             online: bool,
+            directions: u8,
         ) -> Result<wire::BindReply> {
-            self.bind_set_with(slot, peer_key, peer_display, online, 0)
+            self.bind_set_with(slot, peer_key, peer_display, online, directions, 0)
         }
 
         /// `debug_flags` is `wire::BINDFLAG_FAIL_*` / `SKIP_ROLLBACK`, and is
@@ -3638,12 +3851,15 @@ pub mod session {
             peer_key: &str,
             peer_display: &str,
             online: bool,
+            directions: u8,
             debug_flags: u32,
         ) -> Result<wire::BindReply> {
+            let wanted = wire::bind_direction_flags(directions);
             let req = wire::BindRequest {
                 op: wire::BIND_SET,
                 slot,
                 flags: (if online { wire::BINDFLAG_ONLINE } else { 0 })
+                    | wanted
                     | (debug_flags & wire::BINDFLAG_DEBUG_MASK),
                 // Set carries 0: the DRIVER allocates the generation and
                 // returns it in the reply.
@@ -3717,7 +3933,9 @@ pub mod session {
         pub fn poll_events(&mut self) -> Vec<wire::ControlEvent> {
             let mut out = Vec::new();
             loop {
-                let Some(p) = self.pending.as_mut() else { return out };
+                let Some(p) = self.pending.as_mut() else {
+                    return out;
+                };
                 match p.poll(&self.handle) {
                     Ok(Some(ev)) => {
                         out.push(ev);
@@ -3834,7 +4052,11 @@ mod tests {
         assert_eq!(MAP_REPLY_BYTES, 296);
         assert_eq!(NOTIFY_REQUEST_BYTES, 24);
         assert_eq!(NOTIFY_REPLY_BYTES, 8);
-        assert_eq!(PROTOCOL_VERSION, 5, "the layout above IS version 5");
+        // v6 changes the meaning of bind flags, not any struct size.
+        assert_eq!(
+            PROTOCOL_VERSION, 6,
+            "the direction-mask contract is version 6"
+        );
     }
 
     /// Every added field is read from the offset the C header asserts, by
@@ -3860,7 +4082,10 @@ mod tests {
         assert_eq!(r.stage, STAGE_INSTALL_RENDER);
         assert_eq!(r.nt_status, 0xC000_0001);
         assert_eq!(r.published, PUB_CAPTURE);
-        assert!(!r.set_is_whole());
+        assert!(
+            !r.publishes_exactly(PUB_CAPTURE),
+            "a non-OK reply never satisfies SET"
+        );
 
         let text = r.failure_text();
         assert!(text.contains("speaker filters"), "{text}");
@@ -3868,58 +4093,101 @@ mod tests {
         assert!(text.contains("microphone only"), "{text}");
     }
 
-    /// The gate `bind_call` actually runs, on every combination that matters.
-    ///
-    /// The half-published SET is the exact shape M6-2 shipped: `status: ok`,
-    /// `state: bound`, and no speaker in the system list. It must come back as
-    /// an Err whose text names what IS published, because that sentence is
-    /// what reaches `daemon.status` and therefore the only thing anybody
-    /// upstream can act on.
-    #[test]
-    fn the_gate_rejects_every_reply_that_did_not_do_what_it_said() {
-        let ok_set = BindReply {
+    fn ok_bind_reply(published: u32) -> BindReply {
+        BindReply {
             status: STATUS_OK,
             slot: 0,
             generation: 1,
             state: SLOT_BOUND,
             stage: STAGE_NONE,
             nt_status: 0,
-            published: PUB_BOTH,
+            published,
             flags: 0,
-        };
-        assert!(bind_outcome(true, &ok_set).is_ok());
+        }
+    }
+
+    /// OUT-only, IN-only and zero are first-class successful SETs in v6, not
+    /// incomplete versions of `PUB_BOTH`.
+    #[test]
+    fn set_accepts_each_exact_v6_direction_mask() {
+        for wanted in [0, PUB_RENDER, PUB_CAPTURE, PUB_BOTH] {
+            let reply = ok_bind_reply(wanted);
+            assert!(reply.publishes_exactly(wanted), "wanted 0x{wanted:x}");
+            assert!(
+                bind_outcome(Some(wanted), &reply).is_ok(),
+                "wanted 0x{wanted:x}"
+            );
+        }
 
         // A naming fallback is NOT a failed bind: the devices exist. It is
         // reported separately (`endpoint_name_fell_back`), never by turning a
-        // working device pair into an error the coordinator would retry.
+        // correctly published direction into an error the coordinator retries.
         let named_generically = BindReply {
             flags: BINDREPLY_FLAG_NAME_FALLBACK,
-            ..ok_set
+            ..ok_bind_reply(PUB_RENDER)
         };
-        assert!(bind_outcome(true, &named_generically).is_ok());
+        assert!(bind_outcome(Some(PUB_RENDER), &named_generically).is_ok());
         assert!(named_generically.endpoint_name_fell_back());
-        assert!(!ok_set.endpoint_name_fell_back());
+        assert!(!ok_bind_reply(PUB_RENDER).endpoint_name_fell_back());
+    }
 
-        // A SET with only the microphone: the defect under repair.
-        let half = BindReply { published: PUB_CAPTURE, ..ok_set };
-        let e = bind_outcome(true, &half).expect_err("half a pair is not a bind");
-        assert!(e.contains("microphone only"), "{e}");
+    /// Equality is exact in both directions: every missing bit and every extra
+    /// bit is rejected, even though each actual mask is independently valid.
+    #[test]
+    fn set_rejects_every_extra_or_missing_direction() {
+        let masks = [0, PUB_RENDER, PUB_CAPTURE, PUB_BOTH];
+        for wanted in masks {
+            for actual in masks {
+                if actual == wanted {
+                    continue;
+                }
+                let e = bind_outcome(Some(wanted), &ok_bind_reply(actual))
+                    .expect_err("a mismatched publication mask cannot be success");
+                assert!(
+                    e.contains(&format!("0x{actual:x}")),
+                    "actual missing from: {e}"
+                );
+                assert!(
+                    e.contains(&format!("0x{wanted:x}")),
+                    "wanted missing from: {e}"
+                );
+            }
+        }
 
-        // And only the speaker, symmetrically.
-        let half = BindReply { published: PUB_RENDER, ..ok_set };
-        assert!(bind_outcome(true, &half).is_err());
+        let invalid = ok_bind_reply(0x4);
+        let e = bind_outcome(Some(PUB_RENDER), &invalid)
+            .expect_err("an unknown publication bit cannot be masked into success");
+        assert!(e.contains("invalid direction mask"), "{e}");
+        assert!(e.contains("0x4"), "{e}");
 
-        // Nothing at all, still claiming OK.
-        let none = BindReply { published: 0, ..ok_set };
-        assert!(bind_outcome(true, &none).is_err());
+        assert!(
+            bind_outcome(Some(0x4), &invalid).is_err(),
+            "matching unknown bits are still not a valid v6 mask"
+        );
+    }
 
-        // A CLEAR is whole when NOTHING is left.
-        let ok_clear = BindReply { state: SLOT_FREE, published: 0, ..ok_set };
-        assert!(bind_outcome(false, &ok_clear).is_ok());
-        // A CLEAR that left half the pair behind is a failure, not a success:
-        // the next SET would then be repairing a slot nobody knows is broken.
-        let leftover = BindReply { state: SLOT_FREE, published: PUB_RENDER, ..ok_set };
-        assert!(bind_outcome(false, &leftover).is_err());
+    #[test]
+    fn clear_still_requires_nothing_to_be_published() {
+        let ok_clear = BindReply {
+            state: SLOT_FREE,
+            ..ok_bind_reply(0)
+        };
+        assert!(bind_outcome(None, &ok_clear).is_ok());
+        for leftover in [PUB_RENDER, PUB_CAPTURE, PUB_BOTH] {
+            let reply = BindReply {
+                state: SLOT_FREE,
+                ..ok_bind_reply(leftover)
+            };
+            assert!(
+                bind_outcome(None, &reply).is_err(),
+                "leftover 0x{leftover:x}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_ok_reply_keeps_the_drivers_stage_and_status_diagnostics() {
+        let ok_set = ok_bind_reply(PUB_RENDER);
 
         // A non-OK status is reported with the driver's own stage and NTSTATUS
         // rather than a generic "refused".
@@ -3930,47 +4198,43 @@ mod tests {
             published: PUB_RENDER,
             ..ok_set
         };
-        let e = bind_outcome(true, &failed).expect_err("partial is not success");
+        let e = bind_outcome(Some(PUB_RENDER), &failed).expect_err("partial is not success");
         assert!(e.contains("rolling a failed install back"), "{e}");
         assert!(e.contains("0xc0000017"), "{e}");
     }
 
-    /// THE invariant, as an assertion rather than a comment: a SET that says
-    /// OK while publishing only one half is NOT whole, and the daemon must be
-    /// able to see that from the reply alone.
-    ///
-    /// This is the exact shape M6-2 shipped — `status: ok`, `state: bound`,
-    /// and no speaker in the system list. In v1 the reply had no field that
-    /// could express it, so the daemon believed the status word.
+    /// Pins both semantic mappings, rather than relying on their current bit
+    /// values happening to be adjacent. These are the flags Session::bind_set
+    /// actually uses.
     #[test]
-    fn a_set_that_publishes_one_half_is_not_whole_however_ok_it_claims_to_be() {
-        let whole = BindReply {
-            status: STATUS_OK,
-            slot: 0,
-            generation: 1,
-            state: SLOT_BOUND,
-            stage: STAGE_NONE,
-            nt_status: 0,
-            published: PUB_BOTH,
-            flags: 0,
-        };
-        assert!(whole.set_is_whole());
+    fn coordinator_directions_map_to_exact_windows_flags_and_publications() {
+        use crate::halbridge::{HAL_PUBLISH_BOTH, HAL_PUBLISH_IN, HAL_PUBLISH_OUT};
 
-        for half in [PUB_RENDER, PUB_CAPTURE, 0] {
-            let r = BindReply { published: half, ..whole };
-            assert!(
-                !r.set_is_whole(),
-                "published 0x{half:x} with status ok must NOT count as a bound device pair"
-            );
+        let cases = [
+            (0, 0, 0),
+            (HAL_PUBLISH_OUT, BINDFLAG_WANT_RENDER, PUB_RENDER),
+            (HAL_PUBLISH_IN, BINDFLAG_WANT_CAPTURE, PUB_CAPTURE),
+            (HAL_PUBLISH_BOTH, BINDFLAG_WANT_MASK, PUB_BOTH),
+        ];
+        for (directions, flags, published) in cases {
+            assert_eq!(bind_direction_flags(directions), flags);
+            assert_eq!(requested_publication(directions), published);
         }
     }
 
     /// The debug bits are one contiguous, non-overlapping block, and none of
-    /// them collides with `BINDFLAG_ONLINE`. A collision would make the daemon
-    /// inject a fault every time it marked a peer online.
+    /// them collides with online OR the two v6 direction bits. A collision
+    /// would make an ordinary capability advertisement inject a fault.
     #[test]
-    fn the_fault_injection_bits_cannot_collide_with_the_online_flag() {
-        assert_eq!(BINDFLAG_DEBUG_MASK & BINDFLAG_ONLINE, 0);
+    fn the_fault_injection_bits_cannot_collide_with_production_flags() {
+        assert_eq!(
+            BINDFLAG_DEBUG_MASK & (BINDFLAG_ONLINE | BINDFLAG_WANT_MASK),
+            0
+        );
+        assert_eq!(BINDFLAG_ONLINE & BINDFLAG_WANT_MASK, 0);
+        assert_eq!(BINDFLAG_WANT_RENDER.count_ones(), 1);
+        assert_eq!(BINDFLAG_WANT_CAPTURE.count_ones(), 1);
+        assert_eq!(BINDFLAG_WANT_RENDER & BINDFLAG_WANT_CAPTURE, 0);
         let bits = [
             BINDFLAG_FAIL_RENDER,
             BINDFLAG_FAIL_CAPTURE,
@@ -4011,15 +4275,25 @@ mod tests {
         assert_eq!(&b[16..24], &0x5555_5555_6666_6666u64.to_le_bytes());
         // peer_key at 24, ASCII, NUL padded to 40.
         assert_eq!(&b[24..40], b"0123456789abcdef");
-        assert!(b[40..64].iter().all(|&c| c == 0), "peer_key must be NUL padded");
+        assert!(
+            b[40..64].iter().all(|&c| c == 0),
+            "peer_key must be NUL padded"
+        );
         // display at 64, UTF-16LE — and carrying the composed name, not the
         // bare input: "AudioHub \u{2013} AB".
         let want: Vec<u16> = "AudioHub \u{2013} AB".encode_utf16().collect();
         for (i, u) in want.iter().enumerate() {
-            assert_eq!(&b[64 + i * 2..66 + i * 2], &u.to_le_bytes(), "code unit {i}");
+            assert_eq!(
+                &b[64 + i * 2..66 + i * 2],
+                &u.to_le_bytes(),
+                "code unit {i}"
+            );
         }
         let end = 64 + want.len() * 2;
-        assert!(b[end..320].iter().all(|&c| c == 0), "display must be NUL terminated and padded");
+        assert!(
+            b[end..320].iter().all(|&c| c == 0),
+            "display must be NUL terminated and padded"
+        );
     }
 
     #[test]
@@ -4056,9 +4330,15 @@ mod tests {
         // perfectly as the first four fields, and the missing `published`
         // would silently read as 0 — "nothing published" — on a bind that
         // actually worked.
-        assert!(decode_bind_reply(&[0u8; 16]).is_none(), "a v1 reply is not a v2 reply");
+        assert!(
+            decode_bind_reply(&[0u8; 16]).is_none(),
+            "a v1 reply is not a v2 reply"
+        );
         assert!(decode_query_slots_reply(&[0u8; QUERY_SLOTS_REPLY_BYTES - 1]).is_none());
-        assert!(decode_query_slots_reply(&[0u8; 784]).is_none(), "the v1 size is refused");
+        assert!(
+            decode_query_slots_reply(&[0u8; 784]).is_none(),
+            "the v1 size is refused"
+        );
         assert!(decode_control_event(&[0u8; 23]).is_none());
     }
 
@@ -4073,7 +4353,10 @@ mod tests {
         assert!(!valid_peer_key(""), "empty");
         assert!(!valid_peer_key("b47382dc9026704"), "15 chars");
         assert!(!valid_peer_key("b47382dc902670420"), "17 chars");
-        assert!(!valid_peer_key("B47382DC90267042"), "uppercase hex is not the format we emit");
+        assert!(
+            !valid_peer_key("B47382DC90267042"),
+            "uppercase hex is not the format we emit"
+        );
         assert!(!valid_peer_key("b47382dc9026704g"), "g is not hex");
         // The ones that would corrupt a device-interface reference string.
         assert!(!valid_peer_key(r"..\..\evil\aaaa"));
@@ -4105,7 +4388,10 @@ mod tests {
             peer_key: "0123456789abcdef",
             peer_display: "x",
         };
-        assert_eq!(encode_bind_request(&bad), Err(BindEncodeError::SlotOutOfRange));
+        assert_eq!(
+            encode_bind_request(&bad),
+            Err(BindEncodeError::SlotOutOfRange)
+        );
     }
 
     // -- clamp_utf16 --------------------------------------------------------
@@ -4144,7 +4430,10 @@ mod tests {
         assert_eq!(v.len(), 4);
         assert_eq!(v[0], b'a' as u16);
         assert_eq!(v[1], b'b' as u16);
-        assert_eq!(v[2], 0, "the emoji did not fit, so NOTHING of it was written");
+        assert_eq!(
+            v[2], 0,
+            "the emoji did not fit, so NOTHING of it was written"
+        );
         assert!(
             !v.iter().any(|u| (0xD800..0xE000).contains(u)),
             "a lone surrogate escaped: {v:04X?}"
@@ -4167,7 +4456,11 @@ mod tests {
         let long = "漢".repeat(500);
         let v = clamp_utf16(&long, DISPLAY_CHARS);
         assert_eq!(v.len(), DISPLAY_CHARS);
-        assert_eq!(v[DISPLAY_CHARS - 1], 0, "the last unit is always the terminator");
+        assert_eq!(
+            v[DISPLAY_CHARS - 1],
+            0,
+            "the last unit is always the terminator"
+        );
         let end = v.iter().position(|&u| u == 0).unwrap();
         assert_eq!(end, DISPLAY_CHARS - 1);
         assert_eq!(String::from_utf16(&v[..end]).unwrap().chars().count(), 127);
@@ -4213,9 +4506,9 @@ mod tests {
     /// BARE peer name, and every Windows endpoint duly came out labelled
     /// `WIN-IR01HVEFU7G`. The test stayed green throughout.
     ///
-    /// The input here is therefore exactly what `haldev::display_names`
-    /// produces. Take the prefixing out of `encode_bind_request` and this goes
-    /// red, which is the whole point.
+    /// The input here is therefore exactly the prefix-free label `haldev`
+    /// carries for Windows. Take the prefixing out of `encode_bind_request`
+    /// and this goes red, which is the whole point.
     #[test]
     fn the_wire_name_is_composed_from_the_bare_peer_name() {
         assert_eq!(wire_display("WIN-30"), "AudioHub – WIN-30");
@@ -4224,22 +4517,19 @@ mod tests {
         assert_eq!(wire_display("WIN-30 (2)"), "AudioHub – WIN-30 (2)");
     }
 
-    /// And the composed name is the macOS name minus the direction word.
-    ///
-    /// This is the cross-platform pin: the driver appends the direction word
-    /// itself, so what goes on the wire has to be the exact prefix of what
-    /// macOS calls the same device. Change the prefix on one side alone and
-    /// this fails.
+    /// The system data-flow category, not a translated suffix, distinguishes
+    /// input from output on both platforms. The driver therefore receives the
+    /// exact complete label used by both macOS devices.
     #[test]
-    fn the_wire_name_is_the_macos_name_without_its_direction_word() {
-        let (out, mic) = crate::haldev::device_names("WIN-30", false);
+    fn the_wire_name_is_the_complete_cross_platform_device_name() {
+        let (out, mic) = crate::haldev::device_names("WIN-30", false, "zh-CN");
         let stem = wire_display("WIN-30");
-        assert_eq!(out, format!("{stem} 扬声器"));
-        assert_eq!(mic, format!("{stem} 麦克风"));
-        // Nothing directional may ride along on the wire: the driver appends
-        // its own word to it and would produce "... 扬声器 扬声器".
+        assert_eq!(out, stem);
+        assert_eq!(mic, stem);
         assert!(!stem.contains('扬'));
         assert!(!stem.contains('麦'));
+        let marked = crate::haldev::device_display_name("WIN-30", true, "en-US");
+        assert_eq!(wire_display(&marked), "AudioHub – WIN-30 (Offline)");
     }
 
     /// A Clear carries no name, and must not carry a lone prefix either.
@@ -4281,13 +4571,13 @@ mod tests {
         b[at + 4..at + 8].copy_from_slice(&42u32.to_le_bytes());
         b[at + 8..at + 8 + 16].copy_from_slice(b"b47382dc90267042");
         b[at + 8 + PEERKEY_BUF..at + 12 + PEERKEY_BUF].copy_from_slice(&PUB_BOTH.to_le_bytes());
-        // slot 5: bound, but only the microphone half is really there. This is
-        // the state the driver must never produce and the daemon must be able
-        // to read back if it ever does.
+        // slot 5 is intentionally capture-only. QuerySlots reports fact, not
+        // policy; reconciliation compares this mask with the peer capability.
         let at5 = 16 + 5 * SLOT_INFO_BYTES;
         b[at5..at5 + 4].copy_from_slice(&SLOT_BOUND.to_le_bytes());
         b[at5 + 8..at5 + 8 + 16].copy_from_slice(b"ec8b4544a5249276");
-        b[at5 + 8 + PEERKEY_BUF..at5 + 12 + PEERKEY_BUF].copy_from_slice(&PUB_CAPTURE.to_le_bytes());
+        b[at5 + 8 + PEERKEY_BUF..at5 + 12 + PEERKEY_BUF]
+            .copy_from_slice(&PUB_CAPTURE.to_le_bytes());
 
         let r = decode_query_slots_reply(&b).expect("well formed");
         assert_eq!(r.status, STATUS_OK);
@@ -4297,7 +4587,10 @@ mod tests {
         assert_eq!(r.slots[3].generation, 42);
         assert_eq!(r.slots[3].peer_key, "b47382dc90267042");
         assert_eq!(r.slots[3].published, PUB_BOTH);
-        assert_eq!(r.slots[5].published, PUB_CAPTURE, "half a pair is visible from user mode");
+        assert_eq!(
+            r.slots[5].published, PUB_CAPTURE,
+            "capture-only is visible from user mode"
+        );
         assert_eq!(r.slots[0].state, SLOT_FREE);
         assert_eq!(r.slots[0].peer_key, "", "a free slot reports no key");
         assert_eq!(r.slots[0].published, 0);
@@ -4345,7 +4638,11 @@ mod tests {
         assert_eq!(b.len(), 24);
         assert_eq!(&b[0..8], &0x1122_3344_5566_7788u64.to_le_bytes());
         assert_eq!(&b[8..16], &0x0000_00AA_BBCC_DDEEu64.to_le_bytes());
-        assert_eq!(&b[16..20], &PROTOCOL_VERSION.to_le_bytes(), "checked again here");
+        assert_eq!(
+            &b[16..20],
+            &PROTOCOL_VERSION.to_le_bytes(),
+            "checked again here"
+        );
         assert_eq!(&b[20..24], &0u32.to_le_bytes(), "flags MBZ");
     }
 
@@ -4371,8 +4668,8 @@ mod tests {
         b[28..32].copy_from_slice(&196_608u32.to_le_bytes()); // spk_bytes @28
         b[32..36].copy_from_slice(&98_304u32.to_le_bytes()); // mic_bytes
         b[36..40].copy_from_slice(&0u32.to_le_bytes()); // reserved MBZ
-        // va at 40, and it is 8-byte quantities: a 4-byte read here would pick
-        // up the top half of the previous entry on every index but the first.
+                                                        // va at 40, and it is 8-byte quantities: a 4-byte read here would pick
+                                                        // up the top half of the previous entry on every index but the first.
         for i in 0..RING_SLOTS_MAX {
             let v = 0x0000_7F00_0000_0000u64 + (i as u64) * 0x4000;
             b[40 + i * 8..48 + i * 8].copy_from_slice(&v.to_le_bytes());
@@ -4407,7 +4704,10 @@ mod tests {
     fn a_map_reply_of_the_wrong_length_is_rejected_rather_than_read() {
         assert!(decode_map_reply(&[0u8; MAP_REPLY_BYTES - 1]).is_none());
         assert!(decode_map_reply(&[0u8; MAP_REPLY_BYTES + 1]).is_none());
-        assert!(decode_map_reply(&[0u8; 40]).is_none(), "geometry with no addresses");
+        assert!(
+            decode_map_reply(&[0u8; 40]).is_none(),
+            "geometry with no addresses"
+        );
         assert!(decode_notify_reply(&[0u8; 4]).is_none());
         assert!(decode_notify_reply(&[0u8; 12]).is_none());
     }
@@ -4432,15 +4732,59 @@ mod tests {
         assert_eq!(good.geometry_error(), None);
 
         for (field, bad) in [
-            ("data_offset", MapReply { data_offset: 40, ..good.clone() }),
-            ("capacity_frames", MapReply { capacity_frames: 12_000, ..good.clone() }),
-            ("sample_rate", MapReply { sample_rate: 44_100, ..good.clone() }),
-            ("spk_channels", MapReply { spk_channels: 1, ..good.clone() }),
-            ("mic_channels", MapReply { mic_channels: 2, ..good.clone() }),
-            ("spk_bytes", MapReply { spk_bytes: 65_536, ..good.clone() }),
-            ("mic_bytes", MapReply { mic_bytes: 65_536, ..good.clone() }),
+            (
+                "data_offset",
+                MapReply {
+                    data_offset: 40,
+                    ..good.clone()
+                },
+            ),
+            (
+                "capacity_frames",
+                MapReply {
+                    capacity_frames: 12_000,
+                    ..good.clone()
+                },
+            ),
+            (
+                "sample_rate",
+                MapReply {
+                    sample_rate: 44_100,
+                    ..good.clone()
+                },
+            ),
+            (
+                "spk_channels",
+                MapReply {
+                    spk_channels: 1,
+                    ..good.clone()
+                },
+            ),
+            (
+                "mic_channels",
+                MapReply {
+                    mic_channels: 2,
+                    ..good.clone()
+                },
+            ),
+            (
+                "spk_bytes",
+                MapReply {
+                    spk_bytes: 65_536,
+                    ..good.clone()
+                },
+            ),
+            (
+                "mic_bytes",
+                MapReply {
+                    mic_bytes: 65_536,
+                    ..good.clone()
+                },
+            ),
         ] {
-            let e = bad.geometry_error().unwrap_or_else(|| panic!("{field} must be refused"));
+            let e = bad
+                .geometry_error()
+                .unwrap_or_else(|| panic!("{field} must be refused"));
             assert!(e.contains(field), "the message must name {field}: {e}");
         }
 
@@ -4448,12 +4792,24 @@ mod tests {
         // geometry the daemon cannot consume, but a count it cannot index.
         for n in [0u32, 3, 33, 64, u32::MAX] {
             assert!(
-                MapReply { ring_count: n, ..good.clone() }.geometry_error().is_some(),
+                MapReply {
+                    ring_count: n,
+                    ..good.clone()
+                }
+                .geometry_error()
+                .is_some(),
                 "ring_count {n} must be refused"
             );
         }
         for n in [2u32, 4, 32] {
-            assert_eq!(MapReply { ring_count: n, ..good.clone() }.geometry_error(), None);
+            assert_eq!(
+                MapReply {
+                    ring_count: n,
+                    ..good.clone()
+                }
+                .geometry_error(),
+                None
+            );
         }
     }
 
@@ -4465,8 +4821,15 @@ mod tests {
         assert_eq!(b.len(), 24);
         assert_eq!(&b[0..8], &0x0102_0304_0506_0708u64.to_le_bytes());
         assert_eq!(&b[8..12], &9u32.to_le_bytes(), "slot at 8");
-        assert_eq!(&b[12..16], &0x1234_5678u32.to_le_bytes(), "generation at 12");
-        assert_eq!(&b[16..20], &(NOTIFYFLAG_INPUT | NOTIFYFLAG_MUTED).to_le_bytes());
+        assert_eq!(
+            &b[12..16],
+            &0x1234_5678u32.to_le_bytes(),
+            "generation at 12"
+        );
+        assert_eq!(
+            &b[16..20],
+            &(NOTIFYFLAG_INPUT | NOTIFYFLAG_MUTED).to_le_bytes()
+        );
         assert_eq!(&b[20..24], &0x8000u32.to_le_bytes(), "scalar_q16 at 20");
     }
 
@@ -4497,7 +4860,18 @@ mod tests {
     /// not a fudge factor — it is exactly what a 16.16 encoding costs.
     #[test]
     fn the_notify_scalar_round_trips_through_16_16_fixed_point() {
-        for &v in &[0.0f32, 0.01, 0.1, 0.25, 1.0 / 3.0, 0.5, 0.75, 0.9, 0.99, 1.0] {
+        for &v in &[
+            0.0f32,
+            0.01,
+            0.1,
+            0.25,
+            1.0 / 3.0,
+            0.5,
+            0.75,
+            0.9,
+            0.99,
+            1.0,
+        ] {
             let b = encode_notify_request(1, 0, 0, false, false, v);
             let q = u32::from_le_bytes([b[20], b[21], b[22], b[23]]);
             let back = q16_to_scalar(q);
@@ -4537,7 +4911,11 @@ mod tests {
         assert_eq!(&b[20..24], &5808u32.to_le_bytes(), "frames @20, VERBATIM");
         // and specifically NOT the two ways it could have been mangled
         assert_ne!(&b[20..24], &5808f32.to_bits().to_le_bytes(), "float bits");
-        assert_ne!(&b[20..24], &scalar_to_q16(5808.0).to_le_bytes(), "16.16 fixed point");
+        assert_ne!(
+            &b[20..24],
+            &scalar_to_q16(5808.0).to_le_bytes(),
+            "16.16 fixed point"
+        );
     }
 
     /// The speaker direction leaves the flag CLEAR. Nothing declares the
@@ -4563,7 +4941,10 @@ mod tests {
         let r = decode_latency_reply(&b).expect("well formed");
         assert_eq!(r.status, STATUS_BAD_ARGUMENT);
         assert_eq!(r.frames, 5808, "拒绝了，但它手上仍然是上一次那个值");
-        assert!(decode_latency_reply(&b[..7]).is_none(), "短回复不许当成 0 帧");
+        assert!(
+            decode_latency_reply(&b[..7]).is_none(),
+            "短回复不许当成 0 帧"
+        );
     }
 
     /// The ceiling this side enforces IS the driver's, transcribed
@@ -4571,7 +4952,11 @@ mod tests {
     #[test]
     fn the_latency_ceiling_matches_the_drivers() {
         assert_eq!(LATENCY_MAX_FRAMES, 192_000, "AudioHubIoctl.h: 48000u * 4u");
-        assert_eq!(LATENCY_MAX_FRAMES, crate::devdecl::MAX_FRAMES, "and the daemon's own");
+        assert_eq!(
+            LATENCY_MAX_FRAMES,
+            crate::devdecl::MAX_FRAMES,
+            "and the daemon's own"
+        );
     }
 
     /// Out of range in either direction is CLAMPED, not wrapped. This number
@@ -4611,7 +4996,10 @@ mod tests {
         );
 
         b[0..4].copy_from_slice(&STATUS_STALE_SESSION.to_le_bytes());
-        assert_eq!(decode_notify_reply(&b).unwrap().status, STATUS_STALE_SESSION);
+        assert_eq!(
+            decode_notify_reply(&b).unwrap().status,
+            STATUS_STALE_SESSION
+        );
     }
 
     // -- capabilities -------------------------------------------------------
@@ -4633,9 +5021,15 @@ mod tests {
         };
         assert!(!hello(0).has_dataplane() && !hello(0).has_volume());
         assert!(hello(CAP_DATAPLANE).has_dataplane());
-        assert!(!hello(CAP_DATAPLANE).has_volume(), "rings do not imply a volume node");
+        assert!(
+            !hello(CAP_DATAPLANE).has_volume(),
+            "rings do not imply a volume node"
+        );
         assert!(hello(CAP_VOLUME).has_volume());
-        assert!(!hello(CAP_VOLUME).has_dataplane(), "a volume node does not imply rings");
+        assert!(
+            !hello(CAP_VOLUME).has_dataplane(),
+            "a volume node does not imply rings"
+        );
         let both = hello(CAP_DATAPLANE | CAP_VOLUME);
         assert!(both.has_dataplane() && both.has_volume());
         // An unknown future bit must move neither answer.
@@ -4650,13 +5044,24 @@ mod tests {
     /// for `MmMapLockedPagesSpecifyCache`.
     #[test]
     fn the_ring_byte_sizes_hold_the_frames_they_claim_and_are_page_aligned() {
-        for (bytes, ch, what) in
-            [(SPK_BYTES, SPK_CHANNELS, "speaker"), (MIC_BYTES, MIC_CHANNELS, "microphone")]
-        {
+        for (bytes, ch, what) in [
+            (SPK_BYTES, SPK_CHANNELS, "speaker"),
+            (MIC_BYTES, MIC_CHANNELS, "microphone"),
+        ] {
             let need = RING_DATA_OFFSET + (RING_FRAMES as usize) * (ch as usize) * 4;
-            assert!(bytes >= need, "the {what} ring is {bytes} bytes, it needs {need}");
-            assert!(bytes - need < 16_384, "the {what} ring is over-allocated by a whole page");
-            assert_eq!(bytes % 16_384, 0, "the {what} ring must be 16K-page aligned");
+            assert!(
+                bytes >= need,
+                "the {what} ring is {bytes} bytes, it needs {need}"
+            );
+            assert!(
+                bytes - need < 16_384,
+                "the {what} ring is over-allocated by a whole page"
+            );
+            assert_eq!(
+                bytes % 16_384,
+                0,
+                "the {what} ring must be 16K-page aligned"
+            );
         }
         // 500 ms, which is what the whole latency budget is written against.
         assert_eq!(RING_FRAMES, (RING_SAMPLE_RATE / 1000) * 500);

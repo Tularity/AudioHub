@@ -20,6 +20,7 @@ Abstract:
 #include "endpoints.h"
 #include "minipairs.h"
 #include "perpeer.h"
+#include "ahrings.h"
 
 //-----------------------------------------------------------------------------
 // State
@@ -39,8 +40,8 @@ static BOOLEAN          g_AhInitialised = FALSE;
 static PDEVICE_OBJECT   g_AhPdo = NULL;
 
 //
-// The direction words, READ BACK from the INF's static MediaCategories entries
-// at attach time rather than compiled in.
+// The generic direction names, READ BACK from the INF's static MediaCategories
+// entries at attach time rather than compiled in.
 //
 // Two reasons this is worth a registry read. First, the strings are localizable
 // resources and the INF's [Strings] section is the only place that can ever
@@ -85,8 +86,8 @@ static const DEVPROPKEY AhDevpkeyInterfaceFriendlyName = {
 // delivered as PKEY_Device_DeviceDesc under the interface's EP\0 key, and why
 // neither the pin name nor the interface FriendlyName can do it for a speaker.
 //
-// MediaCategories is still READ here -- it is where the INF keeps the
-// localizable direction words -- but it is no longer WRITTEN. Microsoft
+// MediaCategories is still READ here -- it is where the INF keeps the generic
+// fallback names -- but it is no longer WRITTEN. Microsoft
 // documents the machine-wide key as "reserved for global definitions and
 // should not be modified by new drivers ... will not be supported in a future
 // OS release", and the per-peer software-key entries it used to hold turned
@@ -519,57 +520,22 @@ AhComposeEndpointName(
 
 Routine Description:
 
-    "AudioHub - WIN-30" + " " + "<speaker>".
-
-    TRUNCATION RULE: the PEER's half is what gets cut, never the direction word.
-    A pair of devices that both read "AudioHub - some-very-long-hostna" is
-    merely ugly; a pair that both read "AudioHub - host" with no direction left
-    is unusable, because the only thing distinguishing a speaker from a
-    microphone in the list would be gone.
+    Copies the daemon-composed peer label verbatim. Render and capture use the
+    SAME label; Windows already separates them into output and input device
+    lists, and their endpoint identities and data-flow directions remain
+    distinct. DirectionWord is retained only because the INF values remain the
+    generic fallback when this per-peer property cannot be written.
 
 --*/
 {
     PAGED_CODE();
 
-    SIZE_T dirLen = 0;
-    while (DirectionWord[dirLen] != L'\0') { dirLen++; }
-
-    if (dirLen == 0 || Chars < dirLen + 3)
-    {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    //
-    // Room for " " + direction word + NUL.
-    //
-    SIZE_T budget = Chars - dirLen - 2;
-    SIZE_T n      = 0;
-    while (n < budget - 1 && Display[n] != L'\0')
-    {
-        Out[n] = Display[n];
-        n++;
-    }
-    //
-    // Never end a truncated name on a high surrogate: half a pair is not valid
-    // UTF-16 and this string is about to be written into the registry. Chinese
-    // is in the BMP, but a peer's computer name may hold an emoji -- macOS
-    // allows it -- and the daemon's own clamp guards the same boundary.
-    //
-    if (n > 0 && Out[n - 1] >= 0xD800 && Out[n - 1] <= 0xDBFF)
-    {
-        n--;
-    }
-    Out[n++] = L' ';
-    for (SIZE_T i = 0; i < dirLen; i++)
-    {
-        Out[n++] = DirectionWord[i];
-    }
-    Out[n] = L'\0';
-    return STATUS_SUCCESS;
+    UNREFERENCED_PARAMETER(DirectionWord);
+    return RtlStringCchCopyW(Out, Chars, Display);
 }
 
 //
-// THE ONE PLACE A DIRECTION IS NAMED.
+// THE ONE PLACE THE TWO DIRECTIONAL INTERFACES ARE NAMED.
 //
 // Everything below this table treats the two directions as an array index.
 // That is deliberate and it is the actual fix, not decoration: the defect this
@@ -661,8 +627,8 @@ AhApplyEndpointNames(
 
 Routine Description:
 
-    Composes this slot's endpoint names and writes each one into its own
-    TOPOLOGY interface's EP\0 key.
+    Copies this slot's one peer label to both endpoint-name buffers and writes
+    each copy into its own TOPOLOGY interface's EP\0 key.
 
     Sets Slot->NameFallback when the peer's name could NOT be made to appear, in
     which case the endpoints come up under the system's generic direction names.
@@ -679,19 +645,6 @@ Routine Description:
     PAGED_CODE();
 
     Slot->NameFallback = FALSE;
-
-    if (!g_AhDirWordsOk)
-    {
-        //
-        // The INF's own entries could not be read, so there is no direction
-        // word to append. Composing without one would publish a speaker and a
-        // microphone under the SAME string -- strictly worse than generic
-        // names, which at least still say which is which.
-        //
-        DPF(D_ERROR, ("[AhApplyEndpointNames] no direction words; per-peer naming disabled"));
-        Slot->NameFallback = TRUE;
-        return;
-    }
 
     AH_NAME_TARGET targets[AH_NAME_DIRECTIONS];
     AhNameTargets(Slot, targets);
@@ -1023,7 +976,7 @@ AhSlotPublishedMask(
 
 Routine Description:
 
-    Which halves of this slot's device pair the driver ACTUALLY holds.
+    Which directions of this slot the driver ACTUALLY publishes.
 
     A half counts only when BOTH its filters exist: a topology filter with no
     wave filter (or the reverse) produces no endpoint, and calling that
@@ -1038,6 +991,128 @@ Routine Description:
     if (Slot->OutTopo != NULL && Slot->OutWave != NULL) { mask |= AH_PUB_RENDER; }
     if (Slot->InTopo  != NULL && Slot->InWave  != NULL) { mask |= AH_PUB_CAPTURE; }
     return mask;
+}
+
+// Unlike AhSlotPublishedMask, this includes a direction for which only one of
+// its two port objects survived. Such a half-install is not a usable endpoint,
+// but it MUST be torn down before an idempotent retry can install that direction
+// again. Ignoring it would leak a port while still reporting the requested mask.
+static ULONG
+AhSlotHeldMask(
+    _In_ const AH_SLOT *Slot
+    )
+{
+    PAGED_CODE();
+
+    ULONG mask = 0;
+    if (Slot->OutTopo != NULL || Slot->OutWave != NULL) { mask |= AH_PUB_RENDER; }
+    if (Slot->InTopo  != NULL || Slot->InWave  != NULL) { mask |= AH_PUB_CAPTURE; }
+    return mask;
+}
+
+static ULONG
+AhWantedPublishedMask(
+    _In_ ULONG Flags
+    )
+{
+    ULONG mask = 0;
+    if (Flags & AH_BINDFLAG_WANT_RENDER)  { mask |= AH_PUB_RENDER; }
+    if (Flags & AH_BINDFLAG_WANT_CAPTURE) { mask |= AH_PUB_CAPTURE; }
+    return mask;
+}
+
+// Install exactly one requested direction. The minipairs and endpoint-name
+// properties are prepared before this is called. Keeping this operation
+// directional is what lets a capability change remove a microphone without
+// cycling the peer's still-selected speaker endpoint.
+static NTSTATUS
+AhInstallSlotDirection(
+    _Inout_ PAH_SLOT Slot,
+    _In_    ULONG    Direction,
+    _In_    ULONG    Flags,
+    _Out_   PULONG   Stage
+    )
+{
+    PAGED_CODE();
+
+    const BOOLEAN render = (Direction == AH_PUB_RENDER);
+    const ULONG slot = (ULONG)(Slot - g_AhSlots);
+
+    // Per-slot rings are immortal across endpoint publication changes. Start
+    // each restored direction empty so it cannot replay samples queued before
+    // that capability was withdrawn.
+    AhRingsResetDirection(slot, render ? AUDIOHUB_DIR_OUT : AUDIOHUB_DIR_IN);
+    if ((render && (Flags & AH_BINDFLAG_FAIL_RENDER)) ||
+        (!render && (Flags & AH_BINDFLAG_FAIL_CAPTURE)))
+    {
+        *Stage = render ? AH_STAGE_INSTALL_RENDER : AH_STAGE_INSTALL_CAPTURE;
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    NTSTATUS status;
+    if (render)
+    {
+        status = g_AhAdapter->InstallEndpointFilters(
+            NULL, &Slot->OutPair, &Slot->OutCtx,
+            &Slot->OutTopo, &Slot->OutWave, NULL, NULL);
+        if (NT_SUCCESS(status) && (Slot->OutTopo == NULL || Slot->OutWave == NULL))
+        {
+            *Stage = AH_STAGE_VERIFY;
+            return STATUS_UNSUCCESSFUL;
+        }
+        *Stage = NT_SUCCESS(status) ? AH_STAGE_NONE : AH_STAGE_INSTALL_RENDER;
+    }
+    else
+    {
+        status = g_AhAdapter->InstallEndpointFilters(
+            NULL, &Slot->InPair, &Slot->InCtx,
+            &Slot->InTopo, &Slot->InWave, NULL, NULL);
+        if (NT_SUCCESS(status) && (Slot->InTopo == NULL || Slot->InWave == NULL))
+        {
+            *Stage = AH_STAGE_VERIFY;
+            return STATUS_UNSUCCESSFUL;
+        }
+        *Stage = NT_SUCCESS(status) ? AH_STAGE_NONE : AH_STAGE_INSTALL_CAPTURE;
+    }
+    return status;
+}
+
+static NTSTATUS
+AhRemoveSlotDirections(
+    _Inout_ PAH_SLOT Slot,
+    _In_    ULONG    Directions,
+    _In_    ULONG    DebugFlags,
+    _Out_   PULONG   FailStage
+    )
+{
+    PAGED_CODE();
+
+    NTSTATUS first = STATUS_SUCCESS;
+    ULONG stage = AH_STAGE_NONE;
+    ULONG at = AH_STAGE_NONE;
+    if ((Directions & AH_PUB_RENDER) && (Slot->OutTopo != NULL || Slot->OutWave != NULL))
+    {
+        NTSTATUS s = g_AhAdapter->RemoveEndpointFilters(
+            &Slot->OutPair, Slot->OutTopo, Slot->OutWave, DebugFlags, &at);
+        if (!NT_SUCCESS(s)) { first = s; stage = at; }
+        SAFE_RELEASE(Slot->OutTopo);
+        SAFE_RELEASE(Slot->OutWave);
+        // RemoveEndpointFilters has stopped every WaveRT callback. Reset at
+        // this quiet boundary, not before it, or a final callback could refill
+        // the otherwise immortal per-slot ring with withdrawn audio.
+        AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_OUT);
+    }
+    if ((Directions & AH_PUB_CAPTURE) && (Slot->InTopo != NULL || Slot->InWave != NULL))
+    {
+        NTSTATUS s = g_AhAdapter->RemoveEndpointFilters(
+            &Slot->InPair, Slot->InTopo, Slot->InWave, DebugFlags, &at);
+        if (!NT_SUCCESS(s) && NT_SUCCESS(first)) { first = s; stage = at; }
+        SAFE_RELEASE(Slot->InTopo);
+        SAFE_RELEASE(Slot->InWave);
+        AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_IN);
+    }
+    *FailStage = stage;
+    return first;
 }
 
 #pragma code_seg("PAGE")
@@ -1085,6 +1160,8 @@ Routine Description:
         // that reaches this, and it runs before the adapter is Released.
         //
         Slot->OutTopo = Slot->OutWave = Slot->InTopo = Slot->InWave = NULL;
+        AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_OUT);
+        AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_IN);
         //
         // The registry entries outlive the adapter and are still ours to
         // remove: they live under the PDO's software key and the machine-wide
@@ -1115,6 +1192,11 @@ Routine Description:
     SAFE_RELEASE(Slot->OutWave);
     SAFE_RELEASE(Slot->InTopo);
     SAFE_RELEASE(Slot->InWave);
+
+    // A slot can be handed to another peer without remapping the shared ring
+    // table. Never let that next tenant inherit the previous tenant's audio.
+    AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_OUT);
+    AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_IN);
 
     AhRemoveEndpointNames(Slot);
 
@@ -1781,10 +1863,9 @@ AhPerPeerAttachAdapter(
         //
 
         //
-        // Read the direction words back out of the INF's own static
-        // MediaCategories entries. Reading rather than hardcoding keeps the
-        // localizable strings in [Strings], the only place that can ever grow a
-        // [Strings.0409].
+        // Read the generic direction names back out of the INF's own static
+        // MediaCategories entries. They remain the fallback if writing the
+        // per-peer name fails; the happy path does not append them.
         //
         NTSTATUS o = AhReadPinNameValue(&AH_PIN_NAME_OUT, g_AhDirWordOut, AH_DIRWORD_CHARS);
         NTSTATUS i = AhReadPinNameValue(&AH_PIN_NAME_IN,  g_AhDirWordIn,  AH_DIRWORD_CHARS);
@@ -1792,14 +1873,12 @@ AhPerPeerAttachAdapter(
         if (!g_AhDirWordsOk)
         {
             //
-            // NOT fatal, and NOT silent. Every bind from here on reports
-            // AH_BINDREPLY_FLAG_NAME_FALLBACK, so the daemon can say that
-            // the devices are unnamed because the INF's own strings are
-            // missing -- which is an install problem, not a pairing problem,
-            // and the two are otherwise indistinguishable from the outside.
+            // NOT fatal: the per-peer PKEY_Device_DeviceDesc path does not
+            // depend on these values. If that path later fails too, Windows's
+            // built-in endpoint naming is the last fallback.
             //
-            DPF(D_ERROR, ("[AhPerPeerAttachAdapter] INF direction names unreadable "
-                          "(0x%x / 0x%x); per-peer device names disabled", o, i));
+            DPF(D_ERROR, ("[AhPerPeerAttachAdapter] INF fallback names unreadable "
+                          "(0x%x / 0x%x)", o, i));
         }
         else
         {
@@ -1887,17 +1966,17 @@ AhSlotBindSet(
 
 Routine Description:
 
-    Publishes one peer's pair of endpoints, ALL OR NOTHING.
+    Publishes exactly the endpoint directions requested for one peer.
 
     The invariant this routine exists to guarantee:
 
-        AhStatus == AH_STATUS_OK  =>  Result->Published == AH_PUB_BOTH
+        AhStatus == AH_STATUS_OK  =>
+            Result->Published == AhWantedPublishedMask(Flags)
 
-    Half a pair is worthless to a user -- a machine that can be spoken to but
-    not heard from, published under a name that promises both -- and it is not
-    representable in the daemon's model either. So a failure on either half
-    removes the other half again and reports the failure with the stage and the
-    kernel status that caused it.
+    A single endpoint is intentional when the remote machine has only that
+    default direction.  An UNREQUESTED or missing requested endpoint is the
+    failure.  Fresh-bind failures roll back what this call installed; changing
+    an existing peer's mask preserves directions that were not being changed.
 
     The one escape hatch is AH_BINDFLAG_SKIP_ROLLBACK, which exists so a test
     can OBSERVE the partial state (reported as AH_STATUS_PARTIAL, never as OK).
@@ -1939,6 +2018,7 @@ Routine Description:
     AH_LOCK();
 
     PAH_SLOT s = &g_AhSlots[Slot];
+    const ULONG want = AhWantedPublishedMask(Flags);
 
     if (g_AhAdapter == NULL)
     {
@@ -1952,7 +2032,8 @@ Routine Description:
         if (strncmp(s->PeerKey, PeerKey, AH_PEERKEY_BUF) == 0)
         {
             ULONG have = AhSlotPublishedMask(s);
-            if (have == AH_PUB_BOTH)
+            ULONG held = AhSlotHeldMask(s);
+            if (have == want && held == have)
             {
                 //
                 // Idempotent re-Set. The daemon re-Sets whenever a peer's
@@ -1988,14 +2069,62 @@ Routine Description:
             }
 
             //
-            // Bound but not whole. Repair rather than report success: an
-            // idempotent operation has to converge on the intended state, and
-            // "do nothing, it is already bound" would leave the user with a
-            // permanently missing speaker that no retry could ever fix.
+            // Same peer, different advertised capabilities. Change only the
+            // directions that differ: cycling the surviving endpoint would
+            // make Windows move a user's default-device selection away from it.
             //
-            DPF(D_ERROR, ("[AhSlotBindSet] slot %u bound but published=0x%x; reinstalling", Slot, have));
-            (VOID)AhRemoveSlotEndpoints(s, 0, NULL);
-            s->State = AH_SLOT_FREE;
+            ULONG changedStage = AH_STAGE_NONE;
+            // Remove every now-unwanted complete direction AND every broken
+            // half-install. A broken requested direction must be clean before
+            // InstallEndpointFilters can safely retry it.
+            ULONG remove = (have & ~want) | (held & ~have);
+            NTSTATUS changed = AhRemoveSlotDirections(s, remove, 0, &changedStage);
+            for (ULONG direction = AH_PUB_RENDER; NT_SUCCESS(changed) && direction <= AH_PUB_CAPTURE; direction <<= 1)
+            {
+                if ((want & direction) != 0 && (AhSlotPublishedMask(s) & direction) == 0)
+                {
+                    changed = AhInstallSlotDirection(s, direction, Flags, &changedStage);
+                    if (!NT_SUCCESS(changed))
+                    {
+                        // InstallEndpointFilters can fail after returning one
+                        // of the two port pointers. The fresh-bind path below
+                        // removes the whole slot; this reconcile path must
+                        // explicitly clean only the direction it just tried so
+                        // the peer's surviving endpoint is not cycled.
+                        ULONG cleanupStage = AH_STAGE_NONE;
+                        NTSTATUS cleanup = AhRemoveSlotDirections(s, direction, 0, &cleanupStage);
+                        if (!NT_SUCCESS(cleanup))
+                        {
+                            DPF(D_ERROR, ("[AhSlotBindSet] slot %u direction 0x%x "
+                                          "cleanup failed 0x%x (stage %u)",
+                                          Slot, direction, cleanup, cleanupStage));
+                            changed = cleanup;
+                            changedStage = AH_STAGE_ROLLBACK;
+                        }
+                    }
+                }
+            }
+            Result->Published = AhSlotPublishedMask(s);
+            if (!NT_SUCCESS(changed) || Result->Published != want)
+            {
+                Result->Stage = (changedStage == AH_STAGE_NONE) ? AH_STAGE_VERIFY : changedStage;
+                Result->NtStatus = NT_SUCCESS(changed) ? STATUS_UNSUCCESSFUL : changed;
+                *Generation = s->Generation;
+                *State = AH_SLOT_BOUND;
+                *AhStatus = AH_STATUS_PARTIAL;
+                goto Done;
+            }
+
+            // Fence late IO/volume events from a direction that disappeared
+            // and came back while preserving every endpoint object that stayed.
+            s->Generation = g_AhNextGeneration++;
+            if (g_AhNextGeneration == 0) { g_AhNextGeneration = 1; }
+            s->Flags = Flags;
+            *Generation = s->Generation;
+            *State = AH_SLOT_BOUND;
+            *AhStatus = AH_STATUS_OK;
+            if (s->NameFallback) { Result->Flags |= AH_BINDREPLY_FLAG_NAME_FALLBACK; }
+            goto Done;
         }
         else
         {
@@ -2075,88 +2204,30 @@ Routine Description:
         goto Done;
     }
 
-    //
-    // Render first, then capture.
-    //
-    if (Flags & AH_BINDFLAG_FAIL_RENDER)
+    // Install only the directions the peer advertised, render first. Zero is a
+    // valid mask: the pairing keeps its stable slot but publishes no endpoint.
+    for (ULONG direction = AH_PUB_RENDER; direction <= AH_PUB_CAPTURE; direction <<= 1)
     {
-        status = STATUS_UNSUCCESSFUL;
-        stage  = AH_STAGE_INSTALL_RENDER;
-    }
-    else
-    {
-        status = g_AhAdapter->InstallEndpointFilters(
-            NULL,                   // no IRP: this is a dynamic install, exactly as
-                                    // sysvad's Bluetooth path does it
-            &s->OutPair,
-            &s->OutCtx,             // DeviceContext -> every miniport of this
-                                    // endpoint learns its slot and direction
-            &s->OutTopo,
-            &s->OutWave,
-            NULL, NULL);
-        if (NT_SUCCESS(status) && (s->OutTopo == NULL || s->OutWave == NULL))
+        if ((want & direction) == 0) { continue; }
+        status = AhInstallSlotDirection(s, direction, Flags, &stage);
+        if (!NT_SUCCESS(status))
         {
-            //
-            // "It returned success" and "there is a filter" are different
-            // facts. Checking the second one is what makes a silently
-            // half-installed endpoint impossible to report as bound.
-            //
-            status = STATUS_UNSUCCESSFUL;
-            stage  = AH_STAGE_VERIFY;
+            DPF(D_ERROR, ("[AhSlotBindSet] slot %u direction 0x%x install failed 0x%x (stage %u)",
+                          Slot, direction, status, stage));
+            goto Failed;
         }
-        else if (!NT_SUCCESS(status))
-        {
-            stage = AH_STAGE_INSTALL_RENDER;
-        }
-    }
-
-    if (!NT_SUCCESS(status))
-    {
-        DPF(D_ERROR, ("[AhSlotBindSet] slot %u render install failed 0x%x (stage %u)", Slot, status, stage));
-        goto Failed;
-    }
-
-    if (Flags & AH_BINDFLAG_FAIL_CAPTURE)
-    {
-        status = STATUS_UNSUCCESSFUL;
-        stage  = AH_STAGE_INSTALL_CAPTURE;
-    }
-    else
-    {
-        status = g_AhAdapter->InstallEndpointFilters(
-            NULL,
-            &s->InPair,
-            &s->InCtx,
-            &s->InTopo,
-            &s->InWave,
-            NULL, NULL);
-        if (NT_SUCCESS(status) && (s->InTopo == NULL || s->InWave == NULL))
-        {
-            status = STATUS_UNSUCCESSFUL;
-            stage  = AH_STAGE_VERIFY;
-        }
-        else if (!NT_SUCCESS(status))
-        {
-            stage = AH_STAGE_INSTALL_CAPTURE;
-        }
-    }
-
-    if (!NT_SUCCESS(status))
-    {
-        DPF(D_ERROR, ("[AhSlotBindSet] slot %u capture install failed 0x%x (stage %u)", Slot, status, stage));
-        goto Failed;
     }
 
     //
     // The invariant, checked rather than assumed.
     //
     Result->Published = AhSlotPublishedMask(s);
-    if (Result->Published != AH_PUB_BOTH)
+    if (Result->Published != want)
     {
         status = STATUS_UNSUCCESSFUL;
         stage  = AH_STAGE_VERIFY;
-        DPF(D_ERROR, ("[AhSlotBindSet] slot %u published=0x%x after two successful installs",
-                      Slot, Result->Published));
+        DPF(D_ERROR, ("[AhSlotBindSet] slot %u published=0x%x, wanted=0x%x",
+                      Slot, Result->Published, want));
         goto Failed;
     }
 

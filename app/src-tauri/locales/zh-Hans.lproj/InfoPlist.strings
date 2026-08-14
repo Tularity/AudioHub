@@ -1,0 +1,7 @@
+/* macOS 系统权限弹窗（简体中文）。三项键须与 Info.plist 和英文文件保持一致。 */
+
+"NSMicrophoneUsageDescription" = "AudioHub 需要使用麦克风，才能把本机的麦克风声音共享给已配对的另一台设备（例如让 Windows 电脑使用这台 Mac 的麦克风）。仅在你主动开启共享时采集，音频只在局域网内点对点加密传输。";
+
+"NSAudioCaptureUsageDescription" = "AudioHub 需要录制本机的系统音频，才能把这台 Mac 正在播放的声音共享给已配对的另一台设备（例如让 Windows 电脑播放这台 Mac 的音乐）。仅在你主动开启共享时采集，音频只在局域网内点对点加密传输。";
+
+"NSLocalNetworkUsageDescription" = "AudioHub 需要访问本地网络，才能发现同一局域网内的 AudioHub 设备、发布 AirPlay 音频接收器，并直接传输音频。音频不会上传到互联网。";

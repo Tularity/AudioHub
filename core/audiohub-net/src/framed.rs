@@ -107,13 +107,11 @@ pub enum FramedError {
 /// byte for byte; a media writer forwards those bytes untouched. This exists
 /// for [`Kind::Control`] and [`Kind::MuxKeepalive`], which have no datagram to
 /// start from.
-pub fn encode_frame(
-    header: &Header,
-    payload: &[u8],
-    out: &mut Vec<u8>,
-) -> Result<(), FramedError> {
+pub fn encode_frame(header: &Header, payload: &[u8], out: &mut Vec<u8>) -> Result<(), FramedError> {
     if payload.len() > MUX_MAX_PAYLOAD {
-        return Err(FramedError::PayloadTooLarge { declared: payload.len() });
+        return Err(FramedError::PayloadTooLarge {
+            declared: payload.len(),
+        });
     }
     let mut h = header.clone();
     h.payload_len = payload.len() as u32;
@@ -145,7 +143,10 @@ pub fn control_header() -> Header {
 
 /// The header for a [`Kind::MuxKeepalive`] frame. Payload is always empty.
 pub fn keepalive_header() -> Header {
-    Header { kind: Kind::MuxKeepalive, ..control_header() }
+    Header {
+        kind: Kind::MuxKeepalive,
+        ..control_header()
+    }
 }
 
 /// One decoded frame, borrowed from the decoder's buffer.
@@ -221,7 +222,12 @@ impl Default for FrameDecoder {
 
 impl FrameDecoder {
     pub fn new() -> FrameDecoder {
-        FrameDecoder { buf: vec![0u8; MUX_MAX_FRAME], len: 0, consumed: 0, poisoned: false }
+        FrameDecoder {
+            buf: vec![0u8; MUX_MAX_FRAME],
+            len: 0,
+            consumed: 0,
+            poisoned: false,
+        }
     }
 
     /// Copies as much of `input` as fits and returns how much that was.
@@ -266,7 +272,9 @@ impl FrameDecoder {
         // something, then check" — and the whole point of MUX_MAX_PAYLOAD is
         // that a stranger's four bytes must never size anything at all.
         let declared = u32::from_le_bytes(
-            self.buf[PAYLOAD_LEN_OFFSET..PAYLOAD_LEN_OFFSET + 4].try_into().unwrap(),
+            self.buf[PAYLOAD_LEN_OFFSET..PAYLOAD_LEN_OFFSET + 4]
+                .try_into()
+                .unwrap(),
         ) as usize;
         if declared > MUX_MAX_PAYLOAD {
             self.poisoned = true;
@@ -289,7 +297,10 @@ impl FrameDecoder {
             }
         };
         self.consumed = total;
-        Ok(Some(Frame { header, frame: &self.buf[..total] }))
+        Ok(Some(Frame {
+            header,
+            frame: &self.buf[..total],
+        }))
     }
 
     /// Live input bytes held, frames already handed out excluded.
@@ -380,7 +391,10 @@ mod tests {
     }
 
     fn ctl(payload_len: usize) -> Header {
-        Header { payload_len: payload_len as u32, ..control_header() }
+        Header {
+            payload_len: payload_len as u32,
+            ..control_header()
+        }
     }
 
     /// Frames of every awkward size: empty, one byte, a real rung-2 datagram,
@@ -389,12 +403,27 @@ mod tests {
         let deepest = LADDER[0].frame_bytes() + AEAD_TAG_LEN;
         vec![
             (ctl(13), br#"{"type":"ok"}"#.to_vec()),
-            (Header { payload_len: 0, ..keepalive_header() }, Vec::new()),
+            (
+                Header {
+                    payload_len: 0,
+                    ..keepalive_header()
+                },
+                Vec::new(),
+            ),
             (media_header(1, 960), vec![0xA5; 960]),
             (ctl(1), vec![7u8]),
             (media_header(2, deepest), vec![0x11; deepest]),
-            (media_header(3, MUX_MAX_PAYLOAD), vec![0x5A; MUX_MAX_PAYLOAD]),
-            (Header { payload_len: 0, ..keepalive_header() }, Vec::new()),
+            (
+                media_header(3, MUX_MAX_PAYLOAD),
+                vec![0x5A; MUX_MAX_PAYLOAD],
+            ),
+            (
+                Header {
+                    payload_len: 0,
+                    ..keepalive_header()
+                },
+                Vec::new(),
+            ),
         ]
     }
 
@@ -428,7 +457,10 @@ mod tests {
                 batch += 1;
             }
             best_batch = best_batch.max(batch);
-            assert!(taken > 0 || batch > 0, "no progress at offset {off} with chunk {chunk}");
+            assert!(
+                taken > 0 || batch > 0,
+                "no progress at offset {off} with chunk {chunk}"
+            );
             off += taken;
         }
         (got, best_batch)
@@ -465,7 +497,10 @@ mod tests {
         let stream = encode_all(&frames);
 
         let (got, batch) = decode_in_chunks(&stream, 1);
-        assert_eq!(got, frames, "one byte at a time must reproduce the input exactly");
+        assert_eq!(
+            got, frames,
+            "one byte at a time must reproduce the input exactly"
+        );
         assert_eq!(batch, 1, "a single byte cannot complete two frames");
 
         // Chunk sizes chosen to land inside headers, inside payloads and across
@@ -496,9 +531,16 @@ mod tests {
     fn an_oversized_payload_length_is_refused_before_anything_is_allocated() {
         const DECLARED: usize = 1 << 30;
         let mut evil = Vec::new();
-        Header { payload_len: DECLARED as u32, ..media_header(1, 0) }
-            .encode_append(&[], &mut evil);
-        assert_eq!(evil.len(), HEADER_LEN, "the header must be intact and complete");
+        Header {
+            payload_len: DECLARED as u32,
+            ..media_header(1, 0)
+        }
+        .encode_append(&[], &mut evil);
+        assert_eq!(
+            evil.len(),
+            HEADER_LEN,
+            "the header must be intact and complete"
+        );
         evil.extend_from_slice(&[0u8; 8]); // ...and 8 bytes of the promised gigabyte
 
         // Constructed outside the measured window: `new` is the one allocation
@@ -507,10 +549,16 @@ mod tests {
 
         let before = bytes_allocated_here();
         let taken = dec.push(&evil);
-        let err = dec.next_frame().expect_err("a gigabyte payload must be refused");
+        let err = dec
+            .next_frame()
+            .expect_err("a gigabyte payload must be refused");
         let spent = bytes_allocated_here() - before;
 
-        assert_eq!(taken, evil.len(), "the bytes were accepted; it is the length that is rejected");
+        assert_eq!(
+            taken,
+            evil.len(),
+            "the bytes were accepted; it is the length that is rejected"
+        );
         assert_eq!(err, FramedError::PayloadTooLarge { declared: DECLARED });
         assert_eq!(
             spent, 0,
@@ -526,14 +574,21 @@ mod tests {
     #[test]
     fn the_oversized_refusal_does_not_wait_for_the_promised_bytes() {
         let mut evil = Vec::new();
-        Header { payload_len: u32::MAX, ..media_header(1, 0) }.encode_append(&[], &mut evil);
+        Header {
+            payload_len: u32::MAX,
+            ..media_header(1, 0)
+        }
+        .encode_append(&[], &mut evil);
 
         let mut dec = FrameDecoder::new();
         let before = bytes_allocated_here();
         for (i, byte) in evil.iter().enumerate() {
             assert_eq!(dec.push(std::slice::from_ref(byte)), 1);
             match dec.next_frame() {
-                Ok(None) => assert!(i < HEADER_LEN - 1, "refusal must come as the header completes"),
+                Ok(None) => assert!(
+                    i < HEADER_LEN - 1,
+                    "refusal must come as the header completes"
+                ),
                 Err(FramedError::PayloadTooLarge { declared }) => {
                     assert_eq!(declared, u32::MAX as usize);
                     assert_eq!(i, HEADER_LEN - 1, "refused at the wrong byte");
@@ -562,9 +617,14 @@ mod tests {
             let mut bytes = Vec::new();
             media_header(1, len).encode_append(&vec![0u8; len], &mut bytes);
             let read = u32::from_le_bytes(
-                bytes[PAYLOAD_LEN_OFFSET..PAYLOAD_LEN_OFFSET + 4].try_into().unwrap(),
+                bytes[PAYLOAD_LEN_OFFSET..PAYLOAD_LEN_OFFSET + 4]
+                    .try_into()
+                    .unwrap(),
             ) as usize;
-            assert_eq!(read, len, "the frame layer reads the wrong four bytes as the length");
+            assert_eq!(
+                read, len,
+                "the frame layer reads the wrong four bytes as the length"
+            );
             assert_eq!(bytes.len(), HEADER_LEN + len);
         }
     }
@@ -580,9 +640,17 @@ mod tests {
         let mut dec = FrameDecoder::new();
         assert_eq!(dec.push(&datagram), datagram.len());
         let frame = dec.next_frame().expect("decode").expect("one whole frame");
-        assert_eq!(frame.bytes(), &datagram[..], "the frame is the datagram, byte for byte");
+        assert_eq!(
+            frame.bytes(),
+            &datagram[..],
+            "the frame is the datagram, byte for byte"
+        );
         assert_eq!(frame.payload(), &payload[..]);
-        assert_eq!(&frame.bytes()[..4], &MAGIC, "the header travels with the payload as AAD");
+        assert_eq!(
+            &frame.bytes()[..4],
+            &MAGIC,
+            "the header travels with the payload as AAD"
+        );
     }
 
     /// The documented drain loop cannot stall. The buffer is exactly one
@@ -595,16 +663,28 @@ mod tests {
             encode_frame(&media_header(1, 0), &vec![0u8; MUX_MAX_PAYLOAD], &mut v).expect("encode");
             v
         };
-        assert_eq!(biggest.len(), MUX_MAX_FRAME, "the largest legal frame fills the buffer exactly");
+        assert_eq!(
+            biggest.len(),
+            MUX_MAX_FRAME,
+            "the largest legal frame fills the buffer exactly"
+        );
 
         let mut dec = FrameDecoder::new();
         assert_eq!(dec.push(&biggest), MUX_MAX_FRAME);
-        assert_eq!(dec.push(b"more"), 0, "the buffer really is full at this point");
+        assert_eq!(
+            dec.push(b"more"),
+            0,
+            "the buffer really is full at this point"
+        );
         assert!(
             dec.next_frame().expect("decode").is_some(),
             "a full buffer must always contain a frame, or the caller has no way to make progress"
         );
-        assert_eq!(dec.push(b"more"), 4, "draining a frame must free the room it occupied");
+        assert_eq!(
+            dec.push(b"more"),
+            4,
+            "draining a frame must free the room it occupied"
+        );
     }
 
     /// A framing error is terminal. The alternative — log and continue — means
@@ -626,8 +706,15 @@ mod tests {
         // A valid frame arriving afterwards must not resurrect the stream.
         let mut good = Vec::new();
         encode_frame(&media_header(2, 0), b"hello", &mut good).expect("encode");
-        assert_eq!(dec.push(&good), 0, "a poisoned decoder accepts nothing further");
-        assert_eq!(dec.next_frame().expect_err("still poisoned"), FramedError::Poisoned);
+        assert_eq!(
+            dec.push(&good),
+            0,
+            "a poisoned decoder accepts nothing further"
+        );
+        assert_eq!(
+            dec.next_frame().expect_err("still poisoned"),
+            FramedError::Poisoned
+        );
     }
 
     /// An unknown `Kind` reaches the caller as a refusal rather than as a frame,
@@ -654,8 +741,16 @@ mod tests {
         let mut out = Vec::new();
         let err = encode_frame(&control_header(), &vec![0u8; MUX_MAX_PAYLOAD + 1], &mut out)
             .expect_err("one byte over the limit must not encode");
-        assert_eq!(err, FramedError::PayloadTooLarge { declared: MUX_MAX_PAYLOAD + 1 });
-        assert!(out.is_empty(), "a refused frame must not leave a partial frame in the buffer");
+        assert_eq!(
+            err,
+            FramedError::PayloadTooLarge {
+                declared: MUX_MAX_PAYLOAD + 1
+            }
+        );
+        assert!(
+            out.is_empty(),
+            "a refused frame must not leave a partial frame in the buffer"
+        );
 
         encode_frame(&control_header(), &vec![0u8; MUX_MAX_PAYLOAD], &mut out)
             .expect("exactly at the limit must encode");
@@ -667,7 +762,10 @@ mod tests {
     /// desynchronises the stream and is discovered frames later.
     #[test]
     fn the_encoder_ignores_a_header_payload_len_that_disagrees_with_the_payload() {
-        let lying = Header { payload_len: 9999, ..media_header(1, 0) };
+        let lying = Header {
+            payload_len: 9999,
+            ..media_header(1, 0)
+        };
         let mut out = Vec::new();
         encode_frame(&lying, b"four", &mut out).expect("encode");
         assert_eq!(out.len(), HEADER_LEN + 4);
@@ -675,7 +773,10 @@ mod tests {
         let mut dec = FrameDecoder::new();
         dec.push(&out);
         let frame = dec.next_frame().expect("decode").expect("a frame");
-        assert_eq!(frame.header.payload_len, 4, "the payload decides, not the header field");
+        assert_eq!(
+            frame.header.payload_len, 4,
+            "the payload decides, not the header field"
+        );
         assert_eq!(frame.payload(), b"four");
     }
 
@@ -687,11 +788,17 @@ mod tests {
         let c = control_header();
         assert_eq!(c.kind, Kind::Control);
         assert_eq!(c.codec, Codec::Passthrough, "a control frame is not audio");
-        assert_eq!((c.channels, c.sample_rate, c.stream_id, c.session_id), (0, 0, 0, 0));
+        assert_eq!(
+            (c.channels, c.sample_rate, c.stream_id, c.session_id),
+            (0, 0, 0, 0)
+        );
 
         let k = keepalive_header();
         assert_eq!(k.kind, Kind::MuxKeepalive);
-        assert_eq!(k.codec, c.codec, "keepalive must not invent a second dialect");
+        assert_eq!(
+            k.codec, c.codec,
+            "keepalive must not invent a second dialect"
+        );
 
         // Both survive a round trip, which is the part that would break if a
         // filler value were ever set to something Header::parse rejects.
@@ -731,7 +838,14 @@ mod tests {
         }
         let spent = bytes_allocated_here() - before;
 
-        assert_eq!(seen, sample_frames().len(), "every frame must have been decoded");
-        assert_eq!(spent, 0, "decoding allocated {spent} bytes; it is supposed to be a borrow");
+        assert_eq!(
+            seen,
+            sample_frames().len(),
+            "every frame must have been decoded"
+        );
+        assert_eq!(
+            spent, 0,
+            "decoding allocated {spent} bytes; it is supposed to be a borrow"
+        );
     }
 }

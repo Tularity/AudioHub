@@ -15,10 +15,11 @@ import { ShortcutSheetHost, toggleShortcutSheet } from './components/ShortcutShe
 import { PermissionsSheetHost, isPermissionsSheetOpen, openPermissionsSheet } from './components/PermissionsSheet';
 import { installShortcuts } from './lib/shortcutHost';
 import { pendingSignature, readPermSeen, shouldAutoOpenPermissions } from './lib/permIntro';
+import { installNativeSettingsMenu } from './lib/nativeMenu';
 import type { ShortcutActionId } from './lib/shortcuts';
 import { actions, getState, useStore } from './state/store';
 import { isShareMode } from './state/mode';
-import { boot, gateVisible, syncTray } from './state/connection';
+import { boot, gateVisible, syncNativeAppearance, syncTray } from './state/connection';
 import { subscribeLocale, subscribeTheme } from './lib/appearanceHost';
 import { getLocale, t } from './i18n';
 
@@ -117,11 +118,24 @@ export function App() {
   usePermissionIntro(gate);
 
   useEffect(() => { boot(); }, []);
+  // macOS consumes Command-comma in its application menu before WebKit sees a
+  // keydown. The native item emits this event, restoring/focusing the window
+  // on the Rust side first. Browser mode can keep the inert listener: it has no
+  // native emitter, and avoiding a Tauri-global timing check keeps early menu
+  // clicks reliable while the shell is still booting.
+  useEffect(() => installNativeSettingsMenu(
+    window,
+    () => actions.navigate('settings'),
+  ), []);
   // 托盘状态跟着连接走；syncTray 自带去重，重复调用无副作用。
   useEffect(() => useStore.subscribe(syncTray), []);
   // 主题不在 store 里（它是 localStorage + matchMedia，见 lib/appearanceHost），
   // 所以上面那条订阅看不见它变。Dock 图标要跟着深浅走，就得单独订一份。
   useEffect(() => subscribeTheme(syncTray), []);
+  // Unlike ordinary browser copy, native device/tray strings are machine-wide.
+  // connection.ts enforces the Tauri-only boundary before writing the resolved
+  // locale to the daemon; this subscription makes an in-app switch immediate.
+  useEffect(() => subscribeLocale(syncNativeAppearance), []);
   // 授权门挡着的时候不派发：那时候导航到别的页面只会得到一屏查不出任何东西的空视图。
   useEffect(() => (gate ? undefined : installShortcuts(dispatch)), [gate, dispatch]);
 

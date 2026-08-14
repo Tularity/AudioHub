@@ -478,21 +478,23 @@ fn write_control_frame<W: Write>(
     let frame = link.io.take_control_frame()?;
     bucket.gate(shutdown);
     let hard_at = Instant::now() + FRAME_COMPLETION_LIMIT;
-    Some(match write_one_frame(w, &frame, hard_at, hard_at, shutdown) {
-        WriteOutcome::Sent => {
-            bucket.charge(frame.len());
-            link.control_frames_written.fetch_add(1, Ordering::Relaxed);
-            WriteOutcome::Sent
-        }
-        // Not one byte of it moved in five seconds. The stream is still in
-        // sync, so the frame goes back at the head — but the link is finished
-        // either way, and saying so is better than retrying forever.
-        WriteOutcome::Stale => {
-            link.io.requeue_control_frame(frame);
-            WriteOutcome::Dead
-        }
-        WriteOutcome::Dead => WriteOutcome::Dead,
-    })
+    Some(
+        match write_one_frame(w, &frame, hard_at, hard_at, shutdown) {
+            WriteOutcome::Sent => {
+                bucket.charge(frame.len());
+                link.control_frames_written.fetch_add(1, Ordering::Relaxed);
+                WriteOutcome::Sent
+            }
+            // Not one byte of it moved in five seconds. The stream is still in
+            // sync, so the frame goes back at the head — but the link is finished
+            // either way, and saying so is better than retrying forever.
+            WriteOutcome::Stale => {
+                link.io.requeue_control_frame(frame);
+                WriteOutcome::Dead
+            }
+            WriteOutcome::Dead => WriteOutcome::Dead,
+        },
+    )
 }
 
 /// Is a control frame allowed to go out right now?
@@ -517,6 +519,15 @@ fn control_may_go(link: &MuxLink, last_control: Instant) -> bool {
 /// Generic over the sink so the starvation property can be exercised against a
 /// writer that blocks on command rather than against a network.
 pub(crate) fn write_loop<W: Write + Heartbeat>(link: &MuxLink, w: &mut W, shutdown: &AtomicBool) {
+    write_loop_with_park_slice(link, w, shutdown, WRITE_SLICE);
+}
+
+fn write_loop_with_park_slice<W: Write + Heartbeat>(
+    link: &MuxLink,
+    w: &mut W,
+    shutdown: &AtomicBool,
+    park_slice: Duration,
+) {
     link.media.adopt_writer_thread();
     link.io.writer.adopt_current();
     // One bucket for the whole connection, because there is one wire. Charging
@@ -583,7 +594,10 @@ pub(crate) fn write_loop<W: Write + Heartbeat>(link: &MuxLink, w: &mut W, shutdo
         // due while the link is busy still goes out on the next lull instead of
         // waiting for a park slice that a saturated link never reaches.
         if let Err(e) = w.tick() {
-            dlog!("[audiohubd] tier2 mux {}: carrier heartbeat: {e}", link.media.peer);
+            dlog!(
+                "[audiohubd] tier2 mux {}: carrier heartbeat: {e}",
+                link.media.peer
+            );
             link.kill();
             return;
         }
@@ -597,7 +611,8 @@ pub(crate) fn write_loop<W: Write + Heartbeat>(link: &MuxLink, w: &mut W, shutdo
         // Arming it around the park is what makes `MuxControlStream::flush`'s
         // `wake()` reach this thread instead of returning silently.
         link.io.writer.armed(|| {
-            link.media.park_writer(WRITE_SLICE, || link.io.control_pending());
+            link.media
+                .park_writer(park_slice, || link.io.control_pending());
         });
     }
 }
@@ -716,7 +731,10 @@ mod tests {
             while off < buf.len() {
                 off += self.dec.push(&buf[off..]);
                 while let Some(f) = self.dec.next_frame().expect("decode") {
-                    self.frames.lock().unwrap().push((f.header.kind, Instant::now()));
+                    self.frames
+                        .lock()
+                        .unwrap()
+                        .push((f.header.kind, Instant::now()));
                 }
             }
             Ok(buf.len())
@@ -801,7 +819,12 @@ mod tests {
 
     /// Drive the scheduler until it has nothing left to do, without spawning a
     /// thread: one pass of the inner drain loop.
-    fn drain(link: &MuxLink, w: &mut Recorder, bucket: &mut TokenBucket, last_control: &mut Instant) {
+    fn drain(
+        link: &MuxLink,
+        w: &mut Recorder,
+        bucket: &mut TokenBucket,
+        last_control: &mut Instant,
+    ) {
         let shutdown = AtomicBool::new(false);
         loop {
             if control_may_go(link, *last_control) {
@@ -881,7 +904,11 @@ mod tests {
         let t0 = Instant::now();
         drain(&link, &mut w, &mut bucket, &mut last);
 
-        assert_eq!(seen.lock().unwrap().len(), 5, "an idle link held control frames back");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            5,
+            "an idle link held control frames back"
+        );
         assert!(
             t0.elapsed() < CONTROL_CREDIT,
             "five control frames on an idle link took {:?}; the credit is a floor, not a rate limit",
@@ -972,7 +999,11 @@ mod tests {
         std::thread::sleep(crate::tcpmedia::STALE_BUDGET + Duration::from_millis(20));
         let out = write_control_frame(&link, &mut w, &shutdown, &mut bucket);
 
-        assert_eq!(out, Some(WriteOutcome::Sent), "an aged control frame was discarded");
+        assert_eq!(
+            out,
+            Some(WriteOutcome::Sent),
+            "an aged control frame was discarded"
+        );
         assert_eq!(seen.lock().unwrap().len(), 1);
         assert_eq!(link.control_frames_written(), 1);
     }
@@ -1001,7 +1032,11 @@ mod tests {
             write_one_queued(&link.media, &mut w, &shutdown, &mut bucket, None),
             Some(WriteOutcome::Stale)
         );
-        assert_eq!(seen.lock().unwrap().len(), 0, "a stale media frame reached the wire");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            0,
+            "a stale media frame reached the wire"
+        );
         assert_eq!(link.media.stale_dropped(), 1, "the drop was not counted");
     }
 
@@ -1015,7 +1050,10 @@ mod tests {
         assert_eq!(link.media.unexpected_kind(), 0);
         link.media.note_unexpected_kind();
         assert_eq!(link.media.unexpected_kind(), 1);
-        assert!(link.is_alive(), "an unexpected kind is not a reason to drop the connection");
+        assert!(
+            link.is_alive(),
+            "an unexpected kind is not a reason to drop the connection"
+        );
     }
 
     /// A flush must **unpark** the writer, not wait out its park slice.
@@ -1028,9 +1066,17 @@ mod tests {
     /// expiry — a uniform 0–20 ms tax on every message, ~11 ms at the median,
     /// paid twice per `Ping`/`Pong`.
     ///
-    /// Ten rounds summed rather than one measured: a single round passes by
-    /// luck a quarter of the time even when the wakeup is lost, while the sum
-    /// separates ~0.5 ms from ~100 ms with no overlap worth worrying about.
+    /// The assertion is causal, not a wall-clock proxy: after observing the
+    /// writer's armed flag, each `flush()` must increment `WriterPark`'s count
+    /// of actual `Thread::unpark` calls, and the frame must then reach the sink.
+    /// Removing `wake()` from `flush()` therefore fails deterministically even
+    /// on a host where the writer happens to be scheduled before its timeout.
+    ///
+    /// Earlier versions summed ten flush-to-wire wall-clock intervals and
+    /// called anything over 20 ms a lost wake. Under host contention ten normal
+    /// scheduler delays (all shorter than the park slice) add past 20 ms; that
+    /// measured OS scheduling, not this wiring. Per-round time remains in the
+    /// failure message as a diagnostic, never as the proof.
     #[test]
     fn a_control_flush_wakes_the_parked_writer_instead_of_waiting_out_the_slice() {
         let link = test_link();
@@ -1040,35 +1086,59 @@ mod tests {
 
         let wlink = link.clone();
         let wshutdown = shutdown.clone();
+        let parked_slice = Duration::from_secs(2);
         let writer = std::thread::Builder::new()
             .name("test-mux-tx".into())
-            .spawn(move || write_loop(&wlink, &mut w, &wshutdown))
+            .spawn(move || write_loop_with_park_slice(&wlink, &mut w, &wshutdown, parked_slice))
             .expect("spawn the writer");
 
         let mut ctl = MuxControlStream::new(link.io.clone());
         const ROUNDS: usize = 10;
-        let mut total = Duration::ZERO;
+        let mut laps = Vec::with_capacity(ROUNDS);
         for i in 0..ROUNDS {
-            // Let it reach the park. The media queue is empty throughout, so
-            // the only thing that can wake it is the flush below.
-            std::thread::sleep(Duration::from_millis(30));
+            // Observe the premise instead of guessing it from a 30 ms sleep.
+            // Under host contention a newly spawned writer may not have run in
+            // those 30 ms at all; measuring from there tests thread scheduling,
+            // not whether a flush wakes an actually parked writer.
+            let park_deadline = Instant::now() + Duration::from_secs(2);
+            while !link.io.writer.is_armed_for_test() {
+                assert!(
+                    Instant::now() < park_deadline,
+                    "round {i}: writer never armed its park"
+                );
+                std::thread::yield_now();
+            }
             let before = seen.lock().unwrap().len();
+            let wakes_before = link.io.writer.unpark_count_for_test();
 
             let body = [0x11u8; 8];
             let t0 = Instant::now();
-            ctl.write_all(&(body.len() as u32).to_le_bytes()).expect("len");
+            ctl.write_all(&(body.len() as u32).to_le_bytes())
+                .expect("len");
             ctl.write_all(&body).expect("body");
             ctl.flush().expect("flush");
+            let wakes_after = link.io.writer.unpark_count_for_test();
+            assert_eq!(
+                wakes_after,
+                wakes_before + 1,
+                "round {i}: flush queued control while the writer was armed but did not issue \
+                 Thread::unpark"
+            );
 
-            let deadline = t0 + Duration::from_secs(2);
+            let deadline = t0 + parked_slice + Duration::from_secs(1);
             loop {
                 if seen.lock().unwrap().len() > before {
                     break;
                 }
-                assert!(Instant::now() < deadline, "round {i}: the frame never reached the wire");
+                assert!(
+                    Instant::now() < deadline,
+                    "round {i}: the frame never reached the wire after {:?}; prior rounds={laps:?}",
+                    t0.elapsed()
+                );
                 std::thread::yield_now();
             }
-            total += t0.elapsed();
+            let lap = t0.elapsed();
+            laps.push(lap);
         }
 
         shutdown.store(true, Ordering::SeqCst);
@@ -1076,14 +1146,7 @@ mod tests {
         link.media.wake();
         let _ = writer.join();
 
-        // A woken writer does each round in tens of microseconds; a writer that
-        // sleeps out its slice averages WRITE_SLICE/2 per round.
-        let budget = Duration::from_millis(20);
-        assert!(
-            total < budget,
-            "{ROUNDS} control flushes took {total:?} to reach the wire (budget {budget:?}): the \
-             writer is waiting out its {WRITE_SLICE:?} park slice instead of being unparked"
-        );
+        assert_eq!(laps.len(), ROUNDS);
     }
 
     /// Killing the link closes the control inbox, which is how a dead mux
@@ -1096,10 +1159,17 @@ mod tests {
         assert!(link.is_alive());
         link.kill();
         assert!(!link.is_alive());
-        assert!(!link.media.is_alive(), "the media queue outlived the connection");
+        assert!(
+            !link.media.is_alive(),
+            "the media queue outlived the connection"
+        );
 
         let mut buf = [0u8; 8];
-        assert_eq!(ctl.read(&mut buf).expect("read"), 0, "the control stream did not see EOF");
+        assert_eq!(
+            ctl.read(&mut buf).expect("read"),
+            0,
+            "the control stream did not see EOF"
+        );
         // Idempotent: teardown reaches this from both threads.
         link.kill();
     }
@@ -1117,13 +1187,18 @@ mod tests {
 
         let mut ctl = MuxControlStream::new(link.io.clone());
         let body = vec![0x5Au8; MUX_MAX_PAYLOAD * 2 + 11];
-        ctl.write_all(&(body.len() as u32).to_le_bytes()).expect("len");
+        ctl.write_all(&(body.len() as u32).to_le_bytes())
+            .expect("len");
         ctl.write_all(&body).expect("body");
         ctl.flush().expect("flush");
 
         drain(&link, &mut w, &mut bucket, &mut last);
         let kinds: Vec<Kind> = seen.lock().unwrap().iter().map(|(k, _)| *k).collect();
-        assert_eq!(kinds.len(), 3, "expected three control frames, got {kinds:?}");
+        assert_eq!(
+            kinds.len(),
+            3,
+            "expected three control frames, got {kinds:?}"
+        );
         assert!(kinds.iter().all(|k| *k == Kind::Control));
     }
 }

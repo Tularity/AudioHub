@@ -53,12 +53,17 @@ pub use transport::{
 /// `airplay_route="peers"`，而新界面已经没有入口能看见或改回本机播放；不升版会
 /// 形成「界面承诺本机播放、实际无声」的静默错配。
 ///
+/// **7（原生系统表面的语言同步）：不兼容变更。**
+/// `DaemonSettings.native_locale` 决定虚拟设备的离线后缀。新 App 若连到旧
+/// daemon，语言选择会看似成功，系统设备列表却继续显示中文；旧 daemon 还会
+/// 静默忽略同名 `settings.set` 参数。因此不能把它当作普通追加字段。
+///
 /// ⚠ **必须同步改的两处**（不在本 crate，改这里就得改它们，否则 App 拒连）：
 ///   - `app/src-tauri/src/main.rs` 的 `const IPC_VERSION: u32`
 ///   - `app/frontend/src/ipc/client.ts` 的 `export const IPC_VERSION`
 /// 两处都做**严格相等**校验（`main.rs` 的 `port_alive` 分支会直接报版本不符），
 /// 所以它们与本常量是一个原子的三件套。
-pub const IPC_VERSION: u32 = 6;
+pub const IPC_VERSION: u32 = 7;
 
 pub use audiohub_core::audio::DevicesReport;
 pub use audiohub_core::dsp::ToneVerdict;
@@ -158,22 +163,22 @@ pub const DEVICE_OUTPUT: &str = "output";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenSessionParams {
-    pub peer: String,               // fingerprint (prefix allowed, unique)
-    pub kind: String,               // KIND_MIC | KIND_SPK
+    pub peer: String, // fingerprint (prefix allowed, unique)
+    pub kind: String, // KIND_MIC | KIND_SPK
     #[serde(default)]
-    pub source: Option<String>,     // for spk / provider tone probes
+    pub source: Option<String>, // for spk / provider tone probes
     #[serde(default)]
-    pub freq: Option<f32>,          // tone source frequency
+    pub freq: Option<f32>, // tone source frequency
     #[serde(default)]
-    pub backend: Option<String>,    // sysaudio source: backend id, None = "auto"
+    pub backend: Option<String>, // sysaudio source: backend id, None = "auto"
     #[serde(default)]
-    pub monitor: bool,              // mic: play received audio locally
+    pub monitor: bool, // mic: play received audio locally
     #[serde(default)]
-    pub verify_freq: Option<f32>,   // receiver computes ToneVerdict (probe)
+    pub verify_freq: Option<f32>, // receiver computes ToneVerdict (probe)
     #[serde(default)]
     pub simulate_loss_pct: Option<f32>, // sender-side loss injection (probe)
     #[serde(default)]
-    pub volume_sync: bool,          // spk: drive the peer's output volume
+    pub volume_sync: bool, // spk: drive the peer's output volume
     /// mic: ALSO render the decoded peer audio into this NAMED output device
     /// (a third-party virtual card, spec-m4c §B). Independent of `monitor`:
     /// one decode can feed both. A device that cannot be opened fails the
@@ -230,6 +235,10 @@ pub const SETTINGS_WRITABLE_KEYS: &[&str] = &[
     "mode",
     "remove_virtual_on_disconnect",
     "mark_offline_devices",
+    // Resolved locale of the local native App. It is machine-wide because it
+    // names devices in the OS, not ordinary web-page copy. Browser clients
+    // may read it but must not infer that their own locale should overwrite it.
+    "native_locale",
     "mode_a_volume_sync",
     "mode_a_mute_local",
     "discovery_announce",
@@ -265,9 +274,14 @@ pub struct DaemonSettings {
     pub effective_mode: Mode,
     /// plan §7.3: remove a peer's virtual devices while it is disconnected.
     pub remove_virtual_on_disconnect: bool,
-    /// Append `（离线）` to a disconnected peer's device names, so "no sound"
-    /// is visible in the system's own device list (spec-m5b OPEN QUESTION 1).
+    /// Append a localized offline marker to disconnected peer device names, so
+    /// "no sound" is visible in the system's own list (spec-m5b OPEN QUESTION 1).
     pub mark_offline_devices: bool,
+    /// Locale used for strings that escape the UI into native OS surfaces,
+    /// currently the offline suffix in virtual-device names and the App tray.
+    /// `zh-CN` / `en-US`; unknown values are rejected by `settings.set`.
+    #[serde(default = "default_native_locale")]
+    pub native_locale: String,
     /// plan §7.1 模式 A 「与对端音量同步」: this machine's system output follows
     /// the peer's real output device (and the other way round), **peer
     /// authoritative**. Global, not per peer — see `StoredSettings` for why.
@@ -390,8 +404,13 @@ pub struct DaemonSettings {
     pub name_source: Option<String>,
 }
 
-/// One currently connected audio-only AirPlay sender. Artwork and raw metadata
-/// stay inside the receiver; this small view is safe for the UI state snapshot.
+fn default_native_locale() -> String {
+    "zh-CN".to_string()
+}
+
+/// One currently connected audio-only AirPlay sender. Artwork bytes stay
+/// behind a versioned sideband request so this frequently-polled view remains
+/// small even for multi-megabyte covers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AirPlaySessionInfo {
     pub id: u64,
@@ -407,8 +426,23 @@ pub struct AirPlaySessionInfo {
     pub artist: Option<String>,
     #[serde(default)]
     pub album: Option<String>,
+    /// Monotonic revision of the current artwork state. A revision with no
+    /// content type means the sender explicitly cleared the previous image.
+    #[serde(default)]
+    pub artwork_revision: Option<u64>,
+    #[serde(default)]
+    pub artwork_content_type: Option<String>,
     /// How long this sender has been connected, in milliseconds.
     pub connected_ms: u64,
+}
+
+/// One versioned artwork response returned by `airplay.artwork.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AirPlayArtwork {
+    pub session_id: u64,
+    pub revision: u64,
+    pub content_type: String,
+    pub data_base64: String,
 }
 
 /// 一台对端 × 一个方向的两个**目标**档位（plan §15）。
@@ -565,10 +599,18 @@ pub struct HalDeviceInfo {
     pub generation: u32,
     /// "free" | "bound" | "delisted" | "pending" (sent, not yet answered).
     pub state: String,
-    /// The system's own device list really contains both UIDs. This is the
-    /// closed-loop half: `state == "bound"` alone only says the driver
-    /// acknowledged us (spec-m5b §5.2).
+    /// The system's own device list exactly contains every requested direction
+    /// and no stale extra direction. This is the closed-loop half:
+    /// `state == "bound"` alone only says the driver acknowledged us.
     pub observed: bool,
+    /// Requested/acknowledged and OS-observed virtual directions. Bit 0 is the
+    /// speaker/out endpoint, bit 1 the microphone/in endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_directions: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_directions: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_directions: Option<u8>,
     pub peer_connected: bool,
     pub io_out: bool,
     pub io_in: bool,
@@ -586,6 +628,12 @@ pub struct PeerHalDevice {
     pub in_uid: String,
     pub state: String,
     pub observed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_directions: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_directions: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_directions: Option<u8>,
 }
 
 /// Who opened a session, reported as `SessionInfo.origin`.
@@ -981,9 +1029,9 @@ pub struct SessionStats {
     /// yet" and "nothing is flowing" are different claims.
     #[serde(default)]
     pub bitrate_kbps: Option<f64>,
-    pub jb_depth_frames: u32,       // current jitter buffer depth (recv side)
-    pub sent_packets: u64,          // send side
-    pub rung: u32,                  // current AUTO ladder rung (0 = best)
+    pub jb_depth_frames: u32, // current jitter buffer depth (recv side)
+    pub sent_packets: u64,    // send side
+    pub rung: u32,            // current AUTO ladder rung (0 = best)
     pub rung_changes: u32,
     pub verdict: Option<ToneVerdict>,
     pub mix_verdicts: Option<Vec<ToneVerdict>>, // provider mixer taps (probe)
@@ -1245,7 +1293,7 @@ pub struct SessionInfo {
 pub struct PeerState {
     #[serde(flatten)]
     pub peer: PairedPeer,
-    pub online: bool,               // live control channel right now
+    pub online: bool, // live control channel right now
     /// A retry loop is armed for this peer (spec-m4c §C). Only ever true for a
     /// peer THIS daemon has connected to itself.
     #[serde(default)]
@@ -1349,6 +1397,17 @@ pub struct PeerState {
     /// Deliberately not persisted with the peer record for the same reason.
     #[serde(default)]
     pub peer_mode: Option<Mode>,
+    /// Whether the peer's live channel reports a real default input endpoint.
+    ///
+    /// `None` means offline or the channel has not delivered its capability
+    /// advertisement yet; `Some(false)` is an explicit observation that no
+    /// endpoint exists. This is connection-scoped and never persisted.
+    #[serde(default)]
+    pub peer_default_input: Option<bool>,
+    /// Live-channel counterpart for the peer's real default output endpoint.
+    /// The same unknown/false distinction and no-persistence rule apply.
+    #[serde(default)]
+    pub peer_default_output: Option<bool>,
     /// This peer has told us it is in a mode that cannot serve us.
     ///
     /// Carried rather than derived by the UI from `peer_mode`, because the two
@@ -1426,7 +1485,7 @@ pub struct PeerState {
 /// - "stats.subscribe"   {interval_ms?}        -> {} (then "stats" events with Vec<SessionInfo>)
 /// - "settings.get"      {}                    -> DaemonSettings
 /// - "settings.set"      {mode?, remove_virtual_on_disconnect?,
-///                        mark_offline_devices?, mode_a_volume_sync?,
+///                        mark_offline_devices?, native_locale?, mode_a_volume_sync?,
 ///                        mode_a_mute_local?, discovery_announce?, autostart?,
 ///                        airplay_enabled?, airplay_name?, airplay_password?,
 ///                        name?}
@@ -1435,6 +1494,7 @@ pub struct PeerState {
 ///       `airplay_password_set`; the secret never enters a frontend store or
 ///       diagnostic state snapshot. Empty clears it.
 /// - "airplay.sessions.list" {}                -> Vec<AirPlaySessionInfo>
+/// - "airplay.artwork.get" {session_id, revision} -> AirPlayArtwork | null
 ///       `name` (user instruction 2026-08-10 #9) is this machine's display
 ///       name; `""` clears the override and follows the host name again. It is
 ///       stored in identity.json beside the signing key, not in settings.json —
@@ -1517,6 +1577,7 @@ pub mod methods {
     pub const SETTINGS_GET: &str = "settings.get";
     pub const SETTINGS_SET: &str = "settings.set";
     pub const AIRPLAY_SESSIONS_LIST: &str = "airplay.sessions.list";
+    pub const AIRPLAY_ARTWORK_GET: &str = "airplay.artwork.get";
     pub const PEERS_PAIR: &str = "peers.pair";
     pub const PEERS_UNPAIR: &str = "peers.unpair";
     pub const PEERS_SET_ALIAS: &str = "peers.set_alias";
@@ -1541,7 +1602,7 @@ pub mod methods {
 
 #[cfg(test)]
 mod version_contract_tests {
-    use super::IPC_VERSION;
+    use super::{HalDeviceInfo, IPC_VERSION};
 
     /// 读仓库里另一处（非本 crate）的源文件。读不到就 panic —— 绝不 skip：
     /// 一条「文件没了就悄悄通过」的守卫，正好在文件被改名的那一刻失效。
@@ -1561,7 +1622,10 @@ mod version_contract_tests {
     /// 「匹配第一个」会让守卫在别人加一行注释时开始读错地方，而且照样是绿的。
     fn sole_int_after(src: &str, rel: &str, needle: &str) -> u32 {
         let hits = src.matches(needle).count();
-        assert_eq!(hits, 1, "{rel} 里 `{needle}` 出现了 {hits} 次，期望恰好 1 次");
+        assert_eq!(
+            hits, 1,
+            "{rel} 里 `{needle}` 出现了 {hits} 次，期望恰好 1 次"
+        );
         let tail = &src[src.find(needle).unwrap() + needle.len()..];
         let digits: String = tail
             .trim_start()
@@ -1596,5 +1660,33 @@ mod version_contract_tests {
             "三处 IPC_VERSION 不一致（本 crate={IPC_VERSION}、{RS}={shell}、{TS}={front}）。\
              App 会以「服务版本不兼容」拒连：音频照跑，界面全死。"
         );
+    }
+
+    #[test]
+    fn legacy_hal_rows_keep_missing_direction_masks_distinct_from_explicit_zero() {
+        let base = serde_json::json!({
+            "slot": 0,
+            "fingerprint": "peer",
+            "out_uid": "AudioHub:peer:out",
+            "in_uid": "AudioHub:peer:in",
+            "out_name": "AudioHub – peer",
+            "in_name": "AudioHub – peer",
+            "generation": 1,
+            "state": "bound",
+            "observed": true,
+            "peer_connected": true,
+            "io_out": false,
+            "io_in": false,
+            "spk_frames": 0,
+            "mic_frames": 0,
+            "mic_dropped": 0
+        });
+        let legacy: HalDeviceInfo = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(legacy.requested_directions, None);
+
+        let mut explicit = base;
+        explicit["requested_directions"] = serde_json::json!(0);
+        let explicit: HalDeviceInfo = serde_json::from_value(explicit).unwrap();
+        assert_eq!(explicit.requested_directions, Some(0));
     }
 }

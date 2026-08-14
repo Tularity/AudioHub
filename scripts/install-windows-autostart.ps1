@@ -107,7 +107,7 @@ Write-Output ("firewall : " + $FirewallRuleName + " -> " + $ExeD + " (Domain, Pr
 # VBS wrapper the daemon-only layout required is gone with it.
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-$action = New-ScheduledTaskAction -Execute $ExeA
+$action = New-ScheduledTaskAction -Execute $ExeA -Argument '--background'
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $User
 $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)

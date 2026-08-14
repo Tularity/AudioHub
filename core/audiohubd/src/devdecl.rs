@@ -17,7 +17,7 @@
 //!
 //! ## 口径：声明多少
 //!
-//! 虚拟**扬声器**（App 把音频放进「AudioHub – 对端 扬声器」，我们发给对端播）
+//! 虚拟**扬声器**（App 把音频放进输出设备「AudioHub – 对端」，我们发给对端播）
 //! 那条发送流的 `sum_ms`，一个数不多一个数不少：
 //!
 //! ```text
@@ -140,9 +140,7 @@ pub(crate) fn should_send(st: &DeclState, want: u32) -> bool {
     match st.acked {
         None => true,
         Some(acked) if acked == want => false,
-        Some(acked) => {
-            acked.abs_diff(want) >= DEADBAND_FRAMES || st.tries < GIVE_UP_AFTER
-        }
+        Some(acked) => acked.abs_diff(want) >= DEADBAND_FRAMES || st.tries < GIVE_UP_AFTER,
     }
 }
 
@@ -188,7 +186,9 @@ pub(crate) fn frames_for(p: &PipelineLatency) -> Option<u32> {
 
 /// 排障用的一行。`daemon.status` 与 stderr 共用。
 pub(crate) fn line(what: &str, st: &DeclState) -> String {
-    let want = st.want.map_or("-".to_string(), |f| format!("{f}f ({:.1} ms)", ms_of(f)));
+    let want = st
+        .want
+        .map_or("-".to_string(), |f| format!("{f}f ({:.1} ms)", ms_of(f)));
     let acked = match st.acked {
         None => "never answered".to_string(),
         Some(f) => format!("{f}f ({:.1} ms)", ms_of(f)),
@@ -200,7 +200,10 @@ pub(crate) fn line(what: &str, st: &DeclState) -> String {
     } else {
         ""
     };
-    format!("{what}: want={want} declared={acked} tries={}{note}", st.tries)
+    format!(
+        "{what}: want={want} declared={acked} tries={}{note}",
+        st.tries
+    )
 }
 
 fn ms_of(frames: u32) -> f64 {
@@ -405,9 +408,9 @@ mod driver_audit {
     fn the_latch_only_installs_a_new_value_while_io_is_stopped() {
         let src = read("drivers/macos-hal/src/AudioHubDriver.c");
         let body = window(&src, "static UInt32 AudioHub_LatchLatency", 1400);
-        let guard = body.find("if(inDevice->ioRunning == 0)").expect(
-            "锁存必须以 ioRunning == 0 为条件：没有这一条，声明值会在流跑着的时候变",
-        );
+        let guard = body
+            .find("if(inDevice->ioRunning == 0)")
+            .expect("锁存必须以 ioRunning == 0 为条件：没有这一条，声明值会在流跑着的时候变");
         let assign = body
             .find("inDevice->latencyFrames = inDevice->latencyWanted;")
             .expect("锁存必须把 latencyWanted 装进 latencyFrames");
@@ -445,7 +448,11 @@ mod driver_audit {
     #[test]
     fn the_windows_presentation_position_subtracts_and_saturates() {
         let src = read("drivers/windows-vad/Source/Main/minwavertstream.cpp");
-        let body = window(&src, "NTSTATUS CMiniportWaveRTStream::GetPresentationPosition", 5200);
+        let body = window(
+            &src,
+            "NTSTATUS CMiniportWaveRTStream::GetPresentationPosition",
+            5200,
+        );
         assert!(
             body.contains("framesAccepted - m_AhPresentationOffsetFrames"),
             "呈现位置没有减去下游延迟——这就是 sysvad 原样，即「收下就等于响了」"
@@ -644,14 +651,25 @@ mod tests {
         assert_eq!(frames_for(&pipe(Some(-1.0))), None, "负延迟只可能是算错了");
         // 而测得到的时候，换算是直白的
         assert_eq!(frames_for(&pipe(Some(121.0))), Some(5808));
-        assert_eq!(frames_for(&pipe(Some(0.0))), Some(0), "真测到 0 与没测到不是一回事");
+        assert_eq!(
+            frames_for(&pipe(Some(0.0))),
+            Some(0),
+            "真测到 0 与没测到不是一回事"
+        );
     }
 
     /// 荒唐值在花掉一次 IPC 之前就被拒。上限与两个驱动里的常量是同一个数。
     #[test]
     fn an_absurd_number_is_refused_here_rather_than_by_the_driver() {
-        assert_eq!(MAX_FRAMES, 192_000, "= AH_LATENCY_MAX_FRAMES = kDevice_MaxDeclaredLatency");
-        assert_eq!(declared_frames(Some(4_000.0)), Some(192_000), "正好 4 秒，还收");
+        assert_eq!(
+            MAX_FRAMES, 192_000,
+            "= AH_LATENCY_MAX_FRAMES = kDevice_MaxDeclaredLatency"
+        );
+        assert_eq!(
+            declared_frames(Some(4_000.0)),
+            Some(192_000),
+            "正好 4 秒，还收"
+        );
         assert_eq!(declared_frames(Some(4_000.1)), None);
     }
 
@@ -665,21 +683,50 @@ mod tests {
         let never = DeclState::default();
         assert!(should_send(&never, 5808), "驱动从没答过 ⇒ 必发");
 
-        let acked_short = DeclState { want: Some(5808), acked: Some(0), tries: 1, ..Default::default() };
-        assert!(should_send(&acked_short, 5808), "答的是 0 而要的是 5808 ⇒ 没到位，继续发");
+        let acked_short = DeclState {
+            want: Some(5808),
+            acked: Some(0),
+            tries: 1,
+            ..Default::default()
+        };
+        assert!(
+            should_send(&acked_short, 5808),
+            "答的是 0 而要的是 5808 ⇒ 没到位，继续发"
+        );
 
-        let done = DeclState { want: Some(5808), acked: Some(5808), tries: 3, ..Default::default() };
+        let done = DeclState {
+            want: Some(5808),
+            acked: Some(5808),
+            tries: 3,
+            ..Default::default()
+        };
         assert!(!should_send(&done, 5808), "答的与要的相等 ⇒ 到位，不再发");
 
         // 差在死区内，但确实没对上：还没试满次数就继续试。
-        let near = DeclState { want: Some(5808), acked: Some(5805), tries: 2, ..Default::default() };
-        assert!(should_send(&near, 5808), "差 3 帧也是没对上，重试次数没用完就还得试");
-        let exhausted = DeclState { tries: GIVE_UP_AFTER, ..near };
+        let near = DeclState {
+            want: Some(5808),
+            acked: Some(5805),
+            tries: 2,
+            ..Default::default()
+        };
+        assert!(
+            should_send(&near, 5808),
+            "差 3 帧也是没对上，重试次数没用完就还得试"
+        );
+        let exhausted = DeclState {
+            tries: GIVE_UP_AFTER,
+            ..near
+        };
         assert!(!should_send(&exhausted, 5808), "试满了就别再每秒撞同一堵墙");
 
         // 而「一次都没答过」是**另一档**：无限重试，因为它会自己好
         // （装了新驱动 / coreaudiod 重启 / 桥重新 attach）。
-        let never_answered = DeclState { want: Some(5808), acked: None, tries: 9_999, pending: false };
+        let never_answered = DeclState {
+            want: Some(5808),
+            acked: None,
+            tries: 9_999,
+            pending: false,
+        };
         assert!(
             should_send(&never_answered, 5808),
             "一次都没答过要一直试：停下就得等到下次 bind，而这条路会自己好"
@@ -693,7 +740,12 @@ mod tests {
     /// 少了停止条件是持续负载，少了这一条是永久卡死。
     #[test]
     fn a_target_that_really_moved_always_gets_tried_again() {
-        let mut st = DeclState { want: Some(5808), acked: Some(5805), tries: GIVE_UP_AFTER, pending: false };
+        let mut st = DeclState {
+            want: Some(5808),
+            acked: Some(5805),
+            tries: GIVE_UP_AFTER,
+            pending: false,
+        };
         assert!(!should_send(&st, 5808), "先确认它确实卡住了");
         // 链路真的变长了（对端换了网络）
         let fresh = 5808 + DEADBAND_FRAMES;
@@ -712,8 +764,16 @@ mod tests {
         assert_eq!(DEADBAND_FRAMES, 960, "20 ms @ 48k");
         assert_eq!(advance_want(None, 5808), Some(5808), "第一次总是要有个目标");
         assert_eq!(advance_want(Some(5808), 5810), None, "抖 2 帧 ⇒ 目标不动");
-        assert_eq!(advance_want(Some(5808), 5808 + 960), Some(6768), "跨过死区 ⇒ 换目标");
-        assert_eq!(advance_want(Some(5808), 5808 - 960), Some(4848), "反方向同样");
+        assert_eq!(
+            advance_want(Some(5808), 5808 + 960),
+            Some(6768),
+            "跨过死区 ⇒ 换目标"
+        );
+        assert_eq!(
+            advance_want(Some(5808), 5808 - 960),
+            Some(4848),
+            "反方向同样"
+        );
         assert_eq!(advance_want(Some(5808), 5808 + 959), None, "差一帧不算跨过");
     }
 
@@ -721,13 +781,28 @@ mod tests {
     /// 它们在数值上都可能长成「acked != want」。
     #[test]
     fn the_status_line_tells_held_apart_from_ignored() {
-        let held = DeclState { want: Some(5808), acked: Some(0), pending: true, tries: 1 };
+        let held = DeclState {
+            want: Some(5808),
+            acked: Some(0),
+            pending: true,
+            tries: 1,
+        };
         assert!(line("play", &held).contains("takes effect when it stops"));
 
-        let ignored = DeclState { want: Some(5808), acked: None, pending: false, tries: GIVE_UP_AFTER };
+        let ignored = DeclState {
+            want: Some(5808),
+            acked: None,
+            pending: false,
+            tries: GIVE_UP_AFTER,
+        };
         assert!(line("play", &ignored).contains("never acknowledged"));
 
-        let ok = DeclState { want: Some(5808), acked: Some(5808), pending: false, tries: 1 };
+        let ok = DeclState {
+            want: Some(5808),
+            acked: Some(5808),
+            pending: false,
+            tries: 1,
+        };
         let s = line("play", &ok);
         assert!(!s.contains("never acknowledged") && !s.contains("takes effect"));
         assert!(s.contains("121.0 ms"), "帧数得换算成人读得懂的毫秒: {s}");

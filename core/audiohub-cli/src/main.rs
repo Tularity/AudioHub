@@ -348,10 +348,18 @@ fn dispatch(cmd: ProbeCmd, json: bool) -> Result<i32> {
             let summary = run_echo_client(&sock, to, &cfg)?;
             info(&format!(
                 "sent={} received={} loss={:.2}% p50={:.2}ms p95={:.2}ms",
-                summary.sent, summary.received, summary.loss_pct, summary.rtt_p50_ms, summary.rtt_p95_ms
+                summary.sent,
+                summary.received,
+                summary.loss_pct,
+                summary.rtt_p50_ms,
+                summary.rtt_p95_ms
             ));
             emit_json(json, &summary);
-            Ok(if summary.received == 0 { EXIT_NO_TRAFFIC } else { 0 })
+            Ok(if summary.received == 0 {
+                EXIT_NO_TRAFFIC
+            } else {
+                0
+            })
         }
         ProbeCmd::Winvad { cmd } => winvad::dispatch(cmd, json),
     }
@@ -393,7 +401,10 @@ fn cmd_devices_watch(secs: f32, json: bool) -> Result<i32> {
             ));
         }),
     )?;
-    info(&format!("{} device change event(s) in {secs}s", events.len()));
+    info(&format!(
+        "{} device change event(s) in {secs}s",
+        events.len()
+    ));
     emit_json(
         json,
         &serde_json::json!({"secs": secs, "count": events.len(), "events": events}),
@@ -420,7 +431,9 @@ fn cmd_tone(
     let opened = match sel {
         DeviceSel::Default => None,
         DeviceSel::Name(name) => {
-            info(&format!("playing {freq} Hz for {secs}s (amp {amp}) into '{name}'"));
+            info(&format!(
+                "playing {freq} Hz for {secs}s (amp {amp}) into '{name}'"
+            ));
             // Feed the named device in real time: LivePlayback::start_on
             // resolves the name (no silent fallback to the default) and
             // owns the stream, so the tone lands where it was asked to.
@@ -689,8 +702,8 @@ fn cmd_sysaudio(
     let pull = play_pull.map(|peer| {
         std::thread::spawn(move || -> Result<u64> {
             let sock = UdpSocket::bind("0.0.0.0:0")?;
-            let prate = peek_media_rate(&sock, Some(peer), Duration::from_millis(5000))?
-                .unwrap_or(48000);
+            let prate =
+                peek_media_rate(&sock, Some(peer), Duration::from_millis(5000))?.unwrap_or(48000);
             let (guard, mut audio_tx) = LivePlayback::start(prate)?;
             let cfg = RxCfg {
                 secs: pull_secs,
@@ -711,7 +724,11 @@ fn cmd_sysaudio(
     let mut tone = match self_tone {
         Some(freq) => {
             let (guard, audio_tx) = LivePlayback::start(rate)?;
-            Some((guard, audio_tx, ToneSource::new(freq, 0.5, rate, FRAME_MS as u32)))
+            Some((
+                guard,
+                audio_tx,
+                ToneSource::new(freq, 0.5, rate, FRAME_MS as u32),
+            ))
         }
         None => None,
     };
@@ -929,7 +946,11 @@ fn cmd_selftest(json: bool) -> Result<i32> {
     // 这次改动新增的面。
     let src: Vec<f32> = vec![-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 0.9999, 1.0];
     let mut rt_ok = true;
-    for depth in [dsp::WireDepth::S16, dsp::WireDepth::S24, dsp::WireDepth::F32] {
+    for depth in [
+        dsp::WireDepth::S16,
+        dsp::WireDepth::S24,
+        dsp::WireDepth::F32,
+    ] {
         let back = dsp::decode_pcm(&dsp::encode_pcm(&src, depth), depth);
         // 1 LSB = 2 / 2^bits；f32 档要求逐位相等，用 0 容差表达。
         let tol = if depth == dsp::WireDepth::F32 {
@@ -938,10 +959,17 @@ fn cmd_selftest(json: bool) -> Result<i32> {
             2.0 / (1u32 << (depth.bits() - 1)) as f32
         };
         rt_ok &= back.len() == src.len()
-            && src.iter().zip(back.iter()).all(|(a, b)| (a - b).abs() <= tol);
+            && src
+                .iter()
+                .zip(back.iter())
+                .all(|(a, b)| (a - b).abs() <= tol);
         // 整数档必须削顶到满幅；f32 档**不削顶**（线路这一段不做任何量化）。
         let over = dsp::decode_pcm(&dsp::encode_pcm(&[1.5], depth), depth)[0];
-        rt_ok &= if depth == dsp::WireDepth::F32 { over == 1.5 } else { over > 0.999 };
+        rt_ok &= if depth == dsp::WireDepth::F32 {
+            over == 1.5
+        } else {
+            over > 0.999
+        };
     }
     check("wire_pcm_roundtrip", rt_ok);
 
@@ -954,7 +982,8 @@ fn cmd_selftest(json: bool) -> Result<i32> {
             secs: 1.0,
             ..ToneTxCfg::default()
         };
-        let handle = std::thread::spawn(move || run_tx_tone(&tx_sock, TxMode::Push(rx_addr), &tx_cfg));
+        let handle =
+            std::thread::spawn(move || run_tx_tone(&tx_sock, TxMode::Push(rx_addr), &tx_cfg));
         let rx_cfg = RxCfg {
             secs: 3.0,
             verify_freq: Some(1000.0),
@@ -962,7 +991,11 @@ fn cmd_selftest(json: bool) -> Result<i32> {
         };
         let outcome = run_rx(&rx_sock, RxMode::Listen, &rx_cfg, None)?;
         let tx_ok = matches!(handle.join(), Ok(Ok(_)));
-        let detected = outcome.verdict.as_ref().map(|v| v.detected).unwrap_or(false);
+        let detected = outcome
+            .verdict
+            .as_ref()
+            .map(|v| v.detected)
+            .unwrap_or(false);
         Ok(tx_ok && detected && outcome.summary.lost == 0 && !outcome.timed_out)
     })()
     .unwrap_or(false);
@@ -1008,7 +1041,9 @@ fn cmd_tx(
                     run_tx_tone(&sock, TxMode::Push(dest), &cfg)?
                 }
                 None if serve => {
-                    info(&format!("tx tone serve on 0.0.0.0:{port}, waiting for PullReq"));
+                    info(&format!(
+                        "tx tone serve on 0.0.0.0:{port}, waiting for PullReq"
+                    ));
                     run_tx_tone(&sock, TxMode::Serve, &cfg)?
                 }
                 None => return Err(anyhow!("tx requires --to or --serve")),
@@ -1056,12 +1091,18 @@ fn run_tx_mic(
         info(&format!("tx mic push -> {dest} for {secs}s"));
         subs.push(dest);
     } else if serve {
-        info(&format!("tx mic serve on 0.0.0.0:{port}, waiting for PullReq"));
+        info(&format!(
+            "tx mic serve on 0.0.0.0:{port}, waiting for PullReq"
+        ));
         let wait_deadline = Instant::now() + Duration::from_secs_f32(secs.max(10.0) + 5.0);
         loop {
             if Instant::now() >= wait_deadline {
                 info("no PullReq arrived; giving up (self-termination contract)");
-                return Ok(TxReport { sent_packets: 0, sent_bytes: 0, secs: 0.0 });
+                return Ok(TxReport {
+                    sent_packets: 0,
+                    sent_bytes: 0,
+                    secs: 0.0,
+                });
             }
             match sock.recv_from(&mut buf) {
                 Ok((n, from)) => {
@@ -1244,7 +1285,9 @@ fn cmd_rx(
         // the stream's true rate is whatever the sender captured at — learn it
         // from the first Media header (peeked, so run_rx still counts the packet)
         let rate = peek_media_rate(&sock, pull, Duration::from_millis(5000))?.unwrap_or(48000);
-        info(&format!("playback wired at {rate} Hz (from first media packet)"));
+        info(&format!(
+            "playback wired at {rate} Hz (from first media packet)"
+        ));
         let (guard, mut audio_tx) = LivePlayback::start(rate)?;
         playback_guard = Some(guard);
         Some(Box::new(move |frame: &[f32]| audio_tx.push(frame)))
@@ -1274,7 +1317,13 @@ fn cmd_rx(
     if outcome.timed_out && outcome.summary.received == 0 {
         return Ok(EXIT_NO_TRAFFIC);
     }
-    if verify_freq.is_some() && !outcome.verdict.as_ref().map(|v| v.detected).unwrap_or(false) {
+    if verify_freq.is_some()
+        && !outcome
+            .verdict
+            .as_ref()
+            .map(|v| v.detected)
+            .unwrap_or(false)
+    {
         return Ok(EXIT_CHECK_FAILED);
     }
     Ok(0)

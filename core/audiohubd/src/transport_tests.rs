@@ -281,7 +281,8 @@ impl Node {
         let pkts = p1.checked_sub(p0)?;
         // A deep rung splits each 10 ms frame into two wire packets, so packets
         // alone do not equal frames; normalise by the split of the live rung.
-        let parts = audiohub_net::media::rung_format(self.tx_rung()?).wire_packets_per_frame() as u64;
+        let parts =
+            audiohub_net::media::rung_format(self.tx_rung()?).wire_packets_per_frame() as u64;
         let frames = pkts / parts.max(1);
         if frames < 50 {
             return None;
@@ -296,7 +297,9 @@ impl Node {
             .iter()
             .find_map(|s| {
                 let st = &s["stats"];
-                let q = st["quality"].as_object().or_else(|| st["peer_quality"].as_object())?;
+                let q = st["quality"]
+                    .as_object()
+                    .or_else(|| st["peer_quality"].as_object())?;
                 q.get("wire_depth")?.as_str().map(str::to_string)
             })
     }
@@ -310,7 +313,9 @@ impl Node {
             .iter()
             .find_map(|s| {
                 let st = &s["stats"];
-                let q = st["quality"].as_object().or_else(|| st["peer_quality"].as_object())?;
+                let q = st["quality"]
+                    .as_object()
+                    .or_else(|| st["peer_quality"].as_object())?;
                 Some((
                     q.get("wire_rate_hz")?.as_u64()? as u32,
                     q.get("bandwidth_hz")?.as_u64()? as u32,
@@ -498,7 +503,11 @@ fn pair(a: &Node, b: &Node) {
 /// Pair and connect A to B **at `addr`**, which need not be B's own address.
 fn pair_through(a: &Node, b: &Node, addr: &str) {
     let pin = b.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
-    let pin = pin.get("pin").and_then(Value::as_str).expect("pin").to_string();
+    let pin = pin
+        .get("pin")
+        .and_then(Value::as_str)
+        .expect("pin")
+        .to_string();
     a.ok(methods::PEERS_PAIR, json!({ "addr": addr, "pin": pin }));
     a.ok(
         methods::PEERS_CONNECT,
@@ -741,7 +750,9 @@ fn the_number_in_the_quality_stop_id_is_the_number_ipc_reports() {
     ] {
         a.set_transport(&b.fingerprint(), "send", "quality", id);
         let want = khz * 1000;
-        eventually(&format!("session.list 的 sample_rate 变成 {want} （档 {id}）"), || a.session_wire_rate() == Some(want),
+        eventually(
+            &format!("session.list 的 sample_rate 变成 {want} （档 {id}）"),
+            || a.session_wire_rate() == Some(want),
         );
         // 正向对照：上面那条 `eventually` 若因为**根本没有会话**而恒为 None，
         // 它会超时而不是通过；这里再取一次并断言，好让失败信息带上实际值。
@@ -810,7 +821,9 @@ fn the_bit_depth_really_travels_on_the_wire() {
         ("pcm48k32f", "f32", 1920.0),
     ] {
         a.set_transport(&b.fingerprint(), "send", "quality", id);
-        eventually(&format!("b 从包头读出的位深变成 {want_depth}（档 {id}）"), || b.session_wire_depth().as_deref() == Some(want_depth),
+        eventually(
+            &format!("b 从包头读出的位深变成 {want_depth}（档 {id}）"),
+            || b.session_wire_depth().as_deref() == Some(want_depth),
         );
         assert_eq!(
             b.session_wire_rate(),
@@ -845,7 +858,11 @@ fn the_bit_depth_really_travels_on_the_wire() {
             b.quality_wire_depth().as_deref() == Some(want_depth)
         });
         // 发送侧自己也报得出来（它的真值源是格号，不是包头）。
-        assert_eq!(a.session_wire_depth().as_deref(), Some(want_depth), "发送侧的位深读数不对");
+        assert_eq!(
+            a.session_wire_depth().as_deref(),
+            Some(want_depth),
+            "发送侧的位深读数不对"
+        );
     }
 
     // 低采样率档必须仍是 16 位：阶梯上不存在「低采样率 + 高位深」的组合。
@@ -899,7 +916,9 @@ fn the_send_side_reports_the_payload_bytes_it_put_on_the_wire() {
         let depth = audiohub_core::dsp::WireDepth::parse(want_depth).expect("known depth");
         let want_rung = audiohub_net::media::rung_of(48_000, depth).expect("48 kHz rung");
         a.set_transport(&b.fingerprint(), "send", "quality", id);
-        eventually(&format!("the wire to settle on {want_depth} for {id}"), || a.tx_rung() == Some(want_rung),
+        eventually(
+            &format!("the wire to settle on {want_depth} for {id}"),
+            || a.tx_rung() == Some(want_rung),
         );
 
         // ±4%, not the ±15% the receive-side test uses. The three rungs are
@@ -911,10 +930,12 @@ fn the_send_side_reports_the_payload_bytes_it_put_on_the_wire() {
         // snapshot, so the residual noise is ~1 packet in 150 frames.
         const TOL: f64 = 0.04;
         let mut got = None;
-        eventually(&format!("the send-side byte account to settle for {id}"), || {
-            got = a.tx_wire_bytes_per_frame(Duration::from_millis(1500));
-            got.is_some_and(|v| (v - want_bytes).abs() < want_bytes * TOL)
-        },
+        eventually(
+            &format!("the send-side byte account to settle for {id}"),
+            || {
+                got = a.tx_wire_bytes_per_frame(Duration::from_millis(1500));
+                got.is_some_and(|v| (v - want_bytes).abs() < want_bytes * TOL)
+            },
         );
         let got = got.expect("the window must contain audio, or this asserts nothing");
         assert!(
@@ -949,15 +970,22 @@ fn the_two_ends_agree_on_what_a_wire_byte_is() {
             && b.stat_u64("wire_bytes").is_some_and(|v| v > 100_000)
     });
 
-    let (tx_pay, tx_dg) = (a.stat_u64("wire_bytes").unwrap(), a.stat_u64("datagram_bytes").unwrap(),
+    let (tx_pay, tx_dg) = (
+        a.stat_u64("wire_bytes").unwrap(),
+        a.stat_u64("datagram_bytes").unwrap(),
     );
-    let (rx_pay, rx_dg) = (b.stat_u64("wire_bytes").unwrap(), b.stat_u64("datagram_bytes").unwrap(),
+    let (rx_pay, rx_dg) = (
+        b.stat_u64("wire_bytes").unwrap(),
+        b.stat_u64("datagram_bytes").unwrap(),
     );
 
     // Same numerator on both sides: whatever the sender calls payload, the
     // receiver decrypts the same count. Loss is possible, so the receiver may
     // trail; it must not *exceed*, and it must not trail by a framing-sized gap.
-    assert!(rx_pay <= tx_pay, "the receiver saw more payload ({rx_pay}) than was sent ({tx_pay})");
+    assert!(
+        rx_pay <= tx_pay,
+        "the receiver saw more payload ({rx_pay}) than was sent ({tx_pay})"
+    );
     let shortfall = (tx_pay - rx_pay) as f64 / tx_pay as f64;
     assert!(
         shortfall < 0.02,
@@ -1007,19 +1035,29 @@ fn the_reported_bitrate_follows_the_rung_in_both_directions() {
     eventually("the priming rung to take", || a.tx_rung() == Some(RUNG_16K));
     std::thread::sleep(Duration::from_secs(3));
 
-    for (id, want_kbps) in [("pcm48k16", 768.0f64), ("pcm48k24", 1152.0), ("pcm48k32f", 1536.0),
+    for (id, want_kbps) in [
+        ("pcm48k16", 768.0f64),
+        ("pcm48k24", 1152.0),
+        ("pcm48k32f", 1536.0),
     ] {
         a.set_transport(&b.fingerprint(), "send", "quality", id);
         for (who, node) in [("sender", &a), ("receiver", &b)] {
+            let mut got = None;
             eventually_within(
                 Duration::from_secs(20),
                 &format!("{who}'s bitrate_kbps to reach the {id} band"),
                 || {
-                    node.stat_f64("bitrate_kbps")
-                        .is_some_and(|v| (v - want_kbps).abs() < want_kbps * 0.15)
+                    got = node.stat_f64("bitrate_kbps");
+                    got.is_some_and(|v| (v - want_kbps).abs() < want_kbps * 0.15)
                 },
             );
-            let got = node.stat_f64("bitrate_kbps").expect("a rate must be readable by now");
+            // Keep the exact sample that satisfied the wait. An IPC read adds a
+            // fresh wall-clock point to the sliding window, so reading it again
+            // is not observationally pure: if this test is descheduled between
+            // the two calls, the unchanged byte counter legitimately produces
+            // a different (lower) rate. The full suite caught precisely that
+            // race at 979.1 kbps, 0.1 below the 24-bit band's lower edge.
+            let got = got.expect("a rate must be readable by now");
             assert!(
                 (got - want_kbps).abs() < want_kbps * 0.15,
                 "{who} reports {got:.1} kbps on rung {id}, expected ~{want_kbps:.0}. \
@@ -1071,7 +1109,11 @@ fn a_stale_quality_id_is_refused_and_leaves_the_wire_alone() {
     }
 
     // Nothing the refusals touched: still the rung we parked on.
-    assert_eq!(b.session_wire_rate(), Some(48_000), "a refused set still moved the wire");
+    assert_eq!(
+        b.session_wire_rate(),
+        Some(48_000),
+        "a refused set still moved the wire"
+    );
     assert_eq!(
         b.session_wire_depth().as_deref(),
         Some("s24"),
@@ -1276,10 +1318,11 @@ fn a_high_target_widens_the_envelope_instead_of_reporting_a_fake_ceiling() {
     // 那会悄悄改掉 plan §5 里 AUTO 的整定。
     a.set_transport(&b.fingerprint(), "send", "latency", "auto");
     eventually("the envelope to return to the measured default", || {
-        b.jb_envelope() == Some((
-            audiohub_net::media::JitterBuffer::MIN_TARGET,
-            audiohub_net::media::JitterBuffer::MAX_TARGET,
-        ))
+        b.jb_envelope()
+            == Some((
+                audiohub_net::media::JitterBuffer::MIN_TARGET,
+                audiohub_net::media::JitterBuffer::MAX_TARGET,
+            ))
     });
 }
 
@@ -1361,13 +1404,19 @@ fn a_latency_value_off_the_ladder_is_refused() {
     // 旧拼写要被**规范化**存下来，不是原样留着：盘上留两种写法会让下一个
     // 读者以为是两档。
     let got = a.set_transport(&fp, "recv", "latency", "min");
-    assert_eq!(got["recv"]["latency"].as_str(), Some("0"), "旧的 \"min\" 要被规范化成 \"0\"");
+    assert_eq!(
+        got["recv"]["latency"].as_str(),
+        Some("0"),
+        "旧的 \"min\" 要被规范化成 \"0\""
+    );
 
     // **方向必须说清楚。** 缺 `dir` 时挑一个默认方向去写，就是替用户决定了
     // 「他改的是收还是发」——而那两件事的执行器在不同的机器上。
-    a.call(methods::PEERS_SET_TRANSPORT, json!({ "peer": &fp, "latency": "100" }),
+    a.call(
+        methods::PEERS_SET_TRANSPORT,
+        json!({ "peer": &fp, "latency": "100" }),
     )
-        .expect_err("缺 dir 必须报错，不许挑一个默认方向");
+    .expect_err("缺 dir 必须报错，不许挑一个默认方向");
     a.call(
         methods::PEERS_SET_TRANSPORT,
         json!({ "peer": &fp, "dir": "in", "latency": "100" }),
@@ -1489,7 +1538,6 @@ fn the_settings_view_carries_the_ladders() {
     for s in opus {
         assert_eq!(s["available"].as_bool(), Some(false));
     }
-
 }
 
 /// **热生效：改设置不重启、不重连，也不动任何已开的会话。**
@@ -1593,8 +1641,14 @@ fn the_peers_own_quality_measurement_crosses_the_wire_to_the_sender() {
         ["excellent", "good", "fair", "poor", "unknown"].contains(&grade),
         "评级不是本机口径的取值：{grade}"
     );
-    assert!(pq["window_s"].as_f64().unwrap_or(0.0) > 0.0, "窗口跨度没过来");
-    assert!(pq["popped_ticks"].as_u64().unwrap_or(0) > 0, "原料计数没过来");
+    assert!(
+        pq["window_s"].as_f64().unwrap_or(0.0) > 0.0,
+        "窗口跨度没过来"
+    );
+    assert!(
+        pq["popped_ticks"].as_u64().unwrap_or(0) > 0,
+        "原料计数没过来"
+    );
     // 「还没测」与「测了是 0」的区别必须活着穿过线缆。
     assert!(
         pq["clip_ratio"].is_null() || pq["clip_ratio"].is_f64(),
@@ -1656,7 +1710,10 @@ fn a_peer_reading_without_a_clip_page_does_not_become_excellent() {
     assert_ne!(measured.grade, "unknown", "三个分量都在，等级必须成立");
 
     // 重复流是一票否决，且**不依赖本流的削顶页**（规格 §4.4）。
-    let dup = crate::grade_peer_quality(&QualityReading { duplicate: true, ..base.clone() });
+    let dup = crate::grade_peer_quality(&QualityReading {
+        duplicate: true,
+        ..base.clone()
+    });
     assert_eq!(dup.grade, "poor", "对端判定的重复流没有被一票否决");
 }
 
@@ -1673,7 +1730,9 @@ fn a_connected_peer_reports_its_network_leg_with_no_session_at_all() {
 
     // 前提：确实一条会话都没有。否则这条测的是别的东西。
     assert!(
-        a.ok(methods::SESSION_LIST, json!({})).as_array().map_or(true, |v| v.is_empty()),
+        a.ok(methods::SESSION_LIST, json!({}))
+            .as_array()
+            .map_or(true, |v| v.is_empty()),
         "这条测试的前提是没有会话"
     );
 
@@ -1687,7 +1746,10 @@ fn a_connected_peer_reports_its_network_leg_with_no_session_at_all() {
     let p = a.peer(&bfp);
     let net = p["net_ms"].as_f64().expect("net_ms");
     let rtt = p["rtt_ms"].as_f64().expect("rtt_ms");
-    assert!(net >= 0.0 && net < 1000.0, "回环上的单程延迟不该是 {net} ms");
+    assert!(
+        net >= 0.0 && net < 1000.0,
+        "回环上的单程延迟不该是 {net} ms"
+    );
     assert!(rtt >= 0.0, "rtt {rtt}");
     // 单程 = min-RTT/2，所以它**不可能**比最近一次 RTT 还大出一截。
     // 这条挡的是「把 RTT 直接当成单程报上去」——那会让用户看到的数字翻一倍。
@@ -1697,7 +1759,9 @@ fn a_connected_peer_reports_its_network_leg_with_no_session_at_all() {
     );
     // 会话数仍然是 0：网络段确实与会话无关。
     assert!(
-        a.ok(methods::SESSION_LIST, json!({})).as_array().map_or(true, |v| v.is_empty()),
+        a.ok(methods::SESSION_LIST, json!({}))
+            .as_array()
+            .map_or(true, |v| v.is_empty()),
         "测量过程中冒出了会话，前提被破坏"
     );
 }
@@ -1765,7 +1829,10 @@ fn a_fixed_choice_is_still_in_force_after_a_restart() {
     call(&first, methods::SETTINGS_SET, &json!({ "mode": "a" }));
     let pin = peer.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
     let pin = pin["pin"].as_str().expect("pin").to_string();
-    call(&first, methods::PEERS_PAIR, &json!({ "addr": peer_addr, "pin": pin }),
+    call(
+        &first,
+        methods::PEERS_PAIR,
+        &json!({ "addr": peer_addr, "pin": pin }),
     );
     call(
         &first,
@@ -1788,14 +1855,34 @@ fn a_fixed_choice_is_still_in_force_after_a_restart() {
         .iter()
         .find(|p| p["fingerprint"].as_str() == Some(peer_fp.as_str()))
         .expect("peer survived the restart");
-    assert_eq!(p["transport"]["recv"]["latency"].as_str(), Some("300"), "重启后收·延迟丢了");
-    assert_eq!(p["transport"]["recv"]["quality"].as_str(), Some("pcm24k16"), "重启后收·音质丢了");
-    assert_eq!(p["transport"]["send"]["latency"].as_str(), Some("100"), "重启后发·延迟丢了");
-    assert_eq!(p["transport"]["send"]["quality"].as_str(), Some("pcm32k16"), "重启后发·音质丢了");
+    assert_eq!(
+        p["transport"]["recv"]["latency"].as_str(),
+        Some("300"),
+        "重启后收·延迟丢了"
+    );
+    assert_eq!(
+        p["transport"]["recv"]["quality"].as_str(),
+        Some("pcm24k16"),
+        "重启后收·音质丢了"
+    );
+    assert_eq!(
+        p["transport"]["send"]["latency"].as_str(),
+        Some("100"),
+        "重启后发·延迟丢了"
+    );
+    assert_eq!(
+        p["transport"]["send"]["quality"].as_str(),
+        Some("pcm32k16"),
+        "重启后发·音质丢了"
+    );
     // **盘上真的有这个文件**——只断言回显的话，一个把值留在内存里的实现
     // 在同一个进程内照样全绿。
-    let raw = std::fs::read_to_string(dir.join("peer_transport.json")).expect("peer_transport.json");
-    assert!(raw.contains("300") && raw.contains("pcm24k16"), "档位没落盘：{raw}");
+    let raw =
+        std::fs::read_to_string(dir.join("peer_transport.json")).expect("peer_transport.json");
+    assert!(
+        raw.contains("300") && raw.contains("pcm24k16"),
+        "档位没落盘：{raw}"
+    );
     second.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1809,7 +1896,10 @@ fn unpairing_forgets_the_transport_choices_too() {
     let (a, b) = linked("forget");
     let fp = b.fingerprint();
     a.set_transport(&fp, "recv", "latency", "300");
-    assert_eq!(a.peer(&fp)["transport"]["recv"]["latency"].as_str(), Some("300"));
+    assert_eq!(
+        a.peer(&fp)["transport"]["recv"]["latency"].as_str(),
+        Some("300")
+    );
 
     a.ok(methods::PEERS_UNPAIR, json!({ "peer": &fp }));
     // 重新配对同一台。
@@ -1840,40 +1930,33 @@ fn every_writable_setting_key_is_really_honoured() {
         (
             "mode",
             json!("a"),
-            &(|v: &Value| v.get("mode").cloned().unwrap_or(Value::Null)) as &dyn Fn(&Value) -> Value,
+            &(|v: &Value| v.get("mode").cloned().unwrap_or(Value::Null))
+                as &dyn Fn(&Value) -> Value,
         ),
-        (
-            "remove_virtual_on_disconnect",
-            json!(true),
-            &|v: &Value| {
-            v.get("remove_virtual_on_disconnect").cloned().unwrap_or(Value::Null)
+        ("remove_virtual_on_disconnect", json!(true), &|v: &Value| {
+            v.get("remove_virtual_on_disconnect")
+                .cloned()
+                .unwrap_or(Value::Null)
         }),
-        (
-            "mark_offline_devices",
-            json!(false),
-            &|v: &Value| {
-            v.get("mark_offline_devices").cloned().unwrap_or(Value::Null)
+        ("mark_offline_devices", json!(false), &|v: &Value| {
+            v.get("mark_offline_devices")
+                .cloned()
+                .unwrap_or(Value::Null)
         }),
-        (
-            "mode_a_volume_sync",
-            json!(true),
-            &|v: &Value| {
+        ("native_locale", json!("en-US"), &|v: &Value| {
+            v.get("native_locale").cloned().unwrap_or(Value::Null)
+        }),
+        ("mode_a_volume_sync", json!(true), &|v: &Value| {
             v.get("mode_a_volume_sync").cloned().unwrap_or(Value::Null)
         }),
-        (
-            "mode_a_mute_local",
-            json!(true),
-            &|v: &Value| {
+        ("mode_a_mute_local", json!(true), &|v: &Value| {
             v.get("mode_a_mute_local").cloned().unwrap_or(Value::Null)
         }),
         // `false` is the away-from-default value here — this is the one setting
         // that ships ON — and it is also the only value a test may write: a
         // test daemon that turned announcing ON would put itself on the user's
         // real LAN (see `DaemonCfg::announce`).
-        (
-            "discovery_announce",
-            json!(false),
-            &|v: &Value| {
+        ("discovery_announce", json!(false), &|v: &Value| {
             v.get("discovery_announce").cloned().unwrap_or(Value::Null)
         }),
         ("airplay_enabled", json!(true), &|v: &Value| {
@@ -1884,25 +1967,17 @@ fn every_writable_setting_key_is_really_honoured() {
             json!("AudioHub contract test"),
             &|v: &Value| v.get("airplay_name").cloned().unwrap_or(Value::Null),
         ),
-        ("latency",
-            json!("200"),
-            &|v: &Value| {
+        ("latency", json!("200"), &|v: &Value| {
             v.get("latency").cloned().unwrap_or(Value::Null)
         }),
-        (
-            "quality",
-            json!("pcm32k16"),
-            &|v: &Value| {
+        ("quality", json!("pcm32k16"), &|v: &Value| {
             v.get("quality").cloned().unwrap_or(Value::Null)
         }),
         // 本机名称（用户 2026-08-10 第 9 条）。回读的是**生效值**，所以这条同时
         // 顶住了「写进了 identity.json，但运行中的 daemon 还报着旧名字」——那正是
         // 改名这件事最容易只做一半的地方，而它做一半的时候没有任何一处会报错：
         // 界面上名字变了，对端系统里那两台设备一直挂着旧名。
-        (
-            "name",
-            json!("ahb-renamed"),
-            &|v: &Value| {
+        ("name", json!("ahb-renamed"), &|v: &Value| {
             v.get("name").cloned().unwrap_or(Value::Null)
         }),
     ];
@@ -1917,20 +1992,34 @@ fn every_writable_setting_key_is_really_honoured() {
         // 一句空话，而那正是它存在的全部理由。
         if *key == "autostart" {
             let before = a.ok(methods::SETTINGS_GET, json!({}));
+            let was_enabled = before
+                .get("autostart")
+                .and_then(Value::as_bool)
+                .expect("settings.get 没有返回 autostart");
             assert_eq!(
                 before.get("autostart_supported").and_then(Value::as_bool),
                 Some(false),
                 "测试二进制被判成了可注册登录项的形态——再往下一步就会写进用户的登录项"
             );
-            let e = a
-                .call(methods::SETTINGS_SET, json!({ "autostart": true }))
-                .expect_err("形态不支持时 settings.set autostart 必须报错，而不是静默收下");
-            assert!(e.contains("无法设置开机自启"), "错误信息说不清是什么挡住了：{e}");
+            if was_enabled {
+                // 注册项可能活得比启动它的 bundle / 测试进程长。此时 true 是幂等
+                // 请求，既不需要稳定启动目标，也不应改写或重新加载用户的真实项。
+                let got = a.ok(methods::SETTINGS_SET, json!({ "autostart": true }));
+                assert_eq!(got.get("autostart").and_then(Value::as_bool), Some(true));
+            } else {
+                let e = a
+                    .call(methods::SETTINGS_SET, json!({ "autostart": true }))
+                    .expect_err("形态不支持且当前未注册时，settings.set autostart 必须报错");
+                assert!(
+                    e.contains("无法设置开机自启"),
+                    "错误信息说不清是什么挡住了：{e}"
+                );
+            }
             let after = a.ok(methods::SETTINGS_GET, json!({}));
             assert_eq!(
                 after.get("autostart").and_then(Value::as_bool),
-                Some(false),
-                "一次被拒绝的写入之后，daemon 却报告开机自启已开启"
+                Some(was_enabled),
+                "测试进程的一次幂等/被拒绝写入改变了用户真实的开机自启状态"
             );
             continue;
         }
@@ -1974,6 +2063,19 @@ fn every_writable_setting_key_is_really_honoured() {
     }
 }
 
+#[test]
+fn native_locale_rejects_unknown_or_non_string_values() {
+    let a = Node::start("native-locale-validation");
+    for bad in [json!("fr-FR"), json!(7), Value::Null] {
+        let error = a
+            .call(methods::SETTINGS_SET, json!({ "native_locale": bad }))
+            .expect_err("unsupported native_locale must not be silently ignored");
+        assert!(error.contains("native_locale"), "{error}");
+    }
+    let got = a.ok(methods::SETTINGS_GET, json!({}));
+    assert_eq!(got.get("native_locale"), Some(&json!("zh-CN")));
+}
+
 /// **置灰的开机自启开关必须带着理由一起报出来。**
 ///
 /// plan M9。`autostart_supported=false` 时界面只能把开关画成点不动的；没有
@@ -1981,16 +2083,16 @@ fn every_writable_setting_key_is_really_honoured() {
 /// 已经为同一个形状付过好几次代价（模式降级、广播没生效）。
 ///
 /// 判据里带上 `autostart` 与 `autostart_target`，是为了把「字段忘了发」与
-/// 「字段发了但恒为默认值」分开：前者 `.is_none()`，后者才是 `Some(false)`。
+/// 「测试进程读到了正式 App 已有的登录项」分开。后者是真实且允许的四态之一：
+/// `supported=false && enabled=true`。
 #[test]
 fn the_autostart_switch_reports_why_it_is_greyed_out() {
     let a = Node::start("autostart");
     let v = a.ok(methods::SETTINGS_GET, json!({}));
-    assert_eq!(
-        v.get("autostart").and_then(Value::as_bool),
-        Some(false),
-        "settings.get 里没有 autostart 这个字段：{v}"
-    );
+    let enabled = v
+        .get("autostart")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| panic!("settings.get 里没有 autostart 这个字段：{v}"));
     assert_eq!(
         v.get("autostart_supported").and_then(Value::as_bool),
         Some(false),
@@ -2001,12 +2103,24 @@ fn the_autostart_switch_reports_why_it_is_greyed_out() {
         .and_then(Value::as_str)
         .expect("autostart_supported=false 却没给理由");
     assert!(!why.trim().is_empty(), "理由是空串，等于没给");
-    // 不支持时不许报一个「将会启动什么」——那会让界面显示一条根本不会存在的
-    // 登录项目标。
-    assert!(
-        v.get("autostart_target").map(|t| t.is_null()).unwrap_or(true),
-        "形态不支持却报出了启动目标：{v}"
-    );
+    // 形态不支持与“盘上已有项”是两个正交量：开发机可能已经从正式 App 注册过
+    // 登录项、随后在裸测试二进制里读它。已注册时必须照实报它真正指向谁；没注册
+    // 时才没有一个虚构的“将会启动目标”。
+    if enabled {
+        assert!(
+            v.get("autostart_target")
+                .and_then(Value::as_str)
+                .is_some_and(|target| !target.trim().is_empty()),
+            "已有登录项却没有报出它真正的目标：{v}"
+        );
+    } else {
+        assert!(
+            v.get("autostart_target")
+                .map(|t| t.is_null())
+                .unwrap_or(true),
+            "未注册且不支持注册，却报了一个虚构的目标：{v}"
+        );
+    }
 }
 
 /// **伺服必须导出「它此刻在做什么」，而且那份读数要随时间前进。**
@@ -2022,7 +2136,10 @@ fn the_servo_exports_a_heartbeat_even_with_no_sessions() {
     let a = Node::start("obs-idle");
     let first = a.servo();
     let t0 = first["ticks"].as_u64().expect("ticks 必须是个数");
-    eventually_within(Duration::from_secs(6), "the servo tick counter to advance", || a.servo()["ticks"].as_u64().unwrap_or(0) > t0,
+    eventually_within(
+        Duration::from_secs(6),
+        "the servo tick counter to advance",
+        || a.servo()["ticks"].as_u64().unwrap_or(0) > t0,
     );
     let now = a.servo();
     assert_eq!(
@@ -2037,7 +2154,13 @@ fn the_servo_exports_a_heartbeat_even_with_no_sessions() {
     // **顶层不许再有 `target_ms` / `sum_ms` / `jb_frames`。** 留一个「代表值」
     // 就是 plan §14 裁定 1 那个「每卡一个数字、不管取哪条都在替另一条撒谎」
     // 的 JSON 版本。读旧路径的人应当拿到 null 而不是一个静默错误的数。
-    for gone in ["target", "target_ms", "sum_ms", "jb_frames", "want_frames", "closed_loop",
+    for gone in [
+        "target",
+        "target_ms",
+        "sum_ms",
+        "jb_frames",
+        "want_frames",
+        "closed_loop",
     ] {
         assert!(
             now.get(gone).is_none(),
@@ -2258,7 +2381,10 @@ fn auto_is_distinguishable_from_a_dead_loop_in_the_readout() {
 
     a.set_transport(&b.fingerprint(), "send", "latency", "auto");
     let t0 = b.servo()["ticks"].as_u64().expect("ticks");
-    eventually_within(Duration::from_secs(6), "the loop to keep ticking under AUTO", || b.servo()["ticks"].as_u64().unwrap_or(0) > t0,
+    eventually_within(
+        Duration::from_secs(6),
+        "the loop to keep ticking under AUTO",
+        || b.servo()["ticks"].as_u64().unwrap_or(0) > t0,
     );
     let now = b.rx_servo();
     assert_eq!(now["target"].as_str(), Some(audiohub_ipc::LATENCY_AUTO));
@@ -2307,9 +2433,15 @@ fn the_two_stops_report_the_streams_they_can_actually_act_on() {
         sa["latency_target"].is_null(),
         "a 没有接收流，延迟档在这台机器上没有执行器，却报出了目标：{sa}"
     );
-    assert_eq!(sa["target_from"].as_str(), Some("local"), "a 是消费者，档位是自己设的");
+    assert_eq!(
+        sa["target_from"].as_str(),
+        Some("local"),
+        "a 是消费者，档位是自己设的"
+    );
 
-    eventually("b's receive stream to carry the pushed latency target", || stats(&b)["latency_target"].as_str() == Some("200"),
+    eventually(
+        "b's receive stream to carry the pushed latency target",
+        || stats(&b)["latency_target"].as_str() == Some("200"),
     );
     let sb = stats(&b);
     assert!(
@@ -2381,7 +2513,9 @@ fn the_send_latency_lands_on_the_peers_buffer_and_nowhere_local() {
     );
 
     assert!(
-        a.servo()["by_stream"].as_object().map_or(false, |m| m.is_empty()),
+        a.servo()["by_stream"]
+            .as_object()
+            .map_or(false, |m| m.is_empty()),
         "本机出现了接收流的伺服条目——延迟档被误留在了本地"
     );
 }
@@ -2410,7 +2544,9 @@ fn the_recv_latency_stays_home_and_is_never_pushed() {
     );
     // b 那侧没有接收流，也不该收到任何被拒的外来档位。
     assert!(
-        b.servo()["by_stream"].as_object().map_or(false, |m| m.is_empty()),
+        b.servo()["by_stream"]
+            .as_object()
+            .map_or(false, |m| m.is_empty()),
         "`recv.latency` 被推到了对端：那边没有 rx，它无处执行"
     );
     assert_eq!(
@@ -2432,7 +2568,11 @@ fn the_send_quality_acts_on_the_local_sender_only() {
         a.tx_rung() == Some(RUNG_16K)
     });
     assert_eq!(a.tx_quality_rung(), Some(RUNG_16K));
-    assert_eq!(b.tx_quality_rung(), None, "对端没有发送流，档位却落到了它身上");
+    assert_eq!(
+        b.tx_quality_rung(),
+        None,
+        "对端没有发送流，档位却落到了它身上"
+    );
     assert_eq!(b.servo()["bad_transport_targets"].as_u64(), Some(0));
 }
 
@@ -2489,7 +2629,9 @@ fn a_stream_opened_after_the_stops_were_set_starts_with_them_in_force() {
     );
     tone_session(&a, &b);
 
-    eventually("the freshly opened receive stream to carry the stored target", || a.rx_servo()["target_ms"].as_u64() == Some(300),
+    eventually(
+        "the freshly opened receive stream to carry the stored target",
+        || a.rx_servo()["target_ms"].as_u64() == Some(300),
     );
     eventually(
         "the freshly opened send stream to carry the stored quality",
@@ -2522,10 +2664,7 @@ fn changing_one_peers_stops_leaves_the_other_peers_loop_untouched() {
         consumer.set_transport(&p.fingerprint(), "send", "latency", "200");
     }
     for p in [&p1, &p2] {
-        eventually_within(
-            Duration::from_secs(25),
-            "both peers to adopt 200",
-            || {
+        eventually_within(Duration::from_secs(25), "both peers to adopt 200", || {
             p.rx_servo()["target_ms"].as_u64() == Some(200)
         });
     }
@@ -2555,7 +2694,10 @@ fn changing_one_peers_stops_leaves_the_other_peers_loop_untouched() {
     // 会重新走一段，`moves` 跟着跳。基线已经是收敛值，所以这里的容差只需要
     // 覆盖「恰好在这两拍之间自然微调了一次」。
     let jumped = p2.servo_moves().saturating_sub(p2_moves0);
-    assert!(jumped <= 1, "p2 的伺服被 p1 的换档惊动了 {jumped} 次（基线是收敛值）");
+    assert!(
+        jumped <= 1,
+        "p2 的伺服被 p1 的换档惊动了 {jumped} 次（基线是收敛值）"
+    );
 }
 
 /// **断言 A：属于**另一条连接**的流，`SetTransport` 一律拒绝并计数。**
@@ -2590,7 +2732,9 @@ fn a_set_transport_for_another_connections_stream_is_refused_and_counted() {
         provider.rx_servo()["target_ms"].as_u64() == Some(300)
     });
     // c1 也要有一条连接（pair 已建立），但没有会话——它无权碰 victim。
-    let before = provider.servo()["bad_transport_targets"].as_u64().unwrap_or(0);
+    let before = provider.servo()["bad_transport_targets"]
+        .as_u64()
+        .unwrap_or(0);
 
     c1.send_raw(
         &provider.fingerprint(),
@@ -2601,7 +2745,10 @@ fn a_set_transport_for_another_connections_stream_is_refused_and_counted() {
         },
     );
     eventually("the provider to count the cross-connection attempt", || {
-        provider.servo()["bad_transport_targets"].as_u64().unwrap_or(0) > before
+        provider.servo()["bad_transport_targets"]
+            .as_u64()
+            .unwrap_or(0)
+            > before
     });
     // 而 c2 那条真流**一个字都没变**：拒绝不该有副作用。
     // 多等几拍再断言——被采纳的话，伺服下一拍就会把 target_ms 改成 1000。
@@ -2642,7 +2789,9 @@ fn a_consumer_mode_machine_refuses_pushed_stops_and_counts_them() {
     });
     // 正向对照：这条流此刻跑在 AUTO 上（阶梯当家），固定档为 None。
     assert_eq!(consumer.tx_quality_rung(), None);
-    let before = consumer.servo()["bad_transport_targets"].as_u64().unwrap_or(0);
+    let before = consumer.servo()["bad_transport_targets"]
+        .as_u64()
+        .unwrap_or(0);
 
     // 提供者反过来指挥消费者：这正是 §13 不允许的方向。
     provider.send_raw(
@@ -2654,7 +2803,10 @@ fn a_consumer_mode_machine_refuses_pushed_stops_and_counts_them() {
         },
     );
     eventually("the refusal to be counted", || {
-        consumer.servo()["bad_transport_targets"].as_u64().unwrap_or(0) > before
+        consumer.servo()["bad_transport_targets"]
+            .as_u64()
+            .unwrap_or(0)
+            > before
     });
     assert_eq!(
         consumer.tx_quality_rung(),
@@ -2708,10 +2860,12 @@ fn two_daemons_pinned_to_tier_one_carry_a_tone_over_tcp() {
 
     // (1) one link, two ends.
     eventually("a tier 1 media link on the dialling side", || {
-        a.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        a.tcp_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
     eventually("a tier 1 media link on the accepting side", || {
-        b.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        b.tcp_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
     assert_eq!(
         a.tcp_link().expect("checked above")["fingerprint"].as_str(),
@@ -2730,11 +2884,17 @@ fn two_daemons_pinned_to_tier_one_carry_a_tone_over_tcp() {
 
     // (2) the audio arrived, and it is the audio that was sent.
     eventually_within(Duration::from_secs(20), "B's 1 kHz verdict", || {
-        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
+        b.recv_verdict()
+            .is_some_and(|v| v["detected"] == Value::Bool(true))
     });
     let verdict = b.recv_verdict().expect("checked above");
-    let snr = verdict["snr_db"].as_f64().expect("a detected verdict carries an SNR");
-    assert!(snr >= 40.0, "1 kHz over loopback TCP should be clean, got {snr:.1} dB SNR");
+    let snr = verdict["snr_db"]
+        .as_f64()
+        .expect("a detected verdict carries an SNR");
+    assert!(
+        snr >= 40.0,
+        "1 kHz over loopback TCP should be clean, got {snr:.1} dB SNR"
+    );
 
     // (3) loopback TCP loses nothing.
     let sessions = b.ok(methods::SESSION_LIST, json!({}));
@@ -2743,8 +2903,14 @@ fn two_daemons_pinned_to_tier_one_carry_a_tone_over_tcp() {
         .and_then(|ss| ss.iter().find(|s| s["dir"].as_str() == Some("recv")))
         .expect("B must have a receiving session")
         .clone();
-    assert_eq!(recv["stats"]["lost"].as_u64(), Some(0), "TCP lost a packet: {recv}");
-    let received = recv["stats"]["received"].as_u64().expect("a received count");
+    assert_eq!(
+        recv["stats"]["lost"].as_u64(),
+        Some(0),
+        "TCP lost a packet: {recv}"
+    );
+    let received = recv["stats"]["received"]
+        .as_u64()
+        .expect("a received count");
     assert!(received > 0, "the session reports no packets at all");
 
     // (4) ...and they came off the TCP link, not off the UDP socket.
@@ -2752,7 +2918,10 @@ fn two_daemons_pinned_to_tier_one_carry_a_tone_over_tcp() {
     let b_link = b.tcp_link().expect("still attached");
     let written = a_link["frames_written"].as_u64().expect("a written count");
     let read = b_link["frames_read"].as_u64().expect("a read count");
-    assert!(written > 0, "the sender never wrote a frame to the tier 1 link");
+    assert!(
+        written > 0,
+        "the sender never wrote a frame to the tier 1 link"
+    );
     assert!(
         read >= received,
         "the session counted {received} packets but only {read} came off the tier 1 link, so \
@@ -2797,15 +2966,27 @@ fn a_peer_pinned_to_tier_zero_refuses_the_attach() {
             "freq": 1000.0, "verify_freq": 1000.0
         }),
     );
-    eventually_within(Duration::from_secs(20), "B's 1 kHz verdict over UDP", || {
-        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    },
+    eventually_within(
+        Duration::from_secs(20),
+        "B's 1 kHz verdict over UDP",
+        || {
+            b.recv_verdict()
+                .is_some_and(|v| v["detected"] == Value::Bool(true))
+        },
     );
 
     // Checked after the tone, not before: a link that takes a moment to appear
     // would make an immediate assertion pass for the wrong reason.
-    assert!(a.tcp_media().is_empty(), "a tier 0 peer granted a media attach: {:?}", a.tcp_media());
-    assert!(b.tcp_media().is_empty(), "a tier 0 peer accepted a media attach: {:?}", b.tcp_media());
+    assert!(
+        a.tcp_media().is_empty(),
+        "a tier 0 peer granted a media attach: {:?}",
+        a.tcp_media()
+    );
+    assert!(
+        b.tcp_media().is_empty(),
+        "a tier 0 peer accepted a media attach: {:?}",
+        b.tcp_media()
+    );
 }
 
 /// **A stream opened the instant the peers are paired still goes over TCP.**
@@ -2850,7 +3031,8 @@ fn a_stream_opened_without_waiting_for_the_link_still_goes_over_tcp() {
         }),
     );
     eventually_within(Duration::from_secs(20), "B's 1 kHz verdict", || {
-        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
+        b.recv_verdict()
+            .is_some_and(|v| v["detected"] == Value::Bool(true))
     });
 
     let written = a
@@ -2873,11 +3055,16 @@ fn a_stream_opened_without_waiting_for_the_link_still_goes_over_tcp() {
         .ok(methods::SESSION_LIST, json!({}))
         .as_array()
         .and_then(|ss| {
-            ss.iter().find(|s| s["dir"].as_str() == Some("recv")).cloned()
+            ss.iter()
+                .find(|s| s["dir"].as_str() == Some("recv"))
+                .cloned()
         })
         .and_then(|s| s["stats"]["received"].as_u64())
         .expect("a received count");
-    let read = b.tcp_link().and_then(|l| l["frames_read"].as_u64()).unwrap_or(0);
+    let read = b
+        .tcp_link()
+        .and_then(|l| l["frames_read"].as_u64())
+        .unwrap_or(0);
     assert!(
         read >= received,
         "{received} packets reached the session but only {read} came off the tier 1 link, so \
@@ -2907,7 +3094,11 @@ fn a_tier_zero_peer_refuses_out_loud_rather_than_by_timing_out() {
     pin_tier(&b, &a.fingerprint(), "tier0");
 
     let pin = b.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
-    let pin = pin.get("pin").and_then(Value::as_str).expect("pin").to_string();
+    let pin = pin
+        .get("pin")
+        .and_then(Value::as_str)
+        .expect("pin")
+        .to_string();
     a.ok(methods::PEERS_PAIR, json!({ "addr": b.addr(), "pin": pin }));
     let t0 = Instant::now();
     a.ok(
@@ -2916,7 +3107,10 @@ fn a_tier_zero_peer_refuses_out_loud_rather_than_by_timing_out() {
     );
     let took = t0.elapsed();
 
-    assert!(a.tcp_media().is_empty(), "a tier 0 peer granted a media attach");
+    assert!(
+        a.tcp_media().is_empty(),
+        "a tier 0 peer granted a media attach"
+    );
     assert!(
         took < Duration::from_secs(2),
         "connecting took {took:?}; a refusal that has to be inferred from a timeout costs the \
@@ -2948,7 +3142,10 @@ fn session_tiers(n: &Node) -> Vec<(u64, Option<String>)> {
 
 fn assert_all_sessions_report(n: &Node, who: &str, want: &str) {
     let got = session_tiers(n);
-    assert!(!got.is_empty(), "{who} has no session, so this assertion would be vacuous");
+    assert!(
+        !got.is_empty(),
+        "{who} has no session, so this assertion would be vacuous"
+    );
     for (id, tier) in &got {
         assert_eq!(
             tier.as_deref(),
@@ -2980,7 +3177,8 @@ fn a_session_on_a_tier_one_link_reports_tier_one() {
     pin_tier(&b, &a.fingerprint(), "tier1");
     pair(&a, &b);
     eventually("a tier 1 media link on the accepting side", || {
-        b.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        b.tcp_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
 
     tone_session(&a, &b);
@@ -3033,7 +3231,9 @@ fn the_session_transport_names_the_link_not_the_setting() {
     });
 
     // The premise, restated as an assertion: the SETTING still says tier 1.
-    let setting = a.peer(&b.fingerprint())["transport"]["tier"].as_str().map(str::to_string);
+    let setting = a.peer(&b.fingerprint())["transport"]["tier"]
+        .as_str()
+        .map(str::to_string);
     assert_eq!(
         setting.as_deref(),
         Some("tier1"),
@@ -3080,7 +3280,8 @@ fn a_second_media_attach_is_refused_while_one_is_installed() {
     pin_tier(&b, &a.fingerprint(), "tier1");
     pair(&a, &b);
     eventually("a tier 1 media link on the accepting side", || {
-        b.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        b.tcp_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
 
     // A ticket B would have handed out itself. Minting it directly is the only
@@ -3088,7 +3289,8 @@ fn a_second_media_attach_is_refused_while_one_is_installed() {
     // second live ticket per peer.
     let ticket_b64 = crate::tcpmedia::mint_ticket_for_test(b.h.inner_for_test(), &a.fingerprint());
     let mut s = TcpStream::connect(b.addr()).expect("dial B's control port");
-    s.set_read_timeout(Some(Duration::from_secs(5))).expect("read timeout");
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
     write_frame(&mut s, &ControlMsg::MediaAttach { ticket_b64 }).expect("send media_attach");
     match read_frame(&mut s).expect("read the reply") {
         ControlMsg::Error { message } => assert!(
@@ -3104,7 +3306,11 @@ fn a_second_media_attach_is_refused_while_one_is_installed() {
 
     // ...and the original link is untouched.
     let link = b.tcp_link().expect("the first link survived");
-    assert_eq!(link["alive"], Value::Bool(true), "the refusal killed the live link: {link}");
+    assert_eq!(
+        link["alive"],
+        Value::Bool(true),
+        "the refusal killed the live link: {link}"
+    );
 }
 
 /// **A media frame that fails AEAD is counted, not merely dropped.**
@@ -3136,7 +3342,8 @@ fn a_media_frame_that_fails_aead_is_counted() {
         b.ok(methods::SESSION_LIST, json!({}))
             .as_array()
             .is_some_and(|ss| {
-                ss.iter().any(|s| s["stats"]["received"].as_u64().unwrap_or(0) > 0)
+                ss.iter()
+                    .any(|s| s["stats"]["received"].as_u64().unwrap_or(0) > 0)
             })
     });
 
@@ -3144,7 +3351,12 @@ fn a_media_frame_that_fails_aead_is_counted() {
     // not its ciphertext. Everything up to the AEAD passes.
     // `local_addr` reports the wildcard bind (`0.0.0.0:port`), which is not a
     // destination anything can be sent to; only the port is wanted.
-    let port = b.h.inner_for_test().udp.local_addr().expect("B's media port").port();
+    let port =
+        b.h.inner_for_test()
+            .udp
+            .local_addr()
+            .expect("B's media port")
+            .port();
     let dest: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("dest");
     let payload = [0u8; 64];
     let mut dg = Vec::new();
@@ -3169,7 +3381,8 @@ fn a_media_frame_that_fails_aead_is_counted() {
         b.ok(methods::SESSION_LIST, json!({}))
             .as_array()
             .is_some_and(|ss| {
-                ss.iter().any(|s| s["stats"]["auth_failed"].as_u64().unwrap_or(0) >= 3)
+                ss.iter()
+                    .any(|s| s["stats"]["auth_failed"].as_u64().unwrap_or(0) >= 3)
             })
     });
     // ...and nothing was let through: `received` counts authenticated packets.
@@ -3177,7 +3390,9 @@ fn a_media_frame_that_fails_aead_is_counted() {
         .ok(methods::SESSION_LIST, json!({}))
         .as_array()
         .and_then(|ss| {
-            ss.iter().find(|s| s["dir"].as_str() == Some("recv")).cloned()
+            ss.iter()
+                .find(|s| s["dir"].as_str() == Some("recv"))
+                .cloned()
         })
         .expect("a receiving session");
     assert_eq!(
@@ -3238,7 +3453,8 @@ impl Forwarder {
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 };
-                let Ok(up) = std::net::TcpStream::connect(to) else { continue;
+                let Ok(up) = std::net::TcpStream::connect(to) else {
+                    continue;
                 };
                 // Nagle off on both legs. With it on, the forwarder itself
                 // would add up to 40 ms to every small frame and the round-trip
@@ -3249,7 +3465,8 @@ impl Forwarder {
                     (down.try_clone(), up.try_clone()),
                     (up.try_clone(), down.try_clone()),
                 ] {
-                    let (Ok(mut from), Ok(mut to)) = (from, to) else { continue;
+                    let (Ok(mut from), Ok(mut to)) = (from, to) else {
+                        continue;
                     };
                     let (s, c) = (s.clone(), c.clone());
                     std::thread::spawn(move || {
@@ -3284,7 +3501,10 @@ impl Forwarder {
                 }
             }
         });
-        Forwarder { port, stop, carried,
+        Forwarder {
+            port,
+            stop,
+            carried,
         }
     }
 
@@ -3326,7 +3546,9 @@ fn tier_two_pair(tag: &str, tx_kbps: Option<u64>) -> (Node, Node, Forwarder) {
     // with the scheduler working perfectly. The throttle that isolates the
     // scheduler is the one on our own writer, ahead of the socket.
     let fwd = Forwarder::start(
-        format!("127.0.0.1:{}", b.control_port()).parse().expect("B's control addr"),
+        format!("127.0.0.1:{}", b.control_port())
+            .parse()
+            .expect("B's control addr"),
     );
     fwd.assert_not_a_control_port([&a, &b]);
 
@@ -3375,10 +3597,12 @@ fn a_tier_two_pair_survives_the_source_address_being_lost() {
     let (a, b, fwd) = tier_two_pair("t2", None);
 
     eventually("the mux to come up on the dialling side", || {
-        a.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        a.mux_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
     eventually("the mux to come up on the accepting side", || {
-        b.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        b.mux_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
 
     // (1) A's route to B is the tunnel, and only the tunnel.
@@ -3397,8 +3621,13 @@ fn a_tier_two_pair_survives_the_source_address_being_lost() {
 
     // (2) B cannot tell where A is. Same IP as every other loopback peer, and a
     // port belonging to the forwarder rather than to A.
-    let seen = b.conn_peer_addr(&a.fingerprint()).expect("B has a live channel to A");
-    assert!(seen.ip().is_loopback(), "the forwarder was expected on loopback, saw {seen}");
+    let seen = b
+        .conn_peer_addr(&a.fingerprint())
+        .expect("B has a live channel to A");
+    assert!(
+        seen.ip().is_loopback(),
+        "the forwarder was expected on loopback, saw {seen}"
+    );
     assert_ne!(
         seen.port(),
         a.control_port(),
@@ -3430,20 +3659,39 @@ fn a_tier_two_pair_survives_the_source_address_being_lost() {
         }),
     );
 
-    eventually_within(Duration::from_secs(25), "B's 1 kHz verdict over the mux", || {
-        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    },
+    // Wait for the invariant asserted below, not merely `detected`. Detection
+    // starts at 20 dB; reading the next line's stronger 40 dB assertion on the
+    // first 20 dB snapshot races the two-second rolling tap while it is still
+    // evicting start-up PLC/silence (the observed flaky value was 22.5 dB).
+    let mut clean_snr = None;
+    eventually_within(
+        Duration::from_secs(25),
+        "B's clean 1 kHz verdict over the mux",
+        || {
+            b.recv_verdict().is_some_and(|v| {
+                let snr = v["snr_db"].as_f64();
+                let clean =
+                    v["detected"] == Value::Bool(true) && snr.is_some_and(|snr| snr >= 40.0);
+                if clean {
+                    clean_snr = snr;
+                }
+                clean
+            })
+        },
     );
-    eventually_within(Duration::from_secs(25), "A's 1 kHz verdict over the mux", || {
-        a.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    },
+    eventually_within(
+        Duration::from_secs(25),
+        "A's 1 kHz verdict over the mux",
+        || {
+            a.recv_verdict()
+                .is_some_and(|v| v["detected"] == Value::Bool(true))
+        },
     );
-    let snr = b
-        .recv_verdict()
-        .expect("checked above")["snr_db"]
-        .as_f64()
-        .expect("a detected verdict carries an SNR");
-    assert!(snr >= 40.0, "1 kHz over a loopback mux should be clean, got {snr:.1} dB SNR");
+    let snr = clean_snr.expect("the clean verdict above carries an SNR");
+    assert!(
+        snr >= 40.0,
+        "1 kHz over a loopback mux should be clean, got {snr:.1} dB SNR"
+    );
 
     // (4) The control plane rode the same connection.
     let a_mux = a.mux_link().expect("still up");
@@ -3474,7 +3722,9 @@ fn a_tier_two_pair_survives_the_source_address_being_lost() {
         .and_then(|ss| ss.iter().find(|s| s["dir"].as_str() == Some("recv")))
         .expect("B must have a receiving session")
         .clone();
-    let received = recv["stats"]["received"].as_u64().expect("a received count");
+    let received = recv["stats"]["received"]
+        .as_u64()
+        .expect("a received count");
     let read = b
         .tcp_link()
         .expect("the mux's media half is a tcp_media row")["frames_read"]
@@ -3486,8 +3736,15 @@ fn a_tier_two_pair_survives_the_source_address_being_lost() {
         "the session counted {received} packets but only {read} came off the mux, so the rest \
          arrived over UDP — the downgrade is decorative"
     );
-    assert_eq!(recv["stats"]["lost"].as_u64(), Some(0), "loopback TCP lost a packet: {recv}");
-    assert!(fwd.carried() > 0, "the forwarder carried nothing, so it is not in the path");
+    assert_eq!(
+        recv["stats"]["lost"].as_u64(),
+        Some(0),
+        "loopback TCP lost a packet: {recv}"
+    );
+    assert!(
+        fwd.carried() > 0,
+        "the forwarder carried nothing, so it is not in the path"
+    );
 
     // (6) ...and the statistics **say** tier 2 (plan §9 M8: the tier has to be
     // labelled in the statistics too). This is the only rig in the tree where a
@@ -3596,7 +3853,8 @@ fn media_at_full_rate_does_not_starve_the_control_plane() {
     // trimming the excess, and never a moment when it is empty.
     let (a, b, fwd) = tier_two_pair("t2-starve", Some(1500));
     eventually("the mux to come up", || {
-        a.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        a.mux_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
 
     // Rung 0 in both directions: the most media this ladder can produce.
@@ -3624,9 +3882,13 @@ fn media_at_full_rate_does_not_starve_the_control_plane() {
     // one. `writeq_ms` is how long the frame the writer just picked up had been
     // waiting, so a sustained reading is saturation itself rather than a
     // symptom of it.
-    eventually_within(Duration::from_secs(25), "the media queue to back up", || {
-        a.tcp_link().is_some_and(|l| l["writeq_ms"].as_f64().unwrap_or(0.0) > 50.0)
-    },
+    eventually_within(
+        Duration::from_secs(25),
+        "the media queue to back up",
+        || {
+            a.tcp_link()
+                .is_some_and(|l| l["writeq_ms"].as_f64().unwrap_or(0.0) > 50.0)
+        },
     );
 
     // Sample distinct round trips. `rtt_ms` is the last `Pong`'s, refreshed by
@@ -3683,7 +3945,9 @@ fn media_at_full_rate_does_not_starve_the_control_plane() {
 
     // The throttle really was the constraint: the link moved far less than an
     // unthrottled loopback would have.
-    let queued = a.tcp_link().expect("a media queue")["queued"].as_u64().unwrap_or(0);
+    let queued = a.tcp_link().expect("a media queue")["queued"]
+        .as_u64()
+        .unwrap_or(0);
     assert!(
         queued > 0 || fwd.carried() > 0,
         "nothing was in flight at all, so nothing was being prioritised over"
@@ -3703,7 +3967,8 @@ fn media_at_full_rate_does_not_starve_the_control_plane() {
 fn an_inbound_only_peer_is_awaited_rather_than_dialled() {
     let (a, b, _fwd) = tier_two_pair("t2-inbound", None);
     eventually("the mux to come up", || {
-        b.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        b.mux_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
 
     // While connected, the third state is not claimed: it answers "where is it
@@ -3716,7 +3981,9 @@ fn an_inbound_only_peer_is_awaited_rather_than_dialled() {
     );
 
     // Now drop it from A's side, so B loses the channel it never dials.
-    a.ok(methods::PEERS_DISCONNECT, json!({ "peer": b.fingerprint() }),
+    a.ok(
+        methods::PEERS_DISCONNECT,
+        json!({ "peer": b.fingerprint() }),
     );
     eventually("B to notice A is gone", || {
         b.peer(&a.fingerprint())["online"] == Value::Bool(false)
@@ -3764,7 +4031,8 @@ fn an_inbound_only_peer_is_awaited_rather_than_dialled() {
 fn a_policy_flip_after_the_retry_was_armed_disarms_it() {
     let (a, b, fwd) = tier_two_pair("t2-flip", None);
     eventually("the mux to come up", || {
-        b.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        b.mux_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
 
     // A dialled B, so A has a retry entry — the thing the never-dialled side
@@ -3778,7 +4046,10 @@ fn a_policy_flip_after_the_retry_was_armed_disarms_it() {
     // Now the policy changes under the armed entry.
     set_dial_policy(&a, &b.fingerprint(), "inbound_only");
 
-    eventually_within(Duration::from_secs(20), "A to stop retrying a peer it may not dial", || a.peer(&b.fingerprint())["reconnecting"] == Value::Bool(false),
+    eventually_within(
+        Duration::from_secs(20),
+        "A to stop retrying a peer it may not dial",
+        || a.peer(&b.fingerprint())["reconnecting"] == Value::Bool(false),
     );
 
     // And it is reported as the third state, not as a fault: reporting both
@@ -3822,7 +4093,8 @@ fn a_tier_two_stream_sends_no_keepalive_datagrams() {
 
     // Somewhere a keepalive could go, and something that counts what arrives.
     let sink = UdpSocket::bind("127.0.0.1:0").expect("bind the keepalive sink");
-    sink.set_read_timeout(Some(Duration::from_millis(200))).expect("timeout");
+    sink.set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("timeout");
     let sink_addr = sink.local_addr().expect("sink addr");
 
     let drain = |sink: &UdpSocket| -> usize {
@@ -3896,7 +4168,6 @@ fn a_tier_two_stream_sends_no_keepalive_datagrams() {
     );
 }
 
-
 // ---------------------------------------------------------------- M8 P6: WS
 
 /// Bring up a tier 2 pair whose mux runs **inside a WebSocket** (design §6 P6).
@@ -3921,7 +4192,9 @@ fn tier_two_ws_pair(tag: &str) -> (Node, Node, Forwarder, String) {
     b.set_mode(Mode::Share);
 
     let fwd = Forwarder::start(
-        format!("127.0.0.1:{}", b.control_port()).parse().expect("B's control addr"),
+        format!("127.0.0.1:{}", b.control_port())
+            .parse()
+            .expect("B's control addr"),
     );
     fwd.assert_not_a_control_port([&a, &b]);
 
@@ -3931,8 +4204,14 @@ fn tier_two_ws_pair(tag: &str) -> (Node, Node, Forwarder, String) {
 
     // Pair over the forwarder as a bare connection...
     let pin = b.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
-    let pin = pin.get("pin").and_then(Value::as_str).expect("pin").to_string();
-    a.ok(methods::PEERS_PAIR, json!({ "addr": fwd.addr(), "pin": pin }),
+    let pin = pin
+        .get("pin")
+        .and_then(Value::as_str)
+        .expect("pin")
+        .to_string();
+    a.ok(
+        methods::PEERS_PAIR,
+        json!({ "addr": fwd.addr(), "pin": pin }),
     );
 
     // ...then hand A the URL and let the stored endpoint choose the carrier.
@@ -3985,10 +4264,12 @@ fn a_websocket_mux_carries_everything_the_bare_one_did() {
     let (a, b, fwd, url) = tier_two_ws_pair("t2ws");
 
     eventually("the ws mux to come up on the dialling side", || {
-        a.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        a.mux_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
     eventually("the ws mux to come up on the accepting side", || {
-        b.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        b.mux_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
 
     // (1) A's route to B is the tunnel, and only the tunnel.
@@ -3998,11 +4279,20 @@ fn a_websocket_mux_carries_everything_the_bare_one_did() {
         Some(fwd.port as u64),
         "A recorded something other than the forwarder as B's port: {b_record}"
     );
-    assert_ne!(fwd.port, b.control_port(), "the forwarder and B's control port coincided");
+    assert_ne!(
+        fwd.port,
+        b.control_port(),
+        "the forwarder and B's control port coincided"
+    );
 
     // (2) B cannot tell where A is.
-    let seen = b.conn_peer_addr(&a.fingerprint()).expect("B has a live channel to A");
-    assert!(seen.ip().is_loopback(), "the forwarder was expected on loopback, saw {seen}");
+    let seen = b
+        .conn_peer_addr(&a.fingerprint())
+        .expect("B has a live channel to A");
+    assert!(
+        seen.ip().is_loopback(),
+        "the forwarder was expected on loopback, saw {seen}"
+    );
     assert_ne!(seen.port(), a.control_port(), "B saw A's own control port");
 
     // (3) ...and identity survived anyway, in both directions.
@@ -4023,18 +4313,29 @@ fn a_websocket_mux_carries_everything_the_bare_one_did() {
             }),
         );
     }
-    eventually_within(Duration::from_secs(25), "B's 1 kHz verdict over the ws mux", || {
-        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    },
+    eventually_within(
+        Duration::from_secs(25),
+        "B's 1 kHz verdict over the ws mux",
+        || {
+            b.recv_verdict()
+                .is_some_and(|v| v["detected"] == Value::Bool(true))
+        },
     );
-    eventually_within(Duration::from_secs(25), "A's 1 kHz verdict over the ws mux", || {
-        a.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    },
+    eventually_within(
+        Duration::from_secs(25),
+        "A's 1 kHz verdict over the ws mux",
+        || {
+            a.recv_verdict()
+                .is_some_and(|v| v["detected"] == Value::Bool(true))
+        },
     );
     let snr = b.recv_verdict().expect("checked above")["snr_db"]
         .as_f64()
         .expect("a detected verdict carries an SNR");
-    assert!(snr >= 40.0, "1 kHz over a loopback ws mux should be clean, got {snr:.1} dB SNR");
+    assert!(
+        snr >= 40.0,
+        "1 kHz over a loopback ws mux should be clean, got {snr:.1} dB SNR"
+    );
 
     // (4) The control plane rode the same connection.
     let a_mux = a.mux_link().expect("still up");
@@ -4059,8 +4360,12 @@ fn a_websocket_mux_carries_everything_the_bare_one_did() {
         .and_then(|ss| ss.iter().find(|s| s["dir"].as_str() == Some("recv")))
         .expect("B must have a receiving session")
         .clone();
-    let received = recv["stats"]["received"].as_u64().expect("a received count");
-    let read = b.tcp_link().expect("the mux's media half is a tcp_media row")["frames_read"]
+    let received = recv["stats"]["received"]
+        .as_u64()
+        .expect("a received count");
+    let read = b
+        .tcp_link()
+        .expect("the mux's media half is a tcp_media row")["frames_read"]
         .as_u64()
         .expect("a read count");
     assert!(received > 0, "the session reports no packets at all");
@@ -4069,15 +4374,21 @@ fn a_websocket_mux_carries_everything_the_bare_one_did() {
         "the session counted {received} packets but only {read} came off the ws mux, so the \
          rest arrived over UDP — the downgrade is decorative"
     );
-    assert_eq!(recv["stats"]["lost"].as_u64(), Some(0), "a loopback ws mux lost a packet: {recv}");
+    assert_eq!(
+        recv["stats"]["lost"].as_u64(),
+        Some(0),
+        "a loopback ws mux lost a packet: {recv}"
+    );
     assert!(fwd.carried() > 0, "the forwarder carried nothing");
 
     // (6) **P6's own assertion.** Everything above is equally true of P5's
     // bare-TCP mux; this is the only line that is not.
     for (who, m) in [("A", &a_mux), ("B", &b_mux)] {
         let ws = ws_block(m).unwrap_or_else(|| {
-            panic!("{who}'s mux has no ws block, so it is the bare TCP carrier and {url} did \
-                    nothing: {m}")
+            panic!(
+                "{who}'s mux has no ws block, so it is the bare TCP carrier and {url} did \
+                    nothing: {m}"
+            )
         });
         assert!(
             ws["messages_written"].as_u64().unwrap_or(0) > 0
@@ -4132,12 +4443,15 @@ fn a_websocket_mux_carries_everything_the_bare_one_did() {
 fn the_websocket_heartbeat_survives_ninety_seconds_without_media() {
     let (a, b, _fwd, _url) = tier_two_ws_pair("t2ws-idle");
     eventually("the ws mux to come up", || {
-        a.mux_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        a.mux_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
     // No session is ever opened: "no media traffic" is the injected condition,
     // and the way to inject it is not to produce any.
     assert!(
-        a.ok(methods::SESSION_LIST, json!({})).as_array().is_none_or(|v| v.is_empty()),
+        a.ok(methods::SESSION_LIST, json!({}))
+            .as_array()
+            .is_none_or(|v| v.is_empty()),
         "this test is about an idle link and something opened a session"
     );
 
@@ -4146,9 +4460,19 @@ fn the_websocket_heartbeat_survives_ninety_seconds_without_media() {
     std::thread::sleep(idle);
 
     for (who, n, peer) in [("A", &a, b.fingerprint()), ("B", &b, a.fingerprint())] {
-        let m = n.mux_link().unwrap_or_else(|| panic!("{who}'s mux is gone after {idle:?}"));
-        assert_eq!(m["alive"], Value::Bool(true), "{who}'s mux died while idle: {m}");
-        assert_eq!(n.peer(&peer)["online"], Value::Bool(true), "{who} lost the peer while idle");
+        let m = n
+            .mux_link()
+            .unwrap_or_else(|| panic!("{who}'s mux is gone after {idle:?}"));
+        assert_eq!(
+            m["alive"],
+            Value::Bool(true),
+            "{who}'s mux died while idle: {m}"
+        );
+        assert_eq!(
+            n.peer(&peer)["online"],
+            Value::Bool(true),
+            "{who} lost the peer while idle"
+        );
         let ws = ws_block(&m).unwrap_or_else(|| panic!("{who} is not on the ws carrier: {m}"));
 
         // Four counters, and each names a different half of the mechanism.
@@ -4265,10 +4589,12 @@ fn a_stored_verdict_brings_the_next_connection_up_on_tier_one() {
     pair(&a, &b);
 
     eventually("a tier 1 link on the dialling side", || {
-        a.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        a.tcp_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
     eventually("a tier 1 link on the accepting side", || {
-        b.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
+        b.tcp_link()
+            .is_some_and(|l| l["alive"] == Value::Bool(true))
     });
     // The red line, restated on the reporting surface: the user chose nothing,
     // and every surface still says so.
@@ -4301,7 +4627,10 @@ fn a_verdict_older_than_the_retry_window_is_retired_and_udp_is_probed_again() {
     a.set_mode(Mode::A);
     b.set_mode(Mode::Share);
     // Two hours old, against a one hour window. UDP works on this link.
-    seed_verdict(&a, &b.fingerprint(), 2 * crate::autotier::AUTO_TIER_RETRY_SECS,
+    seed_verdict(
+        &a,
+        &b.fingerprint(),
+        2 * crate::autotier::AUTO_TIER_RETRY_SECS,
     );
     pair(&a, &b);
 
@@ -4319,9 +4648,13 @@ fn a_verdict_older_than_the_retry_window_is_retired_and_udp_is_probed_again() {
             "freq": 1000.0, "verify_freq": 1000.0
         }),
     );
-    eventually_within(Duration::from_secs(20), "B's 1 kHz verdict over UDP", || {
-        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    },
+    eventually_within(
+        Duration::from_secs(20),
+        "B's 1 kHz verdict over UDP",
+        || {
+            b.recv_verdict()
+                .is_some_and(|v| v["detected"] == Value::Bool(true))
+        },
     );
     assert!(
         a.tcp_link().is_none(),
@@ -4396,18 +4729,28 @@ fn a_receiver_that_gets_no_udp_downgrades_the_link_by_itself() {
     // The audio comes back — over TCP, on a link where UDP is dead. Asserted
     // BEFORE the red line so that a build which downgrades correctly but lies
     // about who decided gets all the way here and fails only below.
-    eventually_within(Duration::from_secs(40), "a tier 1 link after the downgrade", || {
-        a.tcp_link().is_some_and(|l| l["alive"] == Value::Bool(true))
-    },
+    eventually_within(
+        Duration::from_secs(40),
+        "a tier 1 link after the downgrade",
+        || {
+            a.tcp_link()
+                .is_some_and(|l| l["alive"] == Value::Bool(true))
+        },
     );
-    eventually_within(Duration::from_secs(40), "B's 1 kHz verdict over TCP", || {
-        b.recv_verdict().is_some_and(|v| v["detected"] == Value::Bool(true))
-    },
+    eventually_within(
+        Duration::from_secs(40),
+        "B's 1 kHz verdict over TCP",
+        || {
+            b.recv_verdict()
+                .is_some_and(|v| v["detected"] == Value::Bool(true))
+        },
     );
 
     // THE RED LINE (plan §16.4 rule 5). The daemon decided; the user did not.
     assert_eq!(
-        lk(&b.h.inner_for_test().peer_transport).get(&afp).transport_tier,
+        lk(&b.h.inner_for_test().peer_transport)
+            .get(&afp)
+            .transport_tier,
         "auto",
         "the automatic downgrade overwrote the user's `auto` with a pin they never made"
     );
@@ -4418,7 +4761,9 @@ fn a_receiver_that_gets_no_udp_downgrades_the_link_by_itself() {
     );
     assert_eq!(b.peer(&afp)["auto_tier"].as_str(), Some("tier1"));
     assert!(
-        b.peer(&afp)["auto_tier_reason"].as_str().is_some_and(|r| r.contains("inbound")),
+        b.peer(&afp)["auto_tier_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("inbound")),
         "the reason is not reported, so the UI can show a slower link and not say why"
     );
 }
@@ -4463,7 +4808,9 @@ fn a_sender_whose_keepalives_never_arrive_downgrades_too() {
         "the wrong signal fired: expected the missing keepalive, got {why:?}"
     );
     assert_eq!(
-        lk(&a.h.inner_for_test().peer_transport).get(&bfp).transport_tier,
+        lk(&a.h.inner_for_test().peer_transport)
+            .get(&bfp)
+            .transport_tier,
         "auto",
         "the automatic downgrade overwrote the user's choice"
     );
@@ -4526,7 +4873,9 @@ fn a_peer_pinned_to_tier_zero_records_the_verdict_but_does_not_act_on_it() {
 
     eventually("B to record the verdict", || verdict(&b, &afp).0.is_some());
     assert_eq!(
-        lk(&b.h.inner_for_test().peer_transport).get(&afp).transport_tier,
+        lk(&b.h.inner_for_test().peer_transport)
+            .get(&afp)
+            .transport_tier,
         "tier0",
         "the pin was overwritten by the detector"
     );
@@ -4587,7 +4936,8 @@ fn a_peer_pinned_to_tier_zero_records_the_verdict_but_does_not_act_on_it() {
         // replay to arrive somewhere B does not allow it to go. A pin binds what
         // this machine asks of the peer, not only what it does itself.
         assert!(
-            !verdict(&a, &bfp).1
+            !verdict(&a, &bfp)
+                .1
                 .is_some_and(|w| w.contains("the peer reported")),
             "a machine pinned to tier 0 announced a downgrade it will not take part in"
         );
@@ -4654,19 +5004,34 @@ fn set_tier_over_ipc_takes_tier2_and_a_persistent_ws_endpoint() {
     let peer_addr = format!("127.0.0.1:{}", peer.h.control_port);
 
     let first = start_daemon(cfg()).expect("start");
-    let call = |h: &DaemonHandle, m: &str, p: &Value| ipcserv::dispatch_for_test(h.inner_for_test(), m, p);
+    let call =
+        |h: &DaemonHandle, m: &str, p: &Value| ipcserv::dispatch_for_test(h.inner_for_test(), m, p);
     let ok = |h: &DaemonHandle, m: &str, p: &Value| call(h, m, p).expect("call");
     ok(&first, methods::SETTINGS_SET, &json!({ "mode": "a" }));
     let pin = peer.ok(methods::PAIRING_ENABLE, json!({ "ttl_s": 60 }));
     let pin = pin["pin"].as_str().expect("pin").to_string();
-    ok(&first, methods::PEERS_PAIR, &json!({ "addr": peer_addr, "pin": pin }),
+    ok(
+        &first,
+        methods::PEERS_PAIR,
+        &json!({ "addr": peer_addr, "pin": pin }),
     );
 
     // (1) tier 2 on a peer reachable at a plain address. No endpoint anywhere.
-    let r = ok(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier2" }),
+    let r = ok(
+        &first,
+        methods::PEERS_SET_TIER,
+        &json!({ "peer": &fp, "tier": "tier2" }),
     );
-    assert_eq!(r["tier"].as_str(), Some("tier2"), "tier2 was not accepted: {r}");
-    assert_eq!(r["previous"].as_str(), Some("auto"), "the previous tier is misreported: {r}");
+    assert_eq!(
+        r["tier"].as_str(),
+        Some("tier2"),
+        "tier2 was not accepted: {r}"
+    );
+    assert_eq!(
+        r["previous"].as_str(),
+        Some("auto"),
+        "the previous tier is misreported: {r}"
+    );
     assert_eq!(
         r["endpoint"].as_str(),
         Some(""),
@@ -4677,21 +5042,33 @@ fn set_tier_over_ipc_takes_tier2_and_a_persistent_ws_endpoint() {
     // Every tier this build knows has to survive the same round trip, or the
     // selector offers a button the daemon will reject at click time.
     for t in ["auto", "tier0", "tier1", "tier2"] {
-        let r = ok(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": t }),
+        let r = ok(
+            &first,
+            methods::PEERS_SET_TIER,
+            &json!({ "peer": &fp, "tier": t }),
         );
         assert_eq!(r["tier"].as_str(), Some(t), "{t} did not round-trip: {r}");
     }
     // ...and one this build does not know is refused rather than stored and
     // echoed back, which is the shape this repo has been caught in six times.
-    let e = call(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier9" }),
+    let e = call(
+        &first,
+        methods::PEERS_SET_TIER,
+        &json!({ "peer": &fp, "tier": "tier9" }),
     )
-        .expect_err("an unknown tier must be refused at the write");
-    assert!(e.contains("tier9"), "the refusal does not name the value it refused: {e}");
+    .expect_err("an unknown tier must be refused at the write");
+    assert!(
+        e.contains("tier9"),
+        "the refusal does not name the value it refused: {e}"
+    );
 
     // (3) wss:// is refused, and the refusal names the real gap (no TLS client)
     // rather than reporting the address as unparseable.
     let stored = "ws://tunnel.example:8080/audio";
-    ok(&first, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "auto", "endpoint": stored }),
+    ok(
+        &first,
+        methods::PEERS_SET_TIER,
+        &json!({ "peer": &fp, "tier": "auto", "endpoint": stored }),
     );
     let e = call(
         &first,
@@ -4699,8 +5076,14 @@ fn set_tier_over_ipc_takes_tier2_and_a_persistent_ws_endpoint() {
         &json!({ "peer": &fp, "tier": "auto", "endpoint": "wss://tunnel.example/audio" }),
     )
     .expect_err("wss:// must be refused at the write, not at the dial");
-    assert!(e.contains("wss://"), "the refusal does not say which scheme it refused: {e}");
-    assert!(e.contains("TLS"), "the refusal does not name the real gap: {e}");
+    assert!(
+        e.contains("wss://"),
+        "the refusal does not say which scheme it refused: {e}"
+    );
+    assert!(
+        e.contains("TLS"),
+        "the refusal does not name the real gap: {e}"
+    );
     // The refused write must not have taken half of itself with it.
     let p = peer_row(&first, &fp);
     assert_eq!(
@@ -4721,12 +5104,19 @@ fn set_tier_over_ipc_takes_tier2_and_a_persistent_ws_endpoint() {
     );
     // Asserting the echo alone would stay green for an implementation that kept
     // the value in memory only, so check the file too.
-    let raw = std::fs::read_to_string(dir.join("peer_transport.json")).expect("peer_transport.json");
-    assert!(raw.contains(stored), "the endpoint never reached the disk: {raw}");
+    let raw =
+        std::fs::read_to_string(dir.join("peer_transport.json")).expect("peer_transport.json");
+    assert!(
+        raw.contains(stored),
+        "the endpoint never reached the disk: {raw}"
+    );
 
     // (4) An empty string clears it -- distinct from omitting the parameter,
     // which leaves the stored value alone.
-    ok(&second, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier1" }),
+    ok(
+        &second,
+        methods::PEERS_SET_TIER,
+        &json!({ "peer": &fp, "tier": "tier1" }),
     );
     let p = peer_row(&second, &fp);
     assert_eq!(
@@ -4734,11 +5124,22 @@ fn set_tier_over_ipc_takes_tier2_and_a_persistent_ws_endpoint() {
         Some(stored),
         "omitting `endpoint` cleared it; then no caller could change only the tier: {p}"
     );
-    ok(&second, methods::PEERS_SET_TIER, &json!({ "peer": &fp, "tier": "tier1", "endpoint": "" }),
+    ok(
+        &second,
+        methods::PEERS_SET_TIER,
+        &json!({ "peer": &fp, "tier": "tier1", "endpoint": "" }),
     );
     let p = peer_row(&second, &fp);
-    assert_eq!(p["transport"]["endpoint"].as_str(), Some(""), "the endpoint did not clear: {p}");
-    assert_eq!(p["transport"]["tier"].as_str(), Some("tier1"), "clearing the endpoint moved the tier: {p}");
+    assert_eq!(
+        p["transport"]["endpoint"].as_str(),
+        Some(""),
+        "the endpoint did not clear: {p}"
+    );
+    assert_eq!(
+        p["transport"]["tier"].as_str(),
+        Some("tier1"),
+        "clearing the endpoint moved the tier: {p}"
+    );
 
     second.shutdown();
     let _ = std::fs::remove_dir_all(&dir);

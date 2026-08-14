@@ -11,5 +11,27 @@
         "shadow": true
       }
     ]
+  },
+  "bundle": {
+    "targets": [
+      "nsis"
+    ],
+    "resources": {
+      "windows/quiet-uninstall.ps1": "quiet-uninstall.ps1",
+      "windows/driver-payload/audiohub-vad-helper.exe": "windows-driver/audiohub-vad-helper.exe",
+      "windows/driver-payload/AudioHubVad.inf": "windows-driver/AudioHubVad.inf",
+      "windows/driver-payload/AudioHubVad.sys": "windows-driver/AudioHubVad.sys",
+      "windows/driver-payload/AudioHubVad.cat": "windows-driver/AudioHubVad.cat"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "languages": [
+          "English",
+          "SimpChinese"
+        ],
+        "installerHooks": "windows/nsis-hooks.nsh"
+      }
+    }
   }
 }

@@ -4,14 +4,15 @@
 // 玻璃胶囊：内容从它下面穿过去滚动，胶囊本身不占布局宽度。testid 全部原样保留，
 // `nav-*` 四个只是换了宿主元素。
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { RawIcon } from './Icon';
 import { useStore } from '../state/store';
 import type { AppState, ViewName } from '../state/store';
 import { isShareMode } from '../state/mode';
-import { connectDaemon, IPC_VERSION } from '../state/connection';
+import { connectDaemon, IPC_VERSION, recoverDaemon } from '../state/connection';
 import { t } from '../i18n';
 import type { MsgKey } from '../i18n';
+import { inertSiblings } from '../lib/modalInert';
 
 type NavEntry = { view: ViewName; labelKey: MsgKey; icon: 'peers' | 'cable' | 'stats' | 'settings' };
 
@@ -147,9 +148,14 @@ export function NavPill({ onNavigate }: { onNavigate: (v: ViewName) => void }) {
 // 每一种失败原因都要给出**不同的**下一步动作；kind 与 src-tauri/src/main.rs
 // 的 DaemonError::kind 一一对应，那边加一种这里就要加一条。
 const FAILURE_COPY: Record<string, { title: MsgKey; desc: MsgKey; hint?: MsgKey }> = {
+  'not-installed': { title: 'overlay.notInstalled.title', desc: 'overlay.notInstalled.desc', hint: 'overlay.notInstalled.hint' },
+  'user-cancelled': { title: 'overlay.notInstalled.title', desc: 'overlay.notInstalled.desc', hint: 'overlay.notInstalled.hint' },
+  stopped: { title: 'overlay.stopped.title', desc: 'overlay.stopped.desc' },
+  'install-failed': { title: 'overlay.installFailed.title', desc: 'overlay.installFailed.desc' },
   'no-binary': { title: 'overlay.noBinary.title', desc: 'overlay.noBinary.desc', hint: 'overlay.noBinary.hint' },
   'spawn-failed': { title: 'overlay.spawnFailed.title', desc: 'overlay.spawnFailed.desc' },
   'port-busy': { title: 'overlay.portBusy.title', desc: 'overlay.portBusy.desc' },
+  'service-conflict': { title: 'overlay.serviceConflict.title', desc: 'overlay.serviceConflict.desc' },
   timeout: { title: 'overlay.timeout.title', desc: 'overlay.timeout.desc' },
   'start-failed': { title: 'overlay.startFailed.title', desc: 'overlay.startFailed.desc' },
   internal: { title: 'overlay.internal.title', desc: 'overlay.internal.desc' },
@@ -174,7 +180,10 @@ function overlayCopy(s: AppState): { title: string; desc: string; hint: string }
     // 必须换一个版本匹配的 daemon。
     return {
       title: t('overlay.version.title'),
-      desc: t('overlay.version.desc', { message: err.message, version: IPC_VERSION }),
+      // `message` may have come from an older/native daemon in a different
+      // locale.  The protocol number is the fact this screen needs; rendering
+      // the daemon's prose here would punch straight through the UI catalogue.
+      desc: t('overlay.version.desc', { version: IPC_VERSION }),
       hint: t('overlay.version.hint'),
     };
   }
@@ -189,14 +198,16 @@ function overlayCopy(s: AppState): { title: string; desc: string; hint: string }
   if (copy) {
     return {
       title: t(copy.title),
-      desc: t(copy.desc) + (err.detail ? `\n\n${t('overlay.detail', { detail: String(err.detail).trim() })}` : ''),
+      // Native details contain paths and OS/daemon prose.  Keep them in the
+      // service log instead of mixing an arbitrary language into this screen.
+      desc: t(copy.desc),
       hint: copy.hint ? t(copy.hint) : '',
     };
   }
   return {
     title: t('overlay.disconnected.title'),
     desc: s.mode === 'tauri'
-      ? t('overlay.disconnected.descTauri', { reason: err.message || t('overlay.disconnected.reasonUnknown') })
+      ? t('overlay.disconnected.descTauri')
       : t('overlay.disconnected.descBrowser'),
     hint: '',
   };
@@ -205,13 +216,44 @@ function overlayCopy(s: AppState): { title: string; desc: string; hint: string }
 export function Overlay() {
   const s = useStore();
   const online = s.conn === 'online';
+  const cardRef = useRef<HTMLDivElement | null>(null);
   // 启动/连接是**进行态**，不是错误：给动画与进度语，不给错误图标和按钮。
   const busy = s.conn === 'starting' || s.conn === 'connecting';
   const copy = overlayCopy(s);
+  const action = s.connError?.kind === 'not-installed'
+    || s.connError?.kind === 'install-failed'
+    || s.connError?.kind === 'user-cancelled'
+    ? 'install'
+    : s.connError?.kind === 'stopped'
+      ? 'start'
+      : 'retry';
+
+  useEffect(() => {
+    if (online) return;
+    const overlay = document.getElementById('overlay');
+    const opener = document.activeElement as HTMLElement | null;
+    // Sheets, confirms and toasts are siblings of #app. Blocking only #app
+    // leaves a previously-open Sheet interactive above the service gate. Keep
+    // every sibling inert, including a modal mounted while recovery is active.
+    // The shared registry is reference-counted because this layer can supersede
+    // an already-open ConfirmDialog; whichever closes first must not unblock the
+    // background still owned by the other modal.
+    const releaseBackground = overlay ? inertSiblings(overlay) : () => undefined;
+    cardRef.current?.focus();
+    return () => {
+      releaseBackground();
+      if (opener?.isConnected && !opener.closest('[inert]')) opener.focus();
+    };
+  }, [online]);
 
   return (
-    <div id="overlay" data-testid="daemon-overlay" hidden={online}>
-      <div className="overlay-card">
+    <div
+      id="overlay" data-testid="daemon-overlay" hidden={online}
+      role="alertdialog" aria-modal="true"
+      aria-labelledby="overlay-title" aria-describedby="overlay-desc overlay-hint"
+      aria-busy={busy}
+    >
+      <div className="overlay-card" tabIndex={-1} ref={cardRef}>
         <span className="overlay-ico" id="overlay-ico" hidden={busy}><RawIcon name="plug" /></span>
         <div className="overlay-wave" id="overlay-wave" hidden={!busy} aria-hidden="true">
           <i /><i /><i /><i /><i />
@@ -220,14 +262,18 @@ export function Overlay() {
         <p id="overlay-desc">{copy.desc}</p>
         <div className="overlay-actions" id="overlay-actions" hidden={busy}>
           <button
-            id="overlay-retry"
+            id="overlay-action"
             className="btn primary"
             type="button"
-            data-testid="overlay-retry"
+            data-testid={`overlay-${action}`}
             disabled={busy}
-            onClick={() => void connectDaemon()}
+            onClick={() => void (action === 'retry' ? connectDaemon() : recoverDaemon(action))}
           >
-            {t('common.retry')}
+            {action === 'install'
+              ? t('common.install')
+              : action === 'start'
+                ? t('common.start')
+                : t('common.retry')}
           </button>
         </div>
         <p className="overlay-hint" id="overlay-hint">{busy ? '' : copy.hint}</p>

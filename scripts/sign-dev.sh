@@ -43,12 +43,17 @@ sign_one() {  # $1 binary  $2 pinned identifier
   # --force replaces the linker-signed ad-hoc signature cargo leaves behind.
   # --identifier is pinned because codesign otherwise derives it from the FILE
   # NAME, so a rename would silently change the code identity.
-  codesign --force --sign "$IDENTITY" --identifier "$2" "$1"
+  local args=(--force --sign "$IDENTITY" --identifier "$2")
+  if [[ "$IDENTITY" == Developer\ ID\ Application:* ]]; then
+    args+=(--options runtime --timestamp)
+  fi
+  codesign "${args[@]}" "$1"
   print -- "[audiohub] signed $(basename "$1") as $2"
   print -- "[audiohub]   $(codesign -d -r- "$1" 2>&1 | grep -o 'designated =>.*')"
 }
 
 identity_usable() {
+  [[ "$IDENTITY" == "-" ]] && return 0
   security find-identity -p codesigning 2>/dev/null | grep -q "\"$IDENTITY\"" && return 0
   # A locally trusted self-signed Code Signing certificate can be usable by
   # codesign while `security find-identity` reports zero valid identities
@@ -83,15 +88,24 @@ sign_one "$ROOT/target/release/audiohub"  com.audiohub.cli    && (( signed++ )) 
 # contains, so signing the wrapper before its contents invalidates it.
 # ($BUNDLE 已在文件开头定义 —— 那里的运行中检测要用到它。)
 if [[ -d "$BUNDLE" ]]; then
-  sign_one "$BUNDLE/Contents/MacOS/audiohub"     com.audiohub.daemon && (( signed++ )) || true
-  sign_one "$BUNDLE/Contents/MacOS/audiohub-app" com.audiohub.app    && (( signed++ )) || true
-  if codesign --force --sign "$IDENTITY" --identifier com.audiohub.app "$BUNDLE" 2>/dev/null; then
-    print -- "[audiohub] signed $BUNDLE"
-    print -- "[audiohub]   $(codesign -d -r- "$BUNDLE" 2>&1 | grep -o 'designated =>.*')"
-    (( signed++ ))
-  else
-    print -u2 -- "[audiohub] WARNING: could not sign $BUNDLE"
+  # A distributable bundle is all-or-nothing: every nested executable must be
+  # signed before the wrapper seals it. Quiet partial success produces an App
+  # which builds and packages but Gatekeeper/notarization rejects later.
+  sign_one "$BUNDLE/Contents/MacOS/audiohubd"    com.audiohub.daemon || exit 1
+  (( signed++ ))
+  sign_one "$BUNDLE/Contents/MacOS/audiohub"     com.audiohub.cli || exit 1
+  (( signed++ ))
+  sign_one "$BUNDLE/Contents/MacOS/audiohub-app" com.audiohub.app || exit 1
+  (( signed++ ))
+  bundle_args=(--force --sign "$IDENTITY" --identifier com.audiohub.app)
+  if [[ "$IDENTITY" == Developer\ ID\ Application:* ]]; then
+    bundle_args+=(--options runtime --timestamp)
   fi
+  codesign "${bundle_args[@]}" "$BUNDLE" || exit 1
+  codesign --verify --deep --strict --verbose=2 "$BUNDLE" || exit 1
+  print -- "[audiohub] signed $BUNDLE"
+  print -- "[audiohub]   $(codesign -d -r- "$BUNDLE" 2>&1 | grep -o 'designated =>.*')"
+  (( signed++ ))
 fi
 
 if (( signed == 0 )); then

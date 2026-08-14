@@ -102,7 +102,11 @@ pub struct DevLatency {
 impl DevLatency {
     /// P0 的唯一取值：读不到。
     pub fn unavailable() -> DevLatency {
-        DevLatency { frames: 0, rate: 0, source: LatSource::Unavailable }
+        DevLatency {
+            frames: 0,
+            rate: 0,
+            source: LatSource::Unavailable,
+        }
     }
 
     /// `None` 时**不可**当 0 用（见文件头约束 1）。
@@ -218,7 +222,10 @@ impl StageId {
     /// 的支路，不是串联的两段——把两条尾级相加会凭空报出双倍延迟。
     /// 所以 Σ 的规则是：串联各级求和，**并行尾级取 max**。
     pub fn is_output_tail(self) -> bool {
-        matches!(self, StageId::PlayRing | StageId::BridgeRing | StageId::HalMic)
+        matches!(
+            self,
+            StageId::PlayRing | StageId::BridgeRing | StageId::HalMic
+        )
     }
 
     /// 最大合法判别码。加新级时**必须**同步改这里，否则 `from_id_str` 会漏掉它。
@@ -282,8 +289,21 @@ const SEND_PACE_SAMPLES: u32 = 240;
 
 impl StageDepth {
     /// 丢弃数可观测且当前为 0 的构造（测试与常量级用）。
-    pub fn new(id: StageId, samples: u32, capacity: u32, rate: u32, drop_mode: DropMode) -> StageDepth {
-        StageDepth { id, samples, capacity, rate, dropped: Some(0), drop_mode }
+    pub fn new(
+        id: StageId,
+        samples: u32,
+        capacity: u32,
+        rate: u32,
+        drop_mode: DropMode,
+    ) -> StageDepth {
+        StageDepth {
+            id,
+            samples,
+            capacity,
+            rate,
+            dropped: Some(0),
+            drop_mode,
+        }
     }
 
     /// 级 4 `send_pace`：常数 5 ms（见 `SEND_PACE_MS` 上的论证）。
@@ -366,7 +386,8 @@ impl StageSlot {
                 self.samples.store(d.samples, Ordering::Relaxed);
                 self.capacity.store(d.capacity, Ordering::Relaxed);
                 self.rate.store(d.rate, Ordering::Relaxed);
-                self.dropped.store(d.dropped.unwrap_or(0), Ordering::Relaxed);
+                self.dropped
+                    .store(d.dropped.unwrap_or(0), Ordering::Relaxed);
                 self.dropped_known
                     .store(d.dropped.is_some(), Ordering::Relaxed);
                 self.drop_mode.store(
@@ -524,17 +545,29 @@ pub struct DepthInterp {
 
 impl DepthInterp {
     /// 拿不到任何时间快照：退回旧行为（读数原样进窗口）。
-    pub const NONE: DepthInterp =
-        DepthInterp { since_write_s: 0.0, writer_sps: 0.0, since_read_s: 0.0, reader_sps: 0.0 };
+    pub const NONE: DepthInterp = DepthInterp {
+        since_write_s: 0.0,
+        writer_sps: 0.0,
+        since_read_s: 0.0,
+        reader_sps: 0.0,
+    };
 
     /// 只知道生产侧的写块时刻（`hal_spk` / `play_ring` 这类**我们读、别人写**的级）。
     pub fn producer(since_write_s: f32, writer_sps: f32) -> DepthInterp {
-        DepthInterp { since_write_s, writer_sps, ..DepthInterp::NONE }
+        DepthInterp {
+            since_write_s,
+            writer_sps,
+            ..DepthInterp::NONE
+        }
     }
 
     /// 只知道消费侧的读块时刻（`hal_mic` / `bridge_ring` 这类**我们写、别人读**的级）。
     pub fn consumer(since_read_s: f32, reader_sps: f32) -> DepthInterp {
-        DepthInterp { since_read_s, reader_sps, ..DepthInterp::NONE }
+        DepthInterp {
+            since_read_s,
+            reader_sps,
+            ..DepthInterp::NONE
+        }
     }
 
     /// 补上另一侧。两侧都填才可能把量化减到 0。
@@ -708,7 +741,9 @@ struct StepState {
 
 impl StepState {
     fn push(&mut self, v: f32) {
-        let Some(prev) = self.last.replace(v) else { return };
+        let Some(prev) = self.last.replace(v) else {
+            return;
+        };
         let d = (v - prev) as f64;
         let mag = d.abs();
         // 尺度先用**旧**窗口判，再把本次 |Δ| 收进去：否则一次大跳变会先把
@@ -827,7 +862,11 @@ impl DriftTracker {
         // 它同样吃修正后的值——量化噪声被剔掉，鲁棒尺度收紧，检测器只会更灵。
         self.steps[id.index()].push(v);
         let w = &mut self.win[id.index()];
-        w.push(Pt { t_s: now_s, v, interp: !interp.is_none() });
+        w.push(Pt {
+            t_s: now_s,
+            v,
+            interp: !interp.is_none(),
+        });
         // 窗口外的点直接丢：一次早期抖动不该永远压着斜率。
         let cutoff = now_s - Self::WINDOW_S;
         let keep = w.iter().position(|p| p.t_s >= cutoff).unwrap_or(w.len());
@@ -929,7 +968,11 @@ impl DriftTracker {
             .sum();
         let resid_sd = (sse / (n - 2.0)).sqrt();
         let sxx_centered = denom / n;
-        let stderr_sps = if sxx_centered <= 0.0 { 0.0 } else { resid_sd / sxx_centered.sqrt() };
+        let stderr_sps = if sxx_centered <= 0.0 {
+            0.0
+        } else {
+            resid_sd / sxx_centered.sqrt()
+        };
         Some(DriftFit {
             slope_sps,
             stderr_sps,
@@ -977,7 +1020,11 @@ mod tests {
     #[test]
     fn unavailable_device_latency_is_none_not_zero() {
         assert_eq!(DevLatency::unavailable().ms(), None);
-        let real = DevLatency { frames: 512, rate: 48_000, source: LatSource::Api };
+        let real = DevLatency {
+            frames: 512,
+            rate: 48_000,
+            source: LatSource::Api,
+        };
         assert!((real.ms().unwrap() - 10.6666).abs() < 1e-3);
     }
 
@@ -987,9 +1034,13 @@ mod tests {
     #[test]
     fn drop_modes_are_indistinguishable_by_depth_alone() {
         let src_fifo = StageDepth::new(StageId::SrcFifo, 48_000, 48_000, 48_000, DropMode::Oldest);
-        let play_ring = StageDepth::new(StageId::PlayRing, 48_000, 48_000, 48_000, DropMode::Newest);
+        let play_ring =
+            StageDepth::new(StageId::PlayRing, 48_000, 48_000, 48_000, DropMode::Newest);
         assert_eq!(src_fifo.ms(), play_ring.ms(), "深度读数一模一样");
-        assert!(src_fifo.saturated() && play_ring.saturated(), "饱和判定也一模一样");
+        assert!(
+            src_fifo.saturated() && play_ring.saturated(),
+            "饱和判定也一模一样"
+        );
         assert_ne!(
             src_fifo.drop_mode, play_ring.drop_mode,
             "唯一的区别在 drop_mode：丢最旧=恒定迟到但连续，丢最新=迟到+断续"
@@ -1023,7 +1074,11 @@ mod tests {
         slot.store(Some(d));
         assert_eq!(slot.load(), Some(d));
         slot.store(None);
-        assert_eq!(slot.load(), None, "源消失后必须报『没有这一级』，不是报旧值");
+        assert_eq!(
+            slot.load(),
+            None,
+            "源消失后必须报『没有这一级』，不是报旧值"
+        );
     }
 
     /// 「丢弃数观测不到」必须原样穿过原子槽 —— 若它退化成 0，UI 会给出
@@ -1052,7 +1107,11 @@ mod tests {
             dropped: Some(0),
             drop_mode: DropMode::Newest,
         }));
-        assert_eq!(slot.load().unwrap().dropped, Some(0), "真的 0 不能变成 None");
+        assert_eq!(
+            slot.load().unwrap().dropped,
+            Some(0),
+            "真的 0 不能变成 None"
+        );
     }
 
     #[test]
@@ -1066,7 +1125,10 @@ mod tests {
             t.push(i as f32, StageId::SrcFifo, 480 * i);
         }
         let s = t.slope(StageId::SrcFifo).expect("10 秒跨度足够");
-        assert!((s - 480.0).abs() < 1e-6, "每秒涨 480 样本 = 1% 速率失配, got {s}");
+        assert!(
+            (s - 480.0).abs() < 1e-6,
+            "每秒涨 480 样本 = 1% 速率失配, got {s}"
+        );
     }
 
     /// 稳态（深度不动）必须给出 0 斜率，而不是 None——「测到了，就是不漂」与
@@ -1093,7 +1155,10 @@ mod tests {
             t.push(40.0 + i as f32, StageId::JitterBuf, 9_000);
         }
         let s = t.slope(StageId::JitterBuf).unwrap();
-        assert!(s.abs() < 1e-6, "早期上升已滑出 30s 窗口，斜率应归零, got {s}");
+        assert!(
+            s.abs() < 1e-6,
+            "早期上升已滑出 30s 窗口，斜率应归零, got {s}"
+        );
     }
 
     /// **源被换掉之后，新源不许继承旧源的斜率。**
@@ -1110,7 +1175,10 @@ mod tests {
             t.push(i as f32, StageId::SrcFifo, 480 * i);
         }
         let before = t.slope(StageId::SrcFifo).expect("旧源确实在漂");
-        assert!((before - 480.0).abs() < 1.0, "前提：旧源斜率 ≈ +480, got {before}");
+        assert!(
+            (before - 480.0).abs() < 1.0,
+            "前提：旧源斜率 ≈ +480, got {before}"
+        );
 
         // 源没了：这一 tick 一个槽都没在场。
         t.retain_only(&[None, None, None]);
@@ -1157,7 +1225,10 @@ mod tests {
         }
         /// 均匀分布在 [-amp, amp] 的整数。
         fn noise(&mut self, amp: i64) -> i64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (((self.0 >> 33) as i64) % (2 * amp + 1)) - amp
         }
     }
@@ -1215,7 +1286,11 @@ mod tests {
             tight.push(i as f32, StageId::PostMix, 4_800 + (i % 2));
         }
         let f = tight.fit(StageId::PostMix).unwrap();
-        assert!(f.stderr_sps > 0.0, "前提：确实有残差，不是完美拟合（SE={}）", f.stderr_sps);
+        assert!(
+            f.stderr_sps > 0.0,
+            "前提：确实有残差，不是完美拟合（SE={}）",
+            f.stderr_sps
+        );
         assert!(
             f.resolution_sps() <= DRIFT_RESOLUTION_SPS,
             "前提：噪声底很紧，实得 3σ 半宽 {}",
@@ -1252,7 +1327,9 @@ mod tests {
             let v = (1_000 + 480 * i + rng.noise(192)) as u32;
             t.push(i as f32, StageId::SrcFifo, v);
         }
-        let s = t.slope(StageId::SrcFifo).expect("480 样本/秒远在噪声底之上");
+        let s = t
+            .slope(StageId::SrcFifo)
+            .expect("480 样本/秒远在噪声底之上");
         assert!((s - 480.0).abs() < 10.0, "斜率仍要准，实得 {s}");
     }
 
@@ -1329,7 +1406,9 @@ mod tests {
 
     /// 1 Hz 心跳的真实开火时刻：整秒 ± 10 ms 的调度抖动。
     fn tick_times(rng: &mut Lcg) -> Vec<f64> {
-        (0..=30).map(|k| k as f64 + rng.noise(10) as f64 / 1000.0).collect()
+        (0..=30)
+            .map(|k| k as f64 + rng.noise(10) as f64 / 1000.0)
+            .collect()
     }
 
     /// **喂入带量化噪声的理想斜率：插值前后的斜率标准误必须显著下降。**
@@ -1374,7 +1453,8 @@ mod tests {
             fixed.push_interp(t as f32, StageId::HalSpk, d, sim.interp(t));
         }
         assert!(
-            ts.iter().any(|&t| (sim.observed(t) as f64 - sim.truth(t)).abs() > 100.0),
+            ts.iter()
+                .any(|&t| (sim.observed(t) as f64 - sim.truth(t)).abs() > 100.0),
             "前提：未修正时至少有点偏出 100 样本，否则这条轨迹根本没有量化可减"
         );
 
@@ -1396,8 +1476,15 @@ mod tests {
         );
         // 再钉一条绝对上限：相对判据在「两边一起变差」时是绿的，绝对判据不是。
         // 1e-3 比实得的 5.6e-6 松 180 倍，只拦住量级级别的退化。
-        assert!(ff.stderr_sps < 1e-3, "插值后的标准误不该有物理噪声，实得 {}", ff.stderr_sps);
-        assert!(!fr.interpolated && ff.interpolated, "两条读数的来源必须自报家门");
+        assert!(
+            ff.stderr_sps < 1e-3,
+            "插值后的标准误不该有物理噪声，实得 {}",
+            ff.stderr_sps
+        );
+        assert!(
+            !fr.interpolated && ff.interpolated,
+            "两条读数的来源必须自报家门"
+        );
 
         // 而且不只是「更平滑」——插值后的斜率要**对**。
         assert!(
@@ -1405,8 +1492,14 @@ mod tests {
             "插值后必须还原出真实涨速 +0.34 样本/秒，实得 {}",
             ff.slope_sps
         );
-        assert_eq!(raw.slope(StageId::HalSpk), None, "原始读数分辨不出 0.34，只能报 None");
-        let got = fixed.slope(StageId::HalSpk).expect("插值后这一级终于说得出话");
+        assert_eq!(
+            raw.slope(StageId::HalSpk),
+            None,
+            "原始读数分辨不出 0.34，只能报 None"
+        );
+        let got = fixed
+            .slope(StageId::HalSpk)
+            .expect("插值后这一级终于说得出话");
         assert!((got - 0.34).abs() < 0.01, "实得 {got}");
     }
 
@@ -1437,7 +1530,11 @@ mod tests {
              这条断言若变绿说明 `DepthInterp::correction_samples` 的两项符号\
              不再是『生产侧加、消费侧减』"
         );
-        assert_eq!(flipped.slope(StageId::HalSpk), None, "噪声翻倍后更不可能分辨出 0.34");
+        assert_eq!(
+            flipped.slope(StageId::HalSpk),
+            None,
+            "噪声翻倍后更不可能分辨出 0.34"
+        );
     }
 
     /// 修正量本身的符号与量纲，直接钉在 `correction_samples()` 上。
@@ -1450,10 +1547,18 @@ mod tests {
         // 容差 1e-3 而不是 1e-6：`0.005f32` 本来就不是精确的 5 ms（差 5e-9 s），
         // 乘 48000 就是 2.6e-4 个样本。写 1e-6 是在断言一件 f32 做不到的事。
         let p = DepthInterp::producer(0.005, 48_000.0);
-        assert!((p.correction_samples() - 240.0).abs() < 1e-3, "{}", p.correction_samples());
+        assert!(
+            (p.correction_samples() - 240.0).abs() < 1e-3,
+            "{}",
+            p.correction_samples()
+        );
         // 消费侧欠着 5 ms 没读走 ⇒ 连续深度比读数**小** 240。
         let c = DepthInterp::consumer(0.005, 48_000.0);
-        assert!((c.correction_samples() + 240.0).abs() < 1e-3, "{}", c.correction_samples());
+        assert!(
+            (c.correction_samples() + 240.0).abs() < 1e-3,
+            "{}",
+            c.correction_samples()
+        );
         // 两侧欠得一样多 ⇒ 互相抵消，读数本来就在连续位置上。
         assert!(p.with_consumer(0.005, 48_000.0).correction_samples().abs() < 1e-9);
         assert!(DepthInterp::NONE.is_none() && DepthInterp::default().is_none());
@@ -1476,7 +1581,11 @@ mod tests {
             DepthInterp::producer(0.005, 0.0),       // 速率没填
             DepthInterp::producer(0.005, -48_000.0),
         ] {
-            assert_eq!(bad.correction_samples(), 0.0, "坏快照必须退化成不修正：{bad:?}");
+            assert_eq!(
+                bad.correction_samples(),
+                0.0,
+                "坏快照必须退化成不修正：{bad:?}"
+            );
             assert!(bad.is_none(), "坏快照不算『插值过』：{bad:?}");
         }
         // 陈旧快照（一整秒没写块了）钳在 100 ms 等效量以内，而不是加进去 48000。
@@ -1489,7 +1598,11 @@ mod tests {
             t.push_interp(i as f32, StageId::HalSpk, 8_672, stale);
         }
         let f = t.fit(StageId::HalSpk).unwrap();
-        assert!(f.slope_sps.abs() < 1e-3, "恒定的修正量不产生斜率，实得 {}", f.slope_sps);
+        assert!(
+            f.slope_sps.abs() < 1e-3,
+            "恒定的修正量不产生斜率，实得 {}",
+            f.slope_sps
+        );
     }
 
     /// 半段插值过、半段没插过的窗口**不许**自称插值过：接缝处会凭空多出一个
@@ -1501,12 +1614,25 @@ mod tests {
             t.push(i as f32, StageId::HalSpk, 8_672);
         }
         for i in 6..=12 {
-            t.push_interp(i as f32, StageId::HalSpk, 8_672, DepthInterp::producer(0.005, 48_000.0));
+            t.push_interp(
+                i as f32,
+                StageId::HalSpk,
+                8_672,
+                DepthInterp::producer(0.005, 48_000.0),
+            );
         }
-        assert!(!t.fit(StageId::HalSpk).unwrap().interpolated, "混着来 ⇒ false");
+        assert!(
+            !t.fit(StageId::HalSpk).unwrap().interpolated,
+            "混着来 ⇒ false"
+        );
         // 旧点滑出 30 s 窗口之后，剩下的全是插值点，这时才该为 true。
         for i in 40..=60 {
-            t.push_interp(i as f32, StageId::HalSpk, 8_672, DepthInterp::producer(0.005, 48_000.0));
+            t.push_interp(
+                i as f32,
+                StageId::HalSpk,
+                8_672,
+                DepthInterp::producer(0.005, 48_000.0),
+            );
         }
         assert!(t.fit(StageId::HalSpk).unwrap().interpolated);
     }
@@ -1601,7 +1727,11 @@ mod tests {
             t.push(i as f32, StageId::HalSpk, (8_672 + rng.noise(192)) as u32);
         }
         let acc = t.steps(StageId::HalSpk);
-        assert_eq!(acc, StepAccum::default(), "300 个噪声点，一次阶跃都不许有：{acc:?}");
+        assert_eq!(
+            acc,
+            StepAccum::default(),
+            "300 个噪声点，一次阶跃都不许有：{acc:?}"
+        );
         assert!(!acc.is_accumulating());
     }
 
@@ -1616,7 +1746,11 @@ mod tests {
         for i in 0..100u32 {
             t.push(i as f32, StageId::PlayRing, 1_000 + 600 * i); // 600 样本/秒
         }
-        assert_eq!(t.steps(StageId::PlayRing), StepAccum::default(), "等速上涨没有阶跃");
+        assert_eq!(
+            t.steps(StageId::PlayRing),
+            StepAccum::default(),
+            "等速上涨没有阶跃"
+        );
         let s = t.slope(StageId::PlayRing).expect("这才是斜率该报的东西");
         assert!((s - 600.0).abs() < 1e-6, "实得 {s}");
     }
@@ -1700,7 +1834,10 @@ mod tests {
         for i in 10..20 {
             t.push(i as f32, StageId::HalSpk, 20_000); // 一次巨跳
         }
-        assert!(t.steps(StageId::HalSpk).is_accumulating(), "前提：旧源确实累积过");
+        assert!(
+            t.steps(StageId::HalSpk).is_accumulating(),
+            "前提：旧源确实累积过"
+        );
         t.retain_only(&[None, None, None]);
         assert_eq!(
             t.steps(StageId::HalSpk),
@@ -1721,7 +1858,10 @@ mod tests {
             t.push(i as f32, StageId::HalSpk, 24_000);
         }
         t.retain_only(&[Some(StageId::SrcFifo), Some(StageId::HalSpk), None]);
-        assert!(t.slope(StageId::SrcFifo).is_some(), "还在场的级必须留着历史");
+        assert!(
+            t.slope(StageId::SrcFifo).is_some(),
+            "还在场的级必须留着历史"
+        );
         assert!(t.slope(StageId::HalSpk).is_some());
     }
 
@@ -1732,10 +1872,15 @@ mod tests {
     /// 那正是它要防的那类静默失效，只不过换了个地方发生。
     fn frontend_stage_ids() -> Vec<String> {
         const REL: &str = "/../../app/frontend/src/lib/metrics.ts";
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../app/frontend/src/lib/metrics.ts");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../app/frontend/src/lib/metrics.ts"
+        );
         let src = std::fs::read_to_string(path).unwrap_or_else(|e| {
-            panic!("读不到前端的级表 {REL}（{e}）。文件被改名/挪走了就把这条测试一起更新，\
-                   不要让它悄悄退化成一条恒真断言")
+            panic!(
+                "读不到前端的级表 {REL}（{e}）。文件被改名/挪走了就把这条测试一起更新，\
+                   不要让它悄悄退化成一条恒真断言"
+            )
         });
         let start = src
             .find("export const LATENCY_STAGES")
@@ -1753,7 +1898,9 @@ mod tests {
                 _ => continue, // `id:` 出现在别处（类型声明里就有一个）
             };
             let rest = &piece[quote.len_utf8()..];
-            let Some(close) = rest.find(quote) else { continue };
+            let Some(close) = rest.find(quote) else {
+                continue;
+            };
             ids.push(rest[..close].to_string());
         }
         ids
@@ -1776,7 +1923,11 @@ mod tests {
             .filter_map(StageId::from_code)
             .map(|id| id.as_str().to_string())
             .collect();
-        assert_eq!(ours.len(), StageId::MAX_CODE as usize, "枚举自己先要是完整的");
+        assert_eq!(
+            ours.len(),
+            StageId::MAX_CODE as usize,
+            "枚举自己先要是完整的"
+        );
 
         theirs.sort();
         ours.sort();
@@ -1807,7 +1958,10 @@ mod tests {
             assert_eq!(id as u8, code);
             // 字符串往返：`from_id_str` 是靠遍历判别码实现的，漏一条这里就红
             assert_eq!(StageId::from_id_str(id.as_str()), Some(id));
-            assert!(id.index() < StageId::COUNT, "判别码要能直接当 DriftTracker 的下标");
+            assert!(
+                id.index() < StageId::COUNT,
+                "判别码要能直接当 DriftTracker 的下标"
+            );
         }
         assert_eq!(StageId::from_code(0), None, "0 保留给『本槽为空』");
         assert_eq!(StageId::from_code(StageId::MAX_CODE + 1), None);
@@ -1824,7 +1978,11 @@ mod tests {
         assert_eq!(p.id, StageId::SendPace);
         assert_eq!(p.ms(), Some(SEND_PACE_MS));
         assert!(!p.saturated(), "它不是队列，永远不该被判饱和");
-        assert_eq!(p.dropped, Some(0), "节拍不丢样本：这是真读数 0，不是观测不到");
+        assert_eq!(
+            p.dropped,
+            Some(0),
+            "节拍不丢样本：这是真读数 0，不是观测不到"
+        );
         assert_eq!(p.drop_mode, DropMode::None);
     }
 
@@ -1847,7 +2005,11 @@ mod tests {
             StageId::PlayDev,
             StageId::Residual,
         ] {
-            assert!(!id.is_output_tail(), "{} 是串联级，必须参与求和", id.as_str());
+            assert!(
+                !id.is_output_tail(),
+                "{} 是串联级，必须参与求和",
+                id.as_str()
+            );
         }
     }
 
@@ -1878,8 +2040,14 @@ mod tests {
         assert_eq!(j(&DropMode::Oldest), "\"oldest\"");
         assert_eq!(j(&DropMode::Newest), "\"newest\"");
         assert_eq!(j(&DropMode::None), "\"none\"");
-        assert_eq!(serde_json::to_string(&LatSource::Unreliable).unwrap(), "\"unreliable\"");
-        assert_eq!(serde_json::to_string(&LatSource::Unavailable).unwrap(), "\"unavailable\"");
+        assert_eq!(
+            serde_json::to_string(&LatSource::Unreliable).unwrap(),
+            "\"unreliable\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LatSource::Unavailable).unwrap(),
+            "\"unavailable\""
+        );
     }
 
     /// **「有值」和「是真值」是两件事，只有后者能清掉「≥」。**
@@ -1896,8 +2064,16 @@ mod tests {
     #[test]
     fn having_a_number_is_not_the_same_as_having_a_true_number() {
         // Windows 形态：读到了 480 帧 = 10 ms，非 Unavailable，`ms()` 有值……
-        let win = DevLatency { frames: 480, rate: 48_000, source: LatSource::Unreliable };
-        assert_eq!(win.ms(), Some(10.0), "它确实有值 —— 所以「齐全了吗」这个判据答『是』");
+        let win = DevLatency {
+            frames: 480,
+            rate: 48_000,
+            source: LatSource::Unreliable,
+        };
+        assert_eq!(
+            win.ms(),
+            Some(10.0),
+            "它确实有值 —— 所以「齐全了吗」这个判据答『是』"
+        );
         assert!(
             !win.source.is_exact(),
             "……但实测真值 41.92 ms，低报 4.2 倍：它永远只能当下限"

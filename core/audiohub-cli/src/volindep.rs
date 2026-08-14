@@ -89,7 +89,11 @@ pub struct ViArgs {
     pub min_volume: f32,
 
     /// How far two levels may differ and still count as the same reading.
-    #[arg(id = "vi-tolerance-db", long = "vi-tolerance-db", default_value_t = 3.0)]
+    #[arg(
+        id = "vi-tolerance-db",
+        long = "vi-tolerance-db",
+        default_value_t = 3.0
+    )]
     pub tolerance_db: f32,
 
     /// Absolute level floor. The floor actually applied is the larger of this
@@ -248,7 +252,11 @@ fn measure(samples: &[f32], rate: u32, tone_hz: f32) -> Measured {
     let rms = if samples.is_empty() {
         0.0
     } else {
-        (samples.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / samples.len() as f64)
+        (samples
+            .iter()
+            .map(|s| (*s as f64) * (*s as f64))
+            .sum::<f64>()
+            / samples.len() as f64)
             .sqrt() as f32
     };
     let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
@@ -296,7 +304,11 @@ pub fn run(args: &ViArgs, backend: &str, json: bool) -> Result<i32> {
             "--vi-low must be in (0,1): this probe only ever turns the volume DOWN, \
              and {} would {}",
             args.low,
-            if args.low >= 1.0 { "raise it" } else { "mute it" }
+            if args.low >= 1.0 {
+                "raise it"
+            } else {
+                "mute it"
+            }
         );
     }
     if args.secs <= 0.5 {
@@ -371,10 +383,7 @@ pub fn run(args: &ViArgs, backend: &str, json: bool) -> Result<i32> {
     } else {
         // One player for every remaining leg: restarting it between legs would
         // put a stream start inside each measurement.
-        let need = WARMUP.as_secs_f32()
-            + args.secs * 3.0
-            + SETTLE.as_secs_f32() * 3.0
-            + 3.0;
+        let need = WARMUP.as_secs_f32() + args.secs * 3.0 + SETTLE.as_secs_f32() * 3.0 + 3.0;
         Some(TonePlayer::start(
             args.tone,
             args.amp,
@@ -406,7 +415,10 @@ pub fn run(args: &ViArgs, backend: &str, json: bool) -> Result<i32> {
         None
     } else {
         let st = guard.set_mute(true)?;
-        crate::info(&format!("leg mute: volume {:.3} muted={}", st.scalar, st.muted));
+        crate::info(&format!(
+            "leg mute: volume {:.3} muted={}",
+            st.scalar, st.muted
+        ));
         let _ = pump(&mut src, SETTLE.as_secs_f32(), false);
         let m = measure(&pump(&mut src, args.secs, true), rate, args.tone);
         Some((st, m))
@@ -476,7 +488,10 @@ pub fn run(args: &ViArgs, backend: &str, json: bool) -> Result<i32> {
             VolumeCoupling::Inconclusive => None,
         };
         if got != Some(want) {
-            failures.push(format!("--vi-expect {want:?} but measured {:?}", report.coupling));
+            failures.push(format!(
+                "--vi-expect {want:?} but measured {:?}",
+                report.coupling
+            ));
         }
     }
     if let Some(want) = args.expect_survives_mute {
@@ -570,7 +585,11 @@ mod tests {
         }
         // The rejection side still has to work, or the above proves nothing:
         // a tone 200 Hz away must NOT be read as level.
-        let off = super::measure(&audiohub_core::dsp::gen_sine(1200.0, SR, n, AMP), SR, 1000.0);
+        let off = super::measure(
+            &audiohub_core::dsp::gen_sine(1200.0, SR, n, AMP),
+            SR,
+            1000.0,
+        );
         assert!(
             off.level < AMP * super::NARROWBAND_SCALE * 0.05,
             "a 1200 Hz tone read {:.5} when asked for 1000 Hz; the passband is too wide",
@@ -582,9 +601,14 @@ mod tests {
     /// assertions name the very strings they forbid, and a scan that included
     /// itself would fail on its own needles.
     fn read(rel: &str) -> String {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join(rel);
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join(rel);
         let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!("cannot read {} ({e}); update this test if the file moved", path.display())
+            panic!(
+                "cannot read {} ({e}); update this test if the file moved",
+                path.display()
+            )
         });
         let marker = "#[cfg(test)]";
         match src.find(marker) {

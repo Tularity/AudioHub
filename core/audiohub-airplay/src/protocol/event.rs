@@ -8,6 +8,8 @@ use std::{error::Error, fmt};
 
 const MEDIA_REMOTE_COMMAND: &str = "sendMediaRemoteCommand";
 const DEVICE_VOLUME_COMMAND: &str = "dvlc";
+const AIRPLAY_VOLUME_MIN_SCALAR: f32 = 0.0;
+const AIRPLAY_VOLUME_MAX_SCALAR: f32 = 1.0;
 
 /// Failure to construct an outbound AirPlay 2 event command.
 #[derive(Debug)]
@@ -21,7 +23,7 @@ impl fmt::Display for EventCommandError {
         match self {
             Self::InvalidVolume(volume) => write!(
                 formatter,
-                "AirPlay event volume must be finite and within 0.0..=1.0, got {volume}"
+                "AirPlay event volume must be finite and within 0..=1, got {volume}"
             ),
             Self::Encode(error) => {
                 write!(formatter, "failed to encode AirPlay event plist: {error}")
@@ -41,20 +43,29 @@ impl Error for EventCommandError {
 
 /// Encode a device-volume (`dvlc`) media-remote command as a binary plist.
 ///
-/// Both the root and `params` carry volume and mute state. Keeping the two
+/// Unlike `/info`'s `initialVolume` and the RTSP text `volume` parameter,
+/// Apple's event handler consumes this field as the visible slider scalar in
+/// `0..=1` and performs the scalar-to-dB conversion itself. Both the root and
+/// `params` carry volume and mute state. Keeping the two
 /// representations identical accommodates senders that inspect either shape
 /// without allowing them to disagree.
 pub(crate) fn encode_device_volume_command(
-    volume: f32,
+    volume_scalar: f32,
     is_muted: bool,
 ) -> Result<Vec<u8>, EventCommandError> {
-    if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
-        return Err(EventCommandError::InvalidVolume(volume));
+    if !volume_scalar.is_finite()
+        || !(AIRPLAY_VOLUME_MIN_SCALAR..=AIRPLAY_VOLUME_MAX_SCALAR).contains(&volume_scalar)
+    {
+        return Err(EventCommandError::InvalidVolume(volume_scalar));
     }
 
     // Canonicalize negative zero so equivalent silence states have identical
     // wire representations.
-    let volume = if volume == 0.0 { 0.0 } else { volume };
+    let volume = if volume_scalar == 0.0 {
+        0.0
+    } else {
+        volume_scalar
+    };
     let volume = Value::Real(f64::from(volume));
     let muted = Value::Boolean(is_muted);
 
@@ -139,7 +150,7 @@ mod tests {
 
     #[test]
     fn non_binary_decimal_is_exactly_widened_from_f32() {
-        let input = 0.05_f32;
+        let input = 0.1_f32;
         let expected = f64::from(input);
         let root = decode(&encode_device_volume_command(input, false).unwrap());
         let root_volume = root.get("volume").and_then(Value::as_real).unwrap();
@@ -156,9 +167,9 @@ mod tests {
 
     #[test]
     fn values_immediately_inside_and_outside_the_endpoints_are_classified_exactly() {
-        let smallest_positive = f32::from_bits(1);
+        let immediately_above_zero = f32::from_bits(1);
         let immediately_below_one = f32::from_bits(1.0_f32.to_bits() - 1);
-        for volume in [smallest_positive, immediately_below_one] {
+        for volume in [immediately_above_zero, immediately_below_one] {
             let root = decode(&encode_device_volume_command(volume, false).unwrap());
             assert_eq!(
                 root.get("volume").and_then(Value::as_real),
@@ -166,9 +177,9 @@ mod tests {
             );
         }
 
-        let smallest_negative = -smallest_positive;
+        let immediately_below_zero = -f32::from_bits(1);
         let immediately_above_one = f32::from_bits(1.0_f32.to_bits() + 1);
-        for volume in [smallest_negative, immediately_above_one] {
+        for volume in [immediately_below_zero, immediately_above_one] {
             assert!(matches!(
                 encode_device_volume_command(volume, false),
                 Err(EventCommandError::InvalidVolume(rejected))

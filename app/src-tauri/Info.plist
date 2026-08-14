@@ -8,11 +8,14 @@
   attributes a request to the *responsible process*, and the daemon is spawned
   as a child of AudioHub.app, so a microphone session opened by that daemon is
   refused outright unless NSMicrophoneUsageDescription is present here.
+
+  English is the base fallback. macOS replaces these values from the bundled
+  en.lproj / zh-Hans.lproj InfoPlist.strings for the user's preferred language.
 -->
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
-  <string>AudioHub 需要使用麦克风，才能把本机的麦克风声音共享给已配对的另一台设备（例如让 Windows 电脑使用这台 Mac 的麦克风）。仅在你主动开启共享时采集，音频只在局域网内点对点加密传输。</string>
+  <string>AudioHub needs microphone access to share this Mac's microphone with a paired device. It records only while you share, and sends audio directly and encrypted over the local network.</string>
 
   <!-- Core Audio process taps (mac-catap, core/audiohub-core/src/sysaudio.rs) are
        gated by kTCCServiceAudioCapture ("system audio recording"), a category
@@ -26,10 +29,10 @@
        key exists (tccd knows kTCCServiceScreenCapture but no usage string for it),
        so mac-sck's screen-recording consent is system-worded and settings-only. -->
   <key>NSAudioCaptureUsageDescription</key>
-  <string>AudioHub 需要录制本机的系统音频，才能把这台 Mac 正在播放的声音共享给已配对的另一台设备（例如让 Windows 电脑播放这台 Mac 的音乐）。仅在你主动开启共享时采集，音频只在局域网内点对点加密传输。</string>
+  <string>AudioHub needs system audio access to share what this Mac is playing with a paired device. It records only while you share, and sends audio directly and encrypted over the local network.</string>
 
   <key>NSLocalNetworkUsageDescription</key>
-  <string>AudioHub 需要访问本地网络，才能发现同一局域网内的 AudioHub 设备、发布 AirPlay 音频接收器，并直接传输音频。音频不会上传到互联网。</string>
+  <string>AudioHub needs local network access to find nearby AudioHub devices, publish its AirPlay audio receiver, and stream audio directly. Audio is not uploaded to the internet.</string>
 
   <!-- macOS 15+ pairs the local-network prompt with the Bonjour service types
        actually browsed; audiohub_net::discovery::SERVICE_TYPE. -->

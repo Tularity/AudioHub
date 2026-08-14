@@ -31,7 +31,8 @@ import { t, joinPhrases } from '../i18n';
 import { actions, getState, useStore } from '../state/store';
 import type { AppState } from '../state/store';
 import {
-  isModeB, isShareMode, peerDeviceRows, halReasonText, peerUnusableText,
+  isModeB, isShareMode, peerAudioDirectionAvailable, peerDeviceRows,
+  peerHasNoAudioDirections, halReasonText, peerUnusableText,
 } from '../state/mode';
 import { refreshSessions, rpc } from '../state/connection';
 import type { PeerState, SessionInfo } from '../ipc/types';
@@ -149,8 +150,8 @@ async function toggleSession(fp: string, kind: 'mic' | 'spk', want: boolean): Pr
 }
 
 function faultText(e: unknown): string {
-  const msg = String((e as Error)?.message || e || '').trim();
-  return msg || t('share.fault.unknown');
+  console.error('[audiohub] session.open failed', e);
+  return t('share.fault.unknown');
 }
 
 // 换共享来源 / 换捕获后端 = 换一条 spk 会话。与 reopenMic 同样先开新的、成功后才关
@@ -247,7 +248,7 @@ function setBridge(fp: string, want: string): void {
 
 // ---------------------------------------------------------------- 对端卡片
 
-// 模式 B 的对端卡片主体：这台对端的两台系统设备 + 它们此刻的状态。
+// 模式 B 的对端卡片主体：这台对端实际具备的系统设备 + 它们此刻的状态。
 // 这里**没有任何选择器**——选哪台对端 = 在系统里选哪台设备（plan §7.1 冻结）。
 function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
   const daemon = useStore((s) => s.daemon);
@@ -255,7 +256,12 @@ function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
   const devs = peerDeviceRows(peer, daemon);
   const has = devs.length > 0;
   const dev = peer.hal_device;
-  const published = !!dev && dev.state === 'bound' && !!dev.observed;
+  const published = !!dev && dev.state === 'bound'
+    && has && devs.every((row) => row.published && row.observed);
+
+  // 对端明确广告零音频能力时，「没有虚拟设备」是正常结果而不是故障。
+  // 整块不渲染，既不留空列表，也不画一条误导性警告。
+  if (peerHasNoAudioDirections(peer)) return null;
 
   let note = '';
   let noteWarn = false;
@@ -279,26 +285,26 @@ function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
       // 卡片整体可点（进入详情）；设备区里的文本要能选中复制 UID。
       onClick={(e) => e.stopPropagation()}
     >
-      {/* 「系统设备」标题行已删（规格 §2.3）：下面两行各带 🔊/🎤 图标 + 设备全名，
+      {/* 「系统设备」标题行已删（规格 §2.3）：下面每个实际方向都带图标 + 设备全名，
           已经自明，标题只是又一个不承载信息的方框。 */}
       <div className="dev-list" hidden={!has}>
-        {(['out', 'in'] as const).map((dir) => {
-          const d = devs.find((x) => x.dir === dir);
+        {devs.map((d) => {
           // 三层状态，含义各不相同：正在被应用使用 / 已发布但没人用 / 还没真正出现在系统里。
-          const io = !!d && d.io;
-          const state = io ? 'live' : published ? 'idle' : 'pending';
-          const text = io ? t('device.inUse') : published ? t('device.idle') : t('device.awaiting');
+          const io = d.io;
+          const ready = d.published && d.observed;
+          const state = io ? 'live' : ready ? 'idle' : 'pending';
+          const text = io ? t('device.inUse') : ready ? t('device.idle') : t('device.awaiting');
           return (
             <div
-              key={dir}
+              key={d.dir}
               className={`dev-row${io ? ' active' : ''}`}
-              data-testid={`peer-device-${dir}-${fp}`}
+              data-testid={`peer-device-${d.dir}-${fp}`}
             >
-              <Icon name={dir === 'out' ? 'spk' : 'mic'} cls="ico dev-ico" />
+              <Icon name={d.icon} cls="ico dev-ico" />
               {/* 设备 UID（`AudioHub:<fp>:out`）整行下沉到详情页 DevicesCard：
                   用户点名它是「不必要的编号」，而它在一级界面既不可执行也无人核对。 */}
               <div className="dev-text">
-                <span className="dev-name" title={d?.name || ''}>{d?.name || t('common.dash')}</span>
+                <span className="dev-name" title={d.name}>{d.name || t('common.dash')}</span>
               </div>
               <span className={`dev-state ${state}`}>{text}</span>
             </div>
@@ -357,7 +363,8 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
   //     `state === 'bound'` 而未被观测到时只是「已下发」，还不能承诺可用；
   //   - 没有 mic 方向的会话 —— 有会话时这一行显示的是实时码率，轮不到状态词。
   // 任一条不满足就退回原样（「空闲」/ 空白）：宣称一个兜不住的就绪状态，比不说更糟。
-  const micReady = recvList.length === 0 && !!peer.online && peer.hal_device?.observed === true;
+  const virtualMic = peerDeviceRows(peer, daemon).find((row) => row.dir === 'in');
+  const micReady = recvList.length === 0 && !!peer.online && virtualMic?.observed === true;
 
   const micBusy = busy.has(busyKey(fp, 'mic'));
   // 重连中不是「离线」：给和「连接中」同一种呼吸点，别让用户以为已经放弃了。
@@ -374,6 +381,10 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
   // 只在本机是使用端时才显示：共享模式下本机根本不打算用它，这行提示对当下的
   // 操作没有任何意义，只是噪声。
   const unusable = share ? '' : peerUnusableText(peer);
+  // 能力广告只约束「本机使用对端」。共享模式里的会话是对端在使用本机，
+  // 此时对端自己有没有麦克风 / 扬声器与那两条流无关，所以共享模式仍显示双向。
+  const txAvailable = share || peerAudioDirectionAvailable(peer, 'out');
+  const rxAvailable = share || peerAudioDirectionAvailable(peer, 'in');
 
   return (
     <article
@@ -411,7 +422,9 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
           `peer` 是无会话时的兜底数据源：延迟按流统计，没有会话就整块没有，而控制面
           的网络单程（`PeerState.net_ms`）配对连上就有——它是「连着但闲着」这一态下
           唯一测得到的一段。 */}
-      <PeerMetrics fp={fp} peer={peer} sendList={sendList} recvList={recvList} micReady={micReady} />
+      <PeerMetrics
+        fp={fp} peer={peer} sendList={sendList} recvList={recvList} micReady={micReady}
+      />
 
       {/* ④ 隐私条紧贴指标区：原位夹在重连提示与开关之间，视觉权重低到会被略过，
           而「对方正在取用本机麦克风」是这张卡上唯一不该被略过的一行。 */}
@@ -441,60 +454,72 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
           共享模式下同样全部下线，理由更硬（plan §13）：本机在这个模式里**根本不
           使用**别的主机，daemon 会直接拒掉 `session.open`。留着它们等于摆一排必然
           报错的开关。 */}
-      <div className="peer-toggles" data-testid={`peer-toggles-${fp}`} hidden={modeB || share}>
-        <div className="toggle-row">
-          <Icon name="mic" /><span className="toggle-label">{t('peers.card.takeMic')}</span>
-          <Switch
-            testid={`toggle-mic-${fp}`} label={t('peers.card.takeMic')} checked={!!micS} pending={micBusy}
-            onToggle={(w) => void toggleSession(fp, 'mic', w)}
-          />
-        </div>
-        <div className="toggle-row">
-          <Icon name="spk" /><span className="toggle-label">{t('peers.card.sendSpk')}</span>
-          <Switch
-            testid={`toggle-spk-${fp}`} label={t('peers.card.sendSpk')} checked={!!spkS}
-            pending={busy.has(busyKey(fp, 'spk'))}
-            onToggle={(w) => void toggleSession(fp, 'spk', w)}
-          />
-        </div>
-        {/* 「送对方扬声器」送的是什么（plan §7.1：默认本机系统音频）+ 用哪个捕获后端
-            （plan §6）。这是模式 A 的核心特性，此前整个界面上没有任何入口。 */}
-        <ShareSourceControl
-          testid={`share-source-${fp}`}
-          daemon={daemon}
-          source={spkSource}
-          backend={spkBackend}
-          pending={busy.has(busyKey(fp, 'spk'))}
-          perm={sysPerm}
-          fault={spkFault}
-          onSource={(v) => setSpkSource(fp, v)}
-          onBackend={(v) => setSpkBackend(fp, v)}
-          onGrant={() => actions.navigate('settings')}
-        />
-        {/* 「送对方扬声器」下方的音量同步控件：会话激活后出现，值来自 stats.volume。 */}
-        <VolumeControl
-          volumeTestid={`volume-${fp}`}
-          muteTestid={`mute-${fp}`}
-          label={t('peers.card.volumeLabel', { name: peer.name || fp })}
-          sess={modeB ? null : spkS}
-          // silent：拖动会连发，失败提示由控件自己在框内给一条，不刷 toast。
-          onSet={(id, params) => rpc('session.set_volume', { id, ...params }, { silent: true })}
-        />
-        <div className="toggle-row">
-          <Icon name="monitor" /><span className="toggle-label">{t('peers.card.monitor')}</span>
-          <Switch
-            testid={`toggle-monitor-${fp}`} label={t('peers.card.monitor')} checked={monitorPref} pending={micBusy}
-            onToggle={(w) => toggleMonitor(fp, w)}
-          />
-        </div>
-        {/* 「取对方麦克风」的第二个去向（plan §7.1）：写入第三方虚拟声卡的播放端。 */}
-        <BridgeControl
-          testid={`bridge-${fp}`}
-          daemon={daemon}
-          value={bridgePref}
-          pending={micBusy}
-          onChange={(v) => setBridge(fp, v)}
-        />
+      <div
+        className="peer-toggles"
+        data-testid={`peer-toggles-${fp}`}
+        hidden={modeB || share || (!txAvailable && !rxAvailable)}
+      >
+        {rxAvailable ? (
+          <div className="toggle-row">
+            <Icon name="mic" /><span className="toggle-label">{t('peers.card.takeMic')}</span>
+            <Switch
+              testid={`toggle-mic-${fp}`} label={t('peers.card.takeMic')} checked={!!micS} pending={micBusy}
+              onToggle={(w) => void toggleSession(fp, 'mic', w)}
+            />
+          </div>
+        ) : null}
+        {txAvailable ? (
+          <>
+            <div className="toggle-row">
+              <Icon name="spk" /><span className="toggle-label">{t('peers.card.sendSpk')}</span>
+              <Switch
+                testid={`toggle-spk-${fp}`} label={t('peers.card.sendSpk')} checked={!!spkS}
+                pending={busy.has(busyKey(fp, 'spk'))}
+                onToggle={(w) => void toggleSession(fp, 'spk', w)}
+              />
+            </div>
+            {/* 发往对端默认输出的共享来源、捕获后端与音量同步同属 TX 能力。 */}
+            <ShareSourceControl
+              testid={`share-source-${fp}`}
+              daemon={daemon}
+              source={spkSource}
+              backend={spkBackend}
+              pending={busy.has(busyKey(fp, 'spk'))}
+              perm={sysPerm}
+              fault={spkFault}
+              onSource={(v) => setSpkSource(fp, v)}
+              onBackend={(v) => setSpkBackend(fp, v)}
+              onGrant={() => actions.navigate('settings')}
+            />
+            <VolumeControl
+              volumeTestid={`volume-${fp}`}
+              muteTestid={`mute-${fp}`}
+              label={t('peers.card.volumeLabel', { name: peer.name || fp })}
+              sess={modeB ? null : spkS}
+              // silent：拖动会连发，失败提示由控件自己在框内给一条，不刷 toast。
+              onSet={(id, params) => rpc('session.set_volume', { id, ...params }, { silent: true })}
+            />
+          </>
+        ) : null}
+        {rxAvailable ? (
+          <>
+            <div className="toggle-row">
+              <Icon name="monitor" /><span className="toggle-label">{t('peers.card.monitor')}</span>
+              <Switch
+                testid={`toggle-monitor-${fp}`} label={t('peers.card.monitor')} checked={monitorPref} pending={micBusy}
+                onToggle={(w) => toggleMonitor(fp, w)}
+              />
+            </div>
+            {/* 取用对端默认输入的监听与虚拟声卡桥接同属 RX 能力。 */}
+            <BridgeControl
+              testid={`bridge-${fp}`}
+              daemon={daemon}
+              value={bridgePref}
+              pending={micBusy}
+              onChange={(v) => setBridge(fp, v)}
+            />
+          </>
+        ) : null}
       </div>
 
       <PeerDevices peer={peer} hidden={!modeB} />

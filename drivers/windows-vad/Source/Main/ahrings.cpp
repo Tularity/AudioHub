@@ -530,6 +530,30 @@ AhRingsHeader(
     return (PAUDIOHUB_RING_HEADER)table->Ring[AUDIOHUB_RING_INDEX(Slot, Dir)].Base;
 }
 
+#pragma code_seg("PAGE")
+VOID
+AhRingsResetDirection(
+    _In_ ULONG Slot,
+    _In_ ULONG Dir
+    )
+{
+    PAGED_CODE();
+
+    PAUDIOHUB_RING_HEADER hdr = AhRingsHeader(Slot, Dir);
+    if (hdr == NULL)
+    {
+        return;
+    }
+
+    // The ring allocation deliberately outlives endpoint objects. Reset both
+    // cursors at a lifecycle boundary so a restored endpoint cannot consume
+    // samples queued by the endpoint that was withdrawn. A late DPC racing
+    // this store is harmless: the transfer helpers clamp cursor deltas to the
+    // ring capacity, and the daemon/PortCls side is already being stopped.
+    AhRingStoreRelease(&hdr->ReadIdx, 0);
+    AhRingStoreRelease(&hdr->WriteIdx, 0);
+}
+
 #pragma code_seg()
 VOID
 AhRingsSignal(VOID)

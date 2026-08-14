@@ -11,6 +11,10 @@ use std::fmt;
 
 pub(crate) const DEFAULT_PACKET_CAPACITY: usize = 128;
 pub(crate) const DEFAULT_REORDER_WINDOW: u64 = 512;
+/// Realtime PTP senders commonly present roughly two seconds ahead of the DAC
+/// clock (about 257 packets at 352 frames/44.1 kHz). Keep that entire lead
+/// bounded without discarding authenticated packets before their deadline.
+pub(crate) const PTP_PACKET_CAPACITY: usize = 512;
 const MAX_PACKET_CAPACITY: usize = 1_024;
 const MAX_REORDER_WINDOW: u64 = 65_535;
 
@@ -147,6 +151,11 @@ impl JitterBuffer {
     pub(crate) fn type96() -> Self {
         Self::with_limits(DEFAULT_PACKET_CAPACITY, DEFAULT_REORDER_WINDOW)
             .expect("fixed type-96 jitter limits are valid")
+    }
+
+    pub(crate) fn ptp_type96() -> Self {
+        Self::with_limits(PTP_PACKET_CAPACITY, DEFAULT_REORDER_WINDOW)
+            .expect("fixed PTP type-96 jitter limits are valid")
     }
 
     pub(crate) fn with_limits(capacity: usize, reorder_window: u64) -> Result<Self, JitterError> {

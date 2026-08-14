@@ -1,25 +1,27 @@
 //! Realtime type-96 UDP transport owned by AudioHub.
 //!
-//! The engine deliberately stops at ordered PCM delivery. The platform audio
-//! sink remains responsible for consuming PCM at the device clock; adding a
-//! separate sender-side pacer here would create a second clock and eventually
-//! drift.
+//! NTP streams preserve the legacy ordered-PCM delivery path. AirPlay 2 PTP
+//! streams are different: their `d7` control packets name an absolute PTP
+//! presentation timeline, so decoded PCM is released only at a bounded local
+//! deadline derived from that timeline.
 
 use super::audio_crypto::{AudioDecryptor, MAX_ENCRYPTED_AUDIO_PACKET_BYTES};
+use super::buffered_clock::PlaybackAnchor;
 use super::clock::{
     build_timing_request, NtpTimestamp, PendingTimingRequest, SyncAnchor, TimingFeedback,
     TimingResponse, TimingWindow,
 };
-use super::decode::{Type96AlacDecoder, CHANNELS, FRAMES_PER_PACKET};
+use super::decode::{Type96AlacDecoder, CHANNELS, FRAMES_PER_PACKET, SAMPLE_RATE};
 use super::jitter::JitterBuffer;
 use super::packet::{RingDisposition, RtpPacket, SequenceExtender16, TimestampExtender32};
+use super::ptp::{PtpClockMapper, PtpClockSample, PtpClockSource};
 use super::setup::Type96Setup;
 use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Instant, MissedTickBehavior};
 
@@ -37,6 +39,19 @@ const STARTUP_PRIME: Duration = Duration::from_millis(24);
 const MIN_SYNC_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_RETRANSMIT_ATTEMPTS: u8 = 6;
 const NONCE_HISTORY: usize = 2_048;
+const PTP_SYNC_ANCHOR_BYTES: usize = 28;
+const MAX_PENDING_PTP_SAMPLES: usize = 32;
+const MAX_CLOCKED_SILENCE_PACKETS: usize = 512;
+// In the realtime d7 profile, the timestamp at bytes 4..8 is 11,035 frames
+// ahead of the RTP frame that must reach the DAC at the advertised PTP time.
+// This is part of the wire profile, not AudioHub's output-device latency.
+const PTP_REALTIME_RENDER_OFFSET_FRAMES: u32 = 11_035;
+const MAX_CLOCKED_FUTURE: Duration = Duration::from_secs(30);
+const MAX_CLOCKED_LATENESS: Duration = Duration::from_millis(500);
+// The default PCM bus primes five 10 ms frames. Release decoded realtime PCM
+// this far ahead of its network presentation point so the platform sink, not
+// the Tokio task wakeup, owns the final device-clock edge.
+const PCM_OUTPUT_LEAD: Duration = Duration::from_millis(50);
 
 #[cfg(not(test))]
 const TIMING_PROBE_INTERVAL: Duration = Duration::from_secs(2);
@@ -122,14 +137,25 @@ pub(crate) struct PreparedType96 {
     data_socket: UdpSocket,
     control_socket: UdpSocket,
     peer_ip: IpAddr,
-    remote_timing: SocketAddr,
     advertised_control_target: Option<SocketAddr>,
-    initial_timing_probe: Option<InitialTimingProbe>,
     ports: Type96Ports,
     decryptor: AudioDecryptor,
     decoder: Type96AlacDecoder,
     jitter: JitterBuffer,
-    timing_window: TimingWindow,
+    clock: PreparedType96Clock,
+}
+
+enum PreparedType96Clock {
+    Ntp {
+        remote_timing: SocketAddr,
+        initial_probe: Option<InitialTimingProbe>,
+        window: TimingWindow,
+    },
+    Ptp {
+        source: PtpClockSource,
+        samples: broadcast::Receiver<PtpClockSample>,
+        epoch: std::time::Instant,
+    },
 }
 
 impl PreparedType96 {
@@ -157,14 +183,6 @@ impl PreparedType96 {
             ));
         }
 
-        let bind_address = with_port(local, 0);
-        let data_socket = UdpSocket::bind(bind_address).await?;
-        let data_port = data_socket.local_addr()?.port();
-        let control_port = timing.port;
-
-        // Build every state object that can fail before SETUP is acknowledged.
-        let decoder = Type96AlacDecoder::new()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let timing_window =
             TimingWindow::new(8, TIMING_WINDOW_AGE_NS, TIMING_MAX_RTT_NS).map_err(|error| {
                 io::Error::new(
@@ -172,24 +190,75 @@ impl PreparedType96 {
                     format!("invalid type-96 clock limits: {error:?}"),
                 )
             })?;
+        let control_port = timing.port;
+        let clock = PreparedType96Clock::Ntp {
+            remote_timing: timing.remote_timing,
+            initial_probe: timing.initial_probe,
+            window: timing_window,
+        };
+        Self::prepare_bound(local, peer, timing.socket, control_port, setup, clock).await
+    }
+
+    /// Prepare a realtime AirPlay 2 stream that is anchored to the PTP clock
+    /// installed during phase one. Unlike NTP, PTP has no sender timing port:
+    /// phase two therefore owns a fresh UDP control endpoint for d7/d5/d6.
+    pub(crate) async fn prepare_with_ptp(
+        local: SocketAddr,
+        peer: SocketAddr,
+        ptp_source: PtpClockSource,
+        setup: Type96Setup,
+    ) -> io::Result<Self> {
+        validate_media_endpoints(local, peer)?;
+        let control_socket = UdpSocket::bind(with_port(local, 0)).await?;
+        let control_port = control_socket.local_addr()?.port();
+        let epoch = std::time::Instant::now();
+        let samples = ptp_source.subscribe();
+        let clock = PreparedType96Clock::Ptp {
+            source: ptp_source,
+            samples,
+            epoch,
+        };
+        Self::prepare_bound(local, peer, control_socket, control_port, setup, clock).await
+    }
+
+    async fn prepare_bound(
+        local: SocketAddr,
+        peer: SocketAddr,
+        control_socket: UdpSocket,
+        control_port: u16,
+        setup: Type96Setup,
+        clock: PreparedType96Clock,
+    ) -> io::Result<Self> {
+        validate_media_endpoints(local, peer)?;
+
+        let bind_address = with_port(local, 0);
+        let data_socket = UdpSocket::bind(bind_address).await?;
+        let data_port = data_socket.local_addr()?.port();
+
+        // Build every state object that can fail before SETUP is acknowledged.
+        let decoder = Type96AlacDecoder::new()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let decryptor = AudioDecryptor::new(*setup.shared_key());
         let advertised_control_target = setup.remote_control_port.map(|port| with_port(peer, port));
+        let jitter = if matches!(&clock, PreparedType96Clock::Ptp { .. }) {
+            JitterBuffer::ptp_type96()
+        } else {
+            JitterBuffer::type96()
+        };
 
         Ok(Self {
             data_socket,
-            control_socket: timing.socket,
+            control_socket,
             peer_ip: peer.ip(),
-            remote_timing: timing.remote_timing,
             advertised_control_target,
-            initial_timing_probe: timing.initial_probe,
             ports: Type96Ports {
                 data_port,
                 control_port,
             },
             decryptor,
             decoder,
-            jitter: JitterBuffer::type96(),
-            timing_window,
+            jitter,
+            clock,
         })
     }
 
@@ -276,13 +345,129 @@ struct GapWait {
     request_count: u8,
 }
 
+/// The 28-byte AirPlay 2 realtime PTP control anchor (`d7`). The remote PTP
+/// nanoseconds name the presentation instant for `frame_with_fixed_offset`
+/// minus the protocol's fixed 11,035-frame render offset. `rtp_current` is
+/// retained to validate/diagnose the sender's announced latency without
+/// folding a sender-specific buffer constant into AudioHub's platform sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PtpSyncAnchor {
+    initial: bool,
+    flags_or_sequence: u16,
+    frame_with_fixed_offset: u32,
+    remote_time_ns: u64,
+    rtp_current: u32,
+    timeline_id: u64,
+}
+
+impl PtpSyncAnchor {
+    fn parse(packet: &[u8]) -> Result<Self, PtpAnchorError> {
+        if packet.len() != PTP_SYNC_ANCHOR_BYTES {
+            return Err(PtpAnchorError::WrongLength {
+                actual: packet.len(),
+            });
+        }
+        let initial = match packet[0] {
+            0x80 => false,
+            0x90 => true,
+            _ => return Err(PtpAnchorError::InvalidHeader),
+        };
+        if packet[1] != 0xd7 {
+            return Err(PtpAnchorError::InvalidHeader);
+        }
+        let remote_time_ns = u64::from_be_bytes(packet[8..16].try_into().expect("fixed slice"));
+        if remote_time_ns == 0 {
+            return Err(PtpAnchorError::MissingRemoteTime);
+        }
+        let timeline_id = u64::from_be_bytes(packet[20..28].try_into().expect("fixed slice"));
+        if timeline_id == 0 {
+            return Err(PtpAnchorError::MissingTimeline);
+        }
+        Ok(Self {
+            initial,
+            flags_or_sequence: u16::from_be_bytes([packet[2], packet[3]]),
+            frame_with_fixed_offset: u32::from_be_bytes(
+                packet[4..8].try_into().expect("fixed slice"),
+            ),
+            remote_time_ns,
+            rtp_current: u32::from_be_bytes(packet[16..20].try_into().expect("fixed slice")),
+            timeline_id,
+        })
+    }
+
+    fn latency_frames(self) -> u32 {
+        self.rtp_current.wrapping_sub(self.frame_with_fixed_offset)
+    }
+
+    fn playback_anchor(self) -> PlaybackAnchor {
+        PlaybackAnchor {
+            timeline_id: self.timeline_id,
+            remote_time_ns: self.remote_time_ns,
+            rtp_time: self
+                .frame_with_fixed_offset
+                .wrapping_sub(PTP_REALTIME_RENDER_OFFSET_FRAMES),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtpAnchorError {
+    WrongLength { actual: usize },
+    InvalidHeader,
+    MissingRemoteTime,
+    MissingTimeline,
+}
+
+struct NtpType96Clock {
+    remote_timing: SocketAddr,
+    window: TimingWindow,
+    pending: Option<PendingTimingRequest>,
+    feedback: Option<TimingFeedback>,
+    sequence: u16,
+    last_anchor: Option<SyncAnchor>,
+    last_local_anchor_ns: Option<u64>,
+}
+
+struct PtpType96Clock {
+    source: PtpClockSource,
+    epoch: std::time::Instant,
+    mapper: Option<PtpClockMapper>,
+    anchor: Option<PlaybackAnchor>,
+    pending_samples: VecDeque<PtpClockSample>,
+    ready_logged: bool,
+    anchor_logged: bool,
+}
+
+enum Type96Clock {
+    Ntp(NtpType96Clock),
+    Ptp(PtpType96Clock),
+}
+
+struct ClockedFrame {
+    sequence: u64,
+    timestamp: u32,
+    pcm: Vec<i16>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClockedSilence {
+    sequence: u64,
+    timestamp: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClockedSchedule {
+    Wait,
+    DeliverAt(Instant),
+    DropLate,
+}
+
 struct Type96Engine {
     data_socket: UdpSocket,
     control_socket: UdpSocket,
     peer_ip: IpAddr,
     advertised_control_target: Option<SocketAddr>,
     observed_control_source: Option<SocketAddr>,
-    remote_timing: SocketAddr,
     data_source: Option<SocketAddr>,
     stream_ssrc: Option<u32>,
     stream_origin: Option<(u64, u64)>,
@@ -291,12 +476,10 @@ struct Type96Engine {
     jitter: JitterBuffer,
     sequence: SequenceExtender16,
     timestamp: TimestampExtender32,
-    timing_window: TimingWindow,
-    pending_timing: Option<PendingTimingRequest>,
-    timing_feedback: Option<TimingFeedback>,
-    timing_sequence: u16,
-    last_anchor: Option<SyncAnchor>,
-    last_local_anchor_ns: Option<u64>,
+    clock: Type96Clock,
+    ptp_samples: Option<broadcast::Receiver<PtpClockSample>>,
+    clocked_frame: Option<ClockedFrame>,
+    clocked_silence: VecDeque<ClockedSilence>,
     last_sync: Option<Instant>,
     recent_nonces: VecDeque<[u8; 8]>,
     nonce_index: HashSet<[u8; 8]>,
@@ -316,20 +499,55 @@ impl Type96Engine {
         commands: mpsc::Receiver<MediaCommand>,
     ) -> Self {
         let monotonic_origin = Instant::now();
-        let initial_timing_probe = prepared.initial_timing_probe;
-        let pending_timing = initial_timing_probe.and_then(|probe| {
-            let expires_at = probe.sent_at.checked_add(TIMING_RESPONSE_LIFETIME)?;
-            let remaining = expires_at.saturating_duration_since(monotonic_origin);
-            if remaining.is_zero() {
-                return None;
+        let (clock, ptp_samples) = match prepared.clock {
+            PreparedType96Clock::Ntp {
+                remote_timing,
+                initial_probe,
+                window,
+            } => {
+                let pending = initial_probe.and_then(|probe| {
+                    let expires_at = probe.sent_at.checked_add(TIMING_RESPONSE_LIFETIME)?;
+                    let remaining = expires_at.saturating_duration_since(monotonic_origin);
+                    if remaining.is_zero() {
+                        return None;
+                    }
+                    Some(PendingTimingRequest {
+                        sequence: probe.sequence,
+                        origin: probe.origin,
+                        local_departure_ns: probe.local_departure_ns,
+                        expires_at_monotonic_ns: duration_nanos(remaining),
+                    })
+                });
+                (
+                    Type96Clock::Ntp(NtpType96Clock {
+                        remote_timing,
+                        window,
+                        pending,
+                        feedback: None,
+                        sequence: initial_probe.map_or(1, |probe| probe.sequence.wrapping_add(1)),
+                        last_anchor: None,
+                        last_local_anchor_ns: None,
+                    }),
+                    None,
+                )
             }
-            Some(PendingTimingRequest {
-                sequence: probe.sequence,
-                origin: probe.origin,
-                local_departure_ns: probe.local_departure_ns,
-                expires_at_monotonic_ns: duration_nanos(remaining),
-            })
-        });
+            PreparedType96Clock::Ptp {
+                source,
+                samples,
+                epoch,
+            } => (
+                Type96Clock::Ptp(PtpType96Clock {
+                    source,
+                    epoch,
+                    mapper: None,
+                    anchor: None,
+                    pending_samples: VecDeque::with_capacity(MAX_PENDING_PTP_SAMPLES),
+                    ready_logged: false,
+                    anchor_logged: false,
+                }),
+                Some(samples),
+            ),
+        };
         Self {
             data_socket: prepared.data_socket,
             control_socket: prepared.control_socket,
@@ -339,7 +557,6 @@ impl Type96Engine {
             // source port the sender will use for d4/d6. Observe that source
             // independently from the first valid control datagram.
             observed_control_source: None,
-            remote_timing: prepared.remote_timing,
             data_source: None,
             stream_ssrc: None,
             stream_origin: None,
@@ -348,12 +565,10 @@ impl Type96Engine {
             jitter: prepared.jitter,
             sequence: SequenceExtender16::new(),
             timestamp: TimestampExtender32::new(),
-            timing_window: prepared.timing_window,
-            pending_timing,
-            timing_feedback: None,
-            timing_sequence: initial_timing_probe.map_or(1, |probe| probe.sequence.wrapping_add(1)),
-            last_anchor: None,
-            last_local_anchor_ns: None,
+            clock,
+            ptp_samples,
+            clocked_frame: None,
+            clocked_silence: VecDeque::new(),
             last_sync: None,
             recent_nonces: VecDeque::with_capacity(NONCE_HISTORY),
             nonce_index: HashSet::with_capacity(NONCE_HISTORY),
@@ -376,6 +591,29 @@ impl Type96Engine {
         timing_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
+            self.prepare_clocked_frame();
+            let schedule = self.clocked_schedule();
+            match schedule {
+                ClockedSchedule::DeliverAt(deadline) if deadline <= Instant::now() => {
+                    self.deliver_clocked_frame();
+                    continue;
+                }
+                ClockedSchedule::DropLate => {
+                    self.drop_late_clocked_frame();
+                    continue;
+                }
+                ClockedSchedule::Wait | ClockedSchedule::DeliverAt(_) => {}
+            }
+            let clocked_deadline = match schedule {
+                ClockedSchedule::DeliverAt(deadline) => Some(deadline),
+                ClockedSchedule::Wait | ClockedSchedule::DropLate => None,
+            };
+            let sleep_deadline = clocked_deadline.unwrap_or_else(|| {
+                Instant::now()
+                    .checked_add(Duration::from_secs(24 * 60 * 60))
+                    .expect("one day fits Tokio Instant")
+            });
+
             tokio::select! {
                 received = self.data_socket.recv_from(&mut data) => {
                     let (length, source) = match received {
@@ -403,6 +641,12 @@ impl Type96Engine {
                 }
                 _ = timing_tick.tick() => {
                     self.send_timing_probe().await;
+                }
+                sample = receive_ptp_sample(&mut self.ptp_samples) => {
+                    self.observe_ptp_sample(sample);
+                }
+                _ = time::sleep_until(sleep_deadline), if clocked_deadline.is_some() => {
+                    self.deliver_clocked_frame();
                 }
                 command = self.commands.recv() => {
                     match command {
@@ -536,10 +780,9 @@ impl Type96Engine {
             return;
         }
         match datagram[1] {
-            0xd3 if source.port() == self.remote_timing.port() => {
-                self.accept_timing_response(datagram)
-            }
-            0xd4 if self.control_source_allowed(source)
+            0xd3 if self.ntp_timing_source_allowed(source) => self.accept_timing_response(datagram),
+            0xd4 if matches!(self.clock, Type96Clock::Ntp(_))
+                && self.control_source_allowed(source)
                 && self
                     .last_sync
                     .is_none_or(|last| last.elapsed() >= MIN_SYNC_INTERVAL) =>
@@ -547,8 +790,22 @@ impl Type96Engine {
                 if let Ok(anchor) = SyncAnchor::parse(datagram) {
                     self.observed_control_source.get_or_insert(source);
                     self.last_sync = Some(Instant::now());
-                    self.last_anchor = Some(anchor);
-                    self.refresh_local_anchor();
+                    if let Type96Clock::Ntp(clock) = &mut self.clock {
+                        clock.last_anchor = Some(anchor);
+                    }
+                    self.refresh_ntp_anchor();
+                }
+            }
+            0xd7 if matches!(self.clock, Type96Clock::Ptp(_))
+                && self.control_source_allowed(source)
+                && self
+                    .last_sync
+                    .is_none_or(|last| last.elapsed() >= MIN_SYNC_INTERVAL) =>
+            {
+                if let Ok(anchor) = PtpSyncAnchor::parse(datagram) {
+                    self.observed_control_source.get_or_insert(source);
+                    self.last_sync = Some(Instant::now());
+                    self.install_ptp_anchor(anchor);
                 }
             }
             0xd6 if self.control_source_allowed(source)
@@ -563,6 +820,13 @@ impl Type96Engine {
             }
             _ => {}
         }
+    }
+
+    fn ntp_timing_source_allowed(&self, source: SocketAddr) -> bool {
+        matches!(
+            &self.clock,
+            Type96Clock::Ntp(clock) if source == clock.remote_timing
+        )
     }
 
     fn control_source_allowed(&self, source: SocketAddr) -> bool {
@@ -581,7 +845,10 @@ impl Type96Engine {
     }
 
     fn accept_timing_response(&mut self, datagram: &[u8]) {
-        let Some(pending) = self.pending_timing else {
+        let Type96Clock::Ntp(clock) = &self.clock else {
+            return;
+        };
+        let Some(pending) = clock.pending else {
             return;
         };
         let response = match TimingResponse::parse(datagram, None) {
@@ -607,28 +874,127 @@ impl Type96Engine {
             Ok(sample) => sample,
             Err(_) => return,
         };
-        if self.timing_window.insert(sample, monotonic).is_err() {
+        let Type96Clock::Ntp(clock) = &mut self.clock else {
+            return;
+        };
+        if clock.window.insert(sample, monotonic).is_err() {
             return;
         }
-        self.pending_timing = None;
-        self.timing_feedback = Some(TimingFeedback {
+        clock.pending = None;
+        clock.feedback = Some(TimingFeedback {
             remote_reference: response.remote_transmit,
             local_receive: arrival,
         });
-        self.refresh_local_anchor();
+        self.refresh_ntp_anchor();
     }
 
-    fn refresh_local_anchor(&mut self) {
-        let Some(anchor) = self.last_anchor else {
+    fn refresh_ntp_anchor(&mut self) {
+        let monotonic = self.monotonic_ns();
+        let Type96Clock::Ntp(clock) = &mut self.clock else {
             return;
         };
-        let Some(sample) = self.timing_window.best(self.monotonic_ns()) else {
+        let Some(anchor) = clock.last_anchor else {
             return;
         };
-        self.last_local_anchor_ns = anchor.local_anchor_ns(sample);
+        let Some(sample) = clock.window.best(monotonic) else {
+            return;
+        };
+        clock.last_local_anchor_ns = anchor.local_anchor_ns(sample);
+    }
+
+    fn install_ptp_anchor(&mut self, anchor: PtpSyncAnchor) {
+        let peer_ip = self.peer_ip;
+        let Type96Clock::Ptp(clock) = &mut self.clock else {
+            return;
+        };
+        let playback_anchor = anchor.playback_anchor();
+        let reset_mapper = clock
+            .mapper
+            .as_ref()
+            .is_none_or(|mapper| mapper.grandmaster() != playback_anchor.timeline_id);
+        if reset_mapper {
+            clock.mapper = Some(PtpClockMapper::new(
+                peer_ip,
+                playback_anchor.timeline_id,
+                clock.epoch,
+            ));
+            clock.ready_logged = false;
+        }
+        clock.anchor = Some(playback_anchor);
+        if !clock.anchor_logged {
+            clock.anchor_logged = true;
+            log::info!(
+                target: "audiohub_airplay::airplay2",
+                "AirPlay 2 realtime PTP anchor accepted initial={} sequence={} latency_frames={} timeline={:016x}",
+                anchor.initial,
+                anchor.flags_or_sequence,
+                anchor.latency_frames(),
+                anchor.timeline_id
+            );
+        }
+
+        let pending = std::mem::take(&mut clock.pending_samples);
+        for sample in pending {
+            if sample.peer == peer_ip && sample.grandmaster == playback_anchor.timeline_id {
+                Self::observe_ptp_sample_value(clock, sample);
+            }
+        }
+    }
+
+    fn observe_ptp_sample(&mut self, sample: Result<PtpClockSample, broadcast::error::RecvError>) {
+        let sample = match sample {
+            Ok(sample) => sample,
+            Err(broadcast::error::RecvError::Lagged(_)) => return,
+            Err(broadcast::error::RecvError::Closed) => {
+                self.ptp_samples = None;
+                return;
+            }
+        };
+        if sample.peer != self.peer_ip {
+            return;
+        }
+        let Type96Clock::Ptp(clock) = &mut self.clock else {
+            return;
+        };
+        if clock.mapper.is_none() {
+            if clock.pending_samples.len() == MAX_PENDING_PTP_SAMPLES {
+                clock.pending_samples.pop_front();
+            }
+            clock.pending_samples.push_back(sample);
+            return;
+        }
+        Self::observe_ptp_sample_value(clock, sample);
+    }
+
+    fn observe_ptp_sample_value(clock: &mut PtpType96Clock, sample: PtpClockSample) {
+        let Some(mapper) = clock.mapper.as_mut() else {
+            return;
+        };
+        match mapper.observe(sample) {
+            Ok(Some(estimate)) => {
+                if !clock.ready_logged {
+                    clock.ready_logged = true;
+                    log::info!(
+                        target: "audiohub_airplay::airplay2",
+                        "AirPlay 2 realtime PTP clock ready samples={} timeline={:016x}",
+                        estimate.retained_samples,
+                        sample.grandmaster
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => log::debug!(
+                target: "audiohub_airplay::airplay2",
+                "AirPlay 2 realtime PTP sample rejected: {error}"
+            ),
+        }
     }
 
     fn drain_ready(&mut self) {
+        if matches!(self.clock, Type96Clock::Ptp(_)) {
+            self.prepare_clocked_frame();
+            return;
+        }
         while let Some(packet) = self.jitter.pop_ready() {
             match self.decoder.decode_packet(packet.payload()) {
                 Ok(pcm) => self.output.write(pcm.samples()),
@@ -638,6 +1004,108 @@ impl Type96Engine {
         if self.jitter.missing_ranges().is_empty() {
             self.gap = None;
         }
+    }
+
+    fn prepare_clocked_frame(&mut self) {
+        if !self.delivery_started
+            || self.clocked_frame.is_some()
+            || !matches!(self.clock, Type96Clock::Ptp(_))
+        {
+            return;
+        }
+
+        if let Some(silence) = self.clocked_silence.pop_front() {
+            self.clocked_frame = Some(ClockedFrame {
+                sequence: silence.sequence,
+                timestamp: silence.timestamp,
+                pcm: vec![0; FRAMES_PER_PACKET * CHANNELS],
+            });
+            return;
+        }
+
+        let Some(packet) = self.jitter.pop_ready() else {
+            return;
+        };
+        let pcm = match self.decoder.decode_packet(packet.payload()) {
+            Ok(pcm) => pcm.samples().to_vec(),
+            Err(_) => vec![0; FRAMES_PER_PACKET * CHANNELS],
+        };
+        self.clocked_frame = Some(ClockedFrame {
+            sequence: packet.sequence,
+            timestamp: packet.timestamp as u32,
+            pcm,
+        });
+        if self.jitter.missing_ranges().is_empty() {
+            self.gap = None;
+        }
+    }
+
+    fn clocked_schedule(&self) -> ClockedSchedule {
+        let Some(frame) = self.clocked_frame.as_ref() else {
+            return ClockedSchedule::Wait;
+        };
+        let Type96Clock::Ptp(clock) = &self.clock else {
+            return ClockedSchedule::Wait;
+        };
+        let Some(anchor) = clock.anchor else {
+            return ClockedSchedule::Wait;
+        };
+        let now = std::time::Instant::now();
+        let deadline =
+            match clock
+                .source
+                .platform_deadline_for_rtp(anchor, frame.timestamp, SAMPLE_RATE)
+            {
+                Some(result) => result,
+                None => {
+                    let Some(mapper) = clock.mapper.as_ref() else {
+                        return ClockedSchedule::Wait;
+                    };
+                    mapper.deadline_for_rtp(now, anchor, frame.timestamp, SAMPLE_RATE)
+                }
+            };
+        match deadline {
+            Ok(deadline) => {
+                let deadline = deadline.checked_sub(PCM_OUTPUT_LEAD).unwrap_or(now);
+                if deadline > now + MAX_CLOCKED_FUTURE {
+                    log::warn!(
+                        target: "audiohub_airplay::airplay2",
+                        "AirPlay 2 realtime PTP deadline exceeded the 30 second safety limit"
+                    );
+                    ClockedSchedule::Wait
+                } else if now.saturating_duration_since(deadline) <= MAX_CLOCKED_LATENESS {
+                    ClockedSchedule::DeliverAt(Instant::from_std(deadline))
+                } else {
+                    ClockedSchedule::DropLate
+                }
+            }
+            Err(error) => {
+                log::debug!(
+                    target: "audiohub_airplay::airplay2",
+                    "AirPlay 2 realtime PTP deadline unavailable: {error}"
+                );
+                ClockedSchedule::Wait
+            }
+        }
+    }
+
+    fn deliver_clocked_frame(&mut self) {
+        if let Some(frame) = self.clocked_frame.take() {
+            self.output.write(&frame.pcm);
+        }
+    }
+
+    fn drop_late_clocked_frame(&mut self) {
+        let Some(frame) = self.clocked_frame.take() else {
+            return;
+        };
+        log::warn!(
+            target: "audiohub_airplay::airplay2",
+            "AirPlay 2 dropped late realtime frame sequence={} timestamp={}",
+            frame.sequence,
+            frame.timestamp
+        );
+        self.output.flush();
     }
 
     async fn service_media_tick(&mut self) {
@@ -686,7 +1154,11 @@ impl Type96Engine {
             let skipped = missing.packet_count();
             let new_next = missing.last.saturating_add(1);
             if self.jitter.advance_to(new_next).is_ok() {
-                self.write_silence(skipped);
+                if matches!(&self.clock, Type96Clock::Ptp(_)) {
+                    self.enqueue_clocked_silence(missing.first, missing.last);
+                } else {
+                    self.write_silence(skipped);
+                }
                 self.gap = None;
                 self.drain_ready();
             }
@@ -728,8 +1200,13 @@ impl Type96Engine {
 
     async fn send_timing_probe(&mut self) {
         let monotonic = self.monotonic_ns();
-        if self
-            .pending_timing
+        let Type96Clock::Ntp(clock) = &mut self.clock else {
+            // PTP is passive. In particular, never emit an NTP d2 probe from
+            // the separately advertised PTP control socket.
+            return;
+        };
+        if clock
+            .pending
             .is_some_and(|pending| monotonic <= pending.expires_at_monotonic_ns)
         {
             // Keep one origin token outstanding at a time. Replacing it before
@@ -738,28 +1215,66 @@ impl Type96Engine {
             // feedback timestamps.
             return;
         }
-        self.pending_timing = None;
+        clock.pending = None;
+        let remote_timing = clock.remote_timing;
+        let sequence = clock.sequence;
+        let feedback = clock.feedback;
 
         let Some(transmit) = system_ntp_now() else {
             return;
         };
-        let packet = build_timing_request(self.timing_sequence, transmit, self.timing_feedback);
+        let packet = build_timing_request(sequence, transmit, feedback);
         if self
             .control_socket
-            .send_to(&packet, self.remote_timing)
+            .send_to(&packet, remote_timing)
             .await
             .is_err()
         {
             return;
         }
-        self.pending_timing = Some(PendingTimingRequest {
-            sequence: self.timing_sequence,
+        let Type96Clock::Ntp(clock) = &mut self.clock else {
+            return;
+        };
+        clock.pending = Some(PendingTimingRequest {
+            sequence,
             origin: transmit,
             local_departure_ns: transmit.to_nanos(),
             expires_at_monotonic_ns: monotonic
                 .saturating_add(duration_nanos(TIMING_RESPONSE_LIFETIME)),
         });
-        self.timing_sequence = self.timing_sequence.wrapping_add(1);
+        clock.sequence = sequence.wrapping_add(1);
+    }
+
+    fn enqueue_clocked_silence(&mut self, first: u64, last: u64) {
+        let Some((origin_sequence, origin_timestamp)) = self.stream_origin else {
+            return;
+        };
+        let mut sequence = first;
+        loop {
+            if self.clocked_silence.len() == MAX_CLOCKED_SILENCE_PACKETS {
+                log::warn!(
+                    target: "audiohub_airplay::airplay2",
+                    "AirPlay 2 realtime PTP concealment queue reached its bounded limit"
+                );
+                break;
+            }
+            let sequence_delta = i128::from(sequence) - i128::from(origin_sequence);
+            let timestamp = i128::from(origin_timestamp)
+                .checked_add(sequence_delta.saturating_mul(FRAMES_PER_PACKET as i128));
+            if let Some(timestamp) = timestamp.and_then(|value| u64::try_from(value).ok()) {
+                self.clocked_silence.push_back(ClockedSilence {
+                    sequence,
+                    timestamp: timestamp as u32,
+                });
+            }
+            if sequence == last {
+                break;
+            }
+            let Some(next) = sequence.checked_add(1) else {
+                break;
+            };
+            sequence = next;
+        }
     }
 
     fn write_silence(&mut self, packet_count: u64) {
@@ -774,7 +1289,11 @@ impl Type96Engine {
     }
 
     fn flush_stream(&mut self) {
-        self.jitter = JitterBuffer::type96();
+        self.jitter = if matches!(&self.clock, Type96Clock::Ptp(_)) {
+            JitterBuffer::ptp_type96()
+        } else {
+            JitterBuffer::type96()
+        };
         self.sequence = SequenceExtender16::new();
         self.timestamp = TimestampExtender32::new();
         self.stream_ssrc = None;
@@ -782,8 +1301,20 @@ impl Type96Engine {
         self.gap = None;
         self.startup_deadline = None;
         self.delivery_started = false;
-        self.last_anchor = None;
-        self.last_local_anchor_ns = None;
+        self.clocked_frame = None;
+        self.clocked_silence.clear();
+        self.last_sync = None;
+        match &mut self.clock {
+            Type96Clock::Ntp(clock) => {
+                clock.last_anchor = None;
+                clock.last_local_anchor_ns = None;
+            }
+            // PTP is a connection-level clock. A media FLUSH resets packet
+            // ordering and pending PCM but keeps the current mapper/anchor;
+            // periodic d7 packets will refine it without a needless silent
+            // re-prime window.
+            Type96Clock::Ptp(_) => {}
+        }
         self.output.flush();
     }
 
@@ -801,12 +1332,7 @@ fn validate_endpoints(
     peer: SocketAddr,
     remote_timing_port: u16,
 ) -> io::Result<()> {
-    if local.is_ipv4() != peer.is_ipv4() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "local and peer media addresses use different IP families",
-        ));
-    }
+    validate_media_endpoints(local, peer)?;
     if remote_timing_port == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -814,6 +1340,25 @@ fn validate_endpoints(
         ));
     }
     Ok(())
+}
+
+fn validate_media_endpoints(local: SocketAddr, peer: SocketAddr) -> io::Result<()> {
+    if local.is_ipv4() != peer.is_ipv4() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "local and peer media addresses use different IP families",
+        ));
+    }
+    Ok(())
+}
+
+async fn receive_ptp_sample(
+    receiver: &mut Option<broadcast::Receiver<PtpClockSample>>,
+) -> Result<PtpClockSample, broadcast::error::RecvError> {
+    match receiver.as_mut() {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 fn system_ntp_now() -> Option<NtpTimestamp> {
@@ -998,6 +1543,83 @@ mod tests {
         packet[8..16].copy_from_slice(&(1u64 << 32).to_be_bytes());
         packet[16..20].copy_from_slice(&452u32.to_be_bytes());
         packet
+    }
+
+    fn valid_ptp_sync(
+        rtp_at_dac: u32,
+        rtp_current: u32,
+        remote_time_ns: u64,
+        timeline_id: u64,
+    ) -> [u8; PTP_SYNC_ANCHOR_BYTES] {
+        let mut packet = [0u8; PTP_SYNC_ANCHOR_BYTES];
+        packet[0] = 0x90;
+        packet[1] = 0xd7;
+        packet[2..4].copy_from_slice(&7u16.to_be_bytes());
+        packet[4..8].copy_from_slice(&rtp_at_dac.to_be_bytes());
+        packet[8..16].copy_from_slice(&remote_time_ns.to_be_bytes());
+        packet[16..20].copy_from_slice(&rtp_current.to_be_bytes());
+        packet[20..28].copy_from_slice(&timeline_id.to_be_bytes());
+        packet
+    }
+
+    async fn publish_ptp_triplet(
+        source: &PtpClockSource,
+        peer: IpAddr,
+        timeline_id: u64,
+        local_origin: std::time::Instant,
+        remote_origin_ns: u64,
+    ) {
+        for _ in 0..3 {
+            time::sleep(Duration::from_millis(4)).await;
+            let received_at = std::time::Instant::now();
+            source.publish_test_sample(PtpClockSample {
+                peer,
+                grandmaster: timeline_id,
+                remote_time_ns: remote_origin_ns
+                    .saturating_add(duration_nanos(received_at.duration_since(local_origin))),
+                received_at,
+            });
+        }
+    }
+
+    #[test]
+    fn parses_exact_ptp_d7_anchor_and_rejects_invalid_clock_fields() {
+        let packet = valid_ptp_sync(u32::MAX - 9, 20, 5_000_000_000, 0x1112_1314_1516_1718);
+        let anchor = PtpSyncAnchor::parse(&packet).unwrap();
+        assert!(anchor.initial);
+        assert_eq!(anchor.flags_or_sequence, 7);
+        assert_eq!(anchor.frame_with_fixed_offset, u32::MAX - 9);
+        assert_eq!(anchor.rtp_current, 20);
+        assert_eq!(anchor.latency_frames(), 30);
+        assert_eq!(anchor.remote_time_ns, 5_000_000_000);
+        assert_eq!(anchor.timeline_id, 0x1112_1314_1516_1718);
+        assert_eq!(
+            anchor.playback_anchor().rtp_time,
+            (u32::MAX - 9).wrapping_sub(PTP_REALTIME_RENDER_OFFSET_FRAMES)
+        );
+
+        assert_eq!(
+            PtpSyncAnchor::parse(&packet[..27]),
+            Err(PtpAnchorError::WrongLength { actual: 27 })
+        );
+        let mut invalid = packet;
+        invalid[1] = 0xd4;
+        assert_eq!(
+            PtpSyncAnchor::parse(&invalid),
+            Err(PtpAnchorError::InvalidHeader)
+        );
+        invalid = packet;
+        invalid[8..16].fill(0);
+        assert_eq!(
+            PtpSyncAnchor::parse(&invalid),
+            Err(PtpAnchorError::MissingRemoteTime)
+        );
+        invalid = packet;
+        invalid[20..28].fill(0);
+        assert_eq!(
+            PtpSyncAnchor::parse(&invalid),
+            Err(PtpAnchorError::MissingTimeline)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1374,6 +1996,136 @@ mod tests {
         assert!(request[16..24].iter().any(|byte| *byte != 0));
         assert_ne!(&request[24..32], &first_transmit);
         harness.handle.abort().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ptp_type96_uses_d7_deadlines_and_flush_retains_the_clock_epoch() {
+        const TIMELINE: u64 = 0x2122_2324_2526_2728;
+        let data = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let control = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = data.local_addr().unwrap();
+        let ptp = PtpClockSource::test_source();
+        let prepared = PreparedType96::prepare_with_ptp(
+            "127.0.0.1:0".parse().unwrap(),
+            peer,
+            ptp.clone(),
+            type96_setup_with_control(Some(control.local_addr().unwrap().port())),
+        )
+        .await
+        .unwrap();
+        let ports = prepared.ports();
+        assert_ne!(ports.data_port, 0);
+        assert_ne!(ports.control_port, 0);
+        assert_ne!(ports.data_port, ports.control_port);
+
+        let state = Arc::new(Mutex::new(OutputState::default()));
+        let handle = prepared.start(Box::new(TestOutput(state.clone())));
+
+        // PTP owns a separate control socket and is entirely passive: even
+        // after the test-only 100 ms NTP tick, no d2 timing probe is emitted.
+        let mut unexpected = [0u8; 64];
+        assert!(time::timeout(
+            Duration::from_millis(130),
+            control.recv_from(&mut unexpected),
+        )
+        .await
+        .is_err());
+
+        let local_origin = std::time::Instant::now();
+        let remote_origin_ns = 7_000_000_000;
+        publish_ptp_triplet(&ptp, peer.ip(), TIMELINE, local_origin, remote_origin_ns).await;
+        let remote_now_ns = remote_origin_ns.saturating_add(duration_nanos(local_origin.elapsed()));
+        control
+            .send_to(
+                &valid_ptp_sync(0, 77_175, remote_now_ns + 400_000_000, TIMELINE),
+                target(ports.control_port),
+            )
+            .await
+            .unwrap();
+        data.send_to(&encrypted_packet(1, 0, SSRC, 1), target(ports.data_port))
+            .await
+            .unwrap();
+
+        // Startup priming alone must not release PTP media. The d7/PTP
+        // presentation point, minus the bounded PCM lead, is still in future.
+        time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(state.lock().unwrap().writes, 0);
+        wait_for(|| state.lock().unwrap().writes == 1).await;
+
+        handle.flush().await.unwrap();
+        assert_eq!(state.lock().unwrap().flushes, 1);
+        data.send_to(
+            &encrypted_packet(1, 0, SSRC ^ 1, 2),
+            target(ports.data_port),
+        )
+        .await
+        .unwrap();
+        wait_for(|| state.lock().unwrap().writes == 2).await;
+
+        // A later d7 may refine the same retained timeline without being a
+        // prerequisite for post-FLUSH playback.
+        let remote_now_ns = remote_origin_ns.saturating_add(duration_nanos(local_origin.elapsed()));
+        control
+            .send_to(
+                &valid_ptp_sync(0, 77_175, remote_now_ns + 300_000_000, TIMELINE),
+                target(ports.control_port),
+            )
+            .await
+            .unwrap();
+        data.send_to(
+            &encrypted_packet(2, 352, SSRC ^ 1, 3),
+            target(ports.data_port),
+        )
+        .await
+        .unwrap();
+        wait_for(|| state.lock().unwrap().writes == 3).await;
+
+        handle.abort().await;
+        wait_for(|| state.lock().unwrap().dropped).await;
+    }
+
+    #[tokio::test]
+    async fn ptp_type96_buffers_more_than_two_seconds_without_dropping_packets() {
+        const TIMELINE: u64 = 0x3132_3334_3536_3738;
+        const FIRST_RTP: u32 = 90_314;
+        const PACKETS: u16 = 300;
+
+        let data = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let control = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = data.local_addr().unwrap();
+        let ptp = PtpClockSource::test_source();
+        let prepared = PreparedType96::prepare_with_ptp(
+            "127.0.0.1:0".parse().unwrap(),
+            peer,
+            ptp,
+            type96_setup_with_control(Some(control.local_addr().unwrap().port())),
+        )
+        .await
+        .unwrap();
+        let (_commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
+        let state = Arc::new(Mutex::new(OutputState::default()));
+        let mut engine = Type96Engine::new(prepared, Box::new(TestOutput(state)), command_rx);
+
+        // The measured macOS system sender starts about 90,314 frames (2.048
+        // seconds) ahead of the d7 presentation anchor. All queued packets
+        // must survive until that deadline instead of hitting the old 128
+        // packet ceiling at roughly one second.
+        engine.accept_control(
+            &valid_ptp_sync(11_035, FIRST_RTP + 11_035, 8_000_000_000, TIMELINE),
+            control.local_addr().unwrap(),
+        );
+        for index in 0..PACKETS {
+            assert!(engine.accept_encrypted_audio(
+                &encrypted_packet(
+                    index.wrapping_add(1),
+                    FIRST_RTP + u32::from(index) * FRAMES_PER_PACKET as u32,
+                    SSRC,
+                    u64::from(index) + 1,
+                ),
+                Some(peer),
+            ));
+        }
+        assert_eq!(engine.jitter.len(), usize::from(PACKETS));
     }
 
     #[tokio::test(flavor = "multi_thread")]

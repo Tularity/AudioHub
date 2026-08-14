@@ -15,8 +15,10 @@
 //     选择器**——这正是模式 B 存在的理由（以系统最原生的体验为核心目标）；
 //   · 只有模式 A 才在 UI 里决定音频送往哪个对端。
 
-import type { DaemonInfo, HalDeviceInfo, PeerState } from '../ipc/types';
+import type { DaemonInfo, DaemonSettings, HalDeviceInfo, PeerState } from '../ipc/types';
 import { t } from '../i18n';
+import { latencyStops, normLatency, qualityStops, stopLabel } from '../lib/transportStops';
+import type { Dir } from '../lib/metrics';
 import type { AppState } from './store';
 
 export const MODE_SHARE = 'share';
@@ -165,7 +167,113 @@ export const selectModeDowngraded = (s: AppState): boolean => modeDowngraded(s);
 export const selectHalKind = (s: AppState): HalKind => halState(s.daemon).kind;
 export const selectHalAvailable = (s: AppState): boolean => halState(s.daemon).available;
 
+// ---------------------------------------------------------------- 对端音频能力
+
+export type PeerAudioDirection = 'out' | 'in';
+export const HAL_DIRECTION_OUT = 1;
+export const HAL_DIRECTION_IN = 2;
+
+/**
+ * 使用端能否使用对端的某个音频方向。
+ *
+ * `out` = 本机发往对端默认输出（本机虚拟扬声器 / TX）；
+ * `in`  = 本机取用对端默认输入（本机虚拟麦克风 / RX）。
+ *
+ * 只有明确的 `false` 才不可用。字段缺席 / `null` 是旧 daemon、离线或广告
+ * 还没到，必须保留旧行为，不得把「不知道」提前画成「没有」。
+ */
+export function peerAudioDirectionAvailable(
+  peer: PeerState | null | undefined,
+  dir: PeerAudioDirection,
+): boolean {
+  const live = dir === 'out' ? peer?.peer_default_output : peer?.peer_default_input;
+  if (typeof live === 'boolean') return live;
+  const persisted = peer?.hal_device?.requested_directions;
+  if (typeof persisted === 'number') {
+    return (persisted & (dir === 'out' ? HAL_DIRECTION_OUT : HAL_DIRECTION_IN)) !== 0;
+  }
+  return true;
+}
+
+/** 使用端应该呈现的方向，固定 TX 在前、RX 在后。 */
+export function peerAudioDirections(peer: PeerState | null | undefined): PeerAudioDirection[] {
+  return (['out', 'in'] as const).filter((dir) => peerAudioDirectionAvailable(peer, dir));
+}
+
+/** 实时广告明确零能力，或离线时 HAL 保留的最后能力 mask 为零。 */
+export function peerHasNoAudioDirections(peer: PeerState | null | undefined): boolean {
+  return peerAudioDirections(peer).length === 0;
+}
+
+/**
+ * 统计诊断页的只读传输档位行。
+ *
+ * 使用端只呈现对端确实具备的端点；共享端执行的是对方请求、本机端点是否存在与此
+ * 无关，所以仍保留 TX / RX 两行。缺失能力字段按旧协议处理为两个方向都可用。
+ */
+export function transportCells(
+  ds: DaemonSettings | null,
+  peer: PeerState,
+  shared = (ds?.effective_mode || ds?.mode) === MODE_SHARE,
+): { dir: Dir; latency: string; quality: string }[] {
+  const latency = latencyStops(ds);
+  const quality = qualityStops(ds);
+  const tr = peer.transport || {};
+  const directions: Dir[] = shared ? ['out', 'in'] : peerAudioDirections(peer);
+  return directions.map((dir) => {
+    const slot = dir === 'in' ? tr.recv : tr.send;
+    return {
+      dir,
+      // 读不到就是 `—`（`stopLabel` 返回 null）：**绝不填一个 auto 冒充**。
+      latency: stopLabel(
+        latency,
+        slot?.latency ? normLatency(slot.latency) : slot?.latency,
+      ) ?? t('common.dash'),
+      quality: stopLabel(quality, slot?.quality) ?? t('common.dash'),
+    };
+  });
+}
+
 // ---------------------------------------------------------------- 设备
+
+type DirectionalDevice = Pick<HalDeviceInfo,
+  | 'out_name' | 'out_uid' | 'in_name' | 'in_uid'
+  | 'state' | 'observed'
+  | 'requested_directions' | 'published_directions' | 'observed_directions'
+>;
+
+function maskHas(mask: number | null | undefined, bit: number, fallback: boolean): boolean {
+  return typeof mask === 'number' ? (mask & bit) !== 0 : fallback;
+}
+
+/**
+ * 一条 HAL 记录应该有哪些设备行。实时对端能力是最新事实，优先于协调器上一轮的
+ * requested mask；能力消息与下一次 HAL reconcile 之间存在一个很短的窗口，若反过来
+ * 取值，UI 会在 peers.list 下一轮之前继续显示旧设备，或继续隐藏刚恢复的方向。
+ * 离线/尚未广告时再依次退到 requested mask、名称 / UID / 已发布 mask，保证旧 daemon
+ * 与持久化设备不消失。
+ */
+function requestedDirections(
+  device: DirectionalDevice,
+  peer?: PeerState | null,
+): PeerAudioDirection[] {
+  const hasLiveCapability = typeof peer?.peer_default_output === 'boolean'
+    || typeof peer?.peer_default_input === 'boolean';
+  if (hasLiveCapability) return peerAudioDirections(peer);
+
+  if (typeof device.requested_directions === 'number') {
+    return (['out', 'in'] as const).filter((dir) =>
+      (device.requested_directions! & (dir === 'out' ? HAL_DIRECTION_OUT : HAL_DIRECTION_IN)) !== 0);
+  }
+
+  const out = !!(device.out_name || device.out_uid)
+    || maskHas(device.published_directions, HAL_DIRECTION_OUT, false)
+    || maskHas(device.observed_directions, HAL_DIRECTION_OUT, false);
+  const input = !!(device.in_name || device.in_uid)
+    || maskHas(device.published_directions, HAL_DIRECTION_IN, false)
+    || maskHas(device.observed_directions, HAL_DIRECTION_IN, false);
+  return (['out', 'in'] as const).filter((dir) => (dir === 'out' ? out : input));
+}
 
 const DEVICE_STATE_KEY = {
   bound: 'device.state.bound',
@@ -174,10 +282,16 @@ const DEVICE_STATE_KEY = {
   free: 'device.state.free',
 } as const;
 
-/** 驱动侧的机器可读状态 → 本地化文案。认不出的状态原样回显（诊断值，不进语料）。 */
+/**
+ * 驱动侧的机器可读状态 → 本地化文案。
+ *
+ * 未知非空值只能留在日志等诊断面，不能穿透到 UI：daemon 的枚举是协议字段，既可能
+ * 是 snake_case，也不承诺使用当前界面的语言。字段缺席仍返回空串，让句子层沿用破折号。
+ */
 export function deviceStateLabel(state: string | null | undefined): string {
   const k = DEVICE_STATE_KEY[state as keyof typeof DEVICE_STATE_KEY];
-  return k ? t(k) : String(state ?? '');
+  if (k) return t(k);
+  return state ? t('device.state.unknown') : '';
 }
 
 /** `hal.devices` 里属于某个对端的那一条（诊断字段齐全，PeerState 上的那份没有）。 */
@@ -193,12 +307,14 @@ export interface DeviceRow {
   uid: string;
   role: string;
   io: boolean;
+  published: boolean;
+  observed: boolean;
   frames: number | null;
   dropped: number | null;
 }
 
 /**
- * 一台对端的两台设备，按「输出 / 输入」摊平成行，供卡片与设置页共用。
+ * 一台对端真正请求的虚拟设备，按「输出 / 输入」摊平成行。
  * `peer.hal_device` 是权威（模式 A 下它就是 null），`hal.devices` 只补诊断字段。
  */
 export function peerDeviceRows(
@@ -208,28 +324,44 @@ export function peerDeviceRows(
   const d = peer && peer.hal_device;
   if (!d || !peer) return [];
   const info = halDeviceOf(daemon, peer.fingerprint);
-  return [
-    {
-      dir: 'out',
-      icon: 'spk',
-      name: d.out_name || '',
-      uid: d.out_uid || '',
-      role: t('device.speaker'),
-      io: !!(info && info.io_out),
-      frames: info ? (info.spk_frames ?? null) : null,
-      dropped: null,
-    },
-    {
-      dir: 'in',
-      icon: 'mic',
-      name: d.in_name || '',
-      uid: d.in_uid || '',
-      role: t('device.microphone'),
-      io: !!(info && info.io_in),
-      frames: info ? (info.mic_frames ?? null) : null,
-      dropped: info ? (info.mic_dropped ?? null) : null,
-    },
-  ];
+  return requestedDirections(d, peer).map((dir): DeviceRow => {
+    const out = dir === 'out';
+    const bit = out ? HAL_DIRECTION_OUT : HAL_DIRECTION_IN;
+    const publishedMask = info?.published_directions ?? d.published_directions;
+    const observedMask = info?.observed_directions ?? d.observed_directions;
+    return {
+      dir,
+      icon: out ? 'spk' : 'mic',
+      name: (out ? d.out_name : d.in_name) || '',
+      uid: (out ? d.out_uid : d.in_uid) || '',
+      role: t(out ? 'device.speaker' : 'device.microphone'),
+      io: !!(info && (out ? info.io_out : info.io_in)),
+      published: maskHas(publishedMask, bit, d.state === 'bound'),
+      observed: maskHas(observedMask, bit, !!d.observed),
+      frames: info ? ((out ? info.spk_frames : info.mic_frames) ?? null) : null,
+      dropped: out ? null : (info ? (info.mic_dropped ?? null) : null),
+    };
+  });
+}
+
+/** 设置页 HAL 诊断表的同一套方向裁剪，但数据直接来自 `hal.devices`。 */
+export function halInventoryRows(device: HalDeviceInfo, peer?: PeerState | null): DeviceRow[] {
+  return requestedDirections(device, peer).map((dir): DeviceRow => {
+    const out = dir === 'out';
+    const bit = out ? HAL_DIRECTION_OUT : HAL_DIRECTION_IN;
+    return {
+      dir,
+      icon: out ? 'spk' : 'mic',
+      name: (out ? device.out_name : device.in_name) || '',
+      uid: (out ? device.out_uid : device.in_uid) || '',
+      role: t(out ? 'device.speaker' : 'device.microphone'),
+      io: !!(out ? device.io_out : device.io_in),
+      published: maskHas(device.published_directions, bit, device.state === 'bound'),
+      observed: maskHas(device.observed_directions, bit, !!device.observed),
+      frames: (out ? device.spk_frames : device.mic_frames) ?? null,
+      dropped: out ? null : (device.mic_dropped ?? null),
+    };
+  });
 }
 
 /**
@@ -246,7 +378,8 @@ export function halReasonText(reason: string | null | undefined): string {
     // 用户的下一步也不同。daemon 侧的 `haldev::no_device_reason` 有一条测试
     // 会读这个文件，确认每个它能发出的 reason 在这里都有分支。
     case 'mode_share': return t('halReason.modeShare');
-    default: return reason ? t('halReason.other', { reason }) : t('halReason.none');
+    // 原始 reason 是机器可读诊断值；未知枚举不进入面向用户的句子。
+    default: return reason ? t('halReason.other') : t('halReason.none');
   }
 }
 
@@ -264,8 +397,8 @@ export function halReasonText(reason: string | null | undefined): string {
  *
  * | 条件 | 说什么 |
  * |---|---|
- * | 一台设备都没有 | `hal_reason` 那句「为什么没有」 |
- * | 两台都已发布 | 对端在线 ⇒ 可选用；离线 ⇒ 仍在列表里但不出声 |
+ * | 一台设备都没有 | 零能力 ⇒ 不显示；否则显示 `hal_reason` |
+ * | 所有请求方向都已发布 | 对端在线 ⇒ 可选用；离线 ⇒ 仍在列表里但不出声 |
  * | 尚未发布、系统已列出 | 驱动状态 + 已列出 |
  * | 尚未发布、系统未列出 | 驱动状态 + 尚未列出 |
  *
@@ -274,23 +407,27 @@ export function halReasonText(reason: string | null | undefined): string {
  * **请求了模式 B** 时渲染，于是那句「当前为模式 A，没有虚拟设备」没有任何时刻
  * 说得出口——语料里那个键已经删掉，再写它会在屏幕上印出键名本身。
  *
- * ⚠ 这一支绝不能返回空串：`halReasonText()` 的 `default` 兜住了缺席与不认识的
- * reason，所以「请求了 B 却一台设备都没有」的那一刻屏幕上一定有话说。那正是
- * 用户最需要解释的一刻。
+ * ⚠ 只有一个例外允许返回空串：对端已明确广告麦克风与扬声器都不存在。
+ * 那不是故障，画一条「暂无设备」警告反而是噪声。其余「请求了 B 却没有设备」
+ * 仍必须经 `halReasonText()` 给出可操作的解释。
  */
 export function peerDevicesNote(
   peer: PeerState | null | undefined,
   daemon: DaemonInfo | null | undefined,
 ): string {
   const dev = peer?.hal_device;
-  const published = !!dev && dev.state === 'bound' && !!dev.observed;
-  if (!peerDeviceRows(peer, daemon).length) return halReasonText(peer?.hal_reason);
+  const rows = peerDeviceRows(peer, daemon);
+  const published = !!dev && dev.state === 'bound'
+    && rows.length > 0 && rows.every((row) => row.published && row.observed);
+  if (!rows.length) {
+    return peerHasNoAudioDirections(peer) ? '' : halReasonText(peer?.hal_reason);
+  }
   if (published) {
     return peer?.online ? t('detail.devices.published') : t('detail.devices.offline');
   }
-  // 「已列出 / 尚未列出」是两句独立的话，不是一句里换一个词：别的语言可能整句改写。
+  // 「全部已列出 / 尚有方向未列出」是两句独立的话。
   const state = deviceStateLabel(dev?.state) || t('common.dash');
-  return dev && dev.observed
+  return rows.every((row) => row.observed)
     ? t('detail.devices.stateListed', { state })
     : t('detail.devices.stateUnlisted', { state });
 }

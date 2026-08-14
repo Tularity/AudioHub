@@ -57,10 +57,10 @@ fn main() {
         ipc_port,
         config_dir: None, // env/platform default
         announce,
-        hal_bridge: None, // production: AUDIOHUB_HAL_BRIDGE decides
+        hal_bridge: None,       // production: AUDIOHUB_HAL_BRIDGE decides
         tx_throttle_kbps: None, // production: AUDIOHUB_TEST_TX_KBPS decides (normally unlimited)
-        block_udp: None, // production: AUDIOHUB_TEST_BLOCK_UDP decides (normally nothing)
-        announce_fault: false, // test-only knob; there is no production value for it
+        block_udp: None,        // production: AUDIOHUB_TEST_BLOCK_UDP decides (normally nothing)
+        announce_fault: false,  // test-only knob; there is no production value for it
         airplay_advertise: true,
     }) {
         Ok(h) => Arc::new(h),
@@ -83,7 +83,9 @@ fn main() {
     } else {
         elog!(
             "[audiohubd] running: control_port={} ipc_port={} fp={}",
-            handle.control_port, handle.ipc_port, handle.fingerprint
+            handle.control_port,
+            handle.ipc_port,
+            handle.fingerprint
         );
     }
 

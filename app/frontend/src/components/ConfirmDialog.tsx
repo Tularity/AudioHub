@@ -5,9 +5,11 @@
 // 命令式 API（`await confirmDialog({...})`）保持不变：调用点在事件处理器里，
 // 改成声明式会把「问一句再做」拆成两段状态机，得不偿失。
 
-import { useEffect, useRef, useSyncExternalStore } from 'react';
+import { useEffect, useId, useRef, useSyncExternalStore } from 'react';
 import { t } from '../i18n';
 import { isEscape } from '../lib/shortcuts';
+import { FOCUSABLE_SELECTOR, trapIndex } from '../lib/sheet';
+import { inertSiblings } from '../lib/modalInert';
 
 export interface ConfirmOpts {
   title: string;
@@ -55,16 +57,85 @@ function done(v: boolean): void {
 
 export function ConfirmHost() {
   const live = useSyncExternalStore(subscribe, () => current);
+  const maskRef = useRef<HTMLDivElement>(null);
+  const cardRef = useRef<HTMLDivElement>(null);
   const okRef = useRef<HTMLButtonElement>(null);
+  const titleId = useId();
 
   useEffect(() => {
     if (!live) return;
-    okRef.current?.focus();
+    const mask = maskRef.current;
+    const card = cardRef.current;
+    const opener = document.activeElement as HTMLElement | null;
+    // The recovery overlay is always mounted and has the highest modal
+    // priority. Keep it out of this layer's background set so a daemon drop can
+    // supersede the confirmation instead of revealing an inert recovery UI.
+    const overlay = document.getElementById('overlay');
+    const releaseBackground = mask
+      ? inertSiblings(mask, overlay ? [overlay] : [])
+      : () => undefined;
+    const overlayVisible = () => overlay?.hidden === false;
+    const focusables = (): HTMLElement[] => (card
+      ? Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
+      : []);
+    const focusDialog = () => {
+      if (overlayVisible()) return;
+      (okRef.current ?? card)?.focus();
+    };
+
+    focusDialog();
+
+    // A confirmation may be created by an async completion while the daemon
+    // recovery overlay is already visible. Once recovery leaves, move focus
+    // into the still-open confirmation; otherwise focus would return to an
+    // inert background control. The timeout runs after Overlay's effect cleanup
+    // has released its own inert lock.
+    let focusTimer: number | undefined;
+    const overlayObserver = overlay
+      ? new MutationObserver(() => {
+          if (overlayVisible()) return;
+          window.clearTimeout(focusTimer);
+          focusTimer = window.setTimeout(focusDialog, 0);
+        })
+      : null;
+    overlayObserver?.observe(overlay!, { attributes: true, attributeFilter: ['hidden'] });
+
     const onKey = (e: KeyboardEvent) => {
-      if (isEscape(e)) { e.preventDefault(); done(false); }
+      if (document.getElementById('overlay')?.hidden === false) return;
+      if (isEscape(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        done(false);
+        return;
+      }
+      if (e.key !== 'Tab' || !card) return;
+      const list = focusables();
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      if (!list.length) {
+        card.focus();
+        return;
+      }
+      const idx = trapIndex(
+        list.length,
+        list.indexOf(document.activeElement as HTMLElement),
+        e.shiftKey,
+      );
+      list[idx]!.focus();
     };
     document.addEventListener('keydown', onKey, true);
-    return () => document.removeEventListener('keydown', onKey, true);
+    return () => {
+      document.removeEventListener('keydown', onKey, true);
+      overlayObserver?.disconnect();
+      window.clearTimeout(focusTimer);
+      releaseBackground();
+      // The trigger can disappear as a consequence of the confirmed action.
+      // It can also still sit below the recovery overlay; focusing an inert
+      // node would steal the screen reader cursor from that higher-priority UI.
+      if (opener?.isConnected && !opener.closest('[inert]')) opener.focus();
+    };
   }, [live]);
 
   if (!live) return null;
@@ -73,13 +144,21 @@ export function ConfirmHost() {
 
   return (
     <div
+      ref={maskRef}
       className="confirm-mask"
       data-testid={testid}
       // 点遮罩 = 取消。点卡片内部不能穿透过去（危险操作误关掉是小事，误确认才是大事）。
       onClick={(e) => { if (e.target === e.currentTarget) done(false); }}
     >
-      <div className="confirm-card" role="alertdialog" aria-modal="true">
-        <h2 className="confirm-title">{live.title}</h2>
+      <div
+        ref={cardRef}
+        className="confirm-card"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+      >
+        <h2 className="confirm-title" id={titleId}>{live.title}</h2>
         {lines.map((line, i) => <p className="confirm-body" key={i}>{line}</p>)}
         <div className="confirm-actions">
           <button className="btn" type="button" data-testid={`${testid}-cancel`} onClick={() => done(false)}>

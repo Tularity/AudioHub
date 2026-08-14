@@ -117,8 +117,12 @@ function LatencyCell({ fp, dir, lat, series }: {
   else value = t('metric.latency.none');
 
   return (
-    <span className="metric-cell" data-testid={`metric-latency-${dir}-${fp}`}>
-      <span className="metric-cap">{t('metric.latency.label')}</span>
+    <span
+      className="metric-cell"
+      role="group"
+      data-testid={`metric-latency-${dir}-${fp}`}
+      aria-label={t('metric.latency.label')}
+    >
       {/* 没有等级就没有色阶：给一个只覆盖半条链路的数字上色，等于替它做了那个
           不成立的端到端判断。此时用正文色（既不是 tone-*，也不是「读不到」的暗色）。 */}
       {/* 「≥」的理由挂在数字自己身上。此前它是数字旁边一枚独立的 `?` 角标——
@@ -276,17 +280,14 @@ function QualityCell({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading |
   const measuring = isQualityMeasuring(q);
   const gradeKey = qualityGradeTextKey(q);
   const gradeText = gradeKey ? t(gradeKey) : '';
-  // 出处标记。**必须在数字旁边**，不能只进 title：本机在发送方向上没有音质测点、
-  // 根本量不到，不标就等于让这张卡宣称了一个它测不出来的结论。
-  //
-  // 它**只在一栏出现**这件事本身就在教用户「两个方向不对称」，比任何一句解释都省。
-  // 注意判据是 `fromPeer`（数据驱动，见 metrics.ts 的 `fromPeer: !own`），
-  // **不是方向**：一条 recv 会话回退到 `peer_quality` 时它同样该出现。
-  const fromPeer = !!q?.fromPeer;
 
   return (
-    <span className="metric-cell" data-testid={`metric-quality-${dir}-${fp}`}>
-      <span className="metric-cap">{t('metric.quality.label')}</span>
+    <span
+      className="metric-cell metric-cell-quality"
+      role="group"
+      data-testid={`metric-quality-${dir}-${fp}`}
+      aria-label={t('metric.quality.label')}
+    >
       {/* 四点指示已删（用户 2026-08-11 第 1 条）——理由记在 lib/metrics.ts 里
           `qualityDots` 原先的位置上。要点：那四颗点是等级的**影子**，而下面这个
           kHz · bit 才是随网络实时变的真读数，且它已经同时带着色阶。 */}
@@ -316,16 +317,6 @@ function QualityCell({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading |
         hidden={!gradeText}
       >
         {gradeText}
-      </span>
-      {/* 一枚克制的角标，与「未含对方主机」同一套视觉语言（小字 + 边框），但用
-          dim 而不是 warn：这不是警告——读数是真的，只是量它的人在对面。 */}
-      <span
-        className="metric-origin"
-        data-testid={`quality-frompeer-${dir}-${fp}`}
-        title={t('metric.quality.fromPeerWhy')}
-        hidden={!fromPeer}
-      >
-        {fromPeer ? t('metric.quality.fromPeer') : ''}
       </span>
     </span>
   );
@@ -372,8 +363,8 @@ function QualityParts({ fp, dir, q }: { fp: string; dir: Dir; q: QualityReading 
           <span className={`stage-ms${q ? '' : ' unknown'}`}>{partValue(id)}</span>
         </div>
       ))}
-      {/* 出处整句。角标只有四个字（「对端测得」），展开明细的人要的是那句完整的
-          解释——为什么本机给不出这三个数字。 */}
+      {/* 一级卡片不再用出处角标挤占读数宽度；展开明细的人仍然需要知道
+          为什么本机给不出这三个数字，所以这里保留完整的出处说明。 */}
       <p className="metric-foot" data-testid={`quality-frompeer-note-${dir}-${fp}`} hidden={!q?.fromPeer}>
         {q?.fromPeer ? t('metric.quality.fromPeerWhy') : ''}
       </p>
@@ -535,7 +526,10 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
   const kbps = sess?.stats?.bitrate_kbps ?? undefined;
   const idleReady = !sess && !!ready;
 
-  const dirLabel = t(dir === 'out' ? 'peers.card.streamOut' : 'peers.card.streamIn');
+  // 一级卡片的可见方向词在所有语言下固定为 TX / RX，避免占用码率行的
+  // 有效宽度。读屏标签仍用完整的本地化方向词，不让视觉缩写损失无障碍语义。
+  const visibleDirLabel = dir === 'out' ? 'TX' : 'RX';
+  const accessibleDirLabel = t(dir === 'out' ? 'peers.card.streamOut' : 'peers.card.streamIn');
   // 方向语义 + 延迟档主导权。**这一句是把 Settings 里那条教训搬到卡片上**：
   // `servo_pass` 只遍历本机的接收流，发送方向的 jitter buffer 在对端、由对端
   // 自己的档位管。不说的话，一台只发不收的使用端拖了延迟滑条会看到「两栏里
@@ -580,7 +574,7 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
         <div className="dir-stream">
           <span className="dir-name" title={t(govKey)}>
             <span className="dir-arrow" aria-hidden="true">{dir === 'out' ? '↑' : '↓'}</span>
-            {dirLabel}
+            {visibleDirLabel}
           </span>
           <p className="metric-idle-text" data-testid={`peer-dir-idle-${dir}-${fp}`}>
             {idleReady ? t('peers.card.micReady') : t('peers.card.dirIdle')}
@@ -609,7 +603,7 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
         aria-expanded={open}
         aria-controls={`latency-detail-${dir}-${fp}`}
         aria-label={joinPhrases([
-          dirLabel,
+          accessibleDirLabel,
           t(open ? 'metric.latency.collapse' : 'metric.latency.expand'),
         ])}
         title={joinPhrases([t(govKey), t('metric.latency.footnote')])}
@@ -648,7 +642,7 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
             而这个词与它描述的那条码率条现在贴在一起，反而更近了。 */}
         <span className="dir-name" title={t(govKey)}>
           <span className="dir-arrow" aria-hidden="true">{dir === 'out' ? '↑' : '↓'}</span>
-          {dirLabel}
+          {visibleDirLabel}
         </span>
         {/* ⚠ 这条不是电平，是**码率除以 900**（`Meter` 只接一个标量）。所以它与
             右边那个 kbps 是同一个数的两种画法，不是「一件事的两个尺度」。
@@ -704,7 +698,9 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
  * `spec-telemetry-ia` §2.1 冻结了「卡片就地展开只承载分段明细」，双栏之后若给
  * 每个方向各留延迟 / 音质两个面板，一张卡会长出四个。
  */
-export function PeerMetrics({ fp, peer, sendList, recvList, micReady }: {
+export function PeerMetrics({
+  fp, peer, sendList, recvList, micReady,
+}: {
   fp: string;
   peer: PeerState | null;
   /** 本机在**发**的会话（`dir === 'send'`），含共享模式的 `mic/send`。 */
@@ -731,10 +727,17 @@ export function PeerMetrics({ fp, peer, sendList, recvList, micReady }: {
   const net = any ? undefined : readPeerNet(peer);
 
   return (
-    <div className={`peer-metrics${any ? '' : ' idle'}`} data-testid={`peer-metrics-${fp}`} onClick={keep}>
+    <div
+      className={`peer-metrics${any ? '' : ' idle'}`}
+      data-testid={`peer-metrics-${fp}`}
+      data-directions="2"
+      onClick={keep}
+    >
       {/* 降级归因条：**只在降级时出现**，且紧贴着下面两个延迟读数（§16.4 第 1、3 条）。
           Tier 0 与「未判定」都不画——理由分别见 `TierBanner` 的注释。 */}
       {isDegradedTier(tier) ? <TierBanner fp={fp} tier={tier} /> : null}
+      {/* 能力只决定下面虚拟设备区的方向，不裁掉卡片的观测区。即使对端没有默认
+          输入和输出，TX / RX 也都保留为 idle，让不同卡片仍可在同一位置比较。 */}
       <DirBlock
         fp={fp} dir="out" list={sendList}
         open={open === 'out'} onToggle={() => setOpen((v) => (v === 'out' ? null : 'out'))}

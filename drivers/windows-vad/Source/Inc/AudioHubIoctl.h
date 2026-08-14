@@ -118,7 +118,13 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 // that shows is a level meter nobody is looking at. An equality check turns
 // that into "refuses to bind", which is loud.
 //
-#define AUDIOHUB_WIN_PROTOCOL_VERSION   5u
+// v6: AH_BIND_REQUEST.flags gains exact render/capture intent bits. A valid
+// peer may request both directions, either one by itself, or zero while its
+// stable pairing slot is retained. A v5 driver would ignore the new bits and
+// silently publish both endpoints, so this semantic change also requires an
+// equality-version bump even though no struct size changed.
+//
+#define AUDIOHUB_WIN_PROTOCOL_VERSION   6u
 
 //
 // Must equal HAL_MAX_SLOTS in core/audiohubd/src/halbridge.rs. The driver's
@@ -215,18 +221,15 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 #define AH_STATUS_INTERNAL          6u
 #define AH_STATUS_NOT_BOUND         7u
 //
-// A Set failed AND the rollback that should have made it "nothing at all" also
-// failed, so the slot is left with one half of a device pair published.
-//
-// This is the ONLY status under which `published` may be a value other than 0
-// or (AH_PUB_RENDER|AH_PUB_CAPTURE). It exists because the alternative --
-// reporting the leftover as OK -- is the defect this protocol version was cut
-// for: a speaker that never came back while the daemon was told "bound".
+// A Set did not converge on the exact requested direction mask: an install,
+// removal, or rollback failed. A one-bit `published` value is NOT inherently
+// partial in v6; it is a valid AH_STATUS_OK result when that one direction was
+// requested. The status describes disagreement with the request, not popcount.
 //
 #define AH_STATUS_PARTIAL           8u
 
 //=============================================================================
-// Where a bind failed, and which halves of the pair are actually published.
+// Where a bind failed, and which directions are actually published.
 //
 // `stage` + `nt_status` are diagnostics: they never change what the daemon
 // DOES (`status` alone decides that), they change what it can SAY. Without
@@ -260,10 +263,9 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 #define AH_BINDREPLY_FLAG_NAME_FALLBACK 0x1u
 
 //
-// One bit per half of a peer's device pair. The invariant a bound slot must
-// satisfy is `published == AH_PUB_BOTH`; anything else is a bug that is now
-// ASSERTABLE from user mode instead of only visible by looking at the system's
-// device list with human eyes.
+// One bit per possible direction. In v6 the success invariant is exact equality
+// with AH_BINDFLAG_WANT_RENDER/CAPTURE; a one-bit value is a valid capability,
+// while an extra or missing requested bit is a detectable failure.
 //
 #define AH_PUB_RENDER               0x1u
 #define AH_PUB_CAPTURE              0x2u
@@ -383,21 +385,28 @@ typedef struct _AH_HELLO_REPLY {
 //
 #define AH_BINDFLAG_ONLINE  0x1u
 
+// v6: the exact endpoint directions this peer can serve. A v5 driver ignores
+// unknown bits and would publish both, hence the equality version bump above.
+#define AH_BINDFLAG_WANT_RENDER   0x2u
+#define AH_BINDFLAG_WANT_CAPTURE  0x4u
+#define AH_BINDFLAG_WANT_MASK     (AH_BINDFLAG_WANT_RENDER | AH_BINDFLAG_WANT_CAPTURE)
+
 //
 // FAULT INJECTION. Never set by audiohubd -- only by `audiohub probe winvad`
 // and by the regression harness, and the driver logs every use.
 //
-// These exist because "the driver must report a half-failed install honestly"
-// is not testable without a way to MAKE one half fail: the natural failure is
-// a kernel condition nobody can summon on demand. A test that can only observe
-// the happy path is how the original defect survived a full acceptance run.
+// These exist because "the driver must report a failed requested direction
+// honestly" is not testable without a way to MAKE the install fail: the
+// natural failure is a kernel condition nobody can summon on demand. A test
+// that can only observe the happy path is how the original defect survived a
+// full acceptance run.
 //
 // The privilege argument: reaching this device already lets the caller create
 // and destroy virtual audio endpoints. Being able to make that creation fail is
 // strictly less power than being able to do it at all.
 //
 #define AH_BINDFLAG_FAIL_RENDER     0x100u  // SET: fail the speaker half
-#define AH_BINDFLAG_FAIL_CAPTURE    0x200u  // SET: fail the microphone half
+#define AH_BINDFLAG_FAIL_CAPTURE    0x200u  // SET: fail requested microphone
 #define AH_BINDFLAG_SKIP_ROLLBACK   0x400u  // SET: leave the partial install in
                                             // place, so AH_STATUS_PARTIAL and
                                             // the `published` mask can be seen
@@ -440,11 +449,11 @@ typedef struct _AH_BIND_REQUEST {
     WCHAR  display[AH_DISPLAY_CHARS];   // UTF-16LE. The peer's BASE name, i.e.
                                         // "AudioHub - <host>" WITH the prefix
                                         // and WITHOUT any direction suffix.
-                                        // The driver appends the direction word
-                                        // (read from the INF, never hardcoded)
-                                        // to build each pin's label, and also
-                                        // sets this verbatim as the filter's
+                                        // The driver uses this verbatim for BOTH
+                                        // endpoint labels and for the filter's
                                         // DEVPKEY_DeviceInterface_FriendlyName.
+                                        // Direction remains structural (render
+                                        // vs capture), not part of the name.
 } AH_BIND_REQUEST;
 
 typedef struct _AH_BIND_REPLY {
@@ -455,7 +464,8 @@ typedef struct _AH_BIND_REPLY {
     UINT32 stage;           // AH_STAGE_* -- NONE unless something failed
     UINT32 nt_status;       // the raw NTSTATUS of that stage, 0 when NONE
     UINT32 published;       // AH_PUB_* bitmask as it stands AFTER this call.
-                            // status==OK on a SET requires AH_PUB_BOTH;
+                            // status==OK on a SET requires exact equality with
+                            // the AH_BINDFLAG_WANT_* mask mapped to AH_PUB_*;
                             // status==OK on a CLEAR requires 0.
     UINT32 flags;           // AH_BINDREPLY_FLAG_* (v3; MBZ reserved in v2)
 } AH_BIND_REPLY;
@@ -471,10 +481,9 @@ typedef struct _AH_SLOT_INFO {
     UINT32 generation;
     CHAR   peer_key[AH_PEERKEY_BUF];    // NUL-filled when free
     UINT32 published;                   // AH_PUB_* as the driver's own port
-                                        // pointers stand right now. A slot that
-                                        // says BOUND with anything but
-                                        // AH_PUB_BOTH is the failure this field
-                                        // was added to make detectable.
+                                        // pointers stand right now. Any mask is
+                                        // valid in v6; reconciliation compares
+                                        // it with the peer's requested mask.
 } AH_SLOT_INFO;
 
 typedef struct _AH_QUERY_SLOTS_REPLY {

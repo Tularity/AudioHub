@@ -34,7 +34,8 @@ use audiohub_airplay::{
     PcmRead, PcmReader, Protocol, ReceiverVolumeControlSnapshot, RemoteControlInfo,
     RemoteControlSnapshot, RuntimePhase, SenderVolumeSnapshot, SessionInfo as RuntimeSessionInfo,
 };
-use audiohub_ipc::AirPlaySessionInfo;
+use audiohub_ipc::{AirPlayArtwork, AirPlaySessionInfo};
+use base64::prelude::*;
 use mdns_sd::{DaemonEvent, IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use crate::{dlog, lk, DaemonInner};
@@ -440,8 +441,13 @@ impl SystemVolumeState {
         if self.muted {
             AIRPLAY_VOLUME_MUTE_DB
         } else {
-            system_scalar_to_airplay_db(self.scalar)
+            self.slider_db()
         }
+    }
+
+    /// AirPlay 2's visible slider remains independent from mute state.
+    fn slider_db(self) -> f32 {
+        system_scalar_to_airplay_db(self.scalar)
     }
 }
 
@@ -1920,13 +1926,11 @@ impl AirPlayController {
         config.password = password;
         config.enable_airplay2 = true;
         config.airplay2_identity_path = Some(self.airplay2_identity_path.clone());
-        config.initial_volume_db = match read_system_volume() {
-            Ok(volume) => Some(volume.airplay_db()),
-            Err(error) => {
-                dlog!("[audiohubd] AirPlay initial system volume unavailable: {error:#}");
-                None
-            }
-        };
+        config.set_receiver_volume_provider(|| {
+            read_system_volume()
+                .map(|volume| (volume.slider_db(), volume.muted))
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("{error:#}")))
+        });
         #[cfg(test)]
         config.use_ephemeral_ptp_ports_for_tests();
 
@@ -2279,6 +2283,17 @@ impl AirPlayController {
             .filter(|session| session.protocol == Protocol::AirPlay2)
             .map(|session| session_view(session, now))
             .collect()
+    }
+
+    pub(crate) fn artwork(&self, session_id: u64, revision: u64) -> Option<AirPlayArtwork> {
+        let state = lk(&self.state);
+        let artwork = state.runtime.as_ref()?.artwork(session_id, revision)?;
+        Some(AirPlayArtwork {
+            session_id: artwork.session_id,
+            revision: artwork.revision,
+            content_type: artwork.content_type,
+            data_base64: BASE64_STANDARD.encode(artwork.data),
+        })
     }
 
     pub(crate) fn has_active_session(&self) -> bool {
@@ -2796,6 +2811,8 @@ fn session_view(session: RuntimeSessionInfo, now_unix_ms: u64) -> AirPlaySession
         title: session.title,
         artist: session.artist,
         album: session.album,
+        artwork_revision: session.artwork_revision,
+        artwork_content_type: session.artwork_content_type,
         connected_ms: now_unix_ms.saturating_sub(session.started_unix_ms),
     }
 }
@@ -3969,6 +3986,23 @@ mod tests {
         assert_eq!(mute.scalar, 0.0);
         assert!(mute.muted);
         assert_eq!(mute.airplay_db(), -144.0);
+    }
+
+    #[test]
+    fn muted_receiver_keeps_its_real_airplay2_slider_position() {
+        let state = SystemVolumeState {
+            scalar: 0.4,
+            muted: true,
+        };
+        assert!((state.slider_db() - -18.0).abs() < 1e-5);
+        assert_eq!(state.airplay_db(), -144.0);
+    }
+
+    #[test]
+    fn event_wire_volume_uses_system_slider_scalar() {
+        for scalar in [0.0_f32, 0.01, 0.05, 0.5, 1.0] {
+            assert!((scalar.clamp(0.0, 1.0) - scalar).abs() < f32::EPSILON);
+        }
     }
 
     #[test]
@@ -6181,6 +6215,8 @@ mod tests {
             title: Some("Track".into()),
             artist: None,
             album: None,
+            artwork_revision: Some(3),
+            artwork_content_type: Some("image/jpeg".into()),
             elapsed_ms: None,
             duration_ms: None,
             started_unix_ms: 1_000,
@@ -6189,6 +6225,8 @@ mod tests {
         let view = session_view(session.clone(), 4_250);
         assert_eq!(view.connected_ms, 3_250);
         assert_eq!(view.peer, "192.0.2.4");
+        assert_eq!(view.artwork_revision, Some(3));
+        assert_eq!(view.artwork_content_type.as_deref(), Some("image/jpeg"));
         assert_eq!(session_view(session, 900).connected_ms, 0);
     }
 

@@ -71,7 +71,12 @@ pub struct RingObservation {
 
 impl RingObservation {
     pub fn new(rate: u32) -> RingObservation {
-        RingObservation { samples_sum: 0, samples_max: 0, polls: 0, rate }
+        RingObservation {
+            samples_sum: 0,
+            samples_max: 0,
+            polls: 0,
+            rate,
+        }
     }
 
     /// 记一次观测。
@@ -116,8 +121,12 @@ pub const STAGE_PLAY_DEV: &str = "play_dev";
 /// 进 JSON（`to_json` 的 `order`）而不是只留在 Rust 里：`parts` 是个对象，
 /// **JSON 对象无序**，读的人没法从中恢复「哪一级在前」。而这个顺序恰恰是排障
 /// 时的第一个问题——延迟堆在采集侧还是播放侧。
-pub const STAGE_ORDER: [&str; 4] =
-    [STAGE_CAPTURE_DEV, STAGE_CAPTURE_RING, STAGE_PLAY_RING, STAGE_PLAY_DEV];
+pub const STAGE_ORDER: [&str; 4] = [
+    STAGE_CAPTURE_DEV,
+    STAGE_CAPTURE_RING,
+    STAGE_PLAY_RING,
+    STAGE_PLAY_DEV,
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StageEstimate {
@@ -166,8 +175,11 @@ fn device_stage(id: &'static str, parts: &DevLatencyParts) -> StageEstimate {
     let ms = total.ms();
     let detail = match ms {
         Some(_) => {
-            let breakdown: Vec<String> =
-                parts.parts.iter().map(|(n, f)| format!("{n}={f}f")).collect();
+            let breakdown: Vec<String> = parts
+                .parts
+                .iter()
+                .map(|(n, f)| format!("{n}={f}f"))
+                .collect();
             format!(
                 "{} frames @ {} Hz [{}] transport={:?} device={}",
                 total.frames,
@@ -199,7 +211,12 @@ fn device_stage(id: &'static str, parts: &DevLatencyParts) -> StageEstimate {
             why.join("; ")
         }
     };
-    StageEstimate { id, ms, source: total.source, detail }
+    StageEstimate {
+        id,
+        ms,
+        source: total.source,
+        detail,
+    }
 }
 
 fn ring_stage(id: &'static str, obs: &RingObservation) -> StageEstimate {
@@ -214,7 +231,12 @@ fn ring_stage(id: &'static str, obs: &RingObservation) -> StageEstimate {
         ),
         None => "the copy loop never polled this ring".to_string(),
     };
-    StageEstimate { id, ms: obs.ms(), source: obs.source(), detail }
+    StageEstimate {
+        id,
+        ms: obs.ms(),
+        source: obs.source(),
+        detail,
+    }
 }
 
 /// 两个定性取**更不可信**的那个。与 `devlat::worse` 同序，刻意不共享：
@@ -248,13 +270,23 @@ pub fn estimate(
         ring_stage(STAGE_PLAY_RING, play_ring),
         device_stage(STAGE_PLAY_DEV, play_dev),
     ];
-    let missing: Vec<&'static str> =
-        stages.iter().filter(|s| s.ms.is_none()).map(|s| s.id).collect();
+    let missing: Vec<&'static str> = stages
+        .iter()
+        .filter(|s| s.ms.is_none())
+        .map(|s| s.id)
+        .collect();
     let total_ms = missing
         .is_empty()
         .then(|| stages.iter().filter_map(|s| s.ms).sum::<f64>());
-    let source = stages.iter().fold(LatSource::Api, |acc, s| worse(acc, s.source));
-    LoopbackEstimate { stages, total_ms, source, missing }
+    let source = stages
+        .iter()
+        .fold(LatSource::Api, |acc, s| worse(acc, s.source));
+    LoopbackEstimate {
+        stages,
+        total_ms,
+        source,
+        missing,
+    }
 }
 
 /// `probe loopback --json` 里 `est_latency` 那个对象。
@@ -286,8 +318,14 @@ pub fn to_line(est: &LoopbackEstimate) -> String {
     let head = match est.total_ms {
         // 前缀恒为 `>=`：见 `is_calibrated` —— 这个和永远是下限，即使四项全是
         // `Api`。定性只决定后面括号里那句，不决定要不要这个前缀。
-        Some(ms) => format!("estimated mic->speaker latency >={ms:.2} ms ({:?}, uncalibrated)", est.source),
-        None => format!("estimated mic->speaker latency unavailable (missing {:?})", est.missing),
+        Some(ms) => format!(
+            "estimated mic->speaker latency >={ms:.2} ms ({:?}, uncalibrated)",
+            est.source
+        ),
+        None => format!(
+            "estimated mic->speaker latency unavailable (missing {:?})",
+            est.missing
+        ),
     };
     let parts: Vec<String> = est
         .stages
@@ -331,7 +369,10 @@ mod tests {
     }
 
     fn stage<'a>(est: &'a LoopbackEstimate, id: &str) -> &'a StageEstimate {
-        est.stages.iter().find(|s| s.id == id).expect("stage present")
+        est.stages
+            .iter()
+            .find(|s| s.id == id)
+            .expect("stage present")
     }
 
     // ------------------------------------------------------------ the sum
@@ -339,10 +380,18 @@ mod tests {
     #[test]
     fn the_total_is_the_sum_of_the_four_parts_and_every_part_is_reported() {
         // 480 frames @48k = 10ms; 240 samples @48k = 5ms.
-        let est = estimate(&ok_parts(480), &ring(48_000, &[240]), &ring(48_000, &[480]), &ok_parts(960));
+        let est = estimate(
+            &ok_parts(480),
+            &ring(48_000, &[240]),
+            &ring(48_000, &[480]),
+            &ok_parts(960),
+        );
         assert_eq!(est.missing, Vec::<&str>::new());
         let total = est.total_ms.expect("all four parts readable");
-        assert!((total - 45.0).abs() < 1e-9, "10 + 5 + 10 + 20 = 45, got {total}");
+        assert!(
+            (total - 45.0).abs() < 1e-9,
+            "10 + 5 + 10 + 20 = 45, got {total}"
+        );
 
         // 分项必须**各自**报出来 —— 合并成一个数就答不出「这 45 ms 堵在哪」。
         for (id, want) in [
@@ -351,7 +400,9 @@ mod tests {
             (STAGE_PLAY_RING, 10.0),
             (STAGE_PLAY_DEV, 20.0),
         ] {
-            let got = stage(&est, id).ms.unwrap_or_else(|| panic!("{id} has no ms"));
+            let got = stage(&est, id)
+                .ms
+                .unwrap_or_else(|| panic!("{id} has no ms"));
             assert!((got - want).abs() < 1e-9, "{id}: want {want} ms, got {got}");
         }
         assert_eq!(
@@ -372,7 +423,10 @@ mod tests {
             &parts(44_100, 0, LatSource::Api, Transport::BuiltIn),
         );
         let ms = stage(&est, STAGE_PLAY_RING).ms.expect("readable");
-        assert!((ms - 10.0).abs() < 1e-9, "441 samples @44.1k is 10 ms, got {ms}");
+        assert!(
+            (ms - 10.0).abs() < 1e-9,
+            "441 samples @44.1k is 10 ms, got {ms}"
+        );
     }
 
     #[test]
@@ -391,8 +445,16 @@ mod tests {
         // 少一项就少一段延迟。把读到的三项加起来上报「看着更有用」，实际是把一个
         // 已知缺口伪装成一个完整读数 —— devlat 的判据 2，同一条规矩。
         let dead = DevLatencyParts::empty("no such device");
-        let est = estimate(&ok_parts(480), &ring(48_000, &[240]), &ring(48_000, &[480]), &dead);
-        assert_eq!(est.total_ms, None, "a partial sum must not be published as a total");
+        let est = estimate(
+            &ok_parts(480),
+            &ring(48_000, &[240]),
+            &ring(48_000, &[480]),
+            &dead,
+        );
+        assert_eq!(
+            est.total_ms, None,
+            "a partial sum must not be published as a total"
+        );
         assert_eq!(est.missing, vec![STAGE_PLAY_DEV]);
         assert_eq!(est.source, LatSource::Unavailable);
         // 其余三项照报：知道的部分不因为缺了一项而一起消失。
@@ -408,7 +470,9 @@ mod tests {
         assert_eq!(est.total_ms, None);
         assert_eq!(est.missing, vec![STAGE_CAPTURE_DEV]);
         assert!(
-            stage(&est, STAGE_CAPTURE_DEV).detail.contains("missing components"),
+            stage(&est, STAGE_CAPTURE_DEV)
+                .detail
+                .contains("missing components"),
             "the reason must name the missing components: {}",
             stage(&est, STAGE_CAPTURE_DEV).detail
         );
@@ -422,23 +486,38 @@ mod tests {
             &ring(48_000, &[480]),
             &ok_parts(480),
         );
-        assert_eq!(est.total_ms, None, "zero polls is 'unknown', and unknown kills the sum");
+        assert_eq!(
+            est.total_ms, None,
+            "zero polls is 'unknown', and unknown kills the sum"
+        );
         assert_eq!(est.missing, vec![STAGE_CAPTURE_RING]);
     }
 
     #[test]
     fn a_ring_observed_at_depth_zero_is_a_real_reading() {
         // 与上一条的区别就是这套遥测的全部意义：观测到 0 是真读数，没观测过不是。
-        let est = estimate(&ok_parts(480), &ring(48_000, &[0, 0]), &ring(48_000, &[0]), &ok_parts(480));
+        let est = estimate(
+            &ok_parts(480),
+            &ring(48_000, &[0, 0]),
+            &ring(48_000, &[0]),
+            &ok_parts(480),
+        );
         assert_eq!(stage(&est, STAGE_CAPTURE_RING).ms, Some(0.0));
         assert!(est.total_ms.is_some());
     }
 
     #[test]
     fn a_ring_with_no_rate_cannot_be_converted() {
-        let est = estimate(&ok_parts(480), &ring(0, &[240]), &ring(48_000, &[0]), &ok_parts(480));
+        let est = estimate(
+            &ok_parts(480),
+            &ring(0, &[240]),
+            &ring(48_000, &[0]),
+            &ok_parts(480),
+        );
         assert_eq!(est.missing, vec![STAGE_CAPTURE_RING]);
-        assert!(stage(&est, STAGE_CAPTURE_RING).detail.contains("rate is unknown"));
+        assert!(stage(&est, STAGE_CAPTURE_RING)
+            .detail
+            .contains("rate is unknown"));
     }
 
     // ------------------------------------------------------- the qualifier
@@ -454,7 +533,10 @@ mod tests {
             &parts(48_000, 480, LatSource::Unreliable, Transport::BuiltIn),
         );
         assert_eq!(est.source, LatSource::Unreliable);
-        assert!(est.total_ms.is_some(), "unreliable is still a number, just a worse one");
+        assert!(
+            est.total_ms.is_some(),
+            "unreliable is still a number, just a worse one"
+        );
     }
 
     #[test]
@@ -466,17 +548,32 @@ mod tests {
             &ring(48_000, &[0]),
             &parts(48_000, 960, LatSource::Api, Transport::Bluetooth),
         );
-        assert_eq!(est.source, LatSource::Unreliable, "A2DP under-reports by an order of magnitude");
+        assert_eq!(
+            est.source,
+            LatSource::Unreliable,
+            "A2DP under-reports by an order of magnitude"
+        );
     }
 
     #[test]
     fn four_perfect_api_readings_are_still_not_a_calibrated_measurement() {
         // 这条测试守的是 plan §7.6 第 6 条：不许拿不完整的量冒充端到端物理量。
         // 谁把 is_calibrated 改成「四项全 Api 就算标定」，这里就红。
-        let est = estimate(&ok_parts(480), &ring(48_000, &[0]), &ring(48_000, &[0]), &ok_parts(480));
+        let est = estimate(
+            &ok_parts(480),
+            &ring(48_000, &[0]),
+            &ring(48_000, &[0]),
+            &ok_parts(480),
+        );
         assert_eq!(est.source, LatSource::Api);
-        assert!(!est.is_calibrated(), "nothing here timed a signal end to end");
-        assert!(to_line(&est).contains(">="), "an uncalibrated total is a floor, and must read as one");
+        assert!(
+            !est.is_calibrated(),
+            "nothing here timed a signal end to end"
+        );
+        assert!(
+            to_line(&est).contains(">="),
+            "an uncalibrated total is a floor, and must read as one"
+        );
         assert!(to_line(&est).contains("uncalibrated"));
     }
 
@@ -484,7 +581,12 @@ mod tests {
 
     #[test]
     fn the_json_says_what_the_number_is_and_is_not() {
-        let est = estimate(&ok_parts(480), &ring(48_000, &[240]), &ring(48_000, &[480]), &ok_parts(960));
+        let est = estimate(
+            &ok_parts(480),
+            &ring(48_000, &[240]),
+            &ring(48_000, &[480]),
+            &ok_parts(960),
+        );
         let v = to_json(&est);
         assert_eq!(v["calibrated"], serde_json::json!(false));
         assert_eq!(v["source"], serde_json::json!("api"));
@@ -494,13 +596,19 @@ mod tests {
         assert!(method.contains("No loopback calibration"));
         // 环驻留是瞬时量 —— 采样口径与数字必须同行。
         let sampling = v["ring_sampling"].as_str().expect("sampling note");
-        assert!(sampling.contains("mean"), "the sampling rule must be stated: {sampling}");
+        assert!(
+            sampling.contains("mean"),
+            "the sampling rule must be stated: {sampling}"
+        );
         // `parts` is a JSON OBJECT, and JSON objects are unordered — without
         // this the reader cannot tell which stage comes first, which is the
         // first question anyone debugging a latency figure asks.
         assert_eq!(v["order"], serde_json::json!(STAGE_ORDER));
         for id in STAGE_ORDER {
-            assert!(v["parts"][id]["ms"].is_number(), "part {id} missing from JSON: {v}");
+            assert!(
+                v["parts"][id]["ms"].is_number(),
+                "part {id} missing from JSON: {v}"
+            );
             assert!(v["parts"][id]["source"].is_string());
             assert!(v["parts"][id]["detail"].is_string());
         }

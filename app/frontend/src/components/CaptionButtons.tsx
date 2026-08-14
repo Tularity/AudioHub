@@ -38,7 +38,8 @@ async function call(cmd: WindowCmd): Promise<void> {
   } catch (err) {
     if (reported) return;
     reported = true;
-    toast(t('chrome.captionFailed', { message: err instanceof Error ? err.message : String(err) }), 'error');
+    console.error('[audiohub] native caption command failed', err);
+    toast(t('chrome.captionFailed'), 'error');
   }
 }
 

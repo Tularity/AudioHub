@@ -86,11 +86,14 @@ pub fn run_tx_tone(sock: &UdpSocket, mode: TxMode, cfg: &ToneTxCfg) -> anyhow::R
         TxMode::Serve => {
             // wait for the first valid PullReq, but bounded: the CLI contract
             // (spec §5) is self-termination, so an absent puller must not hang us.
-            let wait_deadline =
-                Instant::now() + Duration::from_secs_f32(cfg.secs.max(10.0) + 5.0);
+            let wait_deadline = Instant::now() + Duration::from_secs_f32(cfg.secs.max(10.0) + 5.0);
             loop {
                 if Instant::now() >= wait_deadline {
-                    return Ok(TxReport { sent_packets: 0, sent_bytes: 0, secs: 0.0 });
+                    return Ok(TxReport {
+                        sent_packets: 0,
+                        sent_bytes: 0,
+                        secs: 0.0,
+                    });
                 }
                 match sock.recv_from(&mut buf) {
                     Ok((n, from)) => {
@@ -310,7 +313,9 @@ pub fn run_rx(
                         // 探针今天只发 s16，但收方要能诚实地拒绝它不认识的深度：
                         // 按 s16 硬解一个 24 位载荷会得到一段**有声音、但全是垃圾**
                         // 的波形，而没有任何一处会报错。
-                        let Some(depth) = h.codec.wire_depth() else { continue };
+                        let Some(depth) = h.codec.wire_depth() else {
+                            continue;
+                        };
                         let frame = dsp::decode_pcm(payload, depth);
                         if let Some(cb) = on_frame.as_mut() {
                             cb(&frame);

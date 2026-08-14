@@ -59,8 +59,7 @@ pub const LATENCY_LEGACY_MIN: &str = "min";
 /// 相邻档比值 1.3–2×：低端细（那里 10 ms 是可感知的一大步），高端粗
 /// （那里 50 ms 谁也听不出差别）。等差会在高端浪费一半档位，等比会在低端
 /// 给不出 10 ms 这种必须存在的整数档。
-pub const LATENCY_STOPS_MS: [u16; 13] =
-    [0, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000];
+pub const LATENCY_STOPS_MS: [u16; 13] = [0, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 750, 1000];
 
 /// 用户对**端到端总延迟**的要求。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,7 +279,10 @@ impl QualityTarget {
         if !stop.available {
             return None;
         }
-        let (rate, depth) = (stop.rate?, audiohub_core::dsp::WireDepth::parse(&stop.depth?)?);
+        let (rate, depth) = (
+            stop.rate?,
+            audiohub_core::dsp::WireDepth::parse(&stop.depth?)?,
+        );
         audiohub_net::media::rung_of(rate, depth).map(QualityTarget::Fixed)
     }
 
@@ -297,7 +299,11 @@ mod tests {
     /// 档位表本身的形状：升序、无重复、两端就是用户点名的那两个数。
     #[test]
     fn the_latency_stops_are_an_ascending_ladder_from_zero_to_one_second() {
-        assert_eq!(*LATENCY_STOPS_MS.first().unwrap(), 0, "最左固定档必须是 0（最低）");
+        assert_eq!(
+            *LATENCY_STOPS_MS.first().unwrap(),
+            0,
+            "最左固定档必须是 0（最低）"
+        );
         assert_eq!(*LATENCY_STOPS_MS.last().unwrap(), 1000, "上限由用户点名");
         for w in LATENCY_STOPS_MS.windows(2) {
             assert!(w[0] < w[1], "档位必须严格升序：{} !< {}", w[0], w[1]);
@@ -307,11 +313,18 @@ mod tests {
     /// 每一档都能原样转一圈回来。滑条的全部前提是两端对「有哪些档」一致。
     #[test]
     fn every_latency_stop_round_trips_through_the_wire_spelling() {
-        assert_eq!(LatencyTarget::parse(LATENCY_AUTO), Some(LatencyTarget::Auto));
+        assert_eq!(
+            LatencyTarget::parse(LATENCY_AUTO),
+            Some(LatencyTarget::Auto)
+        );
         assert_eq!(LatencyTarget::Auto.as_wire(), LATENCY_AUTO);
         for &ms in &LATENCY_STOPS_MS {
             let t = LatencyTarget::TotalMs(ms);
-            assert_eq!(LatencyTarget::parse(&t.as_wire()), Some(t), "{ms} ms 没转回来");
+            assert_eq!(
+                LatencyTarget::parse(&t.as_wire()),
+                Some(t),
+                "{ms} ms 没转回来"
+            );
         }
     }
 
@@ -369,15 +382,20 @@ mod tests {
             .filter_map(|q| Some((q.rate?, q.depth.clone()?)))
             .collect();
         have.sort();
-        let mut want: Vec<(u32, String)> =
-            LADDER.iter().map(|f| (f.rate_hz, f.depth.as_str().to_string())).collect();
+        let mut want: Vec<(u32, String)> = LADDER
+            .iter()
+            .map(|f| (f.rate_hz, f.depth.as_str().to_string()))
+            .collect();
         want.sort();
         assert_eq!(
             have, want,
             "可选质量档与媒体面的格式阶梯对不上；多出来的那档会被静默忽略"
         );
         // 每一档都必须同时报出采样率**与**位深——少一个，前端就得去解析 id。
-        for q in quality_stops().iter().filter(|q| q.available && q.id != QUALITY_AUTO) {
+        for q in quality_stops()
+            .iter()
+            .filter(|q| q.available && q.id != QUALITY_AUTO)
+        {
             assert!(q.rate.is_some(), "{} 没报采样率", q.id);
             assert!(q.depth.is_some(), "{} 没报位深", q.id);
             assert!(q.kbps.is_some(), "{} 没报码率", q.id);
@@ -444,7 +462,11 @@ mod tests {
             .collect();
         assert_eq!(opus.len(), 3, "plan §5 承诺的是 256k/128k/64k 三档");
         for q in &opus {
-            assert!(!q.available, "{} 标了可用，但 Cargo.toml 里没有 libopus", q.id);
+            assert!(
+                !q.available,
+                "{} 标了可用，但 Cargo.toml 里没有 libopus",
+                q.id
+            );
             assert_eq!(
                 QualityTarget::parse(&q.id),
                 None,
@@ -457,10 +479,15 @@ mod tests {
 
     #[test]
     fn every_available_quality_stop_round_trips() {
-        assert_eq!(QualityTarget::parse(QUALITY_AUTO), Some(QualityTarget::Auto));
+        assert_eq!(
+            QualityTarget::parse(QUALITY_AUTO),
+            Some(QualityTarget::Auto)
+        );
         assert_eq!(QualityTarget::Auto.as_wire(), QUALITY_AUTO);
         for q in quality_stops().iter().filter(|q| q.available) {
-            let Some(t) = QualityTarget::parse(&q.id) else { continue };
+            let Some(t) = QualityTarget::parse(&q.id) else {
+                continue;
+            };
             assert_eq!(t.as_wire(), q.id, "{} 的 as_wire 与 id 不一致", q.id);
             assert_eq!(QualityTarget::parse(&t.as_wire()), Some(t));
         }
@@ -501,8 +528,15 @@ mod tests {
         assert_eq!(QualityTarget::Auto.slider_index(), 0, "AUTO 必须在最左");
         let mut seen = vec![0usize];
         for (i, q) in stops.iter().enumerate() {
-            let Some(t) = QualityTarget::parse(&q.id) else { continue };
-            assert_eq!(t.slider_index(), i, "{} 的滑条位置与它在表里的位置对不上", q.id);
+            let Some(t) = QualityTarget::parse(&q.id) else {
+                continue;
+            };
+            assert_eq!(
+                t.slider_index(),
+                i,
+                "{} 的滑条位置与它在表里的位置对不上",
+                q.id
+            );
             if i > 0 {
                 seen.push(i);
             }
@@ -512,6 +546,10 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), n, "两个质量档撞到了同一个滑条位置");
-        assert_eq!(n, 1 + audiohub_net::media::LADDER.len(), "可选档数与阶梯长度对不上");
+        assert_eq!(
+            n,
+            1 + audiohub_net::media::LADDER.len(),
+            "可选档数与阶梯长度对不上"
+        );
     }
 }

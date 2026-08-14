@@ -1,0 +1,5 @@
+[target.x86_64-pc-windows-msvc]
+# The App is the complete end-user artifact. Static CRT linkage keeps its App,
+# daemon, CLI, and elevated helper runnable on a clean Windows installation
+# without a separately installed Visual C++ Redistributable.
+rustflags = ["-C", "target-feature=+crt-static"]

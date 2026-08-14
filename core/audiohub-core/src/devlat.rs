@@ -416,14 +416,25 @@ mod imp {
     }
 
     fn at(selector: u32, scope: u32) -> PropAddr {
-        PropAddr { selector, scope, element: ELEM_MAIN }
+        PropAddr {
+            selector,
+            scope,
+            element: ELEM_MAIN,
+        }
     }
 
     fn get_u32(obj: AudioObjectID, a: &PropAddr) -> Option<u32> {
         let mut v: u32 = 0;
         let mut sz: u32 = 4;
         let st = unsafe {
-            AudioObjectGetPropertyData(obj, a, 0, null(), &mut sz, &mut v as *mut u32 as *mut c_void)
+            AudioObjectGetPropertyData(
+                obj,
+                a,
+                0,
+                null(),
+                &mut sz,
+                &mut v as *mut u32 as *mut c_void,
+            )
         };
         (st == 0 && sz == 4).then_some(v)
     }
@@ -432,7 +443,14 @@ mod imp {
         let mut v: f64 = 0.0;
         let mut sz: u32 = 8;
         let st = unsafe {
-            AudioObjectGetPropertyData(obj, a, 0, null(), &mut sz, &mut v as *mut f64 as *mut c_void)
+            AudioObjectGetPropertyData(
+                obj,
+                a,
+                0,
+                null(),
+                &mut sz,
+                &mut v as *mut f64 as *mut c_void,
+            )
         };
         (st == 0 && sz == 8).then_some(v)
     }
@@ -601,14 +619,7 @@ mod imp {
         let mut ids = vec![0u32; n];
         let mut io = bytes;
         let st = unsafe {
-            AudioObjectGetPropertyData(
-                dev,
-                &a,
-                0,
-                null(),
-                &mut io,
-                ids.as_mut_ptr() as *mut c_void,
-            )
+            AudioObjectGetPropertyData(dev, &a, 0, null(), &mut io, ids.as_mut_ptr() as *mut c_void)
         };
         if st != 0 {
             return None;
@@ -655,14 +666,24 @@ mod imp {
         let mut parts = Vec::with_capacity(4);
         let mut missing = Vec::new();
 
-        take("device", get_u32(dev, &at(SEL_LATENCY, scope)), &mut parts, &mut missing);
+        take(
+            "device",
+            get_u32(dev, &at(SEL_LATENCY, scope)),
+            &mut parts,
+            &mut missing,
+        );
         take(
             "safety_offset",
             get_u32(dev, &at(SEL_SAFETY_OFFSET, scope)),
             &mut parts,
             &mut missing,
         );
-        take("stream", stream_latency(dev, scope), &mut parts, &mut missing);
+        take(
+            "stream",
+            stream_latency(dev, scope),
+            &mut parts,
+            &mut missing,
+        );
         // BufferFrameSize 名义上是 global scope，但个别驱动只在方向 scope 上答；
         // 两个都试过再判缺项，免得把「问错 scope」记成「设备不支持」。
         let io_buf = get_u32(dev, &at(SEL_BUFFER_FRAME_SIZE, SCOPE_GLOBAL))
@@ -803,7 +824,13 @@ mod imp {
 
     impl PropVariant {
         fn empty() -> PropVariant {
-            PropVariant { vt: 0, r1: 0, r2: 0, r3: 0, val: [0; 2] }
+            PropVariant {
+                vt: 0,
+                r1: 0,
+                r2: 0,
+                r3: 0,
+                val: [0; 2],
+            }
         }
     }
 
@@ -888,11 +915,8 @@ mod imp {
         base: IUnknownVtbl,
         get_count: usize,
         get_at: usize,
-        get_value: unsafe extern "system" fn(
-            *mut c_void,
-            *const PropertyKey,
-            *mut PropVariant,
-        ) -> HRESULT,
+        get_value:
+            unsafe extern "system" fn(*mut c_void, *const PropertyKey, *mut PropVariant) -> HRESULT,
         set_value: usize,
         commit: usize,
     }
@@ -1094,9 +1118,7 @@ mod imp {
             // WASAPI 端点没有 macOS 那种 UID 属性，`DeviceEntry.uid` 在这边本来
             // 就恒为 None（`audio.rs` 的注释说明了原因）。凭名字编一个出来是撒谎，
             // 所以这里直接说不支持。
-            DevTarget::Uid(uid) => {
-                Err(format!("addressing devices by UID {uid:?} is macOS-only"))
-            }
+            DevTarget::Uid(uid) => Err(format!("addressing devices by UID {uid:?} is macOS-only")),
             DevTarget::Name(want) => {
                 let mut coll = ComPtr::null();
                 let hr = unsafe {
@@ -1109,7 +1131,10 @@ mod imp {
                     )
                 };
                 if hr < 0 {
-                    return Err(format!("EnumAudioEndpoints failed: HRESULT 0x{:08X}", hr as u32));
+                    return Err(format!(
+                        "EnumAudioEndpoints failed: HRESULT 0x{:08X}",
+                        hr as u32
+                    ));
                 }
                 let mut count: u32 = 0;
                 let hr = unsafe {
@@ -1206,9 +1231,8 @@ mod imp {
 
         let mut default_100ns: i64 = 0;
         let mut min_100ns: i64 = 0;
-        let period_ok = unsafe {
-            ((*v).get_device_period)(client.0, &mut default_100ns, &mut min_100ns) >= 0
-        };
+        let period_ok =
+            unsafe { ((*v).get_device_period)(client.0, &mut default_100ns, &mut min_100ns) >= 0 };
 
         let mut parts = Vec::with_capacity(1);
         let mut missing = Vec::new();
@@ -1281,9 +1305,25 @@ mod tests {
     /// 断言是同一条纪律 —— 混用 48000 会引入 −8.8% 的系统性偏差。
     #[test]
     fn frames_convert_with_the_devices_own_rate() {
-        let at48 = parts(&[("device", 0), ("safety_offset", 33), ("stream", 0), ("io_buffer", 512)], 48_000);
+        let at48 = parts(
+            &[
+                ("device", 0),
+                ("safety_offset", 33),
+                ("stream", 0),
+                ("io_buffer", 512),
+            ],
+            48_000,
+        );
         assert!((at48.total().ms().unwrap() - 545.0 * 1000.0 / 48_000.0).abs() < 1e-9);
-        let at44 = parts(&[("device", 0), ("safety_offset", 33), ("stream", 0), ("io_buffer", 512)], 44_100);
+        let at44 = parts(
+            &[
+                ("device", 0),
+                ("safety_offset", 33),
+                ("stream", 0),
+                ("io_buffer", 512),
+            ],
+            44_100,
+        );
         assert!((at44.total().ms().unwrap() - 545.0 * 1000.0 / 44_100.0).abs() < 1e-9);
         // 同样 545 帧，44.1k 上比 48k 上多 8.8%
         let a = at48.total().ms().unwrap();
@@ -1295,7 +1335,10 @@ mod tests {
     /// 把读到的三项加起来上报看着更有用，实际上是把一个已知缺口伪装成完整读数。
     #[test]
     fn a_missing_component_poisons_the_whole_reading() {
-        let mut p = parts(&[("device", 100), ("safety_offset", 33), ("io_buffer", 512)], 48_000);
+        let mut p = parts(
+            &[("device", 100), ("safety_offset", 33), ("io_buffer", 512)],
+            48_000,
+        );
         p.missing.push("stream");
         assert_eq!(p.total().source, LatSource::Unavailable);
         assert_eq!(p.total().ms(), None, "绝不能变成读到的那三项之和");
@@ -1347,7 +1390,12 @@ mod tests {
     #[test]
     fn a_genuine_zero_is_not_a_missing_reading() {
         let virt = DevLatencyParts {
-            parts: vec![("device", 0), ("safety_offset", 0), ("stream", 0), ("io_buffer", 512)],
+            parts: vec![
+                ("device", 0),
+                ("safety_offset", 0),
+                ("stream", 0),
+                ("io_buffer", 512),
+            ],
             missing: Vec::new(),
             rate: 48_000,
             transport: Transport::Virtual,
@@ -1371,8 +1419,12 @@ mod tests {
     /// 规格 §3.4 那 10–20 ms 里的一大半。
     #[test]
     fn losing_any_single_component_makes_the_whole_reading_unavailable() {
-        const FULL: [(&str, u32); 4] =
-            [("device", 88), ("safety_offset", 320), ("stream", 12), ("io_buffer", 512)];
+        const FULL: [(&str, u32); 4] = [
+            ("device", 88),
+            ("safety_offset", 320),
+            ("stream", 12),
+            ("io_buffer", 512),
+        ];
         // 前提：四项齐全时是可用的真值
         let whole = parts(&FULL, 48_000);
         assert_eq!(whole.total().source, LatSource::Api);
@@ -1394,7 +1446,12 @@ mod tests {
                 "少了 {} 却仍然出数",
                 FULL[drop_idx].0
             );
-            assert_eq!(t.ms(), None, "少了 {} 时不许退化成剩下三项之和", FULL[drop_idx].0);
+            assert_eq!(
+                t.ms(),
+                None,
+                "少了 {} 时不许退化成剩下三项之和",
+                FULL[drop_idx].0
+            );
         }
     }
 
@@ -1412,7 +1469,15 @@ mod tests {
             Transport::ContinuityWireless,
             Transport::Aggregate,
         ] {
-            let mut p = parts(&[("device", 1_000), ("safety_offset", 33), ("stream", 0), ("io_buffer", 512)], 48_000);
+            let mut p = parts(
+                &[
+                    ("device", 1_000),
+                    ("safety_offset", 33),
+                    ("stream", 0),
+                    ("io_buffer", 512),
+                ],
+                48_000,
+            );
             p.transport = t;
             assert_eq!(p.total().source, LatSource::Unreliable, "{t:?} 必须降级");
             // 降级不等于丢弃：数字还在，只是不可采信为真值
@@ -1427,7 +1492,15 @@ mod tests {
             Transport::FireWire,
             Transport::ContinuityWired,
         ] {
-            let mut p = parts(&[("device", 100), ("safety_offset", 33), ("stream", 0), ("io_buffer", 512)], 48_000);
+            let mut p = parts(
+                &[
+                    ("device", 100),
+                    ("safety_offset", 33),
+                    ("stream", 0),
+                    ("io_buffer", 512),
+                ],
+                48_000,
+            );
             p.transport = t;
             assert_eq!(p.total().source, LatSource::Api, "{t:?} 不该被无端降级");
         }
@@ -1498,7 +1571,10 @@ mod tests {
             (hidden_ms - 639.0 * 1000.0 / 44_100.0).abs() < 1e-9,
             "壳比成员少报的正是那一段 stream 延迟, got {hidden_ms}"
         );
-        assert!(hidden_ms > 10.0, "少报 {hidden_ms:.1} ms —— 与规格 §3.4 说的整个误差预算同量级");
+        assert!(
+            hidden_ms > 10.0,
+            "少报 {hidden_ms:.1} ms —— 与规格 §3.4 说的整个误差预算同量级"
+        );
         // 所以壳的读数必须带「≥」，成员的可以当真值
         assert_eq!(shell.total().source, LatSource::Unreliable);
         assert_eq!(member.total().source, LatSource::Api);
@@ -1529,7 +1605,12 @@ mod tests {
         );
         let mut win = parts(&[("device_period", 480)], 48_000);
         win.base_source = WINDOWS_DEVICE_PERIOD_SOURCE;
-        for t in [Transport::BuiltIn, Transport::Usb, Transport::Hdmi, Transport::Bluetooth] {
+        for t in [
+            Transport::BuiltIn,
+            Transport::Usb,
+            Transport::Hdmi,
+            Transport::Bluetooth,
+        ] {
             win.transport = t;
             let total = win.total();
             assert_eq!(total.ms(), Some(10.0), "{t:?}：读数本身照报，它是个真下限");
@@ -1564,15 +1645,31 @@ mod tests {
     /// `Unreliable` 更好看的东西：取更不可信的那个。
     #[test]
     fn the_less_trustworthy_label_wins() {
-        assert_eq!(worse(LatSource::Api, LatSource::Assumed), LatSource::Assumed);
-        assert_eq!(worse(LatSource::Assumed, LatSource::Api), LatSource::Assumed);
-        assert_eq!(worse(LatSource::Assumed, LatSource::Unreliable), LatSource::Unreliable);
-        assert_eq!(worse(LatSource::Unreliable, LatSource::Unavailable), LatSource::Unavailable);
+        assert_eq!(
+            worse(LatSource::Api, LatSource::Assumed),
+            LatSource::Assumed
+        );
+        assert_eq!(
+            worse(LatSource::Assumed, LatSource::Api),
+            LatSource::Assumed
+        );
+        assert_eq!(
+            worse(LatSource::Assumed, LatSource::Unreliable),
+            LatSource::Unreliable
+        );
+        assert_eq!(
+            worse(LatSource::Unreliable, LatSource::Unavailable),
+            LatSource::Unavailable
+        );
 
         let mut win = parts(&[("device_period", 480)], 48_000);
         win.base_source = LatSource::Assumed;
         win.transport = Transport::BuiltIn;
-        assert_eq!(win.total().source, LatSource::Assumed, "有线不代表这个模型变成了真值");
+        assert_eq!(
+            win.total().source,
+            LatSource::Assumed,
+            "有线不代表这个模型变成了真值"
+        );
         win.transport = Transport::Bluetooth;
         assert_eq!(win.total().source, LatSource::Unreliable);
     }

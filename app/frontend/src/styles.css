@@ -1390,7 +1390,7 @@ body[data-window-controls="right"] .chrome-pop {
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 16px;
 }
-/* 模式 B 的卡片主体是两行「AudioHub – <主机名> 扬声器 / 麦克风」+ 完整 UID：
+/* 模式 B 的卡片主体最多是两行同名的 AudioHub 输出 / 输入设备 + 完整 UID：
    按 320px 排，主机名会被省略号吃掉——而主机名正是用户在系统设备菜单里要认的
    那部分。加宽到 400px 让常见长度整行放得下。 */
 .peer-grid.mode-b { grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); }
@@ -1464,17 +1464,16 @@ body[data-window-controls="right"] .chrome-pop {
   color: inherit; text-align: left; cursor: pointer; width: 100%;
 }
 .dir-head.idle { cursor: default; }
-/* 方向词 + 箭头。**整个方案的要害**：码率条前面永远先有方向，物理上不可能再把
-   接收方向的那条读成「全部」。箭头是冗余编码，中文两字是无障碍主体。
-   width 是承重的、不是对齐洁癖：两块的码率条必须从同一个 x 起画，否则「发送」
-   与「接收」两个词一样长而两条条子错开，会被读成两条条子量的不是同一件事。
-   （中文两字 22px + gap 4px + 箭头 12px ≈ 40px，留 44px 给字体差异。） */
+/* 方向缩写 + 箭头。**整个方案的要害**：码率条前面永远先有 TX / RX，
+   物理上不可能再把接收方向的那条读成「全部」。箭头是冗余编码，完整的本地化方向语义
+   由控件的 aria-label 保留。width 是承重的、不是对齐洁癖：两块的码率条必须从
+   同一个 x 起画；44px 在双平台字体下都能完整容纳箭头和两字母缩写。 */
 .dir-name {
   flex: none; width: 44px; display: inline-flex; align-items: center; gap: 4px;
   font-size: 11px; color: var(--text-dim); letter-spacing: .04em; white-space: nowrap;
 }
 .dir-arrow { font-size: 12px; opacity: .8; }
-/* 同方向多条会话时的「N 路」。与 .metric-origin 同一套语言（小字 + 淡边框）。 */
+/* 同方向多条会话时的「N 路」：小字 + 淡边框，不与主读数争权重。 */
 .dir-count {
   flex: none; font-size: 10px; color: var(--text-dim);
   border: 1px solid var(--line); border-radius: 999px; padding: 1px 6px; white-space: nowrap;
@@ -1512,14 +1511,17 @@ body[data-window-controls="right"] .chrome-pop {
    载体见 `.dir-head`。 */
 /* 指标格本身是按钮（点开就地展开明细）：按钮外观全部清掉，只留下光标与焦点环。 */
 .metric-cell {
-  /* Four English tokens can share the quality cell (label, format, grade, origin).
-     Two pixels keeps each token distinct while preserving the complete grade
-     at the compact window width; 6px made even "Good" collapse to an ellipsis. */
+  /* Label, format and grade share the quality cell. Two pixels keeps each token
+     distinct while preserving the complete grade at the compact window width;
+     6px made even "Good" collapse to an ellipsis. */
   display: flex; align-items: baseline; gap: 2px;
   background: none; border: 0; padding: 0; margin: 0;
   color: inherit; text-align: left; cursor: pointer;
   flex: 1 1 auto; min-width: 0;
 }
+/* 延迟以左边缘为视觉锚点，音质则以右边缘为视觉锚点；数值与等级作为一个整体
+   靠右，idle 的「—」与 active 的采样率读数因此落在完全相同的位置。 */
+.metric-cell-quality { justify-content: flex-end; text-align: right; }
 .metric-cap { font-size: 11px; color: var(--text-dim); letter-spacing: .06em; flex: none; white-space: nowrap; }
 /* 22px + tabular-nums：与统计页的 .tile-num / .metric-num 同级，数字跳动时不抖宽度。
    nowrap 是必须的：「≥186 ms」中间那个空格在窄卡片上会断行，指标行一旦变成两行，
@@ -1587,15 +1589,6 @@ body[data-window-controls="right"] .chrome-pop {
   font-size: 11px; color: var(--warn); flex: 0 1 auto; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* 出处角标「对端测得」。与 .metric-scope 同一套语言（小字、贴着数字），但用 dim 而
-   不是 warn：它不是警告——读数是真的，只是量它的人在对面。加一圈极淡的边框让它读起来
-   像一枚标签而不是又一段正文，否则它会被当成等级词的下半句。 */
-.metric-origin {
-  flex: none; font-size: 10px; color: var(--text-dim);
-  border: 1px solid var(--line); border-radius: 999px; padding: 1px 5px;
-  white-space: nowrap; align-self: center;
-}
-
 /* ---- 降级归因条（plan §16.4）------------------------------------------------
    位置就是它的全部意义：`.peer-metrics` 的第一个孩子，紧贴在下面两个延迟读数
    之上。§16.4 第 1 条要求「因」与「果」落在同一视野里——挪到卡片头部就已经
@@ -2173,12 +2166,16 @@ body[data-window-controls="right"] .chrome-pop {
 
 /* ---- 共享协议（仅共享模式） ---- */
 
-/* 输入与保存/清除动作同组；窄窗时在组内换行，不把输入框压成一条缝。 */
+/* Sheet 内只保留字段自身的草稿动作（默认 / 清除）；真正保存统一在 footer。 */
 .proto-field {
   display: flex; align-items: center; justify-content: flex-end;
   gap: 8px; flex-wrap: wrap;
 }
 .proto-input { width: 220px; max-width: 100%; }
+.sheet-field-control .btn.is-staged {
+  color: var(--warn); border-color: rgba(var(--warn-rgb), .42);
+  background: rgba(var(--warn-rgb), .08);
+}
 .proto-settings-summary {
   display: block; max-width: 260px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -2203,10 +2200,20 @@ body[data-window-controls="right"] .chrome-pop {
   list-style: none; display: flex; flex-direction: column; gap: 8px;
 }
 .proto-session {
-  display: flex; flex-direction: column; gap: 6px;
+  display: flex; align-items: center; gap: 12px;
   padding: 12px 14px;
   border: 1px solid var(--line); border-radius: var(--radius-sm);
   background: var(--fill-faint);
+}
+.proto-session-artwork {
+  flex: 0 0 58px; width: 58px; height: 58px;
+  border-radius: 8px; object-fit: cover;
+  background: var(--fill-soft);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.proto-session-body {
+  min-width: 0; flex: 1;
+  display: flex; flex-direction: column; gap: 6px;
 }
 .proto-session-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .proto-session-head strong {
@@ -2402,6 +2409,26 @@ body[data-window-controls="right"] .chrome-pop {
 .mode-title-wrap { flex: 1; min-width: 220px; }
 .mode-sub { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
 .mode-desc { font-size: 13px; color: var(--text); line-height: 1.65; max-width: 720px; }
+.mode-note-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 10px;
+}
+
+@media (max-width: 720px) {
+  .mode-note-row {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .mode-note-row .mode-note {
+    flex-basis: 100%;
+  }
+}
+.mode-note-row[hidden] { display: none; }
+.mode-note-row .mode-note { margin: 0; flex: 1; min-width: 0; }
+.mode-note-row .btn { flex: none; margin-left: auto; }
 .mode-note { font-size: 12px; color: var(--text-dim); line-height: 1.6; }
 .mode-note.tone-ok { color: var(--ok); }
 .mode-note.tone-warn { color: var(--warn); }
@@ -2508,7 +2535,7 @@ body[data-window-controls="right"] .chrome-pop {
 
 /* ---- 确认框 ---- */
 
-/* z-index 62：压过授权门(40)、#overlay(50) 与二级菜单 .sheet-scrim(60)——确认框是
+/* z-index 62：压过授权门(40) 与二级菜单 .sheet-scrim(60)——确认框是
    用户刚按下的那个动作的直接回应，任何东西盖住它都会变成「点了没反应」。
    原值 55 只压得过前两者；2026-08-10 之后「重置指纹」「解除配对」这类危险按钮开在
    Sheet **里面**，55 会让它们弹出的确认框整个被 Sheet 的遮罩盖住。 */
@@ -2631,7 +2658,7 @@ canvas.spark { width: 160px; height: 36px; display: block; }
 /* ---- 首启授权门 ---- */
 
 /* z-index 40：盖住整个应用（含侧栏导航，被挡住时不该还能点走），
-   但排在 #overlay(50) 之下——服务断了要先说服务的事。 */
+   但排在全局服务 Overlay 之下——服务断了要先说服务的事。 */
 #gate {
   position: fixed; inset: 0; z-index: 40;
   display: flex; align-items: flex-start; justify-content: center;
@@ -2721,7 +2748,8 @@ body.is-tauri .gate-drag {
 /* ---- 覆盖层 ---- */
 
 #overlay {
-  position: fixed; inset: 0; z-index: 50;
+  /* 服务生命周期是全局前置条件：它必须盖住 Sheet(60)、Confirm(62) 及授权门。 */
+  position: fixed; inset: 0; z-index: 100;
   display: flex; align-items: center; justify-content: center;
   background: rgba(var(--bg-rgb), .78);
   backdrop-filter: blur(6px);
@@ -3105,7 +3133,7 @@ body.is-tauri .gate-drag {
 .sc-freed { margin: 8px 0 0; min-height: 16px; font-size: 12px; color: var(--accent); }
 .sc-actions { display: flex; gap: 8px; margin-top: 10px; }
 
-/* 速查表。盖住全屏，点空白关闭；它是纯只读的一屏，所以没有按钮，只有 Esc。 */
+/* 所有二级菜单共用的遮罩与卡片。编辑型菜单的提交区见下面 `.sheet-actions`。 */
 .sheet-scrim {
   position: fixed; inset: 0; z-index: 60;
   display: flex; align-items: center; justify-content: center;
@@ -3141,7 +3169,8 @@ body.is-tauri .gate-drag {
 /* ---- 二级菜单（components/Sheet.tsx） ---- */
 
 /* 只在 Sheet 内部生效，速查表原有的 `.sheet-row` 一行行的形状不受影响。
-   `.sheet-scrim` 的 z-index 仍是 60；开在它之上的 `.confirm-mask` 是 62。 */
+   `.sheet-scrim` 的 z-index 是 60；开在它之上的 `.confirm-mask` 是 62，二者都在
+   全局服务 Overlay(100) 之下。 */
 .sheet-head { display: flex; align-items: center; gap: 7px; margin-bottom: 12px; }
 .sheet-head .sheet-title { margin: 0; }
 .sheet-body { display: flex; flex-direction: column; gap: 2px; }
@@ -3149,11 +3178,17 @@ body.is-tauri .gate-drag {
   display: flex; align-items: center; justify-content: flex-end; gap: 8px;
   margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line);
 }
-/* 危险动作靠左推开，与「关闭」拉出距离：两枚按钮并排且只差一个词的时候，
-   点错的代价完全不对等。 */
-.sheet-actions > .danger-slot { margin-right: auto; }
+/* 恢复默认 / 重新检查一类辅助动作在左，取消 + 保存（或危险主动作）在右。
+   这让输入项共享一个菜单级提交点，不再把一枚「保存」黏在每个字段旁边。 */
+.sheet-actions-leading {
+  display: flex; align-items: center; gap: 8px; margin-right: auto;
+}
 /* Sheet 里放整块设置行时给它一点呼吸，不然行与行贴在一起读不出边界。 */
 .sheet-body .setting-row { padding: 8px 0; }
+/* 编辑型 Sheet 的字段占满内容宽度；提交动作只出现在统一 footer。 */
+.sheet-form-row { display: flex; flex-direction: column; gap: 8px; }
+.sheet-form-row .field { width: 100%; }
+.sheet-form-row .input { width: 100%; }
 /* Sheet 里那句**后果**（plan §3.1 第 4 类，界面上仅存的四处之一）。`.sheet-body`
    的 2px 行距是给一行行的设置行用的；一段解释贴在输入框下方 2px 处会被读成输入框
    自己的提示，而它说的是按下「保存」之后会发生什么。 */

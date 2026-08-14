@@ -78,10 +78,10 @@
 //! 而它替换掉的 `GetDevicePeriod` 偏 31.9 ms —— 换来的是 4 倍的准确度，
 //! **但换不来「≥」的消失**。
 
-#[cfg(windows)]
-use crate::devlat::{DevLatencyParts, DevTarget};
 #[cfg(not(windows))]
 use crate::devlat::DevTarget;
+#[cfg(windows)]
+use crate::devlat::{DevLatencyParts, DevTarget};
 use crate::latency::LatSource;
 
 /// 标定值在 [`DevLatencyParts::base_source`] 上的可信度标签。
@@ -306,7 +306,13 @@ mod imp {
 
     impl PropVariant {
         fn empty() -> PropVariant {
-            PropVariant { vt: 0, r1: 0, r2: 0, r3: 0, val: [0; 2] }
+            PropVariant {
+                vt: 0,
+                r1: 0,
+                r2: 0,
+                r3: 0,
+                val: [0; 2],
+            }
         }
     }
 
@@ -402,11 +408,8 @@ mod imp {
         base: IUnknownVtbl,
         get_count: usize,
         get_at: usize,
-        get_value: unsafe extern "system" fn(
-            *mut c_void,
-            *const PropertyKey,
-            *mut PropVariant,
-        ) -> HRESULT,
+        get_value:
+            unsafe extern "system" fn(*mut c_void, *const PropertyKey, *mut PropVariant) -> HRESULT,
         set_value: usize,
         commit: usize,
     }
@@ -581,7 +584,9 @@ mod imp {
                 }
                 Ok(device)
             }
-            DevTarget::Uid(uid) => Err(format!("addressing endpoints by UID {uid:?} is macOS-only")),
+            DevTarget::Uid(uid) => {
+                Err(format!("addressing endpoints by UID {uid:?} is macOS-only"))
+            }
             DevTarget::Name(want) => {
                 let mut coll = ComPtr::null();
                 let hr = unsafe {
@@ -594,7 +599,10 @@ mod imp {
                     )
                 };
                 if hr < 0 {
-                    return Err(format!("EnumAudioEndpoints failed: HRESULT 0x{:08X}", hr as u32));
+                    return Err(format!(
+                        "EnumAudioEndpoints failed: HRESULT 0x{:08X}",
+                        hr as u32
+                    ));
                 }
                 let mut count: u32 = 0;
                 let hr = unsafe {
@@ -658,10 +666,19 @@ mod imp {
         let mut client = ComPtr::null();
         let hr = unsafe {
             let v = device.vtbl::<IMMDeviceVtbl>();
-            ((*v).activate)(device.0, &IID_IAUDIO_CLIENT, CLSCTX_ALL, ptr::null_mut(), &mut client.0)
+            ((*v).activate)(
+                device.0,
+                &IID_IAUDIO_CLIENT,
+                CLSCTX_ALL,
+                ptr::null_mut(),
+                &mut client.0,
+            )
         };
         if hr < 0 {
-            return Err(format!("Activate(IAudioClient) failed: HRESULT 0x{:08X}", hr as u32));
+            return Err(format!(
+                "Activate(IAudioClient) failed: HRESULT 0x{:08X}",
+                hr as u32
+            ));
         }
         let v = unsafe { client.vtbl::<IAudioClientVtbl>() };
 
@@ -671,25 +688,26 @@ mod imp {
         }
         // 引擎的混音格式原样用：改一个字段就换了一条重采样路径，标定的就不是
         // 生产流走的那一条了。
-        let (rate, block_align) =
-            unsafe { ((*fmt).samples_per_sec, (*fmt).block_align as u32) };
+        let (rate, block_align) = unsafe { ((*fmt).samples_per_sec, (*fmt).block_align as u32) };
         let free_fmt = || unsafe { CoTaskMemFree(fmt as *mut c_void) };
         if rate == 0 || block_align == 0 {
             free_fmt();
-            return Err(format!("mix format is unusable: rate={rate} block_align={block_align}"));
+            return Err(format!(
+                "mix format is unusable: rate={rate} block_align={block_align}"
+            ));
         }
 
         let mut default_100ns: i64 = 0;
         let mut min_100ns: i64 = 0;
-        let period_frames = if unsafe {
-            ((*v).get_device_period)(client.0, &mut default_100ns, &mut min_100ns)
-        } >= 0
-            && default_100ns > 0
-        {
-            (default_100ns as u128 * rate as u128 / 10_000_000u128) as u32
-        } else {
-            0
-        };
+        let period_frames =
+            if unsafe { ((*v).get_device_period)(client.0, &mut default_100ns, &mut min_100ns) }
+                >= 0
+                && default_100ns > 0
+            {
+                (default_100ns as u128 * rate as u128 / 10_000_000u128) as u32
+            } else {
+                0
+            };
 
         let Some(event) = Event::create() else {
             free_fmt();
@@ -711,7 +729,10 @@ mod imp {
         };
         free_fmt();
         if hr < 0 {
-            return Err(format!("IAudioClient::Initialize failed: HRESULT 0x{:08X}", hr as u32));
+            return Err(format!(
+                "IAudioClient::Initialize failed: HRESULT 0x{:08X}",
+                hr as u32
+            ));
         }
         if unsafe { ((*v).set_event_handle)(client.0, event.0) } < 0 {
             return Err("SetEventHandle failed".into());
@@ -746,7 +767,10 @@ mod imp {
 
         let hr = unsafe { ((*v).start)(client.0) };
         if hr < 0 {
-            return Err(format!("IAudioClient::Start failed: HRESULT 0x{:08X}", hr as u32));
+            return Err(format!(
+                "IAudioClient::Start failed: HRESULT 0x{:08X}",
+                hr as u32
+            ));
         }
         let _stop = Started(&client);
 
@@ -784,7 +808,8 @@ mod imp {
             return Err("no steady-state samples collected".into());
         }
         let samples = lag.len() as u32;
-        let spread = lag.iter().max().copied().unwrap_or(0) - lag.iter().min().copied().unwrap_or(0);
+        let spread =
+            lag.iter().max().copied().unwrap_or(0) - lag.iter().min().copied().unwrap_or(0);
         Ok(OutputCalibration {
             frames: median(&mut lag),
             rate,
@@ -807,7 +832,10 @@ mod imp {
         let mut buf: *mut u8 = ptr::null_mut();
         let hr = unsafe { ((*rv).get_buffer)(render.0, frames, &mut buf) };
         if hr < 0 {
-            return Err(format!("IAudioRenderClient::GetBuffer failed: HRESULT 0x{:08X}", hr as u32));
+            return Err(format!(
+                "IAudioRenderClient::GetBuffer failed: HRESULT 0x{:08X}",
+                hr as u32
+            ));
         }
         let hr = unsafe { ((*rv).release_buffer)(render.0, frames, AUDCLNT_BUFFERFLAGS_SILENT) };
         if hr < 0 {
@@ -833,8 +861,10 @@ mod imp {
     use crate::devlat::DevTarget;
 
     pub fn calibrate_output(_t: DevTarget<'_>) -> Result<OutputCalibration, String> {
-        Err("output calibration is Windows-only; CoreAudio exposes the latency properties directly"
-            .into())
+        Err(
+            "output calibration is Windows-only; CoreAudio exposes the latency properties directly"
+                .into(),
+        )
     }
 }
 
@@ -909,10 +939,22 @@ mod tests {
     fn a_calibration_only_matches_the_endpoint_it_was_taken_on() {
         let c = cal(Some("Speakers (ADAM Audio D3V  )"), 48_000, 2012, 576);
         assert!(c.matches(Some("Speakers (ADAM Audio D3V  )"), 48_000));
-        assert!(!c.matches(Some("Odyssey G8 (2- NVIDIA High Definition Audio)"), 48_000), "换端点");
-        assert!(!c.matches(Some("Speakers (ADAM Audio D3V  )"), 44_100), "换速率");
-        assert!(!c.matches(None, 48_000), "对方名字读不到 ⇒ 无法核对 ⇒ 不许命中");
-        assert!(!c.matches(Some("Speakers (ADAM Audio D3V  )"), 0), "速率 0 ⇒ 换算不成毫秒");
+        assert!(
+            !c.matches(Some("Odyssey G8 (2- NVIDIA High Definition Audio)"), 48_000),
+            "换端点"
+        );
+        assert!(
+            !c.matches(Some("Speakers (ADAM Audio D3V  )"), 44_100),
+            "换速率"
+        );
+        assert!(
+            !c.matches(None, 48_000),
+            "对方名字读不到 ⇒ 无法核对 ⇒ 不许命中"
+        );
+        assert!(
+            !c.matches(Some("Speakers (ADAM Audio D3V  )"), 0),
+            "速率 0 ⇒ 换算不成毫秒"
+        );
         // 标定自己没读到名字时，任何比对都不许命中
         let anon = cal(None, 48_000, 2012, 576);
         assert!(!anon.matches(Some("Speakers (ADAM Audio D3V  )"), 48_000));

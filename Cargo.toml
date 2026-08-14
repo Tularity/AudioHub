@@ -8,8 +8,23 @@ members = [
     "core/audiohub-ipc",
     "core/audiohub-cli",
     "core/audiohubd",
+    "tools/audiohub-vad-helper",
 ]
 exclude = ["test"]
 
 [profile.release]
 opt-level = 3
+
+[profile.dev]
+# macOS defaults this to "unpacked": each codegen unit's .o stays in
+# target/debug/deps for the binary that references it to point at, and nothing
+# ever reclaims the ones a recompile orphans. By 2026-08-10 that was 758k files
+# and 12G. "packed" hands the debug info to dsymutil instead, so a rebuild
+# rewrites one .dSYM in place rather than shedding another generation of .o.
+# Debug info itself is unchanged — the .dSYM still carries every local variable.
+#
+# `rustc --print split-debuginfo --target x86_64-pc-windows-gnu` offers only
+# "off", so this value is meaningless there. Cargo ignores it for that target
+# rather than failing: cross-building audiohub-core to windows-gnu with this
+# profile in place still succeeds. Nothing to special-case.
+split-debuginfo = "packed"

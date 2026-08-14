@@ -635,7 +635,10 @@ impl Default for VolumeSync {
 
 impl VolumeSync {
     pub fn new() -> VolumeSync {
-        VolumeSync { reported: None, pending: None }
+        VolumeSync {
+            reported: None,
+            pending: None,
+        }
     }
 
     /// Records that `scalar`/`muted` were just written because the PEER asked.
@@ -776,7 +779,11 @@ mod imp {
     }
 
     fn at(selector: u32, scope: u32, element: u32) -> PropAddr {
-        PropAddr { selector, scope, element }
+        PropAddr {
+            selector,
+            scope,
+            element,
+        }
     }
 
     fn has(dev: AudioObjectID, a: &PropAddr) -> bool {
@@ -885,9 +892,7 @@ mod imp {
 
     fn prop_size(dev: AudioObjectID, a: &PropAddr) -> Option<u32> {
         let mut sz: u32 = 0;
-        let st = unsafe {
-            AudioObjectGetPropertyDataSize(dev, a, 0, std::ptr::null(), &mut sz)
-        };
+        let st = unsafe { AudioObjectGetPropertyDataSize(dev, a, 0, std::ptr::null(), &mut sz) };
         (st == 0).then_some(sz)
     }
 
@@ -1139,7 +1144,10 @@ mod imp {
             .filter_map(|a| get_f32(dev, a).map(|v| (a.element, v)))
             .collect();
         let Some(&(first_elem, first_db)) = dbs.first() else {
-            bail!("{} has a dB volume property that will not read", label(target));
+            bail!(
+                "{} has a dB volume property that will not read",
+                label(target)
+            );
         };
         // Averaged in the GAIN domain, not the dB domain. dB is logarithmic,
         // so averaging it is a geometric mean of amplitude and would call a
@@ -1285,7 +1293,13 @@ mod imp {
 
     impl PropVariant {
         fn empty() -> PropVariant {
-            PropVariant { vt: 0, r1: 0, r2: 0, r3: 0, val: [0; 2] }
+            PropVariant {
+                vt: 0,
+                r1: 0,
+                r2: 0,
+                r3: 0,
+                val: [0; 2],
+            }
         }
     }
 
@@ -1357,11 +1371,8 @@ mod imp {
         base: IUnknownVtbl,
         get_count: usize,
         get_at: usize,
-        get_value: unsafe extern "system" fn(
-            *mut c_void,
-            *const PropertyKey,
-            *mut PropVariant,
-        ) -> HRESULT,
+        get_value:
+            unsafe extern "system" fn(*mut c_void, *const PropertyKey, *mut PropVariant) -> HRESULT,
         set_value: usize,
         commit: usize,
     }
@@ -1382,8 +1393,7 @@ mod imp {
             unsafe extern "system" fn(*mut c_void, f32, *const GUID) -> HRESULT,
         /// `GetMasterVolumeLevel(float *dB)` — the readback half.
         get_master_volume_level: unsafe extern "system" fn(*mut c_void, *mut f32) -> HRESULT,
-        get_master_volume_level_scalar:
-            unsafe extern "system" fn(*mut c_void, *mut f32) -> HRESULT,
+        get_master_volume_level_scalar: unsafe extern "system" fn(*mut c_void, *mut f32) -> HRESULT,
         set_channel_volume_level: usize,
         set_channel_volume_level_scalar: usize,
         get_channel_volume_level: usize,
@@ -1645,11 +1655,7 @@ mod imp {
         (hr >= 0).then_some((lo, hi))
     }
 
-    fn read_gain(
-        ep: &Endpoint,
-        target: Option<&str>,
-        requested: Option<f32>,
-    ) -> Result<GainState> {
+    fn read_gain(ep: &Endpoint, target: Option<&str>, requested: Option<f32>) -> Result<GainState> {
         let v = unsafe { ep.vol.vtbl::<IAudioEndpointVolumeVtbl>() };
         let mut db: f32 = 0.0;
         check(
@@ -1715,7 +1721,11 @@ mod imp {
     use anyhow::{bail, Result};
 
     pub fn get(_target: Option<&str>) -> Result<VolumeState> {
-        Ok(VolumeState { scalar: 0.0, muted: false, adjustable: false })
+        Ok(VolumeState {
+            scalar: 0.0,
+            muted: false,
+            adjustable: false,
+        })
     }
 
     /// Errors rather than reporting a level: a platform with no volume backend
@@ -1749,12 +1759,25 @@ mod mode_a_tests {
     use super::*;
 
     fn peer(scalar: f32, muted: bool) -> VolumeState {
-        VolumeState { scalar, muted, adjustable: true }
+        VolumeState {
+            scalar,
+            muted,
+            adjustable: true,
+        }
     }
 
-    const BOTH_OFF: ModeAVolume = ModeAVolume { sync: false, mute_local: false };
-    const SYNC_ONLY: ModeAVolume = ModeAVolume { sync: true, mute_local: false };
-    const BOTH_ON: ModeAVolume = ModeAVolume { sync: true, mute_local: true };
+    const BOTH_OFF: ModeAVolume = ModeAVolume {
+        sync: false,
+        mute_local: false,
+    };
+    const SYNC_ONLY: ModeAVolume = ModeAVolume {
+        sync: true,
+        mute_local: false,
+    };
+    const BOTH_ON: ModeAVolume = ModeAVolume {
+        sync: true,
+        mute_local: true,
+    };
 
     fn applied(a: FollowAction) -> VolumeWrite {
         match a {
@@ -1772,7 +1795,10 @@ mod mode_a_tests {
             FollowAction::Ignore(_)
         ));
         // ...and 「静音本机」 alone does not smuggle the sync in.
-        let mute_only = ModeAVolume { sync: false, mute_local: true };
+        let mute_only = ModeAVolume {
+            sync: false,
+            mute_local: true,
+        };
         assert!(matches!(
             classify_follow(true, true, mute_only, peer(0.5, false)),
             FollowAction::Ignore(_)
@@ -1809,7 +1835,11 @@ mod mode_a_tests {
     #[test]
     fn muting_this_machine_suppresses_the_mute_half_and_only_that_half() {
         let with = applied(classify_follow(true, true, SYNC_ONLY, peer(0.25, true)));
-        assert_eq!(with.muted, Some(true), "with 「静音本机」 off the mute travels");
+        assert_eq!(
+            with.muted,
+            Some(true),
+            "with 「静音本机」 off the mute travels"
+        );
         assert_eq!(with.scalar, 0.25);
 
         let without = applied(classify_follow(true, true, BOTH_ON, peer(0.25, true)));
@@ -1829,8 +1859,15 @@ mod mode_a_tests {
     /// held inbound only would still mute the peer.
     #[test]
     fn the_same_rule_answers_for_the_outbound_direction() {
-        let local = VolumeState { scalar: 0.8, muted: true, adjustable: true };
-        assert_eq!(applied(classify_follow(true, true, BOTH_ON, local)).muted, None);
+        let local = VolumeState {
+            scalar: 0.8,
+            muted: true,
+            adjustable: true,
+        };
+        assert_eq!(
+            applied(classify_follow(true, true, BOTH_ON, local)).muted,
+            None
+        );
         assert_eq!(
             applied(classify_follow(true, true, SYNC_ONLY, local)).muted,
             Some(true)
@@ -1839,8 +1876,14 @@ mod mode_a_tests {
 
     #[test]
     fn a_peer_scalar_outside_the_range_is_clamped_not_refused() {
-        assert_eq!(applied(classify_follow(true, true, SYNC_ONLY, peer(9.0, false))).scalar, 1.0);
-        assert_eq!(applied(classify_follow(true, true, SYNC_ONLY, peer(-9.0, false))).scalar, 0.0);
+        assert_eq!(
+            applied(classify_follow(true, true, SYNC_ONLY, peer(9.0, false))).scalar,
+            1.0
+        );
+        assert_eq!(
+            applied(classify_follow(true, true, SYNC_ONLY, peer(-9.0, false))).scalar,
+            0.0
+        );
     }
 
     /// A device with no volume control reports the scalar it does not have as
@@ -1854,20 +1897,32 @@ mod mode_a_tests {
     /// own absent reading onto a peer whose speaker is fine.
     #[test]
     fn a_device_with_no_volume_control_reports_an_absence_not_a_level() {
-        let aggregate = VolumeState { scalar: 0.0, muted: false, adjustable: false };
+        let aggregate = VolumeState {
+            scalar: 0.0,
+            muted: false,
+            adjustable: false,
+        };
         assert!(
-            matches!(classify_follow(true, true, SYNC_ONLY, aggregate), FollowAction::Ignore(_)),
+            matches!(
+                classify_follow(true, true, SYNC_ONLY, aggregate),
+                FollowAction::Ignore(_)
+            ),
             "an aggregate device's 0.0 was adopted as a volume: this mutes the other machine, \
              and the user cannot turn it back up"
         );
         // Not about the value: any reading from a device with no control is an
         // absence, even one that happens to look plausible.
         assert!(matches!(
-            classify_follow(true, true, SYNC_ONLY, VolumeState {
-                scalar: 0.4,
-                muted: false,
-                adjustable: false
-            }),
+            classify_follow(
+                true,
+                true,
+                SYNC_ONLY,
+                VolumeState {
+                    scalar: 0.4,
+                    muted: false,
+                    adjustable: false
+                }
+            ),
             FollowAction::Ignore(_)
         ));
     }
@@ -1882,7 +1937,10 @@ mod mode_a_tests {
             classify_mute_on_connect(false, BOTH_ON, None),
             MuteOnConnect::Skip(_)
         ));
-        assert_eq!(classify_mute_on_connect(true, BOTH_ON, None), MuteOnConnect::Mute);
+        assert_eq!(
+            classify_mute_on_connect(true, BOTH_ON, None),
+            MuteOnConnect::Mute
+        );
     }
 
     /// plan §7.1 的技术前提：捕获点位在音量之后的后端上，静音会连镜像一起静掉。
@@ -1893,10 +1951,16 @@ mod mode_a_tests {
             classify_mute_on_connect(true, BOTH_ON, Some(false)),
             MuteOnConnect::Skip(_)
         ));
-        assert_eq!(classify_mute_on_connect(true, BOTH_ON, Some(true)), MuteOnConnect::Mute);
+        assert_eq!(
+            classify_mute_on_connect(true, BOTH_ON, Some(true)),
+            MuteOnConnect::Mute
+        );
         // Unknown is NOT treated as post-mix: the user asked, unmuting undoes
         // it, and a switch that silently does nothing is the worse failure.
-        assert_eq!(classify_mute_on_connect(true, BOTH_ON, None), MuteOnConnect::Mute);
+        assert_eq!(
+            classify_mute_on_connect(true, BOTH_ON, None),
+            MuteOnConnect::Mute
+        );
     }
 
     /// The consumer's echo suppression is the provider's, reused (plan §7.1
@@ -1907,7 +1971,11 @@ mod mode_a_tests {
     fn a_value_adopted_from_the_peer_is_not_reported_back_as_ours() {
         let mut s = VolumeSync::new();
         s.note_peer_apply(0.4, false);
-        assert_eq!(s.poll(peer(0.4, false)), None, "that is the peer's own value coming back");
+        assert_eq!(
+            s.poll(peer(0.4, false)),
+            None,
+            "that is the peer's own value coming back"
+        );
         // A genuine move afterwards still travels.
         assert!(s.poll(peer(0.9, false)).is_some());
     }
@@ -1928,17 +1996,29 @@ mod send_gain_authority_tests {
         assert_eq!(authority_for(None), VolumeAuthority::Peer);
         // 对端设备能调 ⇒ 走控制面（线上满幅），这是默认路径。
         assert_eq!(
-            authority_for(Some(VolumeState { scalar: 0.4, muted: false, adjustable: true })),
+            authority_for(Some(VolumeState {
+                scalar: 0.4,
+                muted: false,
+                adjustable: true
+            })),
             VolumeAuthority::Peer
         );
         // 对端设备不能调 ⇒ 本机接手（macOS 聚合设备：scalar 恒为 0 且不可写）。
         assert_eq!(
-            authority_for(Some(VolumeState { scalar: 0.0, muted: false, adjustable: false })),
+            authority_for(Some(VolumeState {
+                scalar: 0.0,
+                muted: false,
+                adjustable: false
+            })),
             VolumeAuthority::SendGain
         );
         // 静音态与判据无关：能不能调是设备的事，静没静音是状态。
         assert_eq!(
-            authority_for(Some(VolumeState { scalar: 0.9, muted: true, adjustable: false })),
+            authority_for(Some(VolumeState {
+                scalar: 0.9,
+                muted: true,
+                adjustable: false
+            })),
             VolumeAuthority::SendGain
         );
     }
@@ -1995,7 +2075,9 @@ mod gain_tests {
             muted: false,
             adjustable: true,
         };
-        let asked = clamped.requested_db().expect("a write must remember what it asked for");
+        let asked = clamped
+            .requested_db()
+            .expect("a write must remember what it asked for");
         assert!(
             (asked - (-80.0)).abs() <= SAME_DB,
             "the request was lost, only the result survived: {asked} dB"
@@ -2019,10 +2101,16 @@ mod gain_tests {
             applied_db: -30.0,
             ..clamped
         };
-        assert!(!complied.clamped(), "a compliant device must not read as clamped");
+        assert!(
+            !complied.clamped(),
+            "a compliant device must not read as clamped"
+        );
 
         // A plain read asked for nothing, so it cannot have fallen short of it.
-        let read = GainState { requested: None, ..clamped };
+        let read = GainState {
+            requested: None,
+            ..clamped
+        };
         assert_eq!(read.requested_db(), None);
         assert_eq!(read.shortfall_db(), None);
         assert!(!read.clamped());
@@ -2100,7 +2188,9 @@ mod output_gain_hardware_tests {
 
     fn default_output_name() -> Option<String> {
         use cpal::traits::{DeviceTrait, HostTrait};
-        cpal::default_host().default_output_device().and_then(|d| d.name().ok())
+        cpal::default_host()
+            .default_output_device()
+            .and_then(|d| d.name().ok())
     }
 
     fn output_device_names() -> Vec<String> {
@@ -2151,7 +2241,11 @@ mod output_gain_hardware_tests {
                 original.adjustable,
                 "{device:?} exposes no writable volume, so nothing here could be put back"
             );
-            GainGuard { device: device.to_string(), original, done: false }
+            GainGuard {
+                device: device.to_string(),
+                original,
+                done: false,
+            }
         }
 
         /// Puts it back and VERIFIES it landed. `Drop` is the net underneath
@@ -2224,7 +2318,10 @@ mod output_gain_hardware_tests {
         let witness = DefaultOutputWitness::take();
 
         let before = get_output_gain(Some(&dev)).expect("read the dB volume before touching it");
-        assert!(before.adjustable, "{dev:?} exposes no writable dB volume: {before:?}");
+        assert!(
+            before.adjustable,
+            "{dev:?} exposes no writable dB volume: {before:?}"
+        );
 
         let after = {
             let mut g = GainGuard::capture(&dev);
@@ -2238,7 +2335,10 @@ mod output_gain_hardware_tests {
             "asked {dev:?} for −30 dB, it landed at {:.4} dB (threshold {SAME_DB} dB)",
             after.applied_db
         );
-        assert!(!after.clamped(), "a −30 dB request should be in range: {after:?}");
+        assert!(
+            !after.clamped(),
+            "a −30 dB request should be in range: {after:?}"
+        );
         assert_eq!(
             after.requested_db().map(f32::round),
             Some(-30.0),
@@ -2259,7 +2359,10 @@ mod output_gain_hardware_tests {
         let witness = DefaultOutputWitness::take();
 
         let before = get_output_gain(Some(&dev)).expect("read the dB volume before touching it");
-        assert!(before.adjustable, "{dev:?} exposes no writable dB volume: {before:?}");
+        assert!(
+            before.adjustable,
+            "{dev:?} exposes no writable dB volume: {before:?}"
+        );
         let (floor, _) = before.range_db.unwrap_or_else(|| {
             panic!("{dev:?} publishes no dB range, so \"out of range\" has no meaning on it")
         });
@@ -2276,7 +2379,9 @@ mod output_gain_hardware_tests {
             got
         };
 
-        let asked = got.requested_db().expect("a write must remember what it asked for");
+        let asked = got
+            .requested_db()
+            .expect("a write must remember what it asked for");
         assert!(
             (asked - (-80.0)).abs() <= SAME_DB,
             "the request was lost: −80 dB came back as {asked} dB"
@@ -2295,7 +2400,10 @@ mod output_gain_hardware_tests {
         // Measured (design §9): a device at its dB floor does NOT mute itself,
         // so §3.2's "also set the mute control" stays the caller's job and must
         // not be smuggled in here.
-        assert_eq!(got.muted, before.muted, "a gain write must not touch the mute control");
+        assert_eq!(
+            got.muted, before.muted,
+            "a gain write must not touch the mute control"
+        );
         witness.check();
     }
 
@@ -2334,7 +2442,10 @@ mod output_gain_hardware_tests {
             // A device above unity would be pulled DOWN by the wire's 0..=1
             // clamp, so the no-op would stop being one. Leave it alone.
             if state.applied > 1.0 {
-                skipped.push((name, format!("sits above unity ({:.2} dB)", state.applied_db)));
+                skipped.push((
+                    name,
+                    format!("sits above unity ({:.2} dB)", state.applied_db),
+                ));
                 continue;
             }
             let wrote = set_output_gain(Some(&name), state.applied);
@@ -2447,7 +2558,9 @@ mod output_volume_guard_hardware_tests {
 
         let mid = {
             let mut g = OutputVolumeGuard::capture(Some(&dev)).expect("capture the guard");
-            let mid = g.set_volume(before.scalar * 0.25).expect("write the volume");
+            let mid = g
+                .set_volume(before.scalar * 0.25)
+                .expect("write the volume");
             g.restore().expect("restore must report its own failure");
             mid
         };
@@ -2478,11 +2591,15 @@ mod output_volume_guard_hardware_tests {
         let _serial = lock();
         let dev = device();
         let before = get_output_volume(Some(&dev)).expect("read the device before touching it");
-        assert!(before.adjustable && before.scalar > 0.2, "{dev:?}: {before:?}");
+        assert!(
+            before.adjustable && before.scalar > 0.2,
+            "{dev:?}: {before:?}"
+        );
 
         let caught = catch_unwind(AssertUnwindSafe(|| {
             let mut g = OutputVolumeGuard::capture(Some(&dev)).expect("capture the guard");
-            g.set_volume(before.scalar * 0.25).expect("write the volume");
+            g.set_volume(before.scalar * 0.25)
+                .expect("write the volume");
             g.set_mute(true).expect("write the mute");
             panic!("injected: a measurement leg died here");
         }));

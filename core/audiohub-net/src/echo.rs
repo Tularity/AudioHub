@@ -142,7 +142,8 @@ pub fn run_echo_client(
                             && pl.len() >= 8
                         {
                             let echoed_us = u64::from_le_bytes(pl[..8].try_into().unwrap());
-                            let rtt_us = (start.elapsed().as_micros() as u64).saturating_sub(echoed_us);
+                            let rtt_us =
+                                (start.elapsed().as_micros() as u64).saturating_sub(echoed_us);
                             rtts.push(rtt_us as f64 / 1000.0);
                             break;
                         }

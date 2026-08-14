@@ -59,12 +59,11 @@ INF / CAT     AudioHubVad.inf / AudioHubVad.cat
 Class         MEDIA {4d36e96c-e325-11ce-bfc1-08002be10318}
 
 端点          未配对时为 0 个。
-              每配对一台对端 +2 个，接口引用串是
+              每台对端按它实际具备的默认输入/输出增加 0–2 个；接口引用串是
                   AhWaveOut-<16位指纹> / AhTopoOut-<16位指纹>
                   AhWaveIn -<16位指纹> / AhTopoIn -<16位指纹>
-              用户看到的名字由系统合成为「<pin 名> (<devnode FriendlyName>)」，
-              即「AudioHub – <对端主机名> 扬声器 (AudioHub Virtual Audio)」。
-              括号前那一整段与 macOS 的「AudioHub – <主机名> 扬声器」逐字相同。
+              每个方向的端点属性都写同一个可见名称「AudioHub – <对端主机名>」；
+              输出/输入由 Windows 的设备分类、数据流与图标区分，不再在名称末尾重复。
 ```
 
 > **引用串用对端指纹而不是槽位号**，这是本阶段最重要的正确性决定：
@@ -80,19 +79,17 @@ Class         MEDIA {4d36e96c-e325-11ce-bfc1-08002be10318}
 > 而给 KS 接口写同一属性，注册表里逐字读得到、端点名毫无变化。
 > devnode 只有一个、被所有对端共享，所以**括号那半永远无法表达每对端不同的名字**。
 >
-> 能表达的是**括号前那半 = pin 名**（per-filter）。因此每个槽位分到一个
+> 能表达的是端点接口自己的 `PKEY_Device_DeviceDesc`（per-direction）。因此每个槽位分到一个
 > **由对端指纹确定性派生**的 pin 名 GUID（形如
 > `{9F3C7A21-6B48-4D00-<指纹前 4 位>-<指纹后 12 位>}`，第三段末位 0=渲染 1=采集），
-> 驱动在绑定时把 `AudioHub – <主机名> 扬声器` 写进
-> `MediaCategories\{该 GUID}\Name`，解绑时删除。
-> 「扬声器 / 麦克风」这两个词**不写死在 .cpp 里**，而是驱动启动时从 INF 装好的那两条
-> 静态 `MediaCategories` 项里**读回来**——本地化字符串只留 INF 一份，且 `.cpp` 保持纯 ASCII
-> （非 ASCII 源码字面量会被 MSVC 按构建机的 ANSI 代码页解码）。
+> 驱动在绑定时把同一个 `AudioHub – <主机名>` 写进两个方向各自接口的 `EP\0`
+> 设备描述属性，解绑时删除。INF 的通用方向词仍只作为属性写入失败时的系统回退，
+> 正常的每对端名称不含「扬声器 / 麦克风」后缀。
 >
 > 写不进去时**回退**为 INF 的静态 GUID（名字变成通用的「扬声器 (AudioHub Virtual Audio)」），
-> 并在 `AH_BIND_REPLY.flags` 里置 `AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK`
+> 并在 `AH_BIND_REPLY.flags` 里置名称回退标志
 > 一路上报到 `daemon.status` 的 `hal.pin_name_fallbacks`。
-> 回退不算失败（设备可用），但绝不静默——两台对端同时配对时它意味着两个同名扬声器。
+> 回退不算失败（设备可用），但绝不静默——多台对端同时配对时它会让同方向设备重名。
 
 ---
 

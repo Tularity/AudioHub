@@ -71,17 +71,22 @@ describe('backendOptions: the daemon is the authority when it speaks', () => {
     ]);
   });
 
-  // The note is the ONLY place the reason a row is grey ever appears, and the
-  // daemon's carries this host's live state (OS build, last consent refusal)
-  // that no static catalogue entry can know.
-  it('prefers the daemon note over the static catalogue', () => {
+  // `available` / `declined` remain daemon-owned facts, but its prose may use
+  // another locale. Known product vocabulary must come from the UI catalogue.
+  it('localizes a known backend note instead of exposing daemon prose', () => {
     const [opt] = backendOptions(daemon([backend({ note: 'the last attempt was refused' })]));
-    expect(opt.note).toBe('the last attempt was refused');
+    expect(opt.note).not.toBe('the last attempt was refused');
+    expect(opt.note).not.toBe('');
   });
 
-  it('falls back to the catalogue note when the daemon sends an empty one', () => {
+  it('uses the catalogue note when the daemon sends an empty one', () => {
     const [opt] = backendOptions(daemon([backend({ note: '' })]));
     expect(opt.note).not.toBe('');
+  });
+
+  it('keeps daemon prose only as a compatibility fallback for an unknown backend', () => {
+    const [opt] = backendOptions(daemon([backend({ id: 'future-backend', note: 'future note' })]));
+    expect(opt.note).toBe('future note');
   });
 
   // core holds `declined => !available`. A malformed report claiming both must

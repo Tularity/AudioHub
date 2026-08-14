@@ -347,9 +347,8 @@ mod tests {
         // The states are meant to read as a progression. Total ink is the
         // cheapest proxy for "taller wave", and it catches an asset set
         // regenerated with the amplitudes shuffled.
-        let ink = |s: IconState| -> u64 {
-            s.tray_bytes().chunks_exact(4).map(|p| p[3] as u64).sum()
-        };
+        let ink =
+            |s: IconState| -> u64 { s.tray_bytes().chunks_exact(4).map(|p| p[3] as u64).sum() };
         assert!(ink(IconState::Offline) < ink(IconState::Connecting));
         assert!(ink(IconState::Connecting) < ink(IconState::Idle));
         assert!(ink(IconState::Idle) < ink(IconState::Active));

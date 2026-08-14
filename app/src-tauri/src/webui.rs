@@ -98,7 +98,11 @@ fn default_true() -> bool {
 
 impl Default for WebUiSettings {
     fn default() -> Self {
-        Self { enabled: false, port: DEFAULT_PORT, local_only: true }
+        Self {
+            enabled: false,
+            port: DEFAULT_PORT,
+            local_only: true,
+        }
     }
 }
 
@@ -151,7 +155,11 @@ struct Inner {
 fn state() -> &'static Mutex<Inner> {
     static STATE: OnceLock<Mutex<Inner>> = OnceLock::new();
     STATE.get_or_init(|| {
-        Mutex::new(Inner { settings: load_settings(), running: None, error: None })
+        Mutex::new(Inner {
+            settings: load_settings(),
+            running: None,
+            error: None,
+        })
     })
 }
 
@@ -171,7 +179,10 @@ fn load_settings() -> WebUiSettings {
         Ok(s) => s,
         Err(e) => {
             // 坏文件不该把网页服务变成"随机开着"：回到全默认（关闭 + 仅本机）。
-            warn(&format!("webui: {} 解析失败（{e}），使用默认设置", settings_path().display()));
+            warn(&format!(
+                "webui: {} 解析失败（{e}），使用默认设置",
+                settings_path().display()
+            ));
             WebUiSettings::default()
         }
     }
@@ -179,7 +190,8 @@ fn load_settings() -> WebUiSettings {
 
 fn save_settings(s: &WebUiSettings) -> Result<(), String> {
     let dir = config_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建配置目录 {}：{e}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("无法创建配置目录 {}：{e}", dir.display()))?;
     let body = serde_json::to_vec_pretty(s).map_err(|e| format!("序列化设置失败：{e}"))?;
     std::fs::write(settings_path(), body)
         .map_err(|e| format!("无法写入 {}：{e}", settings_path().display()))
@@ -208,7 +220,9 @@ enum Content {
 /// `exe/../../..` 就是 /Applications 本身，让谁能在那儿建个 `ui/` 谁就能决定这个
 /// 服务发什么——`daemon_binary()` 出于同样的理由把开发态候选关在 debug 里。
 fn disk_root() -> Option<PathBuf> {
-    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(PathBuf::from));
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(PathBuf::from));
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(p) = std::env::var_os(ROOT_ENV) {
         if !p.is_empty() {
@@ -239,8 +253,11 @@ impl Content {
             return Content::Dir(dir);
         }
         // 打包形态的常态：frontendDist 被编译进了可执行文件，磁盘上并没有 ui/。
-        let keys: HashSet<String> =
-            app.asset_resolver().iter().map(|(k, _)| k.into_owned()).collect();
+        let keys: HashSet<String> = app
+            .asset_resolver()
+            .iter()
+            .map(|(k, _)| k.into_owned())
+            .collect();
         Content::Embedded(keys, app.clone())
     }
 
@@ -326,7 +343,10 @@ fn sanitize(path: &str) -> Option<Vec<String>> {
 }
 
 fn mime_for(name: &str) -> &'static str {
-    let ext = Path::new(name).extension().and_then(OsStr::to_str).unwrap_or("");
+    let ext = Path::new(name)
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("");
     match ext.to_ascii_lowercase().as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
@@ -399,7 +419,14 @@ fn text_response(
     msg: &str,
     head_only: bool,
 ) -> std::io::Result<()> {
-    write_response(stream, status, "text/plain; charset=utf-8", msg.as_bytes(), head_only, &[])
+    write_response(
+        stream,
+        status,
+        "text/plain; charset=utf-8",
+        msg.as_bytes(),
+        head_only,
+        &[],
+    )
 }
 
 /// 读到请求头结束（`\r\n\r\n`）为止，带上限。返回头部字节。
@@ -416,7 +443,10 @@ fn read_head(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
             return Ok(buf);
         }
         if buf.len() > MAX_HEAD {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "请求头过大"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "请求头过大",
+            ));
         }
     }
 }
@@ -447,7 +477,9 @@ fn host_allowed(head: &str) -> bool {
     if name.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    name.parse::<IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+    name.parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 fn handle(stream: &mut TcpStream, ctx: &Ctx) -> std::io::Result<()> {
@@ -457,7 +489,12 @@ fn handle(stream: &mut TcpStream, ctx: &Ctx) -> std::io::Result<()> {
 
     // local_only 时端口就 bind 在回环上，非本机的包根本到不了这里。再核一遍是
     // 兜底：万一将来 bind 逻辑被改坏，这一行仍然拦得住。
-    if ctx.local_only && !stream.peer_addr().map(|a| a.ip().is_loopback()).unwrap_or(false) {
+    if ctx.local_only
+        && !stream
+            .peer_addr()
+            .map(|a| a.ip().is_loopback())
+            .unwrap_or(false)
+    {
         return text_response(stream, "403 Forbidden", "403 仅允许本机访问", false);
     }
 
@@ -485,7 +522,12 @@ fn handle(stream: &mut TcpStream, ctx: &Ctx) -> std::io::Result<()> {
         );
     }
     if ctx.local_only && !host_allowed(&head) {
-        return text_response(stream, "421 Misdirected Request", "421 Host 不是本机地址", head_only);
+        return text_response(
+            stream,
+            "421 Misdirected Request",
+            "421 Host 不是本机地址",
+            head_only,
+        );
     }
 
     // 查询串与片段不参与路由。
@@ -525,7 +567,11 @@ fn handle(stream: &mut TcpStream, ctx: &Ctx) -> std::io::Result<()> {
     let Some(segments) = sanitize(path) else {
         return text_response(stream, "400 Bad Request", "400 请求路径非法", head_only);
     };
-    let rel = if segments.is_empty() { "index.html".to_string() } else { segments.join("/") };
+    let rel = if segments.is_empty() {
+        "index.html".to_string()
+    } else {
+        segments.join("/")
+    };
 
     // 内容哈希过的 assets/* 可以长缓存；index.html 不行（换版本就换内容）。
     let cache = if rel.starts_with("assets/") {
@@ -628,7 +674,12 @@ fn start_with(settings: WebUiSettings, content: Content) -> Result<Running, Stri
             let Ok(mut stream) = conn else { continue };
             if ctx.inflight.fetch_add(1, Ordering::AcqRel) >= MAX_INFLIGHT {
                 ctx.inflight.fetch_sub(1, Ordering::AcqRel);
-                let _ = text_response(&mut stream, "503 Service Unavailable", "503 连接过多", false);
+                let _ = text_response(
+                    &mut stream,
+                    "503 Service Unavailable",
+                    "503 连接过多",
+                    false,
+                );
                 continue;
             }
             let ctx = ctx.clone();
@@ -648,8 +699,14 @@ fn start_with(settings: WebUiSettings, content: Content) -> Result<Running, Stri
 
     warn(&format!(
         "webui: 监听 {addr}（{}{}）{}",
-        if local_only { "仅本机" } else { "局域网可见 · 无鉴权" },
-        root.as_ref().map(|r| format!(" · {r}")).unwrap_or_else(|| " · 内嵌资源".into()),
+        if local_only {
+            "仅本机"
+        } else {
+            "局域网可见 · 无鉴权"
+        },
+        root.as_ref()
+            .map(|r| format!(" · {r}"))
+            .unwrap_or_else(|| " · 内嵌资源".into()),
         // 放开局域网时把探到的出口地址一并写进日志：界面上那一行同源自这里，
         // 日志里有它才能在不开界面的情况下确认探测确实成功了。
         if local_only {
@@ -660,7 +717,13 @@ fn start_with(settings: WebUiSettings, content: Content) -> Result<Running, Stri
                 .unwrap_or_else(|| " 局域网入口：未能探测到出口地址".into())
         }
     ));
-    Ok(Running { stop, port: settings.port, join, source, root })
+    Ok(Running {
+        stop,
+        port: settings.port,
+        join,
+        source,
+        root,
+    })
 }
 
 fn stop_running(running: Option<Running>) {
@@ -692,9 +755,9 @@ fn status_locked(inner: &Inner) -> WebUiStatus {
         local_only_locked: FORCE_LOCAL_ONLY,
         running: running.is_some(),
         url: running.map(|r| format!("http://127.0.0.1:{}/", r.port)),
-        lan_url: running.filter(|_| !local_only).and_then(|r| {
-            lan_ip().map(|ip| format!("http://{ip}:{}/", r.port))
-        }),
+        lan_url: running
+            .filter(|_| !local_only)
+            .and_then(|r| lan_ip().map(|ip| format!("http://{ip}:{}/", r.port))),
         source: running.map(|r| r.source),
         root: running.and_then(|r| r.root.clone()),
         error: inner.error.clone(),
@@ -807,7 +870,10 @@ mod tests {
             vec!["assets", "index-BHJpio2U.css"]
         );
         // 百分号解码后仍是普通文件名。
-        assert_eq!(sanitize("/assets/a%20b.js").unwrap(), vec!["assets", "a b.js"]);
+        assert_eq!(
+            sanitize("/assets/a%20b.js").unwrap(),
+            vec!["assets", "a b.js"]
+        );
     }
 
     /// 一次完整的请求-应答，读到服务端关连接为止（我们恒发 Connection: close）。
@@ -822,7 +888,10 @@ mod tests {
     }
 
     fn get(port: u16, path: &str) -> String {
-        req(port, &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"))
+        req(
+            port,
+            &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        )
     }
 
     fn free_port() -> u16 {
@@ -841,7 +910,11 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("audiohub-webui-{stamp}"));
         let root = tmp.join("ui");
         std::fs::create_dir_all(root.join("assets")).unwrap();
-        std::fs::write(root.join("index.html"), "<!doctype html><title>AH-INDEX</title>").unwrap();
+        std::fs::write(
+            root.join("index.html"),
+            "<!doctype html><title>AH-INDEX</title>",
+        )
+        .unwrap();
         std::fs::write(root.join("assets/app.js"), "export const AH='JS';").unwrap();
         // 闸门之外的文件：任何一次穿越尝试只要拿到它，测试就该红。
         std::fs::write(tmp.join("secret.txt"), "AH-SECRET-LEAKED").unwrap();
@@ -850,7 +923,10 @@ mod tests {
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::write(
             cfg.join("ipc.json"),
-            br#"{"ipc_version":1,"port":54321,"token":"tok-abc","pid":4242}"#,
+            format!(
+                r#"{{"ipc_version":{},"port":54321,"token":"tok-abc","pid":4242}}"#,
+                crate::IPC_VERSION,
+            ),
         )
         .unwrap();
         std::env::set_var("AUDIOHUB_CONFIG_DIR", &cfg);
@@ -858,7 +934,11 @@ mod tests {
         let port = free_port();
         let canonical = std::fs::canonicalize(&root).unwrap();
         let running = start_with(
-            WebUiSettings { enabled: true, port, local_only: true },
+            WebUiSettings {
+                enabled: true,
+                port,
+                local_only: true,
+            },
             Content::Dir(canonical),
         )
         .expect("监听失败");
@@ -869,13 +949,20 @@ mod tests {
         assert!(index.contains("AH-INDEX"), "{index}");
         assert!(index.contains("text/html"), "{index}");
         let js = get(port, "/assets/app.js");
-        assert!(js.starts_with("HTTP/1.1 200 OK") && js.contains("text/javascript"), "{js}");
+        assert!(
+            js.starts_with("HTTP/1.1 200 OK") && js.contains("text/javascript"),
+            "{js}"
+        );
         assert!(get(port, "/nope.js").starts_with("HTTP/1.1 404"));
 
         // /ipc-endpoint：三个字段，**不含 pid**
         let ep = get(port, "/ipc-endpoint");
         assert!(ep.starts_with("HTTP/1.1 200 OK"), "{ep}");
-        assert!(ep.contains(r#""ipc_version":1"#) && ep.contains(r#""port":54321"#), "{ep}");
+        assert!(
+            ep.contains(&format!(r#""ipc_version":{}"#, crate::IPC_VERSION))
+                && ep.contains(r#""port":54321"#),
+            "{ep}"
+        );
         assert!(ep.contains(r#""token":"tok-abc""#), "{ep}");
         assert!(!ep.contains("pid"), "pid 不该出现在回包里：{ep}");
 
@@ -894,9 +981,15 @@ mod tests {
         }
 
         // Host 闸门（仅本机模式）与方法白名单
-        let rebind = req(port, &format!("GET / HTTP/1.1\r\nHost: evil.example:{port}\r\n\r\n"));
+        let rebind = req(
+            port,
+            &format!("GET / HTTP/1.1\r\nHost: evil.example:{port}\r\n\r\n"),
+        );
         assert!(rebind.starts_with("HTTP/1.1 421"), "{rebind}");
-        let post = req(port, &format!("POST / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"));
+        let post = req(
+            port,
+            &format!("POST / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        );
         assert!(post.starts_with("HTTP/1.1 405"), "{post}");
 
         // 停服：端口必须真的交回来，否则「改端口立即生效」只是看起来生效
@@ -915,62 +1008,120 @@ mod tests {
         let p1 = free_port();
         let st = apply_patch(
             &mut inner,
-            WebUiPatch { enabled: Some(true), port: Some(p1), local_only: Some(true) },
+            WebUiPatch {
+                enabled: Some(true),
+                port: Some(p1),
+                local_only: Some(true),
+            },
             &make,
         )
         .expect("启用失败");
         assert!(st.running && st.enabled && st.local_only, "{st:?}");
-        assert_eq!(st.url.as_deref(), Some(format!("http://127.0.0.1:{p1}/").as_str()));
+        assert_eq!(
+            st.url.as_deref(),
+            Some(format!("http://127.0.0.1:{p1}/").as_str())
+        );
         assert!(get(p1, "/").contains("AH-INDEX"));
         // 落盘了，而且落的是 App 自己的文件——不是 daemon 的 settings.json。
         let saved = std::fs::read_to_string(cfg.join("webui.json")).unwrap();
-        assert!(saved.contains("\"enabled\": true") && saved.contains(&p1.to_string()), "{saved}");
+        assert!(
+            saved.contains("\"enabled\": true") && saved.contains(&p1.to_string()),
+            "{saved}"
+        );
 
         // 改端口：旧端口必须当场空出来，新端口当场能服务。
         let p2 = free_port();
-        let st = apply_patch(&mut inner, WebUiPatch { port: Some(p2), ..Default::default() }, &make)
-            .expect("改端口失败");
+        let st = apply_patch(
+            &mut inner,
+            WebUiPatch {
+                port: Some(p2),
+                ..Default::default()
+            },
+            &make,
+        )
+        .expect("改端口失败");
         assert!(st.running && st.port == p2);
         assert!(get(p2, "/").contains("AH-INDEX"));
-        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, p1)).is_ok(), "旧端口没被交回");
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, p1)).is_ok(),
+            "旧端口没被交回"
+        );
 
         // local_only 关：**必须依然只绑回环**（FORCE_LOCAL_ONLY，plan §7.5 用户裁定）。
         // 判据是两次 bind 的结果，不是我们自己报的字段——回环被占住、通配地址空着，
         // 才证明监听真的在 127.0.0.1 上。
-        let st =
-            apply_patch(&mut inner, WebUiPatch { local_only: Some(false), ..Default::default() }, &make)
-                .expect("写 local_only=false 失败");
+        let st = apply_patch(
+            &mut inner,
+            WebUiPatch {
+                local_only: Some(false),
+                ..Default::default()
+            },
+            &make,
+        )
+        .expect("写 local_only=false 失败");
         assert!(st.running, "{st:?}");
-        assert!(st.local_only && st.local_only_locked, "生效值应当仍是「仅本机」：{st:?}");
+        assert!(
+            st.local_only && st.local_only_locked,
+            "生效值应当仍是「仅本机」：{st:?}"
+        );
         assert!(st.lan_url.is_none(), "锁死期间不该报出局域网地址：{st:?}");
         assert!(
             TcpListener::bind((Ipv4Addr::LOCALHOST, p2)).is_err(),
             "回环端口没被占——监听根本没起来？"
         );
         let wildcard = TcpListener::bind((Ipv4Addr::UNSPECIFIED, p2));
-        assert!(wildcard.is_ok(), "local_only=false 竟然绑上了对外地址：{:?}", wildcard.err());
+        assert!(
+            wildcard.is_ok(),
+            "local_only=false 竟然绑上了对外地址：{:?}",
+            wildcard.err()
+        );
         drop(wildcard);
         // 配置**原样保留**（schema 不动，将来解锁是一行的事，不是一次迁移）。
         let saved = std::fs::read_to_string(cfg.join("webui.json")).unwrap();
-        assert!(saved.contains("\"local_only\": false"), "存的值被悄悄改写了：{saved}");
+        assert!(
+            saved.contains("\"local_only\": false"),
+            "存的值被悄悄改写了：{saved}"
+        );
 
         // 再写回 true：生效值不变，服务照常。
-        let st =
-            apply_patch(&mut inner, WebUiPatch { local_only: Some(true), ..Default::default() }, &make)
-                .expect("写 local_only=true 失败");
+        let st = apply_patch(
+            &mut inner,
+            WebUiPatch {
+                local_only: Some(true),
+                ..Default::default()
+            },
+            &make,
+        )
+        .expect("写 local_only=true 失败");
         assert!(st.running && st.local_only);
         assert!(get(p2, "/").contains("AH-INDEX"));
 
         // 关掉：端口彻底交回。
-        let st =
-            apply_patch(&mut inner, WebUiPatch { enabled: Some(false), ..Default::default() }, &make)
-                .expect("关闭失败");
+        let st = apply_patch(
+            &mut inner,
+            WebUiPatch {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            &make,
+        )
+        .expect("关闭失败");
         assert!(!st.running && !st.enabled && st.url.is_none());
-        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, p2)).is_ok(), "关闭后端口仍被占用");
+        assert!(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, p2)).is_ok(),
+            "关闭后端口仍被占用"
+        );
 
         // 端口下限：拒绝且不改变正在运行的状态。
-        assert!(apply_patch(&mut inner, WebUiPatch { port: Some(80), ..Default::default() }, &make)
-            .is_err());
+        assert!(apply_patch(
+            &mut inner,
+            WebUiPatch {
+                port: Some(80),
+                ..Default::default()
+            },
+            &make
+        )
+        .is_err());
         drop(inner);
 
         std::env::remove_var("AUDIOHUB_CONFIG_DIR");
@@ -982,17 +1133,31 @@ mod tests {
     #[test]
     fn lan_ip_is_sane_or_absent() {
         if let Some(ip) = lan_ip() {
-            assert!(!ip.is_loopback() && !ip.is_unspecified(), "探到的地址不可用：{ip}");
+            assert!(
+                !ip.is_loopback() && !ip.is_unspecified(),
+                "探到的地址不可用：{ip}"
+            );
         }
     }
 
     #[test]
     fn host_gate() {
         let mk = |h: &str| format!("GET / HTTP/1.1\r\nHost: {h}\r\n\r\n");
-        for good in ["127.0.0.1:47800", "localhost:47800", "localhost", "[::1]:47800", "127.0.0.1"] {
+        for good in [
+            "127.0.0.1:47800",
+            "localhost:47800",
+            "localhost",
+            "[::1]:47800",
+            "127.0.0.1",
+        ] {
             assert!(host_allowed(&mk(good)), "应当放行：{good}");
         }
-        for bad in ["evil.example", "evil.example:47800", "10.130.32.236:47800", "mymac.local"] {
+        for bad in [
+            "evil.example",
+            "evil.example:47800",
+            "10.130.32.236:47800",
+            "mymac.local",
+        ] {
             assert!(!host_allowed(&mk(bad)), "应当拒绝：{bad}");
         }
         assert!(!host_allowed("GET / HTTP/1.1\r\n\r\n"));

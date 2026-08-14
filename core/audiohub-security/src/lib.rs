@@ -9,6 +9,11 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+mod macos_launch_agent;
+mod windows_task;
+pub use macos_launch_agent::{inspect_macos_launch_agent_plist, MacLaunchAgentInspection};
+pub use windows_task::{inspect_windows_task_xml, WindowsTaskInspection};
+
 /// Create `path` if necessary and restrict the directory and inheriting
 /// children to AudioHub's private-principal set.
 pub fn secure_private_directory(path: &Path) -> io::Result<()> {
@@ -21,6 +26,17 @@ pub fn secure_private_directory(path: &Path) -> io::Result<()> {
 /// and before writing private bytes to it.
 pub fn secure_private_file(path: &Path) -> io::Result<()> {
     platform::secure(path, false)
+}
+
+/// Return the current process token user's stable SID string on Windows.
+///
+/// Task Scheduler accepts a SID in `<UserId>` directly. That is more reliable
+/// than composing `USERDOMAIN\\USERNAME`: native OpenSSH sessions on a
+/// workgroup machine can report `USERDOMAIN=WORKGROUP`, which is not an account
+/// authority and makes an otherwise valid per-user task impossible to create.
+#[cfg(windows)]
+pub fn current_user_sid_string() -> io::Result<String> {
+    platform::current_user_sid_string()
 }
 
 #[cfg(unix)]
@@ -46,15 +62,16 @@ mod platform {
         PSID,
     };
     use windows_sys::Win32::Security::Authorization::{
-        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE,
-        SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_IS_WELL_KNOWN_GROUP,
-        TRUSTEE_W,
+        ConvertSidToStringSidW, ConvertStringSidToSidW, SetEntriesInAclW, SetNamedSecurityInfoW,
+        EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
+        TRUSTEE_IS_USER, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, EqualSid, GetTokenInformation, TokenUser, WinBuiltinAdministratorsSid,
-        WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-        SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER, WELL_KNOWN_SID_TYPE,
+        CreateWellKnownSid, EqualSid, GetTokenInformation, LookupAccountNameW, TokenUser,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION,
+        NO_INHERITANCE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        SID_NAME_USE, SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER,
+        WELL_KNOWN_SID_TYPE,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -79,6 +96,115 @@ mod platform {
             // documents LocalFree as the matching release function.
             unsafe {
                 LocalFree(self.0.cast::<c_void>());
+            }
+        }
+    }
+
+    struct OwnedLocalWide(*mut u16);
+
+    impl Drop for OwnedLocalWide {
+        fn drop(&mut self) {
+            // SAFETY: ConvertSidToStringSidW documents LocalFree for this
+            // allocated string, and this guard owns it exactly once.
+            unsafe {
+                LocalFree(self.0.cast::<c_void>());
+            }
+        }
+    }
+
+    pub(super) fn current_user_sid_string() -> io::Result<String> {
+        let mut user = current_user_token_information()?;
+        // SAFETY: TOKEN_USER::User.Sid points inside the aligned `user`
+        // allocation, which remains alive through conversion.
+        let user_sid = unsafe { (*(user.as_mut_ptr().cast::<TOKEN_USER>())).User.Sid };
+        let mut raw = ptr::null_mut();
+        // SAFETY: user_sid is a valid token SID; raw points to writable storage
+        // for the LocalAlloc-owned NUL-terminated result.
+        if unsafe { ConvertSidToStringSidW(user_sid, &mut raw) } == 0 {
+            return Err(last_os_error());
+        }
+        let result = OwnedLocalWide(raw);
+        let mut length = 0usize;
+        // SAFETY: ConvertSidToStringSidW returned a valid NUL-terminated string.
+        while unsafe { *result.0.add(length) } != 0 {
+            length += 1;
+        }
+        // SAFETY: the scan above found the terminator inside the allocated
+        // Windows string, so this is the initialized prefix only.
+        Ok(String::from_utf16_lossy(unsafe {
+            std::slice::from_raw_parts(result.0, length)
+        }))
+    }
+
+    /// Compare either a SID spelling or an account name from exported Task
+    /// Scheduler XML to one expected SID. Account text is resolved through the
+    /// local security authority and compared with EqualSid; environment names
+    /// and string approximations never participate in the trust decision.
+    pub(super) fn task_user_id_matches(actual: &str, expected_sid: &str) -> bool {
+        if actual.eq_ignore_ascii_case(expected_sid) {
+            return true;
+        }
+        let actual_wide: Vec<u16> = std::ffi::OsStr::new(actual)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let expected_wide: Vec<u16> = std::ffi::OsStr::new(expected_sid)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut expected = ptr::null_mut();
+        // SAFETY: expected_wide is NUL terminated and `expected` is writable.
+        if unsafe { ConvertStringSidToSidW(expected_wide.as_ptr(), &mut expected) } == 0 {
+            return false;
+        }
+        let expected = OwnedLocalSid(expected);
+
+        let mut sid_bytes = 0u32;
+        let mut domain_chars = 0u32;
+        let mut use_kind: SID_NAME_USE = 0;
+        // SAFETY: this null-buffer call asks LSA for exact output lengths.
+        unsafe {
+            LookupAccountNameW(
+                ptr::null(),
+                actual_wide.as_ptr(),
+                ptr::null_mut(),
+                &mut sid_bytes,
+                ptr::null_mut(),
+                &mut domain_chars,
+                &mut use_kind,
+            )
+        };
+        if sid_bytes == 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+            return false;
+        }
+        let mut actual_sid = aligned_buffer(sid_bytes);
+        let mut domain = vec![0u16; domain_chars.max(1) as usize];
+        // SAFETY: both allocations satisfy the exact sizes returned above.
+        if unsafe {
+            LookupAccountNameW(
+                ptr::null(),
+                actual_wide.as_ptr(),
+                actual_sid.as_mut_ptr().cast::<c_void>(),
+                &mut sid_bytes,
+                domain.as_mut_ptr(),
+                &mut domain_chars,
+                &mut use_kind,
+            )
+        } == 0
+        {
+            return false;
+        }
+        // SAFETY: both pointers name valid SIDs returned by Windows APIs.
+        unsafe { EqualSid(actual_sid.as_mut_ptr().cast::<c_void>(), expected.0) != 0 }
+    }
+
+    struct OwnedLocalSid(PSID);
+
+    impl Drop for OwnedLocalSid {
+        fn drop(&mut self) {
+            // SAFETY: ConvertStringSidToSidW allocates with LocalAlloc.
+            unsafe {
+                LocalFree(self.0);
             }
         }
     }

@@ -112,7 +112,10 @@ impl MediaCrypto {
             .cipher
             .decrypt(
                 Nonce::from_slice(&nonce),
-                Payload { msg: ct, aad: &datagram[..HEADER_LEN] },
+                Payload {
+                    msg: ct,
+                    aad: &datagram[..HEADER_LEN],
+                },
             )
             .map_err(|_| anyhow!("media decrypt failed (tampered or wrong key)"))?;
         Ok((h, pt))
@@ -819,7 +822,8 @@ impl JitterBuffer {
         if !over && !emergency {
             return None;
         }
-        if !emergency && self.tick.saturating_sub(self.last_accel_tick) < self.cfg.accel_interval_ticks
+        if !emergency
+            && self.tick.saturating_sub(self.last_accel_tick) < self.cfg.accel_interval_ticks
         {
             return None;
         }
@@ -980,6 +984,25 @@ impl JitterBuffer {
     /// 基线值只有 [`Self::update_target`] 自己用得着。
     pub fn target(&self) -> u32 {
         self.target_effective()
+    }
+
+    /// Set the **effective** target depth, preserving the underrun penalty.
+    ///
+    /// The controller outside this type observes [`Self::target`], which is
+    /// `baseline + extra`, and therefore its output is expressed in that same
+    /// effective-depth domain.  Writing that number straight into `target`
+    /// would add `extra` a second time: after one underrun, asking to move from
+    /// 10 frames to 9 could actually move to 10 or 11.  Keep the learned safety
+    /// margin, but subtract it when translating the controller's output back
+    /// to the private baseline.
+    ///
+    /// A request below `min_target + extra` lands on that reachable floor.  An
+    /// underrun penalty is deliberately not erased by a latency-setting
+    /// change; its slow decay remains the authority for deciding when the link
+    /// is safe to make shallow again.
+    pub fn set_target_effective(&mut self, want: u32) {
+        let baseline = want.saturating_sub(self.extra).max(1);
+        self.target = baseline.clamp(self.cfg.min_target, self.cfg.max_target);
     }
 
     /// AUTO profile: retarget from observed jitter p95。
@@ -1445,12 +1468,30 @@ pub const SINGLE_PACKET_PAYLOAD_MAX: usize = 1200;
 /// 上半段两档是位深维度上仅有的两个有工业意义的取值：24 bit 是 AES67 /
 /// RFC 3190 的标准交换深度，32 bit 浮点是本管线的原生格式。
 pub const LADDER: [WireFormat; 6] = [
-    WireFormat { rate_hz: 48000, depth: WireDepth::F32 },
-    WireFormat { rate_hz: 48000, depth: WireDepth::S24 },
-    WireFormat { rate_hz: 48000, depth: WireDepth::S16 },
-    WireFormat { rate_hz: 32000, depth: WireDepth::S16 },
-    WireFormat { rate_hz: 24000, depth: WireDepth::S16 },
-    WireFormat { rate_hz: 16000, depth: WireDepth::S16 },
+    WireFormat {
+        rate_hz: 48000,
+        depth: WireDepth::F32,
+    },
+    WireFormat {
+        rate_hz: 48000,
+        depth: WireDepth::S24,
+    },
+    WireFormat {
+        rate_hz: 48000,
+        depth: WireDepth::S16,
+    },
+    WireFormat {
+        rate_hz: 32000,
+        depth: WireDepth::S16,
+    },
+    WireFormat {
+        rate_hz: 24000,
+        depth: WireDepth::S16,
+    },
+    WireFormat {
+        rate_hz: 16000,
+        depth: WireDepth::S16,
+    },
 ];
 
 /// AUTO 能升到的**最高**格（数值最小 = 最好）。
@@ -1605,7 +1646,13 @@ pub struct AutoLadder {
 impl AutoLadder {
     pub fn new() -> Self {
         // 从 AUTO 的天花板起步，不是从阶梯顶端起步。
-        AutoLadder { rung: AUTO_TOP_RUNG, clean: 0, hot: 0, top_rung: AUTO_TOP_RUNG, rung_changes: 0 }
+        AutoLadder {
+            rung: AUTO_TOP_RUNG,
+            clean: 0,
+            hot: 0,
+            top_rung: AUTO_TOP_RUNG,
+            rung_changes: 0,
+        }
     }
 
     /// 降级链路（Tier 1/2）上的阶梯：天花板压到
@@ -1770,7 +1817,11 @@ mod ladder_tests {
         let want_kbps = [1536u32, 1152, 768, 512, 384, 256];
         assert_eq!(LADDER.len(), want_frame_bytes.len());
         for (i, f) in LADDER.iter().enumerate() {
-            assert_eq!(f.frame_bytes(), want_frame_bytes[i], "rung {i} 的每帧明文变了");
+            assert_eq!(
+                f.frame_bytes(),
+                want_frame_bytes[i],
+                "rung {i} 的每帧明文变了"
+            );
             assert_eq!(f.kbps(), want_kbps[i], "rung {i} 的音频码率变了");
             // 分包之后每个数据报装 frame_bytes / n。
             let per_packet = f.frame_bytes() / f.wire_packets_per_frame();
@@ -1801,8 +1852,10 @@ mod ladder_tests {
                 w[1].kbps()
             );
         }
-        let mut seen: Vec<(u32, &str)> =
-            LADDER.iter().map(|f| (f.rate_hz, f.depth.as_str())).collect();
+        let mut seen: Vec<(u32, &str)> = LADDER
+            .iter()
+            .map(|f| (f.rate_hz, f.depth.as_str()))
+            .collect();
         let n = seen.len();
         seen.sort_unstable();
         seen.dedup();
@@ -1813,7 +1866,11 @@ mod ladder_tests {
             .inspect(|f| assert_eq!(f.depth, WireDepth::S16, "老四档必须仍是 s16"))
             .map(|f| f.rate_hz)
             .collect();
-        assert_eq!(legacy, vec![48000, 32000, 24000, 16000], "老四档的采样率被动过了");
+        assert_eq!(
+            legacy,
+            vec![48000, 32000, 24000, 16000],
+            "老四档的采样率被动过了"
+        );
     }
 
     /// **AUTO 从 `AUTO_TOP_RUNG` 起步，且升档永不越过它。**
@@ -1825,11 +1882,21 @@ mod ladder_tests {
     fn auto_starts_at_its_ceiling_and_never_promotes_past_it() {
         let mut l = AutoLadder::new();
         assert_eq!(l.rung(), AUTO_TOP_RUNG, "AUTO 起步格不是天花板");
-        assert_eq!(l.format(), WireFormat { rate_hz: 48000, depth: WireDepth::S16 });
+        assert_eq!(
+            l.format(),
+            WireFormat {
+                rate_hz: 48000,
+                depth: WireDepth::S16
+            }
+        );
         // 一直干净：升到天花板就停住，绝不进深档。
         for _ in 0..500 {
             l.feed_stats(0.0, 0.0);
-            assert!(l.rung() >= AUTO_TOP_RUNG, "AUTO 升进了深档 rung {}", l.rung());
+            assert!(
+                l.rung() >= AUTO_TOP_RUNG,
+                "AUTO 升进了深档 rung {}",
+                l.rung()
+            );
         }
         assert_eq!(l.rung(), AUTO_TOP_RUNG);
         // 一直很差：降到最低档就停住，不会越界。
@@ -1860,7 +1927,11 @@ mod ladder_tests {
         let mut l = AutoLadder::new();
         // 降档：从天花板一路到最低格，每次恰好一格。
         for want in (AUTO_TOP_RUNG + 1)..LADDER.len() as u32 {
-            assert_eq!(l.feed_stats(50.0, 100.0), Some(want), "降档跳格了：一次坏统计只许走一格");
+            assert_eq!(
+                l.feed_stats(50.0, 100.0),
+                Some(want),
+                "降档跳格了：一次坏统计只许走一格"
+            );
         }
         assert_eq!(l.feed_stats(50.0, 100.0), None, "到底之后不该再报变化");
         let down_steps = LADDER.len() as u32 - 1 - AUTO_TOP_RUNG;
@@ -1869,7 +1940,11 @@ mod ladder_tests {
         // 升档：10 个干净周期换一格，同样一次一格。
         for want in (AUTO_TOP_RUNG..LADDER.len() as u32 - 1).rev() {
             for i in 0..9 {
-                assert_eq!(l.feed_stats(0.0, 0.0), None, "第 {i} 个干净周期就升档了：升档必须保守");
+                assert_eq!(
+                    l.feed_stats(0.0, 0.0),
+                    None,
+                    "第 {i} 个干净周期就升档了：升档必须保守"
+                );
             }
             assert_eq!(l.feed_stats(0.0, 0.0), Some(want), "升档跳格了");
         }
@@ -1906,9 +1981,15 @@ mod ladder_tests {
             (4, 5), (5, 10), (4, 15), (5, 31), (4, 19), (3, 23), (4, 8), (5, 51),
             (4, 8), (5, 37), (4, 6), (5, 20), (4, 9), (5, 2),
         ];
-        let want: Vec<u32> =
-            GOLDEN_RLE.iter().flat_map(|&(r, n)| std::iter::repeat_n(r, n)).collect();
-        assert_eq!(want.len(), 600, "the golden sequence lost or gained periods");
+        let want: Vec<u32> = GOLDEN_RLE
+            .iter()
+            .flat_map(|&(r, n)| std::iter::repeat_n(r, n))
+            .collect();
+        assert_eq!(
+            want.len(),
+            600,
+            "the golden sequence lost or gained periods"
+        );
 
         let mut l = AutoLadder::new();
         let mut x: u64 = 0x5169_A3B3_C4D5_E6F7; // xorshift64, seeded by the HEAD it was minted on
@@ -1930,14 +2011,21 @@ mod ladder_tests {
                  (loss {loss}, jitter {jit})"
             );
         }
-        assert_eq!(l.rung_changes, 29, "tier 0 changed rungs a different number of times");
+        assert_eq!(
+            l.rung_changes, 29,
+            "tier 0 changed rungs a different number of times"
+        );
     }
 
     /// The degraded path demotes on backlog and **only after it persists**.
     #[test]
     fn a_streamed_ladder_demotes_after_three_consecutive_backlogged_periods() {
         let mut l = AutoLadder::new_streamed();
-        assert_eq!(l.rung(), AUTO_TOP_RUNG_STREAMED, "degraded AUTO did not start at its ceiling");
+        assert_eq!(
+            l.rung(),
+            AUTO_TOP_RUNG_STREAMED,
+            "degraded AUTO did not start at its ceiling"
+        );
         let hot = STREAMED_WRITEQ_HOT_MS + 1.0;
         for i in 1..STREAMED_HOT_PERIODS {
             assert_eq!(
@@ -1963,7 +2051,11 @@ mod ladder_tests {
             "a clean period moved the rung by itself"
         );
         for _ in 0..(STREAMED_HOT_PERIODS - 1) {
-            assert_eq!(l.feed_streamed(hot, None, false), None, "the hot run was not restarted");
+            assert_eq!(
+                l.feed_streamed(hot, None, false),
+                None,
+                "the hot run was not restarted"
+            );
         }
     }
 
@@ -2024,7 +2116,11 @@ mod ladder_tests {
         for _ in 0..500 {
             l.feed_stats(0.0, 0.0);
         }
-        assert_eq!(l.rung(), AUTO_TOP_RUNG_STREAMED, "tier 0 signals lifted a degraded ladder");
+        assert_eq!(
+            l.rung(),
+            AUTO_TOP_RUNG_STREAMED,
+            "tier 0 signals lifted a degraded ladder"
+        );
         assert_eq!(l.top_rung(), AUTO_TOP_RUNG_STREAMED);
         assert_eq!(AutoLadder::new().top_rung(), AUTO_TOP_RUNG);
     }
@@ -2046,7 +2142,10 @@ mod ladder_tests {
         for _ in 0..9 {
             assert_eq!(l.feed_streamed(0.0, None, false), None);
         }
-        assert_eq!(l.feed_streamed(0.0, None, false), Some(AUTO_TOP_RUNG_STREAMED));
+        assert_eq!(
+            l.feed_streamed(0.0, None, false),
+            Some(AUTO_TOP_RUNG_STREAMED)
+        );
     }
 
     /// A link that is still dropping audio must not be promoted, even when
@@ -2083,7 +2182,11 @@ mod ladder_tests {
         // The gate stops firing: normal promotion resumes from zero clean
         // periods, i.e. the vetoed periods did not bank any credit either.
         for i in 0..9 {
-            assert_eq!(l.feed_streamed(0.0, Some(1.0), false), None, "promoted early on {i}");
+            assert_eq!(
+                l.feed_streamed(0.0, Some(1.0), false),
+                None,
+                "promoted early on {i}"
+            );
         }
         assert_eq!(l.feed_streamed(0.0, Some(1.0), false), Some(floor - 1));
     }
@@ -2133,11 +2236,19 @@ mod ladder_tests {
             "the two profiles no longer differ in depth, so this test proves nothing"
         );
         let learned = JitterBuffer::with_tuning(deep, JbTuning::DEGRADED);
-        assert_eq!(learned.target(), deep, "the setup buffer did not reach the degraded ceiling");
+        assert_eq!(
+            learned.target(),
+            deep,
+            "the setup buffer did not reach the degraded ceiling"
+        );
 
         // What the fix does.
         let kept = JitterBuffer::with_tuning(learned.target(), learned.tuning());
-        assert_eq!(kept.target(), deep, "a resync lost the depth the buffer had learned");
+        assert_eq!(
+            kept.target(),
+            deep,
+            "a resync lost the depth the buffer had learned"
+        );
         assert_eq!(
             kept.tuning().max_target,
             JbTuning::DEGRADED.max_target,
@@ -2171,7 +2282,11 @@ mod ladder_tests {
             (0, WireDepth::S16),
             (96000, WireDepth::F32),
         ] {
-            assert_eq!(rung_of(bad.0, bad.1), None, "{bad:?} 不在阶梯上，不该给出格号");
+            assert_eq!(
+                rung_of(bad.0, bad.1),
+                None,
+                "{bad:?} 不在阶梯上，不该给出格号"
+            );
         }
         // 往返：每一格都查得回自己。
         for (i, f) in LADDER.iter().enumerate() {
@@ -2214,17 +2329,23 @@ mod ladder_tests {
         /// 就必须同时升 `PROTOCOL_VERSION` 并把这个数改成新的版本号。**
         const CODEC_SET_FROZEN_AT: u32 = 3;
 
-        let mut on_wire: Vec<u8> =
-            LADDER.iter().map(|f| Codec::for_depth(f.depth) as u8).collect();
+        let mut on_wire: Vec<u8> = LADDER
+            .iter()
+            .map(|f| Codec::for_depth(f.depth) as u8)
+            .collect();
         on_wire.sort_unstable();
         on_wire.dedup();
         assert_eq!(
             on_wire,
-            vec![Codec::PcmS16le as u8, Codec::PcmF32le as u8, Codec::PcmS24le as u8]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>(),
+            vec![
+                Codec::PcmS16le as u8,
+                Codec::PcmF32le as u8,
+                Codec::PcmS24le as u8
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
             "阶梯上线的 codec 集合变了：必须升 PROTOCOL_VERSION（当前 {PROTOCOL_VERSION}），\
              并把本测试里的 CODEC_SET_FROZEN_AT 改成新版本号。否则老对端要么静音、\
              要么把新载荷按 s16 错解，两种都零报错"
@@ -2245,7 +2366,9 @@ mod ladder_tests {
                 "rung {i} 的位深没有 codec 承载"
             );
         }
-        let split: Vec<usize> = (0..LADDER.len()).filter(|&i| LADDER[i].splits_frame()).collect();
+        let split: Vec<usize> = (0..LADDER.len())
+            .filter(|&i| LADDER[i].splits_frame())
+            .collect();
         assert_eq!(split, vec![0, 1], "分包的格变了：分包判据必须只由帧长决定");
         // 钳位：越界的格号落到最低档，不是 panic、不是回绕到 rung 0。
         assert_eq!(rung_format(LADDER.len() as u32), *LADDER.last().unwrap());
@@ -2267,7 +2390,13 @@ mod telemetry_tests {
     fn depth_overcounts_across_a_hole_but_contiguous_does_not() {
         // 显式整定：本测试量的是 `depth()`/`contiguous()` 的语义，与设定点无关。
         // 走 `new()` 会跟着 `DEFAULT.min_target` 漂，起播条件一变测试就假红。
-        let mut jb = JitterBuffer::with_tuning(2, JbTuning { min_target: 2, ..JbTuning::DEFAULT });
+        let mut jb = JitterBuffer::with_tuning(
+            2,
+            JbTuning {
+                min_target: 2,
+                ..JbTuning::DEFAULT
+            },
+        );
         // 先起播，让 next_seq 落在 10
         jb.push(10, frame());
         jb.push(11, frame());
@@ -2285,7 +2414,13 @@ mod telemetry_tests {
     /// 此时 `depth()` 谎报 30 ms 排队，而下一个 tick 一定 underrun。
     #[test]
     fn a_missing_head_means_zero_queue_however_full_the_map_is() {
-        let mut jb = JitterBuffer::with_tuning(2, JbTuning { min_target: 2, ..JbTuning::DEFAULT });
+        let mut jb = JitterBuffer::with_tuning(
+            2,
+            JbTuning {
+                min_target: 2,
+                ..JbTuning::DEFAULT
+            },
+        );
         jb.push(10, frame());
         jb.push(11, frame());
         assert!(jb.pop().is_some()); // 放掉 10，next_seq = 11
@@ -2409,7 +2544,10 @@ mod telemetry_tests {
         let cap = cap.expect("麦克风源必须报采集环这一级");
         assert_eq!(cap.id, StageId::CapRing);
         assert_eq!(cap.samples, 4_410, "环里此刻积着的就是刚写进去的那些");
-        assert_eq!(cap.capacity, 88_200, "2 秒 @44.1k —— 不是 1 秒（规格 §0.4）");
+        assert_eq!(
+            cap.capacity, 88_200,
+            "2 秒 @44.1k —— 不是 1 秒（规格 §0.4）"
+        );
         assert_eq!(cap.rate, 44_100, "采集环走**设备**速率，不是 48000");
         assert_eq!(cap.ms(), Some(100.0), "4410 / 44100 = 100 ms");
         assert_eq!(
@@ -2417,7 +2555,11 @@ mod telemetry_tests {
             DropMode::Newest,
             "采集环是 push_slice 短写：丢的是新样本，听感是断续"
         );
-        assert_eq!(cap.dropped, Some(0), "还没溢出过 —— 0 是真读数，不是『观测不到』");
+        assert_eq!(
+            cap.dropped,
+            Some(0),
+            "还没溢出过 —— 0 是真读数，不是『观测不到』"
+        );
         // FIFO 那一级此刻是空的，但它必须**存在**（0 样本 ≠ 这一级不存在）。
         let fifo = fifo.expect("麦克风源必须报发送 FIFO 这一级");
         assert_eq!(fifo.id, StageId::SrcFifo);
@@ -2435,7 +2577,11 @@ mod telemetry_tests {
         mic.next_frame(&mut out);
         assert_eq!(out.len(), 480);
         let [cap, fifo] = mic.depths();
-        assert_eq!(cap.unwrap().samples, 0, "AudioRx::pop 全量排空（规格 §0.4）");
+        assert_eq!(
+            cap.unwrap().samples,
+            0,
+            "AudioRx::pop 全量排空（规格 §0.4）"
+        );
         let fifo = fifo.unwrap();
         // 4410 @44.1k -> 48k 约 4800 个样本，取走 480 后剩下的都还压在 FIFO 里。
         assert!(
@@ -2498,7 +2644,8 @@ mod telemetry_tests {
         };
 
         // 1 秒发送 FIFO 装到**恰好**容量。样本是真的、队列是真的。
-        mic.fifo.extend(std::iter::repeat(0.3f32).take(MicSource::FIFO_CAP));
+        mic.fifo
+            .extend(std::iter::repeat(0.3f32).take(MicSource::FIFO_CAP));
         // 2 秒采集环同样装到恰好容量（96000 @48k）。
         assert_eq!(feed.write(&vec![0.3f32; 96_000]), 96_000);
 
@@ -2520,7 +2667,11 @@ mod telemetry_tests {
             "采集环是 **2 秒**（规格 §0.4 的修正三），满载就是 2000 ms"
         );
         assert!(cap.saturated());
-        assert_eq!(cap.drop_mode, DropMode::Newest, "push_slice 短写 ⇒ 迟到 + 断续");
+        assert_eq!(
+            cap.drop_mode,
+            DropMode::Newest,
+            "push_slice 短写 ⇒ 迟到 + 断续"
+        );
 
         // 稳态跑一 tick 之后回落到 990 ms —— 相位约定，不是读数变坏。
         let mut out = Vec::new();
@@ -2539,7 +2690,10 @@ mod telemetry_tests {
             src.next_frame(&mut out);
         }
         let [fifo, second] = src.depths();
-        assert!(second.is_none(), "系统音频源只有 FIFO 一级，后端内部缓冲读不到");
+        assert!(
+            second.is_none(),
+            "系统音频源只有 FIFO 一级，后端内部缓冲读不到"
+        );
         let fifo = fifo.expect("发送 FIFO 这一级");
         assert_eq!(fifo.id, StageId::SrcFifo);
         // 修剪到 CAP=48000，随即本 tick 的 480 被取走 ⇒ 47520 = 990 ms。
@@ -2547,7 +2701,11 @@ mod telemetry_tests {
         assert_eq!(fifo.capacity, 48_000);
         assert_eq!(fifo.rate, 48_000);
         assert!(fifo.saturated(), "≥95% 容量");
-        assert_eq!(fifo.ms(), Some(990.0), "1 秒 FIFO 被灌满 = 将近 1000 ms 驻留");
+        assert_eq!(
+            fifo.ms(),
+            Some(990.0),
+            "1 秒 FIFO 被灌满 = 将近 1000 ms 驻留"
+        );
         assert_eq!(
             fifo.drop_mode,
             DropMode::Oldest,
@@ -2733,7 +2891,10 @@ mod water_level_tests {
     }
 
     fn cfg_min(min_target: u32) -> JbTuning {
-        JbTuning { min_target, ..JbTuning::DEFAULT }
+        JbTuning {
+            min_target,
+            ..JbTuning::DEFAULT
+        }
     }
 
     // ============================================================ 工作点
@@ -2816,10 +2977,7 @@ mod water_level_tests {
             "8 帧积压至少要吐 4 次，实际 {}",
             sim.jb.accel_events
         );
-        assert_eq!(
-            sim.jb.accel_frames, sim.jb.accel_events,
-            "一次收敛净吐一帧"
-        );
+        assert_eq!(sim.jb.accel_frames, sim.jb.accel_events, "一次收敛净吐一帧");
     }
 
     /// **抗停顿深度 = `target_effective()` 帧，一帧不多一帧不少。**
@@ -2892,7 +3050,10 @@ mod water_level_tests {
             fired <= cap,
             "限速器没起作用：{ticks} 个 tick 吐了 {fired} 次，上限 {cap}"
         );
-        assert!(fired >= cap - 2, "压力没造出来，测不到限速：{fired} / {cap}");
+        assert!(
+            fired >= cap - 2,
+            "压力没造出来，测不到限速：{fired} / {cap}"
+        );
     }
 
     /// **应急档不比改动前慢。** 改动前是「一个 tick 里 `while` 循环把超出
@@ -2942,7 +3103,10 @@ mod water_level_tests {
             let o = sim.out.take().unwrap();
             (max_slope(&o), worst_level_step_db(&o), sim.jb.accel_events)
         };
-        let (ref_slope, ref_db, ref_accel) = run(JbTuning { slack: 200, ..JbTuning::DEFAULT });
+        let (ref_slope, ref_db, ref_accel) = run(JbTuning {
+            slack: 200,
+            ..JbTuning::DEFAULT
+        });
         assert_eq!(ref_accel, 0, "参考组不许吐");
 
         let (soft_slope, soft_db, soft_accel) = run(JbTuning::DEFAULT);
@@ -2956,7 +3120,10 @@ mod water_level_tests {
             "C3 电平判据：拼接点附近塌了 {soft_db:.2} dB（等功率律没生效？）"
         );
 
-        let (hard_slope, _, hard_accel) = run(JbTuning { xfade: 0, ..JbTuning::DEFAULT });
+        let (hard_slope, _, hard_accel) = run(JbTuning {
+            xfade: 0,
+            ..JbTuning::DEFAULT
+        });
         assert!(hard_accel > 0);
         assert!(
             hard_slope > 1.10 * ref_slope,
@@ -2995,7 +3162,10 @@ mod water_level_tests {
         sim.push(4);
         sim.run(600);
         assert!(sim.jb.accel_events > 0);
-        assert_eq!(sim.jb.underruns, 0, "有欠载就会混进 PLC 的 0.7 衰减，测的就不是拼接了");
+        assert_eq!(
+            sim.jb.underruns, 0,
+            "有欠载就会混进 PLC 的 0.7 衰减，测的就不是拼接了"
+        );
         for v in sim.out.unwrap() {
             assert!((v - 0.25).abs() <= 1e-6, "直流被拼接改坏了：{v}");
         }
@@ -3020,7 +3190,11 @@ mod water_level_tests {
             sim.run(600);
             assert_eq!(sim.jb.underruns, 0);
             let o = sim.out.take().unwrap();
-            (worst_level_step_db(&o), sim.jb.accel_events, sim.jb.accel_deferred)
+            (
+                worst_level_step_db(&o),
+                sim.jb.accel_events,
+                sim.jb.accel_deferred,
+            )
         };
         let (guarded_db, guarded_accel, deferred) = run(JbTuning::DEFAULT);
         assert!(deferred > 0, "反相素材一次都没被挡下 —— 保护没接上");
@@ -3065,7 +3239,10 @@ mod water_level_tests {
         // 显式 2 帧整定：本测试要复现的是「改动前 `len() > target+6` 会开火」
         // 那个现场，它由 `target=2` + 表里 9 帧构成。跟着 `DEFAULT.min_target`
         // 漂会让起播条件变化、场景本身消失（而不是判据失效）。
-        let cfg = JbTuning { min_target: 2, ..JbTuning::DEFAULT };
+        let cfg = JbTuning {
+            min_target: 2,
+            ..JbTuning::DEFAULT
+        };
         let mut jb = JitterBuffer::with_tuning(cfg.min_target, cfg);
         jb.push(0, vec![0.1; F]);
         jb.push(1, vec![0.1; F]);
@@ -3081,7 +3258,8 @@ mod water_level_tests {
             jb.pop(); // 限速器早已放行，仍然一帧都不许删
         }
         assert_eq!(
-            jb.dropped, before,
+            jb.dropped,
+            before,
             "有洞时删了 {} 帧真音频",
             jb.dropped - before
         );
@@ -3098,7 +3276,11 @@ mod water_level_tests {
     #[test]
     fn a_hole_in_the_middle_must_not_trigger_a_convergence() {
         // 限速器开到全放行，把「该不该收敛」这个决定单独暴露出来。
-        let cfg = JbTuning { accel_interval_ticks: 1, min_target: 2, ..JbTuning::DEFAULT };
+        let cfg = JbTuning {
+            accel_interval_ticks: 1,
+            min_target: 2,
+            ..JbTuning::DEFAULT
+        };
         let mut jb = JitterBuffer::with_tuning(cfg.min_target, cfg);
         jb.push(0, vec![0.1; F]);
         jb.push(1, vec![0.1; F]);
@@ -3115,7 +3297,10 @@ mod water_level_tests {
             "真排队深度只有 2 帧却触发了收敛 —— 判据用的是 len() 不是 contiguous()"
         );
         jb.pop();
-        assert_eq!(jb.underruns, 0, "两帧本该正常放完；收敛把它们吃掉了就会提前欠载");
+        assert_eq!(
+            jb.underruns, 0,
+            "两帧本该正常放完；收敛把它们吃掉了就会提前欠载"
+        );
     }
 
     /// 内存上界仍然存在，且与延迟控制线**分开**：只有 `len()` 越过
@@ -3138,7 +3323,10 @@ mod water_level_tests {
             jb.depth(),
             cfg.max_frames
         );
-        assert!(cfg.max_frames > cfg.max_target + cfg.hard_slack, "两条线必须分开");
+        assert!(
+            cfg.max_frames > cfg.max_target + cfg.hard_slack,
+            "两条线必须分开"
+        );
     }
 
     // ============================================================ 欠载裕度
@@ -3264,13 +3452,52 @@ mod water_level_tests {
         s.run(cfg.extra_decay_ticks as usize / 2);
         assert_eq!(s.jb.target_effective(), t1, "惩罚项退得太快");
         s.run(cfg.extra_decay_ticks as usize / 2 + 10);
-        assert_eq!(s.jb.target_effective(), t1 - 1, "惩罚项不退了？那就成了棘轮");
+        assert_eq!(
+            s.jb.target_effective(),
+            t1 - 1,
+            "惩罚项不退了？那就成了棘轮"
+        );
+    }
+
+    /// A fixed-latency controller operates on the public/effective target.
+    /// Feeding its output back must not add the learned underrun margin twice.
+    #[test]
+    fn setting_an_effective_target_compensates_for_the_underrun_penalty() {
+        let cfg = JbTuning {
+            min_target: 1,
+            max_target: 12,
+            extra_max: 2,
+            ..JbTuning::DEFAULT
+        };
+        let mut jb = JitterBuffer::with_tuning(10, cfg);
+        // Inject the state reached after two real underruns.  The setter is the
+        // subject; the penalty loop itself is covered immediately above.
+        jb.extra = 2;
+        assert_eq!(jb.target_effective(), 12);
+
+        jb.set_target_effective(4);
+        assert_eq!(jb.target_effective(), 4);
+        assert_eq!(
+            jb.underrun_penalty(),
+            2,
+            "changing the user target must not erase learned safety margin"
+        );
+
+        jb.set_target_effective(1);
+        assert_eq!(
+            jb.target_effective(),
+            cfg.min_target + jb.underrun_penalty(),
+            "an unreachable request must land on the penalty-adjusted floor"
+        );
     }
 
     /// 惩罚项有上界，不会因为一串欠载把延迟推到天上。
     #[test]
     fn the_penalty_is_bounded() {
-        let cfg = JbTuning { extra_max: 3, ..JbTuning::DEFAULT };
+        let cfg = JbTuning {
+            extra_max: 3,
+            ..JbTuning::DEFAULT
+        };
         let mut s = Sim::new(cfg, tone(1010.0), false);
         s.warm_up();
         for _ in 0..30 {
@@ -3279,7 +3506,11 @@ mod water_level_tests {
                 s.tick(0);
             }
         }
-        assert!(s.jb.underrun_penalty() <= cfg.extra_max, "惩罚项越界：{}", s.jb.underrun_penalty());
+        assert!(
+            s.jb.underrun_penalty() <= cfg.extra_max,
+            "惩罚项越界：{}",
+            s.jb.underrun_penalty()
+        );
         assert!(s.jb.target_effective() <= cfg.max_target);
     }
 
@@ -3297,7 +3528,10 @@ mod water_level_tests {
         assert_eq!(d.slack, 1, "死区 1 帧");
         assert_eq!(d.accel_interval_ticks, 100, "ρ = 1 %");
         assert_eq!(d.hard_slack, 6, "应急线 = 改动前那条 target+6");
-        assert_eq!(d.extra_decay_ticks, 30_000, "5 分钟 ⇒ 稳态欠载率 ≤ 0.2 次/分钟");
+        assert_eq!(
+            d.extra_decay_ticks, 30_000,
+            "5 分钟 ⇒ 稳态欠载率 ≤ 0.2 次/分钟"
+        );
         assert_eq!(d.xfade, 192, "4 ms，与 trim::X 同值");
         assert_eq!(d.ncc_floor, -0.2, "抵消保护线");
         assert_eq!(d.max_frames, 24, "内存上界必须严格高于应急延迟线（12+6）");
@@ -3309,7 +3543,9 @@ mod water_level_tests {
         assert!(
             d.min_target + d.extra_max < JbTuning::DEFAULT.hard_slack + 2,
             "回归护栏：{}+{} 已经够到改动前的天花板 2+{} 帧了",
-            d.min_target, d.extra_max, JbTuning::DEFAULT.hard_slack,
+            d.min_target,
+            d.extra_max,
+            JbTuning::DEFAULT.hard_slack,
         );
         let t = JbTuning::from_env();
         assert!(t.max_frames >= t.max_target + t.hard_slack + 1);
@@ -3336,14 +3572,23 @@ mod water_level_tests {
             "the underrun penalty is what FINDS the depth; capping it below max_target - \
              min_target makes the raised ceiling unreachable and therefore decorative"
         );
-        assert_eq!(d.max_frames, 48, "memory ceiling must clear max_target + hard_slack + 1 = 47");
+        assert_eq!(
+            d.max_frames, 48,
+            "memory ceiling must clear max_target + hard_slack + 1 = 47"
+        );
         assert_eq!(
             d.underrun_step,
             JbTuning::DEFAULT.underrun_step,
             "the penalty LOOP is unchanged by design; the profile only changes what it may reach"
         );
         assert_eq!(
-            (d.min_target, d.slack, d.hard_slack, d.accel_interval_ticks, d.extra_decay_ticks),
+            (
+                d.min_target,
+                d.slack,
+                d.hard_slack,
+                d.accel_interval_ticks,
+                d.extra_decay_ticks
+            ),
             (
                 JbTuning::DEFAULT.min_target,
                 JbTuning::DEFAULT.slack,
@@ -3367,7 +3612,10 @@ mod water_level_tests {
         // 39-41 frames) rather than to `min_target`, which is the envelope's
         // floor and an order of magnitude below anything the buffer ever sits
         // at. See `STREAMED_SPREAD_CLEAN_MS`.
-        assert_eq!(STREAMED_SPREAD_CLEAN_MS, d.max_target as f64 * FRAME_MS as f64 / 2.0);
+        assert_eq!(
+            STREAMED_SPREAD_CLEAN_MS,
+            d.max_target as f64 * FRAME_MS as f64 / 2.0
+        );
     }
 }
 
@@ -3403,7 +3651,9 @@ mod zero_alloc_wire_tests {
         let mc = MediaCrypto::new_for_stream(&[9u8; 32], 7, b"salt-16-bytes!!!");
         let mut buf = Vec::new();
         for seq in 0..4u32 {
-            let plain: Vec<u8> = (0..960u32).map(|i| (i.wrapping_mul(seq + 1)) as u8).collect();
+            let plain: Vec<u8> = (0..960u32)
+                .map(|i| (i.wrapping_mul(seq + 1)) as u8)
+                .collect();
             let want = mc.seal(&hdr(seq, plain.len()), &plain).expect("seal");
             mc.seal_into(&hdr(seq, plain.len()), &plain, &mut buf)
                 .expect("seal_into");
@@ -3424,10 +3674,12 @@ mod zero_alloc_wire_tests {
         let mc = MediaCrypto::new_for_stream(&[1u8; 32], 3, b"0123456789abcdef");
         let plain = vec![0u8; 960];
         let mut buf = Vec::new();
-        mc.seal_into(&hdr(0, plain.len()), &plain, &mut buf).unwrap();
+        mc.seal_into(&hdr(0, plain.len()), &plain, &mut buf)
+            .unwrap();
         let (cap, ptr) = (buf.capacity(), buf.as_ptr());
         for seq in 1..64u32 {
-            mc.seal_into(&hdr(seq, plain.len()), &plain, &mut buf).unwrap();
+            mc.seal_into(&hdr(seq, plain.len()), &plain, &mut buf)
+                .unwrap();
             assert_eq!(buf.capacity(), cap, "seq {seq}：缓冲被重新分配了");
             assert_eq!(buf.as_ptr(), ptr, "seq {seq}：缓冲搬家了 = 一次 malloc");
         }

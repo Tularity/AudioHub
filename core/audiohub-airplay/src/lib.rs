@@ -20,7 +20,7 @@ pub use bus::{BusConfig, PcmBus, PcmRead, PcmReader, AUDIOHUB_FRAME_SAMPLES, AUD
 pub use convert::StreamingPcmConverter;
 pub use protocol::server::EventCommandSendError;
 pub use runtime::{
-    is_control_port_bind_error, AirPlayConfig, AirPlayEvent, AirPlayRuntime, MdnsService, Protocol,
-    ReceiverVolumeControlSnapshot, RemoteControlInfo, RemoteControlSnapshot, RuntimePhase,
-    RuntimeStatus, SenderVolumeSnapshot, SessionInfo,
+    is_control_port_bind_error, AirPlayConfig, AirPlayEvent, AirPlayRuntime, ArtworkSnapshot,
+    MdnsService, Protocol, ReceiverVolumeControlSnapshot, RemoteControlInfo, RemoteControlSnapshot,
+    RuntimePhase, RuntimeStatus, SenderVolumeSnapshot, SessionInfo,
 };

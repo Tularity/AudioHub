@@ -40,10 +40,11 @@
 //!
 //! # 只有装好的形态才允许注册
 //!
-//! macOS 判据是「daemon 位于某个 `*.app/Contents/MacOS/` 下」，Windows 判据是
-//! 「daemon 旁边有 `audiohub-app.exe`」。跑测试的二进制两个都不满足，于是
-//! **测试进程无论如何写不进用户的登录项**——这条性质由
-//! `transport_tests::every_writable_setting_key_is_really_honoured` 顶着。
+//! macOS 判据是「daemon 位于某个 `*.app/Contents/MacOS/` 下」，或位于 App 经
+//! 管理员鉴权安装的精确 root-owned 版本目录；后一种仍固定把
+//! `/Applications/AudioHub.app` 写进登录项。Windows 判据是「daemon 旁边有
+//! `audiohub-app.exe`」。普通构建/测试二进制两种都不满足，所以测试进程写不进
+//! 用户登录项。
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -57,6 +58,8 @@ use anyhow::{bail, Result};
 /// `SMAppService` 所有，用同一个字符串注册一个手写 plist 只会让「这条登录项是谁
 /// 装的」在两套机制之间无法区分。
 pub(crate) const MAC_LABEL: &str = "com.audiohub.app.autostart";
+const MAC_INSTALLED_APP: &str = "/Applications/AudioHub.app";
+const MAC_SERVICE_VERSIONS: &str = "/Library/Application Support/AudioHub/service/versions";
 
 /// Windows 计划任务名。**与 `scripts/install-windows-autostart.ps1` 逐字相同**，
 /// 所以脚本与 daemon 管的是同一个对象，不会变成两套。
@@ -80,6 +83,9 @@ pub(crate) struct AutostartState {
     /// 此刻真的注册着。**探测出来的**，不是某个存盘 bool 的副本，
     /// 也**不是** `supported` 的推论。
     pub enabled: bool,
+    /// 已注册对象的触发器、主体、SID、权限级别、动作和参数均与固定契约一致。
+    /// 这是修复判据，不单独暴露给 UI；UI 的开关仍表示“系统中是否存在”。
+    current: bool,
     /// 登录时会被拉起的东西（已注册时读自注册项，未注册时是「将会注册什么」）。
     /// 界面靠它看出登录项指向的是不是一个已经被移走的旧 bundle。
     pub target: Option<String>,
@@ -99,6 +105,7 @@ impl AutostartState {
         AutostartState {
             supported: false,
             enabled: false,
+            current: false,
             target: None,
             reason: Some(reason.into()),
         }
@@ -142,6 +149,7 @@ fn xml_escape(s: &str) -> String {
 /// 表达过的意图被系统撤销，比不自启严重得多。
 #[allow(dead_code)] // 见模块开头：另一半平台的载荷靠单测保活
 fn mac_plist(label: &str, app: &Path) -> String {
+    let app = std::fs::canonicalize(app).unwrap_or_else(|_| app.to_path_buf());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -154,6 +162,8 @@ fn mac_plist(label: &str, app: &Path) -> String {
 		<string>/usr/bin/open</string>
 		<string>-g</string>
 		<string>{app}</string>
+		<string>--args</string>
+		<string>--background</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -165,21 +175,6 @@ fn mac_plist(label: &str, app: &Path) -> String {
         label = xml_escape(label),
         app = xml_escape(&app.display().to_string()),
     )
-}
-
-/// 从一个已装好的 plist 里读回它会启动什么。
-///
-/// 判据是 `ProgramArguments` 的**最后一个** `<string>`：前两个固定是
-/// `/usr/bin/open` 与 `-g`。读不出来时返回 `None`，而不是把「注册着」也一起
-/// 否掉——文件在就是注册着，读不懂它只说明界面少显示一行路径。
-#[allow(dead_code)] // 见模块开头：另一半平台的载荷靠单测保活
-fn mac_plist_target(body: &str) -> Option<String> {
-    let args = body.split("<key>ProgramArguments</key>").nth(1)?;
-    let arr = args.split("</array>").next()?;
-    let last = arr.rsplit("<string>").find_map(|seg| seg.split("</string>").next())?;
-    let t = last.trim();
-    (!t.is_empty() && t != "-g" && t != "/usr/bin/open")
-        .then(|| t.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">"))
 }
 
 /// `schtasks /Create` 的参数表。
@@ -207,7 +202,7 @@ fn win_schtasks_delete_argv(task: &str) -> Vec<String> {
 
 #[allow(dead_code)] // 见模块开头：另一半平台的载荷靠单测保活
 fn win_schtasks_query_argv(task: &str) -> Vec<String> {
-    vec!["/Query".into(), "/TN".into(), task.into()]
+    vec!["/Query".into(), "/TN".into(), task.into(), "/XML".into()]
 }
 
 /// 计划任务定义。字段照 `scripts/install-windows-autostart.ps1` 抄，逐条对应：
@@ -219,7 +214,7 @@ fn win_task_xml(app_exe: &Path, user: &str) -> String {
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>AudioHub at logon</Description>
+    <Description>AudioHub</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
@@ -235,6 +230,7 @@ fn win_task_xml(app_exe: &Path, user: &str) -> String {
     </Principal>
   </Principals>
   <Settings>
+    <Enabled>true</Enabled>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
@@ -249,6 +245,7 @@ fn win_task_xml(app_exe: &Path, user: &str) -> String {
   <Actions Context="Author">
     <Exec>
       <Command>{exe}</Command>
+      <Arguments>--background</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -282,6 +279,27 @@ fn app_bundle_of(exe: &Path) -> Option<PathBuf> {
     Some(app.to_path_buf())
 }
 
+/// Resolve the App launch target for either supported macOS daemon layout.
+///
+/// The external form is deliberately exact: only a lowercase SHA-256 version
+/// directory below AudioHub's protected service root may nominate the fixed
+/// installed App. A similarly named binary elsewhere remains unregistrable.
+#[allow(dead_code)]
+fn mac_app_target(exe: &Path) -> Option<PathBuf> {
+    if let Some(app) = app_bundle_of(exe) {
+        return Some(app);
+    }
+    (exe.file_name()? == "audiohubd").then_some(())?;
+    let version = exe.parent()?;
+    (version.parent()? == Path::new(MAC_SERVICE_VERSIONS)).then_some(())?;
+    let hash = version.file_name()?.to_str()?;
+    (hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| PathBuf::from(MAC_INSTALLED_APP))
+}
+
 /// Windows 的对应判据：daemon 旁边有没有 App 的可执行文件。
 /// 与 `main.rs::daemon_binary` 反向——那边是 App 找 daemon，这边是 daemon 找 App。
 #[allow(dead_code)] // 见模块开头：另一半平台的载荷靠单测保活
@@ -305,8 +323,10 @@ fn mac_plist_path(dir: &Path, label: &str) -> PathBuf {
 
 /// 把 plist 写进 `dir`（先写临时文件再 rename：launchd 有可能正好在读它）。
 ///
-/// **不调 `launchctl bootstrap`。** 想要的效果本来就只在下次登录发生；现在
-/// bootstrap 一下的唯一可见后果，是立刻再开一个 App 窗口。
+/// 这里只负责持久文件，故意保持为可在任意平台运行的纯文件系统函数；当前用户
+/// launchd 域的加载/验证由 [`mac_load`] 完成。把两件事挤在这里会让单元测试去碰
+/// 开发者真实的登录项，也会使“文件落盘成功、launchd 却拒绝加载”的半成功状态
+/// 无法单独回滚。
 #[allow(dead_code)] // 见模块开头：另一半平台的载荷靠单测保活
 fn mac_install(dir: &Path, label: &str, app: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
@@ -319,8 +339,8 @@ fn mac_install(dir: &Path, label: &str, app: &Path) -> Result<()> {
 
 /// 删掉 plist。文件本来就不在也算成功——「关掉」这个动作是幂等的。
 ///
-/// 同样不调 `launchctl bootout`：我们从没 bootstrap 过。上一次登录时被 launchd
-/// 载入的那份是 `RunAtLoad` 一次性任务，早已跑完，留在内存里不做任何事。
+/// 这里只负责持久文件；真实 macOS 执行路径会先走 [`mac_unload`]，保证当前
+/// launchd 域和下次登录的持久状态一起关闭。
 #[allow(dead_code)] // 见模块开头：另一半平台的载荷靠单测保活
 fn mac_uninstall(dir: &Path, label: &str) -> Result<()> {
     match std::fs::remove_file(mac_plist_path(dir, label)) {
@@ -330,28 +350,145 @@ fn mac_uninstall(dir: &Path, label: &str) -> Result<()> {
     }
 }
 
-/// 盘上此刻**有没有**这条登录项，以及它指着什么。
+#[cfg(target_os = "macos")]
+fn mac_launch_domain() -> String {
+    // daemon 始终是由当前交互用户的 App 拉起，不会以 root 身份运行；euid 正是
+    // 该 LaunchAgent 所属的 GUI bootstrap domain。避免从 HOME 反推用户名/uid，
+    // 也避免路径中用户名含非 ASCII 时再过一层 shell。
+    format!("gui/{}", unsafe { libc::geteuid() })
+}
+
+#[cfg(target_os = "macos")]
+fn mac_launch_target(label: &str) -> String {
+    format!("{}/{label}", mac_launch_domain())
+}
+
+#[cfg(target_os = "macos")]
+fn mac_launchctl(command: &str, args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
+    let output = std::process::Command::new("/bin/launchctl")
+        .arg(command)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+fn mac_launchctl_failure(action: &str, output: &std::process::Output) -> anyhow::Error {
+    let detail = String::from_utf8_lossy(&output.stderr);
+    anyhow::anyhow!(
+        "launchctl {action} 失败（status={}）：{}",
+        output.status,
+        detail.trim()
+    )
+}
+
+/// 将已经原子写好的 plist 加载到当前用户的 launchd 域，并逐步验证。
+///
+/// plist 是“下次登录是否启用”的持久真值，`launchctl print` 是“当前登录会话是否
+/// 真正接纳”的事实。两者缺一不可：只写文件会让首次安装在界面里显示完成，但本次
+/// 会话里根本没有后台项；只 bootstrap 又会在下一次登录后消失。
+#[cfg(target_os = "macos")]
+fn mac_load(dir: &Path, label: &str) -> Result<()> {
+    let path = mac_plist_path(dir, label);
+    let domain = mac_launch_domain();
+    let target = mac_launch_target(label);
+
+    // 正常的设置保存可能把未改变的 autostart=true 再送来一次。已加载时立即返回，
+    // 避免每次保存其它设置都 bootout/bootstrap 并再次触发 RunAtLoad。但 launchd
+    // 的 disabled override 会跨重启持久，而且一个当前仍 loaded 的 job 也可能同时
+    // 被标记 disabled；因此返回前仍须无条件 enable，不能把 print 成功当作下次
+    // 登录也会启动的证明。
+    let already_loaded = mac_launchctl("print", &[target.as_ref()])?;
+    if already_loaded.status.success() {
+        let enable = mac_launchctl("enable", &[target.as_ref()])?;
+        if !enable.status.success() {
+            return Err(mac_launchctl_failure("enable", &enable));
+        }
+        return Ok(());
+    }
+
+    // 修复安装可能遇到同 label 的旧内存注册。不存在时 bootout 返回非零，属于正常
+    // 情况；真正的成功边界由后面的 bootstrap/enable/print 三步共同验证。
+    let _ = mac_launchctl("bootout", &[target.as_ref()]);
+
+    let bootstrap = mac_launchctl("bootstrap", &[domain.as_ref(), path.as_os_str()])?;
+    if !bootstrap.status.success() {
+        return Err(mac_launchctl_failure("bootstrap", &bootstrap));
+    }
+
+    let enable = mac_launchctl("enable", &[target.as_ref()])?;
+    if !enable.status.success() {
+        let _ = mac_launchctl("bootout", &[target.as_ref()]);
+        return Err(mac_launchctl_failure("enable", &enable));
+    }
+
+    let verify = mac_launchctl("print", &[target.as_ref()])?;
+    if !verify.status.success() {
+        let _ = mac_launchctl("bootout", &[target.as_ref()]);
+        return Err(mac_launchctl_failure("print", &verify));
+    }
+    Ok(())
+}
+
+/// 从当前用户的 launchd 域撤销已加载的 job。
+///
+/// job 不存在时保持幂等；若 `print` 明确看到了它，`bootout` 失败则必须报错，不能
+/// 接着删 plist 并向界面谎报“已经关闭”。
+#[cfg(target_os = "macos")]
+fn mac_unload(label: &str) -> Result<()> {
+    let target = mac_launch_target(label);
+    let present = mac_launchctl("print", &[target.as_ref()])?;
+    if !present.status.success() {
+        return Ok(());
+    }
+    let output = mac_launchctl("bootout", &[target.as_ref()])?;
+    if !output.status.success() {
+        return Err(mac_launchctl_failure("bootout", &output));
+    }
+    Ok(())
+}
+
+/// 盘上此刻**有没有**这条登录项、它指着什么，以及完整合约是否正确。
 ///
 /// 对「本进程配不配注册登录项」不持任何意见——这是本文件那条缺陷的修法核心：
 /// 事实读自文件系统，形态判定是另一个正交的量。
 #[allow(dead_code)] // 见模块开头：另一半平台的载荷靠单测保活
-fn mac_registered(dir: &Path, label: &str) -> (bool, Option<String>) {
+fn mac_registered(
+    dir: &Path,
+    label: &str,
+    expected_app: Option<&Path>,
+) -> (bool, Option<String>, bool) {
     match std::fs::read_to_string(mac_plist_path(dir, label)) {
-        Ok(body) => (true, mac_plist_target(&body)),
-        Err(_) => (false, None),
+        Ok(body) => {
+            let inspection =
+                audiohub_security::inspect_macos_launch_agent_plist(&body, label, expected_app);
+            (true, inspection.target, inspection.current)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, None, false),
+        // Invalid UTF-8 and permission failures still describe a path that is
+        // present but unusable. Calling it disabled would make package bootstrap
+        // preserve it as an intentional opt-out instead of repairing it.
+        Err(_) => (true, None, false),
     }
 }
 
 #[allow(dead_code)] // 见模块开头：另一半平台的载荷靠单测保活
 fn mac_state(dir: &Path, label: &str, app: &Path) -> AutostartState {
-    let (enabled, target) = mac_registered(dir, label);
+    let (enabled, target, current) = mac_registered(dir, label, Some(app));
+    let target = if enabled {
+        target
+    } else {
+        Some(app.display().to_string())
+    };
     AutostartState {
         supported: true,
         enabled,
+        current,
         // 装着时读自**已装好的那份**，不是当前 bundle：两者不同正是「登录项还
         // 指着一个被移走的旧 bundle」这件事，界面得看得见。没装时退回当前
         // bundle，那是「将会注册什么」。
-        target: target.or_else(|| Some(app.display().to_string())),
+        target,
         reason: None,
     }
 }
@@ -367,10 +504,11 @@ fn mac_state(dir: &Path, label: &str, app: &Path) -> AutostartState {
 /// 里真写着的那一个。
 #[allow(dead_code)] // 见模块开头：另一半平台的载荷靠单测保活
 fn mac_state_uninstallable(dir: &Path, label: &str, reason: &str) -> AutostartState {
-    let (enabled, target) = mac_registered(dir, label);
+    let (enabled, target, _) = mac_registered(dir, label, None);
     AutostartState {
         supported: false,
         enabled,
+        current: false,
         target,
         reason: Some(reason.to_string()),
     }
@@ -388,6 +526,20 @@ fn schtasks(args: &[String]) -> std::io::Result<std::process::Output> {
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
         .output()
+}
+
+#[cfg(windows)]
+fn decode_schtasks_xml(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xff, 0xfe]) || bytes.iter().skip(1).step_by(2).all(|byte| *byte == 0) {
+        let words = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .skip_while(|word| *word == 0xfeff)
+            .collect::<Vec<_>>();
+        String::from_utf16_lossy(&words)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 }
 
 // ------------------------------------------------------------------ 对外接口
@@ -434,12 +586,12 @@ fn probe() -> AutostartState {
         let Some(dir) = mac_agents_dir() else {
             return AutostartState::unsupported("读不到 HOME，定位不了 ~/Library/LaunchAgents");
         };
-        match app_bundle_of(&exe) {
+        match mac_app_target(&exe) {
             Some(app) => mac_state(&dir, MAC_LABEL, &app),
             None => mac_state_uninstallable(
                 &dir,
                 MAC_LABEL,
-                "当前服务不是从 AudioHub.app 里运行的（例如直接跑了构建产物里的裸二进制），\
+                "当前服务既不在 AudioHub.app 中，也不在受保护的 AudioHub 服务目录中，\
                  没有一个稳定的启动目标可以写进登录项",
             ),
         }
@@ -447,20 +599,37 @@ fn probe() -> AutostartState {
 
     #[cfg(windows)]
     {
-        let enabled = schtasks(&win_schtasks_query_argv(WIN_TASK))
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let task = schtasks(&win_schtasks_query_argv(WIN_TASK)).ok();
+        let enabled = task.as_ref().is_some_and(|output| output.status.success());
         match app_exe_beside(&exe) {
-            Some(app) => AutostartState {
-                supported: true,
-                enabled,
-                target: Some(app.display().to_string()),
-                reason: None,
-            },
+            Some(app) => {
+                let sid = audiohub_security::current_user_sid_string().ok();
+                let inspection = task
+                    .as_ref()
+                    .filter(|output| output.status.success())
+                    .zip(sid.as_deref())
+                    .map(|(output, sid)| {
+                        audiohub_security::inspect_windows_task_xml(
+                            &decode_schtasks_xml(&output.stdout),
+                            &app,
+                            sid,
+                        )
+                    });
+                AutostartState {
+                    supported: true,
+                    enabled,
+                    current: inspection.as_ref().is_some_and(|state| state.current),
+                    target: inspection
+                        .and_then(|state| state.target)
+                        .or_else(|| Some(app.display().to_string())),
+                    reason: None,
+                }
+            }
             // macOS 那一格的同构：计划任务活得比它旁边那个 App 长。
             None => AutostartState {
                 supported: false,
                 enabled,
+                current: false,
                 target: None,
                 reason: Some(
                     "当前服务旁边没有 audiohub-app.exe，没有一个稳定的启动目标可以写进计划任务"
@@ -497,14 +666,16 @@ enum SetPlan {
 /// 两个方向共用一个 `!supported` 闸门时，用户会得到一条自己开的、界面却关不掉的
 /// 登录项——没有任何途径撤销，除非手工去 `~/Library/LaunchAgents` 删文件。
 fn plan_set(want: bool, cur: &AutostartState) -> SetPlan {
-    match (want, cur.supported, cur.enabled) {
-        // 已经是想要的样子。
-        (w, _, e) if w == e => SetPlan::AlreadyThere,
-        // 开：必须有一个稳定的启动目标。
-        (true, false, _) => SetPlan::Refuse,
-        (true, true, _) => SetPlan::Apply,
-        // 关：永远允许。
-        (false, _, _) => SetPlan::Apply,
+    match (want, cur.supported, cur.enabled, cur.current) {
+        // 关且本来就没有；或开且完整契约已经正确。
+        (false, _, false, _) | (true, _, true, true) => SetPlan::AlreadyThere,
+        // 已存在但当前二进制没有稳定注册形态：仍允许用户关闭；重复开启
+        // 保持现状，不能凭一个开发/裸二进制擅自改写已装 App 的对象。
+        (true, false, true, _) => SetPlan::AlreadyThere,
+        // 开：必须有稳定启动目标。已有但被篡改/陈旧的注册也必须重建。
+        (true, false, _, _) => SetPlan::Refuse,
+        // 关掉任何已存在对象，或创建/修复一个目标明确的对象。
+        _ => SetPlan::Apply,
     }
 }
 
@@ -521,6 +692,17 @@ pub(crate) fn set(want: bool) -> Result<AutostartState> {
             cur.reason.as_deref().unwrap_or("原因未知")
         ),
         SetPlan::AlreadyThere => {
+            #[cfg(target_os = "macos")]
+            if want && cur.supported {
+                let dir = mac_agents_dir().ok_or_else(|| anyhow::anyhow!("读不到 HOME"))?;
+                // 盘上的 plist 是持久状态，但旧版本可能只写了文件、从未把它加载进
+                // 当前登录会话。重复“开启”在 macOS 上因此同时承担一次轻量修复。
+                if let Err(error) = mac_load(&dir, MAC_LABEL) {
+                    // plist 仍表示已启用；不要删除用户原本的下次登录选择，但必须把
+                    // 当前会话未注册这件事如实报给调用方。
+                    bail!("开机自启文件已存在，但当前登录会话加载失败：{error}");
+                }
+            }
             // `cur` 刚探测出来，就是事实；顺手把可能更旧的缓存丢掉。
             if let Ok(mut g) = cache().lock() {
                 *g = None;
@@ -535,7 +717,13 @@ pub(crate) fn set(want: bool) -> Result<AutostartState> {
     }
     let now = state();
     if now.enabled != want {
-        bail!("开机自启没有变成 {want}：写完之后读回来仍是 {}", now.enabled);
+        bail!(
+            "开机自启没有变成 {want}：写完之后读回来仍是 {}",
+            now.enabled
+        );
+    }
+    if want && !now.current {
+        bail!("开机自启任务存在，但完整触发器、用户 SID、权限或动作验证失败");
     }
     Ok(now)
 }
@@ -544,17 +732,31 @@ pub(crate) fn set(want: bool) -> Result<AutostartState> {
 fn apply(want: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let dir = mac_agents_dir()
-            .ok_or_else(|| anyhow::anyhow!("读不到 HOME"))?;
+        let dir = mac_agents_dir().ok_or_else(|| anyhow::anyhow!("读不到 HOME"))?;
         // 撤销不问形态（`plan_set` 的不对称在这里落地）：要删的那个文件是上一个
         // 形态写下的，此刻是什么形态与它无关。
         if !want {
+            mac_unload(MAC_LABEL)?;
             return mac_uninstall(&dir, MAC_LABEL);
         }
         let exe = std::env::current_exe()?;
-        let app = app_bundle_of(&exe)
-            .ok_or_else(|| anyhow::anyhow!("当前服务不在 AudioHub.app 里"))?;
-        mac_install(&dir, MAC_LABEL, &app)
+        let app = mac_app_target(&exe)
+            .ok_or_else(|| anyhow::anyhow!("当前服务不在受支持的 AudioHub 安装位置"))?;
+        // Apply(true) 也承担 stale 修复。若同 Label 的旧 job 仍在内存里，只覆盖
+        // plist 后 mac_load 会看到 `print` 成功并按幂等路径返回，实际动作仍是旧的。
+        // 先撤销旧 job，才能保证随后 bootstrap 的正是刚验证过的完整合约。
+        mac_unload(MAC_LABEL)?;
+        mac_install(&dir, MAC_LABEL, &app)?;
+        if let Err(error) = mac_load(&dir, MAC_LABEL) {
+            // 首次开启必须是一个事务：launchd 没有接纳时，不能留下一个会让 UI
+            // 显示“已开启”的 plist。bootout 在 mac_load 的失败路径已尽力完成。
+            let cleanup = mac_uninstall(&dir, MAC_LABEL);
+            if let Err(cleanup) = cleanup {
+                bail!("当前登录会话加载失败：{error}；回滚 plist 也失败：{cleanup}");
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -574,11 +776,11 @@ fn apply(want: bool) -> Result<()> {
         let app = app_exe_beside(&exe)
             .ok_or_else(|| anyhow::anyhow!("当前服务旁边没有 audiohub-app.exe"))?;
         let args = {
-            let user = format!(
-                "{}\\{}",
-                std::env::var("USERDOMAIN").unwrap_or_default(),
-                std::env::var("USERNAME").unwrap_or_default()
-            );
+            // Use the token SID, not USERDOMAIN\\USERNAME. OpenSSH on a
+            // standalone Windows host reports USERDOMAIN=WORKGROUP, and Task
+            // Scheduler correctly rejects WORKGROUP\\user as unmappable.
+            let user = audiohub_security::current_user_sid_string()
+                .map_err(|error| anyhow::anyhow!("读不到当前用户 SID：{error}"))?;
             let xml_path = std::env::temp_dir().join("audiohub-autostart-task.xml");
             // UTF-16LE + BOM：`schtasks /XML` 只吃这一种编码，UTF-8 会被报成
             // 「任务 XML 包含意外节点」，而那句错误与真正的原因毫无关系。
@@ -628,7 +830,9 @@ mod tests {
     #[test]
     fn only_a_real_bundle_layout_counts_as_installable() {
         assert_eq!(
-            app_bundle_of(Path::new("/Applications/AudioHub.app/Contents/MacOS/audiohub")),
+            app_bundle_of(Path::new(
+                "/Applications/AudioHub.app/Contents/MacOS/audiohub"
+            )),
             Some(PathBuf::from("/Applications/AudioHub.app")),
         );
         // 构建树里的 bundle 同样算数——用户此刻跑的就是这一个。
@@ -652,7 +856,39 @@ mod tests {
             // 没有扩展名。
             "/home/me/AudioHub/Contents/MacOS/audiohubd",
         ] {
-            assert_eq!(app_bundle_of(Path::new(bad)), None, "{bad} 不该被当成可注册形态");
+            assert_eq!(
+                app_bundle_of(Path::new(bad)),
+                None,
+                "{bad} 不该被当成可注册形态"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_protected_versioned_daemon_maps_to_the_installed_app() {
+        let hash = "0123456789abcdef".repeat(4);
+        let daemon = PathBuf::from(MAC_SERVICE_VERSIONS)
+            .join(&hash)
+            .join("audiohubd");
+        assert_eq!(
+            mac_app_target(&daemon),
+            Some(PathBuf::from(MAC_INSTALLED_APP))
+        );
+        assert_eq!(
+            mac_app_target(Path::new(
+                "/Applications/AudioHub.app/Contents/MacOS/audiohubd"
+            )),
+            Some(PathBuf::from("/Applications/AudioHub.app"))
+        );
+
+        for bad in [
+            "/Library/Application Support/AudioHub/service/current/audiohubd",
+            "/Library/Application Support/AudioHub/service/versions/not-a-hash/audiohubd",
+            "/Library/Application Support/AudioHub/service/versions/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/audiohubd",
+            "/Library/Application Support/AudioHub/service/versions/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/audiohub",
+            "/tmp/AudioHub/service/versions/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/audiohubd",
+        ] {
+            assert_eq!(mac_app_target(Path::new(bad)), None, "unsafe layout: {bad}");
         }
     }
 
@@ -685,10 +921,19 @@ mod tests {
     #[test]
     fn the_login_item_launches_the_app_and_runs_at_load() {
         let body = mac_plist(MAC_LABEL, Path::new("/Applications/AudioHub.app"));
-        assert!(body.contains(&format!("<string>{MAC_LABEL}</string>")), "{body}");
-        assert!(body.contains("<key>RunAtLoad</key>\n\t<true/>"), "没有 RunAtLoad：{body}");
+        assert!(
+            body.contains(&format!("<string>{MAC_LABEL}</string>")),
+            "{body}"
+        );
+        assert!(
+            body.contains("<key>RunAtLoad</key>\n\t<true/>"),
+            "没有 RunAtLoad：{body}"
+        );
         assert!(body.contains("<string>/usr/bin/open</string>"), "{body}");
-        assert!(body.contains("<string>-g</string>"), "登录时会抢焦点：{body}");
+        assert!(
+            body.contains("<string>-g</string>"),
+            "登录时会抢焦点：{body}"
+        );
         assert!(
             body.contains("<string>/Applications/AudioHub.app</string>"),
             "登录项没有指向 App bundle：{body}"
@@ -697,6 +942,10 @@ mod tests {
         assert!(
             !body.contains("audiohubd"),
             "登录项直接拉了 daemon —— 那样起来的机器没有任何界面入口：{body}"
+        );
+        assert!(
+            body.contains("<string>--background</string>"),
+            "登录启动必须隐藏窗口并自动拉 daemon：{body}"
         );
         // KeepAlive 写进去 = 用户点了「停止音频服务并退出」也会被 launchd 拽回来。
         assert!(!body.contains("KeepAlive"), "不许 KeepAlive：{body}");
@@ -709,7 +958,10 @@ mod tests {
     #[test]
     fn a_path_with_xml_metacharacters_does_not_produce_a_broken_plist() {
         let body = mac_plist(MAC_LABEL, Path::new("/Users/a&b/<x>/AudioHub.app"));
-        assert!(body.contains("/Users/a&amp;b/&lt;x&gt;/AudioHub.app"), "{body}");
+        assert!(
+            body.contains("/Users/a&amp;b/&lt;x&gt;/AudioHub.app"),
+            "{body}"
+        );
         // 转义之后，除 DTD 那一行的 URL 外不该再有裸 `&`。
         for line in body.lines().filter(|l| !l.contains("DOCTYPE")) {
             for (i, _) in line.match_indices('&') {
@@ -723,8 +975,14 @@ mod tests {
                 );
             }
         }
+        let inspection = audiohub_security::inspect_macos_launch_agent_plist(
+            &body,
+            MAC_LABEL,
+            Some(Path::new("/Users/a&b/<x>/AudioHub.app")),
+        );
+        assert!(inspection.current, "完整合约未通过解析：{inspection:?}");
         assert_eq!(
-            mac_plist_target(&body).as_deref(),
+            inspection.target.as_deref(),
             Some("/Users/a&b/<x>/AudioHub.app"),
             "转义之后读不回原路径"
         );
@@ -741,7 +999,10 @@ mod tests {
         let app = PathBuf::from("/Applications/AudioHub.app");
 
         let off = mac_state(&dir, MAC_LABEL, &app);
-        assert!(off.supported && !off.enabled, "空目录里不该有登录项：{off:?}");
+        assert!(
+            off.supported && !off.enabled,
+            "空目录里不该有登录项：{off:?}"
+        );
 
         mac_install(&dir, MAC_LABEL, &app).expect("install");
         let on = mac_state(&dir, MAC_LABEL, &app);
@@ -752,7 +1013,10 @@ mod tests {
         assert!(!dir.join(format!("{MAC_LABEL}.plist.tmp")).exists());
 
         mac_uninstall(&dir, MAC_LABEL).expect("uninstall");
-        assert!(!mac_state(&dir, MAC_LABEL, &app).enabled, "关掉之后文件还在");
+        assert!(
+            !mac_state(&dir, MAC_LABEL, &app).enabled,
+            "关掉之后文件还在"
+        );
         // 幂等：再关一次不许报错。
         mac_uninstall(&dir, MAC_LABEL).expect("second uninstall must be a no-op");
 
@@ -777,6 +1041,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 仅仅仍指向同一个 App 不代表登录项仍是 AudioHub 写下的那条契约。
+    ///
+    /// 旧实现只从 ProgramArguments 里捞一个 `.app`，所以 RunAtLoad、ProcessType、
+    /// Label 或参数被改坏时仍会把它报成 current，`autostart=true` 也就拒绝修复。
+    #[test]
+    fn a_matching_app_path_with_a_broken_contract_is_stale_and_repairable() {
+        let dir = tmp("stale-mac-contract");
+        let app = Path::new("/Applications/AudioHub.app");
+        let body = mac_plist(MAC_LABEL, app).replace("<true/>", "<false/>");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(mac_plist_path(&dir, MAC_LABEL), body).expect("write plist");
+
+        let state = mac_state(&dir, MAC_LABEL, app);
+        assert!(state.enabled, "plist 存在却被报成 missing：{state:?}");
+        assert_eq!(state.target.as_deref(), Some("/Applications/AudioHub.app"));
+        assert!(
+            !state.current,
+            "RunAtLoad=false 仍被误报为 current：{state:?}"
+        );
+        assert_eq!(
+            plan_set(true, &state),
+            SetPlan::Apply,
+            "已有但失效的 plist 必须走修复，不得按幂等开启跳过"
+        );
+
+        std::fs::write(mac_plist_path(&dir, MAC_LABEL), [0xff]).expect("write invalid plist");
+        let unreadable = mac_state(&dir, MAC_LABEL, app);
+        assert!(
+            unreadable.enabled && !unreadable.current,
+            "存在但不是 UTF-8 的 plist 被误报为 missing/current：{unreadable:?}"
+        );
+        assert_eq!(
+            unreadable.target, None,
+            "读不懂已注册对象时不得拿当前 bundle 路径冒充其实际目标"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **一条活得比自己 bundle 长的登录项，必须照实报出来，并且关得掉。**
     ///
     /// 走到这一格的路径很普通：在装好的 `.app` 里打开自启（plist 落盘），之后从
@@ -791,7 +1094,10 @@ mod tests {
         const WHY: &str = "当前服务不是从 AudioHub.app 里运行的";
 
         // 前提：这个形态确实注册不了——测试二进制就是这样一个形态。
-        assert_eq!(app_bundle_of(Path::new("/repo/target/debug/audiohubd")), None);
+        assert_eq!(
+            app_bundle_of(Path::new("/repo/target/debug/audiohubd")),
+            None
+        );
 
         // 空目录：没装就是没装，两个量都是 false，理由照给。
         let none = mac_state_uninstallable(&dir, MAC_LABEL, WHY);
@@ -805,7 +1111,10 @@ mod tests {
             st.enabled,
             "登录项在盘上却被报成关着 —— 界面会显示「已关闭」，而每次登录仍会拉起 App：{st:?}"
         );
-        assert!(!st.supported, "这个形态注册不了新的，这一点不该被 enabled 带偏：{st:?}");
+        assert!(
+            !st.supported,
+            "这个形态注册不了新的，这一点不该被 enabled 带偏：{st:?}"
+        );
         assert_eq!(
             st.target.as_deref(),
             Some("/Applications/AudioHub.app"),
@@ -814,8 +1123,16 @@ mod tests {
         assert!(st.reason.is_some(), "说不出为什么开不了新的");
 
         // 关得掉：策略允许，动作也真的落到文件系统上。
-        assert_eq!(plan_set(false, &st), SetPlan::Apply, "关一条已注册的登录项被拒了");
-        assert_eq!(plan_set(true, &st), SetPlan::AlreadyThere, "已经开着，再开一次不该动系统");
+        assert_eq!(
+            plan_set(false, &st),
+            SetPlan::Apply,
+            "关一条已注册的登录项被拒了"
+        );
+        assert_eq!(
+            plan_set(true, &st),
+            SetPlan::AlreadyThere,
+            "已经开着，再开一次不该动系统"
+        );
         mac_uninstall(&dir, MAC_LABEL).expect("uninstall");
         assert!(
             !mac_state_uninstallable(&dir, MAC_LABEL, WHY).enabled,
@@ -836,18 +1153,43 @@ mod tests {
         let st = |supported: bool, enabled: bool| AutostartState {
             supported,
             enabled,
+            current: enabled,
             target: None,
             reason: None,
         };
         for (want, supported, enabled, expect, why) in [
-            (false, false, true, SetPlan::Apply, "形态不合格 ⇒ 关不掉自己开的登录项"),
+            (
+                false,
+                false,
+                true,
+                SetPlan::Apply,
+                "形态不合格 ⇒ 关不掉自己开的登录项",
+            ),
             (false, true, true, SetPlan::Apply, "正常的关"),
-            (false, false, false, SetPlan::AlreadyThere, "本来就没有，不该去碰文件系统"),
+            (
+                false,
+                false,
+                false,
+                SetPlan::AlreadyThere,
+                "本来就没有，不该去碰文件系统",
+            ),
             (false, true, false, SetPlan::AlreadyThere, "本来就没有"),
-            (true, false, false, SetPlan::Refuse, "没有稳定启动目标却收下了「开」"),
+            (
+                true,
+                false,
+                false,
+                SetPlan::Refuse,
+                "没有稳定启动目标却收下了「开」",
+            ),
             (true, true, false, SetPlan::Apply, "正常的开"),
             (true, true, true, SetPlan::AlreadyThere, "已经开着"),
-            (true, false, true, SetPlan::AlreadyThere, "已经开着，形态不合格也无需再写一次"),
+            (
+                true,
+                false,
+                true,
+                SetPlan::AlreadyThere,
+                "已有注册但当前形态不合格，不能擅自改写已装 App 的对象",
+            ),
         ] {
             assert_eq!(
                 plan_set(want, &st(supported, enabled)),
@@ -865,8 +1207,8 @@ mod tests {
     fn the_task_name_matches_the_install_script() {
         let p = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../scripts/install-windows-autostart.ps1");
-        let src = std::fs::read_to_string(&p)
-            .unwrap_or_else(|e| panic!("读不到 {}：{e}", p.display()));
+        let src =
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("读不到 {}：{e}", p.display()));
         assert!(
             src.contains(&format!("$TaskName = '{WIN_TASK}'")),
             "{} 里的任务名与 autostart::WIN_TASK（{WIN_TASK}）不一致",
@@ -885,11 +1227,17 @@ mod tests {
         assert!(create.contains(&WIN_TASK.to_string()), "{create:?}");
         assert!(create.contains(&"/XML".to_string()), "没走 XML：{create:?}");
         assert!(create.contains(&r"C:\tmp\t.xml".to_string()), "{create:?}");
-        assert!(create.contains(&"/F".to_string()), "没有 /F，装过的机器更新不了：{create:?}");
+        assert!(
+            create.contains(&"/F".to_string()),
+            "没有 /F，装过的机器更新不了：{create:?}"
+        );
 
         let del = win_schtasks_delete_argv(WIN_TASK);
         assert_eq!(del[0], "/Delete");
-        assert!(del.contains(&"/F".to_string()), "删除会停在一个交互确认上：{del:?}");
+        assert!(
+            del.contains(&"/F".to_string()),
+            "删除会停在一个交互确认上：{del:?}"
+        );
 
         let q = win_schtasks_query_argv(WIN_TASK);
         assert_eq!(q[0], "/Query");
@@ -901,18 +1249,44 @@ mod tests {
     fn the_scheduled_task_xml_launches_the_app_at_logon() {
         let xml = win_task_xml(Path::new(r"C:\Users\a\AudioHub\audiohub-app.exe"), r"PC\a");
         assert!(xml.contains("<LogonTrigger>"), "{xml}");
-        assert!(xml.contains("<Command>C:\\Users\\a\\AudioHub\\audiohub-app.exe</Command>"), "{xml}");
+        assert!(
+            xml.contains("<Command>C:\\Users\\a\\AudioHub\\audiohub-app.exe</Command>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<Arguments>--background</Arguments>"), "{xml}");
+        assert!(
+            xml.contains("<Settings>\n    <Enabled>true</Enabled>"),
+            "{xml}"
+        );
         assert!(xml.contains("<UserId>PC\\a</UserId>"), "{xml}");
         // session 0 隔离拿不到音频端点，所以必须是交互式登录令牌（安装脚本决定 1）。
-        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"), "{xml}");
+        assert!(
+            xml.contains("<LogonType>InteractiveToken</LogonType>"),
+            "{xml}"
+        );
         assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"), "{xml}");
         assert!(xml.contains("<Hidden>true</Hidden>"), "{xml}");
-        assert!(xml.contains("<StartWhenAvailable>true</StartWhenAvailable>"), "{xml}");
+        assert!(
+            xml.contains("<StartWhenAvailable>true</StartWhenAvailable>"),
+            "{xml}"
+        );
         // 拉 App，不是 daemon —— 与 macOS 同一个模型。
         assert!(
             !xml.contains("audiohubd.exe"),
             "计划任务直接拉了 daemon —— 那样起来的机器没有托盘、没有任何界面入口：{xml}"
         );
+    }
+
+    #[test]
+    fn a_present_but_stale_task_is_repaired_when_enabled_again() {
+        let stale = AutostartState {
+            supported: true,
+            enabled: true,
+            current: false,
+            target: Some(r"C:\old\audiohub-app.exe".into()),
+            reason: None,
+        };
+        assert_eq!(plan_set(true, &stale), SetPlan::Apply);
     }
 
     /// `needle` 出现在至少一行**不是注释**的代码上。
@@ -925,7 +1299,10 @@ mod tests {
     fn contains_uncommented(src: &str, needle: &str) -> bool {
         src.lines().filter(|l| l.contains(needle)).any(|l| {
             let t = l.trim_start();
-            !(t.starts_with("//") || t.starts_with("*") || t.starts_with("/*") || t.starts_with("{/*"))
+            !(t.starts_with("//")
+                || t.starts_with("*")
+                || t.starts_with("/*")
+                || t.starts_with("{/*"))
         })
     }
 
@@ -937,7 +1314,9 @@ mod tests {
     #[test]
     fn the_settings_page_really_has_the_autostart_switch() {
         let read = |rel: &str| {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel);
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(rel);
             std::fs::read_to_string(&path).unwrap_or_else(|e| {
                 panic!("读不到 {rel}（{e}）。文件被改名/挪走了就把这条测试一起更新，不要让它退化成恒真断言")
             })

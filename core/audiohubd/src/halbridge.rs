@@ -86,9 +86,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::{dlog, lk};
 #[cfg(target_os = "macos")]
 use crate::{rd, wr};
-use crate::{dlog, lk};
 
 // ---------------------------------------------------------------- frozen contract
 
@@ -178,7 +178,12 @@ const MSG_BIND: i32 = 0x4148_0005; // daemon -> driver, fire and forget
 /// An installed v1 driver therefore refuses this daemon outright, which is the
 /// intended loud failure; a shim that tried to speak both would be guessing at
 /// which layout it is holding.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3 gives each Bind an explicit publication mask.  A v2 driver would ignore
+/// those bits and quietly publish both endpoints for a peer that has only one
+/// real audio direction, so this is an equality bump rather than an additive
+/// hint.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// v1's `AudioHubHelloReply`: 24 header + 4 body + 2 descriptors + 52 payload.
 /// Kept ONLY so a reply of exactly this size can be named as "an old driver is
@@ -235,6 +240,45 @@ pub const REASON_PROTOCOL_MISMATCH: &str = "driver_protocol_mismatch";
 
 const BIND_CLEAR: u32 = 0;
 const BIND_SET: u32 = 1;
+
+/// Direction mask shared by the coordinator and both drivers.  "Out" is the
+/// local virtual speaker (remote default output); "in" is the local virtual
+/// microphone (remote default input).
+pub const HAL_PUBLISH_OUT: u8 = 0x1;
+pub const HAL_PUBLISH_IN: u8 = 0x2;
+pub const HAL_PUBLISH_BOTH: u8 = HAL_PUBLISH_OUT | HAL_PUBLISH_IN;
+
+/// Bind wire flags.  Bit 0 remains the online/logging bit from v2; v3 assigns
+/// bits 1 and 2 to the endpoints the driver must actually publish.
+const BIND_FLAG_ONLINE: u32 = 0x1;
+const BIND_FLAG_OUT: u32 = 0x2;
+const BIND_FLAG_IN: u32 = 0x4;
+
+fn bind_flags(online: bool, directions: u8) -> u32 {
+    (if online { BIND_FLAG_ONLINE } else { 0 })
+        | (if directions & HAL_PUBLISH_OUT != 0 {
+            BIND_FLAG_OUT
+        } else {
+            0
+        })
+        | (if directions & HAL_PUBLISH_IN != 0 {
+            BIND_FLAG_IN
+        } else {
+            0
+        })
+}
+
+fn directions_from_bind_flags(flags: u32) -> u8 {
+    (if flags & BIND_FLAG_OUT != 0 {
+        HAL_PUBLISH_OUT
+    } else {
+        0
+    }) | (if flags & BIND_FLAG_IN != 0 {
+        HAL_PUBLISH_IN
+    } else {
+        0
+    })
+}
 
 /// The low bit of an endpoint. What used to be a one-bit device selector is now
 /// `slot * 2 + dir`, and the direction stayed the LOW bit so slot 0 keeps v1's
@@ -297,7 +341,10 @@ impl HalEndpoint {
         })
     }
     fn to_wire(self) -> u32 {
-        endpoint(self.slot as usize, if self.input { DIR_IN } else { DIR_OUT })
+        endpoint(
+            self.slot as usize,
+            if self.input { DIR_IN } else { DIR_OUT },
+        )
     }
 }
 
@@ -340,16 +387,37 @@ impl HalSlotState {
 pub enum HalControlEvent {
     /// The local user moved the virtual device's slider. The daemon must relay
     /// this to the peer's REAL device via the existing `VolumeSet` path.
-    Volume { at: HalEndpoint, generation: u32, scalar: f32, muted: bool },
+    Volume {
+        at: HalEndpoint,
+        generation: u32,
+        scalar: f32,
+        muted: bool,
+    },
     /// An application started/stopped using the virtual device. In mode B this
     /// is the ONLY signal that opens a session (spec-m5b §5.6).
-    IoState { at: HalEndpoint, generation: u32, running: bool },
+    IoState {
+        at: HalEndpoint,
+        generation: u32,
+        running: bool,
+    },
     /// A slot changed state, or answered an idempotent `Bind`.
-    BindState { slot: u8, generation: u32, state: HalSlotState },
+    BindState {
+        slot: u8,
+        generation: u32,
+        state: HalSlotState,
+        /// Endpoints the driver says are actually published.  This is an ack,
+        /// not an echo of the requested mask.
+        published: u8,
+    },
     /// What this endpoint's declared device latency ACTUALLY is now, in frames.
     /// The driver's answer to a latency notify — never an echo of the request.
     /// `pending` = a newer value is held back until the application stops IO.
-    LatencyState { at: HalEndpoint, generation: u32, frames: u32, pending: bool },
+    LatencyState {
+        at: HalEndpoint,
+        generation: u32,
+        frames: u32,
+        pending: bool,
+    },
     /// A handshake completed. Everything this daemon still intends must be
     /// re-`Set` after this — the driver replays a slot's IO state and volume
     /// only when an idempotent Set lands on it (spec-m5b §1, third trade-off),
@@ -363,14 +431,10 @@ pub enum HalControlEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HalBridgeMode {
-    /// Build a bridge only on a machine whose driver is actually there — the
-    /// name has to resolve once at startup. Everywhere else this is `Ok(None)`
-    /// and the daemon runs exactly as it did before this module existed.
-    ///
-    /// The old build gated on a LaunchAgent marker env var instead, because
-    /// `bootstrap_check_in` of an unknown name SUCCEEDS and would let any
-    /// hand-run daemon steal the name. Looking a name up has no such hazard,
-    /// so the marker is gone.
+    /// Build a silent, retrying bridge on a supported platform. A missing driver
+    /// is ordinary and non-fatal, but it may appear after daemon startup (the
+    /// macOS package restarts coreaudiod asynchronously), so startup cannot be a
+    /// one-shot availability gate.
     Auto,
     /// Build the bridge even when the driver is not there yet and keep looking.
     /// Only a failure we cannot retry out of (no ports, no memory) is fatal.
@@ -387,7 +451,10 @@ pub struct HalBridgeCfg {
 
 impl Default for HalBridgeCfg {
     fn default() -> Self {
-        HalBridgeCfg { service_name: HAL_SERVICE_NAME.to_string(), mode: HalBridgeMode::Auto }
+        HalBridgeCfg {
+            service_name: HAL_SERVICE_NAME.to_string(),
+            mode: HalBridgeMode::Auto,
+        }
     }
 }
 
@@ -399,8 +466,8 @@ impl HalBridgeCfg {
             Some("require") | Some("1") => HalBridgeMode::Require,
             _ => HalBridgeMode::Auto,
         };
-        let service_name = std::env::var("AUDIOHUB_HAL_SERVICE")
-            .unwrap_or_else(|_| HAL_SERVICE_NAME.to_string());
+        let service_name =
+            std::env::var("AUDIOHUB_HAL_SERVICE").unwrap_or_else(|_| HAL_SERVICE_NAME.to_string());
         HalBridgeCfg { service_name, mode }
     }
 }
@@ -585,7 +652,9 @@ pub struct SpkPhaseWindow {
 
 impl Default for SpkPhaseWindow {
     fn default() -> SpkPhaseWindow {
-        SpkPhaseWindow { epochs: [0; HAL_MAX_SLOTS] }
+        SpkPhaseWindow {
+            epochs: [0; HAL_MAX_SLOTS],
+        }
     }
 }
 
@@ -641,7 +710,10 @@ impl HalBridge {
                 // 水位取最大而不是求和：把两个槽各自的 44 ms 目标加成 88 ms
                 // 是一句没有物理含义的话。
                 target_ms: slots.iter().map(|c| c.trim.target_ms).fold(0.0, f32::max),
-                dll_target_ms: slots.iter().map(|c| c.trim.dll_target_ms).fold(0.0, f32::max),
+                dll_target_ms: slots
+                    .iter()
+                    .map(|c| c.trim.dll_target_ms)
+                    .fold(0.0, f32::max),
                 drawdown_ms: slots.iter().map(|c| c.trim.drawdown_ms).fold(0.0, f32::max),
                 tokens_ms: slots.iter().map(|c| c.trim.tokens_ms).fold(0.0, f32::max),
             },
@@ -665,8 +737,13 @@ impl HalBridge {
                 low_water_ms: slots
                     .iter()
                     .filter_map(|c| c.mic_gate.low_water_ms)
-                    .fold(None, |acc: Option<f32>, v| Some(acc.map_or(v, |a| a.min(v)))),
-                depth_ms: slots.iter().map(|c| c.mic_gate.depth_ms).fold(0.0, f32::max),
+                    .fold(None, |acc: Option<f32>, v| {
+                        Some(acc.map_or(v, |a| a.min(v)))
+                    }),
+                depth_ms: slots
+                    .iter()
+                    .map(|c| c.mic_gate.depth_ms)
+                    .fold(0.0, f32::max),
             },
             slots,
         }
@@ -677,7 +754,9 @@ impl HalBridge {
     /// 全部 `Relaxed`：这些量只被读来看，不参与任何同步，而它跑在 10 ms
     /// 截止期线程上，代价必须是零。
     pub fn record_mic_gate(&self, slot: u8, plan: &crate::micgate::MicPlan, occupied: u32) {
-        let Some(c) = self.shared.slots.get(slot as usize) else { return };
+        let Some(c) = self.shared.slots.get(slot as usize) else {
+            return;
+        };
         c.mic_depth_frames.store(occupied, Ordering::Relaxed);
         c.mic_low_water.fetch_min(occupied, Ordering::Relaxed);
         if plan.starved {
@@ -766,7 +845,10 @@ impl HalBridge {
                 continue;
             }
             if best.map_or(true, |b| err > b.err_frames) {
-                best = Some(SpkPhase { slot: slot as u8, err_frames: err });
+                best = Some(SpkPhase {
+                    slot: slot as u8,
+                    err_frames: err,
+                });
             }
         }
         best
@@ -982,15 +1064,16 @@ pub struct HalBindRequest {
     pub in_uid: String,
     pub out_name: String,
     pub in_name: String,
-    /// The peer's disambiguated display name with NO direction suffix —
-    /// "AudioHub – WIN-30", where `out_name` would be "AudioHub – WIN-30 扬声器".
+    /// The peer's complete disambiguated display name — "AudioHub – WIN-30".
     ///
-    /// macOS ignores this and uses `out_name`/`in_name`, which are the complete
-    /// device names. Windows uses ONLY this, because it composes the string the
-    /// user sees itself: the endpoint name is `"<pin name> (<filter
-    /// FriendlyName>)"`, and the driver controls only the half in brackets.
-    /// Sending `out_name` there would produce "扬声器 (AudioHub – WIN-30 扬声器)".
+    /// macOS uses `out_name`/`in_name`; Windows uses this platform-neutral peer
+    /// label as the value written to each direction's endpoint property. All
+    /// three fields intentionally contain the same visible label today.
     pub display: String,
+    /// [`HAL_PUBLISH_OUT`] | [`HAL_PUBLISH_IN`].  Zero is valid: it retires all
+    /// endpoints for a paired peer whose last-known machine has no usable
+    /// default audio direction while keeping the slot assignment stable.
+    pub directions: u8,
     /// bit0 of the wire `flags`: the peer is connected. Logging only on the
     /// driver's side — a device is published either way (plan §7.3).
     pub online: bool,
@@ -1295,7 +1378,11 @@ pub(crate) mod trim {
             return None;
         }
         let peak = gate_peak(r, f, X, want);
-        let tier = if peak < GATE_QUIET { Tier::Quiet } else { Tier::Forced };
+        let tier = if peak < GATE_QUIET {
+            Tier::Quiet
+        } else {
+            Tier::Forced
+        };
         if tier > plan.allow {
             return None; // escalate 还没放行到这一档：再等等，等待很便宜
         }
@@ -1308,7 +1395,13 @@ pub(crate) mod trim {
         if tau < T_MIN || tau > span || tau > plan.feasible {
             return None;
         }
-        Some(Decision { tau, ncc, tier, forced: tier == Tier::Forced, charge: true })
+        Some(Decision {
+            tau,
+            ncc,
+            tier,
+            forced: tier == Tier::Forced,
+            charge: true,
+        })
     }
 
     /// 本 tick 的**第一段** peek 长度：一帧 + 相关档上限 + 搜索余量。
@@ -1345,8 +1438,7 @@ pub(crate) mod trim {
         for tau in lo..=hi {
             let n = ncc_at(r, f, x, tau);
             let better = n > best_ncc + 1e-6;
-            let tie = (n - best_ncc).abs() <= 1e-6
-                && want.abs_diff(tau) < want.abs_diff(best);
+            let tie = (n - best_ncc).abs() <= 1e-6 && want.abs_diff(tau) < want.abs_diff(best);
             if better || tie {
                 best = tau;
                 best_ncc = n;
@@ -1398,8 +1490,7 @@ pub(crate) mod trim {
         let equal_gain = p >= 1.0 - 1e-6;
         for k in 0..x {
             let i = f - x + k;
-            let u = 0.5
-                * (1.0 - (std::f32::consts::PI * (k as f32 + 0.5) / x as f32).cos());
+            let u = 0.5 * (1.0 - (std::f32::consts::PI * (k as f32 + 0.5) / x as f32).cos());
             let (ga, gb) = if equal_gain {
                 (1.0 - u, u)
             } else {
@@ -1422,7 +1513,11 @@ pub(crate) mod trim {
 
     impl MaxWin {
         fn new() -> MaxWin {
-            MaxWin { b: [0; DD_WINDOW_S], cur: 0, started: false }
+            MaxWin {
+                b: [0; DD_WINDOW_S],
+                cur: 0,
+                started: false,
+            }
         }
         fn push(&mut self, sec: u64, v: u32) {
             if !self.started {
@@ -1588,13 +1683,7 @@ pub(crate) mod trim {
 
         /// 每个 tick 的第一步：观测 + 记账 + 出许可。`avail` 是**读之前**的
         /// `readable()`（即 `A_n`），`cap` 是环容量。
-        pub fn begin_tick(
-            &mut self,
-            now_us: u64,
-            punctual: bool,
-            avail: u32,
-            cap: u32,
-        ) -> Plan {
+        pub fn begin_tick(&mut self, now_us: u64, punctual: bool, avail: u32, cap: u32) -> Plan {
             let dt = match self.last_us {
                 Some(t) if now_us > t => (now_us - t) as f32 / 1e6,
                 _ => 0.0,
@@ -1653,8 +1742,7 @@ pub(crate) mod trim {
             if punctual {
                 if let Some(d) = self.last_d {
                     let w = avail.saturating_sub(d);
-                    self.drawdown = (self.drawdown + super::HAL_FRAME_48K as u32)
-                        .saturating_sub(w);
+                    self.drawdown = (self.drawdown + super::HAL_FRAME_48K as u32).saturating_sub(w);
                     self.dd.push(now_us / 1_000_000, self.drawdown);
                 }
             }
@@ -1665,9 +1753,7 @@ pub(crate) mod trim {
             } else {
                 RHO
             };
-            self.tokens = (self.tokens
-                + rho * dt * super::HAL_SAMPLE_RATE as f32)
-                .min(B_TOK);
+            self.tokens = (self.tokens + rho * dt * super::HAL_SAMPLE_RATE as f32).min(B_TOK);
 
             // ---- 每秒重算目标水位 ----
             if now_us >= self.next_target_us {
@@ -1704,7 +1790,13 @@ pub(crate) mod trim {
             } else {
                 0
             };
-            Plan { budget, d_floor, feasible, allow, fast }
+            Plan {
+                budget,
+                d_floor,
+                feasible,
+                allow,
+                fast,
+            }
         }
 
         /// 每个 tick 的最后一步：`d_after` 是**读后**残量（`A − 实际读走`）。
@@ -1876,7 +1968,10 @@ pub(crate) mod trim {
         struct Lcg(u64);
         impl Lcg {
             fn next_u32(&mut self) -> u32 {
-                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (self.0 >> 33) as u32
             }
             fn unit(&mut self) -> f32 {
@@ -1989,7 +2084,10 @@ pub(crate) mod trim {
                 "**判据自身失效**：硬切没被 C2 抓住 (got {r_hard:.3}×)，\
                  那这条判据以后永远会通过"
             );
-            assert!(r_hard > 5.0, "硬切与阈值之间应有一个数量级的分离度, got {r_hard:.3}×");
+            assert!(
+                r_hard > 5.0,
+                "硬切与阈值之间应有一个数量级的分离度, got {r_hard:.3}×"
+            );
         }
 
         /// 不相关内容必须用**等功率**律，否则电平在拼接点塌陷。
@@ -2008,7 +2106,10 @@ pub(crate) mod trim {
             let hop = MSF / 2; // 0.5 ms
             let d_power = c3_worst_db(&eq_power, win, hop);
             let d_gain = c3_worst_db(&eq_gain, win, hop);
-            assert!(d_power <= 1.5, "等功率律不该有电平凹陷, got {d_power:.2} dB");
+            assert!(
+                d_power <= 1.5,
+                "等功率律不该有电平凹陷, got {d_power:.2} dB"
+            );
             assert!(
                 d_gain > 1.5,
                 "**判据自身失效**：等增益误用在不相关内容上没被 C3 抓住 \
@@ -2037,7 +2138,10 @@ pub(crate) mod trim {
             let (good, tau, _) = stream_one_splice(&input, X, 2, T_MAX_CORR, None, None);
             assert_eq!(tau, 480);
             let snr_good = c4_min_snr_db(&good, 1000.0);
-            assert!(snr_good >= 40.0, "搜索命中整周期时不该有谱扩散, got {snr_good:.1} dB");
+            assert!(
+                snr_good >= 40.0,
+                "搜索命中整周期时不该有谱扩散, got {snr_good:.1} dB"
+            );
             let (bad, _, _) = stream_one_splice(&input, 0, 2, 0, Some(492), None);
             let snr_bad = c4_min_snr_db(&bad, 1000.0);
             assert!(
@@ -2192,7 +2296,9 @@ pub(crate) mod trim {
                 // 生产者：环满则短写（驱动侧 drop-newest，本进程观测不到）
                 self.w = (self.w + produce).min(self.r + self.cap);
                 let avail = self.level() as u32;
-                let plan = self.ctl.begin_tick(self.now_us, punctual, avail, self.cap as u32);
+                let plan = self
+                    .ctl
+                    .begin_tick(self.now_us, punctual, avail, self.cap as u32);
                 let floor = self.ctl.d_floor_frames();
                 let mut tau = 0usize;
                 if plan.wants_trim() {
@@ -2309,7 +2415,10 @@ pub(crate) mod trim {
                 }
                 sim.tick(produce, true);
             }
-            assert!(sim.trims > 0, "这 10 分钟里必须真的削过，否则这条测试是空的");
+            assert!(
+                sim.trims > 0,
+                "这 10 分钟里必须真的削过，否则这条测试是空的"
+            );
             assert_eq!(
                 sim.short_frames, 0,
                 "trim 削过头了：补了 {} 帧静音（{} 段）",
@@ -2355,7 +2464,10 @@ pub(crate) mod trim {
                 "D_floor 没跟上实测回撤: {} 帧",
                 hit.ctl.d_floor_frames()
             );
-            let (a, b) = (calm.level() as f32 / MSF as f32, hit.level() as f32 / MSF as f32);
+            let (a, b) = (
+                calm.level() as f32 / MSF as f32,
+                hit.level() as f32 / MSF as f32,
+            );
             assert!(
                 b >= a + 60.0,
                 "见过 120 ms 漏写之后仍然收敛到 {b:.1} ms（对照组 {a:.1} ms）                 —— 目标水位没有跟着实测回撤走，下一次漏写就是一次断续"
@@ -2536,7 +2648,8 @@ pub(crate) mod trim {
                 sim.tick_at(t0 + i * 50, 0, false);
             }
             assert_eq!(
-                sim.trims, trims_before,
+                sim.trims,
+                trims_before,
                 "追平期削了 {} 次 —— 那些水位是假高，削完立刻欠载",
                 sim.trims - trims_before
             );
@@ -2574,8 +2687,8 @@ pub(crate) mod trim {
             let mut binding = 0usize; // 有多少个格点上 `feasible` 是唯一那道闸
             for &starve in &[0usize, 1, 3, 10, 20] {
                 for &avail in &[
-                    0u32, 1, 480, 700, 720, 721, 1_200, 1_201, 1_440, 2_000, 5_000,
-                    12_000, 20_000, 23_000, 24_000,
+                    0u32, 1, 480, 700, 720, 721, 1_200, 1_201, 1_440, 2_000, 5_000, 12_000, 20_000,
+                    23_000, 24_000,
                 ] {
                     let mut c = Ctl::new(Mode::Active);
                     let mut t = 0u64;
@@ -2616,7 +2729,10 @@ pub(crate) mod trim {
                 }
             }
             // 这条判据必须真的被行使过 —— 全程不 binding 的扫描等于没测。
-            assert!(binding >= 8, "可行性从未成为那道闸，扫描没有意义（{binding}）");
+            assert!(
+                binding >= 8,
+                "可行性从未成为那道闸，扫描没有意义（{binding}）"
+            );
         }
 
         /// 15：**目标水位随实测回撤上调**，且下调受限。
@@ -3206,7 +3322,10 @@ pub(crate) mod dll {
             // 目标 40 ms、水位 60 ms ⇒ err = 40−60 = −20 ms = −960 帧。
             let err = -20.0 * (RATE / 1000) as f64;
             let corr = d.update(err);
-            assert!(corr > 1.0, "水位高于目标却给出 corr = {corr}（≤1 = 读得更慢）");
+            assert!(
+                corr > 1.0,
+                "水位高于目标却给出 corr = {corr}（≤1 = 读得更慢）"
+            );
             assert!(
                 d.period_nanos() < nominal,
                 "周期没变短：{} ns（标称 {} ns）",
@@ -3229,11 +3348,11 @@ pub(crate) mod dll {
             // 大到需要成千上万个 tick 才卸得完。
             for _ in 0..60_000 {
                 let corr = d.update(-1e9); // 会先被 ERR_CLAMP_FRAMES 夹到一整环
+                assert!((0.9..=1.1).contains(&corr), "corr 跑飞了：{corr}");
                 assert!(
-                    (0.9..=1.1).contains(&corr),
-                    "corr 跑飞了：{corr}"
+                    (corr - 1.0).abs() <= CORR_CLAMP + 1e-12,
+                    "corr 超出 ±500 ppm：{corr}"
                 );
-                assert!((corr - 1.0).abs() <= CORR_CLAMP + 1e-12, "corr 超出 ±500 ppm：{corr}");
             }
             let fast = d.period_nanos() as f64;
             assert!(
@@ -3273,7 +3392,10 @@ pub(crate) mod dll {
 
             d.resync();
             assert_eq!(d.corr(), 1.0, "resync 之后 corr 不是 1.0");
-            assert!((d.bw() - BW_CAPTURE).abs() < 1e-12, "resync 没有回到捕获带宽");
+            assert!(
+                (d.bw() - BW_CAPTURE).abs() < 1e-12,
+                "resync 没有回到捕获带宽"
+            );
             assert_eq!(
                 d.update(0.0),
                 1.0,
@@ -3307,10 +3429,7 @@ pub(crate) mod dll {
                 dev_ok < dev_bad,
                 "复位之后反而偏得更远（复位 {dev_ok:.2} ms / 不复位 {dev_bad:.2} ms）"
             );
-            assert!(
-                dev_ok < 1.0,
-                "复位之后 20 s 还偏离目标 {dev_ok:.2} ms"
-            );
+            assert!(dev_ok < 1.0, "复位之后 20 s 还偏离目标 {dev_ok:.2} ms");
         }
 
         /// 稳态：同时钟、无扰动 ⇒ 水位停在目标上，`corr` 回到 1.0 附近。
@@ -3465,7 +3584,11 @@ impl HalSpeakerSource {
             .map(|s| s.disc_epoch.load(Ordering::Relaxed))
             .unwrap_or(0);
         // 一次性预分配，之后 10 ms 节拍上零分配。mode=off 不分配这 154 KB。
-        let n = if mode == trim::Mode::Off { 0 } else { Self::SCRATCH_FRAMES };
+        let n = if mode == trim::Mode::Off {
+            0
+        } else {
+            Self::SCRATCH_FRAMES
+        };
         HalSpeakerSource {
             bridge,
             slot,
@@ -3635,8 +3758,7 @@ impl HalSpeakerSource {
         };
         let ext_len = trim::peek_ext(plan);
         let (got, base) = if ext_len > base_len
-            && trim::silent_span(&self.peek_mono[..got], f, trim::X, trim::GATE_SILENT)
-                >= got - f
+            && trim::silent_span(&self.peek_mono[..got], f, trim::X, trim::GATE_SILENT) >= got - f
         {
             match self.peek_mono_frames(ext_len, avail) {
                 Some(v) => v,
@@ -3662,7 +3784,8 @@ impl HalSpeakerSource {
         if let Some(s) = self.bridge.slots.get(self.slot as usize) {
             // 从环里真正取走的是 f+τ 帧 —— 这个计数器对账的是驱动写了多少，
             // 不是我们发了多少，所以记取走量。
-            s.spk_frames.fetch_add((f + d.tau) as u64, Ordering::Relaxed);
+            s.spk_frames
+                .fetch_add((f + d.tau) as u64, Ordering::Relaxed);
             s.trim_events.fetch_add(1, Ordering::Relaxed);
             s.trim_frames.fetch_add(d.tau as u64, Ordering::Relaxed);
             if d.forced {
@@ -3820,8 +3943,10 @@ impl HalSpeakerSource {
         let ms = |frames: f32| frames / trim::MSF as f32;
         s.trim_target_ms
             .store(ms(self.ctl.d_target_frames()).to_bits(), Ordering::Relaxed);
-        s.dll_target_ms
-            .store(ms(self.ctl.dll_target_frames()).to_bits(), Ordering::Relaxed);
+        s.dll_target_ms.store(
+            ms(self.ctl.dll_target_frames()).to_bits(),
+            Ordering::Relaxed,
+        );
         s.trim_drawdown_ms.store(
             ms(self.ctl.drawdown_frames() as f32).to_bits(),
             Ordering::Relaxed,
@@ -4455,12 +4580,8 @@ mod platform {
         fn mach_msg_destroy(msg: *mut MsgHeader);
         fn mach_port_allocate(task: MachPort, right: i32, name: *mut MachPort) -> KernReturn;
         fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
-        fn mach_port_mod_refs(
-            task: MachPort,
-            name: MachPort,
-            right: i32,
-            delta: i32,
-        ) -> KernReturn;
+        fn mach_port_mod_refs(task: MachPort, name: MachPort, right: i32, delta: i32)
+            -> KernReturn;
         fn mach_vm_deallocate(task: MachPort, address: u64, size: u64) -> KernReturn;
         fn mach_make_memory_entry_64(
             target_task: MachPort,
@@ -4582,7 +4703,12 @@ mod platform {
         ///
         /// Consumes `entry` on every path: on failure it is deallocated here,
         /// on success `Drop` owns it.
-        fn attach(entry: MachPort, geom: RingGeom, want_channels: u32, what: &str) -> Result<RingMem> {
+        fn attach(
+            entry: MachPort,
+            geom: RingGeom,
+            want_channels: u32,
+            what: &str,
+        ) -> Result<RingMem> {
             let mut me = RingMem {
                 addr: 0,
                 size: 0,
@@ -4891,7 +5017,9 @@ mod platform {
 
     impl Rings {
         pub fn new() -> Rings {
-            Rings { inner: std::sync::RwLock::new(None) }
+            Rings {
+                inner: std::sync::RwLock::new(None),
+            }
         }
 
         /// 0 with no driver attached (or a slot this driver does not have):
@@ -5017,19 +5145,21 @@ mod platform {
         if cfg.mode == HalBridgeMode::Off {
             return Ok(None);
         }
-        // The gate for `Auto`: does the driver's name resolve right now? Unlike
-        // the old check-in, a look-up cannot accidentally succeed — the name
-        // exists only because coreaudiod published it — so no marker env var is
-        // needed and a hand-run daemon is a first-class citizen again.
+        // Seed the reconnect loop when the service is already present. Missing
+        // at this instant is not a reason to omit the bridge: PackageKit can
+        // return while coreaudiod is still loading AudioServerPlugIns, and a
+        // daemon started in that window must attach later without another
+        // restart. Auto keeps this steady state silent; Require makes it visible
+        // for diagnostics.
         let first_port = match look_up(&cfg.service_name) {
             Ok(p) => Some(p),
             Err(e) => {
-                if cfg.mode != HalBridgeMode::Require {
-                    // The normal case on a machine with no driver. Silent: this
-                    // is every CI box and every Mac before installation.
-                    return Ok(None);
+                if cfg.mode == HalBridgeMode::Require {
+                    dlog!(
+                        "[audiohubd] HAL bridge: '{}' not published yet ({e:#}); will keep looking",
+                        cfg.service_name
+                    );
                 }
-                dlog!("[audiohubd] HAL bridge: '{}' not published yet ({e:#}); will keep looking", cfg.service_name);
                 None
             }
         };
@@ -5069,7 +5199,10 @@ mod platform {
             superseded: AtomicBool::new(false),
             tick_punctual: AtomicBool::new(true),
         });
-        dlog!("[audiohubd] HAL bridge: looking for mach service '{}'", cfg.service_name);
+        dlog!(
+            "[audiohubd] HAL bridge: looking for mach service '{}'",
+            cfg.service_name
+        );
 
         let s = shared.clone();
         let name = cfg.service_name.clone();
@@ -5094,14 +5227,20 @@ mod platform {
             }
         };
 
-        Ok(Some(HalBridge { shared, thread: Mutex::new(Some(thread)) }))
+        Ok(Some(HalBridge {
+            shared,
+            thread: Mutex::new(Some(thread)),
+        }))
     }
 
     /// A SEND right on the driver's service port, or an error naming why not.
     /// `BOOTSTRAP_UNKNOWN_SERVICE` is the ordinary "no driver here" answer.
     fn look_up(name: &str) -> Result<MachPort> {
         if name.len() > BOOTSTRAP_MAX_NAME_LEN {
-            anyhow::bail!("mach service name is {} bytes, max {BOOTSTRAP_MAX_NAME_LEN}", name.len());
+            anyhow::bail!(
+                "mach service name is {} bytes, max {BOOTSTRAP_MAX_NAME_LEN}",
+                name.len()
+            );
         }
         let cname = CString::new(name)?;
         let mut bootstrap: MachPort = MACH_PORT_NULL;
@@ -5161,6 +5300,31 @@ mod platform {
         }
     }
 
+    /// Owns exactly one SEND user-reference until it is explicitly transferred.
+    /// Unlike a receive right, `mach_port_deallocate` is the correct release.
+    struct SendRightGuard(MachPort);
+
+    impl SendRightGuard {
+        fn name(&self) -> MachPort {
+            self.0
+        }
+
+        /// Transfers the owned user-reference to `Shared::driver_port`.
+        fn into_raw(mut self) -> MachPort {
+            let port = self.0;
+            self.0 = MACH_PORT_NULL;
+            port
+        }
+    }
+
+    impl Drop for SendRightGuard {
+        fn drop(&mut self) {
+            if self.0 != MACH_PORT_NULL {
+                unsafe { mach_port_deallocate(task_self(), self.0) };
+            }
+        }
+    }
+
     /// The whole connect-retry policy, deliberately kept free of mach so it can
     /// be driven by a fake clock in a unit test.
     struct RetryPlan {
@@ -5170,7 +5334,10 @@ mod platform {
 
     impl RetryPlan {
         fn ready_now(now: Instant) -> RetryPlan {
-            RetryPlan { backoff: RETRY_MIN, next_attempt: now }
+            RetryPlan {
+                backoff: RETRY_MIN,
+                next_attempt: now,
+            }
         }
         fn due(&self, now: Instant) -> bool {
             now >= self.next_attempt
@@ -5195,6 +5362,11 @@ mod platform {
         first_port: Option<MachPort>,
     ) {
         let _guard = PortGuard(control);
+        // Take ownership before doing any other work. In particular, shutdown
+        // may already be set when the newly spawned thread first runs; the loop
+        // then never attempts a handshake, but this pending send right must
+        // still be returned to the task's name space.
+        let mut pending = first_port.map(SendRightGuard);
         let mut buf = MsgBuf::new();
         // The two things that ever land in this buffer. A message that does not
         // fit is discarded by the kernel (no MACH_RCV_LARGE), which would turn
@@ -5204,9 +5376,6 @@ mod platform {
         const _: () = assert!(RCV_BUF >= std::mem::size_of::<HelloReply>() + MAX_TRAILER);
         const _: () = assert!(RCV_BUF >= std::mem::size_of::<ControlMsg>() + MAX_TRAILER);
         const _: () = assert!(RCV_BUF >= std::mem::size_of::<HelloRequest>() + MAX_TRAILER);
-        // Held between the look-up and the handshake so a failed handshake does
-        // not throw away a perfectly good send right.
-        let mut pending = first_port;
         let mut retry = RetryPlan::ready_now(Instant::now());
         let mut next_ping = Instant::now() + PING_EVERY;
         let mut send_timeouts = 0u32;
@@ -5237,6 +5406,13 @@ mod platform {
             } else if kr != MACH_RCV_TIMED_OUT {
                 // A malformed or oversized message must not spin this thread.
                 std::thread::sleep(Duration::from_millis(50));
+            }
+
+            // shutdown() can race the receive above. Do not turn a still-pending
+            // startup right into a new two-second handshake while joining; its
+            // guard releases it on the exit path below.
+            if shared.stop.load(Ordering::SeqCst) {
+                break;
             }
 
             let now = Instant::now();
@@ -5275,7 +5451,7 @@ mod platform {
             let port = match pending.take() {
                 Some(p) => p,
                 None => match look_up(&service_name) {
-                    Ok(p) => p,
+                    Ok(p) => SendRightGuard(p),
                     Err(_) => {
                         // Silent: "not published" is the steady state on a Mac
                         // whose coreaudiod is between plug-in loads.
@@ -5286,7 +5462,7 @@ mod platform {
                 },
             };
             shared.driver_found.store(true, Ordering::Relaxed);
-            match handshake(&shared, port, control) {
+            match handshake(&shared, port.name(), control) {
                 Ok(()) => {
                     set_driver_port(&shared, port);
                     shared.driver_connected.store(true, Ordering::Relaxed);
@@ -5296,7 +5472,6 @@ mod platform {
                     dlog!("[audiohubd] HAL driver attached; spk/mic rings handed over");
                 }
                 Err(e) => {
-                    unsafe { mach_port_deallocate(task_self(), port) };
                     dlog!("[audiohubd] HAL handshake failed: {e:#}");
                     retry.failed(Instant::now());
                 }
@@ -5306,6 +5481,7 @@ mod platform {
         // only thing that could be attaching. `Shared` outlives this thread
         // (HalSpeakerSource holds an Arc), so leaving the mappings behind would
         // outlive the bridge itself.
+        drop(pending);
         drop_driver_port(&shared);
         shared.rings.detach();
     }
@@ -5313,8 +5489,9 @@ mod platform {
     /// Installs the port of a freshly handshaked driver, releasing whatever was
     /// there. Nothing should be, but leaking a mach port because of a state
     /// machine bug is exactly the kind of leak nobody ever notices.
-    fn set_driver_port(shared: &Shared, port: MachPort) {
+    fn set_driver_port(shared: &Shared, port: SendRightGuard) {
         let mut g = lk(&shared.driver_port);
+        let port = port.into_raw();
         if *g != MACH_PORT_NULL && *g != port {
             unsafe { mach_port_deallocate(task_self(), *g) };
         }
@@ -5424,7 +5601,9 @@ mod platform {
                 // MACH_NOTIFY_SEND_ONCE (id 0x47). That is what a descriptor
                 // count of 3 looked like from this side for a whole debugging
                 // session; if this ever reads 0x47 again, look here first.
-                body: MsgBody { descriptor_count: 1 },
+                body: MsgBody {
+                    descriptor_count: 1,
+                },
                 // MAKE_SEND, not COPY_SEND: we hold the RECEIVE right and are
                 // manufacturing a send right for the driver out of it.
                 control_port: PortDescriptor {
@@ -5495,7 +5674,9 @@ mod platform {
         // and it is a no-op on a plain message.
         if rep.status != STATUS_OK {
             unsafe { mach_msg_destroy(hdr) };
-            shared.driver_protocol.store(rep.protocol_version, Ordering::Relaxed);
+            shared
+                .driver_protocol
+                .store(rep.protocol_version, Ordering::Relaxed);
             let why = match rep.status {
                 STATUS_BAD_VERSION => {
                     *lk(&shared.status_reason) = Some(REASON_PROTOCOL_MISMATCH.to_string());
@@ -5505,8 +5686,7 @@ mod platform {
                     )
                 }
                 STATUS_NO_MEMORY => {
-                    *lk(&shared.status_reason) =
-                        Some("driver_out_of_memory".to_string());
+                    *lk(&shared.status_reason) = Some("driver_out_of_memory".to_string());
                     "it could not create the shared rings".to_string()
                 }
                 s => {
@@ -5575,9 +5755,7 @@ mod platform {
             );
             attached.push(match (spk, mic) {
                 (Ok(spk), Ok(mic)) => Ok(RingPair { spk, mic }),
-                (Err(e), _) | (Ok(_), Err(e)) => {
-                    Err(e.context(format!("slot {slot}")))
-                }
+                (Err(e), _) | (Ok(_), Err(e)) => Err(e.context(format!("slot {slot}"))),
             });
         }
         let mut pairs = Vec::with_capacity(n);
@@ -5612,7 +5790,9 @@ mod platform {
         shared.spk_flush.store(u16::MAX, Ordering::Release);
         shared.slot_count.store(rep.slot_count, Ordering::Relaxed);
         shared.session_id.store(rep.session_id, Ordering::Relaxed);
-        shared.driver_protocol.store(rep.protocol_version, Ordering::Relaxed);
+        shared
+            .driver_protocol
+            .store(rep.protocol_version, Ordering::Relaxed);
         *lk(&shared.status_reason) = None;
         // Bumped LAST: a coordinator that sees the new epoch must find a
         // session id and rings it can actually use in the same instant.
@@ -5658,7 +5838,9 @@ mod platform {
                     );
                     return;
                 };
-                let Some(c) = shared.slots.get(slot) else { return };
+                let Some(c) = shared.slots.get(slot) else {
+                    return;
+                };
                 let prev = c.generation.swap(msg.generation, Ordering::AcqRel);
                 if prev != msg.generation {
                     // The slot was reused (or first bound). The driver resets a
@@ -5673,11 +5855,16 @@ mod platform {
                     slot: slot as u8,
                     generation: msg.generation,
                     state,
+                    published: directions_from_bind_flags(msg.flags),
                 });
             }
             CTL_VOLUME | CTL_IO_STATE | CTL_LATENCY_STATE => {
-                let Some(at) = HalEndpoint::from_wire(msg.endpoint) else { return };
-                let Some(c) = shared.slots.get(at.slot as usize) else { return };
+                let Some(at) = HalEndpoint::from_wire(msg.endpoint) else {
+                    return;
+                };
+                let Some(c) = shared.slots.get(at.slot as usize) else {
+                    return;
+                };
                 let want = c.generation.load(Ordering::Acquire);
                 if want == 0 || msg.generation != want {
                     // A late StopIO from the slot's previous tenant, or a
@@ -5897,7 +6084,7 @@ mod platform {
                 header: MsgHeader::default(),
                 op: BIND_SET,
                 slot: req.slot as u32,
-                flags: if req.online { 1 } else { 0 },
+                flags: bind_flags(req.online, req.directions),
                 // Set carries 0: the DRIVER allocates the generation and
                 // reports it back in the BindState this message provokes.
                 generation: 0,
@@ -5993,9 +6180,8 @@ mod platform {
             /// without taking the "driver's" away — exactly what COPY_SEND on
             /// the reply descriptor does on the wire.
             fn entry_copy(&self) -> MachPort {
-                let kr = unsafe {
-                    mach_port_mod_refs(task_self(), self.entry, MACH_PORT_RIGHT_SEND, 1)
-                };
+                let kr =
+                    unsafe { mach_port_mod_refs(task_self(), self.entry, MACH_PORT_RIGHT_SEND, 1) };
                 assert_eq!(kr, KERN_SUCCESS, "duplicate the entry send right");
                 self.entry
             }
@@ -6059,11 +6245,13 @@ mod platform {
             assert_eq!(HAL_RING_DATA_OFFSET, 64);
             assert_eq!(std::mem::size_of::<RingHeader>(), 40);
 
-            // v2 message sizes (spec-m5b §4.2). The `const _` block beside the
-            // struct definitions asserts these at compile time; restating them
+            // v3 message sizes (spec-m5b §4.2). The layout is unchanged from
+            // v2; only the previously-unused Bind/BindState flag bits gained
+            // direction semantics. The `const _` block beside the struct
+            // definitions asserts these at compile time; restating them
             // here is what makes a deliberate contract change show up as a
             // NAMED test failure rather than as a wall of const-eval errors.
-            assert_eq!(PROTOCOL_VERSION, 2);
+            assert_eq!(PROTOCOL_VERSION, 3);
             assert_eq!(std::mem::size_of::<HelloRequest>(), 48);
             assert_eq!(std::mem::size_of::<HelloReply>(), 472);
             assert_eq!(std::mem::size_of::<ControlMsg>(), 56);
@@ -6072,7 +6260,22 @@ mod platform {
             assert_eq!(HAL_MAX_ENDPOINTS, 32);
         }
 
-        // ---- v2 wire round trips ------------------------------------------
+        #[test]
+        fn v3_bind_flags_keep_online_separate_from_each_publication_direction() {
+            assert_eq!(bind_flags(false, 0), 0);
+            assert_eq!(bind_flags(true, 0), BIND_FLAG_ONLINE);
+            assert_eq!(bind_flags(false, HAL_PUBLISH_OUT), BIND_FLAG_OUT);
+            assert_eq!(bind_flags(false, HAL_PUBLISH_IN), BIND_FLAG_IN);
+            assert_eq!(
+                bind_flags(true, HAL_PUBLISH_BOTH),
+                BIND_FLAG_ONLINE | BIND_FLAG_OUT | BIND_FLAG_IN
+            );
+            for mask in [0, HAL_PUBLISH_OUT, HAL_PUBLISH_IN, HAL_PUBLISH_BOTH] {
+                assert_eq!(directions_from_bind_flags(bind_flags(true, mask)), mask);
+            }
+        }
+
+        // ---- v3 wire round trips ------------------------------------------
         //
         // One round trip per message shape (spec-m5b §7 step 2). Each one does
         // TWO things, and the second is the one that matters: it reads every
@@ -6143,7 +6346,9 @@ mod platform {
                     voucher: MACH_PORT_NULL,
                     id: MSG_HELLO_REPLY,
                 },
-                body: MsgBody { descriptor_count: HAL_MAX_ENDPOINTS as u32 },
+                body: MsgBody {
+                    descriptor_count: HAL_MAX_ENDPOINTS as u32,
+                },
                 entries: [PortDescriptor::default(); HAL_MAX_ENDPOINTS],
                 status: STATUS_OK,
                 protocol_version: PROTOCOL_VERSION,
@@ -6185,7 +6390,7 @@ mod platform {
                 assert_eq!(got.entries[i].dtype, MACH_MSG_PORT_DESCRIPTOR);
             }
             assert_eq!(got.status, STATUS_OK);
-            assert_eq!(got.protocol_version, 2);
+            assert_eq!(got.protocol_version, 3);
             assert_eq!(got.slot_count, 16);
             assert_eq!(got.data_offset, 64);
             assert_eq!(got.spk_capacity_frames, HAL_RING_FRAMES);
@@ -6200,9 +6405,13 @@ mod platform {
             // AudioHubBridge.h's _Static_asserts, read off the wire.
             assert_eq!(wire.u32_at(24), 32, "body.descriptor_count @24");
             assert_eq!(wire.u32_at(28), 0x2000, "entries @28");
-            assert_eq!(wire.u32_at(28 + 31 * 12), 0x2000 + 31, "the last entry ends at 412");
+            assert_eq!(
+                wire.u32_at(28 + 31 * 12),
+                0x2000 + 31,
+                "the last entry ends at 412"
+            );
             assert_eq!(wire.u32_at(412), STATUS_OK, "status @412");
-            assert_eq!(wire.u32_at(416), 2, "protocol_version @416");
+            assert_eq!(wire.u32_at(416), 3, "protocol_version @416");
             assert_eq!(wire.u32_at(420), 16, "slot_count @420");
             assert_eq!(wire.u32_at(424), 64, "data_offset @424");
             assert_eq!(wire.u32_at(444), HAL_SAMPLE_RATE, "sample_rate @444");
@@ -6281,7 +6490,9 @@ mod platform {
                 },
                 op: BIND_SET,
                 slot: 9,
-                flags: 0x1,
+                // Online + output-only. Distinct bits make the v3 publication
+                // contract visible in the absolute-offset wire test.
+                flags: BIND_FLAG_ONLINE | BIND_FLAG_OUT,
                 generation: 0,
                 session_id: 0x0A0B_0C0D_0E0F_1011,
                 peer_key: fixed("fp-0123456789abcdef"),
@@ -6298,7 +6509,8 @@ mod platform {
             assert_eq!(got.header.size, 472);
             assert_eq!(got.op, BIND_SET);
             assert_eq!(got.slot, 9);
-            assert_eq!(got.flags, 0x1);
+            assert_eq!(got.flags, 0x3);
+            assert_eq!(directions_from_bind_flags(got.flags), HAL_PUBLISH_OUT);
             assert_eq!(got.generation, 0);
             assert_eq!(got.session_id, 0x0A0B_0C0D_0E0F_1011);
             assert_eq!(got.peer_key, sent.peer_key);
@@ -6309,7 +6521,7 @@ mod platform {
 
             assert_eq!(wire.u32_at(24), BIND_SET, "op @24");
             assert_eq!(wire.u32_at(28), 9, "slot @28");
-            assert_eq!(wire.u32_at(32), 0x1, "flags @32");
+            assert_eq!(wire.u32_at(32), 0x3, "flags @32");
             assert_eq!(wire.u32_at(36), 0, "generation @36");
             assert_eq!(wire.u64_at(40), 0x0A0B_0C0D_0E0F_1011, "session_id @40");
             // The five char arrays, each read at its own offset: a size that is
@@ -6346,7 +6558,10 @@ mod platform {
             assert_eq!(m.write(&input, 5), 5);
             let mut out = [0.0f32; 10];
             assert_eq!(m.read(&mut out, 5), 5);
-            assert_eq!(out, [100.0, 200.0, 101.0, 201.0, 102.0, 202.0, 103.0, 203.0, 104.0, 204.0]);
+            assert_eq!(
+                out,
+                [100.0, 200.0, 101.0, 201.0, 102.0, 202.0, 103.0, 203.0, 104.0, 204.0]
+            );
             assert_eq!(m.hdr().write_idx.load(Ordering::Relaxed), 24_003);
             assert_eq!(m.hdr().read_idx.load(Ordering::Relaxed), 24_003);
             // the physical split: 2 frames at the tail, 3 wrapped to the front
@@ -6391,7 +6606,11 @@ mod platform {
             // the equivalent guard is the src/dst length clamp.
             assert_eq!(m.write(&[1.0, 2.0], 8), 2, "clamped to the source length");
             let mut small = [0.0f32; 1];
-            assert_eq!(m.read(&mut small, 8), 1, "clamped to the destination length");
+            assert_eq!(
+                m.read(&mut small, 8),
+                1,
+                "clamped to the destination length"
+            );
         }
 
         #[test]
@@ -6412,7 +6631,10 @@ mod platform {
             let m = attach_ring(&d, HAL_SPK_CHANNELS);
             assert_eq!(m.hdr().magic, HAL_RING_MAGIC);
             assert_eq!(m.hdr().capacity_frames, HAL_RING_FRAMES);
-            assert_eq!(m.data_offset, HAL_RING_DATA_OFFSET, "the reply's offset, not a local one");
+            assert_eq!(
+                m.data_offset, HAL_RING_DATA_OFFSET,
+                "the reply's offset, not a local one"
+            );
             assert_eq!(m.capacity, HAL_RING_FRAMES);
             assert_eq!(m.size, HAL_SPK_BYTES);
             // ...and it is genuinely the driver's object: the sample the
@@ -6429,13 +6651,62 @@ mod platform {
             let d = FakeDriverRing::new(HAL_SPK_CHANNELS, HAL_SPK_BYTES);
             let base = d.geom(HAL_SPK_CHANNELS);
             let bad: Vec<(&str, RingGeom, &str)> = vec![
-                ("channels", RingGeom { channels: 4, ..base }, "can only consume"),
-                ("rate", RingGeom { sample_rate: 44_100, ..base }, "fixed at 48000Hz"),
-                ("no capacity", RingGeom { capacity_frames: 0, ..base }, "no capacity"),
-                ("offset inside header", RingGeom { data_offset: 8, ..base }, "past the 40-byte header"),
-                ("unaligned offset", RingGeom { data_offset: 66, ..base }, "4-aligned"),
-                ("too small", RingGeom { bytes: 4096, ..base }, "its own geometry needs"),
-                ("absurd", RingGeom { bytes: MAX_RING_BYTES + 1, ..base }, "its own geometry needs"),
+                (
+                    "channels",
+                    RingGeom {
+                        channels: 4,
+                        ..base
+                    },
+                    "can only consume",
+                ),
+                (
+                    "rate",
+                    RingGeom {
+                        sample_rate: 44_100,
+                        ..base
+                    },
+                    "fixed at 48000Hz",
+                ),
+                (
+                    "no capacity",
+                    RingGeom {
+                        capacity_frames: 0,
+                        ..base
+                    },
+                    "no capacity",
+                ),
+                (
+                    "offset inside header",
+                    RingGeom {
+                        data_offset: 8,
+                        ..base
+                    },
+                    "past the 40-byte header",
+                ),
+                (
+                    "unaligned offset",
+                    RingGeom {
+                        data_offset: 66,
+                        ..base
+                    },
+                    "4-aligned",
+                ),
+                (
+                    "too small",
+                    RingGeom {
+                        bytes: 4096,
+                        ..base
+                    },
+                    "its own geometry needs",
+                ),
+                (
+                    "absurd",
+                    RingGeom {
+                        bytes: MAX_RING_BYTES + 1,
+                        ..base
+                    },
+                    "its own geometry needs",
+                ),
             ];
             // `RingMem` owns a mapping and a port right, so it deliberately has
             // no Debug; unwrap_err would need one.
@@ -6475,7 +6746,10 @@ mod platform {
             assert_eq!(shared.append_spk_frame(0, &mut out), 3);
             assert_eq!(out.len(), HAL_FRAME_48K);
             assert_eq!(&out[..3], &[0.5, 0.5, 0.5]);
-            assert!(out[3..].iter().all(|s| *s == 0.0), "underrun must be silence");
+            assert!(
+                out[3..].iter().all(|s| *s == 0.0),
+                "underrun must be silence"
+            );
         }
 
         #[test]
@@ -6598,7 +6872,10 @@ mod platform {
             assert!(src.depths().iter().all(|s| s.is_none()));
             // ...驱动没给出的槽同理。
             let (_ds, _dm, attached) = attached_spk(0);
-            assert!(spk_source(&attached, 3).depths().iter().all(|s| s.is_none()));
+            assert!(spk_source(&attached, 3)
+                .depths()
+                .iter()
+                .all(|s| s.is_none()));
             // 而附着着的槽 0 即使空环也**要**报这一级（0 样本是真读数）。
             let d = spk_source(&attached, 0).depths()[0].expect("槽 0 有环");
             assert_eq!(d.samples, 0);
@@ -6630,7 +6907,6 @@ mod platform {
             assert_eq!(d.dropped, None, "丢弃发生在驱动那一侧，观测不到就报 None");
             assert_eq!(d.drop_mode, DropMode::Newest);
         }
-
 
         // ==================================================== 治法 A / B / 埋点
         //
@@ -6664,7 +6940,12 @@ mod platform {
                 mic: attach_ring(&dm, HAL_MIC_CHANNELS),
             }]);
             let prod = attach_ring(&ds, HAL_SPK_CHANNELS);
-            Rig { prod, shared: Arc::new(test_shared(rings)), _ds: ds, _dm: dm }
+            Rig {
+                prod,
+                shared: Arc::new(test_shared(rings)),
+                _ds: ds,
+                _dm: dm,
+            }
         }
 
         impl Rig {
@@ -6676,7 +6957,10 @@ mod platform {
                 self.shared.rings.spk_readable(0).unwrap().0
             }
             fn bridge(&self) -> HalBridge {
-                HalBridge { shared: self.shared.clone(), thread: Mutex::new(None) }
+                HalBridge {
+                    shared: self.shared.clone(),
+                    thread: Mutex::new(None),
+                }
             }
             fn source(&self, mode: trim::Mode) -> HalSpeakerSource {
                 HalSpeakerSource::with_mode(self.shared.clone(), 0, mode)
@@ -6718,7 +7002,10 @@ mod platform {
                 before,
                 "水位必须回到卡顿之前 —— 不是回到 0（那会欠载），是回到跳变前"
             );
-            assert_eq!(rig.counters().skip_drained_frames, 11 * HAL_FRAME_48K as u64);
+            assert_eq!(
+                rig.counters().skip_drained_frames,
+                11 * HAL_FRAME_48K as u64
+            );
             assert!(
                 rig.shared.slots[0].disc_epoch.load(Ordering::Relaxed) > epoch_before,
                 "排空必须作废「上一 tick 的读后残量」：`W = A − D` 只在两次读之间\
@@ -6860,9 +7147,7 @@ mod platform {
             rig.drive(&frame);
             src.tick(10_000, &mut out);
             out.clear();
-            let p = b
-                .spk_phase_error(&mut win)
-                .expect("第二拍必须给出新鲜观测");
+            let p = b.spk_phase_error(&mut win).expect("第二拍必须给出新鲜观测");
             assert_eq!(p.slot, 0);
             assert!(
                 p.err_frames < 0.0,
@@ -6997,7 +7282,9 @@ mod platform {
                 rig.shared.slots[slot]
                     .dll_err_frames
                     .store(err.to_bits(), Ordering::Relaxed);
-                rig.shared.slots[slot].dll_epoch.fetch_add(1, Ordering::Release);
+                rig.shared.slots[slot]
+                    .dll_epoch
+                    .fetch_add(1, Ordering::Release);
             };
             // 槽 0 严重积压（想读快），槽 1 已经在目标之下（想读慢）。
             put(0, -9_000.0);
@@ -7006,10 +7293,7 @@ mod platform {
             put(0, -9_000.0);
             put(1, 300.0);
             let p = b.spk_phase_error(&mut win).expect("两个槽都新鲜");
-            assert_eq!(
-                p.slot, 1,
-                "归约取了积压那条 —— 加快唤醒会把槽 1 读穿"
-            );
+            assert_eq!(p.slot, 1, "归约取了积压那条 —— 加快唤醒会把槽 1 读穿");
             assert_eq!(p.err_frames, 300.0);
         }
 
@@ -7040,8 +7324,15 @@ mod platform {
                 c.trim.target_ms
             );
             assert!(c.trim.events > 0, "一次都没削");
-            assert!(c.trim.frames >= (400 * 48 - 60 * 48) as u64 * 9 / 10, "削掉的量对不上存量");
-            assert_eq!(c.underrun.frames, 0, "削过头了，补了 {} 帧静音", c.underrun.frames);
+            assert!(
+                c.trim.frames >= (400 * 48 - 60 * 48) as u64 * 9 / 10,
+                "削掉的量对不上存量"
+            );
+            assert_eq!(
+                c.underrun.frames, 0,
+                "削过头了，补了 {} 帧静音",
+                c.underrun.frames
+            );
             assert!(c.trim.drawdown_ms >= 0.0 && c.trim.target_ms >= 15.0);
         }
 
@@ -7136,11 +7427,20 @@ mod platform {
         ///     先算 `punctual`、再排空、最后才 `tick = behind`（不变量 I6：
         ///     追平期的高水位是假象，不许削）；
         ///   · 治法 A 排空的量 = 被跳过的 tick 本来会读走的帧。
-        fn ratchet_run(g: Guard, n_stalls: usize, stall_ms: u64, settle_ticks: usize) -> RatchetRun {
+        fn ratchet_run(
+            g: Guard,
+            n_stalls: usize,
+            stall_ms: u64,
+            settle_ticks: usize,
+        ) -> RatchetRun {
             let rig = rig();
             let bridge = rig.bridge();
             let frame = tone_frame();
-            let mode = if g == Guard::Full { trim::Mode::Active } else { trim::Mode::Off };
+            let mode = if g == Guard::Full {
+                trim::Mode::Active
+            } else {
+                trim::Mode::Off
+            };
             let mut src = rig.source(mode);
             let mut out = Vec::new();
             let mut now_us = 0u64;
@@ -7285,7 +7585,10 @@ mod platform {
             let cold = trim::D_TARGET_COLD as f32 / 48.0;
 
             // 只有 A：停在开流水位附近，一帧都没削。
-            assert!((a_end - cold).abs() < 6.0, "只有 A 应当停在 {cold:.1} ms，实际 {a_end:.1}");
+            assert!(
+                (a_end - cold).abs() < 6.0,
+                "只有 A 应当停在 {cold:.1} ms，实际 {a_end:.1}"
+            );
             assert_eq!(a.trim_frames, 0);
 
             // A+B：收敛到 `D_target`（生产者严格规律 ⇒ 回撤 0 ⇒ 目标压到下限）。
@@ -7338,21 +7641,26 @@ mod platform {
             }
             let c = rig.counters();
             assert!(c.trim.events > 0, "这段里必须真的削过");
-            assert_eq!(c.underrun.frames, 0, "补静音会把判据的前提（连续单音）破坏掉");
+            assert_eq!(
+                c.underrun.frames, 0,
+                "补静音会把判据的前提（连续单音）破坏掉"
+            );
 
             // C2 时域斜率：参照物是同长度、同幅度的干净正弦。
-            let reference = audiohub_core::dsp::gen_sine(
-                1000.0,
-                HAL_SAMPLE_RATE,
-                stream.len(),
-                0.5,
-            );
+            let reference =
+                audiohub_core::dsp::gen_sine(1000.0, HAL_SAMPLE_RATE, stream.len(), 0.5);
             let c2 = max_slope(&stream) / max_slope(&reference);
-            assert!(c2 <= 1.10, "C2：生产路径上整条流的最大斜率涨了 {c2:.3}×（硬切约 15×）");
+            assert!(
+                c2 <= 1.10,
+                "C2：生产路径上整条流的最大斜率涨了 {c2:.3}×（硬切约 15×）"
+            );
 
             // C3 时域包络：2 ms 窗（必须比 4 ms 的淡化窄）。
             let c3 = c3_worst_db(&stream, 2 * 48, 48 / 2);
-            assert!(c3 <= 1.5, "C3：生产路径上出现了 {c3:.2} dB 的短时电平不连续");
+            assert!(
+                c3 <= 1.5,
+                "C3：生产路径上出现了 {c3:.2} dB 的短时电平不连续"
+            );
 
             // C4 频域：拼接窗的带外能量。
             let c4 = c4_min_snr_db(&stream, 1000.0);
@@ -7392,7 +7700,10 @@ mod platform {
                 out.clear();
             }
             let ms = rig.readable() as f32 / 48.0;
-            assert!(ms <= 60.0, "静音快速通道 400 ms 之内没收敛：还剩 {ms:.1} ms");
+            assert!(
+                ms <= 60.0,
+                "静音快速通道 400 ms 之内没收敛：还剩 {ms:.1} ms"
+            );
             assert_eq!(rig.counters().underrun.frames, 0);
         }
 
@@ -7440,7 +7751,11 @@ mod platform {
             src.tick(t0 + 40_000, &mut out);
             let c = rig.counters();
             assert_eq!(c.underrun.events, 2, "隔了一帧之后再短读是新的一段");
-            assert_eq!(c.underrun.worst_run_frames, 3 * HAL_FRAME_48K as u32, "最长段是历史最大");
+            assert_eq!(
+                c.underrun.worst_run_frames,
+                3 * HAL_FRAME_48K as u32,
+                "最长段是历史最大"
+            );
         }
 
         /// 冷启动/重新附着后**先把环填到 `D_TARGET_COLD` 再开始消费**。
@@ -7568,7 +7883,10 @@ mod platform {
                 out.clear();
             }
             assert_eq!(rig.counters().underrun.events, 1);
-            assert_eq!(rig.counters().underrun.worst_run_frames, 2 * HAL_FRAME_48K as u32);
+            assert_eq!(
+                rig.counters().underrun.worst_run_frames,
+                2 * HAL_FRAME_48K as u32
+            );
 
             // 驱动脱离：这一级不存在了，段必须在这里收尾。
             rig.shared.rings.detach();
@@ -7631,7 +7949,10 @@ mod platform {
             // 最强的嫌疑人之一，不能因为没排掉东西就从案发记录里消失。
             let t_before = s.last_drain_us.load(Ordering::Relaxed);
             let left = rig.readable();
-            assert_eq!(b.drain_spk(0, 100 * HAL_FRAME_48K), left as usize - trim::D_FLOOR_MIN);
+            assert_eq!(
+                b.drain_spk(0, 100 * HAL_FRAME_48K),
+                left as usize - trim::D_FLOOR_MIN
+            );
             assert!(s.last_drain_us.load(Ordering::Relaxed) >= t_before);
             assert_eq!(
                 s.last_drain_left.load(Ordering::Relaxed),
@@ -7682,7 +8003,11 @@ mod platform {
             assert_eq!(st.slots.len(), 1);
             assert!(st.trim.events > 0, "trim.events 没上报");
             assert!(st.trim.frames > 0, "trim.frames 没上报");
-            assert!(st.trim.target_ms >= 15.0, "target_ms 没上报: {}", st.trim.target_ms);
+            assert!(
+                st.trim.target_ms >= 15.0,
+                "target_ms 没上报: {}",
+                st.trim.target_ms
+            );
             assert!(st.trim.tokens_ms >= 0.0);
             assert_eq!(st.skip_drained_frames, 240);
             assert_eq!(st.underrun.frames, 0);
@@ -7835,7 +8160,11 @@ mod platform {
 
             // ...of the same pages: the header the driver stamped before we
             // ever saw the entry is already visible through ours.
-            assert_eq!(m.hdr().magic, HAL_RING_MAGIC, "we mapped a copy, not the object");
+            assert_eq!(
+                m.hdr().magic,
+                HAL_RING_MAGIC,
+                "we mapped a copy, not the object"
+            );
             assert_eq!(m.hdr().capacity_frames, HAL_RING_FRAMES);
 
             // Writes cross in both directions, in the header and in the samples.
@@ -7850,7 +8179,11 @@ mod platform {
                 *a.add(7) = 0.75;
                 assert_eq!(*b.add(7), 0.75, "sample area is a copy, not shared memory");
                 *b.add(HAL_RING_FRAMES as usize - 1) = -0.5;
-                assert_eq!(*a.add(HAL_RING_FRAMES as usize - 1), -0.5, "last frame not shared");
+                assert_eq!(
+                    *a.add(HAL_RING_FRAMES as usize - 1),
+                    -0.5,
+                    "last frame not shared"
+                );
             }
         }
 
@@ -7979,10 +8312,18 @@ mod platform {
 
                 rings.detach();
                 assert!(!rings.attached());
-                assert_eq!(rings.read_spk(0, &mut out, 2), 0, "a detached ring is silence");
+                assert_eq!(
+                    rings.read_spk(0, &mut out, 2),
+                    0,
+                    "a detached ring is silence"
+                );
                 assert_eq!(rings.write_mic(0, &[0.5; 8]), None, "not 'full' — absent");
             }
-            assert_eq!(heard, vec![1.0, 2.0, 3.0], "each session heard its own driver");
+            assert_eq!(
+                heard,
+                vec![1.0, 2.0, 3.0],
+                "each session heard its own driver"
+            );
         }
 
         // ------------------------------ one reply, thirty-two memory entries
@@ -8069,7 +8410,9 @@ mod platform {
                         voucher: MACH_PORT_NULL,
                         id: MSG_HELLO_REPLY,
                     },
-                    body: MsgBody { descriptor_count: N as u32 },
+                    body: MsgBody {
+                        descriptor_count: N as u32,
+                    },
                     entries: [PortDescriptor::default(); N],
                     status: STATUS_OK,
                     protocol_version: PROTOCOL_VERSION,
@@ -8103,7 +8446,10 @@ mod platform {
         /// before anything tries to receive it. Two threads, one task: mach
         /// rights are task-wide, so this is the same kernel path the driver
         /// takes, minus the process boundary.
-        fn send_reply_from_thread<const N: usize>(entries: &[MachPort], dest: MachPort) -> KernReturn {
+        fn send_reply_from_thread<const N: usize>(
+            entries: &[MachPort],
+            dest: MachPort,
+        ) -> KernReturn {
             let msg = MultiEntryReply::<N>::build(entries, dest);
             std::thread::spawn(move || {
                 let mut msg = msg;
@@ -8156,7 +8502,13 @@ mod platform {
                 )
             };
             if kr != MACH_MSG_SUCCESS {
-                return Received { kr, size: 0, descriptors: 0, trailer: 0, names: Vec::new() };
+                return Received {
+                    kr,
+                    size: 0,
+                    descriptors: 0,
+                    trailer: 0,
+                    names: Vec::new(),
+                };
             }
             // SAFETY: every offset below is 4-aligned against an 8-aligned
             // allocation, and a successful receive guarantees the kernel wrote
@@ -8178,7 +8530,13 @@ mod platform {
                         .name
                 })
                 .collect();
-            Received { kr, size, descriptors, trailer, names }
+            Received {
+                kr,
+                size,
+                descriptors,
+                trailer,
+                names,
+            }
         }
 
         /// Received send rights are OURS. Dropping them by hand is the whole
@@ -8186,7 +8544,10 @@ mod platform {
         fn release_names(names: &[MachPort]) {
             for n in names {
                 let kr = unsafe { mach_port_deallocate(task_self(), *n) };
-                assert_eq!(kr, KERN_SUCCESS, "received name {n:#x} must be a live send right");
+                assert_eq!(
+                    kr, KERN_SUCCESS,
+                    "received name {n:#x} must be a live send right"
+                );
             }
         }
 
@@ -8220,7 +8581,9 @@ mod platform {
                     // descriptor index it arrived in: 32 entries that all
                     // shared ONE object would pass a naive "is it shared?"
                     // check and silently cross-wire every peer's audio.
-                    d.hdr().write_idx.store(0x1000 + i as u64, Ordering::Release);
+                    d.hdr()
+                        .write_idx
+                        .store(0x1000 + i as u64, Ordering::Release);
                     d
                 })
                 .collect();
@@ -8238,7 +8601,8 @@ mod platform {
             );
             let got = receive_into(port, WIRE + MAX_TRAILER, HELLO_TIMEOUT_MS);
             assert_eq!(
-                got.kr, MACH_MSG_SUCCESS,
+                got.kr,
+                MACH_MSG_SUCCESS,
                 "a {N}-descriptor reply did not survive receive into {} bytes (kr {:#x}); \
                  the 32-descriptor single-reply design is not viable — \
                  fall back to per-slot attach messages",
@@ -8254,7 +8618,10 @@ mod platform {
                 WIRE + MAX_TRAILER,
                 std::mem::size_of::<HelloReply>(),
             );
-            assert_eq!(got.size as usize, WIRE, "the wire size must be computable from the struct");
+            assert_eq!(
+                got.size as usize, WIRE,
+                "the wire size must be computable from the struct"
+            );
             assert_eq!(got.descriptors as usize, N, "every descriptor must arrive");
             assert_eq!(got.names.len(), N);
 
@@ -8266,8 +8633,15 @@ mod platform {
             // boundary the names would differ; the ref-counting below is
             // identical either way.
             let unique: std::collections::HashSet<MachPort> = got.names.iter().copied().collect();
-            assert_eq!(unique.len(), N, "the kernel collapsed distinct memory entries onto one name");
-            assert!(!got.names.contains(&MACH_PORT_NULL), "a null name is a descriptor that never arrived");
+            assert_eq!(
+                unique.len(),
+                N,
+                "the kernel collapsed distinct memory entries onto one name"
+            );
+            assert!(
+                !got.names.contains(&MACH_PORT_NULL),
+                "a null name is a descriptor that never arrived"
+            );
 
             // Every entry through the PRODUCTION attach path, then a two-way
             // sharing check per slot. Anything less would prove the message
@@ -8277,10 +8651,19 @@ mod platform {
                 .iter()
                 .enumerate()
                 .map(|(i, name)| {
-                    RingMem::attach(*name, rings[i].geom(HAL_MIC_CHANNELS), HAL_MIC_CHANNELS, "slot")
-                        .unwrap_or_else(|e| panic!("slot {i} of {N} would not map ({e:#}); \
+                    RingMem::attach(
+                        *name,
+                        rings[i].geom(HAL_MIC_CHANNELS),
+                        HAL_MIC_CHANNELS,
+                        "slot",
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "slot {i} of {N} would not map ({e:#}); \
                              the 32-descriptor single-reply design is not viable — \
-                             fall back to per-slot attach messages"))
+                             fall back to per-slot attach messages"
+                        )
+                    })
                 })
                 .collect();
             for (i, m) in mapped.iter().enumerate() {
@@ -8324,7 +8707,9 @@ mod platform {
                 let rings: Vec<FakeDriverRing> = (0..N)
                     .map(|i| {
                         let d = FakeDriverRing::new(HAL_MIC_CHANNELS, PAGE);
-                        d.hdr().write_idx.store(0x5000 + i as u64, Ordering::Release);
+                        d.hdr()
+                            .write_idx
+                            .store(0x5000 + i as u64, Ordering::Release);
                         d
                     })
                     .collect();
@@ -8339,7 +8724,11 @@ mod platform {
                     "the kernel refused to send {N} descriptors"
                 );
                 let got = receive_into(port, wire + MAX_TRAILER, HELLO_TIMEOUT_MS);
-                assert_eq!(got.kr, MACH_MSG_SUCCESS, "{N} descriptors failed to arrive: {:#x}", got.kr);
+                assert_eq!(
+                    got.kr, MACH_MSG_SUCCESS,
+                    "{N} descriptors failed to arrive: {:#x}",
+                    got.kr
+                );
                 assert_eq!(got.descriptors as usize, N);
                 // Spot-check that the pages are real this far up, not just the
                 // descriptor array: a per-message limit could plausibly deliver
@@ -8385,8 +8774,9 @@ mod platform {
             const WIRE: usize = MultiEntryReply::<N>::WIRE;
             const PAGE: usize = 16_384;
 
-            let rings: Vec<FakeDriverRing> =
-                (0..N).map(|_| FakeDriverRing::new(HAL_MIC_CHANNELS, PAGE)).collect();
+            let rings: Vec<FakeDriverRing> = (0..N)
+                .map(|_| FakeDriverRing::new(HAL_MIC_CHANNELS, PAGE))
+                .collect();
             let entries: Vec<MachPort> = rings.iter().map(|d| d.entry).collect();
             let port = alloc_recv_port().expect("a receive port");
             let _guard = PortGuard(port);
@@ -8398,8 +8788,11 @@ mod platform {
             let mut minimum = None;
             for extra in 0..=MAX_TRAILER {
                 let rcv = WIRE + extra;
-                assert_eq!(send_reply_from_thread::<N>(&entries, port), MACH_MSG_SUCCESS,
-                    "send failed at probe {rcv} — earlier rejects were queued, not destroyed");
+                assert_eq!(
+                    send_reply_from_thread::<N>(&entries, port),
+                    MACH_MSG_SUCCESS,
+                    "send failed at probe {rcv} — earlier rejects were queued, not destroyed"
+                );
                 let got = receive_into(port, rcv, HELLO_TIMEOUT_MS);
                 if got.kr == MACH_MSG_SUCCESS {
                     assert_eq!(got.descriptors as usize, N);
@@ -8424,7 +8817,10 @@ mod platform {
                 WIRE + MAX_TRAILER,
                 WIRE + MAX_TRAILER - minimum
             );
-            assert!(minimum >= WIRE, "the kernel cannot have delivered a truncated message");
+            assert!(
+                minimum >= WIRE,
+                "the kernel cannot have delivered a truncated message"
+            );
             assert!(
                 minimum <= WIRE + MAX_TRAILER,
                 "sizing a buffer as message + MAX_TRAILER is NOT sufficient; every \
@@ -8442,7 +8838,10 @@ mod platform {
             // true the moment the constant was fixed.
             const PRE_V2_RCV_BUF: usize = 256;
             assert!(PRE_V2_RCV_BUF < minimum);
-            assert_eq!(send_reply_from_thread::<N>(&entries, port), MACH_MSG_SUCCESS);
+            assert_eq!(
+                send_reply_from_thread::<N>(&entries, port),
+                MACH_MSG_SUCCESS
+            );
             let with_the_old_buffer = receive_into(port, PRE_V2_RCV_BUF, HELLO_TIMEOUT_MS);
             assert_eq!(
                 with_the_old_buffer.kr, MACH_RCV_TOO_LARGE,
@@ -8456,7 +8855,10 @@ mod platform {
                 "RCV_BUF is {RCV_BUF}B; a {WIRE}B HelloReply needs at least {minimum}B or the \
                  kernel destroys it and the handshake times out with no diagnostic"
             );
-            assert_eq!(send_reply_from_thread::<N>(&entries, port), MACH_MSG_SUCCESS);
+            assert_eq!(
+                send_reply_from_thread::<N>(&entries, port),
+                MACH_MSG_SUCCESS
+            );
             let with_todays_buffer = receive_into(port, RCV_BUF, HELLO_TIMEOUT_MS);
             assert_eq!(
                 with_todays_buffer.kr, MACH_MSG_SUCCESS,
@@ -8471,7 +8873,10 @@ mod platform {
 
             // ONE byte too small, then a full-size retry with a real timeout.
             // A timeout is the proof: the message is gone, not waiting.
-            assert_eq!(send_reply_from_thread::<N>(&entries, port), MACH_MSG_SUCCESS);
+            assert_eq!(
+                send_reply_from_thread::<N>(&entries, port),
+                MACH_MSG_SUCCESS
+            );
             let short = receive_into(port, minimum - 1, HELLO_TIMEOUT_MS);
             assert_eq!(
                 short.kr, MACH_RCV_TOO_LARGE,
@@ -8485,8 +8890,7 @@ mod platform {
                  MACH_RCV_LARGE the kernel is supposed to destroy it; if it does not, an \
                  undersized buffer wedges the port instead of costing one handshake, and \
                  both ends' buffer-sizing comments are wrong",
-                retry.kr,
-                retry.descriptors
+                retry.kr, retry.descriptors
             );
             println!(
                 "[undersized receive] {}B (minimum-1) -> MACH_RCV_TOO_LARGE, \
@@ -8510,13 +8914,14 @@ mod platform {
             // own reference) and the next must NOT, which is only true if the
             // count was exactly one.
             for (i, d) in rings.iter().enumerate() {
-                let first = unsafe {
-                    mach_port_mod_refs(task_self(), d.entry, MACH_PORT_RIGHT_SEND, -1)
-                };
-                assert_eq!(first, KERN_SUCCESS, "entry {i} lost the creator's own reference");
-                let second = unsafe {
-                    mach_port_mod_refs(task_self(), d.entry, MACH_PORT_RIGHT_SEND, -1)
-                };
+                let first =
+                    unsafe { mach_port_mod_refs(task_self(), d.entry, MACH_PORT_RIGHT_SEND, -1) };
+                assert_eq!(
+                    first, KERN_SUCCESS,
+                    "entry {i} lost the creator's own reference"
+                );
+                let second =
+                    unsafe { mach_port_mod_refs(task_self(), d.entry, MACH_PORT_RIGHT_SEND, -1) };
                 assert_ne!(
                     second, KERN_SUCCESS,
                     "entry {i} still holds a send right after every message carrying it was \
@@ -8527,11 +8932,52 @@ mod platform {
             // The names are gone now, so `FakeDriverRing::drop`'s deallocate is
             // a no-op; its `mach_vm_deallocate` still has work to do, because a
             // mapping holds its own reference to the VM object.
-            println!("[undersized receive] all {N} entries back to a single user reference: \
-                      a destroyed message returns the rights it carried");
+            println!(
+                "[undersized receive] all {N} entries back to a single user reference: \
+                      a destroyed message returns the rights it carried"
+            );
         }
 
         // --------------------------------------------- connect/retry ladder
+
+        #[test]
+        fn shutdown_before_first_handshake_releases_the_pending_send_right() {
+            let driver_port = FakeDriverRing::new(HAL_SPK_CHANNELS, HAL_SPK_BYTES);
+            let pending = driver_port.entry_copy();
+            let control = alloc_recv_port().expect("allocate the service loop's receive right");
+            let shared = Arc::new(test_shared(Rings::new()));
+            shared.stop.store(true, Ordering::SeqCst);
+
+            // The loop must take ownership even though `stop` makes it skip its
+            // first iteration. This is the exact start/shutdown race: no
+            // handshake exists yet to transfer the send right into driver_port.
+            service_loop(
+                shared,
+                "com.audiohub.driver.pending-right-test".to_string(),
+                control,
+                Some(pending),
+            );
+
+            // `FakeDriverRing` began with one creator reference and entry_copy
+            // added exactly one for the service loop. Its guard must have
+            // returned that copy: consuming the creator reference succeeds,
+            // while a second decrement must fail. A leak makes both succeed;
+            // a double-release makes the first fail.
+            let first = unsafe {
+                mach_port_mod_refs(task_self(), driver_port.entry, MACH_PORT_RIGHT_SEND, -1)
+            };
+            assert_eq!(
+                first, KERN_SUCCESS,
+                "pending cleanup released too many rights"
+            );
+            let second = unsafe {
+                mach_port_mod_refs(task_self(), driver_port.entry, MACH_PORT_RIGHT_SEND, -1)
+            };
+            assert_ne!(
+                second, KERN_SUCCESS,
+                "the unattempted first-handshake send right leaked on shutdown"
+            );
+        }
 
         #[test]
         fn retry_backs_off_by_doubling_and_stops_at_the_cap() {
@@ -8540,7 +8986,10 @@ mod platform {
             assert!(r.due(t0), "the first attempt happens immediately");
 
             r.failed(t0);
-            assert!(!r.due(t0), "a failure must never be retried in the same pass");
+            assert!(
+                !r.due(t0),
+                "a failure must never be retried in the same pass"
+            );
             assert!(!r.due(t0 + RETRY_MIN - Duration::from_millis(1)));
             assert!(r.due(t0 + RETRY_MIN));
 
@@ -8565,7 +9014,10 @@ mod platform {
                     RETRY_MAX,
                 ]
             );
-            assert!(waits.iter().all(|w| *w >= RETRY_MIN), "the loop must never spin");
+            assert!(
+                waits.iter().all(|w| *w >= RETRY_MIN),
+                "the loop must never spin"
+            );
         }
 
         #[test]
@@ -8599,8 +9051,14 @@ mod platform {
             // inside a coreaudiod that is still alive keeps its port).
             *lk(&shared.last_driver_msg) = Some(now);
             expire_silent_driver(&shared, now + DRIVER_SILENT_AFTER);
-            assert!(shared.driver_connected.load(Ordering::Relaxed), "exactly at the edge is alive");
-            expire_silent_driver(&shared, now + DRIVER_SILENT_AFTER + Duration::from_millis(1));
+            assert!(
+                shared.driver_connected.load(Ordering::Relaxed),
+                "exactly at the edge is alive"
+            );
+            expire_silent_driver(
+                &shared,
+                now + DRIVER_SILENT_AFTER + Duration::from_millis(1),
+            );
             assert!(!shared.driver_connected.load(Ordering::Relaxed));
         }
 
@@ -8616,7 +9074,10 @@ mod platform {
             *lk(&shared.driver_port) = 0xdead_beef;
             shared.driver_connected.store(true, Ordering::Relaxed);
             disconnect_port(&shared, 0x1234, "a stale session's failure");
-            assert!(shared.driver_connected.load(Ordering::Relaxed), "wrong port tore down the live one");
+            assert!(
+                shared.driver_connected.load(Ordering::Relaxed),
+                "wrong port tore down the live one"
+            );
             *lk(&shared.driver_port) = MACH_PORT_NULL;
             shared.driver_connected.store(false, Ordering::Relaxed);
             // The public path swallows it: a peer volume change with no driver
@@ -8636,12 +9097,18 @@ mod platform {
         }
 
         #[test]
-        fn auto_mode_is_silent_and_bridgeless_when_the_driver_is_absent() {
+        fn auto_mode_silently_keeps_looking_when_the_driver_is_absent() {
             let cfg = HalBridgeCfg {
                 service_name: "com.audiohub.driver.nonexistent.test".to_string(),
                 mode: HalBridgeMode::Auto,
             };
-            assert!(start(cfg).expect("absent driver is not an error").is_none());
+            let bridge = start(cfg)
+                .expect("absent driver is not an error")
+                .expect("auto keeps a reconnectable bridge alive");
+            std::thread::sleep(Duration::from_millis(600));
+            assert!(!bridge.status().driver_found);
+            assert!(!bridge.status().driver_connected);
+            drop(bridge);
         }
 
         /// The retry ladder for real, thread and all: `Require` builds a bridge
@@ -8656,7 +9123,9 @@ mod platform {
                 service_name: "com.audiohub.driver.nonexistent.test".to_string(),
                 mode: HalBridgeMode::Require,
             };
-            let b = start(cfg).expect("require builds a bridge and keeps looking").expect("some");
+            let b = start(cfg)
+                .expect("require builds a bridge and keeps looking")
+                .expect("some");
             // Long enough for the loop's 200ms receive to time out and at least
             // one look-up to fail.
             std::thread::sleep(Duration::from_millis(600));
@@ -8677,14 +9146,18 @@ mod platform {
             assert_eq!(b.status().mic_dropped, 0);
             assert!(b.drain_events().is_empty());
             b.notify_volume(HalEndpoint::out(0), 1, 0.4, false); // no driver: a no-op
-            // ...as are Binds: nothing to send them to, and the coordinator
-            // simply retries on its next pass.
+                                                                 // ...as are Binds: nothing to send them to, and the coordinator
+                                                                 // simply retries on its next pass.
             assert!(!b.bind_clear(0, 1));
             assert_eq!(b.slot_count(), 0, "a bridge with no driver has no capacity");
 
             let t = Instant::now();
             drop(b); // shutdown + join
-            assert!(t.elapsed() < Duration::from_secs(2), "join took {:?}", t.elapsed());
+            assert!(
+                t.elapsed() < Duration::from_secs(2),
+                "join took {:?}",
+                t.elapsed()
+            );
         }
 
         #[test]
@@ -8907,7 +9380,10 @@ mod platform {
             .name("ahb-halbridge".to_string())
             .spawn(move || service_loop(s))?;
 
-        Ok(Some(HalBridge { shared, thread: Mutex::new(Some(thread)) }))
+        Ok(Some(HalBridge {
+            shared,
+            thread: Mutex::new(Some(thread)),
+        }))
     }
 
     /// Publishes a freshly handshaken session. Bumping `attach_epoch` is what
@@ -8916,8 +9392,12 @@ mod platform {
     /// are acknowledged to THIS daemon any more.
     #[cfg(windows)]
     fn attach(shared: &Arc<Shared>, s: Session) {
-        let (id, slots, protocol, check) =
-            (s.session_id, s.slot_count, s.driver_protocol, s.client_check);
+        let (id, slots, protocol, check) = (
+            s.session_id,
+            s.slot_count,
+            s.driver_protocol,
+            s.client_check,
+        );
 
         if s.identity_check_degraded() {
             // Loud on purpose. A caller-identity check that silently degraded
@@ -8964,7 +9444,10 @@ mod platform {
         *lk(&shared.status_reason) = None;
         *lk(&shared.last_driver_msg) = Some(Instant::now());
         shared.attach_epoch.fetch_add(1, Ordering::AcqRel);
-        shared.push_event(HalControlEvent::Attached { session_id: id, slot_count: slots });
+        shared.push_event(HalControlEvent::Attached {
+            session_id: id,
+            slot_count: slots,
+        });
         dlog!("[audiohubd] hal: attached, session {id}, {slots} slots, client_check {check}");
     }
 
@@ -9001,7 +9484,9 @@ mod platform {
                 match Session::open() {
                     Ok(s) => attach(&shared, s),
                     Err(e) => {
-                        shared.driver_found.store(e.driver_present(), Ordering::Relaxed);
+                        shared
+                            .driver_found
+                            .store(e.driver_present(), Ordering::Relaxed);
                         shared
                             .driver_protocol
                             .store(e.driver_protocol().unwrap_or(0), Ordering::Relaxed);
@@ -9040,7 +9525,11 @@ mod platform {
         if slot as usize >= HAL_MAX_SLOTS {
             return None;
         }
-        let at = if ev.input() { HalEndpoint::mic(slot) } else { HalEndpoint::out(slot) };
+        let at = if ev.input() {
+            HalEndpoint::mic(slot)
+        } else {
+            HalEndpoint::out(slot)
+        };
         match ev.kind {
             wire::EVENT_VOLUME => Some(HalControlEvent::Volume {
                 at,
@@ -9048,18 +9537,32 @@ mod platform {
                 scalar: ev.scalar(),
                 muted: ev.muted(),
             }),
-            wire::EVENT_IOSTATE => {
-                Some(HalControlEvent::IoState { at, generation: ev.generation, running: ev.running() })
-            }
+            wire::EVENT_IOSTATE => Some(HalControlEvent::IoState {
+                at,
+                generation: ev.generation,
+                running: ev.running(),
+            }),
             wire::EVENT_SLOT => {
                 let state = match ev.state {
                     wire::SLOT_FREE => HalSlotState::Free,
-                    wire::SLOT_BOUND => HalSlotState::Bound,
+                    // A Windows slot event has no publication-mask field.  A
+                    // successful SET is already reported synchronously below
+                    // with the authoritative mask, so accepting this weaker
+                    // duplicate would overwrite it with an invented value.
+                    wire::SLOT_BOUND => return None,
                     wire::SLOT_DELISTED => HalSlotState::Delisted,
                     _ => return None,
                 };
                 shared.arm_flush(slot);
-                Some(HalControlEvent::BindState { slot, generation: ev.generation, state })
+                Some(HalControlEvent::BindState {
+                    slot,
+                    generation: ev.generation,
+                    state,
+                    // A slot event carries no publication mask.  The synchronous
+                    // Bind reply below is the authoritative source; spontaneous
+                    // free/delisted events publish nothing.
+                    published: 0,
+                })
             }
             _ => None,
         }
@@ -9130,15 +9633,19 @@ mod platform {
                 });
             }
             Err(e) => {
-                dlog!("[audiohubd] hal: slot {} latency declaration failed: {e:#}", at.slot);
+                dlog!(
+                    "[audiohubd] hal: slot {} latency declaration failed: {e:#}",
+                    at.slot
+                );
             }
         }
     }
 
     #[cfg(windows)]
     pub fn send_bind_set(shared: &Shared, req: &HalBindRequest) -> bool {
-        // `display`, not `out_name`/`in_name`: those two already carry the
-        // direction suffix, which on Windows is the driver's to append.
+        // `display`, not `out_name`/`in_name`: this is the platform-neutral
+        // field at the Windows protocol boundary. All three intentionally carry
+        // the same visible label today; the OS device class conveys direction.
         //
         // And `display` goes across UNMODIFIED. The prefix is composed inside
         // wire::encode_bind_request, through the same haldev helper the macOS
@@ -9146,14 +9653,20 @@ mod platform {
         // by leaving it out — and the result was every endpoint labelled with
         // a bare host name. There is deliberately nothing at this call site
         // left to get wrong.
-        bind_call(shared, req.slot, true, |s| {
-            s.bind_set(req.slot, &req.peer_key, &req.display, req.online)
+        bind_call(shared, req.slot, Some(req.directions), |s| {
+            s.bind_set(
+                req.slot,
+                &req.peer_key,
+                &req.display,
+                req.online,
+                req.directions,
+            )
         })
     }
 
     #[cfg(windows)]
     pub fn send_bind_clear(shared: &Shared, slot: u8, generation: u32) -> bool {
-        bind_call(shared, slot, false, |s| s.bind_clear(slot, generation))
+        bind_call(shared, slot, None, |s| s.bind_clear(slot, generation))
     }
 
     /// Runs one bind IOCTL and turns the reply into the same `BindState` the
@@ -9171,12 +9684,14 @@ mod platform {
     /// said OK and it was not true", and a guard that lives only inside the
     /// thing it is guarding cannot catch that.
     #[cfg(windows)]
-    fn bind_call<F>(shared: &Shared, slot: u8, is_set: bool, f: F) -> bool
+    fn bind_call<F>(shared: &Shared, slot: u8, requested: Option<u8>, f: F) -> bool
     where
         F: FnOnce(&Session) -> Result<wire::BindReply>,
     {
         let guard = lk(&shared.rings.session);
-        let Some(s) = guard.as_ref() else { return false };
+        let Some(s) = guard.as_ref() else {
+            return false;
+        };
 
         let reply = match f(s) {
             Ok(r) => r,
@@ -9191,8 +9706,23 @@ mod platform {
         };
         drop(guard);
 
-        if let Err(what) = wire::bind_outcome(is_set, &reply) {
-            let op = if is_set { "bind" } else { "unbind" };
+        let wanted = requested.map(|m| {
+            (if m & HAL_PUBLISH_OUT != 0 {
+                wire::PUB_RENDER
+            } else {
+                0
+            }) | (if m & HAL_PUBLISH_IN != 0 {
+                wire::PUB_CAPTURE
+            } else {
+                0
+            })
+        });
+        if let Err(what) = wire::bind_outcome(wanted, &reply) {
+            let op = if requested.is_some() {
+                "bind"
+            } else {
+                "unbind"
+            };
             dlog!("[audiohubd] hal: slot {slot} {op} failed: {what}");
             shared.bind_failures.fetch_add(1, Ordering::Relaxed);
             *lk(&shared.last_bind_error) = Some(format!("slot {slot}: {op} failed: {what}"));
@@ -9206,7 +9736,9 @@ mod platform {
             // label, so it is counted and logged rather than absorbed — the
             // whole point of the v2/v3 reply fields is that the driver never
             // gets to answer OK and leave part of the truth out.
-            shared.endpoint_name_fallbacks.fetch_add(1, Ordering::Relaxed);
+            shared
+                .endpoint_name_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
             dlog!(
                 "[audiohubd] hal: slot {slot} bound, but the per-peer device name could \
                  not be applied; the endpoints carry the generic direction names"
@@ -9229,6 +9761,15 @@ mod platform {
             slot,
             generation: reply.generation,
             state,
+            published: (if reply.published & wire::PUB_RENDER != 0 {
+                HAL_PUBLISH_OUT
+            } else {
+                0
+            }) | (if reply.published & wire::PUB_CAPTURE != 0 {
+                HAL_PUBLISH_IN
+            } else {
+                0
+            }),
         });
         *lk(&shared.last_driver_msg) = Some(Instant::now());
         true

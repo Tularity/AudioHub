@@ -125,18 +125,19 @@ describe('the notes the view can ask for all exist in the catalogue', () => {
     'settings.startup.orphaned',
   ] as const) {
     it(`has a string for ${key}`, () => {
-      const s = t(key, { reason: 'x' });
+      const s = t(key);
       expect(s).not.toBe(key);
       expect(s.length).toBeGreaterThan(0);
     });
   }
 
   // The orphaned line has one job the others do not: telling the user the item
-  // is still in force *and* still removable. A copy that only repeats the
-  // greyed-out explanation would leave them where they started.
+  // is still in force *and* still removable. The daemon's natural-language
+  // reason is intentionally not interpolated because it may use another UI
+  // locale; the detailed diagnostic remains in the service log.
   it('tells the orphaned user they can still switch it off', () => {
-    const s = t('settings.startup.orphaned', { reason: 'not a bundle' });
+    const s = t('settings.startup.orphaned');
     expect(s).toContain('关闭');
-    expect(s).toContain('not a bundle');
+    expect(s).not.toContain('not a bundle');
   });
 });

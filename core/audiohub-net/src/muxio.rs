@@ -38,7 +38,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -114,6 +114,11 @@ struct Inbox {
 pub struct WriterPark {
     thread: OnceLock<std::thread::Thread>,
     parked: AtomicBool,
+    /// Number of times a producer actually found the writer armed and issued
+    /// `Thread::unpark`.  This is a causal diagnostic, not a work counter: one
+    /// token can coalesce several producers, which is exactly what `unpark`
+    /// promises.
+    unparks: AtomicU64,
 }
 
 impl WriterPark {
@@ -154,8 +159,22 @@ impl WriterPark {
         if self.parked.load(Ordering::SeqCst) {
             if let Some(t) = self.thread.get() {
                 t.unpark();
+                self.unparks.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Observation used by the daemon's wakeup invariant test: the writer has
+    /// published that it is about to (or already does) park.
+    #[doc(hidden)]
+    pub fn is_armed_for_test(&self) -> bool {
+        self.parked.load(Ordering::SeqCst)
+    }
+
+    /// Causal wakeup observation for the daemon's cross-crate invariant test.
+    #[doc(hidden)]
+    pub fn unpark_count_for_test(&self) -> u64 {
+        self.unparks.load(Ordering::Relaxed)
     }
 }
 
@@ -273,7 +292,11 @@ pub struct MuxControlStream {
 
 impl MuxControlStream {
     pub fn new(io: std::sync::Arc<MuxIo>) -> MuxControlStream {
-        MuxControlStream { io, pending: Vec::new(), read_deadline: None }
+        MuxControlStream {
+            io,
+            pending: Vec::new(),
+            read_deadline: None,
+        }
     }
 
     pub fn io(&self) -> &std::sync::Arc<MuxIo> {
@@ -312,7 +335,10 @@ impl Read for MuxControlStream {
             };
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "mux read deadline"));
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "mux read deadline",
+                ));
             }
             let (g, _) = self
                 .io
@@ -425,7 +451,11 @@ mod tests {
             while off < frame.len() {
                 off += dec.push(&frame[off..]);
                 while let Some(f) = dec.next_frame().expect("decode") {
-                    assert_eq!(f.header.kind, Kind::Control, "the writer emitted a non-control kind");
+                    assert_eq!(
+                        f.header.kind,
+                        Kind::Control,
+                        "the writer emitted a non-control kind"
+                    );
                     out.extend_from_slice(f.payload());
                 }
             }
@@ -447,7 +477,10 @@ mod tests {
         let bytes = drain_stream(&io);
         let mut want = (msg.len() as u32).to_le_bytes().to_vec();
         want.extend_from_slice(msg);
-        assert_eq!(bytes, want, "the control byte stream did not survive framing");
+        assert_eq!(
+            bytes, want,
+            "the control byte stream did not survive framing"
+        );
     }
 
     /// One control message becomes **one** frame, not one per `write` call.
@@ -459,7 +492,10 @@ mod tests {
         let mut s = MuxControlStream::new(io.clone());
         s.write_all(&[0u8; 4]).expect("len");
         s.write_all(&[7u8; 200]).expect("body");
-        assert!(!io.control_pending(), "bytes reached the outbox before the flush");
+        assert!(
+            !io.control_pending(),
+            "bytes reached the outbox before the flush"
+        );
         s.flush().expect("flush");
 
         let mut frames = 0;
@@ -477,13 +513,19 @@ mod tests {
     fn a_message_larger_than_one_frame_spans_several_and_reassembles() {
         let io = io();
         let mut s = MuxControlStream::new(io.clone());
-        let body: Vec<u8> = (0..MUX_MAX_PAYLOAD * 2 + 37).map(|i| (i % 251) as u8).collect();
-        s.write_all(&(body.len() as u32).to_le_bytes()).expect("len");
+        let body: Vec<u8> = (0..MUX_MAX_PAYLOAD * 2 + 37)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        s.write_all(&(body.len() as u32).to_le_bytes())
+            .expect("len");
         s.write_all(&body).expect("body");
         s.flush().expect("flush");
 
         let queued = io.lock_outbox().len();
-        assert_eq!(queued, 3, "expected three frames for a 2×payload + 41 byte stream");
+        assert_eq!(
+            queued, 3,
+            "expected three frames for a 2×payload + 41 byte stream"
+        );
 
         let bytes = drain_stream(&io);
         assert_eq!(&bytes[..4], &(body.len() as u32).to_le_bytes());
@@ -500,18 +542,22 @@ mod tests {
         assert!(io.deliver_control(b"abc"));
 
         let mut buf = [0u8; 8];
-        s.set_read_deadline(Some(Instant::now() + Duration::from_secs(5))).expect("arm");
+        s.set_read_deadline(Some(Instant::now() + Duration::from_secs(5)))
+            .expect("arm");
         assert_eq!(s.read(&mut buf).expect("read"), 3);
         assert_eq!(&buf[..3], b"abc");
 
         s.set_read_deadline(Some(Instant::now())).expect("arm");
-        let e = s.read(&mut buf).expect_err("an expired deadline must not block");
+        let e = s
+            .read(&mut buf)
+            .expect_err("an expired deadline must not block");
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
 
         // ...and the stream is still usable afterwards, which is what "consumed
         // nothing" means in practice.
         assert!(io.deliver_control(b"de"));
-        s.set_read_deadline(Some(Instant::now() + Duration::from_secs(5))).expect("arm");
+        s.set_read_deadline(Some(Instant::now() + Duration::from_secs(5)))
+            .expect("arm");
         assert_eq!(s.read(&mut buf).expect("read"), 2);
         assert_eq!(&buf[..2], b"de");
     }
@@ -527,10 +573,21 @@ mod tests {
         io.close();
 
         let mut buf = [0u8; 8];
-        assert_eq!(s.read(&mut buf).expect("read"), 4, "bytes that arrived before the close were lost");
+        assert_eq!(
+            s.read(&mut buf).expect("read"),
+            4,
+            "bytes that arrived before the close were lost"
+        );
         assert_eq!(&buf[..4], b"tail");
-        assert_eq!(s.read(&mut buf).expect("read"), 0, "a closed inbox must report EOF");
-        assert!(!io.deliver_control(b"more"), "a closed inbox must refuse further bytes");
+        assert_eq!(
+            s.read(&mut buf).expect("read"),
+            0,
+            "a closed inbox must report EOF"
+        );
+        assert!(
+            !io.deliver_control(b"more"),
+            "a closed inbox must refuse further bytes"
+        );
     }
 
     /// A blocked reader wakes when bytes arrive, rather than sitting out its
@@ -540,7 +597,8 @@ mod tests {
     fn a_blocked_reader_wakes_when_bytes_arrive() {
         let io = io();
         let mut s = MuxControlStream::new(io.clone());
-        s.set_read_deadline(Some(Instant::now() + Duration::from_secs(10))).expect("arm");
+        s.set_read_deadline(Some(Instant::now() + Duration::from_secs(10)))
+            .expect("arm");
 
         let feeder = io.clone();
         std::thread::spawn(move || {
@@ -551,7 +609,10 @@ mod tests {
         let t0 = Instant::now();
         let mut buf = [0u8; 8];
         assert_eq!(s.read(&mut buf).expect("read"), 4);
-        assert!(t0.elapsed() < Duration::from_secs(5), "the reader slept through the delivery");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the reader slept through the delivery"
+        );
     }
 
     /// A peer that stops reading fills the outbox, and the write **fails**
@@ -564,12 +625,17 @@ mod tests {
         let mut s = MuxControlStream::new(io.clone());
         for i in 0..MAX_PENDING_FRAMES {
             s.write_all(b"xxxx").expect("write");
-            s.flush().unwrap_or_else(|e| panic!("flush {i} failed early: {e}"));
+            s.flush()
+                .unwrap_or_else(|e| panic!("flush {i} failed early: {e}"));
         }
         s.write_all(b"xxxx").expect("write");
         let e = s.flush().expect_err("the outbox must refuse frame 65");
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(io.lock_outbox().len(), MAX_PENDING_FRAMES, "the bound was exceeded anyway");
+        assert_eq!(
+            io.lock_outbox().len(),
+            MAX_PENDING_FRAMES,
+            "the bound was exceeded anyway"
+        );
     }
 
     /// The inbox is bounded too, and overflow closes the connection with a
@@ -585,7 +651,10 @@ mod tests {
                 break;
             }
             delivered += chunk.len();
-            assert!(delivered <= MAX_INBOX_BYTES, "the inbox grew past its bound");
+            assert!(
+                delivered <= MAX_INBOX_BYTES,
+                "the inbox grew past its bound"
+            );
         }
         assert!(io.is_closed(), "an overflow must end the connection");
         assert!(io.overflowed(), "the reason for the close was lost");
@@ -600,9 +669,15 @@ mod tests {
         let io = io();
         let mut s = MuxControlStream::new(io.clone());
         s.write_all(b"unflushed").expect("write");
-        assert!(!io.control_pending(), "an unflushed write reached the outbox");
+        assert!(
+            !io.control_pending(),
+            "an unflushed write reached the outbox"
+        );
         s.flush().expect("flush");
-        assert!(io.control_pending(), "the flush did not deliver the buffered bytes");
+        assert!(
+            io.control_pending(),
+            "the flush did not deliver the buffered bytes"
+        );
     }
 
     /// A frame the writer could not start is retried whole. The head of the
@@ -619,6 +694,10 @@ mod tests {
 
         let first = io.take_control_frame().expect("first");
         io.requeue_control_frame(first.clone());
-        assert_eq!(io.take_control_frame().expect("again"), first, "the retry lost its place");
+        assert_eq!(
+            io.take_control_frame().expect("again"),
+            first,
+            "the retry lost its place"
+        );
     }
 }

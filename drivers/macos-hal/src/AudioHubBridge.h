@@ -230,7 +230,7 @@ static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t 
 // grew 104 -> 472 bytes and the control message 48 -> 56, so a compatibility
 // shim would have to guess which layout it is holding. There is deliberately
 // none.
-#define kAudioHubProtocolVersion 2u
+#define kAudioHubProtocolVersion 3u
 
 // One (spk, mic) ring pair per slot, all created up front and never released;
 // binding a peer to a slot is a metadata operation, so the realtime path never
@@ -329,6 +329,14 @@ static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t 
 #define kAudioHubBind_Clear      0u // retire the slot; generation must match the current one
 #define kAudioHubBind_Set        1u // bind (or idempotently re-bind) the slot to a peer
 
+// Bind flags.  Online remains logging-only; v3's publication bits decide
+// which endpoint directions exist for this peer.  A peer with no default input
+// must not leave a microphone-shaped device in another machine's picker.
+#define kAudioHubBindFlag_Online  0x1u
+#define kAudioHubBindFlag_Out     0x2u
+#define kAudioHubBindFlag_In      0x4u
+#define kAudioHubBindFlag_Dirs    (kAudioHubBindFlag_Out | kAudioHubBindFlag_In)
+
 // Reply status codes
 #define kAudioHubStatus_OK              0u
 #define kAudioHubStatus_BadVersion      1u
@@ -424,13 +432,13 @@ typedef struct AudioHubControlMsg
 // The strings are FIXED-SIZE and the receiver terminates them itself — it never
 // trusts the sender's terminator. They are sized to the longest thing each can
 // legitimately hold: peer_key for a fingerprint, the uids for "AudioHub:<fp>:out",
-// and the names for a peer's computer name plus a disambiguating suffix.
+// and the names for the complete, disambiguated per-peer label.
 typedef struct AudioHubBindMsg
 {
     mach_msg_header_t header;
     uint32_t          op;         // kAudioHubBind_Set | kAudioHubBind_Clear
     uint32_t          slot;       // 0..slot_count-1
-    uint32_t          flags;      // bit0 = peer is online (logging only)
+    uint32_t          flags;      // kAudioHubBindFlag_* (v3)
     uint32_t          generation; // Clear: the stamp the daemon believes is current. Set: 0, the driver assigns
     uint64_t          session_id; // the HelloReply's; a mismatch is kAudioHubStatus_StaleSession
     char              peer_key[40];

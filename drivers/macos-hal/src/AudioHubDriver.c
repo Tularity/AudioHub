@@ -197,6 +197,11 @@ typedef struct AudioHubSlot
     AudioHubMailbox bindState;    // kAudioHubCtl_BindState, retried like the rest
 } AudioHubSlot;
 
+static inline Boolean AudioHub_WantsDir(uint32_t inFlags, uint32_t inDir)
+{
+    return (inFlags & ((inDir == kAudioHubDir_Out) ? kAudioHubBindFlag_Out : kAudioHubBindFlag_In)) != 0;
+}
+
 static pthread_mutex_t          gPlugIn_StateMutex = PTHREAD_MUTEX_INITIALIZER;
 static UInt32                   gPlugIn_RefCount   = 0;
 static AudioServerPlugInHostRef gPlugIn_Host       = NULL;
@@ -645,6 +650,34 @@ static void AudioHub_RebuildDeviceListLocked(void)
     gDeviceListCount = theCount;
 }
 
+// gPlugIn_StateMutex held. RelatedDevices is a view of the slot's CURRENTLY
+// published halves, not of the two records reserved for it. A delisted record
+// deliberately stays alive for StopIO, but exposing its id through a listed
+// sibling would let the HAL rediscover an object that is already leaving.
+//
+// Returns the full number of listed devices; at most inCapacity ids are copied.
+static UInt32 AudioHub_CopyRelatedDeviceIDsLocked(const AudioHubDevice* inDevice,
+                                                  AudioObjectID* outDeviceIDs,
+                                                  UInt32 inCapacity)
+{
+    const AudioHubSlot* theSlot = &gSlots[inDevice->slotIndex];
+    UInt32 theCount = 0;
+    for(uint32_t theDir = 0; theDir < kAudioHubDevsPerSlot; ++theDir)
+    {
+        const AudioHubDevice* theDevice = &theSlot->dev[theDir];
+        if(!theDevice->listed)
+        {
+            continue;
+        }
+        if((outDeviceIDs != NULL) && (theCount < inCapacity))
+        {
+            outDeviceIDs[theCount] = AudioHub_ID(&theDevice->deviceID);
+        }
+        ++theCount;
+    }
+    return theCount;
+}
+
 // Ordinary thread (the bridge service thread), NO lock held, and only once the
 // host has finished registering the plug-in object.
 //
@@ -675,7 +708,15 @@ static void AudioHub_PostBindState(AudioHubSlot* inSlot, uint32_t inState)
 {
     Float32 theStateAsScalar;
     memcpy(&theStateAsScalar, &inState, sizeof(theStateAsScalar));
-    AudioHub_Post(&inSlot->bindState, theStateAsScalar, 0u);
+    uint32_t theFlags = 0;
+    if(inState == kAudioHubSlot_Bound)
+    {
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        if(inSlot->dev[kAudioHubDir_Out].listed) theFlags |= kAudioHubBindFlag_Out;
+        if(inSlot->dev[kAudioHubDir_In].listed)  theFlags |= kAudioHubBindFlag_In;
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+    }
+    AudioHub_Post(&inSlot->bindState, theStateAsScalar, theFlags);
 }
 
 // Re-post everything the daemon needs to know about one slot, taken from the
@@ -693,6 +734,10 @@ static void AudioHub_ReplaySlotState(AudioHubSlot* inSlot)
     for(uint32_t theDir = 0; theDir < kAudioHubDevsPerSlot; ++theDir)
     {
         AudioHubDevice* theDevice = &inSlot->dev[theDir];
+        if(!theDevice->listed)
+        {
+            continue;
+        }
         pthread_mutex_lock(&gPlugIn_StateMutex);
         const Float32 theScalar = theDevice->volumeScalar;
         const Boolean theMuted = theDevice->muted;
@@ -726,7 +771,7 @@ static void AudioHub_PublishSlotRings(AudioHubSlot* inSlot)
     for(uint32_t theDir = 0; theDir < kAudioHubDevsPerSlot; ++theDir)
     {
         AudioHubDevice* theDevice = &inSlot->dev[theDir];
-        if(theDevice->ring == NULL)
+        if(!theDevice->listed || (theDevice->ring == NULL))
         {
             continue;
         }
@@ -851,7 +896,7 @@ static int AudioHub_BindSlot(AudioHubSlot* inSlot, const AudioHubBindMsg* inMsg)
             theDevice->deviceUID  = theUIDs[theDir];  // the +1 from CopyWireString, kept
             theDevice->deviceName = theNames[theDir]; // likewise
             theDevice->modelUID   = CFRetain(theDevice->isInput ? kModelUID_In : kModelUID_Out);
-            theDevice->listed     = true;
+            theDevice->listed     = AudioHub_WantsDir(inMsg->flags, theDir);
 
             theDevice->sampleRate     = kDevice_SampleRate;
             AudioHub_InitDeviceTiming(theDevice);
@@ -1119,6 +1164,103 @@ static Boolean AudioHub_SlotHasUIDsLocked(const AudioHubSlot* inSlot, CFStringRe
     return true;
 }
 
+// Service thread, NO lock held. Capability changes keep the surviving object
+// ids stable, so tell the host that their relationship changed. The generation
+// and state guard prevents a snapshotted id from being announced after the slot
+// starts retirement or is rebound; PropertiesChanged itself may re-enter the
+// property getters, so it must remain outside gPlugIn_StateMutex.
+static void AudioHub_AnnounceRelatedDevices(AudioHubSlot* inSlot,
+                                            uint32_t inGeneration,
+                                            const AudioObjectID* inDeviceIDs,
+                                            UInt32 inDeviceCount)
+{
+    if((gPlugIn_Host == NULL) || (atomic_load(&gHostReady) == 0) ||
+       (inSlot->state != kSlotBound) || (inSlot->generation != inGeneration))
+    {
+        return;
+    }
+
+    AudioObjectPropertyAddress theAddress;
+    theAddress.mSelector = kAudioDevicePropertyRelatedDevices;
+    theAddress.mScope    = kAudioObjectPropertyScopeGlobal;
+    theAddress.mElement  = kAudioObjectPropertyElementMain;
+    for(UInt32 theIndex = 0; theIndex < inDeviceCount; ++theIndex)
+    {
+        if((inSlot->state != kSlotBound) || (inSlot->generation != inGeneration))
+        {
+            return;
+        }
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, inDeviceIDs[theIndex], 1, &theAddress);
+    }
+}
+
+// Change which halves of an existing binding are visible without replacing
+// either device record.  The UID and AudioObjectID of the surviving direction
+// therefore stay stable, so changing the peer's microphone capability cannot
+// throw away the user's selected virtual speaker (and vice versa).
+static void AudioHub_UpdateSlotDirections(AudioHubSlot* inSlot, uint32_t inFlags)
+{
+    uint32_t theAdded = 0;
+    uint32_t theRemoved = 0;
+    uint32_t theGeneration = 0;
+    AudioObjectID theRelatedChanged[kAudioHubDevsPerSlot];
+    UInt32 theRelatedChangedCount = 0;
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    for(uint32_t theDir = 0; theDir < kAudioHubDevsPerSlot; ++theDir)
+    {
+        AudioHubDevice* theDevice = &inSlot->dev[theDir];
+        const Boolean theWanted = AudioHub_WantsDir(inFlags, theDir);
+        if(theWanted == theDevice->listed)
+        {
+            continue;
+        }
+        theDevice->listed = theWanted;
+        if(theWanted) theAdded |= (1u << theDir);
+        else          theRemoved |= (1u << theDir);
+    }
+    if((theAdded | theRemoved) != 0)
+    {
+        AudioHub_RebuildDeviceListLocked();
+        theGeneration = inSlot->generation;
+        theRelatedChangedCount = AudioHub_CopyRelatedDeviceIDsLocked(
+            &inSlot->dev[kAudioHubDir_Out], theRelatedChanged, kAudioHubDevsPerSlot);
+    }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    // Delist first, then unpublish: an existing client may still call StopIO
+    // after the device leaves the list and must continue to resolve the object.
+    for(uint32_t theDir = 0; theDir < kAudioHubDevsPerSlot; ++theDir)
+    {
+        if((theRemoved & (1u << theDir)) != 0)
+        {
+            AudioHubBridge_UnpublishRing(inSlot->dev[theDir].ring);
+            // Unpublish waits for every IOProc to leave. Reset only at this
+            // quiet boundary so a removed endpoint cannot leave samples for
+            // the same direction when the capability later returns.
+            AudioHubBridge_ResetRing(inSlot->dev[theDir].ring);
+        }
+    }
+    // A direction returning after an absence must not replay samples left by
+    // the old default device/capability epoch.
+    for(uint32_t theDir = 0; theDir < kAudioHubDevsPerSlot; ++theDir)
+    {
+        if((theAdded & (1u << theDir)) != 0)
+        {
+            AudioHubBridge_ResetRing(inSlot->dev[theDir].ring);
+        }
+    }
+    if(theAdded != 0)
+    {
+        AudioHub_PublishSlotRings(inSlot);
+    }
+    if((theAdded | theRemoved) != 0)
+    {
+        atomic_store(&gDeviceListDirty, 1);
+        AudioHub_AnnounceRelatedDevices(inSlot, theGeneration, theRelatedChanged, theRelatedChangedCount);
+    }
+}
+
 static void AudioHub_HandleBindSet(AudioHubSlot* inSlot, const AudioHubBindMsg* inMsg)
 {
     const uint32_t theSlotIndex = inSlot->dev[0].slotIndex;
@@ -1159,6 +1301,7 @@ static void AudioHub_HandleBindSet(AudioHubSlot* inSlot, const AudioHubBindMsg* 
             if(theSameUIDs)
             {
                 AudioHub_RenameSlot(inSlot, theNames);
+                AudioHub_UpdateSlotDirections(inSlot, inMsg->flags);
             }
         }
         for(uint32_t theDir = 0; theDir < kAudioHubDevsPerSlot; ++theDir)
@@ -1976,11 +2119,13 @@ static OSStatus AudioHub_GetDevicePropertyDataSize(const AudioHubDevice* inDevic
             *outDataSize = sizeof(UInt32);
             break;
         case kAudioDevicePropertyRelatedDevices:
-            // BOTH devices of this slot. This is the only native way macOS has of
-            // saying "these two are the same machine", and it is what makes Audio
-            // MIDI Setup group a peer's speaker and microphone together.
-            *outDataSize = kAudioHubDevsPerSlot * sizeof(AudioObjectID);
+        {
+            pthread_mutex_lock(&gPlugIn_StateMutex);
+            const UInt32 theNumberItems = AudioHub_CopyRelatedDeviceIDsLocked(inDevice, NULL, 0);
+            pthread_mutex_unlock(&gPlugIn_StateMutex);
+            *outDataSize = theNumberItems * (UInt32)sizeof(AudioObjectID);
             break;
+        }
         case kAudioDevicePropertyStreams:
             *outDataSize = AudioHub_ScopeMatchesDevice(inDevice, inAddress->mScope) ? sizeof(AudioObjectID) : 0;
             break;
@@ -2104,20 +2249,12 @@ static OSStatus AudioHub_GetDevicePropertyData(AudioHubDevice* inDevice, const A
             break;
         case kAudioDevicePropertyRelatedDevices:
         {
-            // Both halves of the pair, self included. The sibling is found by
-            // structure (same slot, other direction), never by arithmetic on an
-            // object id.
-            UInt32 theNumberItemsToFetch = inDataSize / (UInt32)sizeof(AudioObjectID);
-            if(theNumberItemsToFetch > kAudioHubDevsPerSlot)
-            {
-                theNumberItemsToFetch = kAudioHubDevsPerSlot;
-            }
-            AudioHubSlot* theSlot = &gSlots[inDevice->slotIndex];
+            const UInt32 theCapacity = inDataSize / (UInt32)sizeof(AudioObjectID);
             AudioObjectID* theList = (AudioObjectID*)outData;
-            for(UInt32 theIndex = 0; theIndex < theNumberItemsToFetch; ++theIndex)
-            {
-                theList[theIndex] = AudioHub_ID(&theSlot->dev[theIndex].deviceID);
-            }
+            pthread_mutex_lock(&gPlugIn_StateMutex);
+            const UInt32 theNumberItems = AudioHub_CopyRelatedDeviceIDsLocked(inDevice, theList, theCapacity);
+            pthread_mutex_unlock(&gPlugIn_StateMutex);
+            const UInt32 theNumberItemsToFetch = (theNumberItems < theCapacity) ? theNumberItems : theCapacity;
             *outDataSize = theNumberItemsToFetch * (UInt32)sizeof(AudioObjectID);
             break;
         }

@@ -2,8 +2,14 @@
 # AudioHub macOS HAL driver — build script (M5 scaffold).
 #
 # Builds build/AudioHubDriver.driver (bundle: Contents/MacOS/AudioHubDriver +
-# Contents/Info.plist) as a UNIVERSAL binary (arm64 + x86_64), ad-hoc codesigns
-# it, then verifies the signature and the plist. This script does NOT install.
+# Contents/Info.plist) as a UNIVERSAL binary (arm64 + x86_64), signs it, then
+# verifies the signature and the plist. This script does NOT install.
+#
+# Signing is deliberately a BUILD-TIME operation. Re-signing a driver after it
+# has been embedded in AudioHub.app would invalidate the outer bundle seal.
+# AUDIOHUB_DRIVER_SIGN_IDENTITY may select a release identity. Development
+# builds prefer the stable local "AudioHub Dev" identity and fall back to an
+# ad-hoc signature only when that identity is unavailable.
 #
 # ---- round-2 MANUAL install steps (never run automatically) ----
 # coreaudiod loads the bundle it finds; a plain `cp -R` over an existing
@@ -54,7 +60,20 @@ clang -bundle \
 
 cp Info.plist "$PLIST"
 
-codesign --force --sign - "$BUNDLE"
+SIGN_IDENTITY="${AUDIOHUB_DRIVER_SIGN_IDENTITY:-}"
+if [[ -z "$SIGN_IDENTITY" ]]; then
+    if security find-identity -p codesigning 2>/dev/null | grep -q '"AudioHub Dev"'; then
+        SIGN_IDENTITY="AudioHub Dev"
+    else
+        SIGN_IDENTITY="-"
+    fi
+fi
+
+SIGN_ARGS=(--force --sign "$SIGN_IDENTITY")
+if [[ "$SIGN_IDENTITY" == Developer\ ID\ Application:* ]]; then
+    SIGN_ARGS+=(--options runtime --timestamp)
+fi
+codesign "${SIGN_ARGS[@]}" "$BUNDLE"
 
 # --- verification: any failure here must fail the build -----------------------
 archs="$(lipo -archs "$BIN")"
@@ -75,5 +94,5 @@ plutil -lint "$PLIST" || {
     exit 1
 }
 
-echo "built: $BUNDLE ($archs, macOS $MACOS_MIN+), signature and plist verified"
+echo "built: $BUNDLE ($archs, macOS $MACOS_MIN+, signed by $SIGN_IDENTITY), signature and plist verified"
 echo "install is manual (round 2), see comments at the top of this script"

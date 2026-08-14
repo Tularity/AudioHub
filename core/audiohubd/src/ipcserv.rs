@@ -52,7 +52,10 @@ pub(crate) fn accept_loop(inner: Arc<DaemonInner>, listener: TcpListener) {
 }
 
 fn daemon_info(inner: &DaemonInner) -> DaemonInfo {
-    let (output_devices, virtual_cards) = crate::device_listing(inner);
+    // Authentication hello and daemon.status share this constructor. Device
+    // discovery therefore MUST stay a snapshot read: a broken OS audio service
+    // must not turn every reconnect into another permanently blocked thread.
+    let (output_devices, virtual_cards) = crate::device_listing_snapshot(inner);
     DaemonInfo {
         ipc_version: IPC_VERSION,
         name: inner.identity().name.clone(),
@@ -61,7 +64,7 @@ fn daemon_info(inner: &DaemonInner) -> DaemonInfo {
         uptime_s: inner.start.elapsed().as_secs_f64(),
         output_devices,
         virtual_cards,
-        // NOT behind `device_listing`'s cache, and not behind one of its own.
+        // NOT behind `device_listing_snapshot`'s cache, and not behind one of its own.
         // `list_backends()` is a class-existence + OS-version check that is
         // contractually forbidden from opening a capture (sysaudio.rs), so it
         // costs nothing here; what it DOES carry is live state — the macOS note
@@ -120,8 +123,7 @@ fn reject_browser_origin(req: &Request, resp: Response) -> Result<Response, Erro
     if let Some(origin) = req.headers().get("origin") {
         let ok = origin.to_str().map(origin_allowed).unwrap_or(false);
         if !ok {
-            let mut err =
-                ErrorResponse::new(Some("audiohub ipc rejects non-local origins".into()));
+            let mut err = ErrorResponse::new(Some("audiohub ipc rejects non-local origins".into()));
             *err.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;
             return Err(err);
         }
@@ -189,7 +191,8 @@ fn client_thread(inner: Arc<DaemonInner>, stream: TcpStream) {
     {
         return;
     }
-    let Some(mut ws) = accept_ws(stream) else { return;
+    let Some(mut ws) = accept_ws(stream) else {
+        return;
     };
 
     let authed = read_text(&mut ws, Duration::from_secs(5))
@@ -241,7 +244,8 @@ fn client_thread(inner: Arc<DaemonInner>, stream: TcpStream) {
         }
         match ws.read() {
             Ok(Message::Text(t)) => {
-                let Ok(req) = serde_json::from_str::<Value>(&t) else { continue;
+                let Ok(req) = serde_json::from_str::<Value>(&t) else {
+                    continue;
                 };
                 let id = req.get("id").cloned().unwrap_or(Value::Null);
                 let method = req
@@ -407,6 +411,8 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                             // there is no channel to have heard a mode on.
                             // "Unknown", never "usable".
                             peer_mode: None,
+                            peer_default_input: None,
+                            peer_default_output: None,
                             peer_unusable: false,
                         }),
                 )?
@@ -485,17 +491,30 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 let id = params
                     .get("id")
                     .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow::anyhow!("missing 'id'"))? as u32;
+                    .ok_or_else(|| anyhow::anyhow!("missing 'id'"))?
+                    as u32;
                 conn::close_session(inner, id)?;
                 json!({})
             }
             methods::SESSION_LIST => serde_json::to_value(crate::build_session_infos(inner))?,
             methods::AIRPLAY_SESSIONS_LIST => serde_json::to_value(inner.airplay.sessions())?,
+            methods::AIRPLAY_ARTWORK_GET => {
+                let session_id = params
+                    .get("session_id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("missing 'session_id'"))?;
+                let revision = params
+                    .get("revision")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("missing 'revision'"))?;
+                serde_json::to_value(inner.airplay.artwork(session_id, revision))?
+            }
             methods::SESSION_SET_VOLUME => {
                 let id = params
                     .get("id")
                     .and_then(Value::as_u64)
-                    .ok_or_else(|| anyhow::anyhow!("missing 'id'"))? as u32;
+                    .ok_or_else(|| anyhow::anyhow!("missing 'id'"))?
+                    as u32;
                 let scalar = params
                     .get("scalar")
                     .and_then(Value::as_f64)
@@ -583,6 +602,15 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 }
                 set_bool!("remove_virtual_on_disconnect", remove_virtual_on_disconnect);
                 set_bool!("mark_offline_devices", mark_offline_devices);
+                if let Some(value) = params.get("native_locale") {
+                    let locale = value
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("native_locale must be a string"))?;
+                    if !crate::settings::valid_native_locale(locale) {
+                        anyhow::bail!("native_locale must be 'zh-CN' or 'en-US'");
+                    }
+                    next.native_locale = locale.to_string();
+                }
                 set_bool!("mode_a_volume_sync", mode_a_volume_sync);
                 set_bool!("mode_a_mute_local", mode_a_mute_local);
                 if let Some(v) = params.get("discovery_announce").and_then(Value::as_bool) {
@@ -899,11 +927,17 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("missing 'dir' ('recv' | 'send')"))?;
                 if dir != DIR_RECV && dir != DIR_SEND {
-                    anyhow::bail!("dir 必须是 '{DIR_RECV}'（本机收）或 '{DIR_SEND}'（本机发），收到 '{dir}'");
+                    anyhow::bail!(
+                        "dir 必须是 '{DIR_RECV}'（本机收）或 '{DIR_SEND}'（本机发），收到 '{dir}'"
+                    );
                 }
                 let mut t = lk(&inner.peer_transport).get(&fp);
                 {
-                    let slot = if dir == DIR_RECV { &mut t.recv } else { &mut t.send };
+                    let slot = if dir == DIR_RECV {
+                        &mut t.recv
+                    } else {
+                        &mut t.send
+                    };
                     if let Some(v) = params.get("latency").and_then(Value::as_str) {
                         let parsed = LatencyTarget::parse(v).ok_or_else(|| {
                             anyhow::anyhow!(
@@ -970,8 +1004,7 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 // 也不一定是 tier 2。
                 let dial = match params.get("dial_policy").and_then(Value::as_str) {
                     Some(d) => {
-                        Some(crate::peer_transport::DialPolicy::parse(d).ok_or_else(
-                        || {
+                        Some(crate::peer_transport::DialPolicy::parse(d).ok_or_else(|| {
                             anyhow::anyhow!(
                                 "dial_policy 必须是 'both'、'outbound_only' 或 \
                                  'inbound_only'，收到 '{d}'"
@@ -1063,6 +1096,7 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         effective_mode: haldev::effective_mode(inner),
         remove_virtual_on_disconnect: s.remove_virtual_on_disconnect,
         mark_offline_devices: s.mark_offline_devices,
+        native_locale: s.native_locale.clone(),
         mode_a_volume_sync: s.mode_a_volume_sync,
         mode_a_mute_local: s.mode_a_mute_local,
         discovery_announce: s.discovery_announce,
@@ -1178,6 +1212,9 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
             let cell = live
                 .map(|c| *crate::lk(&c.peer_mode))
                 .unwrap_or(crate::PeerModeCell::Unheard);
+            let capabilities = live
+                .map(|c| *crate::lk(&c.peer_audio_capabilities))
+                .unwrap_or(crate::PeerAudioCapabilitiesCell::Unheard);
             // 网络单程估计**只在连接活着时**给：拿上一次的读数冒充现在，
             // 与 `peer_mode` 那条规矩同源。
             //
@@ -1197,13 +1234,17 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
                 rtt_ms: clock.map(|e| e.last_rtt_us as f64 / 1000.0),
                 online: live.is_some(),
                 peer_mode: cell.mode(),
+                peer_default_input: capabilities.default_input(),
+                peer_default_output: capabilities.default_output(),
                 peer_unusable: cell.unusable(),
                 reconnecting,
                 // The third state, and it is only meaningful while the peer is
                 // not connected: an inbound-only peer with a live channel is
                 // simply online, and reporting both would ask the UI to choose.
                 awaiting_inbound: live.is_none()
-                    && !lk(&inner.peer_transport).dial_policy(&p.fingerprint).may_dial(),
+                    && !lk(&inner.peer_transport)
+                        .dial_policy(&p.fingerprint)
+                        .may_dial(),
                 retry_in_s,
                 hal_device: hal.peer_device(&p.fingerprint),
                 hal_reason: hal.reasons.get(&p.fingerprint).cloned(),

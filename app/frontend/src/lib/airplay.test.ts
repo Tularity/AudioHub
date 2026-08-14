@@ -56,6 +56,17 @@ describe('AirPlay 设置界面边界', () => {
     expect(card).not.toContain('data-testid="share-proto-airplay-password"');
   });
 
+  it('名称与密码共用 Sheet 底部的一次保存', () => {
+    const sheetStart = SHARE_PROTOCOLS_SRC.indexOf('function AirPlaySettingsSheet');
+    const cardStart = SHARE_PROTOCOLS_SRC.indexOf('function AirPlayCard');
+    const sheet = SHARE_PROTOCOLS_SRC.slice(sheetStart, cardStart);
+    expect(sheet).toContain('data-testid="share-proto-airplay-save"');
+    expect(sheet).toContain('primaryAction={(');
+    expect(sheet).toContain("dismissLabel={t('common.cancel')}");
+    expect(sheet).not.toContain('share-proto-airplay-name-save');
+    expect(sheet).not.toContain('share-proto-airplay-password-save');
+  });
+
   it('不再提供 AirPlay 音频去向选择', () => {
     expect(SHARE_PROTOCOLS_SRC).not.toContain('airplay_route');
     expect(SHARE_PROTOCOLS_SRC).not.toContain('share.proto.airplay.route');

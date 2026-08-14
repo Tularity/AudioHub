@@ -11,7 +11,7 @@
 //! ## Why the exclusion exists (plan §13 "失效形态")
 //!
 //! Before §13 a machine was a provider AND a consumer at once. Let X share its
-//! *default* microphone with Y while X is in mode B with "AudioHub – Z 麦克风"
+//! *default* microphone with Y while X is in mode B with Z's AudioHub input device
 //! selected as its default input: Y then receives **Z's** microphone, and X is
 //! a relay it never agreed to be. Add "Z is using X" and the graph closes into
 //! a cycle whose latency grows without bound until some stage saturates — the

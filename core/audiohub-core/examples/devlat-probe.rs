@@ -24,7 +24,10 @@ fn main() {
 
     println!("\n---- 全部设备 ----");
     for e in audio::list_devices_detailed() {
-        for (kind, on) in [(DeviceKind::Output, e.is_output), (DeviceKind::Input, e.is_input)] {
+        for (kind, on) in [
+            (DeviceKind::Output, e.is_output),
+            (DeviceKind::Input, e.is_input),
+        ] {
             if !on {
                 continue;
             }
@@ -32,7 +35,11 @@ fn main() {
                 Some(uid) => DevTarget::Uid(uid),
                 None => DevTarget::Name(&e.name),
             };
-            let dir = if matches!(kind, DeviceKind::Output) { "out" } else { "in " };
+            let dir = if matches!(kind, DeviceKind::Output) {
+                "out"
+            } else {
+                "in "
+            };
             show(&format!("[{dir}] {}", e.name), &devlat::query(kind, target));
         }
     }

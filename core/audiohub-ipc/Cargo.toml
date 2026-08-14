@@ -7,3 +7,6 @@ edition = "2021"
 audiohub-core = { path = "../audiohub-core" }
 audiohub-net = { path = "../audiohub-net" }
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

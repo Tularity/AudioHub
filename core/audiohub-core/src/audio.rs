@@ -53,6 +53,25 @@ pub struct DevicesReport {
     pub devices: Vec<DeviceEntry>,
 }
 
+/// Whether the host currently exposes a default endpoint in each direction.
+///
+/// This intentionally asks only for the endpoint handles. In particular it
+/// does not query an input format or open a capture stream, so callers can use
+/// it for capability advertisement without triggering microphone permission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DefaultDevicePresence {
+    pub input: bool,
+    pub output: bool,
+}
+
+pub fn default_device_presence() -> DefaultDevicePresence {
+    let host = cpal::default_host();
+    DefaultDevicePresence {
+        input: host.default_input_device().is_some(),
+        output: host.default_output_device().is_some(),
+    }
+}
+
 fn describe(cfg: &SupportedStreamConfig) -> String {
     format!(
         "{}Hz {}ch {}",
@@ -103,6 +122,25 @@ impl DeviceKind {
             DeviceKind::Output => "output",
         }
     }
+}
+
+/// Index of one named device in the raw, cross-direction system inventory.
+///
+/// macOS exposes one global CoreAudio device array. Two distinct objects in
+/// that array may deliberately carry the same display name when one is an
+/// input and the other an output; the system UI already separates those
+/// directions. A name-only search of the global array would therefore select
+/// whichever object happened to appear first. Keep this decision pure so the
+/// same-label case is covered without opening a real audio device in a test.
+#[cfg(any(target_os = "macos", test))]
+fn named_direction_index(entries: &[DeviceEntry], kind: DeviceKind, name: &str) -> Option<usize> {
+    entries.iter().position(|d| {
+        d.name == name
+            && match kind {
+                DeviceKind::Input => d.is_input,
+                DeviceKind::Output => d.is_output,
+            }
+    })
 }
 
 /// Names of every device that can play audio, deduplicated, enumeration order.
@@ -189,7 +227,10 @@ fn resolve_name(names: &[String], query: &str, kind: DeviceKind) -> Result<Strin
         _ => bail!(
             "{} device name {q:?} is ambiguous; candidates: [{}]",
             kind.word(),
-            hits.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            hits.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }
@@ -222,7 +263,7 @@ fn find_device_by_uid(kind: DeviceKind, uid: &str) -> Result<(cpal::Device, Stri
 /// permission-free.
 #[cfg(target_os = "macos")]
 mod devices {
-    use super::{DeviceEntry, DeviceKind};
+    use super::{named_direction_index, DeviceEntry, DeviceKind};
     use anyhow::{bail, Result};
     use std::ffi::c_void;
     use std::mem::size_of;
@@ -296,7 +337,11 @@ mod devices {
     }
 
     fn at(selector: u32, scope: u32) -> PropAddr {
-        PropAddr { selector, scope, element: ELEM_MAIN }
+        PropAddr {
+            selector,
+            scope,
+            element: ELEM_MAIN,
+        }
     }
 
     fn prop_size(dev: AudioObjectID, a: &PropAddr) -> Option<u32> {
@@ -477,7 +522,10 @@ mod devices {
     /// snapshot did not move underneath.
     fn locate_uid(ids: &[AudioObjectID], kind: DeviceKind, uid: &str) -> Result<(usize, String)> {
         let scope = scope_of(kind);
-        let Some(i) = ids.iter().position(|&d| device_uid(d).as_deref() == Some(uid)) else {
+        let Some(i) = ids
+            .iter()
+            .position(|&d| device_uid(d).as_deref() == Some(uid))
+        else {
             bail!(
                 "no {} device matches UID {uid:?}; available: [{}]",
                 kind.word(),
@@ -562,14 +610,44 @@ mod devices {
             .collect()
     }
 
-    /// A coreaudio device carries both directions, so the direction was already
-    /// settled by `list`; only the name has to match here.
-    pub fn find(_kind: DeviceKind, name: &str) -> Option<cpal::Device> {
+    /// Finds a named CoreAudio device in the requested direction.
+    ///
+    /// `host.devices()` is global and unfiltered. In particular, AudioHub's
+    /// virtual input and output may intentionally have one display name, so a
+    /// plain `.find(name)` can return the wrong flow. Match the corresponding
+    /// AudioObjectID inventory by index, with the same snapshot/re-read guard
+    /// used by `find_by_uid`; scope, not the label, decides the direction.
+    pub fn find(kind: DeviceKind, name: &str) -> Option<cpal::Device> {
         use cpal::traits::{DeviceTrait, HostTrait};
-        cpal::default_host()
-            .devices()
-            .ok()?
-            .find(|d| d.name().map_or(false, |n| n == name))
+        let host = cpal::default_host();
+        for _ in 0..3 {
+            let ids = device_ids();
+            let mut handles: Vec<cpal::Device> = host.devices().ok()?.collect();
+            if handles.len() != ids.len() || device_ids() != ids {
+                continue;
+            }
+            let entries: Vec<DeviceEntry> = ids
+                .iter()
+                .map(|&id| DeviceEntry {
+                    name: device_name(id).unwrap_or_default(),
+                    uid: None,
+                    id: Some(id),
+                    is_input: scope_channels(id, SCOPE_INPUT) > 0,
+                    is_output: scope_channels(id, SCOPE_OUTPUT) > 0,
+                })
+                .collect();
+            if device_ids() != ids {
+                continue;
+            }
+            let i = named_direction_index(&entries, kind, name)?;
+            if handles[i].name().ok().as_deref() != Some(name) {
+                // The CoreAudio property view and cpal's handle view moved or
+                // disagree. Never turn that into a handle for another device.
+                continue;
+            }
+            return Some(handles.swap_remove(i));
+        }
+        None
     }
 }
 
@@ -853,7 +931,11 @@ impl Dll {
         // and positive, and "deeper" means `z3` still climbing. Only that case
         // is windup; a `z3` already heading back is the recovery we want to
         // let through untouched.
-        let deeper = if raw < lo { self.z3 > z3_held } else { self.z3 < z3_held };
+        let deeper = if raw < lo {
+            self.z3 > z3_held
+        } else {
+            self.z3 < z3_held
+        };
         if deeper {
             self.z3 = z3_held;
         }
@@ -1193,9 +1275,17 @@ impl PlayServo {
             [
                 v("AUDIOHUB_PLAY_TARGET_MARGIN_MS", Self::MARGIN_MS, 0.0),
                 v("AUDIOHUB_PLAY_TARGET_BASE_MS", Self::BASE_TARGET_MS, 1.0),
-                v("AUDIOHUB_PLAY_UNDERRUN_STEP_MS", Self::UNDERRUN_STEP_MS, 0.0),
+                v(
+                    "AUDIOHUB_PLAY_UNDERRUN_STEP_MS",
+                    Self::UNDERRUN_STEP_MS,
+                    0.0,
+                ),
                 v("AUDIOHUB_PLAY_UNDERRUN_MAX_MS", Self::UNDERRUN_MAX_MS, 0.0),
-                v("AUDIOHUB_PLAY_UNDERRUN_DECAY_S", Self::UNDERRUN_DECAY_S, 1.0),
+                v(
+                    "AUDIOHUB_PLAY_UNDERRUN_DECAY_S",
+                    Self::UNDERRUN_DECAY_S,
+                    1.0,
+                ),
             ]
         })
     }
@@ -1503,7 +1593,9 @@ pub fn play_samples_blocking(samples: &[f32], src_rate: u32) -> Result<()> {
             return Err(anyhow!(e));
         }
         if Instant::now() >= drain_deadline {
-            return Err(anyhow!("output stream stalled (no progress before deadline)"));
+            return Err(anyhow!(
+                "output stream stalled (no progress before deadline)"
+            ));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1678,7 +1770,11 @@ impl AudioTx {
         let n_out = (n_in as f64 * rate / self.src_rate as f64).round().max(1.0) as u32;
         if n_out.abs_diff(self.servo.tuned_period) * 10 > self.servo.tuned_period {
             self.servo.tuned_period = n_out;
-            let bw = if self.servo.capture_left > 0 { Dll::BW_MAX } else { Dll::BW_MIN };
+            let bw = if self.servo.capture_left > 0 {
+                Dll::BW_MAX
+            } else {
+                Dll::BW_MIN
+            };
             self.servo.dll.set_bw(bw, n_out, self.dev_rate);
         }
         // ---- 误差信号 ----
@@ -1892,7 +1988,12 @@ impl AudioTx {
     /// **只给测试**：把欠载回退的三个整定量换成能在虚拟时间里跑完的值。
     /// 生产值（5 ms / 10 ms / 120 s）意味着一次完整衰减要 20 分钟虚拟时间。
     #[doc(hidden)]
-    pub fn set_underrun_rollback_for_test(&mut self, step_ms: f64, cap_ms: f64, decay_updates: u32) {
+    pub fn set_underrun_rollback_for_test(
+        &mut self,
+        step_ms: f64,
+        cap_ms: f64,
+        decay_updates: u32,
+    ) {
         let ms = self.dev_rate as f64 / 1000.0;
         self.servo.underrun_step = step_ms * ms;
         self.servo.underrun_cap = cap_ms * ms;
@@ -2047,7 +2148,10 @@ impl LivePlayback {
         stream.play()?;
 
         Ok((
-            LivePlayback { _stream: stream, health },
+            LivePlayback {
+                _stream: stream,
+                health,
+            },
             AudioTx {
                 prod,
                 // 伺服开着 ⇒ 重采样器**必须**在场，哪怕 src_rate == dev_rate：
@@ -2126,7 +2230,11 @@ impl AudioRx {
         let (prod, cons) = rb.split();
         let dropped = Arc::new(AtomicU64::new(0));
         (
-            AudioRx { cons, rate, dropped: Arc::clone(&dropped) },
+            AudioRx {
+                cons,
+                rate,
+                dropped: Arc::clone(&dropped),
+            },
             CaptureFeed { prod, dropped },
         )
     }
@@ -2245,8 +2353,15 @@ impl LiveCapture {
         };
         stream.play()?;
         Ok((
-            LiveCapture { _stream: stream, health },
-            AudioRx { cons, rate, dropped },
+            LiveCapture {
+                _stream: stream,
+                health,
+            },
+            AudioRx {
+                cons,
+                rate,
+                dropped,
+            },
             rate,
         ))
     }
@@ -2270,7 +2385,10 @@ struct FanoutState {
 
 impl Fanout {
     fn new() -> Fanout {
-        Fanout { state: Mutex::new(FanoutState::default()), cv: Condvar::new() }
+        Fanout {
+            state: Mutex::new(FanoutState::default()),
+            cv: Condvar::new(),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, FanoutState> {
@@ -2313,7 +2431,10 @@ struct Handshake {
 
 impl Handshake {
     fn new() -> Handshake {
-        Handshake { slot: Mutex::new(None), cv: Condvar::new() }
+        Handshake {
+            slot: Mutex::new(None),
+            cv: Condvar::new(),
+        }
     }
 
     fn publish(&self, r: std::result::Result<(), String>) {
@@ -2335,7 +2456,11 @@ impl Handshake {
             if left.is_zero() {
                 return None;
             }
-            g = self.cv.wait_timeout(g, left).unwrap_or_else(|e| e.into_inner()).0;
+            g = self
+                .cv
+                .wait_timeout(g, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 }
@@ -2349,7 +2474,10 @@ pub struct DeviceChangeWatcher {
 }
 
 impl DeviceChangeWatcher {
-    pub fn start(kind: DeviceKind, cb: Box<dyn Fn() + Send + 'static>) -> Result<DeviceChangeWatcher> {
+    pub fn start(
+        kind: DeviceKind,
+        cb: Box<dyn Fn() + Send + 'static>,
+    ) -> Result<DeviceChangeWatcher> {
         let fanout = Arc::new(Fanout::new());
         let ready = Arc::new(Handshake::new());
         let f = Arc::clone(&fanout);
@@ -2378,7 +2506,10 @@ impl DeviceChangeWatcher {
             .context("spawn device watcher thread")?;
 
         match ready.take() {
-            Some(Ok(())) => Ok(DeviceChangeWatcher { fanout, worker: Some(worker) }),
+            Some(Ok(())) => Ok(DeviceChangeWatcher {
+                fanout,
+                worker: Some(worker),
+            }),
             Some(Err(msg)) => {
                 // The worker already returned, so this join is immediate.
                 fanout.stop();
@@ -2390,7 +2521,9 @@ impl DeviceChangeWatcher {
                 // rather than block the caller for however long that takes.
                 fanout.stop();
                 drop(worker);
-                Err(anyhow!("device watcher did not register before the deadline"))
+                Err(anyhow!(
+                    "device watcher did not register before the deadline"
+                ))
             }
         }
     }
@@ -2493,7 +2626,11 @@ mod watch_imp {
             DeviceKind::Input => SEL_DEFAULT_INPUT,
             DeviceKind::Output => SEL_DEFAULT_OUTPUT,
         };
-        let addr = PropAddr { selector, scope: SCOPE_GLOBAL, element: ELEM_MAIN };
+        let addr = PropAddr {
+            selector,
+            scope: SCOPE_GLOBAL,
+            element: ELEM_MAIN,
+        };
         // The HAL keeps this pointer until the listener is removed, so the Arc
         // strong count has to stay raised for exactly that long.
         let ctx = Arc::into_raw(fanout);
@@ -2572,8 +2709,12 @@ mod watch_imp {
         d3: 0x4D85,
         d4: [0x83, 0x90, 0x6C, 0x70, 0x3C, 0xEC, 0x60, 0xC0],
     };
-    const IID_IUNKNOWN: GUID =
-        GUID { d1: 0, d2: 0, d3: 0, d4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
+    const IID_IUNKNOWN: GUID = GUID {
+        d1: 0,
+        d2: 0,
+        d3: 0,
+        d4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+    };
 
     const CLSCTX_INPROC_SERVER: u32 = 0x1;
     const COINIT_MULTITHREADED: u32 = 0x0;
@@ -2625,8 +2766,7 @@ mod watch_imp {
     #[repr(C)]
     struct IMMNotificationClientVtbl {
         base: IUnknownVtbl,
-        on_device_state_changed:
-            unsafe extern "system" fn(*mut c_void, *const u16, u32) -> HRESULT,
+        on_device_state_changed: unsafe extern "system" fn(*mut c_void, *const u16, u32) -> HRESULT,
         on_device_added: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
         on_device_removed: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
         on_default_device_changed:
@@ -2667,7 +2807,10 @@ mod watch_imp {
     }
 
     unsafe extern "system" fn nc_add_ref(this: *mut c_void) -> u32 {
-        (*(this as *mut NotifyClient)).refs.fetch_add(1, Ordering::Relaxed) + 1
+        (*(this as *mut NotifyClient))
+            .refs
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
     }
 
     unsafe extern "system" fn nc_release(this: *mut c_void) -> u32 {
@@ -2713,7 +2856,11 @@ mod watch_imp {
     }
 
     static NC_VTBL: IMMNotificationClientVtbl = IMMNotificationClientVtbl {
-        base: IUnknownVtbl { query_interface: nc_qi, add_ref: nc_add_ref, release: nc_release },
+        base: IUnknownVtbl {
+            query_interface: nc_qi,
+            add_ref: nc_add_ref,
+            release: nc_release,
+        },
         on_device_state_changed: nc_state,
         on_device_added: nc_added,
         on_device_removed: nc_removed,
@@ -2771,7 +2918,10 @@ mod watch_imp {
             )
         };
         if hr < 0 {
-            bail!("CoCreateInstance(MMDeviceEnumerator) failed: HRESULT 0x{:08X}", hr as u32);
+            bail!(
+                "CoCreateInstance(MMDeviceEnumerator) failed: HRESULT 0x{:08X}",
+                hr as u32
+            );
         }
         let flow = match kind {
             DeviceKind::Input => E_CAPTURE,
@@ -2792,9 +2942,16 @@ mod watch_imp {
                 nc_release(client as *mut c_void);
                 release(enumerator);
             }
-            bail!("RegisterEndpointNotificationCallback failed: HRESULT 0x{:08X}", hr as u32);
+            bail!(
+                "RegisterEndpointNotificationCallback failed: HRESULT 0x{:08X}",
+                hr as u32
+            );
         }
-        Ok(Registration { client, enumerator, _apt: apt })
+        Ok(Registration {
+            client,
+            enumerator,
+            _apt: apt,
+        })
     }
 
     pub fn unregister(reg: Registration) {
@@ -3005,7 +3162,11 @@ mod devlist_imp {
     }
 
     pub fn register(state: Arc<Mutex<WatchState>>) -> Result<Registration> {
-        let addr = PropAddr { selector: SEL_DEVICES, scope: SCOPE_GLOBAL, element: ELEM_MAIN };
+        let addr = PropAddr {
+            selector: SEL_DEVICES,
+            scope: SCOPE_GLOBAL,
+            element: ELEM_MAIN,
+        };
         // The HAL keeps this pointer until the listener is removed, so the Arc
         // strong count has to stay raised for exactly that long.
         let ctx = Arc::into_raw(state);
@@ -3038,9 +3199,7 @@ mod devlist_imp {
             unsafe { drop(Arc::from_raw(reg.ctx)) };
             true
         } else {
-            eprintln!(
-                "[audiohub] AudioObjectRemovePropertyListener(dev#) failed: OSStatus {st}"
-            );
+            eprintln!("[audiohub] AudioObjectRemovePropertyListener(dev#) failed: OSStatus {st}");
             false
         }
     }
@@ -3064,6 +3223,16 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    fn named_entry(name: &str, is_input: bool, is_output: bool) -> DeviceEntry {
+        DeviceEntry {
+            name: name.to_string(),
+            uid: None,
+            id: None,
+            is_input,
+            is_output,
+        }
+    }
+
     /// `unwrap_err` would demand Debug on the stream handles.
     fn err_of<T>(r: Result<T>) -> String {
         match r {
@@ -3076,6 +3245,27 @@ mod tests {
     fn dedup_keeps_first_occurrence_order() {
         let got = dedup_in_order(names(&["b", "a", "b", "", "c"]));
         assert_eq!(got, names(&["b", "a", "c"]));
+    }
+
+    #[test]
+    fn same_label_in_two_directions_resolves_by_direction_not_array_order() {
+        let entries = vec![
+            named_entry("AudioHub – Studio", true, false),
+            named_entry("Unrelated", true, true),
+            named_entry("AudioHub – Studio", false, true),
+        ];
+        assert_eq!(
+            named_direction_index(&entries, DeviceKind::Input, "AudioHub – Studio"),
+            Some(0)
+        );
+        assert_eq!(
+            named_direction_index(&entries, DeviceKind::Output, "AudioHub – Studio"),
+            Some(2)
+        );
+        assert_eq!(
+            named_direction_index(&entries, DeviceKind::Output, "missing"),
+            None
+        );
     }
 
     #[test]
@@ -3101,7 +3291,12 @@ mod tests {
 
     #[test]
     fn exact_match_is_case_insensitive_and_still_beats_prefix_siblings() {
-        let devs = names(&["Loopback Audio", "Loopback Audio 2", "MMAudio Device", "MMAudio Device (UI Sounds)"]);
+        let devs = names(&[
+            "Loopback Audio",
+            "Loopback Audio 2",
+            "MMAudio Device",
+            "MMAudio Device (UI Sounds)",
+        ]);
         for (q, want) in [
             ("loopback audio", "Loopback Audio"),
             ("LOOPBACK AUDIO", "Loopback Audio"),
@@ -3121,7 +3316,10 @@ mod tests {
     fn two_devices_with_one_name_are_ambiguous_not_a_coin_flip() {
         let raw = names(&["USB Audio", "MacBook Pro Speakers", "USB Audio"]);
         // presentation collapses them, resolution must not
-        assert_eq!(dedup_in_order(raw.clone()), names(&["USB Audio", "MacBook Pro Speakers"]));
+        assert_eq!(
+            dedup_in_order(raw.clone()),
+            names(&["USB Audio", "MacBook Pro Speakers"])
+        );
         for q in ["USB Audio", "usb audio", "USB"] {
             let e = err_of(resolve_name(&raw, q, DeviceKind::Output));
             assert!(e.contains("ambiguous"), "query {q:?}: {e}");
@@ -3147,7 +3345,10 @@ mod tests {
         let devs = names(&["BlackHole 2ch", "BlackHole 16ch", "ADAM Audio D3V"]);
         let e = err_of(resolve_name(&devs, "black", DeviceKind::Output));
         assert!(e.contains("ambiguous"), "{e}");
-        assert!(e.contains("BlackHole 2ch") && e.contains("BlackHole 16ch"), "{e}");
+        assert!(
+            e.contains("BlackHole 2ch") && e.contains("BlackHole 16ch"),
+            "{e}"
+        );
         assert!(!e.contains("ADAM"), "{e}");
     }
 
@@ -3169,7 +3370,10 @@ mod tests {
         for kind in [DeviceKind::Output, DeviceKind::Input] {
             let raw = devices::list_all(kind);
             for n in list_names(kind) {
-                let twins = raw.iter().filter(|x| x.to_lowercase() == n.to_lowercase()).count();
+                let twins = raw
+                    .iter()
+                    .filter(|x| x.to_lowercase() == n.to_lowercase())
+                    .count();
                 if twins > 1 {
                     // This machine really has two cards under one name: the only
                     // honest answer is a refusal, not one of them at random.
@@ -3193,7 +3397,10 @@ mod tests {
         assert!(!outs.is_empty(), "no output devices at all");
         let rep = default_devices_report().unwrap();
         if let Some(d) = rep.default_output {
-            assert!(outs.contains(&d), "default output {d:?} missing from {outs:?}");
+            assert!(
+                outs.contains(&d),
+                "default output {d:?} missing from {outs:?}"
+            );
         }
         if let Some(d) = rep.default_input {
             let ins = list_input_devices();
@@ -3238,7 +3445,10 @@ mod tests {
             return;
         };
         let e = err_of(LivePlayback::start_on(&input_only, 48000));
-        assert!(e.contains("no output device matches"), "{input_only:?}: {e}");
+        assert!(
+            e.contains("no output device matches"),
+            "{input_only:?}: {e}"
+        );
     }
 
     // ---- stream health (the seam the daemon watches)
@@ -3250,7 +3460,10 @@ mod tests {
         assert!(h.take_error().is_none());
 
         h.fail("output", &cpal::StreamError::DeviceNotAvailable);
-        assert!(!h.is_alive(), "a reported stream error must kill the stream");
+        assert!(
+            !h.is_alive(),
+            "a reported stream error must kill the stream"
+        );
         let first = h.take_error().expect("the cause is kept, not just printed");
         assert!(first.contains("output stream error"), "{first}");
 
@@ -3267,7 +3480,9 @@ mod tests {
         h.fail(
             "input",
             &cpal::StreamError::BackendSpecific {
-                err: cpal::BackendSpecificError { description: "later fallout".into() },
+                err: cpal::BackendSpecificError {
+                    description: "later fallout".into(),
+                },
             },
         );
         let msg = h.take_error().unwrap();
@@ -3324,12 +3539,20 @@ mod tests {
             (DeviceKind::Input, list_input_devices()),
         ] {
             for n in names {
-                let hit = all.iter().find(|d| d.name == n);
-                let d = hit.unwrap_or_else(|| panic!("{kind:?} {n:?} missing from the detailed listing"));
-                match kind {
-                    DeviceKind::Output => assert!(d.is_output, "{n:?} listed as output but is_output=false"),
-                    DeviceKind::Input => assert!(d.is_input, "{n:?} listed as input but is_input=false"),
-                }
+                // Input and output endpoints may intentionally share one
+                // display name. Direction is part of the identity here; a
+                // name-only `find` can select the other endpoint first.
+                let hit = all.iter().any(|d| {
+                    d.name == n
+                        && match kind {
+                            DeviceKind::Output => d.is_output,
+                            DeviceKind::Input => d.is_input,
+                        }
+                });
+                assert!(
+                    hit,
+                    "{kind:?} {n:?} missing from the matching detailed listing"
+                );
             }
         }
     }
@@ -3349,7 +3572,9 @@ mod tests {
     #[test]
     fn every_uid_resolves_back_to_its_own_device() {
         for d in list_devices_detailed() {
-            let Some(uid) = d.uid.as_deref() else { continue };
+            let Some(uid) = d.uid.as_deref() else {
+                continue;
+            };
             for (kind, applies) in [
                 (DeviceKind::Output, d.is_output),
                 (DeviceKind::Input, d.is_input),
@@ -3381,8 +3606,9 @@ mod tests {
         }
         assert!(err_of(LivePlayback::start_on_uid("NoSuchUID", 48000))
             .contains("no output device matches UID"));
-        assert!(err_of(LiveCapture::start_on_uid("NoSuchUID"))
-            .contains("no input device matches UID"));
+        assert!(
+            err_of(LiveCapture::start_on_uid("NoSuchUID")).contains("no input device matches UID")
+        );
     }
 
     /// A UID is an opaque identifier, not a display string: the case-insensitive
@@ -3392,18 +3618,27 @@ mod tests {
     #[test]
     fn uid_matching_is_exact_and_case_sensitive() {
         let Some(d) = list_devices_detailed().into_iter().find(|d| {
-            d.is_output && d.uid.as_deref().map_or(false, |u| u.chars().any(|c| c.is_alphabetic()))
+            d.is_output
+                && d.uid
+                    .as_deref()
+                    .map_or(false, |u| u.chars().any(|c| c.is_alphabetic()))
         }) else {
             eprintln!("[audiohub] skip: no output device with an alphabetic UID");
             return;
         };
         let uid = d.uid.unwrap();
-        assert_eq!(device_name_for_uid(DeviceKind::Output, &uid).unwrap(), d.name);
+        assert_eq!(
+            device_name_for_uid(DeviceKind::Output, &uid).unwrap(),
+            d.name
+        );
         for bad in [uid.to_uppercase(), uid.to_lowercase()] {
             if bad == uid {
                 continue;
             }
-            assert!(device_name_for_uid(DeviceKind::Output, &bad).is_err(), "{bad:?}");
+            assert!(
+                device_name_for_uid(DeviceKind::Output, &bad).is_err(),
+                "{bad:?}"
+            );
         }
         // a prefix is not a match either
         assert!(device_name_for_uid(DeviceKind::Output, &uid[..uid.len() - 1]).is_err());
@@ -3436,10 +3671,7 @@ mod tests {
             st.events.iter().map(|e| (e.kind, e.uid.clone())).collect();
         assert_eq!(
             kinds,
-            vec![
-                ("removed", Some("A".into())),
-                ("added", Some("C".into()))
-            ]
+            vec![("removed", Some("A".into())), ("added", Some("C".into()))]
         );
         // the live callback saw exactly the same events
         assert_eq!(rx.try_iter().count(), 2);
@@ -3632,8 +3864,7 @@ mod rate_servo {
         /// 再推一帧。顺序与现实一致（声卡是独立线程，不等我们）。
         fn tick(&mut self) {
             self.run_device_until(self.now_ns + 10_000_000);
-            let inflight =
-                (self.now_ns as f64 - self.last_cb_ns) * 48_000.0 / 1e9;
+            let inflight = (self.now_ns as f64 - self.last_cb_ns) * 48_000.0 / 1e9;
             let dac = self.dac_lag.map_or(0.0, |d| d.as_secs_f64() * 48_000.0);
             self.downstream_ms = (self.tx.queued() as f64 - inflight + dac) / 48.0;
             self.tx.push_at(&[0.25f32; F], self.at(self.now_ns));
@@ -4003,7 +4234,10 @@ mod rate_servo {
         );
         for s in [&with_lag, &without] {
             let err = (s.downstream_ms - s.tx.servo_target() as f64 / 48.0).abs();
-            assert!(err < 3.0, "下游总量必须收敛到各自的目标，实测差 {err:.1} ms");
+            assert!(
+                err < 3.0,
+                "下游总量必须收敛到各自的目标，实测差 {err:.1} ms"
+            );
         }
         // 环的**储备**两边一样 —— 硬件缓冲不许从这里扣。
         let ring = (without.queued() as f64 - with_lag.queued() as f64) / 48.0;
@@ -4167,7 +4401,10 @@ mod rate_servo {
         // 而这里的超额是我们**自己**改设定值造成的，不是链路故障。为一次内部
         // 参数变化制造一次可闻的跳进，代价和收益不成比例。
         let before_bleed = s.downstream_ms;
-        assert!(before_bleed > 90.0, "先确认水位确实被顶到了高位：{before_bleed:.0} ms");
+        assert!(
+            before_bleed > 90.0,
+            "先确认水位确实被顶到了高位：{before_bleed:.0} ms"
+        );
         for _ in 0..30_000 {
             s.tick(); // 300 秒
         }
@@ -4229,7 +4466,11 @@ mod rate_servo {
         }));
         let db = |g: f64| 20.0 * g.log10();
         // 实测：linear ≈ −2.0 dB，cubic ≈ −0.5 dB @10 kHz。
-        assert!(db(linear) < -1.5, "线性插值在 φ=0.5 处应衰减约 2 dB，实测 {:.2} dB", db(linear));
+        assert!(
+            db(linear) < -1.5,
+            "线性插值在 φ=0.5 处应衰减约 2 dB，实测 {:.2} dB",
+            db(linear)
+        );
         assert!(
             db(cubic) > db(linear) + 1.0,
             "三次核必须明显平于线性：cubic {:.2} dB vs linear {:.2} dB",
@@ -4243,7 +4484,9 @@ mod rate_servo {
     #[test]
     fn the_cubic_kernel_is_lossless_at_unity_ratio() {
         let mut rs = VarResampler::new(48_000, 48_000);
-        let x: Vec<f32> = (0..1_000).map(|n| ((n * 37) % 101) as f32 / 101.0 - 0.5).collect();
+        let x: Vec<f32> = (0..1_000)
+            .map(|n| ((n * 37) % 101) as f32 / 101.0 - 0.5)
+            .collect();
         let mut y = Vec::new();
         rs.process(&x[..500], &mut y);
         rs.process(&x[500..], &mut y);

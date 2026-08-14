@@ -207,8 +207,10 @@ impl TransportControl {
     pub(crate) fn set_live(&self, live: TransportLive) {
         match live.achieved_ms {
             Some(ms) if ms.is_finite() && ms >= 0.0 => {
-                self.live_ms_x100
-                    .store((ms * 100.0).round().min(u32::MAX as f64) as u32, Ordering::Relaxed);
+                self.live_ms_x100.store(
+                    (ms * 100.0).round().min(u32::MAX as f64) as u32,
+                    Ordering::Relaxed,
+                );
                 self.live_ms_valid.store(true, Ordering::Relaxed);
             }
             // 测不到就说测不到。**绝不留上一次的值**——一条断了的流会显示成
@@ -216,7 +218,8 @@ impl TransportControl {
             _ => self.live_ms_valid.store(false, Ordering::Relaxed),
         }
         self.live_at_floor.store(live.at_floor, Ordering::Relaxed);
-        self.live_at_ceiling.store(live.at_ceiling, Ordering::Relaxed);
+        self.live_at_ceiling
+            .store(live.at_ceiling, Ordering::Relaxed);
         self.live_rung1
             .store(live.rung.map_or(0, |r| r + 1), Ordering::Relaxed);
         self.live_streams.store(live.streams, Ordering::Relaxed);
@@ -265,7 +268,10 @@ mod tests {
         assert_eq!(c.quality_rung(), Some(4));
         assert_eq!(
             c.quality_rung().map(audiohub_net::media::rung_format),
-            Some(audiohub_net::media::WireFormat { rate_hz: 24_000, depth: WireDepth::S16 })
+            Some(audiohub_net::media::WireFormat {
+                rate_hz: 24_000,
+                depth: WireDepth::S16
+            })
         );
         assert_eq!(c.latency_target(), LatencyTarget::TotalMs(200));
 
@@ -276,7 +282,10 @@ mod tests {
         assert_eq!(c.quality_rung(), Some(0), "格号 0 被当成了 AUTO");
         assert_eq!(
             c.quality_rung().map(audiohub_net::media::rung_format),
-            Some(audiohub_net::media::WireFormat { rate_hz: 48_000, depth: WireDepth::F32 })
+            Some(audiohub_net::media::WireFormat {
+                rate_hz: 48_000,
+                depth: WireDepth::F32
+            })
         );
 
         c.publish_latency(LatencyTarget::Auto);
@@ -294,7 +303,10 @@ mod tests {
         let c = TransportControl::default();
         c.publish_latency(LatencyTarget::TotalMs(100));
         c.set_servo_frames(Some(7));
-        c.set_live(TransportLive { achieved_ms: Some(101.0), ..Default::default() });
+        c.set_live(TransportLive {
+            achieved_ms: Some(101.0),
+            ..Default::default()
+        });
         assert_eq!(c.servo_frames(), Some(7));
 
         // 同一个档位再发一次：不许动。
@@ -316,18 +328,32 @@ mod tests {
     #[test]
     fn a_lost_measurement_clears_the_readout_rather_than_going_stale() {
         let c = TransportControl::default();
-        c.set_live(TransportLive { achieved_ms: Some(123.45), streams: 2, ..Default::default() });
+        c.set_live(TransportLive {
+            achieved_ms: Some(123.45),
+            streams: 2,
+            ..Default::default()
+        });
         assert_eq!(c.live().achieved_ms, Some(123.45));
-        c.set_live(TransportLive { achieved_ms: None, streams: 2, ..Default::default() });
+        c.set_live(TransportLive {
+            achieved_ms: None,
+            streams: 2,
+            ..Default::default()
+        });
         assert_eq!(
             c.live().achieved_ms,
             None,
             "读数丢了却还显示上一次的值——断流时会显示成一切正常"
         );
         // NaN / 负数同样按「测不到」处理，不许写进读数
-        c.set_live(TransportLive { achieved_ms: Some(f64::NAN), ..Default::default() });
+        c.set_live(TransportLive {
+            achieved_ms: Some(f64::NAN),
+            ..Default::default()
+        });
         assert_eq!(c.live().achieved_ms, None);
-        c.set_live(TransportLive { achieved_ms: Some(-1.0), ..Default::default() });
+        c.set_live(TransportLive {
+            achieved_ms: Some(-1.0),
+            ..Default::default()
+        });
         assert_eq!(c.live().achieved_ms, None);
     }
 
@@ -381,6 +407,9 @@ mod tests {
                 );
             }
         }
-        assert!(hit.iter().all(|&b| b), "阶梯上有格子没有任何一个质量档能选中：{hit:?}");
+        assert!(
+            hit.iter().all(|&b| b),
+            "阶梯上有格子没有任何一个质量档能选中：{hit:?}"
+        );
     }
 }

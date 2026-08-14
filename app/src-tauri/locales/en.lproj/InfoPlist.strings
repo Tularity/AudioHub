@@ -1,0 +1,8 @@
+/* macOS system permission prompts (English). Keep all three keys in sync with
+   Info.plist and zh-Hans.lproj/InfoPlist.strings. */
+
+"NSMicrophoneUsageDescription" = "AudioHub needs microphone access to share this Mac's microphone with a paired device. It records only while you share, and sends audio directly and encrypted over the local network.";
+
+"NSAudioCaptureUsageDescription" = "AudioHub needs system audio access to share what this Mac is playing with a paired device. It records only while you share, and sends audio directly and encrypted over the local network.";
+
+"NSLocalNetworkUsageDescription" = "AudioHub needs local network access to find nearby AudioHub devices, publish its AirPlay audio receiver, and stream audio directly. Audio is not uploaded to the internet.";

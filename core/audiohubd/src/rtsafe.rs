@@ -73,7 +73,10 @@ impl<T> SpscRing<T> {
     ///
     /// **全部分配都发生在这里**，之后的稳态路径一次都不分配。
     pub(crate) fn new(cap: usize, mut make: impl FnMut(usize) -> T) -> SpscRing<T> {
-        assert!(cap.is_power_of_two() && cap >= 2, "容量必须是 ≥2 的 2 的幂，给的是 {cap}");
+        assert!(
+            cap.is_power_of_two() && cap >= 2,
+            "容量必须是 ≥2 的 2 的幂，给的是 {cap}"
+        );
         let slots: Vec<UnsafeCell<T>> = (0..cap).map(|i| UnsafeCell::new(make(i))).collect();
         SpscRing {
             slots: slots.into_boxed_slice(),
@@ -218,6 +221,9 @@ mod tests {
         assert_eq!(consumer.join().unwrap(), N);
         // 生产者自旋重试，所以**一条都不许少**；`rejected` 会是正数（撞满过
         // 很多次），那不是丢失 —— 这正是这个计数器不叫 `dropped` 的理由。
-        assert!(r.rejected() > 0, "64 槽跑 20 万条却一次都没撞满？测试没在真的并发");
+        assert!(
+            r.rejected() > 0,
+            "64 槽跑 20 万条却一次都没撞满？测试没在真的并发"
+        );
     }
 }

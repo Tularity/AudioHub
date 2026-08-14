@@ -93,7 +93,8 @@ export function BeDiscoveredSheet({ onClose }: { onClose: () => void }) {
       testid="pair-armed-sheet"
       title={t('pair.left.title')}
       help={<Help label={t('wiki.discovery')} url={WIKI.discovery} testid="pair-armed-help" />}
-      footer={footer}
+      primaryAction={footer}
+      dismissDisabled={busy}
       onClose={onClose}
     >
       <div className="pair-active" hidden={!pairing}>
@@ -212,7 +213,8 @@ export function AddPeerSheet({ onClose }: { onClose: () => void }) {
       onClose();
     } catch (e) {
       setSteps('failed');
-      setCliHint(t('pair.right.failed', { message: String((e as Error)?.message || e), addr: a, pin: p }));
+      console.error('[audiohub] pairing failed', e);
+      setCliHint(t('pair.right.failed'));
     } finally {
       setBusy(false);
     }

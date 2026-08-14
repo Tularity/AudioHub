@@ -5,6 +5,9 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Private filesystem permissions shared by AudioHub components"
 
+[dependencies]
+quick-xml = "0.41"
+
 [target.'cfg(windows)'.dependencies]
 # 0.52 uses ordinary import libraries and remains compatible with AudioHub's
 # x86_64-pc-windows-gnu build. Newer raw-dylib releases do not.

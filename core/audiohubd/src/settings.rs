@@ -17,6 +17,12 @@ use serde::{Deserialize, Serialize};
 
 use audiohub_ipc::Mode;
 
+/// `native_locale` was added while keeping version 6. It is a defaultable,
+/// additive preference: an existing file must keep the old Chinese device
+/// names until its native App reports another locale, and an older v6 daemon
+/// must be able to read a file rewritten by this build without treating it as
+/// a future version and resetting `mode` to `share`.
+///
 /// Bumped to 6 for the audio-only AirPlay receiver wish/name. The password is
 /// intentionally not part of this record; it has a separate restricted file
 /// and only a presence bit crosses IPC.
@@ -87,6 +93,11 @@ pub(crate) struct StoredSettings {
     pub mode: Mode,
     pub remove_virtual_on_disconnect: bool,
     pub mark_offline_devices: bool,
+    /// Resolved language of the native App for names shown by the operating
+    /// system. This is deliberately not inferred by the headless daemon: a
+    /// service/session locale can differ from the interactive user's locale.
+    #[serde(default = "default_native_locale")]
+    pub native_locale: String,
     /// plan §7.1 「与对端音量同步」 — a mode-A option, so it lives HERE and not
     /// in `peer_transport.json`. Three reasons, in order of weight:
     ///
@@ -131,6 +142,14 @@ pub(crate) struct StoredSettings {
     pub airplay_name: String,
 }
 
+fn default_native_locale() -> String {
+    "zh-CN".to_string()
+}
+
+pub(crate) fn valid_native_locale(locale: &str) -> bool {
+    matches!(locale, "zh-CN" | "en-US")
+}
+
 impl Default for StoredSettings {
     fn default() -> Self {
         StoredSettings {
@@ -162,6 +181,7 @@ impl Default for StoredSettings {
             // failure (peer asleep -> default output silent) is invisible
             // everywhere except inside our own window.
             mark_offline_devices: true,
+            native_locale: default_native_locale(),
             // plan §7.1 calls both of these 「选项」/「独立开关」 — opt-in, and
             // both reach outside our own process to change a device the user is
             // listening to right now. A default that silences a machine, or
@@ -247,6 +267,13 @@ impl StoredSettings {
     /// （字段名还叫 `consumer_mode`），那种文件在 `load` 里就反序列化失败、
     /// 整条记录落到默认值，根本走不到这里 —— 见 `SETTINGS_VERSION` 的注释。
     fn normalized(mut self) -> StoredSettings {
+        if !valid_native_locale(&self.native_locale) {
+            crate::dlog!(
+                "[audiohubd] settings.json has unsupported native_locale {:?}; using zh-CN",
+                self.native_locale
+            );
+            self.native_locale = default_native_locale();
+        }
         if self.version > SETTINGS_VERSION {
             crate::dlog!(
                 "[audiohubd] settings.json is version {} (this build writes {SETTINGS_VERSION}); \
@@ -279,7 +306,6 @@ impl StoredSettings {
         std::fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
         Ok(())
     }
-
 }
 
 const AIRPLAY_SECRET_FILE: &str = "airplay-password";
@@ -524,7 +550,10 @@ mod tests {
     fn the_discovery_switch_survives_the_file_both_ways() {
         let dir = tmp("m3switch");
         for want in [false, true, false] {
-            let s = StoredSettings { discovery_announce: want, ..StoredSettings::default() };
+            let s = StoredSettings {
+                discovery_announce: want,
+                ..StoredSettings::default()
+            };
             s.save(&dir).expect("save");
             let got = StoredSettings::load(&dir);
             assert_eq!(
@@ -558,7 +587,10 @@ mod tests {
             };
             want.save(&dir).expect("save");
             let got = StoredSettings::load(&dir);
-            assert_eq!(got.mode_a_volume_sync, sync, "mode_a_volume_sync 没有活过盘");
+            assert_eq!(
+                got.mode_a_volume_sync, sync,
+                "mode_a_volume_sync 没有活过盘"
+            );
             assert_eq!(got.mode_a_mute_local, mute, "mode_a_mute_local 没有活过盘");
             assert_eq!(got, want, "两个开关之外还有别的字段被这次写入改掉了");
         }
@@ -586,7 +618,10 @@ mod tests {
         assert!(!got.mark_offline_devices);
         assert!(!got.mode_a_volume_sync, "缺席的新开关取默认值，不是随机值");
         assert!(!got.mode_a_mute_local);
-        assert_eq!(got.version, SETTINGS_VERSION, "读回来要按本 build 的版本重写");
+        assert_eq!(
+            got.version, SETTINGS_VERSION,
+            "读回来要按本 build 的版本重写"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -606,10 +641,52 @@ mod tests {
         // that round-trips as some *other* mode is the failure this whole
         // change exists to prevent.
         for m in [Mode::Share, Mode::A, Mode::B] {
-            let s = StoredSettings { mode: m, ..StoredSettings::default() };
+            let s = StoredSettings {
+                mode: m,
+                ..StoredSettings::default()
+            };
             s.save(&dir).expect("save");
-            assert_eq!(StoredSettings::load(&dir).mode, m, "{m} did not survive the file");
+            assert_eq!(
+                StoredSettings::load(&dir).mode,
+                m,
+                "{m} did not survive the file"
+            );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_locale_survives_restart_and_old_files_keep_the_old_chinese_names() {
+        let dir = tmp("native-locale");
+        let en = StoredSettings {
+            native_locale: "en-US".into(),
+            ..StoredSettings::default()
+        };
+        en.save(&dir).expect("save en-US");
+        assert_eq!(StoredSettings::load(&dir).native_locale, "en-US");
+
+        // v6 predates this field. Defaulting it to zh-CN is behavioural
+        // preservation: those installations already showed `（离线）`.
+        std::fs::write(
+            dir.join("settings.json"),
+            br#"{"version":6,"mode":"b","remove_virtual_on_disconnect":false,
+                 "mark_offline_devices":true}"#,
+        )
+        .expect("write v6");
+        let old = StoredSettings::load(&dir);
+        assert_eq!(old.native_locale, "zh-CN");
+        assert_eq!(old.mode, Mode::B, "adding locale changed the user's mode");
+        assert_eq!(old.version, SETTINGS_VERSION);
+
+        // A hand-edited unsupported value cannot leak arbitrary language tags
+        // into the naming path; normalize to the same compatibility default.
+        std::fs::write(
+            dir.join("settings.json"),
+            br#"{"version":6,"mode":"b","remove_virtual_on_disconnect":false,
+                 "mark_offline_devices":true,"native_locale":"fr-FR"}"#,
+        )
+        .expect("write unsupported locale");
+        assert_eq!(StoredSettings::load(&dir).native_locale, "zh-CN");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -656,7 +733,11 @@ mod tests {
                 Mode::Share,
                 "consumer_mode={old} must not be carried into the new field"
             );
-            assert_eq!(got, StoredSettings::default(), "the whole record resets, not just mode");
+            assert_eq!(
+                got,
+                StoredSettings::default(),
+                "the whole record resets, not just mode"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -675,8 +756,15 @@ mod tests {
         )
         .expect("write");
         let got = StoredSettings::load(&dir);
-        assert_eq!(got.mode, Mode::Share, "a mode from an unknown version is not trusted");
-        assert!(got.remove_virtual_on_disconnect, "...but the ordinary preferences are kept");
+        assert_eq!(
+            got.mode,
+            Mode::Share,
+            "a mode from an unknown version is not trusted"
+        );
+        assert!(
+            got.remove_virtual_on_disconnect,
+            "...but the ordinary preferences are kept"
+        );
         assert!(!got.mark_offline_devices);
         assert_eq!(got.version, SETTINGS_VERSION, "and it is rewritten as ours");
         let _ = std::fs::remove_dir_all(&dir);
@@ -704,13 +792,22 @@ mod tests {
         // 把每一个老用户的 mode 重置为 share，测试全绿。实测现场：磁盘上
         // `"mode":"b"`，运行中的 daemon 报 `mode=share`，§13 拆掉全部虚拟设备。
         assert_eq!(got.mode, Mode::B, "老版本文件的 mode 必须原样保住");
-        assert_eq!(got.version, SETTINGS_VERSION, "读回来要按本 build 的版本重写");
+        assert_eq!(
+            got.version, SETTINGS_VERSION,
+            "读回来要按本 build 的版本重写"
+        );
         assert!(got.remove_virtual_on_disconnect, "普通开关必须原样保住");
         assert!(!got.mark_offline_devices);
         // 两个走掉的字段不该在结构上留下任何痕迹。
         let json = serde_json::to_string(&got).expect("serialize");
-        assert!(!json.contains("\"latency\""), "latency 还在 settings.json 里：{json}");
-        assert!(!json.contains("\"quality\""), "quality 还在 settings.json 里：{json}");
+        assert!(
+            !json.contains("\"latency\""),
+            "latency 还在 settings.json 里：{json}"
+        );
+        assert!(
+            !json.contains("\"quality\""),
+            "quality 还在 settings.json 里：{json}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -784,11 +881,19 @@ mod tests {
                 .expect("loosen directory for upgrade test");
             load_airplay_password(&dir).expect("reload repairs permissions");
             assert_eq!(
-                std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+                std::fs::metadata(&path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
                 0o600
             );
             assert_eq!(
-                std::fs::metadata(&dir).expect("metadata").permissions().mode() & 0o777,
+                std::fs::metadata(&dir)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
                 0o700
             );
         }

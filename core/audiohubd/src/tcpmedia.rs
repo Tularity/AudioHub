@@ -55,7 +55,6 @@ use audiohub_net::framed::FrameDecoder;
 use audiohub_net::packet::Kind;
 use audiohub_net::secure::SessionMsg;
 
-
 use crate::peer_transport::TransportTier;
 use crate::rtsafe::SpscRing;
 use crate::{dlog, lk, ConnShared, DaemonInner, TxShared};
@@ -224,9 +223,7 @@ impl MediaPath {
     pub(crate) fn auto_top_rung(&self) -> u32 {
         match self {
             MediaPath::Udp(_) => audiohub_net::media::AUTO_TOP_RUNG,
-            MediaPath::Tcp(_) | MediaPath::Framed(_) => {
-                audiohub_net::media::AUTO_TOP_RUNG_STREAMED
-            }
+            MediaPath::Tcp(_) | MediaPath::Framed(_) => audiohub_net::media::AUTO_TOP_RUNG_STREAMED,
         }
     }
 
@@ -737,7 +734,10 @@ impl TokenBucket {
             return;
         }
         let cost = Duration::from_secs_f64(bytes as f64 / self.bps as f64);
-        let base = self.next_at.unwrap_or_else(Instant::now).max(Instant::now());
+        let base = self
+            .next_at
+            .unwrap_or_else(Instant::now)
+            .max(Instant::now());
         self.next_at = Some(base + cost);
     }
 }
@@ -819,7 +819,8 @@ pub(crate) fn write_one_queued<W: Write>(
                 link.frames_written.fetch_add(1, Ordering::Relaxed);
                 if let Some(o) = owner {
                     o.sent_packets.fetch_add(1, Ordering::Relaxed);
-                    o.sent_bytes.fetch_add(slot.buf.len() as u64, Ordering::Relaxed);
+                    o.sent_bytes
+                        .fetch_add(slot.buf.len() as u64, Ordering::Relaxed);
                     o.sent_payload_bytes
                         .fetch_add(slot.payload_len as u64, Ordering::Relaxed);
                 }
@@ -890,7 +891,10 @@ fn read_loop(inner: &Arc<DaemonInner>, link: &TcpMediaLink, s: &mut TcpStream, f
         }
         let n = match s.read(&mut scratch) {
             Ok(0) => {
-                dlog!("[audiohubd] tier1 media {}: peer closed the media connection", link.fp());
+                dlog!(
+                    "[audiohubd] tier1 media {}: peer closed the media connection",
+                    link.fp()
+                );
                 return;
             }
             Ok(n) => n,
@@ -956,14 +960,17 @@ pub(crate) fn serve(
     // into bursts that wait for an ACK — roughly 40 ms of jitter with no
     // visible cause anywhere in our own numbers. A link we cannot turn it off
     // on is a link we refuse to promote.
-    s.set_nodelay(true).context("tier 1 media requires TCP_NODELAY")?;
+    s.set_nodelay(true)
+        .context("tier 1 media requires TCP_NODELAY")?;
     s.set_nonblocking(false)?;
     s.set_write_timeout(Some(WRITE_SLICE))?;
     s.set_read_timeout(Some(READ_SLICE))?;
     let peer = s.peer_addr()?;
 
     let link = Arc::new(TcpMediaLink::new(conn.fp.clone(), peer, inner.tx_bps));
-    let mut wsock = s.try_clone().context("clone the media socket for the writer")?;
+    let mut wsock = s
+        .try_clone()
+        .context("clone the media socket for the writer")?;
 
     let wlink = link.clone();
     let winner = inner.clone();
@@ -1037,7 +1044,11 @@ fn mint_ticket(inner: &Arc<DaemonInner>, fp: &str) -> String {
     let mut t = lk(&inner.media_tickets);
     let now = Instant::now();
     t.retain(|x| x.expires > now);
-    t.push(MediaTicket { bytes, fp: fp.to_string(), expires: now + TICKET_TTL });
+    t.push(MediaTicket {
+        bytes,
+        fp: fp.to_string(),
+        expires: now + TICKET_TTL,
+    });
     b64
 }
 
@@ -1171,7 +1182,10 @@ fn pump_for_ticket(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, deadline: I
             }
             Ok(None) => {}
             Err(e) => {
-                dlog!("[audiohubd] control channel {} while attaching tier 1: {e:#}", conn.fp);
+                dlog!(
+                    "[audiohubd] control channel {} while attaching tier 1: {e:#}",
+                    conn.fp
+                );
                 return false;
             }
         }
@@ -1204,7 +1218,9 @@ fn await_attach(conn: &Arc<ConnShared>, deadline: Instant, dialling: bool) {
         if !conn.alive.load(Ordering::SeqCst) {
             break;
         }
-        let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
         if left.is_zero() {
             break;
         }
@@ -1322,7 +1338,10 @@ pub(crate) fn on_ticket(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, ticket
         .name("ahb-tcpmedia".into())
         .spawn(move || {
             if let Err(e) = dial_and_serve(&owned_inner, &owned_conn, dest, &ticket_b64) {
-                dlog!("[audiohubd] tier 1 media to {} ({dest}): {e:#}", owned_conn.fp);
+                dlog!(
+                    "[audiohubd] tier 1 media to {} ({dest}): {e:#}",
+                    owned_conn.fp
+                );
                 // Let a later ticket try again. Leaving the flag set would make
                 // one failed dial permanent for the life of the connection.
                 //
@@ -1361,8 +1380,13 @@ fn dial_and_serve(
         .with_context(|| format!("connect {dest}"))?;
     s.set_read_timeout(Some(crate::conn::HANDSHAKE_TIMEOUT))?;
     s.set_write_timeout(Some(crate::conn::WRITE_TIMEOUT))?;
-    write_frame(&mut s, &ControlMsg::MediaAttach { ticket_b64: ticket_b64.to_string() })
-        .context("send media_attach")?;
+    write_frame(
+        &mut s,
+        &ControlMsg::MediaAttach {
+            ticket_b64: ticket_b64.to_string(),
+        },
+    )
+    .context("send media_attach")?;
     match read_frame(&mut s).context("read media_attach reply")? {
         ControlMsg::Ok {} => {}
         ControlMsg::Error { message } => bail!("peer refused the media attach: {message}"),
@@ -1386,7 +1410,10 @@ pub(crate) struct AttachGate {
 
 impl AttachGate {
     pub(crate) fn new() -> Arc<AttachGate> {
-        Arc::new(AttachGate { claimed: AtomicBool::new(false), settled: Condvar::new() })
+        Arc::new(AttachGate {
+            claimed: AtomicBool::new(false),
+            settled: Condvar::new(),
+        })
     }
 
     /// Wake everyone waiting for `media_path` to settle.
@@ -1441,7 +1468,12 @@ pub(crate) fn claim(
     ticket_b64: &str,
 ) -> Result<(Arc<ConnShared>, AttachClaim)> {
     let refuse = |s: &mut TcpStream, why: &str| {
-        let _ = write_frame(s, &ControlMsg::Error { message: why.into() });
+        let _ = write_frame(
+            s,
+            &ControlMsg::Error {
+                message: why.into(),
+            },
+        );
     };
     let Some(fp) = claim_ticket(inner, ticket_b64) else {
         refuse(s, "unknown or expired media attach ticket");
@@ -1469,8 +1501,14 @@ pub(crate) fn claim(
     match s.peer_addr() {
         Ok(a) if a.ip() == conn.peer_ip => {}
         Ok(a) => {
-            refuse(s, "media attach from an address that is not the control peer");
-            bail!("media_attach for {fp} from {a}, whose control peer is {}", conn.peer_ip);
+            refuse(
+                s,
+                "media attach from an address that is not the control peer",
+            );
+            bail!(
+                "media_attach for {fp} from {a}, whose control peer is {}",
+                conn.peer_ip
+            );
         }
         Err(e) => {
             refuse(s, "media attach socket has no peer address");
@@ -1507,7 +1545,12 @@ mod tests {
 
     impl FakeSink {
         fn new(chunk: usize) -> FakeSink {
-            FakeSink { blocked_until: None, written: Vec::new(), chunk, partial: Vec::new() }
+            FakeSink {
+                blocked_until: None,
+                written: Vec::new(),
+                chunk,
+                partial: Vec::new(),
+            }
         }
     }
 
@@ -1613,13 +1656,21 @@ mod tests {
         let out = write_one_queued(&l, &mut sink, &shutdown, &mut bucket, Some(cap));
         let waited = t0.elapsed();
 
-        assert_eq!(out, Some(WriteOutcome::Stale), "a frame that never got a byte out must be dropped");
+        assert_eq!(
+            out,
+            Some(WriteOutcome::Stale),
+            "a frame that never got a byte out must be dropped"
+        );
         assert!(
             waited < STALE_BUDGET / 2,
             "the writer held the wire for {waited:?}: the cap was ignored and the frame ran to \
              the {STALE_BUDGET:?} stale budget instead"
         );
-        assert_eq!(sink.written.len(), 0, "a frame the gate dropped reached the wire");
+        assert_eq!(
+            sink.written.len(),
+            0,
+            "a frame the gate dropped reached the wire"
+        );
     }
 
     /// The queue is bounded, drops the newest, and counts it — the shape
@@ -1632,7 +1683,11 @@ mod tests {
         let now = Instant::now();
         assert_eq!(l.capacity(), SEND_SLOTS);
         for i in 0..SEND_SLOTS + 5 {
-            assert_eq!(push(&l, now, &owner, i), i < SEND_SLOTS, "slot {i} decided wrong");
+            assert_eq!(
+                push(&l, now, &owner, i),
+                i < SEND_SLOTS,
+                "slot {i} decided wrong"
+            );
         }
         assert_eq!(l.queued(), SEND_SLOTS, "the queue grew past its capacity");
         assert_eq!(l.dropped(), 5, "the overflow was not counted");
@@ -1649,7 +1704,11 @@ mod tests {
             false
         }));
         assert_eq!(l.queued(), 0);
-        assert_eq!(l.dropped(), 0, "voiding is not refusal; they are different events");
+        assert_eq!(
+            l.dropped(),
+            0,
+            "voiding is not refusal; they are different events"
+        );
     }
 
     /// A dead link accepts nothing. Without this, a stream whose link died
@@ -1719,7 +1778,11 @@ mod tests {
                     Ok(())
                 }
             }
-            let mut tap = Tap { inner: &mut sink, tx: report_tx, t0 };
+            let mut tap = Tap {
+                inner: &mut sink,
+                tx: report_tx,
+                t0,
+            };
             write_loop(&wl, &mut tap, &ws);
         });
 
@@ -1738,7 +1801,11 @@ mod tests {
             l.wake();
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(l.queued(), 0, "the queue never drained after the stall ended");
+        assert_eq!(
+            l.queued(),
+            0,
+            "the queue never drained after the stall ended"
+        );
 
         shutdown.store(true, Ordering::SeqCst);
         l.wake();
@@ -1761,7 +1828,10 @@ mod tests {
             worst = worst.max(age);
             seen += 1;
         }
-        assert!(seen > 0, "no frame's age was ever reported, so (c) tested nothing");
+        assert!(
+            seen > 0,
+            "no frame's age was ever reported, so (c) tested nothing"
+        );
         assert!(
             worst <= STALE_BUDGET + WRITE_SLICE * 3,
             "a frame reached the wire {worst:?} after it was queued; the stale gate is supposed \
@@ -1795,8 +1865,16 @@ mod tests {
         l.kill();
         let written = h.join().expect("writer");
         assert_eq!(written.len(), 1, "the frame was abandoned part-written");
-        assert_eq!(written[0], frame(7), "the frame that arrived is not the frame that was sent");
-        assert_eq!(l.stale_dropped(), 0, "a frame already on the wire was counted as stale");
+        assert_eq!(
+            written[0],
+            frame(7),
+            "the frame that arrived is not the frame that was sent"
+        );
+        assert_eq!(
+            l.stale_dropped(),
+            0,
+            "a frame already on the wire was counted as stale"
+        );
     }
 
     /// A ticket is single use, scoped to one peer, and dies with its TTL.
@@ -1844,7 +1922,10 @@ mod tests {
     #[test]
     fn the_source_guard_sees_only_production_text() {
         let c = code();
-        assert!(c.contains("fn write_loop"), "code() removed the code as well");
+        assert!(
+            c.contains("fn write_loop"),
+            "code() removed the code as well"
+        );
         assert!(
             !c.contains("the stale gate is supposed to cap"),
             "code() still contains this module's assertion messages, so every guard below is \
@@ -1872,17 +1953,26 @@ mod tests {
     #[test]
     fn the_media_socket_refuses_to_run_with_nagle_enabled() {
         let src = code();
-        let lines: Vec<&str> = src.lines().filter(|l| l.contains("set_nodelay(")).collect();
-        assert!(!lines.is_empty(), "set_nodelay disappeared from the media socket entirely");
-        for l in lines {
+        // rustfmt may keep `.context(...)?` on this physical line or wrap it
+        // onto the next one. Inspect the complete statement so formatting
+        // alone cannot turn the semantic guard red.
+        let statements: Vec<&str> = src
+            .split(';')
+            .filter(|statement| statement.contains("set_nodelay("))
+            .collect();
+        assert!(
+            !statements.is_empty(),
+            "set_nodelay disappeared from the media socket entirely"
+        );
+        for statement in statements {
             assert!(
-                !l.contains("let _"),
-                "the media socket ignores set_nodelay's result: {l}\nNagle would then be on with \
+                !statement.contains("let _"),
+                "the media socket ignores set_nodelay's result: {statement}\nNagle would then be on with \
                  nothing to say so"
             );
             assert!(
-                l.contains('?'),
-                "set_nodelay's failure is not propagated: {l}\nA link we cannot disable Nagle on \
+                statement.contains('?'),
+                "set_nodelay's failure is not propagated: {statement}\nA link we cannot disable Nagle on \
                  must be refused, not promoted"
             );
         }
@@ -1910,7 +2000,9 @@ mod tests {
     #[test]
     fn the_stale_gate_times_each_frame_from_when_that_frame_was_queued() {
         let src = code();
-        let at = src.find("fn write_one_queued").expect("write_one_queued is gone");
+        let at = src
+            .find("fn write_one_queued")
+            .expect("write_one_queued is gone");
         let body = &src[at..];
         let end = body.find("\n}\n").expect("write_one_queued has no end");
         let body = &body[..end];
@@ -2052,14 +2144,20 @@ mod tests {
         let src = code();
         for f in ["fn enqueue(", "fn wake("] {
             let at = src.find(f).unwrap_or_else(|| {
-                panic!("{f} is gone from tcpmedia.rs; tx_loop's entry point moved and this guard \
-                        is now checking nothing")
+                panic!(
+                    "{f} is gone from tcpmedia.rs; tx_loop's entry point moved and this guard \
+                        is now checking nothing"
+                )
             });
             let open = at + src[at..].find(" {\n").expect("no signature end") + 3;
             let end = open + src[open..].find("\n    }\n").expect("no function end");
             let body = &src[open..end];
-            assert!(!body.is_empty(), "{f}'s body came out empty, so every check below is vacuous");
-            for (needle, why) in crate::engine::deadline_thread_guards::BANNED_ON_THE_DEADLINE_THREAD
+            assert!(
+                !body.is_empty(),
+                "{f}'s body came out empty, so every check below is vacuous"
+            );
+            for (needle, why) in
+                crate::engine::deadline_thread_guards::BANNED_ON_THE_DEADLINE_THREAD
             {
                 assert!(
                     !body.contains(needle),
@@ -2168,13 +2266,23 @@ mod tests {
             "the gauge read {:.1} ms for frames the gate itself judged stale",
             l.writeq_ms()
         );
-        assert!(l.stale_dropped() >= 4, "the gate did not fire on frames it had to");
+        assert!(
+            l.stale_dropped() >= 4,
+            "the gate did not fire on frames it had to"
+        );
         // Peak is retained, window peak is taken.
         assert!(l.writeq_peak_ms() >= l.writeq_ms() - 0.001);
         let taken = l.take_writeq_peak_ms();
         assert!(taken > 0.0, "the window peak was empty right after a stall");
-        assert_eq!(l.take_writeq_peak_ms(), 0.0, "the window peak was not reset by the take");
-        assert!(l.writeq_peak_ms() > 0.0, "taking the window peak also cleared the lifetime peak");
+        assert_eq!(
+            l.take_writeq_peak_ms(),
+            0.0,
+            "the window peak was not reset by the take"
+        );
+        assert!(
+            l.writeq_peak_ms() > 0.0,
+            "taking the window peak also cleared the lifetime peak"
+        );
     }
 
     /// The test token bucket limits throughput to roughly what it is asked for.
@@ -2206,6 +2314,9 @@ mod tests {
             off.gate(&shutdown);
             off.charge(100_000);
         }
-        assert!(t1.elapsed() < Duration::from_millis(50), "a disabled bucket still slept");
+        assert!(
+            t1.elapsed() < Duration::from_millis(50),
+            "a disabled bucket still slept"
+        );
     }
 }

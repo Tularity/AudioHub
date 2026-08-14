@@ -29,7 +29,7 @@ import { t, joinPhrases } from '../i18n';
 import { WIKI } from '../lib/external';
 import { fmt } from '../lib/fmt';
 import { checkEndpoint } from '../lib/peerAddr';
-import { latencyStops, normLatency, qualityStops, stopLabel } from '../lib/transportStops';
+import { latencyStops, normLatency, qualityStops } from '../lib/transportStops';
 import { pickWorst, qualityDepthKey, readLatency, readQuality, splitByDirection } from '../lib/metrics';
 import type { Dir } from '../lib/metrics';
 import {
@@ -39,7 +39,8 @@ import {
 } from '../lib/tier';
 import { rpc, refreshPeers } from '../state/connection';
 import {
-  MODE_B, halDeviceOf, peerDeviceRows, peerDevicesNote, requestedMode,
+  MODE_B, halDeviceOf, peerAudioDirections, peerDeviceRows, peerDevicesNote,
+  peerHasNoAudioDirections, requestedMode, selectIsShareMode,
 } from '../state/mode';
 import { useStore } from '../state/store';
 import type { PeerState, SessionInfo } from '../ipc/types';
@@ -372,10 +373,10 @@ function EndpointField({ fp, tier, endpoint, reset }: {
 }
 
 /**
- * 这台对端的两台虚拟设备（用户 2026-08-10 第 18 条：并入「连通方式」下面）。
+ * 这台对端实际请求的虚拟设备（用户 2026-08-10 第 18 条：并入「连通方式」下面）。
  *
  * 它此前是详情页上一张独立的卡（`Detail.tsx` 的 `DevicesCard`）。搬进来是因为
- * 「这台对端怎么连的」与「它在我系统里长成哪两台设备」是同一个问题的两半，
+ * 「这台对端怎么连的」与「它在我系统里长成哪些设备」是同一个问题的两半，
  * 而分成两张卡时中间隔着别的板块。
  *
  * # 为什么渲染判据取 `requestedMode` 而不是 `effectiveMode`
@@ -395,11 +396,12 @@ function PeerDevices({ peer }: { peer: PeerState }) {
   const fp = peer.fingerprint;
   const rows = peerDeviceRows(peer, daemon);
   const info = halDeviceOf(daemon, fp);
-  const dev = peer.hal_device;
-  const published = !!dev && dev.state === 'bound' && !!dev.observed;
   // 那一句是四叉分支，住在 `state/mode.ts` 里并有单测——它在这次搬家里换了判据，
   // 而「搬家 + 改判据」正是本仓反复栽跟头的组合。
   const note = peerDevicesNote(peer, daemon);
+
+  // 明确零能力是正常能力集，不是一个「暂无设备」故障卡。
+  if (peerHasNoAudioDirections(peer)) return null;
 
   return (
     <div className="transport-devices" data-testid="detail-hal-devices">
@@ -426,8 +428,8 @@ function PeerDevices({ peer }: { peer: PeerState }) {
                 r.dropped ? t('device.dropped', { n: fmt.count(r.dropped) }) : null,
               ])}
             </span>
-            <span className={`dev-state ${r.io ? 'live' : published ? 'idle' : 'pending'}`}>
-              {r.io ? t('device.inUse') : published ? t('device.idle') : t('device.awaiting')}
+            <span className={`dev-state ${r.io ? 'live' : r.published && r.observed ? 'idle' : 'pending'}`}>
+              {r.io ? t('device.inUse') : r.published && r.observed ? t('device.idle') : t('device.awaiting')}
             </span>
           </div>
         ))}
@@ -449,10 +451,13 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
   // 共享模式：本机不发起，故本机存的四个档对任何链路都不生效。
   // 判据取 `effective_mode`（真的在跑的那个），不取 `mode`（用户请求的）——
   // 请求了模式 B 但驱动没起来的机器实际跑在别的模式上。
-  const shared = (ds?.effective_mode || ds?.mode) === 'share';
+  const shared = useStore(selectIsShareMode);
   // 虚拟设备那一块的判据。取**请求**的模式，不取生效的——理由在 `PeerDevices` 上。
   const wantsModeB = useStore(requestedMode) === MODE_B;
   const tr = peer.transport || {};
+  // 共享模式展示对端在本机上驱动的双向执行器；使用模式则只显示对端
+  // 明确拥有的默认端点。`None` 由 `peerAudioDirections` 保持为可见。
+  const directions = shared ? ROWS : peerAudioDirections(peer);
 
   // 卡片指标区按 `dir`（本机视角）分栏，这里用**同一个函数**——
   // 两处各写一份判据，就会出现「详情页的收对着卡片的发」这种谁也查不出来的错位。
@@ -494,7 +499,7 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
   }
 
   /** 装载时被重置掉的档位格（daemon 报的原值）。空数组 = 一切正常。 */
-  const resets = ROWS.flatMap((dir) => {
+  const resets = directions.flatMap((dir) => {
     const slot = dir === 'in' ? tr.recv : tr.send;
     const out: { dir: Dir; kind: 'latency' | 'quality'; old: string }[] = [];
     if (typeof slot?.latency_reset_from === 'string') {
@@ -556,42 +561,44 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
           })).join(' ')}
         </p>
       ) : null}
-      <div className="transport-grid" data-testid="detail-transport-grid">
-        <span className="transport-corner" aria-hidden="true" />
-        {/* 「这是目标不是实测」「延迟由接收端执行、音质由发送端执行」两段说明
-            都搬进了 wiki（用户 2026-08-10 裁定，docs/plan.md §3.1）。两枚 `?` 挂在
-            列头而不是卡片标题上：这张卡有两个**不同**的旋钮，一个入口指不了两处。 */}
-        <span className="transport-col title-row">
-          {t('detail.transport.colLatency')}
-          <Help label={t('wiki.latency')} url={WIKI.latencyTarget} testid="detail-transport-latency-help" />
-        </span>
-        <span className="transport-col title-row">
-          {t('detail.transport.colQuality')}
-          <Help label={t('wiki.quality')} url={WIKI.qualityLadder} testid="detail-transport-quality-help" />
-        </span>
-        {ROWS.map((dir) => (
-          <div className="transport-row" key={dir} data-dir={dir} data-testid={`detail-transport-row-${dir}`}>
-            <span className="transport-rowname">
-              <span className="dir-arrow" aria-hidden="true">{dir === 'out' ? '↑' : '↓'}</span>
-              {t(dir === 'out' ? 'peers.card.streamOut' : 'peers.card.streamIn')}
-            </span>
-            <Cell
-              dir={dir} kind="latency" stops={lStops}
-              value={valueOf(dir, 'latency')}
-              live={liveLatency(listOf(dir))}
-              disabled={shared || busy}
-              onSelect={(v) => set(dir, 'latency', v)}
-            />
-            <Cell
-              dir={dir} kind="quality" stops={qStops}
-              value={valueOf(dir, 'quality')}
-              live={liveQuality(listOf(dir))}
-              disabled={shared || busy}
-              onSelect={(v) => set(dir, 'quality', v)}
-            />
-          </div>
-        ))}
-      </div>
+      {directions.length ? (
+        <div className="transport-grid" data-testid="detail-transport-grid">
+          <span className="transport-corner" aria-hidden="true" />
+          {/* 「这是目标不是实测」「延迟由接收端执行、音质由发送端执行」两段说明
+              都搬进了 wiki（用户 2026-08-10 裁定，docs/plan.md §3.1）。两枚 `?` 挂在
+              列头而不是卡片标题上：这张卡有两个**不同**的旋钮，一个入口指不了两处。 */}
+          <span className="transport-col title-row">
+            {t('detail.transport.colLatency')}
+            <Help label={t('wiki.latency')} url={WIKI.latencyTarget} testid="detail-transport-latency-help" />
+          </span>
+          <span className="transport-col title-row">
+            {t('detail.transport.colQuality')}
+            <Help label={t('wiki.quality')} url={WIKI.qualityLadder} testid="detail-transport-quality-help" />
+          </span>
+          {directions.map((dir) => (
+            <div className="transport-row" key={dir} data-dir={dir} data-testid={`detail-transport-row-${dir}`}>
+              <span className="transport-rowname">
+                <span className="dir-arrow" aria-hidden="true">{dir === 'out' ? '↑' : '↓'}</span>
+                {t(dir === 'out' ? 'peers.card.streamOut' : 'peers.card.streamIn')}
+              </span>
+              <Cell
+                dir={dir} kind="latency" stops={lStops}
+                value={valueOf(dir, 'latency')}
+                live={liveLatency(listOf(dir))}
+                disabled={shared || busy}
+                onSelect={(v) => set(dir, 'latency', v)}
+              />
+              <Cell
+                dir={dir} kind="quality" stops={qStops}
+                value={valueOf(dir, 'quality')}
+                live={liveQuality(listOf(dir))}
+                disabled={shared || busy}
+                onSelect={(v) => set(dir, 'quality', v)}
+              />
+            </div>
+          ))}
+        </div>
+      ) : null}
       {/* ---- 连通方式（plan §16.2 的「手动覆盖恒可用」）--------------------
           放在四个档位**之后**：那四个是日常旋钮，这一个是「网络不让我直连」
           时才动的。四个互斥选项而不是一个开关——`auto` 与 `tier0` 不是同一件事
@@ -643,7 +650,7 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
         </div>
         {/* ---- 虚拟设备（用户第 18 条）----------------------------------
             接在四个档位按钮**之后**：先说这条链路怎么连，再说它在系统里长成
-            哪两台设备。判据 `requestedMode === 'b'` 见 `PeerDevices` 的注释——
+            哪些设备。判据 `requestedMode === 'b'` 见 `PeerDevices` 的注释——
             这里判、组件不判，两处都判会分岔。 */}
         {wantsModeB ? <PeerDevices peer={peer} /> : null}
         {/* ---- 隧道地址（用户第 19 条：属于「单连接复用」，按条件显示）------
@@ -667,41 +674,4 @@ export function PeerTransportCard({ peer }: { peer: PeerState }) {
           以为它在线上——那比没有更坏。 */}
     </section>
   );
-}
-
-/**
- * **统计诊断页**那张只读总览用得到：一台对端四个档的文本形态。
- *
- * （它曾经在设置页。用户 2026-08-10 第 10 条把它搬去了统计诊断页——那一页的分工
- * 就是「跨对端的只读汇总」，而设置页是「本机的全局配置」，可这四个值从 §15 起
- * 已经不是全局的了。见 docs/plan.md §17。）
- *
- * # 这里为什么不再有「规范化」这一步
- *
- * 曾经有。质量档串有三条读路径（详情页滑条的 `valueOf`、本函数、共享模式的
- * 回显），每条都得记得调一次 `normQuality()` —— 而**本函数漏掉了**：同一个
- * 存盘值在详情页显示「PCM 32 kHz · 16 bit」、在这张总览里显示裸的 `pcm32k`，
- * 两处各说各话且没有任何一处会报错。那层兼容代码自己制造了这个回归。
- *
- * 现在 daemon 在**装载时一次性**把认不出来的串重置为默认（`StoredDir::sanitize`），
- * 于是这里拿到的永远是档表里有的 id，三条读路径不可能再分岔。
- * 重置这件事本身由 `quality_reset_from` / `latency_reset_from` 带到 UI 说明。
- */
-export function transportCells(
-  ds: import('../ipc/types').DaemonSettings | null,
-  peer: PeerState,
-): { dir: Dir; latency: string; quality: string }[] {
-  const l = latencyStops(ds);
-  const q = qualityStops(ds);
-  const tr = peer.transport || {};
-  return ROWS.map((dir) => {
-    const slot = dir === 'in' ? tr.recv : tr.send;
-    return {
-      dir,
-      // 读不到就是 `—`（`stopLabel` 返回 null）：**绝不填一个 auto 冒充**。
-      latency: stopLabel(l, slot?.latency ? normLatency(slot.latency) : slot?.latency)
-        ?? t('common.dash'),
-      quality: stopLabel(q, slot?.quality) ?? t('common.dash'),
-    };
-  });
 }

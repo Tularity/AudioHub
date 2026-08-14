@@ -219,7 +219,11 @@ fn an_offline_peer_reports_no_mode_at_all() {
     //    判死时都会出现。
     {
         let st = crate::lk(&a.h.inner_for_test().state);
-        let c = st.conns.get(&bfp).expect("the conn must still be in the table").clone();
+        let c = st
+            .conns
+            .get(&bfp)
+            .expect("the conn must still be in the table")
+            .clone();
         drop(st);
         c.alive.store(false, std::sync::atomic::Ordering::SeqCst);
     }
@@ -353,6 +357,48 @@ fn leaving_share_mode_closes_the_sessions_peers_already_had() {
             .iter()
             .any(|s| s.get("origin").and_then(Value::as_str) == Some("peer"))
     });
+}
+
+/// A real capability-loss teardown traverses both halves of the encrypted
+/// control channel: the endpoint owner removes its peer-originated stream and
+/// sends `CloseStream`, then the opener removes its matching local session.
+///
+/// Presence is injected only at the watcher/teardown boundary so this remains
+/// deterministic on a machine whose physical devices cannot be unplugged by a
+/// test. Session creation, ownership and the close notification are all the
+/// production paths.
+#[test]
+fn losing_a_local_output_closes_the_peer_stream_and_notifies_its_opener() {
+    let a = Node::start("endpoint-loss-a");
+    let b = Node::start("endpoint-loss-b");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    pair(&a, &b);
+
+    a.ok(methods::SESSION_OPEN, tone_spk(&b.fingerprint()));
+    eventually("both ends to publish the speaker session", || {
+        !a.sessions().is_empty()
+            && b.sessions()
+                .iter()
+                .any(|s| s.get("origin").and_then(Value::as_str) == Some("peer"))
+    });
+
+    crate::conn::close_peer_sessions_missing_local_endpoints(
+        b.h.inner_for_test(),
+        audiohub_core::audio::DefaultDevicePresence {
+            input: true,
+            output: false,
+        },
+    );
+
+    assert!(
+        b.sessions().is_empty(),
+        "the endpoint owner retained the stream after its output disappeared"
+    );
+    eventually(
+        "CloseStream to remove the opener's matching session",
+        || a.sessions().is_empty(),
+    );
 }
 
 /// 镜像：切**进**共享模式会关掉本机自己开的会话。

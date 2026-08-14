@@ -89,7 +89,7 @@ function PermissionsSheet({ auto }: { auto: boolean }) {
 
   const note = perms.list.length ? ''
     : perms.supported === false ? t('settings.perm.unsupported')
-      : perms.error ? t('settings.perm.error', { message: perms.error })
+      : perms.error ? t('settings.perm.error')
         : conn === 'online' ? t('settings.perm.probing') : t('settings.perm.offline');
 
   return (

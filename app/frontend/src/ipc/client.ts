@@ -13,7 +13,7 @@ import { t } from '../i18n';
 // 校验是**严格相等**（见下面 connect() 里的 `v !== IPC_VERSION`），所以这里落后一个
 // 版本不是「少显示一点数据」而是**整个界面拒连**。守卫在 Rust 侧：
 // core/audiohub-ipc 的 `the_three_ipc_version_declarations_agree` 直接读本文件。
-export const IPC_VERSION = 6;
+export const IPC_VERSION = 7;
 
 const DEFAULT_TIMEOUT_MS = 10000;
 
@@ -65,6 +65,8 @@ export class IpcClient {
   private pending = new Map<number, Pending>();
   private listeners = new Map<string, Set<Listener>>();
   private authed = false;
+  /** Rejects the one authentication handshake currently owned by `ws`. */
+  private cancelConnect: (() => void) | null = null;
 
   on(name: string, fn: Listener): () => void {
     if (!this.listeners.has(name)) this.listeners.set(name, new Set());
@@ -88,12 +90,18 @@ export class IpcClient {
       let settled = false;
       let authTimer: ReturnType<typeof setTimeout> | null = null;
       let ws: WebSocket & { __abandoned?: boolean };
+      let cancelConnect: (() => void) | null = null;
 
       const finish = <T>(fn: (arg: T) => void, arg: T) => {
         if (authTimer) clearTimeout(authTimer);
         authTimer = null;
         if (settled) return;
         settled = true;
+        // A newer connect may already own the class-level cancellation slot.
+        // Clear only the closure installed by this exact handshake.
+        if (cancelConnect && this.cancelConnect === cancelConnect) {
+          this.cancelConnect = null;
+        }
         fn(arg);
       };
       // 握手失败/超时一律关掉 socket：close 事件会把 conn 推向 offline 并触发重试。
@@ -109,6 +117,8 @@ export class IpcClient {
         return;
       }
       this.ws = ws;
+      cancelConnect = () => finish(reject, new Error(t('error.connectionClosed')));
+      this.cancelConnect = cancelConnect;
 
       authTimer = setTimeout(() => fail(new Error(t('error.authTimeout'))), AUTH_TIMEOUT_MS);
 
@@ -194,11 +204,16 @@ export class IpcClient {
 
   close(): void {
     const ws = this.ws as (WebSocket & { __abandoned?: boolean }) | null;
+    const cancelConnect = this.cancelConnect;
+    this.cancelConnect = null;
     this.ws = null;
     this.authed = false;
     this.failAll(t('error.connectionClosed'));
+    // Mark the socket first: rejecting the Promise schedules user code, while a
+    // synchronous/custom WebSocket close event must already know it is stale.
+    if (ws) ws.__abandoned = true;
+    cancelConnect?.();
     if (ws) {
-      ws.__abandoned = true;
       try { ws.close(); } catch { /* ignore */ }
     }
   }

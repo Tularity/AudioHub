@@ -288,7 +288,11 @@ pub(crate) fn step(i: ServoIn) -> ServoOut {
     // 死区：误差半帧以内不动。用**当前**深度算的误差，不是用 want 算的。
     let now_ms = floor_ms + jb_ms;
     if (now_ms - target_ms as f64).abs() <= DEADBAND_MS {
-        return ServoOut { want_frames: i.jb_frames, at_floor, at_ceiling };
+        return ServoOut {
+            want_frames: i.jb_frames,
+            at_floor,
+            at_ceiling,
+        };
     }
 
     // 限速：一拍最多挪一帧。
@@ -300,7 +304,11 @@ pub(crate) fn step(i: ServoIn) -> ServoOut {
     } else {
         i.jb_frames
     };
-    ServoOut { want_frames, at_floor, at_ceiling }
+    ServoOut {
+        want_frames,
+        at_floor,
+        at_ceiling,
+    }
 }
 
 #[cfg(test)]
@@ -322,7 +330,8 @@ mod tests {
     #[test]
     fn the_frame_length_agrees_with_the_engine() {
         assert_eq!(
-            FRAME_MS, crate::engine::FRAME_MS as f64,
+            FRAME_MS,
+            crate::engine::FRAME_MS as f64,
             "servo 与 engine 的帧长不一致：伺服每一步的换算都会偏"
         );
     }
@@ -332,7 +341,11 @@ mod tests {
     #[test]
     fn auto_never_moves_the_buffer() {
         for sum in [None, Some(10.0), Some(1000.0)] {
-            let out = step(ServoIn { target: LatencyTarget::Auto, sum_ms: sum, ..base() });
+            let out = step(ServoIn {
+                target: LatencyTarget::Auto,
+                sum_ms: sum,
+                ..base()
+            });
             assert_eq!(out.want_frames, 4, "AUTO 下伺服动了深度（sum={sum:?}）");
             assert!(!out.at_floor && !out.at_ceiling, "AUTO 不该报够不到");
         }
@@ -345,7 +358,11 @@ mod tests {
     #[test]
     fn a_missing_measurement_still_bounds_the_buffer_by_the_target() {
         // 目标 0 ms ⇒ 上界 0 帧 ⇒ 往下走（限速一帧）
-        let low = step(ServoIn { sum_ms: None, target: LatencyTarget::TotalMs(0), ..base() });
+        let low = step(ServoIn {
+            sum_ms: None,
+            target: LatencyTarget::TotalMs(0),
+            ..base()
+        });
         assert!(low.want_frames < 4, "开环下也该朝目标走：{low:?}");
         // 目标 1000 ms ⇒ 上界 100 帧 ⇒ 往上走
         let high = step(ServoIn {
@@ -392,10 +409,16 @@ mod tests {
     #[test]
     fn the_servo_moves_toward_the_target_not_away_from_it() {
         // 现状 100 ms（地板 60 + JB 40），目标 200 ⇒ 必须加深
-        let up = step(ServoIn { target: LatencyTarget::TotalMs(200), ..base() });
+        let up = step(ServoIn {
+            target: LatencyTarget::TotalMs(200),
+            ..base()
+        });
         assert!(up.want_frames > 4, "目标更高却没有加深：{up:?}");
         // 目标 50 ⇒ 必须削浅
-        let down = step(ServoIn { target: LatencyTarget::TotalMs(50), ..base() });
+        let down = step(ServoIn {
+            target: LatencyTarget::TotalMs(50),
+            ..base()
+        });
         assert!(down.want_frames < 4, "目标更低却没有削浅：{down:?}");
     }
 
@@ -435,15 +458,25 @@ mod tests {
         // 先在 40 ms 地板上收敛
         for _ in 0..200 {
             let sum = 40.0 + frames as f64 * FRAME_MS;
-            frames = step(ServoIn { target, sum_ms: Some(sum), jb_frames: frames, ..base() })
-                .want_frames;
+            frames = step(ServoIn {
+                target,
+                sum_ms: Some(sum),
+                jb_frames: frames,
+                ..base()
+            })
+            .want_frames;
         }
         let first = frames;
         // 网络恶化：地板涨到 120 ms。总延迟目标不变 ⇒ JB 必须让出 80 ms。
         for _ in 0..200 {
             let sum = 120.0 + frames as f64 * FRAME_MS;
-            frames = step(ServoIn { target, sum_ms: Some(sum), jb_frames: frames, ..base() })
-                .want_frames;
+            frames = step(ServoIn {
+                target,
+                sum_ms: Some(sum),
+                jb_frames: frames,
+                ..base()
+            })
+            .want_frames;
         }
         assert!(
             frames < first,
@@ -493,7 +526,10 @@ mod tests {
             lo_frames: 2,
             hi_frames: 12,
         });
-        assert!(out.at_ceiling, "上限只能给到 160 ms，目标 1000 ms 却没报够不到");
+        assert!(
+            out.at_ceiling,
+            "上限只能给到 160 ms，目标 1000 ms 却没报够不到"
+        );
         assert!(!out.at_floor);
         assert_eq!(out.want_frames, 12, "已在上限");
     }
@@ -509,7 +545,10 @@ mod tests {
             lo_frames: 2,
             hi_frames: 12,
         });
-        assert!(!out.at_floor && !out.at_ceiling, "恰好达标被报成了够不到：{out:?}");
+        assert!(
+            !out.at_floor && !out.at_ceiling,
+            "恰好达标被报成了够不到：{out:?}"
+        );
     }
 
     /// 死区：误差半帧以内不动，否则会和 JB 自己的欠载回路互相追。
@@ -547,7 +586,10 @@ mod tests {
                 hi_frames: 40,
             });
             let d = (out.want_frames as i64 - 10).abs();
-            assert!(d <= MAX_STEP_FRAMES as i64, "一拍挪了 {d} 帧（sum={sum}, target={target}）");
+            assert!(
+                d <= MAX_STEP_FRAMES as i64,
+                "一拍挪了 {d} 帧（sum={sum}, target={target}）"
+            );
         }
     }
 
@@ -561,6 +603,9 @@ mod tests {
             lo_frames: 12,
             hi_frames: 2,
         });
-        assert!((2..=12).contains(&out.want_frames), "包络颠倒时越界了：{out:?}");
+        assert!(
+            (2..=12).contains(&out.want_frames),
+            "包络颠倒时越界了：{out:?}"
+        );
     }
 }

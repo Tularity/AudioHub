@@ -127,7 +127,10 @@ fn lobe_and_total(windowed: &[f32], sample_rate: u32, freq_hz: f32) -> (f64, f64
         }
         inband += goertzel_power(windowed, sample_rate, f as f32) as f64;
     }
-    let total: f64 = windowed.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>()
+    let total: f64 = windowed
+        .iter()
+        .map(|&x| (x as f64) * (x as f64))
+        .sum::<f64>()
         / (windowed.len() as f64)
         / 2.0;
     (inband, total)
@@ -393,7 +396,10 @@ pub fn decode_pcm_into(bytes: &[u8], depth: WireDepth, out: &mut Vec<f32>) -> De
     let bps = depth.bytes_per_sample();
     out.clear();
     out.reserve(bytes.len() / bps);
-    let mut stats = DecodeStats { nonfinite: 0, ragged: bytes.len() % bps };
+    let mut stats = DecodeStats {
+        nonfinite: 0,
+        ragged: bytes.len() % bps,
+    };
     match depth {
         WireDepth::S16 => {
             for b in bytes.chunks_exact(2) {
@@ -554,7 +560,11 @@ impl SendGain {
     /// 真正的校验在写入侧（`conn.rs` 拒收非有限 scalar）；这里只是不给自己留一条
     /// 能把 NaN 送上线的路。
     pub fn set_target(&mut self, gain: f32) {
-        self.target = if gain.is_finite() { gain.clamp(0.0, 1.0) } else { 1.0 };
+        self.target = if gain.is_finite() {
+            gain.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
     }
 
     /// 此刻**真正施加**的增益（斜坡的当前值，不是去向）。
@@ -601,7 +611,11 @@ impl SendGain {
             if self.cur != self.target {
                 let d = self.target - self.cur;
                 // 剩下的路不够一步就直接落到目标：否则会在目标附近永久抖动。
-                self.cur = if d.abs() <= slew { self.target } else { self.cur + slew.copysign(d) };
+                self.cur = if d.abs() <= slew {
+                    self.target
+                } else {
+                    self.cur + slew.copysign(d)
+                };
             }
             // **一次乘法，不是两次。** 写成 `x * self.cur * something` 就是
             // plan §12.5 那条「不存在双重衰减」在本机这一侧的失效形态。
@@ -697,7 +711,11 @@ mod zero_alloc_tests {
             let bytes = encode_pcm(&samples, depth);
             let mut back = Vec::new();
             let st = decode_pcm_into(&bytes, depth, &mut back);
-            assert_eq!(st, DecodeStats::default(), "{depth:?} 干净输入不该有异常计数");
+            assert_eq!(
+                st,
+                DecodeStats::default(),
+                "{depth:?} 干净输入不该有异常计数"
+            );
             assert_eq!(back.len(), samples.len(), "{depth:?} 样本数变了");
             if depth == WireDepth::F32 {
                 for (i, (&a, &b)) in samples.iter().zip(back.iter()).enumerate() {
@@ -762,14 +780,24 @@ mod zero_alloc_tests {
     #[test]
     fn the_f32_decoder_scrubs_non_finite_values_and_counts_them() {
         let mut bytes = Vec::new();
-        for v in [1.0f32, f32::NAN, 0.5, f32::INFINITY, -0.25, f32::NEG_INFINITY] {
+        for v in [
+            1.0f32,
+            f32::NAN,
+            0.5,
+            f32::INFINITY,
+            -0.25,
+            f32::NEG_INFINITY,
+        ] {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         let mut out = Vec::new();
         let st = decode_pcm_into(&bytes, WireDepth::F32, &mut out);
         assert_eq!(st.nonfinite, 3, "三个非有限值应当各计一次");
         assert_eq!(st.ragged, 0);
-        assert!(out.iter().all(|v| v.is_finite()), "输出里还有非有限值：{out:?}");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "输出里还有非有限值：{out:?}"
+        );
         assert_eq!(out, vec![1.0, 0.0, 0.5, 0.0, -0.25, 0.0]);
         // 整数档天然不可能产生非有限值——喂同一串字节也不该有计数。
         for depth in [WireDepth::S16, WireDepth::S24] {
@@ -784,14 +812,22 @@ mod zero_alloc_tests {
     /// 计数器的价值恰恰在于将来某次改动让它非零时有人会看见。
     #[test]
     fn a_ragged_payload_is_dropped_but_counted() {
-        for (depth, extra) in [(WireDepth::S16, 1usize), (WireDepth::S24, 2), (WireDepth::F32, 3)] {
+        for (depth, extra) in [
+            (WireDepth::S16, 1usize),
+            (WireDepth::S24, 2),
+            (WireDepth::F32, 3),
+        ] {
             let mut bytes = encode_pcm(&[0.25, -0.25], depth);
             let full = bytes.len();
             bytes.extend(std::iter::repeat(0u8).take(extra));
             let mut out = Vec::new();
             let st = decode_pcm_into(&bytes, depth, &mut out);
             assert_eq!(st.ragged, extra, "{depth:?} 残字节没被计数");
-            assert_eq!(out.len(), full / depth.bytes_per_sample(), "{depth:?} 残字节没被丢弃");
+            assert_eq!(
+                out.len(),
+                full / depth.bytes_per_sample(),
+                "{depth:?} 残字节没被丢弃"
+            );
         }
     }
 
@@ -811,7 +847,11 @@ mod zero_alloc_tests {
         assert_eq!(WireDepth::parse("32"), None);
         assert_eq!(WireDepth::parse("s32"), None);
         assert_eq!(WireDepth::parse(""), None);
-        assert_eq!(WireDepth::parse("S16"), None, "拼写是精确匹配，不做大小写吸附");
+        assert_eq!(
+            WireDepth::parse("S16"),
+            None,
+            "拼写是精确匹配，不做大小写吸附"
+        );
     }
 }
 
@@ -859,7 +899,10 @@ mod send_gain_tests {
         // 兜底启用但音量在 100 %：仍然必须是透明的（线上与默认路径逐位相同）。
         let mut g = SendGain::new();
         g.set_target(1.0);
-        assert!(g.is_transparent(), "增益 = 1.0 却不透明：白付一次乘法 + 一次 dither");
+        assert!(
+            g.is_transparent(),
+            "增益 = 1.0 却不透明：白付一次乘法 + 一次 dither"
+        );
     }
 
     /// **增益变更必须走斜坡。** 一次跳变就是一次阶跃，阶跃就是爆音；
@@ -912,7 +955,10 @@ mod send_gain_tests {
             g.apply(&dc, SR, WireDepth::F32, &mut scratch);
         }
         assert_eq!(g.current(), 1.0, "回程没有精确回到满幅");
-        assert!(g.is_transparent(), "回到满幅之后没有恢复透明 —— 白付乘法与 dither");
+        assert!(
+            g.is_transparent(),
+            "回到满幅之后没有恢复透明 —— 白付乘法与 dither"
+        );
     }
 
     /// 斜坡时长与**格号无关**：低采样率格上必须还是 20 ms，不是 20 ms × 3。
@@ -967,7 +1013,10 @@ mod send_gain_tests {
             ya = quiet.apply(&source, SR, WireDepth::F32, &mut sa).to_vec();
             yb = loud.apply(&source, SR, WireDepth::F32, &mut sb).to_vec();
         }
-        assert_eq!(source, pristine, "共享的源帧被就地改写了 —— 扇出的其余流全被带偏");
+        assert_eq!(
+            source, pristine,
+            "共享的源帧被就地改写了 —— 扇出的其余流全被带偏"
+        );
         assert_eq!(yb, pristine, "透明的那条流没有拿到原帧");
         assert_eq!(ya.len(), source.len(), "输出长度变了 —— 暂存多半没被清空");
         for (i, (&x, &y)) in pristine.iter().zip(ya.iter()).enumerate() {
@@ -1026,7 +1075,7 @@ mod send_gain_tests {
         const CODES: f32 = 100.3; // 刻意落在两个码字之间
         let want = CODES / 32767.0;
         let dc = vec![1.0f32; SR as usize]; // 1 s，够均值收敛
-        // 对照：直接乘、不掺 dither，就是模块头警告的那条路。
+                                            // 对照：直接乘、不掺 dither，就是模块头警告的那条路。
         let plain: Vec<f32> = dc.iter().map(|x| x * want).collect();
         let plain_back = decode_pcm(&encode_pcm(&plain, WireDepth::S16), WireDepth::S16);
         let lsb = 1.0f32 / 32767.0;
@@ -1087,7 +1136,10 @@ mod send_gain_tests {
             settle(&mut g, &tone, WireDepth::F32);
             g.set_target(bad);
             let y = settle(&mut g, &tone, WireDepth::F32);
-            assert!(y.iter().all(|v| v.is_finite()), "{bad} 把非有限样本送上了线");
+            assert!(
+                y.iter().all(|v| v.is_finite()),
+                "{bad} 把非有限样本送上了线"
+            );
             assert_eq!(g.current(), 1.0, "{bad} 之后增益没有回到满幅");
         }
         // 越界值被钳住，而不是被当成非有限值扔掉。
@@ -1286,7 +1338,9 @@ mod servo_bend_no_longer_defeats_the_tone_verdict {
         let mut noise = vec![0.0f32; SR as usize * 3];
         let mut r = 0x2545_F491_4F6C_DD1Du64;
         for n in noise.iter_mut() {
-            r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            r = r
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *n = ((r >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.5;
         }
         let v = verify_tone(&noise, SR, FREQ);

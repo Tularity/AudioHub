@@ -938,20 +938,23 @@ AhCtlDeviceControl(
         }
 
         //
-        // Last line of defence for the invariant. Everything below this point
-        // has already been checked inside perpeer.cpp, but the promise
-        // "AH_STATUS_OK on a SET means both endpoints exist" is what the daemon
-        // and every test lean on, so it is re-checked at the boundary where it
-        // is actually made. A driver that gets this wrong has to say so.
+        // Last line of defence for the v6 invariant. Everything below this
+        // point has already been checked inside perpeer.cpp, but the promise is
+        // exact equality with the requested render/capture mask -- including
+        // legitimate one-direction and zero masks. Re-check it at the boundary
+        // where the reply is actually made.
         //
+        ULONG wanted = 0;
+        if (req.flags & AH_BINDFLAG_WANT_RENDER)  { wanted |= AH_PUB_RENDER; }
+        if (req.flags & AH_BINDFLAG_WANT_CAPTURE) { wanted |= AH_PUB_CAPTURE; }
         if (ahStatus == AH_STATUS_OK && code == IOCTL_AUDIOHUB_BIND_SET &&
-            result.Published != AH_PUB_BOTH)
+            result.Published != wanted)
         {
-            DPF(D_ERROR, ("[AhCtlDeviceControl] slot %u would have reported OK with published 0x%x",
-                          req.slot, result.Published));
+            DPF(D_ERROR, ("[AhCtlDeviceControl] slot %u would have reported OK with "
+                          "published 0x%x, wanted 0x%x",
+                          req.slot, result.Published, wanted));
             ahStatus = AH_STATUS_PARTIAL;
             if (result.Stage == AH_STAGE_NONE) { result.Stage = AH_STAGE_VERIFY; }
-            state = AH_SLOT_FREE;
         }
 
         rep->status     = ahStatus;

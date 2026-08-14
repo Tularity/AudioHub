@@ -8,7 +8,7 @@
 // 代价是危险操作的**可发现性减弱**了，补偿是它多了一层 Sheet 再加原有的确认框，
 // 误触反而更难。
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { Icon } from '../components/Icon';
 import { confirmDialog } from '../components/ConfirmDialog';
 import { Help } from '../components/Controls';
@@ -17,8 +17,9 @@ import { WIKI } from '../lib/external';
 import { toast } from '../components/Toasts';
 import { volumeText } from '../components/VolumeControl';
 import { fmt, sessionFlow, dirLabel } from '../lib/fmt';
-import { t } from '../i18n';
+import { listFormat, t } from '../i18n';
 import { actions, useStore } from '../state/store';
+import { peerDeviceRows } from '../state/mode';
 import { PeerTransportCard } from '../components/PeerTransport';
 import { refreshPeers, rpc } from '../state/connection';
 import type { PeerState, SessionInfo, VolumeState } from '../ipc/types';
@@ -49,16 +50,16 @@ function VerdictCell({ v }: { v: { detected?: boolean; snr_db?: number } | null 
 function AliasSheet({ peer, onClose }: { peer: PeerState; onClose: () => void }) {
   const fp = peer.fingerprint;
   const [busy, setBusy] = useState(false);
-  const ref = useRef<HTMLInputElement>(null);
+  // Sheet 是一次编辑事务：轮询回来的 peer 对象继续刷新，但不能覆盖已经敲下的草稿。
+  // 关闭 / Esc / 遮罩统一丢弃它，只有底部那一枚保存按钮会写 daemon。
+  const [draft, setDraft] = useState(peer.alias || '');
+  const saved = peer.alias || '';
+  const normalized = draft.trim();
+  const dirty = normalized !== saved;
 
-  // 输入框只在用户没有在编辑时跟随 daemon，否则每秒一帧会把正在输入的字冲掉。
-  useEffect(() => {
-    const node = ref.current;
-    if (node && document.activeElement !== node) node.value = peer.alias || '';
-  }, [peer.alias]);
-
-  async function setAlias(value: string | null) {
-    if (busy) return;
+  async function saveAlias() {
+    if (busy || !dirty) return;
+    const value = normalized || null;
     setBusy(true);
     try {
       const res = await rpc<{ display_name?: string }>('peers.set_alias', { peer: fp, alias: value });
@@ -66,6 +67,7 @@ function AliasSheet({ peer, onClose }: { peer: PeerState; onClose: () => void })
         ? t('detail.alias.renamed', { name: (res && res.display_name) || value })
         : t('detail.alias.restored'), 'ok');
       await refreshPeers();
+      onClose();
     } catch { /* rpc 已 toast */ } finally {
       setBusy(false);
     }
@@ -79,45 +81,51 @@ function AliasSheet({ peer, onClose }: { peer: PeerState; onClose: () => void })
          已记住的设备选择完全不受影响。这件事必须能查到，否则用户会因为怕搞乱
          Zoom 里的选择而不敢改名——细节在 wiki，由这枚 `?` 指过去。 */
       help={<Help label={t('wiki.deviceNaming')} url={WIKI.deviceNaming} testid="detail-alias-help" />}
+      dismissLabel={t('common.cancel')}
+      dismissDisabled={busy}
       onClose={onClose}
+      footer={(
+        <button
+          className="btn ghost small" type="button" data-testid="detail-alias-clear"
+          disabled={busy || (!draft && !saved)}
+          onClick={() => setDraft('')}
+        >
+          {t('detail.alias.default')}
+        </button>
+      )}
+      primaryAction={(
+        <button
+          className="btn primary" type="button" data-testid="detail-alias-save"
+          disabled={busy || !dirty}
+          onClick={() => void saveAlias()}
+        >
+          {t('common.save')}
+        </button>
+      )}
     >
-      <div className="form-row">
-        <label className="field grow">
+      <div className="sheet-form-row">
+        <label className="field">
           <span className="field-label">{t('detail.alias.field')}</span>
           <input
-            ref={ref}
             className="input"
             data-testid="detail-alias-input"
             maxLength={48}
             placeholder={peer.name || t('detail.alias.placeholder')}
             autoComplete="off"
             spellCheck="false"
-            defaultValue={peer.alias || ''}
+            value={draft}
+            disabled={busy}
+            onChange={(e) => setDraft(e.currentTarget.value)}
             onKeyDown={(e) => {
-              if (e.key !== 'Enter') return;
+              if (e.key !== 'Enter' || !dirty) return;
               e.preventDefault();
-              void setAlias(e.currentTarget.value.trim() || null);
+              void saveAlias();
             }}
           />
         </label>
-        <span className="field-btn">
-          <button
-            className="btn primary small" type="button" data-testid="detail-alias-save" disabled={busy}
-            onClick={() => void setAlias((ref.current?.value || '').trim() || null)}
-          >
-            {t('common.save')}
-          </button>
-          <button
-            className="btn ghost small" type="button" data-testid="detail-alias-clear"
-            disabled={busy || !peer.alias}
-            onClick={() => { if (ref.current) ref.current.value = ''; void setAlias(null); }}
-          >
-            {t('common.clear')}
-          </button>
-        </span>
       </div>
       {/* 后果句。plan §3.1 第 4 类（后果）允许留在界面上——这个名字不只影响本页，
-          它会改掉这台对端在系统设备列表里那两台设备的名字，而那正是用户不敢按
+          它会改掉这台对端在系统设备列表里实际存在的虚拟设备名称，而那正是用户不敢按
           「保存」的原因。 */}
       <p className="muted small sheet-effect" data-testid="detail-alias-effect">{t('detail.alias.effect')}</p>
     </Sheet>
@@ -128,6 +136,7 @@ export function DetailView() {
   const fp = useStore((s) => s.route.peerFp);
   const peer = useStore((s) => s.peers.find((p) => p.fingerprint === fp) || null);
   const sessions = useStore((s) => s.sessions);
+  const daemon = useStore((s) => s.daemon);
   const addrHistory = useStore((s) => (fp ? s.addrHistory[fp] : undefined));
   const [unpairing, setUnpairing] = useState(false);
   // 详情头那两枚图标各开一个 Sheet。**同层只允许一个**（Sheet 的契约），所以这里
@@ -170,11 +179,13 @@ export function DetailView() {
   const cur: PeerState = peer;
 
   async function unpair() {
-    const dev = cur.hal_device;
+    const devices = peerDeviceRows(cur, daemon);
     const body = [
       t('detail.unpair.confirmLead', { name: cur.display_name || cur.name || peerFp }),
-      dev
-        ? t('detail.unpair.confirmDevices', { out: dev.out_name || '', in: dev.in_name || '' })
+      devices.length
+        ? t('detail.unpair.confirmDevices', {
+          devices: listFormat(devices.map((device) => device.name || device.role)),
+        })
         : t('detail.unpair.confirmNoDevices'),
     ];
     if (!await confirmDialog({
@@ -369,22 +380,27 @@ export function DetailView() {
       {sheet === 'alias' ? <AliasSheet peer={peer} onClose={closeSheet} /> : null}
       {/* 危险操作的二级菜单（用户第 17 条）。按下「解除配对」**仍然**走原来那道
           确认框——两道不是冗余：Sheet 挡的是误触，确认框挡的是误判（它逐条列出
-          会从系统里消失的那两台设备）。 */}
+          会从系统里消失的实际虚拟设备）。 */}
       {sheet === 'danger' ? (
         <Sheet
           testid="detail-danger-sheet"
           title={t('detail.danger.title')}
           help={<Help label={t('wiki.unpair')} url={WIKI.unpair} testid="detail-danger-help" />}
+          dismissLabel={t('common.cancel')}
+          dismissDisabled={unpairing}
           onClose={closeSheet}
-        >
-          <div className="field-btn">
+          primaryAction={(
             <button
               className="btn danger" type="button" data-testid="detail-unpair"
               disabled={unpairing} onClick={() => void unpair()}
             >
               {t('detail.unpair')}
             </button>
-          </div>
+          )}
+        >
+          <p className="muted small">
+            {t('detail.unpair.confirmLead', { name: cur.display_name || cur.name || peerFp })}
+          </p>
         </Sheet>
       ) : null}
     </>

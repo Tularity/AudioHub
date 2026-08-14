@@ -84,9 +84,9 @@ use audiohub_core::latency::{DevLatency, DriftTracker, DropMode, StageDepth, Sta
 use audiohub_core::sysaudio::{self, VirtualCard};
 use audiohub_core::volume::{self, VolumeState, VolumeSync};
 use audiohub_ipc::{
-    IpcEndpoint, LatConfidence, MixHealth, Mode, OpenSessionParams, PipelineLatency,
-    PipelineStage, QualityStats, SessionInfo, SessionStats, IPC_VERSION, KIND_SPK, ORIGIN_HAL,
-    ORIGIN_PEER, ORIGIN_USER,
+    IpcEndpoint, LatConfidence, MixHealth, Mode, OpenSessionParams, PipelineLatency, PipelineStage,
+    QualityStats, SessionInfo, SessionStats, IPC_VERSION, KIND_SPK, ORIGIN_HAL, ORIGIN_PEER,
+    ORIGIN_USER,
 };
 use audiohub_net::discovery::{self, AnnounceGuard};
 use audiohub_net::identity::{LocalIdentity, PairedPeer};
@@ -509,7 +509,10 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         Ok(b) => {
             if let Some(br) = &b {
                 let st = br.status();
-                dlog!("hal bridge: driver_found={} name={hal_name}", st.driver_found);
+                dlog!(
+                    "hal bridge: driver_found={} name={hal_name}",
+                    st.driver_found
+                );
             }
             b.map(Arc::new)
         }
@@ -569,8 +572,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         airplay,
         halbridge: Mutex::new(hal_bridge),
         settings: Mutex::new(stored),
-        peer_transport: Mutex::new(peer_transport::PeerTransportStore::load(
-            &cfg_dir_for_state)),
+        peer_transport: Mutex::new(peer_transport::PeerTransportStore::load(&cfg_dir_for_state)),
         servo_site: Mutex::new(servo::ServoSite::default()),
         haldev: Mutex::new(haldev::HalDevState::new(haldev::SlotTable::load(
             &cfg_dir_for_state,
@@ -582,13 +584,20 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         recon: Mutex::new(HashMap::new()),
         dev_in_epoch: AtomicU64::new(0),
         dev_out_epoch: Arc::new(AtomicU64::new(0)),
-        devices: Mutex::new(None),
+        devices: DeviceInventory::production(),
         dev_lat: devlats::DevLatCache::new(),
         play_ring: StageSlot::new(),
         play_drift: Mutex::new(DriftTracker::new()),
         mix_clip: quality::ClipMeter::new(),
         mix_meter: quality::MixMeter::new(),
     });
+
+    // Device enumeration is an OS-service call on both supported platforms.
+    // In particular, a wedged CoreAudio HAL plug-in can make it wait forever.
+    // Prime the snapshot asynchronously now; IPC hello/status are deliberately
+    // unable to run the scanner themselves and remain available while this is
+    // still empty (or while a later refresh is stuck).
+    let _ = device_listing_snapshot(&inner);
 
     // Stored AirPlay state is daemon-owned just like discovery announcing.
     // Reconcile before the mixer starts so it cannot observe an uninitialised
@@ -700,9 +709,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     {
         install_signal_handlers();
         let i = inner.clone();
-        threads.push(spawn(
-            "ahb-signal",
-            Box::new(move || signal_watch_loop(i)))?);
+        threads.push(spawn("ahb-signal", Box::new(move || signal_watch_loop(i)))?);
     }
 
     Ok(DaemonHandle {
@@ -846,15 +853,15 @@ pub(crate) struct DaemonInner {
     /// against their own last-seen value, so one event drives every rebuild.
     pub dev_in_epoch: AtomicU64,
     pub dev_out_epoch: Arc<AtomicU64>,
-    pub devices: Mutex<Option<DeviceCache>>,
+    pub devices: Arc<DeviceInventory>,
     /// 规格 §3.2 的级 2 `cap_dev` 与级 9 `play_dev`：两个**默认设备**的固有延迟。
     ///
     /// 与 `play_ring` 同一条归属理由——它是**设备**属性，不属于任何一条会话，
     /// 所以挂在 daemon 上、按方向各一份。多条流报同一个 `play_dev` 是物理事实
     /// （规格 §7.2 R7），同样**不可跨流求和**。
     ///
-    /// 缓存与失效规则见 [`devlats::DevLatCache`]；它只在 1 s 的 ticker /
-    /// `session.list` 上被读，**不在音频节拍上**。
+    /// 缓存与失效规则见 [`devlats::DevLatCache`]；只有 1 s ticker 刷新系统
+    /// 属性，IPC / `session.list` 只拿快照，**不在音频节拍上**。
     pub dev_lat: devlats::DevLatCache,
     /// 真实默认输出的播放环深度（规格 §3.2 的级 8 `play_ring`），由混音线程
     /// 每 10 ms 发布。
@@ -875,10 +882,10 @@ pub(crate) struct DaemonInner {
     pub mix_meter: quality::MixMeter,
 }
 
-/// Device enumeration costs a system call per device and `daemon.status` sits
-/// on the IPC hello path, so the listing is cached briefly and dropped on any
-/// default-device change.
-pub(crate) struct DeviceCache {
+/// One completed system-device inventory. A stale snapshot is still useful:
+/// it is strictly better than making IPC availability depend on CoreAudio.
+#[derive(Clone)]
+struct DeviceCache {
     at: Instant,
     epoch: u64,
     outputs: Vec<String>,
@@ -887,28 +894,246 @@ pub(crate) struct DeviceCache {
 
 const DEVICE_CACHE_TTL: Duration = Duration::from_secs(2);
 
-pub(crate) fn device_listing(inner: &DaemonInner) -> (Vec<String>, Vec<VirtualCard>) {
+type DeviceScan = dyn Fn() -> (Vec<String>, Vec<VirtualCard>) + Send + Sync + 'static;
+
+#[derive(Default)]
+struct DeviceInventoryState {
+    snapshot: Option<DeviceCache>,
+    /// Protected by the same short-held mutex as `snapshot`: deciding to start
+    /// and marking the start is one operation, so a burst of IPC connections
+    /// can never fan out into a burst of stuck CoreAudio threads.
+    refreshing: bool,
+}
+
+/// Non-blocking facade around the platform device inventory.
+///
+/// The scanner is injected rather than hard-coded so the failure that matters
+/// here is testable: a platform call that never returns. No lock is held while
+/// it runs. At most one detached refresh exists; daemon shutdown must not wait
+/// for an OS audio service that may itself be wedged.
+pub(crate) struct DeviceInventory {
+    state: Mutex<DeviceInventoryState>,
+    scan: Arc<DeviceScan>,
+}
+
+impl DeviceInventory {
+    fn production() -> Arc<Self> {
+        Self::with_scanner(|| {
+            (
+                audio::list_output_devices(),
+                sysaudio::detect_virtual_cards(),
+            )
+        })
+    }
+
+    fn with_scanner(
+        scan: impl Fn() -> (Vec<String>, Vec<VirtualCard>) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(DeviceInventoryState::default()),
+            scan: Arc::new(scan),
+        })
+    }
+
+    /// Return immediately with the last completed snapshot (empty on the very
+    /// first call), scheduling one refresh when it is missing or stale.
+    fn snapshot(self: &Arc<Self>, epoch: u64) -> (Vec<String>, Vec<VirtualCard>) {
+        let (snapshot, start_refresh) = {
+            let mut state = lk(&self.state);
+            let fresh = state.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.epoch == epoch && snapshot.at.elapsed() < DEVICE_CACHE_TTL
+            });
+            let start_refresh = !fresh && !state.refreshing;
+            if start_refresh {
+                state.refreshing = true;
+            }
+            (state.snapshot.clone(), start_refresh)
+        };
+
+        if start_refresh {
+            self.spawn_refresh(epoch);
+        }
+
+        snapshot
+            .map(|snapshot| (snapshot.outputs, snapshot.cards))
+            .unwrap_or_default()
+    }
+
+    fn spawn_refresh(self: &Arc<Self>, epoch: u64) {
+        let weak = Arc::downgrade(self);
+        let scanner = self.scan.clone();
+        let spawned = std::thread::Builder::new()
+            .name("ahb-device-scan".into())
+            .spawn(move || {
+                // A platform backend should report failure as an empty list,
+                // but contain an unexpected panic as well: otherwise the flag
+                // would stay raised after the thread unwound and no healthy
+                // future refresh could repair the snapshot.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scanner()));
+                let Some(inventory) = weak.upgrade() else {
+                    return;
+                };
+                let mut state = lk(&inventory.state);
+                if let Ok((outputs, cards)) = result {
+                    state.snapshot = Some(DeviceCache {
+                        at: Instant::now(),
+                        epoch,
+                        outputs,
+                        cards,
+                    });
+                }
+                state.refreshing = false;
+            });
+
+        if let Err(error) = spawned {
+            lk(&self.state).refreshing = false;
+            dlog!("[audiohubd] device inventory refresh could not start: {error}");
+        }
+    }
+}
+
+/// IPC-safe device inventory access. This function never enumerates devices;
+/// it only clones a completed, bounded snapshot and optionally launches the
+/// single background refresher.
+pub(crate) fn device_listing_snapshot(inner: &DaemonInner) -> (Vec<String>, Vec<VirtualCard>) {
     let epoch = inner
         .dev_in_epoch
         .load(Ordering::Relaxed)
         .wrapping_add(inner.dev_out_epoch.load(Ordering::Relaxed));
-    {
-        let c = lk(&inner.devices);
-        if let Some(c) = c.as_ref() {
-            if c.epoch == epoch && c.at.elapsed() < DEVICE_CACHE_TTL {
-                return (c.outputs.clone(), c.cards.clone());
+    inner.devices.snapshot(epoch)
+}
+
+#[cfg(test)]
+mod device_inventory_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Condvar;
+
+    /// Regression for the macOS failure where CoreAudio wedged inside device
+    /// enumeration: every UI reconnect used to run the same call on its own IPC
+    /// thread, leaving an ever-growing pile of `ahb-ipc-conn` threads behind.
+    #[test]
+    fn blocked_refresh_returns_last_snapshot_and_coalesces_all_callers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let scan_calls = calls.clone();
+        let scan_gate = gate.clone();
+        let inventory = DeviceInventory::with_scanner(move || {
+            let call = scan_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return (vec!["old output".to_string()], Vec::new());
             }
+
+            let (lock, wake) = &*scan_gate;
+            let open = lk(lock);
+            // The timeout makes a failed assertion unable to strand the test
+            // process. Production has no such escape hatch; that is exactly
+            // why the IPC-facing path must tolerate a scanner that never ends.
+            let _ = wake
+                .wait_timeout_while(open, Duration::from_secs(2), |open| !*open)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (vec!["new output".to_string()], Vec::new())
+        });
+
+        // First read primes the async scanner and is allowed to be empty.
+        assert_eq!(inventory.snapshot(1).0, Vec::<String>::new());
+        let first_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let snapshot = inventory.snapshot(1).0;
+            if snapshot == ["old output"] {
+                break;
+            }
+            assert!(
+                Instant::now() < first_deadline,
+                "initial scan did not publish"
+            );
+            std::thread::sleep(Duration::from_millis(1));
         }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A new epoch hits from many client threads at once. Exactly one of
+        // them may start the deliberately blocked scan; every caller must
+        // still receive the old completed value and finish independently.
+        let readers = 32;
+        let start = Arc::new(std::sync::Barrier::new(readers + 1));
+        let mut reader_threads = Vec::new();
+        for _ in 0..readers {
+            let inventory = inventory.clone();
+            let start = start.clone();
+            reader_threads.push(std::thread::spawn(move || {
+                start.wait();
+                assert_eq!(inventory.snapshot(2).0, ["old output"]);
+            }));
+        }
+        let burst_started = Instant::now();
+        start.wait();
+        for reader in reader_threads {
+            reader.join().expect("snapshot reader panicked");
+        }
+        assert!(
+            burst_started.elapsed() < Duration::from_secs(1),
+            "snapshot readers waited for the platform scanner"
+        );
+
+        let entered_deadline = Instant::now() + Duration::from_secs(1);
+        while calls.load(Ordering::SeqCst) != 2 {
+            assert!(
+                Instant::now() < entered_deadline,
+                "blocked scanner was not entered"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        for _ in 0..128 {
+            assert_eq!(inventory.snapshot(2).0, ["old output"]);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "concurrent/stale readers started more than one refresh"
+        );
+
+        let (lock, wake) = &*gate;
+        *lk(lock) = true;
+        wake.notify_all();
+
+        let publish_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let snapshot = inventory.snapshot(2).0;
+            if snapshot == ["new output"] {
+                break;
+            }
+            assert!(
+                Instant::now() < publish_deadline,
+                "completed refresh did not replace the snapshot"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
-    let outputs = audio::list_output_devices();
-    let cards = sysaudio::detect_virtual_cards();
-    *lk(&inner.devices) = Some(DeviceCache {
-        at: Instant::now(),
-        epoch,
-        outputs: outputs.clone(),
-        cards: cards.clone(),
-    });
-    (outputs, cards)
+
+    #[test]
+    fn panicking_refresh_releases_the_single_refresh_gate() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scan_calls = calls.clone();
+        let inventory = DeviceInventory::with_scanner(move || {
+            if scan_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("injected platform scanner panic");
+            }
+            (vec!["recovered output".to_string()], Vec::new())
+        });
+
+        assert!(inventory.snapshot(9).0.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if inventory.snapshot(9).0 == ["recovered output"] {
+                break;
+            }
+            assert!(Instant::now() < deadline, "refresh gate stayed stuck");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 }
 
 /// spec-m4c §D: the platform watchers are created and dropped on ONE thread —
@@ -916,6 +1141,10 @@ pub(crate) fn device_listing(inner: &DaemonInner) -> (Vec<String>, Vec<VirtualCa
 /// unregisters it. The callbacks fire on a platform thread, so they do nothing
 /// but bump an epoch; every rebuild happens on the loop that owns the device.
 fn device_watch_loop(inner: Arc<DaemonInner>) {
+    let mut announced_epoch = (
+        inner.dev_in_epoch.load(Ordering::Relaxed),
+        inner.dev_out_epoch.load(Ordering::Relaxed),
+    );
     let mut guards = Vec::new();
     for (kind, label) in [(DeviceKind::Input, "input"), (DeviceKind::Output, "output")] {
         let i = inner.clone();
@@ -933,6 +1162,16 @@ fn device_watch_loop(inner: Arc<DaemonInner>) {
     }
     while !inner.shutdown.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
+        let epoch = (
+            inner.dev_in_epoch.load(Ordering::Relaxed),
+            inner.dev_out_epoch.load(Ordering::Relaxed),
+        );
+        if epoch != announced_epoch {
+            announced_epoch = epoch;
+            // The platform callback remains non-blocking: endpoint discovery
+            // and encrypted fan-out happen here on the watcher owner thread.
+            conn::announce_audio_capabilities(&inner);
+        }
     }
     drop(guards); // unregisters
 }
@@ -1134,10 +1373,10 @@ fn mux_status(inner: &DaemonInner) -> serde_json::Value {
 
 /// `daemon.status.latency_guard.dev_lat`：两台默认设备的固有延迟现场。
 ///
-/// 走缓存（`dev_lats()` 会按需刷新），所以 `daemon.status` 不会变成一条
-/// 「每次调用都问四遍 CoreAudio」的路径。
+/// 只读 ticker 上一次完成的缓存。这里绝不能「按需刷新」：CoreAudio 故障时
+/// status 是 UI 判断 daemon 仍活着的生命线，不能让每条 IPC 连接各自陪等。
 fn dev_lats_status(inner: &DaemonInner) -> serde_json::Value {
-    let lats = dev_lats(inner);
+    let lats = dev_lats_snapshot(inner);
     serde_json::json!({
         "cap_dev_ms": lats.input.ms(),
         "play_dev_ms": lats.output.ms(),
@@ -1158,7 +1397,9 @@ fn declared_status(inner: &DaemonInner) -> serde_json::Value {
         if rec.fingerprint.is_empty() {
             continue;
         }
-        lines.push(devdecl::line(&format!("slot {slot} spk ({})", rec.fingerprint), &rec.decl_out,
+        lines.push(devdecl::line(
+            &format!("slot {slot} spk ({})", rec.fingerprint),
+            &rec.decl_out,
         ));
     }
     serde_json::json!({
@@ -1466,6 +1707,14 @@ pub(crate) struct ConnShared {
     /// field exists to prevent, just delayed — an entry that says "usable"
     /// about a machine that has since become a consumer.
     pub(crate) peer_mode: Mutex<PeerModeCell>,
+    /// What this peer says its real default audio endpoints are right now.
+    ///
+    /// Connection-scoped for the same reason as `peer_mode`: after a channel
+    /// dies, its last advertisement is history rather than a statement about
+    /// what the peer can serve now. The receiving peer uses this only for
+    /// presentation/device coordination; OpenStream acceptance is enforced by
+    /// the machine that owns the endpoint.
+    pub(crate) peer_audio_capabilities: Mutex<PeerAudioCapabilitiesCell>,
 }
 
 /// The peer's advertised mode, with "unknown" and "unrecognised" kept apart.
@@ -1505,6 +1754,67 @@ impl PeerModeCell {
             PeerModeCell::Unrecognised => true,
             PeerModeCell::Unheard => false,
         }
+    }
+}
+
+/// The peer's two endpoint facts, preserving "not heard yet" independently
+/// from the explicit false and true values carried on the wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum PeerAudioCapabilitiesCell {
+    #[default]
+    Unheard,
+    Known {
+        default_input: bool,
+        default_output: bool,
+    },
+}
+
+impl PeerAudioCapabilitiesCell {
+    pub(crate) fn known(self) -> Option<(bool, bool)> {
+        match self {
+            Self::Unheard => None,
+            Self::Known {
+                default_input,
+                default_output,
+            } => Some((default_input, default_output)),
+        }
+    }
+
+    pub(crate) fn default_input(self) -> Option<bool> {
+        self.known().map(|(input, _)| input)
+    }
+
+    pub(crate) fn default_output(self) -> Option<bool> {
+        self.known().map(|(_, output)| output)
+    }
+}
+
+#[cfg(test)]
+mod peer_audio_capability_tests {
+    use super::PeerAudioCapabilitiesCell;
+
+    #[test]
+    fn unknown_false_and_true_remain_three_distinct_states() {
+        let unknown = PeerAudioCapabilitiesCell::Unheard;
+        assert_eq!(unknown.known(), None);
+        assert_eq!(unknown.default_input(), None);
+        assert_eq!(unknown.default_output(), None);
+
+        let absent = PeerAudioCapabilitiesCell::Known {
+            default_input: false,
+            default_output: false,
+        };
+        assert_eq!(absent.known(), Some((false, false)));
+        assert_eq!(absent.default_input(), Some(false));
+        assert_eq!(absent.default_output(), Some(false));
+
+        let present = PeerAudioCapabilitiesCell::Known {
+            default_input: true,
+            default_output: true,
+        };
+        assert_eq!(present.known(), Some((true, true)));
+        assert_eq!(present.default_input(), Some(true));
+        assert_eq!(present.default_output(), Some(true));
     }
 }
 
@@ -1662,7 +1972,8 @@ pub(crate) enum PongOutcome {
 
 impl ClockFilter {
     pub(crate) fn new() -> ClockFilter {
-        ClockFilter { win: VecDeque::new(),
+        ClockFilter {
+            win: VecDeque::new(),
         }
     }
 
@@ -1768,6 +2079,13 @@ pub(crate) struct SessionEntry {
     pub conn: Arc<ConnShared>,
     pub kind: String, // OpenStream kind label, same on both sides
     pub dir: String,  // local perspective: "send" = we emit media
+    /// Media source from the opener's `OpenStream`, when one was named.
+    ///
+    /// This is deliberately kept even for peer-originated sessions, whose
+    /// `replay` is `None`: if the real default input disappears, `mic` (and an
+    /// omitted source, which means `mic`) must close, while `tone`, `sysaudio`
+    /// and `halspk` remain valid alternate sources.
+    pub source: Option<String>,
     pub rx: Option<Arc<RxStream>>,
     pub tx: Option<Arc<TxShared>>,
     pub volume: Arc<VolumeCell>,
@@ -1977,7 +2295,9 @@ pub(crate) struct PeerLatCell {
 
 impl PeerLatCell {
     pub(crate) fn new() -> PeerLatCell {
-        PeerLatCell { win: Mutex::new(VecDeque::new()), mismatch_warned: AtomicBool::new(false),
+        PeerLatCell {
+            win: Mutex::new(VecDeque::new()),
+            mismatch_warned: AtomicBool::new(false),
         }
     }
 
@@ -2024,7 +2344,13 @@ impl PeerLatCell {
         if win.len() == PEER_REPORT_WINDOW {
             win.pop_front();
         }
-        win.push_back(PeerReport { at, seq_us, stages, local_ms, dev, quality,
+        win.push_back(PeerReport {
+            at,
+            seq_us,
+            stages,
+            local_ms,
+            dev,
+            quality,
         });
         drop(win);
 
@@ -2046,7 +2372,10 @@ impl PeerLatCell {
     pub(crate) fn snapshot(&self) -> Option<PeerLatSnapshot> {
         let mut win = lk(&self.win);
         // 陈到不能用的整条丢掉。年龄用本机 `Instant`，见 `PeerReport::at`。
-        while win.front().map_or(false, |p| p.at.elapsed() > PEER_REPORT_MAX_AGE) {
+        while win
+            .front()
+            .map_or(false, |p| p.at.elapsed() > PEER_REPORT_MAX_AGE)
+        {
             win.pop_front();
         }
         let newest = win.back()?;
@@ -2423,7 +2752,9 @@ impl RxStream {
                 half_conceal: 0,
                 conceal: quality::ConcealWindow::new(),
             }),
-            post: Mutex::new(PostMix { fifo: VecDeque::new(), dropped: 0,
+            post: Mutex::new(PostMix {
+                fifo: VecDeque::new(),
+                dropped: 0,
             }),
             ring: verify_freq.map(|_| Mutex::new(VecDeque::new())),
             stats: Mutex::new(RxCell {
@@ -2638,7 +2969,11 @@ impl TxShared {
     /// 把线性增益编成 [`TxShared::send_gain`] 的存储形态。非有限值读作 1.0：
     /// 这是把 NaN 挡在 10 ms 线程之外的第一道（第二道在 `dsp::SendGain::set_target`）。
     pub(crate) fn gain_bits(gain: f32) -> u32 {
-        let g = if gain.is_finite() { gain.clamp(0.0, 1.0) } else { 1.0 };
+        let g = if gain.is_finite() {
+            gain.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         g.to_bits()
     }
 
@@ -2698,7 +3033,7 @@ pub(crate) fn build_session_infos(inner: &DaemonInner) -> Vec<SessionInfo> {
     };
     // 逐级延迟会计**全部**在装配层一次算完（见 `assemble_pipelines`）：
     // N 条流进，N 条读数出，第 i 条只由第 i 条流自己的队列决定。
-    let lats = dev_lats(inner);
+    let lats = dev_lats_snapshot(inner);
     let pipelines = assemble_pipelines(
         &inner.play_ring,
         &inner.play_drift,
@@ -2734,11 +3069,16 @@ pub(crate) fn build_session_infos(inner: &DaemonInner) -> Vec<SessionInfo> {
 /// 刻意不含 `conn`、不含 `SessionEntry`：见 `assemble_pipelines` 的文档。
 /// 这也是这一层能被测试驱动的原因——`SessionEntry.conn` 要一条真 TCP 与一次
 /// 完整握手才造得出来，收它当参数就等于把装配层永久挡在测试之外。
-/// 两个默认设备此刻的固有延迟读数。带缓存，见 [`devlats::DevLatCache`]。
-///
-/// epoch 的合成方式与 `device_listing` **逐字相同**（两个方向相加）：
-/// 任一方向的默认设备变了都要重查，因为一条流的头和尾分别挂在两边。
-pub(crate) fn dev_lats(inner: &DaemonInner) -> devlats::DevLats {
+/// IPC/报告路径读两个默认设备最近一次完成的固有延迟快照。绝不访问系统音频
+/// 服务；首次后台刷新完成前如实返回 `Unavailable`。
+pub(crate) fn dev_lats_snapshot(inner: &DaemonInner) -> devlats::DevLats {
+    inner.dev_lat.snapshot()
+}
+
+/// 在唯一的 1 s ticker 上刷新固有延迟。epoch 的合成方式与
+/// `device_listing_snapshot` **逐字相同**（两个方向相加）：任一方向的默认设备
+/// 变了都要重查，因为一条流的头和尾分别挂在两边。
+fn refresh_dev_lats(inner: &DaemonInner) -> devlats::DevLats {
     let epoch = inner
         .dev_in_epoch
         .load(Ordering::Relaxed)
@@ -3285,7 +3625,7 @@ fn local_pipeline(inner: &DaemonInner, e: &SessionEntry) -> Option<PipelineLaten
         e.dir == DIR_SEND,
         e.tx.as_deref().is_some_and(has_capture_stage),
         e.rx.as_deref().is_some_and(renders_to_default_output),
-        dev_lats(inner),
+        dev_lats_snapshot(inner),
     );
     let mut p = build_pipeline(e, dev)?;
     if let Some(rx) = &e.rx {
@@ -3359,8 +3699,8 @@ fn peer_quality_payload(
     let rx = e.rx.as_ref()?;
     // 与 `build_session_info_with` 里那份**同一个判据**，故意重复取值而不是
     // 抽一个共用变量：两处若分了岔，用户会在两台机器上看到同一条流两个等级。
-    let duplicate = (rx.is_spk || rx.monitor)
-        && build_mix_health(inner).map_or(false, |h| h.duplicate_suspect);
+    let duplicate =
+        (rx.is_spk || rx.monitor) && build_mix_health(inner).map_or(false, |h| h.duplicate_suspect);
     // 锁各拿各的、不嵌套（`sample_telemetry` 上的锁序说明）。
     //
     // `last_rate` 就是媒体包头里的 `sample_rate`（`engine.rs` 的
@@ -3560,7 +3900,7 @@ pub(crate) fn build_session_info(
     let pipeline = assemble_pipelines(
         &inner.play_ring,
         &inner.play_drift,
-        vec![StreamLat::of(e, dev_lats(inner))],
+        vec![StreamLat::of(e, dev_lats_snapshot(inner))],
     )
     .pop()
     .flatten();
@@ -3594,19 +3934,25 @@ fn build_session_info_with(
         rung_changes: 0,
         verdict: None,
         mix_verdicts: None,
-        volume: if e.volume.enabled { *lk(&e.volume.state) } else { None },
+        volume: if e.volume.enabled {
+            *lk(&e.volume.state)
+        } else {
+            None
+        },
         // plan §7.2。读的是**旗标**而不是 `volume.adjustable`：两者是两句不同的话
         // （对端设备的事实 vs 本机此刻在不在兜底里），见 `VolumeCell::software_gain`。
-        volume_software_gain: e.volume.enabled
-            && e.volume.software_gain.load(Ordering::Relaxed),
+        volume_software_gain: e.volume.enabled && e.volume.software_gain.load(Ordering::Relaxed),
         pipeline: None,
         // 目标档随每条流一起报（plan §14 裁定 4：界面必须说清「这是目标」）。
         // 取自**执行器手边的那份原子量**，不是设置的副本——设置的副本正是
         // 本项目栽过六次的那个东西。
-        latency_target: e.rx.as_ref().and_then(|rx| match rx.transport.latency_target() {
-            audiohub_ipc::LatencyTarget::Auto => None,
-            t => Some(t.as_wire()),
-        }),
+        latency_target: e
+            .rx
+            .as_ref()
+            .and_then(|rx| match rx.transport.latency_target() {
+                audiohub_ipc::LatencyTarget::Auto => None,
+                t => Some(t.as_wire()),
+            }),
         quality_target: e
             .tx
             .as_ref()
@@ -3645,7 +3991,12 @@ fn build_session_info_with(
     // 目标是谁定的。`origin == Peer` ⇒ 本机是提供者，档位由使用方推来。
     if s.latency_target.is_some() || s.quality_target.is_some() {
         s.target_from = Some(
-            if e.origin == SessionOrigin::Peer { "peer" } else { "local" }.to_string(),
+            if e.origin == SessionOrigin::Peer {
+                "peer"
+            } else {
+                "local"
+            }
+            .to_string(),
         );
     }
     // 这条流**线上的采样率**（Hz）。收方取媒体包头，发方取自己阶梯格号对应的速率。
@@ -3932,6 +4283,12 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
             }
         }
         let entries = snapshot_sessions(&inner);
+        // The ticker is the single owner of platform latency refreshes. Do it
+        // before either StageReport or `latency_pass` consumes the snapshot so
+        // their "same reading" invariant remains true. If the OS audio service
+        // wedges, only this background thread waits; every IPC report keeps
+        // serving the last completed values.
+        let _ = refresh_dev_lats(&inner);
         autos.retain(|id, _| entries.iter().any(|e| e.id == *id && e.tx.is_some()));
         // 遥测的 1 s 心跳：喂漂移窗口、补 Q1 采样点。放在 ticker 而不是音频
         // 节拍上，是因为线性回归与 `Mutex` 都不允许出现在 10 ms 循环里
@@ -4083,7 +4440,10 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                             AutoLadder::new()
                         };
                         tx.rung.store(ladder.top_rung(), Ordering::Relaxed);
-                        AutoCell { ladder, last_seq: 0, streamed,
+                        AutoCell {
+                            ladder,
+                            last_seq: 0,
+                            streamed,
                         }
                     });
                     // Tier 1/2: the primary signal is **local** (our own send
@@ -4159,8 +4519,10 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
 /// 就会出现「界面说 121 ms、伺服认为已达标、而 CoreAudio 被告知 79 ms」这种
 /// 谁也查不出来的三方分歧。这一层算一次、发下去，于是按定义不可能分岔。
 fn latency_pass(inner: &Arc<DaemonInner>, entries: &[SessionEntry]) {
-    // ⚠ **本轮起 `sum_ms` 里含两台声卡的固有延迟**（`devlats` 接的线）。
-    let lats = dev_lats(inner);
+    // The ticker refreshed this snapshot once before its per-session pass.
+    // Reading it again here preserves one sample for both consumers without a
+    // second platform query if the first one itself took longer than the TTL.
+    let lats = dev_lats_snapshot(inner);
     let pipelines = assemble_pipelines(
         &inner.play_ring,
         &inner.play_drift,
@@ -4199,9 +4561,7 @@ fn declare_pass(
         for slot in 0..halbridge::HAL_MAX_SLOTS {
             let (fp, generation) = {
                 let rec = &st.slots[slot];
-                if rec.fingerprint.is_empty()
-                    || rec.state != Some(halbridge::HalSlotState::Bound)
-                {
+                if rec.fingerprint.is_empty() || rec.state != Some(halbridge::HalSlotState::Bound) {
                     continue;
                 }
                 (rec.fingerprint.clone(), rec.generation)
@@ -4226,7 +4586,8 @@ fn declare_pass(
             // 没有 `fresh` 时**什么都不做**，而不是把 `want` 清成 0：
             // 一次测不到（对端刚断、某一级读不到）不是「这条路变成零延迟了」。
             // 驱动保持它上一个测出来的值，那仍然是一个测出来的值。
-            let Some(want) = rec.decl_out.want else { continue;
+            let Some(want) = rec.decl_out.want else {
+                continue;
             };
             if !devdecl::should_send(&rec.decl_out, want) {
                 continue;
@@ -4271,16 +4632,14 @@ pub(crate) fn publish_targets(inner: &DaemonInner, entries: &[SessionEntry]) {
                 // 对端没表态 ⇒ AUTO。**不是 0**，也不是本机存的那一份：
                 // 本机存的那份在共享模式下对任何链路都不生效，拿它去驱动
                 // 一条由对端指挥的流，就是替对端做了一个它没做过的决定。
-                None => lk(&e.pushed.rx_latency)
-                    .unwrap_or(audiohub_ipc::LatencyTarget::Auto),
+                None => lk(&e.pushed.rx_latency).unwrap_or(audiohub_ipc::LatencyTarget::Auto),
             };
             rx.transport.publish_latency(lat);
         }
         if let Some(tx) = &e.tx {
             let q = match &mine {
                 Some(t) => t.send.quality_target(),
-                None => lk(&e.pushed.tx_quality)
-                    .unwrap_or(audiohub_ipc::QualityTarget::Auto),
+                None => lk(&e.pushed.tx_quality).unwrap_or(audiohub_ipc::QualityTarget::Auto),
             };
             tx.transport.publish_quality(q);
         }
@@ -4392,7 +4751,11 @@ fn servo_by_stream(inner: &DaemonInner) -> serde_json::Value {
             // 两者在同一个 `target_ms` 上长得一模一样，只有这里能分开。
             obj.insert(
                 "target_from".into(),
-                serde_json::json!(if e.origin == SessionOrigin::Peer { "peer" } else { "local" }),
+                serde_json::json!(if e.origin == SessionOrigin::Peer {
+                    "peer"
+                } else {
+                    "local"
+                }),
             );
         }
         m.insert(e.id.to_string(), o);
@@ -4597,7 +4960,8 @@ fn owner_alive(ep: &IpcEndpoint) -> bool {
 /// Refuse to overwrite a live daemon's endpoint file: two daemons sharing a
 /// config dir silently hijack each other's ipc.json and either exit deletes it.
 fn ensure_endpoint_unowned(dir: &Path) -> Result<()> {
-    let Some(ep) = read_ipc_json(dir) else { return Ok(());
+    let Some(ep) = read_ipc_json(dir) else {
+        return Ok(());
     };
     if owner_alive(&ep) {
         bail!(
@@ -4685,8 +5049,8 @@ mod telemetry_tests {
     #[test]
     fn one_unreadable_stage_makes_the_whole_sum_none() {
         let good = vec![
-            stage(StageId::JitterBuf, 960, 48_000),  // 20 ms
-            stage(StageId::PostMix, 480, 48_000),    // 10 ms
+            stage(StageId::JitterBuf, 960, 48_000), // 20 ms
+            stage(StageId::PostMix, 480, 48_000),   // 10 ms
         ];
         assert_eq!(sum_stage_ms(&good), Some(30.0));
 
@@ -4729,8 +5093,16 @@ mod telemetry_tests {
         assert_eq!(s.samples, 4_410, "环里排着的就是刚 push 进去的那些");
         assert_eq!(s.capacity, 44_100, "播放环容量 = 1 秒设备速率");
         assert_eq!(s.rate, 44_100, "**设备**速率，不是 48000");
-        assert_eq!(s.ms, Some(100.0), "4410 / 44100 = 100 ms（按 48k 算会是 91.875）");
-        assert_eq!(s.drop_mode, DropMode::Newest, "push_slice 短写：丢的是新样本");
+        assert_eq!(
+            s.ms,
+            Some(100.0),
+            "4410 / 44100 = 100 ms（按 48k 算会是 91.875）"
+        );
+        assert_eq!(
+            s.drop_mode,
+            DropMode::Newest,
+            "push_slice 短写：丢的是新样本"
+        );
         assert_eq!(s.dropped, Some(0));
         assert!(!s.saturated);
 
@@ -4786,7 +5158,9 @@ mod telemetry_tests {
     /// 丢弃行为本身与改动前逐字相同（`drain(..excess)`）。
     #[test]
     fn post_mix_overflow_drops_oldest_and_counts_it() {
-        let mut pm = PostMix { fifo: VecDeque::new(), dropped: 0,
+        let mut pm = PostMix {
+            fifo: VecDeque::new(),
+            dropped: 0,
         };
         let mut out = [0.0f32; 480];
         // 灌进远超 100 ms 上限的音频：6000 样本 -> 取走 480 -> 剩 5520 > 4800
@@ -4804,7 +5178,9 @@ mod telemetry_tests {
     /// 没溢出时不能凭空记丢弃。
     #[test]
     fn post_mix_within_budget_drops_nothing() {
-        let mut pm = PostMix { fifo: VecDeque::new(), dropped: 0,
+        let mut pm = PostMix {
+            fifo: VecDeque::new(),
+            dropped: 0,
         };
         let mut out = [0.0f32; 480];
         pm.advance(Some(vec![0.5; 960]), &mut out);
@@ -4879,11 +5255,15 @@ mod telemetry_tests {
     fn an_unmeasured_clip_component_leaves_the_grade_undecided() {
         let rx = rx_stream();
         seed_conceal(&rx, 996, 4); // Q1 = (4+0)/1000 = 0.4% -> Good
-        // 削顶页还没攒满
+                                   // 削顶页还没攒满
         assert!(rx.clip.window().is_none(), "前提：这一页还没完成");
 
-        let q = build_quality(&rx, 48_000, Some(audiohub_core::dsp::WireDepth::S16), false).expect("Q1/Q3 有读数 ⇒ 分量明细照给");
-        assert_eq!(q.clip_ratio, None, "还没测 ⇒ None。填 0 会说成『测了，一点没削』");
+        let q = build_quality(&rx, 48_000, Some(audiohub_core::dsp::WireDepth::S16), false)
+            .expect("Q1/Q3 有读数 ⇒ 分量明细照给");
+        assert_eq!(
+            q.clip_ratio, None,
+            "还没测 ⇒ None。填 0 会说成『测了，一点没削』"
+        );
         assert_eq!(q.clip_excess_db, None);
         assert!(q.partial, "木桶少了一块板，必须说出来");
         assert_eq!(
@@ -4897,7 +5277,8 @@ mod telemetry_tests {
 
         // 同一条流，页攒满之后：Q2 立刻把等级拉到底，并指名是电平的问题。
         flip_a_loud_clip_page(&rx.clip);
-        let q = build_quality(&rx, 48_000, Some(audiohub_core::dsp::WireDepth::S16), false).expect("三分量齐全");
+        let q = build_quality(&rx, 48_000, Some(audiohub_core::dsp::WireDepth::S16), false)
+            .expect("三分量齐全");
         assert_eq!(q.clip_ratio, Some(1.0), "整页都在越界");
         assert!(!q.partial);
         assert_eq!(q.grade, "poor");
@@ -4916,7 +5297,8 @@ mod telemetry_tests {
         seed_conceal(&rx, 900, 100); // Q1 = 100/1000 = 10% -> Poor
         assert!(rx.clip.window().is_none(), "前提：削顶页仍未完成");
 
-        let q = build_quality(&rx, 48_000, Some(audiohub_core::dsp::WireDepth::S16), false).expect("有结论");
+        let q = build_quality(&rx, 48_000, Some(audiohub_core::dsp::WireDepth::S16), false)
+            .expect("有结论");
         assert_eq!(q.grade, "poor", "断续已经触底，削顶再差也压不下去");
         assert_eq!(q.worst, "continuity");
         assert!(q.partial, "等级确定，但木桶确实少了一块板 —— 两件事都要说");
@@ -4938,7 +5320,11 @@ mod telemetry_tests {
         let v: serde_json::Value = serde_json::to_value(&h).unwrap();
         assert!(v["clip_ratio"].is_null(), "还没测 ⇒ null，不是 0");
         assert!(v["clip_excess_db"].is_null());
-        let measured = MixHealth { clip_ratio: Some(0.0), clip_excess_db: Some(-120.0), ..h };
+        let measured = MixHealth {
+            clip_ratio: Some(0.0),
+            clip_excess_db: Some(-120.0),
+            ..h
+        };
         let v: serde_json::Value = serde_json::to_value(&measured).unwrap();
         assert_eq!(v["clip_ratio"], 0.0, "真的 0 必须与 null 区分得开");
     }
@@ -4950,7 +5336,8 @@ mod telemetry_tests {
         let rx = rx_stream();
         seed_conceal(&rx, 1000, 0); // Q1 = 0 -> Excellent
         assert!(rx.clip.window().is_none());
-        let q = build_quality(&rx, 48_000, Some(audiohub_core::dsp::WireDepth::S16), true).expect("有结论");
+        let q = build_quality(&rx, 48_000, Some(audiohub_core::dsp::WireDepth::S16), true)
+            .expect("有结论");
         assert_eq!(q.grade, "poor", "两路重复流相加把整段波形 ×2");
         assert_eq!(q.worst, "level");
         assert!(!q.partial, "一票否决是实测结论，不是缺席");
@@ -5092,12 +5479,21 @@ mod telemetry_tests {
             matches!(p.confidence, LatConfidence::LocalOnly),
             "P0a 只有本侧分项，对端没上报 —— 不猜、不用 RTT 顶替"
         );
-        assert!(p.net_ms.is_none(), "RTT 只能当一段，且现在还没有可信的单程值");
-        assert!(p.sum_ms.is_none(), "对端分项缺失 ⇒ 总和无从谈起，绝不用 0 填补");
+        assert!(
+            p.net_ms.is_none(),
+            "RTT 只能当一段，且现在还没有可信的单程值"
+        );
+        assert!(
+            p.sum_ms.is_none(),
+            "对端分项缺失 ⇒ 总和无从谈起，绝不用 0 填补"
+        );
         // 设备级由**调用方**给（本例传 `None`）。三态的分界线在这里就要钉住：
         // `None` = 这条流路径上没有那台声卡；`Some(unavailable)` = 有但读不到。
         // 两者在求和里的行为**相反**（贡献 0 / 否决总数），混起来只差一个字符。
-        assert_eq!(p.dev, None, "调用方传的是「本流没有设备级」，构建函数不许自作主张编一个");
+        assert_eq!(
+            p.dev, None,
+            "调用方传的是「本流没有设备级」，构建函数不许自作主张编一个"
+        );
         let with_dead_device =
             build_pipeline_from(false, None, Some(&rx), Some(DevLatency::unavailable()))
                 .expect("有分项");
@@ -5128,7 +5524,11 @@ mod telemetry_tests {
         }));
         let p = build_pipeline_from(true, Some(&tx), None, None).expect("有分项");
         assert_eq!(p.side, "send");
-        assert_eq!(p.stages.len(), 1, "第二个槽是空的 ⇒ 不占位，不报 0 样本的假读数");
+        assert_eq!(
+            p.stages.len(),
+            1,
+            "第二个槽是空的 ⇒ 不占位，不报 0 样本的假读数"
+        );
         assert_eq!(p.stages[0].id, "src_fifo");
         assert_eq!(p.stages[0].ms, Some(500.0));
         assert_eq!(p.stages[0].dropped, Some(11));
@@ -5172,7 +5572,10 @@ mod telemetry_tests {
             ))
         };
         let slope_now = |tx: &TxShared| {
-            build_pipeline_from(true, Some(tx), None, None).unwrap().stages[0].drift_sps
+            build_pipeline_from(true, Some(tx), None, None)
+                .unwrap()
+                .stages[0]
+                .drift_sps
         };
 
         let tx = TxShared::new();
@@ -5182,7 +5585,10 @@ mod telemetry_tests {
             sample_tx_drift(i as f32, &tx);
         }
         let before = slope_now(&tx).expect("旧源确实在漂");
-        assert!((before - 480.0).abs() < 1.0, "前提：旧源斜率 ≈ +480, got {before}");
+        assert!(
+            (before - 480.0).abs() < 1.0,
+            "前提：旧源斜率 ≈ +480, got {before}"
+        );
 
         // 源被收尸：`tx_loop` 的 clear_send_stages 把槽清空，`TxShared` 还活着。
         tx.stages[0].store(None);
@@ -5334,7 +5740,10 @@ mod telemetry_tests {
         tx.stages[2].store(Some(StageDepth::send_pace()));
         let p = build_pipeline_from(true, Some(&tx), None, None).expect("有分项");
         let ids: Vec<&str> = p.stages.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"send_pace"), "组帧节拍必须出现在分项里, got {ids:?}");
+        assert!(
+            ids.contains(&"send_pace"),
+            "组帧节拍必须出现在分项里, got {ids:?}"
+        );
         assert_eq!(p.local_ms, Some(105.0), "100 + 5；漏掉节拍会报 100");
         let pace = p.stages.iter().find(|s| s.id == "send_pace").unwrap();
         assert_eq!(pace.ms, Some(5.0));
@@ -5399,7 +5808,10 @@ mod telemetry_tests {
         assert_eq!(v["local_ms"], 400.0);
         assert!(v["sum_ms"].is_null(), "对端分项缺失 ⇒ 总和必须是 null");
         let st = &v["stages"][0];
-        assert_eq!(st["id"], "hal_spk", "级 id 与 metrics.ts 的 LATENCY_STAGES 一致");
+        assert_eq!(
+            st["id"], "hal_spk",
+            "级 id 与 metrics.ts 的 LATENCY_STAGES 一致"
+        );
         assert_eq!(st["ms"], 400.0);
         assert_eq!(st["drop_mode"], "newest");
         assert_eq!(
@@ -5408,7 +5820,10 @@ mod telemetry_tests {
         );
         // drift ≈ 0 + 不饱和 + dropped 不可观测 ⇒ 「收支平衡但永远迟到」。
         assert_eq!(st["drift_sps"], 0.0);
-        assert!(st["dropped"].is_null(), "驱动侧的丢弃观测不到 ⇒ null，不是 0");
+        assert!(
+            st["dropped"].is_null(),
+            "驱动侧的丢弃观测不到 ⇒ null，不是 0"
+        );
         assert_eq!(v["dev"]["source"], "unavailable");
 
         let q = QualityStats {
@@ -5447,7 +5862,12 @@ mod telemetry_tests {
 
         // 削顶页还没攒满：**null 而不是 0**，并且 partial 说出「木桶少了一块板」。
         // 这两个字段是「还没测」与「测了，确实静音」之间唯一的区别。
-        let unmeasured = QualityStats { clip_ratio: None, clip_excess_db: None, partial: true, ..q };
+        let unmeasured = QualityStats {
+            clip_ratio: None,
+            clip_excess_db: None,
+            partial: true,
+            ..q
+        };
         let v: serde_json::Value = serde_json::to_value(&unmeasured).unwrap();
         assert!(v["clip_ratio"].is_null(), "还没测 ⇒ null，绝不是 0");
         assert!(v["clip_excess_db"].is_null());
@@ -5592,13 +6012,19 @@ mod telemetry_tests {
         }
         let e = f.estimate().expect("RTT 不需要对端时戳");
         assert_eq!(e.min_rtt_us, 300);
-        assert!(e.offset_us.is_none(), "对端没给时戳 ⇒ θ 必须是 None，绝不是 0");
+        assert!(
+            e.offset_us.is_none(),
+            "对端没给时戳 ⇒ θ 必须是 None，绝不是 0"
+        );
 
         let mut p = send_pipeline(9_600);
         attach_peer_and_net(&mut p, None, Some(e));
         assert_eq!(p.net_ms, Some(0.15), "网络段照常成立");
         assert!(p.clock_offset_us.is_none());
-        assert!(p.clock_unc_us.is_none(), "θ 不存在 ⇒ 它的不确定度也不该出现");
+        assert!(
+            p.clock_unc_us.is_none(),
+            "θ 不存在 ⇒ 它的不确定度也不该出现"
+        );
     }
 
     /// 对端 daemon 重启（时基从 0 重来）⇒ θ 整体平移 ⇒ 整窗作废。
@@ -5635,7 +6061,10 @@ mod telemetry_tests {
         feed(&mut f, 8, 0, 150, 150);
         let before = f.len();
         // 未来的 t1（负 RTT）
-        assert_eq!(f.note_pong(9_000_000, 8_000_000, None), PongOutcome::Implausible);
+        assert_eq!(
+            f.note_pong(9_000_000, 8_000_000, None),
+            PongOutcome::Implausible
+        );
         // 荒谬大的往返（> 2 s）
         assert_eq!(f.note_pong(0, 5_000_000, None), PongOutcome::Implausible);
         assert_eq!(f.len(), before, "坏样本一个都不许进窗");
@@ -5711,7 +6140,10 @@ mod telemetry_tests {
         assert!(p.peer_age_s.is_none());
         assert_eq!(p.confidence, LatConfidence::LocalOnly);
         assert_eq!(p.net_ms, Some(0.15), "网络段自己是成立的");
-        assert!(p.sum_ms.is_none(), "对端那一半缺席 ⇒ 总和必须 None，不许拿 RTT 顶");
+        assert!(
+            p.sum_ms.is_none(),
+            "对端那一半缺席 ⇒ 总和必须 None，不许拿 RTT 顶"
+        );
     }
 
     /// 总和 = 本侧 Σ + **恰好一段**网络 + 对端 Σ。
@@ -5740,7 +6172,10 @@ mod telemetry_tests {
         // `send_pipeline` 传的是 `dev = None`（这条构造流没有采集设备），
         // 对端的 `cell_reporting` 也不带 `dev`。前提与结论一起断言，否则前提
         // 变了而结论没跟着变，读数会静默地从下限变成谎话。
-        assert_eq!(p.dev, None, "本条的前提是「没有设备级」，不是「设备级读不到」");
+        assert_eq!(
+            p.dev, None,
+            "本条的前提是「没有设备级」，不是「设备级读不到」"
+        );
         assert_eq!(p.peer_dev, None);
         assert!(
             !devlats::both_exact(p.dev, p.peer_dev),
@@ -5771,15 +6206,24 @@ mod telemetry_tests {
     /// ⇒ 第二个断言红，且红出来的差值就是被吞掉的那一段。
     #[test]
     fn wiring_the_device_stages_raises_the_total_by_exactly_those_two_stages() {
-        let cap = DevLatency { frames: 480, rate: 48_000, source: LatSource::Api,
+        let cap = DevLatency {
+            frames: 480,
+            rate: 48_000,
+            source: LatSource::Api,
         };
         // 30-win 实测的那 2012 帧：`written − IAudioClock::GetPosition()`
-        let play = DevLatency { frames: 2_012, rate: 48_000, source: LatSource::Assumed,
+        let play = DevLatency {
+            frames: 2_012,
+            rate: 48_000,
+            source: LatSource::Assumed,
         };
 
         let before = {
             let mut p = send_pipeline(9_600);
-            attach_peer_and_net(&mut p, cell_reporting(&[180.0]).snapshot(), Some(clock(580)),
+            attach_peer_and_net(
+                &mut p,
+                cell_reporting(&[180.0]).snapshot(),
+                Some(clock(580)),
             );
             p
         };
@@ -5804,7 +6248,10 @@ mod telemetry_tests {
         // 本侧的队列 Σ **一毫秒都不许动**：设备级不进 `local_ms`，
         // 否则对端按 `stages` 重算出来的值会与我们自报的对不上，
         // `PEER_SUM_MISMATCH_MS` 那条交叉校验会每拍报一次假警。
-        assert_eq!(after.local_ms, before.local_ms, "local_ms 是「Σ 我这一侧的队列级」");
+        assert_eq!(
+            after.local_ms, before.local_ms,
+            "local_ms 是「Σ 我这一侧的队列级」"
+        );
         // 对端那台是标定值（`Assumed`）⇒ 仍是下限，「≥」不许消失。
         assert_eq!(
             after.confidence,
@@ -5823,7 +6270,10 @@ mod telemetry_tests {
     /// 那条管「总数算不算得出来」，这条管「算出来的总数敢不敢自称精确」。
     #[test]
     fn full_confidence_needs_two_api_readings_and_nothing_less() {
-        let api = DevLatency { frames: 480, rate: 48_000, source: LatSource::Api,
+        let api = DevLatency {
+            frames: 480,
+            rate: 48_000,
+            source: LatSource::Api,
         };
         let full = |local: Option<DevLatency>, peer_dev: Option<DevLatency>| {
             let mut p = send_pipeline_with_dev(9_600, local);
@@ -5832,15 +6282,38 @@ mod telemetry_tests {
             attach_peer_and_net(&mut p, Some(peer), Some(clock(580)));
             p.confidence
         };
-        assert_eq!(full(Some(api), Some(api)), LatConfidence::Full, "两侧都是平台真值");
+        assert_eq!(
+            full(Some(api), Some(api)),
+            LatConfidence::Full,
+            "两侧都是平台真值"
+        );
         for degraded in [LatSource::Assumed, LatSource::Unreliable] {
-            let d = DevLatency { frames: 480, rate: 48_000, source: degraded,
+            let d = DevLatency {
+                frames: 480,
+                rate: 48_000,
+                source: degraded,
             };
-            assert_eq!(full(Some(d), Some(api)), LatConfidence::LowerBound, "{degraded:?} 在本侧");
-            assert_eq!(full(Some(api), Some(d)), LatConfidence::LowerBound, "{degraded:?} 在对端");
+            assert_eq!(
+                full(Some(d), Some(api)),
+                LatConfidence::LowerBound,
+                "{degraded:?} 在本侧"
+            );
+            assert_eq!(
+                full(Some(api), Some(d)),
+                LatConfidence::LowerBound,
+                "{degraded:?} 在对端"
+            );
         }
-        assert_eq!(full(None, Some(api)), LatConfidence::LowerBound, "本侧没有设备级");
-        assert_eq!(full(Some(api), None), LatConfidence::LowerBound, "对端没有设备级");
+        assert_eq!(
+            full(None, Some(api)),
+            LatConfidence::LowerBound,
+            "本侧没有设备级"
+        );
+        assert_eq!(
+            full(Some(api), None),
+            LatConfidence::LowerBound,
+            "对端没有设备级"
+        );
         // 读不到则连总数都没有 ⇒ 更谈不上 Full
         let dead = DevLatency::unavailable();
         assert_eq!(full(Some(dead), Some(api)), LatConfidence::Unavailable);
@@ -5930,9 +6403,15 @@ mod telemetry_tests {
     fn every_one_of_the_five_terms_can_veto_the_total() {
         let (l, n, pe) = (Some(205.0), Some(0.29), Some(180.0));
         // 两台声卡：本侧 10 ms（480 帧 @48k），对端 41.92 ms（2012 帧，30-win 实测）
-        let ld = Some(DevLatency { frames: 480, rate: 48_000, source: LatSource::Api,
+        let ld = Some(DevLatency {
+            frames: 480,
+            rate: 48_000,
+            source: LatSource::Api,
         });
-        let pd = Some(DevLatency { frames: 2_012, rate: 48_000, source: LatSource::Assumed,
+        let pd = Some(DevLatency {
+            frames: 2_012,
+            rate: 48_000,
+            source: LatSource::Assumed,
         });
         let dead = Some(DevLatency::unavailable());
         assert!(
@@ -6027,15 +6506,30 @@ mod telemetry_tests {
         let now = Instant::now();
 
         let fresh = PeerLatCell::new();
-        fresh.accept_at(now - Duration::from_secs(4), 1, peer_stage_ms(180.0), None, None, None,
+        fresh.accept_at(
+            now - Duration::from_secs(4),
+            1,
+            peer_stage_ms(180.0),
+            None,
+            None,
+            None,
         );
         let s = fresh.snapshot().expect("4 秒前的读数仍可用");
         assert!(s.age_s > 3.0, "但要标成陈旧：age_s={}", s.age_s);
 
         let dead = PeerLatCell::new();
-        dead.accept_at(now - Duration::from_secs(20), 1, peer_stage_ms(180.0), None, None, None,
+        dead.accept_at(
+            now - Duration::from_secs(20),
+            1,
+            peer_stage_ms(180.0),
+            None,
+            None,
+            None,
         );
-        assert!(dead.snapshot().is_none(), "20 秒前的读数不再是关于「现在」的证据");
+        assert!(
+            dead.snapshot().is_none(),
+            "20 秒前的读数不再是关于「现在」的证据"
+        );
 
         let mut p = send_pipeline(9_600);
         attach_peer_and_net(&mut p, dead.snapshot(), Some(clock(580)));
@@ -6092,7 +6586,10 @@ mod telemetry_tests {
             compose_sum_ms(pa.local_ms, net, peer, None, None),
             compose_sum_ms(pb.local_ms, net, peer, None, None),
         ] {
-            assert!((sum.unwrap() - 1025.29).abs() < 1e-9, "每条流各自 1005+0.29+20，实得 {sum:?}");
+            assert!(
+                (sum.unwrap() - 1025.29).abs() < 1e-9,
+                "每条流各自 1005+0.29+20，实得 {sum:?}"
+            );
         }
         // 跨流相加会得到这个数。它不该出现在任何一条流的读数里。
         let n_fold = pa.local_ms.unwrap() + pb.local_ms.unwrap();
@@ -6119,9 +6616,17 @@ mod telemetry_tests {
     }
 
     fn send_lat<'a>(
-        tx: &'a TxShared, peer: Option<PeerLatSnapshot>, clock: Option<ClockEstimate>,
+        tx: &'a TxShared,
+        peer: Option<PeerLatSnapshot>,
+        clock: Option<ClockEstimate>,
     ) -> StreamLat<'a> {
-        StreamLat { is_send: true, tx: Some(tx), rx: None, peer, clock, dev: None,
+        StreamLat {
+            is_send: true,
+            tx: Some(tx),
+            rx: None,
+            peer,
+            clock,
+            dev: None,
         }
     }
 
@@ -6144,7 +6649,12 @@ mod telemetry_tests {
     fn the_assembly_layer_gives_each_stream_its_own_depth_never_the_fleet_sum() {
         // 扇出：a、b 共用一个源（物理队列只有一份 ⇒ 报同一个数是**正确的**）。
         let shared: audiohub_core::latency::SourceDepths = [
-            Some(StageDepth::new(StageId::SrcFifo, 48_000, 48_000, 48_000, DropMode::Oldest,
+            Some(StageDepth::new(
+                StageId::SrcFifo,
+                48_000,
+                48_000,
+                48_000,
+                DropMode::Oldest,
             )),
             None,
         ];
@@ -6162,12 +6672,18 @@ mod telemetry_tests {
         let out = assemble_pipelines(
             &play_ring,
             &play_drift,
-            vec![send_lat(&a, None, None), send_lat(&b, None, None), send_lat(&c, None, None),
+            vec![
+                send_lat(&a, None, None),
+                send_lat(&b, None, None),
+                send_lat(&c, None, None),
             ],
         );
 
         assert_eq!(out.len(), 3, "N 条流进，必须 N 条读数出，一一对应");
-        let ms: Vec<Option<f64>> = out.iter().map(|p| p.as_ref().and_then(|p| p.local_ms)).collect();
+        let ms: Vec<Option<f64>> = out
+            .iter()
+            .map(|p| p.as_ref().and_then(|p| p.local_ms))
+            .collect();
         assert_eq!(
             ms,
             vec![Some(1005.0), Some(1005.0), Some(105.0)],
@@ -6179,8 +6695,16 @@ mod telemetry_tests {
         let fleet_sum = 1005.0 + 1005.0 + 105.0; // 2115
         let fleet_avg = fleet_sum / 3.0; // 705
         for (i, m) in ms.iter().enumerate() {
-            assert_ne!(*m, Some(fleet_sum), "第 {i} 条流报出了全站总和 —— 三倍假延迟");
-            assert_ne!(*m, Some(fleet_avg), "第 {i} 条流报出了全站均值 —— 同一类错误的平均版");
+            assert_ne!(
+                *m,
+                Some(fleet_sum),
+                "第 {i} 条流报出了全站总和 —— 三倍假延迟"
+            );
+            assert_ne!(
+                *m,
+                Some(fleet_avg),
+                "第 {i} 条流报出了全站均值 —— 同一类错误的平均版"
+            );
         }
     }
 
@@ -6205,9 +6729,15 @@ mod telemetry_tests {
             ],
         );
         let (pa, pb) = (out[0].as_ref().unwrap(), out[1].as_ref().unwrap());
-        assert!((pa.sum_ms.unwrap() - 385.29).abs() < 1e-9, "a：205 + 0.29 + 180");
+        assert!(
+            (pa.sum_ms.unwrap() - 385.29).abs() < 1e-9,
+            "a：205 + 0.29 + 180"
+        );
         assert_eq!(pa.confidence, LatConfidence::LowerBound);
-        assert!(pb.sum_ms.is_none(), "b 没有对端上报 ⇒ 总和 None，不许借用邻居的");
+        assert!(
+            pb.sum_ms.is_none(),
+            "b 没有对端上报 ⇒ 总和 None，不许借用邻居的"
+        );
         assert!(pb.peer_local_ms.is_none());
         assert_eq!(pb.confidence, LatConfidence::LocalOnly);
         assert_eq!(pb.local_ms, Some(205.0), "b 自己那一半照样成立");
@@ -6245,9 +6775,21 @@ mod telemetry_tests {
             &play_ring,
             &play_drift,
             vec![
-                StreamLat { is_send: false, tx: None, rx: Some(&r1), peer: None, clock: None, dev: None,
+                StreamLat {
+                    is_send: false,
+                    tx: None,
+                    rx: Some(&r1),
+                    peer: None,
+                    clock: None,
+                    dev: None,
                 },
-                StreamLat { is_send: false, tx: None, rx: Some(&r2), peer: None, clock: None, dev: None,
+                StreamLat {
+                    is_send: false,
+                    tx: None,
+                    rx: Some(&r2),
+                    peer: None,
+                    clock: None,
+                    dev: None,
                 },
             ],
         );
@@ -6347,12 +6889,24 @@ mod telemetry_tests {
         };
         let back: SessionMsg =
             serde_json::from_str(&serde_json::to_string(&msg).unwrap()).expect("报文往返");
-        let SessionMsg::StageReport { stages, local_ms, dev, seq_us, .. } = back else {
+        let SessionMsg::StageReport {
+            stages,
+            local_ms,
+            dev,
+            seq_us,
+            ..
+        } = back
+        else {
             panic!("变体在往返中变了")
         };
 
         let cell = PeerLatCell::new();
-        let why = cell.accept(seq_us, stages.iter().map(from_wire_stage).collect(), local_ms, dev, None,
+        let why = cell.accept(
+            seq_us,
+            stages.iter().map(from_wire_stage).collect(),
+            local_ms,
+            dev,
+            None,
         );
         assert!(
             why.is_none(),
@@ -6364,7 +6918,11 @@ mod telemetry_tests {
         attach_peer_and_net(&mut local, cell.snapshot(), Some(clock(580)));
         assert_eq!(local.peer_local_ms, Some(205.0), "对端那一半原样过来了");
         let ids: Vec<&str> = local.peer_stages.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["src_fifo", "send_pace"], "对端分项逐级可见，不是一个总数");
+        assert_eq!(
+            ids,
+            vec!["src_fifo", "send_pace"],
+            "对端分项逐级可见，不是一个总数"
+        );
         assert_eq!(local.peer_stages[0].ms, Some(200.0));
         assert!(
             (local.sum_ms.unwrap() - 510.29).abs() < 1e-9,
@@ -6385,7 +6943,11 @@ mod telemetry_tests {
         // 对端自称 0 ms，实际分项摆着 100 ms。
         let why = c.accept(1, peer_stage_ms(100.0), Some(0.0), None, None);
         assert!(why.is_some(), "口径对不上必须说出来");
-        assert!(c.accept(2, peer_stage_ms(100.0), Some(0.0), None, None).is_none(), "只说一次");
+        assert!(
+            c.accept(2, peer_stage_ms(100.0), Some(0.0), None, None)
+                .is_none(),
+            "只说一次"
+        );
         assert_eq!(
             c.snapshot().unwrap().local_ms,
             Some(100.0),
@@ -6470,7 +7032,10 @@ mod fault_injection {
     }
 
     /// 走完整条生产汇总链路，返回这条会话此刻上报的 `PipelineLatency`。
-    fn report(play_ring: &StageSlot, play_drift: &Mutex<DriftTracker>, rx: &RxStream,
+    fn report(
+        play_ring: &StageSlot,
+        play_drift: &Mutex<DriftTracker>,
+        rx: &RxStream,
     ) -> PipelineLatency {
         let mut p = build_pipeline_from(false, None, Some(rx), None).expect("这条流有可读的级");
         attach_output_tails(play_ring, play_drift, rx, &mut p);
@@ -6478,11 +7043,11 @@ mod fault_injection {
     }
 
     fn stage_of<'a>(p: &'a PipelineLatency, id: &str) -> &'a PipelineStage {
-        p.stages
-            .iter()
-            .find(|s| s.id == id)
-            .unwrap_or_else(|| {
-            panic!("分项里没有 {id}，实际有 {:?}", p.stages.iter().map(|s| &s.id).collect::<Vec<_>>())
+        p.stages.iter().find(|s| s.id == id).unwrap_or_else(|| {
+            panic!(
+                "分项里没有 {id}，实际有 {:?}",
+                p.stages.iter().map(|s| &s.id).collect::<Vec<_>>()
+            )
         })
     }
 
@@ -6566,7 +7131,11 @@ mod fault_injection {
             pr.ms
         );
         assert!(pr.saturated, "深度贴着容量");
-        assert_eq!(pr.drop_mode, DropMode::Newest, "push_slice 短写：丢最新 ⇒ 听感是迟到 + 断续");
+        assert_eq!(
+            pr.drop_mode,
+            DropMode::Newest,
+            "push_slice 短写：丢最新 ⇒ 听感是迟到 + 断续"
+        );
         assert_eq!(
             pr.drift_sps.map(|v| v.abs() < 1e-9),
             Some(true),
@@ -6691,7 +7260,10 @@ mod fault_injection {
             !spk.saturated,
             "80% 不算饱和 —— **靠「是否饱和」判断这一级健不健康恰好会漏掉它**"
         );
-        assert_eq!(spk.dropped, None, "观测不到就报 None，不报 0（0 是「很健康」的假保证）");
+        assert_eq!(
+            spk.dropped, None,
+            "观测不到就报 None，不报 0（0 是「很健康」的假保证）"
+        );
         assert_eq!(
             p.local_ms,
             Some(405.0),
@@ -6838,8 +7410,9 @@ mod fault_injection {
 
         // 灌爆这张桥的环，再按 mixer 的相位发布（推之前读）。
         bridge_tx.push(&vec![0.25f32; 60_000]);
-        rx.bridge_ring
-            .store(Some(engine::ring_depth_before_push(StageId::BridgeRing, &bridge_tx,
+        rx.bridge_ring.store(Some(engine::ring_depth_before_push(
+            StageId::BridgeRing,
+            &bridge_tx,
         )));
 
         let p = report(&empty_site, &no_drift, &rx);
@@ -6916,7 +7489,10 @@ mod fault_injection {
         for tick in 0..secs * 100 {
             drift_tick(&mut sink, &mut tx, &slot, t0, tick, &mut cb, &mut next);
             if (tick + 1) % 3_000 == 0 {
-                out.push(stage_of(&report(&slot, &drift, &rx), "play_ring").ms.expect("有读数"),
+                out.push(
+                    stage_of(&report(&slot, &drift, &rx), "play_ring")
+                        .ms
+                        .expect("有读数"),
                 );
             }
         }
@@ -7015,8 +7591,9 @@ mod fault_injection {
         seed_upstream_50ms(&rx);
         let slot = StageSlot::new();
         engine::publish_play_ring(&slot, &site);
-        rx.bridge_ring
-            .store(Some(engine::ring_depth_before_push(StageId::BridgeRing, &bridge,
+        rx.bridge_ring.store(Some(engine::ring_depth_before_push(
+            StageId::BridgeRing,
+            &bridge,
         )));
         rx.hal_mic.store(Some(StageDepth {
             id: StageId::HalMic,
@@ -7028,7 +7605,11 @@ mod fault_injection {
         }));
 
         let p = report(&slot, &Mutex::new(DriftTracker::new()), &rx);
-        assert_eq!(p.stages.len(), 5, "两条串联级 + 三条并行尾级都要列出来给排障看");
+        assert_eq!(
+            p.stages.len(),
+            5,
+            "两条串联级 + 三条并行尾级都要列出来给排障看"
+        );
         assert_eq!(
             p.local_ms,
             Some(1_050.0),

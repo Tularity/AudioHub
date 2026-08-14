@@ -134,9 +134,7 @@ pub fn judge_volume_independence(input: &VolumeIndependenceInput) -> VolumeIndep
 
     let observed_low_db = ratio_db(input.low.level, input.baseline.level);
     let predicted_low_db = ratio_db(input.low.scalar, input.baseline.scalar);
-    let observed_mute_db = input
-        .muted
-        .map(|m| ratio_db(m.level, input.baseline.level));
+    let observed_mute_db = input.muted.map(|m| ratio_db(m.level, input.baseline.level));
 
     let mut coupling = VolumeCoupling::Inconclusive;
     let mut survives_mute: Option<bool> = None;
@@ -215,8 +213,8 @@ pub fn judge_volume_independence(input: &VolumeIndependenceInput) -> VolumeIndep
         ));
     }
 
-    let conclusive =
-        coupling != VolumeCoupling::Inconclusive && (input.muted.is_none() || survives_mute.is_some());
+    let conclusive = coupling != VolumeCoupling::Inconclusive
+        && (input.muted.is_none() || survives_mute.is_some());
 
     VolumeIndependenceReport {
         backend_id: input.backend_id.to_string(),
@@ -238,11 +236,12 @@ pub fn judge_volume_independence(input: &VolumeIndependenceInput) -> VolumeIndep
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sysaudio::{BACKEND_MAC_CATAP, BACKEND_WIN_DEVICE_LOOPBACK, BACKEND_WIN_PROC_EXCLUDE};
+    use crate::sysaudio::{
+        BACKEND_MAC_CATAP, BACKEND_WIN_DEVICE_LOOPBACK, BACKEND_WIN_PROC_EXCLUDE,
+    };
 
     /// Levels a real run produces: a 0.30 tone, ambient 60 dB under it, the low
     /// leg at a quarter of the volume.
@@ -255,8 +254,14 @@ mod tests {
         VolumeIndependenceInput {
             backend_id: backend,
             ambient_level: 0.0003,
-            baseline: VolumeLeg { scalar: 0.8, level: baseline_level },
-            low: VolumeLeg { scalar: 0.2, level: low_level },
+            baseline: VolumeLeg {
+                scalar: 0.8,
+                level: baseline_level,
+            },
+            low: VolumeLeg {
+                scalar: 0.2,
+                level: low_level,
+            },
             muted: mute_level.map(|level| VolumeLeg { scalar: 0.8, level }),
             tolerance_db: 3.0,
             floor: 0.002,
@@ -269,7 +274,10 @@ mod tests {
         assert_eq!(r.coupling, VolumeCoupling::Independent);
         assert_eq!(r.survives_mute, Some(true));
         assert!(r.conclusive, "notes: {:?}", r.notes);
-        assert!(!r.contradicts_table, "plan §7.1 already predicts true for mac-catap");
+        assert!(
+            !r.contradicts_table,
+            "plan §7.1 already predicts true for mac-catap"
+        );
     }
 
     /// 0.8 -> 0.2 is -12.04 dB; a post-mix capture drops by exactly that.
@@ -287,7 +295,11 @@ mod tests {
             r.conclusive,
             "'follows' is a verdict, not a failure — it is the expected answer here"
         );
-        assert!((r.predicted_low_db - -12.04).abs() < 0.05, "{}", r.predicted_low_db);
+        assert!(
+            (r.predicted_low_db - -12.04).abs() < 0.05,
+            "{}",
+            r.predicted_low_db
+        );
     }
 
     /// The failure mode this whole probe is built against: nothing is playing,
@@ -305,7 +317,11 @@ mod tests {
         );
         assert_eq!(r.survives_mute, None);
         assert!(!r.conclusive);
-        assert!(r.notes.iter().any(|n| n.contains("no signal")), "{:?}", r.notes);
+        assert!(
+            r.notes.iter().any(|n| n.contains("no signal")),
+            "{:?}",
+            r.notes
+        );
     }
 
     /// Same trap one step subtler: the room IS making noise, the tone is not
@@ -333,7 +349,11 @@ mod tests {
         i.low.scalar = 0.75; // 0.8 -> 0.75 is only -0.56 dB
         let r = judge_volume_independence(&i);
         assert_eq!(r.coupling, VolumeCoupling::Inconclusive);
-        assert!(r.notes.iter().any(|n| n.contains("not separable")), "{:?}", r.notes);
+        assert!(
+            r.notes.iter().any(|n| n.contains("not separable")),
+            "{:?}",
+            r.notes
+        );
     }
 
     /// A drop that matches neither 0 dB nor -12 dB is a third thing, and the
@@ -344,7 +364,9 @@ mod tests {
         let r = judge_volume_independence(&input(BACKEND_MAC_CATAP, 0.30, 0.15, None));
         assert_eq!(r.coupling, VolumeCoupling::Inconclusive);
         assert!(
-            r.notes.iter().any(|n| n.contains("neither hypothesis fits")),
+            r.notes
+                .iter()
+                .any(|n| n.contains("neither hypothesis fits")),
             "{:?}",
             r.notes
         );
@@ -356,12 +378,8 @@ mod tests {
     fn a_measurement_that_contradicts_the_plan_table_says_so() {
         // plan §7.1 says win-device-loopback does NOT survive a mute; measure
         // that it does.
-        let r = judge_volume_independence(&input(
-            BACKEND_WIN_DEVICE_LOOPBACK,
-            0.30,
-            0.30,
-            Some(0.30),
-        ));
+        let r =
+            judge_volume_independence(&input(BACKEND_WIN_DEVICE_LOOPBACK, 0.30, 0.30, Some(0.30)));
         assert_eq!(r.survives_mute, Some(true));
         assert_eq!(r.table_says, Some(false));
         assert!(r.contradicts_table);
@@ -377,7 +395,10 @@ mod tests {
     #[test]
     fn filling_in_an_unmeasured_row_is_not_a_contradiction() {
         let r = judge_volume_independence(&input(BACKEND_WIN_PROC_EXCLUDE, 0.30, 0.30, Some(0.30)));
-        assert_eq!(r.table_says, None, "plan §7.1 leaves win-proc-exclude 待实测");
+        assert_eq!(
+            r.table_says, None,
+            "plan §7.1 leaves win-proc-exclude 待实测"
+        );
         assert_eq!(r.survives_mute, Some(true));
         assert!(!r.contradicts_table);
         assert!(r.conclusive);
@@ -390,8 +411,15 @@ mod tests {
         let r = judge_volume_independence(&input(BACKEND_MAC_CATAP, 0.30, 0.30, Some(0.03)));
         assert_eq!(r.coupling, VolumeCoupling::Independent);
         assert_eq!(r.survives_mute, None);
-        assert!(!r.conclusive, "a mute leg that was run but did not decide is not a verdict");
-        assert!(r.notes.iter().any(|n| n.contains("mute leg undecided")), "{:?}", r.notes);
+        assert!(
+            !r.conclusive,
+            "a mute leg that was run but did not decide is not a verdict"
+        );
+        assert!(
+            r.notes.iter().any(|n| n.contains("mute leg undecided")),
+            "{:?}",
+            r.notes
+        );
     }
 
     /// Skipping the mute leg is allowed and still conclusive for the volume

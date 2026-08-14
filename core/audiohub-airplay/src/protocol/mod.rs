@@ -8,6 +8,7 @@ pub(crate) mod fairplay;
 pub(crate) mod identity;
 pub(crate) mod info;
 pub(crate) mod media;
+pub(crate) mod metadata;
 pub(crate) mod pairing;
 pub(crate) mod rtsp;
 pub(crate) mod server;

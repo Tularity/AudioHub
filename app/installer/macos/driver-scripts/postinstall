@@ -1,0 +1,99 @@
+#!/bin/sh
+# Runs as root after the HAL component package has copied the already-signed
+# driver into place. Never sign or mutate executable contents here: the exact
+# payload verified during the build is the payload coreaudiod must load.
+set -eu
+
+DRIVER="/Library/Audio/Plug-Ins/HAL/AudioHubDriver.driver"
+BIN="$DRIVER/Contents/MacOS/AudioHubDriver"
+
+/usr/sbin/chown -R root:wheel "$DRIVER"
+/bin/chmod -R go-w "$DRIVER"
+
+if [ ! -x "$BIN" ]; then
+  echo "AudioHubDriver payload is missing its executable" >&2
+  exit 1
+fi
+/usr/bin/codesign --verify --deep --strict "$DRIVER"
+
+# Loading/updating an AudioServerPlugIn briefly interrupts system audio. The
+# settings UI warns before invoking this package; a full AudioHub.pkg install
+# makes the same unavoidable transition once near the end of installation.
+#
+# AudioServerPlugIns run in Core-Audio-Driver-Service helper processes. Merely
+# kickstarting coreaudiod is not sufficient: macOS can leave an existing helper
+# alive across that restart, still executing the old mapped bundle. Depending
+# on the macOS generation and load state, ps(1) reports either the original
+# Apple helper image or a plug-in-specific process name. Retire only those two
+# exact identities accepted for AudioHub; another driver's renamed host must
+# never match. The App verifies after PackageKit that every old helper PID
+# disappeared and that a fresh helper published our Mach service before it
+# starts audiohubd again.
+HELPER='/System/Library/Frameworks/CoreAudio.framework/Versions/A/XPCServices/com.apple.audio.Core-Audio-Driver-Service.helper.xpc/Contents/MacOS/com.apple.audio.Core-Audio-Driver-Service.helper'
+AUDIOHUB_HELPER_NAME='Core Audio Driver (AudioHubDriver.driver)'
+COREAUDIOD='/usr/sbin/coreaudiod'
+
+is_audiohub_hal_helper_image() {
+  image="$1"
+  [ "$image" = "$HELPER" ] || [ "$image" = "$AUDIOHUB_HELPER_NAME" ]
+}
+audiohub_helper_pids() {
+  # Assigning the remaining fields to image preserves the spaces and
+  # parentheses in macOS's plug-in-specific process name.
+  /bin/ps -axo pid=,comm= 2>/dev/null | while read -r pid image; do
+    case "$pid" in ''|*[!0-9]*) continue;; esac
+    if is_audiohub_hal_helper_image "$image"; then
+      printf '%s\n' "$pid"
+    fi
+  done
+}
+
+OLD_HELPERS=$(audiohub_helper_pids)
+OLD_COREAUDIOD=$(/bin/ps -axo pid=,comm= | /usr/bin/awk -v daemon="$COREAUDIOD" '$2 == daemon { print $1 }')
+for helper_pid in $OLD_HELPERS; do
+  current=$(/bin/ps -p "$helper_pid" -o comm= 2>/dev/null | /usr/bin/sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+  if is_audiohub_hal_helper_image "$current"; then
+    /bin/kill -TERM "$helper_pid" 2>/dev/null || true
+  fi
+done
+
+# Do not let one wedged old plug-in host survive the package transaction. PID
+# reuse is guarded by checking its current executable path again before KILL.
+attempt=0
+while [ "$attempt" -lt 20 ]; do
+  old_alive=0
+  for helper_pid in $OLD_HELPERS; do
+    current=$(/bin/ps -p "$helper_pid" -o comm= 2>/dev/null | /usr/bin/sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+    if is_audiohub_hal_helper_image "$current"; then
+      old_alive=1
+    fi
+  done
+  [ "$old_alive" -eq 0 ] && break
+  /bin/sleep 0.1
+  attempt=$((attempt + 1))
+done
+for helper_pid in $OLD_HELPERS; do
+  current=$(/bin/ps -p "$helper_pid" -o comm= 2>/dev/null | /usr/bin/sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+  if is_audiohub_hal_helper_image "$current"; then
+    /bin/kill -KILL "$helper_pid" 2>/dev/null || true
+  fi
+done
+
+if ! /bin/launchctl kickstart -kp system/com.apple.audio.coreaudiod 2>/dev/null; then
+  # The launchd job can be between generations when kickstart is requested.
+  # Never use a name-wide kill fallback: act only on the PIDs captured above,
+  # and re-check the executable immediately before each signal so PID reuse
+  # cannot target an unrelated process. Absence is success; the App's
+  # post-transaction generation check will report if launchd does not recover.
+  for core_pid in $OLD_COREAUDIOD; do
+    current=$(/bin/ps -p "$core_pid" -o comm= 2>/dev/null | /usr/bin/xargs || true)
+    [ "$current" != "$COREAUDIOD" ] || /bin/kill -TERM "$core_pid" 2>/dev/null || true
+  done
+  /bin/sleep 0.2
+  for core_pid in $OLD_COREAUDIOD; do
+    current=$(/bin/ps -p "$core_pid" -o comm= 2>/dev/null | /usr/bin/xargs || true)
+    [ "$current" != "$COREAUDIOD" ] || /bin/kill -KILL "$core_pid" 2>/dev/null || true
+  done
+fi
+
+exit 0

@@ -14,9 +14,12 @@
 // opens with that story). Hence this file.
 
 import { describe, it, expect } from 'vitest';
-import { peerDevicesNote } from './mode';
+import {
+  HAL_DIRECTION_IN, HAL_DIRECTION_OUT, deviceStateLabel, halInventoryRows,
+  halReasonText, peerAudioDirections, peerDeviceRows, peerDevicesNote,
+} from './mode';
 import { t } from '../i18n';
-import type { DaemonInfo, PeerHalDevice, PeerState } from '../ipc/types';
+import type { DaemonInfo, HalDeviceInfo, PeerHalDevice, PeerState } from '../ipc/types';
 
 const FP = 'aa:bb:cc';
 
@@ -24,7 +27,7 @@ function peer(over: Partial<PeerState> = {}): PeerState {
   return { fingerprint: FP, name: 'thirty-win', ...over };
 }
 
-/** A peer that owns two devices. `peerDeviceRows` keys off `hal_device` alone. */
+/** 两个方向都存在的旧版形状（无能力字段 / mask）。 */
 function withDevices(dev: Partial<PeerHalDevice>, over: Partial<PeerState> = {}): PeerState {
   return peer({
     hal_device: { out_name: 'AudioHub spk', in_name: 'AudioHub mic', ...dev },
@@ -122,11 +125,134 @@ describe('peerDevicesNote: the three arms that have devices', () => {
     expect(note).not.toContain('undefined');
   });
 
-  // An unrecognised state string is passed through verbatim rather than
-  // swallowed: a future daemon state the UI has no word for is still more
-  // useful on screen than a dash.
-  it('passes an unrecognised state string through', () => {
-    const note = peerDevicesNote(withDevices({ state: 'quarantined', observed: true }), daemon);
-    expect(note).toBe(t('detail.devices.stateListed', { state: 'quarantined' }));
+  // Driver state is a machine enum, not UI copy. New daemon values must not
+  // appear as English/snake_case inside a Chinese sentence.
+  it('localizes an unrecognised driver state instead of exposing the machine token', () => {
+    const raw = 'waiting_for_driver_v2';
+    const note = peerDevicesNote(withDevices({ state: raw, observed: true }), daemon);
+    expect(deviceStateLabel(raw)).toBe(t('device.state.unknown'));
+    expect(note).toBe(t('detail.devices.stateListed', { state: t('device.state.unknown') }));
+    expect(note).not.toContain(raw);
+  });
+
+  it('localizes an unrecognised HAL reason instead of exposing the machine token', () => {
+    const raw = 'driver_claim_timed_out';
+    const note = halReasonText(raw);
+    expect(note).toBe(t('halReason.other'));
+    expect(note).not.toContain(raw);
+  });
+});
+
+describe('per-direction peer capabilities', () => {
+  it('keeps both directions visible when the new capability fields are unknown', () => {
+    expect(peerAudioDirections(peer())).toEqual(['out', 'in']);
+    expect(peerDeviceRows(withDevices({}), daemon).map((row) => row.dir))
+      .toEqual(['out', 'in']);
+  });
+
+  it('keeps only the virtual speaker / TX row for an output-only peer', () => {
+    const p = peer({
+      peer_default_output: true,
+      peer_default_input: false,
+      hal_device: {
+        out_name: 'AudioHub output-only',
+        out_uid: 'AudioHub:out-only:out',
+        requested_directions: HAL_DIRECTION_OUT,
+        published_directions: HAL_DIRECTION_OUT,
+        observed_directions: HAL_DIRECTION_OUT,
+        state: 'bound',
+        observed: true,
+      },
+    });
+    const rows = peerDeviceRows(p, daemon);
+    expect(peerAudioDirections(p)).toEqual(['out']);
+    expect(rows.map((row) => row.dir)).toEqual(['out']);
+    expect(rows[0]).toMatchObject({ published: true, observed: true });
+  });
+
+  it('keeps only the virtual microphone / RX row for an input-only peer', () => {
+    const p = peer({
+      peer_default_output: false,
+      peer_default_input: true,
+      hal_device: {
+        in_name: 'AudioHub input-only',
+        in_uid: 'AudioHub:in-only:in',
+        requested_directions: HAL_DIRECTION_IN,
+        published_directions: HAL_DIRECTION_IN,
+        observed_directions: 0,
+        state: 'pending',
+        observed: false,
+      },
+    });
+    const rows = peerDeviceRows(p, daemon);
+    expect(peerAudioDirections(p)).toEqual(['in']);
+    expect(rows.map((row) => row.dir)).toEqual(['in']);
+    expect(rows[0]).toMatchObject({ published: true, observed: false });
+  });
+
+  it('renders neither rows nor a false warning for an explicitly zero-capability peer', () => {
+    const p = peer({
+      peer_default_output: false,
+      peer_default_input: false,
+      hal_device: {
+        requested_directions: 0,
+        published_directions: 0,
+        observed_directions: 0,
+        state: 'bound',
+        observed: true,
+      },
+    });
+    expect(peerAudioDirections(p)).toEqual([]);
+    expect(peerDeviceRows(p, daemon)).toEqual([]);
+    expect(peerDevicesNote(p, daemon)).toBe('');
+  });
+
+  it('uses the HAL requested mask for Settings inventory rows and per-direction state', () => {
+    const device: HalDeviceInfo = {
+      fingerprint: FP,
+      requested_directions: HAL_DIRECTION_IN,
+      published_directions: HAL_DIRECTION_IN,
+      observed_directions: 0,
+      out_name: 'must stay hidden',
+      in_name: 'AudioHub input-only',
+      state: 'pending',
+      observed: false,
+      io_out: true,
+      io_in: false,
+    };
+    expect(halInventoryRows(device).map((row) => row.dir)).toEqual(['in']);
+    expect(halInventoryRows(device)[0]).toMatchObject({
+      name: 'AudioHub input-only', published: true, observed: false, io: false,
+    });
+  });
+
+  it('never revives a direction which the live peer capability explicitly rejects', () => {
+    const stale: HalDeviceInfo = {
+      fingerprint: FP,
+      requested_directions: HAL_DIRECTION_OUT | HAL_DIRECTION_IN,
+      published_directions: HAL_DIRECTION_OUT | HAL_DIRECTION_IN,
+      observed_directions: HAL_DIRECTION_OUT | HAL_DIRECTION_IN,
+      out_name: 'AudioHub stale output',
+      in_name: 'AudioHub input',
+      state: 'bound',
+      observed: true,
+    };
+    const inputOnly = peer({ peer_default_output: false, peer_default_input: true });
+    expect(halInventoryRows(stale, inputOnly).map((row) => row.dir)).toEqual(['in']);
+  });
+
+  it('shows a direction restored by live capability before the HAL mask catches up', () => {
+    const stale: HalDeviceInfo = {
+      fingerprint: FP,
+      requested_directions: 0,
+      published_directions: 0,
+      observed_directions: 0,
+      out_name: 'AudioHub output',
+      in_name: 'AudioHub input',
+      state: 'pending',
+      observed: false,
+    };
+    const outputOnly = peer({ peer_default_output: true, peer_default_input: false });
+    expect(halInventoryRows(stale, outputOnly).map((row) => row.dir)).toEqual(['out']);
   });
 });

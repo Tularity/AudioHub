@@ -37,7 +37,7 @@ export function ShareSourceControl({
   pending?: boolean;
   /** daemon.permissions 里的 system_audio 那一条，拿不到就传 null。 */
   perm: PermissionState | null;
-  /** 上一次开启失败的原因（daemon 原话），没有就传 ''。 */
+  /** 上一次开启失败的本地化说明，没有就传 ''。 */
   fault: string;
   onSource: (v: string) => void;
   onBackend: (v: string) => void;
@@ -153,7 +153,8 @@ export function ShareSourceControl({
         </button>
       </div>
 
-      {/* 开不起来的原话。它比任何我们自己写的说明都准确，所以原样呈现。 */}
+      {/* 开不起来必须留下常驻说明，但 daemon 的诊断可能使用另一种语言；可见内容
+          由调用方收敛为当前 UI 语种，原始诊断只进开发日志。 */}
       <p className="share-fault" data-testid={`${testid}-fault`} hidden={!fault}>
         {t('share.fault', { reason: fault })}
       </p>

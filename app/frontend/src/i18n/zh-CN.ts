@@ -19,6 +19,8 @@ export const zhCN = {
   'common.clear': '清除',
   'common.close': '关闭',
   'common.open': '打开',
+  'common.install': '安装',
+  'common.start': '启动',
   'common.copy': '复制',
   // 复制失败在详情页与设置页是同一件事，一条键服务两处——分成两条早晚会各自漂移。
   'common.copyFailed': '复制失败，请手动选择文本',
@@ -43,13 +45,13 @@ export const zhCN = {
   'nav.detail': '对端详情',
 
   // 窗口拖不动时的唯一线索。静默失败正是这个 bug 之前难以定位的原因，所以宁可吵。
-  'chrome.dragFailed': '窗口拖拽不可用：{message}。请重启 AudioHub。',
+  'chrome.dragFailed': '窗口拖拽不可用，请重启 AudioHub。',
   // Windows 自绘标题按钮。三条都用动词，读屏念出来是「最小化 按钮」。
   'chrome.minimize': '最小化',
   'chrome.maximize': '最大化',
   'chrome.restore': '向下还原',
   'chrome.close': '关闭窗口（音频服务继续运行）',
-  'chrome.captionFailed': '窗口按钮不可用：{message}。请重启 AudioHub。',
+  'chrome.captionFailed': '窗口按钮不可用，请重启 AudioHub。',
 
   'badge.online': '在线',
   'badge.starting': '启动中',
@@ -91,18 +93,27 @@ export const zhCN = {
   'overlay.connecting.desc': '正在连接本机端口 {port} …',
   'overlay.connecting.descNoPort': '正在获取本机服务连接信息…',
   'overlay.version.title': 'AudioHub 服务版本不兼容',
-  'overlay.version.desc': '{message}。本界面只能与 IPC 协议 v{version} 的服务通信，请更新到同一次构建。',
+  'overlay.version.desc': '本界面需要 IPC 协议 v{version}，但本机服务版本不同；请将两者更新到同一次构建。',
   'overlay.version.hint': '提示：确认 audiohub 与本界面来自同一次构建。',
   'overlay.noEndpoint.title': '缺少连接参数',
   'overlay.noEndpoint.desc': '请以 ?port=<端口>&token=<令牌> 打开本页面，或直接访问本机服务提供的界面地址。',
   'overlay.noEndpoint.hint': '浏览器模式无法启动服务：请在终端运行 audiohub daemon 后等待自动重连。',
   'overlay.noBinary.title': '找不到 AudioHub 服务程序',
-  'overlay.noBinary.desc': '应用内缺少 audiohub 服务程序。请重新安装 AudioHub；开发环境可设 AUDIOHUB_BIN 指向已编译的 audiohub。',
+  'overlay.noBinary.desc': 'App 内缺少服务程序或安装组件，请重新安装 AudioHub。',
   'overlay.noBinary.hint': '重装后再点「重试」。',
+  'overlay.notInstalled.title': '安装 AudioHub 后台服务',
+  'overlay.notInstalled.desc': '需要系统鉴权，随后会在本机自签并安装后台服务。',
+  'overlay.notInstalled.hint': '使用当前 App 内的服务，不会联网下载。',
+  'overlay.stopped.title': 'AudioHub 服务未启动',
+  'overlay.stopped.desc': '后台服务已经安装，但当前没有运行；启动后即可继续。',
+  'overlay.installFailed.title': '后台服务安装失败',
+  'overlay.installFailed.desc': '未能自签、安装或注册后台服务，请重试。',
   'overlay.spawnFailed.title': '无法启动 AudioHub 服务',
   'overlay.spawnFailed.desc': '已定位到服务程序，但进程启动失败——多为文件权限或系统隔离属性。可重新安装，或在终端执行 audiohub daemon 查看完整错误。',
   'overlay.portBusy.title': 'AudioHub 服务端口被占用',
   'overlay.portBusy.desc': '所需端口已被其它程序占用（多为仍在运行的旧实例）。请结束该进程，或执行 audiohub ctl shutdown 后重试。',
+  'overlay.serviceConflict.title': 'AudioHub 服务冲突',
+  'overlay.serviceConflict.desc': '未验证或无响应的进程占用了服务端点；请先退出该进程，再重试。',
   'overlay.timeout.title': 'AudioHub 服务启动超时',
   'overlay.timeout.desc': '服务已启动但未在预期时间内就绪。请稍候重试；持续失败可在终端运行 audiohub daemon 观察日志。',
   'overlay.startFailed.title': '无法启动 AudioHub 服务',
@@ -110,7 +121,7 @@ export const zhCN = {
   'overlay.internal.title': '无法启动 AudioHub 服务',
   'overlay.internal.desc': '界面与本机服务管理器之间的调用失败。请重试，或重启 AudioHub。',
   'overlay.disconnected.title': 'AudioHub 服务已断开',
-  'overlay.disconnected.descTauri': '与本机服务的连接已断开（{reason}），每 5 秒自动重连。',
+  'overlay.disconnected.descTauri': '正在后台尝试恢复；如仍离线，请手动重试。',
   'overlay.disconnected.reasonUnknown': '原因未知',
   'overlay.disconnected.descBrowser': '与本机服务的连接已断开，每 5 秒自动重试。',
   'overlay.detail': '详细信息：{detail}',
@@ -134,19 +145,36 @@ export const zhCN = {
   // 「选了这个，另一件事就不做了」。
 
   'hal.unknown': '服务未连接，暂时无法判断驱动是否可用。',
-  'hal.absent': '未检测到 AudioHub 驱动，模式 B 不可用；安装驱动并重启本应用后即可选择。',
+  'hal.absent': '未检测到 AudioHub 驱动，模式 B 不可用；安装后即可选择。',
   'hal.absent.why': '未检测到 AudioHub 驱动，无法使用模式 B',
   'hal.mismatch': '驱动版本与本机服务不匹配{versions}：不会有任何虚拟设备出现。请安装配套版本的驱动。',
   'hal.mismatch.versions': '（服务 v{mine} / 驱动 v{theirs}）',
   'hal.detached': '驱动已注册，但桥接通道尚未建立：已发布的设备保留在系统中，当前不处理音频。请稍候或重启服务。',
   'hal.ready': '已连接 AudioHub 驱动，模式 B 可用。',
+  'settings.driver.install': '安装驱动',
+  'settings.driver.update': '更新驱动',
+  'settings.driver.repair': '修复驱动',
+  'settings.driver.restartService': '重启服务',
+  'settings.driver.installing': '安装中…',
+  'settings.driver.restarting': '重启中…',
+  'settings.driver.confirmTitle.install': '安装 AudioHub 驱动？',
+  'settings.driver.confirmTitle.update': '更新 AudioHub 驱动？',
+  'settings.driver.confirmTitle.repair': '修复 AudioHub 驱动？',
+  'settings.driver.confirmBody': '需要系统鉴权；加载驱动时，系统音频会短暂中断。',
+  'settings.driver.done': '驱动已安装。',
+  'settings.driver.cancelled': '已取消驱动安装。',
+  'settings.driver.failed': '驱动安装失败。',
+  'settings.driver.unavailable': '驱动文件已安装，但系统未能加载。请检查驱动签名策略和诊断日志。',
+  'settings.driver.reboot': '驱动已安装；重启 Windows 后完成。',
+  'settings.driver.serviceRestarted': '服务已重启。',
+  'settings.driver.serviceRestartFailed': '服务重启失败。',
 
   'halReason.capacity': '虚拟设备数量已达上限（16 台）。解除其它配对后可用。',
   'halReason.noDriver': '本机未安装 AudioHub 驱动，无法为该对端创建虚拟设备。',
   'halReason.removedWhileOffline': '已按「断开后移除虚拟设备」移除；对端重连后以相同 UID 恢复。',
   'halReason.modeA': '当前为模式 A：虚拟设备仅存在于模式 B。',
   'halReason.modeShare': '当前为共享模式：本机对外提供设备而不使用对端设备，因此不存在虚拟设备。',
-  'halReason.other': '暂无虚拟设备（{reason}）。',
+  'halReason.other': '暂无虚拟设备，服务上报了未知原因。',
   'halReason.none': '暂无虚拟设备。',
 
   // ---------------------------------------------------------------- 设备
@@ -154,6 +182,7 @@ export const zhCN = {
   'device.state.pending': '等待驱动确认',
   'device.state.delisted': '正在移除',
   'device.state.free': '未发布',
+  'device.state.unknown': '驱动状态未知',
   'device.inUse': '● 使用中',
   'device.idle': '○ 未使用',
   'device.awaiting': '○ 等待系统发布',
@@ -362,9 +391,8 @@ export const zhCN = {
   //
   // 音质三分量（补偿、削顶、带宽）全是**接收侧**的量，所以一条纯发送的通路本机
   // 恒无读数——「送对方扬声器」的音质格此前**永远**空着，而链路其实好得很。
-  // 现在由对端把它那侧测到的回传过来。必须标：数是真的，但量它的人在对面，
-  // 不标就等于让本机宣称了一个它没有测点的结论。
-  'metric.quality.fromPeer': '对端测得',
+  // 现在由对端把它那侧测到的回传过来。一级卡片不再放出处角标，但展开
+  // 音质明细后仍用这句说清测点在对面。
   'metric.quality.fromPeerWhy': '音质三分量仅接收端可测，而本条通路由本机发送，故读数由对端测得后回传。',
 
   'quality.part.continuity.name': '连续性',
@@ -578,10 +606,11 @@ export const zhCN = {
   // 详情头那枚 ✎ 的 aria-label / title。按钮没有文字，这就是它唯一说得出的话。
   'detail.alias.openLabel': '编辑别名',
   // 后果句（plan §3.1 第 4 类）。改名不只影响本页——它会就地改掉系统设备列表里
-  // 那两台设备的名字，而那正是用户不敢按「保存」的原因。
-  'detail.alias.effect': '会一并改掉这台对端在系统设备列表里那两台设备的名字。',
+  // 实际存在的虚拟设备名称，而那正是用户不敢按「保存」的原因。
+  'detail.alias.effect': '会一并改掉这台对端在系统设备列表里的虚拟设备名称。',
   'detail.alias.field': '显示名称',
   'detail.alias.placeholder': '对端主机名',
+  'detail.alias.default': '恢复默认',
   'detail.alias.renamed': '已改名为「{name}」',
   'detail.alias.restored': '已恢复为对端主机名',
 
@@ -589,10 +618,10 @@ export const zhCN = {
   // `detail.devices.modeA`（「当前为模式 A，没有虚拟设备。」）在 2026-08-10 的
   // 重整里删除：那一块现在只在**请求了模式 B** 时渲染，于是这句话没有任何时刻
   // 说得出口——它恰好是 plan §3.1 禁掉的那种纯描述句。
-  'detail.devices.published': '两台设备已列入系统音频设备列表，可供任意应用选用。',
+  'detail.devices.published': '虚拟设备已列入系统音频设备列表，可供任意应用选用。',
   'detail.devices.offline': '⚠ 对端离线：设备仍列于系统中可供选择，但不处理任何音频。',
-  'detail.devices.stateListed': '驱动状态「{state}」，系统设备列表已列出这两台设备。',
-  'detail.devices.stateUnlisted': '驱动状态「{state}」，系统设备列表尚未列出这两台设备。',
+  'detail.devices.stateListed': '驱动状态「{state}」，请求的虚拟设备均已列出。',
+  'detail.devices.stateUnlisted': '驱动状态「{state}」，仍有请求的虚拟设备未列出。',
 
   'detail.addrs.title': '地址历史',
   'detail.addrs.empty': '暂无地址记录',
@@ -622,7 +651,7 @@ export const zhCN = {
   'detail.unpair': '解除配对',
   'detail.unpair.confirmTitle': '解除配对？',
   'detail.unpair.confirmLead': '将解除与「{name}」的配对，并撤销双向信任。',
-  'detail.unpair.confirmDevices': '将立即从系统移除「{out}」与「{in}」。若其中之一为当前默认设备，系统会自动切换。',
+  'detail.unpair.confirmDevices': '将立即从系统移除：{devices}。若其中之一为当前默认设备，系统会自动切换。',
   'detail.unpair.confirmNoDevices': '该对端当前没有虚拟设备，仅移除信任关系与已建立的会话。',
   'detail.unpair.done': '已解除配对',
 
@@ -678,7 +707,7 @@ export const zhCN = {
   // 而不是把它报成一句泛泛的「地址无法识别」。
   'addr.endpointNeedsUrl': '隧道地址必须以 ws:// 开头。直连请留空。',
   'pair.right.done': '已与「{name}」完成配对',
-  'pair.right.failed': '配对失败：{message}。请确认对端已启用配对模式、PIN 未过期、地址可达。',
+  'pair.right.failed': '配对失败。请确认对端已启用配对模式、PIN 未过期、地址可达。',
   'pair.step.connect': '建立连接',
   'pair.step.verifyPin': '校验 PIN',
   'pair.step.exchangeKeys': '交换密钥',
@@ -696,6 +725,7 @@ export const zhCN = {
   'share.proto.airplay.password': '投送密码',
   'share.proto.airplay.passwordPlaceholderUnset': '未设置；输入密码以启用',
   'share.proto.airplay.passwordPlaceholderSet': '已设置；输入新密码以替换',
+  'share.proto.airplay.passwordWillClear': '保存后移除密码',
   'share.proto.airplay.settings': '接收设置',
   'share.proto.airplay.settingsTitle': 'AirPlay 接收设置',
   'share.proto.airplay.passwordSet': '已设密码',
@@ -706,8 +736,8 @@ export const zhCN = {
   'share.proto.airplay.stateLoading': '正在读取…',
   'share.proto.airplay.stateStarting': '正在启动…',
   'share.proto.airplay.stateListening': '正在监听',
-  'share.proto.airplay.stateError': '启动失败：{message}',
-  'share.proto.airplay.stateWarning': '接收仍在运行；{message}',
+  'share.proto.airplay.stateError': '接收器启动失败，请查看服务日志',
+  'share.proto.airplay.stateWarning': '接收仍在运行，但存在运行警告',
   'share.proto.airplay.stateUnsupported': '当前服务不支持 AirPlay 接收',
   'share.proto.airplay.airplay2Port': 'AirPlay 2 端口 {port}',
 
@@ -746,7 +776,7 @@ export const zhCN = {
   'settings.identity.nameEnv': '由环境变量 AUDIOHUB_NAME 指定，此处只读。',
   // §3.1 第 4 类「后果」，获准留在界面上：改名会改掉每台对端系统里那两台虚拟
   // 设备的名字，而对端要等下一次连接才看得到。
-  'settings.identity.renameEffect': '会改掉每台对端系统里那两台设备的名字，对端下次连接时生效。',
+  'settings.identity.renameEffect': '会改掉每台对端系统里的虚拟设备名称，对端下次连接时生效。',
   'settings.identity.reset': '重置',
   'settings.identity.resetTitle': '重置本机指纹',
   'settings.identity.pairedCount': '已配对对端',
@@ -784,12 +814,12 @@ export const zhCN = {
   'settings.web.urlLanUnknown': '局域网：使用本机在该网段的 IP 加同一端口访问（未能自动探测出口地址）。',
   'settings.web.off': '未启用。启用后此处将显示可直接打开的网址。',
   'settings.web.starting': '正在读取当前状态…',
-  'settings.web.error': '没能开始监听：{message}',
+  'settings.web.error': '没能开始监听',
   'settings.web.errorHint': '设置已保存，但端口未能绑定——最常见的原因是该端口已被其它程序占用。请更换端口后重试。',
   'settings.web.warnTitle': '关闭此开关后，本机服务的令牌将以明文提供给任何访问者',
   'settings.web.sourceDisk': '页面文件来自磁盘目录 {root}。',
   'settings.web.sourceEmbedded': '页面文件来自应用内嵌资源，与窗口里是同一份。',
-  'settings.web.browserOnly': '你正经网页端查看本页。以下三项只能在应用窗口内修改，否则一次误操作即可关掉你正在用的入口。',
+  'settings.web.browserOnly': '你正通过网页端查看本页。以下三项只能在应用窗口内修改，否则一次误操作即可关掉你正在用的入口。',
 
   // ---- plan §15：对端详情页的传输档位 ----
   // 卡片上那一行「这个数是目标不是能力」。措辞必须让用户一眼分出两件事：
@@ -1010,18 +1040,17 @@ export const zhCN = {
   // 里面没有用户需要立刻执行的动作，整段进 wiki，界面上只留那枚 `?`。
   'settings.startup.autostartTitle': '开机时自动启动 AudioHub',
   'settings.startup.target': '登录时启动',
-  'settings.startup.unsupported': '当前形态无法设置开机自启：{reason}',
+  'settings.startup.unsupported': '当前形态无法设置开机自启。',
   // `supported=false && enabled=true`：登录项是**别的形态**（装好的 App）留下的，
   // 活得比它长。这句话必须同时说清三件事：它还在生效、当前形态开不了新的、
   // 但**关得掉**——否则用户看到的是一条自己开过、界面却答不出状况的登录项。
-  'settings.startup.orphaned': '开机自启仍在注册状态，由已安装的 AudioHub.app 写入。当前形态改不了它的指向（{reason}），但可在此关闭。',
+  'settings.startup.orphaned': '开机自启仍在注册状态，由已安装的 AudioHub.app 写入。当前形态改不了它的指向，但可在此关闭。',
   'settings.startup.unknown': '当前服务不提供开机自启接口（服务版本较旧）。',
 
   // ---- 快捷键（二级菜单：⌘/ 与「设置 › 杂项 › 快捷键」开的是同一个面板）------
   // ⚠ `settings.shortcuts.title` 已删：编辑器与速查表合并成一个面板之后，
   // 它的标题统一走 `shortcuts.sheet.title`——两条键说同一个词就会漂。
   'settings.shortcuts.resetAll': '全部恢复默认',
-  'settings.shortcuts.resetAllDone': '快捷键已全部恢复默认。',
 
   'shortcuts.action.peers': '主面板',
   // `shortcuts.action.pair` 随「配对向导」那一页一并删（用户 2026-08-11 第 1 条）：
@@ -1088,7 +1117,7 @@ export const zhCN = {
   // 那会让整段说明与它下面每一行自相矛盾。
   'settings.perm.recheck': '重新检查',
   'settings.perm.unsupported': '当前服务不提供权限查询接口，无法在此显示或申请权限。',
-  'settings.perm.error': '权限探测失败：{message}',
+  'settings.perm.error': '权限探测失败，请稍后重试。',
   'settings.perm.probing': '正在探测系统权限…',
   'settings.perm.offline': '服务未连接，暂无法探测权限状态。',
 
@@ -1251,14 +1280,13 @@ export const zhCN = {
   'perm.unknown.why': '该权限由本机服务上报，界面暂无对应说明。',
 
   // ---------------------------------------------------------------- 错误
-  // 这些是 Error.message。它们不只写进 console：rpc() 会把 message 直接 toast 出去，
-  // 离线覆盖层也会把它插进「与本机服务的连接已断开（{reason}）」。所以它们同样是
-  // 面向用户的文案，必须走语料。
+  // IPC/连接模块产生的错误同样会进入 toast 与覆盖层，因此仍是面向用户的文案，
+  // 不能因为住在基础设施模块就写死。
   'error.versionMismatch': '服务协议版本不匹配（期望 {expected}，实际 {actual}）',
   'error.unknownVersion': '未知',
   'error.authTimeout': '服务认证握手超时',
   'error.authFailed': '认证失败',
-  'error.requestFailed': '请求失败',
+  'error.requestFailed': '操作失败，请查看服务日志。',
   'error.requestTimeout': '请求超时：{method}',
   'error.disconnected': '连接已断开',
   'error.connectionClosed': '连接已关闭',

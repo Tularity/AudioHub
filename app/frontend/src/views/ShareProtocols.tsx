@@ -10,9 +10,9 @@ import { fmt } from '../lib/fmt';
 import { joinPhrases, t } from '../i18n';
 import type { MsgKey } from '../i18n';
 import type {
-  AirPlaySessionInfo, DaemonSettings, DaemonSettingsPatch,
+  AirPlayArtwork, AirPlaySessionInfo, DaemonSettings, DaemonSettingsPatch,
 } from '../ipc/types';
-import { applySettings } from '../state/connection';
+import { applySettings, rpc } from '../state/connection';
 import { useShallow, useStore } from '../state/store';
 
 function stateText(
@@ -30,7 +30,7 @@ function stateText(
   ];
   if (settings?.airplay_error) {
     return joinPhrases([
-      t('share.proto.airplay.stateError', { message: settings.airplay_error }),
+      t('share.proto.airplay.stateError'),
       ...ports,
     ]);
   }
@@ -39,7 +39,7 @@ function stateText(
       t('share.proto.airplay.stateListening'),
       ...ports,
       settings.airplay_warning
-        ? t('share.proto.airplay.stateWarning', { message: settings.airplay_warning })
+        ? t('share.proto.airplay.stateWarning')
         : null,
     ]);
   }
@@ -55,22 +55,27 @@ function AirPlaySettingsSheet({
   onPush: (patch: DaemonSettingsPatch) => Promise<boolean>;
   onClose: () => void;
 }) {
-  const [nameDraft, setNameDraft] = useState<string | null>(null);
+  // 这扇 Sheet 是一个设置事务：两项输入先留在本地，底部「保存」一次提交。
+  // 关闭 / Esc / 遮罩都只是取消，不再让字段旁各自发一次 settings.set。
+  const savedName = settings.airplay_name || '';
+  const [nameDraft, setNameDraft] = useState(savedName);
   // 密码只活在组件里。daemon 只回 password_set，store 与快照都没有密码槽位。
   const [passwordDraft, setPasswordDraft] = useState('');
+  const [clearPassword, setClearPassword] = useState(false);
 
-  const savedName = settings?.airplay_name || '';
-  const shownName = nameDraft ?? savedName;
-  const normalizedName = shownName.trim();
-  const nameDirty = nameDraft != null && normalizedName !== savedName;
+  const normalizedName = nameDraft.trim();
+  const nameDirty = normalizedName !== savedName;
+  const passwordDirty = passwordDraft.length > 0 || clearPassword;
+  const dirty = nameDirty || passwordDirty;
   const disabled = writing > 0;
 
-  async function saveName(next: string): Promise<void> {
-    if (await onPush({ airplay_name: next.trim() })) setNameDraft(null);
-  }
-
-  async function savePassword(next: string): Promise<void> {
-    if (await onPush({ airplay_password: next })) setPasswordDraft('');
+  async function save(): Promise<void> {
+    if (disabled || !dirty) return;
+    const patch: DaemonSettingsPatch = {};
+    if (nameDirty) patch.airplay_name = normalizedName;
+    if (passwordDraft) patch.airplay_password = passwordDraft;
+    else if (clearPassword) patch.airplay_password = '';
+    if (await onPush(patch)) onClose();
   }
 
   return (
@@ -84,7 +89,19 @@ function AirPlaySettingsSheet({
           testid="share-proto-airplay-settings-help"
         />
       )}
+      dismissLabel={t('common.cancel')}
+      dismissDisabled={disabled}
       onClose={onClose}
+      primaryAction={(
+        <button
+          className="btn primary" type="button"
+          data-testid="share-proto-airplay-save"
+          disabled={disabled || !dirty}
+          onClick={() => void save()}
+        >
+          {t('common.save')}
+        </button>
+      )}
       wide
     >
       <SettingRow
@@ -93,32 +110,24 @@ function AirPlaySettingsSheet({
           ? t('share.proto.airplay.effectiveName', { name: effectiveName })
           : undefined}
         control={(
-          <div className="proto-field">
+          <div className="proto-field sheet-field-control">
             <input
               className="input proto-input"
               data-testid="share-proto-airplay-name"
               disabled={disabled}
-              value={shownName}
+              value={nameDraft}
               maxLength={48}
               placeholder={effectiveName || t('share.proto.airplay.namePlaceholder')}
               onChange={(event) => setNameDraft(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === 'Enter' && nameDirty) void saveName(normalizedName);
+                if (event.key === 'Enter' && dirty) void save();
               }}
             />
             <button
-              className="btn small primary" type="button"
-              data-testid="share-proto-airplay-name-save"
-              disabled={disabled || !nameDirty}
-              onClick={() => void saveName(normalizedName)}
-            >
-              {t('common.save')}
-            </button>
-            <button
               className="btn small" type="button"
               data-testid="share-proto-airplay-name-default"
-              disabled={disabled || (!savedName && normalizedName === '')}
-              onClick={() => void saveName('')}
+              disabled={disabled || normalizedName === ''}
+              onClick={() => setNameDraft('')}
             >
               {t('share.proto.airplay.nameDefault')}
             </button>
@@ -128,8 +137,9 @@ function AirPlaySettingsSheet({
 
       <SettingRow
         title={t('share.proto.airplay.password')}
+        note={clearPassword ? t('share.proto.airplay.passwordWillClear') : undefined}
         control={(
-          <div className="proto-field">
+          <div className="proto-field sheet-field-control">
             <input
               className="input proto-input"
               type="password"
@@ -141,26 +151,23 @@ function AirPlaySettingsSheet({
               placeholder={settings.airplay_password_set
                 ? t('share.proto.airplay.passwordPlaceholderSet')
                 : t('share.proto.airplay.passwordPlaceholderUnset')}
-              onChange={(event) => setPasswordDraft(event.target.value)}
+              onChange={(event) => {
+                setPasswordDraft(event.target.value);
+                setClearPassword(false);
+              }}
               onKeyDown={(event) => {
-                if (event.key === 'Enter' && passwordDraft) {
-                  void savePassword(passwordDraft);
-                }
+                if (event.key === 'Enter' && dirty) void save();
               }}
             />
             <button
-              className="btn small primary" type="button"
-              data-testid="share-proto-airplay-password-save"
-              disabled={disabled || !passwordDraft}
-              onClick={() => void savePassword(passwordDraft)}
-            >
-              {t('common.save')}
-            </button>
-            <button
-              className="btn small" type="button"
+              className={`btn small${clearPassword ? ' is-staged' : ''}`} type="button"
               data-testid="share-proto-airplay-password-clear"
-              disabled={disabled || !settings.airplay_password_set}
-              onClick={() => void savePassword('')}
+              aria-pressed={clearPassword}
+              disabled={disabled || (!settings.airplay_password_set && !passwordDraft)}
+              onClick={() => {
+                setPasswordDraft('');
+                setClearPassword((value) => (settings.airplay_password_set ? !value : false));
+              }}
             >
               {t('common.clear')}
             </button>
@@ -308,6 +315,7 @@ function sessionFormat(session: AirPlaySessionInfo): string {
 function ActiveSession({ session, index }: {
   session: AirPlaySessionInfo; index: number;
 }) {
+  const [artworkUrl, setArtworkUrl] = useState<string | null>(null);
   const title = session.title || t('share.proto.active.unknownTrack');
   const peer = session.peer || t('share.proto.active.unknownPeer');
   const protocol = session.protocol || t('share.proto.active.protocolUnknown');
@@ -317,27 +325,72 @@ function ActiveSession({ session, index }: {
     ? fmt.uptime(session.connected_ms / 1000)
     : null;
 
+  useEffect(() => {
+    let cancelled = false;
+    const sessionId = session.id;
+    const revision = session.artwork_revision;
+    const contentType = session.artwork_content_type?.toLowerCase() || null;
+    if (
+      typeof sessionId !== 'number'
+      || !Number.isSafeInteger(sessionId)
+      || typeof revision !== 'number'
+      || !Number.isSafeInteger(revision)
+      || !['image/jpeg', 'image/png'].includes(contentType || '')
+    ) {
+      setArtworkUrl(null);
+      return () => { cancelled = true; };
+    }
+
+    setArtworkUrl(null);
+    void rpc<AirPlayArtwork | null>(
+      'airplay.artwork.get',
+      { session_id: sessionId, revision },
+      { silent: true, timeoutMs: 5000 },
+    ).then((artwork) => {
+      if (
+        cancelled
+        || !artwork
+        || artwork.session_id !== sessionId
+        || artwork.revision !== revision
+        || artwork.content_type.toLowerCase() !== contentType
+        || !/^[A-Za-z0-9+/]*={0,2}$/.test(artwork.data_base64)
+      ) return;
+      setArtworkUrl(`data:${contentType};base64,${artwork.data_base64}`);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [session.id, session.artwork_revision, session.artwork_content_type]);
+
   return (
     <li
       className="proto-session"
       data-testid={`share-proto-session-${session.id ?? index}`}
     >
-      <div className="proto-session-head">
-        <strong>{title}</strong>
-        <span className="tag">{protocol}</span>
-        <span className={`tag ${session.paused ? 'warn' : 'ok'}`}>
-          {session.paused
-            ? t('share.proto.active.paused')
-            : t('share.proto.active.playing')}
-        </span>
-      </div>
-      {media ? <div className="proto-session-media">{media}</div> : null}
-      <div className="proto-session-meta">
-        <span>{t('share.proto.active.peer', { peer })}</span>
-        {format ? <span>{format}</span> : null}
-        {connected
-          ? <span>{t('share.proto.active.connected', { time: connected })}</span>
-          : null}
+      {artworkUrl ? (
+        <img
+          className="proto-session-artwork"
+          src={artworkUrl}
+          alt=""
+          data-testid={`share-proto-artwork-${session.id ?? index}`}
+        />
+      ) : null}
+      <div className="proto-session-body">
+        <div className="proto-session-head">
+          <strong>{title}</strong>
+          <span className="tag">{protocol}</span>
+          <span className={`tag ${session.paused ? 'warn' : 'ok'}`}>
+            {session.paused
+              ? t('share.proto.active.paused')
+              : t('share.proto.active.playing')}
+          </span>
+        </div>
+        {media ? <div className="proto-session-media">{media}</div> : null}
+        <div className="proto-session-meta">
+          <span>{t('share.proto.active.peer', { peer })}</span>
+          {format ? <span>{format}</span> : null}
+          {connected
+            ? <span>{t('share.proto.active.connected', { time: connected })}</span>
+            : null}
+        </div>
       </div>
     </li>
   );

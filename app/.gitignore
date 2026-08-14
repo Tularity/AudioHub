@@ -3,3 +3,8 @@
 /src-tauri/icons/icon.icns
 /src-tauri/icons/icon.iconset/
 /src-tauri/binaries/
+/src-tauri/windows/driver-payload/
+
+# Local Python test caches are never installer inputs.
+__pycache__/
+*.py[cod]

@@ -12,10 +12,11 @@ pub(crate) const SOURCE_VERSION: &str = "366.0";
 pub(crate) const MODEL: &str = "AudioHub,1";
 /// Audio-only profile measured against Music 1.6.5 on macOS 26.5.2. It
 /// advertises only capabilities implemented by this receiver: audio, unified
-/// control, buffered audio and PTP-session negotiation. Pairing is negotiated
+/// control, classic metadata/progress/artwork, rich now-playing metadata,
+/// buffered audio and PTP-session negotiation. Pairing is negotiated
 /// transiently on the control connection; persistent HomeKit pairing and
 /// grouping remain disabled (`acl=0`, `gcgl=0`, `igl=0`).
-pub(crate) const FEATURES: u64 = 0x0001_0340_405C_4A00;
+pub(crate) const FEATURES: u64 = 0x0005_0340_405F_CA00;
 pub(crate) const STATUS_AUDIO_ATTACHED: u32 = 0x4;
 pub(crate) const STATUS_PASSWORD_REQUIRED: u32 = 1 << 7;
 
@@ -25,7 +26,10 @@ pub(crate) struct InfoProfile<'a> {
     pub(crate) password_required: bool,
     pub(crate) identity: &'a ReceiverIdentity,
     pub(crate) features: u64,
+    /// Visible slider in AirPlay's ordinary `-30..=0 dB` domain.
     pub(crate) initial_volume_db: Option<f32>,
+    /// Receiver mute state, independent from the visible slider.
+    pub(crate) is_muted: Option<bool>,
 }
 
 impl InfoProfile<'_> {
@@ -60,6 +64,7 @@ impl InfoProfile<'_> {
             format!("gid={pi}"),
             "gcgl=0".into(),
             "igl=0".into(),
+            "md=0,1,2".into(),
             format!("model={MODEL}"),
             "protovers=1.1".into(),
             format!("pi={pi}"),
@@ -73,7 +78,11 @@ impl InfoProfile<'_> {
         let mut root = Dictionary::new();
         root.insert("vv".into(), Value::Integer(2.into()));
         root.insert("protocolVersion".into(), Value::String("1.1".into()));
-        root.insert("volumeControlType".into(), Value::Integer(3.into()));
+        // AudioHub drives the receiver's system software endpoint. Declaring
+        // AbsoluteHardware (3) makes Control Center treat the initial value as
+        // an unavailable hardware control and can collapse its expanded UI to
+        // zero; AbsoluteSoftware is the matching AirPlay contract.
+        root.insert("volumeControlType".into(), Value::Integer(4.into()));
         root.insert("canRecordScreenStream".into(), Value::Boolean(false));
         root.insert("keepAliveSendStatsAsBody".into(), Value::Boolean(false));
         root.insert("screenDemoMode".into(), Value::Boolean(false));
@@ -108,6 +117,9 @@ impl InfoProfile<'_> {
 
         if let Some(volume) = self.initial_volume_db {
             root.insert("initialVolume".into(), Value::Real(f64::from(volume)));
+        }
+        if let Some(is_muted) = self.is_muted {
+            root.insert("isMuted".into(), Value::Boolean(is_muted));
         }
 
         Ok(root)
@@ -153,11 +165,13 @@ mod tests {
             identity: &identity,
             features: FEATURES,
             initial_volume_db: Some(-18.0),
+            is_muted: Some(true),
         };
         let txt = profile.txt_records();
         assert!(txt
             .iter()
-            .any(|value| value == "features=0x405C4A00,0x10340"));
+            .any(|value| value == "features=0x405FCA00,0x50340"));
+        assert!(txt.iter().any(|value| value == "md=0,1,2"));
         assert!(txt.iter().any(|value| value == "flags=0x4"));
         assert!(!txt.iter().any(|value| value.starts_with("pw=")));
 
@@ -174,11 +188,15 @@ mod tests {
             dictionary
                 .get("volumeControlType")
                 .and_then(Value::as_unsigned_integer),
-            Some(3)
+            Some(4)
         );
         assert_eq!(
             dictionary.get("initialVolume").and_then(Value::as_real),
             Some(-18.0)
+        );
+        assert_eq!(
+            dictionary.get("isMuted").and_then(Value::as_boolean),
+            Some(true)
         );
         assert_eq!(
             dictionary.get("pk").and_then(Value::as_data),
@@ -212,12 +230,19 @@ mod tests {
             identity: &identity,
             features: FEATURES,
             initial_volume_db: None,
+            is_muted: Some(true),
         };
         assert_eq!(profile.status_flags(), 0x84);
         assert!(profile
             .txt_records()
             .iter()
             .any(|value| value == "flags=0x84"));
+        let dictionary = profile.dictionary().unwrap();
+        assert!(!dictionary.contains_key("initialVolume"));
+        assert_eq!(
+            dictionary.get("isMuted").and_then(Value::as_boolean),
+            Some(true)
+        );
     }
 
     #[test]

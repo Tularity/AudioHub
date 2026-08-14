@@ -27,15 +27,22 @@ import { isConfirmOpen } from './ConfirmDialog';
 import { sheetEscapeCloses, trapIndex, FOCUSABLE_SELECTOR } from '../lib/sheet';
 
 export function Sheet({
-  testid, title, help, children, footer, onClose, auto = false, wide = false,
+  testid, title, help, children, footer, primaryAction, dismissLabel,
+  dismissDisabled = false, onClose, auto = false, wide = false,
 }: {
   testid: string;
   title: string;
   /** 标题右边那枚 `?`。与页面上的区块标题同一个形状。 */
   help?: ReactNode;
   children: ReactNode;
-  /** 底部动作区。关闭按钮由调用方给——不同 Sheet 的主动作不一样。 */
+  /** 底部左侧的辅助动作（例如恢复默认 / 重新检查），不承担提交。 */
   footer?: ReactNode;
+  /** 底部最右的菜单级主动作。编辑型 Sheet 的「保存」只应出现在这里。 */
+  primaryAction?: ReactNode;
+  /** 有未提交草稿时用「取消」，只读 / 即时动作面板仍用缺省的「关闭」。 */
+  dismissLabel?: ReactNode;
+  /** 提交进行中时同时挡住按钮、Esc 与遮罩，避免已发出的写入看起来像被取消。 */
+  dismissDisabled?: boolean;
   onClose: () => void;
   /** 由 effect 自动弹出（而非用户点开）。只做标记，供回归断言用。 */
   auto?: boolean;
@@ -48,8 +55,8 @@ export function Sheet({
   // `onClose` 走 ref，**下面那个 effect 的依赖数组必须留空**。
   //
   // 这不是一次微优化，是一条正确性要求。effect 一旦把 `onClose` 列进依赖，调用方
-  // 传一个内联箭头（`onClose={() => setOpen(false)}`，七处里有三处最终就是这么来的：
-  // Peers.tsx 那两扇二级菜单的 `onClose` 由父组件内联生成，一路透传下来）就会让它
+  // 传一个内联箭头（`onClose={() => setOpen(false)}`；Peers.tsx 那两扇二级菜单的
+  // `onClose` 就由父组件内联生成、一路透传下来）会让它
   // **每次重渲都重跑一遍**：cleanup 先把焦点还给「触发者」，effect 再把焦点抢回
   // 卡片里的第一个可聚焦元素。而「让对方找到我」正开着倒计时，`BeDiscoveredSheet`
   // 是 1 Hz 重渲的——表现为用户每按一次 Tab，一秒之内就被弹回标题旁的 `?`，
@@ -60,6 +67,8 @@ export function Sheet({
   // 只是键盘用户用不了。
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
+  const dismissDisabledRef = useRef(dismissDisabled);
+  dismissDisabledRef.current = dismissDisabled;
 
   useEffect(() => {
     const card = cardRef.current;
@@ -78,12 +87,22 @@ export function Sheet({
     else card?.focus();
 
     const onKey = (e: KeyboardEvent) => {
+      // The daemon recovery gate is the global top-level modal. A Sheet can
+      // remain mounted underneath it while a connection drops, but must not
+      // consume Esc/Tab or move focus until recovery completes.
+      if (document.getElementById('overlay')?.hidden === false) return;
+      // A confirmation is the modal directly above this Sheet. Its mask makes
+      // the Sheet inert, and its own handler owns both Escape and Tab. Yielding
+      // here avoids the older Sheet trap briefly pulling focus behind the
+      // confirmation before the later-registered Confirm handler corrects it.
+      if (isConfirmOpen()) return;
       if (isEscape(e)) {
         // Esc 不一定归这一层——录制态与开在上面的确认框都比它更内层。判据是纯函数，
         // 有单测；这里只负责问。
         if (!sheetEscapeCloses({ recording: isRecordingCapture(), confirmOpen: isConfirmOpen() })) {
           return;
         }
+        if (dismissDisabledRef.current) return;
         e.preventDefault();
         e.stopPropagation();
         closeRef.current();
@@ -117,7 +136,9 @@ export function Sheet({
       data-auto={auto ? 'on' : undefined}
       // 点遮罩关闭，**仅当点的就是遮罩本身**。卡片内部的点击不许穿透过来——
       // 误关是小事，误确认才是大事（与 ConfirmDialog 同一条判据）。
-      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !dismissDisabled) onClose();
+      }}
     >
       <div
         className={`sheet-card${wide ? ' wide' : ''}`}
@@ -133,12 +154,15 @@ export function Sheet({
         </div>
         <div className="sheet-body">{children}</div>
         <div className="sheet-actions">
-          {footer}
+          {footer ? <div className="sheet-actions-leading">{footer}</div> : null}
           <button
-            className="btn" type="button" data-testid={`${testid}-close`} onClick={onClose}
+            className="btn" type="button" data-testid={`${testid}-close`}
+            disabled={dismissDisabled}
+            onClick={onClose}
           >
-            {t('common.close')}
+            {dismissLabel ?? t('common.close')}
           </button>
+          {primaryAction}
         </div>
       </div>
     </div>

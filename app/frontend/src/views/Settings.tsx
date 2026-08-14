@@ -41,13 +41,16 @@ import { t, joinPhrases } from '../i18n';
 import type { MsgKey } from '../i18n';
 import { getState, useStore } from '../state/store';
 import type { AppState } from '../state/store';
-import type { DaemonSettings } from '../ipc/types';
+import type { DaemonSettings, DriverInstallerStatus, DriverInstallResult } from '../ipc/types';
+import { isTauri, tauriInvoke } from '../ipc/endpoint';
 import {
   MODE_SHARE, MODE_A, MODE_B,
-  halState, requestedMode, isModeB, modeDowngraded, deviceStateLabel,
+  halState, requestedMode, isModeB, modeDowngraded, deviceStateLabel, halInventoryRows,
 } from '../state/mode';
 import type { AppMode } from '../state/mode';
-import { applySettings, rpc } from '../state/connection';
+import {
+  applySettings, installDriverAndReconnect, refreshStatus, restartDaemonService, rpc,
+} from '../state/connection';
 
 // plan §13：三档。`Record<AppMode, MsgKey>` 而不是 `Record<string, MsgKey>`——
 // 后者会让漏掉一档在编译期毫无声响，运行期变成一次 `t(undefined)`。
@@ -80,6 +83,30 @@ function ModeCard() {
   const mode = useStore(requestedMode);
   const downgraded = useStore(modeDowngraded);
   const st = halState(daemon);
+  const [driverInstaller, setDriverInstaller] = useState<DriverInstallerStatus | null>(null);
+  const [driverTask, setDriverTask] = useState<'install' | 'restart' | null>(null);
+  const driverBusy = driverTask !== null;
+  const driverNeedsReboot = driverInstaller?.reboot_required === true
+    || driverInstaller?.state === 'reboot_required';
+  const driverCanRestart = (st.kind === 'detached' || st.kind === 'absent')
+    && driverInstaller?.installed === true
+    && (driverInstaller.platform !== 'windows' || driverInstaller.daemon_image_configured)
+    && !driverNeedsReboot;
+  const showDriverNote = driverNeedsReboot || st.tone !== 'ok';
+  // A healthy driver does not need a permanent "ready" sentence, but an
+  // installed native payload must remain repairable without first breaking it.
+  const showDriverAction = isTauri()
+    && !driverNeedsReboot
+    && (st.tone !== 'ok' || driverInstaller?.installed === true);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let alive = true;
+    tauriInvoke<DriverInstallerStatus>('driver_installer_status')
+      .then((status) => { if (alive) setDriverInstaller(status); })
+      .catch((error) => console.error('[audiohub] driver installer status failed', error));
+    return () => { alive = false; };
+  }, [st.kind]);
 
   async function setMode(v: AppMode): Promise<void> {
     if (v === requestedMode(getState())) return;
@@ -87,6 +114,80 @@ function ModeCard() {
       await applySettings({ mode: v });
       toast(t(SWITCHED_KEY[v]), 'ok');
     } catch { /* rpc 已 toast */ }
+  }
+
+  async function installDriver(): Promise<void> {
+    const operation: 'install' | 'update' | 'repair' = st.kind === 'mismatch'
+      ? 'update'
+      : driverInstaller?.installed
+        ? 'repair'
+        : 'install';
+    const titleKey = {
+      install: 'settings.driver.confirmTitle.install',
+      update: 'settings.driver.confirmTitle.update',
+      repair: 'settings.driver.confirmTitle.repair',
+    } as const;
+    const actionKey = {
+      install: 'settings.driver.install',
+      update: 'settings.driver.update',
+      repair: 'settings.driver.repair',
+    } as const;
+    const confirmed = await confirmDialog({
+      title: t(titleKey[operation]),
+      body: [t('settings.driver.confirmBody')],
+      confirmText: t(actionKey[operation]),
+      testid: 'confirm-driver-install',
+    });
+    if (!confirmed) return;
+    setDriverTask('install');
+    try {
+      const result: DriverInstallResult = await installDriverAndReconnect();
+      if (result.reboot_required) {
+        toast(t('settings.driver.reboot'), 'warn');
+      } else if (result.state === 'installed_unavailable') {
+        toast(t('settings.driver.unavailable'), 'error');
+      } else {
+        toast(t('settings.driver.done'), 'ok');
+      }
+      // macOS reconnects its bridge after coreaudiod returns; Windows restarts
+      // the daemon after helper verification. Refresh across both transition
+      // windows instead of requiring a restart or a page change.
+      for (const delay of [400, 1200, 3000, 6000]) {
+        window.setTimeout(() => void refreshStatus(), delay);
+      }
+      setDriverInstaller(await tauriInvoke<DriverInstallerStatus>('driver_installer_status'));
+    } catch (raw) {
+      const error = raw as { kind?: string; detail?: string; message?: string };
+      console.error('[audiohub] driver install failed', raw);
+      if (error?.kind === 'user-cancelled') toast(t('settings.driver.cancelled'), 'info');
+      else if (error?.kind === 'installed-unavailable') toast(t('settings.driver.unavailable'), 'error');
+      else toast(t('settings.driver.failed'), 'error');
+    } finally {
+      setDriverTask(null);
+    }
+  }
+
+  async function restartDriverService(): Promise<void> {
+    setDriverTask('restart');
+    try {
+      await restartDaemonService();
+      let ready = false;
+      for (const delay of [0, 250, 750, 1500, 2500]) {
+        if (delay) await new Promise<void>((resolve) => window.setTimeout(resolve, delay));
+        await refreshStatus();
+        if (halState(getState().daemon).kind === 'ready') {
+          ready = true;
+          break;
+        }
+      }
+      if (!ready) throw new Error('driver bridge did not become ready');
+      toast(t('settings.driver.serviceRestarted'), 'ok');
+    } catch (raw) {
+      console.error('[audiohub] daemon restart failed', raw);
+      toast(t('settings.driver.serviceRestartFailed'), 'error');
+    } finally {
+      setDriverTask(null);
+    }
   }
 
   return (
@@ -116,14 +217,37 @@ function ModeCard() {
           ]}
         />
       </div>
-      {/* 「驱动就绪」是常态，不是消息：只有出问题时这行才值得占一行。 */}
-      <p
-        className={`mode-note tone-${st.tone}`}
-        data-testid="settings-mode-note"
-        hidden={st.tone === 'ok'}
-      >
-        {st.text}
-      </p>
+      {/* 「驱动就绪」是常态，不是消息；但已安装驱动始终要有修复入口。 */}
+      <div className="mode-note-row" hidden={!showDriverNote && !showDriverAction}>
+        {showDriverNote ? (
+          <p className={`mode-note tone-${st.tone}`} data-testid="settings-mode-note">
+            {driverNeedsReboot ? t('settings.driver.reboot') : st.text}
+          </p>
+        ) : null}
+        {showDriverAction ? (
+          <button
+            className="btn small primary"
+            type="button"
+            data-testid="settings-driver-install"
+            disabled={driverBusy || driverInstaller?.supported === false || driverInstaller?.bundled === false}
+            onClick={() => void (
+              driverCanRestart
+                ? restartDriverService()
+                : installDriver()
+            )}
+          >
+            {driverTask
+              ? t(driverTask === 'restart' ? 'settings.driver.restarting' : 'settings.driver.installing')
+              : st.kind === 'mismatch'
+                ? t('settings.driver.update')
+                : driverCanRestart
+                  ? t('settings.driver.restartService')
+                : driverInstaller?.installed
+                  ? t('settings.driver.repair')
+                  : t('settings.driver.install')}
+          </button>
+        ) : null}
+      </div>
       {/* 用户存的是 B、daemon 只能给 A：这是**降级**，不是「他选了 A」。 */}
       <p className="mode-warn" data-testid="consumer-mode-downgraded" hidden={!downgraded}>
         {t('mode.downgraded')}
@@ -309,10 +433,17 @@ function DeviceInventory() {
   const list = hal && Array.isArray(hal.devices) ? hal.devices : [];
   const cap = ds ? ds.hal_capacity : (hal ? 16 : 0);
   const used = ds ? ds.hal_used : list.length;
+  const entries = list.map((device) => {
+    const fp = device.fingerprint || '';
+    const peer = s.peers.find((candidate) => candidate.fingerprint === fp);
+    return { device, fp, peer, rows: halInventoryRows(device, peer) };
+  }).filter((entry) => entry.rows.length > 0);
 
   // 只在**没有设备**时说话。有设备时那一行清单自己就是答案，再补一句
   // 「已发布 = …」是把定义写在结论旁边——正是这一轮要清掉的东西。
-  const note = list.length
+  // HAL 表里可能暂时保留一个 requested mask = 0 的槽。它代表对端明确零能力，
+  // 不是驱动故障：这种情况既不画空卡，也不画「没有设备」警告。
+  const note = entries.length || list.length
     ? ''
     : !hal ? t('settings.devices.noteNoDriver')
       : isModeB(s) ? t('settings.devices.noteModeB') : t('settings.devices.noteModeA');
@@ -327,18 +458,13 @@ function DeviceInventory() {
             : t('settings.devices.countNa')}
         </span>
       </div>
-      <div className="dev-inventory" data-testid="settings-hal-devices" hidden={list.length === 0}>
-        {list.map((d) => {
-          const fp = d.fingerprint || '';
-          const peer = s.peers.find((p) => p.fingerprint === fp);
+      <div className="dev-inventory" data-testid="settings-hal-devices" hidden={entries.length === 0}>
+        {entries.map(({ device: d, fp, peer, rows }) => {
           const owner = (peer && (peer.display_name || peer.name)) || fp.slice(0, 12);
           // state 与 observed 是两件事：前者是驱动应答了我们，后者是系统真的列出了它。
           // 只报前者，就会把「发过 Bind 但设备没出现」显示成一切正常。
-          const published = d.state === 'bound' && d.observed;
-          const rows = [
-            { dir: 'out' as const, ico: 'spk' as const, name: d.out_name, uid: d.out_uid, io: d.io_out, frames: d.spk_frames, drop: null as number | null },
-            { dir: 'in' as const, ico: 'mic' as const, name: d.in_name, uid: d.in_uid, io: d.io_in, frames: d.mic_frames, drop: d.mic_dropped ?? null },
-          ];
+          const published = d.state === 'bound'
+            && rows.every((row) => row.published && row.observed);
           return (
             <div key={fp} className="dev-inv-card" data-testid={`settings-hal-device-${fp}`}>
               <div className="dev-inv-head">
@@ -357,7 +483,7 @@ function DeviceInventory() {
               </div>
               {rows.map((r) => (
                 <div key={r.dir} className="dev-inv-row" data-testid={`settings-hal-${r.dir}-${fp}`}>
-                  <Icon name={r.ico} cls="ico dev-ico" />
+                  <Icon name={r.icon} cls="ico dev-ico" />
                   <div className="dev-text">
                     <span className="dev-name">{r.name || t('common.dash')}</span>
                     <code className="dev-uid mono">{r.uid || ''}</code>
@@ -365,11 +491,11 @@ function DeviceInventory() {
                   <span className="dev-frames mono">
                     {joinPhrases([
                       t('device.frames', { n: fmt.count(r.frames) }),
-                      r.drop ? t('device.dropped', { n: fmt.count(r.drop) }) : null,
+                      r.dropped ? t('device.dropped', { n: fmt.count(r.dropped) }) : null,
                     ])}
                   </span>
-                  <span className={`dev-state ${r.io ? 'live' : 'idle'}`}>
-                    {r.io ? t('device.inUse') : t('device.idle')}
+                  <span className={`dev-state ${r.io ? 'live' : r.published && r.observed ? 'idle' : 'pending'}`}>
+                    {r.io ? t('device.inUse') : r.published && r.observed ? t('device.idle') : t('device.awaiting')}
                   </span>
                 </div>
               ))}
@@ -418,7 +544,10 @@ function WebAccessRows() {
         setStatus(s);
         setPortDraft(String(s.port));
       })
-      .catch((e) => { if (alive) toast(String(e), 'warn'); })
+      .catch((e) => {
+        console.error('[audiohub] web UI status failed', e);
+        if (alive) toast(t('settings.web.error'), 'warn');
+      })
       .finally(() => { if (alive) setLoaded(true); });
     return () => { alive = false; };
   }, [editable]);
@@ -433,10 +562,11 @@ function WebAccessRows() {
       setStatus(next);
       setPortDraft(String(next.port));
       if (next.enabled && !next.running && next.error) {
-        toast(t('settings.web.error', { message: next.error }), 'warn');
+        toast(t('settings.web.error'), 'warn');
       }
     } catch (e) {
-      toast(String(e), 'warn');
+      console.error('[audiohub] web UI settings failed', e);
+      toast(t('settings.web.error'), 'warn');
     } finally {
       setBusy(false);
     }
@@ -565,7 +695,7 @@ function WebAccessRows() {
         hidden={!st || !st.error}
       >
         {st && st.error
-          ? joinPhrases([t('settings.web.error', { message: st.error }), t('settings.web.errorHint')])
+          ? joinPhrases([t('settings.web.error'), t('settings.web.errorHint')])
           : ''}
       </p>
 
@@ -810,18 +940,18 @@ function IdentityResetButton({ fp }: { fp: string }) {
           testid="settings-identity-reset-sheet"
           title={t('settings.identity.resetTitle')}
           help={<Help label={t('wiki.discovery')} url={WIKI.fingerprint} testid="settings-identity-reset-help" />}
+          dismissLabel={t('common.cancel')}
+          dismissDisabled={busy}
           onClose={() => setOpen(false)}
-          footer={(
-            <span className="danger-slot">
-              <button
-                className="btn small danger" type="button"
-                data-testid="settings-identity-reset-confirm"
-                disabled={busy}
-                onClick={() => void doReset()}
-              >
-                {t('settings.identity.reset')}
-              </button>
-            </span>
+          primaryAction={(
+            <button
+              className="btn danger" type="button"
+              data-testid="settings-identity-reset-confirm"
+              disabled={busy}
+              onClick={() => void doReset()}
+            >
+              {t('settings.identity.reset')}
+            </button>
           )}
         >
           <div className="kv">
@@ -891,9 +1021,9 @@ function StartupRows({ writing, noSettings, onPush }: {
         {v.note === 'unknown'
           ? t('settings.startup.unknown')
           : v.note === 'unsupported'
-            ? t('settings.startup.unsupported', { reason: v.reason || t('common.dash') })
+            ? t('settings.startup.unsupported')
             : v.note === 'orphaned'
-              ? t('settings.startup.orphaned', { reason: v.reason || t('common.dash') })
+              ? t('settings.startup.orphaned')
               : ''}
       </p>
     </>

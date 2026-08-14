@@ -60,7 +60,8 @@ impl std::error::Error for UnpairedByPeer {}
 
 /// True when this error chain reports that the peer unpaired from us.
 pub fn was_unpaired_by_peer(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.downcast_ref::<UnpairedByPeer>().is_some())
+    e.chain()
+        .any(|c| c.downcast_ref::<UnpairedByPeer>().is_some())
 }
 
 /// The machine at the other end of this connection is US: the handshake came
@@ -83,7 +84,11 @@ pub struct SelfConnection {
 
 impl std::fmt::Display for SelfConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "this connection came back to ourselves ({})", self.fingerprint)
+        write!(
+            f,
+            "this connection came back to ourselves ({})",
+            self.fingerprint
+        )
     }
 }
 
@@ -91,7 +96,8 @@ impl std::error::Error for SelfConnection {}
 
 /// True when this error chain reports that we connected to ourselves.
 pub fn was_self_connection(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.downcast_ref::<SelfConnection>().is_some())
+    e.chain()
+        .any(|c| c.downcast_ref::<SelfConnection>().is_some())
 }
 
 fn now_unix() -> u64 {
@@ -108,7 +114,13 @@ fn b64d(s: &str) -> Result<Vec<u8>> {
 }
 
 // per-sender transcript: MAC covers only the sender's own public key
-fn confirm_hmac(k: &[u8], label: &[u8], spake_a: &[u8], spake_b: &[u8], pub_sender: &[u8]) -> HmacSha256 {
+fn confirm_hmac(
+    k: &[u8],
+    label: &[u8],
+    spake_a: &[u8],
+    spake_b: &[u8],
+    pub_sender: &[u8],
+) -> HmacSha256 {
     let mut h = Sha256::new();
     h.update(spake_a);
     h.update(spake_b);
@@ -120,7 +132,13 @@ fn confirm_hmac(k: &[u8], label: &[u8], spake_a: &[u8], spake_b: &[u8], pub_send
     mac
 }
 
-fn confirm_mac(k: &[u8], label: &[u8], spake_a: &[u8], spake_b: &[u8], pub_sender: &[u8]) -> Vec<u8> {
+fn confirm_mac(
+    k: &[u8],
+    label: &[u8],
+    spake_a: &[u8],
+    spake_b: &[u8],
+    pub_sender: &[u8],
+) -> Vec<u8> {
     confirm_hmac(k, label, spake_a, spake_b, pub_sender)
         .finalize()
         .into_bytes()
@@ -175,7 +193,10 @@ pub fn pair_initiator<T: ControlIo + ?Sized>(
         },
     )?;
     let (msg_b, peer_name) = match read_frame(s)? {
-        ControlMsg::PairResp { spake_msg_b64, name } => (b64d(&spake_msg_b64)?, name),
+        ControlMsg::PairResp {
+            spake_msg_b64,
+            name,
+        } => (b64d(&spake_msg_b64)?, name),
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     };
@@ -192,13 +213,21 @@ pub fn pair_initiator<T: ControlIo + ?Sized>(
         },
     )?;
     let (mac_b, pub_b_b64) = match read_frame(s)? {
-        ControlMsg::PairConfirmB { mac_b64, public_key_b64 } => (b64d(&mac_b64)?, public_key_b64),
+        ControlMsg::PairConfirmB {
+            mac_b64,
+            public_key_b64,
+        } => (b64d(&mac_b64)?, public_key_b64),
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     };
     let pub_b = pub_arr(&pub_b_b64)?;
     if !confirm_mac_ok(&k, CONFIRM_LABEL_B, &msg_a, &msg_b, &pub_b, &mac_b) {
-        let _ = write_frame(s, &ControlMsg::Error { message: "pin mismatch".into() });
+        let _ = write_frame(
+            s,
+            &ControlMsg::Error {
+                message: "pin mismatch".into(),
+            },
+        );
         bail!("pin mismatch");
     }
     match read_frame(s)? {
@@ -230,9 +259,11 @@ pub fn pair_responder<T: ControlIo + ?Sized>(
     let _ = s.set_nodelay(true);
 
     let (msg_a, peer_name, listen_port) = match read_frame(s)? {
-        ControlMsg::PairInit { spake_msg_b64, name, listen_port } => {
-            (b64d(&spake_msg_b64)?, name, listen_port)
-        }
+        ControlMsg::PairInit {
+            spake_msg_b64,
+            name,
+            listen_port,
+        } => (b64d(&spake_msg_b64)?, name, listen_port),
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     };
@@ -253,13 +284,21 @@ pub fn pair_responder<T: ControlIo + ?Sized>(
         .map_err(|e| anyhow!("spake2 finish failed: {e:?}"))?;
 
     let (mac_a, pub_a_b64) = match read_frame(s)? {
-        ControlMsg::PairConfirmA { mac_b64, public_key_b64 } => (b64d(&mac_b64)?, public_key_b64),
+        ControlMsg::PairConfirmA {
+            mac_b64,
+            public_key_b64,
+        } => (b64d(&mac_b64)?, public_key_b64),
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     };
     let pub_a = pub_arr(&pub_a_b64)?;
     if !confirm_mac_ok(&k, CONFIRM_LABEL_A, &msg_a, &msg_b, &pub_a, &mac_a) {
-        let _ = write_frame(s, &ControlMsg::Error { message: "pin mismatch".into() });
+        let _ = write_frame(
+            s,
+            &ControlMsg::Error {
+                message: "pin mismatch".into(),
+            },
+        );
         bail!("pin mismatch");
     }
     let mac_b = confirm_mac(&k, CONFIRM_LABEL_B, &msg_a, &msg_b, &id.public_key_bytes());
@@ -328,9 +367,9 @@ fn authenticate_unpaired(
     if fp_r == id.fingerprint {
         return Err(anyhow::Error::new(SelfConnection { fingerprint: fp_r }));
     }
-    let peer = store
-        .find(&fp_r)
-        .ok_or_else(|| anyhow!("a machine we are not paired with ({fp_r}) refused us as unpaired"))?;
+    let peer = store.find(&fp_r).ok_or_else(|| {
+        anyhow!("a machine we are not paired with ({fp_r}) refused us as unpaired")
+    })?;
     let m = unpaired_preimage(nonce_i, &fp_r, &id.fingerprint);
     if !verify_sig(&peer.public_key_b64, &m, &b64d(sig_b64)?) {
         bail!("the refusal from {fp_r} is not signed by that peer's key; keeping the pairing");
@@ -375,7 +414,8 @@ impl std::error::Error for ProtocolMismatch {}
 
 /// True when this error chain reports a control protocol version mismatch.
 pub fn was_protocol_mismatch(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.downcast_ref::<ProtocolMismatch>().is_some())
+    e.chain()
+        .any(|c| c.downcast_ref::<ProtocolMismatch>().is_some())
 }
 
 /// Strict equality (plan §13). Deliberately not `theirs >= ours` or any other
@@ -437,17 +477,23 @@ pub fn verify_initiator<T: ControlIo + ?Sized>(
         // peer's virtual devices) instead of retrying forever — but ONLY once
         // the refusal is proved to come from that peer. Everything else here is
         // a failed connection, and a failed connection never edits the store.
-        ControlMsg::Unpaired { sig_b64, public_key_b64 } => {
-            let fingerprint = authenticate_unpaired(&sig_b64, &public_key_b64, &nonce_i, id, store)?;
+        ControlMsg::Unpaired {
+            sig_b64,
+            public_key_b64,
+        } => {
+            let fingerprint =
+                authenticate_unpaired(&sig_b64, &public_key_b64, &nonce_i, id, store)?;
             return Err(anyhow::Error::new(UnpairedByPeer { fingerprint }));
         }
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     };
     let (sig_r, pub_r_b64, name_r) = match read_frame(s)? {
-        ControlMsg::VerifyResponse { sig_b64, public_key_b64, name } => {
-            (b64d(&sig_b64)?, public_key_b64, name)
-        }
+        ControlMsg::VerifyResponse {
+            sig_b64,
+            public_key_b64,
+            name,
+        } => (b64d(&sig_b64)?, public_key_b64, name),
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     };
@@ -468,7 +514,9 @@ pub fn verify_initiator<T: ControlIo + ?Sized>(
     if !verify_sig(&peer.public_key_b64, &m_r, &sig_r) {
         let _ = write_frame(
             s,
-            &ControlMsg::Error { message: "signature verification failed".into() },
+            &ControlMsg::Error {
+                message: "signature verification failed".into(),
+            },
         );
         bail!("signature verification failed");
     }
@@ -533,14 +581,23 @@ pub fn verify_responder<T: ControlIo + ?Sized>(
     s.set_read_deadline(Some(Instant::now() + HANDSHAKE_TIMEOUT))?;
 
     let (fp_i, nonce_i) = match read_frame(s)? {
-        ControlMsg::VerifyHello { fingerprint, nonce_b64, version } => {
+        ControlMsg::VerifyHello {
+            fingerprint,
+            nonce_b64,
+            version,
+        } => {
             // Checked BEFORE the store lookup, so a version-mismatched peer is
             // told about the version rather than about its fingerprint — and,
             // more importantly, so it can never reach the `Unpaired` branch
             // below. That branch makes the initiator DELETE a pairing, and a
             // build we cannot speak to must not be able to trigger it.
             if let Err(e) = check_protocol(version) {
-                let _ = write_frame(s, &ControlMsg::Error { message: e.to_string() });
+                let _ = write_frame(
+                    s,
+                    &ControlMsg::Error {
+                        message: e.to_string(),
+                    },
+                );
                 return Err(e);
             }
             (fingerprint, b64d(&nonce_b64)?)
@@ -593,9 +650,11 @@ pub fn verify_responder<T: ControlIo + ?Sized>(
         },
     )?;
     let (sig_i, name_i) = match read_frame(s)? {
-        ControlMsg::VerifyResponse { sig_b64, public_key_b64: _, name } => {
-            (b64d(&sig_b64)?, name)
-        }
+        ControlMsg::VerifyResponse {
+            sig_b64,
+            public_key_b64: _,
+            name,
+        } => (b64d(&sig_b64)?, name),
         ControlMsg::Error { message } => bail!("{message}"),
         other => bail!("unexpected message: {other:?}"),
     };
@@ -603,7 +662,9 @@ pub fn verify_responder<T: ControlIo + ?Sized>(
     if !verify_sig(&peer.public_key_b64, &m_i, &sig_i) {
         let _ = write_frame(
             s,
-            &ControlMsg::Error { message: "signature verification failed".into() },
+            &ControlMsg::Error {
+                message: "signature verification failed".into(),
+            },
         );
         bail!("signature verification failed");
     }
@@ -679,7 +740,10 @@ mod handshake_deadline_tests {
     }
 
     fn scratch(tag: &str) -> PathBuf {
-        let n = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
         let p = std::env::temp_dir().join(format!("ahb-hsdl-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&p).expect("mkdir");
         p
@@ -691,12 +755,21 @@ mod handshake_deadline_tests {
         let id = LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
         let store = PeerStore::load_at(Some(&dir)).expect("store");
 
-        let mut peer = SilentPeer { deadline: None, reads_before_any_deadline: 0 };
+        let mut peer = SilentPeer {
+            deadline: None,
+            reads_before_any_deadline: 0,
+        };
         let out = verify_responder(&mut peer, &id, &store);
 
-        assert!(out.is_err(), "a peer that never speaks must not be waited on forever");
+        assert!(
+            out.is_err(),
+            "a peer that never speaks must not be waited on forever"
+        );
         assert_eq!(peer.reads_before_any_deadline, 0);
-        assert!(peer.deadline.is_some(), "verify_responder left the read unbounded");
+        assert!(
+            peer.deadline.is_some(),
+            "verify_responder left the read unbounded"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -708,12 +781,21 @@ mod handshake_deadline_tests {
         let id = LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
         let store = PeerStore::load_at(Some(&dir)).expect("store");
 
-        let mut peer = SilentPeer { deadline: None, reads_before_any_deadline: 0 };
+        let mut peer = SilentPeer {
+            deadline: None,
+            reads_before_any_deadline: 0,
+        };
         let out = verify_initiator(&mut peer, &id, &store);
 
-        assert!(out.is_err(), "a tunnel that accepts and stays silent must not hang the dialler");
+        assert!(
+            out.is_err(),
+            "a tunnel that accepts and stays silent must not hang the dialler"
+        );
         assert_eq!(peer.reads_before_any_deadline, 0);
-        assert!(peer.deadline.is_some(), "verify_initiator left the read unbounded");
+        assert!(
+            peer.deadline.is_some(),
+            "verify_initiator left the read unbounded"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -767,7 +849,12 @@ mod protocol_version_tests {
     /// The responder is the PRODUCTION function — the whole point of these
     /// tests is that the shipped code refuses, not that a hand-written check
     /// would.
-    fn serve(dir: &PathBuf) -> (std::net::SocketAddr, std::thread::JoinHandle<Result<PairedPeer>>) {
+    fn serve(
+        dir: &PathBuf,
+    ) -> (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<Result<PairedPeer>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         let dir = dir.clone();
@@ -844,7 +931,10 @@ mod protocol_version_tests {
         let (a, b) = pair_of("stale");
         let (out, reply) = exchange(&a.id.fingerprint, PROTOCOL_VERSION - 1, &b.dir);
         let e = out.expect_err("must be refused");
-        assert!(was_protocol_mismatch(&e), "expected a version mismatch, got: {e:#}");
+        assert!(
+            was_protocol_mismatch(&e),
+            "expected a version mismatch, got: {e:#}"
+        );
         assert!(
             matches!(reply, Ok(ControlMsg::Error { .. })),
             "the initiator has to be TOLD, not just dropped: {reply:?}"
@@ -865,7 +955,10 @@ mod protocol_version_tests {
         let (a, b) = pair_of("absent");
         let (out, _) = exchange(&a.id.fingerprint, VERSION_ABSENT, &b.dir);
         let e = out.expect_err("must be refused");
-        assert!(was_protocol_mismatch(&e), "expected a version mismatch, got: {e:#}");
+        assert!(
+            was_protocol_mismatch(&e),
+            "expected a version mismatch, got: {e:#}"
+        );
         let text = format!("{e:#}");
         assert!(
             text.contains("before mode advertisement"),
@@ -887,7 +980,10 @@ mod protocol_version_tests {
         let b = Party::new("order-resp");
         let (out, reply) = exchange("ffffffffffffffff", VERSION_ABSENT, &b.dir);
         let e = out.expect_err("must be refused");
-        assert!(was_protocol_mismatch(&e), "expected a version mismatch, got: {e:#}");
+        assert!(
+            was_protocol_mismatch(&e),
+            "expected a version mismatch, got: {e:#}"
+        );
         match reply {
             Ok(ControlMsg::Error { .. }) => {}
             Ok(ControlMsg::Unpaired { .. }) => panic!(
@@ -919,13 +1015,18 @@ mod protocol_version_tests {
     fn a_refused_version_leaves_both_peer_stores_untouched() {
         let (a, b) = pair_of("nostorewrite");
         let store_path = |p: &Party| p.dir.join("paired_peers.json");
-        let before: Vec<Vec<u8>> =
-            [&a, &b].iter().map(|p| std::fs::read(store_path(p)).expect("store")).collect();
+        let before: Vec<Vec<u8>> = [&a, &b]
+            .iter()
+            .map(|p| std::fs::read(store_path(p)).expect("store"))
+            .collect();
 
         // One version behind: the shape M8 produces when only one end is rebuilt.
         let (out, reply) = exchange(&a.id.fingerprint, PROTOCOL_VERSION - 1, &b.dir);
         assert!(was_protocol_mismatch(&out.expect_err("must be refused")));
-        assert!(matches!(reply, Ok(ControlMsg::Error { .. })), "the peer must be told: {reply:?}");
+        assert!(
+            matches!(reply, Ok(ControlMsg::Error { .. })),
+            "the peer must be told: {reply:?}"
+        );
 
         for (p, was) in [&a, &b].iter().zip(before) {
             let now = std::fs::read(store_path(p)).expect("store");
@@ -944,7 +1045,10 @@ mod protocol_version_tests {
     #[test]
     fn the_gate_is_equality_not_a_minimum() {
         assert!(check_protocol(PROTOCOL_VERSION).is_ok());
-        assert!(check_protocol(PROTOCOL_VERSION + 1).is_err(), "a newer peer is refused too");
+        assert!(
+            check_protocol(PROTOCOL_VERSION + 1).is_err(),
+            "a newer peer is refused too"
+        );
         assert!(check_protocol(PROTOCOL_VERSION - 1).is_err());
     }
 }

@@ -183,7 +183,9 @@ pub fn silence_webview_context_menu(window: &tauri::WebviewWindow) {
             let Ok(core) = webview.controller().CoreWebView2() else {
                 return;
             };
-            let Ok(settings) = core.Settings() else { return };
+            let Ok(settings) = core.Settings() else {
+                return;
+            };
             let settings: ICoreWebView2Settings = settings;
             let _ = settings.SetAreDefaultContextMenusEnabled(false);
         }

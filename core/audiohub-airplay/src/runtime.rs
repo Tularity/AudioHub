@@ -56,6 +56,121 @@ pub enum Protocol {
     AirPlay2,
 }
 
+/// Receiver-owned volume state exposed to an AirPlay sender.
+///
+/// AirPlay 2 represents the visible slider and mute state independently. The
+/// slider always remains in the ordinary `-30..=0 dB` range; `-144 dB` is a
+/// legacy text-parameter sentinel and must not replace the slider while muted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ReceiverVolumeSnapshot {
+    /// Receiver slider position in AirPlay's linear `-30..=0 dB` domain.
+    pub(crate) slider_db: f32,
+    /// Whether the receiver output is muted independently of its slider.
+    pub(crate) is_muted: bool,
+}
+
+impl ReceiverVolumeSnapshot {
+    /// Validate and construct one receiver volume snapshot.
+    pub(crate) fn new(slider_db: f32, is_muted: bool) -> io::Result<Self> {
+        if !slider_db.is_finite() || !(-30.0..=0.0).contains(&slider_db) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AirPlay receiver slider volume must be within -30..=0 dB",
+            ));
+        }
+        Ok(Self {
+            slider_db,
+            is_muted,
+        })
+    }
+
+    /// Convert the legacy text-parameter representation into AP2's split
+    /// slider/mute state. A mute sentinel has no slider payload, so the
+    /// conservative zero-percent position is retained for compatibility.
+    fn from_legacy_db(db: f32) -> io::Result<Self> {
+        if db == -144.0 {
+            Self::new(-30.0, true)
+        } else {
+            Self::new(db, false)
+        }
+    }
+
+    /// Value used by legacy `GET_PARAMETER volume` responses.
+    pub(crate) fn legacy_text_db(self) -> f32 {
+        if self.is_muted {
+            -144.0
+        } else {
+            self.slider_db
+        }
+    }
+}
+
+type ReceiverVolumeReader = dyn Fn() -> io::Result<ReceiverVolumeSnapshot> + Send + Sync + 'static;
+
+/// Thread-safe live receiver-volume reader shared by protocol connections.
+///
+/// The callback is invoked for every protocol query, rather than being sampled
+/// only when the receiver starts. This keeps `/info`, event `updateInfo`, and
+/// text volume queries aligned with the actual system output state.
+#[derive(Clone)]
+pub(crate) struct ReceiverVolumeProvider {
+    reader: Arc<ReceiverVolumeReader>,
+    last_good: Arc<Mutex<Option<ReceiverVolumeSnapshot>>>,
+}
+
+impl ReceiverVolumeProvider {
+    /// Wrap a thread-safe live reader.
+    fn new(
+        reader: impl Fn() -> io::Result<ReceiverVolumeSnapshot> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            reader: Arc::new(reader),
+            last_good: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Construct a provider for a fixed compatibility value.
+    pub(crate) fn fixed(snapshot: ReceiverVolumeSnapshot) -> Self {
+        let provider = Self::new(move || Ok(snapshot));
+        *provider
+            .last_good
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(snapshot);
+        provider
+    }
+
+    /// Read and validate the current receiver state.
+    pub(crate) fn current(&self) -> io::Result<ReceiverVolumeSnapshot> {
+        let fresh = (self.reader)().and_then(|snapshot| {
+            ReceiverVolumeSnapshot::new(snapshot.slider_db, snapshot.is_muted)
+        });
+        match fresh {
+            Ok(snapshot) => {
+                *self
+                    .last_good
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(snapshot);
+                Ok(snapshot)
+            }
+            Err(error) => self
+                .last_good
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref()
+                .copied()
+                .ok_or(error),
+        }
+    }
+}
+
+impl fmt::Debug for ReceiverVolumeProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReceiverVolumeProvider")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Configuration for one receiver runtime.
 #[derive(Clone)]
 pub struct AirPlayConfig {
@@ -73,9 +188,14 @@ pub struct AirPlayConfig {
     pub airplay2_port: u16,
     /// Stable AirPlay 2 Ed25519 identity. Required when AP2 is enabled.
     pub airplay2_identity_path: Option<PathBuf>,
-    /// Default-output volume reported to a sender while the AP2 session is
-    /// established. `None` omits the optional `initialVolume` field.
+    /// Legacy fixed fallback for callers without a live receiver-volume
+    /// provider. `-144 dB` is interpreted as muted with a zero-percent AP2
+    /// slider; new callers should use [`Self::set_receiver_volume_provider`].
     pub initial_volume_db: Option<f32>,
+    /// Live default-output volume queried by each AirPlay protocol request.
+    /// When present, this takes precedence over `initial_volume_db` and keeps
+    /// the ordinary slider value independent from the mute flag.
+    receiver_volume_provider: Option<ReceiverVolumeProvider>,
     /// Bounded PCM bus and clock-servo configuration.
     pub bus: BusConfig,
     // In-process daemon tests need independent UDP sockets because Cargo
@@ -96,6 +216,7 @@ impl AirPlayConfig {
             airplay2_port: 0,
             airplay2_identity_path: None,
             initial_volume_db: None,
+            receiver_volume_provider: None,
             bus: BusConfig::default(),
             ptp_test_ephemeral: false,
         }
@@ -107,6 +228,20 @@ impl AirPlayConfig {
     #[doc(hidden)]
     pub fn use_ephemeral_ptp_ports_for_tests(&mut self) {
         self.ptp_test_ephemeral = true;
+    }
+
+    /// Install the live system-volume reader used by AirPlay protocol
+    /// responses. The callback may run concurrently on several connection
+    /// tasks and must return `(slider_db, is_muted)`, where `slider_db` is in
+    /// the ordinary `-30..=0 dB` range even while muted.
+    pub fn set_receiver_volume_provider(
+        &mut self,
+        reader: impl Fn() -> io::Result<(f32, bool)> + Send + Sync + 'static,
+    ) {
+        self.receiver_volume_provider = Some(ReceiverVolumeProvider::new(move || {
+            let (slider_db, is_muted) = reader()?;
+            ReceiverVolumeSnapshot::new(slider_db, is_muted)
+        }));
     }
 
     fn validate(mut self) -> io::Result<Self> {
@@ -155,6 +290,10 @@ impl fmt::Debug for AirPlayConfig {
             .field("airplay2_port", &self.airplay2_port)
             .field("airplay2_identity_path", &self.airplay2_identity_path)
             .field("initial_volume_db", &self.initial_volume_db)
+            .field(
+                "receiver_volume_provider_set",
+                &self.receiver_volume_provider.is_some(),
+            )
             .field("bus", &self.bus)
             .finish()
     }
@@ -200,6 +339,10 @@ pub struct SessionInfo {
     pub artist: Option<String>,
     /// Current metadata, if supplied.
     pub album: Option<String>,
+    /// Monotonic revision for the current artwork state. A revision with no
+    /// content type means the sender explicitly cleared the previous image.
+    pub artwork_revision: Option<u64>,
+    pub artwork_content_type: Option<String>,
     /// Last reported playback position.
     pub elapsed_ms: Option<u64>,
     /// Last reported track duration.
@@ -208,6 +351,17 @@ pub struct SessionInfo {
     pub started_unix_ms: u64,
     /// True when this session currently owns the shared PCM bus.
     pub selected_for_output: bool,
+}
+
+/// Authoritative, versioned cover image for one concrete runtime session.
+/// Artwork bytes are intentionally absent from [`RuntimeStatus`] and must be
+/// fetched only when the small session view reports a new revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtworkSnapshot {
+    pub session_id: u64,
+    pub revision: u64,
+    pub content_type: String,
+    pub data: Vec<u8>,
 }
 
 /// DACP bearer capability for the active AirPlay 2 sender.
@@ -324,7 +478,7 @@ impl ReceiverVolumeControlSnapshot {
 
     pub fn send_device_volume(
         &self,
-        volume: f32,
+        volume_scalar: f32,
         is_muted: bool,
     ) -> Result<(), EventCommandSendError> {
         if !self.is_current() {
@@ -333,7 +487,7 @@ impl ReceiverVolumeControlSnapshot {
                 "AirPlay event volume authority was revoked",
             ));
         }
-        self.info.sender.send_device_volume(volume, is_muted)
+        self.info.sender.send_device_volume(volume_scalar, is_muted)
     }
 }
 
@@ -369,12 +523,13 @@ pub enum AirPlayEvent {
         artist: Option<String>,
         album: Option<String>,
     },
-    /// Sender-provided cover image. Empty data clears it.
+    /// Sender-provided cover revision. Bytes stay in the bounded runtime
+    /// artwork store and are fetched explicitly by session/revision.
     Artwork {
         protocol: Protocol,
         session_id: Option<u64>,
-        content_type: String,
-        data: Vec<u8>,
+        content_type: Option<String>,
+        revision: u64,
     },
     /// Playback progress derived by the protocol engine.
     Progress {
@@ -430,6 +585,7 @@ struct StatusState {
     remote_controls: BTreeMap<Protocol, RemoteControlInfo>,
     upstream_sessions: BTreeMap<Protocol, u64>,
     sender_volume_revisions: BTreeMap<Protocol, u64>,
+    artwork: BTreeMap<Protocol, ArtworkSnapshot>,
     receiver_volume_control: Option<ReceiverVolumeControlInfo>,
     last_error: Option<String>,
 }
@@ -465,6 +621,7 @@ struct Shared {
     bus: PcmBus,
     ports: BTreeMap<Protocol, u16>,
     next_session: AtomicU64,
+    next_artwork_revision: AtomicU64,
     status: Mutex<StatusState>,
     remote_control_revision: Arc<AtomicU64>,
     receiver_volume_control_revision: Arc<AtomicU64>,
@@ -477,12 +634,14 @@ impl Shared {
             bus,
             ports,
             next_session: AtomicU64::new(1),
+            next_artwork_revision: AtomicU64::new(1),
             status: Mutex::new(StatusState {
                 phase: RuntimePhase::Starting,
                 sessions: BTreeMap::new(),
                 remote_controls: BTreeMap::new(),
                 upstream_sessions: BTreeMap::new(),
                 sender_volume_revisions: BTreeMap::new(),
+                artwork: BTreeMap::new(),
                 receiver_volume_control: None,
                 last_error: None,
             }),
@@ -504,6 +663,7 @@ impl Shared {
             status.remote_controls.clear();
             status.upstream_sessions.clear();
             status.sender_volume_revisions.clear();
+            status.artwork.clear();
             if status.receiver_volume_control.take().is_some() {
                 self.bump_receiver_volume_control_revision();
             }
@@ -551,6 +711,7 @@ impl Shared {
                     }
                     status.sessions.remove(&protocol);
                     status.sender_volume_revisions.remove(&protocol);
+                    status.artwork.remove(&protocol);
                     if status.remote_controls.remove(&protocol).is_some() {
                         self.bump_remote_control_revision();
                     }
@@ -584,6 +745,8 @@ impl Shared {
                     title: None,
                     artist: None,
                     album: None,
+                    artwork_revision: None,
+                    artwork_content_type: None,
                     elapsed_ms: None,
                     duration_ms: None,
                     started_unix_ms: SystemTime::now()
@@ -665,6 +828,7 @@ impl Shared {
                 // value before installing this mapping.
                 status.sessions.remove(&protocol);
                 status.sender_volume_revisions.remove(&protocol);
+                status.artwork.remove(&protocol);
                 if status.remote_controls.remove(&protocol).is_some() {
                     self.bump_remote_control_revision();
                 }
@@ -688,6 +852,10 @@ impl Shared {
             title: previous.as_ref().and_then(|item| item.title.clone()),
             artist: previous.as_ref().and_then(|item| item.artist.clone()),
             album: previous.as_ref().and_then(|item| item.album.clone()),
+            artwork_revision: previous.as_ref().and_then(|item| item.artwork_revision),
+            artwork_content_type: previous
+                .as_ref()
+                .and_then(|item| item.artwork_content_type.clone()),
             elapsed_ms: previous.as_ref().and_then(|item| item.elapsed_ms),
             duration_ms: previous.as_ref().and_then(|item| item.duration_ms),
             started_unix_ms: SystemTime::now()
@@ -698,6 +866,9 @@ impl Shared {
             selected_for_output: true,
         };
         status.sessions.insert(protocol, session);
+        if let Some(artwork) = status.artwork.get_mut(&protocol) {
+            artwork.session_id = id;
+        }
         if let Some(remote) = status.remote_controls.get_mut(&protocol) {
             remote.session_id = id;
             self.bump_remote_control_revision();
@@ -769,6 +940,117 @@ impl Shared {
         Some(session_id)
     }
 
+    fn update_metadata_versioned(
+        &self,
+        protocol: Protocol,
+        upstream_session_id: Option<u64>,
+        title: Option<String>,
+        artist: Option<String>,
+        album: Option<String>,
+    ) -> Option<u64> {
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(upstream_session_id) = upstream_session_id {
+            if status.upstream_sessions.get(&protocol).copied() != Some(upstream_session_id) {
+                return None;
+            }
+        }
+        let session = status.sessions.get_mut(&protocol)?;
+        session.title = title;
+        session.artist = artist;
+        session.album = album;
+        Some(session.id)
+    }
+
+    fn update_progress_versioned(
+        &self,
+        protocol: Protocol,
+        upstream_session_id: Option<u64>,
+        elapsed_ms: Option<u64>,
+        duration_ms: Option<u64>,
+    ) -> Option<u64> {
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(upstream_session_id) = upstream_session_id {
+            if status.upstream_sessions.get(&protocol).copied() != Some(upstream_session_id) {
+                return None;
+            }
+        }
+        let session = status.sessions.get_mut(&protocol)?;
+        session.elapsed_ms = elapsed_ms;
+        session.duration_ms = duration_ms;
+        Some(session.id)
+    }
+
+    fn update_paused_versioned(
+        &self,
+        protocol: Protocol,
+        upstream_session_id: Option<u64>,
+        paused: bool,
+    ) -> Option<u64> {
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(upstream_session_id) = upstream_session_id {
+            if status.upstream_sessions.get(&protocol).copied() != Some(upstream_session_id) {
+                return None;
+            }
+        }
+        let session = status.sessions.get_mut(&protocol)?;
+        session.paused = paused;
+        Some(session.id)
+    }
+
+    fn update_artwork_versioned(
+        &self,
+        protocol: Protocol,
+        upstream_session_id: Option<u64>,
+        content_type: String,
+        data: Vec<u8>,
+    ) -> Option<(u64, u64)> {
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(upstream_session_id) = upstream_session_id {
+            if status.upstream_sessions.get(&protocol).copied() != Some(upstream_session_id) {
+                return None;
+            }
+        }
+        let session_id = status.sessions.get(&protocol)?.id;
+        let revision = self.next_artwork_revision.fetch_add(1, Ordering::AcqRel);
+        let normalized_type = content_type.to_ascii_lowercase();
+        let content_type = (!data.is_empty()
+            && matches!(normalized_type.as_str(), "image/jpeg" | "image/png"))
+        .then_some(normalized_type);
+        let session = status
+            .sessions
+            .get_mut(&protocol)
+            .expect("session identity was checked while holding the lock");
+        session.artwork_revision = Some(revision);
+        session.artwork_content_type = content_type.clone();
+        match content_type {
+            Some(content_type) => {
+                status.artwork.insert(
+                    protocol,
+                    ArtworkSnapshot {
+                        session_id,
+                        revision,
+                        content_type,
+                        data,
+                    },
+                );
+            }
+            None => {
+                status.artwork.remove(&protocol);
+            }
+        }
+        Some((session_id, revision))
+    }
+
+    fn artwork(&self, session_id: u64, revision: u64) -> Option<ArtworkSnapshot> {
+        self.status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .artwork
+            .values()
+            .find(|artwork| artwork.session_id == session_id && artwork.revision == revision)
+            .cloned()
+    }
+
     fn end_sink(&self, protocol: Protocol, id: u64) {
         let removed = {
             let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
@@ -779,6 +1061,7 @@ impl Shared {
             {
                 status.sessions.remove(&protocol);
                 status.sender_volume_revisions.remove(&protocol);
+                status.artwork.remove(&protocol);
                 if status.remote_controls.remove(&protocol).is_some() {
                     self.bump_remote_control_revision();
                 }
@@ -809,6 +1092,7 @@ impl Shared {
         }
         status.upstream_sessions.remove(&protocol);
         status.sender_volume_revisions.remove(&protocol);
+        status.artwork.remove(&protocol);
         if status.remote_controls.remove(&protocol).is_some() {
             self.bump_remote_control_revision();
         }
@@ -987,13 +1271,21 @@ impl AirPlayRuntime {
             .airplay2_identity_path
             .clone()
             .expect("validated AirPlay 2 identity path");
+        let receiver_volume_provider = match config.receiver_volume_provider.clone() {
+            Some(provider) => Some(provider),
+            None => config
+                .initial_volume_db
+                .map(ReceiverVolumeSnapshot::from_legacy_db)
+                .transpose()?
+                .map(ReceiverVolumeProvider::fixed),
+        };
         let server_config = Arc::new(ServerConfig::load(
             config.name.clone(),
             config.mac,
             config.password.clone(),
             identity_path,
             config.ptp_test_ephemeral,
-            config.initial_volume_db,
+            receiver_volume_provider,
         )?);
         // Reserve the requested control port only after all fallible receiver
         // configuration has loaded. The daemon may safely classify a marked
@@ -1065,6 +1357,13 @@ impl AirPlayRuntime {
     /// Current runtime/session snapshot with no secret fields.
     pub fn status(&self) -> RuntimeStatus {
         self.shared.snapshot()
+    }
+
+    /// Fetch one exact artwork revision reported by [`Self::status`]. Stale
+    /// revisions and ended sessions return `None`, so callers cannot attach a
+    /// delayed image to a replacement sender.
+    pub fn artwork(&self, session_id: u64, revision: u64) -> Option<ArtworkSnapshot> {
+        self.shared.artwork(session_id, revision)
     }
 
     /// Secret-bearing DACP capability for the concrete active PCM session.
@@ -1403,6 +1702,91 @@ async fn forward_ap2(
                             });
                         }
                     }
+                    Some(ProbeEvent::Metadata {
+                        stream_id,
+                        title,
+                        artist,
+                        album,
+                        ..
+                    }) => {
+                        if let Some(session_id) = shared.update_metadata_versioned(
+                            Protocol::AirPlay2,
+                            Some(stream_id),
+                            title.clone(),
+                            artist.clone(),
+                            album.clone(),
+                        ) {
+                            shared.events.send(AirPlayEvent::Metadata {
+                                protocol: Protocol::AirPlay2,
+                                session_id: Some(session_id),
+                                title,
+                                artist,
+                                album,
+                            });
+                        }
+                    }
+                    Some(ProbeEvent::Artwork {
+                        stream_id,
+                        content_type,
+                        data,
+                        ..
+                    }) => {
+                        if let Some((session_id, revision)) = shared.update_artwork_versioned(
+                            Protocol::AirPlay2,
+                            Some(stream_id),
+                            content_type.clone(),
+                            data,
+                        ) {
+                            let normalized_type = content_type.to_ascii_lowercase();
+                            shared.events.send(AirPlayEvent::Artwork {
+                                protocol: Protocol::AirPlay2,
+                                session_id: Some(session_id),
+                                content_type: matches!(
+                                    normalized_type.as_str(),
+                                    "image/jpeg" | "image/png"
+                                )
+                                .then_some(normalized_type),
+                                revision,
+                            });
+                        }
+                    }
+                    Some(ProbeEvent::Progress {
+                        stream_id,
+                        elapsed_ms,
+                        duration_ms,
+                        ..
+                    }) => {
+                        if let Some(session_id) = shared.update_progress_versioned(
+                            Protocol::AirPlay2,
+                            Some(stream_id),
+                            elapsed_ms,
+                            duration_ms,
+                        ) {
+                            if let (Some(elapsed_ms), Some(duration_ms)) =
+                                (elapsed_ms, duration_ms)
+                            {
+                                shared.events.send(AirPlayEvent::Progress {
+                                    protocol: Protocol::AirPlay2,
+                                    session_id: Some(session_id),
+                                    elapsed_ms,
+                                    duration_ms,
+                                });
+                            }
+                        }
+                    }
+                    Some(ProbeEvent::Paused { stream_id, paused, .. }) => {
+                        if let Some(session_id) = shared.update_paused_versioned(
+                            Protocol::AirPlay2,
+                            Some(stream_id),
+                            paused,
+                        ) {
+                            shared.events.send(AirPlayEvent::Paused {
+                                protocol: Protocol::AirPlay2,
+                                session_id: Some(session_id),
+                                paused,
+                            });
+                        }
+                    }
                     Some(event) => {
                         log::info!(
                             target: "audiohub_airplay::airplay2",
@@ -1521,6 +1905,64 @@ mod tests {
         assert!(config.enable_airplay2);
         assert_eq!(config.airplay2_port, 0);
         assert_eq!(config.password, None);
+    }
+
+    #[test]
+    fn receiver_volume_provider_is_live_validated_and_thread_safe() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let provider_reads = Arc::clone(&reads);
+        let provider = ReceiverVolumeProvider::new(move || {
+            provider_reads.fetch_add(1, Ordering::SeqCst);
+            ReceiverVolumeSnapshot::new(-12.5, true)
+        });
+
+        let workers = (0..4)
+            .map(|_| {
+                let provider = provider.clone();
+                thread::spawn(move || provider.current().unwrap())
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            assert_eq!(
+                worker.join().unwrap(),
+                ReceiverVolumeSnapshot {
+                    slider_db: -12.5,
+                    is_muted: true,
+                }
+            );
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 4);
+
+        let attempts = Arc::new(AtomicU64::new(0));
+        let reader_attempts = Arc::clone(&attempts);
+        let cached = ReceiverVolumeProvider::new(move || {
+            if reader_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                ReceiverVolumeSnapshot::new(-9.0, false)
+            } else {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "device changed"))
+            }
+        });
+        assert_eq!(cached.current().unwrap().slider_db, -9.0);
+        assert_eq!(cached.current().unwrap().slider_db, -9.0);
+
+        let invalid = ReceiverVolumeProvider::new(|| {
+            Ok(ReceiverVolumeSnapshot {
+                slider_db: f32::NAN,
+                is_muted: false,
+            })
+        });
+        assert_eq!(
+            invalid.current().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn legacy_mute_fallback_does_not_leak_into_airplay2_slider() {
+        let snapshot = ReceiverVolumeSnapshot::from_legacy_db(-144.0).unwrap();
+        assert_eq!(snapshot.slider_db, -30.0);
+        assert!(snapshot.is_muted);
+        assert_eq!(snapshot.legacy_text_db(), -144.0);
     }
 
     #[test]
@@ -1970,6 +2412,74 @@ mod tests {
 
         shared.end_sink(Protocol::AirPlay2, active);
         assert!(shared.active_remote_control().is_none());
+    }
+
+    #[test]
+    fn descriptive_state_and_artwork_revision_follow_only_the_current_session() {
+        let shared = test_shared();
+        let session_id = shared.activate_sink(
+            Protocol::AirPlay2,
+            Some(7),
+            44_100,
+            2,
+            Some(test_peer().ip()),
+        );
+        assert_eq!(
+            shared.update_metadata_versioned(
+                Protocol::AirPlay2,
+                Some(7),
+                Some("Song".into()),
+                Some("Artist".into()),
+                Some("Album".into()),
+            ),
+            Some(session_id)
+        );
+        assert_eq!(
+            shared.update_progress_versioned(
+                Protocol::AirPlay2,
+                Some(7),
+                Some(12_000),
+                Some(180_000),
+            ),
+            Some(session_id)
+        );
+
+        let (updated_session, revision) = shared
+            .update_artwork_versioned(
+                Protocol::AirPlay2,
+                Some(7),
+                "image/png".into(),
+                b"\x89PNG\r\n\x1a\ncover".to_vec(),
+            )
+            .unwrap();
+        assert_eq!(updated_session, session_id);
+        let artwork = shared.artwork(session_id, revision).unwrap();
+        assert_eq!(artwork.content_type, "image/png");
+        assert_eq!(artwork.data, b"\x89PNG\r\n\x1a\ncover");
+        assert!(shared.artwork(session_id, revision + 1).is_none());
+
+        let session = shared.snapshot().sessions.pop().unwrap();
+        assert_eq!(session.title.as_deref(), Some("Song"));
+        assert_eq!(session.artist.as_deref(), Some("Artist"));
+        assert_eq!(session.album.as_deref(), Some("Album"));
+        assert_eq!(session.elapsed_ms, Some(12_000));
+        assert_eq!(session.duration_ms, Some(180_000));
+        assert_eq!(session.artwork_revision, Some(revision));
+        assert_eq!(session.artwork_content_type.as_deref(), Some("image/png"));
+
+        let (_, cleared_revision) = shared
+            .update_artwork_versioned(Protocol::AirPlay2, Some(7), "image/none".into(), Vec::new())
+            .unwrap();
+        assert!(shared.artwork(session_id, cleared_revision).is_none());
+        let session = shared.snapshot().sessions.pop().unwrap();
+        assert_eq!(session.artwork_revision, Some(cleared_revision));
+        assert_eq!(session.artwork_content_type, None);
+
+        assert!(shared
+            .update_artwork_versioned(Protocol::AirPlay2, Some(6), "image/png".into(), vec![1],)
+            .is_none());
+        shared.end_sink(Protocol::AirPlay2, session_id);
+        assert!(shared.artwork(session_id, revision).is_none());
     }
 
     #[test]

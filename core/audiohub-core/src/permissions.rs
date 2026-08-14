@@ -74,7 +74,10 @@ impl PermissionKind {
     }
 
     pub fn parse(s: &str) -> Option<PermissionKind> {
-        PermissionKind::ALL.iter().copied().find(|k| k.as_str() == s)
+        PermissionKind::ALL
+            .iter()
+            .copied()
+            .find(|k| k.as_str() == s)
     }
 }
 
@@ -303,7 +306,9 @@ fn request_microphone() -> Result<()> {
     match settled {
         MicStatus::Authorized => Ok(()),
         MicStatus::Denied | MicStatus::Restricted => {
-            anyhow::bail!("用户拒绝了麦克风权限；可在「系统设置 > 隐私与安全性 > 麦克风」中重新开启")
+            anyhow::bail!(
+                "用户拒绝了麦克风权限；可在「系统设置 > 隐私与安全性 > 麦克风」中重新开启"
+            )
         }
         // Still unanswered (or AVFoundation unavailable): only a failure to
         // open is worth reporting as an error — the caller re-probes anyway.
@@ -466,10 +471,9 @@ mod mac {
                     "受系统策略限制（描述文件 / 屏幕使用时间等），本机无法授予麦克风权限。"
                         .to_string(),
                 ),
-                MicStatus::NotDetermined => (
-                    None,
-                    "尚未询问：点击授权会弹出系统对话框。".to_string(),
-                ),
+                MicStatus::NotDetermined => {
+                    (None, "尚未询问：点击授权会弹出系统对话框。".to_string())
+                }
                 MicStatus::Unavailable => (
                     None,
                     "无法加载 AVFoundation，当前状态未知；首次采集时系统会询问。".to_string(),
@@ -583,8 +587,7 @@ mod tests {
         assert_eq!(&p[6..12], &[0, 0, 0, 0, 0, 0], "no answer sections");
         let name = &p[12..p.len() - 4];
         assert_eq!(
-            name,
-            b"\x09_services\x07_dns-sd\x04_udp\x05local\x00",
+            name, b"\x09_services\x07_dns-sd\x04_udp\x05local\x00",
             "service enumeration PTR name"
         );
         assert_eq!(&p[p.len() - 4..], &[0, 12, 0x80, 0x01], "PTR + QU|IN");

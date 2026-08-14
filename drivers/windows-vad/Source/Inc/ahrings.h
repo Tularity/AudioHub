@@ -86,6 +86,12 @@ BOOLEAN AhRingsMapped(VOID);
 _IRQL_requires_max_(DISPATCH_LEVEL)
 PAUDIOHUB_RING_HEADER AhRingsHeader(_In_ ULONG Slot, _In_ ULONG Dir);
 
+// PASSIVE_LEVEL lifecycle fence. Discard queued samples whenever one
+// direction is withdrawn or freshly restored; otherwise the immortal per-slot
+// ring can replay audio captured before the capability change.
+_IRQL_requires_max_(PASSIVE_LEVEL)
+VOID AhRingsResetDirection(_In_ ULONG Slot, _In_ ULONG Dir);
+
 //
 // Wakes the daemon after a DPC moved audio. A no-op when the daemon passed no
 // event handle, which is fully supported -- the daemon's mixer is driven by

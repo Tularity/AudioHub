@@ -242,7 +242,11 @@ impl LocalIdentity {
     /// rewritten by `settings.set` while the daemon runs, and a cached copy on
     /// a value that lives inside an `Arc<DaemonInner>` cannot be updated.
     pub fn name_source_at(dir: Option<&Path>) -> NameSource {
-        if !std::env::var("AUDIOHUB_NAME").unwrap_or_default().trim().is_empty() {
+        if !std::env::var("AUDIOHUB_NAME")
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
             return NameSource::Env;
         }
         let base = dir.map(Path::to_path_buf).unwrap_or_else(Self::config_dir);
@@ -326,7 +330,10 @@ impl LocalIdentity {
             .as_slice()
             .try_into()
             .map_err(|_| anyhow!("identity secret must be 32 bytes"))?;
-        Ok(Self::from_key(name.to_string(), SigningKey::from_bytes(&seed)))
+        Ok(Self::from_key(
+            name.to_string(),
+            SigningKey::from_bytes(&seed),
+        ))
     }
 
     fn from_key(name: String, signing_key: SigningKey) -> Self {
@@ -425,8 +432,7 @@ impl PeerStore {
             .unwrap_or_else(LocalIdentity::config_dir);
         let path = base.join("paired_peers.json");
         let peers = if path.exists() {
-            let bytes =
-                std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+            let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
             let file: StoreFile = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse {}", path.display()))?;
             file.peers
@@ -441,7 +447,11 @@ impl PeerStore {
             version: 1,
             peers: self.peers.clone(),
         };
-        write_atomic(&self.path, serde_json::to_string_pretty(&file)?.as_bytes(), false)
+        write_atomic(
+            &self.path,
+            serde_json::to_string_pretty(&file)?.as_bytes(),
+            false,
+        )
     }
 
     /// Writes `peer`, KEEPING the local alias and the original `added_unix`
@@ -512,8 +522,8 @@ fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
         .with_context(|| format!("secure private directory {}", dir.display()))?;
     let tmp = path.with_extension("json.tmp");
     {
-        let mut f = std::fs::File::create(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         if secret {
             secure_private_file(&tmp).with_context(|| format!("secure {}", tmp.display()))?;
         }
@@ -533,7 +543,10 @@ mod name_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn scratch(tag: &str) -> PathBuf {
-        let n = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
         let p = std::env::temp_dir().join(format!("ahb-name-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&p).expect("mkdir");
         p
@@ -550,7 +563,10 @@ mod name_tests {
             "from-env"
         );
         // Blank / whitespace-only is "unset", not "an empty name".
-        assert_eq!(resolve_name("   ", Some("stored"), "host", "file"), "stored");
+        assert_eq!(
+            resolve_name("   ", Some("stored"), "host", "file"),
+            "stored"
+        );
         assert_eq!(resolve_name("", None, "host", "file"), "host");
         assert_eq!(resolve_name("", None, "", "file"), "file");
         assert_eq!(resolve_name("", None, "", ""), "");
@@ -588,7 +604,10 @@ mod name_tests {
         // point of the field is that it outlives the process.
         let again = LocalIdentity::load_or_create_at(Some(&dir)).expect("reload");
         assert_eq!(again.name, "客厅 Mac");
-        assert_eq!(LocalIdentity::name_source_at(Some(&dir)), NameSource::Custom);
+        assert_eq!(
+            LocalIdentity::name_source_at(Some(&dir)),
+            NameSource::Custom
+        );
         assert_eq!(
             LocalIdentity::name_override_at(Some(&dir)),
             Some("客厅 Mac".to_string())
@@ -605,7 +624,10 @@ mod name_tests {
         // empty machine name would reach the peer as two nameless audio devices.
         let back = LocalIdentity::set_name_at(Some(&dir), Some("   ")).expect("clear");
         assert_eq!(back, local_hostname());
-        assert_eq!(LocalIdentity::name_source_at(Some(&dir)), NameSource::Hostname);
+        assert_eq!(
+            LocalIdentity::name_source_at(Some(&dir)),
+            NameSource::Hostname
+        );
         assert_eq!(LocalIdentity::name_override_at(Some(&dir)), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -614,8 +636,12 @@ mod name_tests {
     fn the_stored_name_is_stripped_of_control_characters_and_clamped() {
         let dir = scratch("sanitize");
         LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
-        let got = LocalIdentity::set_name_at(Some(&dir), Some("  living\nroom\u{7f}  ")).expect("set");
-        assert_eq!(got, "livingroom", "a pasted newline reaches every peer's device list");
+        let got =
+            LocalIdentity::set_name_at(Some(&dir), Some("  living\nroom\u{7f}  ")).expect("set");
+        assert_eq!(
+            got, "livingroom",
+            "a pasted newline reaches every peer's device list"
+        );
         let long = "x".repeat(80);
         let clamped = LocalIdentity::set_name_at(Some(&dir), Some(&long)).expect("set");
         assert_eq!(clamped.chars().count(), 48);
@@ -645,7 +671,10 @@ mod name_tests {
         let fresh_fp = LocalIdentity::reset_key_at(Some(&dir)).expect("reset");
         assert_ne!(fresh_fp, before.fingerprint);
         let after = LocalIdentity::load_or_create_at(Some(&dir)).expect("reload");
-        assert_eq!(after.fingerprint, fresh_fp, "the returned fingerprint is the one on disk");
+        assert_eq!(
+            after.fingerprint, fresh_fp,
+            "the returned fingerprint is the one on disk"
+        );
         assert_eq!(after.name, "studio");
         assert_ne!(after.public_key_b64(), before.public_key_b64());
         let _ = std::fs::remove_dir_all(&dir);
@@ -666,8 +695,14 @@ mod name_tests {
         });
         std::fs::write(&path, serde_json::to_vec_pretty(&legacy).expect("json")).expect("write");
         let id = LocalIdentity::load_or_create_at(Some(&dir)).expect("legacy identity loads");
-        assert_eq!(id.fingerprint, fingerprint_of(&key.verifying_key().to_bytes()));
-        assert_eq!(LocalIdentity::name_source_at(Some(&dir)), NameSource::Hostname);
+        assert_eq!(
+            id.fingerprint,
+            fingerprint_of(&key.verifying_key().to_bytes())
+        );
+        assert_eq!(
+            LocalIdentity::name_source_at(Some(&dir)),
+            NameSource::Hostname
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -679,10 +714,8 @@ mod name_tests {
         let dir = scratch("private-mode");
         LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
         let path = dir.join("identity.json");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .expect("file mode");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
-            .expect("dir mode");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("file mode");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("dir mode");
 
         LocalIdentity::load_or_create_at(Some(&dir)).expect("reload");
         assert_eq!(

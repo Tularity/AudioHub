@@ -481,7 +481,10 @@ impl PeerTransportStore {
         let top: Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(e) => {
-                crate::dlog!("[audiohubd] {} 读不出来（{e}）；全部对端按默认档位跑", path.display());
+                crate::dlog!(
+                    "[audiohubd] {} 读不出来（{e}）；全部对端按默认档位跑",
+                    path.display()
+                );
                 return PeerTransportStore::default();
             }
         };
@@ -545,7 +548,10 @@ impl PeerTransportStore {
     pub(crate) fn save(&self, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let path = Self::path(dir);
-        let body = serde_json::to_vec_pretty(&OnDisk { version: FILE_VERSION, peers: &self.map })?;
+        let body = serde_json::to_vec_pretty(&OnDisk {
+            version: FILE_VERSION,
+            peers: &self.map,
+        })?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("rename into {}", path.display()))?;
@@ -577,7 +583,9 @@ impl PeerTransportStore {
     /// contract as [`PeerTransportStore::get`]: callers need something
     /// executable, and "never set" executes the same as "set to auto".
     pub(crate) fn tier(&self, fp: &str) -> TransportTier {
-        self.map.get(fp).map_or(TransportTier::Auto, PeerTransport::tier)
+        self.map
+            .get(fp)
+            .map_or(TransportTier::Auto, PeerTransport::tier)
     }
 
     /// The tier to actually **run** on: [`PeerTransport::effective_tier`] for a
@@ -592,7 +600,9 @@ impl PeerTransportStore {
     /// each other forever: each one is nominally tier 0, so each one says no,
     /// and no downgrade can ever complete.
     pub(crate) fn effective_tier(&self, fp: &str) -> TransportTier {
-        self.map.get(fp).map_or(TransportTier::Tier0, PeerTransport::effective_tier)
+        self.map
+            .get(fp)
+            .map_or(TransportTier::Tier0, PeerTransport::effective_tier)
     }
 
     /// Record a detector verdict for `fp`. Returns `true` when it changed
@@ -628,7 +638,9 @@ impl PeerTransportStore {
     /// Same contract again: a peer nobody has configured dials both ways, which
     /// is what every peer did before this setting existed.
     pub(crate) fn dial_policy(&self, fp: &str) -> DialPolicy {
-        self.map.get(fp).map_or(DialPolicy::Both, PeerTransport::dial_policy)
+        self.map
+            .get(fp)
+            .map_or(DialPolicy::Both, PeerTransport::dial_policy)
     }
 
     /// The peer's URL-shaped address, if it has one and it parses.
@@ -697,7 +709,11 @@ mod tests {
         assert_eq!(back.get("aa11").recv.latency, "300");
         assert_eq!(back.get("aa11").send.latency, "100");
         assert_eq!(back.get("aa11").recv.quality, "pcm32k16");
-        assert_eq!(back.tier("aa11"), TransportTier::Tier1, "the pinned tier did not survive");
+        assert_eq!(
+            back.tier("aa11"),
+            TransportTier::Tier1,
+            "the pinned tier did not survive"
+        );
         // 没设过的对端拿到默认，不是恐慌也不是 None。
         assert_eq!(back.get("zz99"), PeerTransport::default());
         assert_eq!(back.tier("zz99"), TransportTier::Auto);
@@ -723,9 +739,17 @@ mod tests {
         std::fs::write(PeerTransportStore::path(&dir), raw).expect("write");
 
         let s = PeerTransportStore::load(&dir);
-        assert_eq!(s.get("aa11").recv.latency, "300", "the neighbouring setting was lost");
+        assert_eq!(
+            s.get("aa11").recv.latency,
+            "300",
+            "the neighbouring setting was lost"
+        );
         assert_eq!(s.tier("aa11"), TransportTier::Auto);
-        assert_eq!(s.get("aa11").transport_tier_reset_from, None, "absent is not corrupt");
+        assert_eq!(
+            s.get("aa11").transport_tier_reset_from,
+            None,
+            "absent is not corrupt"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -747,19 +771,28 @@ mod tests {
     #[test]
     fn an_unrecognised_tier_is_reset_and_reported() {
         let mut t = PeerTransport {
-            recv: StoredDir { latency: "300".into(), ..StoredDir::default() },
+            recv: StoredDir {
+                latency: "300".into(),
+                ..StoredDir::default()
+            },
             transport_tier: "tier-of-the-week".into(),
             ..PeerTransport::default()
         };
         t.sanitize();
-        assert_eq!(t.transport_tier, "auto", "an unbuildable tier was left in place");
+        assert_eq!(
+            t.transport_tier, "auto",
+            "an unbuildable tier was left in place"
+        );
         assert_eq!(
             t.transport_tier_reset_from.as_deref(),
             Some("tier-of-the-week"),
             "the tier was reset silently; the UI has nothing to explain it with"
         );
         assert_eq!(t.tier(), TransportTier::Auto);
-        assert_eq!(t.recv.latency, "300", "a valid neighbouring cell was collateral damage");
+        assert_eq!(
+            t.recv.latency, "300",
+            "a valid neighbouring cell was collateral damage"
+        );
     }
 
     /// The tier's reset marker never reaches disk, same as the other two.
@@ -767,14 +800,23 @@ mod tests {
     fn the_tier_reset_marker_is_not_persisted() {
         let dir = tmpdir("notiermark");
         let mut s = PeerTransportStore::default();
-        let mut t = PeerTransport { transport_tier: "tier9".into(), ..PeerTransport::default() };
+        let mut t = PeerTransport {
+            transport_tier: "tier9".into(),
+            ..PeerTransport::default()
+        };
         t.sanitize();
         s.set("aa11", t);
         s.save(&dir).expect("save");
 
         let raw = std::fs::read_to_string(PeerTransportStore::path(&dir)).expect("read");
-        assert!(!raw.contains("reset_from"), "the reset marker was written to disk");
-        assert!(!raw.contains("tier9"), "the unrecognised tier was written back out");
+        assert!(
+            !raw.contains("reset_from"),
+            "the reset marker was written to disk"
+        );
+        assert!(
+            !raw.contains("tier9"),
+            "the unrecognised tier was written back out"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -797,7 +839,11 @@ mod tests {
             (TransportTier::Tier2, "tier2"),
         ];
         for (t, wire) in all {
-            assert_eq!(t.as_wire(), wire, "a stored tier string changed under the file on disk");
+            assert_eq!(
+                t.as_wire(),
+                wire,
+                "a stored tier string changed under the file on disk"
+            );
             assert_eq!(TransportTier::parse(wire), Some(t));
         }
         for other in ["", "tier3", "TIER1", "udp", "mux", " tier1"] {
@@ -824,10 +870,18 @@ mod tests {
         for (p, wire, may_dial) in all {
             assert_eq!(p.as_wire(), wire);
             assert_eq!(DialPolicy::parse(wire), Some(p));
-            assert_eq!(p.may_dial(), may_dial, "'{wire}' decides the wrong way about dialling");
+            assert_eq!(
+                p.may_dial(),
+                may_dial,
+                "'{wire}' decides the wrong way about dialling"
+            );
         }
         for other in ["", "inbound", "outbound", "none", "InboundOnly"] {
-            assert_eq!(DialPolicy::parse(other), None, "'{other}' parsed as a dial policy");
+            assert_eq!(
+                DialPolicy::parse(other),
+                None,
+                "'{other}' parsed as a dial policy"
+            );
         }
     }
 
@@ -850,7 +904,10 @@ mod tests {
         assert_eq!(t.dial_policy, "both");
         assert_eq!(t.dial_policy_reset_from.as_deref(), Some("sometimes"));
         assert_eq!(t.dial_policy(), DialPolicy::Both);
-        assert_eq!(t.transport_tier, "tier2", "a valid neighbouring cell was collateral damage");
+        assert_eq!(
+            t.transport_tier, "tier2",
+            "a valid neighbouring cell was collateral damage"
+        );
     }
 
     /// A record written before `dial_policy` existed still loads and reads as
@@ -870,9 +927,21 @@ mod tests {
 
         let s = PeerTransportStore::load(&dir);
         assert_eq!(s.dial_policy("aa11"), DialPolicy::Both);
-        assert_eq!(s.tier("aa11"), TransportTier::Tier1, "the neighbouring setting was lost");
-        assert_eq!(s.get("aa11").dial_policy_reset_from, None, "absent is not corrupt");
-        assert_eq!(s.dial_policy("zz99"), DialPolicy::Both, "an unknown peer must still dial");
+        assert_eq!(
+            s.tier("aa11"),
+            TransportTier::Tier1,
+            "the neighbouring setting was lost"
+        );
+        assert_eq!(
+            s.get("aa11").dial_policy_reset_from,
+            None,
+            "absent is not corrupt"
+        );
+        assert_eq!(
+            s.dial_policy("zz99"),
+            DialPolicy::Both,
+            "an unknown peer must still dial"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -951,7 +1020,10 @@ mod tests {
             Some("nonsense"),
             "latency was reset silently; the UI has nothing to explain it with"
         );
-        assert_eq!(d.quality, "auto", "stale id `pcm32k` was left in place or translated");
+        assert_eq!(
+            d.quality, "auto",
+            "stale id `pcm32k` was left in place or translated"
+        );
         assert_eq!(
             d.quality_reset_from.as_deref(),
             Some("pcm32k"),
@@ -976,8 +1048,14 @@ mod tests {
         d.sanitize();
         assert_eq!(d.latency, "300");
         assert_eq!(d.quality, "pcm48k24");
-        assert_eq!(d.latency_reset_from, None, "a valid stop was flagged as reset");
-        assert_eq!(d.quality_reset_from, None, "a valid stop was flagged as reset");
+        assert_eq!(
+            d.latency_reset_from, None,
+            "a valid stop was flagged as reset"
+        );
+        assert_eq!(
+            d.quality_reset_from, None,
+            "a valid stop was flagged as reset"
+        );
     }
 
     /// The reset happens **on load**, so every read site sees the sanitised
@@ -998,8 +1076,14 @@ mod tests {
         let t = PeerTransportStore::load(&dir).get("aa11");
         assert_eq!(t.recv.quality, "auto", "stale id survived the load path");
         assert_eq!(t.recv.quality_reset_from.as_deref(), Some("pcm32k"));
-        assert_eq!(t.recv.latency, "300", "a valid neighbouring cell was collateral damage");
-        assert_eq!(t.send.quality, "pcm48k24", "a valid cell in the other direction was reset");
+        assert_eq!(
+            t.recv.latency, "300",
+            "a valid neighbouring cell was collateral damage"
+        );
+        assert_eq!(
+            t.send.quality, "pcm48k24",
+            "a valid cell in the other direction was reset"
+        );
         assert_eq!(t.send.quality_reset_from, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1010,9 +1094,18 @@ mod tests {
     fn the_reset_marker_is_not_persisted() {
         let dir = tmpdir("nomark");
         let mut s = PeerTransportStore::default();
-        let mut d = StoredDir { quality: "pcm32k".into(), ..StoredDir::default() };
+        let mut d = StoredDir {
+            quality: "pcm32k".into(),
+            ..StoredDir::default()
+        };
         d.sanitize();
-        s.set("aa11", PeerTransport { recv: d, ..PeerTransport::default() });
+        s.set(
+            "aa11",
+            PeerTransport {
+                recv: d,
+                ..PeerTransport::default()
+            },
+        );
         s.save(&dir).expect("save");
 
         let raw = std::fs::read_to_string(PeerTransportStore::path(&dir)).expect("read");
@@ -1054,7 +1147,11 @@ mod tests {
             t.transport_tier, "auto",
             "the detector overwrote the user's setting; AUTO is now indistinguishable from a pin"
         );
-        assert_eq!(t.tier(), TransportTier::Auto, "the choice must still read as AUTO");
+        assert_eq!(
+            t.tier(),
+            TransportTier::Auto,
+            "the choice must still read as AUTO"
+        );
         assert_eq!(
             t.effective_tier(),
             TransportTier::Tier1,
@@ -1090,7 +1187,11 @@ mod tests {
         t.transport_tier = "tier1".into();
         s.set("pinned1", t);
         assert_eq!(s.effective_tier("pinned1"), TransportTier::Tier1);
-        assert_eq!(s.get("pinned1").auto_tier(), None, "a pin is not an observation");
+        assert_eq!(
+            s.get("pinned1").auto_tier(),
+            None,
+            "a pin is not an observation"
+        );
     }
 
     /// An unknown peer runs tier 0, and "never observed" is not stored as
@@ -1099,7 +1200,11 @@ mod tests {
     fn a_peer_nobody_has_observed_runs_tier_zero_and_says_so() {
         let s = PeerTransportStore::default();
         assert_eq!(s.effective_tier("nobody"), TransportTier::Tier0);
-        assert_eq!(s.peek("nobody"), None, "`peek` must not invent a record to report");
+        assert_eq!(
+            s.peek("nobody"),
+            None,
+            "`peek` must not invent a record to report"
+        );
         assert_eq!(s.get("nobody").auto_tier(), None);
     }
 
@@ -1112,7 +1217,11 @@ mod tests {
         for bogus in ["tier2", "tier0", "auto", "tier-of-the-week"] {
             let mut t = PeerTransport::default();
             t.auto_tier = Some(bogus.to_string());
-            assert_eq!(t.auto_tier(), None, "`{bogus}` was accepted as an automatic verdict");
+            assert_eq!(
+                t.auto_tier(),
+                None,
+                "`{bogus}` was accepted as an automatic verdict"
+            );
             assert_eq!(
                 t.effective_tier(),
                 TransportTier::Tier0,
@@ -1120,7 +1229,10 @@ mod tests {
             );
             // ...and it is dropped rather than left on disk for ever.
             t.sanitize();
-            assert_eq!(t.auto_tier, None, "the unexecutable `{bogus}` is still stored");
+            assert_eq!(
+                t.auto_tier, None,
+                "the unexecutable `{bogus}` is still stored"
+            );
         }
     }
 
@@ -1130,7 +1242,12 @@ mod tests {
     fn a_verdict_survives_a_round_trip_through_the_file() {
         let dir = tmpdir("verdict");
         let mut s = PeerTransportStore::default();
-        s.note_auto_tier("aa11", TransportTier::Tier1, "no inbound UDP media", 1_700_000_000);
+        s.note_auto_tier(
+            "aa11",
+            TransportTier::Tier1,
+            "no inbound UDP media",
+            1_700_000_000,
+        );
         s.save(&dir).expect("save");
         let back = PeerTransportStore::load(&dir);
         assert_eq!(
@@ -1139,7 +1256,10 @@ mod tests {
             "the verdict did not survive; every reconnect replays the detection silence"
         );
         let t = back.get("aa11");
-        assert_eq!(t.transport_tier, "auto", "the user's choice was rewritten on the way out");
+        assert_eq!(
+            t.transport_tier, "auto",
+            "the user's choice was rewritten on the way out"
+        );
         assert_eq!(t.auto_tier_reason.as_deref(), Some("no inbound UDP media"));
         assert_eq!(t.auto_tier_since, Some(1_700_000_000));
         std::fs::remove_dir_all(&dir).ok();
@@ -1162,7 +1282,14 @@ mod tests {
             "the original reason and timestamp are what the user has been looking at"
         );
         assert!(s.clear_auto_tier("aa11"));
-        assert!(!s.clear_auto_tier("aa11"), "clearing twice is not a second change");
-        assert_eq!(s.effective_tier("aa11"), TransportTier::Tier0, "retired means re-probe");
+        assert!(
+            !s.clear_auto_tier("aa11"),
+            "clearing twice is not a second change"
+        );
+        assert_eq!(
+            s.effective_tier("aa11"),
+            TransportTier::Tier0,
+            "retired means re-probe"
+        );
     }
 }

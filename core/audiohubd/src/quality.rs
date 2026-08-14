@@ -85,7 +85,9 @@ pub(crate) struct ConcealWindow {
 
 impl ConcealWindow {
     pub(crate) fn new() -> ConcealWindow {
-        ConcealWindow { pts: VecDeque::new() }
+        ConcealWindow {
+            pts: VecDeque::new(),
+        }
     }
 
     /// 追加一个采样点并丢弃窗口外的。
@@ -100,7 +102,9 @@ impl ConcealWindow {
         // `now - 10s` 是真的算不出来。算不出来就**不修剪**——让窗口暂时长一点，
         // 远好过 `unwrap_or(now)` 那种写法：那会把 cutoff 定成「现在」，一次
         // 把窗口削到只剩一个点，于是接下来 10 秒 `window()` 全部返回 None。
-        let Some(cutoff) = now.checked_sub(WINDOW) else { return };
+        let Some(cutoff) = now.checked_sub(WINDOW) else {
+            return;
+        };
         // 队首始终保留「不晚于 cutoff 的最新一点」作为基线：直接按 cutoff 硬删
         // 会在稀疏采样时把整个窗口删空。
         while self.pts.len() >= 2 && self.pts[1].0 <= cutoff {
@@ -437,8 +441,10 @@ impl MixMeter {
 
     fn flip(&self, now_ms: u64, start_ms: u64) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.prev_max_contrib
-            .store(self.cur_max_contrib.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.prev_max_contrib.store(
+            self.cur_max_contrib.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.prev_pair
             .store(self.cur_pair.load(Ordering::Relaxed), Ordering::Relaxed);
         self.prev_dup
@@ -695,12 +701,22 @@ mod tests {
     // ---- Q1 窗口 ----
 
     fn c(popped: u64, plc: u64, silence: u64) -> JbCounts {
-        JbCounts { popped, plc, silence, underruns: 0, dropped: 0, half_conceal: 0 }
+        JbCounts {
+            popped,
+            plc,
+            silence,
+            underruns: 0,
+            dropped: 0,
+            half_conceal: 0,
+        }
     }
 
     /// 带半帧隐藏的那一版（深档专用）。
     fn ch(popped: u64, plc: u64, silence: u64, half: u64) -> JbCounts {
-        JbCounts { half_conceal: half, ..c(popped, plc, silence) }
+        JbCounts {
+            half_conceal: half,
+            ..c(popped, plc, silence)
+        }
     }
 
     /// 规格 §6.2：构造 lifetime 计数序列，断言窗口值不受 10 s 之前的事件影响。
@@ -797,7 +813,10 @@ mod tests {
              深档丢一半包在等级上完全不可见"
         );
         // 权重 = PLC 的一半：一次半帧隐藏正好伪造 10 ms 里的 5 ms。
-        assert!((halves - 10.0 / 100.0).abs() < 1e-12, "(0.5*20)/100, got {halves}");
+        assert!(
+            (halves - 10.0 / 100.0).abs() < 1e-12,
+            "(0.5*20)/100, got {halves}"
+        );
         // 与整帧 PLC 比时**分母必须对齐**：PLC 帧是 JB 自己造出来的，它进分母
         // （`popped + plc + silence`）；半帧隐藏那一帧是真的被 pop 出去的，
         // `popped` 已经算过它。所以「同样 100 帧输出，其中 20 帧全隐藏」对的是
@@ -836,12 +855,30 @@ mod tests {
 
     #[test]
     fn excess_db_is_negative_below_the_knee_and_finite_in_silence() {
-        let quiet = ClipWindow { span_s: 10.0, samples: 480, over: 0, peak: 0.4 };
+        let quiet = ClipWindow {
+            span_s: 10.0,
+            samples: 480,
+            over: 0,
+            peak: 0.4,
+        };
         assert!(quiet.excess_db() < 0.0, "没碰到拐点就是负值");
-        let silent = ClipWindow { span_s: 10.0, samples: 480, over: 0, peak: 0.0 };
-        assert!(silent.excess_db().is_finite(), "全静音不能给出 -inf（JSON 会变 null）");
+        let silent = ClipWindow {
+            span_s: 10.0,
+            samples: 480,
+            over: 0,
+            peak: 0.0,
+        };
+        assert!(
+            silent.excess_db().is_finite(),
+            "全静音不能给出 -inf（JSON 会变 null）"
+        );
         // 两路 0.8 相加 = 1.6，正好 +6 dB
-        let doubled = ClipWindow { span_s: 10.0, samples: 480, over: 480, peak: 1.6 };
+        let doubled = ClipWindow {
+            span_s: 10.0,
+            samples: 480,
+            over: 480,
+            peak: 1.6,
+        };
         assert!((doubled.excess_db() - 6.0206).abs() < 1e-3);
     }
 
@@ -881,9 +918,16 @@ mod tests {
             corr_peak: Some(0.99),
         };
         assert!(!occasional.duplicate_suspect(), "5% 的巧合不是实锤");
-        let sustained = MixWindow { dup_ticks: 990, ..occasional };
+        let sustained = MixWindow {
+            dup_ticks: 990,
+            ..occasional
+        };
         assert!(sustained.duplicate_suspect());
-        let never_paired = MixWindow { pair_ticks: 0, dup_ticks: 0, ..occasional };
+        let never_paired = MixWindow {
+            pair_ticks: 0,
+            dup_ticks: 0,
+            ..occasional
+        };
         assert!(!never_paired.duplicate_suspect(), "从没两路同时求和过");
     }
 
@@ -899,15 +943,28 @@ mod tests {
         assert_eq!(worst, "level");
         assert!(!partial, "三分量齐全");
         // 对照：若用加权平均（这里手算一次）会得到「良」——这正是我们拒绝的做法
-        let avg = (Grade::Excellent as u8 + Grade::Poor as u8 + Grade::Excellent as u8) as f32 / 3.0;
-        assert!(avg > Grade::Good as u8 as f32 - 0.01, "平均值会谎报成 {avg:.2} ≈ 良");
+        let avg =
+            (Grade::Excellent as u8 + Grade::Poor as u8 + Grade::Excellent as u8) as f32 / 3.0;
+        assert!(
+            avg > Grade::Good as u8 as f32 - 0.01,
+            "平均值会谎报成 {avg:.2} ≈ 良"
+        );
     }
 
     #[test]
     fn min_composition_picks_each_limiting_component() {
-        assert_eq!(compose(Grade::Fair, Some(Grade::Excellent), Grade::Good).1, "continuity");
-        assert_eq!(compose(Grade::Good, Some(Grade::Fair), Grade::Excellent).1, "level");
-        assert_eq!(compose(Grade::Good, Some(Grade::Good), Grade::Fair).1, "bandwidth");
+        assert_eq!(
+            compose(Grade::Fair, Some(Grade::Excellent), Grade::Good).1,
+            "continuity"
+        );
+        assert_eq!(
+            compose(Grade::Good, Some(Grade::Fair), Grade::Excellent).1,
+            "level"
+        );
+        assert_eq!(
+            compose(Grade::Good, Some(Grade::Good), Grade::Fair).1,
+            "bandwidth"
+        );
         assert_eq!(
             compose(Grade::Excellent, Some(Grade::Excellent), Grade::Excellent),
             (Some(Grade::Excellent), "none", false)
@@ -917,8 +974,14 @@ mod tests {
     /// 平手时报最刺耳的那一项。
     #[test]
     fn ties_report_continuity_first() {
-        assert_eq!(compose(Grade::Poor, Some(Grade::Poor), Grade::Poor).1, "continuity");
-        assert_eq!(compose(Grade::Fair, Some(Grade::Fair), Grade::Excellent).1, "continuity");
+        assert_eq!(
+            compose(Grade::Poor, Some(Grade::Poor), Grade::Poor).1,
+            "continuity"
+        );
+        assert_eq!(
+            compose(Grade::Fair, Some(Grade::Fair), Grade::Excellent).1,
+            "continuity"
+        );
     }
 
     /// **削顶还没测出来时，总等级不成立——不许拿在场分量的上界当结论。**
@@ -938,14 +1001,23 @@ mod tests {
     fn an_unmeasured_component_leaves_the_grade_undecided() {
         // Q1 良好 / Q2 缺席 / Q3 优：真实等级只知道 ≤ 良好，可能是差。
         let (g, worst, partial) = compose(Grade::Good, None, Grade::Excellent);
-        assert_eq!(g, None, "旧写法在这里给出 Some(Good) —— 那正是用户看到的『良好』");
+        assert_eq!(
+            g, None,
+            "旧写法在这里给出 Some(Good) —— 那正是用户看到的『良好』"
+        );
         assert_eq!(worst, "none", "等级都还没定，谈不上谁拖后腿");
         assert!(partial, "少了一块板必须说出来");
 
         // 全优 + 缺一项同样不成立：「优」在这里只是上界，不是三分量的结论。
-        assert_eq!(compose(Grade::Excellent, None, Grade::Excellent), (None, "none", true));
+        assert_eq!(
+            compose(Grade::Excellent, None, Grade::Excellent),
+            (None, "none", true)
+        );
         // 一般也一样：区间 [差, 一般] 里没有一个等级可以拿出来说。
-        assert_eq!(compose(Grade::Excellent, None, Grade::Fair), (None, "none", true));
+        assert_eq!(
+            compose(Grade::Excellent, None, Grade::Fair),
+            (None, "none", true)
+        );
 
         // 对照：同样的三个输入，只要 Q2 到场，等级立刻成立。缺席与在场的分界
         // 就是这一个 `Some`，不是任何阈值。
@@ -1030,7 +1102,10 @@ mod tests {
             seq = seq.wrapping_add(1);
             jb.pop();
         }
-        assert_eq!(jb.underruns, 1, "the harness must produce exactly one underrun");
+        assert_eq!(
+            jb.underruns, 1,
+            "the harness must produce exactly one underrun"
+        );
         JbCounts::delta(jb_counts(&jb), before)
     }
 
@@ -1046,7 +1121,10 @@ mod tests {
     #[test]
     fn the_initial_prebuffer_contributes_no_conceal_at_any_depth() {
         for min_target in [1u32, 2, 3, 4, 5, 8, 12] {
-            let cfg = JbTuning { min_target, ..JbTuning::DEFAULT };
+            let cfg = JbTuning {
+                min_target,
+                ..JbTuning::DEFAULT
+            };
 
             // Frames trickling in at real-time pace.
             let mut jb = JitterBuffer::with_tuning(min_target, cfg);

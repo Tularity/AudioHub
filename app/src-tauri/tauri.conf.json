@@ -29,7 +29,9 @@
     "resources": {
       "../../LICENSE": "licenses/AudioHub-LICENSE.txt",
       "../../NOTICE.md": "licenses/AudioHub-NOTICE.md",
-      "../../THIRD-PARTY-LICENSES.html": "licenses/THIRD-PARTY-LICENSES.html"
+      "../../THIRD-PARTY-LICENSES.html": "licenses/THIRD-PARTY-LICENSES.html",
+      "locales/en.lproj/InfoPlist.strings": "en.lproj/InfoPlist.strings",
+      "locales/zh-Hans.lproj/InfoPlist.strings": "zh-Hans.lproj/InfoPlist.strings"
     },
     "targets": [
       "app"
@@ -41,7 +43,8 @@
       "icons/icon.icns"
     ],
     "externalBin": [
-      "binaries/audiohub"
+      "binaries/audiohub",
+      "binaries/audiohubd"
     ],
     "macOS": {
       "minimumSystemVersion": "11.0"

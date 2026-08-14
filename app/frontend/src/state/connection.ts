@@ -9,7 +9,7 @@ import { IpcClient, VersionMismatchError, IPC_VERSION } from '../ipc/client';
 import { resolveEndpoint, isTauri, tauriInvoke } from '../ipc/endpoint';
 import type {
   AirPlaySessionInfo, DaemonInfo, DaemonSettings, DaemonSettingsPatch,
-  IpcEndpoint, PeerState, SessionInfo,
+  DaemonServiceStatus, DriverInstallResult, IpcEndpoint, PeerState, SessionInfo,
 } from '../ipc/types';
 import { actions, getState, setState } from './store';
 import type { ConnError } from './store';
@@ -18,8 +18,12 @@ import { applyChromeDirection } from '../lib/platform';
 import { activeTheme } from '../lib/appearanceHost';
 import { iconStateFrom } from '../lib/trayIcon';
 import { isUnknownMethod, sanitizeDaemonSettings } from '../lib/airplay';
+import { nativeLocaleNeedsSync } from '../lib/nativeLocale';
+import { nativeServiceGate } from '../lib/daemonService';
+import type { NativeServiceGate } from '../lib/daemonService';
+import { autoRetryDelay } from '../lib/connectionRetry';
 import { toast } from '../components/Toasts';
-import { t } from '../i18n';
+import { getLocale, t } from '../i18n';
 
 export { IPC_VERSION };
 
@@ -29,8 +33,63 @@ let statusTimer: ReturnType<typeof setInterval> | null = null;
 let peersTimer: ReturnType<typeof setInterval> | null = null;
 let airplayTimer: ReturnType<typeof setInterval> | null = null;
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
-let connecting = false;
+let retryAttempt = 0;
+let nativeLifecycleOperation = false;
 let booted = false;
+
+/**
+ * Identity of one connectDaemon transaction.
+ *
+ * Promise.race cannot cancel the losing promise.  A timed-out native status
+ * probe can therefore resume much later, and without this fence it would be
+ * able to open a socket over the current attempt, close that socket from its
+ * catch block, and publish stale state. `live` stops work inside the attempt;
+ * the monotonic generation separately tells its outer controller whether no
+ * newer attempt has taken over the visible state slot.
+ */
+interface ConnectAttempt {
+  generation: number;
+  live: boolean;
+}
+
+let nextConnectGeneration = 0;
+let activeConnectAttempt: ConnectAttempt | null = null;
+
+class StaleConnectAttempt extends Error {
+  constructor() {
+    super('stale AudioHub connection attempt');
+    this.name = 'StaleConnectAttempt';
+  }
+}
+
+function attemptOwnsSlot(attempt: ConnectAttempt): boolean {
+  return activeConnectAttempt?.generation === attempt.generation;
+}
+
+function assertCurrentAttempt(attempt: ConnectAttempt): void {
+  if (!attempt.live || !attemptOwnsSlot(attempt)) throw new StaleConnectAttempt();
+}
+
+async function awaitCurrentAttempt<T>(attempt: ConnectAttempt, promise: Promise<T>): Promise<T> {
+  const value = await promise;
+  assertCurrentAttempt(attempt);
+  return value;
+}
+
+/** Invalidate the old generation before a retry or native lifecycle action. */
+function invalidateActiveConnectAttempt(): boolean {
+  const previous = activeConnectAttempt;
+  if (!previous) return false;
+  previous.live = false;
+  activeConnectAttempt = null;
+  return true;
+}
+
+function beginConnectAttempt(): ConnectAttempt {
+  const attempt = { generation: ++nextConnectGeneration, live: true };
+  activeConnectAttempt = attempt;
+  return attempt;
+}
 
 export interface RpcOpts { silent?: boolean; timeoutMs?: number }
 
@@ -38,7 +97,12 @@ export async function rpc<T = unknown>(method: string, params: unknown = {}, opt
   try {
     return await client.request<T>(method, params, opts.timeoutMs);
   } catch (e) {
-    if (!opts.silent) toast(String((e as Error)?.message || e), 'error');
+    // IPC errors are daemon diagnostics and may have been authored in another
+    // locale.  Keep the raw value in the developer console; visible copy must
+    // come from the active UI catalogue until the wire carries structured
+    // error codes.
+    console.error(`[audiohub] ${method} failed`, e);
+    if (!opts.silent) toast(t('error.requestFailed'), 'error');
     throw e;
   }
 }
@@ -47,11 +111,109 @@ export function ensureDaemon(): Promise<IpcEndpoint> {
   return tauriInvoke<IpcEndpoint>('ensure_daemon');
 }
 
+export function daemonServiceStatus(): Promise<DaemonServiceStatus> {
+  return tauriInvoke<DaemonServiceStatus>('daemon_service_status');
+}
+
+/**
+ * Complete the explicit native recovery action selected on the service gate.
+ * Registration and process start are deliberately separate: a stopped,
+ * already-installed service must not silently rewrite the user's login item.
+ */
+export async function recoverDaemon(action: 'install' | 'start'): Promise<void> {
+  if (!isTauri() || nativeLifecycleOperation) return;
+  nativeLifecycleOperation = true;
+  // A delayed status/handshake from the service gate must not resume inside the
+  // install/start transaction. If it already owns a socket, abandon that exact
+  // pre-transaction socket before invoking native lifecycle code.
+  if (invalidateActiveConnectAttempt()) client.close();
+  cancelRetry(true);
+  setState({ conn: 'starting', connError: null });
+  try {
+    await tauriInvoke<IpcEndpoint>(
+      action === 'install' ? 'install_daemon_service' : 'start_daemon_service',
+    );
+  } catch (err) {
+    setState({ conn: 'offline', connError: connError(startFailure(err)) });
+    nativeLifecycleOperation = false;
+    return;
+  }
+  nativeLifecycleOperation = false;
+  await connectDaemon();
+}
+
+/**
+ * Restart the native daemon as one UI transaction. While it runs, the socket
+ * close handler suppresses its ordinary retry so it cannot race the native
+ * stop/start window. The command only returns once the replacement endpoint is
+ * healthy; reconnect immediately instead of leaving the user behind a
+ * five-second offline retry gate.
+ */
+export async function restartDaemonService(): Promise<void> {
+  await runNativeLifecycleCommand<IpcEndpoint>('restart_daemon_service');
+  if (getState().conn !== 'online') {
+    throw new Error(t('settings.driver.serviceRestartFailed'));
+  }
+}
+
+export async function installDriverAndReconnect(): Promise<DriverInstallResult> {
+  return runNativeLifecycleCommand<DriverInstallResult>('install_driver');
+}
+
+async function runNativeLifecycleCommand<T>(command: string): Promise<T> {
+  if (!isTauri() || nativeLifecycleOperation) {
+    throw new Error(t('settings.driver.serviceRestartFailed'));
+  }
+  nativeLifecycleOperation = true;
+  if (invalidateActiveConnectAttempt()) client.close();
+  cancelRetry(true);
+  let result: T;
+  try {
+    result = await tauriInvoke<T>(command);
+  } catch (error) {
+    nativeLifecycleOperation = false;
+    // The operation may have failed before touching the daemon (for example a
+    // cancelled authorization) or after its socket closed. In the latter
+    // case, expose one stable, actionable failure. Starting a reconnect timer
+    // here races the lifecycle command's own stop/start transaction and used
+    // to multiply blocked auth attempts when the replacement daemon was
+    // present but unhealthy.
+    if (!client.connected) {
+      setState({ conn: 'offline', connError: connError(startFailure(error)) });
+    }
+    throw error;
+  }
+  // A successful driver install may or may not have restarted the daemon
+  // (Windows can require a reboot), while Restart always did. Re-authenticate
+  // either way so the UI cannot retain a socket and status snapshot belonging
+  // to the previous process generation.
+  setState({ conn: 'starting', connError: null });
+  client.close();
+  nativeLifecycleOperation = false;
+  await connectDaemon();
+  return result;
+}
+
 // ---- 连接 ----
 
-function scheduleRetry(): void {
+function cancelRetry(resetBudget = false): void {
   if (retryTimer) clearTimeout(retryTimer);
-  retryTimer = setTimeout(() => void connectDaemon(), 5000);
+  retryTimer = null;
+  if (resetBudget) retryAttempt = 0;
+}
+
+function scheduleRetry(error: ConnError): void {
+  // One owner, one timer. A WebSocket close emitted by the attempt itself is
+  // suppressed below; this guard also protects against any future duplicate
+  // notification path without shifting the promised retry deadline.
+  if (retryTimer) return;
+  const delay = autoRetryDelay(error.kind, retryAttempt);
+  if (delay == null) return;
+  retryAttempt += 1;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    void connectDaemon({ background: true });
+  }, delay);
 }
 
 // 整轮连接（含自动拉起）的兜底上限：任何一步挂死都不能让 conn 永久停在
@@ -59,11 +221,21 @@ function scheduleRetry(): void {
 // Rust 侧 ensure_daemon 自带 8s 就绪窗口，这里必须比它 + 认证握手宽裕。
 const CONNECT_ATTEMPT_TIMEOUT_MS = 30000;
 
-function withTimeout<T>(promise: Promise<T>, ms: number, msg: string): Promise<T> {
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  msg: string,
+  onTimeout: () => void,
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   return Promise.race([
     promise.finally(() => { if (timer) clearTimeout(timer); }),
-    new Promise<T>((_, rej) => { timer = setTimeout(() => rej(new Error(msg)), ms); }),
+    new Promise<T>((_, rej) => {
+      timer = setTimeout(() => {
+        onTimeout();
+        rej(new Error(msg));
+      }, ms);
+    }),
   ]);
 }
 
@@ -89,18 +261,52 @@ function connError(e: unknown): ConnError {
   return { kind: 'other', message: String((e as Error)?.message || e), detail: null };
 }
 
-async function attemptConnect(): Promise<DaemonInfo> {
-  const ep = await resolveEndpoint();
+function nativeGateFailure(gate: Exclude<NativeServiceGate, null>): Error {
+  switch (gate) {
+    case 'no-binary':
+      return startFailure({ kind: gate, message: t('overlay.noBinary.title') });
+    case 'not-installed':
+      return startFailure({ kind: gate, message: t('overlay.notInstalled.title') });
+    case 'stopped':
+      return startFailure({ kind: gate, message: t('overlay.stopped.title') });
+  }
+}
+
+async function attemptConnect(attempt: ConnectAttempt): Promise<DaemonInfo> {
+  assertCurrentAttempt(attempt);
+  // Native startup is gated by the installation transaction even when an old
+  // or manually-started daemon happens to be reachable. Otherwise a failed
+  // registration can disappear on the next poll: the socket connects, the UI
+  // skips service status, and the user is told setup succeeded when no login
+  // entry/marker exists.
+  let nativeService: DaemonServiceStatus | null = null;
+  if (isTauri()) {
+    try {
+      nativeService = await awaitCurrentAttempt(attempt, daemonServiceStatus());
+    } catch (err) {
+      if (err instanceof StaleConnectAttempt) throw err;
+      throw startFailure(err);
+    }
+    const gate = nativeServiceGate(nativeService);
+    // Do this before resolveEndpoint/client.connect. `running: false` means the
+    // native shell did not bind ipc.json's PID to the selected daemon image; a
+    // reachable old/foreign endpoint must not bypass that ownership boundary.
+    if (gate) throw nativeGateFailure(gate);
+  }
+
+  const ep = await awaitCurrentAttempt(attempt, resolveEndpoint());
   setState({
     endpoint: ep ? { port: ep.port, token: ep.token } : null,
     endpointSource: ep ? ep.source : null,
   });
   if (ep) {
     try {
-      return await client.connect(ep.port, ep.token);
+      return await awaitCurrentAttempt(attempt, client.connect(ep.port, ep.token));
     } catch (e) {
+      if (e instanceof StaleConnectAttempt) throw e;
       // 版本不兼容时端口已被占用，再拉一个 daemon 也解决不了。
       if (e instanceof VersionMismatchError) throw e;
+      assertCurrentAttempt(attempt);
       client.close();
       if (!isTauri()) throw e;
     }
@@ -110,41 +316,74 @@ async function attemptConnect(): Promise<DaemonInfo> {
     throw e;
   }
 
-  // 独立 App：启动即可用。用户不需要点任何东西，这里自动把服务拉起来。
-  // Rust 侧 ensure_daemon 幂等（先探测 ipc.json + 连接），健康 daemon 绝不重复拉起。
-  setState({ conn: 'starting', connError: null });
-  let started: IpcEndpoint;
-  try {
-    started = await ensureDaemon();
-  } catch (err) {
-    throw startFailure(err);
+  // Native App owns the service lifecycle, but first installation and an
+  // ordinary stopped service are different user decisions. Do not mutate a
+  // login item or start a background process merely because a polling retry
+  // happened. The overlay exposes the correct explicit action for each state.
+  let service = nativeService;
+  if (!service) {
+    try {
+      service = await awaitCurrentAttempt(attempt, daemonServiceStatus());
+    } catch (err) {
+      if (err instanceof StaleConnectAttempt) throw err;
+      throw startFailure(err);
+    }
   }
-  setState({
-    endpoint: { port: started.port, token: started.token },
-    endpointSource: 'tauri',
-    conn: 'connecting',
-  });
-  return client.connect(started.port, started.token);
+  const gate = nativeServiceGate(service);
+  if (gate) throw nativeGateFailure(gate);
+  if (service.running) {
+    // The native probe says a daemon is accepting local connections, so a
+    // failed WebSocket/auth handshake is not a stopped-service condition. Keep
+    // the truthful generic reconnect action while the endpoint/token settles.
+    throw startFailure({ kind: 'running-unreachable', message: t('overlay.disconnected.title') });
+  }
+  throw startFailure({ kind: 'stopped', message: t('overlay.stopped.title') });
 }
 
-export async function connectDaemon(): Promise<void> {
-  if (connecting) return;
-  connecting = true;
-  if (retryTimer) clearTimeout(retryTimer);
-  setState({ conn: 'connecting', connError: null });
+interface ConnectDaemonOpts {
+  /** Keep the current offline error visible while a timer-owned attempt runs. */
+  background?: boolean;
+}
+
+export async function connectDaemon(opts: ConnectDaemonOpts = {}): Promise<void> {
+  // A timer never supersedes an in-flight attempt. A user/lifecycle call does:
+  // it creates a fresh generation even while the old Promise.race loser is
+  // still pending, and abandons only that pre-existing attempt's socket.
+  if (opts.background && activeConnectAttempt) return;
+  const superseded = invalidateActiveConnectAttempt();
+  if (superseded) client.close();
+  // Direct calls are user/startup/lifecycle actions. Each gets a fresh finite
+  // retry budget and supersedes any pending background attempt.
+  if (!opts.background) cancelRetry(true);
+  const attempt = beginConnectAttempt();
+  if (!opts.background) setState({ conn: 'connecting', connError: null });
   try {
-    const daemon = await withTimeout(attemptConnect(), CONNECT_ATTEMPT_TIMEOUT_MS, t('error.connectTimeout'));
+    const daemon = await withTimeout(
+      attemptConnect(attempt),
+      CONNECT_ATTEMPT_TIMEOUT_MS,
+      t('error.connectTimeout'),
+      // Keep the controller in its slot so it can publish this timeout, but
+      // fence the losing promise before it can cross another await boundary.
+      () => { if (attemptOwnsSlot(attempt)) attempt.live = false; },
+    );
+    assertCurrentAttempt(attempt);
+    cancelRetry(true);
     setState({
       conn: 'online', daemon, connError: null, lastStatusAt: Date.now(),
       airplaySessions: [], airplaySessionsSupported: null,
     });
     afterConnect();
   } catch (e) {
+    // A newer generation owns both the socket and the visible connection state.
+    // The old controller must not close, overwrite, or schedule anything.
+    if (!attemptOwnsSlot(attempt) || e instanceof StaleConnectAttempt) return;
+    attempt.live = false;
     client.close(); // 放弃可能仍在挂起的 socket
-    setState({ conn: 'offline', connError: connError(e) });
-    scheduleRetry();
+    const error = connError(e);
+    setState({ conn: 'offline', connError: error });
+    scheduleRetry(error);
   } finally {
-    connecting = false;
+    if (attemptOwnsSlot(attempt)) activeConnectAttempt = null;
   }
 }
 
@@ -183,6 +422,10 @@ export async function refreshSettings(): Promise<void> {
   if (!client.connected) return;
   try {
     actions.setDaemonSettings(await client.request<DaemonSettings>('settings.get', {}));
+    // Only the installed native App owns native OS copy. A browser connected
+    // to the same daemon may use another language, but must never rename this
+    // machine's system devices underneath the interactive desktop user.
+    syncNativeAppearance();
   } catch (e) {
     const msg = String((e as Error)?.message || e);
     if (/unknown method/i.test(msg)) actions.setSettingsUnsupported();
@@ -265,7 +508,10 @@ export async function refreshPermissions(opts: PermRefreshOpts = {}): Promise<vo
       const msg = String((e as Error)?.message || e);
       // ipcserv.rs 的兜底文案是 unknown method '<name>'：这不是故障，只是这一版
       // 服务不上报权限。查不到就当没有门——「不知道」绝不能被当成「没授权」。
-      actions.setPermissionsError(msg, /unknown method/i.test(msg) ? false : null);
+      actions.setPermissionsError(
+        /unknown method/i.test(msg) ? null : t('settings.perm.error'),
+        /unknown method/i.test(msg) ? false : null,
+      );
     } finally {
       permAt = performance.now();
       permInflight = null;
@@ -292,6 +538,40 @@ export function gateVisible(): boolean {
 // ---- 托盘 ----
 
 let trayKey: string | null = null;
+let nativeLocaleSyncing = false;
+
+/**
+ * Push the resolved locale to native, machine-wide surfaces. This entry point
+ * is subscribed to locale changes by App.tsx and is also run after every
+ * settings refresh, covering both first connection and daemon restarts.
+ *
+ * `mode === 'tauri'` is the security/ownership boundary: browser Web UI locale
+ * remains a viewer preference and cannot rename OS devices or the App tray.
+ */
+export function syncNativeAppearance(): void {
+  syncTray();
+  const s = getState();
+  const want = getLocale();
+  if (!client.connected || nativeLocaleSyncing || !nativeLocaleNeedsSync(
+    s.mode, s.conn === 'online', s.daemonSettings?.native_locale, want,
+  )) return;
+  nativeLocaleSyncing = true;
+  void client.request<unknown>('settings.set', { native_locale: want })
+    .then((raw) => {
+      const settings = sanitizeDaemonSettings(raw);
+      if (settings) actions.setDaemonSettings(settings);
+      void refreshPeers();
+    })
+    .catch(() => { /* next 5 s settings refresh retries; no locale-change toast */ })
+    .finally(() => {
+      nativeLocaleSyncing = false;
+      // The user can choose another language while this write is in flight.
+      // Re-read current state instead of letting the older reply win forever.
+      if (getLocale() !== want) {
+        syncNativeAppearance();
+      }
+    });
+}
 
 export function syncTray(): void {
   const s = getState();
@@ -302,8 +582,9 @@ export function syncTray(): void {
   // 传 activeTheme() 而不是系统深浅：用户把主题钉成浅色时，窗口是浅色的，
   // Dock 图标就该跟着窗口，而不是跟着系统。
   const theme = activeTheme();
+  const locale = getLocale();
   // 去重键必须覆盖每一个进了参数表的量，否则新维度的变化会被这一行悄悄吃掉。
-  const key = `${online}|${port}|${state}|${theme}`;
+  const key = `${online}|${port}|${state}|${theme}|${locale}`;
   if (key === trayKey) return;
   trayKey = key;
   tauriInvoke('set_tray_status', {
@@ -311,6 +592,7 @@ export function syncTray(): void {
     port: online ? port : null,
     state,
     theme,
+    locale,
   }).catch(() => {});
 }
 
@@ -321,9 +603,19 @@ client.on('close', () => {
   if (peersTimer) clearInterval(peersTimer);
   if (airplayTimer) clearInterval(airplayTimer);
   setState({
-    conn: 'offline', airplaySessions: [], airplaySessionsSupported: null,
+    conn: nativeLifecycleOperation ? 'starting' : 'offline',
+    connError: nativeLifecycleOperation ? null : getState().connError,
+    airplaySessions: [], airplaySessionsSupported: null,
   });
-  scheduleRetry();
+  if (nativeLifecycleOperation) return;
+  // A connection attempt owns its own failure classification and retry
+  // decision. Its socket may emit close before connect() rejects; scheduling
+  // here as well used to create a second visible attempt path.
+  if (activeConnectAttempt) return;
+  const error = getState().connError || {
+    kind: 'running-unreachable', message: t('overlay.disconnected.title'), detail: null,
+  };
+  scheduleRetry(error);
 });
 
 client.on('event:stats', (data) => actions.pushStats(data));

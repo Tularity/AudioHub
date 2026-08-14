@@ -42,8 +42,16 @@ impl MemDuplex {
         let a2b: Shared = Arc::new((Mutex::new(Pipe::default()), Condvar::new()));
         let b2a: Shared = Arc::new((Mutex::new(Pipe::default()), Condvar::new()));
         (
-            MemDuplex { rx: b2a.clone(), tx: a2b.clone(), read_deadline: None },
-            MemDuplex { rx: a2b, tx: b2a, read_deadline: None },
+            MemDuplex {
+                rx: b2a.clone(),
+                tx: a2b.clone(),
+                read_deadline: None,
+            },
+            MemDuplex {
+                rx: a2b,
+                tx: b2a,
+                read_deadline: None,
+            },
         )
     }
 }
@@ -95,7 +103,10 @@ impl Write for MemDuplex {
         let (_, cv) = &*self.tx;
         let mut p = lock(&self.tx);
         if p.closed {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "the other end is gone"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the other end is gone",
+            ));
         }
         p.buf.extend(data.iter().copied());
         cv.notify_all();
@@ -123,7 +134,10 @@ impl ControlIo for MemDuplex {
         // There is no address, so there is no address to report. Inventing one
         // would put a value that reads like a measurement in front of every
         // caller that logs it.
-        Err(io::Error::new(io::ErrorKind::Unsupported, "in-memory transport has no peer address"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "in-memory transport has no peer address",
+        ))
     }
 
     fn set_nodelay(&mut self, _nodelay: bool) -> io::Result<()> {
@@ -174,8 +188,8 @@ mod tests {
                 .expect("clock")
                 .as_nanos();
             let seq = PARTY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir = std::env::temp_dir()
-                .join(format!("ahb-{tag}-{}-{n}-{seq}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("ahb-{tag}-{}-{n}-{seq}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("mkdir");
             let id = LocalIdentity::load_or_create_at(Some(&dir)).expect("identity");
             Party { id, dir }
@@ -230,7 +244,10 @@ mod tests {
 
         let store_a = PeerStore::load_at(Some(&a.dir)).expect("initiator store");
         let peer_b = verify_initiator(&mut end_a, &a.id, &store_a).expect("verify as initiator");
-        assert_eq!(peer_b.fingerprint, b.id.fingerprint, "verified the wrong peer");
+        assert_eq!(
+            peer_b.fingerprint, b.id.fingerprint,
+            "verified the wrong peer"
+        );
         let ch_a =
             SecureChannel::establish_initiator(end_a, &a.id, &peer_b).expect("initiator establish");
         let ch_b = responder
@@ -252,12 +269,15 @@ mod tests {
         let (mut ch_a, mut ch_b) = established_pair();
 
         assert_eq!(
-            ch_a.peer_addr().expect_err("an in-memory channel has no address").kind(),
+            ch_a.peer_addr()
+                .expect_err("an in-memory channel has no address")
+                .kind(),
             io::ErrorKind::Unsupported,
             "if this channel has an address it is running on a socket, and the test proves nothing"
         );
 
-        ch_a.send(&SessionMsg::Ping { t_us: 424_242 }).expect("initiator sends");
+        ch_a.send(&SessionMsg::Ping { t_us: 424_242 })
+            .expect("initiator sends");
         match ch_b
             .recv_timeout(Duration::from_secs(5))
             .expect("responder read")
@@ -267,16 +287,21 @@ mod tests {
             other => panic!("expected the Ping we sent, got {other:?}"),
         }
 
-        ch_b
-            .send(&SessionMsg::Pong { t_us: 424_242, peer_t_us: Some(7) })
-            .expect("responder answers");
+        ch_b.send(&SessionMsg::Pong {
+            t_us: 424_242,
+            peer_t_us: Some(7),
+        })
+        .expect("responder answers");
         match ch_a
             .recv_timeout(Duration::from_secs(5))
             .expect("initiator read")
             .expect("a message before the deadline")
         {
             SessionMsg::Pong { t_us, peer_t_us } => {
-                assert_eq!(t_us, 424_242, "the reply did not carry our own timestamp back");
+                assert_eq!(
+                    t_us, 424_242,
+                    "the reply did not carry our own timestamp back"
+                );
                 assert_eq!(peer_t_us, Some(7));
             }
             other => panic!("expected a Pong, got {other:?}"),
@@ -297,7 +322,10 @@ mod tests {
             .recv_timeout(Duration::from_millis(200))
             .expect("a quiet channel is not an error");
         let waited = t0.elapsed();
-        assert!(got.is_none(), "nothing was sent, so nothing may be returned: {got:?}");
+        assert!(
+            got.is_none(),
+            "nothing was sent, so nothing may be returned: {got:?}"
+        );
         assert!(
             waited >= Duration::from_millis(150),
             "returned after {waited:?}: the deadline was not waited out, so it is not being applied"

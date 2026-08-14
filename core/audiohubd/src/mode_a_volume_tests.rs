@@ -23,7 +23,9 @@
 use std::path::PathBuf;
 
 fn read(rel: &str) -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join(rel);
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "读不到 {}（{e}）。文件被改名/挪走了就把这条测试一起更新，\
@@ -119,7 +121,10 @@ fn the_consumer_does_not_speak_before_the_peer_has() {
 fn the_one_shot_mute_fires_where_the_stream_becomes_established() {
     let src = read("conn.rs");
     assert!(
-        has(&src, "mute_local_on_connect(inner, capture_backend.as_deref())"),
+        has(
+            &src,
+            "mute_local_on_connect(inner, capture_backend.as_deref())"
+        ),
         "open_session_from 里没有 「静音本机」 的调用点：开关存在但什么都不做"
     );
     assert!(
@@ -183,7 +188,9 @@ fn the_one_shot_mute_does_not_fire_on_a_reconnect_replay() {
 #[test]
 fn both_switches_exist_in_the_settings_view() {
     const TSX: &str = "app/frontend/src/views/Settings.tsx";
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(TSX);
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(TSX);
     let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "读不到 {TSX}（{e}）。文件被改名/挪走了就把这条测试一起更新，\

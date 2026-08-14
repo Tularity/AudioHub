@@ -150,7 +150,15 @@ impl ControlIo for TcpStream {
 ///
 /// 安全网是 `check_protocol` 的严格相等：它把版本不匹配变成一条指名道姓的拒绝，
 /// 且**不修改任何一侧的配对记录**。部署纪律因此是「同一窗口内两端全部重建」。
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// ## 版本 5：默认音频端点能力
+///
+/// v5 的两位能力不是普通遥测。旧端完全不发送
+/// `SessionMsg::AudioCapabilities`，而「没收到」不能安全地解释成任一边：当成
+/// `true` 会向没有真实端点的主机公布幽灵设备，当成 `false` 又会隐藏确实存在的
+/// 设备。严格版本相等把这个不可判定状态变成明确的升级错误；真正的开流闸门仍
+/// 由被请求的一侧现查本机端点，绝不信任对端广告。
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// What a missing `version` field decodes to: a peer old enough to have no
 /// version at all. Distinct from any real version so the refusal message can
@@ -363,7 +371,10 @@ mod tests {
         let msg: ControlMsg =
             serde_json::from_slice(br#"{"type":"unpaired"}"#).expect("parse legacy frame");
         match msg {
-            ControlMsg::Unpaired { sig_b64, public_key_b64 } => {
+            ControlMsg::Unpaired {
+                sig_b64,
+                public_key_b64,
+            } => {
                 assert!(sig_b64.is_empty(), "no signature in the legacy frame");
                 assert!(public_key_b64.is_empty(), "no key in the legacy frame");
             }

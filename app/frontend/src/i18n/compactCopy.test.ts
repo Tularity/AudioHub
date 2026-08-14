@@ -18,17 +18,14 @@ const budgets = {
   'pair.left.open': 14,
   'pair.left.enable': 14,
   'pair.left.disable': 12,
-  'metric.latency.label': 8,
   'metric.latency.grade.imperceptible': 7,
   'metric.latency.grade.conversational': 7,
   'metric.latency.grade.noticeable': 7,
   'metric.latency.grade.unusable': 7,
-  'metric.quality.label': 8,
   'metric.quality.grade.excellent': 8,
   'metric.quality.grade.good': 8,
   'metric.quality.grade.fair': 8,
   'metric.quality.grade.poor': 8,
-  'metric.quality.fromPeer': 8,
   'detail.sessions.colSession': 3,
   'detail.sessions.colFlow': 4,
   'detail.sessions.colDir': 4,
@@ -44,6 +41,18 @@ const budgets = {
 type BudgetedKey = keyof typeof budgets;
 const budgetedKeys = Object.keys(budgets) as BudgetedKey[];
 
+// These notes are not inside a button, but remain visible throughout their
+// corresponding settings/detail section. Long English prose here makes the
+// card or sheet much taller than zh-CN, so keep a deliberate per-sentence cap.
+const persistentCopyBudgets = {
+  'share.proto.airplay.consequence': 125,
+  'detail.transport.endpointShadow': 85,
+  'settings.startup.orphaned': 100,
+} as const satisfies Partial<Record<keyof typeof enUS, number>>;
+
+type PersistentCopyKey = keyof typeof persistentCopyBudgets;
+const persistentCopyKeys = Object.keys(persistentCopyBudgets) as PersistentCopyKey[];
+
 describe('en-US copy in width-constrained controls', () => {
   it('keeps the language selector compact', () => {
     expect(LOCALE_ENDONYM['en-US'].length, 'en-US endonym').toBeLessThanOrEqual(12);
@@ -56,6 +65,17 @@ describe('en-US copy in width-constrained controls', () => {
       .map((key) => `${key}: ${JSON.stringify(enUS[key])} (${enUS[key].length} > ${budgets[key]})`);
 
     expect(over, `shorten copy used by narrow controls:\n${over.join('\n')}`).toEqual([]);
+  });
+
+  it('keeps persistent explanatory copy within explicit length budgets', () => {
+    const over = persistentCopyKeys
+      .filter((key) => enUS[key].length > persistentCopyBudgets[key])
+      .map((key) => (
+        `${key}: ${JSON.stringify(enUS[key])} `
+        + `(${enUS[key].length} > ${persistentCopyBudgets[key]})`
+      ));
+
+    expect(over, `shorten persistent copy:\n${over.join('\n')}`).toEqual([]);
   });
 
   it('does not restore the verbose labels that previously broke the layout', () => {

@@ -237,7 +237,7 @@ pub enum SessionMsg {
         /// still too short, and that is a different claim from `0.0`. It also
         /// keeps this variant readable by a peer built before the field existed,
         /// which matters for exactly one class of deployment mistake — two
-        /// builds that both say `PROTOCOL_VERSION = 4`.
+        /// builds that both claim the same `PROTOCOL_VERSION`.
         #[serde(default)]
         spread_ms: Option<f64>,
     },
@@ -383,6 +383,24 @@ pub enum SessionMsg {
         /// deserialising into `Mode` would fail the whole frame and make the
         /// peer look like it never advertised at all.
         mode: String,
+    },
+    /// "These are the real default audio endpoints I expose right now."
+    ///
+    /// Sent by both sides immediately after a secure channel is registered and
+    /// again whenever either default endpoint changes. `default_input` means a
+    /// normal `kind=mic, dir=recv` request can be sourced from this machine's
+    /// microphone; `default_output` means a normal `kind=spk, dir=send` request
+    /// can be rendered by this machine. Synthetic test sources remain separate
+    /// from these physical endpoint facts.
+    ///
+    /// This is an affordance, never authority: the receiver of an OpenStream
+    /// samples its own endpoints again before accepting. Neither field has a
+    /// serde default because omission is "unknown", not an observed `false`.
+    /// That ambiguity is also why adding this message bumped the strict P2P
+    /// protocol version to 5.
+    AudioCapabilities {
+        default_input: bool,
+        default_output: bool,
     },
     /// "I have unpaired from you." Sent immediately before `Bye` when the local
     /// user removes a pairing while the channel is up (plan §7.1, ruled in
@@ -550,13 +568,19 @@ fn derive_keys(ss: &[u8], nonce_i: &[u8], nonce_r: &[u8], initiator: bool) -> De
         DerivedKeys {
             c_tx: c_i2r,
             c_rx: c_r2i,
-            media: MediaKeys { tx: m_i2r, rx: m_r2i },
+            media: MediaKeys {
+                tx: m_i2r,
+                rx: m_r2i,
+            },
         }
     } else {
         DerivedKeys {
             c_tx: c_r2i,
             c_rx: c_i2r,
-            media: MediaKeys { tx: m_r2i, rx: m_i2r },
+            media: MediaKeys {
+                tx: m_r2i,
+                rx: m_i2r,
+            },
         }
     };
     // [u8; 32] is Copy, so the struct above holds copies: wipe the locals.
@@ -652,9 +676,11 @@ impl<T: ControlIo> SecureChannel<T> {
         )?;
 
         let (eph_r_b64, nonce_r_b64, sig_r_b64) = match read_frame(&mut s)? {
-            ControlMsg::SecResp { eph_pub_b64, nonce_b64, sig_b64 } => {
-                (eph_pub_b64, nonce_b64, sig_b64)
-            }
+            ControlMsg::SecResp {
+                eph_pub_b64,
+                nonce_b64,
+                sig_b64,
+            } => (eph_pub_b64, nonce_b64, sig_b64),
             ControlMsg::Error { message } => bail!("{message}"),
             other => bail!("unexpected message: {other:?}"),
         };
@@ -665,7 +691,9 @@ impl<T: ControlIo> SecureChannel<T> {
         if !verify_sig(&peer.public_key_b64, &m_r, &sig_r) {
             let _ = write_frame(
                 &mut s,
-                &ControlMsg::Error { message: "secure handshake signature invalid".into() },
+                &ControlMsg::Error {
+                    message: "secure handshake signature invalid".into(),
+                },
             );
             bail!("secure handshake signature invalid");
         }
@@ -688,19 +716,27 @@ impl<T: ControlIo> SecureChannel<T> {
         s.set_read_deadline(Some(Instant::now() + HANDSHAKE_TIMEOUT))?;
 
         let (eph_i_b64, nonce_i_b64, sig_i_b64) = match read_frame(&mut s)? {
-            ControlMsg::SecInit { eph_pub_b64, nonce_b64, sig_b64 } => {
-                (eph_pub_b64, nonce_b64, sig_b64)
-            }
+            ControlMsg::SecInit {
+                eph_pub_b64,
+                nonce_b64,
+                sig_b64,
+            } => (eph_pub_b64, nonce_b64, sig_b64),
             ControlMsg::Error { message } => bail!("{message}"),
             other => bail!("unexpected message: {other:?}"),
         };
         let eph_i = arr32(&b64d(&eph_i_b64)?)?;
         let nonce_i = b64d(&nonce_i_b64)?;
         let sig_i = b64d(&sig_i_b64)?;
-        if !verify_sig(&peer.public_key_b64, &sig_preimage_i(&eph_i, &nonce_i), &sig_i) {
+        if !verify_sig(
+            &peer.public_key_b64,
+            &sig_preimage_i(&eph_i, &nonce_i),
+            &sig_i,
+        ) {
             let _ = write_frame(
                 &mut s,
-                &ControlMsg::Error { message: "secure handshake signature invalid".into() },
+                &ControlMsg::Error {
+                    message: "secure handshake signature invalid".into(),
+                },
             );
             bail!("secure handshake signature invalid");
         }
@@ -767,7 +803,10 @@ impl<T: ControlIo> SecureChannel<T> {
             .map_err(|_| anyhow!("control encrypt failed"))?;
         if let Err(e) = write_frame(
             &mut self.stream,
-            &ControlMsg::Enc { n, data_b64: BASE64_STANDARD.encode(ct) },
+            &ControlMsg::Enc {
+                n,
+                data_b64: BASE64_STANDARD.encode(ct),
+            },
         ) {
             self.poisoned = true;
             return Err(e).context("write secure control frame");
@@ -908,9 +947,13 @@ mod wire_compat_tests {
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     enum LegacySessionMsg {
-        Ping { t_us: u64 },
+        Ping {
+            t_us: u64,
+        },
         /// 老版本的 `Pong`：只有 `t_us`。
-        Pong { t_us: u64 },
+        Pong {
+            t_us: u64,
+        },
         Bye {},
     }
 
@@ -927,6 +970,40 @@ mod wire_compat_tests {
         }
     }
 
+    #[test]
+    fn audio_capabilities_have_two_required_independent_wire_bits() {
+        let msg = SessionMsg::AudioCapabilities {
+            default_input: false,
+            default_output: true,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "audio_capabilities",
+                "default_input": false,
+                "default_output": true
+            })
+        );
+        let back: SessionMsg = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back,
+            SessionMsg::AudioCapabilities {
+                default_input: false,
+                default_output: true
+            }
+        ));
+
+        let missing = serde_json::json!({
+            "type": "audio_capabilities",
+            "default_input": true
+        });
+        assert!(
+            serde_json::from_value::<SessionMsg>(missing).is_err(),
+            "an absent endpoint fact is unknown and must never become false"
+        );
+    }
+
     /// **老对端收到新 `Pong`**：多出来的 `peer_t_us` 被 serde 忽略，照常解析。
     /// 若谁给 `SessionMsg` 加了 `deny_unknown_fields`，这条会立刻变红。
     #[test]
@@ -936,7 +1013,8 @@ mod wire_compat_tests {
             peer_t_us: Some(456),
         })
         .unwrap();
-        match serde_json::from_str::<LegacySessionMsg>(&json).expect("老对端必须解析得动") {
+        match serde_json::from_str::<LegacySessionMsg>(&json).expect("老对端必须解析得动")
+        {
             LegacySessionMsg::Pong { t_us } => assert_eq!(t_us, 123),
             other => panic!("解析成了 {other:?}"),
         }
@@ -950,7 +1028,8 @@ mod wire_compat_tests {
     #[test]
     fn an_old_pong_yields_none_not_a_zero_timestamp() {
         let legacy = serde_json::to_string(&LegacySessionMsg::Pong { t_us: 99 }).unwrap();
-        match serde_json::from_str::<SessionMsg>(&legacy).expect("新端必须解析得动老报文") {
+        match serde_json::from_str::<SessionMsg>(&legacy).expect("新端必须解析得动老报文")
+        {
             SessionMsg::Pong { t_us, peer_t_us } => {
                 assert_eq!(t_us, 99);
                 assert!(
@@ -998,7 +1077,13 @@ mod wire_compat_tests {
         };
         let back: SessionMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         match back {
-            SessionMsg::StageReport { stream_id, stages, local_ms, seq_us, .. } => {
+            SessionMsg::StageReport {
+                stream_id,
+                stages,
+                local_ms,
+                seq_us,
+                ..
+            } => {
                 assert_eq!(stream_id, 7);
                 assert_eq!(seq_us, 42);
                 assert_eq!(local_ms, Some(1005.0));
@@ -1020,7 +1105,11 @@ mod wire_compat_tests {
     /// 那条红线在**线上**也必须活着，所以这里逐个断言，不用 `..` 糊过去。
     #[test]
     fn a_quality_reading_survives_the_wire_including_the_difference_between_none_and_zero() {
-        for (clip, excess) in [(None, None), (Some(0.0), Some(-120.0)), (Some(0.031), Some(2.5))] {
+        for (clip, excess) in [
+            (None, None),
+            (Some(0.0), Some(-120.0)),
+            (Some(0.031), Some(2.5)),
+        ] {
             let msg = SessionMsg::StageReport {
                 stream_id: 9,
                 stages: vec![],
@@ -1045,7 +1134,10 @@ mod wire_compat_tests {
             };
             let back: SessionMsg =
                 serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
-            let SessionMsg::StageReport { quality: Some(q), .. } = back else {
+            let SessionMsg::StageReport {
+                quality: Some(q), ..
+            } = back
+            else {
                 panic!("音质原料没活过线缆")
             };
             assert_eq!(q.window_s, 10.5);
@@ -1093,7 +1185,10 @@ mod wire_compat_tests {
         let json = r#"{"type":"stage_report","stream_id":1,"stages":[],
                        "local_ms":null,"dev":null,"seq_us":5}"#;
         let msg: SessionMsg = serde_json::from_str(json).expect("老报文必须照常解析");
-        let SessionMsg::StageReport { quality, stream_id, .. } = msg else {
+        let SessionMsg::StageReport {
+            quality, stream_id, ..
+        } = msg
+        else {
             panic!("解析成了别的变体")
         };
         assert_eq!(stream_id, 1);

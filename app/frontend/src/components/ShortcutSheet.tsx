@@ -30,14 +30,13 @@ import { useState, useSyncExternalStore } from 'react';
 import { Help } from './Controls';
 import { Sheet } from './Sheet';
 import { ShortcutRow } from './ShortcutRow';
-import { toast } from './Toasts';
 import { WIKI } from '../lib/external';
 import { getOverrides, setOverrides, subscribeShortcuts } from '../lib/shortcutHost';
 import {
   ACTION_LABEL, PLATFORM, SHORTCUT_ACTIONS,
   applyBinding, clearOverride, isCustomized, resolveBindings,
 } from '../lib/shortcuts';
-import type { ShortcutActionId } from '../lib/shortcuts';
+import type { ShortcutActionId, ShortcutOverrides } from '../lib/shortcuts';
 import { t } from '../i18n';
 
 // ---------------------------------------------------------------- 开合
@@ -76,13 +75,19 @@ export function ShortcutSheetHost() {
 }
 
 function ShortcutSheet() {
-  // 读的是**当前生效**的绑定，所以在这里改完立刻反映，不用重开。
-  //
-  // ⚠ override 存在模块级 + localStorage，**不进 `AppState`**：它是纯 UI 偏好，
-  // 与 daemon 无关，塞进 DaemonSettings 就等于改 IPC 契约，还会在下一次 settings
-  // 写入时被一并发出去。
-  const overrides = useSyncExternalStore(subscribeShortcuts, getOverrides);
-  const bindings = resolveBindings(overrides, PLATFORM);
+  // override 仍存在模块级 + localStorage，**不进 `AppState`**；Sheet 打开时只复制一份
+  // 草稿。录制、逐项清除与「全部恢复」都先改草稿，底部保存才替换当前生效值。
+  const committed = useSyncExternalStore(subscribeShortcuts, getOverrides);
+  const [draft, setDraft] = useState<ShortcutOverrides>(() => ({ ...getOverrides() }));
+  const bindings = resolveBindings(draft, PLATFORM);
+  const has = (value: ShortcutOverrides, action: ShortcutActionId) => (
+    Object.prototype.hasOwnProperty.call(value, action)
+  );
+  // 缺席 = 用默认，显式 null = 禁用；比较时必须连「有没有这个键」一起比较。
+  const dirty = SHORTCUT_ACTIONS.some((action) => (
+    has(committed, action) !== has(draft, action) || committed[action] !== draft[action]
+  ));
+  const hasDraftOverrides = SHORTCUT_ACTIONS.some((action) => has(draft, action));
   // 冲突提示要说出「被抢走绑定的是谁」，而那一行随即变成「未设置」——不高亮一下
   // 的话，用户看不到自己刚刚拿走了什么。
   const [freed, setFreed] = useState<ShortcutActionId | null>(null);
@@ -91,7 +96,7 @@ function ShortcutSheet() {
     const taken = accel
       ? SHORTCUT_ACTIONS.find((id) => id !== action && bindings[id] === accel) ?? null
       : null;
-    setOverrides(applyBinding(overrides, action, accel, bindings));
+    setDraft(applyBinding(draft, action, accel, bindings));
     setFreed(taken);
   }
 
@@ -100,19 +105,34 @@ function ShortcutSheet() {
       testid="shortcut-sheet"
       title={t('shortcuts.sheet.title')}
       help={<Help label={t('wiki.shortcuts')} url={WIKI.shortcuts} testid="settings-shortcuts-help" />}
+      dismissLabel={t('common.cancel')}
       onClose={closeShortcutSheet}
       footer={(
         <button
           type="button"
           className="btn small"
           data-testid="shortcuts-reset-all"
+          disabled={!hasDraftOverrides}
           onClick={() => {
-            setOverrides({});
+            setDraft({});
             setFreed(null);
-            toast(t('settings.shortcuts.resetAllDone'), 'ok');
           }}
         >
           {t('settings.shortcuts.resetAll')}
+        </button>
+      )}
+      primaryAction={(
+        <button
+          type="button"
+          className="btn primary"
+          data-testid="shortcuts-save"
+          disabled={!dirty}
+          onClick={() => {
+            setOverrides(draft);
+            closeShortcutSheet();
+          }}
+        >
+          {t('common.save')}
         </button>
       )}
     >
@@ -122,10 +142,10 @@ function ShortcutSheet() {
             key={action}
             action={action}
             accel={bindings[action]}
-            customized={isCustomized(overrides, action)}
+            customized={isCustomized(draft, action)}
             bindings={bindings}
             onCommit={(accel) => commit(action, accel)}
-            onReset={() => { setOverrides(clearOverride(overrides, action)); setFreed(null); }}
+            onReset={() => { setDraft(clearOverride(draft, action)); setFreed(null); }}
           />
         ))}
       </div>

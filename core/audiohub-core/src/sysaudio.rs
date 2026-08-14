@@ -517,7 +517,9 @@ pub fn resolve_backend(id: &str) -> Result<BackendInfo> {
         let picked = explain_auto(&all).picked;
         return picked
             .and_then(|p| all.into_iter().find(|b| b.id == p))
-            .ok_or_else(|| anyhow!("no system-audio capture backend is available on this platform"));
+            .ok_or_else(|| {
+                anyhow!("no system-audio capture backend is available on this platform")
+            });
     }
     all.into_iter()
         .find(|b| b.id == id)
@@ -584,12 +586,23 @@ const CATALOG: &[(&str, &str, &str, &[&str])] = &[
         "vbcable",
         "VB-Audio Virtual Cable",
         "vbcable",
-        &["vb-audio", "vb audio", "cable input", "cable output", "voicemeeter"],
+        &[
+            "vb-audio",
+            "vb audio",
+            "cable input",
+            "cable output",
+            "voicemeeter",
+        ],
     ),
 ];
 
 /// Conservative extra patterns reported as kind "other" when present.
-const OTHER_PATTERNS: &[&str] = &["soundflower", "loopback audio", "virtual audio", "virtual cable"];
+const OTHER_PATTERNS: &[&str] = &[
+    "soundflower",
+    "loopback audio",
+    "virtual audio",
+    "virtual cable",
+];
 
 /// Device-name enumeration only (spec-m4b §C): never opens a device, so it can
 /// never trigger a permission prompt. Catalog entries are always returned (with
@@ -599,7 +612,9 @@ pub fn detect_virtual_cards() -> Vec<VirtualCard> {
     let lower: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
     let mut out: Vec<VirtualCard> = Vec::new();
     for (id, label, kind, pats) in CATALOG {
-        let hit = lower.iter().position(|n| pats.iter().any(|p| n.contains(p)));
+        let hit = lower
+            .iter()
+            .position(|n| pats.iter().any(|p| n.contains(p)));
         out.push(VirtualCard {
             id: (*id).to_string(),
             name: hit.map_or_else(|| (*label).to_string(), |i| names[i].clone()),
@@ -608,7 +623,10 @@ pub fn detect_virtual_cards() -> Vec<VirtualCard> {
         });
     }
     for (i, n) in lower.iter().enumerate() {
-        if CATALOG.iter().any(|(_, _, _, pats)| pats.iter().any(|p| n.contains(p))) {
+        if CATALOG
+            .iter()
+            .any(|(_, _, _, pats)| pats.iter().any(|p| n.contains(p)))
+        {
             continue;
         }
         if !OTHER_PATTERNS.iter().any(|p| n.contains(p)) {
@@ -714,7 +732,12 @@ mod win {
         d4: [u8; 8],
     }
 
-    const IID_IUNKNOWN: Guid = Guid { d1: 0, d2: 0, d3: 0, d4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46] };
+    const IID_IUNKNOWN: Guid = Guid {
+        d1: 0,
+        d2: 0,
+        d3: 0,
+        d4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+    };
     const IID_IAGILE_OBJECT: Guid = Guid {
         d1: 0x94EA2B94,
         d2: 0xE9CC,
@@ -1059,7 +1082,10 @@ mod win {
     }
 
     unsafe extern "system" fn handler_add_ref(this: *mut c_void) -> u32 {
-        (*(this as *mut Handler)).refs.fetch_add(1, Ordering::Relaxed) + 1
+        (*(this as *mut Handler))
+            .refs
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
     }
 
     unsafe extern "system" fn handler_release(this: *mut c_void) -> u32 {
@@ -1247,9 +1273,7 @@ mod win {
             WAVE_FORMAT_PCM if bits == 16 => SampleKind::S16,
             WAVE_FORMAT_IEEE_FLOAT if bits == 32 => SampleKind::F32,
             WAVE_FORMAT_EXTENSIBLE => {
-                mask = ptr::read_unaligned(
-                    (p as *const u8).add(CHANNEL_MASK_OFFSET) as *const u32
-                );
+                mask = ptr::read_unaligned((p as *const u8).add(CHANNEL_MASK_OFFSET) as *const u32);
                 let sub: Guid =
                     ptr::read_unaligned((p as *const u8).add(SUBFORMAT_OFFSET) as *const Guid);
                 if sub == SUBTYPE_IEEE_FLOAT && bits == 32 {
@@ -1262,7 +1286,12 @@ mod win {
             }
             _ => return None,
         };
-        Some(Format { kind, channels, rate, mask })
+        Some(Format {
+            kind,
+            channels,
+            rate,
+            mask,
+        })
     }
 
     // ---- capture handle
@@ -1321,7 +1350,9 @@ mod win {
         let fail_thread = Arc::clone(&fail);
         let join = std::thread::Builder::new()
             .name("audiohub-sysaudio".into())
-            .spawn(move || capture_thread(exclude_self, prod, stop_thread, ready_tx, fail_thread))?;
+            .spawn(move || {
+                capture_thread(exclude_self, prod, stop_thread, ready_tx, fail_thread)
+            })?;
         // Under the daemon's 5s source-ack budget (conn.rs): a backend that
         // cannot start must surface as an error there, not as an ack timeout.
         match ready_rx.recv_timeout(Duration::from_secs(4)) {
@@ -1402,7 +1433,12 @@ mod win {
                     // plain interleaved stereo.
                     opened = Some((
                         c,
-                        Format { kind: cand.0, channels: cand.1, rate: cand.2, mask: 0 },
+                        Format {
+                            kind: cand.0,
+                            channels: cand.1,
+                            rate: cand.2,
+                            mask: 0,
+                        },
                     ));
                     break;
                 }
@@ -1437,7 +1473,12 @@ mod win {
             let f = parsed.ok_or_else(|| "unsupported endpoint mix format".to_string())?;
             (client, f)
         };
-        let Format { kind, channels, rate, mask } = fmt;
+        let Format {
+            kind,
+            channels,
+            rate,
+            mask,
+        } = fmt;
         let cv = vtbl::<IAudioClientVtbl>(client.0);
         if channels == 0 || rate == 0 {
             return Err("device reported a zero-channel/zero-rate format".into());
@@ -1512,8 +1553,7 @@ mod win {
                         for i in 0..n {
                             wide.push(match kind {
                                 SampleKind::S16 => {
-                                    let v: i16 =
-                                        ptr::read_unaligned(data.add(i * 2) as *const i16);
+                                    let v: i16 = ptr::read_unaligned(data.add(i * 2) as *const i16);
                                     v as f32 / 32768.0
                                 }
                                 SampleKind::F32 => {
@@ -1562,20 +1602,20 @@ mod mac {
         kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceIsStackedKey,
         kAudioAggregateDeviceMainSubDeviceKey, kAudioAggregateDeviceNameKey,
         kAudioAggregateDeviceSubDeviceListKey, kAudioAggregateDeviceTapAutoStartKey,
-        kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey,
-        kAudioDevicePermissionsError, kAudioDevicePropertyDeviceUID,
-        kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreamConfiguration,
-        kAudioHardwareIllegalOperationError, kAudioHardwareUnspecifiedError,
+        kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioDevicePermissionsError,
+        kAudioDevicePropertyDeviceUID, kAudioDevicePropertyNominalSampleRate,
+        kAudioDevicePropertyStreamConfiguration, kAudioHardwareIllegalOperationError,
         kAudioHardwarePropertyDefaultOutputDevice,
-        kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyElementMain,
-        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioObjectSystemObject,
-        kAudioObjectUnknown, kAudioSubDeviceUIDKey, kAudioSubTapDriftCompensationKey,
-        kAudioSubTapUIDKey, kAudioTapPropertyFormat, kAudioTapPropertyUID,
-        AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID, AudioDeviceIOProcID,
-        AudioDeviceStart, AudioDeviceStop, AudioHardwareCreateAggregateDevice,
-        AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
-        AudioHardwareDestroyProcessTap, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
-        AudioObjectID, AudioObjectPropertyAddress, CATapDescription, CATapMuteBehavior,
+        kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioHardwareUnspecifiedError,
+        kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, kAudioObjectUnknown,
+        kAudioSubDeviceUIDKey, kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey,
+        kAudioTapPropertyFormat, kAudioTapPropertyUID, AudioDeviceCreateIOProcID,
+        AudioDeviceDestroyIOProcID, AudioDeviceIOProcID, AudioDeviceStart, AudioDeviceStop,
+        AudioHardwareCreateAggregateDevice, AudioHardwareCreateProcessTap,
+        AudioHardwareDestroyAggregateDevice, AudioHardwareDestroyProcessTap,
+        AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+        AudioObjectPropertyAddress, CATapDescription, CATapMuteBehavior,
     };
     use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp};
     use objc2_core_foundation::CFDictionary;
@@ -1648,7 +1688,10 @@ mod mac {
     fn fourcc(v: OSStatus) -> String {
         let b = (v as u32).to_be_bytes();
         if b.iter().all(|c| (0x20..0x7f).contains(c)) {
-            format!("'{}' ({v})", b.iter().map(|c| *c as char).collect::<String>())
+            format!(
+                "'{}' ({v})",
+                b.iter().map(|c| *c as char).collect::<String>()
+            )
         } else {
             format!("{v}")
         }
@@ -1995,7 +2038,10 @@ mod mac {
         }
         let out_uid = get_string(
             out_dev,
-            addr(kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal),
+            addr(
+                kAudioDevicePropertyDeviceUID,
+                kAudioObjectPropertyScopeGlobal,
+            ),
         )
         .map_err(|st| anyhow!("default output device has no UID (status {})", fourcc(st)))?;
 
@@ -2255,7 +2301,13 @@ mod tests {
 
     #[test]
     fn front_pair_is_the_front_pair_on_every_layout() {
-        for (mask, chans) in [(STEREO, 2), (QUAD, 4), (S5_1, 6), (S5_1_SURROUND, 6), (S7_1, 8)] {
+        for (mask, chans) in [
+            (STEREO, 2),
+            (QUAD, 4),
+            (S5_1, 6),
+            (S5_1_SURROUND, 6),
+            (S7_1, 8),
+        ] {
             assert_eq!(front_pair(mask, chans), (0, 1), "mask 0x{mask:X}");
         }
     }
@@ -2454,7 +2506,11 @@ mod mute_precondition_tests {
 
     #[test]
     fn auto_takes_the_first_available_in_priority_order() {
-        let list = [fake("a", false, false), fake("b", true, false), fake("c", true, false)];
+        let list = [
+            fake("a", false, false),
+            fake("b", true, false),
+            fake("c", true, false),
+        ];
         let choice = explain_auto(&list);
         assert_eq!(choice.picked.as_deref(), Some("b"));
         assert_eq!(choice.steps[0].outcome, AutoOutcome::SkippedUnavailable);
@@ -2469,7 +2525,11 @@ mod mute_precondition_tests {
     /// reason for existing, carried into the auto report.
     #[test]
     fn auto_says_which_losers_are_permanent() {
-        let list = [fake("gone", false, true), fake("later", false, false), fake("ok", true, false)];
+        let list = [
+            fake("gone", false, true),
+            fake("later", false, false),
+            fake("ok", true, false),
+        ];
         let steps = explain_auto(&list).steps;
         assert_eq!(steps[0].outcome, AutoOutcome::SkippedDeclined);
         assert_eq!(steps[1].outcome, AutoOutcome::SkippedUnavailable);
@@ -2529,7 +2589,11 @@ mod mute_precondition_tests {
         let mut seen = chain.clone();
         seen.sort();
         seen.dedup();
-        assert_eq!(seen.len(), chain.len(), "a repeat means the pool stopped shrinking");
+        assert_eq!(
+            seen.len(),
+            chain.len(),
+            "a repeat means the pool stopped shrinking"
+        );
     }
 
     /// The chain is capped by the candidate count so a selection rule that

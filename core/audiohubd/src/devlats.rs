@@ -49,9 +49,9 @@ use audiohub_core::devcal::OutputCalibration;
 use audiohub_core::devlat::{self, DevLatencyParts, DevTarget};
 use audiohub_core::latency::DevLatency;
 
-use crate::lk;
 #[cfg(windows)]
 use crate::dlog;
+use crate::lk;
 
 #[cfg(windows)]
 use audiohub_core::devcal;
@@ -82,7 +82,10 @@ pub(crate) struct DevLats {
 impl DevLats {
     /// 什么都没查到的形状。**两个都 `Unavailable`，不是 0。**
     pub(crate) fn unavailable() -> DevLats {
-        DevLats { input: DevLatency::unavailable(), output: DevLatency::unavailable() }
+        DevLats {
+            input: DevLatency::unavailable(),
+            output: DevLatency::unavailable(),
+        }
     }
 }
 
@@ -92,7 +95,7 @@ impl DevLats {
 ///
 /// `dev` 的语义是「**这条流**经过的那台声卡」。本机的默认输入是一台真实设备，
 /// 但一条以**虚拟扬声器**为源的发送流（模式 B：App 把音频放进
-/// 「AudioHub – 对端 扬声器」，我们从 `hal_spk` 环读出来发走）**根本没经过它**。
+/// 输出设备「AudioHub – 对端」，我们从 `hal_spk` 环读出来发走）**根本没经过它**。
 /// 把默认麦克风的延迟挂到那条流上，是往总数里加一段这条链路上不存在的时间——
 /// 与「用 0 填补缺项」是同一类谎，只是符号相反。
 ///
@@ -118,7 +121,7 @@ impl DevLats {
 ///
 /// ⚠⚠ **第二个未闭合项：默认设备恰好是我们自己那张虚拟卡时，读到的是一句谎。**
 /// 本机 2026-08-04 实测就是这个配置——默认输出与默认输入都是
-/// 「AudioHub – WIN-IR01HVEFU7G 扬声器 / 麦克风」，两者都报
+/// 同名的 AudioHub 输出 / 输入设备「AudioHub – WIN-IR01HVEFU7G」，两者都报
 /// `device=0 safety=0 stream=0 io_buffer=512` = 10.667 ms，标 `Api`。
 /// 这个 10.667 ms 对**本模块**是如实转述（驱动确实这么声明），但那个声明本身
 /// 是错的：`AudioHubDriver.c` 的 `case kAudioDevicePropertyLatency` 硬编码 0，
@@ -151,16 +154,20 @@ impl DevLatReport {
     pub fn line(&self, what: &str) -> String {
         let p = &self.parts;
         let t = p.total();
-        let ms = t.ms().map_or("unavailable".to_string(), |v| format!("{v:.2} ms"));
-        let items: Vec<String> =
-            p.parts.iter().map(|(n, f)| format!("{n}={f}f")).collect();
+        let ms = t
+            .ms()
+            .map_or("unavailable".to_string(), |v| format!("{v:.2} ms"));
+        let items: Vec<String> = p.parts.iter().map(|(n, f)| format!("{n}={f}f")).collect();
         let miss = if p.missing.is_empty() {
             String::new()
         } else {
             format!(" missing=[{}]", p.missing.join(","))
         };
         let cal = if self.calibrated { " (calibrated)" } else { "" };
-        let err = p.error.as_deref().map_or(String::new(), |e| format!(" err={e}"));
+        let err = p
+            .error
+            .as_deref()
+            .map_or(String::new(), |e| format!(" err={e}"));
         format!(
             "{what}: {ms} [{}]{miss} rate={} transport={:?} source={:?}{cal} dev={:?}{err}",
             items.join(" "),
@@ -225,7 +232,10 @@ impl DevLatCache {
                 input: None,
                 output: None,
             }),
-            cal: Arc::new(Mutex::new(CalSlot { result: None, epoch: u64::MAX })),
+            cal: Arc::new(Mutex::new(CalSlot {
+                result: None,
+                epoch: u64::MAX,
+            })),
             cal_running: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -233,6 +243,16 @@ impl DevLatCache {
     /// 取两个方向的读数，必要时刷新。**在 1 s 的 ticker 上调，不在音频线程上。**
     pub(crate) fn read(&self, epoch: u64) -> DevLats {
         self.read_at(epoch, Instant::now())
+    }
+
+    /// Last completed reading, without consulting the platform.
+    ///
+    /// IPC reporting uses this accessor exclusively. A CoreAudio/WASAPI query
+    /// is allowed to stall the daemon's single background ticker, but must
+    /// never stall one client thread per reconnect. Before the first refresh
+    /// this deliberately returns `Unavailable`, not a fabricated zero.
+    pub(crate) fn snapshot(&self) -> DevLats {
+        lk(&self.st).lats
     }
 
     /// [`read`] 的全部内容，只是「现在」由调用方给。
@@ -252,7 +272,10 @@ impl DevLatCache {
         let mut st = lk(&self.st);
         st.epoch = epoch;
         st.at = Some(now);
-        st.lats = DevLats { input: input.parts.total(), output: output.parts.total() };
+        st.lats = DevLats {
+            input: input.parts.total(),
+            output: output.parts.total(),
+        };
         st.input = Some(input);
         st.output = Some(output);
         st.lats
@@ -265,7 +288,13 @@ impl DevLatCache {
         };
         let mut out_parts = devlat::query(DeviceKind::Output, DevTarget::Default);
         let calibrated = self.fold_calibration(&mut out_parts, epoch);
-        (input, DevLatReport { parts: out_parts, calibrated })
+        (
+            input,
+            DevLatReport {
+                parts: out_parts,
+                calibrated,
+            },
+        )
     }
 
     /// Windows：把那次开流标定折进输出读数；顺带在需要时把标定踢起来。
@@ -343,7 +372,10 @@ impl DevLatCache {
                         "devcal 标定失败，play_dev 保留 GetDevicePeriod 那个偏低 4.2 倍的下限: {e}"
                     ),
                 }
-                *lk(&cal) = CalSlot { result: Some(r), epoch };
+                *lk(&cal) = CalSlot {
+                    result: Some(r),
+                    epoch,
+                };
                 running.store(false, Ordering::SeqCst);
             });
         // ⚠ 建线程失败也必须把闸放回去。漏掉这一行，`cal_running` 会**永远**停在
@@ -425,10 +457,17 @@ mod tests {
     use super::*;
 
     fn api(frames: u32) -> DevLatency {
-        DevLatency { frames, rate: 48_000, source: LatSource::Api }
+        DevLatency {
+            frames,
+            rate: 48_000,
+            source: LatSource::Api,
+        }
     }
     fn lats(inp: DevLatency, out: DevLatency) -> DevLats {
-        DevLats { input: inp, output: out }
+        DevLats {
+            input: inp,
+            output: out,
+        }
     }
 
     /// **发送流拿输入设备，接收流拿输出设备。** 拿反了不会有任何报错——
@@ -438,8 +477,16 @@ mod tests {
     #[test]
     fn a_send_stream_takes_the_capture_device_and_a_recv_stream_the_output_one() {
         let l = lats(api(2001), api(1403));
-        assert_eq!(stream_dev(true, true, true, l).unwrap().frames, 2001, "send ⇒ 输入设备");
-        assert_eq!(stream_dev(false, true, true, l).unwrap().frames, 1403, "recv ⇒ 输出设备");
+        assert_eq!(
+            stream_dev(true, true, true, l).unwrap().frames,
+            2001,
+            "send ⇒ 输入设备"
+        );
+        assert_eq!(
+            stream_dev(false, true, true, l).unwrap().frames,
+            1403,
+            "recv ⇒ 输出设备"
+        );
     }
 
     /// **路径上没有那台设备 ⇒ `None`，而不是把默认设备的数挂上去。**
@@ -450,8 +497,16 @@ mod tests {
     #[test]
     fn a_stream_without_that_device_reports_no_device_stage_at_all() {
         let l = lats(api(2001), api(1403));
-        assert_eq!(stream_dev(true, false, true, l), None, "hal_spk / sysaudio 源没有采集声卡");
-        assert_eq!(stream_dev(false, true, false, l), None, "纯桥接 / 纯虚拟麦克风尾级没走真实输出");
+        assert_eq!(
+            stream_dev(true, false, true, l),
+            None,
+            "hal_spk / sysaudio 源没有采集声卡"
+        );
+        assert_eq!(
+            stream_dev(false, true, false, l),
+            None,
+            "纯桥接 / 纯虚拟麦克风尾级没走真实输出"
+        );
     }
 
     /// **「本级不存在」贡献 0，「本级存在但读不到」毒化求和。**
@@ -464,7 +519,11 @@ mod tests {
     /// | `dev.and_then(\|d\| d.ms())` | 没有设备级的流整条 `sum_ms` 消失 | **红**（第 1 行断言） |
     #[test]
     fn dev_contributes_zero_only_when_absent() {
-        assert_eq!(dev_sum_ms(None), Some(0.0), "本级不存在 ⇒ 不占时间，也不毒化");
+        assert_eq!(
+            dev_sum_ms(None),
+            Some(0.0),
+            "本级不存在 ⇒ 不占时间，也不毒化"
+        );
         assert_eq!(
             dev_sum_ms(Some(DevLatency::unavailable())),
             None,
@@ -472,7 +531,14 @@ mod tests {
         );
         assert_eq!(dev_sum_ms(Some(api(480))), Some(10.0));
         // 速率 0 与 Unavailable 同权：帧数没有速率换算不成毫秒
-        assert_eq!(dev_sum_ms(Some(DevLatency { frames: 480, rate: 0, source: LatSource::Api })), None);
+        assert_eq!(
+            dev_sum_ms(Some(DevLatency {
+                frames: 480,
+                rate: 0,
+                source: LatSource::Api
+            })),
+            None
+        );
     }
 
     /// **只有两侧都 `Api` 才够格叫「精确」。** 四种不够格的取值逐条钉死。
@@ -484,12 +550,23 @@ mod tests {
     fn only_two_api_readings_earn_the_word_exact() {
         let ok = api(512);
         assert!(both_exact(Some(ok), Some(ok)));
-        for bad in [LatSource::Assumed, LatSource::Unreliable, LatSource::Unavailable] {
-            let d = DevLatency { frames: 512, rate: 48_000, source: bad };
+        for bad in [
+            LatSource::Assumed,
+            LatSource::Unreliable,
+            LatSource::Unavailable,
+        ] {
+            let d = DevLatency {
+                frames: 512,
+                rate: 48_000,
+                source: bad,
+            };
             assert!(!both_exact(Some(d), Some(ok)), "{bad:?} 在本侧");
             assert!(!both_exact(Some(ok), Some(d)), "{bad:?} 在对端");
         }
-        assert!(!both_exact(None, Some(ok)), "本侧没有设备级 ⇒ 那一截未建模 ⇒ 不许叫 Full");
+        assert!(
+            !both_exact(None, Some(ok)),
+            "本侧没有设备级 ⇒ 那一截未建模 ⇒ 不许叫 Full"
+        );
         assert!(!both_exact(Some(ok), None), "对端没有设备级同理");
         assert!(!both_exact(None, None));
     }
@@ -499,8 +576,14 @@ mod tests {
     fn the_cache_expires_on_both_a_device_change_and_the_ttl() {
         let t0 = Instant::now();
         assert!(stale(7, None, 7, t0), "从来没查过 ⇒ 必查");
-        assert!(!stale(7, Some(t0), 7, t0 + Duration::from_secs(1)), "同一台设备、一秒内 ⇒ 命中");
-        assert!(stale(7, Some(t0), 8, t0 + Duration::from_millis(1)), "换了默认设备 ⇒ 立刻失效");
+        assert!(
+            !stale(7, Some(t0), 7, t0 + Duration::from_secs(1)),
+            "同一台设备、一秒内 ⇒ 命中"
+        );
+        assert!(
+            stale(7, Some(t0), 8, t0 + Duration::from_millis(1)),
+            "换了默认设备 ⇒ 立刻失效"
+        );
         assert!(stale(7, Some(t0), 7, t0 + TTL), "到点 ⇒ 失效");
         assert!(!stale(7, Some(t0), 7, t0 + TTL - Duration::from_millis(1)));
     }
@@ -516,7 +599,11 @@ mod tests {
     #[test]
     fn an_old_peer_that_cannot_read_its_device_makes_the_total_unmeasurable() {
         let old_peer = Some(DevLatency::unavailable());
-        assert_eq!(dev_sum_ms(old_peer), None, "旧对端自陈读不到 ⇒ 总数没有，不是少一段");
+        assert_eq!(
+            dev_sum_ms(old_peer),
+            None,
+            "旧对端自陈读不到 ⇒ 总数没有，不是少一段"
+        );
         // 而它与「这条流没有设备级」在类型上只差一层 `Some`
         assert_eq!(dev_sum_ms(None), Some(0.0));
         assert!(!both_exact(Some(api(512)), old_peer), "更不许升级成 Full");
@@ -536,7 +623,9 @@ mod tests {
                     assert_eq!(d.ms(), None, "{what}: Unavailable 必须没有毫秒值");
                 }
                 _ => {
-                    let ms = d.ms().unwrap_or_else(|| panic!("{what}: 非 Unavailable 必有毫秒值"));
+                    let ms = d
+                        .ms()
+                        .unwrap_or_else(|| panic!("{what}: 非 Unavailable 必有毫秒值"));
                     assert!(ms.is_finite() && ms >= 0.0, "{what}: {ms} 不是合法毫秒值");
                     assert!(ms < 1_000.0, "{what}: 单台设备的固有延迟不该到秒级");
                 }

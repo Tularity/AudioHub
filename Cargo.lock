@@ -126,6 +126,7 @@ dependencies = [
  "audiohub-core",
  "audiohub-net",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -156,6 +157,17 @@ dependencies = [
 name = "audiohub-security"
 version = "0.1.0"
 dependencies = [
+ "quick-xml",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "audiohub-vad-helper"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
  "windows-sys 0.52.0",
 ]
 

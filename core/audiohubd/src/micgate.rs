@@ -240,7 +240,13 @@ impl MicGate {
                 starved,
             }
         } else {
-            MicPlan { allow: want, withheld: 0, draining: false, drain_started: false, starved }
+            MicPlan {
+                allow: want,
+                withheld: 0,
+                draining: false,
+                drain_started: false,
+                starved,
+            }
         }
     }
 
@@ -264,8 +270,9 @@ mod tests {
     ///
     /// 不用推导值：推导给的是 992–1984 帧，而实测整条带在 992 之下——
     /// 拿推导值写这条测试，它对真实系统一个字都没说。
-    const MEASURED_BAND: [u32; 16] =
-        [32, 64, 96, 160, 192, 224, 256, 288, 320, 352, 384, 480, 512, 544, 576, 608];
+    const MEASURED_BAND: [u32; 16] = [
+        32, 64, 96, 160, 192, 224, 256, 288, 320, 352, 384, 480, 512, 544, 576, 608,
+    ];
 
     #[test]
     fn t1_the_free_running_band_never_triggers_the_gate() {
@@ -335,7 +342,10 @@ mod tests {
         assert!(p.drain_started && p.draining);
         // 天花板与地板之间：迟滞保持排空（否则会在天花板上每拍抖一次）。
         let p = g.decide((D_CEIL + D_FLOOR) / 2, Q_P);
-        assert!(p.draining && !p.drain_started, "迟滞段应继续排空且不重复计事件");
+        assert!(
+            p.draining && !p.drain_started,
+            "迟滞段应继续排空且不重复计事件"
+        );
         // 落到地板以下：松手。
         let p = g.decide(D_FLOOR - 1, Q_P);
         assert!(!p.draining);
@@ -359,13 +369,19 @@ mod tests {
     fn t6_starvation_means_the_ring_was_emptied_not_merely_shallow() {
         let mut g = MicGate::new();
         assert!(g.decide(0, Q_P).starved, "环被读空必须报出来");
-        assert!(!g.decide(32, Q_P).starved, "32 帧是实测自由带的下沿，不是欠载");
+        assert!(
+            !g.decide(32, Q_P).starved,
+            "32 帧是实测自由带的下沿，不是欠载"
+        );
         // ⚠ 这一条是回归防线。第一版判据是 `occupied < Q_C`，部署后 60 s 报了
         // 95 730 次「欠载」，而同一分钟的录音是 59.99 s 连续无洞——因为实测
         // 自由带 32–608 帧**整条都在一个消费量子之下**。在系统健康时尖叫的
         // 指标比没有指标更坏。
         for occ in MEASURED_BAND {
-            assert!(!g.decide(occ, Q_P).starved, "实测自由带内的 {occ} 帧被报成欠载");
+            assert!(
+                !g.decide(occ, Q_P).starved,
+                "实测自由带内的 {occ} 帧被报成欠载"
+            );
         }
         // 欠载判据与少写判据**互不影响**：环空时照样全写（地板优先）。
         assert_eq!(g.decide(0, Q_P).allow, Q_P);

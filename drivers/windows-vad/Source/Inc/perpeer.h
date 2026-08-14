@@ -122,20 +122,18 @@ Abstract:
 // user's default-device choice), and it is why a naming test MUST use a peer
 // key it has never used before.
 //
-// The direction word is NOT hardcoded here: it is READ BACK from the INF's
-// static MediaCategories entries (AH_PIN_NAME_OUT / AH_PIN_NAME_IN) at attach
-// time, so the localizable strings stay in the INF's [Strings] section, which
-// is the only place that can ever grow a [Strings.0409]. Those entries keep
-// earning their place as the pin-name fallback; only the PER-PEER writes are
-// gone.
+// The direction words are NOT part of a successfully named endpoint. Both the
+// output and input endpoint use the daemon-composed "AudioHub - <host>" label;
+// Windows already separates them by data flow. The words are still read from
+// the INF so its static pin names remain observable as the generic fallback if
+// the per-peer PKEY_Device_DeviceDesc write fails.
 //
 #define AH_DIRWORD_CHARS        32
 
 //
-// AH_DISPLAY_CHARS (128, incl. terminator) + ' ' + a direction word + NUL.
-// The peer's half is what gets truncated when this overflows -- never the
-// direction word, because two devices distinguished only by a host name that
-// got cut off are worse than one whose host name is short.
+// The endpoint-name buffers keep the historical extra room even though the
+// successful name is now exactly Display. They are internal driver storage,
+// not wire ABI; retaining their size keeps this naming-only change isolated.
 //
 #define AH_ENDPOINT_NAME_CHARS       (AH_DISPLAY_CHARS + AH_DIRWORD_CHARS + 2)
 
@@ -199,9 +197,8 @@ typedef struct _AH_SLOT
     // prefix included, direction suffix excluded.
     WCHAR               Display[AH_DISPLAY_CHARS];
 
-    // The composed per-peer endpoint names, "AudioHub - <host> <direction>".
-    // These are what goes into EP\0 as PKEY_Device_DeviceDesc, and they are
-    // also what a test asserts the system's device list contains, verbatim.
+    // Two copies of the same per-peer endpoint label, "AudioHub - <host>".
+    // Each goes into its direction's own EP\0 as PKEY_Device_DeviceDesc.
     WCHAR               NameOut[AH_ENDPOINT_NAME_CHARS];
     WCHAR               NameIn[AH_ENDPOINT_NAME_CHARS];
 
@@ -320,22 +317,19 @@ typedef struct _AH_OP_RESULT
 //
 // Bind operations. Both are idempotent in the way plan §7.3 needs:
 //
-//  * SET on a slot already bound to the SAME peer key AND fully published
+//  * SET on a slot already bound to the SAME peer key and exact requested mask
 //    returns the current generation and does nothing else -- no
 //    re-registration, no rewriting of the persistent FriendlyName property.
 //    The daemon re-Sets a slot whenever the peer's online flag changes, and
 //    under "paired means published, disconnect keeps the device" that would
 //    otherwise be pure registry churn.
 //
-//    A slot that is bound but NOT fully published is repaired instead:
-//    torn down and reinstalled. "Idempotent" must mean "converges on the
-//    intended state", not "never touches a broken one".
+//    A differing mask is reconciled per direction. The surviving endpoint is
+//    not cycled, so Windows keeps the user's default-device selection.
 //
-//  * SET IS ALL OR NOTHING. If either half fails to install, the other half is
-//    removed again and the call reports failure. Half a device pair is useless
-//    to a user and unrepresentable in the daemon's model, so the driver never
-//    produces one; `Published == AH_PUB_BOTH` on success is an invariant a
-//    test can assert.
+//  * SET succeeds only when `Published` exactly equals the requested render /
+//    capture mask. One direction by itself is a valid capability, not a partial
+//    failure. A fresh-bind install failure still rolls back the call's work.
 //
 //  * CLEAR on a free slot succeeds. CLEAR quoting a stale generation is
 //    IGNORED, so a Clear delayed past a re-bind cannot cut down the binding

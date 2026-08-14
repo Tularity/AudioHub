@@ -318,7 +318,9 @@ pub(crate) fn snapshot(inner: &DaemonInner) -> HashMap<String, (bool, Option<f64
     lk(&inner.recon)
         .iter()
         .map(|(fp, e)| {
-            let retry_in = e.next_at.map(|t| t.saturating_duration_since(now).as_secs_f64());
+            let retry_in = e
+                .next_at
+                .map(|t| t.saturating_duration_since(now).as_secs_f64());
             (fp.clone(), (e.next_at.is_some(), retry_in))
         })
         .collect()
@@ -518,7 +520,9 @@ fn attempt(inner: &Arc<DaemonInner>, fp: &str) {
                 }
             };
             if let Some((n, d)) = next {
-                dlog!("[audiohubd] peer {fp}: reconnect attempt {n} failed ({e:#}); retry in {d:.1}s");
+                dlog!(
+                    "[audiohubd] peer {fp}: reconnect attempt {n} failed ({e:#}); retry in {d:.1}s"
+                );
             }
         }
     }
@@ -558,7 +562,10 @@ mod tests {
 
     /// 设备协调器为同一槽位的虚拟麦克风开的会话（另一个方向，同一个 bug）。
     fn hal_mic() -> OpenSessionParams {
-        OpenSessionParams { hal: true, ..base("mic") }
+        OpenSessionParams {
+            hal: true,
+            ..base("mic")
+        }
     }
 
     /// UI / CLI 开的普通会话。
@@ -576,7 +583,10 @@ mod tests {
 
     impl Live {
         fn open(&mut self, params: &OpenSessionParams, origin: SessionOrigin) {
-            self.0.push(PlannedSession { params: params.clone(), origin });
+            self.0.push(PlannedSession {
+                params: params.clone(),
+                origin,
+            });
         }
 
         /// `replay_sessions` 里 `live_intents` 拿到的东西。
@@ -617,7 +627,10 @@ mod tests {
         }
 
         fn matching(&self, p: &OpenSessionParams) -> Vec<&PlannedSession> {
-            self.0.iter().filter(|s| same_media_intent(&s.params, p)).collect()
+            self.0
+                .iter()
+                .filter(|s| same_media_intent(&s.params, p))
+                .collect()
         }
     }
 
@@ -686,7 +699,10 @@ mod tests {
     #[test]
     fn a_replay_never_adds_a_second_stream_for_a_link_already_live() {
         let spk = hal_spk();
-        let planned = PlannedSession { params: spk.clone(), origin: SessionOrigin::Hal { slot: 0 } };
+        let planned = PlannedSession {
+            params: spk.clone(),
+            origin: SessionOrigin::Hal { slot: 0 },
+        };
 
         assert_eq!(
             plan_replay(&planned, &[spk.clone()], Mode::B),
@@ -705,7 +721,10 @@ mod tests {
     /// 靠一次断线就能在模式 B 下复活。
     #[test]
     fn the_replay_path_goes_through_the_same_mode_gate() {
-        let ui = PlannedSession { params: user_tone(), origin: SessionOrigin::User };
+        let ui = PlannedSession {
+            params: user_tone(),
+            origin: SessionOrigin::User,
+        };
         assert_eq!(
             plan_replay(&ui, &[], Mode::A),
             ReplayAction::Open(SessionOrigin::User),
@@ -718,10 +737,16 @@ mod tests {
 
         // CLI / probe 的 override 仍然通行，和 IPC 路径的判断完全一致。
         let cli = PlannedSession {
-            params: OpenSessionParams { override_mode: true, ..user_tone() },
+            params: OpenSessionParams {
+                override_mode: true,
+                ..user_tone()
+            },
             origin: SessionOrigin::User,
         };
-        assert_eq!(plan_replay(&cli, &[], Mode::B), ReplayAction::Open(SessionOrigin::User));
+        assert_eq!(
+            plan_replay(&cli, &[], Mode::B),
+            ReplayAction::Open(SessionOrigin::User)
+        );
     }
 
     /// 修复不能把正常的重连恢复弄坏：UI/CLI 开的会话没有别的主人，断线后必须
@@ -733,7 +758,11 @@ mod tests {
         live.open(&tone, SessionOrigin::User);
 
         let plan = live.drop_connection();
-        assert_eq!(plan.len(), 1, "用户会话必须进入恢复计划——重放是它唯一的救生索");
+        assert_eq!(
+            plan.len(),
+            1,
+            "用户会话必须进入恢复计划——重放是它唯一的救生索"
+        );
 
         live.replay_pass(&plan, Mode::A);
         let same = live.matching(&tone);
@@ -756,7 +785,10 @@ mod tests {
 
         // 模式 B 下 UI 会话过不了闸门，所以这里用 override 版本代表 CLI/probe。
         let plan = vec![PlannedSession {
-            params: OpenSessionParams { override_mode: true, ..tone.clone() },
+            params: OpenSessionParams {
+                override_mode: true,
+                ..tone.clone()
+            },
             origin: SessionOrigin::User,
         }];
         live.coordinator_pass(0, &spk);
@@ -774,26 +806,56 @@ mod tests {
         let spk = hal_spk();
         assert!(!same_media_intent(&spk, &hal_mic()), "方向不同");
         assert!(
-            !same_media_intent(&spk, &OpenSessionParams { source: Some(SOURCE_TONE.into()), ..spk.clone() }),
+            !same_media_intent(
+                &spk,
+                &OpenSessionParams {
+                    source: Some(SOURCE_TONE.into()),
+                    ..spk.clone()
+                }
+            ),
             "音源不同"
         );
         assert!(
-            !same_media_intent(&user_tone(), &OpenSessionParams { freq: Some(880.0), ..user_tone() }),
+            !same_media_intent(
+                &user_tone(),
+                &OpenSessionParams {
+                    freq: Some(880.0),
+                    ..user_tone()
+                }
+            ),
             "探针频率不同就是两条流"
         );
         let mic = hal_mic();
         assert!(
-            !same_media_intent(&mic, &OpenSessionParams { bridge: Some("BlackHole 2ch".into()), ..mic.clone() }),
+            !same_media_intent(
+                &mic,
+                &OpenSessionParams {
+                    bridge: Some("BlackHole 2ch".into()),
+                    ..mic.clone()
+                }
+            ),
             "桥接落点不同"
         );
         assert!(
-            !same_media_intent(&mic, &OpenSessionParams { monitor: true, ..mic.clone() }),
+            !same_media_intent(
+                &mic,
+                &OpenSessionParams {
+                    monitor: true,
+                    ..mic.clone()
+                }
+            ),
             "本机监听与否不同"
         );
         assert!(
             !same_media_intent(
-                &OpenSessionParams { backend: Some("wasapi".into()), ..base("spk") },
-                &OpenSessionParams { backend: Some("tap".into()), ..base("spk") }
+                &OpenSessionParams {
+                    backend: Some("wasapi".into()),
+                    ..base("spk")
+                },
+                &OpenSessionParams {
+                    backend: Some("tap".into()),
+                    ..base("spk")
+                }
             ),
             "sysaudio 后端不同"
         );
@@ -806,7 +868,10 @@ mod tests {
     #[test]
     fn the_peer_selector_is_not_part_of_the_key() {
         let a = hal_spk();
-        let b = OpenSessionParams { peer: "aabb".to_string(), ..hal_spk() }; // 同一台，前缀写法
+        let b = OpenSessionParams {
+            peer: "aabb".to_string(),
+            ..hal_spk()
+        }; // 同一台，前缀写法
         assert!(same_media_intent(&a, &b));
     }
 }

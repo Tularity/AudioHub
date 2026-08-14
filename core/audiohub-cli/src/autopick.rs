@@ -27,9 +27,7 @@
 //! `list_backends()` declarations alone.
 
 use anyhow::Result;
-use audiohub_core::sysaudio::{
-    self, AutoOutcome, BackendInfo, BACKEND_AUTO,
-};
+use audiohub_core::sysaudio::{self, AutoOutcome, BackendInfo, BACKEND_AUTO};
 
 use crate::{emit_json, info, EXIT_CHECK_FAILED};
 
@@ -98,11 +96,18 @@ pub fn run(args: &AutoArgs, json: bool) -> Result<i32> {
         } else {
             ""
         };
-        info(&format!("  {:<22} {}{} — {}", s.id, verdict, forced, s.note));
+        info(&format!(
+            "  {:<22} {}{} — {}",
+            s.id, verdict, forced, s.note
+        ));
     }
     info(&format!(
         "fallback order from here: {}",
-        if chain.is_empty() { "(nothing available)".to_string() } else { chain.join(" -> ") }
+        if chain.is_empty() {
+            "(nothing available)".to_string()
+        } else {
+            chain.join(" -> ")
+        }
     ));
 
     let mut checks = Vec::new();
@@ -110,14 +115,19 @@ pub fn run(args: &AutoArgs, json: bool) -> Result<i32> {
     // 1. The pick must be one the host actually offers, and startable.
     //    `start_backend` refuses declined ids, so a declined pick would be a
     //    hard error where a working fallback sat one row down.
-    let picked_info: Option<&BackendInfo> =
-        choice.picked.as_ref().and_then(|p| effective.iter().find(|b| &b.id == p));
+    let picked_info: Option<&BackendInfo> = choice
+        .picked
+        .as_ref()
+        .and_then(|p| effective.iter().find(|b| &b.id == p));
     match picked_info {
         Some(b) => {
             checks.push(Check {
                 name: "picked-is-available",
                 ok: b.available && !b.declined,
-                detail: format!("picked '{}' available={} declined={}", b.id, b.available, b.declined),
+                detail: format!(
+                    "picked '{}' available={} declined={}",
+                    b.id, b.available, b.declined
+                ),
             });
         }
         None => {
@@ -126,7 +136,8 @@ pub fn run(args: &AutoArgs, json: bool) -> Result<i32> {
             checks.push(Check {
                 name: "picked-is-available",
                 ok: true,
-                detail: "no backend available on this host; auto correctly reports none".to_string(),
+                detail: "no backend available on this host; auto correctly reports none"
+                    .to_string(),
             });
         }
     }
@@ -229,7 +240,10 @@ mod tests {
     /// The uninjected run describes the host and must agree with itself.
     #[test]
     fn a_plain_explain_auto_run_passes_on_any_host() {
-        assert_eq!(run(&args(&[]), false).expect("explain-auto must not error"), 0);
+        assert_eq!(
+            run(&args(&[]), false).expect("explain-auto must not error"),
+            0
+        );
     }
 
     /// Knocking out whatever this host actually picked must still pass — the

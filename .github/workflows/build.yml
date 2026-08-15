@@ -1,0 +1,371 @@
+# Full cross-platform build, gated on a marker in the commit message.
+#
+# WHAT COMES OUT
+#   macOS    AudioHub-<version>-dev.dmg   (app + pkg + uninstaller, from app/build-app.sh)
+#   Windows  AudioHub_<version>_x64-setup-dev.exe  (NSIS, from scripts/build-windows-installer.ps1)
+#
+# HOW IT IS TRIGGERED
+#   [build]    push  -> build both platforms, keep the artifacts on the run
+#   [release]  push  -> the same build, then publish a GitHub Release
+#   Manual runs via the Actions tab can pick either.
+#
+# Every other push does nothing at all. This repository has no CI history and
+# its build is expensive (a WDK NuGet restore, two Cargo workspaces, a Tauri
+# bundle per platform), so building on every commit would be the wrong default
+# — the marker is the opt-in.
+#
+# ⚠ THESE ARTIFACTS ARE DEVELOPMENT BUILDS, NOT DISTRIBUTABLE ONES.
+#   * macOS: no Developer ID and no notarisation. `app/build-app.sh` falls back
+#     to an ad-hoc signature and says so. Gatekeeper will refuse it on any
+#     machine but the one that built it.
+#   * Windows: `-AuthenticodeMode Development` passes `--no-sign` to Tauri, and
+#     `-AllowUnsignedDriver` packages an unsigned AudioHubVad. That flag changes
+#     packaging only — nothing here installs a driver, imports a certificate, or
+#     enables testsigning.
+#   Shipping either to a user is a separate decision that needs real
+#   certificates; see plan.md §19 for the release form.
+
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What to produce
+        type: choice
+        default: build
+        options: [build, release]
+
+# One build per ref. A second push cancels the first: these runners are slow
+# and an obsolete artifact is worth nothing.
+concurrency:
+  group: build-${{ github.ref }}
+  # Cancelling a superseded BUILD is right; cancelling a release mid-publish is
+  # not, so the release job opts out of the group below.
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pinned in scripts/generate-third-party-licenses.mjs, which refuses any other
+  # version. Kept here as well so the failure is "the workflow is out of date"
+  # rather than a confusing mismatch three minutes into the run.
+  CARGO_ABOUT_VERSION: 0.9.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------- gate
+  #
+  # Decides whether to build at all, and whether to release. Split into its own
+  # job so the expensive matrix has a single, readable condition instead of the
+  # same `contains(...)` expression copied into every step.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      release: ${{ steps.decide.outputs.release }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: decide
+        shell: bash
+        env:
+          # Through the environment, never interpolated into the script body: a
+          # commit message is attacker-controlled text and `${{ }}` inside a
+          # `run:` is textual substitution, so a message containing a quote and
+          # a semicolon would execute as shell.
+          MSG: ${{ github.event.head_commit.message }}
+          DISPATCH: ${{ github.event.inputs.mode }}
+        run: |
+          set -euo pipefail
+          build=false
+          release=false
+          if [ -n "$DISPATCH" ]; then
+            build=true
+            [ "$DISPATCH" = release ] && release=true
+          else
+            # Only the head commit's message is consulted. A push can carry many
+            # commits and marking an older one is almost always accidental.
+            case "$MSG" in
+              *'[release]'*) build=true; release=true ;;
+              *'[build]'*)   build=true ;;
+            esac
+          fi
+          echo "build=$build"   >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Build gate"
+            echo
+            echo "- build: \`$build\`"
+            echo "- release: \`$release\`"
+            echo
+            echo 'Add `[build]` or `[release]` to the head commit message to trigger one.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The single source of truth for both bundlers; read it rather than
+          # duplicating a number that would silently drift. jq rather than node:
+          # this job installs no toolchain, and depending on whatever node the
+          # runner image happens to ship is a dependency nobody declared.
+          v=$(jq -re .version app/src-tauri/tauri.conf.json)
+          [ -n "$v" ] || { echo "could not read version"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- macOS
+  macos:
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    # arm64. The product targets Apple Silicon and the HAL driver is built for
+    # the host arch by app/build-app.sh; an x86_64 runner would produce a bundle
+    # that does not match any development machine here.
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc -vV
+
+      # Two workspaces: the root one and the Tauri app. Keyed separately so a
+      # change in one does not throw away the other's cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            app/src-tauri
+          key: macos
+
+      - name: Cache cargo-installed tools
+        id: tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-about
+            ~/.cargo/bin/cargo-tauri
+          key: macos-cargo-tools-about${{ env.CARGO_ABOUT_VERSION }}-tauri2
+
+      - name: Install cargo-about and cargo-tauri
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # --features cli is required: the default build of cargo-about 0.9 has
+          # no binary, and the licence generator only checks `--version`.
+          cargo install --locked cargo-about --version "$CARGO_ABOUT_VERSION" --features cli
+          # build-app.sh installs this itself when missing; doing it here keeps
+          # it inside the cached step instead of the timed build.
+          cargo install --locked tauri-cli --version "^2"
+
+      - name: Build app, pkg and dmg
+        run: |
+          set -euo pipefail
+          # No AUDIOHUB_RELEASE: that flag is fail-closed and demands Developer
+          # ID identities plus a notarytool keychain profile, neither of which
+          # exists on a runner. The script then signs ad-hoc and says so.
+          zsh app/build-app.sh
+
+      - name: Locate the dmg
+        id: dmg
+        run: |
+          set -euo pipefail
+          dmg=$(ls app/src-tauri/target/release/bundle/dmg/*.dmg | head -1)
+          [ -f "$dmg" ] || { echo "no dmg was produced"; exit 1; }
+          echo "path=$dmg" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$dmg")" >> "$GITHUB_OUTPUT"
+          {
+            echo "### macOS"
+            echo
+            echo "- \`$(basename "$dmg")\` — $(stat -f%z "$dmg") bytes"
+            echo "- sha256 \`$(shasum -a 256 "$dmg" | cut -d' ' -f1)\`"
+            echo "- ad-hoc signed, **not** notarised"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: ${{ steps.dmg.outputs.path }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- Windows
+  windows:
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    runs-on: windows-latest
+    # Longer than macOS on purpose: a cold run also restores the WDK NuGet
+    # packages and builds the kernel-mode driver before Tauri is even reached.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+
+      - name: Rust toolchain
+        shell: pwsh
+        run: |
+          # The build scripts invoke `cargo +stable-x86_64-pc-windows-msvc`, so
+          # the toolchain must exist under exactly that name. The runner's
+          # default is already msvc, but the explicit name is what they ask for
+          # and rustup does not alias it.
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          rustup default stable-x86_64-pc-windows-msvc
+          rustc -vV
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            app/src-tauri
+          key: windows
+
+      - name: Cache cargo-installed tools
+        id: tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-about.exe
+            ~/.cargo/bin/cargo-tauri.exe
+          key: windows-cargo-tools-about${{ env.CARGO_ABOUT_VERSION }}-tauri2
+
+      - name: Install cargo-about and cargo-tauri
+        if: steps.tools.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          cargo install --locked cargo-about --version $env:CARGO_ABOUT_VERSION --features cli
+          cargo install --locked tauri-cli --version "^2"
+
+      # `app/ui` is gitignored, so a fresh checkout has none — and
+      # build-windows-installer.ps1 only runs `npm install`, never the build.
+      # tauri-build embeds frontendDist at COMPILE time, so a missing or stale
+      # app/ui produces an exe that runs and shows the wrong UI. That is the
+      # expensive kind of failure to notice, which is why this is its own step.
+      - name: Build the frontend into app/ui
+        shell: pwsh
+        run: |
+          npm --prefix app/frontend ci
+          npm --prefix app/frontend run build
+          if (-not (Test-Path 'app/ui/index.html')) { throw 'app/ui/index.html was not produced' }
+
+      - name: Build the NSIS installer
+        shell: pwsh
+        run: |
+          # The AudioHubVad driver builds from the WDK **NuGet packages**
+          # (drivers/windows-vad/tools/restore-wdk.ps1), not an installed WDK,
+          # so a stock windows-latest runner is enough: MSBuild and vswhere come
+          # with the image and signing is off (/p:SignMode=Off).
+          ./scripts/build-windows-installer.ps1 -AllowUnsignedDriver -AuthenticodeMode Development
+
+      - name: Locate the installer
+        id: exe
+        shell: pwsh
+        run: |
+          $dir = 'app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis'
+          $exe = Get-ChildItem -Path $dir -Filter '*setup*.exe' -ErrorAction SilentlyContinue |
+                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $exe) { throw "no installer was produced under $dir" }
+          "path=$($exe.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+          "name=$($exe.Name)"     | Out-File $env:GITHUB_OUTPUT -Append
+          $h = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          @(
+            '### Windows'
+            ''
+            "- ``$($exe.Name)`` — $($exe.Length) bytes"
+            "- sha256 ``$h``"
+            '- unsigned, packages an unsigned AudioHubVad'
+          ) | Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: ${{ steps.exe.outputs.path }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- release
+  release:
+    needs: [gate, macos, windows]
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    # Its own group, so a push landing while assets are being uploaded cannot
+    # cancel a half-published release.
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    # Narrowed to this job. The build jobs never need to write to the repo, and
+    # the default token is read-only above.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Describe what is being published
+        id: meta
+        shell: bash
+        env:
+          MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          # A tag per run, not per version: `version` in tauri.conf.json only
+          # moves on a deliberate bump, and two releases cannot share a tag.
+          # The run number keeps them ordered and unique without pretending a
+          # rebuild is a new version.
+          echo "tag=v${{ needs.gate.outputs.version }}-ci.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          # First line only: release titles are one line, and the marker is noise.
+          subject=$(printf '%s' "$MSG" | head -1 | sed 's/\[release\]//g' | xargs || true)
+          [ -n "$subject" ] || subject="build ${{ github.run_number }}"
+          echo "subject=$subject" >> "$GITHUB_OUTPUT"
+          # Built OUTSIDE dist/ and moved in afterwards. Redirecting into
+          # dist/CHECKSUMS.md creates the file before the loop reads `dist/*`,
+          # so the table lists itself — with the checksum of an empty file.
+          notes=$(mktemp)
+          {
+            echo "| file | bytes | sha256 |"
+            echo "| --- | ---: | --- |"
+            for f in dist/*; do
+              [ -f "$f" ] || continue
+              printf '| `%s` | %s | `%s` |\n' \
+                "$(basename "$f")" "$(stat -c%s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
+            done
+            echo
+            echo 'Development build: the dmg is ad-hoc signed and not notarised;'
+            echo 'the installer is unsigned and carries an unsigned AudioHubVad.'
+          } > "$notes"
+          mv "$notes" dist/CHECKSUMS.md
+          cat dist/CHECKSUMS.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ needs.gate.outputs.version }} — ${{ steps.meta.outputs.subject }}
+          target_commitish: ${{ github.sha }}
+          # Prerelease, always. Nothing this workflow can produce is signed or
+          # notarised, so presenting it as a normal release would misrepresent
+          # what it is. Promoting a build is a manual decision made with real
+          # certificates in hand.
+          prerelease: true
+          generate_release_notes: true
+          body_path: dist/CHECKSUMS.md
+          files: |
+            dist/*.dmg
+            dist/*.exe
+          fail_on_unmatched_files: true

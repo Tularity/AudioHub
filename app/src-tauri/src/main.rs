@@ -95,7 +95,7 @@ fn write_installer_result(path: Option<&std::path::Path>, success: bool) {
         warn("installer bootstrap has no result path");
         return;
     };
-    let result = (|| -> std::io::Result<()> {
+    let attempt = || -> std::io::Result<()> {
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.file_type().is_file() {
             return Err(std::io::Error::other(
@@ -108,9 +108,48 @@ fn write_installer_result(path: Option<&std::path::Path>, success: bool) {
             .open(path)?;
         output.write_all(if success { b"ok\r\n" } else { b"failed\r\n" })?;
         output.sync_all()
-    })();
-    if let Err(error) = result {
-        warn(&format!("cannot write installer result: {error}"));
+    };
+
+    // Retry, because the installer is reading this file ten times a second.
+    //
+    // NSIS polls the result with FileOpen/FileRead/FileClose every 100 ms, and
+    // that handle does not share write access. A single attempt therefore has a
+    // real chance of landing inside the installer's read and failing with
+    // ERROR_SHARING_VIOLATION (os error 32) — after which the App used to log a
+    // line and give up, the file stayed "pending", and the installer aborted at
+    // its 30 s timeout reporting that the service could not be registered. The
+    // service had in fact been registered; only the answer was lost. Observed
+    // on a real install, 2026-08-16.
+    //
+    // The installer holds the handle for microseconds, so a short retry lands
+    // on the next gap. The window is well inside the installer's own timeout,
+    // and every attempt re-checks that the target is still the regular file the
+    // installer pre-created.
+    const RESULT_WRITE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+    const RESULT_WRITE_GAP: std::time::Duration = std::time::Duration::from_millis(25);
+    let deadline = std::time::Instant::now() + RESULT_WRITE_WINDOW;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        match attempt() {
+            Ok(()) => {
+                if attempts > 1 {
+                    warn(&format!(
+                        "installer result written after {attempts} attempts (the installer had the file open)"
+                    ));
+                }
+                return;
+            }
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    warn(&format!(
+                        "cannot write installer result after {attempts} attempts: {error}"
+                    ));
+                    return;
+                }
+                std::thread::sleep(RESULT_WRITE_GAP);
+            }
+        }
     }
 }
 

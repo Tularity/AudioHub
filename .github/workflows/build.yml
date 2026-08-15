@@ -1,8 +1,8 @@
 # Full cross-platform build, gated on a marker in the commit message.
 #
 # WHAT COMES OUT
-#   macOS    AudioHub-<version>-dev.dmg   (app + pkg + uninstaller, from app/build-app.sh)
-#   Windows  AudioHub_<version>_x64-setup-dev.exe  (NSIS, from scripts/build-windows-installer.ps1)
+#   macOS    AudioHub-<version>.dmg   (app + pkg + uninstaller, from app/build-app.sh)
+#   Windows  AudioHub_<version>_x64-setup.exe  (NSIS, from scripts/build-windows-installer.ps1)
 #
 # HOW IT IS TRIGGERED
 #   [build]    push  -> build both platforms, keep the artifacts on the run
@@ -182,7 +182,10 @@ jobs:
         id: dmg
         run: |
           set -euo pipefail
-          dmg=$(ls app/src-tauri/target/release/bundle/dmg/*.dmg | head -1)
+          # Newest first, like the Windows step. Identical on a clean runner,
+          # but an alphabetical pick would take AudioHub-0.1.0-dev.dmg over
+          # AudioHub-1.0.0.dmg in any tree that still holds an older bundle.
+          dmg=$(ls -t app/src-tauri/target/release/bundle/dmg/*.dmg | head -1)
           [ -f "$dmg" ] || { echo "no dmg was produced"; exit 1; }
           echo "path=$dmg" >> "$GITHUB_OUTPUT"
           echo "name=$(basename "$dmg")" >> "$GITHUB_OUTPUT"

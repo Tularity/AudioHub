@@ -261,6 +261,68 @@ def render_logo(size=512):
     return px
 
 
+# The installer chrome shares the shell's dark gradient so the setup window and
+# the app that follows it are recognisably the same product.
+PANEL_TOP = (0x1F, 0x24, 0x2E)
+PANEL_BOTTOM = (0x0F, 0x11, 0x15)
+
+
+def write_bmp(path, w, h, px):
+    """24-bit bottom-up BMP from RGBA, over the panel gradient.
+
+    NSIS wants BMP for its header and sidebar images and does not handle alpha
+    predictably, so the mark is composited here onto an opaque panel rather than
+    shipped transparent and left to the installer.
+    """
+    row_pad = (-w * 3) % 4
+    stride = w * 3 + row_pad
+    body = bytearray()
+    for y in range(h - 1, -1, -1):  # BMP rows run bottom-up
+        row = y * w * 4
+        for x in range(w):
+            i = row + x * 4
+            body += bytes((px[i + 2], px[i + 1], px[i]))  # BGR
+        body += b"\x00" * row_pad
+    size = 14 + 40 + len(body)
+    header = struct.pack("<2sIHHI", b"BM", size, 0, 0, 14 + 40)
+    info = struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0, len(body), 2835, 2835, 0, 0)
+    Path(path).write_bytes(header + info + body)
+
+
+def render_panel(w, h, mark_height_frac=0.62, centre_frac=0.5):
+    """The mark on the shell gradient, sized to the panel rather than a square.
+
+    `wave_points` centres in a square canvas, so the mark is rendered into its
+    own square and blitted, which keeps the stroke geometry identical to the app
+    icon at any panel aspect ratio.
+    """
+    px = bytearray(w * h * 4)
+    for y in range(h):
+        t = y / float(max(1, h - 1))
+        bg = tuple(int(PANEL_TOP[k] + (PANEL_BOTTOM[k] - PANEL_TOP[k]) * t) for k in range(3))
+        row = y * w * 4
+        for x in range(w):
+            i = row + x * 4
+            px[i], px[i + 1], px[i + 2], px[i + 3] = bg[0], bg[1], bg[2], 255
+
+    side = max(8, int(h * mark_height_frac))
+    mark = render_logo(side)
+    ox = int(w * centre_frac) - side // 2
+    oy = (h - side) // 2
+    for y in range(side):
+        for x in range(side):
+            a = mark[(y * side + x) * 4 + 3]
+            if not a:
+                continue
+            dx, dy = ox + x, oy + y
+            if not (0 <= dx < w and 0 <= dy < h):
+                continue
+            d = (dy * w + dx) * 4
+            for k in range(3):
+                px[d + k] = (ACCENT[k] * a + px[d + k] * (255 - a)) // 255
+    return px
+
+
 TRAY_PX = 44  # keep in sync with TRAY_PX in src-tauri/src/icon.rs (const-asserted)
 
 
@@ -274,6 +336,16 @@ def main():
     logo = here.parents[2] / "assets" / "logo.png"
     logo.parent.mkdir(parents=True, exist_ok=True)
     write_png(logo, 512, 512, render_logo(512))
+    # Installer chrome. Same mark, same gradient, generated rather than drawn so
+    # the setup windows cannot drift from the icon they are introducing.
+    inst = logo.parent / "installer"
+    inst.mkdir(parents=True, exist_ok=True)
+    # NSIS: fixed sizes, and it wants BMP.
+    write_bmp(inst / "nsis-header.bmp", 150, 57, render_panel(150, 57, 0.78, 0.5))
+    write_bmp(inst / "nsis-sidebar.bmp", 164, 314, render_panel(164, 314, 0.30, 0.5))
+    # macOS pkg: productbuild draws this behind the left pane.
+    write_png(inst / "macos-pkg-background.png", 620, 418,
+              render_panel(620, 418, 0.42, 0.5))
 
     for name, amp, alpha in STATES:
         tray = render_tray(TRAY_PX, amp, alpha)

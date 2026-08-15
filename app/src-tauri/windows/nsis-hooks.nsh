@@ -24,10 +24,29 @@ LangString AudioHubDriverRemoveFailed ${LANG_ENGLISH} "Windows could not safely 
 LangString AudioHubDriverRemoveFailed ${LANG_SIMPCHINESE} "Windows 无法安全移除 AudioHub 虚拟音频驱动。$\r$\n$\r$\n$1$\r$\n$\r$\nApp 和后台服务已保留，可稍后重试。"
 LangString AudioHubUserCleanupFailed ${LANG_ENGLISH} "AudioHub could not remove this user's background-service lifecycle files. The App was kept so reinstall cannot silently inherit a broken startup state."
 LangString AudioHubUserCleanupFailed ${LANG_SIMPCHINESE} "无法清理当前用户的后台服务生命周期文件。App 已保留，以免重装时继承错误的启动状态。"
-LangString AudioHubDaemonStopFailed ${LANG_ENGLISH} "The existing AudioHub background service did not stop. No program files were changed; start the installer again to retry."
-LangString AudioHubDaemonStopFailed ${LANG_SIMPCHINESE} "现有 AudioHub 后台服务未能停止。程序文件尚未更改；请重新运行安装程序重试。"
+LangString AudioHubGracefulStopTimeout ${LANG_ENGLISH} "The graceful shutdown request did not answer in time; falling back to the exact-path process sweep."
+LangString AudioHubGracefulStopTimeout ${LANG_SIMPCHINESE} "优雅关停请求未在预期时间内返回；改用精确路径进程清扫。"
+; One message used to cover six unrelated failures, which is exactly what made
+; the 2026-08-16 uninstall report impossible to place. Same fix as the bootstrap
+; strings above: each site says which step failed.
+LangString AudioHubStopHandshakeSetupFailed ${LANG_ENGLISH} "AudioHub could not prepare the shutdown handshake file. No program files were changed; start the installer again to retry."
+LangString AudioHubStopHandshakeSetupFailed ${LANG_SIMPCHINESE} "无法准备关停握手文件。程序文件尚未更改；请重新运行安装程序重试。"
+LangString AudioHubStopHandshakeLaunchFailed ${LANG_ENGLISH} "AudioHub could not run the shutdown request as the logged-on user. No program files were changed; start the installer again to retry."
+LangString AudioHubStopHandshakeLaunchFailed ${LANG_SIMPCHINESE} "无法以当前登录用户身份执行关停请求。程序文件尚未更改；请重新运行安装程序重试。"
+LangString AudioHubProcessSweepFailed ${LANG_ENGLISH} "An installed AudioHub process is still running and could not be stopped. No program files were changed; start the installer again to retry."
+LangString AudioHubProcessSweepFailed ${LANG_SIMPCHINESE} "仍有已安装的 AudioHub 进程在运行且无法停止。程序文件尚未更改；请重新运行安装程序重试。"
+; Four different things can go wrong here and they used to share one message,
+; which made a real failure report (2026-08-16) impossible to place: the text
+; said the service could not be registered, when in fact it had been and only
+; the answer was lost. Each path now names itself.
 LangString AudioHubBootstrapFailed ${LANG_ENGLISH} "AudioHub was copied, but its background service could not be registered and started. Installation stopped instead of reporting a partial setup."
 LangString AudioHubBootstrapFailed ${LANG_SIMPCHINESE} "AudioHub 已复制，但无法注册并启动后台服务。安装已停止，不会把不完整的状态报告为成功。"
+LangString AudioHubBootstrapNoHandoff ${LANG_ENGLISH} "AudioHub was copied, but the installer could not hand the setup step to your user account. Installation stopped instead of reporting a partial setup."
+LangString AudioHubBootstrapNoHandoff ${LANG_SIMPCHINESE} "AudioHub 已复制，但安装程序无法把设置步骤交给当前用户账户。安装已停止，不会把不完整的状态报告为成功。"
+LangString AudioHubBootstrapNoLaunch ${LANG_ENGLISH} "AudioHub was copied, but it could not be started to finish setup. Installation stopped instead of reporting a partial setup."
+LangString AudioHubBootstrapNoLaunch ${LANG_SIMPCHINESE} "AudioHub 已复制，但无法启动它来完成设置。安装已停止，不会把不完整的状态报告为成功。"
+LangString AudioHubBootstrapTimeout ${LANG_ENGLISH} "AudioHub was copied and started, but it did not report the result of registering its background service within 30 seconds. Installation stopped instead of reporting a partial setup. Check app.log in %APPDATA%\AudioHub, then run the installer again."
+LangString AudioHubBootstrapTimeout ${LANG_SIMPCHINESE} "AudioHub 已复制并启动，但 30 秒内没有回报后台服务的注册结果。安装已停止，不会把不完整的状态报告为成功。请查看 %APPDATA%\AudioHub 下的 app.log，然后重新运行安装程序。"
 LangString AudioHubInstallDirRejected ${LANG_ENGLISH} "AudioHub can only use its dedicated Program Files directory. The selected or existing directory is unsafe, redirected, or belongs to another product."
 LangString AudioHubInstallDirRejected ${LANG_SIMPCHINESE} "AudioHub 只能安装到 Program Files 下的专用目录。当前目录不安全、被重定向或属于其它程序。"
 
@@ -78,7 +97,8 @@ LangString AudioHubInstallDirRejected ${LANG_SIMPCHINESE} "AudioHub 只能安装
   Pop $0
   Pop $1
   ${If} $0 != 0
-    MessageBox MB_OK|MB_ICONSTOP "$(AudioHubDaemonStopFailed)" /SD IDOK
+    ; $1 carries which process and, when the kill itself was refused, why.
+    MessageBox MB_OK|MB_ICONSTOP "$(AudioHubProcessSweepFailed)$\r$\n$\r$\n$1" /SD IDOK
     Abort
   ${EndIf}
   SetOutPath "$INSTDIR"
@@ -108,14 +128,14 @@ LangString AudioHubInstallDirRejected ${LANG_SIMPCHINESE} "AudioHub 只能安装
     Pop $1
     ${If} $0 != 0
       Delete $3
-      MessageBox MB_OK|MB_ICONSTOP "$(AudioHubDaemonStopFailed)" /SD IDOK
+      MessageBox MB_OK|MB_ICONSTOP "$(AudioHubStopHandshakeSetupFailed)" /SD IDOK
       Abort
     ${EndIf}
     nsis_tauri_utils::RunAsUser "$SYSDIR\cmd.exe" '/d /s /c ""$INSTDIR\audiohub.exe" ctl shutdown --json >nul 2>&1 && echo ok>"$3" || echo failed>"$3""'
     Pop $0
     ${If} $0 != 0
       Delete $3
-      MessageBox MB_OK|MB_ICONSTOP "$(AudioHubDaemonStopFailed)" /SD IDOK
+      MessageBox MB_OK|MB_ICONSTOP "$(AudioHubStopHandshakeLaunchFailed)" /SD IDOK
       Abort
     ${EndIf}
     StrCpy $4 0
@@ -128,7 +148,11 @@ audiohub_upgrade_stop_wait:
     FileClose $5
     ${If} $6 == "ok$\r$\n"
       Delete $3
-      Sleep 500
+      ; The CLI returns as soon as the daemon *replies*; the daemon only then
+      ; runs teardown, which is allowed BYE_BUDGET (1500ms, core/audiohubd) on
+      ; top of releasing the driver. Waiting 500ms here opened fire on a daemon
+      ; still inside its own budget and made the sweep race a healthy exit.
+      Sleep 2000
       Goto audiohub_upgrade_stop_done
     ${ElseIf} $6 == "failed$\r$\n"
       Delete $3
@@ -136,12 +160,16 @@ audiohub_upgrade_stop_wait:
       ; below is the authoritative proof that replacement is safe.
       Goto audiohub_upgrade_stop_done
     ${EndIf}
-    ${If} $4 < 100
+    ; `ctl shutdown` may legitimately block for its own 15s IPC read timeout
+    ; (core/audiohub-cli/src/ctl.rs), so the former 10s budget declared a healthy
+    ; child failed. A timeout is also *weaker* evidence than the "failed" branch
+    ; above, which already defers to the sweep — so it must not be the one case
+    ; that aborts. Fall through and let the exact-path sweep decide.
+    ${If} $4 < 300
       Goto audiohub_upgrade_stop_wait
     ${EndIf}
     Delete $3
-    MessageBox MB_OK|MB_ICONSTOP "$(AudioHubDaemonStopFailed)" /SD IDOK
-    Abort
+    DetailPrint "$(AudioHubGracefulStopTimeout)"
 audiohub_upgrade_stop_done:
   ${EndIf}
   !insertmacro AudioHubStopInstalledProcesses
@@ -218,14 +246,14 @@ audiohub_upgrade_stop_done:
   Pop $1
   ${If} $0 != 0
     Delete $3
-    MessageBox MB_OK|MB_ICONSTOP "$(AudioHubBootstrapFailed)" /SD IDOK
+    MessageBox MB_OK|MB_ICONSTOP "$(AudioHubBootstrapNoHandoff)" /SD IDOK
     Abort
   ${EndIf}
   nsis_tauri_utils::RunAsUser "$INSTDIR\${MAINBINARYNAME}.exe" '--installer-bootstrap --installer-result "$3"'
   Pop $0
   ${If} $0 != 0
     Delete $3
-    MessageBox MB_OK|MB_ICONSTOP "$(AudioHubBootstrapFailed)" /SD IDOK
+    MessageBox MB_OK|MB_ICONSTOP "$(AudioHubBootstrapNoLaunch)" /SD IDOK
     Abort
   ${EndIf}
   StrCpy $4 0
@@ -247,8 +275,11 @@ audiohub_bootstrap_wait:
   ${If} $4 < 300
     Goto audiohub_bootstrap_wait
   ${EndIf}
+  ; Timed out with the file still "pending". The App may well have finished its
+  ; work and only failed to deliver the answer, so this message sends the user
+  ; to app.log rather than asserting that the service is unregistered.
   Delete $3
-  MessageBox MB_OK|MB_ICONSTOP "$(AudioHubBootstrapFailed)" /SD IDOK
+  MessageBox MB_OK|MB_ICONSTOP "$(AudioHubBootstrapTimeout)" /SD IDOK
   Abort
 audiohub_bootstrap_done:
 !macroend
@@ -310,14 +341,14 @@ audiohub_uninstall_decisions_done:
     Pop $1
     ${If} $0 != 0
       Delete $3
-      MessageBox MB_OK|MB_ICONSTOP "$(AudioHubDaemonStopFailed)" /SD IDOK
+      MessageBox MB_OK|MB_ICONSTOP "$(AudioHubStopHandshakeSetupFailed)" /SD IDOK
       Abort
     ${EndIf}
     nsis_tauri_utils::RunAsUser "$SYSDIR\cmd.exe" '/d /s /c ""$INSTDIR\audiohub.exe" ctl shutdown --json >nul 2>&1 && echo ok>"$3" || echo failed>"$3""'
     Pop $0
     ${If} $0 != 0
       Delete $3
-      MessageBox MB_OK|MB_ICONSTOP "$(AudioHubDaemonStopFailed)" /SD IDOK
+      MessageBox MB_OK|MB_ICONSTOP "$(AudioHubStopHandshakeLaunchFailed)" /SD IDOK
       Abort
     ${EndIf}
     StrCpy $4 0
@@ -330,18 +361,24 @@ audiohub_uninstall_stop_wait:
     FileClose $5
     ${If} $6 == "ok$\r$\n"
       Delete $3
-      Sleep 500
+      ; The CLI returns as soon as the daemon *replies*; the daemon only then
+      ; runs teardown, which is allowed BYE_BUDGET (1500ms, core/audiohubd) on
+      ; top of releasing the driver. Waiting 500ms here opened fire on a daemon
+      ; still inside its own budget and made the sweep race a healthy exit.
+      Sleep 2000
       Goto audiohub_uninstall_stop_done
     ${ElseIf} $6 == "failed$\r$\n"
       Delete $3
       Goto audiohub_uninstall_stop_done
     ${EndIf}
-    ${If} $4 < 100
+    ; Same budget inversion as the upgrade path: a live daemon takes longer to
+    ; drain than the old 10s allowance, which made the first uninstall fail every
+    ; time (the second saw no daemon, failed to connect instantly, and passed).
+    ${If} $4 < 300
       Goto audiohub_uninstall_stop_wait
     ${EndIf}
     Delete $3
-    MessageBox MB_OK|MB_ICONSTOP "$(AudioHubDaemonStopFailed)" /SD IDOK
-    Abort
+    DetailPrint "$(AudioHubGracefulStopTimeout)"
 audiohub_uninstall_stop_done:
   ${EndIf}
   !insertmacro AudioHubStopInstalledProcesses
@@ -401,6 +438,10 @@ audiohub_cleanup_wait:
   IntOp $4 $4 + 1
   Sleep 100
   ${If} ${FileExists} "$3"
+    ; Reset before every read, like the three sibling loops. The stop loop above
+    ; leaves "ok" in $6; without this, a FileOpen that fails would re-read that
+    ; stale answer and call this cleanup successful without the child replying.
+    StrCpy $6 ""
     FileOpen $5 $3 r
     FileRead $5 $6
     FileClose $5
@@ -444,4 +485,33 @@ audiohub_cleanup_done:
   Pop $0
   SetOutPath "$TEMP"
 audiohub_preuninstall_done:
+!macroend
+
+!macro NSIS_HOOK_POSTUNINSTALL
+  ; Leave nothing in the dedicated directory.
+  ;
+  ; NSIS deletes only the files it recorded at install time. Anything else that
+  ; ended up there outlives the uninstall, and the next install then hits
+  ; ValidateInstallDir's "non-empty but not a registered installation" and
+  ; stops — a product that will neither install nor say which file is the
+  ; problem. Since the directory is exclusively AudioHub's, uninstall owns
+  ; clearing it.
+  ;
+  ; Runs after NSIS has removed its own files, so this is normally a no-op that
+  ; catches the remainder. It is best effort: the still-running uninstaller
+  ; image lives here and NSIS removes that itself afterwards, and a leftover
+  ; must not turn a clean uninstall into a failed one.
+  ;
+  ; Not during an update. Tauri's template inserts this hook outside all three
+  ; of its own `${If} $UpdateMode <> 1` guards, so without this one the /UPDATE
+  ; replacement flow would purge the driver payload that the preuninstall hook
+  ; deliberately preserves for the new installer to repair — and an installer
+  ; that then aborts would strand an installed AudioHubVad with no helper left
+  ; on disk to remove it. Unreachable today (nothing passes /UPDATE), but the
+  ; preserve contract is stated two hooks up and must hold here too.
+  ${If} $UpdateMode <> 1
+    !insertmacro AudioHubExtractLifecycleScript
+    nsExec::ExecToLog '"$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\audiohub-installer-lifecycle.ps1" -Mode PurgeInstallDir -InstallDir "$PROGRAMFILES64\${PRODUCTNAME}" -ExpectedInstallDir "$PROGRAMFILES64\${PRODUCTNAME}"'
+    Pop $0
+  ${EndIf}
 !macroend

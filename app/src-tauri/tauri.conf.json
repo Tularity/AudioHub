@@ -48,6 +48,13 @@
     ],
     "macOS": {
       "minimumSystemVersion": "11.0"
+    },
+    "windows": {
+      "nsis": {
+        "headerImage": "../../assets/installer/nsis-header.bmp",
+        "sidebarImage": "../../assets/installer/nsis-sidebar.bmp",
+        "installerIcon": "icons/icon.ico"
+      }
     }
   }
 }

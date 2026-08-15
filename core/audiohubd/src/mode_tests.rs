@@ -528,3 +528,85 @@ fn an_unknown_mode_is_rejected_rather_than_quietly_replaced() {
         "a rejected write must not have moved the mode"
     );
 }
+
+// ------------------------------------------------ 模式变更时的会话对账
+
+/// The teardown rule and the open gate must agree, mode by mode.
+///
+/// This is the invariant the 2026-08-15 leak violated: `session.open` refuses
+/// an IPC-opened session in mode B, yet a switch INTO mode B left one running.
+/// A daemon holding a session it would refuse to create is the bug, so the two
+/// are asserted against each other rather than each against a hand-written
+/// table — a table would have to be edited twice to stay honest, and the whole
+/// failure was someone editing only one of two places.
+#[test]
+fn what_a_mode_refuses_to_open_it_also_refuses_to_keep() {
+    for mode in [Mode::Share, Mode::A, Mode::B] {
+        let gate_allows_ipc = crate::haldev::refuse_using_others(mode, false).is_none();
+        let teardown_keeps_ipc =
+            crate::haldev::mode_permits_origin(mode, crate::SessionOrigin::User);
+        assert_eq!(
+            gate_allows_ipc, teardown_keeps_ipc,
+            "{mode}: session.open and the mode-change teardown disagree about IPC-opened \
+             sessions — one of them lets a session exist that the other forbids"
+        );
+
+        let gate_allows_peer = crate::haldev::refuse_being_used(mode).is_none();
+        let teardown_keeps_peer =
+            crate::haldev::mode_permits_origin(mode, crate::SessionOrigin::Peer);
+        assert_eq!(
+            gate_allows_peer, teardown_keeps_peer,
+            "{mode}: the peer-side gate and the mode-change teardown disagree"
+        );
+    }
+}
+
+/// Virtual devices exist only in mode B, so a `Hal` session may exist only
+/// there. Asserted separately because `Hal` has no `refuse_*` gate to mirror:
+/// the coordinator opens those with `override_mode: true` and its own
+/// `if !mode_b { continue; }` is the gate (`haldev::coordinate_sessions`).
+#[test]
+fn a_hal_session_belongs_to_mode_b_and_nowhere_else() {
+    let hal = crate::SessionOrigin::Hal { slot: 0 };
+    assert!(crate::haldev::mode_permits_origin(Mode::B, hal));
+    assert!(!crate::haldev::mode_permits_origin(Mode::A, hal));
+    assert!(!crate::haldev::mode_permits_origin(Mode::Share, hal));
+}
+
+/// 接线：切进模式 B 必须关掉模式 A 开的 user 会话。
+///
+/// 2026-08-15 在生产 daemon 上 3/3 复现：每走一轮 A→B 就留下一条还在以 200
+/// 包/秒发送的 `sysaudio` 发送流，三轮之后同一个对端上有五条并存。
+///
+/// 为什么直接调 `announce_mode` 而不是走 `settings.set`：`effective_mode` 会把
+/// 「要 B 但没驱动」降级成 A（`haldev::effective_mode`），而测试 daemon 一律传
+/// `HalBridgeMode::Off`——测试进程一旦真去 mach 里找驱动，就会把用户正在跑的
+/// 真 daemon 的驱动抢走（progress.md 记过这次事故）。所以这里注入的是模式本身，
+/// 走的仍然是产品代码里那条唯一的模式变更钩子。
+#[test]
+fn switching_into_mode_b_closes_the_session_mode_a_opened() {
+    let a = Node::start("modeswitch-a");
+    let b = Node::start("modeswitch-b");
+    a.set_mode(Mode::A);
+    b.set_mode(Mode::Share);
+    pair(&a, &b);
+
+    a.ok(methods::SESSION_OPEN, tone_spk(&b.fingerprint()));
+    eventually("a to hold the IPC-opened session", || {
+        a.sessions()
+            .iter()
+            .any(|s| s.get("origin").and_then(Value::as_str) == Some("user"))
+    });
+
+    crate::conn::announce_mode(a.h.inner_for_test(), Mode::B);
+
+    assert!(
+        !a.sessions()
+            .iter()
+            .any(|s| s.get("origin").and_then(Value::as_str) == Some("user")),
+        "mode B kept a session it refuses to open — the A→B leak is back"
+    );
+    // 对端那一半：`teardown_stream(.., true)` 要把 CloseStream 送出去，否则对端
+    // 留着一条永远收不到媒体的接收流，界面上还显示着「在用」。
+    eventually("the peer to drop its half", || b.sessions().is_empty());
+}

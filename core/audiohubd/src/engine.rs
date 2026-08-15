@@ -2,7 +2,7 @@
 //! fan-out + AUTO resample-before-encode, receive/decrypt into jitter buffers,
 //! 10ms mixer with soft clip and a 2s post-mix ring for mix_verdicts.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,7 +15,7 @@ use audiohub_core::audio::{self, AudioTx, LiveCapture, LivePlayback};
 use audiohub_core::dsp::{self, LinearResampler, ToneVerdict};
 use audiohub_core::latency::{DropMode, SourceDepths, StageDepth, StageId, StageSlot, NO_DEPTHS};
 use audiohub_core::sysaudio::{self, SysAudioCapture};
-use audiohub_net::media::{FrameSource, LossInjector, MediaCrypto, MicSource, ToneSource};
+use audiohub_net::media::{CaptureFifo,FrameSource, LossInjector, MediaCrypto, MicSource, ToneSource};
 use audiohub_net::packet::{Codec, Header, Kind};
 
 use crate::rtsafe::SpscRing;
@@ -1024,29 +1024,27 @@ pub(crate) struct SysAudioFrames {
     cap: Box<dyn SysAudioCapture>,
     backend: String,
     excludes_self: bool,
-    rs: Option<LinearResampler>,
-    fifo: VecDeque<f32>,
     raw: Vec<f32>,
-    staged: Vec<f32>,
-    /// FIFO 满时丢掉的样本数。方向是 `DropMode::Oldest`（`pop_front`）。
-    dropped: u64,
+    /// 发送 FIFO 与它的速率伺服。
+    ///
+    /// ⚠ 这里曾是**第三份**逐字相同的裸 `VecDeque` + 定比重采样器
+    /// （另两份在 `audiohub-net` 的 `MicSource` / `SysAudioSource`）。
+    /// 2026-08-15 给那两份加了速率伺服，**唯独漏了这一份**——而 daemon 的模式 A
+    /// 走的正是这一份，`SysAudioSource` 只被 CLI 探针用。结果是单元测试全绿、
+    /// 探针实测正常，而 9.6 小时真机 soak 里深度仍以 +9.6 ms/小时 爬升。
+    /// 三份合一之后这种「修了但没修到生产路径」不可能再发生。
+    fifo: CaptureFifo,
 }
 
 impl SysAudioFrames {
-    /// 1s: a reader that fell behind must drop old audio, never grow unbounded.
-    const FIFO_CAP: usize = 48000;
-
     fn new(cap: Box<dyn SysAudioCapture>, backend: String, excludes_self: bool) -> SysAudioFrames {
         let rate = cap.sample_rate();
         SysAudioFrames {
             cap,
             backend,
             excludes_self,
-            rs: (rate != 48000).then(|| LinearResampler::new(rate, 48000)),
-            fifo: VecDeque::new(),
             raw: Vec::new(),
-            staged: Vec::new(),
-            dropped: 0,
+            fifo: CaptureFifo::new(rate, FRAME_MS as u32),
         }
     }
 
@@ -1056,10 +1054,10 @@ impl SysAudioFrames {
         [
             Some(StageDepth {
                 id: StageId::SrcFifo,
-                samples: self.fifo.len() as u32,
-                capacity: Self::FIFO_CAP as u32,
+                samples: self.fifo.len(),
+                capacity: self.fifo.capacity(),
                 rate: 48_000,
-                dropped: Some(self.dropped),
+                dropped: Some(self.fifo.dropped()),
                 drop_mode: DropMode::Oldest,
             }),
             None,
@@ -1079,32 +1077,13 @@ impl SysAudioFrames {
     /// 储备**。生产者在同一段时间里也停了的话，FIFO 里根本没那么多东西，
     /// 无脑排到底就是把一个延迟问题换成一个欠载问题。
     fn drain_skipped(&mut self, samples: usize) -> usize {
-        let n = samples.min(self.fifo.len().saturating_sub(F48));
-        self.fifo.drain(..n);
-        n
+        self.fifo.drain_skipped(samples)
     }
 
     fn next_frame(&mut self, out: &mut Vec<f32>) -> bool {
         self.raw.clear();
         self.cap.read(&mut self.raw);
-        match self.rs.as_mut() {
-            None => self.fifo.extend(self.raw.iter().copied()),
-            Some(rs) => {
-                self.staged.clear();
-                rs.process(&self.raw, &mut self.staged);
-                self.fifo.extend(self.staged.iter().copied());
-            }
-        }
-        while self.fifo.len() > Self::FIFO_CAP {
-            self.fifo.pop_front();
-            self.dropped += 1; // 丢弃行为未改，只是现在数得出来
-        }
-        out.clear();
-        if self.fifo.len() >= F48 {
-            out.extend(self.fifo.drain(..F48));
-        } else {
-            out.resize(F48, 0.0);
-        }
+        self.fifo.tick(&self.raw, out);
         true
     }
 }
@@ -3954,29 +3933,35 @@ pub(crate) mod tests {
         );
     }
 
-    /// 灌爆 1 秒上限：深度贴顶、丢弃方向是**最旧**、计数对得上、ms 按 48k 换算。
+    /// 过量生产由安全网排回目标水位，**不再顶到 1 秒**；丢弃方向仍是最旧。
+    ///
+    /// 原名 `..._saturates_at_one_second_...`，断言 47_520 样本（990 ms）——
+    /// 那是缺陷成立时的读数。速率伺服上线后饱和本身成了 bug，断言随之反过来。
     #[test]
-    fn a_sysaudio_send_fifo_saturates_at_one_second_and_drops_the_oldest() {
+    fn an_overproducing_sysaudio_source_is_resynced_instead_of_saturating() {
         let mut src = sys_frames(48_000, 5_000); // 每 tick 收 5000、放 480
         let mut out = Vec::new();
         for _ in 0..20 {
             src.next_frame(&mut out);
         }
         let d = src.depths()[0].expect("发送 FIFO 这一级");
-        // 修剪到 CAP=48000 后本 tick 又被取走 480。
-        assert_eq!(d.samples, 47_520);
-        assert!(d.saturated());
-        assert_eq!(d.ms(), Some(990.0), "1 秒 FIFO 灌满 ≈ 990 ms 驻留");
+        assert_eq!(d.samples, 1_440, "安全网排回目标水位（3 帧 = 30 ms）");
+        assert!(
+            !d.saturated(),
+            "过量生产必须被排掉而不是顶到容量上限：饱和就是那个 1 秒延迟缺陷"
+        );
+        assert_eq!(d.ms(), Some(30.0));
         assert_eq!(d.drop_mode, DropMode::Oldest);
-        assert_eq!(
-            d.dropped,
-            Some(20 * 5_000 - 20 * 480 - 47_520),
-            "收进来的 − 放出去的 − 还压着的 = 丢掉的"
+        // 收支守恒，容差留给伺服正在弯的重采样比。
+        let accounted = 20 * 480 + 1_440 + d.dropped.unwrap() as i64;
+        assert!(
+            (accounted - 20 * 5_000).abs() < 200,
+            "收支对不上：吐出 {accounted} vs 吃进 100000"
         );
         // 丢的确实是最旧的：源交的是 1,2,3,…，留在 FIFO 里的必须是尾部。
         src.next_frame(&mut out);
         assert!(
-            out[0] > 50_000.0,
+            out[0] > 95_000.0,
             "留下的必须是晚到的样本，got {} —— 丢弃方向反了",
             out[0]
         );
@@ -3995,7 +3980,7 @@ pub(crate) mod tests {
     // 用真的 `SysAudioFrames`（真 FIFO、真重采样器、真 `next_frame`）跑完整整
     // 96 秒的模拟时间，喂真的 `DriftTracker`，不造任何字面量。
     #[test]
-    fn injection_b_a_steady_rate_mismatch_climbs_then_keeps_dropping() {
+    fn injection_b_a_rate_mismatch_beyond_the_servo_is_shed_at_a_bounded_depth() {
         use audiohub_core::latency::DriftTracker;
 
         // 每 tick 交 485、取走 480 ⇒ +5 样本/tick = **+500 样本/秒**（约 1%）。
@@ -4013,31 +3998,24 @@ pub(crate) mod tests {
             drift.push(sec as f32, d.id, d.samples);
         }
         let mid = src.depths()[0].unwrap();
-        assert!(!mid.saturated(), "此刻还没饱和, got {} 样本", mid.samples);
-        assert_eq!(
-            mid.dropped,
-            Some(0),
-            "还没开始丢 —— 深度在涨，但一个样本都没丢"
-        );
-        let slope = drift
-            .slope(StageId::SrcFifo)
-            .expect("30 秒 31 个点，够算斜率");
+        assert!(!mid.saturated(), "永远不许贴顶, got {} 样本", mid.samples);
+        // 与旧断言相反：安全网从第一秒就在排，所以丢弃**立刻**开始涨。这不是
+        // 退步——排掉的是伺服权限之外的那 9 500 ppm，代价明码记在 `dropped` 上，
+        // 而深度被钉在有界水位而不是一路爬到用户听得见的一秒。
         assert!(
-            (slope - 500.0).abs() < 5.0,
-            "1% 失配 = +500 样本/秒，遥测必须在**饱和之前**就说出来, got {slope}"
+            mid.dropped.unwrap() > 0,
+            "超出伺服权限的失配必须由安全网排掉并计数"
         );
         assert!(
-            mid.ms().unwrap() > 250.0,
-            "已经积到 250 ms 以上了, got {:?}",
+            mid.ms().unwrap() <= 130.0,
+            "深度必须被钉在安全网门限附近，而不是继续爬, got {:?}",
             mid.ms()
         );
 
-        // ---- 阶段二：跑到饱和之后，丢弃**持续增长** ----
+        // ---- 阶段二：长期稳态——深度有界、丢弃匀速 ----
         //
-        // 深度 48000 / 500 每秒 ⇒ 第 96 秒才真正装满。注意 `saturated()` 的判据
-        // 是 ≥95% 容量，也就是第 91 秒就为真，**而那时一个样本都还没丢**
-        // ——「贴顶」与「开始丢」不是同一件事，差着 5 秒。所以取样窗口开在
-        // 第 120 秒之后，那里已经是纯稳态。
+        // 旧版这里等的是「跑到饱和」。有了安全网就永远等不到：深度被钉住，
+        // 而失配的代价改为以恒定速率记在 `dropped` 上。
         let mut dropped_seen = Vec::new();
         for sec in 31..=180 {
             for _ in 0..100 {
@@ -4051,36 +4029,56 @@ pub(crate) mod tests {
         }
         let d = src.depths()[0].unwrap();
         assert!(
-            d.saturated(),
-            "1% 失配跑够久必然贴顶, got {} 样本",
+            !d.saturated(),
+            "跑再久也不许贴顶——那正是被治好的缺陷, got {} 样本",
             d.samples
         );
-        assert_eq!(d.samples, 47_520, "修剪到 48000 后本 tick 又被取走一帧");
-        assert_eq!(d.ms(), Some(990.0), "这就是用户听到的那将近一秒");
+        assert!(
+            d.ms().unwrap() <= 130.0,
+            "150 秒之后深度仍须有界, got {:?}（旧代码此刻是 990 ms）",
+            d.ms()
+        );
         assert_eq!(
             d.drop_mode,
             DropMode::Oldest,
             "丢最旧 ⇒ 恒定迟到但**连续**，不断续"
         );
-        assert!(dropped_seen.len() >= 10, "饱和后采到了足够多的点");
+        assert!(dropped_seen.len() >= 10, "采到了足够多的点");
+        // **单调不减**，而不是逐秒严格增长：安全网是锯齿式的。净失配把深度从目标
+        // 推到门槛要十秒左右才排一次，所以相邻两秒常常相等——旧断言要求每秒都涨，
+        // 那描述的是「每 tick 都在溢出」的旧行为。
         assert!(
-            dropped_seen.windows(2).all(|w| w[1] > w[0]),
+            dropped_seen.windows(2).all(|w| w[1] >= w[0]),
+            "`dropped` 只能涨，不能倒退"
+        );
+        assert!(
+            dropped_seen.last().unwrap() > dropped_seen.first().unwrap(),
             "**丢弃必须一直在涨** —— 这是「稳态速率失配」区别于「被一次卡顿灌满」的唯一判据（规格 §3.3）"
         );
-        // 每秒丢掉的正是那 1%：500 样本/秒。
+        // 每秒排掉的是失配量**减去伺服自己吃下的那一份**：注入 500 样本/秒，
+        // 伺服在 ±500 ppm 上限能吸收 0.0005 × 48000 = 24 样本/秒，余下约 476
+        // 归安全网。这个差值本身就是伺服确实在出力的证据。
         let per_sec = (dropped_seen.last().unwrap() - dropped_seen.first().unwrap()) as f64
             / (dropped_seen.len() - 1) as f64;
         assert!(
-            (per_sec - 500.0).abs() < 5.0,
-            "稳态每秒丢掉的样本数应等于失配量 500, got {per_sec}"
+            (per_sec - 476.0).abs() < 30.0,
+            "稳态每秒排掉的应是 500 − 伺服吃下的 24 ≈ 476, got {per_sec}"
         );
-        // 饱和之后深度不再动 ⇒ 斜率归零。**只看斜率会以为一切正常**，
-        // 必须与 `dropped` 一起读才能得出「正在持续丢」的结论。
-        let late = drift.slope(StageId::SrcFifo).expect("有斜率");
-        assert!(
-            late.abs() < 1.0,
-            "饱和后深度封顶，斜率必然回到 0, got {late} —— 这正是 dropped 不可或缺的理由"
-        );
+        // 深度被钉住 ⇒ 长期斜率≈0。**只看斜率会以为一切正常**，必须与 `dropped`
+        // 一起读才能得出「正在持续丢」的结论——这一条在有安全网之后反而更要紧：
+        // 从前是「饱和了所以不动」，现在是「被治住了所以不动」，两者深度读数相似
+        // 而含义相反，唯一能分开它们的仍然是 `dropped` 的斜率。
+        // `None` 在这里是**合法结论**，不是失败：安全网的锯齿本身就是噪声源，
+        // `DriftFit::resolved()` 的情形 3（斜率没越过自己的 3σ 界、而界很松）
+        // 正是为这种序列准备的。要求它一定报得出数字，等于要求遥测在分辨不出时
+        // 也硬给一个——那恰好是 `drift_sps` 用 `Option` 而不是 0.0 的理由。
+        match drift.slope(StageId::SrcFifo) {
+            Some(late) => assert!(
+                late.abs() < 30.0,
+                "深度被钉住后长期斜率应接近 0, got {late}"
+            ),
+            None => { /* 锯齿噪声盖过了效应；`dropped` 的斜率才是此处的判据 */ }
+        }
     }
 
     /// 后端跑 44.1k 时这一级**仍然**按 48000 换算（它在重采样之后）。
@@ -4746,14 +4744,15 @@ pub(crate) mod tests {
     /// 500 ms，消费者是同一条 `tx_loop`）。同一次卡顿会**同时**在两处注入积压。
     #[test]
     fn a_skipped_tick_drains_the_source_fifo_too() {
-        let mut src = sys_frames(48_000, 5_000);
+        // 积压必须**一次性**造出来：稳态喂再多也没用，安全网每 tick 都会把它排回
+        // 目标水位。一次 120 ms 的到货正是消费侧卡顿之后的真实形态，而且落在安全网
+        // 门限（target + 100 ms）之下，所以它留得住、可被 `drain_skipped` 排。
+        let mut src = sys_frames(48_000, 48_000 * 130 / 1000);
         let mut out = Vec::new();
-        for _ in 0..20 {
-            src.next_frame(&mut out); // 灌到 1 秒上限
-        }
+        src.next_frame(&mut out);
         let before = src.depths()[0].unwrap().samples;
         let dropped_before = src.depths()[0].unwrap().dropped;
-        assert!(before > 40_000, "前提：FIFO 确实积着东西, got {before}");
+        assert!(before as usize > 11 * F48, "前提：FIFO 确实积着东西, got {before}");
 
         // 一次 108 ms 的卡顿 ⇒ 11 个 tick × 480。
         let n = src.drain_skipped(11 * F48);

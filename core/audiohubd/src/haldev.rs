@@ -807,6 +807,41 @@ pub(crate) fn refuse_using_others(mode: Mode, override_mode: bool) -> Option<Str
     }
 }
 
+/// Whether a session opened by `origin` may still exist once `mode` is in force.
+///
+/// This is the **mirror of the two `refuse_*` gates above**, and it has to be:
+/// the gates decide what may be OPENED in a mode, and this decides what may
+/// SURVIVE a switch into that mode. If the two ever disagree, the daemon ends
+/// up holding a session it would refuse to create — which is exactly the bug
+/// this function was extracted to kill (2026-08-15, reproduced 3/3 on the live
+/// daemon: every A→B switch stranded the mode-A `sysaudio` sender, and three
+/// cycles left five senders streaming into one peer at 200 packets/s each).
+///
+/// The predicate it replaces asked only "does the new mode still allow the SIDE
+/// that opened this?" — `theirs { !serves_peers() } else { !consumes_peers() }`.
+/// Both A and B consume, so nothing locally-opened was ever doomed by a switch
+/// between them. The side is not enough information: A and B are two different
+/// MECHANISMS of consuming, and a session belongs to exactly one of them.
+///
+/// `override_mode` deliberately has no counterpart here. It exists so probes can
+/// drive their own daemon past the open gate; it is not a licence for a session
+/// to outlive the mode whose machinery feeds it. A forced `halspk` session in
+/// mode A has no virtual device behind it, and a forced `sysaudio` session in
+/// mode B is the leak above wearing a flag.
+pub(crate) fn mode_permits_origin(mode: Mode, origin: SessionOrigin) -> bool {
+    match origin {
+        // The peer is the opener; we are the provider. Only share mode serves.
+        SessionOrigin::Peer => mode.serves_peers(),
+        // IPC (`session.open`) — mode A's way of consuming a peer. Mode B
+        // refuses these at the gate because there the SYSTEM's device
+        // selection is what opens sessions.
+        SessionOrigin::User => matches!(mode, Mode::A),
+        // A virtual device started doing IO, which can only happen in mode B
+        // because that is the only mode in which virtual devices exist.
+        SessionOrigin::Hal { .. } => matches!(mode, Mode::B),
+    }
+}
+
 /// Whether a PEER may open a stream on us — the enforcement half of plan §13.
 ///
 /// This is the guard that actually prevents the relay: X sharing its "default

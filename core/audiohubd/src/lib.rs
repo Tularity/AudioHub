@@ -1451,6 +1451,30 @@ fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
         })
     });
     Ok(serde_json::json!({
+        // The tx tick servo's own correction. Wired 2026-08-15: `tx_dll_counters`
+        // had carried `#[allow(dead_code)]` and its doc comment said the wiring
+        // was "one line" — and that missing line is exactly what made the
+        // 9.6 h mode-A soak undiagnosable. `corr_ppm` pinned at a rail with
+        // `clamped` climbing means the tick is running open-loop at its limit,
+        // which no downstream servo can fully absorb.
+        "dll": {
+            "updates": engine::tx_dll_counters().updates,
+            "clamped": engine::tx_dll_counters().clamped,
+            "resyncs": engine::tx_dll_counters().resyncs,
+            "corr_ppm": engine::tx_dll_counters().corr_ppm,
+            "bw_hz": engine::tx_dll_counters().bw_hz,
+        },
+        // The capture FIFO's rate servo. Paired with `dll` above on purpose:
+        // in mode A the tick servo gets no observations at all (`updates: 0`,
+        // measured 2026-08-15), so the capture servo is the ONLY thing holding
+        // that queue, and "corr pinned at a rail while the depth still moves"
+        // is the reading that separates "cannot keep up" from "not engaged".
+        "capture_servo": {
+            "corr_ppm": audiohub_net::media::CAPTURE_SERVO.snapshot().corr_ppm,
+            "resyncs": audiohub_net::media::CAPTURE_SERVO.snapshot().resyncs,
+            "depth_samples": audiohub_net::media::CAPTURE_SERVO.snapshot().depth_samples,
+            "target_samples": audiohub_net::media::CAPTURE_SERVO.snapshot().target_samples,
+        },
         "skip": {
             "tx": engine::tx_skip_counters(),
             "mixer": engine::mixer_skip_counters(),

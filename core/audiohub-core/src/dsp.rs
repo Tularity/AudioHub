@@ -437,6 +437,10 @@ pub fn decode_pcm_into(bytes: &[u8], depth: WireDepth, out: &mut Vec<f32>) -> De
 /// block-split processing equals whole-block processing (within tolerance).
 pub struct LinearResampler {
     step: f64, // input samples per output sample
+    /// `step` at correction 1.0. Kept so a servo can express itself as a
+    /// dimensionless ratio and never accumulates rounding by multiplying the
+    /// live `step` in place.
+    nominal_step: f64,
     phase: f64,
     last: f32,
     passthrough: bool,
@@ -446,9 +450,45 @@ impl LinearResampler {
     pub fn new(src: u32, dst: u32) -> Self {
         LinearResampler {
             step: src as f64 / dst.max(1) as f64,
+            nominal_step: src as f64 / dst.max(1) as f64,
             phase: 0.0,
             last: 0.0,
             passthrough: src == dst,
+        }
+    }
+
+    /// Like [`new`](Self::new), but never takes the passthrough shortcut.
+    ///
+    /// A rate servo needs something to bend, and equal nominal rates are the
+    /// case that needs bending MOST: two devices both calling themselves 48 kHz
+    /// are two crystals disagreeing in the tens of ppm, which is precisely the
+    /// mismatch that fills a FIFO with no other way out. `new` would hand back
+    /// a resampler that ignores `set_correction` entirely and the servo would
+    /// be a no-op that still reports a correction.
+    ///
+    /// At correction 1.0 this is sample-exact, not an approximation: `step`
+    /// 1.0 makes every interpolation land on `frac == 0.0`, so each output is a
+    /// verbatim input sample, delayed by exactly one.
+    pub fn servoed(src: u32, dst: u32) -> Self {
+        LinearResampler {
+            passthrough: false,
+            ..Self::new(src, dst)
+        }
+    }
+
+    /// Scale the resampling ratio by `corr` (1.0 = nominal).
+    ///
+    /// `corr > 1.0` consumes MORE input per output, i.e. emits fewer samples.
+    /// That is the direction a servo wants when its downstream FIFO is too
+    /// deep. Note this is the mirror of the tick servo in `halbridge::dll`,
+    /// which divides its period by `corr` — one governs a producer, the other a
+    /// consumer, so the same `corr` has to be applied in opposite directions.
+    /// Getting that backwards turns the loop into positive feedback, which is
+    /// why `SysAudioSource` carries a test that flips the sign and asserts the
+    /// FIFO then diverges.
+    pub fn set_correction(&mut self, corr: f64) {
+        if corr.is_finite() && corr > 0.0 {
+            self.step = self.nominal_step * corr;
         }
     }
 
@@ -1380,6 +1420,119 @@ mod servo_bend_no_longer_defeats_the_tone_verdict {
                 "{label} rms {got:.6} != the analytic full-scale {want:.6}; \
                  r6's TONE_RMS/LEAK_MIN thresholds are pinned to this value"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod servoed_resampler_tests {
+    use super::LinearResampler;
+
+    /// `servoed(48k, 48k)` at correction 1.0 must be sample-exact, not merely
+    /// close. The doc comment on `servoed` claims this — without a test that
+    /// claim is just a comment, and the whole point of refusing the passthrough
+    /// shortcut is that it costs nothing in fidelity.
+    ///
+    /// "Exact" here means every output is a verbatim input sample, delayed by
+    /// one: at step 1.0 the interpolation fraction is always 0.0, so each
+    /// output takes the earlier of its two neighbours untouched.
+    #[test]
+    fn a_servoed_resampler_at_unity_is_sample_exact_with_one_sample_of_delay() {
+        let mut rs = LinearResampler::servoed(48_000, 48_000);
+        let input: Vec<f32> = (1..=16).map(|n| n as f32).collect();
+        let mut out = Vec::new();
+        rs.process(&input, &mut out);
+        assert_eq!(out.len(), input.len());
+        // First output is the pre-roll (no previous chunk), then input[0..15].
+        assert_eq!(out[0], 0.0, "the first output is the empty history sample");
+        assert_eq!(&out[1..], &input[..15], "every later output is verbatim");
+
+        // Across a chunk boundary the delayed sample must be the previous
+        // chunk's last one, not a re-interpolated approximation.
+        let mut out2 = Vec::new();
+        rs.process(&input, &mut out2);
+        assert_eq!(out2[0], 16.0, "chunk boundary must carry the held sample");
+        assert_eq!(&out2[1..], &input[..15]);
+    }
+
+    /// `new` at equal rates takes the passthrough shortcut and therefore
+    /// IGNORES corrections — which is exactly why `servoed` exists. Asserted so
+    /// nobody "simplifies" `CaptureFifo` back onto `new` and silently turns its
+    /// servo into a no-op that still reports a correction.
+    #[test]
+    fn plain_new_at_equal_rates_cannot_be_bent_but_servoed_can() {
+        // Long enough for the correction to be visible as whole samples:
+        // 500 ppm of 1000 is half a sample and rounds away, which is the
+        // difference between "the servo does nothing" and "the test cannot
+        // see it". 100_000 samples make it ~50.
+        let input: Vec<f32> = (1..=100_000).map(|n| n as f32).collect();
+
+        let mut passthrough = LinearResampler::new(48_000, 48_000);
+        passthrough.set_correction(1.0 + 500e-6);
+        let mut a = Vec::new();
+        passthrough.process(&input, &mut a);
+        assert_eq!(a.len(), input.len(), "passthrough ignores the correction");
+
+        let mut servoed = LinearResampler::servoed(48_000, 48_000);
+        servoed.set_correction(1.0 + 500e-6);
+        let mut b = Vec::new();
+        servoed.process(&input, &mut b);
+        assert!(
+            b.len() < input.len(),
+            "a positive correction must emit FEWER samples (got {} for {} in)",
+            b.len(),
+            input.len()
+        );
+    }
+
+    /// A correction is a ratio applied to the NOMINAL step, so repeated calls
+    /// do not compound. Multiplying the live `step` in place would drift the
+    /// ratio away every update and the loop would slowly lose its reference.
+    #[test]
+    fn corrections_are_relative_to_nominal_and_do_not_compound() {
+        let mut rs = LinearResampler::servoed(44_100, 48_000);
+        let input: Vec<f32> = (1..=4800).map(|n| n as f32).collect();
+
+        let mut baseline = Vec::new();
+        rs.process(&input, &mut baseline);
+
+        for _ in 0..20 {
+            rs.set_correction(1.0 + 300e-6);
+        }
+        let mut bent = Vec::new();
+        rs.process(&input, &mut bent);
+
+        // 300 ppm on ~5225 output samples is under two samples; twenty
+        // compounding applications would be ~30x that.
+        let delta = (baseline.len() as i64 - bent.len() as i64).abs();
+        assert!(
+            delta <= 3,
+            "twenty identical corrections changed the output by {delta} samples \
+             — they are compounding instead of being absolute"
+        );
+
+        // And clearing back to 1.0 must restore the nominal rate exactly.
+        rs.set_correction(1.0);
+        let mut restored = Vec::new();
+        rs.process(&input, &mut restored);
+        assert!((restored.len() as i64 - baseline.len() as i64).abs() <= 1);
+    }
+
+    /// A non-finite or non-positive correction is ignored rather than turning
+    /// the step into NaN (which would make `process` loop forever or emit
+    /// nothing at all).
+    #[test]
+    fn a_nonsense_correction_is_refused() {
+        let mut rs = LinearResampler::servoed(48_000, 48_000);
+        let input: Vec<f32> = (1..=100).map(|n| n as f32).collect();
+        let mut good = Vec::new();
+        rs.process(&input, &mut good);
+
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            rs.set_correction(bad);
+            let mut out = Vec::new();
+            rs.process(&input, &mut out);
+            assert_eq!(out.len(), good.len(), "correction {bad} was not refused");
         }
     }
 }

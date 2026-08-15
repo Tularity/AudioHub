@@ -2,6 +2,7 @@
 //! with PLC, frame sources, deterministic loss injection, AUTO quality ladder.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use anyhow::{anyhow, Result};
 use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
@@ -10,7 +11,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
-use audiohub_core::audio::{AudioRx, LiveCapture};
+use audiohub_core::audio::{AudioRx, Dll, LiveCapture};
 use audiohub_core::dsp::LinearResampler;
 use audiohub_core::latency::{DropMode, SourceDepths, StageDepth, StageId, NO_DEPTHS};
 use audiohub_core::sysaudio::{self, BackendInfo, SysAudioCapture};
@@ -1120,22 +1121,295 @@ impl FrameSource for ToneSource {
 /// 所以拆开：**开设备的线程持有 `LiveCapture`，音频线程只拿 `AudioRx`**
 /// （无锁环的消费端，`Send`）。[`MicSource::open`] 把两者一起返回，调用方必须
 /// 让那个 `LiveCapture` 活着——丢掉它 = 关掉采集流 = 这个源从此只出静音。
+/// The send-side capture FIFO, with the rate servo that keeps it from
+/// ratcheting. Shared by `MicSource` and `SysAudioSource` because both had the
+/// identical defect and an identical copy of the code that caused it.
+///
+/// # The defect this exists to remove
+///
+/// Both sources used to be a bare `VecDeque` between two clocks that nothing
+/// reconciled. The producer pushed **everything** the backend had accumulated
+/// (capture clock); the consumer took **exactly one frame** per call (the
+/// `tx_loop` tick). Any mismatch — a scheduling hiccup, a device restart, or
+/// plain crystal drift between the capture device and the tick — accumulated
+/// monotonically, and the only exit was the 1 s cap dropping the OLDEST
+/// samples. So the depth ratcheted up, parked at exactly 1 s, and stayed there
+/// while quietly discarding audio forever. Measured on the production daemon
+/// 2026-08-14 after 7h38m in mode A: `src_fifo` 984.2 ms, `saturated=true`,
+/// `dropped` climbing at 330–500 ppm, and — the tell that it was pure rate
+/// mismatch rather than a one-off stall — the tick-skip counters frozen.
+///
+/// The resampler could not absorb it either: its ratio was computed once from
+/// the nominal rates, so real drift was never corrected. That is why the servo
+/// bends the RESAMPLER rather than the tick — a capture source has no other
+/// control input, and in mode A there is no HAL ring for the tick servo to
+/// observe (its correction sat pinned at the −500 ppm rail, `clamped` counting
+/// 5.0% of all updates).
+///
+/// # Shape
+///
+/// Same two-part design as the HAL path, for the same reasons: a DLL for
+/// steady-state ppm, and a hard resync for steps the DLL would need forever to
+/// walk off (±500 ppm can only shed 0.5 ms per second — a one-second backlog
+/// would take over half an hour).
+/// Last-writer-wins diagnostics for whichever capture FIFO ran most recently.
+///
+/// A process can hold more than one (a mic source and a sysaudio source), so
+/// this is explicitly NOT per-stream accounting — it exists to answer one
+/// question during a soak: is the rate servo holding, or is it pinned against
+/// its rail with the queue drifting anyway. Per-stream depth already comes
+/// through `depths()`; what that cannot show is the *correction being applied*,
+/// and a servo at ±500 ppm with the depth still moving is a completely
+/// different diagnosis from a servo idling near zero.
+///
+/// Same shape and same reasoning as `engine::TX_DLL`.
+pub static CAPTURE_SERVO: CaptureServoCell = CaptureServoCell::new();
+
+pub struct CaptureServoCell {
+    corr_ppm: AtomicI64,
+    resyncs: AtomicU64,
+    depth: AtomicU64,
+    target: AtomicU64,
+}
+
+/// A snapshot of [`CAPTURE_SERVO`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptureServoCounters {
+    pub corr_ppm: f64,
+    pub resyncs: u64,
+    pub depth_samples: u64,
+    pub target_samples: u64,
+}
+
+impl CaptureServoCell {
+    pub const fn new() -> Self {
+        CaptureServoCell {
+            corr_ppm: AtomicI64::new(0),
+            resyncs: AtomicU64::new(0),
+            depth: AtomicU64::new(0),
+            target: AtomicU64::new(0),
+        }
+    }
+
+    fn publish(&self, corr_ppm: f64, resyncs: u64, depth: usize, target: usize) {
+        // Millippm as an integer: the value is a diagnostic, and a fixed-point
+        // store keeps the cell lock-free without an atomic f64.
+        self.corr_ppm
+            .store((corr_ppm * 1000.0) as i64, Ordering::Relaxed);
+        self.resyncs.store(resyncs, Ordering::Relaxed);
+        self.depth.store(depth as u64, Ordering::Relaxed);
+        self.target.store(target as u64, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> CaptureServoCounters {
+        CaptureServoCounters {
+            corr_ppm: self.corr_ppm.load(Ordering::Relaxed) as f64 / 1000.0,
+            resyncs: self.resyncs.load(Ordering::Relaxed),
+            depth_samples: self.depth.load(Ordering::Relaxed),
+            target_samples: self.target.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub struct CaptureFifo {
+    fifo: VecDeque<f32>,
+    resampler: LinearResampler,
+    staged: Vec<f32>,
+    dll: Dll,
+    frame_samples: usize,
+    /// Depth the servo steers toward, in output samples.
+    target: usize,
+    dropped: u64,
+    resyncs: u64,
+    corr: f64,
+    /// Updates left on the wide capture bandwidth before narrowing.
+    capture_left: u32,
+    /// **Test only**: +1.0 is the production sign; -1.0 inverts the error so a
+    /// test can prove the loop is negative feedback by watching it diverge.
+    /// Kept in the production struct on purpose — a test that re-implements the
+    /// control law proves the copy, not the code. Same rationale, and same
+    /// shape, as `PlayServo::error_sign`.
+    error_sign: f64,
+}
+
+impl CaptureFifo {
+    pub const OUT_RATE: u32 = 48000;
+    /// 1 s. Unchanged: this is the last-ditch bound on added latency, and with
+    /// the servo in place it should never be reached.
+    const CAP: usize = 48000;
+    /// Steady-state depth, in frames. Three 10 ms frames = 30 ms, the same
+    /// target the HAL speaker ring settles at, chosen for the same reason:
+    /// enough to absorb one late wakeup, small enough to stay inaudible.
+    const TARGET_FRAMES: usize = 3;
+    /// Same ±500 ppm rail as `PlayServo::MAX_PPM` — 0.87 cents, inaudible, and
+    /// 2.5× the worst realistic two-crystal mismatch.
+    const MAX_PPM: f64 = 500.0;
+    /// A step this far above target is not drift; walking it off at 500 ppm
+    /// would take minutes. Drain to target and restart the loop instead.
+    const RESYNC_MS: usize = 100;
+    /// Updates spent on `BW_MAX` after a start or a resync, to lock quickly
+    /// before narrowing to `BW_MIN` for noise rejection.
+    const CAPTURE_UPDATES: u32 = 200;
+
+    pub fn new(src_rate: u32, frame_ms: u32) -> Self {
+        let frame_samples = (Self::OUT_RATE as u64 * frame_ms as u64 / 1000) as usize;
+        CaptureFifo {
+            fifo: VecDeque::new(),
+            // `servoed`, never `new`: equal nominal rates are exactly the case
+            // that needs bending most (two "48 kHz" crystals disagree by tens
+            // of ppm), and `new` would hand back a passthrough that silently
+            // ignores every correction.
+            resampler: LinearResampler::servoed(src_rate, Self::OUT_RATE),
+            staged: Vec::new(),
+            dll: Dll::new(Dll::BW_MAX, frame_samples.max(1) as u32, Self::OUT_RATE),
+            frame_samples,
+            target: frame_samples * Self::TARGET_FRAMES,
+            dropped: 0,
+            resyncs: 0,
+            corr: 1.0,
+            capture_left: Self::CAPTURE_UPDATES,
+            error_sign: 1.0,
+        }
+    }
+
+    #[cfg(test)]
+    fn flip_error_sign(&mut self) {
+        self.error_sign = -1.0;
+    }
+
+    /// **Test only**: park `n` samples in the queue without running the loop,
+    /// so a telemetry test can ask what a brimming FIFO reads as.
+    #[cfg(test)]
+    pub(crate) fn fill_for_test(&mut self, n: usize) {
+        self.fifo.extend(std::iter::repeat(0.3f32).take(n));
+    }
+
+    pub fn len(&self) -> u32 {
+        self.fifo.len() as u32
+    }
+
+    pub fn capacity(&self) -> u32 {
+        Self::CAP as u32
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    pub fn resyncs(&self) -> u64 {
+        self.resyncs
+    }
+
+    /// Treatment A: after a consumer-side stall longer than the tick budget,
+    /// throw away the samples that were skipped rather than carrying them as
+    /// permanent latency.
+    ///
+    /// **Not counted into `dropped`.** That counter means "the FIFO saturated
+    /// and shed its oldest", and it is the evidence that separates a steady
+    /// rate mismatch from a one-off stall; folding a deliberate drain into it
+    /// destroys exactly that distinction.
+    ///
+    /// One frame of working reserve is always left behind: if the producer was
+    /// stalled over the same interval there is nothing to shed, and draining to
+    /// the floor trades a latency problem for an underrun.
+    pub fn drain_skipped(&mut self, samples: usize) -> usize {
+        let n = samples.min(self.fifo.len().saturating_sub(self.frame_samples));
+        self.fifo.drain(..n);
+        n
+    }
+
+    /// Current correction as a ppm offset — what the telemetry reports and what
+    /// a soak test watches to tell "holding" from "pinned at the rail".
+    pub fn corr_ppm(&self) -> f64 {
+        (self.corr - 1.0) * 1e6
+    }
+
+    /// One tick: take everything the backend produced, emit exactly one frame,
+    /// and close the loop on what is left over.
+    pub fn tick(&mut self, raw: &[f32], out: &mut Vec<f32>) {
+        self.staged.clear();
+        self.resampler.process(raw, &mut self.staged);
+        self.fifo.extend(self.staged.iter().copied());
+
+        out.clear();
+        if self.fifo.len() >= self.frame_samples {
+            out.extend(self.fifo.drain(..self.frame_samples));
+        } else {
+            // Underrun: emit silence rather than stalling the send cadence.
+            out.resize(self.frame_samples, 0.0);
+        }
+
+        // Servo on the POST-DRAIN residue, matching `SpkPhase`'s 「读后残量」:
+        // measuring before the drain reports a depth that is about to be spent
+        // and steers toward a target that is one frame too high.
+        self.settle();
+    }
+
+    fn settle(&mut self) {
+        let depth = self.fifo.len();
+
+        // Safety net first. A step this large is not something to bend away.
+        let resync_samples =
+            Self::OUT_RATE as usize * Self::RESYNC_MS / 1000 + self.target;
+        if depth > resync_samples {
+            let excess = depth - self.target;
+            self.fifo.drain(..excess);
+            self.dropped += excess as u64;
+            self.resyncs += 1;
+            // The integrator holds history from BEFORE the step; leaving it in
+            // makes the loop chase an error that no longer exists and overshoot
+            // into underrun. Same reason `halbridge::dll` resyncs after a tick
+            // skip.
+            self.dll = Dll::new(Dll::BW_MAX, self.frame_samples.max(1) as u32, Self::OUT_RATE);
+            self.capture_left = Self::CAPTURE_UPDATES;
+            self.corr = 1.0;
+            self.resampler.set_correction(1.0);
+            return;
+        }
+
+        // The hard cap stays as the very last resort; reaching it now means the
+        // resync threshold above was somehow skipped.
+        while self.fifo.len() > Self::CAP {
+            self.fifo.pop_front();
+            self.dropped += 1;
+        }
+
+        if self.capture_left > 0 {
+            self.capture_left -= 1;
+            if self.capture_left == 0 {
+                self.dll
+                    .set_bw(Dll::BW_MIN, self.frame_samples.max(1) as u32, Self::OUT_RATE);
+            }
+        }
+
+        // Consumer semantics, identical to `SpkPhase::err_frames`: `target −
+        // depth`, so `> 0` means "let the level rise".
+        let err = self.error_sign * (self.target as f64 - self.fifo.len() as f64);
+        let rail = Self::MAX_PPM / 1e6;
+        let (corr, _clamped) = self.dll.update_clamped(err, 1.0 - rail, 1.0 + rail);
+        self.corr = corr;
+        CAPTURE_SERVO.publish(self.corr_ppm(), self.resyncs, self.fifo.len(), self.target);
+        // MULTIPLY, where the tick servo divides. `corr > 1` there shortens the
+        // period so the consumer reads faster; here it lengthens the resampling
+        // step so the producer emits fewer samples. Both drain a deep buffer;
+        // applying either in the other's direction is positive feedback.
+        self.resampler.set_correction(corr);
+    }
+}
+
 pub struct MicSource {
     rx: AudioRx,
-    resampler: Option<LinearResampler>,
-    fifo: VecDeque<f32>,
     raw: Vec<f32>,
-    staged: Vec<f32>,
-    frame_samples: usize,
-    /// FIFO 满时丢掉的样本数（累计）。方向是 **`DropMode::Oldest`**
-    /// （`while len > CAP { pop_front() }`）：饱和时驻留恰好 = CAP/48000 = 1 秒，
-    /// 音频连续，听感是「恒定迟到但不断」。
-    dropped: u64,
+    /// 发送 FIFO 与它的速率伺服。方向仍是 **`DropMode::Oldest`**，但正常运行下
+    /// 已经不该丢：伺服把水位稳在 `TARGET_FRAMES`，丢弃只剩「阶跃重同步」一条路。
+    fifo: CaptureFifo,
 }
 
 impl MicSource {
     pub const OUT_RATE: u32 = 48000;
-    const FIFO_CAP: usize = 48000; // 1s: bound added latency
+    /// The FIFO's hard cap, re-exported for the telemetry tests. The queue and
+    /// its servo live in [`CaptureFifo`]; this is the one number, not a copy.
+    const FIFO_CAP: usize = CaptureFifo::CAP;
 
     /// 开默认输入设备。**返回的 `LiveCapture` 必须被调用方保管好**（见类型
     /// 文档）：它是 `!Send` 的 cpal 流，只能留在开它的这条线程上，而
@@ -1147,32 +1421,28 @@ impl MicSource {
 
     /// 从一个已经在跑的采集环造源。速率取自设备，不是假定 48k。
     pub fn from_rx(rx: AudioRx, rate: u32, frame_ms: u32) -> MicSource {
-        let resampler = if rate == Self::OUT_RATE {
-            None
-        } else {
-            Some(LinearResampler::new(rate, Self::OUT_RATE))
-        };
         MicSource {
             rx,
-            resampler,
-            fifo: VecDeque::new(),
             raw: Vec::new(),
-            staged: Vec::new(),
-            frame_samples: (Self::OUT_RATE as u64 * frame_ms as u64 / 1000) as usize,
-            dropped: 0,
+            fifo: CaptureFifo::new(rate, frame_ms),
         }
     }
 
     pub fn fifo_len(&self) -> u32 {
-        self.fifo.len() as u32
+        self.fifo.len()
     }
 
     pub fn fifo_cap(&self) -> u32 {
-        Self::FIFO_CAP as u32
+        self.fifo.capacity()
     }
 
     pub fn dropped(&self) -> u64 {
-        self.dropped
+        self.fifo.dropped()
+    }
+
+    /// 伺服当前的速率修正，ppm。长期贴在 ±500 就说明失配超出了弯速率能治的范围。
+    pub fn corr_ppm(&self) -> f64 {
+        self.fifo.corr_ppm()
     }
 }
 
@@ -1180,24 +1450,7 @@ impl FrameSource for MicSource {
     fn next_frame(&mut self, out: &mut Vec<f32>) -> bool {
         self.raw.clear();
         self.rx.pop(&mut self.raw);
-        match self.resampler.as_mut() {
-            None => self.fifo.extend(self.raw.iter().copied()),
-            Some(rs) => {
-                self.staged.clear();
-                rs.process(&self.raw, &mut self.staged);
-                self.fifo.extend(self.staged.iter().copied());
-            }
-        }
-        while self.fifo.len() > Self::FIFO_CAP {
-            self.fifo.pop_front();
-            self.dropped += 1; // 丢弃行为未改，只是现在数得出来
-        }
-        out.clear();
-        if self.fifo.len() >= self.frame_samples {
-            out.extend(self.fifo.drain(..self.frame_samples));
-        } else {
-            out.resize(self.frame_samples, 0.0);
-        }
+        self.fifo.tick(&self.raw, out);
         true
     }
 
@@ -1223,7 +1476,7 @@ impl FrameSource for MicSource {
                 samples: self.fifo_len(),
                 capacity: self.fifo_cap(),
                 rate: Self::OUT_RATE,
-                dropped: Some(self.dropped),
+                dropped: Some(self.dropped()),
                 drop_mode: DropMode::Oldest,
             }),
         ]
@@ -1239,38 +1492,27 @@ impl FrameSource for MicSource {
 pub struct SysAudioSource {
     cap: Box<dyn SysAudioCapture>,
     info: BackendInfo,
-    resampler: Option<LinearResampler>,
-    fifo: VecDeque<f32>,
     raw: Vec<f32>,
-    staged: Vec<f32>,
-    frame_samples: usize,
-    /// 同 `MicSource::dropped`：方向是 `DropMode::Oldest`。
-    dropped: u64,
+    /// 同 `MicSource`：发送 FIFO 与它的速率伺服。
+    fifo: CaptureFifo,
 }
 
 impl SysAudioSource {
     pub const OUT_RATE: u32 = 48000;
-    const FIFO_CAP: usize = 48000; // 1s
+    /// See `MicSource::FIFO_CAP`.
+    #[allow(dead_code)]
+    const FIFO_CAP: usize = CaptureFifo::CAP;
 
     /// `backend` is a backend id or `sysaudio::BACKEND_AUTO` ("auto").
     pub fn new(frame_ms: u32, backend: &str) -> Result<Self> {
         let info = sysaudio::resolve_backend(backend)?;
         let cap = sysaudio::start_backend(&info.id)?;
         let rate = cap.sample_rate();
-        let resampler = if rate == Self::OUT_RATE {
-            None
-        } else {
-            Some(LinearResampler::new(rate, Self::OUT_RATE))
-        };
         Ok(SysAudioSource {
             cap,
             info,
-            resampler,
-            fifo: VecDeque::new(),
             raw: Vec::new(),
-            staged: Vec::new(),
-            frame_samples: (Self::OUT_RATE as u64 * frame_ms as u64 / 1000) as usize,
-            dropped: 0,
+            fifo: CaptureFifo::new(rate, frame_ms),
         })
     }
 
@@ -1288,15 +1530,20 @@ impl SysAudioSource {
     }
 
     pub fn fifo_len(&self) -> u32 {
-        self.fifo.len() as u32
+        self.fifo.len()
     }
 
     pub fn fifo_cap(&self) -> u32 {
-        Self::FIFO_CAP as u32
+        self.fifo.capacity()
     }
 
     pub fn dropped(&self) -> u64 {
-        self.dropped
+        self.fifo.dropped()
+    }
+
+    /// 伺服当前的速率修正，ppm。长期贴在 ±500 就说明失配超出了弯速率能治的范围。
+    pub fn corr_ppm(&self) -> f64 {
+        self.fifo.corr_ppm()
     }
 }
 
@@ -1304,24 +1551,7 @@ impl FrameSource for SysAudioSource {
     fn next_frame(&mut self, out: &mut Vec<f32>) -> bool {
         self.raw.clear();
         self.cap.read(&mut self.raw);
-        match self.resampler.as_mut() {
-            None => self.fifo.extend(self.raw.iter().copied()),
-            Some(rs) => {
-                self.staged.clear();
-                rs.process(&self.raw, &mut self.staged);
-                self.fifo.extend(self.staged.iter().copied());
-            }
-        }
-        while self.fifo.len() > Self::FIFO_CAP {
-            self.fifo.pop_front();
-            self.dropped += 1;
-        }
-        out.clear();
-        if self.fifo.len() >= self.frame_samples {
-            out.extend(self.fifo.drain(..self.frame_samples));
-        } else {
-            out.resize(self.frame_samples, 0.0);
-        }
+        self.fifo.tick(&self.raw, out);
         true
     }
 
@@ -1339,7 +1569,7 @@ impl FrameSource for SysAudioSource {
                 samples: self.fifo_len(),
                 capacity: self.fifo_cap(),
                 rate: Self::OUT_RATE,
-                dropped: Some(self.dropped),
+                dropped: Some(self.dropped()),
                 drop_mode: DropMode::Oldest,
             }),
             None,
@@ -2509,13 +2739,8 @@ mod telemetry_tests {
         SysAudioSource {
             cap: Box::new(FakeSys { rate, chunk, n: 0 }),
             info: fake_backend(),
-            resampler: (rate != SysAudioSource::OUT_RATE)
-                .then(|| LinearResampler::new(rate, SysAudioSource::OUT_RATE)),
-            fifo: VecDeque::new(),
             raw: Vec::new(),
-            staged: Vec::new(),
-            frame_samples: 480,
-            dropped: 0,
+            fifo: CaptureFifo::new(rate, 10),
         }
     }
 
@@ -2530,12 +2755,8 @@ mod telemetry_tests {
         let (rx, mut feed) = AudioRx::detached_for_test(44_100);
         let mut mic = MicSource {
             rx,
-            resampler: Some(LinearResampler::new(44_100, MicSource::OUT_RATE)),
-            fifo: VecDeque::new(),
             raw: Vec::new(),
-            staged: Vec::new(),
-            frame_samples: 480,
-            dropped: 0,
+            fifo: CaptureFifo::new(44_100, 10),
         };
 
         // 声卡交来 4410 个样本（100 ms @44.1k），还没被取走。
@@ -2599,12 +2820,8 @@ mod telemetry_tests {
         let (rx, mut feed) = AudioRx::detached_for_test(48_000);
         let mic = MicSource {
             rx,
-            resampler: None,
-            fifo: VecDeque::new(),
             raw: Vec::new(),
-            staged: Vec::new(),
-            frame_samples: 480,
-            dropped: 0,
+            fifo: CaptureFifo::new(48_000, 10),
         };
         // 环 = 2 秒 = 96000。灌 100000 进去，最后 4000 个写不下。
         let wrote = feed.write(&vec![0.5; 100_000]);
@@ -2635,17 +2852,12 @@ mod telemetry_tests {
         let (rx, mut feed) = AudioRx::detached_for_test(48_000);
         let mut mic = MicSource {
             rx,
-            resampler: None,
-            fifo: VecDeque::new(),
             raw: Vec::new(),
-            staged: Vec::new(),
-            frame_samples: 480,
-            dropped: 0,
+            fifo: CaptureFifo::new(48_000, 10),
         };
 
         // 1 秒发送 FIFO 装到**恰好**容量。样本是真的、队列是真的。
-        mic.fifo
-            .extend(std::iter::repeat(0.3f32).take(MicSource::FIFO_CAP));
+        mic.fifo.fill_for_test(MicSource::FIFO_CAP);
         // 2 秒采集环同样装到恰好容量（96000 @48k）。
         assert_eq!(feed.write(&vec![0.3f32; 96_000]), 96_000);
 
@@ -2673,16 +2885,27 @@ mod telemetry_tests {
             "push_slice 短写 ⇒ 迟到 + 断续"
         );
 
-        // 稳态跑一 tick 之后回落到 990 ms —— 相位约定，不是读数变坏。
+        // 跑一 tick 之后**不再**停在 990 ms：满载是一个阶跃，伺服的安全网把它
+        // 一次性排到目标水位。此前这里断言的 990 ms 正是缺陷本身——FIFO 一旦
+        // 被灌满就永久停在 1 秒，并从此持续丢音频。
         let mut out = Vec::new();
         mic.next_frame(&mut out);
-        assert_eq!(mic.depths()[1].unwrap().ms(), Some(990.0));
+        assert_eq!(
+            mic.depths()[1].unwrap().ms(),
+            Some(30.0),
+            "满载的 FIFO 必须被重同步回目标水位，而不是永久驻留在 1 秒"
+        );
     }
 
-    /// 发送 FIFO 溢出丢的是**最旧**的，饱和时驻留恰好 1.000 秒。
-    /// 真的跑 `next_frame()` 把 FIFO 灌爆，而不是手填一个 `samples: 48_000`。
+    /// 过量生产不再能把 FIFO 顶到 1 秒：安全网每次把它排回目标水位，而丢弃的
+    /// 方向仍然是**最旧**优先。
+    ///
+    /// 这条测试原名 `..._saturates_at_exactly_one_second`，断言的是 47_520 样本
+    /// （990 ms）——也就是缺陷成立时的读数。伺服上线后饱和本身成了 bug，所以
+    /// 断言跟着反过来：**必须没有任何一刻停在 1 秒**。保留下来的是它真正在守的
+    /// 两件事：丢弃计数不虚报，以及留下的是晚到的样本。
     #[test]
-    fn source_fifo_drops_oldest_and_saturates_at_exactly_one_second() {
+    fn an_overproducing_source_is_resynced_instead_of_saturating() {
         // 每 tick 交 5000 个样本、只被取走 480 —— 十几个 tick 就撑爆 1 秒上限。
         let mut src = sys_source(48_000, 5_000);
         let mut out = Vec::new();
@@ -2696,24 +2919,30 @@ mod telemetry_tests {
         );
         let fifo = fifo.expect("发送 FIFO 这一级");
         assert_eq!(fifo.id, StageId::SrcFifo);
-        // 修剪到 CAP=48000，随即本 tick 的 480 被取走 ⇒ 47520 = 990 ms。
-        assert_eq!(fifo.samples, 47_520, "贴着 1 秒上限（刚被取走一帧）");
+        assert_eq!(fifo.samples, 1_440, "安全网把它排回目标水位（3 帧 = 30 ms）");
         assert_eq!(fifo.capacity, 48_000);
         assert_eq!(fifo.rate, 48_000);
-        assert!(fifo.saturated(), "≥95% 容量");
-        assert_eq!(
-            fifo.ms(),
-            Some(990.0),
-            "1 秒 FIFO 被灌满 = 将近 1000 ms 驻留"
+        assert!(
+            !fifo.saturated(),
+            "过量生产必须被排掉而不是顶到容量上限：饱和就是那个 1 秒延迟缺陷"
         );
+        assert_eq!(fifo.ms(), Some(30.0));
         assert_eq!(
             fifo.drop_mode,
             DropMode::Oldest,
             "pop_front 丢最旧：听感是恒定迟到但连续，与播放环的丢最新完全不同"
         );
-        // 20 tick 收 100000、放 9600、还剩 47520，其余被丢。
+        // 收支守恒：**重采样器吐出来的** = 取走的 + 丢掉的 + 还压着的。
+        //
+        // 基准是「吐出来的」而不是「后端交进来的」，容差也由此而来：伺服正在弯
+        // 重采样比，20 个 tick 吐出的样本数与吃进的 100_000 差了几十个。那个差
+        // 值不是误差，正是它在工作的证据；写成精确等式等于断言伺服没生效。
         let dropped = fifo.dropped.expect("源侧的丢弃本进程数得出来");
-        assert_eq!(dropped, 100_000 - 9_600 - 47_520);
+        let accounted = 9_600 + 1_440 + dropped as i64;
+        assert!(
+            (accounted - 100_000).abs() < 200,
+            "收支对不上：吐出 {accounted}，后端交进 100000（差值只该是伺服的弯量）"
+        );
         assert!(dropped > 0, "没溢出就谈不上方向");
 
         // **丢的确实是最旧的**：源交出的是 1,2,3,… 的递增序列，取出的这一帧
@@ -2721,7 +2950,7 @@ mod telemetry_tests {
         // 拿到的会是最开头那 480 个样本。
         src.next_frame(&mut out);
         assert!(
-            out[0] > 50_000.0,
+            out[0] > 95_000.0,
             "FIFO 里留下的必须是晚到的样本，got {} —— 丢弃方向反了",
             out[0]
         );
@@ -2737,9 +2966,16 @@ mod telemetry_tests {
             src.next_frame(&mut out);
         }
         let fifo = src.depths()[0].expect("发送 FIFO 这一级");
-        assert_eq!(fifo.dropped, Some(0));
+        assert_eq!(fifo.dropped, Some(0), "没溢出就不许记丢弃");
         assert!(!fifo.saturated());
-        assert_eq!(fifo.samples, 0, "来多少走多少");
+        // 此前这里断言恒为 0（「来多少走多少」）。加了伺服之后水位会**朝目标
+        // 爬**——空 FIFO 没有余量吸收一次迟到的唤醒，那正是要治的另一半。爬升
+        // 必须是有界的：不许越过目标。
+        assert!(
+            fifo.samples <= 1_440,
+            "水位只该朝目标爬，不该越过它，got {}",
+            fifo.samples
+        );
     }
 
     /// 后端速率不是 48k 时，FIFO 那一级仍然按 **48000** 换算——它在重采样
@@ -3696,5 +3932,140 @@ mod zero_alloc_wire_tests {
         // 复用：第二次写短载荷必须把上一次的尾巴清掉，不能残留。
         h.encode_into(&[], &mut out);
         assert_eq!(out, h.encode(&[]), "encode_into 没有清空 out");
+    }
+}
+
+#[cfg(test)]
+mod capture_fifo_tests {
+    use super::CaptureFifo;
+
+    /// Drive the FIFO with a producer running `ppm` fast relative to the
+    /// consumer, and report the depth after `ticks`.
+    ///
+    /// The producer's fractional surplus is carried between ticks rather than
+    /// rounded away: at 100 ppm a 480-sample frame produces 480.048 samples, and
+    /// truncating that to 480 every tick simulates a *perfectly matched* pair —
+    /// the very thing the test is supposed to perturb.
+    fn run(ppm: f64, ticks: usize, flip: bool) -> CaptureFifo {
+        let mut f = CaptureFifo::new(48_000, 10);
+        if flip {
+            f.flip_error_sign();
+        }
+        let frame = 480usize;
+        let mut out = Vec::new();
+        let mut carry = 0.0f64;
+        for _ in 0..ticks {
+            let exact = frame as f64 * (1.0 + ppm / 1e6) + carry;
+            let n = exact.floor() as usize;
+            carry = exact - n as f64;
+            let raw = vec![0.25f32; n];
+            f.tick(&raw, &mut out);
+            assert_eq!(out.len(), frame, "a tick must always emit exactly one frame");
+        }
+        f
+    }
+
+    /// The defect, as a test: a producer 200 ppm fast used to fill the FIFO
+    /// monotonically until it parked at the 1 s cap. With the servo the depth
+    /// has to settle near the target instead.
+    #[test]
+    fn a_faster_producer_is_absorbed_instead_of_accumulating() {
+        let f = run(200.0, 20_000, false); // 200 s of 10 ms ticks
+        let depth = f.len() as f64;
+        let target = 480.0 * 3.0;
+        assert!(
+            (depth - target).abs() < 480.0,
+            "depth {depth} did not settle within one frame of target {target}; \
+             corr={:.1} ppm resyncs={}",
+            f.corr_ppm(),
+            f.resyncs()
+        );
+        // Without the servo this run drops samples continuously once it hits
+        // the cap. Settling means it never has to.
+        assert_eq!(f.dropped(), 0, "a drift the servo can hold must cost no audio");
+        assert!(
+            f.corr_ppm() > 50.0,
+            "the servo should be leaning against the drift, not idling at 1.0 \
+             (corr={:.1} ppm)",
+            f.corr_ppm()
+        );
+    }
+
+    /// Same, mirrored: a slow producer must not starve the FIFO to nothing.
+    #[test]
+    fn a_slower_producer_is_absorbed_too() {
+        let f = run(-200.0, 20_000, false);
+        let depth = f.len() as f64;
+        let target = 480.0 * 3.0;
+        assert!(
+            (depth - target).abs() < 480.0,
+            "depth {depth} strayed from target {target}; corr={:.1} ppm",
+            f.corr_ppm()
+        );
+        assert!(
+            f.corr_ppm() < -50.0,
+            "the servo should be leaning the other way (corr={:.1} ppm)",
+            f.corr_ppm()
+        );
+    }
+
+    /// The loop is negative feedback, proven by inverting the error and
+    /// watching the same code diverge.
+    ///
+    /// This is the assertion that actually guards the `MULTIPLY where the tick
+    /// servo divides` comment in `settle`. A test that re-derived the control
+    /// law would keep passing if production flipped the sign; this one runs
+    /// production's own loop twice.
+    #[test]
+    fn flipping_the_error_sign_turns_the_servo_into_positive_feedback() {
+        let good = run(200.0, 20_000, false);
+        let bad = run(200.0, 20_000, true);
+        let target = 480.0 * 3.0;
+        assert!(
+            (good.len() as f64 - target).abs() < 480.0,
+            "the production sign must converge"
+        );
+        // Divergence can go either way — toward the ceiling (the FIFO fills and
+        // starts dropping) or toward the floor (it empties and emits silence).
+        // Inverted, this run runs DRY: the loop lengthens the resampling step
+        // exactly when the queue is already short. Either rail refutes "the
+        // convergence above happened on its own".
+        assert!(
+            (bad.len() as f64 - target).abs() > 480.0,
+            "the inverted sign must NOT converge — if it does, the loop is not \
+             doing the work and the convergence above proves nothing \
+             (depth={} dropped={})",
+            bad.len(),
+            bad.dropped()
+        );
+    }
+
+    /// A step too large to bend away is drained at once, not walked off at
+    /// 500 ppm (which would take over half an hour for a one-second backlog).
+    #[test]
+    fn a_large_step_is_resynced_rather_than_bent_away() {
+        let mut f = CaptureFifo::new(48_000, 10);
+        let mut out = Vec::new();
+        // A 400 ms burst: one stalled reader's worth of backlog arriving at once.
+        f.tick(&vec![0.1f32; 48_000 * 400 / 1000], &mut out);
+        assert_eq!(f.resyncs(), 1, "the step should have tripped exactly one resync");
+        let depth = f.len() as f64;
+        assert!(
+            depth <= 480.0 * 3.0 + 1.0,
+            "resync left {depth} samples; it must drain back to target"
+        );
+        assert_eq!(f.corr_ppm().round(), 0.0, "a resync must restart the loop at 1.0");
+    }
+
+    /// Underruns emit silence rather than stalling the send cadence, and the
+    /// servo must not mistake the empty FIFO for a reason to drop audio.
+    #[test]
+    fn an_empty_fifo_still_emits_a_frame() {
+        let mut f = CaptureFifo::new(48_000, 10);
+        let mut out = Vec::new();
+        f.tick(&[], &mut out);
+        assert_eq!(out.len(), 480);
+        assert!(out.iter().all(|s| *s == 0.0));
+        assert_eq!(f.dropped(), 0);
     }
 }

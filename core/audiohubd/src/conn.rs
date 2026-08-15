@@ -767,18 +767,13 @@ pub(crate) fn announce_mode(inner: &Arc<DaemonInner>, mode: Mode) {
         let st = lk(&inner.state);
         st.sessions
             .values()
-            .filter(|e| {
-                let theirs = e.origin == SessionOrigin::Peer;
-                // A session survives only if the new mode still allows the side
-                // that opened it. Written from `mode`'s own answers rather than
-                // from a `match` on the variants, so a fourth mode cannot slip
-                // through with its sessions intact.
-                if theirs {
-                    !mode.serves_peers()
-                } else {
-                    !mode.consumes_peers()
-                }
-            })
+            // A session survives only if the new mode would still permit the
+            // machinery that opened it. `mode_permits_origin` is the mirror of
+            // the two `refuse_*` open gates and lives beside them so the pair
+            // cannot drift; see its doc comment for why asking about the SIDE
+            // alone (the shape this replaced) let every A→B switch strand its
+            // mode-A sender.
+            .filter(|e| !haldev::mode_permits_origin(mode, e.origin))
             .map(|e| e.id)
             .collect()
     };

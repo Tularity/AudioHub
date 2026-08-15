@@ -204,7 +204,15 @@ jobs:
   windows:
     needs: gate
     if: needs.gate.outputs.build == 'true'
-    runs-on: windows-latest
+    # Pinned to 2022, NOT windows-latest. The image behind `latest` now ships
+    # Visual Studio 18, and the WDK NuGet package (10.0.26100.6584) resolves its
+    # MSBuild task assembly by VS major version: on 18 it looks for
+    # Microsoft.DriverKit.Build.Tasks.18.0.dll, which that package does not
+    # contain, and the driver build dies with MSB4062 before compiling a line.
+    # VS 2022 (v17) is also what builds this driver on the hardware test box, so
+    # the pin makes CI match the toolchain the driver is actually known to build
+    # under rather than tracking whatever `latest` becomes next.
+    runs-on: windows-2022
     # Longer than macOS on purpose: a cold run also restores the WDK NuGet
     # packages and builds the kernel-mode driver before Tauri is even reached.
     timeout-minutes: 120

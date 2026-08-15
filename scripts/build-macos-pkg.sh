@@ -30,9 +30,18 @@ else
   [[ ! -L "$BUILD_LOCK" ]] || die "refusing a symlinked macOS build lock: $BUILD_LOCK"
   exec 8>>"$BUILD_LOCK"
   /bin/chmod 0600 "$BUILD_LOCK"
-  /usr/bin/lockf -s -t 0 8 \
-    || die "another macOS AudioHub build is already running"
-  export AUDIOHUB_MACOS_BUILD_LOCK_PATH="$BUILD_LOCK"
+  # See app/build-app.sh for why this is conditional: /usr/bin/lockf is
+  # absent on macOS 14 (and so on the macos-14 runner) and present on 26.
+  # Unconditional, its absence surfaced as "another build is already
+  # running" on a fresh VM where nothing else was running at all.
+  if [[ -x /usr/bin/lockf ]]; then
+    /usr/bin/lockf -s -t 0 8 \
+      || die "another macOS AudioHub build is already running"
+    export AUDIOHUB_MACOS_BUILD_LOCK_PATH="$BUILD_LOCK"
+  else
+    print -ru2 -- "[audiohub] WARNING: /usr/bin/lockf is missing on this host; \
+building without the concurrent-build lock."
+  fi
 fi
 
 [[ -d "$APP" ]] || { print -u2 -- "missing app bundle: $APP"; exit 1; }

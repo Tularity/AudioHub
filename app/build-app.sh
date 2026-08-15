@@ -45,9 +45,25 @@ else
   [[ ! -L "$BUILD_LOCK" ]] || die "refusing a symlinked macOS build lock: $BUILD_LOCK"
   exec 8>>"$BUILD_LOCK"
   /bin/chmod 0600 "$BUILD_LOCK"
-  /usr/bin/lockf -s -t 0 8 \
-    || die "another macOS AudioHub build is already running"
-  export AUDIOHUB_MACOS_BUILD_LOCK_PATH="$BUILD_LOCK"
+  # `lockf` is not on every macOS: it is absent from macOS 14 (and so from the
+  # macos-14 GitHub runner) and present on 26. Without this check its absence
+  # surfaced as `no such file or directory` followed by the `||` branch —
+  # i.e. the build reported "another build is already running" on a machine
+  # where nothing else was running at all.
+  #
+  # Degrading here is safe for exactly one reason, and it is worth stating:
+  # this lock serialises two builds on the SAME checkout, and the only hosts
+  # missing lockf are fresh single-use CI runners that build once. It is not
+  # safe to extend that reasoning to a developer machine, which is why the
+  # absence is announced rather than swallowed.
+  if [[ -x /usr/bin/lockf ]]; then
+    /usr/bin/lockf -s -t 0 8 \
+      || die "another macOS AudioHub build is already running"
+    export AUDIOHUB_MACOS_BUILD_LOCK_PATH="$BUILD_LOCK"
+  else
+    print -ru2 -- "[audiohub] WARNING: /usr/bin/lockf is missing on this host; \
+building without the concurrent-build lock. Do not run two builds at once."
+  fi
 fi
 
 TRIPLE="$(rustc -vV | awk '/^host: /{print $2}')"

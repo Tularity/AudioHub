@@ -337,7 +337,18 @@ Step 'Windows-native frontend dependencies'
 # node_modules, so merely checking that the directory exists is insufficient:
 # a previous checkout can leave a valid-looking but incomplete dependency
 # tree. `npm install` is lockfile-aware and cheap when the tree is current.
-Invoke-Checked { & $Npm --prefix $FrontendDir install --no-audit --no-fund } 'npm install'
+# Run npm FROM the frontend directory rather than relying on --prefix.
+# `--prefix` redirects where packages are written, but which package.json npm
+# READS is a version-dependent detail: on the GitHub windows runner's npm it
+# kept reading the current directory and failed with ENOENT on the repository
+# root's (non-existent) package.json, while the same command worked on a
+# developer box with an older npm. Push-Location has no such ambiguity.
+Push-Location $FrontendDir
+try {
+    Invoke-Checked { & $Npm install --no-audit --no-fund } 'npm install'
+} finally {
+    Pop-Location
+}
 
 # cargo-about resolves the union of target-specific dependency graphs while it
 # runs frozen. A target-qualified fetch only downloads that one graph, so a

@@ -123,6 +123,41 @@ mod downmix {
         n
     }
 
+    /// Same front-pair average, for a NON-INTERLEAVED buffer: one slice per
+    /// channel rather than one slice of frames. Returns how many samples it
+    /// wrote — `min(shortest plane, out.len())`.
+    ///
+    /// This is the shape ScreenCaptureKit delivers audio in (mac-sck): an
+    /// AudioBufferList carrying `channelCount` mono AudioBuffers, not one
+    /// interleaved buffer. The rule is deliberately the same as the interleaved
+    /// form's — average channels 0 and 1, pass a lone channel through — so the
+    /// two backends cannot disagree about what "mono" means. Averaging *all*
+    /// planes instead would attenuate ordinary stereo content on any layout
+    /// wider than 2, exactly as `front_pair` exists to prevent.
+    ///
+    /// Only mac-sck calls it, so it is dead on every other host — the same
+    /// treatment `front_pair_mono` gets for being Windows-only. The unit tests
+    /// still exercise it everywhere, which is the point of keeping the
+    /// arithmetic out of the platform module.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn planar_front_pair_mono_into(planes: &[&[f32]], out: &mut [f32]) -> usize {
+        match planes {
+            [] => 0,
+            [only] => {
+                let n = only.len().min(out.len());
+                out[..n].copy_from_slice(&only[..n]);
+                n
+            }
+            [left, right, ..] => {
+                let n = left.len().min(right.len()).min(out.len());
+                for (f, slot) in out[..n].iter_mut().enumerate() {
+                    *slot = (left[f] + right[f]) * 0.5;
+                }
+                n
+            }
+        }
+    }
+
     /// Appends the mono downmix of `interleaved` to `out`. Only the Windows
     /// capture can grow a Vec from its callback thread; macOS goes through the
     /// slice form above.
@@ -181,13 +216,21 @@ fn entry(id: &str, name: &str, available: bool, excludes_self: bool, note: &str)
 }
 
 /// All known backends in priority order (BACKEND_AUTO takes the first
-/// available one), which on macOS is mac-catap and nothing else: mac-sck is
-/// listed so the ruling against it is visible, but it is `declined` and can
-/// never be picked (see `sck_info`).
+/// available one).
 ///
-/// Listing must never open a capture: on macOS creating the tap is exactly
-/// what raises the TCC consent dialog, so availability is decided from the
-/// runtime presence of the `CATapDescription` class and the OS version alone.
+/// **mac-catap is FIRST and mac-sck follows it, deliberately.** Both are real
+/// backends since 2026-08-15, and on macOS 14.2+ both are available — so this
+/// order is the whole of what makes `auto` still resolve to mac-catap there.
+/// The reason is the permission: mac-catap asks for system-audio recording,
+/// mac-sck asks for screen recording (plan §6.1). Swapping these two rows would
+/// silently start asking every 14.2+ user for the broader grant. mac-sck's
+/// purpose is macOS 13.0–14.1, where mac-catap is unavailable and this walk
+/// falls through to it.
+///
+/// Listing must never open a capture: on macOS creating the tap — or starting
+/// an SCStream — is exactly what raises the TCC consent dialog, so availability
+/// is decided from the runtime presence of the `CATapDescription` / `SCStream`
+/// classes and the OS version alone.
 pub fn list_backends() -> Vec<BackendInfo> {
     vec![
         proc_exclude_info(),
@@ -291,48 +334,99 @@ fn catap_info() -> BackendInfo {
     )
 }
 
-/// **Ruled out, permanently** (2026-08-09; plan §6 / §11.2, status-audit §四).
-/// This is not an unfinished task and must not be picked up as one.
+/// The first macOS whose ScreenCaptureKit can capture audio at all. Below this
+/// the framework exists but `SCStreamConfiguration.capturesAudio` does not, so
+/// a class lookup on its own would report a backend that cannot produce a
+/// sample.
+pub const SCK_MIN_MACOS: (i64, i64) = (13, 0);
+
+/// mac-sck's availability rule, as a pure function of the two facts that decide
+/// it: is the `SCStream` class in this process, and what does the OS report.
 ///
-/// The four-cell backend matrix plan §6 asked for has three real cells and this
-/// declined one. What settled it:
+/// Pure and un-cfg'd on purpose. Availability must be checkable for a version
+/// this machine does not run — the interesting cases are macOS 12 (framework
+/// present since 12.3, audio absent) and the 13.0 boundary, and waiting for a
+/// host at each version is not a test strategy. It is also the reason this
+/// lives outside `mod sck`: the predicate is decidable everywhere, the capture
+/// is not.
+///
+/// Note what is deliberately NOT here: consent. Like mac-catap (see
+/// `catap_info`), TCC has no public preflight, and the only way to learn the
+/// answer is to start a stream — which *is* the prompt. Listing must never
+/// prompt, so `available` means "this host could run it", and `start_backend`
+/// reports the denial.
+pub fn sck_available(class_present: bool, os: (i64, i64, i64)) -> bool {
+    class_present && (os.0, os.1) >= SCK_MIN_MACOS
+}
+
+/// **The 2026-08-09 ruling against this backend was overridden by the project
+/// owner on 2026-08-15, and the backend is implemented** (`mod sck`).
+///
+/// The three reasons the ruling rested on were not wrong, and all three still
+/// hold — they are now the price of an *opt-in* second path rather than grounds
+/// for refusing to build it:
 ///
 /// * **Permission category.** ScreenCaptureKit audio is gated on the
 ///   screen-recording grant; mac-catap is gated on the narrower
-///   system-audio-recording grant. Handing an audio app the right to read the
+///   system-audio-recording one. Handing an audio tool the right to read the
 ///   screen is a strictly larger ask, and macOS re-asks for it periodically.
-///   Note this is a *cost*, not a breach of plan §5/§6's 体验红线 — that line
-///   forbids making the user re-point their output at a virtual device, and a
-///   ScreenCaptureKit tap would not do that either.
+///   This is a *cost*, not a breach of plan §5/§6's 体验红线 — that line forbids
+///   making the user re-point their output at a virtual device, and this
+///   backend does not do that either.
 /// * **Coverage bought.** Exactly macOS 13.0–14.1: below 13 SCK has no audio
-///   capture, and from 14.2 up mac-catap already works. Every host that can run
-///   this backend can run the better one.
-/// * **Cost paid.** ScreenCaptureKit + CoreMedia + block2 + a runtime-defined
-///   stream-output delegate class, none of which are in the tree — a second
-///   capture path that would carry the project's entire macOS mirror on a code
-///   path no routine test would ever select.
+///   capture, and from 14.2 up mac-catap already works.
+/// * **Cost paid.** A second capture path, on which no routine test lands
+///   (every machine this project builds on resolves `auto` to mac-catap).
 ///
-/// Reversing this means flipping `declined` here *and* revoking the ruling in
-/// plan §6; `regress/r6_sysaudio.sh` fails the build if only one of those
-/// happens.
+/// So `mac-catap` stays FIRST in `list_backends()` and remains what `auto`
+/// resolves to wherever it is available; mac-sck is a real, selectable
+/// alternative and the automatic fallback on 13.0–14.1, not the default.
+///
+/// Changing this again means moving `declined`/`available` here *and* the
+/// matching prose in plan §6.1/§11.2; `regress/r6_sysaudio.sh` fails the build
+/// if only one of those happens.
+#[cfg(target_os = "macos")]
 fn sck_info() -> BackendInfo {
-    BackendInfo {
-        declined: true,
-        ..entry(
-            BACKEND_MAC_SCK,
-            "macOS ScreenCaptureKit system audio",
-            false,
-            // excludes_self. A backend that cannot start excludes nothing, and
-            // `engine.rs` keys its feedback-loop warning off this bit — the old
-            // `true` here advertised a property of code that will never exist.
-            false,
-            // UI copy: this string is the only thing a user is ever shown about
-            // the greyed-out row, so it has to say "ruled out", not "not yet".
-            "not offered by AudioHub and not planned: ScreenCaptureKit audio needs the \
-             screen-recording permission, while mac-catap covers macOS 14.2 and later with the \
-             narrower system-audio-recording one",
+    let (maj, min, patch) = mac::os_version();
+    let available = sck_available(sck::class_present(), (maj, min, patch));
+    let note = if available {
+        // UI copy. The only thing a user is ever shown about this row, so it
+        // has to name the one way it differs from the default backend: the
+        // permission it will ask for.
+        concat!(
+            "ScreenCaptureKit system audio, excluding this process; asks for the SCREEN ",
+            "RECORDING permission, which is broader than the system-audio-recording one ",
+            "mac-catap uses — prefer mac-catap unless this host is older than macOS 14.2"
         )
-    }
+        .to_string()
+    } else {
+        format!(
+            "needs macOS {}.{}+ with ScreenCaptureKit audio capture; this host reports macOS \
+             {maj}.{min}.{patch}",
+            SCK_MIN_MACOS.0, SCK_MIN_MACOS.1
+        )
+    };
+    entry(
+        BACKEND_MAC_SCK,
+        "macOS ScreenCaptureKit system audio",
+        available,
+        // excludes_self: the stream is configured with
+        // excludesCurrentProcessAudio, and `sck::start` refuses to run without
+        // it, so this is a property of code that exists.
+        true,
+        &note,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sck_info() -> BackendInfo {
+    entry(
+        BACKEND_MAC_SCK,
+        "macOS ScreenCaptureKit system audio",
+        false,
+        true,
+        "macOS only",
+    )
 }
 
 /// Does muting THIS machine's default output leave the CAPTURED stream intact?
@@ -352,24 +446,24 @@ fn sck_info() -> BackendInfo {
 /// is not a platform-wide fact.
 /// `BACKEND_AUTO` is deliberately absent: callers must ask about the id
 /// `resolve_backend` handed them, because "auto" is a different backend on
-/// every host. **Declined backends are absent for the same class of reason**:
-/// see the `mac-sck` note below.
+/// every host. **A `declined` backend would be absent for a related reason**:
+/// it never runs, so nothing about it is established. Nothing ships declined
+/// today (see `sck_info`), so no row is missing on those grounds.
 pub fn capture_survives_local_mute(backend_id: &str) -> Option<bool> {
     match backend_id {
         // Process-level taps read each process's own render stream, upstream of
         // the device's volume and mute. plan §7.1: 「预期 mac CATap 不受
         // 影响（进程级采集）」.
         //
-        // `BACKEND_MAC_SCK` used to share this arm and no longer does. It is
-        // declined (`sck_info`, plan §6.1, status-audit §四 #41), so no capture
-        // will ever run through it, and a row here would have been the same
-        // empty promise as the `excludes_self: true` that `sck_info` just gave
-        // up: a stated property of code that does not exist. It was dead in
-        // both senses — unreachable too, because `start_backend` rejects a
-        // declined id before any caller gets far enough to ask this. Falling
-        // through to `None` says the only true thing: nothing is established
-        // about a backend that never runs.
-        BACKEND_MAC_CATAP => Some(true),
+        // `BACKEND_MAC_SCK` shares this arm since 2026-08-15, on the same
+        // structural argument rather than a second measurement: ScreenCaptureKit
+        // composes audio per-process (that is what makes
+        // `excludesCurrentProcessAudio` possible at all) and therefore reads the
+        // same side of the output mixer CATap does. ⚠ Like every other row here,
+        // this is plan §7.1's EXPECTATION, not a measurement — the probe
+        // (`probe sysaudio --check-volume-independence`) is what settles it, and
+        // it has not been run against this backend.
+        BACKEND_MAC_CATAP | BACKEND_MAC_SCK => Some(true),
         // plan §7.1: 「win 设备 loopback 受主音量影响（post-mix）」. The one
         // entry the switch must respect, because the resulting silence looks
         // like a network fault, not like a mute the user asked for.
@@ -559,6 +653,7 @@ fn start_resolved(id: &str) -> Result<Box<dyn SysAudioCapture>> {
 fn start_resolved(id: &str) -> Result<Box<dyn SysAudioCapture>> {
     match id {
         BACKEND_MAC_CATAP => mac::start(),
+        BACKEND_MAC_SCK => sck::start(),
         other => bail!("sysaudio backend '{other}' has no implementation"),
     }
 }
@@ -2275,12 +2370,678 @@ mod mac {
     }
 }
 
+// -------------------------------------------------------- macos impl (sck)
+
+/// mac-sck (plan §6.1): ScreenCaptureKit's audio stream, with this process
+/// excluded from it.
+///
+/// The 2026-08-09 ruling that this backend would never be built was overridden
+/// by the project owner on 2026-08-15. It is NOT the default — `sck_info`
+/// carries the reason (a broader TCC grant) and `list_backends` carries the
+/// ordering that enforces it. Its job is macOS 13.0–14.1, where mac-catap's
+/// Core Audio process taps do not exist yet.
+///
+/// Same discipline as `mod mac`, for the same reason: nothing in here may run
+/// during `list_backends()`. Starting an `SCStream` — or even enumerating
+/// shareable content — is what raises the screen-recording TCC dialog, so
+/// availability is decided by `class_present()` plus `os_version()` and nothing
+/// else.
+#[cfg(target_os = "macos")]
+mod sck {
+    use std::cell::UnsafeCell;
+    use std::mem::size_of;
+    use std::ptr::{self, NonNull};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    use anyhow::{anyhow, bail, Result};
+    use block2::{DynBlock, RcBlock};
+    use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, ProtocolObject};
+    use objc2::{define_class, msg_send, AnyThread, DefinedClass};
+    use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
+    use objc2_core_foundation::CFRetained;
+    use objc2_core_media::{
+        kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, CMBlockBuffer, CMSampleBuffer,
+        CMTime, CMTimeFlags,
+    };
+    use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
+    use objc2_screen_capture_kit::{
+        SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamDelegate,
+        SCStreamOutput, SCStreamOutputType, SCWindow,
+    };
+    use ringbuf::traits::{Consumer, Observer, Producer, Split};
+    use ringbuf::{HeapCons, HeapProd, HeapRb};
+
+    use super::{downmix, FailSlot, SysAudioCapture};
+
+    /// What the stream is configured to hand us, and therefore what
+    /// `sample_rate()` reports. ScreenCaptureKit resamples to this itself.
+    pub const SAMPLE_RATE: u32 = 48_000;
+    /// Stereo in, mono out. Asking for 2 rather than 1 keeps the front-pair
+    /// downmix rule identical to every other backend's instead of trusting
+    /// ScreenCaptureKit's own fold-down.
+    const CHANNELS: isize = 2;
+    /// 4s of 48k mono, like both other backends: a stalled reader costs audio,
+    /// it never blocks the callback.
+    const RING_SAMPLES: usize = 48000 * 4;
+    /// Frames downmixed per pass, so the sample handler never allocates.
+    const SCRATCH_FRAMES: usize = 4096;
+    /// A running audio stream delivers buffers whether or not anything is
+    /// playing, so this much silence from the callback means the stream died.
+    /// The delegate's `stream:didStopWithError:` is the better signal; this is
+    /// the backstop for a stream that stops without saying so.
+    ///
+    /// The watchdog counts FRAMES EXTRACTED, not callbacks entered, and the
+    /// difference matters. Unlike `mod mac` — where the IOProc firing at all
+    /// proves the device is running, because Core Audio hands over a raw
+    /// pointer — a ScreenCaptureKit callback can arrive and still yield
+    /// nothing, if unwrapping the `CMSampleBuffer` fails. Ticking on arrival
+    /// would leave that case reporting a perfectly healthy stream of digital
+    /// silence, which is the exact failure `failed()` exists to prevent.
+    const STALL: Duration = Duration::from_secs(10);
+    /// How long to wait on ScreenCaptureKit's asynchronous entry points during
+    /// START. Long enough to cover a first-run consent prompt sitting on screen
+    /// unanswered, short enough that a wedged `replayd` reports instead of
+    /// hanging the session forever.
+    const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+    /// The same wait during TEARDOWN, which is a different trade-off and so is
+    /// a different number. `Drop` runs on whatever thread is tearing the
+    /// session down — often the one that just noticed `failed()` — and nothing
+    /// there is waiting on a human, so the 30s above would only ever be 30s of
+    /// a frozen session. A stop that has not landed by now is not going to.
+    const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Trailing `AudioBuffer` slots. The stream asks for 2 channels and
+    /// ScreenCaptureKit delivers one mono buffer per channel, so this is slack
+    /// rather than a bound the code depends on being exact.
+    /// Upper bound on planes the sample handler will accept on the stack.
+    ///
+    /// ScreenCaptureKit at `CHANNELS = 2` delivers exactly two — measured
+    /// 2026-08-15: `nbuf=2`, `mNumberChannels=1` each, 3840 bytes = 960 f32 =
+    /// 20 ms. The headroom is for a future channel count, not for anything the
+    /// current configuration can produce.
+    const MAX_PLANES: usize = 8;
+
+    /// True once the ScreenCaptureKit stream class is in this process. A class
+    /// lookup: it opens nothing and cannot prompt.
+    pub fn class_present() -> bool {
+        AnyClass::get(c"SCStream").is_some()
+    }
+
+    // ---- the audio buffer list
+    //
+    // C declares `AudioBufferList::mBuffers` as `[AudioBuffer; 1]` and overruns
+    // it on purpose. Spelling the real bound out is what lets the sample
+    // handler fill one on the stack, which is what keeps the callback
+    // allocation-free.
+
+    #[repr(C)]
+    struct BufferListN {
+        number_buffers: u32,
+        buffers: [AudioBuffer; MAX_PLANES],
+    }
+
+    // The cast to `*mut AudioBufferList` below is only sound while the prefix
+    // matches, so it is checked rather than assumed.
+    const _: () = {
+        assert!(align_of::<BufferListN>() == align_of::<AudioBufferList>());
+        assert!(
+            size_of::<BufferListN>()
+                == size_of::<AudioBufferList>() + (MAX_PLANES - 1) * size_of::<AudioBuffer>()
+        );
+        assert!(
+            std::mem::offset_of!(BufferListN, buffers)
+                == std::mem::offset_of!(AudioBufferList, mBuffers)
+        );
+    };
+
+    // ---- the stream output object
+
+    struct OutputIvars {
+        /// Written only from the stream's own serial sample-handler queue, so
+        /// the `&mut` taken in the callback is never aliased even though the
+        /// type is not `Sync`. `mod mac` does the same thing through a raw
+        /// `*mut IoCtx` handed to Core Audio.
+        prod: UnsafeCell<HeapProd<f32>>,
+        ticks: Arc<AtomicU64>,
+        fail: Arc<FailSlot>,
+    }
+
+    define_class!(
+        // SAFETY:
+        // - NSObject has no subclassing requirements.
+        // - `StreamOutput` does not implement `Drop`.
+        #[unsafe(super(NSObject))]
+        #[name = "AudioHubSCKStreamOutput"]
+        #[ivars = OutputIvars]
+        struct StreamOutput;
+
+        unsafe impl NSObjectProtocol for StreamOutput {}
+
+        // SAFETY: the selector and signature are ScreenCaptureKit's own.
+        unsafe impl SCStreamOutput for StreamOutput {
+            #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
+            fn did_output_sample_buffer(
+                &self,
+                _stream: &SCStream,
+                sample_buffer: &CMSampleBuffer,
+                kind: SCStreamOutputType,
+            ) {
+                if kind != SCStreamOutputType::Audio {
+                    return;
+                }
+                // SAFETY: called on the serial sample-handler queue this object
+                // was registered with, so nothing else holds the producer.
+                let frames = unsafe { self.drain(sample_buffer) };
+                // Proof of life is EXTRACTED AUDIO, not an entered callback —
+                // see `STALL`. Counting frames rather than pushed samples on
+                // purpose: a reader that stalls fills the ring and pushes zero,
+                // and that is the reader's problem, not a dead stream.
+                if frames > 0 {
+                    self.ivars().ticks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        // SAFETY: the selector and signature are ScreenCaptureKit's own.
+        unsafe impl SCStreamDelegate for StreamOutput {
+            #[unsafe(method(stream:didStopWithError:))]
+            fn did_stop_with_error(&self, _stream: &SCStream, error: &NSError) {
+                // The honest version of `failed()`: without this a stream that
+                // dies mid-session is indistinguishable from silence, and the
+                // peer receives digital quiet with a healthy 0% loss report.
+                self.ivars().fail.fail(format!(
+                    "the ScreenCaptureKit stream stopped: {}",
+                    error.localizedDescription()
+                ));
+            }
+        }
+    );
+
+    impl StreamOutput {
+        fn new(prod: HeapProd<f32>, ticks: Arc<AtomicU64>, fail: Arc<FailSlot>) -> Retained<Self> {
+            let this = Self::alloc().set_ivars(OutputIvars {
+                prod: UnsafeCell::new(prod),
+                ticks,
+                fail,
+            });
+            unsafe { msg_send![super(this), init] }
+        }
+
+        /// Pulls the sample buffer's audio out, downmixes the front pair to
+        /// mono and pushes it into the ring. Returns the number of frames
+        /// EXTRACTED — which is what the stall watchdog counts, and is
+        /// deliberately not the number pushed (see `STALL`).
+        ///
+        /// # Safety
+        /// Must be called only from the serial sample-handler queue, which is
+        /// what makes the `&mut` on the producer unaliased.
+        unsafe fn drain(&self, sample_buffer: &CMSampleBuffer) -> usize {
+            let mut list: BufferListN = std::mem::zeroed();
+            let mut block: *mut CMBlockBuffer = ptr::null_mut();
+            // Two calls, which is what CoreMedia documents and — measured
+            // 2026-08-15 — what it actually requires. A single call handing it
+            // a generously oversized list returns
+            // `kCMSampleBufferError_ArrayTooSmall` (-12737) while reporting
+            // `needed = 40` and `have = 136`: it wants the size to describe the
+            // list it is going to fill, not an upper bound on it.
+            let mut needed: usize = 0;
+            let probe = sample_buffer.audio_buffer_list_with_retained_block_buffer(
+                ptr::from_mut(&mut needed),
+                ptr::null_mut(),
+                0,
+                None,
+                None,
+                kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+                ptr::null_mut(),
+            );
+            if probe != 0 || needed == 0 || needed > size_of::<BufferListN>() {
+                return 0;
+            }
+            let status = sample_buffer.audio_buffer_list_with_retained_block_buffer(
+                ptr::null_mut(),
+                ptr::from_mut(&mut list).cast::<AudioBufferList>(),
+                needed,
+                None,
+                None,
+                kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+                &mut block,
+            );
+            // "Retained" is in the name: the call hands back a +1 block buffer
+            // that owns the samples. Taking ownership here is what releases it
+            // when this callback returns — and it must be taken even on
+            // failure, because a partial success can still have produced one.
+            let _owned = NonNull::new(block).map(|p| CFRetained::from_raw(p));
+            // Every early return below is a frame count of zero, which is what
+            // eventually trips the stall watchdog if it keeps happening.
+            if status != 0 {
+                return 0;
+            }
+            let count = (list.number_buffers as usize).min(MAX_PLANES);
+            if count == 0 {
+                return 0;
+            }
+            let first = list.buffers[0];
+            if first.mData.is_null() {
+                return 0;
+            }
+            let samples = |b: &AudioBuffer| -> &[f32] {
+                std::slice::from_raw_parts(b.mData.cast::<f32>(), b.mDataByteSize as usize / 4)
+            };
+            let mut scratch = [0f32; SCRATCH_FRAMES];
+            let prod = &mut *self.ivars().prod.get();
+
+            if first.mNumberChannels >= 2 {
+                // Interleaved. ScreenCaptureKit is documented to deliver
+                // non-interleaved float32, so this branch is the defensive one;
+                // it is kept because a wrong guess here would be silent
+                // channel-swapped garbage rather than an error.
+                let chans = first.mNumberChannels as usize;
+                let data = samples(&first);
+                let pair = downmix::front_pair(0, chans);
+                let frames = data.len() / chans;
+                let mut off = 0;
+                while off < frames {
+                    let take = (frames - off).min(SCRATCH_FRAMES);
+                    let n = downmix::front_pair_mono_into(
+                        &data[off * chans..(off + take) * chans],
+                        chans,
+                        pair,
+                        &mut scratch[..take],
+                    );
+                    prod.push_slice(&scratch[..n]);
+                    off += take;
+                }
+                return frames;
+            }
+
+            // Non-interleaved: one mono AudioBuffer per channel. Only the front
+            // pair is read — the rest of the layout is discarded by the same
+            // rule `front_pair` applies to the interleaved case.
+            let mut planes: [&[f32]; 2] = [&[], &[]];
+            let mut used = 0usize;
+            for i in 0..count.min(2) {
+                let b = list.buffers[i];
+                if b.mNumberChannels != 1 || b.mData.is_null() {
+                    break;
+                }
+                planes[i] = samples(&b);
+                used += 1;
+            }
+            if used == 0 {
+                return 0;
+            }
+            let frames = planes[..used].iter().map(|p| p.len()).min().unwrap_or(0);
+            let mut chunk: [&[f32]; 2] = [&[], &[]];
+            let mut off = 0;
+            while off < frames {
+                let take = (frames - off).min(SCRATCH_FRAMES);
+                for i in 0..used {
+                    chunk[i] = &planes[i][off..off + take];
+                }
+                let n =
+                    downmix::planar_front_pair_mono_into(&chunk[..used], &mut scratch[..take]);
+                prod.push_slice(&scratch[..n]);
+                off += take;
+            }
+            frames
+        }
+    }
+
+    // ---- capture handle
+
+    pub struct SckCapture {
+        cons: HeapCons<f32>,
+        fail: Arc<FailSlot>,
+        stop: Arc<AtomicBool>,
+        watcher: Option<JoinHandle<()>>,
+        stream: Retained<SCStream>,
+        output: Retained<StreamOutput>,
+        /// Held for exactly as long as the stream can still call back onto it.
+        _queue: DispatchRetained<DispatchQueue>,
+    }
+
+    /// The Objective-C handles are not thread-affine (ScreenCaptureKit has no
+    /// main-thread requirement for a stream); objc2 simply declines to promise
+    /// that for imported classes. The handle is moved between threads, never
+    /// shared, and the sample handler reaches its state through the retained
+    /// output object rather than through this struct.
+    unsafe impl Send for SckCapture {}
+
+    impl SysAudioCapture for SckCapture {
+        fn read(&mut self, out: &mut Vec<f32>) -> usize {
+            if self.fail.is_failed() {
+                return 0;
+            }
+            let avail = self.cons.occupied_len();
+            if avail == 0 {
+                return 0;
+            }
+            let start = out.len();
+            out.resize(start + avail, 0.0);
+            let got = self.cons.pop_slice(&mut out[start..]);
+            out.truncate(start + got);
+            got
+        }
+
+        fn sample_rate(&self) -> u32 {
+            SAMPLE_RATE
+        }
+
+        fn failed(&self) -> Option<String> {
+            self.fail.reason()
+        }
+    }
+
+    impl Drop for SckCapture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(j) = self.watcher.take() {
+                let _ = j.join();
+            }
+            // Stop before unregistering, and wait for the stop to complete: an
+            // output still attached to a running stream would keep pushing into
+            // a ring whose consumer is about to go away.
+            if let Err(e) = await_completion("stopCapture", TEARDOWN_TIMEOUT, |b| unsafe {
+                self.stream.stopCaptureWithCompletionHandler(Some(b))
+            }) {
+                eprintln!("[audiohub] sysaudio sck teardown: {e}");
+            }
+            // Both outputs, because both were registered — the screen one is
+            // what makes the stream run at all (see `start_inner`).
+            for kind in [SCStreamOutputType::Audio, SCStreamOutputType::Screen] {
+                let _ = unsafe {
+                    self.stream
+                        .removeStreamOutput_type_error(ProtocolObject::from_ref(&*self.output), kind)
+                };
+            }
+        }
+    }
+
+    // ---- start
+
+    pub fn start() -> Result<Box<dyn SysAudioCapture>> {
+        let (maj, min, patch) = super::mac::os_version();
+        if !super::sck_available(class_present(), (maj, min, patch)) {
+            bail!(
+                "ScreenCaptureKit audio capture needs macOS {}.{}+; this host reports macOS \
+                 {maj}.{min}.{patch}",
+                super::SCK_MIN_MACOS.0,
+                super::SCK_MIN_MACOS.1
+            );
+        }
+        unsafe { start_inner() }
+    }
+
+    unsafe fn start_inner() -> Result<Box<dyn SysAudioCapture>> {
+        // Audio-only capture still needs a content filter, and a filter needs
+        // something to attach to. This is also the first call that touches TCC.
+        let content = shareable_content()?;
+        let displays = content.displays();
+        let display = displays.firstObject().ok_or_else(|| {
+            anyhow!(
+                "ScreenCaptureKit reports no capturable display. Audio-only capture still needs a \
+                 content filter and a filter needs a display, so there is nothing to attach to; \
+                 this is also what a denied screen-recording grant looks like"
+            )
+        })?;
+        let excluded: Retained<NSArray<SCWindow>> = NSArray::new();
+        let filter = SCContentFilter::initWithDisplay_excludingWindows(
+            SCContentFilter::alloc(),
+            &display,
+            &excluded,
+        );
+
+        let config = configuration();
+        let (prod, cons) = HeapRb::<f32>::new(RING_SAMPLES).split();
+        let ticks = Arc::new(AtomicU64::new(0));
+        let fail = Arc::new(FailSlot::default());
+        let output = StreamOutput::new(prod, Arc::clone(&ticks), Arc::clone(&fail));
+
+        let stream = SCStream::initWithFilter_configuration_delegate(
+            SCStream::alloc(),
+            &filter,
+            &config,
+            Some(ProtocolObject::from_ref(&*output)),
+        );
+        // Our own serial queue rather than an anonymous system one: it
+        // serialises the sample handler (which is what makes the producer's
+        // `&mut` sound) and it names the thread in a spindump.
+        let queue = DispatchQueue::new("com.audiohub.sysaudio.sck", DispatchQueueAttr::SERIAL);
+        stream
+            .addStreamOutput_type_sampleHandlerQueue_error(
+                ProtocolObject::from_ref(&*output),
+                SCStreamOutputType::Audio,
+                Some(&queue),
+            )
+            .map_err(|e| {
+                anyhow!(
+                    "ScreenCaptureKit refused the audio output: {}",
+                    e.localizedDescription()
+                )
+            })?;
+        // The screen output has to be registered too, even though every frame
+        // it produces is dropped on the floor by the sample handler's
+        // `kind != Audio` guard.
+        //
+        // Measured 2026-08-15 on macOS 26.5: an SCStream carrying ONLY an audio
+        // output starts without complaint, reports no error from
+        // `startCapture`, and then delivers nothing at all — the stall watchdog
+        // fired at 10s while `mac-catap` on the same machine, same second, same
+        // playing audio, read rms=0.019. Adding this line is the whole
+        // difference. Apple's own CaptureSample registers both types and OBS
+        // does the same; the framework treats the screen output as the thing
+        // that makes the stream run, and audio as a rider on it.
+        //
+        // That is also why `configuration()` shrinks the video side to 2x2 at
+        // 1 fps rather than switching it off: there is no switch, and this is
+        // the cheapest surface the framework will composite.
+        stream
+            .addStreamOutput_type_sampleHandlerQueue_error(
+                ProtocolObject::from_ref(&*output),
+                SCStreamOutputType::Screen,
+                Some(&queue),
+            )
+            .map_err(|e| {
+                anyhow!(
+                    "ScreenCaptureKit refused the screen output (audio does not flow without \
+                     it): {}",
+                    e.localizedDescription()
+                )
+            })?;
+
+        await_completion("startCapture", COMPLETION_TIMEOUT, |b| {
+            stream.startCaptureWithCompletionHandler(Some(b))
+        })
+        .map_err(|e| {
+            anyhow!(
+                "needs screen recording consent: {e}. Allow screen recording for this binary (or \
+                 the app that launched it) in System Settings > Privacy & Security, then retry"
+            )
+        })?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        // Unwound by hand: the stream is live from here on, so an early return
+        // has to stop it rather than leave it running with no reader.
+        let watcher = match watch(Arc::clone(&fail), Arc::clone(&stop), ticks) {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = await_completion("stopCapture", TEARDOWN_TIMEOUT, |b| {
+                    stream.stopCaptureWithCompletionHandler(Some(b))
+                });
+                let _ = stream.removeStreamOutput_type_error(
+                    ProtocolObject::from_ref(&*output),
+                    SCStreamOutputType::Audio,
+                );
+                let _ = stream.removeStreamOutput_type_error(
+                    ProtocolObject::from_ref(&*output),
+                    SCStreamOutputType::Screen,
+                );
+                return Err(e);
+            }
+        };
+        Ok(Box::new(SckCapture {
+            cons,
+            fail,
+            stop,
+            watcher: Some(watcher),
+            stream,
+            output,
+            _queue: queue,
+        }))
+    }
+
+    /// Audio-only, self-excluded, with the video pipeline shrunk to the
+    /// smallest thing ScreenCaptureKit accepts.
+    unsafe fn configuration() -> Retained<SCStreamConfiguration> {
+        let c = SCStreamConfiguration::new();
+        c.setCapturesAudio(true);
+        // The hard condition (plan §5): the daemon plays the peer's audio out
+        // of this very process, so a capture that cannot leave us out is a
+        // feedback loop. `sck_info` advertises `excludes_self: true` on the
+        // strength of this line.
+        c.setExcludesCurrentProcessAudio(true);
+        c.setSampleRate(SAMPLE_RATE as isize);
+        c.setChannelCount(CHANNELS);
+        // There is no way to switch the video side off, so it is made
+        // negligible instead: zero is rejected, and the 1920x1080 default would
+        // composite full-screen surfaces every frame that we then discard.
+        c.setWidth(2);
+        c.setHeight(2);
+        c.setMinimumFrameInterval(CMTime {
+            value: 1,
+            timescale: 1,
+            flags: CMTimeFlags::Valid,
+            epoch: 0,
+        });
+        c.setShowsCursor(false);
+        // Apple's documented floor; below 3 the framework drops buffers.
+        c.setQueueDepth(3);
+        c
+    }
+
+    /// Blocks on ScreenCaptureKit's shareable-content query.
+    ///
+    /// This is the call that raises the screen-recording prompt, so it exists
+    /// only on the `start` path and never on the listing path.
+    unsafe fn shareable_content() -> Result<Retained<SCShareableContent>> {
+        let (tx, rx) = mpsc::sync_channel::<std::result::Result<usize, String>>(1);
+        let block = RcBlock::new(
+            move |content: *mut SCShareableContent, err: *mut NSError| {
+                // `Retained<SCShareableContent>` is not `Send` — objc2 makes no
+                // such promise for imported classes — so ownership crosses the
+                // channel as a raw +1 pointer and is re-wrapped on the far
+                // side. The object itself has no thread affinity; only the
+                // wrapper's auto traits are (correctly) conservative.
+                let msg = match unsafe { Retained::retain(content) } {
+                    Some(c) => Ok(Retained::into_raw(c) as usize),
+                    None => Err(unsafe { err.as_ref() }
+                        .map(|e| e.localizedDescription().to_string())
+                        .unwrap_or_else(|| {
+                            "ScreenCaptureKit returned neither content nor an error".to_string()
+                        })),
+                };
+                let _ = tx.send(msg);
+            },
+        );
+        SCShareableContent::getShareableContentWithCompletionHandler(&block);
+        match rx.recv_timeout(COMPLETION_TIMEOUT) {
+            Ok(Ok(addr)) => Retained::from_raw(addr as *mut SCShareableContent)
+                .ok_or_else(|| anyhow!("ScreenCaptureKit handed back a null content object")),
+            Ok(Err(msg)) => bail!(
+                "needs screen recording consent: ScreenCaptureKit refused to enumerate shareable \
+                 content ({msg}). Allow screen recording for this binary (or the app that \
+                 launched it) in System Settings > Privacy & Security, then retry"
+            ),
+            // A prompt nobody answered looks exactly like this from here.
+            Err(_) => bail!(
+                "ScreenCaptureKit did not answer the shareable-content query within {}s; an \
+                 unanswered screen-recording consent prompt is the usual cause",
+                COMPLETION_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
+    /// Runs one of ScreenCaptureKit's completion-handler entry points and waits
+    /// for it.
+    ///
+    /// The `RcBlock` is dropped as soon as this returns, which is safe even on
+    /// the timeout path: the framework copies (and so retains) the block, and a
+    /// send onto a dropped receiver is an ignored error rather than a write
+    /// into freed memory.
+    fn await_completion(
+        what: &str,
+        timeout: Duration,
+        call: impl FnOnce(&DynBlock<dyn Fn(*mut NSError)>),
+    ) -> Result<()> {
+        let (tx, rx) = mpsc::sync_channel::<Option<String>>(1);
+        let block = RcBlock::new(move |err: *mut NSError| {
+            let msg = unsafe { err.as_ref() }.map(|e| e.localizedDescription().to_string());
+            let _ = tx.send(msg);
+        });
+        call(&block);
+        match rx.recv_timeout(timeout) {
+            Ok(None) => Ok(()),
+            Ok(Some(msg)) => bail!("ScreenCaptureKit {what} failed: {msg}"),
+            Err(_) => bail!(
+                "ScreenCaptureKit {what} did not complete within {}s",
+                timeout.as_secs()
+            ),
+        }
+    }
+
+    /// Watches for the stream going quiet without saying so. The delegate
+    /// reports a stream that stops with an error; this catches the one that
+    /// simply stops delivering, which is otherwise indistinguishable from a
+    /// silent desktop.
+    fn watch(
+        fail: Arc<FailSlot>,
+        stop: Arc<AtomicBool>,
+        ticks: Arc<AtomicU64>,
+    ) -> Result<JoinHandle<()>> {
+        Ok(std::thread::Builder::new()
+            .name("audiohub-sck".into())
+            .spawn(move || {
+                let mut last = ticks.load(Ordering::Relaxed);
+                let mut since = Instant::now();
+                while !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let now = ticks.load(Ordering::Relaxed);
+                    if now != last {
+                        last = now;
+                        since = Instant::now();
+                    } else if since.elapsed() >= STALL {
+                        // Both causes are named because this thread cannot tell
+                        // them apart, and guessing one would send whoever reads
+                        // it to the wrong place.
+                        fail.fail(
+                            "no system audio came out of the ScreenCaptureKit stream for 10s: \
+                             either it stopped delivering sample buffers, or its buffers could \
+                             not be read"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                }
+            })?)
+    }
+}
+
 // The downmix rule is platform-independent arithmetic, so it is testable on the
 // mac dev host even though only the Windows capture uses it. Masks are the
 // KSAUDIO_SPEAKER_* layouts from ksmedia.h.
 #[cfg(test)]
 mod tests {
-    use super::downmix::{front_pair, front_pair_mono, front_pair_mono_into, mask_channel_index};
+    use super::downmix::{
+        front_pair, front_pair_mono, front_pair_mono_into, mask_channel_index,
+        planar_front_pair_mono_into,
+    };
 
     const STEREO: u32 = 0x3; // FL|FR
     const QUAD: u32 = 0x33; // FL|FR|BL|BR
@@ -2399,6 +3160,98 @@ mod tests {
         front_pair_mono(&[1.0, 1.0], 0, (0, 1), &mut out);
         assert_eq!(out, vec![1.0]);
     }
+
+    // ------------------------------------------- the non-interleaved form
+    //
+    // ScreenCaptureKit (mac-sck) delivers one mono buffer per channel rather
+    // than one interleaved buffer, so it downmixes through
+    // `planar_front_pair_mono_into`. These run everywhere: the arithmetic is
+    // host-independent, and pinning it here is what stops the two macOS
+    // backends from disagreeing about what "mono" means.
+
+    #[test]
+    fn planar_downmix_averages_the_front_pair() {
+        let left = [1.0f32, 0.0, -1.0, 0.5];
+        let right = [0.0f32, 0.0, 1.0, 0.5];
+        let mut out = [0f32; 4];
+        let n = planar_front_pair_mono_into(&[&left, &right], &mut out);
+        assert_eq!(n, 4);
+        assert_eq!(out, [0.5, 0.0, 0.0, 0.5]);
+    }
+
+    /// A lone plane is a passthrough, not a halved signal — the same rule
+    /// `front_pair(mask, 1) == (0, 0)` gives the interleaved form.
+    #[test]
+    fn planar_downmix_passes_a_single_plane_through() {
+        let mono = [0.5f32, -0.25, 1.0];
+        let mut out = [0f32; 3];
+        assert_eq!(planar_front_pair_mono_into(&[&mono], &mut out), 3);
+        assert_eq!(out, [0.5, -0.25, 1.0]);
+    }
+
+    /// The regression the interleaved form already guards, in the layout
+    /// mac-sck actually sees: extra planes must be DISCARDED, not averaged in.
+    /// Averaging all six would report 0.2 for content that is 0.6.
+    #[test]
+    fn planar_downmix_ignores_channels_past_the_front_pair() {
+        let (l, r) = ([0.8f32; 3], [0.4f32; 3]);
+        let quiet = [0.0f32; 3];
+        let mut out = [0f32; 3];
+        let n = planar_front_pair_mono_into(&[&l, &r, &quiet, &quiet, &quiet, &quiet], &mut out);
+        assert_eq!(n, 3);
+        assert_eq!(out, [0.6, 0.6, 0.6]);
+    }
+
+    /// Ragged planes and a short `out` both truncate rather than read or write
+    /// out of bounds: this runs inside a stream callback where either would be
+    /// memory corruption, not a dropped sample.
+    #[test]
+    fn planar_downmix_is_bounded_by_the_shortest_plane_and_the_output() {
+        let long = [1.0f32; 8];
+        let short = [1.0f32; 3];
+        let mut out = [0f32; 8];
+        assert_eq!(planar_front_pair_mono_into(&[&long, &short], &mut out), 3);
+
+        let mut tiny = [0f32; 2];
+        assert_eq!(planar_front_pair_mono_into(&[&long, &long], &mut tiny), 2);
+        assert_eq!(tiny, [1.0, 1.0]);
+    }
+
+    #[test]
+    fn planar_downmix_handles_no_planes_and_empty_planes() {
+        let mut out = [0f32; 4];
+        assert_eq!(planar_front_pair_mono_into(&[], &mut out), 0);
+        let empty: [f32; 0] = [];
+        assert_eq!(planar_front_pair_mono_into(&[&empty], &mut out), 0);
+        assert_eq!(planar_front_pair_mono_into(&[&empty, &empty], &mut out), 0);
+        assert_eq!(out, [0.0; 4]);
+    }
+
+    /// The callback chunks through a fixed stack scratch, so chunking must give
+    /// bit-identical output to one pass — the same property
+    /// `slice_downmix_matches_the_vec_form_and_chunks_cleanly` pins for the
+    /// interleaved path.
+    #[test]
+    fn planar_downmix_chunks_cleanly() {
+        let left: Vec<f32> = (0..16).map(|i| i as f32 * 0.01).collect();
+        let right: Vec<f32> = (0..16).map(|i| i as f32 * -0.02).collect();
+        let mut want = [0f32; 16];
+        assert_eq!(planar_front_pair_mono_into(&[&left, &right], &mut want), 16);
+
+        let mut got = Vec::new();
+        let mut scratch = [0f32; 5]; // deliberately not a divisor of 16
+        let mut off = 0;
+        while off < want.len() {
+            let take = (want.len() - off).min(scratch.len());
+            let n = planar_front_pair_mono_into(
+                &[&left[off..off + take], &right[off..off + take]],
+                &mut scratch[..take],
+            );
+            got.extend_from_slice(&scratch[..n]);
+            off += take;
+        }
+        assert_eq!(got, want.to_vec());
+    }
 }
 
 #[cfg(test)]
@@ -2417,10 +3270,38 @@ mod mute_precondition_tests {
             "plan §7.1: win 设备 loopback 受主音量影响（post-mix）——静音会连镜像一起静掉"
         );
         assert_eq!(capture_survives_local_mute(BACKEND_MAC_CATAP), Some(true));
+        // Since 2026-08-15 mac-sck is implemented and shares CATap's row: it
+        // composes audio per-process (which is what makes
+        // `excludesCurrentProcessAudio` possible), so it reads the same side of
+        // the output mixer. Like every value in that table this is plan §7.1's
+        // expectation, not a measurement.
+        assert_eq!(capture_survives_local_mute(BACKEND_MAC_SCK), Some(true));
         assert_eq!(
             capture_survives_local_mute(BACKEND_WIN_PROC_EXCLUDE),
             None,
             "plan §7.1: win 进程排除环回**待实测**——不许假装已知"
+        );
+    }
+
+    /// Nothing ships `declined` since the SCK ruling was revoked on 2026-08-15.
+    ///
+    /// Split out from the invariant below on purpose. That one is now vacuously
+    /// true, and a vacuous assertion that LOOKS like coverage is worse than
+    /// none — so the fact that makes it vacuous is asserted here in its own
+    /// right, where flipping a backend back to declined turns it red and sends
+    /// the reader to the invariant next door.
+    #[test]
+    fn no_backend_ships_declined() {
+        let declined: Vec<String> = list_backends()
+            .into_iter()
+            .filter(|b| b.declined)
+            .map(|b| b.id)
+            .collect();
+        assert!(
+            declined.is_empty(),
+            "backend(s) {declined:?} ship declined. That is allowed, but it means \
+             `a_declined_backend_states_no_mute_expectation` is no longer vacuous and \
+             docs/plan.md §6.1 has to say which backend was ruled out and why"
         );
     }
 
@@ -2429,23 +3310,16 @@ mod mute_precondition_tests {
     /// capture running through it — `None` is the only honest answer, and it
     /// is what falling off the end of the match gives.
     ///
-    /// Derived from `list_backends()` instead of naming `mac-sck`, so a
-    /// backend declined later is covered without anyone remembering to come
-    /// back here. `start_backend` already refuses declined ids, so a row here
-    /// is unreachable as well as untrue — but unreachable code that states a
+    /// Derived from `list_backends()` instead of naming a backend, so one
+    /// declined later is covered without anyone remembering to come back here.
+    /// `start_backend` already refuses declined ids, so a row here would be
+    /// unreachable as well as untrue — but unreachable code that states a
     /// falsehood is exactly what gets read as fact by the next person.
     ///
-    /// Injection check: restoring `BACKEND_MAC_SCK` to the `Some(true)` arm
-    /// turns this RED (`Some(true) != None` for 'mac-sck').
+    /// Currently vacuous by construction; see `no_backend_ships_declined`.
     #[test]
     fn a_declined_backend_states_no_mute_expectation() {
-        let declined: Vec<_> = list_backends().into_iter().filter(|b| b.declined).collect();
-        assert!(
-            !declined.is_empty(),
-            "this test is vacuous with no declined backend; mac-sck is declined on \
-             every platform (`sck_info`), so an empty list means the invariant moved"
-        );
-        for b in declined {
+        for b in list_backends().into_iter().filter(|b| b.declined) {
             assert_eq!(
                 capture_survives_local_mute(&b.id),
                 None,
@@ -2634,6 +3508,183 @@ mod mute_precondition_tests {
         }
     }
 
+    // ------------------------------------------------- mac-sck (plan §6.1)
+    //
+    // The 2026-08-09 ruling against ScreenCaptureKit was overridden by the
+    // project owner on 2026-08-15 and the backend is implemented (`mod sck`).
+    // Three separate things have to hold for that to be true rather than
+    // half-done, and each gets its own test: the row is offered and not
+    // declined; `auto` still resolves to mac-catap; and the UI copy stopped
+    // saying the feature does not exist.
+
+    #[test]
+    fn sck_is_offered_as_a_real_backend() {
+        let sck = resolve_backend(BACKEND_MAC_SCK).expect("mac-sck must always be listed");
+        assert!(
+            !sck.declined,
+            "the 2026-08-09 ruling was revoked on 2026-08-15; `declined` here would put the \
+             backend behind a grey-out nobody can lift while the implementation ships dead"
+        );
+        assert!(
+            sck.excludes_self,
+            "the stream is built with excludesCurrentProcessAudio and `sck::start` refuses to \
+             run without it; engine.rs keys its feedback-loop warning off this bit"
+        );
+    }
+
+    /// `auto` must not start asking every macOS 14.2+ user for the screen
+    /// recording grant. The ONLY thing preventing that is mac-catap's position
+    /// in `list_backends()`, so the order is asserted directly — and then the
+    /// consequence is asserted through the real rule.
+    ///
+    /// Injection check: swapping the two rows in `list_backends()` turns both
+    /// halves of this RED.
+    #[test]
+    fn catap_outranks_sck_so_auto_keeps_the_narrower_permission() {
+        let ids: Vec<String> = list_backends().into_iter().map(|b| b.id).collect();
+        let catap = ids.iter().position(|i| i == BACKEND_MAC_CATAP);
+        let sck = ids.iter().position(|i| i == BACKEND_MAC_SCK);
+        assert!(
+            matches!((catap, sck), (Some(c), Some(s)) if c < s),
+            "mac-catap must precede mac-sck in {ids:?}: on macOS 14.2+ both are available, and \
+             this order is the whole of what keeps `auto` on the system-audio-recording grant \
+             instead of the screen-recording one (plan §6.1)"
+        );
+
+        // A macOS 14.2+ host, spelled as an inventory so the assertion holds on
+        // the Windows build too.
+        let mut host = list_backends();
+        for b in host.iter_mut() {
+            b.available = matches!(b.id.as_str(), BACKEND_MAC_CATAP | BACKEND_MAC_SCK);
+        }
+        assert_eq!(
+            explain_auto(&host).picked.as_deref(),
+            Some(BACKEND_MAC_CATAP),
+            "auto must still resolve to mac-catap wherever both mac backends are available"
+        );
+    }
+
+    /// The point of building it: macOS 13.0–14.1, where mac-catap does not
+    /// exist yet. Before 2026-08-15 this fell through to nothing at all.
+    #[test]
+    fn auto_falls_through_to_sck_where_catap_is_too_old() {
+        let mut host = list_backends();
+        for b in host.iter_mut() {
+            b.available = b.id == BACKEND_MAC_SCK;
+        }
+        let choice = explain_auto(&host);
+        assert_eq!(choice.picked.as_deref(), Some(BACKEND_MAC_SCK));
+        assert_eq!(
+            auto_fallback_chain(&host),
+            vec![BACKEND_MAC_SCK.to_string()]
+        );
+    }
+
+    /// The note is the only text a user is ever shown about this row. While the
+    /// backend was declined it had to read as a decision ("not offered", "not
+    /// planned"); now that it exists, those same words would send a user off to
+    /// look for a feature that is sitting right in front of them.
+    #[test]
+    fn the_sck_note_no_longer_claims_the_backend_is_refused_by_policy() {
+        let note = resolve_backend(BACKEND_MAC_SCK).unwrap().note;
+        assert!(!note.trim().is_empty(), "the UI would have nothing to show");
+        let low = note.to_lowercase();
+        for phrase in [
+            "not offered",
+            "not planned",
+            "declined",
+            "ruled out",
+            "will not",
+            "won't",
+            "no plan",
+            "not implemented",
+        ] {
+            assert!(
+                !low.contains(phrase),
+                "mac-sck's note still reads like a refusal ({phrase:?}): {note:?}"
+            );
+        }
+    }
+
+    /// ...and on macOS it has to say the one thing that actually distinguishes
+    /// it from the default backend, because that is the whole reason a user
+    /// would be choosing between the two.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_sck_note_names_the_permission_it_costs_or_the_version_it_needs() {
+        let sck = resolve_backend(BACKEND_MAC_SCK).unwrap();
+        let low = sck.note.to_lowercase();
+        if sck.available {
+            assert!(
+                low.contains("screen recording"),
+                "an available mac-sck must name the broader grant it asks for: {:?}",
+                sck.note
+            );
+            assert!(
+                low.contains("mac-catap"),
+                "...and point at the backend that asks for less: {:?}",
+                sck.note
+            );
+        } else {
+            assert!(
+                low.contains("13.0"),
+                "an unavailable mac-sck must name the OS floor: {:?}",
+                sck.note
+            );
+        }
+    }
+
+    // ---- the availability predicate
+    //
+    // Pure, so the interesting versions can be asserted from any host. The
+    // boundary matters: ScreenCaptureKit itself dates from macOS 12.3, but its
+    // audio capture does not, so a class lookup alone would advertise a backend
+    // that cannot produce a single sample.
+
+    #[test]
+    fn sck_needs_both_the_class_and_the_os() {
+        assert!(!sck_available(false, (26, 5, 2)), "class missing");
+        assert!(!sck_available(false, (13, 0, 0)), "class missing");
+        assert!(sck_available(true, (13, 0, 0)), "the floor is inclusive");
+        assert!(sck_available(true, (26, 5, 2)));
+    }
+
+    #[test]
+    fn sck_is_unavailable_below_the_audio_capture_floor() {
+        // 12.3 has the framework and no audio capture — the case a bare class
+        // lookup would get wrong.
+        assert!(!sck_available(true, (12, 3, 0)));
+        assert!(!sck_available(true, (12, 99, 99)));
+        assert!(!sck_available(true, (11, 0, 0)));
+        assert!(!sck_available(true, (0, 0, 0)));
+    }
+
+    /// The version compare is on (major, minor) and must not be lexicographic
+    /// on the string or truncated to the major: 13.0 passes, 12.x never does,
+    /// and every later major passes regardless of its minor.
+    #[test]
+    fn sck_version_compare_is_ordered_not_textual() {
+        assert!(!sck_available(true, (12, 0, 0)));
+        assert!(sck_available(true, (13, 1, 0)));
+        assert!(sck_available(true, (14, 0, 0)));
+        // 9 > 1 textually, 9 < 13 numerically. The rule must use the number.
+        assert!(!sck_available(true, (9, 0, 0)));
+        assert!(sck_available(true, (100, 0, 0)));
+    }
+
+    /// Availability must never be a function of consent: TCC has no preflight,
+    /// so the only way to learn it is to start a stream, and starting a stream
+    /// is the prompt. `list_backends()` must therefore be callable freely.
+    /// This test would hang or prompt if that discipline broke.
+    #[test]
+    fn listing_backends_is_free_of_side_effects() {
+        for _ in 0..64 {
+            let all = list_backends();
+            assert_eq!(all.len(), 4);
+            let _ = explain_auto(&all);
+        }
+    }
+
     /// Drift guard: `resolve_backend(auto)` and `explain_auto` must stay one
     /// rule. The probe reports the latter and the daemon runs the former, so a
     /// split here would make the probe's report confidently wrong.
@@ -2653,5 +3704,41 @@ mod mute_precondition_tests {
             resolve_backend("").map(|b| b.id).ok(),
             resolve_backend(BACKEND_AUTO).map(|b| b.id).ok()
         );
+    }
+}
+
+/// Guards for the ScreenCaptureKit buffer-extraction contract that cost a live
+/// debugging round on 2026-08-15.
+///
+/// The failure was silent in the worst way: the stream started, reported no
+/// error, delivered audio callbacks at the right cadence, and produced pure
+/// digital silence — while `mac-catap` on the same machine in the same second
+/// read rms=0.019. Only the stall watchdog (which counts EXTRACTED frames, not
+/// entered callbacks) surfaced it at all.
+#[cfg(all(test, target_os = "macos"))]
+mod sck_buffer_contract {
+    use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
+    use std::mem::size_of;
+
+    /// The size CoreMedia asks for is the size of the list it intends to FILL,
+    /// and it must be passed back verbatim — handing it a larger buffer is
+    /// rejected with `kCMSampleBufferError_ArrayTooSmall` (-12737).
+    ///
+    /// Measured: `needed = 40`, `have = 136`, status −12737. Passing `needed`
+    /// instead of `size_of::<BufferListN>()` is the entire fix, which is why
+    /// the arithmetic behind that 40 is pinned here: if a future
+    /// `objc2-core-audio-types` changed either struct's layout, the two-call
+    /// pattern would still work but this number would move, and a reader
+    /// chasing the same bug deserves to find the real one.
+    #[test]
+    fn two_planar_buffers_is_forty_bytes_of_audio_buffer_list() {
+        let two_planes = size_of::<AudioBufferList>() + size_of::<AudioBuffer>();
+        assert_eq!(
+            two_planes, 40,
+            "AudioBufferList + one extra AudioBuffer should be 40 bytes; \
+             CoreMedia asked for exactly this for ScreenCaptureKit's stereo \
+             planar delivery"
+        );
+        assert_eq!(size_of::<AudioBuffer>(), 16);
     }
 }

@@ -25,6 +25,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSArray",
     "NSDictionary",
+    # mac-sck: every ScreenCaptureKit completion handler hands back an NSError.
+    "NSError",
     "NSObject",
     "NSProcessInfo",
     "NSString",
@@ -45,3 +47,35 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
     "std",
     "CFDictionary",
 ] }
+
+# mac-sck (plan §6.1; the 2026-08-09 ruling against this backend was overridden
+# by the project owner on 2026-08-15). Unlike the block above, these ARE new
+# crates in the graph — ScreenCaptureKit's audio path has no CoreAudio-only
+# spelling. Same discipline as the rest of the file: default-features off, only
+# the umbrella modules the code actually names.
+#
+# `dispatch2` is NOT new: it is already in the lock via cpal, and it is named
+# here because addStreamOutput:type:sampleHandlerQueue:error: is cfg-gated on it
+# and the audio callbacks are put on a queue we create rather than an anonymous
+# system one.
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "SCShareableContent",
+    "SCStream",
+    "block2",
+    "dispatch2",
+    "objc2-core-media",
+] }
+objc2-core-media = { version = "0.3", default-features = false, features = [
+    "std",
+    "CMBlockBuffer",
+    "CMSampleBuffer",
+    "CMSync",
+    "CMTime",
+    "objc2",
+    "objc2-core-audio-types",
+] }
+dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
+# Both SCStream lifecycle calls and the shareable-content query take completion
+# handlers; none of the three has a block-free spelling.
+block2 = { version = "0.6", default-features = false, features = ["std"] }

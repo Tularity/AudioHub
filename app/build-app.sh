@@ -74,6 +74,21 @@ TRIPLE="$(rustc -vV | awk '/^host: /{print $2}')"
 # licenses, unpinned cargo-about versions, and accidental local path leakage.
 step "license inventory (locked Cargo graphs)"
 command -v node >/dev/null 2>&1 || die "node not found — required to generate third-party notices"
+# cargo-about runs cargo `--frozen`, so every crate in the graph has to be in
+# the local registry ALREADY: on a cold one it fails with "attempting to make an
+# HTTP request, but --frozen was specified", which reads like a network problem
+# and is not one. A development machine never sees this because its registry is
+# warm from the last build; a fresh checkout does. (The Windows installer script
+# has done this since it was written — this is the same fetch, mirrored.)
+#
+# Both manifests, and deliberately not target-qualified: cargo-about resolves
+# the union of every target's graph, so a target-filtered fetch would leave out
+# crates like alsa that no macOS artifact ever compiles but the report still
+# has to account for.
+cargo fetch --locked --manifest-path "$ROOT/Cargo.toml" \
+  || die "could not fetch the locked dependency graph"
+cargo fetch --locked --manifest-path "$TAURI_DIR/Cargo.toml" \
+  || die "could not fetch the App's locked dependency graph"
 node "$ROOT/scripts/generate-third-party-licenses.mjs"
 [[ -s "$ROOT/THIRD-PARTY-LICENSES.html" ]] \
   || die "third-party license report was not generated"

@@ -1,0 +1,25 @@
+# No end-of-line conversion, anywhere.
+#
+# Git on Windows defaults to core.autocrlf=true and rewrites LF to CRLF on
+# checkout. That is invisible until something hashes a file, and this
+# repository hashes several:
+#
+#   * about.toml pins a SHA-256 of LICENSE for every first-party crate's
+#     clarification. Converted to CRLF the file hashes
+#     1eb85fc97224598dad1852b5d6483bbcf0aa8608790dcc657a5a2a761ae9c8c6
+#     instead of c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4,
+#     cargo-about rejects the clarification, and the build dies with
+#     "no `license` specified, and no license files were found" — a message
+#     that says nothing about line endings. This cost a CI run on 2026-08-15.
+#   * The macOS installer verifies a compiled-in SHA-256 of the script it
+#     elevates (service.rs), and install-daemon.sh hashes the daemon it stages.
+#
+# `-text` on everything is deliberately blunt: an allowlist would have to be
+# extended every time a new hashed file appears, and the failure mode of
+# forgetting is a corrupted artifact rather than a compile error. Nothing here
+# needs CRLF — PowerShell reads LF scripts, and the NSIS sources are ASCII.
+#
+# Note this only governs what git writes to the working tree. Existing clones
+# keep whatever they already have until a file changes; a fresh checkout (which
+# is what CI does every time) gets byte-exact content immediately.
+* -text

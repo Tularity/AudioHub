@@ -533,21 +533,24 @@ foreach ($Required in @('quiet-uninstall.ps1')) {
     }
 }
 
-# Development and Release artifacts must never share a final filename: an
-# unsigned local build must not silently replace a release installer in the
-# handoff directory (or vice versa). Remove the opposite-mode artifact and give
-# Development an unmistakable suffix; Release retains the normal product name.
+# Development and Release artifacts share a final filename.
+#
+# They used to not: an unsigned build got a `-dev` suffix so it could never
+# silently take the place of a signed one in a handoff directory. That
+# separation was dropped on 2026-08-16 — every artifact this project ships is
+# unsigned today, so the suffix only ever appeared, and the released names had
+# to be corrected by hand.
+#
+# ⚠ The hazard it guarded is real and comes back the day a signed build exists:
+# from then on a local unsigned build and a release installer are the same
+# filename, and the only thing telling them apart is the signature itself. If
+# signing identities ever land, restore the distinction here — by directory or
+# by suffix — before the first signed artifact is produced.
+# Any `-dev` artifact left by an older build is removed so the handoff
+# directory cannot serve a stale one under the old name.
 $BaseInstallerName = $Installer.Name
-if ($ReleaseSigning) {
-    $DevelopmentName = [IO.Path]::GetFileNameWithoutExtension($BaseInstallerName) + '-dev.exe'
-    Remove-Item -LiteralPath (Join-Path $NsisDir $DevelopmentName) -Force -ErrorAction SilentlyContinue
-} else {
-    $DevelopmentName = [IO.Path]::GetFileNameWithoutExtension($BaseInstallerName) + '-dev.exe'
-    $DevelopmentPath = Join-Path $NsisDir $DevelopmentName
-    Remove-Item -LiteralPath $DevelopmentPath -Force -ErrorAction SilentlyContinue
-    Move-Item -LiteralPath $Installer.FullName -Destination $DevelopmentPath
-    $Installer = Get-Item -LiteralPath $DevelopmentPath
-}
+$LegacyDevName = [IO.Path]::GetFileNameWithoutExtension($BaseInstallerName) + '-dev.exe'
+Remove-Item -LiteralPath (Join-Path $NsisDir $LegacyDevName) -Force -ErrorAction SilentlyContinue
 
 Step 'verify staged payload and installer'
 foreach ($Path in @(

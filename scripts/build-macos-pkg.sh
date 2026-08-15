@@ -81,11 +81,21 @@ APP_PKG="$WORK/AudioHubApp.pkg"
 DIST="$WORK/Distribution.xml"
 PAYLOAD_ROOT="$WORK/root"
 COMPONENTS="$ROOT/app/installer/macos/app-components.plist"
-if [[ "${AUDIOHUB_RELEASE:-0}" == 1 ]]; then
-  FINAL="$OUT_DIR/AudioHub-${VERSION}.pkg"
-else
-  FINAL="$OUT_DIR/AudioHub-${VERSION}-dev.pkg"
-fi
+# Development and Release artifacts share a final filename.
+#
+# They used to not: an unsigned build got a `-dev` suffix so it could never
+# silently take the place of a signed one in a handoff directory. That
+# separation was dropped on 2026-08-16 — every artifact this project ships is
+# unsigned today, so the suffix only ever appeared, and the released names had
+# to be corrected by hand.
+#
+# ⚠ The hazard it guarded is real and comes back the day a signed build exists:
+# from then on a local unsigned build and a release installer are the same
+# filename, and the only thing telling them apart is the signature itself. If
+# signing identities ever land, restore the distinction here — by directory or
+# by suffix — before the first signed artifact is produced.
+FINAL="$OUT_DIR/AudioHub-${VERSION}.pkg"
+rm -f "$OUT_DIR/AudioHub-${VERSION}-dev.pkg"
 [[ ! -L "$FINAL" && ( ! -e "$FINAL" || -f "$FINAL" ) ]] \
   || { print -u2 -- "refusing a non-regular final package path: $FINAL"; exit 1; }
 CANDIDATE="$WORK/${FINAL:t}"

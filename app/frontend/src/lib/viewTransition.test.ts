@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { navMotion, shouldAnimateNav } from './viewTransition';
+import { isReselection, navMotion, shouldAnimateNav } from './viewTransition';
 
 describe('navDirection follows the nav pill left to right', () => {
   // The pill renders 主面板 | 共享协议 | 统计诊断 | 设置. Clicking a tab to the
@@ -72,5 +72,32 @@ describe('shouldAnimateNav', () => {
 
   it('animates when supported, motion is allowed and nothing is running', () => {
     expect(shouldAnimateNav(true, false, false)).toBe(true);
+  });
+});
+
+describe('isReselection tells a refresh from a page change', () => {
+  const peers = { view: 'peers', peerFp: null };
+
+  it('calls the same page a re-selection', () => {
+    expect(isReselection(peers, { view: 'peers', peerFp: null })).toBe(true);
+  });
+
+  it('calls a different page a navigation', () => {
+    expect(isReselection(peers, { view: 'stats', peerFp: null })).toBe(false);
+  });
+
+  // Two peers are two pages even though both are `detail`, so moving between
+  // them keeps its slide.
+  it('separates two peers inside detail', () => {
+    const a = { view: 'detail', peerFp: 'aa' };
+    expect(isReselection(a, { view: 'detail', peerFp: 'bb' })).toBe(false);
+    expect(isReselection(a, { view: 'detail', peerFp: 'aa' })).toBe(true);
+  });
+
+  // The case that motivated it: `navMotion` scores v -> v as a forward move, so
+  // without the guard the active tab animated on every press.
+  it('guards exactly the case navMotion would have animated', () => {
+    expect(navMotion('stats', 'stats')).toEqual({ dx: 1, dy: 0 });
+    expect(isReselection({ view: 'stats', peerFp: null }, { view: 'stats', peerFp: null })).toBe(true);
   });
 });

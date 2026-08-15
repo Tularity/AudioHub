@@ -77,6 +77,62 @@ export function originPercent(rect: Rect, p: Point): { ox: number; oy: number } 
   };
 }
 
+/** The bits of `HTMLElement` {@link layoutRect} needs, so it can be tested. */
+export interface LayoutBox {
+  offsetLeft: number;
+  offsetTop: number;
+  offsetWidth: number;
+  offsetHeight: number;
+  offsetParent: { getBoundingClientRect(): Rect; clientLeft: number; clientTop: number } | null;
+}
+
+/**
+ * The element's LAYOUT box in viewport coordinates — what it would occupy with
+ * no transform on it.
+ *
+ * ⚠ Do NOT use `getBoundingClientRect()` for this. It reports the *transformed*
+ * box, and `.sheet-card` carries `animation: sheetGrow … backwards` whose `from`
+ * keyframe is `scale(.72)`. `backwards` puts that scale in force during the
+ * animation's delay — from the moment the element exists — and both engines
+ * have resolved it by the first forced layout. Measured in Chromium on
+ * 2026-08-15: the layout effect saw a 403.2px-wide box for a card whose layout
+ * width is 560, i.e. exactly .72.
+ *
+ * Feeding that box to {@link originPercent} yields `(ox_true - 14) / .72`. The
+ * centre maps to itself — which is why a dialog opened from mid-screen looked
+ * right and hid this for months — but every other point is pushed about 1.39×
+ * further out. For the「Add peer」button in a 1000px window the origin landed at
+ * 1078px: 162px past the button and outside the window. On close the card then
+ * shrank toward a point it could never reach and was still half size as it swept
+ * over the button, which is the symptom the user reported (2026-08-15).
+ *
+ * The `offset*` family is used because it is the only geometry the layout
+ * engine exposes that transforms cannot touch, and reading it mutates nothing.
+ * The obvious alternative — blank `animation-name`, measure, put it back — also
+ * works, but only before the first paint: restoring the property restarts the
+ * animation, so it cannot be used to re-measure a card that is already on
+ * screen, which is exactly what closing has to do.
+ *
+ * `offsetLeft` is measured from the offset parent's PADDING edge while
+ * `getBoundingClientRect()` returns its BORDER box, so the parent's border
+ * (`clientLeft`/`clientTop`) closes the gap. It is zero for today's
+ * `.sheet-scrim`; it is here so a border added later cannot silently skew the
+ * origin by its width.
+ */
+export function layoutRect(el: LayoutBox): Rect {
+  const parent = el.offsetParent;
+  const base = parent
+    ? { left: parent.getBoundingClientRect().left + parent.clientLeft,
+        top: parent.getBoundingClientRect().top + parent.clientTop }
+    : { left: 0, top: 0 };
+  return {
+    left: base.left + el.offsetLeft,
+    top: base.top + el.offsetTop,
+    width: el.offsetWidth,
+    height: el.offsetHeight,
+  };
+}
+
 interface OriginTarget {
   addEventListener(type: string, handler: (e: PointerEvent) => void, options?: unknown): void;
   removeEventListener(type: string, handler: (e: PointerEvent) => void, options?: unknown): void;

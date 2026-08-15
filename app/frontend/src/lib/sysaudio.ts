@@ -93,10 +93,13 @@ const BACKENDS: BackendMeta[] = [
     mac: true,
     labelKey: 'sysaudio.backend.macSck.label',
     noteKey: 'sysaudio.backend.macSck.note',
-    // 2026-08-09 裁定不做（plan §6 / §11.2）：ScreenCaptureKit 的音频要「屏幕录制」
-    // 权限，而它比 mac-catap 多覆盖的只有 macOS 13.0–14.1。留在清单里是为了让这个
-    // 裁定看得见——而不是让它变成一个能选、选了永远开不起来的格子。
-    declined: true,
+    // 2026-08-09 的「不做」裁定已由项目所有者于 2026-08-15 推翻，后端已实现
+    // （core `sysaudio.rs` 的 `mod sck`），所以这里**没有** `declined`。
+    //
+    // 下面第 126 行那条「daemon 说了算」的回落早就预见了这一天：真正的事实源是
+    // daemon 上报的 `declined`，目录只是它没上报时的兜底。但 `note` 不走那条路
+    // （见 :136），它恒取自本目录——于是裁定被推翻后，界面一度把这个后端列为可选，
+    // 说明文字却还写着「本项目不提供」。两处必须一起改，这就是那一次。
   },
 ];
 

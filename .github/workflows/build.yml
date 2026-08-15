@@ -333,11 +333,16 @@ jobs:
         run: |
           set -euo pipefail
           ls -l dist
-          # A tag per run, not per version: `version` in tauri.conf.json only
-          # moves on a deliberate bump, and two releases cannot share a tag.
-          # The run number keeps them ordered and unique without pretending a
-          # rebuild is a new version.
-          echo "tag=v${{ needs.gate.outputs.version }}-ci.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          # The version, plainly: `v1.0.0`. This used to carry a `-ci.<run>`
+          # suffix so that a rebuild could never collide with an existing tag,
+          # which was right while every run was a throwaway. It is wrong for a
+          # release people are meant to link to.
+          #
+          # The collision it was avoiding is now a feature: publishing the same
+          # version twice SHOULD fail, because the second one would silently
+          # replace assets other people already downloaded and checksummed.
+          # Releasing again means bumping `version` in tauri.conf.json first.
+          echo "tag=v${{ needs.gate.outputs.version }}" >> "$GITHUB_OUTPUT"
           # First line only: release titles are one line, and the marker is noise.
           subject=$(printf '%s' "$MSG" | head -1 | sed 's/\[release\]//g' | xargs || true)
           [ -n "$subject" ] || subject="build ${{ github.run_number }}"
@@ -347,16 +352,29 @@ jobs:
           # so the table lists itself — with the checksum of an empty file.
           notes=$(mktemp)
           {
-            echo "| file | bytes | sha256 |"
-            echo "| --- | ---: | --- |"
+            # The signing state goes FIRST. It is the one thing every reader has
+            # to know before clicking a download: both operating systems refuse
+            # these files on first launch, and a user who meets that without
+            # warning reads it as "the release is broken" rather than "this is
+            # what an unsigned build looks like".
+            echo '> **These builds are not signed for distribution.**'
+            echo '> The disk image is ad-hoc signed and not notarised, so Gatekeeper'
+            echo '> refuses it; the Windows installer is unsigned and carries an'
+            echo '> unsigned driver, so SmartScreen blocks it. Getting past either is'
+            echo '> a security decision you are making yourself —'
+            echo '> [Installation](https://github.com/Tularity/AudioHub/wiki/Installation)'
+            echo '> walks through it per platform.'
+            echo
+            echo '| file | bytes | sha256 |'
+            echo '| --- | ---: | --- |'
             for f in dist/*; do
               [ -f "$f" ] || continue
               printf '| `%s` | %s | `%s` |\n' \
                 "$(basename "$f")" "$(stat -c%s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
             done
             echo
-            echo 'Development build: the dmg is ad-hoc signed and not notarised;'
-            echo 'the installer is unsigned and carries an unsigned AudioHubVad.'
+            echo 'Verify a download before running it: `shasum -a 256 <file>` on macOS,'
+            echo '`Get-FileHash <file>` on Windows.'
           } > "$notes"
           mv "$notes" dist/CHECKSUMS.md
           cat dist/CHECKSUMS.md >> "$GITHUB_STEP_SUMMARY"
@@ -366,11 +384,14 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ needs.gate.outputs.version }} — ${{ steps.meta.outputs.subject }}
           target_commitish: ${{ github.sha }}
-          # Prerelease, always. Nothing this workflow can produce is signed or
-          # notarised, so presenting it as a normal release would misrepresent
-          # what it is. Promoting a build is a manual decision made with real
-          # certificates in hand.
-          prerelease: true
+          # A normal release, by the project owner's decision (2026-08-16).
+          #
+          # This flag used to be pinned true on the reasoning that nothing here
+          # is signed or notarised. That fact has not changed — but "prerelease"
+          # is GitHub's word for "not finished yet", and 1.0.0 is finished; it is
+          # unsigned, which is a different statement and one the release notes
+          # now make in their first line rather than leaving to a badge.
+          prerelease: false
           generate_release_notes: true
           body_path: dist/CHECKSUMS.md
           files: |

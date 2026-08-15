@@ -9,7 +9,7 @@
 
 use super::buffered_clock::{network_time_nanos, PlaybackAnchor};
 use super::engine::PcmOutput;
-use super::ptp::{PtpClockMapper, PtpClockSample, PtpClockSource};
+use super::ptp::{PtpClockError, PtpClockMapper, PtpClockSample, PtpClockSource};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use plist::{Dictionary, Value};
@@ -66,7 +66,29 @@ const MAX_CLOCKED_LATENESS: Duration = Duration::from_millis(500);
 // The default PCM bus primes five 10 ms frames. Feed it this far ahead of the
 // network presentation deadline so the platform output starts on the anchor.
 const PCM_OUTPUT_LEAD: Duration = Duration::from_millis(50);
-const PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a **starved** receiver waits for a sender that stopped mid-frame
+/// before giving up on the data channel.
+///
+/// ⚠ This used to be 5 s and the only other condition was `read_limit > 0`,
+/// which killed healthy sessions after a few minutes of normal playback
+/// (observed on 30-win, 2026-08-16: two iOS sessions ended at 425 s and 410 s
+/// with `buffered data channel stalled inside a framed block`, while the RTSP
+/// control channel kept answering every request with 200 — the client went on
+/// showing "connected and playing" with no audio and no working volume).
+///
+/// The reasoning that produced 5 s does not survive contact with buffered mode.
+/// A buffered sender ships far ahead and then goes quiet — that is the whole
+/// point of announcing an 8 MiB buffer — and a TCP burst has no reason to end on
+/// a frame boundary, so "a partial frame is pending and nothing has arrived for
+/// five seconds" is the *normal* idle shape, not a fault. The `read_limit > 0`
+/// guard was supposed to cover it but almost never fires: `read_limit` is
+/// `8 MiB - retained`, and retention sits far below 8 MiB for all of a healthy
+/// session.
+///
+/// What actually distinguishes a dead sender is that we have run *out* — no
+/// queued blocks, no ready frame, still playing, and still nothing arriving. See
+/// `starved_stall`.
+const STARVED_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const DATA_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -530,6 +552,25 @@ struct Type103Engine {
     ptp_clock_logged: bool,
     authenticated_block_seen: bool,
     decoded_block_seen: bool,
+    /// Blocks discarded since the last frame actually delivered.
+    ///
+    /// A discard used to cost a decode, a `decoder.reset()` and an
+    /// `output.flush()` **each**, and the flush empties the whole PCM ring and
+    /// un-primes every reader (`bus.rs` `reset_locked`). A multi-second outage
+    /// therefore ran that ~86 times, which is what destroyed the cushion the
+    /// buffer exists to hold — the audible "the 2 s delay is gone" the user
+    /// reported on 2026-08-16. Counting the run and settling up once, when the
+    /// first frame is delivered again, keeps the discard decision (all three
+    /// reference receivers discard late audio) without the collateral damage.
+    late_run_blocks: u64,
+    late_run_first: Option<(u32, u32)>,
+    /// Edge detection for the media clock. The `Err` arm of `ready_schedule`
+    /// used to log at debug, so an INFO capture of a real failure showed
+    /// nothing at all during the outage and then a burst of drop warnings —
+    /// leaving no way to tell a network gap from a local clock stall.
+    clock_unavailable_since: Option<std::time::Instant>,
+    last_clock_outage_ms: u64,
+    housekeeping_ticks: u32,
 }
 
 struct AuthenticatedBlock {
@@ -592,6 +633,11 @@ impl Type103Engine {
             ptp_clock_logged: false,
             authenticated_block_seen: false,
             decoded_block_seen: false,
+            late_run_blocks: 0,
+            late_run_first: None,
+            clock_unavailable_since: None,
+            last_clock_outage_ms: 0,
+            housekeeping_ticks: 0,
         }
     }
 
@@ -681,6 +727,7 @@ impl Type103Engine {
 
     async fn run_stream(&mut self, mut stream: TcpStream) -> RunExit {
         let mut read_buffer = vec![0u8; TCP_READ_CHUNK_BYTES];
+        let mut drops_this_pass = 0usize;
         let mut housekeeping = time::interval(HOUSEKEEPING_INTERVAL);
         housekeeping.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut stream_eof = false;
@@ -699,10 +746,21 @@ impl Type103Engine {
                     if self.playing && deadline <= Instant::now() =>
                 {
                     self.deliver_ready_frame();
+                    drops_this_pass = 0;
                     continue;
                 }
                 ReadySchedule::DropLate if self.playing => {
                     self.drop_late_ready_frame();
+                    drops_this_pass += 1;
+                    if drops_this_pass >= MAX_BLOCKS_PER_PUMP {
+                        drops_this_pass = 0;
+                        // Catching up is a synchronous loop bounded only by the
+                        // queue, which can hold minutes of audio. Without this
+                        // the command channel, the PTP samples and the TCP read
+                        // are all starved for its duration, so an RTSP flush or
+                        // set_rate arriving mid-catch-up waits it out.
+                        tokio::task::yield_now().await;
+                    }
                     continue;
                 }
                 _ => {}
@@ -770,12 +828,38 @@ impl Type103Engine {
                     }
                 }
                 _ = housekeeping.tick() => {
-                    // A full 8 MiB queue deliberately stops TCP reads and must
-                    // not turn that local backpressure into a sender timeout.
-                    if read_limit > 0 && self.framer.partial_frame_timed_out(Instant::now()) {
+                    self.housekeeping_ticks = self.housekeeping_ticks.wrapping_add(1);
+                    // Every 5 s. `lead_ms` is how far ahead of the speaker the
+                    // next frame is — the one number that answers "did the
+                    // cushion come back" without relying on how it sounded.
+                    if self.housekeeping_ticks % 20 == 0 && self.playing {
+                        if let Some(ready) = self.ready_frame.as_ref() {
+                            let timestamp = ready.timestamp;
+                            let now = std::time::Instant::now();
+                            let lead_ms = self
+                                .deadline_for(timestamp)
+                                .map(|d| d.saturating_duration_since(now).as_millis() as i64)
+                                .unwrap_or(-1);
+                            log::info!(
+                                target: "audiohub_airplay::airplay2",
+                                "AirPlay 2 buffered lead_ms={} queued_blocks={} retained_bytes={}",
+                                lead_ms,
+                                self.queued_blocks.len(),
+                                self.retained_wire_bytes()
+                            );
+                        }
+                    }
+                    if starved_stall(
+                        self.playing,
+                        self.queued_blocks.is_empty(),
+                        self.ready_frame.is_none(),
+                        read_limit,
+                        self.framer.partial_frame_timed_out(Instant::now()),
+                    ) {
                         return RunExit::Io(io::Error::new(
                             io::ErrorKind::TimedOut,
-                            "buffered data channel stalled inside a framed block",
+                            "buffered data channel stalled inside a framed block \
+                             while the queue was empty",
                         ));
                     }
                 }
@@ -1060,6 +1144,13 @@ impl Type103Engine {
             if block.payload.is_empty() {
                 continue;
             }
+            if self.timestamp_is_late(block.header.timestamp) {
+                if self.late_run_blocks == 0 {
+                    self.late_run_first = Some((block.header.sequence, block.header.timestamp));
+                }
+                self.late_run_blocks = self.late_run_blocks.saturating_add(1);
+                continue;
+            }
             let pcm = self
                 .decoder
                 .decode(block.header.timestamp, &block.payload)
@@ -1093,6 +1184,78 @@ impl Type103Engine {
         Ok(())
     }
 
+    /// Wall-clock deadline for an RTP timestamp, or `None` when the clock
+    /// cannot answer right now.
+    ///
+    /// `None` and "late" are deliberately different answers: an unusable clock
+    /// is a reason to hold a frame, never a reason to throw it away. The
+    /// portable mapper reports `Stale` once its samples are older than
+    /// `MAPPER_WINDOW` (2 s), and everything it was holding is data we already
+    /// have in hand.
+    fn deadline_for(&mut self, timestamp: u32) -> Option<std::time::Instant> {
+        let anchor = self.playback_anchor?;
+        let now = std::time::Instant::now();
+        let deadline = match self.ptp_source.platform_deadline_for_rtp(
+            anchor,
+            timestamp,
+            BUFFERED_SAMPLE_RATE as u32,
+        ) {
+            Some(result) => result,
+            None => self
+                .ptp_clock
+                .as_ref()?
+                .deadline_for_rtp(now, anchor, timestamp, BUFFERED_SAMPLE_RATE as u32),
+        };
+        match deadline {
+            Ok(deadline) => Some(deadline.checked_sub(PCM_OUTPUT_LEAD).unwrap_or(now)),
+            Err(error) => {
+                self.note_clock_unavailable(&error);
+                None
+            }
+        }
+    }
+
+    /// Whether this block is already past the drop tolerance, decided **before**
+    /// it is decoded.
+    ///
+    /// Discarding in timestamp space turns a multi-second catch-up from one AAC
+    /// decode per 23 ms of skipped audio into pointer arithmetic. The block has
+    /// already passed `apply_deferred_flushes` and the nonce ledger by the time
+    /// this runs, so nothing security-relevant is skipped with it.
+    fn timestamp_is_late(&mut self, timestamp: u32) -> bool {
+        let now = std::time::Instant::now();
+        match self.deadline_for(timestamp) {
+            Some(deadline) => now.saturating_duration_since(deadline) > MAX_CLOCKED_LATENESS,
+            None => false,
+        }
+    }
+
+    /// One edge per outage, at INFO, so a capture can tell a local clock stall
+    /// from a real network gap without guessing from the drop count.
+    fn note_clock_unavailable(&mut self, error: &PtpClockError) {
+        if self.clock_unavailable_since.is_none() {
+            self.clock_unavailable_since = Some(std::time::Instant::now());
+            log::info!(
+                target: "audiohub_airplay::airplay2",
+                "AirPlay 2 media clock unavailable: {error}"
+            );
+        }
+    }
+
+    fn note_clock_available(&mut self) {
+        let Some(since) = self.clock_unavailable_since.take() else {
+            return;
+        };
+        self.last_clock_outage_ms = since.elapsed().as_millis() as u64;
+        log::info!(
+            target: "audiohub_airplay::airplay2",
+            "AirPlay 2 media clock recovered outage_ms={} queued_blocks={} retained_bytes={}",
+            self.last_clock_outage_ms,
+            self.queued_blocks.len(),
+            self.retained_wire_bytes()
+        );
+    }
+
     fn ready_schedule(&mut self) -> ReadySchedule {
         let Some(ready) = self.ready_frame.as_ref() else {
             return ReadySchedule::Wait;
@@ -1116,6 +1279,7 @@ impl Type103Engine {
         };
         match deadline {
             Ok(deadline) => {
+                self.note_clock_available();
                 let deadline = deadline.checked_sub(PCM_OUTPUT_LEAD).unwrap_or(now);
                 if deadline > now + MAX_CLOCKED_FUTURE {
                     log::warn!(
@@ -1130,10 +1294,7 @@ impl Type103Engine {
                 }
             }
             Err(error) => {
-                log::debug!(
-                    target: "audiohub_airplay::airplay2",
-                    "AirPlay 2 PTP media deadline unavailable: {error}"
-                );
+                self.note_clock_unavailable(&error);
                 ReadySchedule::Wait
             }
         }
@@ -1143,16 +1304,17 @@ impl Type103Engine {
         let Some(ready) = self.ready_frame.take() else {
             return;
         };
-        log::warn!(
-            target: "audiohub_airplay::airplay2",
-            "AirPlay 2 dropped late buffered frame sequence={} timestamp={}",
-            ready.sequence,
-            ready.timestamp
-        );
-        // A clock outage creates a media discontinuity. Do not let decoder or
-        // output history bridge from the discarded access unit into the first
-        // frame that is on the recovered timeline.
-        self.reset_decoded_output();
+        if self.late_run_blocks == 0 {
+            self.late_run_first = Some((ready.sequence, ready.timestamp));
+        }
+        self.late_run_blocks = self.late_run_blocks.saturating_add(1);
+        // Deliberately no `reset_decoded_output()` here. The discontinuity is
+        // real and the decoder must not bridge across it, but that is one reset
+        // for the whole run — settled in `deliver_ready_frame` — not one per
+        // discarded frame. Per-frame it also flushed the PCM bus, and that
+        // throws away audio already staged for the speaker and re-arms the
+        // reader prebuffer, so the repair cost far more than the audio it
+        // dropped.
     }
 
     fn deliver_ready_frame(&mut self) {
@@ -1160,6 +1322,28 @@ impl Type103Engine {
             return;
         }
         if let Some(ready) = self.ready_frame.take() {
+            if self.late_run_blocks > 0 {
+                let dropped = std::mem::take(&mut self.late_run_blocks);
+                let (from_sequence, from_timestamp) = self
+                    .late_run_first
+                    .take()
+                    .unwrap_or((ready.sequence, ready.timestamp));
+                log::warn!(
+                    target: "audiohub_airplay::airplay2",
+                    "AirPlay 2 discarded a late buffered run blocks={} approx_ms={}                      from_sequence={} from_timestamp={} resume_sequence={}                      resume_timestamp={} clock_outage_ms={}",
+                    dropped,
+                    dropped.saturating_mul(1_000 * SAMPLES_PER_AAC_FRAME) / BUFFERED_SAMPLE_RATE,
+                    from_sequence,
+                    from_timestamp,
+                    ready.sequence,
+                    ready.timestamp,
+                    self.last_clock_outage_ms
+                );
+                // One discontinuity, one decoder reset. The output bus keeps
+                // what it already holds: flushing it here is what turned a skip
+                // into a collapsed buffer.
+                self.decoder.reset();
+            }
             self.output.write(&ready.pcm);
         }
     }
@@ -1271,6 +1455,33 @@ impl From<FrameError> for io::Error {
     }
 }
 
+/// Whether a half-read frame means the sender is gone rather than merely idle.
+///
+/// Every term is load-bearing, and the version of this check that shipped had
+/// only the last two:
+///
+/// * `playing` — a paused session receives nothing by design. Without this a
+///   long pause is indistinguishable from a dead peer.
+/// * `queue_empty` / `ready_empty` — the difference between "idle" and "dead".
+///   A buffered sender that has filled us up and gone quiet is doing its job;
+///   only once we have played everything and still have nothing is its silence
+///   a failure. This is the term whose absence cost two live sessions.
+/// * `read_limit` — a full 8 MiB queue deliberately stops TCP reads, and that
+///   local backpressure must not read as a sender timeout. Kept, though with
+///   `queue_empty` it can no longer be the only guard: they cannot both be true
+///   unless something is very wrong.
+/// * `framer_timed_out` — nothing has arrived for `STARVED_STALL_TIMEOUT` and
+///   what we do hold is less than one whole frame.
+fn starved_stall(
+    playing: bool,
+    queue_empty: bool,
+    ready_empty: bool,
+    read_limit: usize,
+    framer_timed_out: bool,
+) -> bool {
+    playing && queue_empty && ready_empty && read_limit > 0 && framer_timed_out
+}
+
 struct TcpBlockFramer {
     pending: Vec<u8>,
     last_progress: Option<Instant>,
@@ -1324,7 +1535,7 @@ impl TcpBlockFramer {
             return false;
         }
         self.last_progress
-            .is_some_and(|last| now.saturating_duration_since(last) >= PARTIAL_FRAME_TIMEOUT)
+            .is_some_and(|last| now.saturating_duration_since(last) >= STARVED_STALL_TIMEOUT)
     }
 
     fn has_partial_frame(&self) -> bool {
@@ -2130,7 +2341,18 @@ mod tests {
         wait_for(|| state.lock().unwrap().writes.len() == 2).await;
         let guard = state.lock().unwrap();
         assert_eq!(guard.writes.len(), 2);
-        assert!(guard.flushes >= 1);
+        // The stale frame is still discarded — that decision is unchanged, and
+        // every reference receiver makes it. What changed on 2026-08-16 is its
+        // price: this used to assert `flushes >= 1`, because each discarded
+        // frame called `reset_decoded_output()`, and the flush inside it clears
+        // the whole PCM ring and un-primes every reader (`bus.rs`
+        // `reset_locked`). Over a multi-second outage that ran once per 23 ms of
+        // skipped audio, so the repair destroyed far more audio than the gap
+        // did — audible as "the AirPlay buffer is gone" after any hiccup.
+        //
+        // The discontinuity is still handled: one `decoder.reset()` when the
+        // run ends. The output keeps what it already holds.
+        assert_eq!(guard.flushes, 0, "a late discard must not flush the output bus");
         drop(guard);
         assert!(!handle.is_finished());
         handle.abort().await;
@@ -2635,6 +2857,77 @@ mod tests {
         packet.extend_from_slice(&tag);
         packet.extend_from_slice(&nonce_suffix);
         packet
+    }
+
+
+    // ---------------------------------------------------------------- stall
+    //
+    // The shipped check was `read_limit > 0 && framer.partial_frame_timed_out()`
+    // with a 5 s timeout, and it ended two healthy iOS sessions on 30-win
+    // (2026-08-16) at 425 s and 410 s of ordinary playback. Nothing here existed
+    // then, which is the actual reason it shipped.
+
+    #[test]
+    fn an_idle_sender_with_audio_in_hand_is_not_a_stall() {
+        // The regression, stated as a test: a buffered sender fills the queue and
+        // goes quiet, the burst ended mid-frame, and `read_limit` is positive
+        // because retention sits far below the advertised 8 MiB. Every input the
+        // old check looked at is set exactly as it was in the failure.
+        assert!(!starved_stall(true, false, true, TCP_READ_CHUNK_BYTES, true));
+        assert!(!starved_stall(true, false, false, TCP_READ_CHUNK_BYTES, true));
+    }
+
+    #[test]
+    fn a_paused_session_is_never_a_stall() {
+        // A pause receives nothing by design; without the `playing` term a long
+        // pause would look exactly like a dead peer.
+        assert!(!starved_stall(false, true, true, TCP_READ_CHUNK_BYTES, true));
+    }
+
+    #[test]
+    fn backpressure_is_not_a_stall() {
+        // A full queue stops our own reads. That is us, not the sender.
+        assert!(!starved_stall(true, true, true, 0, true));
+    }
+
+    #[test]
+    fn a_starved_playing_session_with_no_bytes_is_a_stall() {
+        // Everything drained, still playing, still nothing arriving: the one
+        // shape that means the sender is gone rather than merely ahead.
+        assert!(starved_stall(true, true, true, TCP_READ_CHUNK_BYTES, true));
+        // ...but not before the framer says the silence is long enough.
+        assert!(!starved_stall(true, true, true, TCP_READ_CHUNK_BYTES, false));
+    }
+
+    #[test]
+    fn a_burst_ending_mid_frame_leaves_a_partial_frame() {
+        // Why the old check fired at all: TCP has no reason to end a burst on a
+        // frame boundary, so the idle state normally *does* hold a partial frame.
+        let packet = vec![0u8; 40];
+        let block = framed(&packet);
+        let mut framer = TcpBlockFramer::new();
+        framer.push(&block[..block.len() - 3]).unwrap();
+        assert!(framer.has_partial_frame());
+        assert!(framer.next_packet().unwrap().is_none());
+        // Completing it clears the condition, and emptying clears the clock.
+        framer.push(&block[block.len() - 3..]).unwrap();
+        assert!(!framer.has_partial_frame());
+        assert!(framer.next_packet().unwrap().is_some());
+        assert!(framer.last_progress.is_none());
+    }
+
+    #[test]
+    fn the_stall_clock_needs_the_full_timeout() {
+        let block = framed(&vec![0u8; 40]);
+        let mut framer = TcpBlockFramer::new();
+        framer.push(&block[..8]).unwrap();
+        let start = framer.last_progress.unwrap();
+        assert!(!framer.partial_frame_timed_out(start));
+        assert!(!framer.partial_frame_timed_out(start + STARVED_STALL_TIMEOUT - Duration::from_millis(1)));
+        assert!(framer.partial_frame_timed_out(start + STARVED_STALL_TIMEOUT));
+        // The value that shipped. Kept as a number so a future edit that lowers
+        // the constant back into a sender's normal idle gap fails here first.
+        assert!(!framer.partial_frame_timed_out(start + Duration::from_secs(5)));
     }
 
     fn framed(packet: &[u8]) -> Vec<u8> {

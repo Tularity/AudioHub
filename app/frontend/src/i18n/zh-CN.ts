@@ -572,7 +572,7 @@ export const zhCN = {
   'sysaudio.backend.macSck.label': 'macOS 屏幕捕获音频流',
   // 2026-08-09 裁定不做（plan §6 / §11.2）。这句是用户唯一能看到的解释，所以必须说清
   // 「不做」而不是「还没做」——后者会让人一直等一个不会来的版本。
-  'sysaudio.backend.macSck.note': '本项目不提供该路线：它需要「屏幕录制」权限，而进程 Tap 只需「系统音频录制」。',
+  'sysaudio.backend.macSck.note': '备选：需要「屏幕录制」权限，比进程 Tap 更宽。13.0–14.1 上自动回落到它。',
 
   // ---------------------------------------------------------------- 会话
   'session.flow.micRecv': '取对方麦克风',
@@ -1144,7 +1144,7 @@ export const zhCN = {
   'stats.degraded.writeq': '发送积压',
   'stats.degraded.writeqWhy': '帧在发送队列中的等待时长（毫秒，非深度）。上升表明写线程被 TCP 阻塞，是最直接的卡顿来源。',
   'stats.degraded.stale': '超时丢弃',
-  'stats.degraded.staleWhy': '出队时已超过 200 ms 预算而被主动丢弃的帧数。它不是新增的丢包源——主动留下空洞，对端的抖动缓冲才隐藏得住。',
+  'stats.degraded.staleWhy': '出队时已超过 440 ms 预算而被主动丢弃的帧数。它不是新增的丢包源——主动留下空洞，对端的抖动缓冲才隐藏得住。',
   'stats.degraded.writeqPeak': '积压峰值 {v} ms',
   'stats.degraded.writeqAuto': 'AUTO 上次依据 {v} ms',
   'stats.degraded.queued': '队列 {n} / {cap}',

@@ -16,7 +16,7 @@
 // 缓存键，也不再有「忘了同步某个字段」的可能。
 
 import { create } from 'zustand';
-import { navMotion, navigateWithTransition } from '../lib/viewTransition';
+import { isReselection, navMotion, navigateWithTransition } from '../lib/viewTransition';
 import { useStoreWithEqualityFn } from 'zustand/traditional';
 import type {
   AirPlaySessionInfo, DaemonInfo, DaemonSettings, DiscoverResult, PeerState, SessionInfo,
@@ -376,10 +376,18 @@ export const actions = {
    * 语义与改动前逐字相同。
    */
   navigate(view: ViewName, peerFp: string | null = null): void {
+    const route = getState().route;
+    // Re-selecting the page you are already on is a refresh, not a navigation:
+    // the state write stays (subscribers re-read, which is what the press is
+    // asking for) but the transition is skipped. See `isReselection`.
+    if (isReselection(route, { view, peerFp })) {
+      setState({ route: { view, peerFp } });
+      return;
+    }
     // 方向来自两个视图**在导航胶囊上的相对位置**；进出详情走垂直轴（下钻=从底部
     // 浮上来）。在这里算而不是在 viewTransition 里读 store：那个模块刻意与状态层
     // 无关，它只认调用方给的符号。
-    const motion = navMotion(getState().route.view, view);
+    const motion = navMotion(route.view, view);
     navigateWithTransition(() => setState({ route: { view, peerFp } }), motion);
   },
 

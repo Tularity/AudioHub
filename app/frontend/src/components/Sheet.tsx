@@ -26,8 +26,24 @@ import { isEscape } from '../lib/shortcuts';
 import { isRecordingCapture } from '../lib/shortcutHost';
 import { isConfirmOpen } from './ConfirmDialog';
 import { sheetEscapeCloses, trapIndex, FOCUSABLE_SELECTOR, SHEET_EXIT_MS } from '../lib/sheet';
-import { originPercent, recentPointerOrigin } from '../lib/pointerOrigin';
+import { layoutRect, originPercent, recentPointerOrigin } from '../lib/pointerOrigin';
+import type { Point } from '../lib/pointerOrigin';
 import { originOfElement } from '../lib/reveal';
+
+/**
+ * Point the card's growth/shrink at `p`, expressed against the box it has right
+ * now.
+ *
+ * `layoutRect` rather than `getBoundingClientRect`: the entry animation is
+ * declared `backwards`, so its `scale(.72)` is already in force when the layout
+ * effect runs, and measuring the rendered box puts the origin ~1.39× too far
+ * from the centre. The full measurement is on `layoutRect`.
+ */
+function applyOrigin(card: HTMLElement, p: Point): void {
+  const { ox, oy } = originPercent(layoutRect(card), p);
+  card.style.setProperty('--sheet-ox', `${ox.toFixed(2)}%`);
+  card.style.setProperty('--sheet-oy', `${oy.toFixed(2)}%`);
+}
 
 export function Sheet({
   testid, title, help, children, footer, primaryAction, dismissLabel,
@@ -81,9 +97,27 @@ export function Sheet({
   // 配对窗口）。ref 而不是 state 做判断，因为三条路都在同一帧里。
   const [closing, setClosing] = useState(false);
   const closingRef = useRef(false);
+  // The press this card grew out of, kept so the exit can be re-aimed at it.
+  const pressRef = useRef<Point | null>(null);
   const requestClose = useCallback(() => {
     if (closingRef.current) return;
     closingRef.current = true;
+    // Re-express the origin against the box the card has NOW.
+    //
+    // A percentage is only a point once you know which box it is a percentage
+    // of, and the card's box changes after mount: its height follows its
+    // content, and content that arrives a tick late (a list the daemon has not
+    // answered for yet) grows it. Because the card is flex-centred, growing
+    // moves its top edge up as well, so the mount-time percentage no longer
+    // points where it did. Measured 2026-08-15: on the first open after a cold
+    // load the「Add peer」card was 484px tall when the layout effect ran and
+    // 586px once settled, which put the exit origin 52px above the button.
+    //
+    // Doing it here rather than watching for resizes is deliberate: this is the
+    // only moment the value is about to be used for the exit, and by now the
+    // card has been on screen long enough to have settled.
+    const card = cardRef.current;
+    if (card && pressRef.current) applyOrigin(card, pressRef.current);
     setClosing(true);
     window.setTimeout(() => closeRef.current(), SHEET_EXIT_MS);
   }, []);
@@ -105,9 +139,8 @@ export function Sheet({
     const p = recentPointerOrigin(Date.now())
       ?? originOfElement(document.activeElement);
     if (!p) return;
-    const { ox, oy } = originPercent(card.getBoundingClientRect(), p);
-    card.style.setProperty('--sheet-ox', `${ox.toFixed(2)}%`);
-    card.style.setProperty('--sheet-oy', `${oy.toFixed(2)}%`);
+    pressRef.current = p;
+    applyOrigin(card, p);
   }, []);
 
   useEffect(() => {

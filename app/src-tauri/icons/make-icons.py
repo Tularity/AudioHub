@@ -225,12 +225,55 @@ def render_dock_wave(size, amp):
     return a
 
 
+def render_logo(size=512):
+    """The mark alone, accent-coloured on transparency — the README logo.
+
+    A third rendering rather than a reuse, because the other two are both wrong
+    for a document that is read on two backgrounds:
+
+      * `icon.png` carries its own dark plate. That is right for a dock tile and
+        wrong here: on GitHub's light theme it reads as a black box pasted on
+        the page.
+      * `render_tray` forces RGB to zero, because a macOS template image is
+        alpha-only and AppKit supplies the colour. Dropped into a README it is a
+        black mark, invisible on the dark theme.
+
+    Accent on transparency clears both: #31C8B0 holds against white and against
+    #0d1117, so one file serves both themes and there is no `<picture>` with a
+    `prefers-color-scheme` pair to keep in sync.
+
+    Geometry comes from the same WAVE/wave_points as the app icon and the tray
+    glyph, so the logo cannot drift away from the thing it stands for.
+    """
+    px = bytearray(size * size * 4)
+    # Proportionally the tray's padding (4/44), which frames the mark without
+    # the dock tile's much larger inset.
+    pts, scale = wave_points(size, size * 4 // 44, 1.0)
+    rad = WAVE_STROKE * scale / 2.0
+    for y in range(size):
+        row = y * size * 4
+        for x in range(size):
+            c = stroke_coverage(pts, rad, x + 0.5, y + 0.5)
+            if c > 0:
+                i = row + x * 4
+                px[i], px[i + 1], px[i + 2] = ACCENT
+                px[i + 3] = int(round(c * 255))
+    return px
+
+
 TRAY_PX = 44  # keep in sync with TRAY_PX in src-tauri/src/icon.rs (const-asserted)
 
 
 def main():
     here = Path(__file__).resolve().parent
     write_png(here / "icon.png", 1024, 1024, render_app_icon(1024))
+    # Outside this directory on purpose: `assets/` is where a reader looks for a
+    # README image, while everything else here is an application asset consumed
+    # by the bundler or include_bytes!'d by icon.rs. Generated from the same
+    # geometry all the same, so the README can never show a stale mark.
+    logo = here.parents[2] / "assets" / "logo.png"
+    logo.parent.mkdir(parents=True, exist_ok=True)
+    write_png(logo, 512, 512, render_logo(512))
 
     for name, amp, alpha in STATES:
         tray = render_tray(TRAY_PX, amp, alpha)

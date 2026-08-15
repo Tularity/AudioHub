@@ -28,9 +28,9 @@ export const WIKI = {
 
   // —— 运行模式
   modes: `${WIKI_BASE}/Operating-Modes`,
-  modeB: `${WIKI_BASE}/Operating-Modes#consumer-mode-b--virtual-devices`,
+  modeB: `${WIKI_BASE}/Operating-Modes#mode-b--virtual-devices`,
   bridge: `${WIKI_BASE}/Operating-Modes#bridging-to-a-third-party-virtual-cable`,
-  captureSource: `${WIKI_BASE}/Operating-Modes#consumer-mode-a--driverless`,
+  captureSource: `${WIKI_BASE}/Operating-Modes#mode-a--driverless`,
 
   // —— 连通方式
   transport: `${WIKI_BASE}/Transport-Tiers`,
@@ -45,7 +45,7 @@ export const WIKI = {
   volumeModes: `${WIKI_BASE}/Volume#volume-in-each-mode`,
 
   // —— 平台
-  permissions: `${WIKI_BASE}/Platform-Notes#permissions`,
+  permissions: `${WIKI_BASE}/First-Run#the-permission-gate`,
   deviceNaming: `${WIKI_BASE}/Platform-Notes#device-naming`,
 
   // —— 发现与配对

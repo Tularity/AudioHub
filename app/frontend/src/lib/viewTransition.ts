@@ -73,6 +73,27 @@ export function navMotion(from: string, to: string): NavMotion {
   return { dx: b >= a ? 1 : -1, dy: 0 };
 }
 
+/** The two fields that identify a page. Structural, so this module still owes
+ *  the state layer nothing. */
+export interface RouteRef { view: string; peerFp: string | null }
+
+/**
+ * Whether a navigation request merely re-selects the page already on screen.
+ *
+ * Pressing the active tab is a refresh, and a refresh must not animate:
+ * {@link navMotion} scores `v -> v` as a forward move (`b >= a`), so without
+ * this the press cross-faded the page with an identical copy of itself sliding
+ * in from the right. There is no information in that animation — it reads as a
+ * flinch (user, 2026-08-15).
+ *
+ * `peerFp` is part of the comparison because two peers are two pages even
+ * though both are `detail`; moving between them is a real navigation and keeps
+ * its slide.
+ */
+export function isReselection(from: RouteRef, to: RouteRef): boolean {
+  return from.view === to.view && from.peerFp === to.peerFp;
+}
+
 interface ViewTransitionCapable {
   startViewTransition?: (cb: () => void) => { ready: Promise<void>; finished: Promise<void> };
 }

@@ -78,7 +78,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audiohub-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "audiohub-security",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "audiohub-security"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "quick-xml",
  "windows-sys 0.52.0",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "audiohub-vad-helper"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",

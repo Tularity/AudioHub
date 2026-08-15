@@ -9,7 +9,7 @@ ROOT="$(cd "${0:a:h}/.." && pwd)"
 TAURI="$ROOT/app/src-tauri"
 APP="${1:-$TAURI/target/release/bundle/macos/AudioHub.app}"
 OUT_DIR="$TAURI/target/release/bundle/pkg"
-VERSION="${AUDIOHUB_VERSION:-0.1.0}"
+VERSION="${AUDIOHUB_VERSION:-1.0.0}"
 
 die() { print -u2 -- "[audiohub] ERROR: $*"; exit 1; }
 

@@ -1,6 +1,6 @@
 [package]
 name = "audiohub-app"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 # Standalone crate: keep the tauri dependency tree out of the main workspace.

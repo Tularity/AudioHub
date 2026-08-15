@@ -7,7 +7,7 @@ set -euo pipefail
 
 ROOT="$(cd "${0:a:h}/.." && pwd)"
 TAURI="$ROOT/app/src-tauri"
-VERSION="${AUDIOHUB_VERSION:-0.1.0}"
+VERSION="${AUDIOHUB_VERSION:-1.0.0}"
 if (( $# > 0 )); then
   PKG="$1"
 elif [[ -n "${AUDIOHUB_INSTALLER_IDENTITY:-}" ]]; then

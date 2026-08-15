@@ -60,7 +60,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "audiohub-airplay"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "alac",
  "audiohub-security",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "audiohub-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "audiohub-core",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "audiohub-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "block2",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "audiohub-ipc"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "audiohub-core",
  "audiohub-net",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "audiohub-net"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "audiohub-core",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "audiohub-security"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "quick-xml",
  "windows-sys 0.52.0",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "audiohub-vad-helper"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "audiohubd"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "audiohub-airplay",

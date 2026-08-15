@@ -8,7 +8,7 @@ ROOT="$(cd "${0:a:h}/.." && pwd)"
 DRIVER_DIR="$ROOT/drivers/macos-hal"
 OUT="$DRIVER_DIR/build/AudioHubDriver.pkg"
 SCRIPTS="$ROOT/app/installer/macos/driver-scripts"
-VERSION="${AUDIOHUB_VERSION:-0.1.0}"
+VERSION="${AUDIOHUB_VERSION:-1.0.0}"
 
 if [[ "${AUDIOHUB_RELEASE:-0}" == 1 ]]; then
   [[ "${AUDIOHUB_DRIVER_SIGN_IDENTITY:-}" == Developer\ ID\ Application:* ]] \

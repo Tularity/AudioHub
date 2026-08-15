@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use tauri::menu::MenuItemKind;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+// macOS builds its status item on `tray-icon` + `muda` directly (see mac_tray);
+// only the other platforms go through Tauri's tray wrapper.
+#[cfg(not(target_os = "macos"))]
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 
@@ -19,6 +22,8 @@ mod driver_install;
 mod icon;
 #[cfg(target_os = "macos")]
 mod mac_chrome;
+#[cfg(target_os = "macos")]
+mod mac_tray;
 mod service;
 mod webui;
 #[cfg(target_os = "windows")]
@@ -818,6 +823,16 @@ impl NativeLocale {
         }
     }
 
+    /// Caption above the tray volume slider. The slider drives the *peer's*
+    /// output level, not this machine's, so the copy says so — the row appears
+    /// only while a peer session with an adjustable volume exists.
+    fn volume(self) -> &'static str {
+        match self {
+            Self::ZhCn => "对端音量",
+            Self::EnUs => "Peer volume",
+        }
+    }
+
     fn quit_ui(self) -> &'static str {
         match self {
             Self::ZhCn => "退出界面（音频服务继续运行）",
@@ -859,6 +874,12 @@ fn stored_native_locale() -> NativeLocale {
 
 /// Every tray string, kept so a frontend locale change updates the complete
 /// native menu rather than only translating its status line.
+///
+/// Not macOS: there the status item is raw `muda`, whose items are neither
+/// `Send` nor `Sync` and so cannot be `manage`d at all. `mac_tray` keeps the
+/// equivalent handles in its own main-thread-bound state. Two concrete types
+/// rather than one trait: they have nothing in common but their field names.
+#[cfg(not(target_os = "macos"))]
 struct TrayItems {
     show: MenuItem<tauri::Wry>,
     status: MenuItem<tauri::Wry>,
@@ -1072,6 +1093,13 @@ fn is_window_maximized(window: tauri::Window) -> Result<bool, String> {
 ///
 /// `state` and `theme` are optional so that a frontend built before this change
 /// still updates the status line instead of failing argument deserialisation.
+///
+/// `volume`/`muted` drive the macOS tray's volume row and follow the same rule.
+/// `volume: None` means "no adjustable peer session right now" and takes the
+/// whole row out of the menu; the frontend sends `Some` only in mode A with a
+/// live session that actually has a volume to move. `muted` greys the slider out
+/// without moving it — muting is not a volume of zero.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 fn set_tray_status(
     app: AppHandle,
@@ -1080,35 +1108,57 @@ fn set_tray_status(
     state: Option<String>,
     theme: Option<String>,
     locale: Option<String>,
+    volume: Option<f64>,
+    muted: Option<bool>,
 ) {
     let locale = locale
         .as_deref()
         .map(|value| NativeLocale::parse(Some(value)))
         .unwrap_or_else(stored_native_locale);
-    if let Some(items) = app.try_state::<TrayItems>() {
-        let _ = items.show.set_text(locale.show());
-        let _ = items.status.set_text(locale.status(online, port));
-        let _ = items.quit_ui.set_text(locale.quit_ui());
-        let _ = items.quit_all.set_text(locale.quit_all());
+    // Parsed up front so the one main-thread hop below carries the icon too.
+    // Both parsers are pure, so hoisting them changes nothing.
+    let st = state.as_deref().map(icon::IconState::parse);
+    let th = theme
+        .as_deref()
+        .map(icon::IconTheme::parse)
+        .unwrap_or(icon::IconTheme::Dark);
+
+    #[cfg(target_os = "macos")]
+    mac_tray::apply(
+        &app,
+        mac_tray::TrayUpdate {
+            locale,
+            online,
+            port,
+            icon: st.map(|state| (state, th)),
+            volume,
+            muted: muted.unwrap_or(false),
+        },
+    );
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No volume row outside macOS: this change is AppKit-only, and the
+        // Windows tray deliberately keeps the behaviour it shipped with.
+        let _ = (volume, muted);
+        if let Some(items) = app.try_state::<TrayItems>() {
+            let _ = items.show.set_text(locale.show());
+            let _ = items.status.set_text(locale.status(online, port));
+            let _ = items.quit_ui.set_text(locale.quit_ui());
+            let _ = items.quit_all.set_text(locale.quit_all());
+        }
     }
     #[cfg(target_os = "macos")]
     if let Some(items) = app.try_state::<MacAppMenuItems>() {
         let _ = items.settings.set_text(locale.settings());
     }
 
-    let Some(state) = state else { return };
-    let st = icon::IconState::parse(&state);
-    let th = theme
-        .as_deref()
-        .map(icon::IconTheme::parse)
-        .unwrap_or(icon::IconTheme::Dark);
+    // A report without `state` refreshes copy only — unchanged from before.
+    let Some(st) = st else { return };
 
+    // macOS' status item glyph was already updated inside `mac_tray::apply`,
+    // which owns the tray handle; only the dock tile is left, at the bottom.
+    #[cfg(not(target_os = "macos"))]
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        // set_icon + set_icon_as_template as two calls renders twice and
-        // flickers on macOS; the combined setter is there for exactly this.
-        #[cfg(target_os = "macos")]
-        let _ = tray.set_icon_with_as_template(Some(icon::tray_image(st, th)), true);
-        #[cfg(not(target_os = "macos"))]
         let _ = tray.set_icon(Some(icon::tray_image(st, th)));
     }
 
@@ -1181,6 +1231,15 @@ async fn stop_daemon_and_quit(app: AppHandle) {
     app.exit(0);
 }
 
+/// macOS has its own status item built on the crates underneath Tauri, because
+/// the volume slider needs the real `NSMenu` — see `mac_tray`. Everything else
+/// keeps `tauri::tray::TrayIconBuilder` exactly as it was.
+#[cfg(target_os = "macos")]
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    mac_tray::build(app)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let locale = stored_native_locale();
     let show = MenuItem::with_id(app, "show", locale.show(), true, None::<&str>)?;
@@ -1248,6 +1307,7 @@ mod native_locale_tests {
         let zh = NativeLocale::parse(Some("zh-CN"));
         assert_eq!(zh.show(), "显示主窗口");
         assert_eq!(zh.settings(), "设置…");
+        assert_eq!(zh.volume(), "对端音量");
         assert_eq!(zh.status(true, Some(47810)), "状态：在线 · 端口 47810");
         assert!(zh.quit_ui().contains("音频服务"));
         assert!(zh.quit_all().contains("退出"));
@@ -1255,6 +1315,7 @@ mod native_locale_tests {
         let en = NativeLocale::parse(Some("en-US"));
         assert_eq!(en.show(), "Open AudioHub");
         assert_eq!(en.settings(), "Settings…");
+        assert_eq!(en.volume(), "Peer volume");
         assert_eq!(en.status(true, Some(47810)), "Status: Online · Port 47810");
         assert_eq!(en.status(false, None), "Status: Offline");
         assert!(en.quit_ui().is_ascii());
@@ -1350,10 +1411,27 @@ fn main() {
             webui::get_webui_status,
             webui::set_webui_settings
         ])
+        // Tauri hands every muda menu event to these global listeners without
+        // consulting its own id registry (`tauri-2.11.5/src/app.rs:2588`), which
+        // is what lets the macOS status item — built on raw muda in `mac_tray`,
+        // so none of its items are registered — be handled right here. Windows
+        // is untouched: its tray keeps `TrayIconBuilder::on_menu_event`, and the
+        // arms below are `cfg`-gated so nothing is dispatched twice there.
         .on_menu_event(|app, event| {
             #[cfg(target_os = "macos")]
-            if event.id().as_ref() == SETTINGS_MENU_ID {
-                open_native_settings(app);
+            match event.id().as_ref() {
+                SETTINGS_MENU_ID => open_native_settings(app),
+                mac_tray::SHOW_ID => show_main(app),
+                mac_tray::QUIT_UI_ID => app.exit(0),
+                mac_tray::QUIT_ALL_ID => {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ =
+                            tauri::async_runtime::spawn_blocking(shutdown_daemon_blocking).await;
+                        app.exit(0);
+                    });
+                }
+                _ => {}
             }
             #[cfg(not(target_os = "macos"))]
             let _ = (app, event);

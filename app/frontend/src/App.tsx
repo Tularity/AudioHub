@@ -15,11 +15,12 @@ import { ShortcutSheetHost, toggleShortcutSheet } from './components/ShortcutShe
 import { PermissionsSheetHost, isPermissionsSheetOpen, openPermissionsSheet } from './components/PermissionsSheet';
 import { installShortcuts } from './lib/shortcutHost';
 import { pendingSignature, readPermSeen, shouldAutoOpenPermissions } from './lib/permIntro';
-import { installNativeSettingsMenu } from './lib/nativeMenu';
+import { installNativeSettingsMenu, installTrayVolume } from './lib/nativeMenu';
+import { installPointerOrigin } from './lib/pointerOrigin';
 import type { ShortcutActionId } from './lib/shortcuts';
 import { actions, getState, useStore } from './state/store';
 import { isShareMode } from './state/mode';
-import { boot, gateVisible, syncNativeAppearance, syncTray } from './state/connection';
+import { boot, gateVisible, setTrayVolume, syncNativeAppearance, syncTray } from './state/connection';
 import { subscribeLocale, subscribeTheme } from './lib/appearanceHost';
 import { getLocale, t } from './i18n';
 
@@ -127,6 +128,13 @@ export function App() {
     window,
     () => actions.navigate('settings'),
   ), []);
+  // macOS 菜单栏那条音量滑条。与上面同一条理由：浏览器态装一个永远不会触发的
+  // 监听器，比在这里查一次 Tauri 全局要可靠——壳还在启动时原生侧就可能先发事件。
+  useEffect(() => installTrayVolume(window, setTrayVolume), []);
+  // 记住最近一次按下的位置，好让二级菜单从那一点长出来（lib/pointerOrigin.ts）。
+  // 装在根上而不是七个 Sheet 调用点各传一次：靠约定传，迟早有一个忘了传，而忘了
+  // 不报错——那一扇面板只是照旧从屏幕中央缩放。
+  useEffect(() => installPointerOrigin(window), []);
   // 托盘状态跟着连接走；syncTray 自带去重，重复调用无副作用。
   useEffect(() => useStore.subscribe(syncTray), []);
   // 主题不在 store 里（它是 localStorage + matchMedia，见 lib/appearanceHost），

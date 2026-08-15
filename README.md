@@ -61,7 +61,7 @@ The wiki is the real documentation. Each page is written to be read on its own.
 | [Audio Quality](https://github.com/Tularity/AudioHub/wiki/Audio-Quality) | The six-rung quality ladder and how AUTO moves along it |
 | [Latency](https://github.com/Tularity/AudioHub/wiki/Latency) | Measured end-to-end latency and where the milliseconds actually go |
 | [Volume](https://github.com/Tularity/AudioHub/wiki/Volume) | Why loudness and slider positions cannot both match across two machines |
-| [Share Protocols](https://github.com/Tularity/AudioHub/wiki/Share-Protocols) | Audio-only AirPlay reception, local playback, password and bidirectional volume behaviour |
+| [Share Protocols](https://github.com/Tularity/AudioHub/wiki/Share-Protocols) | Audio-only AirPlay 2 reception, local playback, password and bidirectional volume behaviour |
 | [Platform Notes](https://github.com/Tularity/AudioHub/wiki/Platform-Notes) | macOS permissions, Windows driver status |
 | [Glossary](https://github.com/Tularity/AudioHub/wiki/Glossary) | Jitter buffer, underrun, PLC, tier, taper, and friends |
 
@@ -105,7 +105,7 @@ This section exists so nobody is misled by the fact that the rest of it works.
 
 **What works:** share mode both directions; mode A; mode B on macOS; pairing and
 discovery; the quality ladder and AUTO; volume synchronisation; audio-only
-AirPlay reception with fixed local playback and a classic-DACP reverse-volume
+AirPlay 2 reception with fixed local playback and a classic-DACP reverse-volume
 request path; the CLI and its probes.
 
 **What does not, or is not proven:**
@@ -114,14 +114,24 @@ request path; the CLI and its probes.
   architectural floor is about **91 ms**. Sub-40 ms is not reachable in this
   shape, and an early "under 30 ms" target has been formally withdrawn. See
   [Latency](https://github.com/Tularity/AudioHub/wiki/Latency).
-- **Automatic Tier 0 → Tier 1 downgrade is not implemented.** The design is
-  settled and the tier can be pinned by hand, but nothing triggers it for you.
+- **Automatic Tier 0 → Tier 1 downgrade has not been exercised between two
+  machines.** It is implemented — 600 ms of UDP silence, 3 s of keepalive
+  silence, or a peer announcement all trigger it, and it re-probes after an
+  hour — but the trigger has only been seen in tests, never on a real link.
 - **Tier 2 has never been exercised between two machines.** It is implemented and
   unproven.
 - **The Windows virtual driver is unsigned** and cannot be installed by end
   users, as above. Its microphone direction has no cross-machine evidence yet.
-- **No release, no packaging, no notarisation.** Local builds are ad-hoc signed.
-  There are no downloadable binaries.
+- **No release.** The packaging chains exist and are wired up — a macOS
+  driver-pkg → pkg → dmg sequence with notarisation enforced in release mode,
+  and a per-machine Windows NSIS installer — but nothing has been published and
+  there are no downloadable binaries. The default local build stays ad-hoc
+  signed; a release build additionally requires Developer ID Application and
+  Developer ID Installer identities.
+- **Installing on macOS takes one administrator authorization.** The App copies
+  its service to `/Library/Application Support/AudioHub/service/`, re-signs it
+  with a machine-local certificate so the Local Network grant survives updates,
+  and then runs it **as the interactive user** — nothing stays resident as root.
 - Real iOS playback and sender-to-receiver AirPlay volume have been exercised.
   Receiver-to-sender volume requests reach the macOS 26 AirPlaySender's internal
   DACP notification, but that sender does not update its Control Center slider;
@@ -159,8 +169,9 @@ code identity and, with it, the Local Network permission the service depends on.
 It then delegates to `app/build-app.sh`, which builds the frontend, builds the
 service, regenerates icons, stages the service as a Tauri sidecar, and bundles.
 
-The build is **unsigned and ad-hoc only**; Gatekeeper will quarantine a copy that
-has been downloaded, though a locally built bundle runs fine.
+That default build is **ad-hoc signed only**; Gatekeeper will quarantine a copy
+that has been downloaded, though a locally built bundle runs fine. The release
+packaging scripts take a different path and require real Developer ID identities.
 
 Frontend only:
 

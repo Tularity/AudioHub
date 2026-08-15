@@ -18,13 +18,16 @@
 // `:focus-within` 立刻又把它打开，表现为「Esc 按不掉」。这里不出现任何 `:focus-*`
 // 驱动的开合。
 
-import { useEffect, useId, useRef } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { ReactNode } from 'react';
 import { t } from '../i18n';
 import { isEscape } from '../lib/shortcuts';
 import { isRecordingCapture } from '../lib/shortcutHost';
 import { isConfirmOpen } from './ConfirmDialog';
-import { sheetEscapeCloses, trapIndex, FOCUSABLE_SELECTOR } from '../lib/sheet';
+import { sheetEscapeCloses, trapIndex, FOCUSABLE_SELECTOR, SHEET_EXIT_MS } from '../lib/sheet';
+import { originPercent, recentPointerOrigin } from '../lib/pointerOrigin';
+import { originOfElement } from '../lib/reveal';
 
 export function Sheet({
   testid, title, help, children, footer, primaryAction, dismissLabel,
@@ -70,6 +73,43 @@ export function Sheet({
   const dismissDisabledRef = useRef(dismissDisabled);
   dismissDisabledRef.current = dismissDisabled;
 
+  // 退场：React 卸载是同步的，所以「关」原本没有动画——面板在按下的那一帧就消失。
+  // 这里先加 `.closing` 放完退场动画，再真的调用 `onClose`。
+  //
+  // `closing` 同时是**幂等闸**：遮罩、关闭按钮、Esc 三条路都可能在这 170ms 里再触发
+  // 一次，而 `onClose` 多调一次在若干调用点上不是无害的（PairSheet 那两扇会连带停掉
+  // 配对窗口）。ref 而不是 state 做判断，因为三条路都在同一帧里。
+  const [closing, setClosing] = useState(false);
+  const closingRef = useRef(false);
+  const requestClose = useCallback(() => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    setClosing(true);
+    window.setTimeout(() => closeRef.current(), SHEET_EXIT_MS);
+  }, []);
+  const requestCloseRef = useRef(requestClose);
+  requestCloseRef.current = requestClose;
+
+  // 从**按下的那一点**长出来。
+  //
+  // `useLayoutEffect` 而不是 `useEffect`：入场动画从第一帧就开始，而 transform-origin
+  // 必须在那一帧之前写进去，否则第一帧是从中心缩放的，随后跳到正确的原点——那一跳
+  // 比没有动画更难看。layout effect 在 DOM 变更之后、绘制之前跑，正好。
+  //
+  // 取点的优先级：最近一次按下 → 触发它的那个控件的中心 → 卡片自身中心。第二条覆盖
+  // 键盘打开（Space/Enter 产生的 click 没有真实坐标），第三条是兜底。
+  useLayoutEffect(() => {
+    const card = cardRef.current;
+    if (!card) return;
+    // 此刻焦点还在触发它的控件上——下面那个 effect 才把焦点移进卡片。
+    const p = recentPointerOrigin(Date.now())
+      ?? originOfElement(document.activeElement);
+    if (!p) return;
+    const { ox, oy } = originPercent(card.getBoundingClientRect(), p);
+    card.style.setProperty('--sheet-ox', `${ox.toFixed(2)}%`);
+    card.style.setProperty('--sheet-oy', `${oy.toFixed(2)}%`);
+  }, []);
+
   useEffect(() => {
     const card = cardRef.current;
     // 触发它的那个按钮。存在这里而不是靠调用方传，是因为**每一个** Sheet 都要还，
@@ -105,7 +145,8 @@ export function Sheet({
         if (dismissDisabledRef.current) return;
         e.preventDefault();
         e.stopPropagation();
-        closeRef.current();
+        // 经退场闸，不直接调 `onClose` —— 键盘关闭要和点击关闭有同一段动画。
+        requestCloseRef.current();
         return;
       }
       if (e.key !== 'Tab' || !card) return;
@@ -129,15 +170,25 @@ export function Sheet({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 见上：依赖数组必须留空。
   }, []);
 
-  return (
+  // Portalled to <body>, and it is load-bearing rather than tidy. Three of the
+  // seven call sites render their Sheet inside `#view-root` (Peers, Detail,
+  // Settings), and `#view-root` now carries a transform while a sheet is open
+  // (the backdrop recedes a step -- styles.css, `body:has(> .sheet-scrim)`). A
+  // transformed ancestor becomes the containing block for `position: fixed`
+  // descendants, so a scrim left inside the view would stop covering the
+  // viewport the moment the recede began -- the very animation it triggers.
+  // React synthetic events still bubble through the REACT tree, but none of
+  // the three hosts has a click handler above the sheet, so nothing changes
+  // semantically.
+  return createPortal(
     <div
-      className="sheet-scrim"
+      className={`sheet-scrim${closing ? ' closing' : ''}`}
       data-testid={testid}
       data-auto={auto ? 'on' : undefined}
       // 点遮罩关闭，**仅当点的就是遮罩本身**。卡片内部的点击不许穿透过来——
       // 误关是小事，误确认才是大事（与 ConfirmDialog 同一条判据）。
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !dismissDisabled) onClose();
+        if (e.target === e.currentTarget && !dismissDisabled) requestClose();
       }}
     >
       <div
@@ -158,13 +209,14 @@ export function Sheet({
           <button
             className="btn" type="button" data-testid={`${testid}-close`}
             disabled={dismissDisabled}
-            onClick={onClose}
+            onClick={requestClose}
           >
             {dismissLabel ?? t('common.close')}
           </button>
           {primaryAction}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

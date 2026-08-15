@@ -16,6 +16,7 @@
 // 缓存键，也不再有「忘了同步某个字段」的可能。
 
 import { create } from 'zustand';
+import { navMotion, navigateWithTransition } from '../lib/viewTransition';
 import { useStoreWithEqualityFn } from 'zustand/traditional';
 import type {
   AirPlaySessionInfo, DaemonInfo, DaemonSettings, DiscoverResult, PeerState, SessionInfo,
@@ -362,8 +363,24 @@ export const actions = {
     setState({ settingsSupported: false, daemonSettings: null });
   },
 
+  /**
+   * 换页。**唯一**的路由写入点，所以过渡动画也钉在这里而不是各个调用点。
+   *
+   * `App.tsx` 用 `key={view}` 渲染当前视图，于是 React 在路由变化的那一刻**同步**
+   * 卸载旧树——实测 2026-08-15：t=11ms 时旧视图已经不在 DOM 里了。没有东西可以退场，
+   * 这就是换页无论用什么曲线都读作硬切的原因。`navigateWithTransition` 让合成器留
+   * 一份旧帧的**快照**（不是活着的组件树，那会让 1Hz 的指标继续重渲），新旧两帧的
+   * 交叉过渡写在 styles.css 的 `html[data-vt="nav"]::view-transition-*` 里。
+   *
+   * 三条降级路径（不支持、减弱动态、已有过渡在跑）都直接 `apply()`，所以这里的
+   * 语义与改动前逐字相同。
+   */
   navigate(view: ViewName, peerFp: string | null = null): void {
-    setState({ route: { view, peerFp } });
+    // 方向来自两个视图**在导航胶囊上的相对位置**；进出详情走垂直轴（下钻=从底部
+    // 浮上来）。在这里算而不是在 viewTransition 里读 store：那个模块刻意与状态层
+    // 无关，它只认调用方给的符号。
+    const motion = navMotion(getState().route.view, view);
+    navigateWithTransition(() => setState({ route: { view, peerFp } }), motion);
   },
 
   setMonitorPref(fp: string, want: boolean): void {

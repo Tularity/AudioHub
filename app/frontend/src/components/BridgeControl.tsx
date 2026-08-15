@@ -2,6 +2,7 @@
 
 import { Icon } from './Icon';
 import { ExtLink, Help } from './Controls';
+import { Select } from './Select';
 import { WIKI } from '../lib/external';
 import { bridgeCatalog, vendors } from '../lib/bridge';
 import type { DaemonInfo } from '../ipc/types';
@@ -53,26 +54,29 @@ export function BridgeControl({
       // 对端卡片整体可点击（进入详情）：控件里的点击不能冒泡上去，否则一选就被导航走。
       onClick={(e) => e.stopPropagation()}
     >
-      <label className="bridge-row">
+      <div className="bridge-row">
         <Icon name="cable" />
         <span className="bridge-label">{boxLabel}</span>
         <Help label={t('wiki.bridge')} url={WIKI.bridge} testid={`${testid}-help`} />
-        <select
-          className="select"
-          data-testid={testid}
-          aria-label={boxLabel}
+        <Select<string>
+          testid={testid}
+          label={boxLabel}
           value={value || NONE}
           disabled={!has || pending}
-          onChange={(e) => onChange(e.currentTarget.value)}
-        >
-          {/* 选中的卡刚被拔掉/改名：留一个如实标注的条目，别让选择悄悄跳回「不桥接」。 */}
-          {!list.length
-            ? <option value={NONE}>{catalog != null ? t('bridge.undetected') : t('bridge.notReported')}</option>
-            : <option value={NONE}>{t('bridge.none')}</option>}
-          {list.map((c) => <option key={c.name} value={c.name}>{c.name}</option>)}
-          {stale ? <option value={value}>{t('bridge.staleOption', { name: value })}</option> : null}
-        </select>
-      </label>
+          onChange={onChange}
+          options={[
+            {
+              value: NONE,
+              label: !list.length
+                ? (catalog != null ? t('bridge.undetected') : t('bridge.notReported'))
+                : t('bridge.none'),
+            },
+            ...list.map((c) => ({ value: c.name, label: c.name })),
+            // 选中的卡刚被拔掉/改名：留一个如实标注的条目，别让选择悄悄跳回「不桥接」。
+            ...(stale ? [{ value, label: t('bridge.staleOption', { name: value }) }] : []),
+          ]}
+        />
+      </div>
       <p className="bridge-note" data-testid={`${testid}-note`}>{note}</p>
       <div className="bridge-links" data-testid={`${testid}-links`} hidden={has}>
         {vendors().map((v) => (

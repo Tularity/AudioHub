@@ -123,13 +123,15 @@ export function OnboardingGate() {
         </div>
 
         <div className="perm-list" data-testid="onboarding-list">
-          {items.map((p) => (
+          {items.map((p, i) => (
             <PermissionRow
               key={p.id}
               perm={p}
               prefix="onboarding"
               busy={perms.busy}
               deferred={deferred.has(p.id)}
+              // Drives the 70ms entrance stagger in `.perm-list > .perm-row`.
+              index={i}
               onAction={onAction}
               // 可选项才给「稍后再说」：必需项给了就是自相矛盾（它挡着门）。
               onDefer={p.required ? null : (x) => setDeferred((s) => new Set(s).add(x.id))}

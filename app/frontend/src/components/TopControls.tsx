@@ -23,8 +23,9 @@
 // between the platforms -- which edge, and the flex direction that keeps the
 // status dot on the outside of the group either way. No second layout branch.
 
-import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useId, useRef, useState, useSyncExternalStore } from 'react';
 import { RawIcon } from './Icon';
+import { useDismiss } from '../lib/dismiss';
 import { useStore } from '../state/store';
 import { LOCALE_ENDONYM, t } from '../i18n';
 import type { Locale, MsgKey } from '../i18n';
@@ -38,37 +39,6 @@ import {
   setLocalePref, setThemePref, subscribeLocale, subscribeTheme,
 } from '../lib/appearanceHost';
 import { originOfElement, revealSwap } from '../lib/reveal';
-
-// ---------------------------------------------------------------- shared
-
-/**
- * Click-away and Escape for a popover that opens on click.
- *
- * `pointerdown` rather than `click`: a `click` listener fires after the button
- * has already re-rendered, and on the press that closes a menu the browser
- * delivers the close *and* the button's own toggle, so the menu reopens
- * immediately. Listening on the down edge and checking containment is the
- * version that does not fight itself.
- */
-function useDismiss(open: boolean, close: () => void) {
-  const host = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: PointerEvent) => {
-      const el = e.target;
-      if (el instanceof Node && host.current?.contains(el)) return;
-      close();
-    };
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
-    document.addEventListener('pointerdown', onDown, true);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('pointerdown', onDown, true);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open, close]);
-  return host;
-}
 
 // ---------------------------------------------------------------- status
 
@@ -110,6 +80,13 @@ function StatusControl() {
   // plausible lie instead of an em dash.
   const ctlPort = useStore((s) => s.daemon?.control_port ?? null);
   const panelId = useId();
+  // Click, not hover (user, 2026-08-15). Hover-opened panels appear while the
+  // pointer is only passing through, and on a strip this narrow the pointer
+  // passes through constantly on its way to the theme and language buttons.
+  // Same mechanism as `LocaleControl`, so both panels now open exactly one way.
+  const [open, setOpen] = useState(false);
+  const close = useCallback(() => setOpen(false), []);
+  const host = useDismiss<HTMLDivElement>(open, close);
 
   const cls = conn === 'online' ? 'online'
     : (conn === 'connecting' || conn === 'starting') ? 'connecting' : 'offline';
@@ -121,24 +98,30 @@ function StatusControl() {
   // inside it" -- is the same thing it always was, and renaming a stable hook
   // because its markup moved is how automation quietly stops asserting.
   return (
-    <div className="chrome-ctl hoverable" id="daemon-badge" data-testid="daemon-badge">
+    <div className="chrome-ctl" ref={host} id="daemon-badge" data-testid="daemon-badge">
       <button
         type="button"
-        className={`chrome-btn status ${cls}`}
+        className={`chrome-btn status ${cls}${open ? ' open' : ''}`}
         data-testid="chrome-status"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls={panelId}
         aria-label={`${t('chrome.status.title')}: ${label}`}
-        aria-describedby={panelId}
-        /* No `title`, unlike the other two buttons. Both it and the popover
-           open on hover, so Windows draws its native tooltip on top of the
-           panel -- covering the panel's own first line, which says the same
-           word. Found on 30-win. The other two keep their titles: their
-           popovers are click-driven, so the two never appear together. */
+        /* It can carry a `title` now. The old comment said it must not, because
+           button and panel both opened on hover and Windows drew its native
+           tooltip over the panel's own first line. Click-driven, the tooltip
+           and the panel can no longer be on screen at the same time -- the same
+           reason the other two buttons always kept theirs. */
+        title={`${t('chrome.status.title')}: ${label}`}
+        onClick={() => setOpen((v) => !v)}
       >
         <span className={`dot ${cls}`} aria-hidden="true" />
       </button>
       <div
-        className="chrome-pop status-pop"
+        className={`chrome-pop status-pop${open ? ' open' : ''}`}
         id={panelId}
+        role="dialog"
+        aria-label={t('chrome.status.title')}
         data-testid="chrome-status-pop"
         data-no-drag=""
       >
@@ -220,7 +203,7 @@ function LocaleControl() {
         data-no-drag=""
       >
         <p className="pop-title">{t('chrome.locale.title')}</p>
-        {LOCALE_PREFS.map((p) => (
+        {LOCALE_PREFS.map((p, i) => (
           <button
             key={p}
             type="button"
@@ -228,6 +211,9 @@ function LocaleControl() {
             aria-checked={p === pref}
             className={`pop-item${p === pref ? ' on' : ''}`}
             data-testid={`chrome-locale-${p}`}
+            /* Feeds the cascade: item N fades in N steps late (styles.css,
+               `.chrome-pop.open .pop-item`). Index, not anything semantic. */
+            style={{ '--i': i } as React.CSSProperties}
             onClick={() => { setLocalePref(p); close(); }}
           >
             <span className="pop-item-label">

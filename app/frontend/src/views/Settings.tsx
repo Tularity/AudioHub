@@ -226,7 +226,10 @@ function ModeCard() {
         ) : null}
         {showDriverAction ? (
           <button
-            className="btn small primary"
+            // `pending` reuses the `.switch.pending` breathing: a privileged
+            // install takes seconds, and seconds of no feedback at all read as
+            // a hang. Same problem `.switch.pending` was built for.
+            className={`btn small primary${driverTask ? ' pending' : ''}`}
             type="button"
             data-testid="settings-driver-install"
             disabled={driverBusy || driverInstaller?.supported === false || driverInstaller?.bundled === false}

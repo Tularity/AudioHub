@@ -48,6 +48,29 @@ objc2-app-kit = { version = "0.3", features = [
   "NSImageRep",
   "NSBitmapImageRep",
   "NSGraphics",
+  # src/mac_tray.rs: the status item's own NSMenu, plus the label + slider that
+  # ride in a view-based NSMenuItem. NSStatusBar/NSStatusBarButton come with
+  # NSStatusItem, which is what `tray_icon::TrayIcon::ns_status_item` hands back.
+  "NSMenu",
+  "NSMenuItem",
+  "NSSlider",
+  "NSTextField",
+  "NSFont",
+  "NSStatusBar",
+  "NSStatusBarButton",
+  "NSStatusItem",
+] }
+# The macOS status item is built on these two directly rather than through
+# `tauri::tray` / `tauri::menu`, because neither exposes the underlying NSMenu a
+# volume slider has to be inserted into — see the module doc of src/mac_tray.rs
+# for the three dead ends. Both are already in the lock at these versions (tauri
+# itself depends on them), and the feature set here is copied verbatim from
+# tauri's own declaration so unification changes nothing about how they build.
+# Windows is untouched: it keeps `tauri::tray::TrayIconBuilder`.
+muda = { version = "0.19", default-features = false, features = ["serde", "gtk"] }
+tray-icon = { version = "0.24", default-features = false, features = [
+  "serde",
+  "gtk",
 ] }
 
 # src/win_chrome.rs subclasses the window to hand Snap Layouts back after

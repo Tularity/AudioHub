@@ -84,6 +84,7 @@ dependencies = [
  "audiohub-security",
  "audiohub-vad-helper",
  "libc",
+ "muda",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -92,6 +93,7 @@ dependencies = [
  "sha2",
  "tauri",
  "tauri-build",
+ "tray-icon",
  "webview2-com",
  "windows",
 ]

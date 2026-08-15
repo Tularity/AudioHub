@@ -364,6 +364,8 @@ function ActiveSession({ session, index }: {
     <li
       className="proto-session"
       data-testid={`share-proto-session-${session.id ?? index}`}
+      // Drives the 70ms entrance stagger in `.proto-session`.
+      style={{ ['--i' as string]: String(index) } as React.CSSProperties}
     >
       {artworkUrl ? (
         <img

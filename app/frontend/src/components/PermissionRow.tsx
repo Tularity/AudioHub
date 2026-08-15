@@ -9,13 +9,16 @@ import { t } from '../i18n';
 import type { PermissionState } from '../state/permissions';
 
 export function PermissionRow({
-  perm, prefix, busy, deferred = false, onAction, onDefer,
+  perm, prefix, busy, deferred = false, index, onAction, onDefer,
 }: {
   perm: PermissionState;
   /** data-testid 前缀（onboarding / settings-perm） */
   prefix: string;
   busy: string | null;
   deferred?: boolean;
+  /** List position, used only for the entrance stagger (--i). Omit outside a
+      list; the stylesheet falls back to 0 and the row simply enters at once. */
+  index?: number;
   onAction: (p: PermissionState) => void;
   /** 可选项的「稍后再说」；不传则不渲染 */
   onDefer?: ((p: PermissionState) => void) | null;
@@ -46,6 +49,7 @@ export function PermissionRow({
     <div
       className={`perm-row${p.status === 'granted' ? ' granted' : ''}${isBlocking(p) ? ' blocking' : ''}`}
       data-testid={`${prefix}-row-${p.id}`}
+      style={index === undefined ? undefined : ({ ['--i' as string]: String(index) } as React.CSSProperties)}
     >
       <span className="perm-ico"><Icon name={p.icon} /></span>
       <div className="perm-text">

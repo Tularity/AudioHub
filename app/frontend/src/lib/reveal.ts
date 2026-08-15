@@ -34,6 +34,8 @@
 // runs in every one of them. A theme toggle that leaves the app mid-animation
 // because a promise rejected would be far worse than one that never animates.
 
+import { VT_THEME } from './viewTransition';
+
 /** Where the circle starts, in viewport coordinates. */
 export interface RevealOrigin {
   x: number;
@@ -41,17 +43,29 @@ export interface RevealOrigin {
 }
 
 /** How long the circle takes to cross the window, and its curve. */
-export const REVEAL_DURATION_MS = 480;
+export const REVEAL_DURATION_MS = 520;
 /**
  * `ease-out`, not the spring used for panels appearing.
  *
  * A wipe that overshoots would have to come back, and there is nothing for the
  * edge of the window to bounce against. Fast at the start, settling at the end,
- * is what reads as "the new surface swept in" -- and 480ms is long enough to be
- * legible on a 1400px-wide window without being something you wait for.
- * `docs/plan.md` §3.1 asks for measured animation, not a demo reel.
+ * is what reads as "the new surface swept in" rather than "a disc slid across".
+ *
+ * 2026-08-15: **reversed the 2026-08-14 change, which was backwards.** That day
+ * I pushed the curve to `(.16,1,.3,1)` — an even more front-loaded decelerate —
+ * on the theory that a sharper burst would read as "less linear". Measuring the
+ * sheet the next day showed why that is wrong for anything whose trajectory is
+ * meant to be followed: a decelerate curve puts ~80% of the distance into the
+ * first quarter, so the circle is essentially at the far corner before the eye
+ * has moved, and the remaining three quarters are an invisible crawl.
+ *
+ * A wipe is read by following its edge, so the edge has to keep moving. This is
+ * the near-linear curve the sheet's exit settled on (`--ease-depart` in
+ * styles.css), and the duration goes UP rather than down because the circle
+ * crosses far more ground than a panel does. `docs/plan.md` §3.1 asks for
+ * measured animation, not a demo reel — 520ms over a full window still is.
  */
-export const REVEAL_EASING = 'cubic-bezier(.22, 1, .36, 1)';
+export const REVEAL_EASING = 'cubic-bezier(.35, .12, .65, .88)';
 
 /**
  * Radius the circle must reach to cover the viewport: the distance from the
@@ -126,8 +140,16 @@ export function revealSwap(origin: RevealOrigin | null, apply: () => void): void
   }
 
   const start = (doc as Document & ViewTransitionCapable).startViewTransition;
+  // Mark which feature owns the pseudo-elements. Navigation animates them and
+  // this one deliberately does not (it draws its own circle over an otherwise
+  // untouched frame), so the stylesheet has to be able to tell them apart.
+  doc.documentElement.dataset.vt = VT_THEME;
   // `start` is a method on the document; calling it detached loses `this`.
   const transition = start!.call(doc, apply);
+  const clearMark = () => {
+    if (doc.documentElement.dataset.vt === VT_THEME) delete doc.documentElement.dataset.vt;
+  };
+  transition.finished.then(clearMark, clearMark);
 
   const radius = revealRadius(origin, win.innerWidth, win.innerHeight);
   transition.ready.then(() => {

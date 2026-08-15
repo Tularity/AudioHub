@@ -15,6 +15,7 @@
 
 import { Icon } from './Icon';
 import { Help, Segmented } from './Controls';
+import { Select } from './Select';
 import { WIKI } from '../lib/external';
 import {
   BACKEND_AUTO, SOURCE_MIC, SOURCE_SYSAUDIO,
@@ -108,34 +109,34 @@ export function ShareSourceControl({
 
       {/* 后端选择是二级：绝大多数用户不该关心它，但 plan §6 要求「允许配置强制指定」，
           而 probe 的 A/B 实测也只有在这里能被复现。 */}
-      <label className="share-row sub" hidden={!sys}>
+      <div className="share-row sub" hidden={!sys}>
         <Icon name="plug" />
         <span className="share-label">{t('share.backend.label')}</span>
-        <select
-          className="select"
-          data-testid={`${testid}-backend`}
-          aria-label={t('share.backend.label')}
+        <Select<string>
+          testid={`${testid}-backend`}
+          label={t('share.backend.label')}
           value={backend || BACKEND_AUTO}
           disabled={pending || dead}
-          onChange={(e) => onBackend(e.currentTarget.value)}
-        >
-          <option value={BACKEND_AUTO}>{t('share.backend.autoOption')}</option>
-          {/* 「本机不可用」和「本项目不提供」必须分开说：前者换台机器/升个系统就能用，
-              后者谁也修不好。写成同一句话，用户会去折腾一个根本不存在的东西。 */}
-          {options.map((b) => (
-            <option key={b.id} value={b.id} disabled={b.available === false}>
-              {b.declined
+          onChange={onBackend}
+          options={[
+            { value: BACKEND_AUTO, label: t('share.backend.autoOption') },
+            // 「本机不可用」和「本项目不提供」必须分开说：前者换台机器/升个系统就能用，
+            // 后者谁也修不好。写成同一句话，用户会去折腾一个根本不存在的东西。
+            ...options.map((b) => ({
+              value: b.id,
+              label: b.declined
                 ? t('share.backend.optionDeclined', { name: b.label })
                 : b.available === false
                   ? t('share.backend.optionUnavailable', { name: b.label })
-                  : b.label}
-            </option>
-          ))}
-          {stale ? (
-            <option value={backend}>{t('share.backend.staleOption', { id: backend })}</option>
-          ) : null}
-        </select>
-      </label>
+                  : b.label,
+              disabled: b.available === false,
+            })),
+            ...(stale
+              ? [{ value: backend, label: t('share.backend.staleOption', { id: backend }) }]
+              : []),
+          ]}
+        />
+      </div>
 
       <p className="share-note" data-testid={`${testid}-note`}>{note}</p>
 

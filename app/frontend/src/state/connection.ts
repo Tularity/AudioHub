@@ -13,7 +13,9 @@ import type {
 } from '../ipc/types';
 import { actions, getState, setState } from './store';
 import type { ConnError } from './store';
+import { effectiveMode } from './mode';
 import { normalizeList, normalizeOne, gateNeeded } from './permissions';
+import { trayVolumeOf } from '../lib/trayVolume';
 import { applyChromeDirection } from '../lib/platform';
 import { activeTheme } from '../lib/appearanceHost';
 import { iconStateFrom } from '../lib/trayIcon';
@@ -573,6 +575,24 @@ export function syncNativeAppearance(): void {
     });
 }
 
+/**
+ * 写回 macOS 菜单栏那条音量滑条拖出来的值。
+ *
+ * 会话 id **在事件到达的这一刻现取**，不由原生侧带过来：菜单可以一直开着，而
+ * 期间对端可能断开、模式可能被 CLI 改掉。原生侧记住的 id 会指向一条已经不存在的
+ * 会话，那次写入要么静默失败、要么打到别的会话上——两种都比「什么都不做」坏。
+ *
+ * silent：拖动会连发，失败不刷 toast（与对端卡片上那条滑条同一条纪律）。
+ */
+export function setTrayVolume(scalar: number): void {
+  const s = getState();
+  const vol = trayVolumeOf(effectiveMode(s), s.sessions);
+  if (!vol) return;
+  // 不带 muted：省略即保持对端当前静音态（IPC 契约，见 VolumeControl.tsx 顶部）。
+  // 拖一下滑条就把对端悄悄解除静音，是这条契约要挡的那件事。
+  void rpc('session.set_volume', { id: vol.id, scalar }, { silent: true }).catch(() => {});
+}
+
 export function syncTray(): void {
   const s = getState();
   if (s.mode !== 'tauri') return;
@@ -583,8 +603,18 @@ export function syncTray(): void {
   // Dock 图标就该跟着窗口，而不是跟着系统。
   const theme = activeTheme();
   const locale = getLocale();
+  // macOS 菜单栏那条音量滑条。`null` = 整行不出现（不是「出现但为 0」——0 是一个
+  // 真实的音量值，把「没有可调对象」画成 0 就是在撒谎）。
+  //
+  // 量化到 1%：这个函数挂在 store 订阅上，每一帧 stats 都会走一遍，而菜单栏滑条
+  // 的显示精度远低于 1%。不量化则去重键每帧都变，等于每秒往原生侧打一次无意义的
+  // 调用；量化之后**发出去的值与去重键里的值是同一个数**，去重键仍然覆盖了全部
+  // 进入参数表的量（这正是下面那条注释的要求）。
+  const vol = trayVolumeOf(effectiveMode(s), s.sessions);
+  const volume = vol ? Math.round(vol.scalar * 100) / 100 : null;
+  const muted = vol ? vol.muted : null;
   // 去重键必须覆盖每一个进了参数表的量，否则新维度的变化会被这一行悄悄吃掉。
-  const key = `${online}|${port}|${state}|${theme}|${locale}`;
+  const key = `${online}|${port}|${state}|${theme}|${locale}|${volume}|${muted}`;
   if (key === trayKey) return;
   trayKey = key;
   tauriInvoke('set_tray_status', {
@@ -593,6 +623,8 @@ export function syncTray(): void {
     state,
     theme,
     locale,
+    volume,
+    muted,
   }).catch(() => {});
 }
 

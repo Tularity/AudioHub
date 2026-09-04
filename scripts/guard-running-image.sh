@@ -79,7 +79,10 @@ pids_by_image() {
 # lsof 按 inode 精确匹配，是首选判据：进程会把自己的可执行文件作为 txt 持有。
 pids_by_lsof() {
   command -v lsof >/dev/null 2>&1 || return 0
-  lsof -t -- "$@" 2>/dev/null || true
+  # Metadata readers such as LaunchServices may open a newly built executable
+  # without running it. Require a program-text mapping of this exact file;
+  # -a is essential because lsof otherwise ORs the descriptor and path filters.
+  lsof -a -d txt -t -- "$@" 2>/dev/null || true
 }
 
 # 自己和自己的祖先链要排除：本脚本的 argv 里就带着目标路径，调用它的构建脚本同理。

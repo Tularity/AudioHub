@@ -27,6 +27,12 @@ trap cleanup EXIT
 DEST="$STAGE/Library/Audio/Plug-Ins/HAL"
 mkdir -p "$DEST"
 /usr/bin/ditto "$DRIVER_DIR/build/AudioHubDriver.driver" "$DEST/AudioHubDriver.driver"
+# CoreAudio's driver host must read the root-owned payload after installation,
+# even when the build was invoked from a private-umask test workspace.
+/usr/bin/find "$STAGE" -type d -exec /bin/chmod 0755 {} +
+/usr/bin/find "$STAGE" -type f -perm -100 -exec /bin/chmod 0755 {} +
+/usr/bin/find "$STAGE" -type f ! -perm -100 -exec /bin/chmod 0644 {} +
+/usr/bin/codesign --verify --deep --strict "$DEST/AudioHubDriver.driver"
 
 args=(
   --root "$STAGE"

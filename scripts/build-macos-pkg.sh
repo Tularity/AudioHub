@@ -107,8 +107,15 @@ CANDIDATE="$WORK/${FINAL:t}"
 # the otherwise App-only BOM noisy, so stage only ordinary filesystem data.
 /usr/bin/ditto --norsrc --noextattr --noacl --noqtn \
   "$APP" "$PAYLOAD_ROOT/AudioHub.app"
+# The package becomes root-owned at install time. A private build umask must
+# not make its public application payload unreadable to the installing user.
+/usr/bin/find "$PAYLOAD_ROOT" -type d -exec /bin/chmod 0755 {} +
+/usr/bin/find "$PAYLOAD_ROOT" -type f -perm -100 -exec /bin/chmod 0755 {} +
+/usr/bin/find "$PAYLOAD_ROOT" -type f ! -perm -100 -exec /bin/chmod 0644 {} +
 /usr/bin/cmp -s "$APP/Contents/MacOS/audiohubd" "$PAYLOAD_ROOT/AudioHub.app/Contents/MacOS/audiohubd" \
   || { print -u2 -- "staged daemon differs from the signed App"; exit 1; }
+/usr/bin/codesign --verify --deep --strict "$PAYLOAD_ROOT/AudioHub.app" \
+  || { print -u2 -- "staged App signature differs after permission normalization"; exit 1; }
 
 app_args=(
   --root "$PAYLOAD_ROOT"

@@ -214,6 +214,11 @@ rm -f "$OUT_DIR/AudioHub-${VERSION}-dev.dmg"
 [[ ! -L "$FINAL" && ( ! -e "$FINAL" || -f "$FINAL" ) ]] \
   || { print -u2 -- "refusing a non-regular final disk image path: $FINAL"; exit 1; }
 CANDIDATE="$WORK/${FINAL:t}"
+# Disk-image contents are public distribution files, not private build state.
+/usr/bin/find "$STAGE" -type d -exec /bin/chmod 0755 {} +
+/usr/bin/find "$STAGE" -type f -perm -100 -exec /bin/chmod 0755 {} +
+/usr/bin/find "$STAGE" -type f ! -perm -100 -exec /bin/chmod 0644 {} +
+/usr/bin/codesign --verify --deep --strict "$UNINSTALLER"
 /usr/bin/hdiutil create -quiet -ov -format UDZO -imagekey zlib-level=9 \
   -volname "AudioHub $VERSION" -srcfolder "$STAGE" "$CANDIDATE"
 

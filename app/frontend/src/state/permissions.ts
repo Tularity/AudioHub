@@ -12,7 +12,8 @@ import type { IconName } from '../components/Icon';
 import { t } from '../i18n';
 import type { MsgKey } from '../i18n';
 
-const IS_MAC = /mac/i.test(navigator.platform || '') || /Macintosh/i.test(navigator.userAgent || '');
+const IS_MAC = typeof navigator !== 'undefined'
+  && (/mac/i.test(navigator.platform || '') || /Macintosh/i.test(navigator.userAgent || ''));
 
 // 系统设置深链只是兜底：daemon 给了 settings_url 就用它的。锚点取自本机
 // SecurityPrivacyExtension.appex（Privacy_Microphone / Privacy_AudioCapture 确实存在；

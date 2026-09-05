@@ -115,4 +115,6 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-export const IS_MAC = /mac/i.test(navigator.platform || '') || /Macintosh/i.test(navigator.userAgent || '');
+// Pure formatting helpers can also be imported by non-browser consumers.
+export const IS_MAC = typeof navigator !== 'undefined'
+  && (/mac/i.test(navigator.platform || '') || /Macintosh/i.test(navigator.userAgent || ''));

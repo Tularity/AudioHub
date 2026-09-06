@@ -26,6 +26,7 @@ pub fn goertzel_power(samples: &[f32], sample_rate: u32, freq_hz: f32) -> f32 {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToneVerdict {
+    /// Requested detector frequency. This is not a measured spectral peak.
     pub freq_hz: f32,
     pub snr_db: f32,
     pub detected: bool,
@@ -99,6 +100,61 @@ const LOBE_HALF_BINS: i32 = 3;
 /// 「最坏的合法读数离它还有多远」——见
 /// `servo_bend_no_longer_defeats_the_tone_verdict::the_threshold_keeps_its_margin_against_every_legal_servo_bend`。
 pub const TONE_DETECT_DB: f32 = 20.0;
+
+/// Absolute full-scale RMS floor for one eligible tone window.
+///
+/// SNR alone is intentionally insufficient for continuity evidence: an
+/// extremely small numerical residue can have an excellent spectral ratio
+/// while being inaudible. `1e-4` is -80 dBFS, well below the probe tones while
+/// still rejecting that residue.
+pub const TONE_MIN_RMS: f32 = 1.0e-4;
+
+/// A tone is continuous only when at least 95% of its eligible 100 ms windows
+/// pass both the existing SNR threshold and the absolute RMS floor.
+pub const TONE_CONTINUITY_REQUIRED_RATIO: f64 = 0.95;
+
+pub const TONE_WINDOW_MILLIS: u32 = 100;
+pub const TONE_INITIAL_SKIP_MILLIS: u32 = 200;
+
+/// JSON-safe evidence for one complete, post-warmup 100 ms analysis window.
+/// Non-finite measurements are represented as `null` and can never pass.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToneWindowVerdict {
+    pub index: usize,
+    pub rms: Option<f32>,
+    pub snr_db: Option<f32>,
+    /// The current detector verifies energy around the requested frequency; it
+    /// does not claim a robust independent peak-frequency estimate.
+    pub measured_frequency_hz: Option<f32>,
+    pub pass: bool,
+}
+
+/// Window-by-window continuity evidence kept separate from `ToneVerdict` so
+/// existing network and daemon callers retain their established contract.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToneContinuityVerdict {
+    pub requested_frequency_hz: f32,
+    pub measured_frequency_hz: Option<f32>,
+    pub initial_skip_ms: u32,
+    pub window_duration_ms: u32,
+    pub snr_threshold_db: f32,
+    pub rms_threshold: f32,
+    pub required_passing_ratio: f64,
+    pub window_count: usize,
+    pub passing_window_count: usize,
+    pub passing_ratio: f64,
+    pub longest_consecutive_passing_windows: usize,
+    pub longest_consecutive_passing_seconds: f64,
+    pub sustained: bool,
+    pub windows: Vec<ToneWindowVerdict>,
+}
+
+pub fn valid_tone_frequency(sample_rate: u32, frequency_hz: f32) -> bool {
+    sample_rate > 0
+        && frequency_hz.is_finite()
+        && frequency_hz > 0.0
+        && frequency_hz < sample_rate as f32 / 2.0
+}
 
 /// 就地给 `dst` 写入 `chunk` 的 Hann 加窗结果。窗表按 `chunk.len()` 现算。
 fn hann_into(chunk: &[f32], dst: &mut Vec<f32>) {
@@ -212,6 +268,102 @@ pub fn verify_tone(samples: &[f32], sample_rate: u32, freq_hz: f32) -> ToneVerdi
         detected: snr_db > TONE_DETECT_DB,
         samples_analyzed: analyzed,
     }
+}
+
+/// Verify that the requested tone persists across complete 100 ms windows.
+///
+/// The first 200 ms are excluded exactly as in `verify_tone`. A window passes
+/// only when every sample and both derived measurements are finite, its RMS is
+/// at least `TONE_MIN_RMS`, and its SNR exceeds the existing
+/// `TONE_DETECT_DB`. Incomplete tail windows are never eligible. The returned
+/// floating-point values are therefore all finite and safe for strict JSON
+/// serializers; unavailable per-window values are explicit `None`/`null`.
+pub fn verify_tone_continuity(
+    samples: &[f32],
+    sample_rate: u32,
+    requested_frequency_hz: f32,
+) -> Option<ToneContinuityVerdict> {
+    if !valid_tone_frequency(sample_rate, requested_frequency_hz) {
+        return None;
+    }
+    let skip = (sample_rate as usize).saturating_mul(TONE_INITIAL_SKIP_MILLIS as usize) / 1_000;
+    let window_len = (sample_rate as usize).saturating_mul(TONE_WINDOW_MILLIS as usize) / 1_000;
+    let mut windows = Vec::new();
+    let mut passing_window_count = 0usize;
+    let mut consecutive = 0usize;
+    let mut longest_consecutive_passing_windows = 0usize;
+
+    if window_len > 0 && samples.len() >= skip {
+        let mut windowed = Vec::with_capacity(window_len);
+        for (index, chunk) in samples[skip..].chunks(window_len).enumerate() {
+            if chunk.len() != window_len {
+                break;
+            }
+            let finite_input = chunk.iter().all(|sample| sample.is_finite());
+            let (rms, snr_db) = if finite_input {
+                let rms = (chunk
+                    .iter()
+                    .map(|sample| f64::from(*sample) * f64::from(*sample))
+                    .sum::<f64>()
+                    / chunk.len() as f64)
+                    .sqrt() as f32;
+                hann_into(chunk, &mut windowed);
+                let (inband, total) =
+                    lobe_and_total(&windowed, sample_rate, requested_frequency_hz);
+                let eps = 1e-12f64;
+                let noise = (total - inband).max(0.0) + eps;
+                let snr = (10.0 * (inband.max(eps) / noise).log10()) as f32;
+                (
+                    rms.is_finite().then_some(rms),
+                    snr.is_finite().then_some(snr),
+                )
+            } else {
+                (None, None)
+            };
+            let pass = rms.is_some_and(|value| value >= TONE_MIN_RMS)
+                && snr_db.is_some_and(|value| value > TONE_DETECT_DB);
+            if pass {
+                passing_window_count = passing_window_count.saturating_add(1);
+                consecutive = consecutive.saturating_add(1);
+                longest_consecutive_passing_windows =
+                    longest_consecutive_passing_windows.max(consecutive);
+            } else {
+                consecutive = 0;
+            }
+            windows.push(ToneWindowVerdict {
+                index,
+                rms,
+                snr_db,
+                measured_frequency_hz: None,
+                pass,
+            });
+        }
+    }
+
+    let window_count = windows.len();
+    let passing_ratio = if window_count == 0 {
+        0.0
+    } else {
+        passing_window_count as f64 / window_count as f64
+    };
+    Some(ToneContinuityVerdict {
+        requested_frequency_hz,
+        measured_frequency_hz: None,
+        initial_skip_ms: TONE_INITIAL_SKIP_MILLIS,
+        window_duration_ms: TONE_WINDOW_MILLIS,
+        snr_threshold_db: TONE_DETECT_DB,
+        rms_threshold: TONE_MIN_RMS,
+        required_passing_ratio: TONE_CONTINUITY_REQUIRED_RATIO,
+        window_count,
+        passing_window_count,
+        passing_ratio,
+        longest_consecutive_passing_windows,
+        longest_consecutive_passing_seconds: longest_consecutive_passing_windows as f64
+            * f64::from(TONE_WINDOW_MILLIS)
+            / 1_000.0,
+        sustained: window_count > 0 && passing_ratio >= TONE_CONTINUITY_REQUIRED_RATIO,
+        windows,
+    })
 }
 
 // ---------------------------------------------------------------- 线上位深
@@ -516,6 +668,81 @@ impl LinearResampler {
     }
 }
 
+/// Channel-preserving wrapper around [`LinearResampler`]. Each lane owns its
+/// interpolation history, while identical rate/phase state guarantees the lane
+/// outputs stay frame aligned. Scratch vectors are retained, so steady-state
+/// processing does not allocate.
+pub struct InterleavedLinearResampler {
+    channels: usize,
+    lanes: Vec<LinearResampler>,
+    lane_in: Vec<Vec<f32>>,
+    lane_out: Vec<Vec<f32>>,
+}
+
+impl InterleavedLinearResampler {
+    pub fn new(src: u32, dst: u32, channels: u8) -> Self {
+        Self::build(src, dst, channels, false)
+    }
+
+    pub fn servoed(src: u32, dst: u32, channels: u8) -> Self {
+        Self::build(src, dst, channels, true)
+    }
+
+    fn build(src: u32, dst: u32, channels: u8, servoed: bool) -> Self {
+        let channels = channels.clamp(1, 2) as usize;
+        let mut lanes = Vec::with_capacity(channels);
+        let mut lane_in = Vec::with_capacity(channels);
+        let mut lane_out = Vec::with_capacity(channels);
+        for _ in 0..channels {
+            lanes.push(if servoed {
+                LinearResampler::servoed(src, dst)
+            } else {
+                LinearResampler::new(src, dst)
+            });
+            lane_in.push(Vec::new());
+            lane_out.push(Vec::new());
+        }
+        Self {
+            channels,
+            lanes,
+            lane_in,
+            lane_out,
+        }
+    }
+
+    pub fn channels(&self) -> u8 {
+        self.channels as u8
+    }
+
+    pub fn set_correction(&mut self, corr: f64) {
+        for lane in &mut self.lanes {
+            lane.set_correction(corr);
+        }
+    }
+
+    pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        let frames = input.len() / self.channels;
+        if frames == 0 {
+            return;
+        }
+        for ch in 0..self.channels {
+            let lane_in = &mut self.lane_in[ch];
+            lane_in.clear();
+            lane_in.reserve(frames);
+            lane_in.extend((0..frames).map(|f| input[f * self.channels + ch]));
+            self.lane_out[ch].clear();
+            self.lanes[ch].process(lane_in, &mut self.lane_out[ch]);
+        }
+        let out_frames = self.lane_out.iter().map(Vec::len).min().unwrap_or(0);
+        out.reserve(out_frames * self.channels);
+        for frame in 0..out_frames {
+            for ch in 0..self.channels {
+                out.push(self.lane_out[ch][frame]);
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------ §7.2 发送侧软件增益
 
 /// 增益的**转移速率**：走完满量程要这么久。
@@ -632,9 +859,23 @@ impl SendGain {
         depth: WireDepth,
         out: &'a mut Vec<f32>,
     ) -> &'a [f32] {
+        self.apply_interleaved(input, rate_hz, depth, 1, out)
+    }
+
+    /// As [`apply`](Self::apply), advancing the gain ramp once per audio frame
+    /// and applying that exact gain to every channel in the frame.
+    pub fn apply_interleaved<'a>(
+        &mut self,
+        input: &'a [f32],
+        rate_hz: u32,
+        depth: WireDepth,
+        channels: u8,
+        out: &'a mut Vec<f32>,
+    ) -> &'a [f32] {
         if self.is_transparent() {
             return input;
         }
+        let channels = channels.clamp(1, 2) as usize;
         out.clear();
         out.reserve(input.len());
         // 每样本的最大位移。`max(1)` 只是不让荒谬的小采样率把步长除成 0
@@ -647,7 +888,7 @@ impl SendGain {
         } else {
             dither_lsb(depth)
         };
-        for &x in input {
+        for frame in input.chunks(channels) {
             if self.cur != self.target {
                 let d = self.target - self.cur;
                 // 剩下的路不够一步就直接落到目标：否则会在目标附近永久抖动。
@@ -657,10 +898,13 @@ impl SendGain {
                     self.cur + slew.copysign(d)
                 };
             }
-            // **一次乘法，不是两次。** 写成 `x * self.cur * something` 就是
-            // plan §12.5 那条「不存在双重衰减」在本机这一侧的失效形态。
-            let y = x * self.cur;
-            out.push(if lsb > 0.0 { y + self.dither(lsb) } else { y });
+            for &x in frame {
+                // Exactly one multiply, never two. Writing
+                // `x * self.cur * something` violates plan §12.5's
+                // no-double-attenuation invariant on this side.
+                let y = x * self.cur;
+                out.push(if lsb > 0.0 { y + self.dither(lsb) } else { y });
+            }
         }
         out
     }

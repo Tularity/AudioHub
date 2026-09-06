@@ -8,22 +8,72 @@
 use super::apple_challenge::{AppleChallengeError, AppleResponseProvider};
 use rand::rngs::OsRng;
 use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+use rsa::traits::PublicKeyParts;
+use rsa::{Oaep, Pkcs1v15Sign, RsaPrivateKey};
 use std::sync::OnceLock;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Default)]
 pub(crate) struct BundledAirPortExpressProvider;
 
 static PRIVATE_KEY: OnceLock<Option<RsaPrivateKey>> = OnceLock::new();
 
+fn private_key() -> Option<&'static RsaPrivateKey> {
+    PRIVATE_KEY
+        .get_or_init(|| {
+            RsaPrivateKey::from_pkcs1_pem(include_str!("airport_express_private_key.pem")).ok()
+        })
+        .as_ref()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClassicKeyError {
+    ProviderUnavailable,
+    InvalidCiphertext,
+}
+
+impl std::fmt::Display for ClassicKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ProviderUnavailable => "classic compatibility key provider unavailable",
+            Self::InvalidCiphertext => "invalid classic session key",
+        })
+    }
+}
+
+impl std::error::Error for ClassicKeyError {}
+
+pub(crate) trait ClassicKeyProvider: Send + Sync {
+    fn unwrap_key(&self, ciphertext: &[u8]) -> Result<Zeroizing<[u8; 16]>, ClassicKeyError>;
+}
+
+impl ClassicKeyProvider for BundledAirPortExpressProvider {
+    fn unwrap_key(&self, ciphertext: &[u8]) -> Result<Zeroizing<[u8; 16]>, ClassicKeyError> {
+        let expected = super::classic::sdp::WRAPPED_KEY_BYTES;
+        if ciphertext.len() != expected {
+            return Err(ClassicKeyError::InvalidCiphertext);
+        }
+        let key = private_key().ok_or(ClassicKeyError::ProviderUnavailable)?;
+        if key.size() != expected {
+            return Err(ClassicKeyError::ProviderUnavailable);
+        }
+        // Classic RAOP uses OAEP/SHA-1, not AP2's media-key agreement. Keep
+        // private operations blinded and plaintext owned by zeroizing storage.
+        let plaintext = Zeroizing::new(
+            key.decrypt_blinded(&mut OsRng, Oaep::new::<sha1::Sha1>(), ciphertext)
+                .map_err(|_| ClassicKeyError::InvalidCiphertext)?,
+        );
+        let aes_key = plaintext
+            .as_slice()
+            .try_into()
+            .map_err(|_| ClassicKeyError::InvalidCiphertext)?;
+        Ok(Zeroizing::new(aes_key))
+    }
+}
+
 impl AppleResponseProvider for BundledAirPortExpressProvider {
     fn private_pkcs1_v15(&self, input: &[u8]) -> Result<Vec<u8>, AppleChallengeError> {
-        let key = PRIVATE_KEY
-            .get_or_init(|| {
-                RsaPrivateKey::from_pkcs1_pem(include_str!("airport_express_private_key.pem")).ok()
-            })
-            .as_ref()
-            .ok_or(AppleChallengeError::ProviderUnavailable)?;
+        let key = private_key().ok_or(AppleChallengeError::ProviderUnavailable)?;
         key.sign_with_rng(&mut OsRng, Pkcs1v15Sign::new_unprefixed(), input)
             .map_err(|_| AppleChallengeError::InvalidProviderResponse)
     }
@@ -35,6 +85,46 @@ mod tests {
     use base64::engine::general_purpose::STANDARD_NO_PAD;
     use base64::Engine as _;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn classic_key_unwrap_requires_exact_ciphertext_and_plaintext_lengths() {
+        let provider = BundledAirPortExpressProvider;
+        let public = private_key().unwrap().to_public_key();
+        let aes_key = [0x35; 16];
+        let ciphertext = public
+            .encrypt(&mut OsRng, Oaep::new::<sha1::Sha1>(), &aes_key)
+            .unwrap();
+        assert_eq!(&*provider.unwrap_key(&ciphertext).unwrap(), &aes_key);
+        for size in [0, 15, 17, 32] {
+            let ciphertext = public
+                .encrypt(&mut OsRng, Oaep::new::<sha1::Sha1>(), &vec![0x42; size])
+                .unwrap();
+            assert_eq!(
+                provider.unwrap_key(&ciphertext).unwrap_err(),
+                ClassicKeyError::InvalidCiphertext
+            );
+        }
+        for size in [0, 1, 255, 256, 257] {
+            assert_eq!(
+                provider.unwrap_key(&vec![0; size]).unwrap_err(),
+                ClassicKeyError::InvalidCiphertext
+            );
+        }
+    }
+
+    #[test]
+    fn classic_key_unwrap_rejects_another_oaep_hash() {
+        let public = private_key().unwrap().to_public_key();
+        let ciphertext = public
+            .encrypt(&mut OsRng, Oaep::new::<sha2::Sha256>(), &[0x35; 16])
+            .unwrap();
+        assert_eq!(
+            BundledAirPortExpressProvider
+                .unwrap_key(&ciphertext)
+                .unwrap_err(),
+            ClassicKeyError::InvalidCiphertext
+        );
+    }
 
     #[test]
     fn fixed_provider_matches_independent_openssl_vector() {

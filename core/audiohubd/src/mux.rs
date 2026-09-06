@@ -437,7 +437,7 @@ fn start(
     std::thread::Builder::new()
         .name("ahb-mux-tx".into())
         .spawn(move || {
-            crate::engine::raise_audio_thread_qos("mux_write_loop");
+            let _qos_guard = crate::engine::raise_media_send_thread_qos("mux_write_loop");
             write_loop(&wlink, &mut tx, &winner.shutdown);
         })
         .context("spawn the tier 2 writer")?;

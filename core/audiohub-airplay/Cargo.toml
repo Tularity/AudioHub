@@ -1,26 +1,30 @@
 [package]
 name = "audiohub-airplay"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
 description = "AudioHub's cross-platform, audio-only AirPlay receiver adapter"
 
 [dependencies]
+aes = { version = "0.8", features = ["zeroize"] }
 alac = { version = "0.5", default-features = false }
 audiohub-security = { path = "../audiohub-security" }
 base64 = "0.22"
 chacha20poly1305 = "0.10"
+cbc = "0.1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 hkdf = "0.12"
 log = "0.4"
+md-5 = "0.10"
 num-bigint = "0.4"
 num-traits = "0.2"
 plist = "1"
 rand = "0.8"
 rsa = "0.9.8"
 serde = { version = "1", features = ["derive"] }
+sha1 = "0.10"
 sha2 = "0.10"
 subtle = "2"
 symphonia = { version = "0.5.5", default-features = false, features = ["aac"] }

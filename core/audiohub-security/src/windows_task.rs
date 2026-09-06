@@ -170,6 +170,16 @@ fn normalized_windows_path(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Return the sole executable target from an exported scheduled task.
+///
+/// This intentionally does not validate AudioHub's registration contract. It
+/// is used when the running binary cannot provide an expected installed app,
+/// but the UI still needs to report what an existing task will launch.
+pub fn windows_task_target(xml: &str) -> Option<String> {
+    let parsed = parse_task(xml)?;
+    (parsed.commands.len() == 1).then(|| parsed.commands[0].clone())
+}
+
 /// Validate an exported task against the complete AudioHub startup contract.
 pub fn inspect_windows_task_xml(
     xml: &str,
@@ -265,5 +275,21 @@ mod tests {
             "S-1-5-21-42",
         );
         assert!(result.current);
+    }
+
+    #[test]
+    fn target_is_reported_without_an_expected_install_location() {
+        assert_eq!(
+            windows_task_target(&valid()).as_deref(),
+            Some(r"C:\Program Files\AudioHub\audiohub-app.exe")
+        );
+        assert_eq!(
+            windows_task_target(&valid().replace(
+                "</Actions>",
+                "<Exec><Command>C:\\other.exe</Command></Exec></Actions>"
+            )),
+            None
+        );
+        assert_eq!(windows_task_target("<not-task>"), None);
     }
 }

@@ -91,11 +91,11 @@ Abstract:
 // interface's own key:
 //
 //     ...\<AhTopoOut|AhTopoIn>-<fingerprint>\Device Parameters\EP\0
-//         "{a45c254e-df1c-4efd-8020-67d146a850e0},2" = "AudioHub - <host> <dir>"
+//         "{a45c254e-df1c-4efd-8020-67d146a850e0},2" = <daemon peer label>
 //
 // and the endpoint reads
 //
-//     AudioHub - WIN-IR01HVEFU7G <speaker> (AudioHub Virtual Audio)
+//     <daemon peer label> (AudioHub Virtual Audio)
 //
 // whose leading run is byte-identical to the macOS name that plan 7.1 froze.
 //
@@ -123,7 +123,7 @@ Abstract:
 // key it has never used before.
 //
 // The direction words are NOT part of a successfully named endpoint. Both the
-// output and input endpoint use the daemon-composed "AudioHub - <host>" label;
+// output and input endpoint use the same daemon-composed peer label;
 // Windows already separates them by data flow. The words are still read from
 // the INF so its static pin names remain observable as the generic fallback if
 // the per-peer PKEY_Device_DeviceDesc write fails.
@@ -193,22 +193,23 @@ typedef struct _AH_SLOT
     WCHAR               TopoNameIn[AH_REFSTRING_MAX];
     WCHAR               WaveNameIn[AH_REFSTRING_MAX];
 
-    // The peer's base name as the daemon composed it: "AudioHub - <host>",
-    // prefix included, direction suffix excluded.
+    // The peer label exactly as the daemon composed it, prefix included and
+    // direction suffix excluded.
     WCHAR               Display[AH_DISPLAY_CHARS];
 
-    // Two copies of the same per-peer endpoint label, "AudioHub - <host>".
+    // Two copies of the same per-peer endpoint label.
     // Each goes into its direction's own EP\0 as PKEY_Device_DeviceDesc.
     WCHAR               NameOut[AH_ENDPOINT_NAME_CHARS];
     WCHAR               NameIn[AH_ENDPOINT_NAME_CHARS];
 
-    // TRUE once the registry values exist, i.e. once there is something to
-    // clean up. Checked rather than inferred from State: a Set that failed
-    // after writing the names still has to remove them.
+    // TRUE once this slot owns the endpoint-property write attempt. Raised
+    // before the first mandatory identity write, so a Set that fails after
+    // writing only one direction still removes every name/identity value it
+    // may have created; cleared after cleanup.
     BOOLEAN             NamesWritten;
 
-    // TRUE when this slot's endpoints are published under the system's generic
-    // direction names instead of the peer's. Reported to the daemon as
+    // TRUE when this slot's endpoints are published under the INF's generic
+    // fallback labels instead of the peer's. Reported to the daemon as
     // AH_BINDREPLY_FLAG_NAME_FALLBACK.
     BOOLEAN             NameFallback;
 

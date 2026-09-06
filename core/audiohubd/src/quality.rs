@@ -53,10 +53,10 @@ pub(crate) struct JbCounts {
     pub silence: u64,
     pub underruns: u64,
     pub dropped: u64,
-    /// 深档（5 ms 分包）里按**半帧隐藏**交付的帧数。
-    ///
-    /// 不来自 `JitterBuffer`——它在重组环节，见 `JbState::half_conceal`。放进
-    /// 这个快照是为了让它跟着同一个 10 s 窗口差分，并计入 [`conceal_ratio`]。
+    /// Partially concealed packet sets, conservatively charged at 0.5 frame
+    /// each. This legacy-named counter originates in wire reassembly rather
+    /// than `JitterBuffer`; keeping it in the same snapshot makes it follow the
+    /// same 10-second delta window and enter [`conceal_ratio`].
     pub half_conceal: u64,
 }
 
@@ -139,17 +139,17 @@ impl ConcealWindow {
 /// 无隐藏两条 Ie 曲线，同一丢失率下无隐藏的损伤值约为有隐藏的 2.5~3 倍。取 3
 /// 是这条经验的整数化，且与「PLC 连续 5 帧后转静音」自洽。
 ///
-/// # `half_conceal` 权重 0.5 的依据（位深进阶梯新增）
+/// # Why `half_conceal` keeps weight 0.5
 ///
-/// 深档按 5 ms 分包，搭档半帧没来时 `conceal_missing_half` 会把到手的那半帧
-/// 淡出、补齐成一个**长度完整**的帧交付。于是：
+/// Reassembly only publishes a partial frame when at least half of its chunks
+/// arrived. The common two-part loss and the worst accepted four-part loss
+/// fabricate exactly 5 ms of a 10 ms frame. Three- and four-part frames can
+/// sometimes preserve more, but charging every delivered partial as 0.5 frame
+/// is intentionally conservative and preserves the legacy telemetry contract.
 ///
-/// - 它**已经在分母里**：那一帧照常进 JB、照常被 pop，`popped` 算过它。
-/// - 它伪造的正好是 **10 ms 里的 5 ms** —— 半个 PLC 帧的隐藏量，且伪造方式
-///   与 PLC 同族（衰减延续），所以权重取 PLC 的一半，不是 1、也不是 3。
-///
-/// 不计它的后果是这条降级**在 Q1 上完全不可见**：JB 看到的是完整长度的帧，
-/// 不记 PLC、不记 underrun，`popped` 照常增长 ⇒ 深档丢掉一半的包，等级仍报「优」。
+/// The completed frame is already in the denominator through `popped`; the
+/// jitter buffer cannot distinguish it from an intact frame. Omitting this
+/// term would therefore make partial packet loss completely invisible to Q1.
 ///
 /// 分母为 0（窗口内一个 tick 都没输出）⇒ `None`：没有输出就没有音质可言。
 pub(crate) fn conceal_ratio(c: &JbCounts) -> Option<f64> {

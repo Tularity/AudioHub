@@ -77,7 +77,7 @@ use anyhow::{bail, Context, Result};
 use base64::prelude::*;
 
 use audiohub_core::audio::{self, DeviceChangeWatcher, DeviceKind};
-use audiohub_core::dsp::{self, LinearResampler};
+use audiohub_core::dsp::{self, InterleavedLinearResampler};
 #[cfg(test)]
 use audiohub_core::latency::LatSource;
 use audiohub_core::latency::{DevLatency, DriftTracker, DropMode, StageDepth, StageId, StageSlot};
@@ -353,7 +353,9 @@ impl DaemonHandle {
         self.inner.begin_shutdown();
     }
 
-    /// Block until the daemon has fully stopped (all core threads joined).
+    /// Block until every tracked core thread has stopped. A per-generation
+    /// playback owner stuck inside an OS call with no cancellation API is
+    /// detached; if that call returns, it destroys its native stream and exits.
     pub fn wait(&self) {
         loop {
             let h = lk(&self.threads).pop();
@@ -538,6 +540,12 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     // `tx_loop` 的 10 ms 截止期。
     let (build_send, build_recv) = mpsc::channel::<engine::BuildReq>();
     let (built_send, built_recv) = mpsc::channel::<engine::BuildDone>();
+    // Default-output streams have the same thread-affinity and potentially
+    // blocking open/close behavior as capture streams. Their native handles
+    // stay on per-generation owner threads; the mixer receives only a monitor
+    // and ring writer through this coordinator.
+    let (site_build_send, site_build_recv) = mpsc::channel::<engine::SitePlaybackBuildReq>();
+    let (site_built_send, site_built_recv) = mpsc::channel::<engine::SitePlaybackBuildDone>();
     let cfg_dir_for_state = cfg_dir.clone();
     let airplay = airplay::AirPlayController::new(cfg.airplay_advertise, cfg_dir.clone());
     let inner = Arc::new(DaemonInner {
@@ -565,6 +573,8 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         mix_ring: Mutex::new(VecDeque::new()),
         store_lock: Mutex::new(()),
         settings_write_lock: Mutex::new(()),
+        device_output_volume_io: Mutex::new(0),
+        device_input_volume_io: Mutex::new(0),
         shutdown: AtomicBool::new(false),
         cleanup: Once::new(),
         announce_guard: Mutex::new(announce_guard),
@@ -581,12 +591,14 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         hal_mic_io: std::array::from_fn(|_| AtomicBool::new(true)),
         media_tickets: Mutex::new(Vec::new()),
         preauth: AtomicUsize::new(0),
+        next_connection_id: AtomicU64::new(1),
         recon: Mutex::new(HashMap::new()),
         dev_in_epoch: AtomicU64::new(0),
         dev_out_epoch: Arc::new(AtomicU64::new(0)),
         devices: DeviceInventory::production(),
         dev_lat: devlats::DevLatCache::new(),
         play_ring: StageSlot::new(),
+        site_playback: engine::SitePlaybackProbe::new(),
         play_drift: Mutex::new(DriftTracker::new()),
         mix_clip: quality::ClipMeter::new(),
         mix_meter: quality::MixMeter::new(),
@@ -654,6 +666,15 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     {
         let i = inner.clone();
         threads.push(spawn(
+            "ahb-playback-build",
+            Box::new(move || {
+                engine::site_playback_builder_loop(i, site_build_recv, site_built_send)
+            }),
+        )?);
+    }
+    {
+        let i = inner.clone();
+        threads.push(spawn(
             "ahb-media-tx",
             Box::new(move || engine::tx_loop(i, tx_recv, build_send, built_recv)),
         )?);
@@ -662,7 +683,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         let i = inner.clone();
         threads.push(spawn(
             "ahb-mixer",
-            Box::new(move || engine::mixer_loop(i, mix_recv)),
+            Box::new(move || engine::mixer_loop(i, mix_recv, site_build_send, site_built_recv)),
         )?);
     }
     {
@@ -785,6 +806,11 @@ pub(crate) struct DaemonInner {
     /// Serializes the settings.json + write-only-secret mutation as one IPC
     /// operation. Multiple IPC connections may call settings.set concurrently.
     pub settings_write_lock: Mutex<()>,
+    /// Linearizes peer-level endpoint snapshots with writes/readbacks and owns
+    /// their monotonic revisions. Network sends happen after releasing these
+    /// locks; consumers use the revision to discard a reordered old snapshot.
+    pub(crate) device_output_volume_io: Mutex<u64>,
+    pub(crate) device_input_volume_io: Mutex<u64>,
     pub shutdown: AtomicBool,
     cleanup: Once,
     pub announce_guard: Mutex<Option<AnnounceGuard>>,
@@ -845,6 +871,10 @@ pub(crate) struct DaemonInner {
     /// Control connections past the first frame but not yet verified; bounds
     /// the number of unauthenticated handshake threads an attacker can pin.
     pub preauth: AtomicUsize,
+    /// Process-local monotonic identity for a concrete verified connection.
+    /// Arc addresses may be reused after disconnect and therefore cannot be a
+    /// revision epoch or retry token.
+    pub(crate) next_connection_id: AtomicU64,
     /// Reconnect bookkeeping, keyed by fingerprint. An entry exists ONLY for a
     /// peer this daemon has connected out to (spec-m4c §C).
     pub recon: Mutex<HashMap<String, reconnect::PeerRecon>>,
@@ -873,6 +903,9 @@ pub(crate) struct DaemonInner {
     /// 这一级是全链路唯一「丢最新」且此前**完全无遥测**的丢弃点：
     /// `let _ = prod.push_slice(..)` 静默丢尾、零计数、零日志。
     pub play_ring: StageSlot,
+    /// Site-only lifecycle and callback diagnostics for the real default-output
+    /// stream. Bridge outputs deliberately have no write path into this cell.
+    pub(crate) site_playback: engine::SitePlaybackProbe,
     /// 播放环深度的 30 s 漂移窗口（站点级，同上）。
     pub play_drift: Mutex<DriftTracker>,
     /// 求和**之后**的削顶（站点级，不可归属到会话）。三个计入的调用点见
@@ -1623,11 +1656,15 @@ fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
         // 口径警告（进程级聚合、瞬时字段最后写者赢）见
         // `audiohub_core::audio::PlayServoCounters` 的文档。
         "play_servo": audio::play_servo_counters(),
+        // Unlike `play_servo`, this object is written only by the daemon's
+        // real default-output stream. It cannot be overwritten by BridgeOut.
+        "site_playback": engine::site_playback_status(&inner.site_playback),
     }))
 }
 
 /// One verified + encrypted control connection to a peer.
 pub(crate) struct ConnShared {
+    pub(crate) connection_id: u64,
     pub fp: String,
     pub peer: PairedPeer,
     /// The encrypted control channel, over whichever transport carries it:
@@ -1688,6 +1725,11 @@ pub(crate) struct ConnShared {
     /// fails, which is what lets the waiter above stop early instead of sitting
     /// out the whole timeout.
     pub media_attaching: AtomicBool,
+    /// True only after connection registration has finished tier negotiation.
+    /// The connection is published earlier so the attach ticket can find it,
+    /// but no stream may consume its provisional UDP path or unheard audio
+    /// contract until this gate opens and the reader drains parked messages.
+    pub(crate) registration_ready: AtomicBool,
     /// Control messages read off the channel before `conn_reader` existed.
     ///
     /// `register_conn` pumps the channel itself while it waits for an attach
@@ -1790,6 +1832,9 @@ pub(crate) enum PeerAudioCapabilitiesCell {
     Known {
         default_input: bool,
         default_output: bool,
+        max_media_channels: u8,
+        device_volume_version: u8,
+        media_frame_tag_version: u8,
     },
 }
 
@@ -1800,6 +1845,7 @@ impl PeerAudioCapabilitiesCell {
             Self::Known {
                 default_input,
                 default_output,
+                ..
             } => Some((default_input, default_output)),
         }
     }
@@ -1810,6 +1856,38 @@ impl PeerAudioCapabilitiesCell {
 
     pub(crate) fn default_output(self) -> Option<bool> {
         self.known().map(|(_, output)| output)
+    }
+
+    /// Safe media width for a stream opened before/without a capability
+    /// advertisement is mono. Values above the implementation limit are
+    /// clamped so an untrusted peer cannot inflate real-time buffers.
+    pub(crate) fn max_media_channels(self) -> u8 {
+        match self {
+            Self::Known {
+                max_media_channels, ..
+            } => max_media_channels.clamp(1, 2),
+            Self::Unheard => 1,
+        }
+    }
+
+    pub(crate) fn device_volume_version(self) -> u8 {
+        match self {
+            Self::Known {
+                device_volume_version,
+                ..
+            } => device_volume_version,
+            Self::Unheard => 0,
+        }
+    }
+
+    pub(crate) fn media_frame_tag_version(self) -> u8 {
+        match self {
+            Self::Known {
+                media_frame_tag_version,
+                ..
+            } => media_frame_tag_version.min(1),
+            Self::Unheard => 0,
+        }
     }
 }
 
@@ -1827,6 +1905,9 @@ mod peer_audio_capability_tests {
         let absent = PeerAudioCapabilitiesCell::Known {
             default_input: false,
             default_output: false,
+            max_media_channels: 1,
+            device_volume_version: 0,
+            media_frame_tag_version: 0,
         };
         assert_eq!(absent.known(), Some((false, false)));
         assert_eq!(absent.default_input(), Some(false));
@@ -1835,10 +1916,20 @@ mod peer_audio_capability_tests {
         let present = PeerAudioCapabilitiesCell::Known {
             default_input: true,
             default_output: true,
+            max_media_channels: 2,
+            device_volume_version: 1,
+            media_frame_tag_version: 1,
         };
         assert_eq!(present.known(), Some((true, true)));
         assert_eq!(present.default_input(), Some(true));
         assert_eq!(present.default_output(), Some(true));
+        assert_eq!(unknown.max_media_channels(), 1);
+        assert_eq!(absent.max_media_channels(), 1);
+        assert_eq!(present.max_media_channels(), 2);
+        assert_eq!(present.device_volume_version(), 1);
+        assert_eq!(unknown.media_frame_tag_version(), 0);
+        assert_eq!(absent.media_frame_tag_version(), 0);
+        assert_eq!(present.media_frame_tag_version(), 1);
     }
 }
 
@@ -2438,48 +2529,57 @@ fn peer_window_median(win: &VecDeque<PeerReport>) -> Option<f64> {
 
 pub(crate) struct JbState {
     pub jb: JitterBuffer,
+    pub channels: u8,
     pub rs_rate: u32,
-    pub rs: Option<LinearResampler>, // wire rate -> 48k, recreated on rung switch
-    pub rs_last: f32,                // last decoded sample; seeds the next resampler
-    pub jit_win: Vec<f32>,           // per-packet transit deltas (ms) for p95
+    pub rs: Option<InterleavedLinearResampler>,
+    pub rs_last: [f32; 2], // last decoded frame; seeds the next resampler
+    pub jit_win: Vec<f32>, // per-packet transit deltas (ms) for p95
     pub pushes: u32,
     pub last_dropped: u64, // starvation detector (expected-seq raced ahead)
     pub late_streak: u32,
-    /// 当前线上**每帧几个数据报**（深档按 5 ms 分包 ⇒ 2）。
+    /// Stable raw-packet to local-frame mapping across wire-format changes.
     ///
-    /// 它是 JB 帧序号的换算基准（`frame_seq = wire_seq / wire_parts`），
-    /// 所以**它一变，帧序号的基准就变了** ⇒ 必须干净重建 JB，见
-    /// `engine::handle_datagram`。0 = 还没收到过包。
-    pub wire_parts: usize,
-    /// 深档半帧重组：已到达、还在等搭档的那半帧。
+    /// The packet count is frozen inside each epoch. A successor epoch may
+    /// commit only after the previous epoch's raw-sequence high-water mark, so
+    /// a reordered packet cannot roll the receiver back to an old divisor.
+    pub wire_timeline: engine::WireFormatTimeline,
+    /// Two adjacent 10 ms wire frames waiting for their remaining datagrams.
     ///
-    /// `(帧序号, 是不是后半, 样本)`。**没有超时定时器**：下一帧的包一到，
-    /// 上一帧的残片就作废（按半帧隐藏交付）。等待会把延迟目标顶穿，
-    /// 而这条管线的全部纪律就是不许为了平滑多留任何一帧。
-    pub half: Option<(u32, bool, Vec<f32>)>,
-    /// 搭档没来、按半帧隐藏交付了多少次（lifetime）。
+    /// Cross-frame packet reordering may put N+1 part 0 ahead of N's tail, so N
+    /// remains live until it completes or N+2 establishes an explicit expiry
+    /// boundary. Expired frames with enough real chunks are partially concealed;
+    /// fewer than half leave a sequence hole for the jitter buffer's whole-frame
+    /// PLC.
+    pub partial: engine::WireFrameAssembly,
+    /// Lifetime count of partially concealed packet sets.
     ///
-    /// **必须有这个计数器**：半帧隐藏交付的是一个「看起来完整」的帧，JB 因此
-    /// 不会记 PLC ⇒ 若不单独计数，深档丢一半包这件事在 Q1 上**完全不可见**。
-    /// 一个不可见的降级正是本项目反复栽的那个形态。
+    /// This keeps the legacy `half_conceal` telemetry contract: every
+    /// delivered partial frame is conservatively charged as 0.5 of a frame in
+    /// Q1. That is exact when half the chunks are missing and deliberately
+    /// pessimistic for the one-of-three and one-of-four loss cases. Frames with
+    /// more than half missing are not counted here because they go through the
+    /// jitter buffer's ordinary whole-frame PLC instead.
     ///
-    /// ⚠ 光有计数器不算数——它**必须被读**。两条读者都已接上，改任何一条前先
-    /// 想清楚这条降级还剩几条可见路径：
-    ///   1. `JbState::counts()` → `quality::JbCounts::half_conceal` →
-    ///      `conceal_ratio` 以 **0.5 帧**权重进 Q1（那里有权重依据）；
-    ///   2. `build_session_info_with` → `SessionStats::jb_half_conceal` →
-    ///      前端会话明细表那一格。
+    /// The two consumers must remain connected: `JbState::counts()` feeds Q1,
+    /// and `build_session_info_with` publishes `SessionStats::jb_half_conceal`.
     pub half_conceal: u64,
     /// Q1 的 10 s 非消费型窗口（规格 §4.6）。放在这里而不是 `JitterBuffer` 里，
     /// 是为了让 `audiohub-net` 保持纯累计——它不需要知道窗口的存在。
     pub conceal: quality::ConcealWindow,
 }
 
+pub(crate) struct PartialWireFrame {
+    pub frame_seq: u32,
+    pub parts: usize,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub chunks: [Option<Vec<f32>>; 4],
+}
+
 impl JbState {
-    /// 当前 JB 的五个 lifetime 计数器快照，**外加**重组层的半帧隐藏计数。
-    ///
-    /// 第六个数不来自 `JitterBuffer`：半帧隐藏发生在它上游，JB 只看到一个长度
-    /// 完整的帧。放进同一个快照是为了让它跟着同一个 10 s 窗口差分并计入 Q1。
+    /// Snapshot of the jitter-buffer counters plus the reassembly layer's
+    /// conservative partial-conceal count. The latter happens upstream of the
+    /// jitter buffer, which sees a complete-length frame and cannot count it.
     pub(crate) fn counts(&self) -> quality::JbCounts {
         quality::JbCounts {
             popped: self.jb.popped,
@@ -2500,6 +2600,7 @@ impl JbState {
 
 pub(crate) struct PostMix {
     pub fifo: VecDeque<f32>, // absorbs resampler length wobble -> exact 480/frame
+    pub channels: u8,
     /// FIFO 溢出丢掉的样本数。方向是 **`DropMode::Oldest`**（`drain(..excess)`
     /// 从头删），与播放环的丢最新恰好相反——两者深度读数简并，听感不同。
     pub dropped: u64,
@@ -2520,10 +2621,11 @@ impl PostMix {
         for o in out.iter_mut().skip(n) {
             *o = 0.0;
         }
-        if self.fifo.len() > POST_MIX_CAP {
-            let excess = self.fifo.len() - POST_MIX_CAP;
+        let cap = POST_MIX_CAP * self.channels.clamp(1, 2) as usize;
+        if self.fifo.len() > cap {
+            let excess = self.fifo.len() - cap;
             self.fifo.drain(..excess);
-            self.dropped += excess as u64; // 丢弃行为未改，只是现在数得出来
+            self.dropped += (excess / self.channels.clamp(1, 2) as usize) as u64;
         }
     }
 
@@ -2531,7 +2633,7 @@ impl PostMix {
     pub(crate) fn depth(&self) -> StageDepth {
         StageDepth {
             id: StageId::PostMix,
-            samples: self.fifo.len() as u32,
+            samples: (self.fifo.len() / self.channels.clamp(1, 2) as usize) as u32,
             capacity: POST_MIX_CAP as u32,
             rate: 48_000, // 解码后固定 48k，与设备速率无关
             dropped: Some(self.dropped),
@@ -2657,6 +2759,7 @@ pub(crate) struct RxStream {
     pub stream_id: u32,
     pub crypto: MediaCrypto,
     pub verify_freq: Option<f32>,
+    pub channels: u8,
     pub is_spk: bool, // feeds the mixer sum (spk-recv on the provider)
     pub monitor: bool,
     /// Named output device this stream is ALSO rendered into (spec-m4c §B).
@@ -2740,7 +2843,9 @@ impl RxStream {
         bridge: Option<String>,
         hal_slot: Option<u8>,
         ka_path: tcpmedia::MediaPath,
+        channels: u8,
     ) -> RxStream {
+        let channels = channels.clamp(1, 2);
         // Build the first buffer on the profile this path actually uses.
         // `JitterBuffer::new` reaches for `JbTuning::cached()` (= `DEFAULT`),
         // which on tier 1 leaves the stream running a 12-frame target and a
@@ -2757,27 +2862,30 @@ impl RxStream {
             // real streams always key off the opener's per-stream salt
             crypto: MediaCrypto::new_for_stream(key, stream_id, media_salt),
             verify_freq,
+            channels,
             is_spk,
             monitor,
             bridge,
             hal_slot,
             ka_path,
             jbs: Mutex::new(JbState {
-                jb: JitterBuffer::with_tuning(2, jb_tuning),
+                jb: JitterBuffer::with_tuning_channels(2, jb_tuning, channels),
+                channels,
                 rs_rate: 48000,
                 rs: None,
-                rs_last: 0.0,
+                rs_last: [0.0; 2],
                 jit_win: Vec::new(),
                 pushes: 0,
                 last_dropped: 0,
                 late_streak: 0,
-                wire_parts: 0,
-                half: None,
+                wire_timeline: engine::WireFormatTimeline::default(),
+                partial: engine::WireFrameAssembly::default(),
                 half_conceal: 0,
                 conceal: quality::ConcealWindow::new(),
             }),
             post: Mutex::new(PostMix {
                 fifo: VecDeque::new(),
+                channels,
                 dropped: 0,
             }),
             ring: verify_freq.map(|_| Mutex::new(VecDeque::new())),
@@ -2805,6 +2913,18 @@ impl RxStream {
             transport: transport::TransportControl::default(),
             servo_obs: Mutex::new(servo::ServoObs::default()),
         }
+    }
+
+    /// Bind timestamp frame-tag decoding to the sender capability sampled for
+    /// this stream. The default constructor remains the explicit 1.0.0 path so
+    /// tests and callers that do not possess a peer advertisement cannot
+    /// accidentally interpret arbitrary timestamp low bits as frame identity.
+    pub(crate) fn with_media_frame_tag_version(mut self, version: u8) -> Self {
+        self.jbs
+            .get_mut()
+            .expect("new receive-stream mutex is not poisoned")
+            .wire_timeline = engine::WireFormatTimeline::with_frame_tag_version(version);
+        self
     }
 }
 
@@ -2835,6 +2955,7 @@ pub(crate) struct RemoteStats {
 
 pub(crate) struct TxShared {
     pub rung: AtomicU32,
+    pub media_channels: AtomicU32,
     pub rung_changes: AtomicU32,
     pub sent_packets: AtomicU64,
     /// Whole datagrams handed to the kernel (payload + header + AEAD tag).
@@ -2970,6 +3091,7 @@ impl TxShared {
             // 实测：写 0 时 `the_send_latency_lands_on_the_peers_buffer_and_
             // nowhere_local` 从 1.4 s 变成 25 s 甚至超时。
             rung: AtomicU32::new(top_rung),
+            media_channels: AtomicU32::new(1),
             rung_changes: AtomicU32::new(0),
             sent_packets: AtomicU64::new(0),
             sent_bytes: AtomicU64::new(0),
@@ -3252,7 +3374,11 @@ fn sample_telemetry(inner: &DaemonInner, entries: &[SessionEntry]) {
                 st.sample_conceal();
                 st.jb.contiguous() * F48_PER_FRAME
             };
-            let post = lk(&rx.post).fifo.len() as u32;
+            // `PostMix::fifo` stores interleaved scalars, while every latency
+            // and drift reading is expressed in audio frames. Going through
+            // `depth()` keeps stereo from reporting exactly twice the real
+            // queue slope.
+            let post = lk(&rx.post).depth().samples;
             // 两条并行尾级的槽（原子读，不上锁），与上面同一条纪律：槽空就清历史，
             // 否则下一次开桥会继承上一次的斜率。
             let tails = [rx.bridge_ring.load(), rx.hal_mic.load()];
@@ -4225,7 +4351,15 @@ fn build_session_info_with(
         // `""` = 两侧都报不出。**不许兜底成 `"s16"`**：那正是本字段修掉的那个
         // 硬编码在位深维度上的等价物（`sample_rate` 曾经硬编码成 48000）。
         wire_depth: wire_depth.map_or(String::new(), |d| d.as_str().to_string()),
-        channels: 1,
+        channels: e
+            .rx
+            .as_ref()
+            .map(|rx| rx.channels)
+            .or_else(|| {
+                e.tx.as_ref()
+                    .map(|tx| tx.media_channels.load(Ordering::Relaxed).clamp(1, 2) as u8)
+            })
+            .unwrap_or(1),
         stats: s,
         origin: e.origin.label().to_string(),
         hal_slot: e.origin.slot(),
@@ -4296,6 +4430,7 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
         // different device now, so every volume_sync'd spk session must be told
         // what the NEW device reads (and whether it is adjustable at all).
         conn::ping_and_reap(&inner);
+        conn::poll_peer_device_volumes(&inner);
         {
             let mut st = lk(&inner.state);
             if st
@@ -4861,6 +4996,7 @@ fn poll_provider_volume(e: &SessionEntry, live: bool, force: bool) {
         scalar: cur.scalar,
         muted: cur.muted,
         adjustable: cur.adjustable,
+        mute_adjustable: Some(cur.mute_adjustable),
     });
 }
 
@@ -5184,6 +5320,7 @@ mod telemetry_tests {
     fn post_mix_overflow_drops_oldest_and_counts_it() {
         let mut pm = PostMix {
             fifo: VecDeque::new(),
+            channels: 1,
             dropped: 0,
         };
         let mut out = [0.0f32; 480];
@@ -5204,6 +5341,7 @@ mod telemetry_tests {
     fn post_mix_within_budget_drops_nothing() {
         let mut pm = PostMix {
             fifo: VecDeque::new(),
+            channels: 1,
             dropped: 0,
         };
         let mut out = [0.0f32; 480];
@@ -5226,6 +5364,7 @@ mod telemetry_tests {
             None,
             None,
             tcpmedia::MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
+            1,
         )
     }
 
@@ -6792,6 +6931,7 @@ mod telemetry_tests {
                 None,
                 None,
                 tcpmedia::MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
+                1,
             )
         };
         let (r1, r2) = (mk(), mk());
@@ -7026,6 +7166,7 @@ mod fault_injection {
             None,
             None,
             tcpmedia::MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
+            1,
         )
     }
 
@@ -7427,6 +7568,7 @@ mod fault_injection {
             Some("some-usb-dac".to_string()),
             None,
             tcpmedia::MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
+            1,
         );
         seed_upstream_50ms(&rx);
         let empty_site = StageSlot::new();
@@ -7573,6 +7715,7 @@ mod fault_injection {
             None,
             Some(0), // 只写虚拟麦克风
             tcpmedia::MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
+            1,
         );
         seed_upstream_50ms(&rx);
         // 真环的读数由 halbridge.rs 的 `HalBridge::mic_depth` 测试钉死；这里验
@@ -7611,6 +7754,7 @@ mod fault_injection {
             Some("dac".to_string()), // 同时桥接
             Some(1),                 // 同时写虚拟麦克风
             tcpmedia::MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
+            1,
         );
         seed_upstream_50ms(&rx);
         let slot = StageSlot::new();

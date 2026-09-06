@@ -124,7 +124,12 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 // silently publish both endpoints, so this semantic change also requires an
 // equality-version bump even though no struct size changed.
 //
-#define AUDIOHUB_WIN_PROTOCOL_VERSION   6u
+// v7: every published endpoint carries an AudioHub-private property whose
+// value is "v1:<peer fingerprint>:out|in". The daemon uses that immutable
+// identity to address IAudioEndpointVolume directly; a v6 endpoint has no such
+// property and would make idle scalar/mute synchronization silently fail.
+//
+#define AUDIOHUB_WIN_PROTOCOL_VERSION   7u
 
 //
 // Must equal HAL_MAX_SLOTS in core/audiohubd/src/halbridge.rs. The driver's
@@ -157,7 +162,7 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 #define AH_CTL_USERMODE_W       L"\\\\.\\AudioHubVadCtl"
 
 //
-// The value in the device software key that holds the expected daemon image
+// The value in the device hardware key that holds the expected daemon image
 // path(s). REG_SZ or REG_MULTI_SZ. Written by the (administrator) install
 // script; a normal user cannot write under HKLM\SYSTEM, which is the whole
 // integrity argument (§6.2).
@@ -250,8 +255,8 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 
 //
 // Set alongside a SUCCESSFUL bind when the per-peer endpoint name could not be
-// written and the endpoints therefore carry the system's generic direction
-// names ("<speaker>" / "<microphone>") instead of the peer's.
+// written and the endpoints therefore carry the INF's generic fallback labels
+// instead of the peer's.
 //
 // Deliberately a warning bit on an OK reply rather than a failure: a device
 // with a generic name is enormously better than no device, and the daemon can

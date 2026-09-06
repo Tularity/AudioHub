@@ -443,7 +443,7 @@ export const zhCN = {
   'peers.form.done': '连接请求已完成',
 
   'peers.card.unnamed': '未命名主机',
-  'peers.card.viewDetail': '查看 {name} 详情',
+  'peers.card.viewDetail': '查看 {name} 详情，指纹 {fingerprint}',
   // peers.card.alias 已删（规格 §2.3 ①）：改名后原主机名走卡片标题的 title，
   // 详情页另有一张 AliasCard；徽章只是把同一条信息又印一遍。
   'peers.card.noSession': '未建立通路',
@@ -524,10 +524,19 @@ export const zhCN = {
   'volume.mutedPct': '已静音 · {n}%',
   'volume.failed': '音量调节失败，请稍后重试',
   'volume.unadjustable': '对端设备不支持音量调节',
+  'volume.scalarFixedMuteAvailable': '音量不可调，但仍可同步静音',
   'volume.softwareGain': '对端设备不支持音量调节，已由本机软件增益接管',
   'volume.reading': '正在读取对端音量…',
   'volume.noSync': '该会话未启用音量同步',
   'volume.notAdjustable.tag': '不可调',
+  'volume.deviceProtocolUnavailable': '对端尚未报告空闲音量同步能力，请确认在线并升级两端 AudioHub',
+  'volume.deviceModeUnavailable': '模式 B 当前未生效，因此无法控制此设备',
+  'volume.devicePeerUnavailable': '对端当前未在线运行共享模式，因此暂时无法控制其设备音量',
+  'volume.deviceWaiting': '正在读取对端设备音量…',
+  'volume.devicePending': '正在同步…',
+  'volume.deviceQueued': '已排队，将在模式 B 与对端连接恢复后同步',
+  'volume.deviceOutputLabel': '{name} 扬声器音量',
+  'volume.deviceInputLabel': '{name} 麦克风音量',
 
   // ---------------------------------------------------------------- 桥接
   'bridge.label': '桥接到虚拟声卡',
@@ -1216,8 +1225,8 @@ export const zhCN = {
   // 五个计数器全部一片正常，而声音已经坏了 —— 所以它们各有自己的一格，
   // 挂在别人身上就等于没有。非零才显示：两个恒为 0 的数占住位置只会训练
   // 用户忽略这一行。
-  'stats.extra.halfConceal': '半帧补偿 {n} 次',
-  'stats.extra.halfConcealWhy': '高位深档在线上拆成两个 5 ms 包发送，该计数为「只到达一半」的次数。持续增长表明有丢包，可将音质档下调一格。',
+  'stats.extra.halfConceal': '部分帧补偿 {n} 次',
+  'stats.extra.halfConcealWhy': '深位深 PCM 帧会拆成 2～4 个线上包。缺包但至少收到一半真实分块时会重建并计数一次；Q1 每次保守按半帧计费。若持续增长，可将音质档下调一格。',
   'stats.extra.formatMismatch': '格式不符 {n} 包',
   'stats.extra.formatMismatchWhy': '对端声明的线上格式与其实际发送的字节数不符，此类包已丢弃。非零无良性解释：请将两端升级至同一版本。',
   'stats.extra.verdictPass': '校验通过 {snr} dB',

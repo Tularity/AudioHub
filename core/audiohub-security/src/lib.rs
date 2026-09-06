@@ -12,7 +12,7 @@ use std::path::Path;
 mod macos_launch_agent;
 mod windows_task;
 pub use macos_launch_agent::{inspect_macos_launch_agent_plist, MacLaunchAgentInspection};
-pub use windows_task::{inspect_windows_task_xml, WindowsTaskInspection};
+pub use windows_task::{inspect_windows_task_xml, windows_task_target, WindowsTaskInspection};
 
 /// Create `path` if necessary and restrict the directory and inheriting
 /// children to AudioHub's private-principal set.

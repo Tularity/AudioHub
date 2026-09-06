@@ -21,6 +21,7 @@ const MAX_REORDER_WINDOW: u64 = 65_535;
 pub(crate) struct BufferedPacket {
     pub(crate) sequence: u64,
     pub(crate) timestamp: u64,
+    pub(crate) telemetry_token: crate::telemetry::OperationToken,
     payload: Vec<u8>,
 }
 
@@ -90,6 +91,22 @@ pub(crate) enum JitterError {
         capacity: usize,
     },
     SequenceExhausted,
+}
+
+impl JitterError {
+    pub(crate) fn telemetry_reason(&self) -> &'static str {
+        match self {
+            Self::InvalidLimits => "invalid_limits",
+            Self::EmptyPayload => "empty_payload",
+            Self::PayloadTooLarge { .. } => "payload_too_large",
+            Self::Duplicate { .. } => "duplicate",
+            Self::TooOld { .. } => "too_old",
+            Self::OutsideWindow { .. } => "outside_window",
+            Self::InvalidAdvance { .. } => "invalid_advance",
+            Self::Full { .. } => "full",
+            Self::SequenceExhausted => "sequence_exhausted",
+        }
+    }
 }
 
 impl fmt::Display for JitterError {
@@ -177,11 +194,27 @@ impl JitterBuffer {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn insert(
         &mut self,
         sequence: u64,
         timestamp: u64,
         payload: Vec<u8>,
+    ) -> Result<InsertOutcome, JitterError> {
+        self.insert_with_token(
+            sequence,
+            timestamp,
+            payload,
+            crate::telemetry::operation_token(),
+        )
+    }
+
+    pub(crate) fn insert_with_token(
+        &mut self,
+        sequence: u64,
+        timestamp: u64,
+        payload: Vec<u8>,
+        telemetry_token: crate::telemetry::OperationToken,
     ) -> Result<InsertOutcome, JitterError> {
         if self.exhausted {
             return Err(JitterError::SequenceExhausted);
@@ -222,6 +255,7 @@ impl JitterBuffer {
         let packet = BufferedPacket {
             sequence,
             timestamp,
+            telemetry_token,
             payload,
         };
         let outcome = if self.packets.len() == self.capacity {
@@ -410,6 +444,16 @@ mod tests {
         );
         assert_eq!((after_wrap.sequence, after_wrap.timestamp), (65_536, 1_704));
         assert!(jitter.missing_ranges().is_empty());
+    }
+
+    #[test]
+    fn queued_packet_preserves_its_entry_generation_token() {
+        let mut jitter = JitterBuffer::with_limits(2, 8).unwrap();
+        let token = crate::telemetry::operation_token();
+        jitter.insert_with_token(10, 20, payload(1), token).unwrap();
+        jitter.insert_with_token(11, 21, payload(2), token).unwrap();
+        let packet = jitter.pop_ready().unwrap();
+        assert_eq!(packet.telemetry_token, token);
     }
 
     #[test]

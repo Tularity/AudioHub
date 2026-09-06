@@ -9,7 +9,19 @@ ROOT="$(cd "${0:a:h}/.." && pwd)"
 TAURI="$ROOT/app/src-tauri"
 APP="${1:-$TAURI/target/release/bundle/macos/AudioHub.app}"
 OUT_DIR="$TAURI/target/release/bundle/pkg"
-VERSION="${AUDIOHUB_VERSION:-1.0.0}"
+# One source of truth for the version: the same file .github/workflows/build.yml
+# reads with jq to derive the tag and the release name. A literal here is a
+# second source that drifts silently — it agreed with the workflow at 1.0.0 only
+# by coincidence, and the first bump that misses one of them ships a dmg whose
+# filename contradicts its own tag. plutil parses JSON and ships with macOS, so
+# this adds no dependency to a script that already refuses to run anywhere else.
+VERSION="${AUDIOHUB_VERSION:-}"
+if [[ -z "$VERSION" ]]; then
+  VERSION="$(/usr/bin/plutil -extract version raw -o - "$TAURI/tauri.conf.json")" \
+    || { print -u2 -- "[audiohub] ERROR: cannot read version from $TAURI/tauri.conf.json"; exit 1; }
+  [[ -n "$VERSION" ]] \
+    || { print -u2 -- "[audiohub] ERROR: empty version in $TAURI/tauri.conf.json"; exit 1; }
+fi
 
 die() { print -u2 -- "[audiohub] ERROR: $*"; exit 1; }
 

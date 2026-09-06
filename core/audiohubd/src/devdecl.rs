@@ -516,7 +516,7 @@ mod driver_audit {
         let src = read("core/audiohubd/src/lib.rs");
         let body = window(&src, "    ) -> RxStream {", 1200);
         assert!(
-            body.contains("JitterBuffer::with_tuning(2, jb_tuning)")
+            body.contains("JitterBuffer::with_tuning_channels(2, jb_tuning, channels)")
                 && body.contains("engine::jb_tuning_for(&ka_path)"),
             "RxStream::new no longer picks its jitter tuning from the media path, so a degraded \
              stream opens with the tier 0 envelope under a tier 1 stale gate"

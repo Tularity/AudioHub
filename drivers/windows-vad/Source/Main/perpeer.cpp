@@ -40,7 +40,7 @@ static BOOLEAN          g_AhInitialised = FALSE;
 static PDEVICE_OBJECT   g_AhPdo = NULL;
 
 //
-// The generic direction names, READ BACK from the INF's static MediaCategories
+// The generic fallback labels, READ BACK from the INF's static MediaCategories
 // entries at attach time rather than compiled in.
 //
 // Two reasons this is worth a registry read. First, the strings are localizable
@@ -109,7 +109,7 @@ static const DEVPROPKEY AhDevpkeyInterfaceFriendlyName = {
 //      HKR,MediaCategories,... entries landed.
 //   1  the machine-wide fallback KS drops to when the software key has no entry.
 //
-// Read in that order so the direction words come from wherever KS would have
+// Read in that order so the fallback labels come from wherever KS would have
 // taken them, rather than from wherever we happened to look first.
 //
 #define AH_MEDIACAT_SOFTWAREKEY 0u
@@ -131,6 +131,11 @@ static const DEVPROPKEY AhDevpkeyInterfaceFriendlyName = {
 #define AH_EP_SUBKEY_EP_W       L"EP"
 #define AH_EP_SUBKEY_0_W        L"0"
 #define AH_EP_DEVICEDESC_W      L"{a45c254e-df1c-4efd-8020-67d146a850e0},2"
+// Copied by AudioEndpointBuilder from the topology interface's EP\0 key into
+// the resulting MMDevice property store.  User mode uses this opaque identity
+// instead of a localised/stale friendly name when it must address the exact
+// virtual endpoint whose volume changed.
+#define AH_EP_PEERKEY_W         L"{8ca48324-7d8a-4efa-8dd4-7b7503af964b},2"
 
 #define AH_POOLTAG_PERPEER  'PphA'      // "AhpP"
 
@@ -177,7 +182,7 @@ Routine Description:
     Opens the MediaCategories root at one of the two locations, READ ONLY.
 
     Nothing writes MediaCategories any more. The only reason to come here is to
-    read back the direction words the INF installed.
+    read back the fallback labels the INF installed.
 
     Every handle this returns is function-local at the call site ON PURPOSE.
     Bind IOCTLs run in the DAEMON'S process context, and IoOpenDeviceRegistryKey
@@ -249,7 +254,7 @@ Routine Description:
     Reads MediaCategories\<Guid>\Name, trying the software key first and the
     machine-wide key second -- the order KS itself searches in.
 
-    Used ONLY at attach, to read back the direction words the INF installed.
+    Used ONLY at attach, to read back the fallback labels the INF installed.
 
 --*/
 {
@@ -470,6 +475,45 @@ AhWriteEndpointName(
 }
 
 #pragma code_seg("PAGE")
+static NTSTATUS
+AhWriteEndpointPeerKey(
+    _In_z_ PCWSTR ReferenceString,
+    _In_z_ PCSTR  PeerKey,
+    _In_z_ PCWSTR DirectionTag
+    )
+{
+    PAGED_CODE();
+
+    HANDLE ep = NULL;
+    NTSTATUS status = AhOpenEndpointParams(ReferenceString, TRUE, &ep);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    WCHAR identity[24]; // "v1:" + 16 hex + ":" + "out" + NUL
+    status = RtlStringCchPrintfW(identity, ARRAYSIZE(identity),
+                                 L"v1:%S:%s", PeerKey, DirectionTag);
+    if (!NT_SUCCESS(status))
+    {
+        ZwClose(ep);
+        return status;
+    }
+
+    UNICODE_STRING valueName;
+    RtlInitUnicodeString(&valueName, AH_EP_PEERKEY_W);
+    SIZE_T identityChars = 0;
+    while (identityChars < ARRAYSIZE(identity) && identity[identityChars] != L'\0')
+    {
+        identityChars++;
+    }
+    status = ZwSetValueKey(ep, &valueName, 0, REG_SZ, identity,
+                           (ULONG)((identityChars + 1) * sizeof(WCHAR)));
+    ZwClose(ep);
+    return status;
+}
+
+#pragma code_seg("PAGE")
 static VOID
 AhClearEndpointName(
     _In_z_ PCWSTR ReferenceString
@@ -504,6 +548,32 @@ Routine Description:
     if (!NT_SUCCESS(status) && status != STATUS_OBJECT_NAME_NOT_FOUND)
     {
         DPF(D_ERROR, ("[AhClearEndpointName] %S delete failed 0x%x", ReferenceString, status));
+    }
+    ZwClose(ep);
+}
+
+#pragma code_seg("PAGE")
+static VOID
+AhClearEndpointPeerKey(
+    _In_z_ PCWSTR ReferenceString
+    )
+{
+    PAGED_CODE();
+
+    HANDLE ep = NULL;
+    NTSTATUS status = AhOpenEndpointParams(ReferenceString, FALSE, &ep);
+    if (!NT_SUCCESS(status))
+    {
+        return;
+    }
+
+    UNICODE_STRING valueName;
+    RtlInitUnicodeString(&valueName, AH_EP_PEERKEY_W);
+    status = ZwDeleteValueKey(ep, &valueName);
+    if (!NT_SUCCESS(status) && status != STATUS_OBJECT_NAME_NOT_FOUND)
+    {
+        DPF(D_ERROR, ("[AhClearEndpointPeerKey] %S delete failed 0x%x",
+                      ReferenceString, status));
     }
     ZwClose(ep);
 }
@@ -554,6 +624,7 @@ typedef struct _AH_NAME_TARGET
 {
     PCWSTR  ReferenceString;    // the TOPOLOGY interface carrying this endpoint
     PCWSTR  DirectionWord;      // from the INF, read back at attach
+    PCWSTR  IdentityTag;        // "out" or "in", never localised
     PWSTR   Name;               // where the composed name is kept
 } AH_NAME_TARGET;
 
@@ -568,10 +639,12 @@ AhNameTargets(
 
     Targets[0].ReferenceString = Slot->TopoNameOut;
     Targets[0].DirectionWord   = g_AhDirWordOut;
+    Targets[0].IdentityTag     = L"out";
     Targets[0].Name            = Slot->NameOut;
 
     Targets[1].ReferenceString = Slot->TopoNameIn;
     Targets[1].DirectionWord   = g_AhDirWordIn;
+    Targets[1].IdentityTag     = L"in";
     Targets[1].Name            = Slot->NameIn;
 }
 
@@ -584,7 +657,7 @@ AhRemoveEndpointNames(
 
 Routine Description:
 
-    Removes every endpoint-name value this slot wrote.
+    Removes every endpoint name and peer-identity value this slot wrote.
 
     Called from the ONE teardown routine rather than from each of its three
     call sites, so "unpairing leaves no registry litter carrying somebody's
@@ -605,20 +678,17 @@ Routine Description:
     for (ULONG i = 0; i < AH_NAME_DIRECTIONS; i++)
     {
         AhClearEndpointName(targets[i].ReferenceString);
+        AhClearEndpointPeerKey(targets[i].ReferenceString);
     }
 
     Slot->NamesWritten = FALSE;
     //
-    // NameFallback is deliberately NOT cleared here. AhApplyEndpointNames calls
-    // this routine ON its fallback path -- to take back a half-written pair --
-    // and clearing the flag there would erase the decision that had just been
-    // made, leaving the reply claiming everything was fine. The flag's lifetime
-    // belongs to AhApplyEndpointNames, which resets it at the top of every
-    // attempt.
+    // NameFallback is deliberately NOT cleared here. Its lifetime belongs to
+    // AhApplyEndpointNames, which resets it at the top of every attempt.
 }
 
 #pragma code_seg("PAGE")
-static VOID
+static NTSTATUS
 AhApplyEndpointNames(
     _Inout_ PAH_SLOT Slot,
     _In_    ULONG    Flags
@@ -627,18 +697,24 @@ AhApplyEndpointNames(
 
 Routine Description:
 
-    Copies this slot's one peer label to both endpoint-name buffers and writes
-    each copy into its own TOPOLOGY interface's EP\0 key.
+    Writes the authenticated peer key to both topology-interface EP\0 stores,
+    then copies this slot's visible label to both endpoint-name buffers.
+
+    Peer identity is mandatory: user mode uses it to address exactly one
+    MMDevice for scalar volume synchronization. A generic display name is a
+    usable degradation; an endpoint with no identity could receive another
+    peer's volume or silently stop synchronizing, so that failure aborts the
+    bind and is rolled back.
 
     Sets Slot->NameFallback when the peer's name could NOT be made to appear, in
-    which case the endpoints come up under the system's generic direction names.
+    which case the endpoints come up under the system's generic fallback labels.
     That is a real degradation -- with two peers paired the user sees two
     identically named speakers -- so it travels back to the daemon as
     AH_BINDREPLY_FLAG_NAME_FALLBACK rather than being absorbed here.
 
-    Failing the whole bind instead was considered and rejected: a device with a
-    generic name is far more useful than no device, and the peer is already
-    paired by the time this runs.
+    Failing the whole bind for a PRESENTATION error was considered and rejected:
+    a device with a generic name is far more useful than no device. Identity is
+    the opposite trade: no safe user-mode control path exists without it.
 
 --*/
 {
@@ -649,6 +725,30 @@ Routine Description:
     AH_NAME_TARGET targets[AH_NAME_DIRECTIONS];
     AhNameTargets(Slot, targets);
 
+    // Anything written has to be removable, so the flag goes up BEFORE the
+    // first mandatory identity write rather than after the last.
+    Slot->NamesWritten = TRUE;
+    for (ULONG i = 0; i < AH_NAME_DIRECTIONS; i++)
+    {
+        NTSTATUS st = AhWriteEndpointPeerKey(targets[i].ReferenceString,
+                                             Slot->PeerKey,
+                                             targets[i].IdentityTag);
+        if (!NT_SUCCESS(st))
+        {
+            DPF(D_ERROR, ("[AhApplyEndpointNames] peer identity %u failed 0x%x", i, st));
+            AhRemoveEndpointNames(Slot);
+            return st;
+        }
+    }
+
+    if (Flags & AH_BINDFLAG_FAIL_ENDPOINT_NAME)
+    {
+        // The negative control affects presentation only. Identity remains
+        // present because a fallback-named endpoint must still be safe to use.
+        Slot->NameFallback = TRUE;
+        return STATUS_SUCCESS;
+    }
+
     for (ULONG i = 0; i < AH_NAME_DIRECTIONS; i++)
     {
         NTSTATUS st = AhComposeEndpointName(Slot->Display, targets[i].DirectionWord,
@@ -657,27 +757,9 @@ Routine Description:
         {
             DPF(D_ERROR, ("[AhApplyEndpointNames] compose %u failed 0x%x", i, st));
             Slot->NameFallback = TRUE;
-            return;
+            return STATUS_SUCCESS;
         }
     }
-
-    if (Flags & AH_BINDFLAG_FAIL_ENDPOINT_NAME)
-    {
-        //
-        // Fault injection, and the negative control the naming test needs: with
-        // this bit set the assertion that must pass on the happy path has to
-        // FAIL. A naming test without it can only show that some string is
-        // present, not that this driver is what put it there.
-        //
-        Slot->NameFallback = TRUE;
-        return;
-    }
-
-    //
-    // Anything written has to be removable, so the flag goes up BEFORE the
-    // first write rather than after the last.
-    //
-    Slot->NamesWritten = TRUE;
 
     for (ULONG i = 0; i < AH_NAME_DIRECTIONS; i++)
     {
@@ -688,17 +770,21 @@ Routine Description:
             // ALL OR NOTHING, for the same reason the install is: one direction
             // named after the peer and the other not is a device pair that lies
             // about what it is. Take back whatever landed FIRST, then record the
-            // decision -- AhRemoveEndpointNames must not be in a position to
-            // observe, or undo, a flag it does not own.
+            // decision. Clear presentation only: the mandatory identity is
+            // independent and must survive a generic-name fallback.
             //
             DPF(D_ERROR, ("[AhApplyEndpointNames] write %u failed 0x%x", i, st));
-            AhRemoveEndpointNames(Slot);
+            for (ULONG j = 0; j < AH_NAME_DIRECTIONS; j++)
+            {
+                AhClearEndpointName(targets[j].ReferenceString);
+            }
             Slot->NameFallback = TRUE;
-            return;
+            return STATUS_SUCCESS;
         }
     }
 
     DPF(D_TERSE, ("[AhApplyEndpointNames] %S / %S", Slot->NameOut, Slot->NameIn));
+    return STATUS_SUCCESS;
 }
 
 //-----------------------------------------------------------------------------
@@ -1863,7 +1949,7 @@ AhPerPeerAttachAdapter(
         //
 
         //
-        // Read the generic direction names back out of the INF's own static
+        // Read the generic fallback labels back out of the INF's own static
         // MediaCategories entries. They remain the fallback if writing the
         // per-peer name fails; the happy path does not append them.
         //
@@ -1882,7 +1968,7 @@ AhPerPeerAttachAdapter(
         }
         else
         {
-            DPF(D_TERSE, ("[AhPerPeerAttachAdapter] direction names '%S' / '%S'",
+            DPF(D_TERSE, ("[AhPerPeerAttachAdapter] fallback labels '%S' / '%S'",
                           g_AhDirWordOut, g_AhDirWordIn));
         }
 
@@ -2142,7 +2228,7 @@ Routine Description:
     RtlCopyMemory(s->PeerKey, PeerKey, keyLen);
 
     RtlZeroMemory(s->Display, sizeof(s->Display));
-    status = RtlStringCchCopyW(s->Display, AH_DISPLAY_CHARS - 1, Display);
+    status = RtlStringCchCopyW(s->Display, AH_DISPLAY_CHARS, Display);
     if (status == STATUS_BUFFER_OVERFLOW)
     {
         //
@@ -2188,7 +2274,14 @@ Routine Description:
     // composed name is CACHED per endpoint id, so losing that race once is
     // permanent for that peer rather than something the next bind repairs.
     //
-    AhApplyEndpointNames(s, Flags);
+    status = AhApplyEndpointNames(s, Flags);
+    if (!NT_SUCCESS(status))
+    {
+        Result->Stage = AH_STAGE_ENDPOINT_NAME;
+        Result->NtStatus = status;
+        *AhStatus = AH_STATUS_INTERNAL;
+        goto Done;
+    }
     if (s->NameFallback)
     {
         Result->Flags |= AH_BINDREPLY_FLAG_NAME_FALLBACK;

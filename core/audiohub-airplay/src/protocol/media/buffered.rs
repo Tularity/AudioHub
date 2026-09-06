@@ -427,14 +427,20 @@ pub(crate) struct Type103MediaHandle {
 
 impl Type103MediaHandle {
     pub(crate) async fn set_rate(&self, anchor: BufferedRateAnchor) -> io::Result<()> {
+        let telemetry_token = crate::telemetry::operation_token();
         let (reply, done) = oneshot::channel();
-        self.send_command(BufferedCommand::SetRate { anchor, reply })
-            .await?;
+        self.send_command(BufferedCommand::SetRate {
+            anchor,
+            telemetry_token,
+            reply,
+        })
+        .await?;
         wait_for_reply(done).await
     }
 
     /// Apply an authenticated buffered-stream flush request.
     pub(crate) async fn flush(&self, request: BufferedFlush) -> io::Result<()> {
+        let telemetry_token = crate::telemetry::operation_token();
         let invalid_sequence = match request {
             BufferedFlush::All => false,
             BufferedFlush::Immediate { until } => until.sequence > SEQUENCE_MASK,
@@ -443,14 +449,23 @@ impl Type103MediaHandle {
             }
         };
         if invalid_sequence {
+            crate::telemetry::record_control_failure(
+                telemetry_token,
+                crate::telemetry::MediaKind::Buffered,
+                "invalid_flush",
+            );
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "buffered flush boundary exceeds the 24-bit sequence range",
             ));
         }
         let (reply, done) = oneshot::channel();
-        self.send_command(BufferedCommand::Flush { request, reply })
-            .await?;
+        self.send_command(BufferedCommand::Flush {
+            request,
+            telemetry_token,
+            reply,
+        })
+        .await?;
         wait_for_reply(done).await
     }
 
@@ -495,10 +510,12 @@ async fn wait_for_reply(done: oneshot::Receiver<io::Result<()>>) -> io::Result<(
 enum BufferedCommand {
     SetRate {
         anchor: BufferedRateAnchor,
+        telemetry_token: crate::telemetry::OperationToken,
         reply: oneshot::Sender<io::Result<()>>,
     },
     Flush {
         request: BufferedFlush,
+        telemetry_token: crate::telemetry::OperationToken,
         reply: oneshot::Sender<io::Result<()>>,
     },
     Shutdown {
@@ -577,6 +594,7 @@ struct AuthenticatedBlock {
     header: BufferedHeader,
     payload: Vec<u8>,
     wire_bytes: usize,
+    telemetry_token: crate::telemetry::OperationToken,
 }
 
 struct ReadyFrame {
@@ -584,6 +602,10 @@ struct ReadyFrame {
     timestamp: u32,
     pcm: Vec<i16>,
     wire_bytes: usize,
+    telemetry_token: crate::telemetry::OperationToken,
+    deadline_not_ready_since: Option<std::time::Instant>,
+    deadline_warmup_reported: bool,
+    deadline_failure_reasons: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -743,13 +765,13 @@ impl Type103Engine {
             let schedule = self.ready_schedule();
             match schedule {
                 ReadySchedule::DeliverAt(deadline)
-                    if self.playing && deadline <= Instant::now() =>
+                    if self.playing_is_current() && deadline <= Instant::now() =>
                 {
                     self.deliver_ready_frame();
                     drops_this_pass = 0;
                     continue;
                 }
-                ReadySchedule::DropLate if self.playing => {
+                ReadySchedule::DropLate if self.playing_is_current() => {
                     self.drop_late_ready_frame();
                     drops_this_pass += 1;
                     if drops_this_pass >= MAX_BLOCKS_PER_PUMP {
@@ -786,7 +808,7 @@ impl Type103Engine {
                 ReadySchedule::DeliverAt(deadline) => Some(deadline),
                 ReadySchedule::Wait | ReadySchedule::DropLate => None,
             };
-            let has_deadline = self.playing && deadline.is_some();
+            let has_deadline = self.playing_is_current() && deadline.is_some();
             let sleep_deadline = deadline.unwrap_or_else(|| {
                 Instant::now()
                     .checked_add(Duration::from_secs(24 * 60 * 60))
@@ -832,12 +854,15 @@ impl Type103Engine {
                     // Every 5 s. `lead_ms` is how far ahead of the speaker the
                     // next frame is — the one number that answers "did the
                     // cushion come back" without relying on how it sounded.
-                    if self.housekeeping_ticks % 20 == 0 && self.playing {
-                        if let Some(ready) = self.ready_frame.as_ref() {
-                            let timestamp = ready.timestamp;
+                    if self.housekeeping_ticks % 20 == 0 && self.playing_is_current() {
+                        if let Some((timestamp, telemetry_token)) = self
+                            .ready_frame
+                            .as_ref()
+                            .map(|ready| (ready.timestamp, ready.telemetry_token))
+                        {
                             let now = std::time::Instant::now();
                             let lead_ms = self
-                                .deadline_for(timestamp)
+                                .deadline_for(timestamp, telemetry_token)
                                 .map(|d| d.saturating_duration_since(now).as_millis() as i64)
                                 .unwrap_or(-1);
                             log::info!(
@@ -850,7 +875,7 @@ impl Type103Engine {
                         }
                     }
                     if starved_stall(
-                        self.playing,
+                        self.playing_is_current(),
                         self.queued_blocks.is_empty(),
                         self.ready_frame.is_none(),
                         read_limit,
@@ -869,27 +894,58 @@ impl Type103Engine {
 
     fn apply_command(&mut self, command: BufferedCommand) -> CommandResult {
         match command {
-            BufferedCommand::SetRate { anchor, reply } => {
+            BufferedCommand::SetRate {
+                anchor,
+                telemetry_token,
+                reply,
+            } => {
                 let playing = anchor.playing;
                 let state_changed = self.playing != playing;
                 let result = if playing {
-                    self.install_playback_anchor(anchor)
+                    self.install_playback_anchor(anchor, telemetry_token)
                 } else {
                     self.playback_anchor = None;
                     Ok(())
                 };
-                if result.is_ok() && state_changed {
-                    self.playing = playing;
-                    if !playing {
-                        self.output.flush();
+                if result.is_ok() {
+                    if state_changed {
+                        self.playing = playing;
+                        if !playing {
+                            self.output.flush();
+                        }
                     }
+                }
+                if result.is_err() {
+                    crate::telemetry::record_control_failure(
+                        telemetry_token,
+                        crate::telemetry::MediaKind::Buffered,
+                        "invalid_anchor",
+                    );
                 }
                 let _ = reply.send(result);
                 CommandResult::Continue
             }
-            BufferedCommand::Flush { request, reply } => {
+            BufferedCommand::Flush {
+                request,
+                telemetry_token,
+                reply,
+            } => {
                 let result = match request {
                     BufferedFlush::All => {
+                        let dropped =
+                            self.queued_blocks.len() + usize::from(self.ready_frame.is_some());
+                        crate::telemetry::record_expected_control_disposition(
+                            telemetry_token,
+                            crate::telemetry::MediaKind::Buffered,
+                            "control_flush",
+                            1,
+                        );
+                        crate::telemetry::record_expected_control_disposition(
+                            telemetry_token,
+                            crate::telemetry::MediaKind::Buffered,
+                            "control_flush_drop",
+                            dropped,
+                        );
                         self.playing = false;
                         self.playback_anchor = None;
                         self.flush_boundary = None;
@@ -903,7 +959,19 @@ impl Type103Engine {
                         Ok(())
                     }
                     BufferedFlush::Immediate { until } => {
-                        let boundary_reached = self.discard_before(until);
+                        let (boundary_reached, dropped) = self.discard_before(until);
+                        crate::telemetry::record_expected_control_disposition(
+                            telemetry_token,
+                            crate::telemetry::MediaKind::Buffered,
+                            "control_flush",
+                            1,
+                        );
+                        crate::telemetry::record_expected_control_disposition(
+                            telemetry_token,
+                            crate::telemetry::MediaKind::Buffered,
+                            "control_flush_drop",
+                            dropped,
+                        );
                         self.playing = false;
                         self.playback_anchor = None;
                         self.flush_boundary = (!boundary_reached).then_some(until);
@@ -914,18 +982,40 @@ impl Type103Engine {
                     BufferedFlush::Deferred { from, until } => {
                         let distance = sequence_distance(from.sequence, until.sequence);
                         if distance >= SEQUENCE_HALF_RANGE {
+                            crate::telemetry::record_control_failure(
+                                telemetry_token,
+                                crate::telemetry::MediaKind::Buffered,
+                                "invalid_flush",
+                            );
                             Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
                                 "deferred buffered flush spans an ambiguous sequence range",
                             ))
                         } else if distance == 0 {
+                            crate::telemetry::record_expected_control_disposition(
+                                telemetry_token,
+                                crate::telemetry::MediaKind::Buffered,
+                                "deferred_flush",
+                                1,
+                            );
                             Ok(())
                         } else if self.deferred_flushes.len() >= MAX_DEFERRED_FLUSHES {
+                            crate::telemetry::record_control_failure(
+                                telemetry_token,
+                                crate::telemetry::MediaKind::Buffered,
+                                "deferred_limit",
+                            );
                             Err(io::Error::new(
                                 io::ErrorKind::WouldBlock,
                                 "too many pending deferred buffered flushes",
                             ))
                         } else {
+                            crate::telemetry::record_expected_control_disposition(
+                                telemetry_token,
+                                crate::telemetry::MediaKind::Buffered,
+                                "deferred_flush",
+                                1,
+                            );
                             self.deferred_flushes.push(DeferredFlush {
                                 from,
                                 until,
@@ -947,7 +1037,11 @@ impl Type103Engine {
         self.output.flush();
     }
 
-    fn install_playback_anchor(&mut self, anchor: BufferedRateAnchor) -> io::Result<()> {
+    fn install_playback_anchor(
+        &mut self,
+        anchor: BufferedRateAnchor,
+        telemetry_token: crate::telemetry::OperationToken,
+    ) -> io::Result<()> {
         let (Some(rtp_time), Some(seconds), Some(fraction), Some(timeline_id)) = (
             anchor.rtp_time,
             anchor.network_time_secs,
@@ -969,6 +1063,7 @@ impl Type103Engine {
             timeline_id,
             remote_time_ns,
             rtp_time,
+            telemetry_token,
         });
         let reset_clock = self
             .ptp_clock
@@ -979,6 +1074,8 @@ impl Type103Engine {
                 self.peer_ip,
                 timeline_id,
                 self.ptp_epoch,
+                telemetry_token,
+                crate::telemetry::MediaKind::Buffered,
             ));
             self.ptp_clock_logged = false;
         }
@@ -987,21 +1084,42 @@ impl Type103Engine {
         for sample in pending {
             if sample.peer == self.peer_ip && sample.grandmaster == timeline_id {
                 self.observe_ptp_sample_value(sample);
+            } else {
+                crate::telemetry::record_ptp_pending_disposition(
+                    sample.telemetry_token,
+                    "mapper_pending_sample_discarded",
+                    1,
+                );
             }
         }
         Ok(())
     }
 
     fn observe_ptp_sample(&mut self, sample: Result<PtpClockSample, broadcast::error::RecvError>) {
-        let Ok(sample) = sample else {
-            return;
+        let sample = match sample {
+            Ok(sample) => sample,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                crate::telemetry::record_ptp_broadcast_lag(
+                    crate::telemetry::operation_token(),
+                    crate::telemetry::MediaKind::Buffered,
+                    skipped,
+                );
+                return;
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
         };
         if sample.peer != self.peer_ip {
             return;
         }
         if self.ptp_clock.is_none() {
             if self.pending_ptp_samples.len() == MAX_PENDING_PTP_SAMPLES {
-                self.pending_ptp_samples.pop_front();
+                if let Some(evicted) = self.pending_ptp_samples.pop_front() {
+                    crate::telemetry::record_ptp_pending_disposition(
+                        evicted.telemetry_token,
+                        "mapper_pending_sample_evicted",
+                        1,
+                    );
+                }
             }
             self.pending_ptp_samples.push_back(sample);
             return;
@@ -1039,19 +1157,40 @@ impl Type103Engine {
                 break;
             };
             let wire_bytes = packet.len() + LENGTH_PREFIX_BYTES;
+            let telemetry_token = crate::telemetry::operation_token();
+            crate::telemetry::record_media_received(
+                telemetry_token,
+                crate::telemetry::MediaKind::Buffered,
+            );
             if self.flush_pending_wire_bytes > 0 {
                 self.flush_pending_wire_bytes =
                     self.flush_pending_wire_bytes.saturating_sub(wire_bytes);
+                crate::telemetry::record_expected_control_disposition(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Buffered,
+                    "control_flush_drop",
+                    1,
+                );
                 continue;
             }
-            let block = self.authenticate_block(&packet, wire_bytes)?;
+            let block = self.authenticate_block(&packet, wire_bytes, telemetry_token)?;
             if let Some(boundary) = self.flush_boundary {
                 if sequence_precedes(block.header.sequence, boundary.sequence) {
+                    crate::telemetry::record_expected_control_disposition(
+                        block.telemetry_token,
+                        crate::telemetry::MediaKind::Buffered,
+                        "control_flush_drop",
+                        1,
+                    );
                     continue;
                 }
                 self.flush_boundary = None;
             }
             self.queued_wire_bytes = self.queued_wire_bytes.saturating_add(block.wire_bytes);
+            crate::telemetry::record_media_admitted(
+                block.telemetry_token,
+                crate::telemetry::MediaKind::Buffered,
+            );
             self.queued_blocks.push_back(block);
         }
         Ok(())
@@ -1061,20 +1200,61 @@ impl Type103Engine {
         &mut self,
         packet: &[u8],
         wire_bytes: usize,
+        telemetry_token: crate::telemetry::OperationToken,
     ) -> io::Result<AuthenticatedBlock> {
-        let header = parse_buffered_header(packet).map_err(io::Error::from)?;
-        let decrypted = self
-            .decryptor
-            .decrypt(packet, &header)
-            .map_err(io::Error::from)?;
+        let header = match parse_buffered_header(packet) {
+            Ok(header) => header,
+            Err(error) => {
+                crate::telemetry::record_media_admission_rejection(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Buffered,
+                    "header_parse",
+                );
+                return Err(io::Error::from(error));
+            }
+        };
+        let decrypted = match self.decryptor.decrypt(packet, &header) {
+            Ok(decrypted) => {
+                crate::telemetry::record_media_decrypted(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Buffered,
+                );
+                decrypted
+            }
+            Err(error) => {
+                crate::telemetry::record_media_decrypt_failure(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Buffered,
+                );
+                return Err(io::Error::from(error));
+            }
+        };
         // Only authenticated wire data is allowed to advance or terminate the
         // nonce state. An untrusted process sharing the sender IP must not be
         // able to kill playback merely by guessing an old counter value.
-        self.nonce_history.commit(header.nonce_suffix)?;
+        if let Err(error) = self.nonce_history.commit(header.nonce_suffix) {
+            let nonce_rejection_reason =
+                if self.nonce_history.accepted >= self.nonce_history.capacity {
+                    "session_limit"
+                } else {
+                    "nonce_replay"
+                };
+            crate::telemetry::record_media_admission_rejection(
+                telemetry_token,
+                crate::telemetry::MediaKind::Buffered,
+                nonce_rejection_reason,
+            );
+            return Err(error);
+        }
 
         if header.ssrc != BUFFERED_SSRC_AAC_44K1_STEREO
             && !(header.ssrc == 0 && decrypted.is_empty())
         {
+            crate::telemetry::record_media_admission_rejection(
+                telemetry_token,
+                crate::telemetry::MediaKind::Buffered,
+                "ssrc",
+            );
             return Err(PacketError::UnsupportedSsrc {
                 actual: header.ssrc,
             }
@@ -1109,11 +1289,12 @@ impl Type103Engine {
             header,
             payload: decrypted,
             wire_bytes,
+            telemetry_token,
         })
     }
 
     fn prepare_ready_frame(&mut self) -> io::Result<()> {
-        if !self.playing {
+        if !self.playing_is_current() {
             return Ok(());
         }
 
@@ -1123,7 +1304,8 @@ impl Type103Engine {
                     sequence: ready.sequence,
                     timestamp: ready.timestamp,
                 };
-                if self.apply_deferred_flushes(point) {
+                let telemetry_token = ready.telemetry_token;
+                if self.apply_deferred_flushes(point, telemetry_token) {
                     self.ready_frame = None;
                     continue;
                 }
@@ -1138,36 +1320,55 @@ impl Type103Engine {
                 sequence: block.header.sequence,
                 timestamp: block.header.timestamp,
             };
-            if self.apply_deferred_flushes(point) {
+            if self.apply_deferred_flushes(point, block.telemetry_token) {
                 continue;
             }
             if block.payload.is_empty() {
                 continue;
             }
-            if self.timestamp_is_late(block.header.timestamp) {
+            if self.timestamp_is_late(block.header.timestamp, block.telemetry_token) {
+                crate::telemetry::record_predecode_late_drop(
+                    block.telemetry_token,
+                    crate::telemetry::MediaKind::Buffered,
+                );
                 if self.late_run_blocks == 0 {
                     self.late_run_first = Some((block.header.sequence, block.header.timestamp));
                 }
                 self.late_run_blocks = self.late_run_blocks.saturating_add(1);
                 continue;
             }
-            let pcm = self
-                .decoder
-                .decode(block.header.timestamp, &block.payload)
-                .map_err(|error| {
-                    io::Error::new(
+            let pcm = match self.decoder.decode(block.header.timestamp, &block.payload) {
+                Ok(pcm) => {
+                    crate::telemetry::record_media_decoded(
+                        block.telemetry_token,
+                        crate::telemetry::MediaKind::Buffered,
+                    );
+                    pcm
+                }
+                Err(error) => {
+                    crate::telemetry::record_media_decode_failure(
+                        block.telemetry_token,
+                        crate::telemetry::MediaKind::Buffered,
+                    );
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("invalid buffered AAC-LC frame: {error}"),
-                    )
-                })?;
+                    ));
+                }
+            };
             let sequence = block.header.sequence;
             let timestamp = block.header.timestamp;
             let wire_bytes = block.wire_bytes;
+            let telemetry_token = block.telemetry_token;
             self.ready_frame = Some(ReadyFrame {
                 sequence,
                 timestamp,
                 pcm,
                 wire_bytes,
+                telemetry_token,
+                deadline_not_ready_since: None,
+                deadline_warmup_reported: false,
+                deadline_failure_reasons: 0,
             });
         }
         let Some(ready) = self.ready_frame.as_ref() else {
@@ -1192,24 +1393,52 @@ impl Type103Engine {
     /// portable mapper reports `Stale` once its samples are older than
     /// `MAPPER_WINDOW` (2 s), and everything it was holding is data we already
     /// have in hand.
-    fn deadline_for(&mut self, timestamp: u32) -> Option<std::time::Instant> {
-        let anchor = self.playback_anchor?;
+    fn deadline_for(
+        &mut self,
+        timestamp: u32,
+        telemetry_token: crate::telemetry::OperationToken,
+    ) -> Option<std::time::Instant> {
+        let Some(anchor) = self.playback_anchor else {
+            crate::telemetry::record_scheduler_wait(
+                telemetry_token,
+                crate::telemetry::MediaKind::Buffered,
+                "missing_anchor",
+            );
+            return None;
+        };
+        let Some(clock) = self.ptp_clock.as_ref() else {
+            crate::telemetry::record_scheduler_wait(
+                telemetry_token,
+                crate::telemetry::MediaKind::Buffered,
+                "missing_mapper",
+            );
+            return None;
+        };
         let now = std::time::Instant::now();
         let deadline = match self.ptp_source.platform_deadline_for_rtp(
             anchor,
             timestamp,
             BUFFERED_SAMPLE_RATE as u32,
+            telemetry_token,
         ) {
             Some(result) => result,
-            None => self
-                .ptp_clock
-                .as_ref()?
-                .deadline_for_rtp(now, anchor, timestamp, BUFFERED_SAMPLE_RATE as u32),
+            None => clock.deadline_for_rtp(
+                now,
+                anchor,
+                timestamp,
+                BUFFERED_SAMPLE_RATE as u32,
+                telemetry_token,
+            ),
         };
         match deadline {
             Ok(deadline) => Some(deadline.checked_sub(PCM_OUTPUT_LEAD).unwrap_or(now)),
             Err(error) => {
-                self.note_clock_unavailable(&error);
+                // `ready_schedule` owns per-frame deadline telemetry. This
+                // helper is also used by predecode and periodic lead probes;
+                // recording here would multiply one disposition by poll rate.
+                if error != PtpClockError::NotReady {
+                    self.note_clock_unavailable(&error);
+                }
                 None
             }
         }
@@ -1222,9 +1451,13 @@ impl Type103Engine {
     /// decode per 23 ms of skipped audio into pointer arithmetic. The block has
     /// already passed `apply_deferred_flushes` and the nonce ledger by the time
     /// this runs, so nothing security-relevant is skipped with it.
-    fn timestamp_is_late(&mut self, timestamp: u32) -> bool {
+    fn timestamp_is_late(
+        &mut self,
+        timestamp: u32,
+        telemetry_token: crate::telemetry::OperationToken,
+    ) -> bool {
         let now = std::time::Instant::now();
-        match self.deadline_for(timestamp) {
+        match self.deadline_for(timestamp, telemetry_token) {
             Some(deadline) => now.saturating_duration_since(deadline) > MAX_CLOCKED_LATENESS,
             None => false,
         }
@@ -1257,31 +1490,57 @@ impl Type103Engine {
     }
 
     fn ready_schedule(&mut self) -> ReadySchedule {
-        let Some(ready) = self.ready_frame.as_ref() else {
+        let Some((ready_timestamp, telemetry_token)) = self
+            .ready_frame
+            .as_ref()
+            .map(|ready| (ready.timestamp, ready.telemetry_token))
+        else {
             return ReadySchedule::Wait;
         };
         let Some(anchor) = self.playback_anchor else {
+            crate::telemetry::record_scheduler_wait(
+                telemetry_token,
+                crate::telemetry::MediaKind::Buffered,
+                "missing_anchor",
+            );
+            return ReadySchedule::Wait;
+        };
+        let Some(clock) = self.ptp_clock.as_ref() else {
+            crate::telemetry::record_scheduler_wait(
+                telemetry_token,
+                crate::telemetry::MediaKind::Buffered,
+                "missing_mapper",
+            );
             return ReadySchedule::Wait;
         };
         let now = std::time::Instant::now();
-        let deadline = match self.ptp_source.platform_deadline_for_rtp(
+        let (deadline_source, deadline) = match self.ptp_source.platform_deadline_for_rtp(
             anchor,
-            ready.timestamp,
+            ready_timestamp,
             BUFFERED_SAMPLE_RATE as u32,
+            telemetry_token,
         ) {
-            Some(result) => result,
-            None => {
-                let Some(clock) = self.ptp_clock.as_ref() else {
-                    return ReadySchedule::Wait;
-                };
-                clock.deadline_for_rtp(now, anchor, ready.timestamp, BUFFERED_SAMPLE_RATE as u32)
-            }
+            Some(result) => (crate::telemetry::DeadlineSource::Platform, result),
+            None => (
+                crate::telemetry::DeadlineSource::PortableMapper,
+                clock.deadline_for_rtp(
+                    now,
+                    anchor,
+                    ready_timestamp,
+                    BUFFERED_SAMPLE_RATE as u32,
+                    telemetry_token,
+                ),
+            ),
         };
         match deadline {
             Ok(deadline) => {
                 self.note_clock_available();
                 let deadline = deadline.checked_sub(PCM_OUTPUT_LEAD).unwrap_or(now);
                 if deadline > now + MAX_CLOCKED_FUTURE {
+                    crate::telemetry::record_future_safety_wait(
+                        telemetry_token,
+                        crate::telemetry::MediaKind::Buffered,
+                    );
                     log::warn!(
                         target: "audiohub_airplay::airplay2",
                         "AirPlay 2 PTP media deadline exceeded the 30 second safety limit"
@@ -1294,6 +1553,43 @@ impl Type103Engine {
                 }
             }
             Err(error) => {
+                if error == PtpClockError::NotReady {
+                    let ready = self
+                        .ready_frame
+                        .as_mut()
+                        .expect("ready frame remains installed while scheduling");
+                    let since = *ready.deadline_not_ready_since.get_or_insert(now);
+                    if !ready.deadline_warmup_reported {
+                        ready.deadline_warmup_reported = true;
+                        crate::telemetry::record_deadline_warmup_wait(
+                            telemetry_token,
+                            crate::telemetry::MediaKind::Buffered,
+                            deadline_source,
+                        );
+                    }
+                    if now.saturating_duration_since(since) < super::ptp::DEADLINE_NOT_READY_WARMUP
+                    {
+                        return ReadySchedule::Wait;
+                    }
+                }
+                let bit = error.telemetry_bit();
+                let first_for_frame = {
+                    let ready = self
+                        .ready_frame
+                        .as_mut()
+                        .expect("ready frame remains installed while scheduling");
+                    let first = ready.deadline_failure_reasons & bit == 0;
+                    ready.deadline_failure_reasons |= bit;
+                    first
+                };
+                if first_for_frame {
+                    crate::telemetry::record_deadline_rejection(
+                        telemetry_token,
+                        crate::telemetry::MediaKind::Buffered,
+                        deadline_source,
+                        error.telemetry_reason(),
+                    );
+                }
                 self.note_clock_unavailable(&error);
                 ReadySchedule::Wait
             }
@@ -1304,6 +1600,10 @@ impl Type103Engine {
         let Some(ready) = self.ready_frame.take() else {
             return;
         };
+        crate::telemetry::record_scheduler_late_drop(
+            ready.telemetry_token,
+            crate::telemetry::MediaKind::Buffered,
+        );
         if self.late_run_blocks == 0 {
             self.late_run_first = Some((ready.sequence, ready.timestamp));
         }
@@ -1318,7 +1618,7 @@ impl Type103Engine {
     }
 
     fn deliver_ready_frame(&mut self) {
-        if !self.playing {
+        if !self.playing_is_current() {
             return;
         }
         if let Some(ready) = self.ready_frame.take() {
@@ -1344,11 +1644,20 @@ impl Type103Engine {
                 // into a collapsed buffer.
                 self.decoder.reset();
             }
-            self.output.write(&ready.pcm);
+            crate::telemetry::record_media_output(
+                ready.telemetry_token,
+                crate::telemetry::MediaKind::Buffered,
+                ready.pcm.len(),
+            );
+            self.output.write(&ready.pcm, ready.telemetry_token);
         }
     }
 
-    fn apply_deferred_flushes(&mut self, point: WirePoint) -> bool {
+    fn apply_deferred_flushes(
+        &mut self,
+        point: WirePoint,
+        telemetry_token: crate::telemetry::OperationToken,
+    ) -> bool {
         let mut drop_point = false;
         let mut reset_output = false;
         let mut index = 0;
@@ -1381,10 +1690,20 @@ impl Type103Engine {
         if reset_output {
             self.reset_decoded_output();
         }
+        if drop_point {
+            crate::telemetry::record_expected_control_disposition(
+                telemetry_token,
+                crate::telemetry::MediaKind::Buffered,
+                "deferred_flush_drop",
+                1,
+            );
+        }
         drop_point
     }
 
-    fn discard_before(&mut self, boundary: WirePoint) -> bool {
+    fn discard_before(&mut self, boundary: WirePoint) -> (bool, usize) {
+        let queued_before = self.queued_blocks.len();
+        let ready_before = usize::from(self.ready_frame.is_some());
         if self
             .ready_frame
             .as_ref()
@@ -1406,7 +1725,10 @@ impl Type103Engine {
                 || self.queued_blocks.front().is_some_and(|block| {
                     !sequence_precedes(block.header.sequence, boundary.sequence)
                 });
-        boundary_reached
+        let dropped = queued_before
+            .saturating_sub(self.queued_blocks.len())
+            .saturating_add(ready_before.saturating_sub(usize::from(self.ready_frame.is_some())));
+        (boundary_reached, dropped)
     }
 
     fn retained_wire_bytes(&self) -> usize {
@@ -1418,6 +1740,10 @@ impl Type103Engine {
                     .as_ref()
                     .map_or(0, |ready| ready.wire_bytes),
             )
+    }
+
+    fn playing_is_current(&self) -> bool {
+        self.playing
     }
 }
 
@@ -2184,7 +2510,7 @@ mod tests {
     struct TestOutput(Arc<Mutex<OutputState>>);
 
     impl PcmOutput for TestOutput {
-        fn write(&mut self, samples: &[i16]) {
+        fn write(&mut self, samples: &[i16], _telemetry_token: crate::telemetry::OperationToken) {
             self.0.lock().unwrap().writes.push(samples.to_vec());
         }
 
@@ -2226,6 +2552,7 @@ mod tests {
                 grandmaster: 1,
                 remote_time_ns: 1_000_000_000 + elapsed,
                 received_at,
+                telemetry_token: crate::telemetry::operation_token(),
             });
             time::sleep(Duration::from_millis(5)).await;
         }
@@ -2242,6 +2569,7 @@ mod tests {
                     grandmaster: 1,
                     remote_time_ns: 1_000_000_000 + elapsed,
                     received_at,
+                    telemetry_token: crate::telemetry::operation_token(),
                 });
                 time::sleep(Duration::from_millis(5)).await;
             }
@@ -2286,6 +2614,36 @@ mod tests {
         assert_eq!(guard.writes[0].len(), 2_048);
         assert_eq!(guard.writes[1].len(), 2_048);
         drop(guard);
+        handle.abort().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn telemetry_reset_preserves_partial_tcp_frame_anchor_and_decoder() {
+        let (ports, handle, state) = harness().await;
+        let mut sender = TcpStream::connect((Ipv4Addr::LOCALHOST, ports.data_port))
+            .await
+            .unwrap();
+        handle.set_rate(test_rate(true)).await.unwrap();
+        sender
+            .write_all(&framed(&make_packet(1, 0, OWNED_AAC_FRAME_HEX, [1; 8])))
+            .await
+            .unwrap();
+        wait_for(|| state.lock().unwrap().writes.len() == 1).await;
+
+        let second = framed(&make_packet(2, 1_024, OWNED_AAC_FRAME_HEX, [2; 8]));
+        let split = 17;
+        sender.write_all(&second[..split]).await.unwrap();
+        time::sleep(Duration::from_millis(20)).await;
+
+        crate::telemetry::reset();
+
+        sender.write_all(&second[split..]).await.unwrap();
+        wait_for(|| state.lock().unwrap().writes.len() == 2).await;
+        let guard = state.lock().unwrap();
+        assert_eq!(guard.flushes, 0);
+        assert_eq!(guard.writes[1].len(), 2_048);
+        drop(guard);
+        assert!(!handle.is_finished());
         handle.abort().await;
     }
 
@@ -2352,7 +2710,10 @@ mod tests {
         //
         // The discontinuity is still handled: one `decoder.reset()` when the
         // run ends. The output keeps what it already holds.
-        assert_eq!(guard.flushes, 0, "a late discard must not flush the output bus");
+        assert_eq!(
+            guard.flushes, 0,
+            "a late discard must not flush the output bus"
+        );
         drop(guard);
         assert!(!handle.is_finished());
         handle.abort().await;
@@ -2859,7 +3220,6 @@ mod tests {
         packet
     }
 
-
     // ---------------------------------------------------------------- stall
     //
     // The shipped check was `read_limit > 0 && framer.partial_frame_timed_out()`
@@ -2873,15 +3233,33 @@ mod tests {
         // goes quiet, the burst ended mid-frame, and `read_limit` is positive
         // because retention sits far below the advertised 8 MiB. Every input the
         // old check looked at is set exactly as it was in the failure.
-        assert!(!starved_stall(true, false, true, TCP_READ_CHUNK_BYTES, true));
-        assert!(!starved_stall(true, false, false, TCP_READ_CHUNK_BYTES, true));
+        assert!(!starved_stall(
+            true,
+            false,
+            true,
+            TCP_READ_CHUNK_BYTES,
+            true
+        ));
+        assert!(!starved_stall(
+            true,
+            false,
+            false,
+            TCP_READ_CHUNK_BYTES,
+            true
+        ));
     }
 
     #[test]
     fn a_paused_session_is_never_a_stall() {
         // A pause receives nothing by design; without the `playing` term a long
         // pause would look exactly like a dead peer.
-        assert!(!starved_stall(false, true, true, TCP_READ_CHUNK_BYTES, true));
+        assert!(!starved_stall(
+            false,
+            true,
+            true,
+            TCP_READ_CHUNK_BYTES,
+            true
+        ));
     }
 
     #[test]
@@ -2896,7 +3274,13 @@ mod tests {
         // shape that means the sender is gone rather than merely ahead.
         assert!(starved_stall(true, true, true, TCP_READ_CHUNK_BYTES, true));
         // ...but not before the framer says the silence is long enough.
-        assert!(!starved_stall(true, true, true, TCP_READ_CHUNK_BYTES, false));
+        assert!(!starved_stall(
+            true,
+            true,
+            true,
+            TCP_READ_CHUNK_BYTES,
+            false
+        ));
     }
 
     #[test]
@@ -2923,7 +3307,8 @@ mod tests {
         framer.push(&block[..8]).unwrap();
         let start = framer.last_progress.unwrap();
         assert!(!framer.partial_frame_timed_out(start));
-        assert!(!framer.partial_frame_timed_out(start + STARVED_STALL_TIMEOUT - Duration::from_millis(1)));
+        assert!(!framer
+            .partial_frame_timed_out(start + STARVED_STALL_TIMEOUT - Duration::from_millis(1)));
         assert!(framer.partial_frame_timed_out(start + STARVED_STALL_TIMEOUT));
         // The value that shipped. Kept as a number so a future edit that lowers
         // the constant back into a sender's normal idle gap fails here first.

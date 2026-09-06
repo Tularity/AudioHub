@@ -4120,6 +4120,7 @@ fn a_tier_two_stream_sends_no_keepalive_datagrams() {
         None,
         None,
         crate::tcpmedia::MediaPath::Udp(sink_addr),
+        1,
     );
     for _ in 0..CALLS {
         crate::engine::send_pullreq(&inner, &udp_rx);
@@ -4156,6 +4157,7 @@ fn a_tier_two_stream_sends_no_keepalive_datagrams() {
         None,
         None,
         crate::tcpmedia::MediaPath::Framed(link),
+        1,
     );
     for _ in 0..CALLS {
         crate::engine::send_pullreq(&inner, &mux_rx);

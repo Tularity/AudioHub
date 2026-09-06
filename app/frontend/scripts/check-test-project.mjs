@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Fail the build if `tsconfig.test.json` has stopped actually typechecking the
-// tests.
+// Fail the explicit test preflight if `tsconfig.test.json` has stopped actually
+// typechecking the tests. Production builds deliberately do not load this
+// project; test compilation and execution belong to the isolated test VMs.
 //
 // # The failure this exists to catch
 //
@@ -13,9 +14,9 @@
 //
 // The result is not an error. It is a project containing exactly one file
 // (`vitest.config.ts`), which typechecks clean, in a fraction of a second, with
-// exit code 0. `tsc -b` stays green, `npm run build` stays green, and the seven
-// test files are simply never looked at. It stayed that way through a whole
-// commit that advertised the opposite.
+// exit code 0. A broad `tsc -b` stays green, and the test files are simply never
+// looked at. It stayed that way through a whole commit that advertised the
+// opposite.
 //
 // A comment saying "tests must typecheck too" cannot detect this. This can:
 // ask the compiler which files it actually loaded, and compare that against the

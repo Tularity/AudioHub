@@ -2,6 +2,7 @@
 
 pub(crate) mod airport_express;
 pub(crate) mod apple_challenge;
+pub(crate) mod classic;
 pub(crate) mod crypto;
 pub(crate) mod event;
 pub(crate) mod fairplay;

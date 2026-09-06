@@ -212,6 +212,18 @@ export interface PeerHalDevice {
   requested_directions?: number;
   published_directions?: number;
   observed_directions?: number;
+  /** Authoritative peer default-output state mirrored by the virtual speaker. */
+  out_volume?: VolumeState | null;
+  /** Authoritative peer default-input state mirrored by the virtual microphone. */
+  in_volume?: VolumeState | null;
+  /** A speaker-volume change is queued or awaiting peer readback. */
+  out_volume_pending?: boolean;
+  /** A microphone-volume change is queued or awaiting peer readback. */
+  in_volume_pending?: boolean;
+  /** The virtual speaker is applying this scalar as local send-side gain. */
+  out_volume_software_gain?: boolean;
+  /** 0/absent = legacy peer; 1 = idle speaker + microphone device control. */
+  device_volume_version?: number;
 }
 
 export interface PeerState {
@@ -278,6 +290,7 @@ export interface VolumeState {
   scalar: number;
   muted: boolean;
   adjustable?: boolean;
+  mute_adjustable?: boolean;
 }
 
 export interface Verdict {

@@ -48,9 +48,12 @@ pub struct BackendInfo {
 }
 
 pub trait SysAudioCapture: Send {
-    /// Appends mono f32 at `sample_rate()`, returns how many samples it added.
+    /// Appends interleaved f32 at `sample_rate()`, returns scalar samples added.
     fn read(&mut self, out: &mut Vec<f32>) -> usize;
     fn sample_rate(&self) -> u32;
+    fn channels(&self) -> u8 {
+        1
+    }
     /// `Some(reason)` once the capture has died unrecoverably (endpoint
     /// invalidated, device unplugged); `read()` then keeps returning 0. Callers
     /// must surface this: a dead capture is indistinguishable from silence in
@@ -175,6 +178,63 @@ mod downmix {
         let frames = interleaved.len() / chans;
         out.resize(start + frames, 0.0);
         front_pair_mono_into(interleaved, chans, pair, &mut out[start..]);
+    }
+
+    /// Selects the front pair without collapsing it. A mono source is duplicated
+    /// so every backend presents the same two-channel contract upstream.
+    pub fn front_pair_stereo_into(
+        interleaved: &[f32],
+        chans: usize,
+        pair: (usize, usize),
+        out: &mut [f32],
+    ) -> usize {
+        if chans == 0 {
+            return 0;
+        }
+        let frames = (interleaved.len() / chans).min(out.len() / 2);
+        for f in 0..frames {
+            let base = f * chans;
+            out[f * 2] = interleaved[base + pair.0];
+            out[f * 2 + 1] = interleaved[base + pair.1];
+        }
+        frames
+    }
+
+    pub fn front_pair_stereo(
+        interleaved: &[f32],
+        chans: usize,
+        pair: (usize, usize),
+        out: &mut Vec<f32>,
+    ) {
+        if chans == 0 {
+            return;
+        }
+        let start = out.len();
+        let frames = interleaved.len() / chans;
+        out.resize(start + frames * 2, 0.0);
+        front_pair_stereo_into(interleaved, chans, pair, &mut out[start..]);
+    }
+
+    pub fn planar_front_pair_stereo_into(planes: &[&[f32]], out: &mut [f32]) -> usize {
+        match planes {
+            [] => 0,
+            [only] => {
+                let frames = only.len().min(out.len() / 2);
+                for f in 0..frames {
+                    out[f * 2] = only[f];
+                    out[f * 2 + 1] = only[f];
+                }
+                frames
+            }
+            [left, right, ..] => {
+                let frames = left.len().min(right.len()).min(out.len() / 2);
+                for f in 0..frames {
+                    out[f * 2] = left[f];
+                    out[f * 2 + 1] = right[f];
+                }
+                frames
+            }
+        }
     }
 }
 
@@ -814,9 +874,9 @@ mod win {
     const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
     const BUFFER_DURATION_HNS: i64 = 2_000_000; // 200ms, in 100ns units
     const VT_BLOB: u16 = 65;
-    /// Ring holds 4s of 48k mono: a stalled reader drops audio, never blocks
+    /// Ring holds 4s of 48k stereo: a stalled reader drops audio, never blocks
     /// the WASAPI thread.
-    const RING_SAMPLES: usize = 48000 * 4;
+    const RING_SAMPLES: usize = 48000 * 4 * 2;
 
     #[repr(C)]
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1422,6 +1482,10 @@ mod win {
             self.rate
         }
 
+        fn channels(&self) -> u8 {
+            2
+        }
+
         fn failed(&self) -> Option<String> {
             self.fail.reason()
         }
@@ -1602,7 +1666,7 @@ mod win {
 
         let chans = channels as usize;
         let pair = super::downmix::front_pair(mask, chans);
-        let mut mono: Vec<f32> = Vec::with_capacity(4096);
+        let mut stereo: Vec<f32> = Vec::with_capacity(4096 * 2);
         let mut wide: Vec<f32> = Vec::with_capacity(4096 * chans);
         // A negative HRESULT here is terminal (AUDCLNT_E_DEVICE_INVALIDATED when
         // the default endpoint changes or the DAC is unplugged): WASAPI keeps
@@ -1637,10 +1701,10 @@ mod win {
                     fail.fail(hr_err("IAudioCaptureClient::GetBuffer", hr));
                     break 'session;
                 }
-                mono.clear();
+                stereo.clear();
                 if frames > 0 {
                     if bflags & AUDCLNT_BUFFERFLAGS_SILENT != 0 || data.is_null() {
-                        mono.resize(frames as usize, 0.0);
+                        stereo.resize(frames as usize * 2, 0.0);
                     } else {
                         wide.clear();
                         let n = frames as usize * chans;
@@ -1656,12 +1720,12 @@ mod win {
                                 }
                             });
                         }
-                        super::downmix::front_pair_mono(&wide, chans, pair, &mut mono);
+                        super::downmix::front_pair_stereo(&wide, chans, pair, &mut stereo);
                     }
                 }
                 ((*capv).release_buffer)(capture.0, frames);
-                if !mono.is_empty() {
-                    let _ = prod.push_slice(&mono); // full ring drops, never blocks WASAPI
+                if !stereo.is_empty() {
+                    let _ = prod.push_slice(&stereo); // full ring drops, never blocks WASAPI
                 }
             }
         }
@@ -1724,10 +1788,10 @@ mod mac {
     /// `i32` every CoreAudio entry point here returns.
     type OSStatus = i32;
 
-    /// 4s of 48k mono, like the Windows ring: a stalled reader costs audio, it
+    /// 4s of 48k stereo, like the Windows ring: a stalled reader costs audio, it
     /// never blocks the IOProc.
-    const RING_SAMPLES: usize = 48000 * 4;
-    /// Frames downmixed per pass. Core Audio hands over far less than this per
+    const RING_SAMPLES: usize = 48000 * 4 * 2;
+    /// Frames extracted per pass. Core Audio hands over far less than this per
     /// cycle; anything larger is chunked, so the IOProc never has to allocate.
     const SCRATCH_FRAMES: usize = 4096;
     /// A running aggregate device calls its IOProc every cycle whether or not
@@ -1991,7 +2055,7 @@ mod mac {
         if first.mData.is_null() {
             return 0;
         }
-        let mut scratch = [0f32; SCRATCH_FRAMES];
+        let mut scratch = [0f32; SCRATCH_FRAMES * 2];
         let samples = |b: &objc2_core_audio_types::AudioBuffer| -> &[f32] {
             std::slice::from_raw_parts(b.mData.cast::<f32>(), b.mDataByteSize as usize / 4)
         };
@@ -2007,18 +2071,18 @@ mod mac {
             let mut off = 0;
             while off < frames {
                 let take = (frames - off).min(SCRATCH_FRAMES);
-                let n = downmix::front_pair_mono_into(
+                let n = downmix::front_pair_stereo_into(
                     &data[off * chans..(off + take) * chans],
                     chans,
                     pair,
-                    &mut scratch[..take],
+                    &mut scratch[..take * 2],
                 );
-                ctx.prod.push_slice(&scratch[..n]);
+                ctx.prod.push_slice(&scratch[..n * 2]);
                 off += take;
             }
         } else {
-            // Deinterleaved tap: one mono AudioBuffer per channel. Average the
-            // first two — the same front pair, laid out differently.
+            // Deinterleaved tap: one mono AudioBuffer per channel. Preserve the
+            // first two as L/R — the same front pair, laid out differently.
             let left = samples(&first);
             let right = if ctx.tap_channels >= 2 && idx + 1 < count {
                 let second = *bufs.add(idx + 1);
@@ -2035,9 +2099,10 @@ mod mac {
             while off < frames {
                 let take = (frames - off).min(SCRATCH_FRAMES);
                 for i in 0..take {
-                    scratch[i] = (left[off + i] + right[off + i]) * 0.5;
+                    scratch[i * 2] = left[off + i];
+                    scratch[i * 2 + 1] = right[off + i];
                 }
-                ctx.prod.push_slice(&scratch[..take]);
+                ctx.prod.push_slice(&scratch[..take * 2]);
                 off += take;
             }
         }
@@ -2082,6 +2147,10 @@ mod mac {
 
         fn sample_rate(&self) -> u32 {
             self.rate
+        }
+
+        fn channels(&self) -> u8 {
+            2
         }
 
         fn failed(&self) -> Option<String> {
@@ -2421,14 +2490,13 @@ mod sck {
     /// What the stream is configured to hand us, and therefore what
     /// `sample_rate()` reports. ScreenCaptureKit resamples to this itself.
     pub const SAMPLE_RATE: u32 = 48_000;
-    /// Stereo in, mono out. Asking for 2 rather than 1 keeps the front-pair
-    /// downmix rule identical to every other backend's instead of trusting
-    /// ScreenCaptureKit's own fold-down.
+    /// Ask ScreenCaptureKit for the front pair rather than trusting a platform
+    /// fold-down that would destroy channel separation before capture.
     const CHANNELS: isize = 2;
-    /// 4s of 48k mono, like both other backends: a stalled reader costs audio,
+    /// 4s of 48k stereo, like both other backends: a stalled reader costs audio,
     /// it never blocks the callback.
-    const RING_SAMPLES: usize = 48000 * 4;
-    /// Frames downmixed per pass, so the sample handler never allocates.
+    const RING_SAMPLES: usize = 48000 * 4 * 2;
+    /// Frames extracted per pass, so the sample handler never allocates.
     const SCRATCH_FRAMES: usize = 4096;
     /// A running audio stream delivers buffers whether or not anything is
     /// playing, so this much silence from the callback means the stream died.
@@ -2571,8 +2639,8 @@ mod sck {
             unsafe { msg_send![super(this), init] }
         }
 
-        /// Pulls the sample buffer's audio out, downmixes the front pair to
-        /// mono and pushes it into the ring. Returns the number of frames
+        /// Pulls the sample buffer's front pair without collapsing it and
+        /// pushes interleaved stereo into the ring. Returns the number of frames
         /// EXTRACTED — which is what the stall watchdog counts, and is
         /// deliberately not the number pushed (see `STALL`).
         ///
@@ -2631,7 +2699,7 @@ mod sck {
             let samples = |b: &AudioBuffer| -> &[f32] {
                 std::slice::from_raw_parts(b.mData.cast::<f32>(), b.mDataByteSize as usize / 4)
             };
-            let mut scratch = [0f32; SCRATCH_FRAMES];
+            let mut scratch = [0f32; SCRATCH_FRAMES * 2];
             let prod = &mut *self.ivars().prod.get();
 
             if first.mNumberChannels >= 2 {
@@ -2646,13 +2714,13 @@ mod sck {
                 let mut off = 0;
                 while off < frames {
                     let take = (frames - off).min(SCRATCH_FRAMES);
-                    let n = downmix::front_pair_mono_into(
+                    let n = downmix::front_pair_stereo_into(
                         &data[off * chans..(off + take) * chans],
                         chans,
                         pair,
-                        &mut scratch[..take],
+                        &mut scratch[..take * 2],
                     );
-                    prod.push_slice(&scratch[..n]);
+                    prod.push_slice(&scratch[..n * 2]);
                     off += take;
                 }
                 return frames;
@@ -2682,9 +2750,11 @@ mod sck {
                 for i in 0..used {
                     chunk[i] = &planes[i][off..off + take];
                 }
-                let n =
-                    downmix::planar_front_pair_mono_into(&chunk[..used], &mut scratch[..take]);
-                prod.push_slice(&scratch[..n]);
+                let n = downmix::planar_front_pair_stereo_into(
+                    &chunk[..used],
+                    &mut scratch[..take * 2],
+                );
+                prod.push_slice(&scratch[..n * 2]);
                 off += take;
             }
             frames
@@ -2731,6 +2801,10 @@ mod sck {
             SAMPLE_RATE
         }
 
+        fn channels(&self) -> u8 {
+            2
+        }
+
         fn failed(&self) -> Option<String> {
             self.fail.reason()
         }
@@ -2754,8 +2828,10 @@ mod sck {
             // what makes the stream run at all (see `start_inner`).
             for kind in [SCStreamOutputType::Audio, SCStreamOutputType::Screen] {
                 let _ = unsafe {
-                    self.stream
-                        .removeStreamOutput_type_error(ProtocolObject::from_ref(&*self.output), kind)
+                    self.stream.removeStreamOutput_type_error(
+                        ProtocolObject::from_ref(&*self.output),
+                        kind,
+                    )
                 };
             }
         }
@@ -2929,24 +3005,22 @@ mod sck {
     /// only on the `start` path and never on the listing path.
     unsafe fn shareable_content() -> Result<Retained<SCShareableContent>> {
         let (tx, rx) = mpsc::sync_channel::<std::result::Result<usize, String>>(1);
-        let block = RcBlock::new(
-            move |content: *mut SCShareableContent, err: *mut NSError| {
-                // `Retained<SCShareableContent>` is not `Send` — objc2 makes no
-                // such promise for imported classes — so ownership crosses the
-                // channel as a raw +1 pointer and is re-wrapped on the far
-                // side. The object itself has no thread affinity; only the
-                // wrapper's auto traits are (correctly) conservative.
-                let msg = match unsafe { Retained::retain(content) } {
-                    Some(c) => Ok(Retained::into_raw(c) as usize),
-                    None => Err(unsafe { err.as_ref() }
-                        .map(|e| e.localizedDescription().to_string())
-                        .unwrap_or_else(|| {
-                            "ScreenCaptureKit returned neither content nor an error".to_string()
-                        })),
-                };
-                let _ = tx.send(msg);
-            },
-        );
+        let block = RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
+            // `Retained<SCShareableContent>` is not `Send` — objc2 makes no
+            // such promise for imported classes — so ownership crosses the
+            // channel as a raw +1 pointer and is re-wrapped on the far
+            // side. The object itself has no thread affinity; only the
+            // wrapper's auto traits are (correctly) conservative.
+            let msg = match unsafe { Retained::retain(content) } {
+                Some(c) => Ok(Retained::into_raw(c) as usize),
+                None => Err(unsafe { err.as_ref() }
+                    .map(|e| e.localizedDescription().to_string())
+                    .unwrap_or_else(|| {
+                        "ScreenCaptureKit returned neither content nor an error".to_string()
+                    })),
+            };
+            let _ = tx.send(msg);
+        });
         SCShareableContent::getShareableContentWithCompletionHandler(&block);
         match rx.recv_timeout(COMPLETION_TIMEOUT) {
             Ok(Ok(addr)) => Retained::from_raw(addr as *mut SCShareableContent)
@@ -3039,8 +3113,8 @@ mod sck {
 #[cfg(test)]
 mod tests {
     use super::downmix::{
-        front_pair, front_pair_mono, front_pair_mono_into, mask_channel_index,
-        planar_front_pair_mono_into,
+        front_pair, front_pair_mono, front_pair_mono_into, front_pair_stereo_into,
+        mask_channel_index, planar_front_pair_mono_into, planar_front_pair_stereo_into,
     };
 
     const STEREO: u32 = 0x3; // FL|FR
@@ -3071,6 +3145,22 @@ mod tests {
         ] {
             assert_eq!(front_pair(mask, chans), (0, 1), "mask 0x{mask:X}");
         }
+    }
+
+    #[test]
+    fn stereo_extractors_never_average_the_front_pair() {
+        let wide = [
+            1.0, -1.0, 0.2, 0.3, 0.4, 0.5, -0.25, 0.75, 0.6, 0.7, 0.8, 0.9,
+        ];
+        let mut out = [0.0; 4];
+        assert_eq!(front_pair_stereo_into(&wide, 6, (0, 1), &mut out), 2);
+        assert_eq!(out, [1.0, -1.0, -0.25, 0.75]);
+
+        let left = [1.0, -0.25];
+        let right = [-1.0, 0.75];
+        out.fill(0.0);
+        assert_eq!(planar_front_pair_stereo_into(&[&left, &right], &mut out), 2);
+        assert_eq!(out, [1.0, -1.0, -0.25, 0.75]);
     }
 
     #[test]

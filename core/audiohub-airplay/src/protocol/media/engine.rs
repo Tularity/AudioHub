@@ -12,9 +12,9 @@ use super::clock::{
     TimingResponse, TimingWindow,
 };
 use super::decode::{Type96AlacDecoder, CHANNELS, FRAMES_PER_PACKET, SAMPLE_RATE};
-use super::jitter::JitterBuffer;
+use super::jitter::{InsertOutcome, JitterBuffer};
 use super::packet::{RingDisposition, RtpPacket, SequenceExtender16, TimestampExtender32};
-use super::ptp::{PtpClockMapper, PtpClockSample, PtpClockSource};
+use super::ptp::{PtpClockError, PtpClockMapper, PtpClockSample, PtpClockSource};
 use super::setup::Type96Setup;
 use std::collections::{HashSet, VecDeque};
 use std::io;
@@ -60,8 +60,10 @@ const TIMING_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// PCM consumer supplied by the receiver runtime. Calls are intentionally
 /// synchronous and short: the platform bus copies into its own bounded queue.
+/// The caller's operation token follows the decoded block through conversion
+/// so a reset cannot relabel an already scheduled frame as current PCM.
 pub(crate) trait PcmOutput: Send {
-    fn write(&mut self, samples: &[i16]);
+    fn write(&mut self, samples: &[i16], telemetry_token: crate::telemetry::OperationToken);
     fn flush(&mut self);
 }
 
@@ -290,9 +292,13 @@ pub(crate) struct Type96MediaHandle {
 
 impl Type96MediaHandle {
     pub(crate) async fn flush(&self) -> io::Result<()> {
+        let telemetry_token = crate::telemetry::operation_token();
         let (reply, done) = oneshot::channel();
         self.commands
-            .send(MediaCommand::Flush(reply))
+            .send(MediaCommand::Flush {
+                telemetry_token,
+                reply,
+            })
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "media task has stopped"))?;
         done.await
@@ -328,7 +334,10 @@ impl Drop for Type96MediaHandle {
 }
 
 enum MediaCommand {
-    Flush(oneshot::Sender<()>),
+    Flush {
+        telemetry_token: crate::telemetry::OperationToken,
+        reply: oneshot::Sender<()>,
+    },
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -399,13 +408,14 @@ impl PtpSyncAnchor {
         self.rtp_current.wrapping_sub(self.frame_with_fixed_offset)
     }
 
-    fn playback_anchor(self) -> PlaybackAnchor {
+    fn playback_anchor(self, telemetry_token: crate::telemetry::OperationToken) -> PlaybackAnchor {
         PlaybackAnchor {
             timeline_id: self.timeline_id,
             remote_time_ns: self.remote_time_ns,
             rtp_time: self
                 .frame_with_fixed_offset
                 .wrapping_sub(PTP_REALTIME_RENDER_OFFSET_FRAMES),
+            telemetry_token,
         }
     }
 }
@@ -447,12 +457,17 @@ struct ClockedFrame {
     sequence: u64,
     timestamp: u32,
     pcm: Vec<i16>,
+    telemetry_token: crate::telemetry::OperationToken,
+    deadline_not_ready_since: Option<std::time::Instant>,
+    deadline_warmup_reported: bool,
+    deadline_failure_reasons: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ClockedSilence {
     sequence: u64,
     timestamp: u32,
+    telemetry_token: crate::telemetry::OperationToken,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,11 +635,32 @@ impl Type96Engine {
                         Ok(value) => value,
                         Err(error) => return RunExit::Io(error),
                     };
-                    if source.ip() == self.peer_ip
-                        && length <= MAX_ENCRYPTED_AUDIO_PACKET_BYTES
-                        && self.data_source.is_none_or(|pinned| pinned == source)
-                    {
-                        self.accept_encrypted_audio(&data[..length], Some(source));
+                    let telemetry_token = crate::telemetry::operation_token();
+                    crate::telemetry::record_media_received(
+                        telemetry_token,
+                        crate::telemetry::MediaKind::Realtime,
+                    );
+                    let rejection = if source.ip() != self.peer_ip {
+                        Some("source_ip")
+                    } else if length > MAX_ENCRYPTED_AUDIO_PACKET_BYTES {
+                        Some("packet_too_large")
+                    } else if self.data_source.is_some_and(|pinned| pinned != source) {
+                        Some("source_endpoint")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = rejection {
+                        crate::telemetry::record_media_admission_rejection(
+                            telemetry_token,
+                            crate::telemetry::MediaKind::Realtime,
+                            reason,
+                        );
+                    } else {
+                        self.accept_encrypted_audio_with_token(
+                            &data[..length],
+                            Some(source),
+                            telemetry_token,
+                        );
                     }
                 }
                 received = self.control_socket.recv_from(&mut control) => {
@@ -650,8 +686,11 @@ impl Type96Engine {
                 }
                 command = self.commands.recv() => {
                     match command {
-                        Some(MediaCommand::Flush(reply)) => {
-                            self.flush_stream();
+                        Some(MediaCommand::Flush {
+                            telemetry_token,
+                            reply,
+                        }) => {
+                            self.flush_stream(telemetry_token);
                             let _ = reply.send(());
                         }
                         Some(MediaCommand::Shutdown(reply)) => {
@@ -677,46 +716,137 @@ impl Type96Engine {
     /// shape. A duplicate or late packet is still suitable for endpoint
     /// pinning because its AEAD authentication binds it to this stream.
     fn accept_encrypted_audio(&mut self, datagram: &[u8], data_source: Option<SocketAddr>) -> bool {
+        let telemetry_token = crate::telemetry::operation_token();
+        crate::telemetry::record_media_received(
+            telemetry_token,
+            crate::telemetry::MediaKind::Realtime,
+        );
+        self.accept_encrypted_audio_with_token(datagram, data_source, telemetry_token)
+    }
+
+    fn accept_encrypted_audio_with_token(
+        &mut self,
+        datagram: &[u8],
+        data_source: Option<SocketAddr>,
+        telemetry_token: crate::telemetry::OperationToken,
+    ) -> bool {
         let clear = match self.decryptor.decrypt(datagram) {
-            Ok(clear) => clear,
-            Err(_) => return false,
+            Ok(clear) => {
+                crate::telemetry::record_media_decrypted(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                );
+                clear
+            }
+            Err(_) => {
+                crate::telemetry::record_media_decrypt_failure(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                );
+                return false;
+            }
         };
         let nonce: [u8; 8] = datagram[datagram.len() - 8..]
             .try_into()
             .expect("the decryptor accepted a transmitted nonce");
         if self.nonce_index.contains(&nonce) {
+            crate::telemetry::record_media_admission_rejection(
+                telemetry_token,
+                crate::telemetry::MediaKind::Realtime,
+                "nonce_replay",
+            );
             return false;
         }
         let mut packet_bytes = Vec::with_capacity(clear.rtp_header.len() + clear.payload.len());
         packet_bytes.extend_from_slice(&clear.rtp_header);
         packet_bytes.extend_from_slice(&clear.payload);
         let parsed = match RtpPacket::parse(&packet_bytes) {
-            Ok(packet) if packet.payload_type == 96 => packet,
-            _ => return false,
+            Ok(packet) => packet,
+            Err(_) => {
+                crate::telemetry::record_media_admission_rejection(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                    "rtp_parse",
+                );
+                return false;
+            }
         };
+        if parsed.payload_type != 96 {
+            crate::telemetry::record_media_admission_rejection(
+                telemetry_token,
+                crate::telemetry::MediaKind::Realtime,
+                "payload_type",
+            );
+            return false;
+        }
 
         if self.stream_ssrc.is_some_and(|ssrc| ssrc != parsed.ssrc) {
+            crate::telemetry::record_media_admission_rejection(
+                telemetry_token,
+                crate::telemetry::MediaKind::Realtime,
+                "ssrc",
+            );
             return false;
         }
 
         let sequence_preview = match self.sequence.peek(parsed.sequence) {
-            Ok(preview) if preview.disposition != RingDisposition::Duplicate => preview,
-            _ => return false,
+            Ok(preview) if preview.disposition == RingDisposition::Duplicate => {
+                crate::telemetry::record_media_admission_rejection(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                    "sequence_duplicate",
+                );
+                return false;
+            }
+            Ok(preview) => preview,
+            Err(_) => {
+                crate::telemetry::record_media_admission_rejection(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                    "sequence_invalid",
+                );
+                return false;
+            }
         };
         match sequence_preview.disposition {
             RingDisposition::Advanced { by } if by > super::jitter::DEFAULT_REORDER_WINDOW => {
-                return false
+                crate::telemetry::record_media_admission_rejection(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                    "sequence_out_of_window",
+                );
+                return false;
             }
             RingDisposition::Reordered { behind }
                 if behind > super::jitter::DEFAULT_REORDER_WINDOW.saturating_mul(2) =>
             {
-                return false
+                crate::telemetry::record_media_admission_rejection(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                    "sequence_out_of_window",
+                );
+                return false;
             }
             _ => {}
         }
         let timestamp_preview = match self.timestamp.peek(parsed.timestamp) {
-            Ok(preview) if preview.disposition != RingDisposition::Duplicate => preview,
-            _ => return false,
+            Ok(preview) if preview.disposition == RingDisposition::Duplicate => {
+                crate::telemetry::record_media_admission_rejection(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                    "timestamp_duplicate",
+                );
+                return false;
+            }
+            Ok(preview) => preview,
+            Err(_) => {
+                crate::telemetry::record_media_admission_rejection(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                    "timestamp_invalid",
+                );
+                return false;
+            }
         };
         let timestamp_limit = super::jitter::DEFAULT_REORDER_WINDOW
             .saturating_mul(FRAMES_PER_PACKET as u64)
@@ -725,7 +855,12 @@ impl Type96Engine {
             RingDisposition::Advanced { by } | RingDisposition::Reordered { behind: by }
                 if by > timestamp_limit =>
             {
-                return false
+                crate::telemetry::record_media_admission_rejection(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                    "timestamp_out_of_window",
+                );
+                return false;
             }
             _ => {}
         }
@@ -735,17 +870,37 @@ impl Type96Engine {
             let sequence_delta = sequence_candidate as i128 - origin_sequence as i128;
             let timestamp_delta = timestamp_candidate as i128 - origin_timestamp as i128;
             if timestamp_delta != sequence_delta * FRAMES_PER_PACKET as i128 {
+                crate::telemetry::record_media_admission_rejection(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                    "timeline_discontinuity",
+                );
                 return false;
             }
         }
 
         let payload = parsed.payload.to_vec();
-        if self
-            .jitter
-            .insert(sequence_candidate, timestamp_candidate, payload)
-            .is_err()
-        {
-            return false;
+        let insert_outcome = match self.jitter.insert_with_token(
+            sequence_candidate,
+            timestamp_candidate,
+            payload,
+            telemetry_token,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                crate::telemetry::record_jitter_rejection(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                    error.telemetry_reason(),
+                );
+                return false;
+            }
+        };
+        if matches!(insert_outcome, InsertOutcome::ReplacedFarFuture { .. }) {
+            crate::telemetry::record_jitter_far_future_eviction(
+                telemetry_token,
+                crate::telemetry::MediaKind::Realtime,
+            );
         }
         // The engine is single-threaded. Nothing between preview and commit
         // mutates either extender; jitter insertion is the last fallible
@@ -763,6 +918,10 @@ impl Type96Engine {
         self.stream_ssrc.get_or_insert(parsed.ssrc);
         self.stream_origin
             .get_or_insert((sequence_candidate, timestamp_candidate));
+        crate::telemetry::record_media_admitted(
+            telemetry_token,
+            crate::telemetry::MediaKind::Realtime,
+        );
         if let Some(source) = data_source {
             self.data_source.get_or_insert(source);
         }
@@ -776,6 +935,7 @@ impl Type96Engine {
     }
 
     fn accept_control(&mut self, datagram: &[u8], source: SocketAddr) {
+        let telemetry_token = crate::telemetry::operation_token();
         if datagram.len() < 2 {
             return;
         }
@@ -805,7 +965,7 @@ impl Type96Engine {
                 if let Ok(anchor) = PtpSyncAnchor::parse(datagram) {
                     self.observed_control_source.get_or_insert(source);
                     self.last_sync = Some(Instant::now());
-                    self.install_ptp_anchor(anchor);
+                    self.install_ptp_anchor(anchor, telemetry_token);
                 }
             }
             0xd6 if self.control_source_allowed(source)
@@ -902,12 +1062,16 @@ impl Type96Engine {
         clock.last_local_anchor_ns = anchor.local_anchor_ns(sample);
     }
 
-    fn install_ptp_anchor(&mut self, anchor: PtpSyncAnchor) {
+    fn install_ptp_anchor(
+        &mut self,
+        anchor: PtpSyncAnchor,
+        telemetry_token: crate::telemetry::OperationToken,
+    ) {
         let peer_ip = self.peer_ip;
         let Type96Clock::Ptp(clock) = &mut self.clock else {
             return;
         };
-        let playback_anchor = anchor.playback_anchor();
+        let playback_anchor = anchor.playback_anchor(telemetry_token);
         let reset_mapper = clock
             .mapper
             .as_ref()
@@ -917,6 +1081,8 @@ impl Type96Engine {
                 peer_ip,
                 playback_anchor.timeline_id,
                 clock.epoch,
+                telemetry_token,
+                crate::telemetry::MediaKind::Realtime,
             ));
             clock.ready_logged = false;
         }
@@ -937,6 +1103,12 @@ impl Type96Engine {
         for sample in pending {
             if sample.peer == peer_ip && sample.grandmaster == playback_anchor.timeline_id {
                 Self::observe_ptp_sample_value(clock, sample);
+            } else {
+                crate::telemetry::record_ptp_pending_disposition(
+                    sample.telemetry_token,
+                    "mapper_pending_sample_discarded",
+                    1,
+                );
             }
         }
     }
@@ -944,7 +1116,14 @@ impl Type96Engine {
     fn observe_ptp_sample(&mut self, sample: Result<PtpClockSample, broadcast::error::RecvError>) {
         let sample = match sample {
             Ok(sample) => sample,
-            Err(broadcast::error::RecvError::Lagged(_)) => return,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                crate::telemetry::record_ptp_broadcast_lag(
+                    crate::telemetry::operation_token(),
+                    crate::telemetry::MediaKind::Realtime,
+                    skipped,
+                );
+                return;
+            }
             Err(broadcast::error::RecvError::Closed) => {
                 self.ptp_samples = None;
                 return;
@@ -958,7 +1137,13 @@ impl Type96Engine {
         };
         if clock.mapper.is_none() {
             if clock.pending_samples.len() == MAX_PENDING_PTP_SAMPLES {
-                clock.pending_samples.pop_front();
+                if let Some(evicted) = clock.pending_samples.pop_front() {
+                    crate::telemetry::record_ptp_pending_disposition(
+                        evicted.telemetry_token,
+                        "mapper_pending_sample_evicted",
+                        1,
+                    );
+                }
             }
             clock.pending_samples.push_back(sample);
             return;
@@ -997,8 +1182,25 @@ impl Type96Engine {
         }
         while let Some(packet) = self.jitter.pop_ready() {
             match self.decoder.decode_packet(packet.payload()) {
-                Ok(pcm) => self.output.write(pcm.samples()),
-                Err(_) => self.write_silence(1),
+                Ok(pcm) => {
+                    crate::telemetry::record_media_decoded(
+                        packet.telemetry_token,
+                        crate::telemetry::MediaKind::Realtime,
+                    );
+                    crate::telemetry::record_media_output(
+                        packet.telemetry_token,
+                        crate::telemetry::MediaKind::Realtime,
+                        pcm.samples().len(),
+                    );
+                    self.output.write(pcm.samples(), packet.telemetry_token);
+                }
+                Err(_) => {
+                    crate::telemetry::record_media_decode_failure(
+                        packet.telemetry_token,
+                        crate::telemetry::MediaKind::Realtime,
+                    );
+                    self.write_silence(1, packet.telemetry_token);
+                }
             }
         }
         if self.jitter.missing_ranges().is_empty() {
@@ -1019,6 +1221,10 @@ impl Type96Engine {
                 sequence: silence.sequence,
                 timestamp: silence.timestamp,
                 pcm: vec![0; FRAMES_PER_PACKET * CHANNELS],
+                telemetry_token: silence.telemetry_token,
+                deadline_not_ready_since: None,
+                deadline_warmup_reported: false,
+                deadline_failure_reasons: 0,
             });
             return;
         }
@@ -1027,47 +1233,89 @@ impl Type96Engine {
             return;
         };
         let pcm = match self.decoder.decode_packet(packet.payload()) {
-            Ok(pcm) => pcm.samples().to_vec(),
-            Err(_) => vec![0; FRAMES_PER_PACKET * CHANNELS],
+            Ok(pcm) => {
+                crate::telemetry::record_media_decoded(
+                    packet.telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                );
+                pcm.samples().to_vec()
+            }
+            Err(_) => {
+                crate::telemetry::record_media_decode_failure(
+                    packet.telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                );
+                vec![0; FRAMES_PER_PACKET * CHANNELS]
+            }
         };
         self.clocked_frame = Some(ClockedFrame {
             sequence: packet.sequence,
             timestamp: packet.timestamp as u32,
             pcm,
+            telemetry_token: packet.telemetry_token,
+            deadline_not_ready_since: None,
+            deadline_warmup_reported: false,
+            deadline_failure_reasons: 0,
         });
         if self.jitter.missing_ranges().is_empty() {
             self.gap = None;
         }
     }
 
-    fn clocked_schedule(&self) -> ClockedSchedule {
-        let Some(frame) = self.clocked_frame.as_ref() else {
+    fn clocked_schedule(&mut self) -> ClockedSchedule {
+        let Some((frame_timestamp, telemetry_token)) = self
+            .clocked_frame
+            .as_ref()
+            .map(|frame| (frame.timestamp, frame.telemetry_token))
+        else {
             return ClockedSchedule::Wait;
         };
         let Type96Clock::Ptp(clock) = &self.clock else {
             return ClockedSchedule::Wait;
         };
         let Some(anchor) = clock.anchor else {
+            crate::telemetry::record_scheduler_wait(
+                telemetry_token,
+                crate::telemetry::MediaKind::Realtime,
+                "missing_anchor",
+            );
+            return ClockedSchedule::Wait;
+        };
+        let Some(mapper) = clock.mapper.as_ref() else {
+            crate::telemetry::record_scheduler_wait(
+                telemetry_token,
+                crate::telemetry::MediaKind::Realtime,
+                "missing_mapper",
+            );
             return ClockedSchedule::Wait;
         };
         let now = std::time::Instant::now();
-        let deadline =
-            match clock
-                .source
-                .platform_deadline_for_rtp(anchor, frame.timestamp, SAMPLE_RATE)
-            {
-                Some(result) => result,
-                None => {
-                    let Some(mapper) = clock.mapper.as_ref() else {
-                        return ClockedSchedule::Wait;
-                    };
-                    mapper.deadline_for_rtp(now, anchor, frame.timestamp, SAMPLE_RATE)
-                }
-            };
+        let (deadline_source, deadline) = match clock.source.platform_deadline_for_rtp(
+            anchor,
+            frame_timestamp,
+            SAMPLE_RATE,
+            telemetry_token,
+        ) {
+            Some(result) => (crate::telemetry::DeadlineSource::Platform, result),
+            None => (
+                crate::telemetry::DeadlineSource::PortableMapper,
+                mapper.deadline_for_rtp(
+                    now,
+                    anchor,
+                    frame_timestamp,
+                    SAMPLE_RATE,
+                    telemetry_token,
+                ),
+            ),
+        };
         match deadline {
             Ok(deadline) => {
                 let deadline = deadline.checked_sub(PCM_OUTPUT_LEAD).unwrap_or(now);
                 if deadline > now + MAX_CLOCKED_FUTURE {
+                    crate::telemetry::record_future_safety_wait(
+                        telemetry_token,
+                        crate::telemetry::MediaKind::Realtime,
+                    );
                     log::warn!(
                         target: "audiohub_airplay::airplay2",
                         "AirPlay 2 realtime PTP deadline exceeded the 30 second safety limit"
@@ -1080,10 +1328,47 @@ impl Type96Engine {
                 }
             }
             Err(error) => {
-                log::debug!(
-                    target: "audiohub_airplay::airplay2",
-                    "AirPlay 2 realtime PTP deadline unavailable: {error}"
-                );
+                if error == PtpClockError::NotReady {
+                    let frame = self
+                        .clocked_frame
+                        .as_mut()
+                        .expect("clocked frame remains installed while scheduling");
+                    let since = *frame.deadline_not_ready_since.get_or_insert(now);
+                    if !frame.deadline_warmup_reported {
+                        frame.deadline_warmup_reported = true;
+                        crate::telemetry::record_deadline_warmup_wait(
+                            telemetry_token,
+                            crate::telemetry::MediaKind::Realtime,
+                            deadline_source,
+                        );
+                    }
+                    if now.saturating_duration_since(since) < super::ptp::DEADLINE_NOT_READY_WARMUP
+                    {
+                        return ClockedSchedule::Wait;
+                    }
+                }
+                let bit = error.telemetry_bit();
+                let first_for_frame = {
+                    let frame = self
+                        .clocked_frame
+                        .as_mut()
+                        .expect("clocked frame remains installed while scheduling");
+                    let first = frame.deadline_failure_reasons & bit == 0;
+                    frame.deadline_failure_reasons |= bit;
+                    first
+                };
+                if first_for_frame {
+                    crate::telemetry::record_deadline_rejection(
+                        telemetry_token,
+                        crate::telemetry::MediaKind::Realtime,
+                        deadline_source,
+                        error.telemetry_reason(),
+                    );
+                    log::debug!(
+                        target: "audiohub_airplay::airplay2",
+                        "AirPlay 2 realtime PTP deadline unavailable: {error}"
+                    );
+                }
                 ClockedSchedule::Wait
             }
         }
@@ -1091,7 +1376,12 @@ impl Type96Engine {
 
     fn deliver_clocked_frame(&mut self) {
         if let Some(frame) = self.clocked_frame.take() {
-            self.output.write(&frame.pcm);
+            crate::telemetry::record_media_output(
+                frame.telemetry_token,
+                crate::telemetry::MediaKind::Realtime,
+                frame.pcm.len(),
+            );
+            self.output.write(&frame.pcm, frame.telemetry_token);
         }
     }
 
@@ -1099,6 +1389,10 @@ impl Type96Engine {
         let Some(frame) = self.clocked_frame.take() else {
             return;
         };
+        crate::telemetry::record_scheduler_late_drop(
+            frame.telemetry_token,
+            crate::telemetry::MediaKind::Realtime,
+        );
         log::warn!(
             target: "audiohub_airplay::airplay2",
             "AirPlay 2 dropped late realtime frame sequence={} timestamp={}",
@@ -1153,15 +1447,22 @@ impl Type96Engine {
         if expired {
             let skipped = missing.packet_count();
             let new_next = missing.last.saturating_add(1);
-            if self.jitter.advance_to(new_next).is_ok() {
-                if matches!(&self.clock, Type96Clock::Ptp(_)) {
-                    self.enqueue_clocked_silence(missing.first, missing.last);
-                } else {
-                    self.write_silence(skipped);
-                }
-                self.gap = None;
-                self.drain_ready();
+            let telemetry_token = crate::telemetry::operation_token();
+            if let Err(error) = self.jitter.advance_to(new_next) {
+                crate::telemetry::record_jitter_rejection(
+                    telemetry_token,
+                    crate::telemetry::MediaKind::Realtime,
+                    error.telemetry_reason(),
+                );
+                return;
             }
+            if matches!(&self.clock, Type96Clock::Ptp(_)) {
+                self.enqueue_clocked_silence(missing.first, missing.last, telemetry_token);
+            } else {
+                self.write_silence(skipped, telemetry_token);
+            }
+            self.gap = None;
+            self.drain_ready();
             return;
         }
 
@@ -1245,7 +1546,12 @@ impl Type96Engine {
         clock.sequence = sequence.wrapping_add(1);
     }
 
-    fn enqueue_clocked_silence(&mut self, first: u64, last: u64) {
+    fn enqueue_clocked_silence(
+        &mut self,
+        first: u64,
+        last: u64,
+        telemetry_token: crate::telemetry::OperationToken,
+    ) {
         let Some((origin_sequence, origin_timestamp)) = self.stream_origin else {
             return;
         };
@@ -1265,6 +1571,7 @@ impl Type96Engine {
                 self.clocked_silence.push_back(ClockedSilence {
                     sequence,
                     timestamp: timestamp as u32,
+                    telemetry_token,
                 });
             }
             if sequence == last {
@@ -1277,7 +1584,11 @@ impl Type96Engine {
         }
     }
 
-    fn write_silence(&mut self, packet_count: u64) {
+    fn write_silence(
+        &mut self,
+        packet_count: u64,
+        telemetry_token: crate::telemetry::OperationToken,
+    ) {
         let samples_per_packet = FRAMES_PER_PACKET.saturating_mul(CHANNELS);
         let maximum_packets = super::jitter::DEFAULT_REORDER_WINDOW.saturating_add(1);
         let packet_count = packet_count.min(maximum_packets);
@@ -1285,10 +1596,33 @@ impl Type96Engine {
             .ok()
             .and_then(|count| count.checked_mul(samples_per_packet))
             .unwrap_or(samples_per_packet);
-        self.output.write(&vec![0i16; sample_count]);
+        crate::telemetry::record_media_output(
+            telemetry_token,
+            crate::telemetry::MediaKind::Realtime,
+            sample_count,
+        );
+        self.output
+            .write(&vec![0i16; sample_count], telemetry_token);
     }
 
-    fn flush_stream(&mut self) {
+    fn flush_stream(&mut self, telemetry_token: crate::telemetry::OperationToken) {
+        let dropped = self
+            .jitter
+            .len()
+            .saturating_add(usize::from(self.clocked_frame.is_some()))
+            .saturating_add(self.clocked_silence.len());
+        crate::telemetry::record_expected_control_disposition(
+            telemetry_token,
+            crate::telemetry::MediaKind::Realtime,
+            "control_flush",
+            1,
+        );
+        crate::telemetry::record_expected_control_disposition(
+            telemetry_token,
+            crate::telemetry::MediaKind::Realtime,
+            "control_flush_drop",
+            dropped,
+        );
         self.jitter = if matches!(&self.clock, Type96Clock::Ptp(_)) {
             JitterBuffer::ptp_type96()
         } else {
@@ -1418,7 +1752,7 @@ mod tests {
     struct TestOutput(Arc<Mutex<OutputState>>);
 
     impl PcmOutput for TestOutput {
-        fn write(&mut self, samples: &[i16]) {
+        fn write(&mut self, samples: &[i16], _telemetry_token: crate::telemetry::OperationToken) {
             let mut state = self.0.lock().unwrap();
             state.writes += 1;
             state.samples.extend_from_slice(samples);
@@ -1578,6 +1912,7 @@ mod tests {
                 remote_time_ns: remote_origin_ns
                     .saturating_add(duration_nanos(received_at.duration_since(local_origin))),
                 received_at,
+                telemetry_token: crate::telemetry::operation_token(),
             });
         }
     }
@@ -1594,7 +1929,9 @@ mod tests {
         assert_eq!(anchor.remote_time_ns, 5_000_000_000);
         assert_eq!(anchor.timeline_id, 0x1112_1314_1516_1718);
         assert_eq!(
-            anchor.playback_anchor().rtp_time,
+            anchor
+                .playback_anchor(crate::telemetry::operation_token())
+                .rtp_time,
             (u32::MAX - 9).wrapping_sub(PTP_REALTIME_RENDER_OFFSET_FRAMES)
         );
 
@@ -2080,6 +2417,50 @@ mod tests {
         .unwrap();
         wait_for(|| state.lock().unwrap().writes == 3).await;
 
+        handle.abort().await;
+        wait_for(|| state.lock().unwrap().dropped).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn telemetry_reset_preserves_realtime_ptp_frame_and_deadline() {
+        const TIMELINE: u64 = 0x4142_4344_4546_4748;
+        let data = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let control = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = data.local_addr().unwrap();
+        let ptp = PtpClockSource::test_source();
+        let prepared = PreparedType96::prepare_with_ptp(
+            "127.0.0.1:0".parse().unwrap(),
+            peer,
+            ptp.clone(),
+            type96_setup_with_control(Some(control.local_addr().unwrap().port())),
+        )
+        .await
+        .unwrap();
+        let ports = prepared.ports();
+        let state = Arc::new(Mutex::new(OutputState::default()));
+        let handle = prepared.start(Box::new(TestOutput(state.clone())));
+
+        let local_origin = std::time::Instant::now();
+        let remote_origin_ns = 9_000_000_000;
+        publish_ptp_triplet(&ptp, peer.ip(), TIMELINE, local_origin, remote_origin_ns).await;
+        let remote_now_ns = remote_origin_ns.saturating_add(duration_nanos(local_origin.elapsed()));
+        control
+            .send_to(
+                &valid_ptp_sync(0, 77_175, remote_now_ns + 100_000_000, TIMELINE),
+                target(ports.control_port),
+            )
+            .await
+            .unwrap();
+        data.send_to(&encrypted_packet(1, 0, SSRC, 1), target(ports.data_port))
+            .await
+            .unwrap();
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(state.lock().unwrap().writes, 0);
+
+        crate::telemetry::reset();
+
+        wait_for(|| state.lock().unwrap().writes == 1).await;
+        assert_eq!(state.lock().unwrap().flushes, 0);
         handle.abort().await;
         wait_for(|| state.lock().unwrap().dropped).await;
     }

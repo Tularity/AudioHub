@@ -20,15 +20,10 @@ Abstract:
 // software key first -- which is where the inf's
 // HKR,MediaCategories\%GUID.AhPinOut%,Name puts the string.
 //
-// This GUID is the STATIC one, and it now has two jobs beyond naming:
-//
-//   * it is the FALLBACK: an endpoint whose peer name could not be written
-//     keeps it and comes out named with the plain direction word;
-//   * it is the MARKER perpeer.cpp searches this table for. AhCloneTopoFilter
-//     copies the pin array per slot and repoints whichever pin carries this
-//     GUID at that peer's derived GUID. Matching on the value rather than on a
-//     pin index keeps the fact in ONE place -- an index here would rename the
-//     wrong pin, silently, if this table were ever reordered.
+// This static GUID names the INF MediaCategories entry that supplies the
+// generic fallback label. Per-peer endpoint names are applied separately as
+// PKEY_Device_DeviceDesc on each topology interface; this pin name remains
+// unchanged.
 //
 // Category stays KSNODETYPE_SPEAKER: it is what drives the endpoint's form
 // factor, its icon and its rank in the audio endpoint builder's default-device

@@ -626,16 +626,24 @@ fn probe() -> AutostartState {
                 }
             }
             // macOS 那一格的同构：计划任务活得比它旁边那个 App 长。
-            None => AutostartState {
-                supported: false,
-                enabled,
-                current: false,
-                target: None,
-                reason: Some(
-                    "当前服务旁边没有 audiohub-app.exe，没有一个稳定的启动目标可以写进计划任务"
-                        .into(),
-                ),
-            },
+            None => {
+                let target = task
+                    .as_ref()
+                    .filter(|output| output.status.success())
+                    .and_then(|output| {
+                        audiohub_security::windows_task_target(&decode_schtasks_xml(&output.stdout))
+                    });
+                AutostartState {
+                    supported: false,
+                    enabled,
+                    current: false,
+                    target,
+                    reason: Some(
+                        "当前服务旁边没有 audiohub-app.exe，没有一个稳定的启动目标可以写进计划任务"
+                            .into(),
+                    ),
+                }
+            }
         }
     }
 

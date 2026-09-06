@@ -38,16 +38,19 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use audiohub_core::volume;
 use audiohub_ipc::{
-    HalDeviceInfo, Mode, OpenSessionParams, PeerHalDevice, KIND_MIC, KIND_SPK, SOURCE_HAL_SPEAKER,
+    HalDeviceInfo, Mode, OpenSessionParams, PeerHalDevice, VolumeState, KIND_MIC, KIND_SPK,
+    SOURCE_HAL_SPEAKER,
 };
 use audiohub_net::identity::{PairedPeer, PeerStore};
+use audiohub_net::secure::SessionMsg;
 
 use crate::halbridge::{
     self, HalBindRequest, HalControlEvent, HalEndpoint, HalSlotState, HAL_PUBLISH_BOTH,
     HAL_PUBLISH_IN, HAL_PUBLISH_OUT,
 };
-use crate::{conn, dlog, lk, DaemonInner, SessionOrigin};
+use crate::{conn, dlog, lk, DaemonInner, DaemonState, SessionOrigin};
 
 pub const HAL_MAX_SLOTS: usize = halbridge::HAL_MAX_SLOTS;
 
@@ -420,6 +423,511 @@ pub enum BindAction {
     Clear { slot: u8, generation: u32 },
 }
 
+/// One unacknowledged user intent for a peer's real default endpoint.
+///
+/// The request is connection-independent: moving a virtual control while the
+/// peer is offline must survive until the next authenticated control channel.
+/// `sent_connection` only suppresses duplicate writes on one live channel; a
+/// replacement connection gets a different token and therefore retransmits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PendingDeviceVolume {
+    pub(crate) request_id: u64,
+    pub(crate) scalar: f32,
+    pub(crate) muted: Option<bool>,
+    sent_connection: Option<u64>,
+    sent_at: Option<Instant>,
+}
+
+/// Per-slot, per-direction device-volume state for mode B.
+///
+/// This deliberately keeps three facts separate. `pending` is local user
+/// intent and `remote` is the peer's last real readback.  Driver delivery keeps
+/// two more facts separate: `last_delivered` suppresses a repeat of the peer
+/// request, while `driver_echo` is the value the platform actually read back
+/// and will report as the one-shot control event.  Windows may quantize a
+/// scalar on its private audio-taper curve, so those two values are not safely
+/// interchangeable.
+#[derive(Debug, Clone, Copy)]
+struct DeviceVolumeNotifyRetry {
+    value: (f32, bool),
+    not_before: Instant,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeviceVolumeRelay {
+    pub(crate) remote: Option<VolumeState>,
+    pub(crate) pending: Option<PendingDeviceVolume>,
+    /// Local send-gain authority when the peer's real output is fixed. This is
+    /// deliberately separate from `remote`: the latter remains the physical
+    /// fact (`adjustable=false`), while this state is the working virtual knob.
+    software_gain: Option<VolumeState>,
+    remote_connection: Option<u64>,
+    remote_revision: u64,
+    last_delivered: Option<(f32, bool)>,
+    driver_echo: Option<(f32, bool)>,
+    /// Last scalar/mute read from the local virtual endpoint. A Windows master
+    /// update may raise separate channel/node events; after the first event
+    /// reads the final COM state, later duplicates must not become fresh peer
+    /// writes merely because the one-shot echo token was already consumed.
+    local_observed: Option<(f32, bool)>,
+    notify_retry: Option<DeviceVolumeNotifyRetry>,
+    next_request_id: u64,
+}
+
+impl DeviceVolumeRelay {
+    fn clear_protocol_state(&mut self) {
+        self.remote = None;
+        self.pending = None;
+        self.software_gain = None;
+        self.remote_connection = None;
+        self.remote_revision = 0;
+        self.invalidate_notification();
+    }
+
+    /// Forget only daemon -> HAL delivery state. Peer readback, local pending
+    /// intent and fixed-device software gain all survive a driver reconnect.
+    fn invalidate_notification(&mut self) {
+        self.last_delivered = None;
+        self.driver_echo = None;
+        self.local_observed = None;
+        self.notify_retry = None;
+    }
+
+    /// Consume exactly one daemon -> driver reflection.
+    ///
+    /// A mismatching event clears the guard and is a genuine user action. This
+    /// is important when the driver suppresses an equal notification: leaving
+    /// the guard armed forever would swallow a later user move back to the same
+    /// scalar.
+    fn consume_driver_echo(&mut self, now: (f32, bool)) -> bool {
+        self.driver_echo
+            .take()
+            .is_some_and(|sent| vol_same(sent, now))
+    }
+
+    /// Record/coalesce local intent. Returns false for invalid input or the
+    /// one-shot echo of a state this daemon just notified into the endpoint.
+    fn queue_local(&mut self, scalar: f32, muted: Option<bool>) -> bool {
+        if !scalar.is_finite() {
+            return false;
+        }
+        let scalar = scalar.clamp(0.0, 1.0);
+        if let Some(muted) = muted {
+            let value = (scalar, muted);
+            if self.consume_driver_echo(value) {
+                self.local_observed = Some(value);
+                return false;
+            }
+            if self
+                .local_observed
+                .is_some_and(|observed| vol_same(observed, value))
+            {
+                return false;
+            }
+            self.local_observed = Some(value);
+        }
+        self.queue_intent(scalar, muted)
+    }
+
+    /// Queue an explicit app/IPC action. It cannot be a HAL reflection, so it
+    /// must not consume `driver_echo` merely because the requested value is
+    /// equal to the latest peer state.
+    fn queue_intent(&mut self, scalar: f32, muted: Option<bool>) -> bool {
+        if !scalar.is_finite() {
+            return false;
+        }
+        let scalar = scalar.clamp(0.0, 1.0);
+        // A scalar-only tail must not erase an explicit mute write which is
+        // still awaiting acknowledgement. `None` means "leave mute alone",
+        // not "forget the value this same coalesced request already promised".
+        let muted = muted.or_else(|| self.pending.and_then(|pending| pending.muted));
+        if self
+            .pending
+            .is_some_and(|p| (p.scalar - scalar).abs() < HAL_VOL_EPS && p.muted == muted)
+        {
+            return true;
+        }
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        self.pending = Some(PendingDeviceVolume {
+            request_id: self.next_request_id,
+            scalar,
+            muted,
+            sent_connection: None,
+            sent_at: None,
+        });
+        true
+    }
+
+    fn uses_software_gain(&self) -> bool {
+        self.software_gain.is_some() && self.remote.is_some_and(|remote| !remote.adjustable)
+    }
+
+    fn displayed_state(&self) -> Option<VolumeState> {
+        if self.uses_software_gain() {
+            self.software_gain
+        } else {
+            self.remote
+        }
+    }
+
+    /// Update the local fallback knob. `from_driver` arms the current-value
+    /// guard because no daemon -> HAL reflection is needed for a value already
+    /// read from that HAL control.
+    fn queue_software_gain(&mut self, scalar: f32, muted: Option<bool>, from_driver: bool) -> bool {
+        if !scalar.is_finite() || !self.uses_software_gain() {
+            return false;
+        }
+        let scalar = scalar.clamp(0.0, 1.0);
+        let current = self.software_gain.unwrap_or(VolumeState {
+            scalar: 1.0,
+            muted: false,
+            adjustable: false,
+            mute_adjustable: false,
+        });
+        let requested_mute = muted;
+        let muted = requested_mute.unwrap_or(current.muted);
+        if from_driver {
+            let value = (scalar, muted);
+            if self.consume_driver_echo(value) {
+                self.local_observed = Some(value);
+                return false;
+            }
+            if self
+                .local_observed
+                .is_some_and(|observed| vol_same(observed, value))
+            {
+                return false;
+            }
+            self.local_observed = Some(value);
+        }
+        self.software_gain = Some(VolumeState {
+            scalar,
+            muted,
+            adjustable: false,
+            mute_adjustable: current.mute_adjustable,
+        });
+        let carries_remote_mute = current.mute_adjustable
+            && (requested_mute.is_some()
+                || self.pending.is_some_and(|pending| pending.muted.is_some()));
+        if carries_remote_mute {
+            // The scalar remains local gain, but this endpoint advertised an
+            // independent writable mute. Carry the explicit mute to the peer;
+            // its readback decides whether the write actually took.
+            self.queue_intent(scalar, requested_mute);
+        } else {
+            self.pending = None;
+        }
+        if from_driver {
+            self.last_delivered = Some((scalar, muted));
+            self.driver_echo = None;
+            self.local_observed = Some((scalar, muted));
+            self.notify_retry = None;
+        }
+        true
+    }
+
+    /// The pending request this concrete control connection must carry now.
+    ///
+    /// A request is sent immediately on a replacement connection and retried
+    /// on the same connection until its matching readback acknowledges it.
+    fn due_for(&self, connection: u64, now: Instant) -> Option<PendingDeviceVolume> {
+        self.pending.filter(|pending| {
+            pending.sent_connection != Some(connection)
+                || pending.sent_at.is_none_or(|sent_at| {
+                    now.saturating_duration_since(sent_at) >= DEVICE_VOLUME_RETRY
+                })
+        })
+    }
+
+    fn mark_sent(&mut self, request_id: u64, connection: u64, now: Instant) {
+        if let Some(pending) = self.pending.as_mut().filter(|p| p.request_id == request_id) {
+            pending.sent_connection = Some(connection);
+            pending.sent_at = Some(now);
+        }
+    }
+
+    /// Store peer readback and report whether it is now authoritative for the
+    /// virtual endpoint. An initial/periodic snapshot cannot overwrite a local
+    /// pending request; only the matching request acknowledgement can.
+    fn accept_remote(
+        &mut self,
+        connection: u64,
+        revision: u64,
+        request_id: Option<u64>,
+        state: VolumeState,
+        software_gain_capable: bool,
+    ) -> bool {
+        if self.remote_connection == Some(connection) && revision < self.remote_revision {
+            // Network sends happen after the provider releases its endpoint
+            // revision lock. A later periodic snapshot can therefore reach us
+            // before the earlier write acknowledgement. The newer snapshot
+            // remains authoritative, but a matching ACK must still retire the
+            // request; otherwise a snapped/refused device value retries
+            // forever simply because the two valid messages were reordered.
+            let Some(pending) = self
+                .pending
+                .filter(|pending| request_id == Some(pending.request_id))
+            else {
+                return false;
+            };
+            if software_gain_capable {
+                if let Some(remote) = self.remote.filter(|remote| !remote.adjustable) {
+                    let mut local = self.software_gain.unwrap_or(VolumeState {
+                        scalar: pending.scalar,
+                        muted: remote.muted,
+                        adjustable: false,
+                        mute_adjustable: remote.mute_adjustable,
+                    });
+                    local.scalar = pending.scalar;
+                    if remote.mute_adjustable {
+                        local.muted = remote.muted;
+                    }
+                    local.mute_adjustable = remote.mute_adjustable;
+                    self.software_gain = Some(local);
+                }
+            }
+            self.pending = None;
+            return true;
+        }
+        self.remote_connection = Some(connection);
+        self.remote_revision = revision;
+        self.remote = Some(state);
+        if software_gain_capable && !state.adjustable {
+            let mut local = self.software_gain.unwrap_or(VolumeState {
+                scalar: 1.0,
+                muted: state.muted,
+                adjustable: false,
+                mute_adjustable: state.mute_adjustable,
+            });
+            local.mute_adjustable = state.mute_adjustable;
+            let mut clear_pending = true;
+            // A write which discovered the fixed endpoint becomes local gain
+            // intent instead of being discarded with the failed platform set.
+            if let Some(pending) = self.pending {
+                local.scalar = pending.scalar;
+                if let Some(wanted_mute) = pending.muted {
+                    if state.mute_adjustable {
+                        let completed = request_id == Some(pending.request_id)
+                            || (request_id.is_none() && state.muted == wanted_mute);
+                        if completed {
+                            // Matching ACK wins even when the device refused
+                            // and read back a different state.
+                            local.muted = state.muted;
+                        } else {
+                            // An older periodic snapshot cannot cancel a mute
+                            // write which still needs the peer.
+                            local.muted = wanted_mute;
+                            clear_pending = false;
+                        }
+                    } else {
+                        local.muted = wanted_mute;
+                    }
+                } else if state.mute_adjustable {
+                    local.muted = state.muted;
+                }
+            } else if state.mute_adjustable {
+                local.muted = state.muted;
+            }
+            self.software_gain = Some(local);
+            if clear_pending {
+                self.pending = None;
+            }
+            return true;
+        }
+        if state.adjustable {
+            self.software_gain = None;
+        }
+        let Some(pending) = self.pending else {
+            return true;
+        };
+        let observed_intent = (pending.scalar - state.scalar).abs() < HAL_VOL_EPS
+            && pending.muted.is_none_or(|muted| muted == state.muted);
+        if request_id != Some(pending.request_id) && !(request_id.is_none() && observed_intent) {
+            return false;
+        }
+        self.pending = None;
+        true
+    }
+
+    /// Return a new authoritative peer state for HAL notification, suppressing
+    /// repeats, every state shadowed by local pending intent, and a failed
+    /// attempt until its bounded retry deadline. Planning is read-only: only a
+    /// platform-confirmed delivery may advance `last_delivered`.
+    fn plan_notify(&self, at: Instant) -> Option<(f32, bool)> {
+        if self.pending.is_some() {
+            return None;
+        }
+        let remote = self.displayed_state()?;
+        if !remote.scalar.is_finite() {
+            return None;
+        }
+        let value = (remote.scalar.clamp(0.0, 1.0), remote.muted);
+        if self
+            .last_delivered
+            .is_some_and(|notified| vol_same(notified, value))
+        {
+            return None;
+        }
+        if self
+            .notify_retry
+            .is_some_and(|retry| vol_same(retry.value, value) && at < retry.not_before)
+        {
+            return None;
+        }
+        Some(value)
+    }
+
+    /// Complete the two-phase daemon -> HAL delivery. A failed send retains
+    /// no false acknowledgement and becomes due again after one second. The
+    /// attempted value is recorded rather than the current peer value because
+    /// network readback may legitimately change while the platform call runs.
+    fn record_notify_result(
+        &mut self,
+        requested: (f32, bool),
+        driver_echo: Option<(f32, bool)>,
+        delivered: bool,
+        now: Instant,
+    ) {
+        if delivered {
+            self.last_delivered = Some(requested);
+            let echo = driver_echo.unwrap_or(requested);
+            self.driver_echo = Some(echo);
+            self.local_observed = Some(echo);
+            self.notify_retry = None;
+        } else {
+            self.notify_retry = Some(DeviceVolumeNotifyRetry {
+                value: requested,
+                not_before: now + DEVICE_VOLUME_RETRY,
+            });
+        }
+    }
+}
+
+/// Peer-owned real endpoint named on the device-volume wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DeviceVolumeEndpoint {
+    DefaultOutput,
+    DefaultInput,
+}
+
+impl DeviceVolumeEndpoint {
+    pub(crate) const fn as_wire(self) -> &'static str {
+        match self {
+            Self::DefaultOutput => "default_output",
+            Self::DefaultInput => "default_input",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "default_output" => Some(Self::DefaultOutput),
+            "default_input" => Some(Self::DefaultInput),
+            _ => None,
+        }
+    }
+
+    fn relay(self, rec: &SlotRec) -> &DeviceVolumeRelay {
+        match self {
+            Self::DefaultOutput => &rec.out_volume,
+            Self::DefaultInput => &rec.in_volume,
+        }
+    }
+
+    fn relay_mut(self, rec: &mut SlotRec) -> &mut DeviceVolumeRelay {
+        match self {
+            Self::DefaultOutput => &mut rec.out_volume,
+            Self::DefaultInput => &mut rec.in_volume,
+        }
+    }
+
+    fn hal_endpoint(self, slot: u8) -> HalEndpoint {
+        match self {
+            Self::DefaultOutput => HalEndpoint::out(slot),
+            Self::DefaultInput => HalEndpoint::mic(slot),
+        }
+    }
+
+    const fn required_direction(self) -> u8 {
+        match self {
+            Self::DefaultOutput => HAL_PUBLISH_OUT,
+            Self::DefaultInput => HAL_PUBLISH_IN,
+        }
+    }
+}
+
+/// The connection-scoped contract which may carry one slot's endpoint
+/// control.  This is deliberately resolved from `DaemonState::conns` while the
+/// caller holds the slot's HAL lock: a cached Arc/version from before a
+/// reconnect can otherwise resurrect v1 pending state after a replacement
+/// connection has explicitly downgraded and cleared it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerDeviceVolumeProtocol {
+    Offline,
+    PeerNotSharing,
+    Legacy,
+    Modern,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CurrentPeerDeviceVolume {
+    connection_id: Option<u64>,
+    version: u8,
+    protocol: PeerDeviceVolumeProtocol,
+}
+
+fn classify_peer_device_volume_protocol(
+    live: bool,
+    peer_mode: Option<Mode>,
+    version: u8,
+) -> PeerDeviceVolumeProtocol {
+    if !live {
+        PeerDeviceVolumeProtocol::Offline
+    } else if peer_mode != Some(Mode::Share) {
+        PeerDeviceVolumeProtocol::PeerNotSharing
+    } else if version < 1 {
+        PeerDeviceVolumeProtocol::Legacy
+    } else {
+        PeerDeviceVolumeProtocol::Modern
+    }
+}
+
+/// Resolve only the connection currently registered for `fingerprint`.
+///
+/// Callers intentionally invoke this while holding `inner.haldev`: a cap1 ->
+/// cap0 capability handler publishes its new connection cell before waiting
+/// for the same HAL lock to clear relay state. Consequently either this read
+/// observes the downgrade, or the later clear removes everything queued under
+/// the old contract; there is no interleaving which clears first and then lets
+/// a stale cap1 hint write pending state back.
+fn with_current_peer_device_volume_protocol<T>(
+    state: &DaemonState,
+    fingerprint: &str,
+    apply: impl FnOnce(CurrentPeerDeviceVolume) -> T,
+) -> T {
+    let Some(conn) = state
+        .conns
+        .get(fingerprint)
+        .filter(|conn| conn.alive.load(Ordering::SeqCst))
+    else {
+        return apply(CurrentPeerDeviceVolume {
+            connection_id: None,
+            version: 0,
+            protocol: PeerDeviceVolumeProtocol::Offline,
+        });
+    };
+    // Keep both connection-scoped cells locked while `apply` mutates the HAL
+    // relay. A downgrade therefore either happens before this snapshot, or
+    // waits and clears the completed old-contract mutation afterwards.
+    let peer_mode = lk(&conn.peer_mode);
+    let capabilities = lk(&conn.peer_audio_capabilities);
+    let version = capabilities.device_volume_version();
+    apply(CurrentPeerDeviceVolume {
+        connection_id: Some(conn.connection_id),
+        version,
+        protocol: classify_peer_device_volume_protocol(true, peer_mode.mode(), version),
+    })
+}
+
 /// Everything the daemon knows about one slot.
 #[derive(Debug, Clone, Default)]
 pub struct SlotRec {
@@ -466,6 +974,17 @@ pub struct SlotRec {
     /// Per-slot echo suppression for the volume relay. Replaces a single global
     /// cell, which could only ever be right for one peer at a time.
     pub vol_echo: Option<(f32, bool)>,
+    /// Peer value most recently delivered to the legacy virtual speaker.
+    /// Separate from `vol_echo`, which is the platform's applied readback and
+    /// may differ after Windows quantizes its audio-tapered control.
+    legacy_last_delivered: Option<(f32, bool)>,
+    /// Retry throttle for the legacy active-speaker reverse relay. Kept
+    /// separate from `vol_echo`: a failed HAL send is not an echo guard.
+    legacy_notify_retry: Option<DeviceVolumeNotifyRetry>,
+    /// Peer-level controls are independent of media-session lifetime and are
+    /// independent in the two endpoint directions.
+    pub(crate) out_volume: DeviceVolumeRelay,
+    pub(crate) in_volume: DeviceVolumeRelay,
     /// What this slot's virtual SPEAKER declares to the OS as its latency, and
     /// what the driver says it actually declares. See `crate::devdecl`.
     ///
@@ -477,6 +996,14 @@ pub struct SlotRec {
 }
 
 impl SlotRec {
+    fn invalidate_volume_notifications(&mut self) {
+        self.vol_echo = None;
+        self.legacy_last_delivered = None;
+        self.legacy_notify_retry = None;
+        self.out_volume.invalidate_notification();
+        self.in_volume.invalidate_notification();
+    }
+
     fn claimed(&self) -> bool {
         !self.fingerprint.is_empty() || self.sent
     }
@@ -486,6 +1013,448 @@ impl SlotRec {
             Some(s) => s.label(),
             None if self.sent => "pending",
             None => "free",
+        }
+    }
+}
+
+/// Queue one mode-B endpoint action by peer identity. This is used by the IPC
+/// UI path; driver events use [`queue_slot_device_volume`] after the generation
+/// gate has already resolved a slot. Network delivery is intentionally left to
+/// the coordinator tick so no caller performs encrypted I/O while holding the
+/// HAL state lock.
+pub(crate) fn queue_peer_device_volume(
+    inner: &Arc<DaemonInner>,
+    fingerprint: &str,
+    endpoint: DeviceVolumeEndpoint,
+    scalar: f32,
+    muted: Option<bool>,
+) -> Result<()> {
+    if effective_mode(inner) != Mode::B {
+        anyhow::bail!("peer device volume is available only while mode B is in force");
+    }
+    if !scalar.is_finite() {
+        anyhow::bail!("volume scalar must be finite");
+    }
+    let mut st = lk(&inner.haldev);
+    // The first mode check gives a fast error. This one is the authority check
+    // at the mutation point, after waiting for the slot lock.
+    if effective_mode(inner) != Mode::B {
+        anyhow::bail!("peer device volume is available only while mode B is in force");
+    }
+    let slot = st
+        .table
+        .slot_of(fingerprint)
+        .ok_or_else(|| anyhow::anyhow!("peer {fingerprint} has no virtual device slot"))?
+        as usize;
+    let rec = st
+        .slots
+        .get_mut(slot)
+        .filter(|rec| {
+            rec.fingerprint == fingerprint
+                && rec.sent
+                && rec.sent_directions & endpoint.required_direction() != 0
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("peer {fingerprint} has no active virtual device binding")
+        })?;
+    // Keep the connection-map guard through the relay mutation. Registration
+    // also needs this lock, so the connection whose id/capabilities we sample
+    // cannot be replaced between the authority decision and the slot write.
+    let state = lk(&inner.state);
+    let (software_gain, queued, desired) =
+        with_current_peer_device_volume_protocol(&state, fingerprint, |current| -> Result<_> {
+            let modern = match current.protocol {
+                PeerDeviceVolumeProtocol::Offline => false,
+                PeerDeviceVolumeProtocol::PeerNotSharing => {
+                    anyhow::bail!("peer is not currently sharing its audio endpoints")
+                }
+                PeerDeviceVolumeProtocol::Legacy => {
+                    anyhow::bail!("peer does not support idle device-volume synchronization")
+                }
+                PeerDeviceVolumeProtocol::Modern => true,
+            };
+            let relay = endpoint.relay_mut(rec);
+            let software_gain = modern
+                && endpoint == DeviceVolumeEndpoint::DefaultOutput
+                && relay.uses_software_gain();
+            let queued = if software_gain {
+                relay.queue_software_gain(scalar, muted, false)
+            } else {
+                relay.queue_intent(scalar, muted)
+            };
+            let desired = software_gain.then(|| relay.displayed_state()).flatten();
+            Ok((software_gain, queued, desired))
+        })?;
+    drop(state);
+    drop(st);
+    if !queued {
+        anyhow::bail!("volume request was invalid");
+    }
+    if software_gain {
+        conn::sync_peer_software_gain(inner, fingerprint, desired);
+    }
+    Ok(())
+}
+
+/// Queue a genuine OS control change from one exact virtual endpoint.
+fn queue_slot_device_volume(
+    inner: &Arc<DaemonInner>,
+    slot: u8,
+    generation: u32,
+    endpoint: DeviceVolumeEndpoint,
+    scalar: f32,
+    muted: bool,
+) -> Option<bool> {
+    if effective_mode(inner) != Mode::B || !scalar.is_finite() {
+        return None;
+    }
+    let mut st = lk(&inner.haldev);
+    if effective_mode(inner) != Mode::B {
+        return None;
+    }
+    let Some(rec) = st.slots.get_mut(slot as usize) else {
+        return None;
+    };
+    if rec.fingerprint.is_empty()
+        || !rec.sent
+        || rec.generation != generation
+        || rec.sent_directions & endpoint.required_direction() == 0
+    {
+        return None;
+    }
+    let fingerprint = rec.fingerprint.clone();
+    // Do not trust a protocol hint sampled before this HAL critical section:
+    // connection replacement/capability downgrade can clear the relay while
+    // this event is waiting for the lock.
+    let state = lk(&inner.state);
+    let (modern, software_gain, queued, desired) =
+        with_current_peer_device_volume_protocol(&state, &fingerprint, |current| {
+            let modern = current.protocol == PeerDeviceVolumeProtocol::Modern;
+            let relay = endpoint.relay_mut(rec);
+            let software_gain = modern
+                && endpoint == DeviceVolumeEndpoint::DefaultOutput
+                && relay.uses_software_gain();
+            let queued = if software_gain {
+                relay.queue_software_gain(scalar, Some(muted), true)
+            } else if modern {
+                relay.queue_local(scalar, Some(muted))
+            } else {
+                // A live v0/Unheard connection must not consume a stale v1 HAL echo
+                // guard and thereby lose a genuine legacy session-bound write.
+                relay.queue_intent(scalar, Some(muted))
+            };
+            let desired = software_gain.then(|| relay.displayed_state()).flatten();
+            (modern, software_gain, queued, desired)
+        });
+    drop(state);
+    drop(st);
+    if queued && software_gain {
+        conn::sync_peer_software_gain(inner, &fingerprint, desired);
+    }
+    queued.then_some(modern)
+}
+
+fn clear_matching_device_volume_pending(
+    inner: &DaemonInner,
+    slot: u8,
+    endpoint: DeviceVolumeEndpoint,
+    scalar: f32,
+    muted: Option<bool>,
+) {
+    let mut hal = lk(&inner.haldev);
+    let Some(rec) = hal.slots.get_mut(slot as usize) else {
+        return;
+    };
+    let relay = endpoint.relay_mut(rec);
+    if relay.pending.is_some_and(|pending| {
+        (pending.scalar - scalar).abs() < HAL_VOL_EPS && pending.muted == muted
+    }) {
+        relay.pending = None;
+    }
+}
+
+/// Accept an authenticated peer readback for its own real endpoint. Returns
+/// false for an unknown slot or malformed scalar. A non-matching request id is
+/// still retained as the latest observation, but it remains shadowed by local
+/// pending intent until the matching acknowledgement arrives.
+pub(crate) fn accept_peer_device_volume(
+    inner: &Arc<DaemonInner>,
+    fingerprint: &str,
+    endpoint: DeviceVolumeEndpoint,
+    connection: u64,
+    revision: u64,
+    request_id: Option<u64>,
+    mut state: VolumeState,
+) -> bool {
+    if effective_mode(inner) != Mode::B || !state.scalar.is_finite() {
+        return false;
+    }
+    state.scalar = state.scalar.clamp(0.0, 1.0);
+    let mut hal = lk(&inner.haldev);
+    if effective_mode(inner) != Mode::B {
+        return false;
+    }
+    let daemon_state = lk(&inner.state);
+    let Some(slot) = hal.table.slot_of(fingerprint) else {
+        return false;
+    };
+    let Some(rec) = hal.slots.get_mut(slot as usize) else {
+        return false;
+    };
+    if rec.fingerprint != fingerprint
+        || !rec.sent
+        || rec.sent_directions & endpoint.required_direction() == 0
+    {
+        return false;
+    }
+    let (accepted, software_gain) =
+        with_current_peer_device_volume_protocol(&daemon_state, fingerprint, |current| {
+            if current.connection_id != Some(connection)
+                || current.protocol != PeerDeviceVolumeProtocol::Modern
+            {
+                return (false, None);
+            }
+            let relay = endpoint.relay_mut(rec);
+            let accepted = relay.accept_remote(
+                connection,
+                revision,
+                request_id,
+                state,
+                endpoint == DeviceVolumeEndpoint::DefaultOutput,
+            );
+            let software_gain = accepted
+                .then(|| {
+                    (endpoint == DeviceVolumeEndpoint::DefaultOutput)
+                        .then(|| relay.software_gain)
+                        .flatten()
+                })
+                .flatten();
+            (accepted, software_gain)
+        });
+    if !accepted {
+        return false;
+    }
+    drop(daemon_state);
+    drop(hal);
+    if endpoint == DeviceVolumeEndpoint::DefaultOutput {
+        conn::sync_peer_software_gain(inner, fingerprint, software_gain);
+    }
+    true
+}
+
+/// Working local fallback state for a peer whose output has no writable
+/// hardware scalar. Used when a newly opened B session receives its first
+/// per-session fixed-device report.
+pub(crate) fn peer_software_gain_authority(
+    inner: &DaemonInner,
+    fingerprint: &str,
+) -> Option<Option<VolumeState>> {
+    let hal = lk(&inner.haldev);
+    let slot = hal.table.slot_of(fingerprint)? as usize;
+    let rec = hal.slots.get(slot)?;
+    if rec.fingerprint != fingerprint {
+        return None;
+    }
+    rec.out_volume.remote?;
+    Some(rec.out_volume.software_gain)
+}
+
+/// A live capability advertisement explicitly downgraded this peer to the
+/// legacy session-bound contract. Offline/Unheard never calls this, so genuine
+/// queued intent survives ordinary disconnects; an explicit v0 peer cannot
+/// leave stale v1 gain and network volume active at the same time.
+pub(crate) fn clear_peer_device_volume_protocol(
+    inner: &Arc<DaemonInner>,
+    fingerprint: &str,
+    connection: u64,
+) {
+    let cleared = {
+        let mut hal = lk(&inner.haldev);
+        let state = lk(&inner.state);
+        let Some(slot) = hal.table.slot_of(fingerprint) else {
+            return;
+        };
+        let Some(rec) = hal.slots.get_mut(slot as usize) else {
+            return;
+        };
+        if rec.fingerprint != fingerprint {
+            return;
+        }
+        let cleared = with_current_peer_device_volume_protocol(&state, fingerprint, |current| {
+            if current.connection_id != Some(connection) || current.version >= 1 {
+                return false;
+            }
+            rec.out_volume.clear_protocol_state();
+            rec.in_volume.clear_protocol_state();
+            true
+        });
+        drop(state);
+        cleared
+    };
+    if !cleared {
+        return;
+    }
+    conn::sync_peer_software_gain(inner, fingerprint, None);
+}
+
+/// Apply authoritative peer readbacks to both virtual directions. The HAL send
+/// remains outside the state lock because the bridge has a bounded but real
+/// control timeout.
+fn push_peer_device_volumes(inner: &DaemonInner, hal: &halbridge::HalBridge) {
+    let mut pending = Vec::new();
+    let planned_at = Instant::now();
+    {
+        let mut st = lk(&inner.haldev);
+        for (slot, rec) in st.slots.iter_mut().enumerate() {
+            if rec.fingerprint.is_empty() || rec.state != Some(HalSlotState::Bound) {
+                continue;
+            }
+            for endpoint in [
+                DeviceVolumeEndpoint::DefaultOutput,
+                DeviceVolumeEndpoint::DefaultInput,
+            ] {
+                if rec.sent_directions & endpoint.required_direction() == 0 {
+                    continue;
+                }
+                if let Some((scalar, muted)) = endpoint.relay(rec).plan_notify(planned_at) {
+                    pending.push((
+                        slot as u8,
+                        rec.fingerprint.clone(),
+                        endpoint,
+                        endpoint.hal_endpoint(slot as u8),
+                        rec.generation,
+                        scalar,
+                        muted,
+                    ));
+                }
+            }
+        }
+    }
+    for (slot, fingerprint, endpoint, at, generation, scalar, muted) in pending {
+        #[cfg(windows)]
+        let _ = (at, generation);
+        #[cfg(windows)]
+        let (delivered, driver_echo) = match volume::set_audiohub_peer_endpoint_volume(
+            &fingerprint,
+            endpoint == DeviceVolumeEndpoint::DefaultInput,
+            scalar,
+            muted,
+        ) {
+            Ok(state) => (true, Some((state.scalar, state.muted))),
+            Err(err) => {
+                dlog!(
+                    "[audiohubd] hal: cannot apply peer {} {} scalar/mute through its exact \
+                         Windows endpoint: {err:#}",
+                    fingerprint,
+                    endpoint.as_wire()
+                );
+                (false, None)
+            }
+        };
+        #[cfg(not(windows))]
+        let (delivered, driver_echo) = (
+            hal.notify_volume(at, generation, scalar, muted),
+            Some((scalar, muted)),
+        );
+        let mut st = lk(&inner.haldev);
+        let Some(rec) = st.slots.get_mut(slot as usize) else {
+            continue;
+        };
+        if rec.fingerprint != fingerprint
+            || rec.generation != generation
+            || rec.state != Some(HalSlotState::Bound)
+            || rec.sent_directions & endpoint.required_direction() == 0
+        {
+            continue;
+        }
+        endpoint.relay_mut(rec).record_notify_result(
+            (scalar, muted),
+            driver_echo,
+            delivered,
+            Instant::now(),
+        );
+    }
+}
+
+/// Deliver all due mode-B endpoint writes without holding daemon state locks
+/// across encrypted control I/O.
+///
+/// The connection capability and advertised mode are presentation gates here;
+/// the receiving peer independently enforces its local Share-mode authority.
+/// Keeping both gates avoids sending a control an honest peer must reject while
+/// still treating the receiver as the security boundary.
+fn flush_pending_device_volumes(inner: &DaemonInner) {
+    if effective_mode(inner) != Mode::B {
+        return;
+    }
+
+    let conns: Vec<Arc<crate::ConnShared>> = lk(&inner.state)
+        .conns
+        .values()
+        .filter(|conn| conn.alive.load(Ordering::SeqCst))
+        .cloned()
+        .collect();
+    let eligible: HashMap<String, Arc<crate::ConnShared>> = conns
+        .into_iter()
+        .filter(|conn| lk(&conn.peer_mode).mode() == Some(Mode::Share))
+        .filter(|conn| lk(&conn.peer_audio_capabilities).device_volume_version() >= 1)
+        .map(|conn| (conn.fp.clone(), conn))
+        .collect();
+
+    let now = Instant::now();
+    let mut due = Vec::new();
+    {
+        let st = lk(&inner.haldev);
+        for (slot, rec) in st.slots.iter().enumerate() {
+            if rec.fingerprint.is_empty() || !rec.sent || rec.state != Some(HalSlotState::Bound) {
+                continue;
+            }
+            let Some(conn) = eligible.get(&rec.fingerprint) else {
+                continue;
+            };
+            let connection = conn.connection_id;
+            for endpoint in [
+                DeviceVolumeEndpoint::DefaultOutput,
+                DeviceVolumeEndpoint::DefaultInput,
+            ] {
+                if rec.sent_directions & endpoint.required_direction() == 0 {
+                    continue;
+                }
+                if let Some(pending) = endpoint.relay(rec).due_for(connection, now) {
+                    due.push((
+                        slot as u8,
+                        rec.fingerprint.clone(),
+                        endpoint,
+                        connection,
+                        pending,
+                        conn.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    for (slot, fingerprint, endpoint, connection, pending, conn) in due {
+        let sent = conn
+            .send_msg(&SessionMsg::DeviceVolumeSet {
+                endpoint: endpoint.as_wire().to_string(),
+                request_id: pending.request_id,
+                scalar: pending.scalar,
+                muted: pending.muted,
+            })
+            .is_ok();
+        if !sent {
+            continue;
+        }
+        let sent_at = Instant::now();
+        let mut st = lk(&inner.haldev);
+        let Some(rec) = st.slots.get_mut(slot as usize) else {
+            continue;
+        };
+        if rec.fingerprint == fingerprint {
+            endpoint
+                .relay_mut(rec)
+                .mark_sent(pending.request_id, connection, sent_at);
         }
     }
 }
@@ -654,6 +1623,18 @@ impl HalDevState {
         self.table.slot_of(fingerprint)
     }
 
+    /// Device records that still occupy the attached driver's live slot set.
+    ///
+    /// The persistent assignment table deliberately survives a switch out of
+    /// mode B so switching back can reuse the same endpoint identity. It is
+    /// therefore not a count of currently bound or clearing devices.
+    pub(crate) fn device_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|record| !record.fingerprint.is_empty())
+            .count()
+    }
+
     /// The published bitmask the tx loop drains idle speakers from.
     fn published_mask(&self) -> u16 {
         let mut m = 0u16;
@@ -719,6 +1700,14 @@ impl HalDevState {
             requested_directions: Some(r.sent_directions),
             published_directions: Some(r.published_directions),
             observed_directions: Some(r.observed_directions),
+            out_volume: r.out_volume.displayed_state(),
+            in_volume: r.in_volume.remote,
+            out_volume_pending: r.out_volume.pending.is_some(),
+            in_volume_pending: r.in_volume.pending.is_some(),
+            out_volume_software_gain: r.out_volume.uses_software_gain(),
+            // Connection-scoped capability is filled by ipcserv::peer_states;
+            // HalDev owns slot state, not claims made by a possibly-dead peer.
+            device_volume_version: 0,
         })
     }
 }
@@ -1199,7 +2188,7 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
     // and it is per SLOT — the peer that owns slot 3 must not be moved by a
     // drag on slot 5's device, which is exactly what a single global "latest"
     // did (lib.rs's un-filtered fan-out).
-    let mut latest: HashMap<u8, (f32, bool)> = HashMap::new();
+    let mut latest: HashMap<(u8, DeviceVolumeEndpoint), (u32, f32, bool)> = HashMap::new();
     for ev in events {
         match ev {
             HalControlEvent::Attached {
@@ -1207,10 +2196,18 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
                 slot_count,
             } => {
                 dlog!("[audiohubd] hal: attached, session {session_id}, {slot_count} slots");
+                // A new driver session may have rebuilt every endpoint volume
+                // node from defaults. Peer/local intent survives, but every
+                // prior delivery acknowledgement belongs to the old session.
+                let mut st = lk(&inner.haldev);
+                for rec in st.slots.iter_mut() {
+                    rec.invalidate_volume_notifications();
+                }
             }
             HalControlEvent::Detached => {
                 let mut st = lk(&inner.haldev);
                 for rec in st.slots.iter_mut() {
+                    rec.invalidate_volume_notifications();
                     rec.acked = false;
                     rec.state = None;
                     rec.published_directions = 0;
@@ -1247,6 +2244,13 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
                 let Some(rec) = st.slots.get_mut(slot as usize) else {
                     continue;
                 };
+                let changed_directions = rec.published_directions ^ published;
+                if rec.generation != generation
+                    || (state == HalSlotState::Bound && rec.state != Some(HalSlotState::Bound))
+                    || changed_directions != 0
+                {
+                    rec.invalidate_volume_notifications();
+                }
                 let mic_withdrawn = apply_published_directions(rec, published);
                 rec.generation = generation;
                 rec.state = Some(state);
@@ -1282,11 +2286,18 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
                     HalSlotState::Delisted => rec.acked = false,
                 }
             }
-            HalControlEvent::IoState { at, running, .. } => {
+            HalControlEvent::IoState {
+                at,
+                generation,
+                running,
+            } => {
                 let mut st = lk(&inner.haldev);
                 let Some(rec) = st.slots.get_mut(at.slot as usize) else {
                     continue;
                 };
+                if rec.generation != generation {
+                    continue;
+                }
                 let now = Instant::now();
                 if at.input {
                     rec.io_in = running;
@@ -1307,9 +2318,9 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
             }
             HalControlEvent::LatencyState {
                 at,
+                generation,
                 frames,
                 pending,
-                ..
             } => {
                 // The driver's account of what its latency property NOW says.
                 // Recorded, never compared against what we asked for here: the
@@ -1332,29 +2343,79 @@ fn apply_events(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
                 let Some(rec) = st.slots.get_mut(at.slot as usize) else {
                     continue;
                 };
+                if rec.generation != generation {
+                    continue;
+                }
                 rec.decl_out.acked = Some(frames);
                 rec.decl_out.pending = pending;
             }
             HalControlEvent::Volume {
-                at, scalar, muted, ..
+                at,
+                generation,
+                scalar,
+                muted,
             } => {
-                if at.input {
-                    // The virtual microphone's own slider. The capture gain
-                    // belongs to the peer (plan §7.2) and driving it from here
-                    // would be reaching into somebody else's machine.
-                    dlog!(
-                        "[audiohubd] hal: slot {} microphone volume {scalar:.3} muted={muted} \
-                         ignored (the peer owns its capture gain)",
-                        at.slot
-                    );
-                    continue;
-                }
-                latest.insert(at.slot, (scalar, muted));
+                let endpoint = if at.input {
+                    DeviceVolumeEndpoint::DefaultInput
+                } else {
+                    DeviceVolumeEndpoint::DefaultOutput
+                };
+                latest.insert((at.slot, endpoint), (generation, scalar, muted));
             }
         }
     }
-    for (slot, (scalar, muted)) in latest {
-        relay_volume_to_peer(inner, slot, scalar, muted);
+    for ((slot, endpoint), (generation, event_scalar, event_muted)) in latest {
+        #[cfg(windows)]
+        let (scalar, muted) = {
+            let fingerprint = {
+                let st = lk(&inner.haldev);
+                let Some(rec) = st.slots.get(slot as usize) else {
+                    continue;
+                };
+                if rec.generation != generation || rec.fingerprint.is_empty() {
+                    continue;
+                }
+                rec.fingerprint.clone()
+            };
+            // KSPROPERTY_AUDIO_VOLUMELEVEL is dB, while the public endpoint
+            // scalar follows an undocumented Windows audio-taper curve.  The
+            // driver event is therefore a change SIGNAL only; reading the
+            // exact MMDevice is the only authoritative scalar/mute value.
+            match volume::get_audiohub_peer_endpoint_volume(
+                &fingerprint,
+                endpoint == DeviceVolumeEndpoint::DefaultInput,
+            ) {
+                Ok(state) => (state.scalar, state.muted),
+                Err(err) => {
+                    dlog!(
+                        "[audiohubd] hal: cannot read peer {} {} after a Windows volume event: \
+                         {err:#}",
+                        fingerprint,
+                        endpoint.as_wire()
+                    );
+                    continue;
+                }
+            }
+        };
+        #[cfg(not(windows))]
+        let (scalar, muted) = (event_scalar, event_muted);
+        #[cfg(windows)]
+        let _ = (event_scalar, event_muted);
+        let Some(modern) =
+            queue_slot_device_volume(inner, slot, generation, endpoint, scalar, muted)
+        else {
+            continue;
+        };
+        // Mixed-version compatibility: a legacy peer can still carry its
+        // historical active-speaker control on a media session. Idle output
+        // and every microphone case remain pending until a v1 control channel
+        // exists; they are never silently claimed as synchronized.
+        if endpoint == DeviceVolumeEndpoint::DefaultOutput
+            && !modern
+            && relay_volume_to_peer(inner, slot, scalar, muted)
+        {
+            clear_matching_device_volume_pending(inner, slot, endpoint, scalar, Some(muted));
+        }
     }
 }
 
@@ -1385,27 +2446,33 @@ fn apply_published_directions(rec: &mut SlotRec, published: u8) -> bool {
 /// allowed to look like a change and start another round trip.
 pub(crate) const HAL_VOL_EPS: f32 = 1.0 / 512.0;
 
+/// Re-send an unacknowledged endpoint write on a healthy control channel.
+/// This is deliberately longer than the 200 ms coordinator tick so a normal
+/// round trip remains one frame while a lost response cannot strand the UI.
+const DEVICE_VOLUME_RETRY: Duration = Duration::from_secs(1);
+
 fn vol_same(a: (f32, bool), b: (f32, bool)) -> bool {
     (a.0 - b.0).abs() < HAL_VOL_EPS && a.1 == b.1
 }
 
 /// Forward direction (spec-m5b §5.5): the local user moved slot N's virtual
 /// speaker, so the peer that owns slot N — and NOBODY else — must follow.
-fn relay_volume_to_peer(inner: &Arc<DaemonInner>, slot: u8, scalar: f32, muted: bool) {
+fn relay_volume_to_peer(inner: &Arc<DaemonInner>, slot: u8, scalar: f32, muted: bool) -> bool {
     let fp = {
         let mut st = lk(&inner.haldev);
         let Some(rec) = st.slots.get_mut(slot as usize) else {
-            return;
+            return false;
         };
         if rec.fingerprint.is_empty() {
-            return;
+            return false;
         }
         // Our own notify_volume coming back around: applying it would send the
         // peer what the peer just told us.
         if rec.vol_echo.map_or(false, |l| vol_same(l, (scalar, muted))) {
-            return;
+            return false;
         }
         rec.vol_echo = Some((scalar, muted));
+        rec.legacy_last_delivered = None;
         rec.fingerprint.clone()
     };
     // ONLY this peer's sessions.
@@ -1420,13 +2487,16 @@ fn relay_volume_to_peer(inner: &Arc<DaemonInner>, slot: u8, scalar: f32, muted: 
             "[audiohubd] hal: slot {slot} speaker volume {scalar:.3} muted={muted} held for \
              {fp}: no volume_sync'd spk session to carry it yet"
         );
-        return;
+        return false;
     }
+    let mut sent = false;
     for id in targets {
-        if let Err(e) = conn::set_session_volume(inner, id, scalar, Some(muted)) {
-            dlog!("[audiohubd] hal: volume {scalar:.3} -> session {id}: {e:#}");
+        match conn::set_session_volume(inner, id, scalar, Some(muted)) {
+            Ok(()) => sent = true,
+            Err(e) => dlog!("[audiohubd] hal: volume {scalar:.3} -> session {id}: {e:#}"),
         }
     }
+    sent
 }
 
 /// Can this session carry a volume change for the peer that owns a slot?
@@ -1454,7 +2524,19 @@ fn push_peer_volumes(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
     // with the state lock already released, and this one must not be the
     // exception that introduces a lock order.
     let sessions = crate::snapshot_sessions(inner);
-    let mut pending: Vec<(HalEndpoint, u32, f32, bool)> = Vec::new();
+    let conns: Vec<Arc<crate::ConnShared>> = lk(&inner.state)
+        .conns
+        .values()
+        .filter(|conn| conn.alive.load(Ordering::SeqCst))
+        .cloned()
+        .collect();
+    let modern: HashSet<String> = conns
+        .into_iter()
+        .filter(|conn| lk(&conn.peer_audio_capabilities).device_volume_version() >= 1)
+        .map(|conn| conn.fp.clone())
+        .collect();
+    let planned_at = Instant::now();
+    let mut pending: Vec<(u8, String, HalEndpoint, u32, f32, bool)> = Vec::new();
     {
         let mut st = lk(&inner.haldev);
         for slot in 0..HAL_MAX_SLOTS {
@@ -1465,6 +2547,9 @@ fn push_peer_volumes(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
                 }
                 (rec.fingerprint.clone(), rec.generation)
             };
+            if modern.contains(&fp) {
+                continue;
+            }
             let state = sessions
                 .iter()
                 .find(|e| carries_volume_for(&e.conn.fp, &e.kind, &e.dir, e.volume.enabled, &fp))
@@ -1475,16 +2560,70 @@ fn push_peer_volumes(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
             }
             let now = (v.scalar.clamp(0.0, 1.0), v.muted);
             let rec = &mut st.slots[slot];
-            if rec.vol_echo.map_or(false, |l| vol_same(l, now)) {
+            if rec
+                .legacy_last_delivered
+                .is_some_and(|delivered| vol_same(delivered, now))
+            {
                 continue;
             }
-            rec.vol_echo = Some(now);
-            pending.push((HalEndpoint::out(slot as u8), generation, now.0, now.1));
+            if rec
+                .legacy_notify_retry
+                .is_some_and(|retry| vol_same(retry.value, now) && planned_at < retry.not_before)
+            {
+                continue;
+            }
+            pending.push((
+                slot as u8,
+                fp,
+                HalEndpoint::out(slot as u8),
+                generation,
+                now.0,
+                now.1,
+            ));
         }
     }
     // Outside the lock: a mach send can sit for its full 500ms timeout.
-    for (at, generation, scalar, muted) in pending {
-        hal.notify_volume(at, generation, scalar, muted);
+    for (slot, fingerprint, at, generation, scalar, muted) in pending {
+        #[cfg(windows)]
+        let _ = (at, generation);
+        #[cfg(windows)]
+        let (delivered, driver_echo) =
+            match volume::set_audiohub_peer_endpoint_volume(&fingerprint, false, scalar, muted) {
+                Ok(state) => (true, Some((state.scalar, state.muted))),
+                Err(err) => {
+                    dlog!(
+                        "[audiohubd] hal: cannot apply legacy peer {} output scalar/mute through \
+                     its exact Windows endpoint: {err:#}",
+                        fingerprint
+                    );
+                    (false, None)
+                }
+            };
+        #[cfg(not(windows))]
+        let (delivered, driver_echo) = (
+            hal.notify_volume(at, generation, scalar, muted),
+            Some((scalar, muted)),
+        );
+        let mut st = lk(&inner.haldev);
+        let Some(rec) = st.slots.get_mut(slot as usize) else {
+            continue;
+        };
+        if rec.fingerprint != fingerprint
+            || rec.generation != generation
+            || rec.state != Some(HalSlotState::Bound)
+        {
+            continue;
+        }
+        if delivered {
+            rec.legacy_last_delivered = Some((scalar, muted));
+            rec.vol_echo = driver_echo;
+            rec.legacy_notify_retry = None;
+        } else {
+            rec.legacy_notify_retry = Some(DeviceVolumeNotifyRetry {
+                value: (scalar, muted),
+                not_before: Instant::now() + DEVICE_VOLUME_RETRY,
+            });
+        }
     }
 }
 
@@ -1495,7 +2634,25 @@ fn push_peer_volumes(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
 /// a virtual device, and a session appears behind it.
 fn coordinate_sessions(inner: &Arc<DaemonInner>, tx: &mpsc::Sender<SessCmd>) {
     let mode_b = effective_mode(inner) == Mode::B;
-    let live: HashSet<u32> = lk(&inner.state).sessions.keys().copied().collect();
+    let (live, connection_contracts): (HashSet<u32>, HashMap<String, bool>) = {
+        let state = lk(&inner.state);
+        let live = state.sessions.keys().copied().collect();
+        let contracts = state
+            .conns
+            .values()
+            .filter(|conn| conn.alive.load(Ordering::Acquire))
+            .map(|conn| {
+                let ready = conn.registration_ready.load(Ordering::Acquire)
+                    && lk(&conn.peer_mode).mode() == Some(Mode::Share)
+                    && !matches!(
+                        *lk(&conn.peer_audio_capabilities),
+                        crate::PeerAudioCapabilitiesCell::Unheard
+                    );
+                (conn.fp.clone(), ready)
+            })
+            .collect();
+        (live, contracts)
+    };
     let now = Instant::now();
     let mut cmds = Vec::new();
     let mut st = lk(&inner.haldev);
@@ -1543,6 +2700,13 @@ fn coordinate_sessions(inner: &Arc<DaemonInner>, tx: &mpsc::Sender<SessCmd>) {
                     // Mode A must never be hijacked by a stray device
                     // selection: in mode A these devices should not exist at
                     // all, and if one lingers, it stays silent.
+                    continue;
+                }
+                // No connection means the worker should dial it. An already
+                // published but half-registered connection must instead wait:
+                // opening now would freeze its provisional UDP path/mono
+                // capability before tier negotiation and advertisements land.
+                if connection_contracts.get(&fp) == Some(&false) {
                     continue;
                 }
                 if st.open_at[slot].map_or(false, |t| now.duration_since(t) < OPEN_COOLDOWN) {
@@ -1722,6 +2886,8 @@ pub(crate) fn coordinator_loop(inner: Arc<DaemonInner>, tx: mpsc::Sender<SessCmd
         // the driver's own change is dispatched (and recorded as "the control
         // already reads this") BEFORE the peer's state is pushed back, so a
         // slider move never bounces off its own round trip.
+        flush_pending_device_volumes(&inner);
+        push_peer_device_volumes(&inner, &hal);
         push_peer_volumes(&inner, &hal);
         coordinate_sessions(&inner, &tx);
     }
@@ -1936,6 +3102,32 @@ mod tests {
         assert_eq!(t3.release("aaaa"), Some(0));
         assert_eq!(t3.assign("cccc", 16), Some(0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hal_used_counts_live_device_records_not_persisted_assignments() {
+        let mut table = SlotTable::new();
+        assert_eq!(table.assign("peer-a", 16), Some(0));
+        let mut state = HalDevState::new(table);
+
+        assert_eq!(state.table.used(), 1, "the stable assignment is retained");
+        assert_eq!(
+            state.device_count(),
+            0,
+            "a retained assignment without a live record is not a bound device"
+        );
+
+        state.slots[0].fingerprint = "peer-a".to_string();
+        assert_eq!(state.device_count(), 1);
+
+        state.slots[0] = SlotRec::default();
+        assert_eq!(state.table.used(), 1, "retirement keeps endpoint identity");
+        assert_eq!(state.device_count(), 0, "retirement frees live capacity");
+        assert_eq!(
+            state.table.assign("peer-a", 16),
+            Some(0),
+            "switching back to mode B must reuse the original slot"
+        );
     }
 
     #[test]
@@ -2350,6 +3542,483 @@ mod tests {
         assert!(!carries_volume_for(a, KIND_MIC, crate::DIR_SEND, true, a));
         assert!(!carries_volume_for(a, KIND_SPK, crate::DIR_RECV, true, a));
         assert!(!carries_volume_for(a, KIND_SPK, crate::DIR_SEND, false, a));
+    }
+
+    #[test]
+    fn replacement_connection_contract_overrides_a_stale_cap1_hint() {
+        assert_eq!(
+            classify_peer_device_volume_protocol(true, Some(Mode::Share), 1),
+            PeerDeviceVolumeProtocol::Modern
+        );
+        // This is the connection cell after replacement, and is the value the
+        // slot-locked runtime lookup must use. A cap1 value cached before the
+        // replacement is deliberately not an input to either queue function.
+        assert_eq!(
+            classify_peer_device_volume_protocol(true, Some(Mode::Share), 0),
+            PeerDeviceVolumeProtocol::Legacy
+        );
+        assert_eq!(
+            classify_peer_device_volume_protocol(true, None, 1),
+            PeerDeviceVolumeProtocol::PeerNotSharing
+        );
+        assert_eq!(
+            classify_peer_device_volume_protocol(false, Some(Mode::Share), 1),
+            PeerDeviceVolumeProtocol::Offline
+        );
+
+        // The classifier is only safe if every mutation path samples it after
+        // acquiring the slot lock. Keep that ordering structural: accepting a
+        // pre-lock `modern` argument is exactly the cap1 -> cap0 resurrection
+        // window this regression covers.
+        let source = include_str!("haldev.rs");
+        for (start, end) in [
+            (
+                "pub(crate) fn queue_peer_device_volume(",
+                "fn queue_slot_device_volume(",
+            ),
+            (
+                "fn queue_slot_device_volume(",
+                "fn clear_matching_device_volume_pending(",
+            ),
+            (
+                "pub(crate) fn accept_peer_device_volume(",
+                "pub(crate) fn peer_software_gain_authority(",
+            ),
+            (
+                "pub(crate) fn clear_peer_device_volume_protocol(",
+                "fn push_peer_device_volumes(",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .and_then(|(_, rest)| rest.split_once(end).map(|(body, _)| body))
+                .expect("volume queue function body");
+            let locked = body.find("lk(&inner.haldev);").expect("slot HAL lock");
+            let resolved = body
+                .find("with_current_peer_device_volume_protocol(")
+                .expect("current connection protocol lookup");
+            assert!(
+                locked < resolved,
+                "{start} sampled the connection contract before taking the slot lock"
+            );
+            assert!(
+                !body[..locked].contains("modern: bool"),
+                "{start} accepted a stale pre-lock protocol hint"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_device_volume_intent_survives_until_matching_readback() {
+        let mut relay = DeviceVolumeRelay::default();
+        let t0 = Instant::now();
+        assert!(relay.queue_local(0.5, Some(false)));
+        let pending = relay.due_for(11, t0).expect("idle intent must be retained");
+        assert_eq!(pending.request_id, 1);
+        assert_eq!(pending.scalar, 0.5);
+        assert_eq!(pending.muted, Some(false));
+
+        relay.mark_sent(pending.request_id, 11, t0);
+        assert!(
+            relay.due_for(11, t0 + DEVICE_VOLUME_RETRY / 2).is_none(),
+            "one live channel must not receive a frame every coordinator tick"
+        );
+        assert_eq!(
+            relay
+                .due_for(11, t0 + DEVICE_VOLUME_RETRY)
+                .map(|p| p.request_id),
+            Some(pending.request_id),
+            "a lost acknowledgement must cause a bounded retry"
+        );
+        assert_eq!(
+            relay.due_for(12, t0).map(|p| p.request_id),
+            Some(pending.request_id),
+            "a replacement connection must replay unacknowledged intent"
+        );
+
+        let stale = VolumeState {
+            scalar: 0.9,
+            muted: false,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        assert!(!relay.accept_remote(11, 1, None, stale, false));
+        assert!(
+            relay.plan_notify(t0).is_none(),
+            "snapshot must not beat pending intent"
+        );
+        assert!(!relay.accept_remote(11, 2, Some(99), stale, false));
+        assert!(
+            relay.pending.is_some(),
+            "a stale ack must not clear the request"
+        );
+
+        let readback = VolumeState {
+            scalar: 0.48,
+            muted: false,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        assert!(relay.accept_remote(11, 3, Some(pending.request_id), readback, false,));
+        assert!(relay.pending.is_none());
+        assert_eq!(relay.plan_notify(t0), Some((0.48, false)));
+        relay.record_notify_result((0.48, false), Some((0.48, false)), true, t0);
+        assert!(
+            relay.plan_notify(t0).is_none(),
+            "equal readback is notified once"
+        );
+
+        assert!(
+            !relay.queue_local(0.48, Some(false)),
+            "the daemon's own HAL notification must not become a network write"
+        );
+        assert!(relay.queue_local(0.6, Some(false)));
+        assert_eq!(relay.pending.map(|p| p.request_id), Some(2));
+    }
+
+    #[test]
+    fn failed_hal_notification_retries_without_claiming_delivery() {
+        let mut relay = DeviceVolumeRelay::default();
+        let t0 = Instant::now();
+        let state = VolumeState {
+            scalar: 0.42,
+            muted: true,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        assert!(relay.accept_remote(7, 1, None, state, false));
+        let value = relay.plan_notify(t0).expect("first delivery is due");
+        relay.record_notify_result(value, None, false, t0);
+        assert!(relay.last_delivered.is_none());
+        assert!(relay.driver_echo.is_none());
+        assert!(
+            relay.plan_notify(t0 + DEVICE_VOLUME_RETRY / 2).is_none(),
+            "a missing driver must not receive five attempts per second"
+        );
+        assert_eq!(
+            relay.plan_notify(t0 + DEVICE_VOLUME_RETRY),
+            Some(value),
+            "the same authoritative state must become due again"
+        );
+        relay.record_notify_result(value, Some(value), true, t0 + DEVICE_VOLUME_RETRY);
+        assert!(relay.plan_notify(t0 + DEVICE_VOLUME_RETRY * 2).is_none());
+    }
+
+    #[test]
+    fn a_new_authoritative_value_bypasses_an_older_failed_retry() {
+        let mut relay = DeviceVolumeRelay::default();
+        let t0 = Instant::now();
+        let first = VolumeState {
+            scalar: 0.2,
+            muted: false,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        assert!(relay.accept_remote(7, 1, None, first, false));
+        let attempted = relay.plan_notify(t0).unwrap();
+        relay.record_notify_result(attempted, None, false, t0);
+
+        let second = VolumeState {
+            scalar: 0.8,
+            muted: true,
+            ..first
+        };
+        assert!(relay.accept_remote(7, 2, None, second, false));
+        assert_eq!(
+            relay.plan_notify(t0 + Duration::from_millis(1)),
+            Some((0.8, true)),
+            "backoff belongs to the failed value, not the endpoint"
+        );
+    }
+
+    #[test]
+    fn delivery_commit_does_not_hide_a_readback_that_changed_during_the_send() {
+        let mut relay = DeviceVolumeRelay::default();
+        let t0 = Instant::now();
+        let first = VolumeState {
+            scalar: 0.3,
+            muted: false,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        assert!(relay.accept_remote(7, 1, None, first, false));
+        let attempted = relay.plan_notify(t0).unwrap();
+        let second = VolumeState {
+            scalar: 0.7,
+            muted: true,
+            ..first
+        };
+        assert!(relay.accept_remote(7, 2, None, second, false));
+        relay.record_notify_result(attempted, Some(attempted), true, t0);
+        assert_eq!(relay.plan_notify(t0), Some((0.7, true)));
+    }
+
+    #[test]
+    fn a_quantized_windows_readback_suppresses_its_echo_without_rearming_delivery() {
+        let mut relay = DeviceVolumeRelay::default();
+        let t0 = Instant::now();
+        let remote = VolumeState {
+            scalar: 0.5,
+            muted: true,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        assert!(relay.accept_remote(7, 1, None, remote, false));
+        let requested = relay.plan_notify(t0).unwrap();
+
+        // Windows may expose a nearby scalar after its private audio-taper
+        // curve and the driver's dB step are applied.  Delivery belongs to the
+        // peer request; the one-shot event guard belongs to the readback.
+        let applied = (0.497, true);
+        relay.record_notify_result(requested, Some(applied), true, t0);
+        assert!(relay.plan_notify(t0).is_none());
+        assert!(!relay.queue_local(applied.0, Some(applied.1)));
+        assert!(
+            !relay.queue_local(applied.0, Some(applied.1)),
+            "a second channel/node event reports the same final COM state"
+        );
+        assert!(relay.pending.is_none());
+
+        assert!(relay.queue_local(0.65, Some(true)));
+        assert!(
+            relay.pending.is_some(),
+            "a later real user move must survive"
+        );
+    }
+
+    #[test]
+    fn duplicate_fixed_output_events_do_not_turn_a_reflected_mute_into_peer_intent() {
+        let mut relay = DeviceVolumeRelay::default();
+        let t0 = Instant::now();
+        let fixed = VolumeState {
+            scalar: 0.0,
+            muted: false,
+            adjustable: false,
+            // This is the dangerous case: a duplicate endpoint event would
+            // otherwise queue the explicit mute back to the peer even though
+            // the fixed scalar itself is local software-gain authority.
+            mute_adjustable: true,
+        };
+        assert!(relay.accept_remote(7, 1, None, fixed, true));
+        let reflected = relay.plan_notify(t0).expect("initial virtual state");
+        relay.record_notify_result(reflected, Some(reflected), true, t0);
+
+        assert!(!relay.queue_software_gain(reflected.0, Some(reflected.1), true));
+        assert!(!relay.queue_software_gain(reflected.0, Some(reflected.1), true));
+        assert!(
+            relay.pending.is_none(),
+            "duplicate channel/node events must not become a peer mute write"
+        );
+    }
+
+    #[test]
+    fn driver_reconnect_replays_readback_without_losing_pending_intent() {
+        let mut relay = DeviceVolumeRelay::default();
+        let t0 = Instant::now();
+        let state = VolumeState {
+            scalar: 0.55,
+            muted: false,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        assert!(relay.accept_remote(7, 1, None, state, false));
+        let value = relay.plan_notify(t0).unwrap();
+        relay.record_notify_result(value, Some(value), true, t0);
+        relay.invalidate_notification();
+        assert_eq!(relay.plan_notify(t0), Some(value));
+
+        assert!(relay.queue_intent(0.9, Some(true)));
+        let request = relay.pending.unwrap().request_id;
+        relay.invalidate_notification();
+        assert_eq!(relay.pending.unwrap().request_id, request);
+        assert!(relay.plan_notify(t0).is_none());
+    }
+
+    #[test]
+    fn microphone_and_speaker_device_volume_state_never_share_an_echo_or_ack() {
+        let mut rec = SlotRec::default();
+        assert!(rec.out_volume.queue_local(0.25, Some(false)));
+        assert!(rec.in_volume.queue_local(0.75, Some(true)));
+        let out_request = rec.out_volume.pending.unwrap().request_id;
+        let in_request = rec.in_volume.pending.unwrap().request_id;
+
+        let input_readback = VolumeState {
+            scalar: 0.75,
+            muted: true,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        assert!(rec
+            .in_volume
+            .accept_remote(11, 1, Some(in_request), input_readback, false));
+        assert!(rec.in_volume.pending.is_none());
+        assert_eq!(
+            rec.out_volume.pending.map(|p| p.request_id),
+            Some(out_request),
+            "input acknowledgement must not touch output pending state"
+        );
+        let now = Instant::now();
+        assert_eq!(rec.in_volume.plan_notify(now), Some((0.75, true)));
+        assert!(rec.out_volume.plan_notify(now).is_none());
+    }
+
+    #[test]
+    fn scalar_only_tail_preserves_an_unacknowledged_explicit_mute() {
+        let mut relay = DeviceVolumeRelay::default();
+        assert!(relay.queue_intent(0.4, Some(true)));
+        assert!(relay.queue_intent(0.6, None));
+        let pending = relay.pending.expect("coalesced intent must remain queued");
+        assert_eq!(pending.scalar, 0.6);
+        assert_eq!(pending.muted, Some(true));
+    }
+
+    #[test]
+    fn endpoint_revisions_reject_reordered_snapshots_but_reset_on_reconnect() {
+        let mut relay = DeviceVolumeRelay::default();
+        let newer = VolumeState {
+            scalar: 0.7,
+            muted: false,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        let older = VolumeState {
+            scalar: 0.2,
+            muted: true,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        assert!(relay.accept_remote(41, 2, None, newer, false));
+        assert!(!relay.accept_remote(41, 1, None, older, false));
+        assert_eq!(relay.remote, Some(newer));
+        assert!(relay.accept_remote(42, 1, None, older, false));
+        assert_eq!(relay.remote, Some(older));
+    }
+
+    #[test]
+    fn reordered_matching_ack_retires_intent_without_overwriting_newer_state() {
+        let mut relay = DeviceVolumeRelay::default();
+        assert!(relay.queue_intent(0.6, Some(true)));
+        let request = relay.pending.unwrap().request_id;
+        let newer = VolumeState {
+            scalar: 0.7,
+            muted: false,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        assert!(!relay.accept_remote(41, 2, None, newer, false));
+        assert!(relay.pending.is_some());
+
+        let older_ack = VolumeState {
+            scalar: 0.58,
+            muted: true,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        assert!(relay.accept_remote(41, 1, Some(request), older_ack, false));
+        assert!(relay.pending.is_none());
+        assert_eq!(relay.remote, Some(newer));
+        assert_eq!(relay.remote_revision, 2);
+        assert_eq!(relay.plan_notify(Instant::now()), Some((0.7, false)));
+    }
+
+    #[test]
+    fn a_fixed_output_converts_pending_device_intent_to_persistent_gain() {
+        let mut relay = DeviceVolumeRelay::default();
+        assert!(relay.queue_intent(0.3, Some(true)));
+        let fixed = VolumeState {
+            scalar: 0.0,
+            muted: false,
+            adjustable: false,
+            mute_adjustable: false,
+        };
+        assert!(relay.accept_remote(7, 1, None, fixed, true));
+        assert!(relay.pending.is_none());
+        assert_eq!(
+            relay.displayed_state(),
+            Some(VolumeState {
+                scalar: 0.3,
+                muted: true,
+                adjustable: false,
+                mute_adjustable: false,
+            })
+        );
+        assert!(relay.uses_software_gain());
+    }
+
+    #[test]
+    fn fixed_scalar_keeps_independently_adjustable_mute_on_the_peer() {
+        let mut relay = DeviceVolumeRelay::default();
+        let fixed = VolumeState {
+            scalar: 0.0,
+            muted: false,
+            adjustable: false,
+            mute_adjustable: true,
+        };
+        assert!(relay.accept_remote(7, 1, None, fixed, true));
+        assert!(relay.queue_software_gain(0.4, Some(true), false));
+        assert_eq!(relay.pending.and_then(|pending| pending.muted), Some(true));
+        assert!(relay.queue_software_gain(0.6, None, false));
+        let pending = relay.pending.expect("slider tail must retain peer mute");
+        assert_eq!(pending.scalar, 0.6);
+        assert_eq!(pending.muted, Some(true));
+
+        assert!(relay.accept_remote(7, 2, None, fixed, true));
+        assert_eq!(
+            relay.pending.map(|pending| pending.request_id),
+            Some(pending.request_id)
+        );
+        assert_eq!(relay.displayed_state().unwrap().muted, true);
+        assert_eq!(relay.displayed_state().unwrap().scalar, 0.6);
+
+        let readback = fixed; // matching ACK may truthfully report refusal
+        assert!(relay.accept_remote(7, 3, Some(pending.request_id), readback, true,));
+        assert!(relay.pending.is_none());
+        assert_eq!(relay.displayed_state().unwrap().muted, false);
+        assert_eq!(relay.displayed_state().unwrap().scalar, 0.6);
+    }
+
+    #[test]
+    fn reordered_fixed_output_ack_follows_the_newer_physical_mute() {
+        let mut relay = DeviceVolumeRelay::default();
+        let fixed = VolumeState {
+            scalar: 0.0,
+            muted: false,
+            adjustable: false,
+            mute_adjustable: true,
+        };
+        assert!(relay.accept_remote(7, 1, None, fixed, true));
+        assert!(relay.queue_software_gain(0.6, Some(true), false));
+        let request = relay.pending.unwrap().request_id;
+
+        assert!(relay.accept_remote(7, 3, None, fixed, true));
+        assert!(relay.pending.is_some());
+        assert_eq!(relay.displayed_state().unwrap().muted, true);
+
+        let older_ack = VolumeState {
+            muted: true,
+            ..fixed
+        };
+        assert!(relay.accept_remote(7, 2, Some(request), older_ack, true));
+        assert!(relay.pending.is_none());
+        assert_eq!(relay.remote, Some(fixed));
+        assert_eq!(relay.remote_revision, 3);
+        assert_eq!(relay.displayed_state().unwrap().scalar, 0.6);
+        assert_eq!(relay.displayed_state().unwrap().muted, false);
+
+        // When the fixed endpoint cannot change mute independently, mute is
+        // part of the local software gain and periodic physical readback must
+        // not erase it.
+        let fixed_local_mute = VolumeState {
+            mute_adjustable: false,
+            ..fixed
+        };
+        let mut local = DeviceVolumeRelay::default();
+        assert!(local.accept_remote(9, 1, None, fixed_local_mute, true));
+        assert!(local.queue_software_gain(0.4, Some(true), false));
+        assert!(local.pending.is_none());
+        assert!(local.accept_remote(9, 2, None, fixed_local_mute, true));
+        assert_eq!(local.displayed_state().unwrap().scalar, 0.4);
+        assert!(local.displayed_state().unwrap().muted);
     }
 
     #[test]

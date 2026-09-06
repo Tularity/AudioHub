@@ -5,17 +5,21 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 
-use audiohub_core::audio::{self, AudioTx, LiveCapture, LivePlayback};
-use audiohub_core::dsp::{self, LinearResampler, ToneVerdict};
+use audiohub_core::audio::{
+    self, AudioTx, LiveCapture, LivePlayback, PlaybackConfigSnapshot, PlaybackMonitor,
+};
+use audiohub_core::dsp::{self, InterleavedLinearResampler, ToneVerdict};
 use audiohub_core::latency::{DropMode, SourceDepths, StageDepth, StageId, StageSlot, NO_DEPTHS};
 use audiohub_core::sysaudio::{self, SysAudioCapture};
-use audiohub_net::media::{CaptureFifo,FrameSource, LossInjector, MediaCrypto, MicSource, ToneSource};
+use audiohub_net::media::{
+    CaptureFifo, FrameSource, LossInjector, MediaCrypto, MicSource, ToneSource,
+};
 use audiohub_net::packet::{Codec, Header, Kind};
 
 use crate::rtsafe::SpscRing;
@@ -35,6 +39,7 @@ const _: () = assert!(
 );
 
 const F48: usize = 480; // 48k @ 10ms
+const F48_STEREO: usize = F48 * 2;
 const RING_CAP: usize = 96000; // 2s @ 48k
 const TONE_AMP: f32 = 0.5;
 
@@ -475,8 +480,14 @@ static TX_DLL: DllCell = DllCell::new();
 ///
 /// 这只降低 >100 ms 卡顿的**频率**，不改变「一旦发生就永久」的性质，所以它
 /// 不能替代治法 A / DLL 伺服，只能叠加。
+#[cfg(target_os = "windows")]
+pub(crate) type AudioThreadQosGuard = audio::ProAudioThreadGuard;
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) struct AudioThreadQosGuard;
+
 #[cfg(target_os = "macos")]
-pub(crate) fn raise_audio_thread_qos(what: &str) {
+pub(crate) fn raise_audio_thread_qos(what: &'static str) -> AudioThreadQosGuard {
     // <pthread/qos.h>：qos_class_t 是 unsigned int，QOS_CLASS_USER_INTERACTIVE
     // = 0x21。relative_priority 传 0 = 该 band 的最高档。
     const QOS_CLASS_USER_INTERACTIVE: libc::c_uint = 0x21;
@@ -491,15 +502,38 @@ pub(crate) fn raise_audio_thread_qos(what: &str) {
         // 失败不是错误：没提上去只是回到从前，治法 A/B 照常工作。
         dlog!("[audiohubd] {what}: 提升线程 QoS 失败 (rc={rc})，按默认优先级继续");
     }
+    AudioThreadQosGuard
 }
 
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn raise_audio_thread_qos(_what: &str) {
-    // Windows 的对应物是 `AvSetMmThreadCharacteristicsW("Pro Audio")`（avrt.dll）。
-    // 收益同样是「降低被抢占的概率」，但代价是给这个 crate 引入一条 Windows
-    // 系统库依赖，而 Cargo.toml 明确记着「gated so the windows-gnu build keeps
-    // its raw-dylib-free dep graph」。Windows 侧的病灶又在 `play_ring`（真跨
-    // 时钟、另开规格），不在这条循环上 —— 先不动，等 win 侧的双向控制器一起做。
+#[cfg(target_os = "windows")]
+pub(crate) fn raise_audio_thread_qos(what: &'static str) -> AudioThreadQosGuard {
+    let guard = audio::promote_current_thread_to_pro_audio(what);
+    if guard.is_active() {
+        dlog!("[audiohubd] {what}: MMCSS Pro Audio active");
+    } else {
+        dlog!("[audiohubd] {what}: MMCSS Pro Audio unavailable; using default priority");
+    }
+    guard
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) fn raise_audio_thread_qos(_what: &'static str) -> AudioThreadQosGuard {
+    AudioThreadQosGuard
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn raise_media_send_thread_qos(what: &'static str) -> AudioThreadQosGuard {
+    raise_audio_thread_qos(what)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn raise_media_send_thread_qos(_what: &'static str) -> AudioThreadQosGuard {
+    AudioThreadQosGuard::inactive()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) fn raise_media_send_thread_qos(_what: &'static str) -> AudioThreadQosGuard {
+    AudioThreadQosGuard
 }
 
 fn poll_tick(kind: ErrorKind) -> bool {
@@ -568,7 +602,7 @@ struct SendSlot {
 }
 
 /// 队列深度（数据报）。必须是 2 的幂（[`SpscRing`] 的硬约束）。
-const SEND_SLOTS: usize = 128;
+const SEND_SLOTS: usize = 128 * audiohub_net::media::MAX_WIRE_PARTS;
 
 /// 每个槽预留的字节数，**按阶梯最深档推导**：
 /// 40 B 头 + 480 样本 × 4 B（`WireDepth::F32`）+ 16 B AEAD 标签 = 1976，
@@ -720,7 +754,7 @@ impl UdpSender {
 pub(crate) fn udp_send_loop(inner: Arc<DaemonInner>) {
     // 与 tx/mixer 同一档 QoS：这条线程现在在媒体路径上，被降档就等于把刚搬走
     // 的延迟原样搬回来。它每 tick 只做一次 `sendto`，抢不走什么。
-    raise_audio_thread_qos("udp_send_loop");
+    let _qos_guard = raise_media_send_thread_qos("udp_send_loop");
     let _ = inner.media_send.thread.set(std::thread::current());
     // Read once, outside the loop, like `rx_loop`'s half of the same hook.
     let block_out = inner.udp_block.out;
@@ -803,6 +837,13 @@ impl SourceSpec {
             SourceSpec::HalSpeaker { slot } => format!("hal speaker slot {slot}"),
         }
     }
+
+    pub(crate) fn preferred_channels(&self) -> u8 {
+        match self {
+            SourceSpec::Tone { .. } | SourceSpec::Mic => 1,
+            SourceSpec::SysAudio { .. } | SourceSpec::HalSpeaker { .. } => 2,
+        }
+    }
 }
 
 pub(crate) enum TxCmd {
@@ -816,6 +857,8 @@ pub(crate) enum TxCmd {
         /// the stream is created — see `ConnShared::current_media_path`.
         path: MediaPath,
         spec: SourceSpec,
+        /// Negotiated interleaved media channels (1 with a 1.0.0 peer).
+        channels: u8,
         loss_pct: f32,
         shared: Arc<TxShared>,
         /// Reports whether the source actually started, so the control-plane
@@ -938,9 +981,14 @@ struct TxStream {
     spec: SourceSpec,
     loss: LossInjector,
     seq: u32,
+    /// Logical media frames for this stream, independent of scheduler ticks.
+    /// Advances exactly when `seq` consumes one frame's packet positions;
+    /// format-alignment padding and tx-loop catch-up do not advance it.
+    media_frame_seq: u64,
     rung: u32,
-    rs: Option<LinearResampler>, // 48k -> rung rate, recreated on rung switch
-    rs_last: f32,                // last source sample; seeds the next resampler
+    channels: u8,
+    rs: Option<InterleavedLinearResampler>, // 48k -> rung rate
+    rs_last: [f32; 2],                      // last source frame; seeds the next resampler
     /// 这一帧（或半帧）的线上载荷。**长期复用**：`dsp::encode_pcm` 每 tick 每流
     /// 分配一个 `Vec` 是本轮第 3 项要消灭的东西。
     ///
@@ -966,6 +1014,7 @@ struct TxStream {
 
 struct SourceEnt {
     src: Src,
+    channels: u8,
     refs: usize,
     /// 造出这个源的那次建源请求的代号。收尸时要原样带回去，好让建源线程
     /// 精确丢掉**配套的**那个 `LiveCapture`（设备变更重建期间，同一个 spec
@@ -1007,6 +1056,13 @@ impl Src {
         }
     }
 
+    fn channels(&self) -> u8 {
+        match self {
+            Src::Frame(f) => f.channels().clamp(1, 2),
+            Src::Sys(s) => s.channels(),
+        }
+    }
+
     /// `Some(reason)` once the source can never produce audio again.
     fn failed(&self) -> Option<String> {
         match self {
@@ -1017,8 +1073,8 @@ impl Src {
 }
 
 /// Bridges `SysAudioCapture` into the 10ms send scheduler: the capture appends
-/// mono f32 at its own rate in irregular WASAPI-sized chunks, the scheduler
-/// wants exactly one 48k frame per tick. Underruns emit silence rather than
+/// interleaved f32 at its own rate in irregular backend-sized chunks, while the
+/// scheduler wants exactly one 48k frame per tick. Underruns emit silence rather than
 /// stalling the cadence — a loopback capture is silent whenever nothing plays.
 pub(crate) struct SysAudioFrames {
     cap: Box<dyn SysAudioCapture>,
@@ -1034,17 +1090,20 @@ pub(crate) struct SysAudioFrames {
     /// 探针实测正常，而 9.6 小时真机 soak 里深度仍以 +9.6 ms/小时 爬升。
     /// 三份合一之后这种「修了但没修到生产路径」不可能再发生。
     fifo: CaptureFifo,
+    channels: u8,
 }
 
 impl SysAudioFrames {
     fn new(cap: Box<dyn SysAudioCapture>, backend: String, excludes_self: bool) -> SysAudioFrames {
         let rate = cap.sample_rate();
+        let channels = cap.channels().clamp(1, 2);
         SysAudioFrames {
             cap,
             backend,
             excludes_self,
             raw: Vec::new(),
-            fifo: CaptureFifo::new(rate, FRAME_MS as u32),
+            fifo: CaptureFifo::new_channels(rate, FRAME_MS as u32, channels),
+            channels,
         }
     }
 
@@ -1085,6 +1144,10 @@ impl SysAudioFrames {
         self.cap.read(&mut self.raw);
         self.fifo.tick(&self.raw, out);
         true
+    }
+
+    fn channels(&self) -> u8 {
+        self.channels
     }
 }
 
@@ -1155,8 +1218,9 @@ pub(crate) struct BuildDone {
     pub result: std::result::Result<Src, String>,
 }
 
-/// 建源 / 收尸线程。**这是进程里唯一允许开关音频设备的地方**（混音线程的
-/// `apply_mixcmd` 是另一处，理由同样是 cpal 流不能跨线程）。
+/// Opens and retires capture sources on their owner thread. Default-output
+/// playback follows the same ownership split in [`site_playback_builder_loop`];
+/// named bridge outputs remain the separate `apply_mixcmd` exception.
 pub(crate) fn source_builder_loop(
     inner: Arc<DaemonInner>,
     reqs: mpsc::Receiver<BuildReq>,
@@ -1289,17 +1353,89 @@ fn build_source(
 /// path and the rung-switch path cannot disagree about it — they used to be one
 /// site because a stream always started on a 48 kHz rung, which stopped being
 /// true when AUTO's ceiling became per-transport.
-fn resampler_for(rung: u32, last: f32) -> Option<LinearResampler> {
+fn resampler_for(rung: u32, channels: u8, last: [f32; 2]) -> Option<InterleavedLinearResampler> {
     let f = audiohub_net::media::rung_format(rung);
     (f.rate_hz != MicSource::OUT_RATE)
-        .then(|| seeded_resampler(MicSource::OUT_RATE, f.rate_hz, last))
+        .then(|| seeded_interleaved_resampler(MicSource::OUT_RATE, f.rate_hz, channels, last))
 }
 
-fn seeded_resampler(src_rate: u32, dst_rate: u32, last: f32) -> LinearResampler {
-    let mut rs = LinearResampler::new(src_rate, dst_rate);
+fn seeded_interleaved_resampler(
+    src_rate: u32,
+    dst_rate: u32,
+    channels: u8,
+    last: [f32; 2],
+) -> InterleavedLinearResampler {
+    let mut rs = InterleavedLinearResampler::new(src_rate, dst_rate, channels);
     let mut discard = Vec::new();
-    rs.process(&[last], &mut discard); // primes `last`; output is not audio
+    rs.process(&last[..channels.clamp(1, 2) as usize], &mut discard);
     rs
+}
+
+/// Convert one decoded wire frame to the mixer's 48 kHz timeline.
+///
+/// A 48 kHz frame bypasses the resampler, but it must also invalidate any
+/// converter left by an earlier lower-rate rung. That converter did not consume
+/// the bypassed frames; reusing it when the wire later returns to the same lower
+/// rate would interpolate from an old phase and an old sample instead of from
+/// the immediately preceding 48 kHz frame.
+fn resample_received_frame(
+    rs: &mut Option<InterleavedLinearResampler>,
+    rs_rate: &mut u32,
+    rs_last: [f32; 2],
+    frame_rate: u32,
+    frame_channels: u8,
+    raw: Vec<f32>,
+) -> Vec<f32> {
+    if frame_rate == MicSource::OUT_RATE {
+        *rs = None;
+        *rs_rate = MicSource::OUT_RATE;
+        return raw;
+    }
+    if *rs_rate != frame_rate || rs.is_none() {
+        // Continue from the last decoded frame: a mid-stream rate change must
+        // not interpolate up from zero.
+        *rs = Some(seeded_interleaved_resampler(
+            frame_rate,
+            MicSource::OUT_RATE,
+            frame_channels,
+            rs_last,
+        ));
+        *rs_rate = frame_rate;
+    }
+    let mut out = Vec::with_capacity((F48 + 8) * frame_channels as usize);
+    rs.as_mut()
+        .expect("non-48 kHz has a resampler")
+        .process(&raw, &mut out);
+    out
+}
+
+/// Convert one interleaved source frame to the negotiated wire width. This is
+/// the sole compatibility downmix: a new peer keeps L/R, while a 1.0.0 peer
+/// receives the historical mono signal. Mono sources can also feed a stereo
+/// stream without changing balance by duplicating into both lanes.
+fn convert_channels(input: &[f32], src_channels: u8, dst_channels: u8, out: &mut Vec<f32>) {
+    let src = src_channels.clamp(1, 2) as usize;
+    let dst = dst_channels.clamp(1, 2) as usize;
+    out.clear();
+    if src == dst {
+        out.extend_from_slice(input);
+        return;
+    }
+    let frames = input.len() / src;
+    out.reserve(frames * dst);
+    match (src, dst) {
+        (2, 1) => {
+            for frame in input[..frames * 2].chunks_exact(2) {
+                out.push((frame[0] + frame[1]) * 0.5);
+            }
+        }
+        (1, 2) => {
+            for &sample in &input[..frames] {
+                out.extend_from_slice(&[sample, sample]);
+            }
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// 把 JB 的**有效**目标深度设到 `want` 帧，不重建、不分配。
@@ -1444,7 +1580,11 @@ fn reshape_jitter_envelope(
         LatencyTarget::Auto => st.jb.target(),
         LatencyTarget::TotalMs(ms) => (ms as u32).div_ceil(FRAME_MS as u32).max(1),
     };
-    st.jb = JitterBuffer::with_tuning(seed.clamp(cfg.min_target, cfg.max_target), cfg);
+    st.jb = JitterBuffer::with_tuning_channels(
+        seed.clamp(cfg.min_target, cfg.max_target),
+        cfg,
+        st.channels,
+    );
     // 五个 lifetime 计数器随新 JB 归零 —— 与 `jb resync` 那条路同一个理由：
     // 旧采样点不能再参与差分，否则窗口值会被 saturating_sub 压成 0，
     // 让一次重建看起来像「这 10 秒完美无瑕」。
@@ -1463,6 +1603,7 @@ struct PendingAdd {
     key: [u8; 32],
     salt: Vec<u8>,
     path: MediaPath,
+    channels: u8,
     loss_pct: f32,
     shared: Arc<TxShared>,
     ack: Option<mpsc::Sender<std::result::Result<(), String>>>,
@@ -1536,6 +1677,9 @@ impl TxState {
             .rung
             .load(Ordering::Relaxed)
             .min(audiohub_net::media::LADDER.len() as u32 - 1);
+        add.shared
+            .media_channels
+            .store(add.channels.clamp(1, 2) as u32, Ordering::Relaxed);
         self.streams.insert(
             add.stream_id,
             TxStream {
@@ -1545,8 +1689,10 @@ impl TxState {
                 crypto: MediaCrypto::new_for_stream(&add.key, add.stream_id, &add.salt),
                 path: add.path,
                 spec: spec.clone(),
+                channels: add.channels.clamp(1, 2),
                 loss: LossInjector::new(add.stream_id, add.loss_pct),
                 seq: 0,
+                media_frame_seq: 0,
                 // 与 `TxShared` 的起步格一致。两处若分了岔，第一 tick 就会
                 // 看到 `want != tx.rung`、白重建一次重采样器并跳一个 seq。
                 //
@@ -1559,11 +1705,11 @@ impl TxState {
                 // `format_mismatch` 每帧递增、整条流一个字都听不见。此前
                 // 之所以没暴露，只是因为起步格恒为 48 kHz 的那一格。
                 rung: start_rung,
-                rs: resampler_for(start_rung, 0.0),
-                rs_last: 0.0,
+                rs: resampler_for(start_rung, add.channels, [0.0; 2]),
+                rs_last: [0.0; 2],
                 // 一帧最深档 = 480 × 4 B（f32）。容量随格号变（换档同时改帧长度
                 // 与每样本字节数），按最深档预留就不会在音频线程上扩容。
-                pay: Vec::with_capacity(F48 * 4),
+                pay: Vec::with_capacity(F48_STEREO * 4),
                 // 0 = 「还没看过」。`dest_override` 在这条流建起来**之前**就被
                 // 学到过的情形因此不会漏：那时代号已经 ≥1，第一 tick 就会去读。
                 dest_epoch_seen: 0,
@@ -1656,10 +1802,12 @@ impl TxState {
                 return;
             }
         };
+        let channels = src.channels();
         // ① 源已经在表里 ⇒ 这是一次设备变更重建。**换芯**：新的先造好、这一刻
         // 才丢老的，与搬家前 `rebuild_mic_source` 的顺序保证逐字相同。
         if let Some(ent) = self.sources.get_mut(&d.spec) {
             let old_src = std::mem::replace(&mut ent.src, src);
+            ent.channels = channels;
             let old_gen = std::mem::replace(&mut ent.gen, d.gen);
             // 换过源，上一 tick 的深度读数描述的是另一个队列了。
             ent.depths = NO_DEPTHS;
@@ -1681,6 +1829,7 @@ impl TxState {
             d.spec.clone(),
             SourceEnt {
                 src,
+                channels,
                 refs: waiters.len(),
                 gen: d.gen,
                 frame: Vec::new(),
@@ -1706,6 +1855,7 @@ fn apply_txcmd(st: &mut TxState, cmd: TxCmd) {
             salt,
             path,
             spec,
+            channels,
             loss_pct,
             shared,
             ack,
@@ -1715,6 +1865,7 @@ fn apply_txcmd(st: &mut TxState, cmd: TxCmd) {
                 key,
                 salt,
                 path,
+                channels: channels.clamp(1, 2),
                 loss_pct,
                 shared,
                 ack,
@@ -1928,7 +2079,7 @@ pub(crate) fn tx_loop(
     // is never replaced.
     let hal = inner.hal();
     let mut dev_epoch = inner.dev_in_epoch.load(Ordering::Relaxed);
-    raise_audio_thread_qos("tx_loop");
+    let _qos_guard = raise_audio_thread_qos("tx_loop");
     // 本线程的 `dlog!` 从此走入队 + 独立线程落盘。**必须在进循环之前**：
     // 之后这条线程上任何一处 `dlog!`（包括 `halbridge` 里那两条欠载段首/段尾）
     // 都不再做阻塞 `write` 也不再抢 `Stderr` 的全局锁。见 `rtlog` 模块文档。
@@ -1955,6 +2106,7 @@ pub(crate) fn tx_loop(
     // 重采样暂存，进程内只分配这一次。48k→其它档只会变短，`F48 * 2` 够用；
     // 真不够 `rs.process` 会自己扩一次，此后不再扩。
     let mut staged: Vec<f32> = Vec::with_capacity(F48 * 2);
+    let mut converted: Vec<f32> = Vec::with_capacity(F48 * 2);
     // plan §7.2 软件增益的输出暂存。与 `staged` 同样是**循环级**的纯 scratch：
     // 写进去、同一次迭代里编完就不再被看，N 条流共一块。
     //
@@ -2115,25 +2267,26 @@ pub(crate) fn tx_loop(
             // （见 `ring_depth_before_push`）。一边谷值一边峰值，差的那一帧会
             // 恒定挂在总数上，而且看起来完全像一个真实缓冲。
             ent.depths = ent.src.depths();
-            if ent.frame.len() != F48 {
+            let expected = F48 * ent.channels as usize;
+            if ent.frame.len() != expected {
                 // An OVER-long frame means the source appended instead of
                 // replacing, and the resize below then re-sends whatever its
                 // very first call produced, forever, while the packet counts,
                 // the loss rate and the tone probe all stay green. That cost a
                 // full debugging session once; it must never be silent again.
                 debug_assert!(
-                    ent.frame.len() <= F48,
-                    "FrameSource yielded {} samples (> {F48}): it appended instead of replacing",
-                    ent.frame.len()
+                    ent.frame.len() <= expected,
+                    "FrameSource yielded {} samples (> {expected}): it appended instead of replacing",
+                    ent.frame.len(),
                 );
-                if ent.frame.len() > F48 && slow_tick {
+                if ent.frame.len() > expected && slow_tick {
                     dlog!(
-                        "[audiohubd] BUG: source yielded {} samples, expected {F48} — \
+                        "[audiohubd] BUG: source yielded {} samples, expected {expected} — \
                          the stream is repeating its first frame",
                         ent.frame.len()
                     );
                 }
-                ent.frame.resize(F48, 0.0);
+                ent.frame.resize(expected, 0.0);
             }
             // playback can start long after the capture did, so the plan §5
             // condition is re-evaluated while such a capture is alive
@@ -2168,7 +2321,10 @@ pub(crate) fn tx_loop(
             // else's. Stages are cleared for the same reason the missing-source
             // arm below clears them: a stale reading left in the slot is a
             // number the UI keeps showing about a stream that is not running.
-            if !tx.shared.armed.load(Ordering::Relaxed) {
+            // Acquire pairs with open_session's publication store: all initial
+            // transport and send-gain state must be visible before the first
+            // media frame is allowed to leave.
+            if !tx.shared.armed.load(Ordering::Acquire) {
                 clear_send_stages(tx);
                 continue;
             }
@@ -2206,21 +2362,26 @@ pub(crate) fn tx_loop(
                 // 位深进阶梯之后 rung 0/1/2 全是 48 kHz，写 `want != 0` 会给
                 // 48 kHz/24 bit 和 48 kHz/16 bit 白建一个 48→48 的重采样器。
                 let f = audiohub_net::media::rung_format(want);
-                tx.rs = resampler_for(want, last);
-                // **把 seq 对齐到新的分包数。** 接收侧用 `seq / parts` 还原帧
-                // 序号，并靠 `seq % 2` 分前后半；换到深档时若 seq 是奇数，
-                // 整条流的前后半会**永久错位**（每一帧都配不上对），表现是
-                // 持续的半帧隐藏 —— 有声音，但一半是编的。
-                //
-                // 代价：至多跳过一个 seq（接收侧记 1 个丢包）。只在
-                // 「不分包 → 分包」这一个方向上、且 seq 为奇数时才发生。
-                let parts = f.wire_packets_per_frame() as u32;
-                let rem = tx.seq % parts;
-                if rem != 0 {
-                    tx.seq = tx.seq.wrapping_add(parts - rem);
-                }
+                tx.rs = resampler_for(want, tx.channels, last);
+                // Align the first packet of a format epoch to its part count.
+                // The receiver uses this boundary to freeze an epoch-relative
+                // frame base and then derives each part from the raw sequence.
+                // Without alignment, observing part 1 before part 0 would make
+                // the boundary ambiguous and could permanently pair chunks from
+                // adjacent frames. At most `parts - 1` raw sequence values are
+                // skipped; packet statistics deliberately retain those holes.
+                let parts = f.wire_packets_per_frame_for(tx.channels) as u32;
+                tx.seq = align_wire_seq(tx.seq, parts);
             }
-            tx.rs_last = ent.frame.last().copied().unwrap_or(tx.rs_last);
+            let wire_input: &[f32] = if ent.channels == tx.channels {
+                &ent.frame
+            } else {
+                convert_channels(&ent.frame, ent.channels, tx.channels, &mut converted);
+                &converted
+            };
+            if let Some(last) = wire_input.chunks_exact(tx.channels as usize).last() {
+                tx.rs_last[..tx.channels as usize].copy_from_slice(last);
+            }
             let fmt = audiohub_net::media::rung_format(tx.rung);
             let rate = fmt.rate_hz;
             // 重采样输出写进**循环级**的暂存，不再是每条流一个字段。
@@ -2236,10 +2397,10 @@ pub(crate) fn tx_loop(
             let samples: &[f32] = match tx.rs.as_mut() {
                 Some(rs) => {
                     staged.clear();
-                    rs.process(&ent.frame, &mut staged);
+                    rs.process(wire_input, &mut staged);
                     &staged
                 }
-                None => &ent.frame,
+                None => wire_input,
             };
             // ------------------------------------ plan §7.2 发送侧软件增益
             //
@@ -2266,9 +2427,11 @@ pub(crate) fn tx_loop(
             tx.gain.set_target(TxShared::gain_of(
                 tx.shared.send_gain.load(Ordering::Relaxed),
             ));
-            let samples: &[f32] = tx.gain.apply(samples, rate, fmt.depth, &mut gained);
-            // 线上一帧拆成几个数据报。深档（48k/24、48k/32f）的整帧明文超过
-            // 一个以太网数据报装得下的量，按 **5 ms** 切成两个包发。
+            let samples: &[f32] =
+                tx.gain
+                    .apply_interleaved(samples, rate, fmt.depth, tx.channels, &mut gained);
+            // Split one 10 ms interleaved frame into the minimum number of
+            // equal MTU-safe datagrams. The widest stereo rung needs four.
             //
             // # 为什么是应用层 5 ms 分包，而不是让 IP 去分片
             //
@@ -2284,12 +2447,13 @@ pub(crate) fn tx_loop(
             // ⚠ **`FRAME_MS` 一个字不改。** 这里动的是**线上包时长**，
             // 与调度节拍是两件事（AES67 没有我们这种抖动缓冲，所以它把两者当成
             // 一件事；我们不必）。JB / 伺服 / DLL / 延迟档 / 音质分级全不受影响。
-            let parts = fmt.wire_packets_per_frame();
+            let parts = fmt.wire_packets_per_frame_for(tx.channels);
             let dropped = tx.loss.should_drop(); // advance LCG every frame
             if dropped {
                 // 丢的是**整帧**：`seq` 照样按实际会发的包数推进，否则接收侧的
                 // 期望序号会与发送侧错位，丢包率算出来是假的。
                 tx.seq = tx.seq.wrapping_add(parts as u32);
+                tx.media_frame_seq = tx.media_frame_seq.wrapping_add(1);
                 continue;
             }
             refresh_dest(tx);
@@ -2316,7 +2480,7 @@ pub(crate) fn tx_loop(
                 let header = Header {
                     kind: Kind::Media,
                     codec: Codec::for_depth(fmt.depth),
-                    channels: 1,
+                    channels: tx.channels,
                     sample_rate: rate,
                     session_id: tx.id as u64,
                     stream_id: tx.id,
@@ -2327,7 +2491,11 @@ pub(crate) fn tx_loop(
                     // 间隔」（微秒级）⇒ **一半的抖动样本近似 0**，p95 被系统性
                     // 拉低 ⇒ AUTO 的降档判据（抖动 > 15 ms）变迟钝。
                     // 加上偏移之后两个样本各自诚实。
-                    timestamp_us: split_timestamp_us(ts_us, p, parts),
+                    timestamp_us: media_timestamp_with_frame_tag(
+                        split_timestamp_us(ts_us, p, parts),
+                        tx.media_frame_seq,
+                        p,
+                    ),
                     payload_len: 0, // seal_into() sets ciphertext length
                 };
                 // **`sendto` 不在这条线程上了**（J1-1）：就地把数据报封进发送
@@ -2383,6 +2551,7 @@ pub(crate) fn tx_loop(
             if let Some(l) = tcp_link {
                 l.wake();
             }
+            tx.media_frame_seq = tx.media_frame_seq.wrapping_add(1);
         }
         // 每 tick 至多一次唤醒，在**全部**流入队之后。见 `UdpSender::wake`。
         if queued_any {
@@ -2559,65 +2728,699 @@ pub(crate) fn rx_loop(inner: Arc<DaemonInner>) {
     }
 }
 
-/// 一帧被切成 `parts` 个包时，第 `p` 个包该带的时间戳。
+/// Timestamp packet `part` at its position inside the 10 ms audio frame.
 ///
-/// ⚠ **后半包必须是 `ts + 5000 µs`，不能与前半包共用同一个时间戳。**
-/// 抖动是 `|transit − prev_transit|`；两个包若共用同一个 `timestamp_us`，
-/// 后半包的 transit 差会退化成「两包间的发送间隔」（微秒级），于是**一半的
-/// 抖动样本近似 0**，p95 被系统性拉低 ⇒ AUTO 的降档判据（抖动 > 15 ms）变迟钝，
-/// 链路已经很糟了它还不降档。
-///
-/// 单独提成函数是为了让守门测试**调用它**而不是把同一行算术抄一遍——
-/// 抄一遍的测试对生产代码的改动完全免疫（本项目栽过的「测试是戏剧」）。
+/// Reusing the frame timestamp for every packet would inject near-zero transit
+/// deltas and bias p95 jitter downward. Keep this as a callable production
+/// helper so the guard test cannot pass by duplicating the arithmetic.
 pub(crate) fn split_timestamp_us(frame_ts_us: u64, part: usize, parts: usize) -> u64 {
     frame_ts_us + (part as u64) * (FRAME_MS * 1000 / parts.max(1) as u64)
 }
 
-/// 深档丢了半帧时，把在手的那一半补成整帧。
+/// Return the first wrapping sequence at or after `seq` divisible by `parts`.
 ///
-/// `held_is_second` = 在手的是**后**半。补法是**上一段真实音频的衰减重复**——
-/// 与 `JitterBuffer::conceal` 同一条原语，只是作用在 240 个样本上而不是 480 个。
+/// `seq + (parts - seq % parts)` is wrong when the addition crosses u32 wrap
+/// and `parts` does not divide 2^32 (notably the three-packet stereo rung).
+/// Trying the at-most-four legal paddings preserves the receiver's invariant
+/// that every new epoch begins at a numeric part-zero boundary.
+fn align_wire_seq(seq: u32, parts: u32) -> u32 {
+    let parts = parts.clamp(1, audiohub_net::media::MAX_WIRE_PARTS as u32);
+    (0..parts)
+        .map(|padding| seq.wrapping_add(padding))
+        .find(|candidate| candidate % parts == 0)
+        .expect("one of consecutive wrapping sequence values is aligned")
+}
+
+const MEDIA_FRAME_COUNTER_BITS: u32 = 6;
+const MEDIA_FRAME_COUNTER_MASK: u64 = (1 << MEDIA_FRAME_COUNTER_BITS) - 1;
+const MEDIA_PACKET_PART_BITS: u32 = 2;
+const MEDIA_PACKET_PART_MASK: u64 = (1 << MEDIA_PACKET_PART_BITS) - 1;
+const MEDIA_FRAME_TAG_BITS: u32 = MEDIA_FRAME_COUNTER_BITS + MEDIA_PACKET_PART_BITS;
+const MEDIA_FRAME_TAG_MODULUS: u64 = 1 << MEDIA_FRAME_TAG_BITS;
+const MEDIA_FRAME_TAG_MASK: u64 = MEDIA_FRAME_TAG_MODULUS - 1;
+/// Beyond 64 frames (640 ms) even the degraded jitter buffer's 48-frame memory
+/// envelope cannot retain the missing audio. Exact PLC placement has no value
+/// there, so the receiver explicitly collapses and re-anchors adjacent.
+const MAX_TAGGED_TRANSITION_FRAMES: u32 = 64;
+
+/// Encode a bounded logical frame tag without expanding the frozen header.
 ///
-/// # 为什么不干脆丢掉整帧走 JB 的 PLC
-///
-/// 半帧隐藏正是「5 ms 分包」相对「让 IP 去分片」的核心收益：分片下任一片丢失
-/// 整帧作废，而这里**一半的真实音频保住了**，期望隐藏音频减半。
-/// 代价是 JB 看到的是一个「完整」帧、不会记 PLC ⇒ 调用方**必须**同时递增
-/// `JbState::half_conceal`，否则这条降级在 Q1 上完全不可见。那个计数器经
-/// `JbState::counts()` 以 **0.5 帧**的权重进 `quality::conceal_ratio`
-/// （一次半帧隐藏正好伪造 10 ms 里的 5 ms），并单独上报为
-/// `SessionStats::jb_half_conceal`。
-///
-/// # 为什么不等搭档
-///
-/// 等待要么设定时器（凭空多出一级缓冲），要么把这一拍拖到下一拍
-/// （直接顶穿延迟目标）。这条管线的纪律是不许为了平滑多留任何一帧：
-/// 搭档没来就是没来，下一帧的包一到，上一帧的残片立刻作废。
-fn conceal_missing_half(held: &[f32], held_is_second: bool, full: usize) -> Vec<f32> {
-    let missing = full.saturating_sub(held.len());
-    let mut out = Vec::with_capacity(full);
-    // 衰减系数与 `JitterBuffer` 的 PLC 同量级：一段 5 ms 的重复，线性淡出到 0。
-    let fade = |i: usize| 1.0 - (i as f32 + 1.0) / (missing.max(1) as f32 + 1.0);
-    if held_is_second {
-        // 缺的是**前**半：用后半的内容反向淡入，让它接到缺口上。
-        // （拿不到「上一帧的尾巴」——那住在 JB 里，这条路径上没有它。）
-        for i in 0..missing {
-            let s = held.get(i % held.len().max(1)).copied().unwrap_or(0.0);
-            out.push(s * (1.0 - fade(i)));
-        }
-        out.extend_from_slice(held);
+/// `timestamp_us` is authenticated header data and its microsecond precision is
+/// far finer than any timing decision in the receiver. The nearest timestamp
+/// whose low eight bits encode `(media_frame_seq mod 64, packet part)` differs
+/// by at most 128 us; two adjacent transit samples can therefore gain at most
+/// 256 us of error, below two percent of AUTO's 15 ms jitter threshold. Six
+/// counter bits make advances 1..=64 unique, while two part bits keep a format
+/// boundary self-describing even when u32 wrap changes numeric divisibility.
+fn media_timestamp_with_frame_tag(timestamp_us: u64, media_frame_seq: u64, part: usize) -> u64 {
+    let tag = ((media_frame_seq & MEDIA_FRAME_COUNTER_MASK) << MEDIA_PACKET_PART_BITS)
+        | (part as u64 & MEDIA_PACKET_PART_MASK);
+    let residue = timestamp_us & MEDIA_FRAME_TAG_MASK;
+    let forward = tag.wrapping_sub(residue) & MEDIA_FRAME_TAG_MASK;
+    let backward = MEDIA_FRAME_TAG_MODULUS - forward;
+    if forward <= backward {
+        timestamp_us
+            .checked_add(forward)
+            .or_else(|| timestamp_us.checked_sub(backward))
+            .unwrap_or(timestamp_us)
     } else {
-        out.extend_from_slice(held);
-        for i in 0..missing {
-            let s = held.get(i % held.len().max(1)).copied().unwrap_or(0.0);
-            out.push(s * fade(i));
+        timestamp_us
+            .checked_sub(backward)
+            .or_else(|| timestamp_us.checked_add(forward))
+            .unwrap_or(timestamp_us)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MediaFrameTag {
+    frame: u8,
+    part: usize,
+}
+
+fn media_frame_tag(timestamp_us: u64) -> MediaFrameTag {
+    let tag = timestamp_us & MEDIA_FRAME_TAG_MASK;
+    MediaFrameTag {
+        frame: (tag >> MEDIA_PACKET_PART_BITS) as u8,
+        part: (tag & MEDIA_PACKET_PART_MASK) as usize,
+    }
+}
+
+struct ReassembledWireFrame {
+    frame_seq: u32,
+    sample_rate: u32,
+    channels: u8,
+    samples: Vec<f32>,
+    partial_conceal: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WireFormatEpoch {
+    format: audiohub_net::media::WireFormat,
+    parts: usize,
+    /// Raw packet sequence at part zero of `frame_base`.
+    wire_base: u32,
+    /// Receiver-local frame sequence corresponding to `wire_base`.
+    frame_base: u32,
+    /// Greatest raw packet sequence admitted in this epoch.
+    high_wire_seq: u32,
+    /// Logical sender frame modulo 64 for `high_wire_seq`'s frame.
+    high_frame_tag: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WireFormatTransition {
+    from: audiohub_net::media::WireFormat,
+    from_parts: usize,
+    to: audiohub_net::media::WireFormat,
+    to_parts: usize,
+    /// A tagged transition exceeded the exact 64-frame window or carried an
+    /// inconsistent tag, so it was conservatively re-anchored adjacent.
+    frame_tag_fallback: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WirePacketPosition {
+    frame_seq: u32,
+    part: usize,
+    transition: Option<WireFormatTransition>,
+}
+
+/// Maps the sender's packet sequence onto a stable receiver-local frame clock.
+///
+/// The raw sequence advances once per datagram, so dividing it by the current
+/// packet count cannot be a frame clock when that count changes. A format epoch
+/// freezes the divisor and carries the local frame sequence across the boundary.
+/// A new format may commit only beyond the current raw-sequence high-water mark;
+/// packets from an older epoch therefore cannot roll the format back after
+/// reordering or retransmission.
+#[derive(Default)]
+pub(crate) struct WireFormatTimeline {
+    current: Option<WireFormatEpoch>,
+    /// Zero keeps the 1.0.0 ambiguity-preserving fallback; one decodes the
+    /// authenticated frame-counter/packet-part tag advertised by the sender.
+    frame_tag_version: u8,
+}
+
+impl WireFormatTimeline {
+    pub(crate) fn with_frame_tag_version(frame_tag_version: u8) -> Self {
+        Self {
+            current: None,
+            frame_tag_version: frame_tag_version.min(1),
         }
     }
-    out.truncate(full);
-    while out.len() < full {
-        out.push(0.0);
+
+    fn rebase_behind_high_water(epoch: &mut WireFormatEpoch) {
+        const REBASE_AFTER_PACKETS: u32 = 1 << 30;
+        const RETAIN_FRAMES: u32 = 4;
+
+        let high_offset = epoch.high_wire_seq.wrapping_sub(epoch.wire_base);
+        if high_offset < REBASE_AFTER_PACKETS {
+            return;
+        }
+        let high_frame = high_offset / epoch.parts as u32;
+        let shift_frames = high_frame.saturating_sub(RETAIN_FRAMES);
+        epoch.wire_base = epoch
+            .wire_base
+            .wrapping_add(shift_frames.wrapping_mul(epoch.parts as u32));
+        epoch.frame_base = epoch.frame_base.wrapping_add(shift_frames);
     }
-    out
+
+    fn locate(
+        &mut self,
+        wire_seq: u32,
+        timestamp_us: u64,
+        format: audiohub_net::media::WireFormat,
+        parts: usize,
+    ) -> Option<WirePacketPosition> {
+        if !(1..=audiohub_net::media::MAX_WIRE_PARTS).contains(&parts) {
+            return None;
+        }
+
+        let tag = media_frame_tag(timestamp_us);
+        let tag_part_valid = self.frame_tag_version < 1 || tag.part < parts;
+        let part = if self.frame_tag_version >= 1 && tag_part_valid {
+            tag.part
+        } else {
+            wire_seq as usize % parts
+        };
+        let wire_base = wire_seq.wrapping_sub(part as u32);
+        let Some(mut epoch) = self.current else {
+            let frame_base = wire_base / parts as u32;
+            let epoch = WireFormatEpoch {
+                format,
+                parts,
+                wire_base,
+                frame_base,
+                high_wire_seq: wire_seq,
+                high_frame_tag: tag.frame,
+            };
+            self.current = Some(epoch);
+            return Some(WirePacketPosition {
+                frame_seq: frame_base,
+                part,
+                transition: None,
+            });
+        };
+
+        if epoch.format != format || epoch.parts != parts {
+            // The sender changes formats only between complete 10 ms frames and
+            // aligns its raw sequence to the new part count. The aligned base of
+            // a real successor epoch is therefore strictly newer than every raw
+            // sequence admitted under the old format. A delayed old packet fails
+            // this test even after A -> B -> A, because the current epoch's base
+            // remains newer than that packet.
+            if !wire_seq_after(wire_base, epoch.high_wire_seq) {
+                return None;
+            }
+            let high_offset = epoch.high_wire_seq.wrapping_sub(epoch.wire_base);
+            if high_offset >= (1 << 31) {
+                return None;
+            }
+            // Decompose the raw gap into an old-format tail, alignment padding,
+            // and zero or more wholly lost new-format frames. The per-stream
+            // authenticated frame tag fixes the total logical advance. If the
+            // transition exceeds its exact 640 ms window (or is inconsistent),
+            // commit it adjacent instead of rejecting every packet forever or
+            // manufacturing an unproven gap. Legacy senders use that same safe
+            // adjacent mapping because their timestamp low bits carry no tag.
+            let exact_advance = if self.frame_tag_version >= 1 && tag_part_valid {
+                transition_frame_advance(&epoch, wire_base, parts, tag.frame)
+            } else {
+                None
+            };
+            let frame_tag_fallback = self.frame_tag_version >= 1 && exact_advance.is_none();
+            let frame_advance = exact_advance.unwrap_or(1);
+            let previous = WireFormatTransition {
+                from: epoch.format,
+                from_parts: epoch.parts,
+                to: format,
+                to_parts: parts,
+                frame_tag_fallback,
+            };
+            let frame_base = epoch
+                .frame_base
+                .wrapping_add(high_offset / epoch.parts as u32)
+                .wrapping_add(frame_advance);
+            epoch = WireFormatEpoch {
+                format,
+                parts,
+                wire_base,
+                frame_base,
+                high_wire_seq: wire_seq,
+                high_frame_tag: tag.frame,
+            };
+            self.current = Some(epoch);
+            return Some(WirePacketPosition {
+                frame_seq: frame_base,
+                part,
+                transition: Some(previous),
+            });
+        }
+
+        let mut offset = wire_seq.wrapping_sub(epoch.wire_base);
+        if offset >= (1 << 31) {
+            // This is either from an older same-format epoch or older than the
+            // unambiguous half of the wrapping sequence space. Neither can be
+            // allowed to mutate the current assembly.
+            return None;
+        }
+        if self.frame_tag_version >= 1 && tag_part_valid && tag.part != offset as usize % parts {
+            return None;
+        }
+        if wire_seq_after(wire_seq, epoch.high_wire_seq) {
+            epoch.high_wire_seq = wire_seq;
+            epoch.high_frame_tag = tag.frame;
+            // Keep every comparison inside the unambiguous half of wrapping
+            // sequence space for indefinitely running fixed-quality streams.
+            // Four retained frames exceed the reassembler's two-frame window.
+            Self::rebase_behind_high_water(&mut epoch);
+            offset = wire_seq.wrapping_sub(epoch.wire_base);
+        }
+        let position = WirePacketPosition {
+            frame_seq: epoch.frame_base.wrapping_add(offset / parts as u32),
+            part: offset as usize % parts,
+            transition: None,
+        };
+        self.current = Some(epoch);
+        Some(position)
+    }
+}
+
+/// Resolve loss and alignment around a new format epoch.
+///
+/// Let `x` be wholly lost old-format frames after the old frame containing the
+/// high packet, and `y` wholly lost new-format frames before the first observed
+/// new packet. For old part `h`, old width `a`, new width `b`, and alignment
+/// padding `p`, the raw distance is `(a - h) + x*a + p + y*b`, while the logical
+/// frame advance is `1 + x + y`. The authenticated per-stream counter supplies
+/// that advance modulo 64 and the same tag supplies the observed packet part.
+/// Restricting the transition to 1..=64 makes the answer unique;
+/// callers explicitly re-anchor adjacent outside that bounded exact window.
+fn transition_frame_advance(
+    epoch: &WireFormatEpoch,
+    new_wire_base: u32,
+    new_parts: usize,
+    new_frame_tag: u8,
+) -> Option<u32> {
+    let old_offset = epoch.high_wire_seq.wrapping_sub(epoch.wire_base);
+    if old_offset >= (1 << 31) {
+        return None;
+    }
+    let old_parts = epoch.parts as u32;
+    let new_parts = new_parts as u32;
+    let old_part = old_offset % old_parts;
+    let raw_span = new_wire_base.wrapping_sub(epoch.high_wire_seq);
+    if raw_span == 0 || raw_span >= (1 << 31) {
+        return None;
+    }
+    let completion_packets = old_parts - old_part;
+    if raw_span < completion_packets {
+        return None;
+    }
+    // Every logical frame beyond completion consumes at least min(a, b) raw
+    // positions; alignment consumes additional positions and can only lower
+    // the possible advance. This upper bound prevents a real K=128/192 gap
+    // from aliasing to the six-bit K=64 tag value.
+    let max_possible_advance = 1 + (raw_span - completion_packets) / old_parts.min(new_parts);
+    if max_possible_advance > MAX_TAGGED_TRANSITION_FRAMES {
+        return None;
+    }
+    let tag_delta =
+        (new_frame_tag.wrapping_sub(epoch.high_frame_tag) as u32) & MEDIA_FRAME_COUNTER_MASK as u32;
+    let frame_advance = if tag_delta == 0 {
+        MAX_TAGGED_TRANSITION_FRAMES
+    } else {
+        tag_delta
+    };
+    if !(1..=MAX_TAGGED_TRANSITION_FRAMES).contains(&frame_advance) {
+        return None;
+    }
+
+    // `frame_advance = 1 + old_whole_lost + new_whole_lost`.
+    for old_whole_lost in 0..frame_advance {
+        let new_whole_lost = frame_advance - 1 - old_whole_lost;
+        let next_old_seq = epoch
+            .high_wire_seq
+            .wrapping_add(old_parts - old_part)
+            .wrapping_add(old_whole_lost.wrapping_mul(old_parts));
+        let expected_observed_base = align_wire_seq(next_old_seq, new_parts)
+            .wrapping_add(new_whole_lost.wrapping_mul(new_parts));
+        if expected_observed_base == new_wire_base {
+            return Some(frame_advance);
+        }
+    }
+    None
+}
+
+/// The two adjacent wire frames that may legitimately be in flight together.
+///
+/// Packet reordering across a frame boundary is normal: part 0 of frame N+1
+/// can arrive before the last parts of frame N.  Keeping only one partial frame
+/// turned that reorder into artificial concealment.  These slots stay ordered
+/// (`older`, then `newer`) and `retired_through` prevents a late packet from
+/// resurrecting a frame that has already been delivered or declared missing.
+#[derive(Default)]
+pub(crate) struct WireFrameAssembly {
+    older: Option<crate::PartialWireFrame>,
+    newer: Option<crate::PartialWireFrame>,
+    retired_through: Option<u32>,
+}
+
+impl WireFrameAssembly {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// One datagram can unblock both adjacent frames, so reassembly may return two
+/// frames.  A fixed batch avoids another allocation on the receive path.
+struct ReassembledWireBatch {
+    frames: [Option<ReassembledWireFrame>; 2],
+    len: usize,
+}
+
+impl ReassembledWireBatch {
+    fn new() -> Self {
+        Self {
+            frames: [None, None],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, frame: ReassembledWireFrame) {
+        debug_assert!(self.len < self.frames.len());
+        self.frames[self.len] = Some(frame);
+        self.len += 1;
+    }
+}
+
+/// Finalize an incomplete packet set without adding another buffering tier.
+///
+/// At least half of the chunks must be real. Otherwise returning `None` leaves
+/// the frame sequence absent and lets the jitter buffer apply its whole-frame
+/// PLC. When enough chunks survived, every real chunk remains bit-identical in
+/// its original position. Each missing run is filled by fading from the nearest
+/// real chunk before it toward the nearest real chunk after it; a prefix fades
+/// in from zero and a suffix fades out to zero. Gains advance per audio frame,
+/// not per scalar, so stereo channels cannot receive different envelopes.
+fn finalize_partial_wire_frame(pending: crate::PartialWireFrame) -> Option<ReassembledWireFrame> {
+    let parts = pending.parts;
+    if !(2..=audiohub_net::media::MAX_WIRE_PARTS).contains(&parts) {
+        return None;
+    }
+    let present = pending.chunks[..parts]
+        .iter()
+        .filter(|chunk| chunk.is_some())
+        .count();
+    if present * 2 < parts {
+        return None;
+    }
+    let chunk_len = pending.chunks[..parts]
+        .iter()
+        .find_map(|chunk| chunk.as_ref().map(Vec::len))?;
+    let channels = pending.channels.clamp(1, 2) as usize;
+    if chunk_len == 0
+        || chunk_len % channels != 0
+        || pending.chunks[..parts]
+            .iter()
+            .flatten()
+            .any(|chunk| chunk.len() != chunk_len)
+    {
+        return None;
+    }
+
+    let partial_conceal = present != parts;
+    let chunk_frames = chunk_len / channels;
+    let mut samples = Vec::with_capacity(chunk_len * parts);
+    for part in 0..parts {
+        if let Some(chunk) = pending.chunks[part].as_ref() {
+            samples.extend_from_slice(chunk);
+            continue;
+        }
+
+        let mut run_start = part;
+        while run_start > 0 && pending.chunks[run_start - 1].is_none() {
+            run_start -= 1;
+        }
+        let mut run_end = part + 1;
+        while run_end < parts && pending.chunks[run_end].is_none() {
+            run_end += 1;
+        }
+        let left = run_start
+            .checked_sub(1)
+            .and_then(|index| pending.chunks[index].as_deref());
+        let right = (run_end < parts)
+            .then(|| pending.chunks[run_end].as_deref())
+            .flatten();
+        let hidden_frames = (run_end - run_start) * chunk_frames;
+        let hidden_base = (part - run_start) * chunk_frames;
+
+        for frame in 0..chunk_frames {
+            let u = (hidden_base + frame + 1) as f32 / (hidden_frames + 1) as f32;
+            for channel in 0..channels {
+                let scalar = frame * channels + channel;
+                let value = match (left, right) {
+                    (Some(before), Some(after)) => before[scalar] * (1.0 - u) + after[scalar] * u,
+                    (Some(before), None) => before[scalar] * (1.0 - u),
+                    (None, Some(after)) => after[scalar] * u,
+                    (None, None) => 0.0,
+                };
+                samples.push(value);
+            }
+        }
+    }
+
+    Some(ReassembledWireFrame {
+        frame_seq: pending.frame_seq,
+        sample_rate: pending.sample_rate,
+        channels: pending.channels,
+        samples,
+        partial_conceal,
+    })
+}
+
+fn partial_wire_frame_with_chunk(
+    frame_seq: u32,
+    part: usize,
+    parts: usize,
+    sample_rate: u32,
+    channels: u8,
+    decoded: Vec<f32>,
+) -> crate::PartialWireFrame {
+    let mut current = empty_partial_wire_frame(frame_seq, parts, sample_rate, channels);
+    current.chunks[part] = Some(decoded);
+    current
+}
+
+fn empty_partial_wire_frame(
+    frame_seq: u32,
+    parts: usize,
+    sample_rate: u32,
+    channels: u8,
+) -> crate::PartialWireFrame {
+    crate::PartialWireFrame {
+        frame_seq,
+        parts,
+        sample_rate,
+        channels,
+        chunks: std::array::from_fn(|_| None),
+    }
+}
+
+fn wire_frame_complete(frame: &crate::PartialWireFrame) -> bool {
+    frame.chunks[..frame.parts].iter().all(Option::is_some)
+}
+
+/// Sequence comparison for a wrapping u32 media timeline.
+fn wire_seq_after(candidate: u32, anchor: u32) -> bool {
+    let distance = candidate.wrapping_sub(anchor);
+    distance != 0 && distance < (1 << 31)
+}
+
+fn retire_oldest_wire_frame(assembly: &mut WireFrameAssembly, ready: &mut ReassembledWireBatch) {
+    let Some(oldest) = assembly.older.take() else {
+        return;
+    };
+    assembly.retired_through = Some(oldest.frame_seq);
+    if let Some(frame) = finalize_partial_wire_frame(oldest) {
+        ready.push(frame);
+    }
+    assembly.older = assembly.newer.take();
+}
+
+fn deliver_complete_wire_frames(
+    assembly: &mut WireFrameAssembly,
+    ready: &mut ReassembledWireBatch,
+) {
+    while assembly.older.as_ref().is_some_and(wire_frame_complete) {
+        retire_oldest_wire_frame(assembly, ready);
+    }
+}
+
+fn insert_wire_chunk(
+    frame: &mut crate::PartialWireFrame,
+    frame_seq: u32,
+    part: usize,
+    parts: usize,
+    sample_rate: u32,
+    channels: u8,
+    decoded: Vec<f32>,
+) {
+    if frame.frame_seq == frame_seq
+        && frame.parts == parts
+        && frame.sample_rate == sample_rate
+        && frame.channels == channels
+    {
+        frame.chunks[part] = Some(decoded);
+    } else {
+        // A single logical frame cannot safely combine chunks carrying
+        // different format metadata. Replace it and leave the discarded
+        // instance as a sequence hole instead of publishing mixed-format data.
+        *frame =
+            partial_wire_frame_with_chunk(frame_seq, part, parts, sample_rate, channels, decoded);
+    }
+}
+
+/// Insert one decoded wire chunk and return completed frames in strict order.
+///
+/// Frames N and N+1 may coexist. N is finalized only when it becomes complete,
+/// or when N+2 establishes that its reorder window has expired. A complete N+1
+/// waits behind incomplete N; when a late chunk completes N, both frames can be
+/// returned by the same call. Fewer than half of an expired frame's chunks still
+/// produce no frame, preserving the jitter buffer's whole-frame PLC semantics.
+fn collect_wire_chunk(
+    assembly: &mut WireFrameAssembly,
+    frame_seq: u32,
+    part: usize,
+    parts: usize,
+    sample_rate: u32,
+    channels: u8,
+    decoded: Vec<f32>,
+) -> ReassembledWireBatch {
+    let mut ready = ReassembledWireBatch::new();
+    if parts == 1 {
+        assembly.clear();
+        ready.push(ReassembledWireFrame {
+            frame_seq,
+            sample_rate,
+            channels,
+            samples: decoded,
+            partial_conceal: false,
+        });
+        return ready;
+    }
+    if parts > audiohub_net::media::MAX_WIRE_PARTS || part >= parts {
+        return ready;
+    }
+
+    if let Some(retired) = assembly.retired_through {
+        if !wire_seq_after(frame_seq, retired) {
+            return ready;
+        }
+    }
+
+    let mut decoded = Some(decoded);
+    loop {
+        let Some(older_seq) = assembly.older.as_ref().map(|frame| frame.frame_seq) else {
+            let incoming = partial_wire_frame_with_chunk(
+                frame_seq,
+                part,
+                parts,
+                sample_rate,
+                channels,
+                decoded.take().expect("wire chunk inserted once"),
+            );
+            if assembly
+                .retired_through
+                .is_some_and(|retired| frame_seq.wrapping_sub(retired) == 2)
+            {
+                // Preserve the one missing adjacent frame as an empty slot. A
+                // late N+1 can still fill it; N+2 expires it normally.
+                assembly.older = Some(empty_partial_wire_frame(
+                    frame_seq.wrapping_sub(1),
+                    parts,
+                    sample_rate,
+                    channels,
+                ));
+                assembly.newer = Some(incoming);
+            } else {
+                assembly.older = Some(incoming);
+            }
+            break;
+        };
+
+        if frame_seq == older_seq {
+            insert_wire_chunk(
+                assembly.older.as_mut().expect("older slot exists"),
+                frame_seq,
+                part,
+                parts,
+                sample_rate,
+                channels,
+                decoded.take().expect("wire chunk inserted once"),
+            );
+            break;
+        }
+
+        if assembly
+            .newer
+            .as_ref()
+            .is_some_and(|frame| frame.frame_seq == frame_seq)
+        {
+            insert_wire_chunk(
+                assembly.newer.as_mut().expect("newer slot exists"),
+                frame_seq,
+                part,
+                parts,
+                sample_rate,
+                channels,
+                decoded.take().expect("wire chunk inserted once"),
+            );
+            break;
+        }
+
+        if assembly.newer.is_none() && older_seq.wrapping_sub(frame_seq) == 1 {
+            // The first packet we saw belonged to N+1. Admit the immediately
+            // preceding N only if it has not already crossed the retired floor.
+            assembly.newer = assembly.older.take();
+            assembly.older = Some(partial_wire_frame_with_chunk(
+                frame_seq,
+                part,
+                parts,
+                sample_rate,
+                channels,
+                decoded.take().expect("wire chunk inserted once"),
+            ));
+            break;
+        }
+
+        let forward = frame_seq.wrapping_sub(older_seq);
+        if forward == 1 {
+            debug_assert!(assembly.newer.is_none());
+            assembly.newer = Some(partial_wire_frame_with_chunk(
+                frame_seq,
+                part,
+                parts,
+                sample_rate,
+                channels,
+                decoded.take().expect("wire chunk inserted once"),
+            ));
+            break;
+        }
+        if forward < (1 << 31) {
+            // N+2 (or a larger forward jump) is the explicit expiry boundary.
+            // Retire in order until the incoming frame fits the two-slot window.
+            retire_oldest_wire_frame(assembly, &mut ready);
+            deliver_complete_wire_frames(assembly, &mut ready);
+            continue;
+        }
+
+        // Older than both live slots: it is late and must not evict either.
+        return ready;
+    }
+
+    deliver_complete_wire_frames(assembly, &mut ready);
+    ready
 }
 
 pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) {
@@ -2698,16 +3501,26 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
                     h.codec
                 );
             }
-            // ---- 深档的 5 ms 分包：把两个半帧拼回一帧 ------------------------
-            //
-            // 判据用**实到样本数**而不是格式表：一个不分包的对端发来整帧时
-            // 照样能认出来，而按表推会把它当半帧去等一个永远不来的搭档。
-            let full = (h.sample_rate as usize / 100).max(1); // 10 ms @ 线上速率
-            let parts = if !decoded.is_empty() && decoded.len() * 2 == full {
-                2
-            } else {
-                1
+            // The stream width is frozen by OpenStream. A header that changes
+            // it mid-stream would reinterpret every scalar after this point.
+            let wire_channels = h.channels.clamp(1, 2);
+            if audiohub_net::media::rung_of(h.sample_rate, depth).is_none() {
+                let mut c = lk(&rx.stats);
+                c.format_mismatch += 1;
+                dlog!(
+                    "[audiohubd] stream {} received format outside the ladder {:?} @ {} Hz; dropping",
+                    h.stream_id,
+                    depth,
+                    h.sample_rate
+                );
+                return;
+            }
+            let fmt = audiohub_net::media::WireFormat {
+                rate_hz: h.sample_rate,
+                depth,
             };
+            let parts = fmt.wire_packets_per_frame_for(wire_channels);
+            let full = (h.sample_rate as usize / 100).max(1) * wire_channels as usize;
 
             // ---- 包头声明的格式必须与载荷长度**一一对应** ---------------------
             //
@@ -2732,7 +3545,7 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
             // ⚠ 这一段必须留在 `lk(&rx.jbs)` **之前**：它要取 `rx.stats`，而这条
             // 函数里既有的锁序是 stats → jbs（上面那个作用域先取 stats 再放）。
             // 在持有 jbs 时反向去取 stats 会引入一条相反的锁序。
-            if decoded.len() * parts != full {
+            if h.channels != rx.channels || decoded.len() * parts != full {
                 let n = {
                     let mut c = lk(&rx.stats);
                     c.format_mismatch += 1;
@@ -2744,154 +3557,156 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
                 // 样本数。三者一对照，错在哪一维一眼可见。
                 dlog!(
                     "[audiohubd] stream {} 包头格式与载荷长度对不上（第 {n} 次）：\
-                     codec {:?} @ {} Hz，载荷 {} B 解出 {} 样本，本帧应为 {} 样本；丢弃",
+                     codec {:?} @ {} Hz x {}ch (negotiated {}ch), payload {} B decoded to {} \
+                     scalars, expected {} scalars / {} parts; dropping",
                     h.stream_id,
                     h.codec,
                     h.sample_rate,
+                    h.channels,
+                    rx.channels,
                     plain.len(),
                     decoded.len(),
                     full,
+                    parts,
                 );
                 return;
             }
 
             let mut st = lk(&rx.jbs);
-
-            // `frame_seq` 是**帧**序号（JB 的 seq 必须逐帧 +1，它靠这个判洞）；
-            // `h.seq` 是**包**序号。分包数一变，换算基准就变了 ⇒ 帧序号会跳，
-            // 而 JB 的 `next_seq` 会永久停在那个跳过去的洞上（要靠 late_streak
-            // 熬 50 个包 ≈ 500 ms 静音才自愈）。所以这里**主动干净重建**。
-            //
-            // ⚠ 这一步的代价（重新预缓冲，约一个 JB 深度）只落在**跨越分包边界**
-            // 的换档上，也就是 rung 2 ↔ rung 1。而 AUTO 的天花板正是 rung 2
-            // ⇒ **AUTO 自己永远不会触发它**；只有用户手动把滑条拖过
-            // 「48 kHz·16 bit ↔ 48 kHz·24 bit」这条线时才会听到一次，
-            // 那时用户正在主动改音质。AUTO 内部的升降（rung 2..5）一如既往无缝。
-            if st.wire_parts != parts {
-                let was = st.wire_parts;
-                st.wire_parts = parts;
-                st.half = None;
-                if was != 0 {
-                    let target = st.jb.target();
-                    let tuning = st.jb.tuning();
-                    st.jb = audiohub_net::media::JitterBuffer::with_tuning(target, tuning);
-                    st.last_dropped = 0;
-                    st.late_streak = 0;
-                    // 五个 lifetime 计数器随新 JB 归零，这是一次真实的不连续。
-                    st.conceal.reset();
+            let Some(position) = st.wire_timeline.locate(h.seq, h.timestamp_us, fmt, parts) else {
+                // Authentication succeeded, but the packet belongs to an epoch
+                // older than the committed format boundary. It has already fed
+                // packet-level transport statistics; it must not touch format,
+                // reassembly, resampling, or the jitter buffer.
+                return;
+            };
+            if let Some(change) = position.transition {
+                // Chunks from two epochs can never form one audio frame. Drop at
+                // most the two-frame reorder window, but keep the jitter buffer,
+                // its learned target, and its concealment history. The stable
+                // local frame clock makes a rebuild both unnecessary and harmful.
+                st.partial.clear();
+                if change.frame_tag_fallback {
                     dlog!(
-                        "[audiohubd] stream {} 线上分包 {was} -> {parts}，JB 重建",
-                        h.stream_id
+                        "[audiohubd] stream {} media frame tag could not prove a format-boundary \
+                         gap at packet {}; re-anchoring the new epoch adjacent",
+                        h.stream_id,
+                        h.seq,
                     );
                 }
+                dlog!(
+                    "[audiohubd] stream {} wire format {:?}/{} parts -> {:?}/{} parts at packet {}",
+                    h.stream_id,
+                    change.from,
+                    change.from_parts,
+                    change.to,
+                    change.to_parts,
+                    h.seq,
+                );
             }
-            let frame_seq = h.seq / parts as u32;
-            let raw: Vec<f32> = if parts == 1 {
-                decoded
-            } else {
-                let second = h.seq % 2 == 1;
-                match st.half.take() {
-                    // 搭档到了：拼成整帧。乱序到达（后半先来）也能拼，
-                    // 因为配对判据是**帧序号**，不是到达顺序。
-                    Some((pseq, psecond, mut held)) if pseq == frame_seq && psecond != second => {
-                        if second {
-                            held.extend_from_slice(&decoded);
-                            held
-                        } else {
-                            let mut out = decoded;
-                            out.extend_from_slice(&held);
-                            out
-                        }
-                    }
-                    // 搭档没来（或来的是**上一帧**的残片）：立刻按半帧隐藏交付
-                    // 那一帧，**不等**。等待会把延迟目标顶穿。
-                    other => {
-                        if let Some((pseq, psecond, held)) = other {
-                            let filled = conceal_missing_half(&held, psecond, full);
-                            st.half_conceal += 1;
-                            st.jb.push(pseq, filled);
-                        }
-                        st.half = Some((frame_seq, second, decoded));
-                        // 这一半先攒着，本包到此为止（下面的抖动/目标维护照旧走）。
-                        Vec::new()
-                    }
-                }
-            };
-            let last_sample = raw.last().copied();
-            let frame = if raw.is_empty() {
-                // 只到了半帧，本拍没有可交付的整帧。
-                Vec::new()
-            } else if h.sample_rate == 48000 {
-                raw
-            } else {
-                if st.rs_rate != h.sample_rate || st.rs.is_none() {
-                    // continue from the last decoded sample: a mid-stream rate
-                    // change must not interpolate up from zero
-                    st.rs = Some(seeded_resampler(h.sample_rate, 48000, st.rs_last));
-                    st.rs_rate = h.sample_rate;
-                }
-                let mut out = Vec::with_capacity(F48 + 8);
-                st.rs.as_mut().unwrap().process(&raw, &mut out);
-                out
-            };
-            if let Some(l) = last_sample {
-                st.rs_last = l;
-            }
-            // 空帧不入 JB：`push` 会把 `frame_len` 当成 0 之外还占一个 seq，
-            // 于是那一帧对 JB 来说「到了、但是空的」——比没到还坏。
-            if !frame.is_empty() {
-                st.jb.push(frame_seq, frame.clone());
-            }
-            // starvation self-heal: if the JB keeps rejecting arrivals as
-            // late while nearly empty (expected seq raced ahead — mixer
-            // stall or cross-machine clock drift), restart it cleanly
-            if st.jb.dropped > st.last_dropped && st.jb.depth() <= 1 {
-                st.late_streak += 1;
-            } else {
-                st.late_streak = 0;
-            }
-            st.last_dropped = st.jb.dropped;
-            if st.late_streak >= 50 {
-                let target = st.jb.target();
-                // Restart this buffer, do **not** re-tune it. `JitterBuffer::new`
-                // would reach for `JbTuning::cached()` — i.e. `DEFAULT` — and a
-                // resync would silently swap a tier 1 stream's `DEGRADED`
-                // profile for the tier 0 one, on top of `with_tuning`'s
-                // `clamp(1, max_target)` chopping a learned depth of up to 40
-                // frames down to 12. The envelope comes back on the next
-                // `reshape_jitter_envelope` pass (<=1s), but its seed is
-                // `st.jb.target()` — already clamped — so the depth does not:
-                // it can only be re-earned one frame per underrun.
-                //
-                // The trigger is `late_streak >= 50`, i.e. arrivals judged late
-                // while the buffer sits near empty. That is precisely TCP's
-                // stall-then-burst shape, so the site fires *more* readily on
-                // the very link `DEGRADED` exists for. Same class of mistake as
-                // the stale-gate subject drift, one site over.
-                st.jb = audiohub_net::media::JitterBuffer::with_tuning(target, st.jb.tuning());
-                if !frame.is_empty() {
-                    st.jb.push(frame_seq, frame);
-                }
-                st.half = None;
-                st.last_dropped = 0;
-                st.late_streak = 0;
-                // 五个 lifetime 计数器随新 JB 归零，这是一次真实的不连续：
-                // 旧采样点不能再参与差分，否则窗口值会被 saturating_sub 压成 0，
-                // 让一次 resync 看起来像「这 10 秒完美无瑕」。
-                st.conceal.reset();
-                dlog!("[audiohubd] jb resync on stream {}", h.stream_id);
-            }
+            let ready = collect_wire_chunk(
+                &mut st.partial,
+                position.frame_seq,
+                position.part,
+                parts,
+                h.sample_rate,
+                wire_channels,
+                decoded,
+            );
             st.jit_win.push(jit_ms);
             if st.jit_win.len() > 256 {
                 st.jit_win.remove(0);
             }
-            st.pushes += 1;
-            // Q1 窗口的细分辨率采样点（规格 §4.6：每 10 次 push 一点，≈100 ms）。
-            // ticker 每秒还会补一点——那一路才是断流时唯一还在走的，因为**断流
-            // 时这里根本不执行**，而断流正是 Q1 最该报警的时候。
-            if st.pushes % 10 == 0 {
-                st.sample_conceal();
+
+            let pushes_before = st.pushes;
+            for ready_frame in ready.frames.into_iter().flatten() {
+                let ReassembledWireFrame {
+                    frame_seq,
+                    sample_rate: frame_rate,
+                    channels: frame_channels,
+                    samples: raw,
+                    partial_conceal,
+                } = ready_frame;
+                if partial_conceal {
+                    // The jitter buffer sees a complete-length frame and therefore
+                    // cannot account for this upstream concealment itself.
+                    st.half_conceal = st.half_conceal.saturating_add(1);
+                }
+                let last_frame = raw
+                    .chunks_exact(frame_channels as usize)
+                    .last()
+                    .map(|frame| {
+                        let mut last = [0.0; 2];
+                        last[..frame_channels as usize].copy_from_slice(frame);
+                        last
+                    });
+                let rs_last = st.rs_last;
+                let crate::JbState { rs, rs_rate, .. } = &mut *st;
+                let frame =
+                    resample_received_frame(rs, rs_rate, rs_last, frame_rate, frame_channels, raw);
+                if let Some(last) = last_frame {
+                    st.rs_last = last;
+                }
+                // Empty frames never enter the JB: `push` would consume a
+                // sequence number while carrying no audio, which is worse than
+                // leaving the sequence absent for ordinary PLC.
+                if frame.is_empty() {
+                    continue;
+                }
+                st.jb.push(frame_seq, frame.clone());
+
+                // Starvation self-heal runs once per completed FRAME, not once
+                // per wire part. A single datagram may now release two ordered
+                // frames, so both must advance these counters independently.
+                if st.jb.dropped > st.last_dropped && st.jb.depth() <= 1 {
+                    st.late_streak += 1;
+                } else {
+                    st.late_streak = 0;
+                }
+                st.last_dropped = st.jb.dropped;
+                if st.late_streak >= 50 {
+                    let target = st.jb.target();
+                    // Restart this buffer, do **not** re-tune it. `JitterBuffer::new`
+                    // would reach for `JbTuning::cached()` — i.e. `DEFAULT` — and a
+                    // resync would silently swap a tier 1 stream's `DEGRADED`
+                    // profile for the tier 0 one, on top of `with_tuning`'s
+                    // `clamp(1, max_target)` chopping a learned depth of up to 40
+                    // frames down to 12. The envelope comes back on the next
+                    // `reshape_jitter_envelope` pass (<=1s), but its seed is
+                    // `st.jb.target()` — already clamped — so the depth does not:
+                    // it can only be re-earned one frame per underrun.
+                    //
+                    // The trigger is `late_streak >= 50`, i.e. arrivals judged late
+                    // while the buffer sits near empty. That is precisely TCP's
+                    // stall-then-burst shape, so the site fires *more* readily on
+                    // the very link `DEGRADED` exists for. Same class of mistake as
+                    // the stale-gate subject drift, one site over.
+                    st.jb = audiohub_net::media::JitterBuffer::with_tuning_channels(
+                        target,
+                        st.jb.tuning(),
+                        st.channels,
+                    );
+                    st.jb.push(frame_seq, frame);
+                    st.partial.clear();
+                    st.last_dropped = 0;
+                    st.late_streak = 0;
+                    // Reset all five lifetime counters with the new JB. This
+                    // is a real discontinuity: old samples must not enter a
+                    // delta and make the next 10-second window look perfect.
+                    st.conceal.reset();
+                    dlog!("[audiohubd] jb resync on stream {}", h.stream_id);
+                }
+
+                st.pushes += 1;
+                // Fine-grained Q1 window sample (spec §4.6: every 10 frames,
+                // about 100 ms). The ticker also adds one each second; that is
+                // the only path still running during a blackout, when this
+                // receive path does not execute and Q1 matters most.
+                if st.pushes % 10 == 0 {
+                    st.sample_conceal();
+                }
             }
+            let frame_ready = st.pushes != pushes_before;
             // ---- 谁来决定 JB 的目标深度：伺服，还是抖动公式 ----
             //
             // 固定延迟档下**必须**是伺服，而且抖动公式必须彻底闭嘴。两个都写，
@@ -2899,7 +3714,7 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
             // 被改回抖动算出来的那个数，而界面照旧显示 200——「设置生效了」
             // 的错觉，正是本项目栽过五次的形态。
             let servo_want = rx.transport.servo_frames();
-            if st.pushes % 100 == 0 {
+            if frame_ready && st.pushes / 100 != pushes_before / 100 {
                 // 包络（min/max_target）只能在构造时给定。用户把目标从 100 ms
                 // 拖到 1000 ms 时，默认包络 4..12 帧 = 40..120 ms 根本够不着，
                 // 于是必须重建。每秒问一次、已经对了就立刻返回。
@@ -2911,18 +3726,20 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
                     h.stream_id,
                 );
                 if reseeded {
-                    // **把旧的伺服输出一并作废。**
+                    // Invalidate the old servo output as part of the rebuild.
                     //
-                    // 下面那条 `Some(_) if reseeded => {}` 的本意是「让伺服下一拍
-                    // 重新算」，但它只跳过**这一拍**——而这一拍与下一拍相隔 100 个
-                    // 包（≈1 s），伺服未必在这中间跑过。伺服没跑过时下一拍读到的
-                    // 还是那个**在旧包络下算出来的**旧值，于是刚落好的预置
-                    // （300 ms ⇒ 30 帧）会被一个 2、3 帧的旧值立刻推翻，
-                    // 之后只能靠伺服每拍 +1 帧地爬回去（30 帧要爬近 30 秒）。
+                    // The `Some(_) if reseeded` arm below skips only this
+                    // pass; the next pass is 100 audio frames (about one
+                    // second) later, and the servo may not have run between
+                    // them. Reusing an output computed under the old envelope
+                    // would immediately replace a fresh 30-frame preset with
+                    // an old two- or three-frame target, then take almost 30
+                    // seconds to climb back one frame at a time.
                     //
-                    // 这是一个**相位**决定输赢的竞态：伺服那一拍恰好落在重建之前
-                    // 还是之后，结论完全相反，而两条路径都不报错。清掉旧值把它
-                    // 从「看运气」变成「看得见的空缺」。
+                    // Whether the servo happens to run just before or just
+                    // after the rebuild must not decide the result. Clearing
+                    // the old value turns that timing race into an explicit
+                    // missing value that the next servo pass can replace.
                     rx.transport.set_servo_frames(None);
                 }
                 let servo_want = if reseeded { None } else { servo_want };
@@ -3054,6 +3871,28 @@ fn protect_output_sample(sample: f32, sole_airplay: bool) -> f32 {
     }
 }
 
+fn add_airplay_to_local_mix(
+    airplay_frame: &[[f32; 2]; F48],
+    mix: &mut [f32; F48_STEREO],
+    stereo_scratch: &mut [f32; F48_STEREO],
+    corr_a: &mut [f32; F48_STEREO],
+    contrib: &mut u32,
+    corr: &mut Option<f64>,
+) {
+    for (dst, frame) in stereo_scratch.chunks_exact_mut(2).zip(airplay_frame) {
+        dst.copy_from_slice(frame);
+    }
+    *contrib += 1;
+    if *contrib == 1 {
+        corr_a.copy_from_slice(stereo_scratch);
+    } else if *contrib == 2 {
+        *corr = crate::quality::correlation(corr_a, stereo_scratch);
+    }
+    for (dst, sample) in mix.iter_mut().zip(stereo_scratch.iter()) {
+        *dst += *sample;
+    }
+}
+
 /// Appends post-clip mixer output to the 2s ring used by mix_verdicts.
 fn push_mix(inner: &DaemonInner, samples: &[f32]) {
     let mut r = lk(&inner.mix_ring);
@@ -3064,24 +3903,1220 @@ fn push_mix(inner: &DaemonInner, samples: &[f32]) {
     }
 }
 
-/// 一个 `AudioTx` 播放环此刻的深度（级 8 `play_ring` / 级 8′ `bridge_ring`）。
+const SITE_CALLBACK_STALL_THRESHOLD: Duration = Duration::from_millis(250);
+const UNKNOWN_CALLBACK_AGE_US: u64 = u64::MAX;
+const SITE_PLAYBACK_RETRY_MIN: Duration = Duration::from_millis(250);
+const SITE_PLAYBACK_RETRY_MAX: Duration = Duration::from_secs(2);
+const SITE_PLAYBACK_STABLE_RUNNING: Duration = Duration::from_secs(1);
+const SITE_PLAYBACK_OPEN_WATCHDOG: Duration = Duration::from_secs(5);
+const SITE_PLAYBACK_OWNER_POLL: Duration = Duration::from_millis(25);
+const SITE_PLAYBACK_MAX_ABANDONED_OWNERS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SitePlaybackOpenTicket {
+    request_id: u64,
+    device_epoch: u64,
+    reason: &'static str,
+    requested_at: Instant,
+}
+
+#[derive(Default)]
+struct SitePlaybackBuildState {
+    next_request_id: u64,
+    pending: Option<SitePlaybackOpenTicket>,
+}
+
+impl SitePlaybackBuildState {
+    fn begin(
+        &mut self,
+        device_epoch: u64,
+        reason: &'static str,
+        now: Instant,
+    ) -> Option<SitePlaybackOpenTicket> {
+        if self.pending.is_some() {
+            return None;
+        }
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        let ticket = SitePlaybackOpenTicket {
+            request_id: self.next_request_id,
+            device_epoch,
+            reason,
+            requested_at: now,
+        };
+        self.pending = Some(ticket);
+        Some(ticket)
+    }
+
+    fn invalidate(&mut self) -> Option<SitePlaybackOpenTicket> {
+        self.pending.take()
+    }
+
+    fn complete_if_current(
+        &mut self,
+        request_id: u64,
+        request_epoch: u64,
+        current_epoch: u64,
+    ) -> Option<SitePlaybackOpenTicket> {
+        let current = self.pending.is_some_and(|pending| {
+            pending.request_id == request_id
+                && pending.device_epoch == request_epoch
+                && request_epoch == current_epoch
+        });
+        current.then(|| self.pending.take().expect("current ticket exists"))
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+}
+
+/// Requests coordinated away from the mixer. Each native default-output stream
+/// remains on its per-generation owner thread; only its sendable monitor and
+/// ring producer cross back to the mixer.
+pub(crate) enum SitePlaybackBuildReq {
+    Open {
+        request_id: u64,
+        device_epoch: u64,
+        reason: &'static str,
+    },
+    Retire {
+        request_id: u64,
+    },
+}
+
+pub(crate) struct SitePlaybackBuildDone {
+    request_id: u64,
+    device_epoch: u64,
+    reason: &'static str,
+    open_elapsed: Duration,
+    result: std::result::Result<(PlaybackMonitor, AudioTx), String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum SitePlaybackOwnerPhase {
+    Opening = 0,
+    Ready = 1,
+    Expired = 2,
+    Finished = 3,
+}
+
+impl SitePlaybackOwnerPhase {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::Ready,
+            2 => Self::Expired,
+            3 => Self::Finished,
+            _ => Self::Opening,
+        }
+    }
+}
+
+struct SitePlaybackOwnerProgress {
+    phase: AtomicU8,
+}
+
+impl SitePlaybackOwnerProgress {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(SitePlaybackOwnerPhase::Opening as u8),
+        }
+    }
+
+    fn phase(&self) -> SitePlaybackOwnerPhase {
+        SitePlaybackOwnerPhase::from_raw(self.phase.load(Ordering::Acquire))
+    }
+
+    /// Only one side may win the open/watchdog race. A late native open cannot
+    /// publish Ready after the coordinator has expired its generation.
+    fn opened(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                SitePlaybackOwnerPhase::Opening as u8,
+                SitePlaybackOwnerPhase::Ready as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn open_failed(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                SitePlaybackOwnerPhase::Opening as u8,
+                SitePlaybackOwnerPhase::Finished as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn expire_open(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                SitePlaybackOwnerPhase::Opening as u8,
+                SitePlaybackOwnerPhase::Expired as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn cancel(&self) {
+        let mut phase = self.phase.load(Ordering::Acquire);
+        while phase != SitePlaybackOwnerPhase::Expired as u8
+            && phase != SitePlaybackOwnerPhase::Finished as u8
+        {
+            match self.phase.compare_exchange_weak(
+                phase,
+                SitePlaybackOwnerPhase::Expired as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => phase = observed,
+            }
+        }
+    }
+
+    fn finish(&self) {
+        self.phase
+            .store(SitePlaybackOwnerPhase::Finished as u8, Ordering::Release);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SitePlaybackOwnerCmd {
+    Retire,
+}
+
+struct SitePlaybackOwner {
+    control: mpsc::Sender<SitePlaybackOwnerCmd>,
+    progress: Arc<SitePlaybackOwnerProgress>,
+    requested_at: Instant,
+    device_epoch: u64,
+    reason: &'static str,
+}
+
+fn site_playback_owner_budget_allows(abandoned: usize) -> bool {
+    abandoned < SITE_PLAYBACK_MAX_ABANDONED_OWNERS
+}
+
+fn site_playback_owner_watchdog_due(requested_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(requested_at) >= SITE_PLAYBACK_OPEN_WATCHDOG
+}
+
+fn site_playback_owner_loop(
+    request_id: u64,
+    device_epoch: u64,
+    reason: &'static str,
+    control: mpsc::Receiver<SitePlaybackOwnerCmd>,
+    progress: Arc<SitePlaybackOwnerProgress>,
+    done: mpsc::Sender<SitePlaybackBuildDone>,
+) {
+    let cancelled = || !matches!(control.try_recv(), Err(mpsc::TryRecvError::Empty));
+    if cancelled() {
+        progress.finish();
+        return;
+    }
+
+    let started = Instant::now();
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        LivePlayback::start_channels(48_000, 2)
+    }));
+    let open_elapsed = started.elapsed();
+    match opened {
+        Ok(Ok((playback, tx))) => {
+            // Expiry/cancellation wins by changing Opening first. The native
+            // handle is still local here, so every losing path drops it on the
+            // exact thread which created it.
+            if cancelled() || !progress.opened() {
+                drop(playback);
+                progress.finish();
+                return;
+            }
+            if cancelled() {
+                drop(playback);
+                progress.finish();
+                return;
+            }
+            let monitor = playback.monitor();
+            if done
+                .send(SitePlaybackBuildDone {
+                    request_id,
+                    device_epoch,
+                    reason,
+                    open_elapsed,
+                    result: Ok((monitor, tx)),
+                })
+                .is_err()
+            {
+                drop(playback);
+                progress.finish();
+                return;
+            }
+
+            let _ = control.recv();
+            drop(playback);
+            progress.finish();
+        }
+        Ok(Err(error)) => {
+            if progress.open_failed() {
+                let _ = done.send(SitePlaybackBuildDone {
+                    request_id,
+                    device_epoch,
+                    reason,
+                    open_elapsed,
+                    result: Err(format!("{error:#}")),
+                });
+            }
+            progress.finish();
+        }
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic payload");
+            if progress.open_failed() {
+                let _ = done.send(SitePlaybackBuildDone {
+                    request_id,
+                    device_epoch,
+                    reason,
+                    open_elapsed,
+                    result: Err(format!("default-output playback open panicked: {message}")),
+                });
+            }
+            progress.finish();
+        }
+    }
+}
+
+fn stop_site_playback_owners(owners: &mut HashMap<u64, SitePlaybackOwner>) {
+    for (_, owner) in owners.drain() {
+        owner.progress.cancel();
+        let _ = owner.control.send(SitePlaybackOwnerCmd::Retire);
+    }
+}
+
+/// Coordinates default-output owners away from the 10 ms mixer.
 ///
-/// ## ⚠ 采样相位：必须在 `push()` **之前**调用
+/// Each native open runs on its own detached owner thread. A successful owner
+/// retains and drops its `LivePlayback` on that same thread. The tracked
+/// coordinator never waits for an uninterruptible host call, so its shutdown
+/// and the daemon's join remain bounded even if one native open never returns.
+/// Owners deliberately receive no `DaemonInner`: after shutdown, a stuck host
+/// call can retain only its small control/progress channels, not daemon sockets,
+/// HAL state, peers, or other restart-sensitive resources.
+pub(crate) fn site_playback_builder_loop(
+    inner: Arc<DaemonInner>,
+    reqs: mpsc::Receiver<SitePlaybackBuildReq>,
+    done: mpsc::Sender<SitePlaybackBuildDone>,
+) {
+    let mut owners: HashMap<u64, SitePlaybackOwner> = HashMap::new();
+    loop {
+        if inner.shutdown.load(Ordering::SeqCst) {
+            stop_site_playback_owners(&mut owners);
+            return;
+        }
+
+        match reqs.recv_timeout(SITE_PLAYBACK_OWNER_POLL) {
+            Ok(SitePlaybackBuildReq::Open {
+                request_id,
+                device_epoch,
+                reason,
+            }) => {
+                let abandoned = owners
+                    .values()
+                    .filter(|owner| owner.progress.phase() == SitePlaybackOwnerPhase::Expired)
+                    .count();
+                if !site_playback_owner_budget_allows(abandoned) {
+                    let error = format!(
+                        "default-output playback owner budget exhausted: {abandoned} native \
+                         owners remain blocked after cancellation or watchdog expiry"
+                    );
+                    dlog!(
+                        "[audiohubd] site playback owner rejected request={} epoch={} reason={} \
+                         abandoned={} limit={}",
+                        request_id,
+                        device_epoch,
+                        reason,
+                        abandoned,
+                        SITE_PLAYBACK_MAX_ABANDONED_OWNERS,
+                    );
+                    if done
+                        .send(SitePlaybackBuildDone {
+                            request_id,
+                            device_epoch,
+                            reason,
+                            open_elapsed: Duration::ZERO,
+                            result: Err(error),
+                        })
+                        .is_err()
+                    {
+                        stop_site_playback_owners(&mut owners);
+                        return;
+                    }
+                    continue;
+                }
+
+                if let Some(previous) = owners.remove(&request_id) {
+                    previous.progress.cancel();
+                    let _ = previous.control.send(SitePlaybackOwnerCmd::Retire);
+                }
+
+                let requested_at = Instant::now();
+                let progress = Arc::new(SitePlaybackOwnerProgress::new());
+                let (control_send, control_recv) = mpsc::channel();
+                let owner_progress = Arc::clone(&progress);
+                let owner_done = done.clone();
+                let owner_thread = std::thread::Builder::new()
+                    .name(format!("ahb-playback-owner-{request_id}"))
+                    .spawn(move || {
+                        site_playback_owner_loop(
+                            request_id,
+                            device_epoch,
+                            reason,
+                            control_recv,
+                            owner_progress,
+                            owner_done,
+                        )
+                    });
+                match owner_thread {
+                    Ok(owner_thread) => {
+                        // Dropping a JoinHandle detaches it. This is deliberate:
+                        // an OS call with no cancellation API must not make the
+                        // daemon's tracked-thread join unbounded.
+                        drop(owner_thread);
+                        owners.insert(
+                            request_id,
+                            SitePlaybackOwner {
+                                control: control_send,
+                                progress,
+                                requested_at,
+                                device_epoch,
+                                reason,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        if done
+                            .send(SitePlaybackBuildDone {
+                                request_id,
+                                device_epoch,
+                                reason,
+                                open_elapsed: requested_at.elapsed(),
+                                result: Err(format!(
+                                    "spawn default-output playback owner: {error}"
+                                )),
+                            })
+                            .is_err()
+                        {
+                            stop_site_playback_owners(&mut owners);
+                            return;
+                        }
+                    }
+                }
+            }
+            Ok(SitePlaybackBuildReq::Retire { request_id }) => {
+                if let Some(owner) = owners.get(&request_id) {
+                    owner.progress.cancel();
+                    let _ = owner.control.send(SitePlaybackOwnerCmd::Retire);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                stop_site_playback_owners(&mut owners);
+                return;
+            }
+        }
+
+        owners.retain(|_, owner| owner.progress.phase() != SitePlaybackOwnerPhase::Finished);
+        let now = Instant::now();
+        let mut expired_results = Vec::new();
+        for (&request_id, owner) in &owners {
+            let elapsed = now.saturating_duration_since(owner.requested_at);
+            if !site_playback_owner_watchdog_due(owner.requested_at, now)
+                || !owner.progress.expire_open()
+            {
+                continue;
+            }
+            let _ = owner.control.send(SitePlaybackOwnerCmd::Retire);
+            dlog!(
+                "[audiohubd] site playback owner expired request={} epoch={} reason={} \
+                 open_elapsed_ms={} watchdog_ms={}",
+                request_id,
+                owner.device_epoch,
+                owner.reason,
+                elapsed.as_millis(),
+                SITE_PLAYBACK_OPEN_WATCHDOG.as_millis(),
+            );
+            expired_results.push(SitePlaybackBuildDone {
+                request_id,
+                device_epoch: owner.device_epoch,
+                reason: owner.reason,
+                open_elapsed: elapsed,
+                result: Err(format!(
+                    "default-output playback open exceeded the {} ms watchdog",
+                    SITE_PLAYBACK_OPEN_WATCHDOG.as_millis()
+                )),
+            });
+        }
+        for result in expired_results {
+            if done.send(result).is_err() {
+                stop_site_playback_owners(&mut owners);
+                return;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SitePlaybackOpenCause {
+    Initial,
+    DefaultOutputChanged,
+    StreamError,
+    CallbackStall,
+}
+
+/// Retry state for the daemon's real default-output stream.
 ///
-/// 被测量是「此刻交进这一级的样本还要排多久」。`push` 之前的 `queued()` 恰好是
-/// **排在这一帧前面**的样本数，也就是这一帧的驻留时间。`push` 之后读到的是它
-/// **+ 480**，恒定多算一整帧 ≈ 10 ms —— 刚推进去的 480 个样本不用等自己。
+/// A fatal callback error or a callback stall retires the old stream, then the
+/// mixer waits only a short bounded interval before reopening. A default-device
+/// epoch change is authoritative and bypasses any retry that was queued for the
+/// previous device.
+struct SitePlaybackRetry {
+    cause: SitePlaybackOpenCause,
+    retrying: bool,
+    not_before: Option<Instant>,
+    next_delay: Duration,
+    running_since: Option<Instant>,
+    stable: bool,
+}
+
+impl SitePlaybackRetry {
+    fn new() -> Self {
+        Self {
+            cause: SitePlaybackOpenCause::Initial,
+            retrying: false,
+            not_before: None,
+            next_delay: SITE_PLAYBACK_RETRY_MIN,
+            running_since: None,
+            stable: false,
+        }
+    }
+
+    fn open_reason(&self) -> &'static str {
+        match (self.cause, self.retrying) {
+            (SitePlaybackOpenCause::Initial, false) => "initial",
+            (SitePlaybackOpenCause::Initial, true) => "retry_after_open_failure",
+            (SitePlaybackOpenCause::DefaultOutputChanged, false) => "default_output_changed",
+            (SitePlaybackOpenCause::DefaultOutputChanged, true) => {
+                "retry_after_default_output_change"
+            }
+            (SitePlaybackOpenCause::StreamError, false) => "stream_error_recovery",
+            (SitePlaybackOpenCause::StreamError, true) => "retry_after_stream_error",
+            (SitePlaybackOpenCause::CallbackStall, false) => "callback_stall_recovery",
+            (SitePlaybackOpenCause::CallbackStall, true) => "retry_after_callback_stall",
+        }
+    }
+
+    fn ready(&self, now: Instant) -> bool {
+        self.not_before.is_none_or(|deadline| now >= deadline)
+    }
+
+    fn schedule(&mut self, now: Instant) -> Duration {
+        let delay = self.next_delay;
+        self.not_before = Some(now + delay);
+        self.next_delay = std::cmp::min(delay + delay, SITE_PLAYBACK_RETRY_MAX);
+        delay
+    }
+
+    fn after_stream_error(&mut self, now: Instant) -> Duration {
+        self.cause = SitePlaybackOpenCause::StreamError;
+        self.retrying = false;
+        self.running_since = None;
+        self.stable = false;
+        self.schedule(now)
+    }
+
+    fn after_callback_stall(&mut self, now: Instant) -> Duration {
+        self.cause = SitePlaybackOpenCause::CallbackStall;
+        self.retrying = false;
+        self.running_since = None;
+        self.stable = false;
+        self.schedule(now)
+    }
+
+    fn after_open_failure(&mut self, now: Instant) -> Duration {
+        self.retrying = true;
+        self.running_since = None;
+        self.stable = false;
+        self.schedule(now)
+    }
+
+    fn default_output_changed(&mut self) {
+        self.cause = SitePlaybackOpenCause::DefaultOutputChanged;
+        self.retrying = false;
+        self.not_before = None;
+        self.next_delay = SITE_PLAYBACK_RETRY_MIN;
+        self.running_since = None;
+        self.stable = false;
+    }
+
+    fn open_started(&mut self) {
+        self.retrying = false;
+        self.not_before = None;
+        self.running_since = None;
+        self.stable = false;
+    }
+
+    /// Clears accumulated backoff only after the replacement has delivered a
+    /// continuous Running window. `start_channels()` returning `Ok` is not
+    /// enough: WASAPI can report a fatal asynchronous error immediately after
+    /// that return, and treating it as success creates a permanent 250 ms loop.
+    fn observe_phase(&mut self, phase: SitePlaybackPhase, now: Instant) -> bool {
+        if self.stable {
+            return false;
+        }
+        if phase != SitePlaybackPhase::Running {
+            self.running_since = None;
+            return false;
+        }
+        let since = *self.running_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < SITE_PLAYBACK_STABLE_RUNNING {
+            return false;
+        }
+        self.next_delay = SITE_PLAYBACK_RETRY_MIN;
+        self.running_since = None;
+        self.stable = true;
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum SitePlaybackPhase {
+    Closed = 0,
+    Starting = 1,
+    Running = 2,
+    Stalled = 3,
+    Dead = 4,
+}
+
+impl SitePlaybackPhase {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::Starting,
+            2 => Self::Running,
+            3 => Self::Stalled,
+            4 => Self::Dead,
+            _ => Self::Closed,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stalled => "stalled",
+            Self::Dead => "dead",
+        }
+    }
+}
+
+fn classify_site_playback_phase(
+    alive: bool,
+    callback_count: u64,
+    callback_age: Option<Duration>,
+    age_since_open: Option<Duration>,
+) -> SitePlaybackPhase {
+    if !alive {
+        return SitePlaybackPhase::Dead;
+    }
+    let stale = match callback_age {
+        Some(age) => age > SITE_CALLBACK_STALL_THRESHOLD,
+        None if callback_count == 0 => {
+            age_since_open.is_some_and(|age| age > SITE_CALLBACK_STALL_THRESHOLD)
+        }
+        // The callback timestamp and count are deliberately relaxed atomics.
+        // If a reader catches the count first, wait for a coherent snapshot on
+        // the next tick instead of mistaking the stream's total age for a stall.
+        None => false,
+    };
+    if stale {
+        SitePlaybackPhase::Stalled
+    } else if callback_count == 0 {
+        SitePlaybackPhase::Starting
+    } else {
+        SitePlaybackPhase::Running
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SitePlaybackRetireCause {
+    StreamError,
+    CallbackStall,
+}
+
+fn site_playback_retire_cause(phase: SitePlaybackPhase) -> Option<SitePlaybackRetireCause> {
+    match phase {
+        SitePlaybackPhase::Dead => Some(SitePlaybackRetireCause::StreamError),
+        SitePlaybackPhase::Stalled => Some(SitePlaybackRetireCause::CallbackStall),
+        SitePlaybackPhase::Closed | SitePlaybackPhase::Starting | SitePlaybackPhase::Running => {
+            None
+        }
+    }
+}
+
+struct InstalledSitePlayback {
+    request_id: u64,
+    monitor: PlaybackMonitor,
+    tx: AudioTx,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SitePlaybackError {
+    generation: u64,
+    message: String,
+}
+
+#[derive(Debug, Default)]
+struct SitePlaybackMetadata {
+    open_reason: Option<String>,
+    pending_open_reason: Option<String>,
+    open_config: Option<PlaybackConfigSnapshot>,
+    last_stream_error: Option<SitePlaybackError>,
+}
+
+/// Lock-free hot-path snapshot for the daemon's one real default-output stream.
+/// Bridge outputs never publish here. The mutex contains transition-only text
+/// and configuration; the 10 ms mixer path writes atomics only.
+pub(crate) struct SitePlaybackProbe {
+    generation: AtomicU64,
+    phase: AtomicU8,
+    callback_count: AtomicU64,
+    callback_age_us: AtomicU64,
+    ring_queued: AtomicU64,
+    ring_capacity: AtomicU64,
+    ring_dropped: AtomicU64,
+    metadata: Mutex<SitePlaybackMetadata>,
+}
+
+impl SitePlaybackProbe {
+    pub(crate) fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            phase: AtomicU8::new(SitePlaybackPhase::Closed as u8),
+            callback_count: AtomicU64::new(0),
+            callback_age_us: AtomicU64::new(UNKNOWN_CALLBACK_AGE_US),
+            ring_queued: AtomicU64::new(0),
+            ring_capacity: AtomicU64::new(0),
+            ring_dropped: AtomicU64::new(0),
+            metadata: Mutex::new(SitePlaybackMetadata::default()),
+        }
+    }
+
+    fn clear_current(&self) {
+        self.callback_count.store(0, Ordering::Relaxed);
+        self.callback_age_us
+            .store(UNKNOWN_CALLBACK_AGE_US, Ordering::Relaxed);
+        self.ring_queued.store(0, Ordering::Relaxed);
+        self.ring_capacity.store(0, Ordering::Relaxed);
+        self.ring_dropped.store(0, Ordering::Relaxed);
+    }
+
+    fn reopened(&self, config: &PlaybackConfigSnapshot, reason: &str) -> u64 {
+        let generation = self.generation.load(Ordering::Relaxed).wrapping_add(1);
+        {
+            let mut metadata = lk(&self.metadata);
+            metadata.open_reason = Some(reason.to_owned());
+            metadata.pending_open_reason = None;
+            metadata.open_config = Some(config.clone());
+        }
+        self.clear_current();
+        self.generation.store(generation, Ordering::Release);
+        self.phase
+            .store(SitePlaybackPhase::Starting as u8, Ordering::Release);
+        generation
+    }
+
+    fn reopen_requested(&self, reason: &str) {
+        {
+            let mut metadata = lk(&self.metadata);
+            metadata.open_reason = None;
+            metadata.pending_open_reason = Some(reason.to_owned());
+            metadata.open_config = None;
+        }
+        self.clear_current();
+        self.phase
+            .store(SitePlaybackPhase::Closed as u8, Ordering::Release);
+    }
+
+    fn open_failed(&self, retry_reason: &str) {
+        {
+            let mut metadata = lk(&self.metadata);
+            metadata.open_reason = None;
+            metadata.pending_open_reason = Some(retry_reason.to_owned());
+            metadata.open_config = None;
+        }
+        self.clear_current();
+        self.phase
+            .store(SitePlaybackPhase::Closed as u8, Ordering::Release);
+    }
+
+    fn publish(
+        &self,
+        phase: SitePlaybackPhase,
+        callback_count: u64,
+        callback_age: Option<Duration>,
+        tx: &AudioTx,
+    ) {
+        self.callback_count.store(callback_count, Ordering::Relaxed);
+        self.callback_age_us.store(
+            callback_age
+                .map(|age| age.as_micros().min(u64::MAX as u128) as u64)
+                .unwrap_or(UNKNOWN_CALLBACK_AGE_US),
+            Ordering::Relaxed,
+        );
+        self.ring_queued
+            .store(tx.queued() as u64, Ordering::Relaxed);
+        self.ring_capacity
+            .store(tx.capacity() as u64, Ordering::Relaxed);
+        self.ring_dropped.store(tx.dropped(), Ordering::Relaxed);
+        self.phase.store(phase as u8, Ordering::Release);
+    }
+
+    fn record_stream_error(&self, generation: u64, message: String) {
+        lk(&self.metadata).last_stream_error = Some(SitePlaybackError {
+            generation,
+            message,
+        });
+    }
+
+    fn status(&self) -> serde_json::Value {
+        let phase = SitePlaybackPhase::from_raw(self.phase.load(Ordering::Acquire));
+        let present = phase != SitePlaybackPhase::Closed;
+        let callback_age_us = self.callback_age_us.load(Ordering::Relaxed);
+        let metadata = lk(&self.metadata);
+        serde_json::json!({
+            "generation": self.generation.load(Ordering::Acquire),
+            "state": phase.as_str(),
+            "alive": present.then_some(phase != SitePlaybackPhase::Dead),
+            "open_reason": metadata.open_reason.as_deref(),
+            "pending_open_reason": metadata.pending_open_reason.as_deref(),
+            "open_config": metadata.open_config.as_ref(),
+            "callback_count": present.then(|| self.callback_count.load(Ordering::Relaxed)),
+            "last_callback_age_ms": (present && callback_age_us != UNKNOWN_CALLBACK_AGE_US)
+                .then_some(callback_age_us / 1_000),
+            "ring": present.then(|| serde_json::json!({
+                "queued": self.ring_queued.load(Ordering::Relaxed),
+                "capacity": self.ring_capacity.load(Ordering::Relaxed),
+                "dropped": self.ring_dropped.load(Ordering::Relaxed),
+            })),
+            "last_stream_error": metadata.last_stream_error.as_ref(),
+        })
+    }
+}
+
+pub(crate) fn site_playback_status(probe: &SitePlaybackProbe) -> serde_json::Value {
+    probe.status()
+}
+
+struct SitePlaybackTransitions {
+    generation: u64,
+    phase: SitePlaybackPhase,
+    opened_at: Option<Instant>,
+}
+
+impl SitePlaybackTransitions {
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            phase: SitePlaybackPhase::Closed,
+            opened_at: None,
+        }
+    }
+
+    fn opened(
+        &mut self,
+        probe: &SitePlaybackProbe,
+        playback: &PlaybackMonitor,
+        reason: &str,
+        now: Instant,
+    ) {
+        let config = playback.config_snapshot();
+        self.generation = probe.reopened(config, reason);
+        self.phase = SitePlaybackPhase::Starting;
+        self.opened_at = Some(now);
+        dlog!(
+            "[audiohubd] site playback opened generation={} reason={} source={}Hz/{}ch \
+             device={}Hz/{}ch/{} buffer={}",
+            self.generation,
+            reason,
+            config.source_rate_hz,
+            config.source_channels,
+            config.device_rate_hz,
+            config.device_channels,
+            config.sample_format,
+            config.buffer_size,
+        );
+    }
+
+    fn closed(&mut self) {
+        self.phase = SitePlaybackPhase::Closed;
+        self.opened_at = None;
+    }
+
+    fn observe(
+        &mut self,
+        probe: &SitePlaybackProbe,
+        playback: &PlaybackMonitor,
+        tx: &AudioTx,
+        now: Instant,
+    ) -> SitePlaybackPhase {
+        let callback_count = tx.output_callback_count();
+        let callback_age = tx.last_output_callback_age();
+        let no_callback_age = self
+            .opened_at
+            .map(|opened| now.saturating_duration_since(opened));
+        let phase = classify_site_playback_phase(
+            playback.is_alive(),
+            callback_count,
+            callback_age,
+            no_callback_age,
+        );
+
+        // StreamHealth publishes its error text before its fatal flag. Mirror
+        // that ordering here: a status reader that acquires `Dead` must already
+        // be able to read the matching generation and error message.
+        let stream_error = if phase == SitePlaybackPhase::Dead {
+            playback.error_snapshot()
+        } else {
+            None
+        };
+        if let Some(message) = stream_error.clone() {
+            probe.record_stream_error(self.generation, message);
+        }
+        probe.publish(phase, callback_count, callback_age, tx);
+
+        if phase == self.phase {
+            return phase;
+        }
+        match phase {
+            SitePlaybackPhase::Stalled => {
+                let observed_age = callback_age.or(no_callback_age).unwrap_or_default();
+                dlog!(
+                    "[audiohubd] site playback stalled generation={} callback_count={} \
+                     callback_age_ms={} ring={}/{} dropped={}",
+                    self.generation,
+                    callback_count,
+                    observed_age.as_millis(),
+                    tx.queued(),
+                    tx.capacity(),
+                    tx.dropped(),
+                );
+            }
+            SitePlaybackPhase::Dead => {
+                dlog!(
+                    "[audiohubd] site playback dead generation={} callback_count={} \
+                     callback_age_ms={} ring={}/{} dropped={} error={}",
+                    self.generation,
+                    callback_count,
+                    callback_age.map_or(0, |age| age.as_millis()),
+                    tx.queued(),
+                    tx.capacity(),
+                    tx.dropped(),
+                    stream_error.as_deref().unwrap_or("unavailable"),
+                );
+            }
+            _ => {}
+        }
+        self.phase = phase;
+        phase
+    }
+}
+
+/// Retires the site stream when the default-output epoch advances.
 ///
-/// 这也是与源侧的相位对齐：源侧三级都在 `next_frame()` **之后**读，读到的同样是
-/// 「此刻进来的样本前面排着几个」。一边取谷值、一边取峰值，差的那 10 ms 会一直
-/// 挂在总数上，而且因为它恒定，看起来完全像一个真实的缓冲。
+/// This also cancels a delayed retry for the previous device. Calling it once
+/// near the start of a tick and once immediately before output protects the
+/// open/push window: a stream opened while the epoch changes is discarded
+/// rather than receiving a frame for the now-stale default device.
+fn apply_site_default_output_epoch(
+    probe: &SitePlaybackProbe,
+    observed_epoch: u64,
+    current_epoch: &mut u64,
+    playback: &mut Option<InstalledSitePlayback>,
+    build_state: &mut SitePlaybackBuildState,
+    builder: &mpsc::Sender<SitePlaybackBuildReq>,
+    transitions: &mut SitePlaybackTransitions,
+    retry: &mut SitePlaybackRetry,
+) -> bool {
+    if observed_epoch == *current_epoch {
+        return false;
+    }
+
+    *current_epoch = observed_epoch;
+    let generation = transitions.generation;
+    let retired = playback.take();
+    let had_stream = retired.is_some();
+    if let Some(playback) = retired.as_ref() {
+        let _ = builder.send(SitePlaybackBuildReq::Retire {
+            request_id: playback.request_id,
+        });
+    }
+    let invalidated = build_state.invalidate();
+    let had_open_request = invalidated.is_some();
+    if let Some(ticket) = invalidated {
+        // This command follows its Open on the same FIFO. If the native open is
+        // already blocking, the builder drops the result before servicing the
+        // replacement request; the mixer also rejects its stale completion.
+        let _ = builder.send(SitePlaybackBuildReq::Retire {
+            request_id: ticket.request_id,
+        });
+    }
+    retry.default_output_changed();
+    let reason = retry.open_reason();
+    probe.reopen_requested(reason);
+    transitions.closed();
+    drop(retired);
+    dlog!(
+        "[audiohubd] site playback reopen requested generation={} reason={} had_stream={} \
+         had_open_request={}",
+        generation,
+        reason,
+        had_stream,
+        had_open_request,
+    );
+    true
+}
+
+/// Publishes stream health and retires a playback after a fatal callback error
+/// or a callback stall. A stalled producer must not keep filling its one-second
+/// ring: if callbacks resume at the same rate, that backlog never drains and
+/// becomes permanent added latency.
+/// Returning `true` means the paired `AudioTx` was removed and must not receive
+/// this tick's output frame.
+fn observe_and_retire_unhealthy_site_playback(
+    probe: &SitePlaybackProbe,
+    playback: &mut Option<InstalledSitePlayback>,
+    builder: &mpsc::Sender<SitePlaybackBuildReq>,
+    transitions: &mut SitePlaybackTransitions,
+    retry: &mut SitePlaybackRetry,
+    now: Instant,
+) -> bool {
+    let phase = match playback.as_ref() {
+        Some(playback) => transitions.observe(probe, &playback.monitor, &playback.tx, now),
+        None => return false,
+    };
+    if retry.observe_phase(phase, now) {
+        dlog!(
+            "[audiohubd] site playback stable generation={} running_ms={} retry_ms_reset={}",
+            transitions.generation,
+            SITE_PLAYBACK_STABLE_RUNNING.as_millis(),
+            SITE_PLAYBACK_RETRY_MIN.as_millis(),
+        );
+    }
+    let Some(cause) = site_playback_retire_cause(phase) else {
+        return false;
+    };
+
+    let generation = transitions.generation;
+    let error = playback
+        .as_ref()
+        .and_then(|playback| playback.monitor.error_snapshot());
+    let delay = match cause {
+        SitePlaybackRetireCause::StreamError => retry.after_stream_error(now),
+        SitePlaybackRetireCause::CallbackStall => retry.after_callback_stall(now),
+    };
+    let next_reason = retry.open_reason();
+    let retired = playback.take();
+    if let Some(playback) = retired.as_ref() {
+        let _ = builder.send(SitePlaybackBuildReq::Retire {
+            request_id: playback.request_id,
+        });
+    }
+    probe.reopen_requested(next_reason);
+    transitions.closed();
+    drop(retired);
+    dlog!(
+        "[audiohubd] site playback retired generation={} reason={} \
+         next_open_reason={} retry_ms={} error={}",
+        generation,
+        match cause {
+            SitePlaybackRetireCause::StreamError => "stream_error",
+            SitePlaybackRetireCause::CallbackStall => "callback_stall",
+        },
+        next_reason,
+        delay.as_millis(),
+        error.as_deref().unwrap_or("unavailable"),
+    );
+    true
+}
+
+fn request_site_playback_open(
+    probe: &SitePlaybackProbe,
+    build_state: &mut SitePlaybackBuildState,
+    builder: &mpsc::Sender<SitePlaybackBuildReq>,
+    retry: &mut SitePlaybackRetry,
+    device_epoch: u64,
+    now: Instant,
+) -> bool {
+    if build_state.is_pending() || !retry.ready(now) {
+        return false;
+    }
+    let reason = retry.open_reason();
+    let Some(ticket) = build_state.begin(device_epoch, reason, now) else {
+        return false;
+    };
+    probe.reopen_requested(reason);
+    dlog!(
+        "[audiohubd] site playback open requested request={} epoch={} reason={}",
+        ticket.request_id,
+        ticket.device_epoch,
+        ticket.reason,
+    );
+    if builder
+        .send(SitePlaybackBuildReq::Open {
+            request_id: ticket.request_id,
+            device_epoch: ticket.device_epoch,
+            reason: ticket.reason,
+        })
+        .is_ok()
+    {
+        return true;
+    }
+
+    let _ = build_state.complete_if_current(
+        ticket.request_id,
+        ticket.device_epoch,
+        ticket.device_epoch,
+    );
+    let delay = retry.after_open_failure(now);
+    let retry_reason = retry.open_reason();
+    probe.open_failed(retry_reason);
+    dlog!(
+        "[audiohubd] site playback open finished request={} epoch={} reason={} result=error \
+         open_elapsed_ms=0 total_elapsed_ms=0 next_open_reason={} retry_ms={} \
+         error=playback builder unavailable",
+        ticket.request_id,
+        ticket.device_epoch,
+        ticket.reason,
+        retry_reason,
+        delay.as_millis(),
+    );
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_site_playback_build_results(
+    probe: &SitePlaybackProbe,
+    playback: &mut Option<InstalledSitePlayback>,
+    build_state: &mut SitePlaybackBuildState,
+    builder: &mpsc::Sender<SitePlaybackBuildReq>,
+    built: &mpsc::Receiver<SitePlaybackBuildDone>,
+    transitions: &mut SitePlaybackTransitions,
+    retry: &mut SitePlaybackRetry,
+    current_epoch: u64,
+    now: Instant,
+) {
+    while let Ok(done) = built.try_recv() {
+        let ticket =
+            build_state.complete_if_current(done.request_id, done.device_epoch, current_epoch);
+        let total_elapsed = ticket
+            .map(|ticket| now.saturating_duration_since(ticket.requested_at))
+            .unwrap_or_default();
+        let Some(ticket) = ticket else {
+            let result = if done.result.is_ok() {
+                let _ = builder.send(SitePlaybackBuildReq::Retire {
+                    request_id: done.request_id,
+                });
+                "stale_success"
+            } else {
+                "stale_error"
+            };
+            dlog!(
+                "[audiohubd] site playback open finished request={} epoch={} reason={} \
+                 result={} open_elapsed_ms={} current_epoch={}",
+                done.request_id,
+                done.device_epoch,
+                done.reason,
+                result,
+                done.open_elapsed.as_millis(),
+                current_epoch,
+            );
+            continue;
+        };
+
+        match done.result {
+            Ok((monitor, tx)) => {
+                dlog!(
+                    "[audiohubd] site playback open finished request={} epoch={} reason={} \
+                     result=ok open_elapsed_ms={} total_elapsed_ms={}",
+                    ticket.request_id,
+                    ticket.device_epoch,
+                    ticket.reason,
+                    done.open_elapsed.as_millis(),
+                    total_elapsed.as_millis(),
+                );
+                transitions.opened(probe, &monitor, ticket.reason, now);
+                retry.open_started();
+                let replaced = playback.replace(InstalledSitePlayback {
+                    request_id: ticket.request_id,
+                    monitor,
+                    tx,
+                });
+                if let Some(replaced) = replaced {
+                    let _ = builder.send(SitePlaybackBuildReq::Retire {
+                        request_id: replaced.request_id,
+                    });
+                }
+            }
+            Err(error) => {
+                let delay = retry.after_open_failure(now);
+                let retry_reason = retry.open_reason();
+                probe.open_failed(retry_reason);
+                dlog!(
+                    "[audiohubd] site playback open finished request={} epoch={} reason={} \
+                     result=error open_elapsed_ms={} total_elapsed_ms={} next_open_reason={} \
+                     retry_ms={} error={}",
+                    ticket.request_id,
+                    ticket.device_epoch,
+                    ticket.reason,
+                    done.open_elapsed.as_millis(),
+                    total_elapsed.as_millis(),
+                    retry_reason,
+                    delay.as_millis(),
+                    error,
+                );
+            }
+        }
+    }
+}
+
+/// Current depth of an `AudioTx` playback ring (stage 8 `play_ring` or
+/// stage 8-prime `bridge_ring`).
 ///
-/// 速率与容量都取自 `AudioTx` 自己的**设备**速率，不是 48000：环容量恰好等于
-/// `dev_rate`（1.000 秒），拿 48000 去除一个 44.1k 设备的读数会静默偏 −8.8%。
+/// ## Sampling phase: call before `push()`
 ///
-/// 丢弃方向是 `Newest`——`push_slice` 满了就短写，新采样根本没进环。这与三个
-/// 源侧 FIFO 的「丢最旧」在深度上完全简并，只有这个标签能把它们分开
-/// （规格 §0.2）。
+/// The measurement is how long a frame entering this stage must wait. Before
+/// `push`, `queued()` is exactly the number of samples ahead of that frame.
+/// Reading after `push` would add the frame's own 480 samples and overstate
+/// residence by a constant 10 ms.
+///
+/// This matches the source-side phase: its three stages are read immediately
+/// after `next_frame()`, so both sides report samples ahead of the incoming
+/// frame instead of mixing a trough on one side with a peak on the other.
+///
+/// Rate and capacity come from `AudioTx`'s device rate, not a hard-coded
+/// 48 kHz. The ring holds exactly one second at `dev_rate`; dividing a 44.1 kHz
+/// device count by 48 kHz would silently under-report it by 8.8 percent.
+///
+/// The drop mode is `Newest`: a full `push_slice` short-writes and the incoming
+/// samples never enter the ring. Depth alone cannot distinguish that from the
+/// source FIFOs dropping their oldest samples, so the explicit label matters.
 pub(crate) fn ring_depth_before_push(id: StageId, tx: &AudioTx) -> StageDepth {
     StageDepth {
         id,
@@ -3093,12 +5128,11 @@ pub(crate) fn ring_depth_before_push(id: StageId, tx: &AudioTx) -> StageDepth {
     }
 }
 
-/// 发布播放环深度（规格 §3.2 的级 8 `play_ring`）。
+/// Publish stage 8 `play_ring` depth.
 ///
-/// 取 `&StageSlot` 而不是 `&DaemonInner`：这一级的全部接线决策（哪个 getter
-/// 进哪个字段、丢弃方向标什么）都在这几行里，而 `DaemonInner` 要一个 UDP
-/// socket、一堆线程通道和一个真实设备才造得出来——那会把它们永久挡在测试
-/// 之外。调用方传 `&inner.play_ring`。
+/// Taking `&StageSlot` instead of `&DaemonInner` keeps every wiring decision in
+/// this small function and lets tests exercise it without constructing sockets,
+/// thread channels, or a real device. Production passes `&inner.play_ring`.
 pub(crate) fn publish_play_ring(slot: &StageSlot, tx: &AudioTx) {
     slot.store(Some(ring_depth_before_push(StageId::PlayRing, tx)));
 }
@@ -3121,7 +5155,7 @@ struct BridgeOut {
     _pb: LivePlayback,
     tx: AudioTx,
     refs: usize,
-    buf: [f32; F48],
+    buf: [f32; F48_STEREO],
     /// 本 tick **推之前**读到的环深度（级 8′ `bridge_ring`）。
     ///
     /// 存在这里而不是当场发布，是因为发布要按**流**做（一个桥可被多条流引用），
@@ -3140,13 +5174,13 @@ fn apply_mixcmd(cmd: MixCmd, bridges: &mut HashMap<String, BridgeOut>) {
             let opened = if bridges.contains_key(&device) {
                 Ok(None) // already open: this is only a new reference
             } else {
-                LivePlayback::start_on(&device, 48000)
+                LivePlayback::start_on_channels(&device, 48000, 2)
                     .map(|(pb, tx)| {
                         Some(BridgeOut {
                             _pb: pb,
                             tx,
                             refs: 0,
-                            buf: [0.0; F48],
+                            buf: [0.0; F48_STEREO],
                             depth: None,
                         })
                     })
@@ -3184,21 +5218,29 @@ fn apply_mixcmd(cmd: MixCmd, bridges: &mut HashMap<String, BridgeOut>) {
     }
 }
 
-pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) {
-    raise_audio_thread_qos("mixer_loop");
+pub(crate) fn mixer_loop(
+    inner: Arc<DaemonInner>,
+    cmds: mpsc::Receiver<MixCmd>,
+    site_builder: mpsc::Sender<SitePlaybackBuildReq>,
+    site_built: mpsc::Receiver<SitePlaybackBuildDone>,
+) {
+    let _qos_guard = raise_audio_thread_qos("mixer_loop");
     // 与 `tx_loop` 同一条理由：这也是一条 10 ms 截止期线程，`play_ring` 的
     // 5 ms `margin` 买的正是它的唤醒过冲，而一次阻塞 `write` 就能吃光它。
     rtlog::arm("mixer_loop");
     let start = Instant::now();
     let mut tick: u64 = 0;
-    let mut playback: Option<(LivePlayback, AudioTx)> = None;
-    let mut pb_fail_at: Option<Instant> = None;
+    let mut playback: Option<InstalledSitePlayback> = None;
+    let mut playback_build = SitePlaybackBuildState::default();
+    let mut playback_transitions = SitePlaybackTransitions::new();
+    let mut playback_retry = SitePlaybackRetry::new();
     let mut bridges: HashMap<String, BridgeOut> = HashMap::new();
     let mut dev_epoch = inner.dev_out_epoch.load(Ordering::Relaxed);
-    let mut mix = [0.0f32; F48];
-    let mut mon = [0.0f32; F48];
-    let mut frame = [0.0f32; F48];
-    let mut airplay_frame = [0.0f32; F48];
+    let mut mix = [0.0f32; F48_STEREO];
+    let mut mon = [0.0f32; F48_STEREO];
+    let mut frame = [0.0f32; F48_STEREO];
+    let mut stereo = [0.0f32; F48_STEREO];
+    let mut airplay_frame = [[0.0f32; 2]; F48];
     let mut airplay = inner.airplay.local_reader();
     // spec-m5b §5.4 microphone direction. Lifted out of the daemon mutex once,
     // here, so the tick itself never touches that lock; the bridge is installed
@@ -3226,7 +5268,7 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
     // 重复流判据（规格 §4.6）：把**第一个**送进本机输出的 frame 拷进暂存，
     // 与**第二个**做零延迟归一化互相关。零延迟即可——重复流是同一份解码结果
     // 分两条会话进来，样本级已经对齐。480 点点积 ≈ 1.4k flops / 10 ms。
-    let mut corr_a = [0.0f32; F48];
+    let mut corr_a = [0.0f32; F48_STEREO];
     loop {
         if inner.shutdown.load(Ordering::SeqCst) {
             return;
@@ -3234,19 +5276,18 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
         while let Ok(cmd) = cmds.try_recv() {
             apply_mixcmd(cmd, &mut bridges);
         }
-        {
-            // spec-m4c §D: the default output moved, so this stream now plays
-            // into the old device. Drop it and let the code below re-open on
-            // the new default; one frame of silence, no session teardown.
-            // Bridges name their device explicitly and are left alone.
-            let e = inner.dev_out_epoch.load(Ordering::Relaxed);
-            if e != dev_epoch {
-                dev_epoch = e;
-                dlog!("[audiohubd] default output changed; rebuilding the playback stream");
-                playback = None;
-                pb_fail_at = None; // retry now, not after the 10s backoff
-            }
-        }
+        // The default output moved, so this stream now targets the old device.
+        // Named bridge outputs are independent and remain open.
+        apply_site_default_output_epoch(
+            &inner.site_playback,
+            inner.dev_out_epoch.load(Ordering::Relaxed),
+            &mut dev_epoch,
+            &mut playback,
+            &mut playback_build,
+            &site_builder,
+            &mut playback_transitions,
+            &mut playback_retry,
+        );
         // never replay missed ticks (see tx_loop): each replayed tick is an
         // extra pop that races the JB expected-seq ahead of real arrivals
         let behind = start.elapsed().as_millis() as u64 / FRAME_MS;
@@ -3280,6 +5321,37 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
         let streams: Vec<Arc<RxStream>> = rd(&inner.rx_table).values().cloned().collect();
         let airplay_read = airplay.read_into(&mut airplay_frame);
         let airplay_local = airplay_read.session_id.is_some();
+        apply_site_playback_build_results(
+            &inner.site_playback,
+            &mut playback,
+            &mut playback_build,
+            &site_builder,
+            &site_built,
+            &mut playback_transitions,
+            &mut playback_retry,
+            dev_epoch,
+            Instant::now(),
+        );
+        observe_and_retire_unhealthy_site_playback(
+            &inner.site_playback,
+            &mut playback,
+            &site_builder,
+            &mut playback_transitions,
+            &mut playback_retry,
+            Instant::now(),
+        );
+        let site_output_requested =
+            airplay_local || streams.iter().any(|stream| stream.is_spk || stream.monitor);
+        if site_output_requested && playback.is_none() {
+            request_site_playback_open(
+                &inner.site_playback,
+                &mut playback_build,
+                &site_builder,
+                &mut playback_retry,
+                dev_epoch,
+                Instant::now(),
+            );
+        }
         if streams.is_empty() && !airplay_local {
             // an open bridge keeps being written to even before its stream's
             // first frame arrives: a virtual card that is never written to may
@@ -3318,14 +5390,16 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
         let mut corr: Option<f64> = None;
         for s in &streams {
             let popped = lk(&s.jbs).jb.pop();
-            lk(&s.post).advance(popped, &mut frame);
+            let frame_len = F48 * s.channels as usize;
+            lk(&s.post).advance(popped, &mut frame[..frame_len]);
+            to_stereo(&frame[..frame_len], s.channels, &mut stereo);
             // Q2 的可归属那一半（规格 §4.6）：测点在 advance 之后、加进任何
             // 目的地之前。这回答的是「我这一路送进来多响」，是**求和前**的量，
             // 与站点级的求和后削顶是两个不同的问题。
-            s.clip.feed(now_ms, &frame);
+            s.clip.feed(now_ms, &stereo);
             if let Some(ring) = s.ring.as_ref() {
                 let mut r = lk(ring);
-                r.extend(frame.iter().copied());
+                r.extend(stereo.chunks_exact(2).map(|f| (f[0] + f[1]) * 0.5));
                 if r.len() > RING_CAP {
                     let d = r.len() - RING_CAP;
                     r.drain(..d);
@@ -3335,8 +5409,8 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
             // one decoded frame may feed the virtual card AND the local output
             if let Some(name) = s.bridge.as_ref() {
                 if let Some(b) = bridges.get_mut(name) {
-                    for i in 0..F48 {
-                        b.buf[i] += frame[i];
+                    for i in 0..F48_STEREO {
+                        b.buf[i] += stereo[i];
                     }
                 }
             }
@@ -3344,26 +5418,26 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
             // and hal are independent destinations for the SAME decode
             // (spec-m5b §5.4). The bucket is chosen by the PEER's slot, so two
             // peers' audio can never meet.
-            add_to_hal_bucket(s.hal_slot, &frame, &mut hal_bufs, &mut hal_dirty);
+            add_to_hal_bucket(s.hal_slot, &stereo, &mut hal_bufs, &mut hal_dirty);
             if s.is_spk || s.monitor {
                 // 送本机真实输出的那一集合：`out = soft_clip(mix + mon)`。
                 // 站点级削顶正是在这里发生的，所以重复流判据也只看这一集合。
                 contrib += 1;
                 if contrib == 1 {
-                    corr_a.copy_from_slice(&frame);
+                    corr_a.copy_from_slice(&stereo);
                 } else if contrib == 2 {
-                    corr = crate::quality::correlation(&corr_a, &frame);
+                    corr = crate::quality::correlation(&corr_a, &stereo);
                 }
             }
             if s.is_spk {
                 any_spk = true;
-                for i in 0..F48 {
-                    mix[i] += frame[i];
+                for i in 0..F48_STEREO {
+                    mix[i] += stereo[i];
                 }
             } else if s.monitor {
                 any_mon = true;
-                for i in 0..F48 {
-                    mon[i] += frame[i];
+                for i in 0..F48_STEREO {
+                    mon[i] += stereo[i];
                 }
             }
         }
@@ -3371,16 +5445,15 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
             // AirPlay samples stay full-scale. The sender's dB event is
             // applied to the system output control in `airplay.rs`, never
             // multiplied into this frame.
-            contrib += 1;
-            if contrib == 1 {
-                corr_a.copy_from_slice(&airplay_frame);
-            } else if contrib == 2 {
-                corr = crate::quality::correlation(&corr_a, &airplay_frame);
-            }
+            add_airplay_to_local_mix(
+                &airplay_frame,
+                &mut mix,
+                &mut stereo,
+                &mut corr_a,
+                &mut contrib,
+                &mut corr,
+            );
             any_spk = true;
-            for i in 0..F48 {
-                mix[i] += airplay_frame[i];
-            }
         }
         inner.mix_meter.feed(now_ms, contrib, corr);
         let sole_airplay = airplay_local && contrib == 1;
@@ -3474,7 +5547,11 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
                 .iter()
                 .map(|&sample| protect_output_sample(sample, sole_airplay))
                 .collect();
-            push_mix(inner.as_ref(), &clipped);
+            let probe: Vec<f32> = clipped
+                .chunks_exact(2)
+                .map(|f| (f[0] + f[1]) * 0.5)
+                .collect();
+            push_mix(inner.as_ref(), &probe);
         } else {
             clear_mix(inner.as_ref());
         }
@@ -3482,20 +5559,64 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
         // 没有流送本机输出），不能留着上一次的读数。
         let mut have_play_ring = false;
         if any_spk || any_mon {
-            if playback.is_none()
-                && pb_fail_at.map_or(true, |t| t.elapsed() > Duration::from_secs(10))
-            {
-                match LivePlayback::start(48000) {
-                    Ok(p) => playback = Some(p),
-                    Err(e) => {
-                        dlog!("[audiohubd] playback unavailable: {e:#}");
-                        pb_fail_at = Some(Instant::now());
-                    }
-                }
+            // Recheck immediately before accepting an asynchronous open or
+            // writing. The device epoch can advance while this tick is mixed.
+            apply_site_default_output_epoch(
+                &inner.site_playback,
+                inner.dev_out_epoch.load(Ordering::Relaxed),
+                &mut dev_epoch,
+                &mut playback,
+                &mut playback_build,
+                &site_builder,
+                &mut playback_transitions,
+                &mut playback_retry,
+            );
+            apply_site_playback_build_results(
+                &inner.site_playback,
+                &mut playback,
+                &mut playback_build,
+                &site_builder,
+                &site_built,
+                &mut playback_transitions,
+                &mut playback_retry,
+                dev_epoch,
+                Instant::now(),
+            );
+            // A completion can be current when dequeued and stale one instant
+            // later. Recheck the epoch after committing it and before health or
+            // ring access; a stale native stream is retired on its owner thread.
+            apply_site_default_output_epoch(
+                &inner.site_playback,
+                inner.dev_out_epoch.load(Ordering::Relaxed),
+                &mut dev_epoch,
+                &mut playback,
+                &mut playback_build,
+                &site_builder,
+                &mut playback_transitions,
+                &mut playback_retry,
+            );
+            observe_and_retire_unhealthy_site_playback(
+                &inner.site_playback,
+                &mut playback,
+                &site_builder,
+                &mut playback_transitions,
+                &mut playback_retry,
+                Instant::now(),
+            );
+            if playback.is_none() {
+                request_site_playback_open(
+                    &inner.site_playback,
+                    &mut playback_build,
+                    &site_builder,
+                    &mut playback_retry,
+                    dev_epoch,
+                    Instant::now(),
+                );
             }
-            if let Some((_, tx)) = playback.as_mut() {
-                let mut out = [0.0f32; F48];
-                for i in 0..F48 {
+            if let Some(playback) = playback.as_mut() {
+                let tx = &mut playback.tx;
+                let mut out = [0.0f32; F48_STEREO];
+                for i in 0..F48_STEREO {
                     out[i] = mix[i] + mon[i];
                 }
                 // 站点级削顶计入点 3/3：真实默认输出。这是最重要的一个——
@@ -3546,9 +5667,22 @@ pub(crate) fn mixer_loop(inner: Arc<DaemonInner>, cmds: mpsc::Receiver<MixCmd>) 
 /// a single buffer and written to a single ring, so with two peers bound,
 /// whoever recorded peer A's virtual microphone also got peer B. Every positive
 /// test still passed — A's audio WAS in there.
+fn to_stereo(input: &[f32], channels: u8, out: &mut [f32; F48_STEREO]) {
+    match channels.clamp(1, 2) {
+        1 => {
+            for (i, &sample) in input.iter().take(F48).enumerate() {
+                out[i * 2] = sample;
+                out[i * 2 + 1] = sample;
+            }
+        }
+        2 => out.copy_from_slice(&input[..F48_STEREO]),
+        _ => unreachable!(),
+    }
+}
+
 fn add_to_hal_bucket(
     hal_slot: Option<u8>,
-    frame: &[f32; F48],
+    frame: &[f32; F48_STEREO],
     bufs: &mut [[f32; F48]],
     dirty: &mut u16,
 ) {
@@ -3559,7 +5693,7 @@ fn add_to_hal_bucket(
     }
     *dirty |= 1 << slot;
     for i in 0..F48 {
-        bufs[slot][i] += frame[i];
+        bufs[slot][i] += (frame[i * 2] + frame[i * 2 + 1]) * 0.5;
     }
 }
 
@@ -3629,6 +5763,95 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn stereo_is_only_downmixed_at_the_legacy_peer_boundary() {
+        let stereo = [1.0, 0.0, -0.25, 0.75, 0.4, -0.4];
+        let mut out = Vec::new();
+        convert_channels(&stereo, 2, 2, &mut out);
+        assert_eq!(out, stereo, "new-to-new transport changed L/R");
+
+        convert_channels(&stereo, 2, 1, &mut out);
+        assert_eq!(out, [0.5, 0.25, 0.0], "legacy mono compatibility changed");
+
+        let mut restored = [0.0; F48_STEREO];
+        let mono = vec![0.5; F48];
+        to_stereo(&mono, 1, &mut restored);
+        assert!(restored.chunks_exact(2).all(|f| f == [0.5, 0.5]));
+    }
+
+    #[test]
+    fn rx_48k_bypass_invalidates_a_parked_resampler_before_returning_to_the_same_rate() {
+        const LOW_RATE: u32 = 32_000;
+        const CHANNELS: u8 = 2;
+
+        let mut rs = None;
+        let mut rs_rate = MicSource::OUT_RATE;
+        let mut first_low = Vec::with_capacity(320 * CHANNELS as usize);
+        for _ in 0..320 {
+            first_low.extend_from_slice(&[0.9, -0.9]);
+        }
+        let _ = resample_received_frame(
+            &mut rs,
+            &mut rs_rate,
+            [0.0; 2],
+            LOW_RATE,
+            CHANNELS,
+            first_low,
+        );
+        assert!(
+            rs.is_some(),
+            "the first lower-rate frame did not build a converter"
+        );
+        assert_eq!(rs_rate, LOW_RATE);
+
+        let bypass_last = [0.25, -0.75];
+        let mut bypass = vec![0.0; F48_STEREO];
+        bypass[F48_STEREO - 2..].copy_from_slice(&bypass_last);
+        let bypass_expected = bypass.clone();
+        let bypassed = resample_received_frame(
+            &mut rs,
+            &mut rs_rate,
+            [0.9, -0.9],
+            MicSource::OUT_RATE,
+            CHANNELS,
+            bypass,
+        );
+        assert_eq!(
+            bypassed, bypass_expected,
+            "48 kHz stopped being a bit-exact bypass"
+        );
+        assert!(
+            rs.is_none(),
+            "a converter which skipped the 48 kHz frame remained reusable"
+        );
+        assert_eq!(
+            rs_rate,
+            MicSource::OUT_RATE,
+            "the converter's rate identity did not cross the bypass boundary"
+        );
+
+        let mut next_low = Vec::with_capacity(320 * CHANNELS as usize);
+        for _ in 0..320 {
+            next_low.extend_from_slice(&[0.1, 0.2]);
+        }
+        let got = resample_received_frame(
+            &mut rs,
+            &mut rs_rate,
+            bypass_last,
+            LOW_RATE,
+            CHANNELS,
+            next_low.clone(),
+        );
+        let mut fresh =
+            seeded_interleaved_resampler(LOW_RATE, MicSource::OUT_RATE, CHANNELS, bypass_last);
+        let mut expected = Vec::new();
+        fresh.process(&next_low, &mut expected);
+        assert_eq!(
+            got, expected,
+            "returning to the same lower rate reused phase/history from before the 48 kHz span"
+        );
+    }
+
+    #[test]
     fn sole_airplay_is_amplitude_transparent_but_mixed_output_stays_protected() {
         for sample in [-1.0f32, -0.95, 0.0, 0.95, 1.0] {
             assert_eq!(protect_output_sample(sample, true), sample);
@@ -3640,6 +5863,456 @@ pub(crate) mod tests {
         assert_eq!(protected, soft_clip(1.0));
         assert!(protected < 1.0);
         assert_ne!(protect_output_sample(0.95, false), 0.95);
+    }
+
+    #[test]
+    fn airplay_stereo_lanes_reach_local_mix_and_correlation() {
+        let mut airplay = [[0.0; 2]; F48];
+        for (index, frame) in airplay.iter_mut().enumerate() {
+            let left = index as f32 / F48 as f32;
+            *frame = [left, -left];
+        }
+        let expected: Vec<f32> = airplay.iter().flat_map(|frame| *frame).collect();
+
+        let mut mix = [0.25; F48_STEREO];
+        let mut stereo = [0.0; F48_STEREO];
+        let mut corr_a = [0.0; F48_STEREO];
+        let mut contrib = 0;
+        let mut corr = None;
+        add_airplay_to_local_mix(
+            &airplay,
+            &mut mix,
+            &mut stereo,
+            &mut corr_a,
+            &mut contrib,
+            &mut corr,
+        );
+
+        assert_eq!(contrib, 1);
+        assert_eq!(corr, None);
+        assert_eq!(stereo.as_slice(), expected.as_slice());
+        assert_eq!(corr_a.as_slice(), expected.as_slice());
+        for (mixed, source) in mix.iter().zip(expected.iter()) {
+            assert_eq!(*mixed, 0.25 + source);
+        }
+
+        let mut second_mix = [0.0; F48_STEREO];
+        let mut second_scratch = [0.0; F48_STEREO];
+        let mut second_contrib = 1;
+        let mut second_corr = None;
+        add_airplay_to_local_mix(
+            &airplay,
+            &mut second_mix,
+            &mut second_scratch,
+            &mut corr_a,
+            &mut second_contrib,
+            &mut second_corr,
+        );
+        assert_eq!(second_contrib, 2);
+        assert_eq!(second_corr, Some(1.0));
+        assert_eq!(second_mix.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn fatal_site_playback_retries_quickly_with_a_two_second_cap() {
+        let start = Instant::now();
+        let mut retry = SitePlaybackRetry::new();
+
+        let first = retry.after_stream_error(start);
+        assert_eq!(first, Duration::from_millis(250));
+        assert_eq!(retry.open_reason(), "stream_error_recovery");
+        assert!(!retry.ready(start + Duration::from_millis(249)));
+        assert!(retry.ready(start + Duration::from_millis(250)));
+
+        let mut now = start + first;
+        for expected in [500, 1_000, 2_000, 2_000, 2_000] {
+            let delay = retry.after_open_failure(now);
+            assert_eq!(delay, Duration::from_millis(expected));
+            assert_eq!(retry.open_reason(), "retry_after_stream_error");
+            assert!(!retry.ready(now + delay - Duration::from_millis(1)));
+            assert!(retry.ready(now + delay));
+            now += delay;
+        }
+    }
+
+    #[test]
+    fn callback_stall_uses_bounded_recovery_instead_of_preserving_the_ring() {
+        let start = Instant::now();
+        let mut retry = SitePlaybackRetry::new();
+
+        let first = retry.after_callback_stall(start);
+        assert_eq!(first, SITE_PLAYBACK_RETRY_MIN);
+        assert_eq!(retry.open_reason(), "callback_stall_recovery");
+        assert!(!retry.ready(start + first - Duration::from_millis(1)));
+        assert!(retry.ready(start + first));
+
+        let second = retry.after_open_failure(start + first);
+        assert_eq!(second, Duration::from_millis(500));
+        assert_eq!(retry.open_reason(), "retry_after_callback_stall");
+    }
+
+    #[test]
+    fn callback_age_classification_makes_stall_a_retirement_condition() {
+        let threshold = SITE_CALLBACK_STALL_THRESHOLD;
+        assert_eq!(
+            classify_site_playback_phase(true, 1, Some(threshold), None),
+            SitePlaybackPhase::Running,
+            "the exact threshold must not flap a healthy callback"
+        );
+        assert_eq!(
+            classify_site_playback_phase(true, 1, Some(threshold + Duration::from_millis(1)), None,),
+            SitePlaybackPhase::Stalled
+        );
+        assert_eq!(
+            classify_site_playback_phase(true, 0, None, Some(threshold + Duration::from_millis(1)),),
+            SitePlaybackPhase::Stalled,
+            "a stream which never produced its first callback must recover too"
+        );
+        assert_eq!(
+            classify_site_playback_phase(true, 1, None, Some(threshold + Duration::from_secs(1)),),
+            SitePlaybackPhase::Running,
+            "a relaxed count/timestamp snapshot must not use total stream age as callback age"
+        );
+        assert_eq!(
+            classify_site_playback_phase(false, 1, Some(Duration::ZERO), None),
+            SitePlaybackPhase::Dead
+        );
+
+        assert_eq!(
+            site_playback_retire_cause(SitePlaybackPhase::Stalled),
+            Some(SitePlaybackRetireCause::CallbackStall)
+        );
+        assert_eq!(
+            site_playback_retire_cause(SitePlaybackPhase::Dead),
+            Some(SitePlaybackRetireCause::StreamError)
+        );
+        assert_eq!(site_playback_retire_cause(SitePlaybackPhase::Running), None);
+    }
+
+    #[test]
+    fn playback_open_generation_rejects_stale_builder_results() {
+        let now = Instant::now();
+        let mut state = SitePlaybackBuildState::default();
+        let first = state.begin(7, "initial", now).expect("first request");
+        assert!(state.begin(7, "initial", now).is_none());
+        assert_eq!(state.invalidate(), Some(first));
+
+        let second = state
+            .begin(8, "default_output_changed", now)
+            .expect("replacement request");
+        assert!(
+            state
+                .complete_if_current(first.request_id, first.device_epoch, 8)
+                .is_none(),
+            "an old result replaced the new in-flight request"
+        );
+        assert!(state.is_pending());
+        assert!(
+            state
+                .complete_if_current(second.request_id, second.device_epoch, 9)
+                .is_none(),
+            "a result for an already superseded device epoch was accepted"
+        );
+        assert_eq!(
+            state.complete_if_current(second.request_id, second.device_epoch, 8),
+            Some(second)
+        );
+        assert!(!state.is_pending());
+    }
+
+    #[test]
+    fn expired_playback_owner_cannot_publish_a_late_native_open() {
+        let progress = SitePlaybackOwnerProgress::new();
+        assert_eq!(progress.phase(), SitePlaybackOwnerPhase::Opening);
+        assert!(progress.expire_open());
+        assert_eq!(progress.phase(), SitePlaybackOwnerPhase::Expired);
+        assert!(
+            !progress.opened(),
+            "a watchdog-expired native open became installable"
+        );
+        assert!(
+            !progress.open_failed(),
+            "an expired owner emitted a second completion"
+        );
+    }
+
+    #[test]
+    fn playback_owner_watchdog_expires_at_its_declared_boundary() {
+        let requested_at = Instant::now();
+        assert!(!site_playback_owner_watchdog_due(
+            requested_at,
+            requested_at + SITE_PLAYBACK_OPEN_WATCHDOG - Duration::from_millis(1),
+        ));
+        assert!(site_playback_owner_watchdog_due(
+            requested_at,
+            requested_at + SITE_PLAYBACK_OPEN_WATCHDOG,
+        ));
+    }
+
+    #[test]
+    fn completed_playback_open_wins_before_its_watchdog() {
+        let progress = SitePlaybackOwnerProgress::new();
+        assert!(progress.opened());
+        assert_eq!(progress.phase(), SitePlaybackOwnerPhase::Ready);
+        assert!(
+            !progress.expire_open(),
+            "the watchdog expired an owner which had already published Ready"
+        );
+    }
+
+    #[test]
+    fn one_abandoned_native_open_allows_rotation_but_the_leak_is_bounded() {
+        assert!(site_playback_owner_budget_allows(0));
+        assert!(
+            site_playback_owner_budget_allows(1),
+            "one blocked generation prevented its replacement from opening"
+        );
+        assert!(!site_playback_owner_budget_allows(
+            SITE_PLAYBACK_MAX_ABANDONED_OWNERS
+        ));
+    }
+
+    #[test]
+    fn retired_owner_stays_counted_until_its_creation_thread_finishes() {
+        let progress = SitePlaybackOwnerProgress::new();
+        assert!(progress.opened());
+        progress.cancel();
+        assert_eq!(progress.phase(), SitePlaybackOwnerPhase::Expired);
+        progress.finish();
+        assert_eq!(progress.phase(), SitePlaybackOwnerPhase::Finished);
+    }
+
+    #[test]
+    fn repeated_ok_then_early_fatal_streams_keep_escalating_backoff() {
+        let start = Instant::now();
+        let mut retry = SitePlaybackRetry::new();
+        let mut now = start;
+
+        for expected in [250, 500, 1_000, 2_000, 2_000] {
+            retry.open_started();
+            assert!(!retry.observe_phase(SitePlaybackPhase::Running, now));
+            now += Duration::from_millis(10);
+            let delay = retry.after_stream_error(now);
+            assert_eq!(
+                delay,
+                Duration::from_millis(expected),
+                "an Ok open followed by an early async fatal reset the backoff"
+            );
+            now += delay;
+        }
+    }
+
+    #[test]
+    fn a_stably_running_replacement_eventually_resets_the_backoff() {
+        let start = Instant::now();
+        let mut retry = SitePlaybackRetry::new();
+        assert_eq!(retry.after_stream_error(start), Duration::from_millis(250));
+        assert_eq!(
+            retry.after_open_failure(start + Duration::from_millis(250)),
+            Duration::from_millis(500)
+        );
+
+        let reopened = start + Duration::from_millis(750);
+        retry.open_started();
+        assert!(!retry.observe_phase(SitePlaybackPhase::Starting, reopened));
+        assert!(!retry.observe_phase(SitePlaybackPhase::Running, reopened));
+        assert!(!retry.observe_phase(
+            SitePlaybackPhase::Running,
+            reopened + Duration::from_millis(999)
+        ));
+        assert!(retry.observe_phase(
+            SitePlaybackPhase::Running,
+            reopened + SITE_PLAYBACK_STABLE_RUNNING
+        ));
+
+        let delay = retry.after_stream_error(reopened + Duration::from_secs(2));
+        assert_eq!(delay, Duration::from_millis(250));
+        assert_eq!(retry.open_reason(), "stream_error_recovery");
+    }
+
+    #[test]
+    fn a_default_output_epoch_overrides_a_stale_stream_error_retry() {
+        let start = Instant::now();
+        let mut retry = SitePlaybackRetry::new();
+        retry.after_stream_error(start);
+        assert!(!retry.ready(start));
+
+        retry.default_output_changed();
+        assert!(retry.ready(start));
+        assert_eq!(retry.open_reason(), "default_output_changed");
+
+        let delay = retry.after_open_failure(start);
+        assert_eq!(
+            delay,
+            Duration::from_millis(250),
+            "the new default device inherited the previous device's backoff"
+        );
+        assert_eq!(retry.open_reason(), "retry_after_default_output_change");
+    }
+
+    #[test]
+    fn site_playback_status_carries_recovery_generation_and_reason() {
+        let probe = SitePlaybackProbe::new();
+        let config = PlaybackConfigSnapshot {
+            source_rate_hz: 48_000,
+            source_channels: 2,
+            device_rate_hz: 48_000,
+            device_channels: 2,
+            sample_format: "F32".to_owned(),
+            buffer_size: "Default".to_owned(),
+        };
+        assert_eq!(probe.reopened(&config, "initial"), 1);
+        probe.record_stream_error(1, "device unavailable".to_owned());
+        probe.reopen_requested("stream_error_recovery");
+
+        let pending = probe.status();
+        assert_eq!(pending["generation"], 1);
+        assert_eq!(pending["state"], "closed");
+        assert_eq!(pending["pending_open_reason"], "stream_error_recovery");
+        assert_eq!(pending["last_stream_error"]["generation"], 1);
+
+        assert_eq!(probe.reopened(&config, "stream_error_recovery"), 2);
+        let reopened = probe.status();
+        assert_eq!(reopened["generation"], 2);
+        assert_eq!(reopened["state"], "starting");
+        assert_eq!(reopened["open_reason"], "stream_error_recovery");
+        assert!(reopened["pending_open_reason"].is_null());
+        assert_eq!(reopened["last_stream_error"]["generation"], 1);
+    }
+
+    #[test]
+    fn asynchronous_site_result_is_epoch_checked_before_the_real_output_push() {
+        let body = fn_body("pub(crate) fn mixer_loop(");
+        let output = body
+            .split("let mut have_play_ring = false;")
+            .nth(1)
+            .expect("real-output lifecycle branch is missing");
+        let first_epoch = output
+            .find("apply_site_default_output_epoch(")
+            .expect("pre-completion epoch check is missing");
+        let completion = output
+            .find("apply_site_playback_build_results(")
+            .expect("asynchronous open results are not consumed");
+        let after_completion = &output[completion + 1..];
+        let second_epoch = completion
+            + 1
+            + after_completion
+                .find("apply_site_default_output_epoch(")
+                .expect("post-completion epoch check is missing");
+        let health = output
+            .find("observe_and_retire_unhealthy_site_playback(")
+            .expect("post-completion health check is missing");
+        let installed_tx = output
+            .find("playback.as_mut()")
+            .expect("real-output playback access is missing");
+        let push = output
+            .find("tx.push(&out)")
+            .expect("real-output push is missing");
+        assert!(
+            first_epoch < completion
+                && completion < second_epoch
+                && second_epoch < health
+                && health < installed_tx
+                && installed_tx < push,
+            "real-output lifecycle order must be epoch < completion < epoch < health < \
+             AudioTx access < push"
+        );
+    }
+
+    #[test]
+    fn idle_playback_health_is_checked_before_the_idle_short_circuit() {
+        let mixer = fn_body("pub(crate) fn mixer_loop(");
+        let idle = mixer
+            .find("if streams.is_empty() && !airplay_local")
+            .expect("idle short-circuit is missing");
+        let health = mixer[..idle]
+            .rfind("observe_and_retire_unhealthy_site_playback(")
+            .expect("idle path skips site playback health");
+        assert!(
+            health < idle,
+            "the idle short-circuit leaves a dead site playback installed"
+        );
+    }
+
+    #[test]
+    fn a_dead_status_never_precedes_its_error_metadata() {
+        let observe = fn_body("fn observe(");
+        let record = observe
+            .find("probe.record_stream_error(")
+            .expect("fatal error metadata is not recorded");
+        let publish = observe
+            .find("probe.publish(phase")
+            .expect("playback phase is not published");
+        assert!(
+            record < publish,
+            "Dead can become visible before the matching error metadata"
+        );
+    }
+
+    #[test]
+    fn native_site_playback_open_is_confined_to_its_detached_owner_thread() {
+        let mixer = fn_body("pub(crate) fn mixer_loop(");
+        assert!(
+            !mixer.contains("LivePlayback::start_channels("),
+            "the 10 ms mixer still performs a potentially blocking native open"
+        );
+        let coordinator = fn_body("pub(crate) fn site_playback_builder_loop(");
+        assert!(
+            !coordinator.contains("LivePlayback::start_channels("),
+            "one blocked native open still blocks every later generation"
+        );
+        assert!(
+            coordinator.contains("drop(owner_thread)")
+                && coordinator.contains("recv_timeout(SITE_PLAYBACK_OWNER_POLL)")
+                && !coordinator.contains(".join("),
+            "the coordinator can still wait forever for an uninterruptible owner"
+        );
+        let owner = fn_body("fn site_playback_owner_loop(");
+        assert!(
+            owner.contains("LivePlayback::start_channels(48_000, 2)"),
+            "the generation owner does not perform the native open"
+        );
+        assert!(
+            owner.contains("drop(playback)") && owner.contains("control.recv()"),
+            "the native stream is not retained and destroyed on its creation thread"
+        );
+        let completion = fn_body("fn apply_site_playback_build_results(");
+        assert!(
+            completion.contains("result=ok open_elapsed_ms={}")
+                && completion.contains("result=error open_elapsed_ms={}"),
+            "asynchronous open completion lost success/failure duration diagnostics"
+        );
+    }
+
+    #[test]
+    fn playback_coordinator_shutdown_never_joins_an_uninterruptible_owner() {
+        let coordinator = fn_body("pub(crate) fn site_playback_builder_loop(");
+        assert!(
+            coordinator.contains("if inner.shutdown.load(Ordering::SeqCst)")
+                && coordinator.contains("reqs.recv_timeout(SITE_PLAYBACK_OWNER_POLL)")
+                && coordinator.contains("stop_site_playback_owners(&mut owners)")
+                && coordinator.contains("drop(owner_thread)")
+                && !coordinator.contains(".join("),
+            "daemon shutdown can still block on a native playback owner"
+        );
+        let owner = fn_body("fn site_playback_owner_loop(");
+        let source = code();
+        let signature_at = source
+            .find("fn site_playback_owner_loop(")
+            .expect("playback owner signature is missing");
+        let signature_end = signature_at
+            + source[signature_at..]
+                .find(") {")
+                .expect("playback owner signature is incomplete")
+            + 1;
+        let signature = &source[signature_at..signature_end];
+        assert!(
+            !signature.contains("DaemonInner")
+                && !signature.contains("Arc<DaemonInner>")
+                && !owner.contains("inner")
+                && owner.contains("control.recv()"),
+            "a detached owner can retain daemon resources after bounded shutdown"
+        );
     }
 
     /// 终审 §二.14 的**推广检查**：`mix_tone_verdict` 也判音，它是否也坐在
@@ -3830,8 +6503,8 @@ pub(crate) mod tests {
         let mut bufs = vec![[0.0f32; F48]; n];
         let mut dirty = 0u16;
 
-        add_to_hal_bucket(Some(0), &[0.25; F48], &mut bufs, &mut dirty);
-        add_to_hal_bucket(Some(3), &[0.75; F48], &mut bufs, &mut dirty);
+        add_to_hal_bucket(Some(0), &[0.25; F48_STEREO], &mut bufs, &mut dirty);
+        add_to_hal_bucket(Some(3), &[0.75; F48_STEREO], &mut bufs, &mut dirty);
 
         assert_eq!(dirty, 0b1001, "exactly the two slots written are dirty");
         assert!(
@@ -3859,8 +6532,8 @@ pub(crate) mod tests {
         // fan-in plan §1 asks for.
         let mut bufs = vec![[0.0f32; F48]; 4];
         let mut dirty = 0u16;
-        add_to_hal_bucket(Some(1), &[0.25; F48], &mut bufs, &mut dirty);
-        add_to_hal_bucket(Some(1), &[0.25; F48], &mut bufs, &mut dirty);
+        add_to_hal_bucket(Some(1), &[0.25; F48_STEREO], &mut bufs, &mut dirty);
+        add_to_hal_bucket(Some(1), &[0.25; F48_STEREO], &mut bufs, &mut dirty);
         assert!(bufs[1].iter().all(|&v| v == 0.5));
         assert_eq!(dirty, 0b10);
     }
@@ -3869,9 +6542,9 @@ pub(crate) mod tests {
     fn a_stream_bound_to_no_device_touches_nothing() {
         let mut bufs = vec![[0.0f32; F48]; 4];
         let mut dirty = 0u16;
-        add_to_hal_bucket(None, &[1.0; F48], &mut bufs, &mut dirty);
+        add_to_hal_bucket(None, &[1.0; F48_STEREO], &mut bufs, &mut dirty);
         // ...and neither does one naming a slot this driver does not have.
-        add_to_hal_bucket(Some(200), &[1.0; F48], &mut bufs, &mut dirty);
+        add_to_hal_bucket(Some(200), &[1.0; F48_STEREO], &mut bufs, &mut dirty);
         assert_eq!(dirty, 0);
         assert!(bufs.iter().all(|b| b.iter().all(|&v| v == 0.0)));
     }
@@ -4205,7 +6878,7 @@ pub(crate) mod tests {
     fn the_play_ring_is_sampled_before_the_push_not_after() {
         let src = include_str!("engine.rs");
         let body = src
-            .split("if let Some((_, tx)) = playback.as_mut() {")
+            .split("if let Some(playback) = playback.as_mut() {")
             .nth(1)
             .expect("mixer_loop 里的真实输出分支");
         let publish = body.find("publish_play_ring(").expect("发布点");
@@ -4235,12 +6908,14 @@ pub(crate) mod tests {
             crypto: MediaCrypto::new_for_stream(&[0u8; 32], 7, &[0u8; 16]),
             path: MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
             spec: SourceSpec::Mic,
+            channels: 1,
             loss: LossInjector::new(7, 0.0),
             seq: 0,
+            media_frame_seq: 0,
             rung: audiohub_net::media::AUTO_TOP_RUNG,
             rs: None,
-            rs_last: 0.0,
-            pay: Vec::with_capacity(F48 * 4),
+            rs_last: [0.0; 2],
+            pay: Vec::with_capacity(F48_STEREO * 4),
             dest_epoch_seen: 0,
             gain: dsp::SendGain::new(),
             shared: shared.clone(),
@@ -4468,7 +7143,9 @@ pub(crate) mod tests {
     fn the_jb_resync_keeps_the_profile_the_stream_was_running() {
         let body = fn_body("pub(crate) fn handle_datagram(");
         assert!(
-            body.contains("JitterBuffer::with_tuning(target, st.jb.tuning())"),
+            body.contains("JitterBuffer::with_tuning_channels(")
+                && body.contains("st.jb.tuning()")
+                && body.contains("st.channels"),
             "the resync no longer rebuilds through the buffer's own tuning, so a tier 1 stream \
              loses DEGRADED (and its learned depth) on every self-heal"
         );
@@ -4496,7 +7173,7 @@ pub(crate) mod tests {
     #[test]
     fn the_send_gain_is_per_stream_and_lands_between_the_resampler_and_the_encoder() {
         let body = fn_body("pub(crate) fn tx_loop(");
-        let at = body.find("tx.gain.apply(").unwrap_or_else(|| {
+        let at = body.find(".apply_interleaved(").unwrap_or_else(|| {
             panic!(
                 "发送侧软件增益没有按流施加（plan §7.2）：要么根本没接，\
                  要么挂到了共享的源上\n{body}"
@@ -4661,7 +7338,7 @@ pub(crate) mod tests {
     fn the_qos_rationale_no_longer_claims_there_is_no_deadline() {
         let src = include_str!("engine.rs");
         let doc = src
-            .split("fn raise_audio_thread_qos(what: &str) {")
+            .split("pub(crate) fn raise_audio_thread_qos(")
             .next()
             .unwrap();
         let doc = &doc[doc.rfind("/// 把本线程提到").expect("QoS 的文档注释")..];
@@ -4752,7 +7429,10 @@ pub(crate) mod tests {
         src.next_frame(&mut out);
         let before = src.depths()[0].unwrap().samples;
         let dropped_before = src.depths()[0].unwrap().dropped;
-        assert!(before as usize > 11 * F48, "前提：FIFO 确实积着东西, got {before}");
+        assert!(
+            before as usize > 11 * F48,
+            "precondition: the FIFO must contain a backlog, got {before}"
+        );
 
         // 一次 108 ms 的卡顿 ⇒ 11 个 tick × 480。
         let n = src.drain_skipped(11 * F48);
@@ -4799,7 +7479,7 @@ pub(crate) mod tests {
             let mut before = 0u32;
             let mut rel = 0i32;
             unsafe { pthread_get_qos_class_np(pthread_self(), &mut before, &mut rel) };
-            raise_audio_thread_qos("test");
+            let _qos_guard = raise_audio_thread_qos("test");
             let mut after = 0u32;
             unsafe { pthread_get_qos_class_np(pthread_self(), &mut after, &mut rel) };
             (before, after)
@@ -4816,6 +7496,47 @@ pub(crate) mod tests {
             got.0 <= QOS_CLASS_DEFAULT,
             "前提：线程起手确实不是 USER_INTERACTIVE, got {:#x}",
             got.0
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn deadline_audio_threads_enter_windows_mmcss_pro_audio() {
+        let active = std::thread::spawn(|| {
+            let qos_guard = raise_audio_thread_qos("mmcss-unit-test");
+            qos_guard.is_active()
+        })
+        .join()
+        .expect("MMCSS test thread panicked");
+        assert!(
+            active,
+            "the deadline thread remained at ordinary Windows scheduling priority"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn blocking_media_writers_never_enter_mmcss_pro_audio() {
+        let engine = include_str!("engine.rs");
+        let udp = fn_body("pub(crate) fn udp_send_loop(");
+        assert!(udp.contains("raise_media_send_thread_qos("));
+        assert!(!udp.contains("raise_audio_thread_qos("));
+        for (name, source) in [
+            ("mux", include_str!("mux.rs")),
+            ("tcpmedia", include_str!("tcpmedia.rs")),
+        ] {
+            assert!(
+                source.contains("raise_media_send_thread_qos("),
+                "{name} writer lost its non-deadline scheduling wrapper"
+            );
+            assert!(
+                !source.contains("raise_audio_thread_qos("),
+                "{name} writer can perform blocking I/O at Pro Audio priority"
+            );
+        }
+        assert!(
+            engine.matches("raise_audio_thread_qos(\"").count() >= 2,
+            "tx_loop and mixer_loop must still register the deadline helper"
         );
     }
 
@@ -5509,6 +8230,7 @@ pub(crate) mod deadline_thread_guards {
                 salt: vec![0u8; 16],
                 path: MediaPath::Udp("127.0.0.1:1".parse().unwrap()),
                 spec,
+                channels: 1,
                 loss_pct: 0.0,
                 shared: Arc::new(TxShared::new()),
                 ack: Some(a),
@@ -5766,7 +8488,7 @@ mod start_rung_tests {
         for rung in 0..LADDER.len() as u32 {
             let rate = rung_format(rung).rate_hz;
             assert_eq!(
-                resampler_for(rung, 0.0).is_some(),
+                resampler_for(rung, 2, [0.0; 2]).is_some(),
                 rate != MicSource::OUT_RATE,
                 "rung {rung} is {rate} Hz: a stream installed here would put {} samples on the \
                  wire under a header declaring {rate} Hz",
@@ -5846,7 +8568,7 @@ mod wire_split_tests {
     fn the_second_half_carries_a_timestamp_five_milliseconds_later() {
         let ts_us = 1_000_000u64;
         for f in LADDER.iter() {
-            let parts = f.wire_packets_per_frame();
+            let parts = f.wire_packets_per_frame_for(2);
             // **调生产代码的那个函数**，不是把同一行算术抄一遍。
             // 抄一遍的版本对 `tx_loop` 的改动完全免疫（实测：把生产代码里的
             // `+p*5000` 删掉，抄一遍的版本照样绿）。
@@ -5854,14 +8576,12 @@ mod wire_split_tests {
                 .map(|p| split_timestamp_us(ts_us, p, parts))
                 .collect();
             assert_eq!(stamps[0], ts_us, "前半包的时间戳被动过了");
-            if parts == 2 {
+            for p in 0..parts {
                 assert_eq!(
-                    stamps[1],
-                    ts_us + 5_000,
-                    "后半包没有 +5 ms：抖动样本会有一半近似 0"
+                    stamps[p],
+                    ts_us + p as u64 * 10_000 / parts as u64,
+                    "stereo part {p}/{parts} timestamp is not frame-relative"
                 );
-            } else {
-                assert_eq!(stamps.len(), 1);
             }
         }
         // 直接钉住这条不变量，免得将来 `LADDER` 里恰好没有分包档时这条测试
@@ -5875,57 +8595,845 @@ mod wire_split_tests {
         );
     }
 
+    fn timestamp_for_test_frame(media_frame_seq: u64) -> u64 {
+        timestamp_for_test_packet(media_frame_seq, 0)
+    }
+
+    fn timestamp_for_test_packet(media_frame_seq: u64, part: usize) -> u64 {
+        media_timestamp_with_frame_tag(
+            1_000_000 + media_frame_seq * FRAME_MS * 1000,
+            media_frame_seq,
+            part,
+        )
+    }
+
+    #[test]
+    fn media_frame_tag_has_bounded_timing_error_and_uses_the_per_stream_counter() {
+        for media_frame_seq in 0..512u64 {
+            for parts in 1..=audiohub_net::media::MAX_WIRE_PARTS {
+                for part in 0..parts {
+                    let plain =
+                        split_timestamp_us(1_000_003 + media_frame_seq * 10_000, part, parts);
+                    let tagged = media_timestamp_with_frame_tag(plain, media_frame_seq, part);
+                    assert!(plain.abs_diff(tagged) <= 128);
+                    let decoded = media_frame_tag(tagged);
+                    assert_eq!(
+                        decoded.frame,
+                        (media_frame_seq & MEDIA_FRAME_COUNTER_MASK) as u8
+                    );
+                    assert_eq!(decoded.part, part);
+                }
+            }
+        }
+        let tx = tests::fn_body("pub(crate) fn tx_loop(");
+        assert!(
+            tx.contains("timestamp_us: media_timestamp_with_frame_tag(")
+                && tx.contains("split_timestamp_us(ts_us, p, parts)")
+                && tx.contains("tx.media_frame_seq,")
+                && tx.contains("p,")
+                && tx
+                    .matches("tx.media_frame_seq = tx.media_frame_seq.wrapping_add(1);")
+                    .count()
+                    == 2,
+            "the media sender's tag is not tied one-for-one to per-stream raw frame advances"
+        );
+    }
+
+    #[test]
+    fn scheduler_tick_jump_without_raw_advance_does_not_change_the_timeline() {
+        let old_format = rung_format(4);
+        let new_format = rung_format(0);
+        let mut timeline = WireFormatTimeline::with_frame_tag_version(1);
+        let old = timeline
+            .locate(
+                100,
+                media_timestamp_with_frame_tag(1_000_000, 17, 0),
+                old_format,
+                1,
+            )
+            .unwrap();
+
+        // The wall-clock timestamp jumps by eight seconds, modelling tx_loop's
+        // catch-up assignment to its global scheduler tick. This stream did not
+        // consume raw sequence positions during the jump, so its own next media
+        // frame is still exactly counter 18.
+        let new = timeline
+            .locate(
+                107,
+                media_timestamp_with_frame_tag(9_000_000, 18, 3),
+                new_format,
+                4,
+            )
+            .unwrap();
+        assert_eq!(new.frame_seq, old.frame_seq.wrapping_add(1));
+        assert_eq!(new.part, 3);
+        assert!(!new.transition.unwrap().frame_tag_fallback);
+    }
+
     /// 接收侧从**实到样本数**认出半帧，而不是从格式表推。
     ///
     /// 一个不分包的对端发来整帧时照样能认出来；按表推会把它当半帧、
     /// 去等一个永远不来的搭档，表现是**每一帧都走半帧隐藏**（有声音，一半是编的）。
     #[test]
-    fn a_half_frame_is_recognised_by_its_sample_count_not_by_the_ladder() {
+    fn packet_count_is_derived_from_format_and_channel_width() {
         for f in LADDER.iter() {
-            let full = f.rate_hz as usize / 100;
-            let parts = f.wire_packets_per_frame();
-            let arrived = full / parts;
-            let detected = if arrived * 2 == full { 2 } else { 1 };
-            assert_eq!(detected, parts, "{f:?} 的分包数认错了");
-            // 同一档、对端不分包地发整帧：必须被认成整帧。
-            assert_eq!(if full * 2 == full { 2 } else { 1 }, 1, "整帧被当成了半帧");
+            for channels in [1, 2] {
+                let full = f.rate_hz as usize / 100 * channels as usize;
+                let parts = f.wire_packets_per_frame_for(channels);
+                assert_eq!(
+                    full % parts,
+                    0,
+                    "{f:?} x {channels}ch split is not frame/channel aligned"
+                );
+                assert!(parts <= audiohub_net::media::MAX_WIRE_PARTS);
+            }
         }
     }
 
-    /// **搭档没来时补出来的那一帧长度必须正好是一整帧**，且真实的那一半
-    /// 逐样本原样保留。
-    ///
-    /// 长度错了会让 JB 的 `frame_len` 跟着变，混音那一拍就少（或多）一段音频，
-    /// 而没有任何一处会报错。
-    ///
-    /// 注入对照：把 `conceal_missing_half` 的 `out.truncate(full)` 删掉并让
-    /// 淡出循环跑 `missing + 1` 次，这条红在长度。
     #[test]
-    fn a_missing_partner_is_concealed_into_exactly_one_full_frame() {
-        let full = 480usize;
-        let held: Vec<f32> = (0..240).map(|i| (i as f32 / 240.0) - 0.5).collect();
+    fn fixed_format_timeline_matches_the_legacy_packet_division() {
+        for format in LADDER {
+            for channels in [1, 2] {
+                let parts = format.wire_packets_per_frame_for(channels);
+                let mut timeline = WireFormatTimeline::default();
+                for wire_seq in 0..(parts as u32 * 8) {
+                    let position = timeline
+                        .locate(
+                            wire_seq,
+                            timestamp_for_test_frame(wire_seq as u64 / parts as u64),
+                            format,
+                            parts,
+                        )
+                        .expect("a current fixed-format packet was rejected");
+                    assert_eq!(position.frame_seq, wire_seq / parts as u32);
+                    assert_eq!(position.part, wire_seq as usize % parts);
+                    assert!(position.transition.is_none());
+                }
+            }
+        }
+    }
 
-        // 缺后半：前半原样在前，补出来的在后。
-        let a = conceal_missing_half(&held, false, full);
-        assert_eq!(a.len(), full, "补出来的帧不是一整帧");
-        assert_eq!(&a[..240], &held[..], "在手的那一半被改动了");
-        assert!(
-            a.iter().all(|v| v.is_finite()),
-            "隐藏出来的样本里有非有限值"
+    #[test]
+    fn stereo_auto_crosses_a_real_two_part_to_one_part_boundary() {
+        let rung_2 = rung_format(2);
+        let rung_3 = rung_format(3);
+        let rung_4 = rung_format(4);
+        assert_eq!(rung_2.wire_packets_per_frame_for(2), 2);
+        assert_eq!(rung_3.wire_packets_per_frame_for(2), 2);
+        assert_eq!(rung_4.wire_packets_per_frame_for(2), 1);
+
+        let mut timeline = WireFormatTimeline::with_frame_tag_version(1);
+        let first = timeline
+            .locate(100, timestamp_for_test_frame(50), rung_3, 2)
+            .unwrap();
+        let tail = timeline
+            .locate(101, timestamp_for_test_packet(50, 1), rung_3, 2)
+            .unwrap();
+        assert_eq!((first.frame_seq, first.part), (50, 0));
+        assert_eq!((tail.frame_seq, tail.part), (50, 1));
+
+        let successor = timeline
+            .locate(102, timestamp_for_test_frame(51), rung_4, 1)
+            .unwrap();
+        assert_eq!((successor.frame_seq, successor.part), (51, 0));
+        assert_eq!(
+            successor.transition,
+            Some(WireFormatTransition {
+                from: rung_3,
+                from_parts: 2,
+                to: rung_4,
+                to_parts: 1,
+                frame_tag_fallback: false,
+            })
         );
+        assert_eq!(
+            timeline.locate(101, timestamp_for_test_packet(50, 1), rung_3, 2),
+            None
+        );
+        assert_eq!(timeline.current.unwrap().format, rung_4);
 
-        // 缺前半：补出来的在前，后半原样在后。
-        let b = conceal_missing_half(&held, true, full);
-        assert_eq!(b.len(), full);
-        assert_eq!(&b[240..], &held[..], "在手的那一半被改动了");
+        let following = timeline
+            .locate(103, timestamp_for_test_frame(52), rung_4, 1)
+            .unwrap();
+        assert_eq!((following.frame_seq, following.part), (52, 0));
+        assert!(following.transition.is_none());
+    }
 
-        // 隐藏段必须**衰减**（最后一个样本比第一个更接近 0），否则它就不是
-        // 「上一段真实音频的衰减重复」，而是一段会被听成回声的原样复读。
-        let tail_first = a[240].abs();
-        let tail_last = a[full - 1].abs();
+    #[test]
+    fn an_old_same_format_epoch_cannot_reenter_after_a_round_trip() {
+        let two_parts = rung_format(3);
+        let one_part = rung_format(4);
+        let mut timeline = WireFormatTimeline::with_frame_tag_version(1);
+
+        timeline
+            .locate(200, timestamp_for_test_frame(100), two_parts, 2)
+            .unwrap();
+        timeline
+            .locate(201, timestamp_for_test_packet(100, 1), two_parts, 2)
+            .unwrap();
+        assert!(timeline
+            .locate(202, timestamp_for_test_frame(101), one_part, 1)
+            .unwrap()
+            .transition
+            .is_some());
+        // The sender aligns 203 up to 204 before returning to a two-part
+        // format. The skipped raw sequence never represented an audio frame.
+        let newest = timeline
+            .locate(204, timestamp_for_test_frame(102), two_parts, 2)
+            .unwrap();
+        assert_eq!((newest.frame_seq, newest.part), (102, 0));
+        assert!(newest.transition.is_some());
+
+        // This packet has the same format metadata as the current epoch, but
+        // its raw sequence is below the committed boundary and must stay dead.
+        assert_eq!(
+            timeline.locate(201, timestamp_for_test_packet(100, 1), two_parts, 2),
+            None
+        );
+        assert_eq!(timeline.current.unwrap().wire_base, 204);
+        let tail = timeline
+            .locate(205, timestamp_for_test_packet(102, 1), two_parts, 2)
+            .unwrap();
+        assert_eq!((tail.frame_seq, tail.part), (102, 1));
+        assert!(tail.transition.is_none());
+    }
+
+    #[test]
+    fn alignment_padding_never_turns_into_audio_frame_loss() {
+        let one_part = rung_format(4);
+        for (new_format, new_parts) in [
+            (rung_format(5), 1usize),
+            (rung_format(3), 2usize),
+            (rung_format(1), 3usize),
+            (rung_format(0), 4usize),
+        ] {
+            assert_eq!(new_format.wire_packets_per_frame_for(2), new_parts);
+            let unaligned_next = 101u32;
+            let boundary = align_wire_seq(unaligned_next, new_parts as u32);
+            for new_whole_lost in 0..=2u32 {
+                let mut timeline = WireFormatTimeline::with_frame_tag_version(1);
+                let old = timeline
+                    .locate(100, timestamp_for_test_frame(100), one_part, 1)
+                    .unwrap();
+                assert_eq!(old.frame_seq, 100);
+
+                // Observe the last part of the first surviving new-format
+                // frame before its head, after zero, one, or two whole new
+                // frames were lost.
+                let observed_base = boundary.wrapping_add(new_whole_lost * new_parts as u32);
+                let first_seen = observed_base.wrapping_add(new_parts as u32 - 1);
+                let observed_frame = 101 + new_whole_lost as u64;
+                let new = timeline
+                    .locate(
+                        first_seen,
+                        timestamp_for_test_packet(observed_frame, new_parts - 1),
+                        new_format,
+                        new_parts,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    new.frame_seq,
+                    old.frame_seq.wrapping_add(1 + new_whole_lost)
+                );
+                assert_eq!(new.part, new_parts - 1);
+                assert!(new.transition.is_some());
+                assert!(!new.transition.unwrap().frame_tag_fallback);
+
+                let head = timeline
+                    .locate(
+                        observed_base,
+                        timestamp_for_test_frame(observed_frame),
+                        new_format,
+                        new_parts,
+                    )
+                    .unwrap();
+                assert_eq!(head.frame_seq, new.frame_seq);
+                assert_eq!(head.part, 0);
+                assert_eq!(
+                    timeline.locate(100, timestamp_for_test_frame(100), one_part, 1),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_part_count_transitions_are_contiguous() {
+        let one_part = rung_format(4);
+        for (old_format, old_parts) in [
+            (rung_format(3), 2usize),
+            (rung_format(1), 3usize),
+            (rung_format(0), 4usize),
+        ] {
+            let mut timeline = WireFormatTimeline::with_frame_tag_version(1);
+            let boundary = 120u32;
+            let mut old = None;
+            for part in 0..old_parts {
+                old = timeline.locate(
+                    boundary + part as u32,
+                    timestamp_for_test_packet(60, part),
+                    old_format,
+                    old_parts,
+                );
+            }
+            let old = old.unwrap();
+            let new = timeline
+                .locate(
+                    boundary + old_parts as u32,
+                    timestamp_for_test_frame(61),
+                    one_part,
+                    1,
+                )
+                .unwrap();
+            assert_eq!(new.frame_seq, old.frame_seq.wrapping_add(1));
+            assert_eq!(new.part, 0);
+            assert!(new.transition.is_some());
+        }
+    }
+
+    #[test]
+    fn tagged_boundary_preserves_a_missing_tail_and_a_whole_old_frame() {
+        let old_format = rung_format(3);
+        let new_format = rung_format(0);
+        assert_eq!(old_format.wire_packets_per_frame_for(2), 2);
+        assert_eq!(new_format.wire_packets_per_frame_for(2), 4);
+
+        let mut timeline = WireFormatTimeline::with_frame_tag_version(1);
+        let last_seen = timeline
+            .locate(100, timestamp_for_test_frame(20), old_format, 2)
+            .unwrap();
+        assert_eq!((last_seen.frame_seq, last_seen.part), (50, 0));
+
+        // Packet 101 (the tail of frame 50) and packets 102..=103 (all of
+        // frame 51) are lost. Sequence 104 is already aligned for four parts;
+        // observing part 3 first must still place the new frame at 52.
+        let new_tail = timeline
+            .locate(107, timestamp_for_test_packet(22, 3), new_format, 4)
+            .unwrap();
+        assert_eq!((new_tail.frame_seq, new_tail.part), (52, 3));
+        assert!(new_tail.transition.is_some());
+        let new_head = timeline
+            .locate(104, timestamp_for_test_frame(22), new_format, 4)
+            .unwrap();
+        assert_eq!((new_head.frame_seq, new_head.part), (52, 0));
+
+        // Reordered old packets cannot roll the committed epoch back.
+        assert_eq!(
+            timeline.locate(103, timestamp_for_test_packet(21, 1), old_format, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn tagged_tail_loss_is_exact_for_every_new_part_count() {
+        let old_formats = [
+            (rung_format(5), 1usize),
+            (rung_format(3), 2usize),
+            (rung_format(1), 3usize),
+            (rung_format(0), 4usize),
+        ];
+        let new_formats = [
+            (rung_format(4), 1usize),
+            (rung_format(2), 2usize),
+            (rung_format(1), 3usize),
+            (rung_format(0), 4usize),
+        ];
+        for (old_format, old_parts) in old_formats {
+            assert_eq!(old_format.wire_packets_per_frame_for(2), old_parts);
+            for (new_format, new_parts) in new_formats {
+                assert_eq!(new_format.wire_packets_per_frame_for(2), new_parts);
+                if old_format == new_format {
+                    continue;
+                }
+                for old_part in 0..old_parts as u32 {
+                    for new_whole_lost in 0..=2u32 {
+                        let mut timeline = WireFormatTimeline::with_frame_tag_version(1);
+                        let old_wire_base = 120u32;
+                        let old = timeline
+                            .locate(
+                                old_wire_base + old_part,
+                                timestamp_for_test_packet(30, old_part as usize),
+                                old_format,
+                                old_parts,
+                            )
+                            .unwrap();
+
+                        // Lose the rest of the observed old frame, one entire
+                        // old-format frame, and zero to two complete new-format
+                        // frames before observing the new epoch's last part.
+                        let unaligned_new_base = old_wire_base + 2 * old_parts as u32;
+                        let first_new_base = align_wire_seq(unaligned_new_base, new_parts as u32);
+                        let new_wire_base =
+                            first_new_base.wrapping_add(new_whole_lost * new_parts as u32);
+                        let first_seen = new_wire_base.wrapping_add(new_parts as u32 - 1);
+                        let logical_advance = 2 + new_whole_lost;
+                        let new = timeline
+                            .locate(
+                                first_seen,
+                                timestamp_for_test_packet(
+                                    30 + logical_advance as u64,
+                                    new_parts - 1,
+                                ),
+                                new_format,
+                                new_parts,
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            new.frame_seq,
+                            old.frame_seq.wrapping_add(logical_advance),
+                            "old parts {old_parts}, old part {old_part}, new parts {new_parts}, \
+                             new whole lost {new_whole_lost}"
+                        );
+                        assert_eq!(new.part, new_parts - 1);
+                        assert!(new.transition.is_some());
+                        assert!(!new.transition.unwrap().frame_tag_fallback);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_legacy_sender_keeps_the_safe_ambiguous_tail_fallback() {
+        let old_format = rung_format(3);
+        let new_format = rung_format(0);
+        let mut timeline = WireFormatTimeline::default();
+        let old = timeline
+            .locate(100, timestamp_for_test_frame(20), old_format, 2)
+            .unwrap();
+        let new = timeline
+            .locate(107, timestamp_for_test_frame(22), new_format, 4)
+            .unwrap();
+        assert_eq!(new.frame_seq, old.frame_seq.wrapping_add(1));
+        assert_eq!(new.part, 3);
+    }
+
+    #[test]
+    fn a_gap_beyond_the_exact_horizon_reanchors_adjacent_and_keeps_running() {
+        let old_format = rung_format(4);
+        let new_format = rung_format(0);
+        let mut timeline = WireFormatTimeline::with_frame_tag_version(1);
+        let old = timeline
+            .locate(100, timestamp_for_test_frame(0), old_format, 1)
+            .unwrap();
+
+        // First new frame starts at 104, but 64 complete new-format frames are
+        // lost. Logical advance 65 aliases to one in the six-bit counter; the
+        // raw-span horizon gate must refuse that interpretation and collapse
+        // the unretainable gap instead of rejecting the epoch forever.
+        let observed_base = 104u32 + 64 * 4;
+        let new = timeline
+            .locate(
+                observed_base + 3,
+                timestamp_for_test_packet(65, 3),
+                new_format,
+                4,
+            )
+            .unwrap();
+        assert_eq!(new.frame_seq, old.frame_seq.wrapping_add(1));
+        assert!(new.transition.unwrap().frame_tag_fallback);
+
+        let following = timeline
+            .locate(
+                observed_base + 4,
+                timestamp_for_test_frame(66),
+                new_format,
+                4,
+            )
+            .unwrap();
+        assert_eq!(following.frame_seq, new.frame_seq.wrapping_add(1));
+        assert!(following.transition.is_none());
+    }
+
+    #[test]
+    fn the_sixty_four_frame_tag_value_is_exact_only_inside_the_raw_horizon() {
+        let old_format = rung_format(4);
+        let new_format = rung_format(5);
+        let mut timeline = WireFormatTimeline::with_frame_tag_version(1);
+        let old = timeline
+            .locate(100, timestamp_for_test_frame(0), old_format, 1)
+            .unwrap();
+        let new = timeline
+            .locate(164, timestamp_for_test_frame(64), new_format, 1)
+            .unwrap();
+        assert_eq!(new.frame_seq, old.frame_seq.wrapping_add(64));
+        assert!(!new.transition.unwrap().frame_tag_fallback);
+    }
+
+    #[test]
+    fn tagged_alignment_transition_is_safe_across_raw_sequence_wrap() {
+        let old_format = rung_format(4);
+        let new_format = rung_format(0);
+        let mut timeline = WireFormatTimeline::with_frame_tag_version(1);
+        let old = timeline
+            .locate(u32::MAX - 2, timestamp_for_test_frame(40), old_format, 1)
+            .unwrap();
+        // The sender burns MAX-1 and MAX solely to align the four-part epoch
+        // at zero. Part 3 may arrive first after the wrap.
+        let new = timeline
+            .locate(3, timestamp_for_test_packet(41, 3), new_format, 4)
+            .unwrap();
+        assert_eq!(new.frame_seq, old.frame_seq.wrapping_add(1));
+        assert_eq!(new.part, 3);
+        assert!(new.transition.is_some());
+    }
+
+    #[test]
+    fn three_part_epoch_keeps_its_explicit_part_across_raw_sequence_wrap() {
+        let old_format = rung_format(4);
+        let new_format = rung_format(1);
+        assert_eq!(new_format.wire_packets_per_frame_for(2), 3);
+        for new_whole_lost in 0..=2u32 {
+            let mut timeline = WireFormatTimeline::with_frame_tag_version(1);
+            let old = timeline
+                .locate(u32::MAX - 1, timestamp_for_test_frame(40), old_format, 1)
+                .unwrap();
+            let first_new_base = u32::MAX;
+            let observed_base = first_new_base.wrapping_add(new_whole_lost * 3);
+            let observed_tail = observed_base.wrapping_add(2);
+            let new = timeline
+                .locate(
+                    observed_tail,
+                    timestamp_for_test_packet(41 + new_whole_lost as u64, 2),
+                    new_format,
+                    3,
+                )
+                .unwrap();
+            assert_eq!(
+                new.frame_seq,
+                old.frame_seq.wrapping_add(1 + new_whole_lost)
+            );
+            assert_eq!(new.part, 2);
+            assert!(!new.transition.unwrap().frame_tag_fallback);
+        }
+    }
+
+    #[test]
+    fn real_loss_inside_an_epoch_keeps_its_frame_hole() {
+        let format = rung_format(3);
+        let mut timeline = WireFormatTimeline::default();
+        let frame_0 = timeline
+            .locate(0, timestamp_for_test_frame(0), format, 2)
+            .unwrap();
+        // Both packets of frame 1 are absent. The first packet of frame 2 must
+        // remain frame 2 rather than being compressed next to frame 0.
+        let frame_2 = timeline
+            .locate(4, timestamp_for_test_frame(2), format, 2)
+            .unwrap();
+        assert_eq!(frame_0.frame_seq, 0);
+        assert_eq!(frame_2.frame_seq, 2);
+    }
+
+    #[test]
+    fn timeline_survives_raw_sequence_wrap_and_long_fixed_streams() {
+        let format = rung_format(3);
+        let mut wrapping = WireFormatTimeline::default();
+        let before = wrapping
+            .locate(u32::MAX - 1, timestamp_for_test_frame(0), format, 2)
+            .unwrap();
+        let tail = wrapping
+            .locate(u32::MAX, timestamp_for_test_frame(0), format, 2)
+            .unwrap();
+        let after = wrapping
+            .locate(0, timestamp_for_test_frame(1), format, 2)
+            .unwrap();
+        assert_eq!(before.frame_seq, u32::MAX / 2);
+        assert_eq!(tail.frame_seq, before.frame_seq);
+        assert_eq!(after.frame_seq, before.frame_seq.wrapping_add(1));
+
+        let mut long = WireFormatTimeline::default();
+        long.locate(0, timestamp_for_test_frame(0), format, 2)
+            .unwrap();
+        let far = long
+            .locate(
+                1 << 30,
+                timestamp_for_test_frame((1u64 << 30) / 2),
+                format,
+                2,
+            )
+            .unwrap();
+        assert_eq!(far.frame_seq, (1 << 30) / 2);
+        assert!(long.current.unwrap().wire_base > 0);
+    }
+
+    #[test]
+    fn a_format_boundary_does_not_rebuild_the_jitter_buffer() {
+        let body = tests::fn_body("pub(crate) fn handle_datagram(");
+        let boundary = body
+            .find("st.wire_timeline.locate(")
+            .expect("receive path does not consult the format timeline");
+        let reassembly = body[boundary..]
+            .find("collect_wire_chunk(")
+            .map(|offset| boundary + offset)
+            .expect("format timeline is not connected to reassembly");
+        let commit = &body[boundary..reassembly];
         assert!(
-            tail_last <= tail_first,
-            "隐藏段没有衰减：{tail_first} -> {tail_last}"
+            !commit.contains("st.jb =") && !commit.contains("JitterBuffer::"),
+            "a wire-format boundary rebuilds the jitter buffer and reintroduces a playout blackout"
+        );
+        assert!(
+            commit.contains("st.partial.clear();"),
+            "mixed-format partial chunks survive an epoch boundary"
+        );
+    }
+
+    fn partial_for_mask(frame_seq: u32, parts: usize, mask: usize) -> crate::PartialWireFrame {
+        const CHANNELS: usize = 2;
+        const FRAMES_PER_CHUNK: usize = 8;
+        let mut chunks: [Option<Vec<f32>>; 4] = std::array::from_fn(|_| None);
+        for (part, chunk) in chunks.iter_mut().enumerate().take(parts) {
+            if mask & (1 << part) == 0 {
+                continue;
+            }
+            *chunk = Some(
+                (0..FRAMES_PER_CHUNK * CHANNELS)
+                    .map(|scalar| frame_seq as f32 + part as f32 / 10.0 + scalar as f32 / 1000.0)
+                    .collect(),
+            );
+        }
+        crate::PartialWireFrame {
+            frame_seq,
+            parts,
+            sample_rate: 48_000,
+            channels: CHANNELS as u8,
+            chunks,
+        }
+    }
+
+    /// Every supported packet count and loss layout must make the same safety
+    /// decision: preserve every received chunk in place when at least half the
+    /// frame is real, otherwise leave a sequence hole for whole-frame PLC.
+    #[test]
+    fn partial_conceal_generalizes_to_every_two_three_and_four_part_layout() {
+        for parts in 2usize..=audiohub_net::media::MAX_WIRE_PARTS {
+            for mask in 0usize..(1 << parts) {
+                let pending = partial_for_mask(17, parts, mask);
+                let expected = pending.chunks.clone();
+                let present = mask.count_ones() as usize;
+                let finished = finalize_partial_wire_frame(pending);
+                if present * 2 < parts {
+                    assert!(
+                        finished.is_none(),
+                        "{present}/{parts} real chunks fabricated a complete frame"
+                    );
+                    continue;
+                }
+
+                let finished = finished.unwrap_or_else(|| {
+                    panic!("{present}/{parts} real chunks should be safely concealable")
+                });
+                let chunk_len = expected.iter().flatten().next().unwrap().len();
+                assert_eq!(finished.samples.len(), chunk_len * parts);
+                assert_eq!(finished.partial_conceal, present != parts);
+                assert!(finished.samples.iter().all(|sample| sample.is_finite()));
+                for (part, expected) in expected.iter().enumerate().take(parts) {
+                    if let Some(expected) = expected {
+                        let actual = &finished.samples[part * chunk_len..(part + 1) * chunk_len];
+                        assert_eq!(
+                            actual, expected,
+                            "received chunk {part}/{parts} was modified during concealment"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn test_chunk(frame_seq: u32, part: usize) -> Vec<f32> {
+        (0..16)
+            .map(|scalar| frame_seq as f32 + part as f32 / 10.0 + scalar as f32 / 1000.0)
+            .collect()
+    }
+
+    fn collect_test_chunk(
+        assembly: &mut WireFrameAssembly,
+        frame_seq: u32,
+        part: usize,
+        parts: usize,
+    ) -> ReassembledWireBatch {
+        collect_wire_chunk(
+            assembly,
+            frame_seq,
+            part,
+            parts,
+            48_000,
+            2,
+            test_chunk(frame_seq, part),
+        )
+    }
+
+    fn take_batch(batch: ReassembledWireBatch) -> Vec<ReassembledWireFrame> {
+        batch.frames.into_iter().flatten().collect()
+    }
+
+    /// N+1 part 0 is ordinary cross-frame reorder, not proof that N is lost.
+    /// N must remain live and complete without concealment when its tail arrives.
+    #[test]
+    fn next_frame_head_does_not_conceal_a_reordered_current_frame_tail() {
+        let mut assembly = WireFrameAssembly::default();
+        for part in [0usize, 1] {
+            assert_eq!(collect_test_chunk(&mut assembly, 10, part, 4).len, 0);
+        }
+        assert_eq!(collect_test_chunk(&mut assembly, 11, 0, 4).len, 0);
+        assert_eq!(collect_test_chunk(&mut assembly, 10, 2, 4).len, 0);
+
+        let frames = take_batch(collect_test_chunk(&mut assembly, 10, 3, 4));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame_seq, 10);
+        assert!(!frames[0].partial_conceal);
+        for part in 0..4 {
+            assert_eq!(
+                &frames[0].samples[part * 16..(part + 1) * 16],
+                test_chunk(10, part).as_slice()
+            );
+        }
+        assert_eq!(assembly.older.as_ref().unwrap().frame_seq, 11);
+        assert!(assembly.newer.is_none());
+
+        // Once N has been delivered, a delayed duplicate cannot resurrect it
+        // ahead of the still-live N+1 slot.
+        assert_eq!(collect_test_chunk(&mut assembly, 10, 2, 4).len, 0);
+        assert_eq!(assembly.older.as_ref().unwrap().frame_seq, 11);
+        assert_eq!(assembly.retired_through, Some(10));
+    }
+
+    /// N is not concealed merely because N+1 exists. N+2 is the explicit
+    /// boundary that retires N when its missing tail never arrives.
+    #[test]
+    fn n_plus_two_expires_an_incomplete_n_and_preserves_both_newer_slots() {
+        let mut assembly = WireFrameAssembly::default();
+        for part in [0usize, 1] {
+            assert_eq!(collect_test_chunk(&mut assembly, 20, part, 4).len, 0);
+        }
+        assert_eq!(collect_test_chunk(&mut assembly, 21, 0, 4).len, 0);
+
+        let frames = take_batch(collect_test_chunk(&mut assembly, 22, 0, 4));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame_seq, 20);
+        assert!(frames[0].partial_conceal);
+        assert_eq!(&frames[0].samples[..16], test_chunk(20, 0).as_slice());
+        assert_eq!(&frames[0].samples[16..32], test_chunk(20, 1).as_slice());
+        assert_eq!(assembly.older.as_ref().unwrap().frame_seq, 21);
+        assert_eq!(assembly.newer.as_ref().unwrap().frame_seq, 22);
+
+        assert_eq!(collect_test_chunk(&mut assembly, 20, 3, 4).len, 0);
+        assert_eq!(assembly.older.as_ref().unwrap().frame_seq, 21);
+        assert_eq!(assembly.newer.as_ref().unwrap().frame_seq, 22);
+    }
+
+    /// A complete N+1 must wait behind incomplete N. The chunk that finally
+    /// completes N releases both frames in sequence order, without concealment.
+    #[test]
+    fn two_complete_adjacent_frames_release_in_order_after_reverse_completion() {
+        let mut assembly = WireFrameAssembly::default();
+        assert_eq!(collect_test_chunk(&mut assembly, 30, 0, 4).len, 0);
+        for part in 0..4 {
+            assert_eq!(collect_test_chunk(&mut assembly, 31, part, 4).len, 0);
+        }
+        for part in [1usize, 2] {
+            assert_eq!(collect_test_chunk(&mut assembly, 30, part, 4).len, 0);
+        }
+
+        let frames = take_batch(collect_test_chunk(&mut assembly, 30, 3, 4));
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.frame_seq)
+                .collect::<Vec<_>>(),
+            vec![30, 31]
+        );
+        assert!(frames.iter().all(|frame| !frame.partial_conceal));
+        assert!(assembly.older.is_none());
+        assert!(assembly.newer.is_none());
+        assert_eq!(assembly.retired_through, Some(31));
+    }
+
+    /// On an established stream, every packet of N+1 may beat every packet of
+    /// N. The retired N-1 anchor creates an empty N slot, so even this fully
+    /// reversed pair is held and released in timeline order.
+    #[test]
+    fn two_whole_frames_arriving_in_reverse_order_use_the_retired_anchor() {
+        let mut assembly = WireFrameAssembly {
+            older: None,
+            newer: None,
+            retired_through: Some(49),
+        };
+        for part in 0..4 {
+            assert_eq!(collect_test_chunk(&mut assembly, 51, part, 4).len, 0);
+        }
+        assert_eq!(assembly.older.as_ref().unwrap().frame_seq, 50);
+        assert_eq!(assembly.newer.as_ref().unwrap().frame_seq, 51);
+        assert!(wire_frame_complete(assembly.newer.as_ref().unwrap()));
+
+        for part in 0..3 {
+            assert_eq!(collect_test_chunk(&mut assembly, 50, part, 4).len, 0);
+        }
+        let frames = take_batch(collect_test_chunk(&mut assembly, 50, 3, 4));
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.frame_seq)
+                .collect::<Vec<_>>(),
+            vec![50, 51]
+        );
+        assert!(frames.iter().all(|frame| !frame.partial_conceal));
+        assert_eq!(assembly.retired_through, Some(51));
+    }
+
+    /// The N+2 boundary uses the same at-least-half rule for every supported
+    /// packet count and preserves every real chunk in its original position.
+    #[test]
+    fn assembly_expiry_obeys_every_two_three_and_four_part_mask() {
+        for parts in 2usize..=audiohub_net::media::MAX_WIRE_PARTS {
+            for mask in 0usize..((1 << parts) - 1) {
+                let mut assembly = WireFrameAssembly {
+                    older: Some(partial_for_mask(40, parts, mask)),
+                    newer: None,
+                    retired_through: Some(39),
+                };
+                assert_eq!(collect_test_chunk(&mut assembly, 41, 0, parts).len, 0);
+                let frames = take_batch(collect_test_chunk(&mut assembly, 42, 0, parts));
+                let present = mask.count_ones() as usize;
+                if present * 2 < parts {
+                    assert!(
+                        frames.is_empty(),
+                        "{present}/{parts} real chunks fabricated an expired frame"
+                    );
+                } else {
+                    assert_eq!(frames.len(), 1, "mask {mask:#b} parts {parts}");
+                    let frame = &frames[0];
+                    assert_eq!(frame.frame_seq, 40);
+                    assert!(frame.partial_conceal);
+                    for part in 0..parts {
+                        if mask & (1 << part) != 0 {
+                            assert_eq!(
+                                &frame.samples[part * 16..(part + 1) * 16],
+                                test_chunk(40, part).as_slice(),
+                                "real chunk {part}/{parts} moved for mask {mask:#b}"
+                            );
+                        }
+                    }
+                }
+                assert_eq!(assembly.older.as_ref().unwrap().frame_seq, 41);
+                assert_eq!(assembly.newer.as_ref().unwrap().frame_seq, 42);
+            }
+        }
+    }
+
+    /// The public lifetime counter is the only way the quality pipeline can
+    /// see concealment that produces a complete-length frame above the JB.
+    #[test]
+    fn production_accounts_for_every_delivered_partial_frame() {
+        let body = tests::fn_body("pub(crate) fn handle_datagram(");
+        let collect = body
+            .find("collect_wire_chunk(")
+            .expect("the production reassembler is not called");
+        let account = body
+            .find("st.half_conceal = st.half_conceal.saturating_add(1);")
+            .expect("partial concealment is invisible to lifetime telemetry");
+        assert!(
+            collect < account,
+            "telemetry runs before reassembly has a result"
         );
     }
 

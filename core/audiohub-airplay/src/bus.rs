@@ -5,17 +5,17 @@ use std::sync::{Arc, Mutex, TryLockError, Weak};
 
 /// AudioHub's internal sample rate.
 pub const AUDIOHUB_RATE: u32 = 48_000;
-/// One 10 ms AudioHub mono frame.
+/// Frames per 10 ms at AudioHub's internal rate.
 pub const AUDIOHUB_FRAME_SAMPLES: usize = 480;
 
 /// Bounds and startup latency for the receiver PCM bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BusConfig {
-    /// Maximum 48 kHz mono samples retained. Oldest samples are discarded on
-    /// overflow, independently for every reader.
+    /// Maximum 48 kHz stereo frames retained. The legacy field name is kept for
+    /// config compatibility; one count is one `[left, right]` frame.
     pub capacity_samples: usize,
-    /// Samples accumulated before a new/reset reader starts. This avoids
-    /// presenting a fragmented first frame to the mixer.
+    /// Stereo frames accumulated before a new/reset reader starts. The legacy
+    /// field name is kept for config compatibility.
     pub prebuffer_samples: usize,
     /// Maximum absolute adaptive resampling correction.
     pub max_correction_ppm: u32,
@@ -67,7 +67,7 @@ struct ReaderState {
 
 #[derive(Debug)]
 struct State {
-    samples: VecDeque<f32>,
+    frames: VecDeque<[f32; 2]>,
     base_seq: u64,
     next_seq: u64,
     epoch: u64,
@@ -86,12 +86,12 @@ struct Inner {
     state: Mutex<State>,
 }
 
-/// A bounded 48 kHz mono PCM bus with independent reader cursors.
+/// A bounded 48 kHz stereo-frame PCM bus with independent reader cursors.
 ///
-/// A slow or abandoned reader can lose old samples, but it cannot make the
+/// A slow or abandoned reader can lose old frames, but it cannot make the
 /// producer allocate without bound or hold another reader back. Starting a
 /// stream and flushing it reset every cursor atomically, so no reader can mix
-/// samples from two AirPlay sessions.
+/// frames from two AirPlay sessions.
 #[derive(Debug, Clone)]
 pub struct PcmBus {
     inner: Arc<Inner>,
@@ -101,6 +101,10 @@ impl PcmBus {
     /// Create a bus. Invalid values are rejected by runtime startup; this
     /// constructor clamps them as a defensive convenience for direct users.
     pub fn new(mut config: BusConfig) -> Self {
+        // Construction runs on the controller/startup thread. Initialize UUID
+        // and reset metadata here so the first realtime read cannot initialize
+        // the process-wide OnceLock.
+        crate::telemetry::prewarm();
         config.capacity_samples = config.capacity_samples.max(AUDIOHUB_FRAME_SAMPLES);
         config.prebuffer_samples = config.prebuffer_samples.min(config.capacity_samples);
         config.max_correction_ppm = config.max_correction_ppm.min(2_000);
@@ -109,7 +113,7 @@ impl PcmBus {
                 config,
                 active_session: AtomicU64::new(0),
                 state: Mutex::new(State {
-                    samples: VecDeque::with_capacity(config.capacity_samples),
+                    frames: VecDeque::with_capacity(config.capacity_samples),
                     base_seq: 0,
                     next_seq: 0,
                     epoch: 0,
@@ -173,28 +177,48 @@ impl PcmBus {
         }
     }
 
-    pub(crate) fn push(&self, session_id: u64, samples: &[f32]) -> bool {
-        if samples.is_empty() {
+    pub(crate) fn push(&self, session_id: u64, frames: &[[f32; 2]]) -> bool {
+        let telemetry_token = crate::telemetry::operation_token();
+        self.push_with_token(session_id, frames, telemetry_token)
+    }
+
+    pub(crate) fn push_with_token(
+        &self,
+        session_id: u64,
+        frames: &[[f32; 2]],
+        telemetry_token: crate::telemetry::OperationToken,
+    ) -> bool {
+        if frames.is_empty() {
             return true;
         }
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.active_session != Some(session_id) {
+            let active_session = state.active_session;
+            drop(state);
+            crate::telemetry::record_pcm_bus_push(
+                telemetry_token,
+                session_id,
+                active_session,
+                frames.len(),
+                0,
+            );
             return false;
         }
 
-        for &sample in samples {
-            state
-                .samples
-                .push_back(if sample.is_finite() { sample } else { 0.0 });
+        for &frame in frames {
+            state.frames.push_back([
+                if frame[0].is_finite() { frame[0] } else { 0.0 },
+                if frame[1].is_finite() { frame[1] } else { 0.0 },
+            ]);
             state.next_seq = state.next_seq.saturating_add(1);
         }
 
         let overflow = state
-            .samples
+            .frames
             .len()
             .saturating_sub(self.inner.config.capacity_samples);
         if overflow != 0 {
-            state.samples.drain(..overflow);
+            state.frames.drain(..overflow);
             state.base_seq = state.base_seq.saturating_add(overflow as u64);
             let base = state.base_seq;
             for reader in state.readers.values_mut() {
@@ -206,6 +230,15 @@ impl PcmBus {
                 }
             }
         }
+        let active_session = state.active_session;
+        drop(state);
+        crate::telemetry::record_pcm_bus_push(
+            telemetry_token,
+            session_id,
+            active_session,
+            frames.len(),
+            overflow,
+        );
         true
     }
 
@@ -250,7 +283,7 @@ impl PcmBus {
 }
 
 fn reset_locked(state: &mut State, active_session: Option<u64>) {
-    state.samples.clear();
+    state.frames.clear();
     state.base_seq = state.next_seq;
     state.epoch = state.epoch.wrapping_add(1);
     state.active_session = active_session;
@@ -267,11 +300,11 @@ fn reset_locked(state: &mut State, active_session: Option<u64>) {
 /// Result of one non-blocking PCM bus read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PcmRead {
-    /// Samples copied from the active AirPlay stream.
+    /// Stereo frames copied from the active AirPlay stream.
     pub copied: usize,
-    /// Silence samples written because the reader was prebuffering or starved.
+    /// Silent stereo frames written because the reader was prebuffering or starved.
     pub silence: usize,
-    /// Samples this reader lost to bounded-ring overflow since its last read.
+    /// Stereo frames this reader lost to overflow since its last read.
     pub dropped: u64,
     /// Active AirPlay session, if any.
     pub session_id: Option<u64>,
@@ -287,17 +320,39 @@ pub struct PcmReader {
 }
 
 impl PcmReader {
-    /// Fill `out` without blocking. Unavailable samples are zero-filled.
+    /// Fill legacy mono output without blocking by explicitly downmixing L/R.
     pub fn read_into(&mut self, out: &mut [f32]) -> PcmRead {
         out.fill(0.0);
+        self.read_frames(out.len(), |index, frame| {
+            out[index] = (frame[0] + frame[1]) * 0.5;
+        })
+    }
+
+    /// Fill native stereo frames without blocking. Unavailable frames are silent.
+    pub fn read_stereo_into(&mut self, out: &mut [[f32; 2]]) -> PcmRead {
+        out.fill([0.0; 2]);
+        self.read_frames(out.len(), |index, frame| out[index] = frame)
+    }
+
+    fn read_frames(
+        &mut self,
+        frame_count: usize,
+        mut write_frame: impl FnMut(usize, [f32; 2]),
+    ) -> PcmRead {
+        let telemetry_token = crate::telemetry::operation_token();
         let Some(inner) = self.inner.upgrade() else {
-            return PcmRead {
-                copied: 0,
-                silence: out.len(),
-                dropped: 0,
-                session_id: None,
-                epoch: 0,
-            };
+            return finish_read(
+                telemetry_token,
+                PcmRead {
+                    copied: 0,
+                    silence: frame_count,
+                    dropped: 0,
+                    session_id: None,
+                    epoch: 0,
+                },
+                false,
+                false,
+            );
         };
         let active_session_hint = session_from_wire(inner.active_session.load(Ordering::Acquire));
         // This reader runs on AudioHub's 10 ms deadline thread. A concurrent
@@ -306,13 +361,18 @@ impl PcmReader {
         let mut state = match inner.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::WouldBlock) => {
-                return PcmRead {
-                    copied: 0,
-                    silence: out.len(),
-                    dropped: 0,
-                    session_id: active_session_hint,
-                    epoch: 0,
-                };
+                return finish_read(
+                    telemetry_token,
+                    PcmRead {
+                        copied: 0,
+                        silence: frame_count,
+                        dropped: 0,
+                        session_id: active_session_hint,
+                        epoch: 0,
+                    },
+                    true,
+                    false,
+                );
             }
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
         };
@@ -323,13 +383,15 @@ impl PcmReader {
         let prebuffer = inner.config.prebuffer_samples as u64;
 
         let Some(reader) = state.readers.get_mut(&self.id) else {
-            return PcmRead {
+            let read = PcmRead {
                 copied: 0,
-                silence: out.len(),
+                silence: frame_count,
                 dropped: 0,
                 session_id: active_session,
                 epoch,
             };
+            drop(state);
+            return finish_read(telemetry_token, read, false, false);
         };
 
         if reader.epoch != epoch {
@@ -347,20 +409,23 @@ impl PcmReader {
 
         let unread = next_seq.saturating_sub(reader.cursor);
         if active_session.is_none() || (!reader.primed && unread < prebuffer) {
-            return PcmRead {
+            let read = PcmRead {
                 copied: 0,
-                silence: out.len(),
+                silence: frame_count,
                 dropped: std::mem::take(&mut reader.dropped_pending),
                 session_id: active_session,
                 epoch,
             };
+            let _ = reader;
+            drop(state);
+            return finish_read(telemetry_token, read, false, false);
         }
         reader.primed = true;
 
-        let copied = (unread as usize).min(out.len());
+        let copied = (unread as usize).min(frame_count);
         let offset = reader.cursor.saturating_sub(base_seq) as usize;
         reader.cursor = reader.cursor.saturating_add(copied as u64);
-        if copied < out.len() {
+        if copied < frame_count {
             // Rebuffer after an underrun. Otherwise every later block would
             // be played one callback late and latency would ratchet upward.
             reader.primed = false;
@@ -369,22 +434,46 @@ impl PcmReader {
         let dropped = std::mem::take(&mut reader.dropped_pending);
         // End the mutable reader borrow before indexing the ring itself.
         let _ = reader;
-        for (dst, src_index) in out.iter_mut().take(copied).zip(offset..) {
-            *dst = state.samples.get(src_index).copied().unwrap_or(0.0);
+        for (dst_index, src_index) in (0..copied).zip(offset..) {
+            write_frame(
+                dst_index,
+                state.frames.get(src_index).copied().unwrap_or([0.0; 2]),
+            );
         }
-        PcmRead {
+        let read = PcmRead {
             copied,
-            silence: out.len() - copied,
+            silence: frame_count - copied,
             dropped,
             session_id: active_session,
             epoch,
-        }
+        };
+        drop(state);
+        finish_read(telemetry_token, read, false, copied < frame_count)
     }
 
     #[cfg(test)]
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
+}
+
+fn finish_read(
+    token: crate::telemetry::OperationToken,
+    read: PcmRead,
+    lock_contention: bool,
+    underrun: bool,
+) -> PcmRead {
+    // Callers that acquired the PCM state release it first. Even the atomic
+    // telemetry handshake therefore never lengthens the bus critical section.
+    crate::telemetry::record_pcm_bus_read(
+        token,
+        read.copied,
+        read.silence,
+        read.dropped,
+        lock_contention,
+        underrun,
+    );
+    read
 }
 
 fn session_from_wire(value: u64) -> Option<u64> {
@@ -422,44 +511,168 @@ mod tests {
         let mut a = bus.subscribe();
         let mut b = bus.subscribe();
         bus.activate(7);
-        assert!(bus.push(7, &[1.0, 2.0, 3.0, 4.0]));
+        assert!(bus.push(
+            7,
+            &[
+                [1.0, -1.0],
+                [2.0, -2.0],
+                [3.0, -3.0],
+                [4.0, -4.0],
+            ]
+        ));
 
-        let mut two = [0.0; 2];
-        assert_eq!(a.read_into(&mut two).copied, 2);
-        assert_eq!(two, [1.0, 2.0]);
-        let mut four = [0.0; 4];
-        assert_eq!(b.read_into(&mut four).copied, 4);
-        assert_eq!(four, [1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(a.read_into(&mut two).copied, 2);
-        assert_eq!(two, [3.0, 4.0]);
+        let mut two = [[0.0; 2]; 2];
+        assert_eq!(a.read_stereo_into(&mut two).copied, 2);
+        assert_eq!(two, [[1.0, -1.0], [2.0, -2.0]]);
+        let mut four = [[0.0; 2]; 4];
+        assert_eq!(b.read_stereo_into(&mut four).copied, 4);
+        assert_eq!(
+            four,
+            [[1.0, -1.0], [2.0, -2.0], [3.0, -3.0], [4.0, -4.0]]
+        );
+        assert_eq!(a.read_stereo_into(&mut two).copied, 2);
+        assert_eq!(two, [[3.0, -3.0], [4.0, -4.0]]);
+    }
+
+    #[test]
+    fn telemetry_reset_preserves_pcm_and_reader_priming() {
+        let bus = PcmBus::new(BusConfig {
+            capacity_samples: 960,
+            prebuffer_samples: 4,
+            max_correction_ppm: 500,
+        });
+        let mut reader = bus.subscribe();
+        bus.activate(17);
+        let pre_reset_token = crate::telemetry::operation_token();
+        assert!(bus.push(
+            17,
+            &[
+                [1.0, -1.0],
+                [2.0, -2.0],
+                [3.0, -3.0],
+                [4.0, -4.0],
+                [5.0, -5.0],
+                [6.0, -6.0],
+            ]
+        ));
+
+        let mut first = [[0.0; 2]; 2];
+        assert_eq!(reader.read_stereo_into(&mut first).copied, 2);
+        assert_eq!(first, [[1.0, -1.0], [2.0, -2.0]]);
+
+        crate::telemetry::reset();
+        assert!(bus.push_with_token(
+            17,
+            &[[7.0, -7.0], [8.0, -8.0]],
+            pre_reset_token
+        ));
+
+        let mut second = [[0.0; 2]; 6];
+        let report = reader.read_stereo_into(&mut second);
+        assert_eq!(report.copied, 6);
+        assert_eq!(report.silence, 0);
+        assert_eq!(report.session_id, Some(17));
+        assert_eq!(
+            second,
+            [
+                [3.0, -3.0],
+                [4.0, -4.0],
+                [5.0, -5.0],
+                [6.0, -6.0],
+                [7.0, -7.0],
+                [8.0, -8.0],
+            ]
+        );
     }
 
     #[test]
     fn overflow_is_bounded_and_reported_per_reader() {
+        let telemetry_before = crate::telemetry::snapshot().counters;
         let bus = tiny_bus();
         let mut reader = bus.subscribe();
         bus.activate(9);
-        let samples: Vec<f32> = (0..1_100).map(|n| n as f32).collect();
-        bus.push(9, &samples);
-        let mut out = [0.0; 2];
-        let report = reader.read_into(&mut out);
+        let frames: Vec<[f32; 2]> = (0..1_100)
+            .map(|n| [n as f32, -(n as f32)])
+            .collect();
+        bus.push(9, &frames);
+        let mut out = [[0.0; 2]; 2];
+        let report = reader.read_stereo_into(&mut out);
         assert_eq!(report.dropped, 140);
-        assert_eq!(out, [140.0, 141.0]);
+        assert_eq!(out, [[140.0, -140.0], [141.0, -141.0]]);
+        let telemetry_after = crate::telemetry::snapshot().counters;
+        assert!(
+            telemetry_after.pcm_bus_overflow_events
+                >= telemetry_before.pcm_bus_overflow_events.saturating_add(1)
+        );
+        assert!(
+            telemetry_after.pcm_bus_overflow_samples
+                >= telemetry_before
+                    .pcm_bus_overflow_samples
+                    .saturating_add(140)
+        );
+        assert!(
+            telemetry_after.pcm_bus_reader_dropped_samples
+                >= telemetry_before
+                    .pcm_bus_reader_dropped_samples
+                    .saturating_add(140)
+        );
+    }
+
+    #[test]
+    fn lock_contention_and_active_stream_underrun_are_distinct_failures() {
+        let telemetry_before = crate::telemetry::snapshot().counters;
+        let bus = tiny_bus();
+        let mut reader = bus.subscribe();
+        bus.activate(11);
+
+        let state = bus.inner.state.lock().unwrap();
+        let contention = reader.read_into(&mut [0.0; 8]);
+        drop(state);
+        assert_eq!(contention.copied, 0);
+        assert_eq!(contention.silence, 8);
+
+        assert!(bus.push(11, &[[0.25, -0.25], [0.5, -0.5]]));
+        let underrun = reader.read_stereo_into(&mut [[0.0; 2]; 8]);
+        assert_eq!(underrun.copied, 2);
+        assert_eq!(underrun.silence, 6);
+
+        let telemetry_after = crate::telemetry::snapshot().counters;
+        assert!(
+            telemetry_after.pcm_bus_lock_contention_reads
+                >= telemetry_before
+                    .pcm_bus_lock_contention_reads
+                    .saturating_add(1)
+        );
+        assert!(
+            telemetry_after.pcm_bus_underrun_reads
+                >= telemetry_before.pcm_bus_underrun_reads.saturating_add(1)
+        );
+        assert!(
+            telemetry_after.pcm_bus_failures_total
+                >= telemetry_before.pcm_bus_failures_total.saturating_add(2)
+        );
     }
 
     #[test]
     fn new_session_invalidates_old_sink_and_resets_readers() {
+        let mismatches_before = crate::telemetry::snapshot()
+            .counters
+            .pcm_bus_pushes_owner_mismatch;
         let bus = tiny_bus();
         let mut reader = bus.subscribe();
         bus.activate(1);
-        bus.push(1, &[0.5, 0.6]);
+        bus.push(1, &[[0.5, -0.5], [0.6, -0.6]]);
         bus.activate(2);
-        assert!(!bus.push(1, &[0.9]));
-        assert!(bus.push(2, &[0.2]));
-        let mut out = [0.0; 1];
-        let report = reader.read_into(&mut out);
+        assert!(!bus.push(1, &[[0.9, -0.9]]));
+        assert!(bus.push(2, &[[0.2, -0.2]]));
+        let mut out = [[0.0; 2]; 1];
+        let report = reader.read_stereo_into(&mut out);
         assert_eq!(report.session_id, Some(2));
-        assert_eq!(out, [0.2]);
+        assert_eq!(out, [[0.2, -0.2]]);
+        let telemetry = crate::telemetry::snapshot();
+        assert!(
+            telemetry.counters.pcm_bus_pushes_owner_mismatch >= mismatches_before.saturating_add(1)
+        );
     }
 
     #[test]
@@ -472,8 +685,8 @@ mod tests {
         let mut realtime = bus.subscribe();
         let _stale = bus.subscribe();
         bus.activate(1);
-        bus.push(1, &vec![0.0; 960]);
-        realtime.read_into(&mut [0.0; 480]);
+        bus.push(1, &vec![[0.0; 2]; 960]);
+        realtime.read_stereo_into(&mut [[0.0; 2]; 480]);
         // The realtime reader is at the post-read target (480); the stale
         // observer still has 960 unread but must not influence the servo.
         assert_eq!(bus.unread_for(realtime.id()), 480);
@@ -485,18 +698,70 @@ mod tests {
         let bus = tiny_bus();
         let mut reader = bus.subscribe();
         bus.activate(1);
-        bus.push(1, &[0.25, 0.5]);
+        bus.push(1, &[[0.25, -0.25], [0.5, -0.5]]);
 
         let guard = bus.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out = [1.0; 2];
-        let report = reader.read_into(&mut out);
+        let mut out = [[1.0; 2]; 2];
+        let report = reader.read_stereo_into(&mut out);
         assert_eq!(report.copied, 0);
         assert_eq!(report.silence, 2);
         assert_eq!(report.session_id, Some(1), "contention is not a disconnect");
-        assert_eq!(out, [0.0, 0.0]);
+        assert_eq!(out, [[0.0; 2]; 2]);
         drop(guard);
 
-        assert_eq!(reader.read_into(&mut out).copied, 2);
-        assert_eq!(out, [0.25, 0.5], "content remains queued after contention");
+        assert_eq!(reader.read_stereo_into(&mut out).copied, 2);
+        assert_eq!(
+            out,
+            [[0.25, -0.25], [0.5, -0.5]],
+            "content remains queued after contention"
+        );
+    }
+
+    #[test]
+    fn prebuffer_and_underrun_use_whole_stereo_frames() {
+        let bus = PcmBus::new(BusConfig {
+            capacity_samples: 960,
+            prebuffer_samples: 4,
+            max_correction_ppm: 500,
+        });
+        let mut reader = bus.subscribe();
+        bus.activate(1);
+        bus.push(1, &[[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]);
+
+        let mut out = [[9.0; 2]; 2];
+        let waiting = reader.read_stereo_into(&mut out);
+        assert_eq!(waiting.copied, 0);
+        assert_eq!(waiting.silence, 2);
+        assert_eq!(out, [[0.0; 2]; 2]);
+
+        bus.push(1, &[[4.0, 40.0]]);
+        let mut out = [[0.0; 2]; 6];
+        let underrun = reader.read_stereo_into(&mut out);
+        assert_eq!(underrun.copied, 4);
+        assert_eq!(underrun.silence, 2);
+        assert_eq!(
+            out,
+            [
+                [1.0, 10.0],
+                [2.0, 20.0],
+                [3.0, 30.0],
+                [4.0, 40.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_mono_reader_explicitly_downmixes_stereo_frames() {
+        let bus = tiny_bus();
+        let mut reader = bus.subscribe();
+        bus.activate(1);
+        bus.push(1, &[[0.75, -0.25], [-0.5, 0.25]]);
+
+        let mut out = [0.0; 2];
+        let read = reader.read_into(&mut out);
+        assert_eq!(read.copied, 2);
+        assert_eq!(out, [0.25, -0.125]);
     }
 }

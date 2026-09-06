@@ -325,9 +325,12 @@
   </ItemGroup>
   <ItemGroup>
     <Inf Exclude="@(Inx)" Include="*.inx">
-      <!-- Empty => stampinf's default "*" (the builder's LOCAL date), which
-           inf2cat rejects as postdated on any machine ahead of UTC. build.ps1
-           supplies a UTC-derived date instead. -->
+      <!-- StampInf's TimeStamp is the four-part driver version, despite its
+           name. It must advance whenever the driver protocol changes so a
+           released equal-rank package cannot remain bound during upgrade. -->
+      <TimeStamp>1.0.1.0</TimeStamp>
+      <!-- An empty DateStamp uses the builder's local date, which Inf2Cat can
+           reject as postdated. build.ps1 supplies a UTC-derived date. -->
       <DateStamp Condition="'$(AudioHubDriverVerDate)' != ''">$(AudioHubDriverVerDate)</DateStamp>
     </Inf>
     <FilesToPackage Include="$(TargetPath)" Condition="'$(ConfigurationType)'=='Driver' or '$(ConfigurationType)'=='DynamicLibrary'" />

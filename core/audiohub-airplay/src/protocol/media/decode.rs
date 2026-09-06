@@ -121,6 +121,10 @@ impl Type96AlacDecoder {
         Ok(DecodedPcm { samples })
     }
 
+    pub(crate) fn reset(&mut self) {
+        self.reset_decoder();
+    }
+
     fn reset_decoder(&mut self) {
         self.scratch.fill(0);
         self.decoder = Decoder::new(self.stream_info.clone());

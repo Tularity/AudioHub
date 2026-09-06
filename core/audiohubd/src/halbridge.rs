@@ -604,7 +604,7 @@ pub struct HalBridgeStatus {
     /// moving. This pair is the only place that state is representable.
     pub last_bind_error: Option<String>,
     /// Binds that SUCCEEDED but published the peer's devices under the generic
-    /// direction names instead of the peer's own (Windows only). Monotonic.
+    /// INF fallback labels instead of the peer's own (Windows only). Monotonic.
     ///
     /// Separate from `bind_failures` because it is not one: the devices exist
     /// and work. It is counted at all because with two peers paired it means
@@ -799,6 +799,10 @@ impl HalBridge {
     /// had played anything, forever, with every counter and probe still green.
     pub fn append_spk_frame(&self, slot: u8, out: &mut Vec<f32>) -> usize {
         self.shared.append_spk_frame(slot, out)
+    }
+
+    fn append_spk_stereo_frame(&self, slot: u8, out: &mut Vec<f32>) -> usize {
+        self.shared.append_spk_stereo_frame(slot, out)
     }
 
     /// 这个槽的扬声器环此刻积着多少帧，以及环有多大（规格 §3.2 的级 3′
@@ -1009,14 +1013,21 @@ impl HalBridge {
     }
 
     /// Reverse direction of plan §7.2: the peer's real device reported a new
-    /// volume, so the virtual control must show it. Best effort — a driver that
-    /// is not attached simply misses it and re-reads on its next handshake.
+    /// volume, so the virtual control must show it. Returns whether the
+    /// platform accepted the notification. A missing/busy driver returns
+    /// false, allowing the coordinator to retry the same authoritative value.
     ///
     /// `generation` is the slot's current stamp; the driver drops anything that
     /// does not match, which is what keeps a volume meant for the previous
     /// tenant of a slot off the new one's control.
-    pub fn notify_volume(&self, at: HalEndpoint, generation: u32, scalar: f32, muted: bool) {
-        self.shared.notify_volume(at, generation, scalar, muted);
+    pub fn notify_volume(
+        &self,
+        at: HalEndpoint,
+        generation: u32,
+        scalar: f32,
+        muted: bool,
+    ) -> bool {
+        self.shared.notify_volume(at, generation, scalar, muted)
     }
 
     /// Tell the driver how many frames of latency this endpoint must declare to
@@ -1498,6 +1509,197 @@ pub(crate) mod trim {
             };
             let b = if i + tau < n { r[i + tau] } else { 0.0 };
             out.push(ga * r[i] + gb * b);
+        }
+    }
+
+    /// Stereo-safe forms of the trim primitives. Frame offsets are kept in
+    /// audio frames while samples remain interleaved. Analysing both channels
+    /// independently is essential: an anti-phase stereo signal is valid audio,
+    /// not silence, and must never take the silent fast path after `(L+R)/2`.
+    pub fn ncc_at_interleaved(r: &[f32], channels: usize, f: usize, x: usize, tau: usize) -> f32 {
+        let channels = channels.max(1);
+        if x == 0 || f < x || r.len() / channels < f + tau {
+            return 0.0;
+        }
+        let (mut num, mut sa, mut sb) = (0.0f64, 0.0f64, 0.0f64);
+        for k in 0..x {
+            for ch in 0..channels {
+                let a = r[(f - x + k) * channels + ch] as f64;
+                let b = r[(f - x + k + tau) * channels + ch] as f64;
+                num += a * b;
+                sa += a * a;
+                sb += b * b;
+            }
+        }
+        let den = (sa * sb).sqrt();
+        if den <= 0.0 {
+            return 0.0;
+        }
+        ((num / den) as f32).clamp(-1.0, 1.0)
+    }
+
+    pub fn gate_peak_interleaved(
+        r: &[f32],
+        channels: usize,
+        f: usize,
+        x: usize,
+        span: usize,
+    ) -> f32 {
+        let channels = channels.max(1);
+        let frames = r.len() / channels;
+        let lo = f.saturating_sub(x).min(frames) * channels;
+        let hi = (f + span).min(frames) * channels;
+        r[lo..hi].iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    pub fn silent_span_interleaved(
+        r: &[f32],
+        channels: usize,
+        f: usize,
+        x: usize,
+        thr: f32,
+    ) -> usize {
+        let channels = channels.max(1);
+        let frames = r.len() / channels;
+        for frame in f.saturating_sub(x).min(frames)..f.min(frames) {
+            if r[frame * channels..(frame + 1) * channels]
+                .iter()
+                .any(|s| s.abs() >= thr)
+            {
+                return 0;
+            }
+        }
+        let mut n = 0;
+        for frame in f.min(frames)..frames {
+            if r[frame * channels..(frame + 1) * channels]
+                .iter()
+                .any(|s| s.abs() >= thr)
+            {
+                break;
+            }
+            n += 1;
+        }
+        n
+    }
+
+    fn search_tau_interleaved(
+        r: &[f32],
+        channels: usize,
+        f: usize,
+        x: usize,
+        want: usize,
+        lo: usize,
+        hi: usize,
+    ) -> (usize, f32) {
+        let hi = hi.min((r.len() / channels.max(1)).saturating_sub(f));
+        if lo > hi {
+            let tau = want.min(hi);
+            return (tau, ncc_at_interleaved(r, channels, f, x, tau));
+        }
+        let mut best = lo;
+        let mut best_ncc = f32::NEG_INFINITY;
+        for tau in lo..=hi {
+            let n = ncc_at_interleaved(r, channels, f, x, tau);
+            let better = n > best_ncc + 1e-6;
+            let tie = (n - best_ncc).abs() <= 1e-6 && want.abs_diff(tau) < want.abs_diff(best);
+            if better || tie {
+                best = tau;
+                best_ncc = n;
+            }
+        }
+        (best, best_ncc)
+    }
+
+    pub fn decide_interleaved(r: &[f32], channels: usize, plan: &Plan) -> Option<Decision> {
+        let channels = channels.max(1);
+        let f = super::HAL_FRAME_48K;
+        let frames = r.len() / channels;
+        if frames < f + T_MIN {
+            return None;
+        }
+        let span = frames - f;
+        let sil = silent_span_interleaved(r, channels, f, X, GATE_SILENT).min(span);
+        if sil >= T_MIN {
+            let fast = plan.fast.min(sil).min(plan.feasible);
+            let choice = if fast >= T_MIN {
+                Some((fast, false))
+            } else {
+                let t = plan.budget.min(T_MAX_SILENT).min(sil).min(plan.feasible);
+                (t >= T_MIN).then_some((t, true))
+            };
+            if let Some((tau, charge)) = choice {
+                return Some(Decision {
+                    tau,
+                    ncc: ncc_at_interleaved(r, channels, f, X, tau),
+                    tier: Tier::Silent,
+                    forced: false,
+                    charge,
+                });
+            }
+        }
+        let want = plan.budget.min(T_MAX_CORR).min(plan.feasible);
+        if want < T_MIN {
+            return None;
+        }
+        let peak = gate_peak_interleaved(r, channels, f, X, want);
+        let tier = if peak < GATE_QUIET {
+            Tier::Quiet
+        } else {
+            Tier::Forced
+        };
+        if tier > plan.allow {
+            return None;
+        }
+        let lo = T_MIN.max(want.saturating_sub(DELTA));
+        let hi = (want + DELTA).min(plan.feasible).min(span);
+        if hi < lo {
+            return None;
+        }
+        let (tau, ncc) = search_tau_interleaved(r, channels, f, X, want, lo, hi);
+        if tau < T_MIN || tau > span || tau > plan.feasible {
+            return None;
+        }
+        Some(Decision {
+            tau,
+            ncc,
+            tier,
+            forced: tier == Tier::Forced,
+            charge: true,
+        })
+    }
+
+    pub fn splice_interleaved(
+        r: &[f32],
+        channels: usize,
+        f: usize,
+        x: usize,
+        tau: usize,
+        ncc: f32,
+        out: &mut Vec<f32>,
+    ) {
+        let channels = channels.max(1);
+        debug_assert!(r.len() / channels >= f + tau);
+        let x = x.min(f);
+        out.reserve(f * channels);
+        out.extend_from_slice(&r[..f.saturating_sub(x) * channels]);
+        if x == 0 {
+            return;
+        }
+        let p = 0.5 + 0.5 * ncc.clamp(0.0, 1.0);
+        let equal_gain = p >= 1.0 - 1e-6;
+        for k in 0..x {
+            let frame = f - x + k;
+            let u = 0.5 * (1.0 - (std::f32::consts::PI * (k as f32 + 0.5) / x as f32).cos());
+            let (ga, gb) = if equal_gain {
+                (1.0 - u, u)
+            } else {
+                ((1.0 - u).powf(p), u.powf(p))
+            };
+            for ch in 0..channels {
+                let a = r[frame * channels + ch];
+                let b = r[(frame + tau) * channels + ch];
+                out.push(ga * a + gb * b);
+            }
         }
     }
 
@@ -3542,10 +3744,12 @@ pub struct HalSpeakerSource {
     log_window_us: u64,
     log_in_window: u32,
     log_suppressed: u32,
-    /// 预分配的 peek 暂存：交织立体声 + 下混单声道。**10 ms 节拍上零分配**。
+    /// Preallocated interleaved-stereo peek scratch. No allocation on the
+    /// 10 ms deadline path.
+    /// Trim analyses both channels so anti-phase material cannot masquerade
+    /// as silence and applies one frame-aligned splice to L and R.
     /// 只在 `mode != off` 时分配。
     peek_st: Vec<f32>,
-    peek_mono: Vec<f32>,
 }
 
 impl HalSpeakerSource {
@@ -3606,7 +3810,6 @@ impl HalSpeakerSource {
             log_in_window: 0,
             log_suppressed: 0,
             peek_st: vec![0.0; n * HAL_SPK_CHANNELS as usize],
-            peek_mono: vec![0.0; n],
         }
     }
 
@@ -3655,7 +3858,7 @@ impl HalSpeakerSource {
             // `underrun.events` 少计，`worst_run_frames` 变成一个**跨越脱离
             // 期**的合成数——它描述的时长里有一半根本没有环存在。
             self.note_short(0, 0, now_us);
-            self.bridge.append_spk_frame(self.slot, out);
+            self.bridge.append_spk_stereo_frame(self.slot, out);
             return;
         };
 
@@ -3685,7 +3888,7 @@ impl HalSpeakerSource {
         if let Some(deadline) = self.prime_until_us {
             if (avail as usize) < trim::D_TARGET_COLD && now_us < deadline {
                 self.note_short(0, avail, now_us);
-                out.resize(out.len() + HAL_FRAME_48K, 0.0);
+                out.resize(out.len() + HAL_FRAME_48K * HAL_SPK_CHANNELS as usize, 0.0);
                 return;
             }
             self.prime_until_us = None;
@@ -3703,7 +3906,7 @@ impl HalSpeakerSource {
             }
         }
         if tau == 0 {
-            let got = self.bridge.append_spk_frame(self.slot, out);
+            let got = self.bridge.append_spk_stereo_frame(self.slot, out);
             self.note_short((HAL_FRAME_48K - got) as u32, avail, now_us);
         } else {
             self.note_short(0, avail, now_us);
@@ -3746,21 +3949,27 @@ impl HalSpeakerSource {
     /// 动过一个下标。
     fn try_trim(&mut self, plan: &trim::Plan, avail: u32, out: &mut Vec<f32>) -> usize {
         let f = HAL_FRAME_48K;
-        if self.peek_mono.is_empty() {
+        if self.peek_st.is_empty() {
             return 0;
         }
         // 两段式 peek：绝大多数 tick 只需要第一段（≈1 344 帧 = 5.4 KB 立体声）。
         // 只有第一段确认为纯静音时才去取更长的那一段——静音档的可削量可达
         // 250 ms，为它每 tick 搬 100 KB 是纯浪费。
         let base_len = trim::peek_base(plan);
-        let Some((got, base)) = self.peek_mono_frames(base_len, avail) else {
+        let Some((got, base)) = self.peek_stereo_frames(base_len, avail) else {
             return 0;
         };
         let ext_len = trim::peek_ext(plan);
         let (got, base) = if ext_len > base_len
-            && trim::silent_span(&self.peek_mono[..got], f, trim::X, trim::GATE_SILENT) >= got - f
+            && trim::silent_span_interleaved(
+                &self.peek_st[..got * HAL_SPK_CHANNELS as usize],
+                HAL_SPK_CHANNELS as usize,
+                f,
+                trim::X,
+                trim::GATE_SILENT,
+            ) >= got - f
         {
-            match self.peek_mono_frames(ext_len, avail) {
+            match self.peek_stereo_frames(ext_len, avail) {
                 Some(v) => v,
                 None => (got, base),
             }
@@ -3768,15 +3977,31 @@ impl HalSpeakerSource {
             (got, base)
         };
 
-        let Some(d) = trim::decide(&self.peek_mono[..got], plan) else {
+        let Some(d) = trim::decide_interleaved(
+            &self.peek_st[..got * HAL_SPK_CHANNELS as usize],
+            HAL_SPK_CHANNELS as usize,
+            plan,
+        ) else {
             return 0;
         };
         // F 档的软条件：相关度太低就再等 200 ms 找个好点位。不改变 10 s 死线。
         if d.forced && d.ncc < trim::NCC_MIN_F && self.ctl.retry_ncc() {
             return 0;
         }
-        trim::splice(&self.peek_mono[..got], f, trim::X, d.tau, d.ncc, out);
-        debug_assert_eq!(out.len(), f, "不变量 I1：输出恒为一帧");
+        trim::splice_interleaved(
+            &self.peek_st[..got * HAL_SPK_CHANNELS as usize],
+            HAL_SPK_CHANNELS as usize,
+            f,
+            trim::X,
+            d.tau,
+            d.ncc,
+            out,
+        );
+        debug_assert_eq!(
+            out.len(),
+            f * HAL_SPK_CHANNELS as usize,
+            "invariant I1: output is exactly one interleaved stereo frame"
+        );
         self.bridge
             .rings
             .advance_spk(self.slot as usize, base, f + d.tau);
@@ -3798,11 +4023,11 @@ impl HalSpeakerSource {
         d.tau
     }
 
-    /// peek `want` 帧、下混进 `self.peek_mono`，返回 `(帧数, 读基准)`。
+    /// Peek `want` interleaved stereo frames and return `(frames, read base)`.
     /// `None` = 没有环 / 不够一帧加最小削减量。
-    fn peek_mono_frames(&mut self, want: usize, avail: u32) -> Option<(usize, u64)> {
+    fn peek_stereo_frames(&mut self, want: usize, avail: u32) -> Option<(usize, u64)> {
         let ch = HAL_SPK_CHANNELS as usize;
-        let n = want.min(avail as usize).min(self.peek_mono.len());
+        let n = want.min(avail as usize).min(self.peek_st.len() / ch);
         if n < HAL_FRAME_48K + trim::T_MIN {
             return None;
         }
@@ -3812,11 +4037,6 @@ impl HalSpeakerSource {
                 .peek_spk(self.slot as usize, &mut self.peek_st[..n * ch], n)?;
         if got < HAL_FRAME_48K + trim::T_MIN {
             return None;
-        }
-        // 与 `read_spk_chunk` 同一条下混：分析必须发生在**我们真正要发出去的
-        // 那个信号**上，不是发生在左声道上。
-        for i in 0..got {
-            self.peek_mono[i] = (self.peek_st[i * ch] + self.peek_st[i * ch + 1]) * 0.5;
         }
         Some((got, base))
     }
@@ -3985,6 +4205,10 @@ impl audiohub_net::media::FrameSource for HalSpeakerSource {
             }
         }
         true // silence when idle: the virtual device is alive even with no app on it
+    }
+
+    fn channels(&self) -> u8 {
+        HAL_SPK_CHANNELS as u8
     }
     /// 只有虚拟扬声器环一级。`None` = 驱动没附着，那一级**不存在**（不是 0 ms）。
     fn depths(&self) -> audiohub_core::latency::SourceDepths {
@@ -4297,6 +4521,40 @@ impl Shared {
         got
     }
 
+    /// Appends one native interleaved stereo HAL frame. Frame counts and ring
+    /// indices stay in audio frames; only the sample slice is twice as wide.
+    fn append_spk_stereo_frame(&self, slot: u8, out: &mut Vec<f32>) -> usize {
+        let got = self.read_spk_stereo_chunk(slot, out, HAL_FRAME_48K);
+        if got < HAL_FRAME_48K {
+            out.resize(
+                out.len() + (HAL_FRAME_48K - got) * HAL_SPK_CHANNELS as usize,
+                0.0,
+            );
+        }
+        got
+    }
+
+    fn read_spk_stereo_chunk(&self, slot: u8, out: &mut Vec<f32>, frames: usize) -> usize {
+        let frames = frames.min(HAL_FRAME_48K);
+        if self.take_flush(slot) {
+            self.rings.flush_spk_consumer(slot as usize);
+        }
+        let start = out.len();
+        out.resize(start + frames * HAL_SPK_CHANNELS as usize, 0.0);
+        let got = self.rings.read_spk(
+            slot as usize,
+            &mut out[start..start + frames * HAL_SPK_CHANNELS as usize],
+            frames,
+        );
+        out.truncate(start + got * HAL_SPK_CHANNELS as usize);
+        if got > 0 {
+            if let Some(c) = self.slots.get(slot as usize) {
+                c.spk_frames.fetch_add(got as u64, Ordering::Relaxed);
+            }
+        }
+        got
+    }
+
     /// Appends at most `frames` (<= HAL_FRAME_48K) mono samples.
     fn read_spk_chunk(&self, slot: u8, out: &mut Vec<f32>, frames: usize) -> usize {
         let frames = frames.min(HAL_FRAME_48K);
@@ -4340,8 +4598,8 @@ impl Shared {
         wrote
     }
 
-    fn notify_volume(&self, at: HalEndpoint, generation: u32, scalar: f32, muted: bool) {
-        platform::send_notify(self, at, generation, scalar, muted);
+    fn notify_volume(&self, at: HalEndpoint, generation: u32, scalar: f32, muted: bool) -> bool {
+        platform::send_notify(self, at, generation, scalar, muted)
     }
 
     fn notify_latency(&self, at: HalEndpoint, generation: u32, frames: u32) {
@@ -5992,7 +6250,7 @@ mod platform {
         generation: u32,
         scalar: f32,
         muted: bool,
-    ) {
+    ) -> bool {
         let (kr, port) = send_to_driver(
             shared,
             NOTIFY_VOLUME,
@@ -6006,6 +6264,7 @@ mod platform {
         if kr != MACH_MSG_SUCCESS && kr != MACH_SEND_TIMED_OUT {
             disconnect_port(shared, port, "volume relay found its port dead");
         }
+        kr == MACH_MSG_SUCCESS
     }
 
     pub fn send_latency(shared: &Shared, at: HalEndpoint, generation: u32, frames: u32) {
@@ -6753,6 +7012,21 @@ mod platform {
         }
 
         #[test]
+        fn hal_speaker_source_preserves_asymmetric_stereo_and_pads_by_frame() {
+            let (ds, _dm, rings) = attached_rings();
+            let spk = attach_ring(&ds, HAL_SPK_CHANNELS);
+            let stereo = [1.0, 0.0, -0.25, 0.75, 0.4, -0.4];
+            assert_eq!(spk.write(&stereo, 3), 3);
+            let shared = Arc::new(test_shared(rings));
+            let mut source = HalSpeakerSource::with_mode(shared, 0, trim::Mode::Off);
+            let mut out = Vec::new();
+            source.tick(HalSpeakerSource::PRIME_TIMEOUT_US + 1, &mut out);
+            assert_eq!(out.len(), HAL_FRAME_48K * 2);
+            assert_eq!(&out[..6], &stereo);
+            assert!(out[6..].iter().all(|s| *s == 0.0));
+        }
+
+        #[test]
         fn mic_writes_are_counted_and_overflow_is_reported() {
             let (_ds, dm, rings) = attached_rings();
             dm.hdr().write_idx.store(23_997, Ordering::Relaxed);
@@ -6858,7 +7132,7 @@ mod platform {
             // 真的取走一帧之后才准下降，且恰好降 480。
             let mut out = Vec::new();
             src.next_frame(&mut out);
-            assert_eq!(out.len(), HAL_FRAME_48K);
+            assert_eq!(out.len(), HAL_FRAME_48K * 2);
             assert_eq!(src.depths()[0].unwrap().samples, 19_200 - 480);
         }
 
@@ -7038,7 +7312,7 @@ mod platform {
             for t in 0..500u64 {
                 rig.drive(&frame);
                 src.tick(t * 10_000, &mut out);
-                assert_eq!(out.len(), HAL_FRAME_48K);
+                assert_eq!(out.len(), HAL_FRAME_48K * 2);
                 out.clear();
             }
             assert_eq!(
@@ -7313,7 +7587,11 @@ mod platform {
             for t in 0..6_000u64 {
                 rig.drive(&frame);
                 src.tick(t * 10_000, &mut out);
-                assert_eq!(out.len(), HAL_FRAME_48K, "不变量 I1：输出恒为一帧");
+                assert_eq!(
+                    out.len(),
+                    HAL_FRAME_48K * 2,
+                    "invariant I1: output is exactly one frame"
+                );
                 out.clear();
             }
             let c = rig.counters();
@@ -7635,8 +7913,12 @@ mod platform {
             for t in 0..6_000u64 {
                 rig.drive(&frame);
                 src.tick(t * 10_000, &mut out);
-                assert_eq!(out.len(), HAL_FRAME_48K, "不变量 I1：输出恒为一帧");
-                stream.extend_from_slice(&out);
+                assert_eq!(
+                    out.len(),
+                    HAL_FRAME_48K * 2,
+                    "invariant I1: output is exactly one frame"
+                );
+                stream.extend(out.chunks_exact(2).map(|frame| frame[0]));
                 out.clear();
             }
             let c = rig.counters();
@@ -7696,7 +7978,7 @@ mod platform {
             for t in 0..40u64 {
                 rig.drive(&silence);
                 src.tick(t * 10_000, &mut out);
-                assert_eq!(out.len(), HAL_FRAME_48K);
+                assert_eq!(out.len(), HAL_FRAME_48K * 2);
                 out.clear();
             }
             let ms = rig.readable() as f32 / 48.0;
@@ -7725,7 +8007,7 @@ mod platform {
             let t0 = HalSpeakerSource::PRIME_TIMEOUT_US + 10_000;
             // 环是空的：整帧补静音。
             src.tick(t0, &mut out);
-            assert_eq!(out.len(), HAL_FRAME_48K);
+            assert_eq!(out.len(), HAL_FRAME_48K * 2);
             assert!(out.iter().all(|s| *s == 0.0));
             let c = rig.counters();
             assert_eq!(c.underrun.frames, HAL_FRAME_48K as u64);
@@ -7777,7 +8059,11 @@ mod platform {
             // 环是空的：预填期发整帧静音，**不计欠载**，也不动 read_idx。
             for t in 0..2u64 {
                 src.tick(t * 10_000, &mut out);
-                assert_eq!(out.len(), HAL_FRAME_48K, "预填期仍然要输出整整一帧");
+                assert_eq!(
+                    out.len(),
+                    HAL_FRAME_48K * 2,
+                    "priming must still emit exactly one frame"
+                );
                 assert!(out.iter().all(|s| *s == 0.0), "预填期输出必须是静音");
                 out.clear();
             }
@@ -7802,7 +8088,7 @@ mod platform {
                 rig.drive(&frame);
             }
             src.tick(30_000, &mut out);
-            assert_eq!(out.len(), HAL_FRAME_48K);
+            assert_eq!(out.len(), HAL_FRAME_48K * 2);
             assert!(out.iter().any(|s| *s != 0.0), "预填结束后第一帧必须有声音");
             assert_eq!(
                 rig.counters().underrun.frames,
@@ -7826,7 +8112,7 @@ mod platform {
             assert_eq!(rig.counters().underrun.frames, 0);
             // 超时之后：回到正常路径，空环 ⇒ 如实计欠载。
             src.tick(HalSpeakerSource::PRIME_TIMEOUT_US + 10_000, &mut out);
-            assert_eq!(out.len(), HAL_FRAME_48K);
+            assert_eq!(out.len(), HAL_FRAME_48K * 2);
             assert_eq!(
                 rig.counters().underrun.frames,
                 HAL_FRAME_48K as u64,
@@ -7970,7 +8256,7 @@ mod platform {
             let mut out = Vec::new();
             for t in 0..10u64 {
                 src.tick(t * 10_000, &mut out);
-                assert_eq!(out.len(), HAL_FRAME_48K);
+                assert_eq!(out.len(), HAL_FRAME_48K * 2);
                 out.clear();
             }
             assert_eq!(shared.slots[0].snapshot().underrun.frames, 0);
@@ -9080,9 +9366,8 @@ mod platform {
             );
             *lk(&shared.driver_port) = MACH_PORT_NULL;
             shared.driver_connected.store(false, Ordering::Relaxed);
-            // The public path swallows it: a peer volume change with no driver
-            // attached is a no-op, not an error the daemon has to handle.
-            shared.notify_volume(HalEndpoint::out(0), 1, 0.5, false);
+            // The public path reports a retryable miss without panicking.
+            assert!(!shared.notify_volume(HalEndpoint::out(0), 1, 0.5, false));
             assert!(!shared.driver_connected.load(Ordering::Relaxed));
         }
 
@@ -9145,9 +9430,9 @@ mod platform {
             assert_eq!(b.write_mic_mono(0, &[0.25; 64]), 0);
             assert_eq!(b.status().mic_dropped, 0);
             assert!(b.drain_events().is_empty());
-            b.notify_volume(HalEndpoint::out(0), 1, 0.4, false); // no driver: a no-op
-                                                                 // ...as are Binds: nothing to send them to, and the coordinator
-                                                                 // simply retries on its next pass.
+            assert!(!b.notify_volume(HalEndpoint::out(0), 1, 0.4, false));
+            // ...as are Binds: nothing to send them to, and the coordinator
+            // simply retries on its next pass.
             assert!(!b.bind_clear(0, 1));
             assert_eq!(b.slot_count(), 0, "a bridge with no driver has no capacity");
 
@@ -9182,8 +9467,11 @@ mod platform {
     /// The name is inherited from the macOS side. On Windows it holds two
     /// things: the driver session (control plane) and the mapped rings (data
     /// plane), and they are deliberately separate. The session lives behind a
-    /// `Mutex` because an IOCTL is a blocking round trip; the rings live behind
-    /// their own `RwLock` because the audio path must never wait on a control
+    /// `Mutex` because an IOCTL is a blocking round trip. That same mutex is
+    /// the lifecycle transition lock: attach holds it while moving and
+    /// publishing rings, and detach holds it until those rings are inaccessible
+    /// and the matching control handle is gone. The rings live behind their own
+    /// `RwLock` because the audio path must never wait on an ordinary control
     /// call to read a frame.
     ///
     /// Putting both HERE rather than adding fields to `Shared` is what keeps
@@ -9301,7 +9589,8 @@ mod platform {
         _generation: u32,
         _scalar: f32,
         _muted: bool,
-    ) {
+    ) -> bool {
+        false
     }
 
     #[cfg(not(windows))]
@@ -9321,6 +9610,33 @@ mod platform {
 
     #[cfg(windows)]
     use crate::halbridge_win::{session::Session, wire};
+
+    /// Daemon-local identity of one published Windows control session.
+    ///
+    /// The driver's id is not enough on its own: it restarts from one when the
+    /// image reloads. `attach_epoch` is monotonic for this daemon lifetime, so
+    /// the pair also rejects a late failure from a pre-reload session whose
+    /// driver id happens to have been reused.
+    #[cfg(windows)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct WindowsSessionIdentity {
+        attach_epoch: u64,
+        driver_session_id: u64,
+    }
+
+    #[cfg(windows)]
+    impl WindowsSessionIdentity {
+        fn capture(shared: &Shared, session: &Session) -> Self {
+            Self {
+                attach_epoch: shared.attach_epoch.load(Ordering::Acquire),
+                driver_session_id: session.session_id,
+            }
+        }
+
+        fn matches(self, attach_epoch: u64, driver_session_id: u64) -> bool {
+            self.attach_epoch == attach_epoch && self.driver_session_id == driver_session_id
+        }
+    }
 
     /// How often the service thread retries a missing driver and drains the
     /// inverted call. The macOS side is woken by mach; here there is nothing to
@@ -9399,6 +9715,20 @@ mod platform {
             s.client_check,
         );
 
+        // `session` is also the Windows lifecycle transition lock. Hold it
+        // from before the mapping moves until every public fact and the
+        // session itself have been published. Otherwise a late IOCTL failure
+        // could detach the new mapping between `move_into` and `Some(s)`, then
+        // leave a connected control session with no data plane.
+        let mut session = lk(&shared.rings.session);
+        if session.is_some() {
+            dlog!(
+                "[audiohubd] hal: refusing to attach session {id} while another Windows \
+                 control session is still published"
+            );
+            return;
+        }
+
         if s.identity_check_degraded() {
             // Loud on purpose. A caller-identity check that silently degraded
             // to "the ACL let you in" is indistinguishable from no check, and
@@ -9426,7 +9756,17 @@ mod platform {
             // is a level meter nobody is looking at.
             dlog!(
                 "[audiohubd] hal: the driver has no volume node (AH_CAP_VOLUME is clear); \
-                 the samples in the rings are pre-attenuated, so volume must not be synced"
+                the samples in the rings are pre-attenuated, so volume must not be synced"
+            );
+        } else if !s.has_volume_event() {
+            // Drivers predating CAP_VOLUMEEVENT accept IOCTL_NOTIFY but cannot
+            // raise the topology control-change event which makes the Windows
+            // slider move. Treating that reply as delivery would permanently
+            // suppress the relay's retry even though the visible endpoint did
+            // not change.
+            dlog!(
+                "[audiohubd] hal: the driver cannot publish remote volume changes to the Windows \
+                 audio engine (AH_CAP_VOLUMEEVENT is clear); volume notify delivery is disabled"
             );
         }
 
@@ -9434,8 +9774,14 @@ mod platform {
         // mixer and the tx engine reach it WITHOUT taking the session mutex —
         // which an IOCTL can hold for its whole round trip.
         s.rings.move_into(&shared.rings.rings);
+        // A new control session has not established any slot generation yet.
+        // Drop volume/IO events until the idempotent bind replies below name
+        // the generation this daemon is coordinating.
+        for slot in &shared.slots {
+            slot.generation.store(0, Ordering::Release);
+        }
 
-        *lk(&shared.rings.session) = Some(s);
+        *session = Some(s);
         shared.session_id.store(id, Ordering::SeqCst);
         shared.slot_count.store(slots as u32, Ordering::SeqCst);
         shared.driver_protocol.store(protocol, Ordering::Relaxed);
@@ -9455,7 +9801,24 @@ mod platform {
     /// died is not a peer that was unpaired, and plan §7.3 keeps a paired
     /// peer's devices in the system list either way.
     #[cfg(windows)]
-    fn detach(shared: &Shared, why: &str) {
+    fn detach_locked(
+        shared: &Shared,
+        mut session: std::sync::MutexGuard<'_, Option<Session>>,
+        expected: Option<WindowsSessionIdentity>,
+        why: &str,
+    ) -> bool {
+        let Some(live) = session.as_ref() else {
+            return false;
+        };
+        if expected.is_some_and(|expected| {
+            !expected.matches(shared.attach_epoch.load(Ordering::Acquire), live.session_id)
+        }) {
+            // This failure belongs to a session which has already been
+            // replaced. It must not touch either the replacement's mappings
+            // or its control handle.
+            return false;
+        }
+
         // THE RINGS GO FIRST, before anything can drop the session and with it
         // the control handle. The mapping is torn down by the driver in
         // IRP_MJ_CLEANUP — i.e. the instant `CloseHandle` runs — so the mixer
@@ -9463,16 +9826,37 @@ mod platform {
         // `WinRings`'s write lock is exactly that wait. Reverse these two and
         // a driver restart during playback is a segfault in whichever thread
         // happened to be mid-memcpy.
+        // `session` stays locked across both operations. This is the same lock
+        // attach holds across mapping move + publication, so there is no gap
+        // in which either transition can consume the other's rings.
         shared.rings.rings.detach();
-        if lk(&shared.rings.session).take().is_none() {
-            return;
-        }
+        drop(session.take());
         shared.driver_connected.store(false, Ordering::Relaxed);
         shared.slot_count.store(0, Ordering::SeqCst);
         shared.session_id.store(0, Ordering::SeqCst);
         *lk(&shared.status_reason) = Some(why.to_string());
         shared.push_event(HalControlEvent::Detached);
         dlog!("[audiohubd] hal: detached ({why})");
+        true
+    }
+
+    #[cfg(windows)]
+    fn detach(shared: &Shared, why: &str) -> bool {
+        let session = lk(&shared.rings.session);
+        detach_locked(shared, session, None, why)
+    }
+
+    /// Tear down exactly the session whose IOCTL failed. Both volume notify
+    /// and bind use this path while still holding the session transition lock;
+    /// neither exposes a drop/relock window to a replacement attach.
+    #[cfg(windows)]
+    fn detach_failed_session(
+        shared: &Shared,
+        session: std::sync::MutexGuard<'_, Option<Session>>,
+        failed: WindowsSessionIdentity,
+        why: &str,
+    ) -> bool {
+        detach_locked(shared, session, Some(failed), why)
     }
 
     #[cfg(windows)]
@@ -9498,8 +9882,35 @@ mod platform {
                 // is no volume node and no data plane — but the loop is here so
                 // that adding either is a driver-side change only.
                 let events = {
-                    let mut g = lk(&shared.rings.session);
-                    g.as_mut().map(|s| s.poll_events()).unwrap_or_default()
+                    let mut guard = lk(&shared.rings.session);
+                    let (polled, failed) = match guard.as_mut() {
+                        Some(session) => {
+                            let failed = WindowsSessionIdentity::capture(&shared, session);
+                            (session.poll_events(), Some(failed))
+                        }
+                        None => (Ok(Vec::new()), None),
+                    };
+                    match polled {
+                        Ok(events) => events,
+                        Err(err) => {
+                            // An inverted-call failure is a control-session
+                            // failure, not permission to disable driver events
+                            // forever. Detach this exact session; service_loop
+                            // will reopen and re-arm it on the next pass.
+                            if let Some(failed) = failed {
+                                detach_failed_session(
+                                    &shared,
+                                    guard,
+                                    failed,
+                                    &format!(
+                                        "driver control-event call failed; reopening session: \
+                                         {err:#}"
+                                    ),
+                                );
+                            }
+                            Vec::new()
+                        }
+                    }
                 };
                 if !events.is_empty() {
                     *lk(&shared.last_driver_msg) = Some(Instant::now());
@@ -9514,7 +9925,7 @@ mod platform {
             std::thread::sleep(SERVICE_TICK);
         }
 
-        detach(&shared, "daemon shutting down");
+        let _ = detach(&shared, "daemon shutting down");
     }
 
     /// Wire event -> bridge event, dropping anything about a slot the driver
@@ -9531,17 +9942,36 @@ mod platform {
             HalEndpoint::out(slot)
         };
         match ev.kind {
-            wire::EVENT_VOLUME => Some(HalControlEvent::Volume {
-                at,
-                generation: ev.generation,
-                scalar: ev.scalar(),
-                muted: ev.muted(),
-            }),
-            wire::EVENT_IOSTATE => Some(HalControlEvent::IoState {
-                at,
-                generation: ev.generation,
-                running: ev.running(),
-            }),
+            wire::EVENT_VOLUME | wire::EVENT_IOSTATE => {
+                let current = shared.slots[slot as usize]
+                    .generation
+                    .load(Ordering::Acquire);
+                if current == 0 || ev.generation != current {
+                    dlog!(
+                        "[audiohubd] hal: dropping Windows event {} for slot {} at generation {} \
+                         (current {})",
+                        ev.kind,
+                        slot,
+                        ev.generation,
+                        current
+                    );
+                    return None;
+                }
+                if ev.kind == wire::EVENT_VOLUME {
+                    Some(HalControlEvent::Volume {
+                        at,
+                        generation: ev.generation,
+                        scalar: ev.scalar(),
+                        muted: ev.muted(),
+                    })
+                } else {
+                    Some(HalControlEvent::IoState {
+                        at,
+                        generation: ev.generation,
+                        running: ev.running(),
+                    })
+                }
+            }
             wire::EVENT_SLOT => {
                 let state = match ev.state {
                     wire::SLOT_FREE => HalSlotState::Free,
@@ -9553,7 +9983,12 @@ mod platform {
                     wire::SLOT_DELISTED => HalSlotState::Delisted,
                     _ => return None,
                 };
-                shared.arm_flush(slot);
+                let previous = shared.slots[slot as usize]
+                    .generation
+                    .swap(ev.generation, Ordering::AcqRel);
+                if previous != ev.generation {
+                    shared.arm_flush(slot);
+                }
                 Some(HalControlEvent::BindState {
                     slot,
                     generation: ev.generation,
@@ -9576,9 +10011,10 @@ mod platform {
     /// setting in a software APO upstream of the ring. Sending anyway would be
     /// asking for the setting to be applied twice.
     ///
-    /// Failures are logged, never propagated. This is a best-effort follow of
-    /// somebody else's slider; it must not be able to tear down a session that
-    /// is otherwise carrying audio perfectly well.
+    /// The best-effort miss is returned to the relay for bounded retry. An
+    /// actual IOCTL failure detaches the stale driver control session so the
+    /// service loop can reopen it; the audio mapping owned by that session is
+    /// no longer safe to keep using either.
     #[cfg(windows)]
     pub fn send_notify(
         shared: &Shared,
@@ -9586,17 +10022,33 @@ mod platform {
         generation: u32,
         scalar: f32,
         muted: bool,
-    ) {
+    ) -> bool {
         let guard = lk(&shared.rings.session);
-        let Some(s) = guard.as_ref() else { return };
-        if !s.has_volume() {
-            return;
+        let Some(s) = guard.as_ref() else {
+            return false;
+        };
+        if !s.has_volume() || !s.has_volume_event() {
+            return false;
         }
-        if let Err(e) = s.notify(at.slot, generation, at.input, muted, scalar) {
-            dlog!(
-                "[audiohubd] hal: slot {} volume notify failed: {e:#}",
-                at.slot
-            );
+        let failed = WindowsSessionIdentity::capture(shared, s);
+        match s.notify(at.slot, generation, at.input, muted, scalar) {
+            Ok(_) => true,
+            Err(e) => {
+                // An IOCTL failure makes this control handle unusable in the
+                // same way as a failed bind. Drop the session so service_loop
+                // can reopen the driver; retrying forever against the same
+                // stale handle would strand volume sync after a driver restart.
+                detach_failed_session(
+                    shared,
+                    guard,
+                    failed,
+                    &format!(
+                        "slot {} volume notify failed; the driver stopped answering: {e:#}",
+                        at.slot
+                    ),
+                );
+                false
+            }
         }
     }
 
@@ -9676,10 +10128,10 @@ mod platform {
     /// carried by the reply's own status field, and a non-OK status is reported
     /// as failure so the coordinator retries on its next pass.
     ///
-    /// `is_set` splits the two operations because their success invariants are
-    /// different and BOTH are checked here: a SET that returns OK must have
-    /// published `PUB_BOTH`, a CLEAR that returns OK must have published
-    /// nothing. The driver checks the same thing; this side checks it again
+    /// `requested` splits the two operations because their success invariants
+    /// are different and BOTH are checked here: a SET that returns OK must
+    /// publish its exact requested mask, while a CLEAR must publish nothing.
+    /// The driver checks the same thing; this side checks it again
     /// because the whole class of defect being guarded against is "the driver
     /// said OK and it was not true", and a guard that lives only inside the
     /// thing it is guarding cannot catch that.
@@ -9692,6 +10144,7 @@ mod platform {
         let Some(s) = guard.as_ref() else {
             return false;
         };
+        let failed = WindowsSessionIdentity::capture(shared, s);
 
         let reply = match f(s) {
             Ok(r) => r,
@@ -9699,8 +10152,12 @@ mod platform {
                 // A failed IOCTL means the handle is no longer usable in any
                 // way we can distinguish, so the session goes. Dropping it
                 // inside the guard, then reporting, keeps the two consistent.
-                drop(guard);
-                detach(shared, &format!("the driver stopped answering: {e:#}"));
+                detach_failed_session(
+                    shared,
+                    guard,
+                    failed,
+                    &format!("the driver stopped answering: {e:#}"),
+                );
                 return false;
             }
         };
@@ -9741,7 +10198,7 @@ mod platform {
                 .fetch_add(1, Ordering::Relaxed);
             dlog!(
                 "[audiohubd] hal: slot {slot} bound, but the per-peer device name could \
-                 not be applied; the endpoints carry the generic direction names"
+                 not be applied; the endpoints carry the generic INF fallback labels"
             );
         }
 
@@ -9755,6 +10212,12 @@ mod platform {
             // index into that slot's ring would otherwise replay the previous
             // tenant's audio to the next one. Harmless while there is no data
             // plane; wrong the moment there is.
+            shared.arm_flush(slot);
+        }
+        let previous = shared.slots[slot as usize]
+            .generation
+            .swap(reply.generation, Ordering::AcqRel);
+        if previous != reply.generation {
             shared.arm_flush(slot);
         }
         shared.push_event(HalControlEvent::BindState {
@@ -9773,5 +10236,86 @@ mod platform {
         });
         *lk(&shared.last_driver_msg) = Some(Instant::now());
         true
+    }
+
+    #[cfg(all(test, windows))]
+    mod windows_session_lifecycle_tests {
+        use super::WindowsSessionIdentity;
+
+        #[test]
+        fn a_late_ioctl_failure_cannot_match_a_replacement_attach_even_if_driver_id_repeats() {
+            let failed = WindowsSessionIdentity {
+                attach_epoch: 17,
+                driver_session_id: 1,
+            };
+
+            assert!(
+                failed.matches(17, 1),
+                "the failing session must match itself"
+            );
+            assert!(
+                !failed.matches(18, 2),
+                "a normal replacement must not match the failed attach"
+            );
+            assert!(
+                !failed.matches(18, 1),
+                "a driver reload may reuse id 1; the daemon attach epoch must still reject it"
+            );
+        }
+
+        #[test]
+        fn notify_bind_and_attach_share_one_session_transition_guard() {
+            let source = include_str!("halbridge.rs");
+
+            let attach = source
+                .split_once("    fn attach(shared: &Arc<Shared>, s: Session) {")
+                .and_then(|(_, rest)| rest.split_once("    fn detach_locked(").map(|(v, _)| v))
+                .expect("Windows attach body");
+            let locked = attach
+                .find("let mut session = lk(&shared.rings.session);")
+                .expect("attach transition guard");
+            let moved = attach
+                .find("s.rings.move_into(&shared.rings.rings);")
+                .expect("ring mapping move");
+            let published = attach
+                .find("*session = Some(s);")
+                .expect("session publication");
+            assert!(
+                locked < moved && moved < published,
+                "attach must lock before moving rings and retain that guard through publication"
+            );
+
+            for (start, end) in [
+                (
+                    "    #[cfg(windows)]\n    pub fn send_notify(",
+                    "    /// The Windows leg of latency declaration.",
+                ),
+                (
+                    "    fn bind_call<F>(",
+                    "    #[cfg(all(test, windows))]\n    mod windows_session_lifecycle_tests",
+                ),
+            ] {
+                let body = source
+                    .split_once(start)
+                    .and_then(|(_, rest)| rest.split_once(end).map(|(v, _)| v))
+                    .expect("Windows IOCTL call body");
+                let captured = body
+                    .find("WindowsSessionIdentity::capture(shared, s)")
+                    .expect("failed session identity capture");
+                let detached = body
+                    .find("detach_failed_session(")
+                    .expect("session-scoped failure detach");
+                assert!(
+                    captured < detached,
+                    "identity must be captured before detach"
+                );
+                if let Some(dropped) = body.find("drop(guard);") {
+                    assert!(
+                        detached < dropped,
+                        "the failing IOCTL path exposed a drop/relock window before detach"
+                    );
+                }
+            }
+        }
     }
 }

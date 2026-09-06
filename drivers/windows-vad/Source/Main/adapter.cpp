@@ -485,6 +485,7 @@ Return Value:
 } // AddDevice
 
 #pragma code_seg()
+
 NTSTATUS
 _IRQL_requires_max_(DISPATCH_LEVEL)
 PowerControlCallback
@@ -599,7 +600,7 @@ Return Value:
     IF_FAILED_JUMP(ntStatus, Exit);
 
     //
-    // Caller-identity policy lives in the DEVICE software key, which only an
+    // Caller-identity policy lives in the DEVICE hardware key, which only an
     // administrator can write, so it can only be read once we have a PDO.
     //
     {
@@ -721,4 +722,3 @@ Return Value:
 }
 
 #pragma code_seg()
-

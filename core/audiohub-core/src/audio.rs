@@ -8,6 +8,191 @@ use cpal::{SampleFormat, SupportedStreamConfig};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
+#[cfg(target_os = "windows")]
+mod windows_pro_audio {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    type SetCharacteristics = unsafe extern "system" fn(*const u16, *mut u32) -> *mut c_void;
+    type RevertCharacteristics = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(name: *const i8) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const i8) -> *mut c_void;
+        fn GetLastError() -> u32;
+        fn GetCurrentThreadId() -> u32;
+    }
+
+    #[derive(Clone, Copy)]
+    struct AvrtApi {
+        // Retaining the module for the process lifetime is deliberate. Windows
+        // TLS destructors run under the loader lock, so unloading Avrt from an
+        // audio callback closure's destructor could deadlock during teardown.
+        _module: usize,
+        set: SetCharacteristics,
+        revert: RevertCharacteristics,
+    }
+
+    static API: OnceLock<Option<AvrtApi>> = OnceLock::new();
+    static SERVICE_PREPARED: AtomicBool = AtomicBool::new(false);
+    static SET_LOCK: Mutex<()> = Mutex::new(());
+    const PRO_AUDIO: [u16; 10] = [
+        b'P' as u16,
+        b'r' as u16,
+        b'o' as u16,
+        b' ' as u16,
+        b'A' as u16,
+        b'u' as u16,
+        b'd' as u16,
+        b'i' as u16,
+        b'o' as u16,
+        0,
+    ];
+
+    pub(super) struct Registration {
+        task: *mut c_void,
+        revert: RevertCharacteristics,
+        owner_thread: u32,
+        what: &'static str,
+    }
+
+    fn api() -> Option<AvrtApi> {
+        *API.get_or_init(|| {
+            // Dynamic resolution preserves the windows-gnu build's
+            // raw-dylib-free dependency graph.
+            let module = unsafe { LoadLibraryA(c"avrt.dll".as_ptr()) };
+            if module.is_null() {
+                eprintln!(
+                    "[audiohub] load Avrt.dll for MMCSS failed (win32={})",
+                    unsafe { GetLastError() }
+                );
+                return None;
+            }
+            let set_ptr =
+                unsafe { GetProcAddress(module, c"AvSetMmThreadCharacteristicsW".as_ptr()) };
+            let revert_ptr =
+                unsafe { GetProcAddress(module, c"AvRevertMmThreadCharacteristics".as_ptr()) };
+            if set_ptr.is_null() || revert_ptr.is_null() {
+                let error = unsafe { GetLastError() };
+                eprintln!("[audiohub] resolve MMCSS entry points failed (win32={error})");
+                return None;
+            }
+
+            let set: SetCharacteristics = unsafe { std::mem::transmute(set_ptr) };
+            let revert: RevertCharacteristics = unsafe { std::mem::transmute(revert_ptr) };
+            Some(AvrtApi {
+                _module: module as usize,
+                set,
+                revert,
+            })
+        })
+    }
+
+    pub(super) fn enter(what: &'static str) -> Option<Registration> {
+        let api = api()?;
+        let mut task_index = 0u32;
+        let task = unsafe { (api.set)(PRO_AUDIO.as_ptr(), &mut task_index) };
+        if task.is_null() {
+            return None;
+        }
+        Some(Registration {
+            task,
+            revert: api.revert,
+            owner_thread: unsafe { GetCurrentThreadId() },
+            what,
+        })
+    }
+
+    pub(super) fn prepare() -> bool {
+        if SERVICE_PREPARED.load(Ordering::Acquire) {
+            return true;
+        }
+        // Resolve Avrt and activate MMCSS before cpal starts its real-time
+        // callback. Serialize this first service activation; once it has
+        // succeeded, per-thread registrations require no process lock.
+        let _set_guard = SET_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if SERVICE_PREPARED.load(Ordering::Acquire) {
+            return true;
+        }
+        for _ in 0..3 {
+            if let Some(registration) = enter("MMCSS prewarm") {
+                drop(registration);
+                SERVICE_PREPARED.store(true, Ordering::Release);
+                return true;
+            }
+        }
+        // Do not cache failure: a later stream/thread setup gets another
+        // non-real-time prewarm attempt instead of disabling MMCSS forever.
+        false
+    }
+
+    pub(super) fn is_prepared() -> bool {
+        SERVICE_PREPARED.load(Ordering::Acquire)
+    }
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            let current_thread = unsafe { GetCurrentThreadId() };
+            if current_thread != self.owner_thread {
+                // AvRevertMmThreadCharacteristics must run on the registering
+                // thread. Refusing the call is safer than reverting an
+                // unrelated thread; Windows releases the registration when
+                // the owner thread exits.
+                eprintln!(
+                    "[audiohub] {}: refusing cross-thread MMCSS revert (owner={}, current={})",
+                    self.what, self.owner_thread, current_thread
+                );
+                return;
+            }
+            if unsafe { (self.revert)(self.task) } == 0 {
+                eprintln!(
+                    "[audiohub] {}: leave MMCSS Pro Audio failed (win32={})",
+                    self.what,
+                    unsafe { GetLastError() }
+                );
+            }
+        }
+    }
+}
+
+/// Owns one Windows MMCSS registration and reverts it on the registering
+/// thread. An inactive guard is used while a cpal callback closure is moved to
+/// its platform thread.
+#[cfg(target_os = "windows")]
+#[must_use = "dropping the guard immediately also removes the MMCSS registration"]
+pub struct ProAudioThreadGuard(Option<windows_pro_audio::Registration>);
+
+#[cfg(target_os = "windows")]
+impl ProAudioThreadGuard {
+    pub fn inactive() -> Self {
+        Self(None)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn promote_current_thread_to_pro_audio(what: &'static str) -> ProAudioThreadGuard {
+    if !windows_pro_audio::prepare() {
+        return ProAudioThreadGuard::inactive();
+    }
+    promote_current_thread_to_prepared_pro_audio(what)
+}
+
+#[cfg(target_os = "windows")]
+fn promote_current_thread_to_prepared_pro_audio(what: &'static str) -> ProAudioThreadGuard {
+    ProAudioThreadGuard(windows_pro_audio::enter(what))
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_windows_pro_audio() -> bool {
+    windows_pro_audio::prepare()
+}
+
 /// One system audio device as this process sees it.
 ///
 /// `uid` (kAudioDevicePropertyDeviceUID) is the opaque, stable handle a device
@@ -1049,6 +1234,51 @@ impl VarResampler {
     }
 }
 
+/// Retains independent cubic interpolation history per interleaved channel.
+/// Identical step/phase evolution keeps lanes frame-aligned.
+pub struct InterleavedVarResampler {
+    channels: usize,
+    lanes: Vec<VarResampler>,
+    lane_in: Vec<Vec<f32>>,
+    lane_out: Vec<Vec<f32>>,
+}
+
+impl InterleavedVarResampler {
+    pub fn new(src: u32, dst: u32, channels: u8) -> Self {
+        let channels = channels.clamp(1, 2) as usize;
+        Self {
+            channels,
+            lanes: (0..channels).map(|_| VarResampler::new(src, dst)).collect(),
+            lane_in: (0..channels).map(|_| Vec::new()).collect(),
+            lane_out: (0..channels).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    pub fn set_correction(&mut self, corr: f64) {
+        for lane in &mut self.lanes {
+            lane.set_correction(corr);
+        }
+    }
+
+    pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        let frames = input.len() / self.channels;
+        for ch in 0..self.channels {
+            self.lane_in[ch].clear();
+            self.lane_in[ch].reserve(frames);
+            self.lane_in[ch].extend((0..frames).map(|f| input[f * self.channels + ch]));
+            self.lane_out[ch].clear();
+            self.lanes[ch].process(&self.lane_in[ch], &mut self.lane_out[ch]);
+        }
+        let out_frames = self.lane_out.iter().map(Vec::len).min().unwrap_or(0);
+        out.reserve(out_frames * self.channels);
+        for frame in 0..out_frames {
+            for ch in 0..self.channels {
+                out.push(self.lane_out[ch][frame]);
+            }
+        }
+    }
+}
+
 /// 声卡侧发布给伺服的观测量。写者是输出回调（实时线程），读者是
 /// `AudioTx::push`（mixer 线程）。
 ///
@@ -1122,6 +1352,10 @@ impl DeviceClock {
         }
         let now_ns = now.saturating_duration_since(self.base).as_nanos() as u64;
         Some(Duration::from_nanos(now_ns.saturating_sub(last)))
+    }
+
+    fn callback_count(&self) -> u64 {
+        self.cb_count.load(Ordering::Relaxed)
     }
 
     fn dac_lag_samples(&self, rate: u32) -> f64 {
@@ -1482,6 +1716,10 @@ impl StreamHealth {
     fn take_error(&self) -> Option<String> {
         self.err.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
+
+    fn error_snapshot(&self) -> Option<String> {
+        self.err.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
 }
 
 fn err_sink(
@@ -1489,6 +1727,57 @@ fn err_sink(
     what: &'static str,
 ) -> impl FnMut(cpal::StreamError) + Send + 'static {
     move |e| health.fail(what, &e)
+}
+
+struct OutputCallbackPriority {
+    attempts: u8,
+    #[cfg(target_os = "windows")]
+    prepared: bool,
+    #[cfg(target_os = "windows")]
+    guard: ProAudioThreadGuard,
+}
+
+// This private value is created with an inactive guard and moved exactly once
+// into cpal's callback closure. The guard becomes active only after that move.
+// If cpal ever destroys the active closure elsewhere, Registration::drop's
+// thread-id check refuses the thread-affine Windows revert call.
+#[cfg(target_os = "windows")]
+unsafe impl Send for OutputCallbackPriority {}
+
+impl OutputCallbackPriority {
+    fn new() -> Self {
+        #[cfg(target_os = "windows")]
+        let prepared = prepare_windows_pro_audio();
+        Self {
+            attempts: 0,
+            #[cfg(target_os = "windows")]
+            prepared,
+            #[cfg(target_os = "windows")]
+            guard: ProAudioThreadGuard::inactive(),
+        }
+    }
+
+    fn ensure(&mut self, what: &'static str) {
+        #[cfg(target_os = "windows")]
+        {
+            if !self.prepared {
+                // Another ordinary setup thread may have completed a retry
+                // after this stream was constructed. Observing that success
+                // is an atomic read only; callback threads never run prepare.
+                self.prepared = windows_pro_audio::is_prepared();
+            }
+            if !self.prepared || self.guard.is_active() || self.attempts >= 3 {
+                return;
+            }
+            self.attempts += 1;
+            self.guard = promote_current_thread_to_prepared_pro_audio(what);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = what;
+            self.attempts = 1;
+        }
+    }
 }
 
 fn build_output_stream_f32(
@@ -1503,11 +1792,13 @@ fn build_output_stream_f32(
 ) -> Result<cpal::Stream> {
     let channels = config.channels as usize;
     let mut mono: Vec<f32> = Vec::new();
+    let mut callback_priority = OutputCallbackPriority::new();
     match supported_format {
         SampleFormat::I16 => {
             let stream = device.build_output_stream(
                 config,
                 move |data: &mut [i16], info: &cpal::OutputCallbackInfo| {
+                    callback_priority.ensure("output callback");
                     let frames = data.len() / channels;
                     mono.resize(frames, 0.0);
                     fill_mono(&mut mono, info);
@@ -1526,6 +1817,7 @@ fn build_output_stream_f32(
             let stream = device.build_output_stream(
                 config,
                 move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                    callback_priority.ensure("output callback");
                     let frames = data.len() / channels;
                     mono.resize(frames, 0.0);
                     fill_mono(&mut mono, info);
@@ -1538,6 +1830,79 @@ fn build_output_stream_f32(
             )?;
             Ok(stream)
         }
+    }
+}
+
+fn build_output_stream_interleaved(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    supported_format: SampleFormat,
+    health: &Arc<StreamHealth>,
+    source_channels: u8,
+    mut fill: impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static,
+) -> Result<cpal::Stream> {
+    let dev_channels = config.channels.max(1) as usize;
+    let source_channels = source_channels.clamp(1, 2) as usize;
+    let mut source = Vec::<f32>::new();
+    let mut callback_priority = OutputCallbackPriority::new();
+    let map = move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+        let frames = data.len() / dev_channels;
+        source.resize(frames * source_channels, 0.0);
+        fill(&mut source, info);
+        for (frame, src) in data
+            .chunks_mut(dev_channels)
+            .zip(source.chunks_exact(source_channels))
+        {
+            map_interleaved_frame(src, frame);
+        }
+    };
+    match supported_format {
+        SampleFormat::I16 => {
+            // CPAL's native i16 path needs a temporary f32 device-layout
+            // buffer; it is retained by the callback after its first resize.
+            let mut mapped = Vec::<f32>::new();
+            let mut map = map;
+            Ok(device.build_output_stream(
+                config,
+                move |data: &mut [i16], info| {
+                    callback_priority.ensure("output callback");
+                    mapped.resize(data.len(), 0.0);
+                    map(&mut mapped, info);
+                    for (dst, &src) in data.iter_mut().zip(&mapped) {
+                        *dst = (src.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    }
+                },
+                err_sink(Arc::clone(health), "output"),
+                None,
+            )?)
+        }
+        _ => {
+            let mut map = map;
+            Ok(device.build_output_stream(
+                config,
+                move |data: &mut [f32], info| {
+                    callback_priority.ensure("output callback");
+                    map(data, info);
+                },
+                err_sink(Arc::clone(health), "output"),
+                None,
+            )?)
+        }
+    }
+}
+
+fn map_interleaved_frame(source: &[f32], device: &mut [f32]) {
+    match (source.len(), device.len()) {
+        (1, _) => device.fill(source[0]),
+        (2, 1) => device[0] = (source[0] + source[1]) * 0.5,
+        (2, 2..) => {
+            device[0] = source[0];
+            device[1] = source[1];
+            if device.len() > 2 {
+                device[2..].fill(0.0);
+            }
+        }
+        _ => device.fill(0.0),
     }
 }
 
@@ -1605,16 +1970,55 @@ pub fn play_samples_blocking(samples: &[f32], src_rate: u32) -> Result<()> {
     Ok(())
 }
 
+/// Immutable parameters used to open one concrete playback stream.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlaybackConfigSnapshot {
+    pub source_rate_hz: u32,
+    pub source_channels: u8,
+    pub device_rate_hz: u32,
+    pub device_channels: u16,
+    pub sample_format: String,
+    pub buffer_size: String,
+}
+
 pub struct LivePlayback {
     _stream: cpal::Stream,
     health: Arc<StreamHealth>,
+    config: PlaybackConfigSnapshot,
+}
+
+/// Sendable observation handle for a playback stream whose native stream must
+/// remain on the thread that opened it.
+///
+/// `cpal::Stream` is not sendable on every supported backend. Supervisors can
+/// move this handle together with [`AudioTx`] while a dedicated device thread
+/// retains and eventually drops the corresponding [`LivePlayback`].
+#[derive(Clone)]
+pub struct PlaybackMonitor {
+    health: Arc<StreamHealth>,
+    config: PlaybackConfigSnapshot,
+}
+
+impl PlaybackMonitor {
+    pub fn is_alive(&self) -> bool {
+        self.health.is_alive()
+    }
+
+    pub fn error_snapshot(&self) -> Option<String> {
+        self.health.error_snapshot()
+    }
+
+    pub fn config_snapshot(&self) -> &PlaybackConfigSnapshot {
+        &self.config
+    }
 }
 
 pub struct AudioTx {
     prod: HeapProd<f32>,
+    channels: u8,
     /// 伺服关闭且收发同速率时是 `None`（逐样本直通，与加伺服之前逐字同构）；
     /// 只要伺服开着就一定在场——弯速率是它唯一的执行器。
-    resampler: Option<VarResampler>,
+    resampler: Option<InterleavedVarResampler>,
     staging: Vec<f32>,
     /// 跨时钟速率伺服。见模块中部「跨时钟速率伺服（play_ring）」那一节。
     servo: PlayServo,
@@ -1639,17 +2043,18 @@ pub struct AudioTx {
 }
 
 impl AudioTx {
-    pub fn push(&mut self, mono_samples: &[f32]) {
-        self.push_at(mono_samples, Instant::now());
+    pub fn push(&mut self, samples: &[f32]) {
+        self.push_at(samples, Instant::now());
     }
 
     /// `push` 的可注入时钟版本。生产代码只走 `push`；测试用它跑**虚拟时间**
     /// （`t0 + Duration::from_millis(10*tick)`），这样一小时的漂移可以在几秒里
     /// 跑完，而走的仍然是同一条生产路径、同一个真 `HeapRb`、同一个真重采样器。
     #[doc(hidden)]
-    pub fn push_at(&mut self, mono_samples: &[f32], now: Instant) {
+    pub fn push_at(&mut self, samples: &[f32], now: Instant) {
+        let frames = samples.len() / self.channels.clamp(1, 2) as usize;
         if self.servo.enabled {
-            match self.servo_step(mono_samples.len(), now) {
+            match self.servo_step(frames, now) {
                 ServoAction::Skip => return, // 深端硬跳：本块整块不写
                 ServoAction::Pad(n) => self.write_silence(n),
                 ServoAction::Go => {}
@@ -1657,12 +2062,12 @@ impl AudioTx {
         }
         match self.resampler.as_mut() {
             None => {
-                let wrote = self.prod.push_slice(mono_samples);
-                self.note_short_write(mono_samples.len(), wrote);
+                let wrote = self.prod.push_slice(samples);
+                self.note_short_write(samples.len(), wrote);
             }
             Some(rs) => {
                 self.staging.clear();
-                rs.process(mono_samples, &mut self.staging);
+                rs.process(samples, &mut self.staging);
                 let wrote = self.prod.push_slice(&self.staging);
                 self.note_short_write(self.staging.len(), wrote);
             }
@@ -1778,7 +2183,7 @@ impl AudioTx {
             self.servo.dll.set_bw(bw, n_out, self.dev_rate);
         }
         // ---- 误差信号 ----
-        let ring = self.prod.occupied_len() as f64;
+        let ring = self.prod.occupied_len() as f64 / self.channels as f64;
         let inflight = match self.dev.since_last_callback(now) {
             // 回调停摆（设备刚开、被拔掉、或者线程饿死）：读数不可信，
             // 宁可不动也不要拿一个错的量去积分。
@@ -1898,8 +2303,8 @@ impl AudioTx {
 
     fn write_silence(&mut self, n: usize) {
         // 分块写，避免为一次重同步分配一整秒的零。
-        let mut left = n;
-        let chunk = [0.0f32; 480];
+        let mut left = n * self.channels as usize;
+        let chunk = [0.0f32; 960];
         while left > 0 {
             let k = left.min(chunk.len());
             let wrote = self.prod.push_slice(&chunk[..k]);
@@ -1912,20 +2317,22 @@ impl AudioTx {
 
     fn note_short_write(&self, wanted: usize, wrote: usize) {
         if wrote < wanted {
-            self.dropped
-                .fetch_add((wanted - wrote) as u64, Ordering::Relaxed);
+            self.dropped.fetch_add(
+                ((wanted - wrote) / self.channels as usize) as u64,
+                Ordering::Relaxed,
+            );
         }
     }
 
     /// 此刻环里排队等着送进声卡的样本数（规格 §3.2 的级 8 `play_ring`）。
     /// 整数样本计数，单机单时钟内读取，**无任何估计成分**。
     pub fn queued(&self) -> u32 {
-        self.prod.occupied_len() as u32
+        (self.prod.occupied_len() / self.channels as usize) as u32
     }
 
     /// 环容量（样本）。播放环恰好 = 1 秒设备速率。
     pub fn capacity(&self) -> u32 {
-        self.prod.capacity().get() as u32
+        (self.prod.capacity().get() / self.channels as usize) as u32
     }
 
     /// 消费者（声卡）的标称速率。换算 ms 必须用它，不能用 48000。
@@ -1935,6 +2342,20 @@ impl AudioTx {
 
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Number of callbacks delivered by the concrete output stream paired with
+    /// this writer. Supervisors combine it with callback age to distinguish
+    /// startup from a stream that stopped making progress.
+    pub fn output_callback_count(&self) -> u64 {
+        self.dev.callback_count()
+    }
+
+    /// Age of the most recent output callback, or `None` until the first one.
+    /// Reading it has no effect on the playback servo; the owner may use the
+    /// snapshot to retire and replace a stalled stream.
+    pub fn last_output_callback_age(&self) -> Option<Duration> {
+        self.dev.since_last_callback(Instant::now())
     }
 
     /// **测试用**：不开设备，造一个与 `LivePlayback::on_device` 同构的播放环
@@ -1967,7 +2388,8 @@ impl AudioTx {
         (
             AudioTx {
                 prod,
-                resampler: servo.then(|| VarResampler::new(48_000, dev_rate)),
+                channels: 1,
+                resampler: servo.then(|| InterleavedVarResampler::new(48_000, dev_rate, 1)),
                 staging: Vec::new(),
                 servo: PlayServo::new(dev_rate, servo),
                 dev: dev.clone(),
@@ -2080,19 +2502,49 @@ impl LivePlayback {
         self.health.take_error()
     }
 
+    /// Non-consuming copy of the first fatal stream error for diagnostics.
+    pub fn error_snapshot(&self) -> Option<String> {
+        self.health.error_snapshot()
+    }
+
+    pub fn config_snapshot(&self) -> &PlaybackConfigSnapshot {
+        &self.config
+    }
+
+    /// Clone the stream's sendable health/configuration view. The native
+    /// stream itself remains owned by this value and on its opening thread.
+    pub fn monitor(&self) -> PlaybackMonitor {
+        PlaybackMonitor {
+            health: Arc::clone(&self.health),
+            config: self.config.clone(),
+        }
+    }
+
     pub fn start(src_rate: u32) -> Result<(LivePlayback, AudioTx)> {
+        Self::start_channels(src_rate, 1)
+    }
+
+    pub fn start_channels(src_rate: u32, channels: u8) -> Result<(LivePlayback, AudioTx)> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
             .ok_or_else(|| anyhow!("no default output device"))?;
-        LivePlayback::on_device(&device, src_rate)
+        LivePlayback::on_device(&device, src_rate, channels)
     }
 
     /// Plays to the named output device. Errors when the name does not resolve
     /// or the device will not open — never falls back to the default device.
     pub fn start_on(device_name: &str, src_rate: u32) -> Result<(LivePlayback, AudioTx)> {
+        Self::start_on_channels(device_name, src_rate, 1)
+    }
+
+    pub fn start_on_channels(
+        device_name: &str,
+        src_rate: u32,
+        channels: u8,
+    ) -> Result<(LivePlayback, AudioTx)> {
         let (device, resolved) = find_device(DeviceKind::Output, device_name)?;
-        LivePlayback::on_device(&device, src_rate)
+        LivePlayback::on_device(&device, src_rate, channels)
             .with_context(|| format!("open output device {resolved:?}"))
     }
 
@@ -2100,20 +2552,41 @@ impl LivePlayback {
     /// cannot address a device whose name is generated at runtime, nor tell two
     /// identically named cards apart; the UID can do both.
     pub fn start_on_uid(uid: &str, src_rate: u32) -> Result<(LivePlayback, AudioTx)> {
+        Self::start_on_uid_channels(uid, src_rate, 1)
+    }
+
+    pub fn start_on_uid_channels(
+        uid: &str,
+        src_rate: u32,
+        channels: u8,
+    ) -> Result<(LivePlayback, AudioTx)> {
         let (device, resolved) = find_device_by_uid(DeviceKind::Output, uid)?;
-        LivePlayback::on_device(&device, src_rate)
+        LivePlayback::on_device(&device, src_rate, channels)
             .with_context(|| format!("open output device {resolved:?} (UID {uid:?})"))
     }
 
-    fn on_device(device: &cpal::Device, src_rate: u32) -> Result<(LivePlayback, AudioTx)> {
+    fn on_device(
+        device: &cpal::Device,
+        src_rate: u32,
+        channels: u8,
+    ) -> Result<(LivePlayback, AudioTx)> {
+        let channels = channels.clamp(1, 2);
         let supported = device
             .default_output_config()
             .context("default output config")?;
         let config: cpal::StreamConfig = supported.config();
         let dev_rate = config.sample_rate.0;
+        let config_snapshot = PlaybackConfigSnapshot {
+            source_rate_hz: src_rate,
+            source_channels: channels,
+            device_rate_hz: dev_rate,
+            device_channels: config.channels,
+            sample_format: format!("{:?}", supported.sample_format()),
+            buffer_size: format!("{:?}", config.buffer_size),
+        };
 
         // >= 500ms required; use 1s of device-rate samples
-        let rb = HeapRb::<f32>::new(dev_rate.max(8000) as usize);
+        let rb = HeapRb::<f32>::new(dev_rate.max(8000) as usize * channels as usize);
         let (prod, mut cons) = rb.split();
 
         let health = StreamHealth::new();
@@ -2122,14 +2595,15 @@ impl LivePlayback {
         // 全部只能在这里采。
         let dev = DeviceClock::new();
         let dev_cb = dev.clone();
-        let stream = build_output_stream_f32(
+        let stream = build_output_stream_interleaved(
             device,
             &config,
             supported.sample_format(),
             &health,
-            move |mono, info| {
-                let got = cons.pop_slice(mono);
-                for m in &mut mono[got..] {
+            channels,
+            move |samples, info| {
+                let got = cons.pop_slice(samples);
+                for m in &mut samples[got..] {
                     *m = 0.0; // underrun -> silence
                 }
                 // `playback − callback` = Snapcast 的 `outputBufferDacTime`。
@@ -2139,8 +2613,8 @@ impl LivePlayback {
                 let ts = info.timestamp();
                 dev_cb.note_callback(
                     Instant::now(),
-                    mono.len(),
-                    got,
+                    samples.len() / channels as usize,
+                    got / channels as usize,
                     ts.playback.duration_since(&ts.callback),
                 );
             },
@@ -2151,12 +2625,14 @@ impl LivePlayback {
             LivePlayback {
                 _stream: stream,
                 health,
+                config: config_snapshot,
             },
             AudioTx {
                 prod,
+                channels,
                 // 伺服开着 ⇒ 重采样器**必须**在场，哪怕 src_rate == dev_rate：
                 // 弯比率是环路唯一的执行器，没有它环路就没有手。
-                resampler: Some(VarResampler::new(src_rate, dev_rate)),
+                resampler: Some(InterleavedVarResampler::new(src_rate, dev_rate, channels)),
                 staging: Vec::new(),
                 servo: PlayServo::new(dev_rate, true),
                 dev,
@@ -3218,6 +3694,100 @@ impl DeviceChangeWatcher {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn every_output_callback_path_enters_mmcss_pro_audio() {
+        let source = include_str!("audio.rs");
+        let mono = source
+            .split("fn build_output_stream_f32(")
+            .nth(1)
+            .expect("mono output builder is missing")
+            .split("fn build_output_stream_interleaved(")
+            .next()
+            .unwrap();
+        assert_eq!(
+            mono.matches("callback_priority.ensure(").count(),
+            2,
+            "both native mono sample-format callbacks must register MMCSS"
+        );
+        assert!(
+            mono.contains("let mut callback_priority = OutputCallbackPriority::new();"),
+            "MMCSS must be prewarmed before cpal starts the callback thread"
+        );
+        let interleaved = source
+            .split("fn build_output_stream_interleaved(")
+            .nth(1)
+            .expect("interleaved output builder is missing")
+            .split("fn map_interleaved_frame(")
+            .next()
+            .unwrap();
+        assert_eq!(
+            interleaved.matches("callback_priority.ensure(").count(),
+            2,
+            "both native interleaved sample-format callbacks must register MMCSS"
+        );
+        assert!(
+            interleaved.contains("let mut callback_priority = OutputCallbackPriority::new();"),
+            "the interleaved callback must prewarm MMCSS before stream creation"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn output_callback_priority_activates_after_moving_to_its_worker() {
+        // Prewarm on the ordinary stream-construction thread, then reproduce
+        // cpal's one-way move of the callback state into its WASAPI worker.
+        let priority = OutputCallbackPriority::new();
+        let active = std::thread::spawn(move || {
+            let mut priority = priority;
+            priority.ensure("output callback unit test");
+            priority.guard.is_active()
+        })
+        .join()
+        .expect("MMCSS callback-priority test thread panicked");
+        assert!(active, "the simulated output callback did not enter MMCSS");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn mmcss_module_lifetime_never_reenters_the_windows_loader() {
+        let source = include_str!("audio.rs");
+        let mmcss = source
+            .split("mod windows_pro_audio {")
+            .nth(1)
+            .expect("Windows MMCSS implementation is missing")
+            .split("/// Owns one Windows MMCSS registration")
+            .next()
+            .unwrap();
+        assert!(
+            !mmcss.contains("FreeLibrary"),
+            "Avrt must remain loaded for the process lifetime; unloading from callback teardown can deadlock under the loader lock"
+        );
+        assert!(
+            !mmcss.contains("thread_local!"),
+            "MMCSS teardown must be owned by an explicit callback/thread guard, not a Windows TLS destructor"
+        );
+    }
+
+    #[test]
+    fn device_mapping_keeps_left_right_until_a_physically_mono_device() {
+        let mut stereo = [0.0; 2];
+        map_interleaved_frame(&[1.0, -1.0], &mut stereo);
+        assert_eq!(stereo, [1.0, -1.0]);
+
+        let mut surround = [0.0; 6];
+        map_interleaved_frame(&[0.75, -0.25], &mut surround);
+        assert_eq!(&surround[..2], &[0.75, -0.25]);
+
+        let mut mono = [9.0];
+        map_interleaved_frame(&[1.0, -1.0], &mut mono);
+        assert_eq!(
+            mono,
+            [0.0],
+            "only a mono hardware endpoint may collapse L/R"
+        );
+    }
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

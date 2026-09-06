@@ -25,7 +25,9 @@ describe('React copy boundary', () => {
     for (const file of tsxFiles()) {
       const source = readFileSync(file, 'utf8');
       const ast = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-      const rel = relative(srcRoot, file);
+      // Allow-list keys are repository paths; keep them stable on the Windows
+      // VM test environment instead of leaking the host path separator.
+      const rel = relative(srcRoot, file).replaceAll('\\', '/');
 
       const visit = (node: ts.Node): void => {
         if (ts.isJsxText(node)) {

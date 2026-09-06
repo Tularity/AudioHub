@@ -165,6 +165,10 @@ pub struct QualityReading {
     pub duplicate: bool,
 }
 
+fn legacy_max_media_channels() -> u8 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionMsg {
@@ -261,13 +265,47 @@ pub enum SessionMsg {
         src: String,
     },
     /// Provider -> consumer: what the provider's output device actually reads
-    /// now. `adjustable=false` means the device has no volume we can drive, so
-    /// the consumer shows the value but disables its slider.
+    /// now. `adjustable=false` disables the scalar path (or selects mode-B
+    /// send gain); mute remains independently governed by `mute_adjustable`.
     VolumeState {
         stream_id: u32,
         scalar: f32,
         muted: bool,
         adjustable: bool,
+        #[serde(default)]
+        mute_adjustable: Option<bool>,
+    },
+    /// Mode-B consumer -> provider: apply one virtual endpoint control to the
+    /// peer's matching real default endpoint. Unlike `VolumeSet`, this message
+    /// belongs to the authenticated peer connection rather than a media
+    /// stream, so idle devices and microphones remain controllable.
+    ///
+    /// `muted=None` changes only the scalar. `request_id` is scoped to the
+    /// connection's peer and endpoint; the provider echoes it in the readback
+    /// after attempting the platform write.
+    DeviceVolumeSet {
+        endpoint: String,
+        request_id: u64,
+        scalar: f32,
+        #[serde(default)]
+        muted: Option<bool>,
+    },
+    /// Mode-B provider -> consumer: authoritative readback of one real default
+    /// endpoint. Periodic snapshots omit `request_id`; a write acknowledgement
+    /// carries the exact id received in `DeviceVolumeSet`.
+    DeviceVolumeState {
+        endpoint: String,
+        #[serde(default)]
+        request_id: Option<u64>,
+        /// Provider-local monotonic endpoint revision. Consumers compare this
+        /// only within one concrete control connection, allowing a restarted
+        /// provider to begin again at one without accepting reordered stale
+        /// snapshots from the previous connection.
+        revision: u64,
+        scalar: f32,
+        muted: bool,
+        adjustable: bool,
+        mute_adjustable: bool,
     },
     Ping {
         t_us: u64,
@@ -401,6 +439,27 @@ pub enum SessionMsg {
     AudioCapabilities {
         default_input: bool,
         default_output: bool,
+        /// Maximum interleaved media channels this peer can send and receive.
+        ///
+        /// A peer predating this field is deliberately interpreted as mono.
+        /// Serde ignores this extra field in the other direction, so 1.0.0 and
+        /// newer builds keep the v5 control channel and negotiate one channel.
+        #[serde(default = "legacy_max_media_channels")]
+        max_media_channels: u8,
+        /// Version of the device-volume synchronisation contract understood by
+        /// this peer. Zero is the legacy behaviour. The first stereo-capable
+        /// build advertises one; the actual DeviceVolume messages live with
+        /// the volume-sync implementation, not this capability declaration.
+        #[serde(default)]
+        device_volume_version: u8,
+        /// Version of the authenticated media timestamp frame tag emitted by
+        /// this peer. Zero means the timestamp carries timing only (1.0.0).
+        /// Version one stores the logical sender frame modulo 64 plus the
+        /// packet's part index in the timestamp's eight lowest microsecond
+        /// bits, allowing a receiver to distinguish packet loss from format
+        /// alignment even across raw-sequence wrap.
+        #[serde(default)]
+        media_frame_tag_version: u8,
     },
     /// "I have unpaired from you." Sent immediately before `Bye` when the local
     /// user removes a pairing while the channel is up (plan §7.1, ruled in
@@ -971,10 +1030,13 @@ mod wire_compat_tests {
     }
 
     #[test]
-    fn audio_capabilities_have_two_required_independent_wire_bits() {
+    fn audio_capabilities_keep_endpoint_bits_required_and_default_new_features() {
         let msg = SessionMsg::AudioCapabilities {
             default_input: false,
             default_output: true,
+            max_media_channels: 2,
+            device_volume_version: 1,
+            media_frame_tag_version: 1,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(
@@ -982,7 +1044,10 @@ mod wire_compat_tests {
             serde_json::json!({
                 "type": "audio_capabilities",
                 "default_input": false,
-                "default_output": true
+                "default_output": true,
+                "max_media_channels": 2,
+                "device_volume_version": 1,
+                "media_frame_tag_version": 1
             })
         );
         let back: SessionMsg = serde_json::from_value(json).unwrap();
@@ -990,7 +1055,27 @@ mod wire_compat_tests {
             back,
             SessionMsg::AudioCapabilities {
                 default_input: false,
-                default_output: true
+                default_output: true,
+                max_media_channels: 2,
+                device_volume_version: 1,
+                media_frame_tag_version: 1,
+            }
+        ));
+
+        let legacy = serde_json::json!({
+            "type": "audio_capabilities",
+            "default_input": true,
+            "default_output": false
+        });
+        let legacy: SessionMsg = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            legacy,
+            SessionMsg::AudioCapabilities {
+                default_input: true,
+                default_output: false,
+                max_media_channels: 1,
+                device_volume_version: 0,
+                media_frame_tag_version: 0,
             }
         ));
 
@@ -1002,6 +1087,40 @@ mod wire_compat_tests {
             serde_json::from_value::<SessionMsg>(missing).is_err(),
             "an absent endpoint fact is unknown and must never become false"
         );
+    }
+
+    #[test]
+    fn device_volume_state_carries_endpoint_revision_and_optional_ack() {
+        let msg = SessionMsg::DeviceVolumeState {
+            endpoint: "default_input".into(),
+            request_id: Some(17),
+            revision: 23,
+            scalar: 0.625,
+            muted: true,
+            adjustable: true,
+            mute_adjustable: true,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["revision"], 23);
+        assert_eq!(json["request_id"], 17);
+        assert!(matches!(
+            serde_json::from_value::<SessionMsg>(json).unwrap(),
+            SessionMsg::DeviceVolumeState {
+                request_id: Some(17),
+                revision: 23,
+                ..
+            }
+        ));
+
+        let missing_revision = serde_json::json!({
+            "type": "device_volume_state",
+            "endpoint": "default_output",
+            "scalar": 0.5,
+            "muted": false,
+            "adjustable": true,
+            "mute_adjustable": true
+        });
+        assert!(serde_json::from_value::<SessionMsg>(missing_revision).is_err());
     }
 
     /// **老对端收到新 `Pong`**：多出来的 `peer_t_us` 被 serde 忽略，照常解析。

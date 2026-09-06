@@ -15,10 +15,11 @@ accepted = [
     "MPL-2.0",
 ]
 
-# AudioHub currently releases native macOS arm64 and Windows x64 binaries.
-# cargo-about treats this as the union of both target-specific graphs.
+# Keep the license inventory valid for the authoritative macOS arm64 build,
+# the macOS x86_64 reference build, and the Windows x64 build.
 targets = [
     "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
     "x86_64-pc-windows-msvc",
 ]
 

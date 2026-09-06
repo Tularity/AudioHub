@@ -634,6 +634,32 @@ pub struct PeerHalDevice {
     pub published_directions: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_directions: Option<u8>,
+    /// Last authoritative state of the peer's real default output, mirrored by
+    /// this peer's virtual speaker. Independent of media-session lifetime, so a
+    /// paired-but-idle device can still display and change it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_volume: Option<VolumeState>,
+    /// Last authoritative state of the peer's real default input, mirrored by
+    /// this peer's virtual microphone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_volume: Option<VolumeState>,
+    /// A local virtual-speaker change is queued or awaiting authoritative
+    /// readback from the peer. This is a real state, not inferred from IO being
+    /// active: volume control deliberately remains live while the device is idle.
+    #[serde(default)]
+    pub out_volume_pending: bool,
+    /// The input-direction counterpart of [`Self::out_volume_pending`].
+    #[serde(default)]
+    pub in_volume_pending: bool,
+    /// The virtual speaker currently owns volume as send-side gain because the
+    /// peer's real default output reported `adjustable=false`.
+    #[serde(default)]
+    pub out_volume_software_gain: bool,
+    /// Peer/device volume-control contract understood on this connection.
+    /// `0` means absent/legacy and clients must disable idle device controls;
+    /// version `1` carries independent default-output and default-input state.
+    #[serde(default)]
+    pub device_volume_version: u8,
 }
 
 /// Who opened a session, reported as `SessionInfo.origin`.
@@ -1172,12 +1198,13 @@ pub struct SessionStats {
     pub datagram_bytes: u64,
 
     // ------------------------------------------------ 位深进阶梯带来的两个降级
-    /// 深档（5 ms 分包）里「搭档半帧没来、按半帧隐藏交付」的次数（lifetime）。
+    /// Lifetime count of packet sets delivered through partial concealment.
     ///
-    /// **必须单独上报**：半帧隐藏交付的是一个**长度完整**的帧，JB 因此不记 PLC、
-    /// 不记 underrun —— 若不单独计数，「深档丢了一半的包」这件事在整套遥测上
-    /// 一个字都不会出现。它同时以 0.5 帧的权重计入 Q1 隐藏率
-    /// （`quality::conceal_ratio`）：一次半帧隐藏正好伪造了半帧音频。
+    /// The legacy field name is retained for wire/API compatibility. Every
+    /// event is conservatively charged as 0.5 frame in the Q1 conceal ratio;
+    /// this is exact when half the chunks are absent and pessimistic when a
+    /// three- or four-part frame loses only one. The completed-length frame is
+    /// otherwise invisible to the jitter buffer's PLC and underrun counters.
     #[serde(default)]
     pub jb_half_conceal: u64,
     /// 包头声明的线上格式与载荷长度对不上、因而被丢弃的包数（lifetime）。
@@ -1482,6 +1509,14 @@ pub struct PeerState {
 ///       the result shows up as `stats.volume` on the next session.list/event.
 ///       An omitted `muted` leaves the peer's mute control untouched — it is
 ///       never resolved to a default, which would unmute a muted machine)
+/// - "peer.set_device_volume" {peer, endpoint, scalar, muted?} -> {}
+///       Mode-B device control, independent of media sessions. `endpoint` is
+///       the peer-owned real endpoint: `"default_output"` for this peer's
+///       virtual speaker or `"default_input"` for its virtual microphone.
+///       An omitted `muted` preserves the peer endpoint's current mute state.
+///       Convergence and an offline queued write are reported through
+///       `PeerHalDevice::{out,in}_volume{,_pending}`; clients must not fabricate
+///       a session id when the device is idle.
 /// - "stats.subscribe"   {interval_ms?}        -> {} (then "stats" events with Vec<SessionInfo>)
 /// - "settings.get"      {}                    -> DaemonSettings
 /// - "settings.set"      {mode?, remove_virtual_on_disconnect?,
@@ -1495,6 +1530,17 @@ pub struct PeerState {
 ///       diagnostic state snapshot. Empty clears it.
 /// - "airplay.sessions.list" {}                -> Vec<AirPlaySessionInfo>
 /// - "airplay.artwork.get" {session_id, revision} -> AirPlayArtwork | null
+/// - "airplay.telemetry.get" {}                -> AirPlay telemetry schema v3 snapshot
+/// - "airplay.telemetry.reset" {}              -> new empty schema v3 generation
+///       Numeric leaves are cumulative inside `reset_generation` except fields
+///       ending in `_gauge`, which are point-in-time values and may decrease.
+///       SETPEERS/SETPEERSX remain ACK-but-ignored; application-to-clock and
+///       terminal response outcomes are reported independently. Each media mode
+///       exposes PTP broadcast lag and cross-generation discard event/sample
+///       totals; `control_sessions` identifies each observed RTSP connection by
+///       its unique `(peer_ip, connection_id)` pair for cross-VM evidence
+///       binding. `active_control_sessions` is the currently registered subset;
+///       concurrent/reconnected clients sharing an IP remain distinct.
 ///       `name` (user instruction 2026-08-10 #9) is this machine's display
 ///       name; `""` clears the override and follows the host name again. It is
 ///       stored in identity.json beside the signing key, not in settings.json —
@@ -1573,11 +1619,14 @@ pub mod methods {
     pub const SESSION_CLOSE: &str = "session.close";
     pub const SESSION_LIST: &str = "session.list";
     pub const SESSION_SET_VOLUME: &str = "session.set_volume";
+    pub const PEER_SET_DEVICE_VOLUME: &str = "peer.set_device_volume";
     pub const STATS_SUBSCRIBE: &str = "stats.subscribe";
     pub const SETTINGS_GET: &str = "settings.get";
     pub const SETTINGS_SET: &str = "settings.set";
     pub const AIRPLAY_SESSIONS_LIST: &str = "airplay.sessions.list";
     pub const AIRPLAY_ARTWORK_GET: &str = "airplay.artwork.get";
+    pub const AIRPLAY_TELEMETRY_GET: &str = "airplay.telemetry.get";
+    pub const AIRPLAY_TELEMETRY_RESET: &str = "airplay.telemetry.reset";
     pub const PEERS_PAIR: &str = "peers.pair";
     pub const PEERS_UNPAIR: &str = "peers.unpair";
     pub const PEERS_SET_ALIAS: &str = "peers.set_alias";
@@ -1602,7 +1651,7 @@ pub mod methods {
 
 #[cfg(test)]
 mod version_contract_tests {
-    use super::{HalDeviceInfo, IPC_VERSION};
+    use super::{HalDeviceInfo, PeerHalDevice, IPC_VERSION};
 
     /// 读仓库里另一处（非本 crate）的源文件。读不到就 panic —— 绝不 skip：
     /// 一条「文件没了就悄悄通过」的守卫，正好在文件被改名的那一刻失效。
@@ -1688,5 +1737,51 @@ mod version_contract_tests {
         explicit["requested_directions"] = serde_json::json!(0);
         let explicit: HalDeviceInfo = serde_json::from_value(explicit).unwrap();
         assert_eq!(explicit.requested_directions, Some(0));
+    }
+
+    #[test]
+    fn legacy_peer_devices_disable_idle_volume_without_inventing_state() {
+        let base = serde_json::json!({
+            "out_name": "AudioHub speaker",
+            "in_name": "AudioHub microphone",
+            "out_uid": "AudioHub:peer:out",
+            "in_uid": "AudioHub:peer:in",
+            "state": "bound",
+            "observed": true
+        });
+        let legacy: PeerHalDevice = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(legacy.out_volume, None);
+        assert_eq!(legacy.in_volume, None);
+        assert!(!legacy.out_volume_pending);
+        assert!(!legacy.in_volume_pending);
+        assert!(!legacy.out_volume_software_gain);
+        assert_eq!(legacy.device_volume_version, 0);
+
+        let mut current = base;
+        current["out_volume"] = serde_json::json!({
+            "scalar": 0.25,
+            "muted": false,
+            "adjustable": true,
+            "mute_adjustable": false
+        });
+        current["in_volume"] = serde_json::json!({
+            "scalar": 0.75,
+            "muted": true,
+            "adjustable": true,
+            "mute_adjustable": true
+        });
+        current["out_volume_pending"] = serde_json::json!(true);
+        current["out_volume_software_gain"] = serde_json::json!(true);
+        current["device_volume_version"] = serde_json::json!(1);
+        let current: PeerHalDevice = serde_json::from_value(current).unwrap();
+        let output = current.out_volume.unwrap();
+        let input = current.in_volume.unwrap();
+        assert_eq!(output.scalar, 0.25);
+        assert!(!output.mute_adjustable);
+        assert_eq!(input.scalar, 0.75);
+        assert!(input.mute_adjustable);
+        assert!(current.out_volume_pending);
+        assert!(current.out_volume_software_gain);
+        assert_eq!(current.device_volume_version, 1);
     }
 }

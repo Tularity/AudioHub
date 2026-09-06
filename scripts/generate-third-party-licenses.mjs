@@ -144,15 +144,10 @@ function frontendRuntimePackages() {
 
   const nodeModules = join(frontend, "node_modules");
   if (!existsSync(nodeModules)) {
-    // npm verifies every downloaded tarball against the integrity hash in the
-    // committed lockfile. A full install is intentional: the immediately
-    // following frontend build also needs the locked dev tools.
-    run("npm", ["ci", "--no-audit", "--no-fund"], {
-      cwd: frontend,
-      // npm is a .cmd shim on Windows and therefore needs cmd.exe. Every
-      // argument here is a fixed literal; no lockfile data enters the shell.
-      shell: process.platform === "win32",
-    });
+    throw new Error(
+      "frontend dependencies are not provisioned; run " +
+      "npm ci --ignore-scripts in a separate dependency stage",
+    );
   }
 
   const packages = traversedProductionPaths.map((packagePath) => {
@@ -349,7 +344,11 @@ try {
   // stay frozen/offline, so report contents cannot depend on a mutable license
   // service. Cargo package contents are verified by the two Cargo.lock files.
   for (const manifest of ["Cargo.toml", "app/src-tauri/Cargo.toml"]) {
-    for (const target of ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"]) {
+    for (const target of [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-pc-windows-msvc",
+    ]) {
       run("cargo", ["fetch", "--locked", "--manifest-path", manifest, "--target", target]);
     }
   }

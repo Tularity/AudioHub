@@ -1,7 +1,15 @@
 //! Bounded AirPlay 2 control-session probe owned by AudioHub.
 
-use super::airport_express::BundledAirPortExpressProvider;
+mod classic_control;
+
+use super::airport_express::{BundledAirPortExpressProvider, ClassicKeyProvider};
 use super::apple_challenge::{self, AppleChallengeError};
+use super::classic::auth::{DigestChallenge, DigestError};
+use super::classic::media::{
+    ClassicAudioConfig, ClassicMediaHandle, ClassicRecordCommit, PreparedClassic,
+};
+use super::classic::sdp::Announcement;
+use super::classic::transport::Transport as ClassicTransport;
 use super::crypto::{derive_control_keys, derive_event_keys, ChannelKeys, EncryptedChannel};
 use super::event::encode_device_volume_command;
 use super::fairplay::{self, BundledFairPlayProvider, FairPlayError};
@@ -20,7 +28,7 @@ use super::metadata::{self, Artwork, MergePolicy, NowPlayingUpdate, PatchField, 
 use super::pairing::PairSetupServer;
 use super::rtsp::{Header, Request, RequestDecoder, RequestLimits, Response};
 use super::tlv8::{self, Tlv8Field, Tlv8Limits};
-use crate::runtime::{ReceiverVolumeProvider, ReceiverVolumeSnapshot};
+use crate::runtime::{Protocol, ReceiverVolumeProvider, ReceiverVolumeSnapshot};
 use plist::{Dictionary, Value};
 use rand::{rngs::OsRng, RngCore};
 use std::collections::HashMap;
@@ -51,6 +59,10 @@ const ACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_EVENT_ACCEPT_ATTEMPTS: usize = 4;
 const READ_CHUNK_BYTES: usize = 4 * 1024;
 const MAX_CONTROL_BODY_BYTES: usize = 64 * 1024;
+const MAX_PEER_LIST_ENTRIES: usize = 64;
+const PEER_LIST_EVENT_ID_LIMIT: usize = 16;
+const PEER_LIST_EVENT_ADDRESS_LIMIT: usize = 32;
+const PEER_LIST_EVENT_CLOCK_LIMIT: usize = 16;
 const MAX_METADATA_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ARTWORK_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NOW_PLAYING_BODY_BYTES: usize = 5 * 1024 * 1024;
@@ -92,6 +104,9 @@ pub(crate) struct ServerConfig {
     ptp_test_ephemeral: bool,
     features: u64,
     receiver_volume: Option<ReceiverVolumeProvider>,
+    classic_key: Arc<dyn ClassicKeyProvider>,
+    classic_key_permits: Arc<Semaphore>,
+    classic_attempts: TokenBucketLimiter,
 }
 
 impl ServerConfig {
@@ -117,11 +132,43 @@ impl ServerConfig {
             ptp_test_ephemeral,
             features: FEATURES,
             receiver_volume,
+            classic_key: Arc::new(BundledAirPortExpressProvider),
+            classic_key_permits: Arc::new(Semaphore::new(2)),
+            classic_attempts: TokenBucketLimiter::new(6.0, 1.0),
         })
     }
 
     pub(crate) fn txt_records(&self) -> Vec<String> {
         self.profile(None).txt_records()
+    }
+
+    pub(crate) fn classic_instance_name(&self) -> String {
+        format!("{}@{}", hex::encode_upper(self.mac), self.name)
+    }
+
+    pub(crate) fn classic_txt_records(&self) -> Vec<String> {
+        vec![
+            "txtvers=1".into(),
+            "cn=1".into(),
+            "et=1".into(),
+            "ek=1".into(),
+            "tp=UDP".into(),
+            "sr=44100".into(),
+            "ss=16".into(),
+            "ch=2".into(),
+            "md=0,1,2".into(),
+            "vn=65537".into(),
+            "vs=366.0".into(),
+            format!("am={}", super::info::MODEL),
+            format!("pw={}", self.password.is_some()),
+            format!("sf=0x{:X}", self.profile(None).status_flags()),
+            format!(
+                "ft=0x{:X},0x{:X}",
+                self.features as u32,
+                self.features >> 32
+            ),
+            format!("pk={}", self.identity.public_key_hex()),
+        ]
     }
 
     pub(crate) fn info_body(&self) -> io::Result<Vec<u8>> {
@@ -186,10 +233,41 @@ pub(crate) struct SetupPhase1Fields {
 /// Synchronous factory invoked only after the successful phase-two response
 /// has reached the encrypted control socket. It cannot make SETUP falsely
 /// succeed: every fallible network/decoder resource is prepared beforehand.
-pub(crate) type PcmOutputFactory = Arc<dyn Fn(u64, SocketAddr) -> Box<dyn PcmOutput> + Send + Sync>;
+pub(crate) type PcmOutputFactory =
+    Arc<dyn Fn(u64, SocketAddr, Protocol) -> Box<dyn PcmOutput> + Send + Sync>;
+
+struct CompletionOutput {
+    inner: Option<Box<dyn PcmOutput>>,
+    finished: watch::Sender<bool>,
+}
+
+impl PcmOutput for CompletionOutput {
+    fn write(&mut self, samples: &[i16], token: crate::telemetry::OperationToken) {
+        self.inner
+            .as_mut()
+            .expect("live PCM output")
+            .write(samples, token);
+    }
+
+    fn flush(&mut self) {
+        if let Some(inner) = &mut self.inner {
+            inner.flush();
+        }
+    }
+}
+
+impl Drop for CompletionOutput {
+    fn drop(&mut self) {
+        // Release the concrete sink before waking an idle RTSP owner to
+        // release its global media permit.
+        drop(self.inner.take());
+        let _ = self.finished.send(true);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct VolumeUpdate {
+    pub(crate) protocol: Protocol,
     pub(crate) stream_id: u64,
     pub(crate) revision: u64,
     pub(crate) db: f32,
@@ -213,12 +291,14 @@ impl std::fmt::Debug for RemoteControlCredentials {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteControlState {
     Active {
+        protocol: Protocol,
         stream_id: u64,
         peer: SocketAddr,
         credentials: Option<RemoteControlCredentials>,
         event_commands: Option<EventCommandSender>,
     },
     Ended {
+        protocol: Protocol,
         stream_id: u64,
     },
 }
@@ -237,6 +317,13 @@ pub(crate) struct EventCommandSender {
 }
 
 impl EventCommandSender {
+    #[cfg(test)]
+    pub(crate) fn test_ready() -> Self {
+        let (sender, _commands) = event_command_channel(true);
+        sender.ready.store(true, Ordering::Release);
+        sender
+    }
+
     pub(crate) fn same_channel(&self, other: &Self) -> bool {
         self.commands.same_channel(&other.commands)
     }
@@ -821,6 +908,10 @@ fn apply_seconds_patch(slot: &mut Option<u64>, patch: PatchField<f64>, replace: 
 }
 
 struct ConnectionState {
+    protocol: ConnectionProtocol,
+    classic: ClassicConnection,
+    connection_id: crate::telemetry::ConnectionId,
+    peer_ip: IpAddr,
     requests: RequestDecoder,
     pairing: Option<PairSetupServer>,
     control: Option<EncryptedChannel>,
@@ -829,6 +920,7 @@ struct ConnectionState {
     event_commands: Option<EventCommandSender>,
     phase_one: Option<PhaseOneState>,
     media: Option<ActiveMedia>,
+    media_completion: Option<watch::Receiver<bool>>,
     /// One global receiver slot owned by this control connection while it has
     /// an active or prepared media stream. Keeping the permit outside the
     /// concrete stream lets the same connection replace a stream atomically.
@@ -840,15 +932,43 @@ struct ConnectionState {
     latest_remote_control: watch::Sender<Option<RemoteControlState>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionProtocol {
+    Undecided,
+    AirPlay2,
+    Classic,
+}
+
+#[derive(Default)]
+struct ClassicConnection {
+    challenge: Option<DigestChallenge>,
+    authenticated: bool,
+    auth_failures: u8,
+    announced: Option<ClassicAudioConfig>,
+    session: Option<String>,
+}
+
 impl ConnectionState {
     fn new(
+        peer_ip: IpAddr,
         latest_remote_control: watch::Sender<Option<RemoteControlState>>,
     ) -> Result<Self, ConnectionError> {
         // Plaintext pairing/control stays at the small default body budget.
         // `install_control_after_m4` raises it only after authentication.
         let limits = RequestLimits::default();
+        let requests = RequestDecoder::new(limits).map_err(|_| ConnectionError::Framing)?;
+        let connection_id = crate::telemetry::ConnectionId::new();
+        crate::telemetry::register_control_session(
+            crate::telemetry::operation_token(),
+            peer_ip,
+            connection_id,
+        );
         Ok(Self {
-            requests: RequestDecoder::new(limits).map_err(|_| ConnectionError::Framing)?,
+            protocol: ConnectionProtocol::Undecided,
+            classic: ClassicConnection::default(),
+            connection_id,
+            peer_ip,
+            requests,
             pairing: None,
             control: None,
             event_keys: None,
@@ -856,6 +976,7 @@ impl ConnectionState {
             event_commands: None,
             phase_one: None,
             media: None,
+            media_completion: None,
             media_permit: None,
             remote_control: RemoteControlAccumulator::default(),
             pending_volume_db: None,
@@ -880,6 +1001,7 @@ impl ConnectionState {
         let _ = self
             .latest_remote_control
             .send(Some(RemoteControlState::Active {
+                protocol: self.media.as_ref().expect("active stream").protocol(),
                 stream_id,
                 peer,
                 credentials: self.remote_control.complete(),
@@ -897,6 +1019,11 @@ fn publishable_event_commands(commands: Option<&EventCommandSender>) -> Option<E
 
 impl Drop for ConnectionState {
     fn drop(&mut self) {
+        crate::telemetry::unregister_control_session(
+            crate::telemetry::operation_token(),
+            self.peer_ip,
+            self.connection_id,
+        );
         if let Some(commands) = self.event_commands.take() {
             commands.revoke();
         }
@@ -907,6 +1034,7 @@ impl Drop for ConnectionState {
             let _ = self
                 .latest_remote_control
                 .send(Some(RemoteControlState::Ended {
+                    protocol: media.protocol(),
                     stream_id: media.stream_id(),
                 }));
             drop(media);
@@ -921,11 +1049,16 @@ enum PhaseOneState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaKind {
+    Classic,
     Realtime,
     Buffered,
 }
 
 enum PreparedMedia {
+    Classic {
+        stream_id: u64,
+        media: PreparedClassic,
+    },
     Type96 {
         stream_id: u64,
         media: PreparedType96,
@@ -939,12 +1072,25 @@ enum PreparedMedia {
 impl PreparedMedia {
     fn stream_id(&self) -> u64 {
         match self {
-            Self::Type96 { stream_id, .. } | Self::Type103 { stream_id, .. } => *stream_id,
+            Self::Classic { stream_id, .. }
+            | Self::Type96 { stream_id, .. }
+            | Self::Type103 { stream_id, .. } => *stream_id,
+        }
+    }
+
+    fn protocol(&self) -> Protocol {
+        match self {
+            Self::Classic { .. } => Protocol::AirPlay1,
+            _ => Protocol::AirPlay2,
         }
     }
 
     fn start(self, output: Box<dyn PcmOutput>) -> ActiveMedia {
         match self {
+            Self::Classic { stream_id, media } => ActiveMedia::Classic {
+                stream_id,
+                handle: media.start(output),
+            },
             Self::Type96 { stream_id, media } => ActiveMedia::Type96 {
                 stream_id,
                 handle: media.start(output),
@@ -958,6 +1104,10 @@ impl PreparedMedia {
 }
 
 enum ActiveMedia {
+    Classic {
+        stream_id: u64,
+        handle: ClassicMediaHandle,
+    },
     Type96 {
         stream_id: u64,
         handle: Type96MediaHandle,
@@ -971,12 +1121,32 @@ enum ActiveMedia {
 impl ActiveMedia {
     fn stream_id(&self) -> u64 {
         match self {
-            Self::Type96 { stream_id, .. } | Self::Type103 { stream_id, .. } => *stream_id,
+            Self::Classic { stream_id, .. }
+            | Self::Type96 { stream_id, .. }
+            | Self::Type103 { stream_id, .. } => *stream_id,
+        }
+    }
+
+    fn protocol(&self) -> Protocol {
+        match self {
+            Self::Classic { .. } => Protocol::AirPlay1,
+            _ => Protocol::AirPlay2,
+        }
+    }
+
+    fn prepare_classic_record(&self, info: ClassicRtpInfo) -> io::Result<ClassicRecordCommit> {
+        match self {
+            Self::Classic { handle, .. } => handle.prepare_record(info.sequence, info.timestamp),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a classic stream",
+            )),
         }
     }
 
     fn kind(&self) -> MediaKind {
         match self {
+            Self::Classic { .. } => MediaKind::Classic,
             Self::Type96 { .. } => MediaKind::Realtime,
             Self::Type103 { .. } => MediaKind::Buffered,
         }
@@ -984,6 +1154,7 @@ impl ActiveMedia {
 
     fn is_finished(&self) -> bool {
         match self {
+            Self::Classic { handle, .. } => handle.is_finished(),
             Self::Type96 { handle, .. } => handle.is_finished(),
             Self::Type103 { handle, .. } => handle.is_finished(),
         }
@@ -992,7 +1163,7 @@ impl ActiveMedia {
     async fn set_rate(&self, anchor: BufferedRateAnchor) -> io::Result<()> {
         match self {
             Self::Type103 { handle, .. } => handle.set_rate(anchor).await,
-            Self::Type96 { .. } => Err(io::Error::new(
+            Self::Type96 { .. } | Self::Classic { .. } => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "rate control is only valid for buffered media",
             )),
@@ -1001,6 +1172,12 @@ impl ActiveMedia {
 
     async fn flush(&self, request: FlushRequest) -> io::Result<()> {
         match (self, request) {
+            (Self::Classic { handle, .. }, FlushRequest::Classic { info }) => {
+                handle.flush(info.sequence, info.timestamp).await
+            }
+            (Self::Classic { handle, .. }, FlushRequest::CurrentStream) => {
+                handle.flush(None, None).await
+            }
             (Self::Type96 { handle, .. }, FlushRequest::CurrentStream) => handle.flush().await,
             (Self::Type103 { handle, .. }, FlushRequest::CurrentStream) => {
                 handle.flush(BufferedFlush::All).await
@@ -1008,15 +1185,16 @@ impl ActiveMedia {
             (Self::Type103 { handle, .. }, FlushRequest::Buffered { request }) => {
                 handle.flush(request).await
             }
-            (Self::Type96 { .. }, FlushRequest::Buffered { .. }) => Err(io::Error::new(
+            _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "buffered flush is only valid for buffered media",
             )),
         }
     }
 
-    async fn abort(&self) {
+    async fn abort(&mut self) {
         match self {
+            Self::Classic { handle, .. } => handle.abort().await,
             Self::Type96 { handle, .. } => handle.abort().await,
             Self::Type103 { handle, .. } => handle.abort().await,
         }
@@ -1025,8 +1203,15 @@ impl ActiveMedia {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlushRequest {
+    Classic { info: ClassicRtpInfo },
     CurrentStream,
     Buffered { request: BufferedFlush },
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ClassicRtpInfo {
+    sequence: Option<u16>,
+    timestamp: Option<u32>,
 }
 
 #[derive(Default)]
@@ -1104,17 +1289,21 @@ async fn run_connection(
     next_stream_id: Arc<AtomicU64>,
     volume_revision: Arc<AtomicU64>,
 ) -> Result<(), ConnectionError> {
-    let mut state = ConnectionState::new(latest_remote_control)?;
+    let mut state = ConnectionState::new(peer.ip(), latest_remote_control)?;
     loop {
         if state.media.as_ref().is_some_and(ActiveMedia::is_finished) {
             if let Some(media) = state.media.take() {
                 let stream_id = media.stream_id();
                 let _ = state
                     .latest_remote_control
-                    .send(Some(RemoteControlState::Ended { stream_id }));
+                    .send(Some(RemoteControlState::Ended {
+                        protocol: media.protocol(),
+                        stream_id,
+                    }));
                 drop(media);
             }
             state.media_permit = None;
+            state.media_completion = None;
             state.now_playing = ConnectionNowPlaying::default();
         }
         let request_timeout = if state.media.is_some() {
@@ -1163,6 +1352,11 @@ async fn process_one_request(
     let Some(mut request) = read_next_request(socket, state).await? else {
         return Ok(ConnectionProgress::Eof);
     };
+    crate::telemetry::register_control_session(
+        crate::telemetry::operation_token(),
+        peer.ip(),
+        state.connection_id,
+    );
 
     let local_addr = socket.local_addr().map_err(|_| ConnectionError::Io)?;
     let encrypted = state.control.is_some();
@@ -1190,30 +1384,16 @@ async fn process_one_request(
         },
     };
 
-    if apple_response.is_ok() {
-        state.remote_control.observe(&request);
-        state.publish_remote_control(peer);
-    }
-
-    let active_stream_id = state.active_stream_id();
-    let active_media_kind = state.active_media_kind();
     let mut outcome = match &apple_response {
         Ok(_) => {
-            dispatch_request(
+            classic_control::dispatch(
                 &request,
-                encrypted,
                 peer,
                 local_addr,
                 config,
                 pair_setup_limiter,
-                &mut state.pairing,
-                &mut state.event_keys,
-                state.event_task.is_some(),
-                &mut state.phase_one,
-                state.media_permit.is_some(),
-                active_stream_id,
-                active_media_kind,
                 next_stream_id,
+                state,
             )
             .await
         }
@@ -1242,6 +1422,23 @@ async fn process_one_request(
             DispatchOutcome::close(response_for(&request, 503, "Service Unavailable"))
         }
     };
+    let mut classic_record_commit = None;
+    if let Some(info) = outcome.classic_record {
+        match state
+            .media
+            .as_ref()
+            .map(|media| media.prepare_classic_record(info))
+        {
+            Some(Ok(commit)) => classic_record_commit = Some(commit),
+            result => {
+                let error = result.and_then(Result::err).unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "classic media is not active")
+                });
+                outcome.response = media_command_error_response(&request, &error);
+                outcome.classic_record = None;
+            }
+        }
+    }
     // A control request may only receive 200 after the media engine has
     // accepted it. This keeps RTSP state and audio state atomic from the
     // sender's perspective, especially when the bounded deferred-flush queue
@@ -1291,11 +1488,26 @@ async fn process_one_request(
         match Header::new("Apple-Response", value.as_bytes().to_vec()) {
             Ok(header) => outcome.response.headers.push(header),
             Err(_) => {
+                let phase2_telemetry =
+                    outcome
+                        .phase2_telemetry
+                        .take()
+                        .map(|telemetry| Phase2TelemetryOutcome {
+                            status: 500,
+                            reason: "apple_response_header_failed",
+                            ..telemetry
+                        });
+                let peer_list_telemetry = outcome.peer_list_telemetry.take();
                 outcome =
                     DispatchOutcome::close(response_for(&request, 500, "Internal Server Error"));
+                outcome.phase2_telemetry = phase2_telemetry;
+                outcome.peer_list_telemetry = peer_list_telemetry;
             }
         }
     }
+
+    outcome.record_phase2_prepared(peer.ip(), state.connection_id);
+    outcome.record_peer_list_prepared(peer.ip(), state.connection_id);
 
     if request.method() == "POST" && request.target() == "/feedback" {
         log::debug!(
@@ -1306,7 +1518,8 @@ async fn process_one_request(
     } else {
         log::info!(
             target: "audiohub_airplay::airplay2",
-            "AirPlay 2 RTSP peer={peer} encrypted={encrypted} challenge_present={challenge_present} method={} target={} status={}",
+            "AirPlay RTSP peer={peer} protocol={:?} encrypted={encrypted} challenge_present={challenge_present} method={} target={} status={}",
+            state.protocol,
             request.method(),
             request.target(),
             outcome.response.status,
@@ -1316,14 +1529,60 @@ async fn process_one_request(
     let activate_event_after_response =
         request.method() == "RECORD" && (200..300).contains(&outcome.response.status);
     request.wipe_body();
-    let encoded = outcome
-        .response
-        .encode()
-        .map_err(|_| ConnectionError::ResponseEncoding)?;
+    let encoded = match outcome.response.encode() {
+        Ok(encoded) => encoded,
+        Err(_) => {
+            outcome.record_response_commit_failure(peer.ip(), state.connection_id);
+            return Err(ConnectionError::ResponseEncoding);
+        }
+    };
 
     // M4 is itself plaintext. Install the control keys only after every byte
     // of that response has been accepted by the socket write path.
-    write_response(socket, state.control.as_mut(), &encoded).await?;
+    if let Err(error) = write_response(socket, state.control.as_mut(), &encoded).await {
+        outcome.record_response_write_failure(peer.ip(), state.connection_id);
+        return Err(error);
+    }
+    if (200..300).contains(&outcome.response.status) {
+        if let Some(commit) = classic_record_commit {
+            commit.commit();
+        }
+        // Accepted pre-session headers remain connection-local until a
+        // media session exists. Rejected or unwritten responses commit none.
+        state.remote_control.observe(&request);
+        state.publish_remote_control(peer);
+    }
+    if let Some(announcement) = outcome.install_classic_announcement.take() {
+        state.classic.announced = Some(announcement);
+        state
+            .requests
+            .set_default_max_body_bytes(MAX_NOW_PLAYING_BODY_BYTES)
+            .map_err(|_| ConnectionError::Framing)?;
+    }
+    if let Some(session) = outcome.install_classic_session.take() {
+        state.classic.session = Some(session);
+    }
+    let mut phase2_commit_token = outcome
+        .phase2_telemetry
+        .take()
+        .filter(|telemetry| telemetry.status == 200)
+        .map(|telemetry| telemetry.token);
+    if let Some(telemetry) = outcome.peer_list_telemetry.take() {
+        if outcome.response.status == 200 {
+            crate::telemetry::record_peer_list_update_committed(
+                telemetry.token,
+                peer.ip(),
+                state.connection_id,
+                telemetry.parsed,
+            );
+        } else {
+            crate::telemetry::record_peer_list_update_commit_failure(
+                telemetry.token,
+                peer.ip(),
+                state.connection_id,
+            );
+        }
+    }
     if activate_event_after_response {
         if let Some(commands) = state.event_commands.as_ref() {
             commands.activate_after_record();
@@ -1349,12 +1608,21 @@ async fn process_one_request(
         state.media_permit = Some(permit);
     }
     if let Some(prepared) = outcome.start_media {
-        if let Some(previous) = state.media.take() {
+        if let Some(mut previous) = state.media.take() {
             previous.abort().await;
         }
         let stream_id = prepared.stream_id();
-        let output = output_factory(stream_id, peer);
-        state.media = Some(prepared.start(output));
+        let protocol = prepared.protocol();
+        let output = output_factory(stream_id, peer, protocol);
+        let (finished, completion) = watch::channel(false);
+        state.media_completion = Some(completion);
+        state.media = Some(prepared.start(Box::new(CompletionOutput {
+            inner: Some(output),
+            finished,
+        })));
+        if let Some(token) = phase2_commit_token.take() {
+            crate::telemetry::record_phase2_committed(token, peer.ip(), state.connection_id);
+        }
         match state.remote_control.complete() {
             Some(credentials) => log::info!(
                 target: "audiohub_airplay::airplay2",
@@ -1372,7 +1640,7 @@ async fn process_one_request(
         }
         state.publish_remote_control(peer);
         if let Some(db) = state.pending_volume_db {
-            publish_volume(latest_volume, volume_revision, stream_id, db);
+            publish_volume(latest_volume, volume_revision, protocol, stream_id, db);
         }
         let _ = event_tx.try_send(ProbeEvent::SessionStarted {
             peer: peer.ip(),
@@ -1385,10 +1653,22 @@ async fn process_one_request(
             let _ = event_tx.send(event).await;
         }
     }
+    if let Some(token) = phase2_commit_token.take() {
+        // A status-200 phase-two response is terminal only once its prepared
+        // media state is installed. Preserve the otherwise invisible branch
+        // without changing the RTSP response or clock-selection behavior.
+        crate::telemetry::record_phase2_commit_failure(token, peer.ip(), state.connection_id);
+    }
     if let Some(db) = outcome.volume_db {
         state.pending_volume_db = Some(db);
         if let Some(stream_id) = state.active_stream_id() {
-            publish_volume(latest_volume, volume_revision, stream_id, db);
+            publish_volume(
+                latest_volume,
+                volume_revision,
+                state.media.as_ref().expect("active media").protocol(),
+                stream_id,
+                db,
+            );
             let _ = event_tx.try_send(ProbeEvent::Volume {
                 peer: peer.ip(),
                 stream_id,
@@ -1415,15 +1695,17 @@ async fn process_one_request(
     }
 
     if outcome.teardown_media {
-        if let Some(media) = state.media.take() {
+        if let Some(mut media) = state.media.take() {
             let _ = state
                 .latest_remote_control
                 .send(Some(RemoteControlState::Ended {
+                    protocol: media.protocol(),
                     stream_id: media.stream_id(),
                 }));
             media.abort().await;
         }
         state.media_permit = None;
+        state.media_completion = None;
         state.pending_volume_db = None;
         state.now_playing = ConnectionNowPlaying::default();
     }
@@ -1451,6 +1733,7 @@ fn media_command_error_response(request: &Request, error: &io::Error) -> Respons
 fn publish_volume(
     latest_volume: &watch::Sender<Option<VolumeUpdate>>,
     volume_revision: &AtomicU64,
+    protocol: Protocol,
     stream_id: u64,
     db: f32,
 ) {
@@ -1458,6 +1741,7 @@ fn publish_volume(
         .fetch_add(1, Ordering::AcqRel)
         .wrapping_add(1);
     let _ = latest_volume.send(Some(VolumeUpdate {
+        protocol,
         stream_id,
         revision,
         db,
@@ -1499,7 +1783,10 @@ async fn read_next_request(
     state: &mut ConnectionState,
 ) -> Result<Option<Request>, ConnectionError> {
     loop {
-        let authenticated = state.control.is_some();
+        let authenticated = state.control.is_some()
+            || (state.protocol == ConnectionProtocol::Classic
+                && state.classic.authenticated
+                && (state.classic.announced.is_some() || state.media.is_some()));
         if let Some(request) = state
             .requests
             .next_request(|method, target, headers| {
@@ -1511,10 +1798,18 @@ async fn read_next_request(
         }
 
         let mut wire = [0u8; READ_CHUNK_BYTES];
-        let read = socket
-            .read(&mut wire)
-            .await
-            .map_err(|_| ConnectionError::Io)?;
+        let read = if let Some(completion) = state.media_completion.as_mut() {
+            if *completion.borrow() {
+                return Ok(None);
+            }
+            tokio::select! {
+                result = socket.read(&mut wire) => result,
+                _ = completion.changed() => return Ok(None),
+            }
+        } else {
+            socket.read(&mut wire).await
+        }
+        .map_err(|_| ConnectionError::Io)?;
         if read == 0 {
             return Ok(None);
         }
@@ -1556,6 +1851,7 @@ fn max_body_for_request(
         return Some(MAX_NOW_PLAYING_BODY_BYTES);
     }
     Some(match method {
+        "ANNOUNCE" => super::classic::sdp::MAX_SDP_BYTES,
         // Stock senders attach a small binary-plist qualifier to GET /info.
         // Keep GET bounded, but do not reject that request before dispatch.
         "GET" => MAX_CONTROL_BODY_BYTES,
@@ -1596,7 +1892,63 @@ async fn write_response(
         .map_err(|_| ConnectionError::Io)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Phase2TelemetryOutcome {
+    token: crate::telemetry::OperationToken,
+    stream_type: Option<u64>,
+    status: u16,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerListUpdateMethod {
+    SetPeers,
+    SetPeersX,
+}
+
+impl PeerListUpdateMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SetPeers => "SETPEERS",
+            Self::SetPeersX => "SETPEERSX",
+        }
+    }
+
+    fn expected_content_type(self) -> &'static str {
+        match self {
+            Self::SetPeers => "/peer-list-changed",
+            Self::SetPeersX => "/peer-list-changed-x",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PeerListTelemetryContext {
+    peer_count: usize,
+    address_count: usize,
+    peer_ids: Vec<String>,
+    addresses: Vec<String>,
+    clock_identity_count: usize,
+    clock_identities: Vec<u64>,
+    clock_port_count: usize,
+    local_clock_port_matches: usize,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct PeerListTelemetryOutcome {
+    token: crate::telemetry::OperationToken,
+    method: PeerListUpdateMethod,
+    content_type: Option<String>,
+    parsed: bool,
+    reason: &'static str,
+    context: PeerListTelemetryContext,
+}
+
 struct DispatchOutcome {
+    install_classic_announcement: Option<ClassicAudioConfig>,
+    install_classic_session: Option<String>,
+    classic_record: Option<ClassicRtpInfo>,
     response: Response,
     install_control: Option<ChannelKeys>,
     install_event_keys: Option<ChannelKeys>,
@@ -1610,12 +1962,17 @@ struct DispatchOutcome {
     set_media_rate: Option<BufferedRateAnchor>,
     teardown_media: bool,
     probe_event: Option<ProbeEvent>,
+    phase2_telemetry: Option<Phase2TelemetryOutcome>,
+    peer_list_telemetry: Option<PeerListTelemetryOutcome>,
     close_after: bool,
 }
 
 impl DispatchOutcome {
     fn reply(response: Response) -> Self {
         Self {
+            install_classic_announcement: None,
+            install_classic_session: None,
+            classic_record: None,
             response,
             install_control: None,
             install_event_keys: None,
@@ -1629,12 +1986,17 @@ impl DispatchOutcome {
             set_media_rate: None,
             teardown_media: false,
             probe_event: None,
+            phase2_telemetry: None,
+            peer_list_telemetry: None,
             close_after: false,
         }
     }
 
     fn close(response: Response) -> Self {
         Self {
+            install_classic_announcement: None,
+            install_classic_session: None,
+            classic_record: None,
             response,
             install_control: None,
             install_event_keys: None,
@@ -1648,8 +2010,142 @@ impl DispatchOutcome {
             set_media_rate: None,
             teardown_media: false,
             probe_event: None,
+            phase2_telemetry: None,
+            peer_list_telemetry: None,
             close_after: true,
         }
+    }
+
+    fn with_phase2_telemetry(
+        mut self,
+        token: crate::telemetry::OperationToken,
+        stream_type: Option<u64>,
+        status: u16,
+        reason: &'static str,
+    ) -> Self {
+        debug_assert_eq!(self.response.status, status);
+        self.phase2_telemetry = Some(Phase2TelemetryOutcome {
+            token,
+            stream_type,
+            status,
+            reason,
+        });
+        self
+    }
+
+    fn record_phase2_prepared(
+        &mut self,
+        peer: IpAddr,
+        connection_id: crate::telemetry::ConnectionId,
+    ) {
+        let Some(telemetry) = self.phase2_telemetry.as_mut() else {
+            return;
+        };
+        if telemetry.status != self.response.status {
+            telemetry.status = self.response.status;
+            telemetry.reason = "terminal_response_overridden";
+        }
+        crate::telemetry::record_phase2_prepared(
+            telemetry.token,
+            peer,
+            connection_id,
+            telemetry.stream_type,
+            telemetry.status,
+            telemetry.reason,
+        );
+    }
+
+    #[cfg(test)]
+    fn record_phase2_committed(
+        &mut self,
+        peer: IpAddr,
+        connection_id: crate::telemetry::ConnectionId,
+    ) {
+        let Some(telemetry) = self.phase2_telemetry.take() else {
+            return;
+        };
+        if telemetry.status == 200 {
+            crate::telemetry::record_phase2_committed(telemetry.token, peer, connection_id);
+        }
+    }
+
+    fn record_response_write_failure(
+        &mut self,
+        peer: IpAddr,
+        connection_id: crate::telemetry::ConnectionId,
+    ) {
+        if let Some(telemetry) = self.phase2_telemetry.take() {
+            crate::telemetry::record_phase2_socket_write_failure(
+                telemetry.token,
+                peer,
+                connection_id,
+                telemetry.status,
+            );
+        }
+        if let Some(telemetry) = self.peer_list_telemetry.take() {
+            crate::telemetry::record_peer_list_update_socket_write_failure(
+                telemetry.token,
+                peer,
+                connection_id,
+            );
+        }
+    }
+
+    fn record_response_commit_failure(
+        &mut self,
+        peer: IpAddr,
+        connection_id: crate::telemetry::ConnectionId,
+    ) {
+        if let Some(telemetry) = self.phase2_telemetry.take() {
+            if telemetry.status == 200 {
+                crate::telemetry::record_phase2_commit_failure(
+                    telemetry.token,
+                    peer,
+                    connection_id,
+                );
+            }
+        }
+        if let Some(telemetry) = self.peer_list_telemetry.take() {
+            crate::telemetry::record_peer_list_update_commit_failure(
+                telemetry.token,
+                peer,
+                connection_id,
+            );
+        }
+    }
+
+    fn with_peer_list_telemetry(mut self, telemetry: PeerListTelemetryOutcome) -> Self {
+        self.peer_list_telemetry = Some(telemetry);
+        self
+    }
+
+    fn record_peer_list_prepared(
+        &self,
+        peer: IpAddr,
+        connection_id: crate::telemetry::ConnectionId,
+    ) {
+        let Some(telemetry) = self.peer_list_telemetry.as_ref() else {
+            return;
+        };
+        crate::telemetry::record_peer_list_update_prepared(
+            telemetry.token,
+            peer,
+            connection_id,
+            telemetry.method.as_str(),
+            telemetry.content_type.as_deref(),
+            self.response.status,
+            telemetry.parsed,
+            telemetry.reason,
+            telemetry.context.peer_count,
+            telemetry.context.address_count,
+            &telemetry.context.peer_ids,
+            &telemetry.context.addresses,
+            telemetry.context.clock_identity_count,
+            &telemetry.context.clock_identities,
+            telemetry.context.clock_port_count,
+            telemetry.context.local_clock_port_matches,
+            telemetry.context.truncated,
+        );
     }
 }
 
@@ -1668,6 +2164,7 @@ async fn dispatch_request(
     active_stream_id: Option<u64>,
     active_media_kind: Option<MediaKind>,
     next_stream_id: &AtomicU64,
+    connection_id: crate::telemetry::ConnectionId,
 ) -> DispatchOutcome {
     if has_ambiguous_cseq(request) {
         return DispatchOutcome::close(response_for(request, 400, "Bad Request"));
@@ -1686,6 +2183,7 @@ async fn dispatch_request(
             active_stream_id,
             active_media_kind,
             next_stream_id,
+            connection_id,
         )
         .await
     } else {
@@ -1743,6 +2241,7 @@ async fn dispatch_encrypted(
     active_stream_id: Option<u64>,
     active_media_kind: Option<MediaKind>,
     next_stream_id: &AtomicU64,
+    connection_id: crate::telemetry::ConnectionId,
 ) -> DispatchOutcome {
     match (request.method(), request.target()) {
         ("OPTIONS", _) => options_response(request),
@@ -1755,6 +2254,9 @@ async fn dispatch_encrypted(
             DispatchOutcome::reply(response_for(request, 200, "OK"))
         }
         ("SETUP", _) => {
+            // Bind all preparation awaits and the eventual response/media
+            // commit to the reset generation active when phase two entered.
+            let telemetry_token = crate::telemetry::operation_token();
             let local_timing_peer_id = config.identity.public_identifier();
             let mut outcome = setup_response(
                 request,
@@ -1768,6 +2270,8 @@ async fn dispatch_encrypted(
                 phase_one,
                 has_media_permit,
                 next_stream_id,
+                telemetry_token,
+                connection_id,
             )
             .await;
             if let Some(endpoint) = outcome.install_event_endpoint.as_mut() {
@@ -1790,7 +2294,24 @@ async fn dispatch_encrypted(
         },
         ("SET_PARAMETER", _) => set_parameter_response(request),
         ("RECORD", _) => record_response(request),
-        ("SETPEERS" | "SETPEERSX", _) => DispatchOutcome::reply(response_for(request, 200, "OK")),
+        ("SETPEERS", _) => {
+            let telemetry_token = crate::telemetry::operation_token();
+            peer_list_update_response(
+                request,
+                PeerListUpdateMethod::SetPeers,
+                &config.identity.public_identifier(),
+                telemetry_token,
+            )
+        }
+        ("SETPEERSX", _) => {
+            let telemetry_token = crate::telemetry::operation_token();
+            peer_list_update_response(
+                request,
+                PeerListUpdateMethod::SetPeersX,
+                &config.identity.public_identifier(),
+                telemetry_token,
+            )
+        }
         ("SETRATEANCHORTIME", _) => {
             if active_media_kind != Some(MediaKind::Buffered) {
                 return DispatchOutcome::reply(response_for(
@@ -1927,19 +2448,52 @@ async fn setup_response(
     phase_one: &mut Option<PhaseOneState>,
     connection_has_media_permit: bool,
     next_stream_id: &AtomicU64,
+    telemetry_token: crate::telemetry::OperationToken,
+    connection_id: crate::telemetry::ConnectionId,
 ) -> DispatchOutcome {
+    let phase2_like = request
+        .body()
+        .windows(b"streams".len())
+        .any(|window| window == b"streams");
     if !has_content_type(request, BINARY_PLIST_CONTENT_TYPE) {
-        return DispatchOutcome::close(response_for(request, 400, "Bad Request"));
+        let outcome = DispatchOutcome::close(response_for(request, 400, "Bad Request"));
+        return if phase2_like {
+            outcome.with_phase2_telemetry(
+                telemetry_token,
+                None,
+                400,
+                "phase2_content_type_missing_or_wrong",
+            )
+        } else {
+            outcome
+        };
     }
     let setup = match parse_setup(request.body()) {
         Ok(setup) => setup,
-        Err(()) => return DispatchOutcome::close(response_for(request, 400, "Bad Request")),
+        Err(ParseSetupError::Phase2(reason)) => {
+            return DispatchOutcome::close(response_for(request, 400, "Bad Request"))
+                .with_phase2_telemetry(telemetry_token, None, 400, reason);
+        }
+        Err(ParseSetupError::Unclassified) => {
+            let outcome = DispatchOutcome::close(response_for(request, 400, "Bad Request"));
+            return if phase2_like {
+                outcome.with_phase2_telemetry(
+                    telemetry_token,
+                    None,
+                    400,
+                    "phase2_unclassified_malformed",
+                )
+            } else {
+                outcome
+            };
+        }
     };
 
     match setup {
         ParsedSetup::Streams { stream_type } => {
             let Some(stream_type) = stream_type else {
-                return DispatchOutcome::close(response_for(request, 400, "Bad Request"));
+                return DispatchOutcome::close(response_for(request, 400, "Bad Request"))
+                    .with_phase2_telemetry(telemetry_token, None, 400, "missing_stream_type");
             };
             if !matches!(
                 stream_type,
@@ -1951,7 +2505,12 @@ async fn setup_response(
                     peer: peer.ip(),
                     stream_type: Some(stream_type),
                 });
-                return outcome;
+                return outcome.with_phase2_telemetry(
+                    telemetry_token,
+                    Some(stream_type),
+                    501,
+                    "unsupported_stream_type",
+                );
             }
 
             let timing_matches_stream = matches!(
@@ -1965,7 +2524,13 @@ async fn setup_response(
                     request,
                     455,
                     "Method Not Valid in This State",
-                ));
+                ))
+                .with_phase2_telemetry(
+                    telemetry_token,
+                    Some(stream_type),
+                    455,
+                    "timing_mode_mismatch",
+                );
             }
 
             let new_media_permit = if connection_has_media_permit {
@@ -1982,7 +2547,13 @@ async fn setup_response(
                             request,
                             453,
                             "Not Enough Bandwidth",
-                        ));
+                        ))
+                        .with_phase2_telemetry(
+                            telemetry_token,
+                            Some(stream_type),
+                            453,
+                            "active_media_permit_unavailable",
+                        );
                     }
                 };
                 Some(permit)
@@ -1998,7 +2569,13 @@ async fn setup_response(
                                 request,
                                 400,
                                 "Bad Request",
-                            ));
+                            ))
+                            .with_phase2_telemetry(
+                                telemetry_token,
+                                Some(stream_type),
+                                400,
+                                "realtime_setup_parse_failed",
+                            );
                         }
                     };
                     let Some(timing) = phase_one.as_ref() else {
@@ -2006,7 +2583,13 @@ async fn setup_response(
                             request,
                             500,
                             "Internal Server Error",
-                        ));
+                        ))
+                        .with_phase2_telemetry(
+                            telemetry_token,
+                            Some(stream_type),
+                            500,
+                            "realtime_timing_state_missing",
+                        );
                     };
                     let media = match timing {
                         // An NTP timing socket is owned by one classic stream
@@ -2040,7 +2623,13 @@ async fn setup_response(
                                 request,
                                 500,
                                 "Internal Server Error",
-                            ));
+                            ))
+                            .with_phase2_telemetry(
+                                telemetry_token,
+                                Some(stream_type),
+                                500,
+                                "realtime_media_prepare_failed",
+                            );
                         }
                     };
                     let body = match setup_type96_phase_two_body(media.ports()) {
@@ -2050,7 +2639,13 @@ async fn setup_response(
                                 request,
                                 500,
                                 "Internal Server Error",
-                            ));
+                            ))
+                            .with_phase2_telemetry(
+                                telemetry_token,
+                                Some(stream_type),
+                                500,
+                                "realtime_response_body_failed",
+                            );
                         }
                     };
                     (PreparedMedia::Type96 { stream_id, media }, body)
@@ -2066,7 +2661,13 @@ async fn setup_response(
                                 request,
                                 400,
                                 "Bad Request",
-                            ));
+                            ))
+                            .with_phase2_telemetry(
+                                telemetry_token,
+                                Some(stream_type),
+                                400,
+                                "buffered_setup_parse_failed",
+                            );
                         }
                     };
                     let Some(PhaseOneState::Ptp(ptp_clock)) = phase_one.as_ref() else {
@@ -2074,7 +2675,13 @@ async fn setup_response(
                             request,
                             500,
                             "Internal Server Error",
-                        ));
+                        ))
+                        .with_phase2_telemetry(
+                            telemetry_token,
+                            Some(stream_type),
+                            500,
+                            "buffered_ptp_state_missing",
+                        );
                     };
                     let media = match PreparedType103::prepare(
                         local_addr,
@@ -2093,7 +2700,13 @@ async fn setup_response(
                                 request,
                                 500,
                                 "Internal Server Error",
-                            ));
+                            ))
+                            .with_phase2_telemetry(
+                                telemetry_token,
+                                Some(stream_type),
+                                500,
+                                "buffered_media_prepare_failed",
+                            );
                         }
                     };
                     let body = match setup_type103_phase_two_body(media.ports()) {
@@ -2103,7 +2716,13 @@ async fn setup_response(
                                 request,
                                 500,
                                 "Internal Server Error",
-                            ));
+                            ))
+                            .with_phase2_telemetry(
+                                telemetry_token,
+                                Some(stream_type),
+                                500,
+                                "buffered_response_body_failed",
+                            );
                         }
                     };
                     (PreparedMedia::Type103 { stream_id, media }, body)
@@ -2112,7 +2731,13 @@ async fn setup_response(
             };
             let mut response = response_for(request, 200, "OK");
             if add_content_type(&mut response, BINARY_PLIST_CONTENT_TYPE).is_err() {
-                return DispatchOutcome::close(response_for(request, 500, "Internal Server Error"));
+                return DispatchOutcome::close(response_for(request, 500, "Internal Server Error"))
+                    .with_phase2_telemetry(
+                        telemetry_token,
+                        Some(stream_type),
+                        500,
+                        "response_content_type_failed",
+                    );
             }
             response.body = body;
             let mut outcome = DispatchOutcome::reply(response);
@@ -2122,12 +2747,13 @@ async fn setup_response(
                 peer: peer.ip(),
                 stream_type: Some(stream_type),
             });
-            outcome
+            outcome.with_phase2_telemetry(telemetry_token, Some(stream_type), 200, "media_prepared")
         }
         ParsedSetup::Session {
             fields,
             remote_timing_port,
             timing_peer,
+            timing_peer_list,
         } => {
             if event_endpoint_installed || phase_one.is_some() {
                 return DispatchOutcome::reply(response_for(
@@ -2237,6 +2863,23 @@ async fn setup_response(
                                 ));
                             }
                         };
+                    crate::telemetry::record_timing_peer_selection(
+                        telemetry_token,
+                        peer.ip(),
+                        connection_id,
+                        &remote_timing_peer.id,
+                        &remote_timing_peer.addresses,
+                        remote_match
+                            .map(|matching| (matching.clock_identity, matching.port_number)),
+                        peer.ip(),
+                        &timing_peer_list
+                            .iter()
+                            .map(|timing_peer| timing_peer.id.clone())
+                            .collect::<Vec<_>>(),
+                        timing_peer_list
+                            .iter()
+                            .any(|timing_peer| timing_peer.id == remote_timing_peer.id),
+                    );
                     let body = match setup_ptp_phase_one_body(
                         event_port,
                         local_addr.ip(),
@@ -2287,16 +2930,26 @@ enum ParsedSetup {
         fields: SetupPhase1Fields,
         remote_timing_port: u16,
         timing_peer: Option<ParsedTimingPeer>,
+        timing_peer_list: Vec<ParsedTimingPeer>,
     },
     Streams {
         stream_type: Option<u64>,
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParseSetupError {
+    Unclassified,
+    Phase2(&'static str),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedTimingPeer {
     id: String,
+    addresses: Vec<String>,
     _supports_receive_matching: bool,
+    advertised_clock_identity: Option<u64>,
+    advertised_clock_port_count: usize,
     receive_matching: Option<ParsedReceiveMatching>,
 }
 
@@ -2319,24 +2972,25 @@ impl ParsedTimingPeer {
     }
 }
 
-fn parse_setup(body: &[u8]) -> Result<ParsedSetup, ()> {
+fn parse_setup(body: &[u8]) -> Result<ParsedSetup, ParseSetupError> {
     if body.len() < 8 || !body.starts_with(b"bplist00") {
-        return Err(());
+        return Err(ParseSetupError::Unclassified);
     }
-    let value = Value::from_reader(Cursor::new(body)).map_err(|_| ())?;
-    let dictionary = value.as_dictionary().ok_or(())?;
+    let value = Value::from_reader(Cursor::new(body)).map_err(|_| ParseSetupError::Unclassified)?;
+    let dictionary = value.as_dictionary().ok_or(ParseSetupError::Unclassified)?;
 
     if let Some(streams) = dictionary.get("streams") {
-        let streams = streams.as_array().ok_or(())?;
+        let phase2_error = || ParseSetupError::Phase2("phase2_stream_envelope_invalid");
+        let streams = streams.as_array().ok_or_else(phase2_error)?;
         if streams.is_empty() {
-            return Err(());
+            return Err(phase2_error());
         }
         let mut first_stream_type = None;
         for (index, stream) in streams.iter().enumerate() {
-            let stream = stream.as_dictionary().ok_or(())?;
-            let stream_type = plist_unsigned(stream, "type")?;
+            let stream = stream.as_dictionary().ok_or_else(phase2_error)?;
+            let stream_type = plist_unsigned(stream, "type").map_err(|_| phase2_error())?;
             if stream_type > u64::from(u32::MAX) {
-                return Err(());
+                return Err(phase2_error());
             }
             if index == 0 {
                 first_stream_type = Some(stream_type);
@@ -2351,41 +3005,48 @@ fn parse_setup(body: &[u8]) -> Result<ParsedSetup, ()> {
         .get("timingProtocol")
         .and_then(Value::as_string)
         .filter(|value| matches!(*value, "NTP" | "PTP" | "None"))
-        .ok_or(())?
+        .ok_or(ParseSetupError::Unclassified)?
         .to_owned();
     let timing_port = match dictionary.get("timingPort") {
         Some(value) => Some(
             value
                 .as_unsigned_integer()
                 .filter(|port| *port <= u64::from(u16::MAX))
-                .ok_or(())?,
+                .ok_or(ParseSetupError::Unclassified)?,
         ),
         None => None,
     };
     let remote_control_only = match dictionary.get("isRemoteControlOnly") {
-        Some(value) => value.as_boolean().ok_or(())?,
+        Some(value) => value.as_boolean().ok_or(ParseSetupError::Unclassified)?,
         None => false,
     };
     let supports_event_volume = dictionary
         .get("sourceVersion")
         .and_then(Value::as_string)
         .is_some_and(source_version_supports_event_volume);
-    validate_ignored_session_encryption_fields(dictionary)?;
+    validate_ignored_session_encryption_fields(dictionary)
+        .map_err(|_| ParseSetupError::Unclassified)?;
 
     let timing_peer = if timing_protocol == "PTP" {
-        Some(parse_timing_peer_info(dictionary.get("timingPeerInfo"))?)
+        Some(
+            parse_timing_peer_info(dictionary.get("timingPeerInfo"))
+                .map_err(|_| ParseSetupError::Unclassified)?,
+        )
     } else {
         None
+    };
+    let timing_peer_list = if timing_protocol == "PTP" {
+        parse_timing_peer_list(dictionary.get("timingPeerList"))
+            .map_err(|_| ParseSetupError::Unclassified)?
+    } else {
+        Vec::new()
     };
 
     match timing_protocol.as_str() {
         "NTP" if timing_port.is_some_and(|port| port != 0) && !remote_control_only => {}
-        "PTP"
-            if timing_port.is_none()
-                && !remote_control_only
-                && parse_timing_peer_list(dictionary.get("timingPeerList")).is_ok() => {}
+        "PTP" if timing_port.is_none() && !remote_control_only && !timing_peer_list.is_empty() => {}
         "None" if timing_port.is_none() && remote_control_only => {}
-        _ => return Err(()),
+        _ => return Err(ParseSetupError::Unclassified),
     }
 
     let remote_timing_port = timing_port
@@ -2400,6 +3061,7 @@ fn parse_setup(body: &[u8]) -> Result<ParsedSetup, ()> {
         },
         remote_timing_port,
         timing_peer,
+        timing_peer_list,
     })
 }
 
@@ -2491,13 +3153,16 @@ fn parse_timing_peer_info(value: Option<&Value>) -> Result<ParsedTimingPeer, ()>
         .and_then(Value::as_array)
         .filter(|addresses| !addresses.is_empty() && addresses.len() <= 64)
         .ok_or(())?;
-    if !addresses.iter().all(|address| {
-        address
-            .as_string()
-            .is_some_and(|address| !address.is_empty() && address.len() <= 255)
-    }) {
-        return Err(());
-    }
+    let addresses = addresses
+        .iter()
+        .map(|address| {
+            address
+                .as_string()
+                .filter(|address| !address.is_empty() && address.len() <= 255)
+                .map(str::to_owned)
+                .ok_or(())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let supports_override = match dictionary.get("SupportsClockPortMatchingOverride") {
         Some(value) => value.as_boolean().ok_or(())?,
@@ -2515,6 +3180,7 @@ fn parse_timing_peer_info(value: Option<&Value>) -> Result<ParsedTimingPeer, ()>
     // the Supports... boolean is exchanged as capability metadata but is not
     // the runtime gate. Some deployed senders publish true before their tuple
     // is populated, while others publish false alongside a usable tuple.
+    let advertised_clock_port_count = clock_ports.as_ref().map_or(0, HashMap::len);
     let receive_matching = match (clock_identity, clock_ports) {
         (None | Some(_), None) => None,
         (Some(clock_identity), Some(clock_ports)) if clock_identity != 0 => {
@@ -2528,20 +3194,100 @@ fn parse_timing_peer_info(value: Option<&Value>) -> Result<ParsedTimingPeer, ()>
 
     Ok(ParsedTimingPeer {
         id,
+        addresses,
         _supports_receive_matching: supports_override,
+        advertised_clock_identity: clock_identity,
+        advertised_clock_port_count,
         receive_matching,
     })
 }
 
-fn parse_timing_peer_list(value: Option<&Value>) -> Result<(), ()> {
+fn parse_timing_peer_list(value: Option<&Value>) -> Result<Vec<ParsedTimingPeer>, ()> {
     let peers = value
         .and_then(Value::as_array)
         .filter(|peers| !peers.is_empty() && peers.len() <= 64)
         .ok_or(())?;
-    for peer in peers {
-        parse_timing_peer_info(Some(peer))?;
+    peers
+        .iter()
+        .map(|peer| parse_timing_peer_info(Some(peer)))
+        .collect()
+}
+
+fn parse_peer_list_update(
+    body: &[u8],
+    method: PeerListUpdateMethod,
+    content_type: Option<&str>,
+    local_timing_peer_id: &str,
+) -> Result<PeerListTelemetryContext, &'static str> {
+    if content_type != Some(method.expected_content_type()) {
+        return Err("content_type");
     }
-    Ok(())
+    if body.is_empty() {
+        return Err("empty_body");
+    }
+    let value = Value::from_reader(Cursor::new(body)).map_err(|_| "plist")?;
+    let peers = value
+        .as_array()
+        .filter(|peers| peers.len() <= MAX_PEER_LIST_ENTRIES)
+        .ok_or("shape")?;
+    let mut context = PeerListTelemetryContext {
+        peer_count: peers.len(),
+        ..PeerListTelemetryContext::default()
+    };
+    match method {
+        PeerListUpdateMethod::SetPeers => {
+            for peer in peers {
+                let address = peer
+                    .as_string()
+                    .filter(|address| !address.is_empty() && address.len() <= 255)
+                    .ok_or("shape")?;
+                context.address_count = context.address_count.saturating_add(1);
+                if context.addresses.len() < PEER_LIST_EVENT_ADDRESS_LIMIT {
+                    context.addresses.push(address.to_owned());
+                } else {
+                    context.truncated = true;
+                }
+            }
+        }
+        PeerListUpdateMethod::SetPeersX => {
+            for peer in peers {
+                let peer = parse_timing_peer_info(Some(peer)).map_err(|_| "shape")?;
+                if context.peer_ids.len() < PEER_LIST_EVENT_ID_LIMIT {
+                    context.peer_ids.push(peer.id.clone());
+                } else {
+                    context.truncated = true;
+                }
+                for address in &peer.addresses {
+                    context.address_count = context.address_count.saturating_add(1);
+                    if context.addresses.len() < PEER_LIST_EVENT_ADDRESS_LIMIT {
+                        context.addresses.push(address.clone());
+                    } else {
+                        context.truncated = true;
+                    }
+                }
+                if let Some(clock_identity) = peer.advertised_clock_identity {
+                    context.clock_identity_count = context.clock_identity_count.saturating_add(1);
+                    if context.clock_identities.len() < PEER_LIST_EVENT_CLOCK_LIMIT {
+                        context.clock_identities.push(clock_identity);
+                    } else {
+                        context.truncated = true;
+                    }
+                }
+                context.clock_port_count = context
+                    .clock_port_count
+                    .saturating_add(peer.advertised_clock_port_count);
+                if peer
+                    .receive_matching
+                    .as_ref()
+                    .is_some_and(|matching| matching.clock_ports.contains_key(local_timing_peer_id))
+                {
+                    context.local_clock_port_matches =
+                        context.local_clock_port_matches.saturating_add(1);
+                }
+            }
+        }
+    }
+    Ok(context)
 }
 
 fn parse_clock_ports(value: &Value) -> Result<HashMap<String, u16>, ()> {
@@ -2701,6 +3447,38 @@ fn encode_binary_dictionary(dictionary: Dictionary) -> io::Result<Vec<u8>> {
     Ok(body)
 }
 
+fn peer_list_update_response(
+    request: &Request,
+    method: PeerListUpdateMethod,
+    local_timing_peer_id: &str,
+    telemetry_token: crate::telemetry::OperationToken,
+) -> DispatchOutcome {
+    let content_type = unique_content_type_from_headers(request.headers());
+    let parsed = parse_peer_list_update(
+        request.body(),
+        method,
+        content_type.as_deref(),
+        local_timing_peer_id,
+    );
+    let (parsed, reason, context) = match parsed {
+        Ok(context) => (true, "parsed", context),
+        Err(reason) => (false, reason, PeerListTelemetryContext::default()),
+    };
+    // Preserve 1.0 behavior: these requests are acknowledged but not applied
+    // to the active mapper yet. Telemetry states that limitation explicitly so
+    // a dual-target reproduction cannot mistake a 200 for a clock update.
+    DispatchOutcome::reply(response_for(request, 200, "OK")).with_peer_list_telemetry(
+        PeerListTelemetryOutcome {
+            token: telemetry_token,
+            method,
+            content_type,
+            parsed,
+            reason,
+            context,
+        },
+    )
+}
+
 fn record_response(request: &Request) -> DispatchOutcome {
     let mut response = response_for(request, 200, "OK");
     let Ok(header) = Header::new("Audio-Latency", b"0".to_vec()) else {
@@ -2719,7 +3497,7 @@ fn options_response(request: &Request) -> DispatchOutcome {
         // sender correctly conclude that the advertised AP2 control flow is
         // unavailable. Keep this list restricted to handlers we own rather
         // than copying a receiver's broader (and partly unsupported) list.
-        b"SETUP, RECORD, FLUSH, FLUSHBUFFERED, SETRATEANCHORTIME, TEARDOWN, OPTIONS, POST, GET, GET_PARAMETER, SET_PARAMETER, SETPEERS, SETPEERSX".to_vec(),
+        b"ANNOUNCE, SETUP, RECORD, FLUSH, FLUSHBUFFERED, SETRATEANCHORTIME, TEARDOWN, OPTIONS, POST, GET, GET_PARAMETER, SET_PARAMETER, SETPEERS, SETPEERSX".to_vec(),
     ) else {
         return DispatchOutcome::close(response_for(request, 500, "Internal Server Error"));
     };
@@ -3611,6 +4389,9 @@ fn pairing_response(request: &Request, body: Vec<u8>, close_after: bool) -> Disp
     response.body = body;
     DispatchOutcome {
         response,
+        install_classic_announcement: None,
+        install_classic_session: None,
+        classic_record: None,
         install_control: None,
         install_event_keys: None,
         install_event_endpoint: None,
@@ -3623,6 +4404,8 @@ fn pairing_response(request: &Request, body: Vec<u8>, close_after: bool) -> Disp
         set_media_rate: None,
         teardown_media: false,
         probe_event: None,
+        phase2_telemetry: None,
+        peer_list_telemetry: None,
         close_after,
     }
 }
@@ -3928,7 +4711,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Condvar, Mutex as StdMutex};
 
-    fn config() -> ServerConfig {
+    pub(super) fn config() -> ServerConfig {
         ServerConfig {
             name: "AudioHub Test".into(),
             mac: [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
@@ -3943,6 +4726,9 @@ mod tests {
             receiver_volume: Some(ReceiverVolumeProvider::fixed(
                 ReceiverVolumeSnapshot::new(-18.0, false).unwrap(),
             )),
+            classic_key: Arc::new(BundledAirPortExpressProvider),
+            classic_key_permits: Arc::new(Semaphore::new(2)),
+            classic_attempts: TokenBucketLimiter::new(6.0, 1.0),
         }
     }
 
@@ -3982,7 +4768,7 @@ mod tests {
 
     fn test_state() -> ConnectionState {
         let (remote_tx, _remote_rx) = watch::channel(None);
-        ConnectionState::new(remote_tx).unwrap()
+        ConnectionState::new("127.0.0.1".parse().unwrap(), remote_tx).unwrap()
     }
 
     fn media_permits() -> Arc<Semaphore> {
@@ -4073,6 +4859,7 @@ mod tests {
             .expect("OPTIONS must include Public");
         let public = std::str::from_utf8(public).unwrap();
         for method in [
+            "ANNOUNCE",
             "OPTIONS",
             "GET",
             "POST",
@@ -4088,7 +4875,7 @@ mod tests {
                 "missing AP2 method {method} from {public}"
             );
         }
-        for unsupported in ["ANNOUNCE", "PAUSE", "PUT"] {
+        for unsupported in ["PAUSE", "PUT"] {
             assert!(
                 !public.split(',').any(|entry| entry.trim() == unsupported),
                 "must not advertise unsupported method {unsupported}"
@@ -4152,6 +4939,7 @@ mod tests {
                 Some(7),
                 Some(MediaKind::Realtime),
                 &AtomicU64::new(8),
+                crate::telemetry::ConnectionId::new(),
             )
             .await;
             assert_eq!(outcome.response.status, 200);
@@ -4188,10 +4976,15 @@ mod tests {
     fn null_output_factory() -> PcmOutputFactory {
         struct NullOutput;
         impl PcmOutput for NullOutput {
-            fn write(&mut self, _samples: &[i16]) {}
+            fn write(
+                &mut self,
+                _samples: &[i16],
+                _telemetry_token: crate::telemetry::OperationToken,
+            ) {
+            }
             fn flush(&mut self) {}
         }
-        Arc::new(|_, _| Box::new(NullOutput))
+        Arc::new(|_, _, _| Box::new(NullOutput))
     }
 
     #[test]
@@ -4247,6 +5040,7 @@ mod tests {
             None,
             None,
             &next_stream_id,
+            crate::telemetry::ConnectionId::new(),
         )
         .await;
         assert_eq!(outcome.response.status, 200);
@@ -4265,6 +5059,112 @@ mod tests {
         assert!(decrypted_response
             .windows(b"bplist00".len())
             .any(|window| window == b"bplist00"));
+    }
+
+    #[tokio::test]
+    async fn media_completion_wakes_idle_control_and_releases_its_permit() {
+        let listener = TokioTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut state = test_state();
+        let permits = Arc::new(Semaphore::new(1));
+        state.media_permit = Some(permits.clone().try_acquire_owned().unwrap());
+        let (finished, completion) = watch::channel(false);
+        state.media_completion = Some(completion);
+        let output = CompletionOutput {
+            inner: Some(null_output_factory()(
+                1,
+                socket.peer_addr().unwrap(),
+                Protocol::AirPlay1,
+            )),
+            finished,
+        };
+        let finish = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(output);
+        });
+        assert!(timeout(
+            Duration::from_millis(500),
+            read_next_request(&mut socket, &mut state)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .is_none());
+        finish.await.unwrap();
+        drop(state);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_classic_requests_cannot_commit_dacp_credentials() {
+        let listener = TokioTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut socket, peer) = listener.accept().await.unwrap();
+        let mut state = test_state();
+        let mut config = config();
+        config.password = Some("secret".into());
+        let (events, _event_rx) = mpsc::channel(8);
+        let (volume, _volume_rx) = watch::channel(None);
+        for (index, (method, extra, expected)) in [
+            ("ANNOUNCE", "", "401"),
+            ("GET_PARAMETER", "", "200"),
+            ("GET_PARAMETER", "Session: wrong\r\n", "454"),
+            ("UNSUPPORTED", "Session: live\r\n", "501"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index > 0 {
+                state.classic.authenticated = true;
+            }
+            if index > 1 {
+                state.classic.session = Some("live".into());
+            }
+            state.requests.feed(format!("{method} /stream RTSP/1.0\r\nCSeq: {}\r\nDACP-ID: A{}\r\nActive-Remote: {}\r\n{extra}Content-Length: 0\r\n\r\n", index + 1, index, index + 100).as_bytes()).unwrap();
+            process_one_request(
+                &mut socket,
+                peer,
+                &config,
+                &events,
+                &volume,
+                &null_output_factory(),
+                &AtomicU64::new(1),
+                &AtomicU64::new(0),
+                &PairSetupLimiter::new(),
+                &AppleChallengeExecutor::new(),
+                &mut state,
+            )
+            .await
+            .unwrap();
+            let mut response = Vec::new();
+            timeout(Duration::from_secs(1), async {
+                while !response_is_complete(&response) {
+                    let mut bytes = [0; 1024];
+                    let length = client.read(&mut bytes).await.unwrap();
+                    assert_ne!(length, 0);
+                    response.extend_from_slice(&bytes[..length]);
+                }
+            })
+            .await
+            .unwrap();
+            assert!(response.starts_with(format!("RTSP/1.0 {expected} ").as_bytes()));
+            if index == 0 {
+                assert!(state.remote_control.complete().is_none());
+            } else {
+                let credentials = state.remote_control.complete().unwrap();
+                assert_eq!(credentials.dacp_id, "A1");
+                assert_eq!(credentials.active_remote, "101");
+            }
+        }
     }
 
     #[tokio::test]
@@ -4835,6 +5735,8 @@ mod tests {
             &mut phase_one_state,
             false,
             &next_stream_id,
+            crate::telemetry::operation_token(),
+            crate::telemetry::ConnectionId::new(),
         )
         .await;
         assert_eq!(outcome.response.status, 200);
@@ -5308,6 +6210,8 @@ mod tests {
             &mut phase_one,
             false,
             &AtomicU64::new(1),
+            crate::telemetry::operation_token(),
+            crate::telemetry::ConnectionId::new(),
         )
         .await;
 
@@ -5426,6 +6330,7 @@ mod tests {
         peer.insert("ClockPorts".into(), Value::Dictionary(clock_ports));
 
         let parsed = parse_timing_peer_info(Some(&Value::Dictionary(peer.clone()))).unwrap();
+        assert_eq!(parsed.addresses, vec!["192.0.2.10".to_owned()]);
         assert_eq!(
             parsed.match_for("receiver-clock"),
             Ok(Some(PtpRemoteMatch {
@@ -5542,6 +6447,8 @@ mod tests {
             &mut phase_one_state,
             false,
             &next_stream_id,
+            crate::telemetry::operation_token(),
+            crate::telemetry::ConnectionId::new(),
         )
         .await;
         assert_eq!(outcome.response.status, 455);
@@ -5597,6 +6504,8 @@ mod tests {
             &mut phase_one,
             false,
             &AtomicU64::new(41),
+            crate::telemetry::operation_token(),
+            crate::telemetry::ConnectionId::new(),
         )
         .await;
         assert_eq!(outcome.response.status, 200);
@@ -5684,6 +6593,8 @@ mod tests {
             &mut phase_one,
             false,
             &AtomicU64::new(51),
+            crate::telemetry::operation_token(),
+            crate::telemetry::ConnectionId::new(),
         )
         .await;
         assert_eq!(outcome.response.status, 200);
@@ -5692,7 +6603,7 @@ mod tests {
         assert_eq!(prepared.stream_id(), 51);
         let ports = match &prepared {
             PreparedMedia::Type103 { media, .. } => media.ports(),
-            PreparedMedia::Type96 { .. } => {
+            PreparedMedia::Type96 { .. } | PreparedMedia::Classic { .. } => {
                 panic!("type-103 SETUP must prepare type-103 media")
             }
         };
@@ -5700,7 +6611,7 @@ mod tests {
         assert_ne!(ports.control_port, 0);
         assert_eq!(ports.audio_buffer_size, 8 * 1024 * 1024);
 
-        let active = prepared.start(null_output_factory()(51, peer));
+        let mut active = prepared.start(null_output_factory()(51, peer, Protocol::AirPlay2));
         assert_eq!(active.kind(), MediaKind::Buffered);
         active
             .set_rate(BufferedRateAnchor {
@@ -5772,6 +6683,7 @@ mod tests {
 
     #[tokio::test]
     async fn media_gate_allows_same_connection_replacement_and_rejects_competitors() {
+        let telemetry_before = crate::telemetry::snapshot().counters;
         let peer: SocketAddr = "127.0.0.1:6000".parse().unwrap();
         let local: SocketAddr = "127.0.0.1:7000".parse().unwrap();
         let permits = media_permits();
@@ -5805,6 +6717,7 @@ mod tests {
         let (_observer, clock) = PtpObserver::bind_ephemeral().await.unwrap();
         let mut first_phase = Some(PhaseOneState::Ptp(clock));
         let mut event_keys = None;
+        let first_connection_id = crate::telemetry::ConnectionId::new();
         let mut first_outcome = setup_response(
             &request,
             peer,
@@ -5817,18 +6730,22 @@ mod tests {
             &mut first_phase,
             false,
             &AtomicU64::new(1),
+            crate::telemetry::operation_token(),
+            first_connection_id,
         )
         .await;
         assert_eq!(first_outcome.response.status, 200);
+        first_outcome.record_phase2_prepared(peer.ip(), first_connection_id);
+        first_outcome.record_phase2_committed(peer.ip(), first_connection_id);
         let first_permit = first_outcome
             .install_media_permit
             .take()
             .expect("first stream acquires the connection permit");
-        let first = first_outcome
+        let mut first = first_outcome
             .start_media
             .take()
             .unwrap()
-            .start(null_output_factory()(1, peer));
+            .start(null_output_factory()(1, peer, Protocol::AirPlay2));
         assert_eq!(permits.available_permits(), 0);
 
         // PTP timing and the connection-owned permit survive a stream-only
@@ -5847,9 +6764,13 @@ mod tests {
             &mut first_phase,
             true,
             &AtomicU64::new(2),
+            crate::telemetry::operation_token(),
+            first_connection_id,
         )
         .await;
         assert_eq!(repeated.response.status, 200);
+        repeated.record_phase2_prepared(peer.ip(), first_connection_id);
+        repeated.record_phase2_committed(peer.ip(), first_connection_id);
         assert!(repeated.install_media_permit.is_none());
         assert!(repeated.start_media.take().is_some());
         assert!(matches!(first_phase, Some(PhaseOneState::Ptp(_))));
@@ -5859,7 +6780,8 @@ mod tests {
         // A different connection still cannot exceed the global media limit.
         let (_observer, clock) = PtpObserver::bind_ephemeral().await.unwrap();
         let mut second_phase = Some(PhaseOneState::Ptp(clock));
-        let second = setup_response(
+        let second_connection_id = crate::telemetry::ConnectionId::new();
+        let mut second = setup_response(
             &request,
             peer,
             local,
@@ -5871,11 +6793,35 @@ mod tests {
             &mut second_phase,
             false,
             &AtomicU64::new(2),
+            crate::telemetry::operation_token(),
+            second_connection_id,
         )
         .await;
         assert_eq!(second.response.status, 453);
+        second.record_phase2_prepared(peer.ip(), second_connection_id);
         assert!(second.start_media.is_none());
         assert!(matches!(second_phase, Some(PhaseOneState::Ptp(_))));
+        let telemetry_after = crate::telemetry::snapshot().counters;
+        assert!(
+            telemetry_after.rtsp_phase2_accepted
+                >= telemetry_before.rtsp_phase2_accepted.saturating_add(2)
+        );
+        assert!(
+            telemetry_after.rtsp_phase2_active_media_rejected_453
+                >= telemetry_before
+                    .rtsp_phase2_active_media_rejected_453
+                    .saturating_add(1)
+        );
+        assert!(
+            telemetry_after.rtsp_phase2_failures_total
+                >= telemetry_before
+                    .rtsp_phase2_failures_total
+                    .saturating_add(1)
+        );
+        assert!(
+            telemetry_after.rtsp_phase2_failures_453
+                >= telemetry_before.rtsp_phase2_failures_453.saturating_add(1)
+        );
 
         first.abort().await;
         drop(first);
@@ -5895,6 +6841,8 @@ mod tests {
             &mut second_phase,
             false,
             &AtomicU64::new(3),
+            crate::telemetry::operation_token(),
+            crate::telemetry::ConnectionId::new(),
         )
         .await;
         assert_eq!(retry.response.status, 200);
@@ -5941,6 +6889,8 @@ mod tests {
             &mut phase_one,
             false,
             &AtomicU64::new(1),
+            crate::telemetry::operation_token(),
+            crate::telemetry::ConnectionId::new(),
         )
         .await;
 
@@ -6381,6 +7331,8 @@ mod tests {
             &mut phase_one_state,
             false,
             &next_stream_id,
+            crate::telemetry::operation_token(),
+            crate::telemetry::ConnectionId::new(),
         )
         .await;
         assert_eq!(outcome.response.status, 400);
@@ -6406,6 +7358,8 @@ mod tests {
             &mut phase_one_state,
             false,
             &next_stream_id,
+            crate::telemetry::operation_token(),
+            crate::telemetry::ConnectionId::new(),
         )
         .await;
         assert_eq!(outcome.response.status, 400);
@@ -6433,6 +7387,8 @@ mod tests {
             &mut phase_one_state,
             false,
             &next_stream_id,
+            crate::telemetry::operation_token(),
+            crate::telemetry::ConnectionId::new(),
         )
         .await;
         assert_eq!(outcome.response.status, 400);
@@ -6551,6 +7507,7 @@ mod tests {
                 None,
                 None,
                 &AtomicU64::new(1),
+                crate::telemetry::ConnectionId::new(),
             )
             .await;
             assert_eq!(outcome.response.status, 200, "{target}");

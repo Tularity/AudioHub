@@ -2280,9 +2280,16 @@ impl AirPlayController {
             .status()
             .sessions
             .into_iter()
-            .filter(|session| session.protocol == Protocol::AirPlay2)
             .map(|session| session_view(session, now))
             .collect()
+    }
+
+    pub(crate) fn telemetry(&self, reset: bool) -> audiohub_airplay::AirPlayTelemetrySnapshot {
+        if reset {
+            audiohub_airplay::reset_telemetry()
+        } else {
+            audiohub_airplay::telemetry_snapshot()
+        }
     }
 
     pub(crate) fn artwork(&self, session_id: u64, revision: u64) -> Option<AirPlayArtwork> {
@@ -2797,10 +2804,13 @@ fn authoritative_volume_target(
 }
 
 fn session_view(session: RuntimeSessionInfo, now_unix_ms: u64) -> AirPlaySessionInfo {
-    debug_assert_eq!(session.protocol, Protocol::AirPlay2);
     AirPlaySessionInfo {
         id: session.id,
-        protocol: "airplay2".to_string(),
+        protocol: match session.protocol {
+            Protocol::AirPlay1 => "airplay1",
+            Protocol::AirPlay2 => "airplay2",
+        }
+        .to_string(),
         peer: session
             .peer
             .map(|peer| peer.to_string())
@@ -2826,7 +2836,7 @@ pub(crate) struct LocalReader {
 }
 
 impl LocalReader {
-    pub(crate) fn read_into(&mut self, out: &mut [f32]) -> PcmRead {
+    pub(crate) fn read_into(&mut self, out: &mut [[f32; 2]]) -> PcmRead {
         let current_epoch = self.controller.bus_epoch.load(Ordering::Acquire);
         if current_epoch != self.bus_epoch {
             let (bus_epoch, bus) = self.controller.bus_snapshot();
@@ -2834,9 +2844,9 @@ impl LocalReader {
             self.reader = bus.map(|bus| bus.subscribe());
         }
         match self.reader.as_mut() {
-            Some(reader) => reader.read_into(out),
+            Some(reader) => reader.read_stereo_into(out),
             None => {
-                out.fill(0.0);
+                out.fill([0.0; 2]);
                 PcmRead {
                     copied: 0,
                     silence: out.len(),
@@ -3216,20 +3226,16 @@ impl std::fmt::Debug for AirPlayMdnsGuard {
 
 impl AirPlayMdnsGuard {
     fn register(services: &[MdnsService]) -> Result<Self> {
-        if services.is_empty() {
-            return Err(anyhow!("receiver returned no DNS-SD services"));
-        }
+        validate_airplay_service_pair(services)?;
         let host = local_host_name();
         let mut registrations = Vec::with_capacity(services.len());
         let mut protocols = HashSet::with_capacity(services.len());
         for service in services {
-            if service.protocol != Protocol::AirPlay2 {
-                return Err(anyhow!(
-                    "receiver returned unsupported AirPlay protocol {:?}",
-                    service.protocol
-                ));
-            }
-            if service.service_type != "_airplay._tcp.local." {
+            let expected_type = match service.protocol {
+                Protocol::AirPlay1 => "_raop._tcp.local.",
+                Protocol::AirPlay2 => "_airplay._tcp.local.",
+            };
+            if service.service_type != expected_type {
                 return Err(anyhow!(
                     "AirPlay protocol {:?} returned mismatched DNS-SD type {:?}",
                     service.protocol,
@@ -3529,6 +3535,79 @@ fn dns_host_label(value: &str) -> String {
     } else {
         label
     }
+}
+
+fn validate_airplay_service_pair(services: &[MdnsService]) -> Result<()> {
+    if services.len() != 2 {
+        return Err(anyhow!("receiver must return its AP2/classic DNS-SD pair"));
+    }
+    let ap2 = services
+        .iter()
+        .find(|s| s.protocol == Protocol::AirPlay2)
+        .ok_or_else(|| anyhow!("AP2 discovery record missing"))?;
+    let classic = services
+        .iter()
+        .find(|s| s.protocol == Protocol::AirPlay1)
+        .ok_or_else(|| anyhow!("classic discovery record missing"))?;
+    if ap2.port == 0
+        || ap2.port != classic.port
+        || ap2.service_type != "_airplay._tcp.local."
+        || classic.service_type != "_raop._tcp.local."
+    {
+        return Err(anyhow!("AirPlay discovery listener/type mismatch"));
+    }
+    let a: HashMap<_, _> = txt_pairs(&ap2.txt_records)?.into_iter().collect();
+    let b: HashMap<_, _> = txt_pairs(&classic.txt_records)?.into_iter().collect();
+    if a.len() != ap2.txt_records.len() || b.len() != classic.txt_records.len() {
+        return Err(anyhow!("duplicate AirPlay discovery key"));
+    }
+    let key = a
+        .get("pk")
+        .ok_or_else(|| anyhow!("AP2 public key missing"))?;
+    if key.len() != 64 || !key.bytes().all(|c| c.is_ascii_hexdigit()) || b.get("pk") != Some(key) {
+        return Err(anyhow!("AirPlay discovery public identities differ"));
+    }
+    let mac = a
+        .get("deviceid")
+        .ok_or_else(|| anyhow!("AP2 device identity missing"))?;
+    let octets: Vec<_> = mac.split(':').collect();
+    if octets.len() != 6
+        || octets
+            .iter()
+            .any(|s| s.len() != 2 || !s.bytes().all(|c| c.is_ascii_hexdigit()))
+    {
+        return Err(anyhow!("invalid AirPlay device identity"));
+    }
+    let prefix = format!("{}@", octets.concat().to_ascii_uppercase());
+    let expected_name = format!(
+        "{prefix}{}",
+        utf8_prefix(&ap2.instance_name, DNS_LABEL_MAX_BYTES - prefix.len())
+    );
+    if classic.instance_name != expected_name {
+        return Err(anyhow!("AirPlay discovery names/identities differ"));
+    }
+    for (key, value) in [
+        ("cn", "1"),
+        ("et", "1"),
+        ("ek", "1"),
+        ("tp", "UDP"),
+        ("sr", "44100"),
+        ("ss", "16"),
+        ("ch", "2"),
+    ] {
+        if b.get(key).map(String::as_str) != Some(value) {
+            return Err(anyhow!("classic discovery profile mismatch"));
+        }
+    }
+    let flags = a
+        .get("flags")
+        .and_then(|s| s.strip_prefix("0x"))
+        .and_then(|s| u32::from_str_radix(s, 16).ok())
+        .ok_or_else(|| anyhow!("AP2 status flags missing"))?;
+    if b.get("pw").map(String::as_str) != Some(if flags & 0x80 != 0 { "true" } else { "false" }) {
+        return Err(anyhow!("AirPlay discovery password states differ"));
+    }
+    Ok(())
 }
 
 fn txt_pairs(records: &[String]) -> Result<Vec<(String, String)>> {
@@ -6169,6 +6248,64 @@ mod tests {
             ]
         );
         assert!(txt_pairs(&["broken".to_string()]).is_err());
+    }
+
+    #[test]
+    fn discovery_requires_same_identity_port_and_encrypted_classic_profile() {
+        let key = "ab".repeat(32);
+        let ap2 = MdnsService {
+            protocol: Protocol::AirPlay2,
+            service_type: "_airplay._tcp.local.".into(),
+            instance_name: "Room".into(),
+            port: 7000,
+            txt_records: vec![
+                "deviceid=02:AA:BB:CC:DD:EE".into(),
+                format!("pk={key}"),
+                "flags=0x84".into(),
+            ],
+        };
+        let classic = MdnsService {
+            protocol: Protocol::AirPlay1,
+            service_type: "_raop._tcp.local.".into(),
+            instance_name: "02AABBCCDDEE@Room".into(),
+            port: 7000,
+            txt_records: vec![
+                format!("pk={key}"),
+                "cn=1".into(),
+                "et=1".into(),
+                "ek=1".into(),
+                "tp=UDP".into(),
+                "sr=44100".into(),
+                "ss=16".into(),
+                "ch=2".into(),
+                "pw=true".into(),
+            ],
+        };
+        let pair = vec![ap2, classic];
+        validate_airplay_service_pair(&pair).unwrap();
+        assert!(validate_airplay_service_pair(&pair[..1]).is_err());
+        let mut other_port = pair.clone();
+        other_port[1].port += 1;
+        assert!(validate_airplay_service_pair(&other_port).is_err());
+        for (old, new) in [
+            ("et=1", "et=0,1"),
+            ("pw=true", "pw=false"),
+            ("ch=2", "ch=8"),
+        ] {
+            let mut invalid = pair.clone();
+            for value in &mut invalid[1].txt_records {
+                if value == old {
+                    *value = new.into();
+                }
+            }
+            assert!(validate_airplay_service_pair(&invalid).is_err());
+        }
+        let mut duplicate = pair.clone();
+        duplicate[1].txt_records.push("cn=1".into());
+        assert!(validate_airplay_service_pair(&duplicate).is_err());
+        let mut other_identity = pair;
+        other_identity[1].instance_name = "112233445566@Room".into();
+        assert!(validate_airplay_service_pair(&other_identity).is_err());
     }
 
     #[test]

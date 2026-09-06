@@ -498,6 +498,10 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
             }
             methods::SESSION_LIST => serde_json::to_value(crate::build_session_infos(inner))?,
             methods::AIRPLAY_SESSIONS_LIST => serde_json::to_value(inner.airplay.sessions())?,
+            methods::AIRPLAY_TELEMETRY_GET => serde_json::to_value(inner.airplay.telemetry(false))?,
+            methods::AIRPLAY_TELEMETRY_RESET => {
+                serde_json::to_value(inner.airplay.telemetry(true))?
+            }
             methods::AIRPLAY_ARTWORK_GET => {
                 let session_id = params
                     .get("session_id")
@@ -527,6 +531,35 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 // unmuted a deliberately-muted machine.
                 let muted = params.get("muted").and_then(Value::as_bool);
                 conn::set_session_volume(inner, id, scalar, muted)?;
+                json!({})
+            }
+            methods::PEER_SET_DEVICE_VOLUME => {
+                let peer = params
+                    .get("peer")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("missing 'peer'"))?;
+                let endpoint = params
+                    .get("endpoint")
+                    .and_then(Value::as_str)
+                    .and_then(haldev::DeviceVolumeEndpoint::parse)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("'endpoint' must be 'default_output' or 'default_input'")
+                    })?;
+                let scalar = params
+                    .get("scalar")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| anyhow::anyhow!("missing 'scalar'"))?
+                    as f32;
+                let muted = match params.get("muted") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(
+                        value
+                            .as_bool()
+                            .ok_or_else(|| anyhow::anyhow!("'muted' must be a boolean"))?,
+                    ),
+                };
+                haldev::queue_peer_device_volume(inner, peer, endpoint, scalar, muted)?;
                 json!({})
             }
             methods::SETTINGS_GET => serde_json::to_value(settings_view(inner))?,
@@ -761,8 +794,20 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                         }
                     }
                 }
+                // A mode transition is also the authority boundary for remote
+                // endpoint writes. Take both endpoint order locks before the
+                // live settings swap: an old Share-mode write either finishes
+                // before this point or rechecks the new mode after it, never
+                // after settings.set has returned claiming the transition.
+                let _mode_volume_order = mode_changed.then(|| {
+                    (
+                        lk(&inner.device_output_volume_io),
+                        lk(&inner.device_input_volume_io),
+                    )
+                });
                 // Publish the staged state only after both files are durable.
                 *lk(&inner.settings) = next;
+                drop(_mode_volume_order);
                 if let Some(want) = announce_target {
                     let now = crate::apply_announce(inner, want);
                     if want && !now {
@@ -1088,7 +1133,7 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
     let auto = crate::autostart::state();
     let (capacity, used) = {
         let st = lk(&inner.haldev);
-        (st.capacity, st.table.used())
+        (st.capacity, st.device_count())
     };
     let airplay_live = inner.airplay.live_status();
     DaemonSettings {
@@ -1229,6 +1274,10 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
             // "observed to be fine" must not render the same way, and `get`
             // would hand back a default that reads as the latter.
             let auto = lk(&inner.peer_transport).peek(&p.fingerprint);
+            let mut hal_device = hal.peer_device(&p.fingerprint);
+            if let Some(device) = hal_device.as_mut() {
+                device.device_volume_version = capabilities.device_volume_version();
+            }
             PeerState {
                 net_ms: clock.map(|e| e.min_rtt_us as f64 / 2000.0),
                 rtt_ms: clock.map(|e| e.last_rtt_us as f64 / 1000.0),
@@ -1246,7 +1295,7 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
                         .dial_policy(&p.fingerprint)
                         .may_dial(),
                 retry_in_s,
-                hal_device: hal.peer_device(&p.fingerprint),
+                hal_device,
                 hal_reason: hal.reasons.get(&p.fingerprint).cloned(),
                 display_name: hal
                     .display

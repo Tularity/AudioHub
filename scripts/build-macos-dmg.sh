@@ -7,7 +7,14 @@ set -euo pipefail
 
 ROOT="$(cd "${0:a:h}/.." && pwd)"
 TAURI="$ROOT/app/src-tauri"
-VERSION="${AUDIOHUB_VERSION:-1.0.0}"
+# Derived, never written twice; see the note in build-macos-pkg.sh.
+VERSION="${AUDIOHUB_VERSION:-}"
+if [[ -z "$VERSION" ]]; then
+  VERSION="$(/usr/bin/plutil -extract version raw -o - "$TAURI/tauri.conf.json")" \
+    || { print -u2 -- "[audiohub] ERROR: cannot read version from $TAURI/tauri.conf.json"; exit 1; }
+  [[ -n "$VERSION" ]] \
+    || { print -u2 -- "[audiohub] ERROR: empty version in $TAURI/tauri.conf.json"; exit 1; }
+fi
 if (( $# > 0 )); then
   PKG="$1"
 else

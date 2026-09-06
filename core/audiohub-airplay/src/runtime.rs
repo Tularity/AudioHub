@@ -3,7 +3,7 @@ use crate::protocol::server::{
     self, EventCommandSendError, EventCommandSender, PcmOutputFactory, ProbeEvent,
     RemoteControlState as Ap2RemoteControlState, ServerConfig, VolumeUpdate as Ap2VolumeUpdate,
 };
-use crate::{BusConfig, PcmBus, StreamingPcmConverter};
+use crate::{BusConfig, PcmBus, StreamingStereoPcmConverter};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -52,6 +52,8 @@ pub fn is_control_port_bind_error(error: &io::Error) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
+    /// Encrypted classic RAOP audio on the shared control listener.
+    AirPlay1,
     /// AudioHub-owned AirPlay 2 control and media protocol.
     AirPlay2,
 }
@@ -629,6 +631,13 @@ struct Shared {
 }
 
 impl Shared {
+    fn protocol_for_upstream(&self, upstream_id: u64) -> Option<Protocol> {
+        let status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        status.upstream_sessions.iter().find_map(|(protocol, id)| {
+            (*id == upstream_id && status.sessions.contains_key(protocol)).then_some(*protocol)
+        })
+    }
+
     fn new(bus: PcmBus, ports: BTreeMap<Protocol, u16>) -> Self {
         Self {
             bus,
@@ -696,6 +705,15 @@ impl Shared {
         let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
         let active = self.bus.active_session();
         if let Some(upstream_session_id) = upstream_session_id {
+            // The one listener allocates stream IDs across both protocols.
+            // A delayed watch from the retired protocol must not recreate it.
+            if status
+                .upstream_sessions
+                .iter()
+                .any(|(other, id)| *other != protocol && *id >= upstream_session_id)
+            {
+                return None;
+            }
             match status.upstream_sessions.get(&protocol).copied() {
                 Some(current) if upstream_session_id < current => return None,
                 Some(current) if upstream_session_id > current => {
@@ -1065,7 +1083,12 @@ impl Shared {
                 if status.remote_controls.remove(&protocol).is_some() {
                     self.bump_remote_control_revision();
                 }
-                if status.receiver_volume_control.take().is_some() {
+                if status
+                    .receiver_volume_control
+                    .as_ref()
+                    .is_some_and(|info| info.session_id == id)
+                {
+                    status.receiver_volume_control = None;
                     self.bump_receiver_volume_control_revision();
                 }
                 status.upstream_sessions.remove(&protocol);
@@ -1096,7 +1119,13 @@ impl Shared {
         if status.remote_controls.remove(&protocol).is_some() {
             self.bump_remote_control_revision();
         }
-        if status.receiver_volume_control.take().is_some() {
+        let ending_id = status.sessions.get(&protocol).map(|session| session.id);
+        if status
+            .receiver_volume_control
+            .as_ref()
+            .is_some_and(|info| Some(info.session_id) == ending_id)
+        {
+            status.receiver_volume_control = None;
             self.bump_receiver_volume_control_revision();
         }
     }
@@ -1140,6 +1169,9 @@ impl Shared {
         let Some(session_id) = status.sessions.get(&protocol).map(|session| session.id) else {
             return;
         };
+        if self.bus.active_session() != Some(session_id) {
+            return;
+        }
         let replacement = sender.map(|sender| ReceiverVolumeControlInfo { session_id, sender });
         if status.receiver_volume_control != replacement {
             status.receiver_volume_control = replacement;
@@ -1265,6 +1297,10 @@ impl AirPlayRuntime {
     /// after its concrete port accepts a loopback connection, or returns the
     /// bind/start failure. Advertisement remains daemon-owned.
     pub fn start(config: AirPlayConfig) -> io::Result<Self> {
+        // This method runs on the daemon/controller thread, before the network
+        // runtime or PCM callback can start. UUID and OnceLock initialization
+        // therefore never occurs on either audio path.
+        crate::telemetry::prewarm();
         let config = config.validate()?;
         let mut ports = BTreeMap::new();
         let identity_path = config
@@ -1293,13 +1329,22 @@ impl AirPlayRuntime {
         // identity and other startup failures can never inherit that marker.
         let reservation = PortReservation::acquire(config.airplay2_port)?;
         ports.insert(Protocol::AirPlay2, reservation.port);
-        let services = vec![MdnsService {
-            protocol: Protocol::AirPlay2,
-            service_type: "_airplay._tcp.local.".to_string(),
-            instance_name: airplay2_instance_name(&config.name),
-            port: reservation.port,
-            txt_records: server_config.txt_records(),
-        }];
+        let services = vec![
+            MdnsService {
+                protocol: Protocol::AirPlay2,
+                service_type: "_airplay._tcp.local.".to_string(),
+                instance_name: airplay2_instance_name(&config.name),
+                port: reservation.port,
+                txt_records: server_config.txt_records(),
+            },
+            MdnsService {
+                protocol: Protocol::AirPlay1,
+                service_type: "_raop._tcp.local.".to_string(),
+                instance_name: airplay2_instance_name(&server_config.classic_instance_name()),
+                port: reservation.port,
+                txt_records: server_config.classic_txt_records(),
+            },
+        ];
         reservation.listener.set_nonblocking(true)?;
         let ap2 = NativeAp2Receiver {
             listener: reservation.listener,
@@ -1451,9 +1496,9 @@ fn run_thread(
         let (volume_tx, volume_rx) = tokio::sync::watch::channel(None);
         let (remote_control_tx, remote_control_rx) = tokio::sync::watch::channel(None);
         let sink_shared = Arc::clone(&shared);
-        let output_factory: PcmOutputFactory = Arc::new(move |stream_id, peer| {
-            let ingress = PcmIngress::new_ap2(Arc::clone(&sink_shared), stream_id, peer);
-            if let Some(session) = sink_shared.session(Protocol::AirPlay2, ingress.session_id) {
+        let output_factory: PcmOutputFactory = Arc::new(move |stream_id, peer, protocol| {
+            let ingress = PcmIngress::new(Arc::clone(&sink_shared), stream_id, peer, protocol);
+            if let Some(session) = sink_shared.session(protocol, ingress.session_id) {
                 sink_shared
                     .events
                     .send(AirPlayEvent::SessionStarted { session });
@@ -1583,30 +1628,42 @@ async fn probe_listener(port: u16) -> bool {
 }
 
 struct PcmIngress {
+    protocol: Protocol,
     shared: Arc<Shared>,
     session_id: u64,
-    converter: StreamingPcmConverter,
-    staged: Vec<f32>,
+    converter: StreamingStereoPcmConverter,
+    staged: Vec<[f32; 2]>,
 }
 
 impl PcmIngress {
+    #[cfg(test)]
     fn new_ap2(shared: Arc<Shared>, upstream_session_id: u64, peer: SocketAddr) -> Self {
+        Self::new(shared, upstream_session_id, peer, Protocol::AirPlay2)
+    }
+
+    fn new(
+        shared: Arc<Shared>,
+        upstream_session_id: u64,
+        peer: SocketAddr,
+        protocol: Protocol,
+    ) -> Self {
         let rate = 44_100;
         let channels = 2;
         let session_id = shared.activate_sink(
-            Protocol::AirPlay2,
+            protocol,
             Some(upstream_session_id),
             rate,
             channels,
             Some(normalize_socket_addr(peer).ip()),
         );
-        let converter = StreamingPcmConverter::new(rate, channels).unwrap_or_else(|_| {
+        let converter = StreamingStereoPcmConverter::new(rate, channels).unwrap_or_else(|_| {
             // The AP2 media engine guarantees nonzero 44.1k stereo.
             // A defensive fallback keeps their playback thread alive while
             // status/events still expose the bad negotiated format.
-            StreamingPcmConverter::new(44_100, 2).expect("constant format is valid")
+            StreamingStereoPcmConverter::new(44_100, 2).expect("constant format is valid")
         });
         Self {
+            protocol,
             shared,
             session_id,
             converter,
@@ -1614,13 +1671,15 @@ impl PcmIngress {
         }
     }
 
-    fn write(&mut self, pcm: &[i16]) {
+    fn write(&mut self, pcm: &[i16], telemetry_token: crate::telemetry::OperationToken) {
         self.staged.clear();
         self.converter
             .set_correction_ppm(self.shared.bus.correction_ppm());
         self.converter.process_i16(pcm, &mut self.staged);
         // Rejected writes belong to an older overlapping protocol session.
-        self.shared.bus.push(self.session_id, &self.staged);
+        self.shared
+            .bus
+            .push_with_token(self.session_id, &self.staged, telemetry_token);
     }
 
     fn flush(&mut self) {
@@ -1631,15 +1690,15 @@ impl PcmIngress {
 
 impl Drop for PcmIngress {
     fn drop(&mut self) {
-        self.shared.end_sink(Protocol::AirPlay2, self.session_id);
+        self.shared.end_sink(self.protocol, self.session_id);
     }
 }
 
 struct Ap2Sink(PcmIngress);
 
 impl PcmOutput for Ap2Sink {
-    fn write(&mut self, pcm: &[i16]) {
-        self.0.write(pcm);
+    fn write(&mut self, pcm: &[i16], telemetry_token: crate::telemetry::OperationToken) {
+        self.0.write(pcm, telemetry_token);
     }
 
     fn flush(&mut self) {
@@ -1674,13 +1733,13 @@ async fn forward_ap2(
                     Ok(()) => {
                         if let Some(volume) = *latest_volume.borrow_and_update() {
                             if let Some(session_id) = shared.update_volume_versioned(
-                                Protocol::AirPlay2,
+                                volume.protocol,
                                 Some(volume.stream_id),
                                 Some(volume.revision),
                                 volume.db,
                             ) {
                                 shared.events.send(AirPlayEvent::Volume {
-                                    protocol: Protocol::AirPlay2,
+                                    protocol: volume.protocol,
                                     session_id: Some(session_id),
                                     db: volume.db,
                                 });
@@ -1693,11 +1752,12 @@ async fn forward_ap2(
             event = receiver.recv(), if events_open => {
                 match event {
                     Some(ProbeEvent::Flushed { stream_id, .. }) => {
+                        let Some(protocol) = shared.protocol_for_upstream(stream_id) else { continue; };
                         if let Some(session_id) =
-                            shared.session_id_versioned(Protocol::AirPlay2, stream_id)
+                            shared.session_id_versioned(protocol, stream_id)
                         {
                             shared.events.send(AirPlayEvent::Flushed {
-                                protocol: Protocol::AirPlay2,
+                                protocol,
                                 session_id: Some(session_id),
                             });
                         }
@@ -1709,15 +1769,16 @@ async fn forward_ap2(
                         album,
                         ..
                     }) => {
+                        let Some(protocol) = shared.protocol_for_upstream(stream_id) else { continue; };
                         if let Some(session_id) = shared.update_metadata_versioned(
-                            Protocol::AirPlay2,
+                            protocol,
                             Some(stream_id),
                             title.clone(),
                             artist.clone(),
                             album.clone(),
                         ) {
                             shared.events.send(AirPlayEvent::Metadata {
-                                protocol: Protocol::AirPlay2,
+                                protocol,
                                 session_id: Some(session_id),
                                 title,
                                 artist,
@@ -1731,15 +1792,16 @@ async fn forward_ap2(
                         data,
                         ..
                     }) => {
+                        let Some(protocol) = shared.protocol_for_upstream(stream_id) else { continue; };
                         if let Some((session_id, revision)) = shared.update_artwork_versioned(
-                            Protocol::AirPlay2,
+                            protocol,
                             Some(stream_id),
                             content_type.clone(),
                             data,
                         ) {
                             let normalized_type = content_type.to_ascii_lowercase();
                             shared.events.send(AirPlayEvent::Artwork {
-                                protocol: Protocol::AirPlay2,
+                                protocol,
                                 session_id: Some(session_id),
                                 content_type: matches!(
                                     normalized_type.as_str(),
@@ -1756,8 +1818,9 @@ async fn forward_ap2(
                         duration_ms,
                         ..
                     }) => {
+                        let Some(protocol) = shared.protocol_for_upstream(stream_id) else { continue; };
                         if let Some(session_id) = shared.update_progress_versioned(
-                            Protocol::AirPlay2,
+                            protocol,
                             Some(stream_id),
                             elapsed_ms,
                             duration_ms,
@@ -1766,7 +1829,7 @@ async fn forward_ap2(
                                 (elapsed_ms, duration_ms)
                             {
                                 shared.events.send(AirPlayEvent::Progress {
-                                    protocol: Protocol::AirPlay2,
+                                    protocol,
                                     session_id: Some(session_id),
                                     elapsed_ms,
                                     duration_ms,
@@ -1775,13 +1838,14 @@ async fn forward_ap2(
                         }
                     }
                     Some(ProbeEvent::Paused { stream_id, paused, .. }) => {
+                        let Some(protocol) = shared.protocol_for_upstream(stream_id) else { continue; };
                         if let Some(session_id) = shared.update_paused_versioned(
-                            Protocol::AirPlay2,
+                            protocol,
                             Some(stream_id),
                             paused,
                         ) {
                             shared.events.send(AirPlayEvent::Paused {
-                                protocol: Protocol::AirPlay2,
+                                protocol,
                                 session_id: Some(session_id),
                                 paused,
                             });
@@ -1790,7 +1854,7 @@ async fn forward_ap2(
                     Some(event) => {
                         log::info!(
                             target: "audiohub_airplay::airplay2",
-                            "AirPlay 2 protocol milestone: {event:?}"
+                            "AirPlay protocol milestone: {event:?}"
                         );
                     }
                     None => events_open = false,
@@ -1803,6 +1867,7 @@ async fn forward_ap2(
 fn forward_ap2_remote_control(shared: &Shared, state: Ap2RemoteControlState) {
     match state {
         Ap2RemoteControlState::Active {
+            protocol,
             stream_id,
             peer,
             credentials,
@@ -1816,7 +1881,7 @@ fn forward_ap2_remote_control(shared: &Shared, state: Ap2RemoteControlState) {
                 active_remote: credentials.active_remote,
             });
             let session = shared.ensure_session_versioned(
-                Protocol::AirPlay2,
+                protocol,
                 Some(stream_id),
                 44_100,
                 2,
@@ -1824,11 +1889,14 @@ fn forward_ap2_remote_control(shared: &Shared, state: Ap2RemoteControlState) {
                 Some(remote_control),
             );
             if session.is_some() {
-                shared.set_receiver_volume_control(Protocol::AirPlay2, stream_id, event_commands);
+                shared.set_receiver_volume_control(protocol, stream_id, event_commands);
             }
         }
-        Ap2RemoteControlState::Ended { stream_id } => {
-            shared.end_upstream_session(Protocol::AirPlay2, stream_id);
+        Ap2RemoteControlState::Ended {
+            protocol,
+            stream_id,
+        } => {
+            shared.end_upstream_session(protocol, stream_id);
         }
     }
 }
@@ -1870,8 +1938,27 @@ mod tests {
         std::net::SocketAddrV6::new("fe80::1234".parse().unwrap(), 7000, 0, 7).into()
     }
 
+    #[test]
+    fn telemetry_reset_preserves_stereo_ingress_state_and_old_token_pcm() {
+        let shared = test_shared();
+        let mut ingress = PcmIngress::new_ap2(Arc::clone(&shared), 91, test_peer());
+        let mut reader = shared.bus.subscribe();
+        let pre_reset_token = crate::telemetry::operation_token();
+
+        ingress.write(&[16_384], pre_reset_token);
+        crate::telemetry::reset();
+        ingress.write(&[-16_384], pre_reset_token);
+
+        let mut out = [[0.0; 2]; 1];
+        let read = reader.read_stereo_into(&mut out);
+        assert_eq!(read.copied, 1);
+        assert_eq!(read.session_id, Some(ingress.session_id));
+        assert_eq!(out, [[0.5, -0.5]]);
+    }
+
     fn remote_state(stream_id: u64, dacp_id: &str, active_remote: &str) -> Ap2RemoteControlState {
         Ap2RemoteControlState::Active {
+            protocol: Protocol::AirPlay2,
             stream_id,
             peer: test_peer(),
             credentials: Some(RemoteControlCredentials {
@@ -1884,14 +1971,14 @@ mod tests {
 
     fn apply_volume(shared: &Shared, update: Ap2VolumeUpdate) -> Option<u64> {
         let session_id = shared.update_volume_versioned(
-            Protocol::AirPlay2,
+            update.protocol,
             Some(update.stream_id),
             Some(update.revision),
             update.db,
         );
         if session_id.is_some() {
             shared.events.send(AirPlayEvent::Volume {
-                protocol: Protocol::AirPlay2,
+                protocol: update.protocol,
                 session_id,
                 db: update.db,
             });
@@ -2087,6 +2174,7 @@ mod tests {
         for (revision, db) in [(1, -20.0), (2, -12.0), (3, -6.0)] {
             volume_tx
                 .send(Some(Ap2VolumeUpdate {
+                    protocol: Protocol::AirPlay2,
                     stream_id: 1,
                     revision,
                     db,
@@ -2199,11 +2287,59 @@ mod tests {
             2,
             Some(test_peer().ip()),
         );
-        forward_ap2_remote_control(&shared, Ap2RemoteControlState::Ended { stream_id: 1 });
+        forward_ap2_remote_control(
+            &shared,
+            Ap2RemoteControlState::Ended {
+                protocol: Protocol::AirPlay2,
+                stream_id: 1,
+            },
+        );
         let current = shared.active_remote_control_snapshot().unwrap();
         assert_eq!(current.info().session_id, replacement);
         assert_eq!(current.info().dacp_id, "C3");
         assert_eq!(current.info().active_remote, "444");
+    }
+
+    #[test]
+    fn retired_classic_cleanup_preserves_current_ap2_event_volume() {
+        let shared = test_shared();
+        let classic = shared.activate_sink(
+            Protocol::AirPlay1,
+            Some(1),
+            44_100,
+            2,
+            Some(test_peer().ip()),
+        );
+        let ap2 = shared.activate_sink(
+            Protocol::AirPlay2,
+            Some(2),
+            44_100,
+            2,
+            Some(test_peer().ip()),
+        );
+        shared.set_receiver_volume_control(
+            Protocol::AirPlay2,
+            2,
+            Some(EventCommandSender::test_ready()),
+        );
+        let current = shared.receiver_volume_control_snapshot().unwrap();
+        assert_eq!(current.session_id(), ap2);
+        shared.set_receiver_volume_control(Protocol::AirPlay1, 1, None);
+        assert!(current.is_current());
+        shared.end_upstream_session(Protocol::AirPlay1, 1);
+        assert!(current.is_current());
+        shared.end_sink(Protocol::AirPlay1, classic);
+        assert!(current.is_current());
+        assert_eq!(
+            shared
+                .receiver_volume_control_snapshot()
+                .unwrap()
+                .session_id(),
+            ap2
+        );
+        shared.end_sink(Protocol::AirPlay2, ap2);
+        assert!(!current.is_current());
+        assert!(shared.receiver_volume_control_snapshot().is_none());
     }
 
     #[test]
@@ -2250,6 +2386,7 @@ mod tests {
             apply_volume(
                 &shared,
                 Ap2VolumeUpdate {
+                    protocol: Protocol::AirPlay2,
                     stream_id: 1,
                     revision: 10,
                     db: -6.0,
@@ -2263,6 +2400,7 @@ mod tests {
         apply_volume(
             &shared,
             Ap2VolumeUpdate {
+                protocol: Protocol::AirPlay2,
                 stream_id: 1,
                 revision: 11,
                 db: -6.0,
@@ -2276,6 +2414,7 @@ mod tests {
             apply_volume(
                 &shared,
                 Ap2VolumeUpdate {
+                    protocol: Protocol::AirPlay2,
                     stream_id: 1,
                     revision: 10,
                     db: -20.0,
@@ -2298,6 +2437,7 @@ mod tests {
             apply_volume(
                 &shared,
                 Ap2VolumeUpdate {
+                    protocol: Protocol::AirPlay2,
                     stream_id: 1,
                     revision: 12,
                     db: -3.0,
@@ -2309,6 +2449,7 @@ mod tests {
             apply_volume(
                 &shared,
                 Ap2VolumeUpdate {
+                    protocol: Protocol::AirPlay2,
                     stream_id: 2,
                     revision: 13,
                     db: -6.0,
@@ -2492,7 +2633,7 @@ mod tests {
     }
 
     #[test]
-    fn starts_native_receiver_and_exposes_only_its_service() {
+    fn starts_one_listener_and_exposes_matching_ap2_and_classic_services() {
         let directory = std::env::temp_dir().join(format!(
             "audiohub-native-receiver-{}-{}",
             std::process::id(),
@@ -2512,7 +2653,7 @@ mod tests {
         let port = status.airplay2_port.expect("control port");
         assert_ne!(port, 0);
         assert!(std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok());
-        assert_eq!(runtime.mdns_services().len(), 1);
+        assert_eq!(runtime.mdns_services().len(), 2);
         let service = &runtime.mdns_services()[0];
         assert_eq!(service.protocol, Protocol::AirPlay2);
         assert_eq!(service.service_type, "_airplay._tcp.local.");
@@ -2520,10 +2661,50 @@ mod tests {
             .txt_records
             .iter()
             .any(|record| record == "flags=0x84"));
+        let classic = &runtime.mdns_services()[1];
+        assert_eq!(classic.protocol, Protocol::AirPlay1);
+        assert_eq!(classic.service_type, "_raop._tcp.local.");
+        assert_eq!(classic.port, port);
+        for entry in ["pw=true", "cn=1", "et=1", "ch=2"] {
+            assert!(classic.txt_records.iter().any(|value| value == entry));
+        }
+        let ap2_key = service
+            .txt_records
+            .iter()
+            .find(|v| v.starts_with("pk="))
+            .unwrap();
+        assert!(classic.txt_records.contains(ap2_key));
         let public = format!("{:?}{service:?}", runtime.status());
         assert!(!public.contains("not-in-status-or-mdns"));
         runtime.stop().unwrap();
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn classic_sink_identity_and_stale_protocol_watch_cannot_replace_ap2() {
+        let shared = test_shared();
+        let classic = PcmIngress::new(Arc::clone(&shared), 10, test_peer(), Protocol::AirPlay1);
+        assert_eq!(
+            shared
+                .session(Protocol::AirPlay1, classic.session_id)
+                .unwrap()
+                .protocol,
+            Protocol::AirPlay1
+        );
+        let ap2 = PcmIngress::new(Arc::clone(&shared), 11, test_peer(), Protocol::AirPlay2);
+        drop(classic);
+        assert_eq!(shared.bus.active_session(), Some(ap2.session_id));
+        assert!(shared
+            .ensure_session_versioned(
+                Protocol::AirPlay1,
+                Some(10),
+                44_100,
+                2,
+                Some(test_peer().ip()),
+                None
+            )
+            .is_none());
+        assert_eq!(shared.protocol_for_upstream(11), Some(Protocol::AirPlay2));
     }
 
     #[test]

@@ -39,10 +39,20 @@ on:
 
 # One build per ref. A second push cancels the first: these runners are slow
 # and an obsolete artifact is worth nothing.
+#
+# Cancelling a superseded BUILD is right; cancelling a release mid-publish is
+# not. The job-level group on `release` does NOT buy that: run-level
+# cancellation takes the whole run, every job with it, so a job-level group is
+# no exemption. A release therefore gets its own per-commit group that no later
+# push can collide with, and only real releases are separated — ordinary builds
+# still share `shared` and still supersede each other.
+# Kept on one line on purpose: a folded scalar would carry newlines into the
+# expression, and this is not the place to find out how they are parsed.
+# The two operands are mutually exclusive without needing an event_name guard —
+# a push has no `inputs`, a dispatch has no `head_commit`, and both nulls
+# evaluate false.
 concurrency:
-  group: build-${{ github.ref }}
-  # Cancelling a superseded BUILD is right; cancelling a release mid-publish is
-  # not, so the release job opts out of the group below.
+  group: build-${{ github.ref }}-${{ (contains(github.event.head_commit.message, '[release]') || github.event.inputs.mode == 'release') && github.sha || 'shared' }}
   cancel-in-progress: true
 
 permissions:
@@ -126,6 +136,8 @@ jobs:
     # that does not match any development machine here.
     runs-on: macos-14
     timeout-minutes: 90
+    env:
+      AUDIOHUB_EXPECTED_APP_ARCH: arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -134,6 +146,15 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: app/frontend/package-lock.json
+
+      - name: Assert build architecture
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$AUDIOHUB_EXPECTED_APP_ARCH"
+
+      - name: Restore frontend dependencies without lifecycle scripts
+        working-directory: app/frontend
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Rust toolchain
         run: |
@@ -166,8 +187,8 @@ jobs:
           # --features cli is required: the default build of cargo-about 0.9 has
           # no binary, and the licence generator only checks `--version`.
           cargo install --locked cargo-about --version "$CARGO_ABOUT_VERSION" --features cli
-          # build-app.sh installs this itself when missing; doing it here keeps
-          # it inside the cached step instead of the timed build.
+          # BuildOnly refuses a missing CLI, so provisioning stays explicit and
+          # cacheable instead of executing an installer inside the product build.
           cargo install --locked tauri-cli --version "^2"
 
       - name: Build app, pkg and dmg
@@ -262,15 +283,16 @@ jobs:
           cargo install --locked cargo-about --version $env:CARGO_ABOUT_VERSION --features cli
           cargo install --locked tauri-cli --version "^2"
 
-      # `app/ui` is gitignored, so a fresh checkout has none — and
-      # build-windows-installer.ps1 only runs `npm install`, never the build.
+      # `app/ui` is gitignored, so a fresh checkout has none. Dependency
+      # restoration is explicit and lifecycle scripts stay disabled; the
+      # installer builder refuses an unprovisioned tree instead of running npm.
       # tauri-build embeds frontendDist at COMPILE time, so a missing or stale
       # app/ui produces an exe that runs and shows the wrong UI. That is the
       # expensive kind of failure to notice, which is why this is its own step.
       - name: Build the frontend into app/ui
         shell: pwsh
         run: |
-          npm --prefix app/frontend ci
+          npm --prefix app/frontend ci --ignore-scripts --no-audit --no-fund
           npm --prefix app/frontend run build
           if (-not (Test-Path 'app/ui/index.html')) { throw 'app/ui/index.html was not produced' }
 

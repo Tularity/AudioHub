@@ -33,7 +33,7 @@ VOID AhCtlDeleteDevice(_In_ PDRIVER_OBJECT DriverObject);
 
 //
 // Called from StartDevice with the devnode's PDO. Reads the expected daemon
-// image path out of the device software key, which only an administrator can
+// image path out of the device hardware key, which only an administrator can
 // write. Absent value => the check degrades to ACL-only and says so in every
 // AH_HELLO_REPLY, rather than degrading silently.
 //

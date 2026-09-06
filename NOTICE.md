@@ -52,12 +52,14 @@ however, bundle the separately identified AirPort Express RSA private key
 described below; therefore the complete receiver must not be described as a
 clean-room implementation or as containing only AudioHub-authored material.
 
-## AirPort Express Apple-Challenge compatibility key
+## AirPort Express compatibility key
 
 `core/audiohub-airplay/src/protocol/airport_express_private_key.pem` is the
 widely leaked Apple/AirPort Express 2048-bit RSA private key used to answer the
 legacy `Apple-Challenge` authenticity check that current Apple Music performs
-before entering its AirPlay 2 control flow. The PEM was copied from
+before entering its AirPlay 2 control flow. The isolated provider also supports
+classic RAOP RSA-OAEP/SHA-1 session-key recovery using this same key; this adds
+no new key material or authorization claim. The PEM was copied from
 `common.c` in shairport-sync at commit
 `08af668a5d17b4714da38981dea4c9039263a4cc` (donor file SHA-256
 `b89676c3daebac78de206fad1be5331c690a3a0e864750b31531ee36450cf058`),

@@ -1,6 +1,12 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { enUS } from './en-US';
 import { zhCN } from './zh-CN';
+
+const peersSource = readFileSync(
+  new URL('../views/Peers.tsx', import.meta.url),
+  'utf8',
+);
 
 const placeholders = (value: string) =>
   [...value.matchAll(/\{(\w+)\}/g)].map((match) => match[1]).sort();
@@ -14,6 +20,16 @@ describe('published language catalogues', () => {
     for (const key of Object.keys(zhCN) as Array<keyof typeof zhCN>) {
       expect(placeholders(enUS[key]), key).toEqual(placeholders(zhCN[key]));
     }
+  });
+
+  it('ends the peer-card accessible name with its complete fingerprint', () => {
+    for (const catalogue of [enUS, zhCN]) {
+      expect(catalogue['peers.card.viewDetail']).toContain('{name}');
+      expect(catalogue['peers.card.viewDetail']).toMatch(/\{fingerprint\}$/);
+    }
+    expect(peersSource).toContain(
+      "aria-label={t('peers.card.viewDetail', { name: displayName, fingerprint: fp })}",
+    );
   });
 
   it('does not silently leave Chinese UI copy in en-US', () => {

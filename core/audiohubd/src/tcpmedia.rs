@@ -123,7 +123,7 @@ const _: () = assert!(
 /// makes dropping the *newest* the right choice rather than merely the easy
 /// one. See the three-option table at `engine.rs`'s `UdpSender`; it applies
 /// here verbatim, and the stale gate below is the part that is new.
-const SEND_SLOTS: usize = 128;
+const SEND_SLOTS: usize = 128 * audiohub_net::media::MAX_WIRE_PARTS;
 
 /// Bytes reserved per slot, sized by the deepest rung's sealed frame exactly as
 /// `engine::SEND_SLOT_BYTES` is — and for the same reason: a slot that has to
@@ -977,7 +977,7 @@ pub(crate) fn serve(
     let writer = std::thread::Builder::new()
         .name("ahb-tcpmedia-tx".into())
         .spawn(move || {
-            crate::engine::raise_audio_thread_qos("tcpmedia_write_loop");
+            let _qos_guard = crate::engine::raise_media_send_thread_qos("tcpmedia_write_loop");
             write_loop(&wlink, &mut wsock, &winner.shutdown);
         })
         .context("spawn the tier 1 media writer")?;

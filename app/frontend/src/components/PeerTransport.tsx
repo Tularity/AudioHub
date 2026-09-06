@@ -23,6 +23,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Help } from './Controls';
 import { Icon } from './Icon';
+import {
+  DeviceVolumeControl, deviceVolumeEndpointFor, deviceVolumeRequest,
+} from './VolumeControl';
 import { StopSlider } from './StopSlider';
 import { toast } from './Toasts';
 import { t, joinPhrases } from '../i18n';
@@ -40,7 +43,7 @@ import {
 import { rpc, refreshPeers } from '../state/connection';
 import {
   MODE_B, halDeviceOf, peerAudioDirections, peerDeviceRows, peerDevicesNote,
-  peerHasNoAudioDirections, requestedMode, selectIsShareMode,
+  isModeB, peerHasNoAudioDirections, requestedMode, selectIsShareMode,
 } from '../state/mode';
 import { useStore } from '../state/store';
 import type { PeerState, SessionInfo } from '../ipc/types';
@@ -393,9 +396,15 @@ function EndpointField({ fp, tier, endpoint, reset }: {
  */
 function PeerDevices({ peer }: { peer: PeerState }) {
   const daemon = useStore((s) => s.daemon);
+  const localModeB = useStore(isModeB);
+  const active = localModeB && !!peer.online && peer.peer_mode === 'share' && !peer.peer_unusable;
+  const inactiveNote = localModeB
+    ? t('volume.devicePeerUnavailable')
+    : t('volume.deviceModeUnavailable');
   const fp = peer.fingerprint;
   const rows = peerDeviceRows(peer, daemon);
   const info = halDeviceOf(daemon, fp);
+  const device = peer.hal_device;
   // 那一句是四叉分支，住在 `state/mode.ts` 里并有单测——它在这次搬家里换了判据，
   // 而「搬家 + 改判据」正是本仓反复栽跟头的组合。
   const note = peerDevicesNote(peer, daemon);
@@ -415,24 +424,52 @@ function PeerDevices({ peer }: { peer: PeerState }) {
         </code>
       </div>
       <div className="dev-list" hidden={rows.length === 0}>
-        {rows.map((r) => (
-          <div key={r.dir} className="dev-row" data-testid={`detail-device-${r.dir}`}>
-            <Icon name={r.icon} cls="ico dev-ico" />
-            <div className="dev-text">
-              <span className="dev-name">{r.name || t('common.dash')}</span>
-              <code className="dev-uid mono">{r.uid || ''}</code>
+        {rows.map((r) => {
+          const output = r.dir === 'out';
+          const endpoint = deviceVolumeEndpointFor(r.dir);
+          const reported = output ? device?.out_volume : device?.in_volume;
+          const volumePending = output ? device?.out_volume_pending : device?.in_volume_pending;
+          return (
+            <div key={r.dir} className="dev-row" data-testid={`detail-device-${r.dir}`}>
+              <Icon name={r.icon} cls="ico dev-ico" />
+              <div className="dev-text">
+                <span className="dev-name">{r.name || t('common.dash')}</span>
+                <code className="dev-uid mono">{r.uid || ''}</code>
+              </div>
+              <span className="dev-frames mono">
+                {joinPhrases([
+                  t('device.frames', { n: fmt.count(r.frames) }),
+                  r.dropped ? t('device.dropped', { n: fmt.count(r.dropped) }) : null,
+                ])}
+              </span>
+              <DeviceVolumeControl
+                peer={fp}
+                endpoint={endpoint}
+                version={device?.device_volume_version}
+                reported={reported}
+                pending={volumePending}
+                online={!!peer.online}
+                active={active}
+                inactiveNote={inactiveNote}
+                softwareGain={output && !!device?.out_volume_software_gain}
+                volumeTestid={`detail-device-volume-${r.dir}`}
+                muteTestid={`detail-device-mute-${r.dir}`}
+                label={t(output ? 'volume.deviceOutputLabel' : 'volume.deviceInputLabel', {
+                  name: r.name || peer.name || fp,
+                })}
+                onSet={(wanted, params) => rpc(
+                  'peer.set_device_volume',
+                  deviceVolumeRequest(fp, wanted, params),
+                  { silent: true },
+                )}
+                onRefresh={() => { void refreshPeers(); }}
+              />
+              <span className={`dev-state ${r.io ? 'live' : r.published && r.observed ? 'idle' : 'pending'}`}>
+                {r.io ? t('device.inUse') : r.published && r.observed ? t('device.idle') : t('device.awaiting')}
+              </span>
             </div>
-            <span className="dev-frames mono">
-              {joinPhrases([
-                t('device.frames', { n: fmt.count(r.frames) }),
-                r.dropped ? t('device.dropped', { n: fmt.count(r.dropped) }) : null,
-              ])}
-            </span>
-            <span className={`dev-state ${r.io ? 'live' : r.published && r.observed ? 'idle' : 'pending'}`}>
-              {r.io ? t('device.inUse') : r.published && r.observed ? t('device.idle') : t('device.awaiting')}
-            </span>
-          </div>
-        ))}
+          );
+        })}
       </div>
       <p className="muted small" data-testid="detail-hal-note">{note}</p>
     </div>

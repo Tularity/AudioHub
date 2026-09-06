@@ -2,6 +2,11 @@
 
 本目录只负责**编译 + 测试签名**，不负责安装。
 
+> **资源边界（2026-08-30）**：本地代理只允许在 `WinAudio-Debug-1` /
+> `WinAudio-Debug-2` 中执行本文命令，并应优先经受守卫的
+> `regress/vm/build-stages.ps1` 分阶段运行。30-win 仅作 Hyper-V 宿主，本机仅作编辑与静态检查；
+> 旧 `sync-30win` 或宿主构建流程已永久废止。发布 CI 只可做不含测试、probe 或音频设备访问的纯构建与非音频元数据校验。
+
 里程碑现状：
 
 - **M6-1（已完成）**：一个编译期写死的静态设备 `AudioHub Virtual Audio` 出现在系统音频设备列表里。
@@ -40,8 +45,8 @@ M6-1 阶段**只改名字与标识，不动任何音频逻辑**（`.cpp` / `.h` 
 | `Source/Filters/speakertoptable.h` / `micarray1toptable.h` | bridge pin 的 `KsPinDescriptor.Name` 指向自定义 GUID | M6-2 |
 | `Source/Main/AudioHubVad.inx` | 四个接口段由**实体端点**降级为**模板**；新增 `MediaCategories` pin 名 | M6-2 |
 | `Source/Main/common.cpp` | `ConnectTopologies` 之后**重新武装**两个 KS 接口；`InstallEndpointFilters` / `RemoveEndpointFilters` / `DisconnectTopologies` 如实报告部分失败 | M6-2 D3 |
-| `Source/Inc/AudioHubIoctl.h` | 协议 2→**3**：`AH_BIND_REPLY.reserved` 变 `flags`，新增 `AH_STAGE_PINNAME` / `AH_BINDFLAG_FAIL_PIN_NAME` / `AH_BINDREPLY_FLAG_PIN_NAME_FALLBACK` | M6-2 D2 |
-| `Source/Inc/perpeer.h` / `Source/Main/perpeer.cpp` | **每对端设备名**：由指纹派生 pin 名 GUID，绑定时写 `MediaCategories\{guid}\Name`，解绑时清除；topology filter 描述符与 pin 数组改为**每槽位一份** | M6-2 D2 |
+| `Source/Inc/AudioHubIoctl.h` | 当前协议 **7**：支持按方向发布端点，并要求每个端点带不可变的对端/方向 identity；以 `AH_STAGE_ENDPOINT_NAME` / `AH_BINDFLAG_FAIL_ENDPOINT_NAME` / `AH_BINDREPLY_FLAG_NAME_FALLBACK` 表达端点属性与命名结果 | M6-2 及后续修订 |
+| `Source/Inc/perpeer.h` / `Source/Main/perpeer.cpp` | **每对端设备名与 identity**：以指纹派生接口 reference string，把 daemon 生成的标签写入两个 topology 接口各自的 `EP\0` `PKEY_Device_DeviceDesc`，并写入 `v1:<指纹>:out|in` 私有属性；identity 写入失败会在发布前回滚并拒绝 bind，解绑时清除两类属性 | M6-2 D2 及后续修订 |
 
 音频逻辑（`minwavert` / `minwavertstream` / `mintopo` / `basetopo`）**至今一行未改**。
 
@@ -79,16 +84,15 @@ Class         MEDIA {4d36e96c-e325-11ce-bfc1-08002be10318}
 > 而给 KS 接口写同一属性，注册表里逐字读得到、端点名毫无变化。
 > devnode 只有一个、被所有对端共享，所以**括号那半永远无法表达每对端不同的名字**。
 >
-> 能表达的是端点接口自己的 `PKEY_Device_DeviceDesc`（per-direction）。因此每个槽位分到一个
-> **由对端指纹确定性派生**的 pin 名 GUID（形如
-> `{9F3C7A21-6B48-4D00-<指纹前 4 位>-<指纹后 12 位>}`，第三段末位 0=渲染 1=采集），
-> 驱动在绑定时把同一个 `AudioHub – <主机名>` 写进两个方向各自接口的 `EP\0`
-> 设备描述属性，解绑时删除。INF 的通用方向词仍只作为属性写入失败时的系统回退，
+> 能表达的是端点接口自己的 `PKEY_Device_DeviceDesc`（per-direction）。每个槽位以对端指纹
+> 确定性派生四个 KS 接口 reference string；驱动在绑定时把同一个
+> `AudioHub – <主机名>` 写进两个 topology 接口各自的 `EP\0` 设备描述属性，解绑时删除。
+> INF 的静态 pin 名只作为属性写入失败时的通用回退，
 > 正常的每对端名称不含「扬声器 / 麦克风」后缀。
 >
-> 写不进去时**回退**为 INF 的静态 GUID（名字变成通用的「扬声器 (AudioHub Virtual Audio)」），
+> 写不进去时**回退**为 INF 的静态标签（当前为 `AudioHub`），
 > 并在 `AH_BIND_REPLY.flags` 里置名称回退标志
-> 一路上报到 `daemon.status` 的 `hal.pin_name_fallbacks`。
+> 一路上报到 `daemon.status` 的 `hal.endpoint_name_fallbacks`。
 > 回退不算失败（设备可用），但绝不静默——多台对端同时配对时它会让同方向设备重名。
 
 ---
@@ -114,13 +118,14 @@ NuGet 路线**不写注册表、不做机器级安装、不需要重启**——�
 <WDKContentRoot>$(NuGetPackageFolder)\c</WDKContentRoot>
 ```
 
-这一点对本项目是硬约束：构建机 30-win 不允许重启。
+这一点仍有价值，但当前资源边界更严格：构建只允许在
+`WinAudio-Debug-1` / `WinAudio-Debug-2` 中进行，30-win 仅作为 Hyper-V 宿主。
 
 ---
 
 ## 2. 构建与签名
 
-在**构建机**上，从本目录执行：
+在通过 `regress/vm/assert-test-vm.ps1` 身份检查的专用测试虚拟机上，从本目录执行：
 
 ```powershell
 # 1) 编译（自动完成 NuGet restore + VCTargets shim）
@@ -144,8 +149,9 @@ _build\dist\                     # ★ 下一阶段只需要这一个目录
   AudioHubVad.sys / .inf / .cat + AudioHubVad-TestCert.cer
 ```
 
-`_build/`、`x64/` 等已写入本目录的 `.gitignore`——仓库会被 `regress/sync-30win.sh`
-同步到 30-win，构建产物不进仓库。
+`_build/`、`x64/` 等已写入本目录的 `.gitignore`。当前应通过受守卫的
+`regress/vm/build-stages.ps1` 在测试虚拟机内构建；旧 `regress/sync-30win.sh`
+与 30-win 构建流程已永久废止，构建产物仍不进仓库。
 
 > 构建**不是**逐位可复现的：`.sys` 带 PE 时间戳，每次重新编译都会变；
 > `.inf` 的 `DriverVer` 由 stampinf 打成构建时刻；`.cat` 每次 Inf2Cat 都重新生成。
@@ -184,8 +190,8 @@ error MSB8020: The build tools for WindowsKernelModeDriver10.0 cannot be found.
 （上游 `Windows-driver-samples/BuildEnvironment.ps1` 也印证了这点：即使在 NuGet 模式下，
 它依然要求存在带 DriverKit 组件的 VS 安装。）
 
-本项目不装那个 VS 组件——装它要动构建机的 VS 安装、有触发 pending-reboot 的风险，
-而 30-win 的「无挂起重启」基线必须保持。改为：
+本项目不装那个 VS 组件——装它要动构建虚拟机的 VS 安装、有触发 pending-reboot 的风险。
+30-win 宿主不得参与构建或被这些步骤修改。改为：
 
 `tools/wdk-vs-shim.ps1` 把 VS 自带的 VC targets 树（v170，约 175 文件 / 2.4 MB）
 复制到 `_build\vctargets\v170`，在副本里补上缺的那几个文件，构建时用
@@ -225,8 +231,8 @@ worker 进程，那些进程持有 `_build\vctargets\v170\Microsoft.Build.CPPTas
 ### DriverVer 的日期必须按 UTC 给，不能用 stampinf 的默认值
 
 stampinf 默认（`%(Inf.TimeStamp)` = `*`）写的是**构建机本地日期**，而 inf2cat 拿 **UTC**
-判「是不是未来日期」。30-win 在 UTC+10，于是**本地时间 10:00 之前发起的每一次构建**
-都会编译链接全过、卡在打包这一步：
+判「是不是未来日期」。旧 30-win 实测在 UTC+10 时，**本地时间 10:00 之前发起的构建**
+会编译链接全过、卡在打包这一步；当前专用 VM 构建仍保留同一 UTC 防御：
 
 ```
 22.9.7: DriverVer set to a date in the future (postdated DriverVer not allowed)

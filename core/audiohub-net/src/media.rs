@@ -12,7 +12,7 @@ use sha2::Sha256;
 use zeroize::Zeroize;
 
 use audiohub_core::audio::{AudioRx, Dll, LiveCapture};
-use audiohub_core::dsp::LinearResampler;
+use audiohub_core::dsp::InterleavedLinearResampler;
 use audiohub_core::latency::{DropMode, SourceDepths, StageDepth, StageId, NO_DEPTHS};
 use audiohub_core::sysaudio::{self, BackendInfo, SysAudioCapture};
 
@@ -506,8 +506,8 @@ const _: () = assert!(
 /// two would drift.
 pub const FRAME_MS: u64 = 10;
 
-/// Per-receive-stream jitter buffer holding 48k mono f32 frames (one frame =
-/// one 10ms tick). pop() once per tick after warm-up; missing frames get PLC
+/// Per-receive-stream jitter buffer holding 48k interleaved f32 frames (one
+/// frame = one 10ms tick). `pop()` runs once per tick after warm-up; missing frames get PLC
 /// (repeat last frame decayed 30% per repeat), silence after 5 consecutive
 /// misses.
 ///
@@ -579,6 +579,7 @@ pub struct JitterBuffer {
     /// 连续因为「素材会抵消」而推迟收敛的次数。到 `ncc_retry_ticks` 就强拼。
     ncc_defer: u32,
     frame_len: usize,
+    channels: usize,
     last_frame: Vec<f32>,
     plc_run: u32,
     pub popped: u64,
@@ -626,6 +627,11 @@ impl JitterBuffer {
     /// 显式整定。生产走 [`JitterBuffer::new`]（读环境变量），**测试走这条**——
     /// `env::var` 是进程级的，并行测试里改它就是互相踩。
     pub fn with_tuning(target: u32, cfg: JbTuning) -> Self {
+        Self::with_tuning_channels(target, cfg, 1)
+    }
+
+    pub fn with_tuning_channels(target: u32, cfg: JbTuning, channels: u8) -> Self {
+        let channels = channels.clamp(1, 2) as usize;
         JitterBuffer {
             frames: BTreeMap::new(),
             next_seq: None,
@@ -637,7 +643,8 @@ impl JitterBuffer {
             next_decay_tick: cfg.extra_decay_ticks,
             last_accel_tick: 0,
             ncc_defer: 0,
-            frame_len: Self::DEFAULT_FRAME_LEN,
+            frame_len: Self::DEFAULT_FRAME_LEN * channels,
+            channels,
             last_frame: Vec::new(),
             plc_run: 0,
             popped: 0,
@@ -840,7 +847,8 @@ impl JitterBuffer {
             let x = self.cfg.xfade;
             let ok = match (self.frames.get(&seq), self.frames.get(&seq.wrapping_add(1))) {
                 (Some(a), Some(b)) if x > 0 && a.len() == b.len() && !a.is_empty() => {
-                    ncc_tail(a, b, x.min(a.len())) >= self.cfg.ncc_floor
+                    let samples = x.saturating_mul(self.channels).min(a.len());
+                    ncc_tail(a, b, samples) >= self.cfg.ncc_floor
                 }
                 _ => true,
             };
@@ -885,30 +893,34 @@ impl JitterBuffer {
     /// 两帧长度不等（流中途换采样率的窗口期）时退化为「丢 `a` 保 `b`」——
     /// 那一刻本来就有一处不连续，不值得为它发明第二套重采样对齐。
     fn splice_two(&self, a: &[f32], b: &[f32]) -> Vec<f32> {
-        let f = a.len();
-        if f == 0 || b.len() != f {
+        let channels = self.channels.max(1);
+        let f = a.len() / channels;
+        if f == 0 || b.len() != a.len() {
             return b.to_vec();
         }
         let x = self.cfg.xfade.min(f);
-        let mut out = Vec::with_capacity(f);
-        out.extend_from_slice(&a[..f - x]);
+        let mut out = Vec::with_capacity(a.len());
+        out.extend_from_slice(&a[..(f - x) * channels]);
         if x == 0 {
             return out;
         }
-        let ncc = ncc_tail(a, b, x);
+        let ncc = ncc_tail(a, b, x * channels);
         let p = 0.5 + 0.5 * ncc.clamp(0.0, 1.0);
         // `p` 恰为 1 时不走 `powf`：`powf(v, 1.0)` 未必逐位返回 v，而「相关时
         // 逐样本恒等」这条不变量正押在这一位上。
         let equal_gain = p >= 1.0 - 1e-6;
         for k in 0..x {
-            let i = f - x + k;
+            let frame = f - x + k;
             let u = 0.5 * (1.0 - (std::f32::consts::PI * (k as f32 + 0.5) / x as f32).cos());
             let (ga, gb) = if equal_gain {
                 (1.0 - u, u)
             } else {
                 ((1.0 - u).powf(p), u.powf(p))
             };
-            out.push(ga * a[i] + gb * b[i]);
+            for ch in 0..channels {
+                let i = frame * channels + ch;
+                out.push(ga * a[i] + gb * b[i]);
+            }
         }
         out
     }
@@ -1055,6 +1067,13 @@ pub trait FrameSource {
     fn next_frame(&mut self, out: &mut Vec<f32>) -> bool;
     fn sample_rate(&self) -> u32;
 
+    /// Number of interleaved channels produced by [`next_frame`](Self::next_frame).
+    /// Legacy and inherently mono sources use the default. Media negotiation
+    /// can still downmix a stereo source for a 1.0.0 peer at the transmit edge.
+    fn channels(&self) -> u8 {
+        1
+    }
+
     /// 本源在「交给发送调度器之前」还压着多少音频（规格 §3.2 的级 1 / 3 / 3′）。
     ///
     /// 默认 `NO_DEPTHS` = 这个源没有任何可观测的排队。`ToneSource` 就属此类：
@@ -1086,6 +1105,68 @@ impl ToneSource {
             step: 2.0 * std::f64::consts::PI * freq_hz as f64 / sample_rate as f64,
             phase: 0.0,
         }
+    }
+}
+
+/// Deterministic stereo source for isolated-VM regression tests. It never
+/// touches an audio device; callers may feed its frames through the real media
+/// pipeline and inspect the remote probe/output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StereoProbePattern {
+    LeftOnly,
+    RightOnly,
+    AntiPhase,
+    DualFrequency,
+}
+
+pub struct StereoProbeSource {
+    pattern: StereoProbePattern,
+    rate: u32,
+    frame_samples: usize,
+    phase_l: f64,
+    phase_r: f64,
+}
+
+impl StereoProbeSource {
+    pub fn new(pattern: StereoProbePattern, sample_rate: u32, frame_ms: u32) -> Self {
+        Self {
+            pattern,
+            rate: sample_rate,
+            frame_samples: sample_rate as usize * frame_ms as usize / 1000,
+            phase_l: 0.0,
+            phase_r: 0.0,
+        }
+    }
+}
+
+impl FrameSource for StereoProbeSource {
+    fn next_frame(&mut self, out: &mut Vec<f32>) -> bool {
+        out.clear();
+        out.reserve(self.frame_samples * 2);
+        let step_l = 2.0 * std::f64::consts::PI * 700.0 / self.rate as f64;
+        let step_r = 2.0 * std::f64::consts::PI * 1300.0 / self.rate as f64;
+        for _ in 0..self.frame_samples {
+            let l = (self.phase_l.sin() * 0.5) as f32;
+            let independent_r = (self.phase_r.sin() * 0.5) as f32;
+            let (l, r) = match self.pattern {
+                StereoProbePattern::LeftOnly => (l, 0.0),
+                StereoProbePattern::RightOnly => (0.0, l),
+                StereoProbePattern::AntiPhase => (l, -l),
+                StereoProbePattern::DualFrequency => (l, independent_r),
+            };
+            out.extend_from_slice(&[l, r]);
+            self.phase_l = (self.phase_l + step_l) % (2.0 * std::f64::consts::PI);
+            self.phase_r = (self.phase_r + step_r) % (2.0 * std::f64::consts::PI);
+        }
+        true
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+
+    fn channels(&self) -> u8 {
+        2
     }
 }
 
@@ -1213,8 +1294,9 @@ impl CaptureServoCell {
 
 pub struct CaptureFifo {
     fifo: VecDeque<f32>,
-    resampler: LinearResampler,
+    resampler: InterleavedLinearResampler,
     staged: Vec<f32>,
+    channels: usize,
     dll: Dll,
     frame_samples: usize,
     /// Depth the servo steers toward, in output samples.
@@ -1252,6 +1334,11 @@ impl CaptureFifo {
     const CAPTURE_UPDATES: u32 = 200;
 
     pub fn new(src_rate: u32, frame_ms: u32) -> Self {
+        Self::new_channels(src_rate, frame_ms, 1)
+    }
+
+    pub fn new_channels(src_rate: u32, frame_ms: u32, channels: u8) -> Self {
+        let channels = channels.clamp(1, 2) as usize;
         let frame_samples = (Self::OUT_RATE as u64 * frame_ms as u64 / 1000) as usize;
         CaptureFifo {
             fifo: VecDeque::new(),
@@ -1259,8 +1346,13 @@ impl CaptureFifo {
             // that needs bending most (two "48 kHz" crystals disagree by tens
             // of ppm), and `new` would hand back a passthrough that silently
             // ignores every correction.
-            resampler: LinearResampler::servoed(src_rate, Self::OUT_RATE),
+            resampler: InterleavedLinearResampler::servoed(
+                src_rate,
+                Self::OUT_RATE,
+                channels as u8,
+            ),
             staged: Vec::new(),
+            channels,
             dll: Dll::new(Dll::BW_MAX, frame_samples.max(1) as u32, Self::OUT_RATE),
             frame_samples,
             target: frame_samples * Self::TARGET_FRAMES,
@@ -1281,11 +1373,12 @@ impl CaptureFifo {
     /// so a telemetry test can ask what a brimming FIFO reads as.
     #[cfg(test)]
     pub(crate) fn fill_for_test(&mut self, n: usize) {
-        self.fifo.extend(std::iter::repeat(0.3f32).take(n));
+        self.fifo
+            .extend(std::iter::repeat(0.3f32).take(n * self.channels));
     }
 
     pub fn len(&self) -> u32 {
-        self.fifo.len() as u32
+        (self.fifo.len() / self.channels) as u32
     }
 
     pub fn capacity(&self) -> u32 {
@@ -1313,9 +1406,9 @@ impl CaptureFifo {
     /// stalled over the same interval there is nothing to shed, and draining to
     /// the floor trades a latency problem for an underrun.
     pub fn drain_skipped(&mut self, samples: usize) -> usize {
-        let n = samples.min(self.fifo.len().saturating_sub(self.frame_samples));
-        self.fifo.drain(..n);
-        n
+        let frames = samples.min((self.len() as usize).saturating_sub(self.frame_samples));
+        self.fifo.drain(..frames * self.channels);
+        frames
     }
 
     /// Current correction as a ppm offset — what the telemetry reports and what
@@ -1332,11 +1425,12 @@ impl CaptureFifo {
         self.fifo.extend(self.staged.iter().copied());
 
         out.clear();
-        if self.fifo.len() >= self.frame_samples {
-            out.extend(self.fifo.drain(..self.frame_samples));
+        let frame_scalars = self.frame_samples * self.channels;
+        if self.fifo.len() >= frame_scalars {
+            out.extend(self.fifo.drain(..frame_scalars));
         } else {
             // Underrun: emit silence rather than stalling the send cadence.
-            out.resize(self.frame_samples, 0.0);
+            out.resize(frame_scalars, 0.0);
         }
 
         // Servo on the POST-DRAIN residue, matching `SpkPhase`'s 「读后残量」:
@@ -1346,21 +1440,24 @@ impl CaptureFifo {
     }
 
     fn settle(&mut self) {
-        let depth = self.fifo.len();
+        let depth = self.fifo.len() / self.channels;
 
         // Safety net first. A step this large is not something to bend away.
-        let resync_samples =
-            Self::OUT_RATE as usize * Self::RESYNC_MS / 1000 + self.target;
+        let resync_samples = Self::OUT_RATE as usize * Self::RESYNC_MS / 1000 + self.target;
         if depth > resync_samples {
             let excess = depth - self.target;
-            self.fifo.drain(..excess);
+            self.fifo.drain(..excess * self.channels);
             self.dropped += excess as u64;
             self.resyncs += 1;
             // The integrator holds history from BEFORE the step; leaving it in
             // makes the loop chase an error that no longer exists and overshoot
             // into underrun. Same reason `halbridge::dll` resyncs after a tick
             // skip.
-            self.dll = Dll::new(Dll::BW_MAX, self.frame_samples.max(1) as u32, Self::OUT_RATE);
+            self.dll = Dll::new(
+                Dll::BW_MAX,
+                self.frame_samples.max(1) as u32,
+                Self::OUT_RATE,
+            );
             self.capture_left = Self::CAPTURE_UPDATES;
             self.corr = 1.0;
             self.resampler.set_correction(1.0);
@@ -1369,26 +1466,32 @@ impl CaptureFifo {
 
         // The hard cap stays as the very last resort; reaching it now means the
         // resync threshold above was somehow skipped.
-        while self.fifo.len() > Self::CAP {
-            self.fifo.pop_front();
+        while self.fifo.len() > Self::CAP * self.channels {
+            for _ in 0..self.channels {
+                self.fifo.pop_front();
+            }
             self.dropped += 1;
         }
 
         if self.capture_left > 0 {
             self.capture_left -= 1;
             if self.capture_left == 0 {
-                self.dll
-                    .set_bw(Dll::BW_MIN, self.frame_samples.max(1) as u32, Self::OUT_RATE);
+                self.dll.set_bw(
+                    Dll::BW_MIN,
+                    self.frame_samples.max(1) as u32,
+                    Self::OUT_RATE,
+                );
             }
         }
 
         // Consumer semantics, identical to `SpkPhase::err_frames`: `target −
         // depth`, so `> 0` means "let the level rise".
-        let err = self.error_sign * (self.target as f64 - self.fifo.len() as f64);
+        let depth = self.fifo.len() / self.channels;
+        let err = self.error_sign * (self.target as f64 - depth as f64);
         let rail = Self::MAX_PPM / 1e6;
         let (corr, _clamped) = self.dll.update_clamped(err, 1.0 - rail, 1.0 + rail);
         self.corr = corr;
-        CAPTURE_SERVO.publish(self.corr_ppm(), self.resyncs, self.fifo.len(), self.target);
+        CAPTURE_SERVO.publish(self.corr_ppm(), self.resyncs, depth, self.target);
         // MULTIPLY, where the tick servo divides. `corr > 1` there shortens the
         // period so the consumer reads faster; here it lengthens the resampling
         // step so the producer emits fewer samples. Both drain a deep buffer;
@@ -1484,7 +1587,7 @@ impl FrameSource for MicSource {
 }
 
 /// System-audio source (spec-m4b §B): whatever this machine is playing,
-/// resampled to 48k mono. Same shape as MicSource — underruns emit silence so
+/// resampled to a 48k front pair. Same shape as MicSource — underruns emit silence so
 /// the send cadence never stalls, and the FIFO is bounded so a stalled reader
 /// costs audio, not latency. `excludes_self()` reports whether the chosen
 /// backend keeps our own playback out of the capture; a false there while we
@@ -1495,6 +1598,7 @@ pub struct SysAudioSource {
     raw: Vec<f32>,
     /// 同 `MicSource`：发送 FIFO 与它的速率伺服。
     fifo: CaptureFifo,
+    channels: u8,
 }
 
 impl SysAudioSource {
@@ -1508,11 +1612,13 @@ impl SysAudioSource {
         let info = sysaudio::resolve_backend(backend)?;
         let cap = sysaudio::start_backend(&info.id)?;
         let rate = cap.sample_rate();
+        let channels = cap.channels().clamp(1, 2);
         Ok(SysAudioSource {
             cap,
             info,
             raw: Vec::new(),
-            fifo: CaptureFifo::new(rate, frame_ms),
+            fifo: CaptureFifo::new_channels(rate, frame_ms, channels),
+            channels,
         })
     }
 
@@ -1557,6 +1663,10 @@ impl FrameSource for SysAudioSource {
 
     fn sample_rate(&self) -> u32 {
         Self::OUT_RATE
+    }
+
+    fn channels(&self) -> u8 {
+        self.channels
     }
 
     /// 只有发送 FIFO 一级：系统音频后端自己的内部缓冲不经过 `AudioRx`，
@@ -1618,7 +1728,7 @@ impl LossInjector {
 // 只依赖本仓库的代码：
 //
 //   **48 kHz 是唯一不经重采样的档**（`engine.rs` 的 tx 侧只在 `rung != 0` 建
-//   重采样器，rx 侧 `if h.sample_rate == 48000` 直通），而 [`LinearResampler`]
+//   resampler; rx bypasses it when `h.sample_rate == 48000`), while [`InterleavedLinearResampler`]
 //   是**纯线性插值、没有任何抗混叠低通**。48 k → 16 k 抽取时 12 kHz 的分量
 //   折回 4 kHz 只被压约 1.8 dB —— 比 16 位量化噪声底高约 90 dB 量级。
 //   ⇒ 拿 48 kHz 换位深 = 用 90 dB 的损伤换 48 dB 的改善。
@@ -1644,7 +1754,19 @@ pub struct WireFormat {
 impl WireFormat {
     /// 一帧（`FRAME_MS = 10 ms`）单声道的**明文**字节数。
     pub const fn frame_bytes(&self) -> usize {
-        (self.rate_hz as usize / 100) * self.depth.bytes_per_sample()
+        self.frame_bytes_for(1)
+    }
+
+    /// Plaintext bytes in one 10 ms interleaved frame.
+    pub const fn frame_bytes_for(&self, channels: u8) -> usize {
+        let channels = if channels == 0 {
+            1
+        } else if channels > MAX_MEDIA_CHANNELS {
+            MAX_MEDIA_CHANNELS
+        } else {
+            channels
+        };
+        (self.rate_hz as usize / 100) * self.depth.bytes_per_sample() * channels as usize
     }
 
     /// **音频**码率（kbps）= `rate × depth_bits / 1000`，单声道。
@@ -1653,20 +1775,44 @@ impl WireFormat {
     /// 保住）。深档的开销比例更高：它们按 5 ms 分包，每 10 ms 要付**两份**
     /// 56 字节的头 + 标签。拿这个数去反推实测带宽对不上是正常的，不是 bug。
     pub const fn kbps(&self) -> u32 {
-        self.rate_hz / 1000 * self.depth.bits()
+        self.kbps_for(1)
     }
 
-    /// 线上是不是按 5 ms 分成两个包发（见 [`WireFormat::wire_packets_per_frame`]）。
-    pub const fn splits_frame(&self) -> bool {
-        self.frame_bytes() > SINGLE_PACKET_PAYLOAD_MAX
-    }
-
-    /// 一帧上线拆成几个数据报。今天只有 1 或 2。
-    pub const fn wire_packets_per_frame(&self) -> usize {
-        if self.splits_frame() {
-            2
-        } else {
+    pub const fn kbps_for(&self, channels: u8) -> u32 {
+        let channels = if channels == 0 {
             1
+        } else if channels > MAX_MEDIA_CHANNELS {
+            MAX_MEDIA_CHANNELS
+        } else {
+            channels
+        };
+        self.rate_hz / 1000 * self.depth.bits() * channels as u32
+    }
+
+    /// Whether one 10 ms frame needs multiple MTU-safe datagrams.
+    pub const fn splits_frame(&self) -> bool {
+        self.splits_frame_for(1)
+    }
+
+    pub const fn splits_frame_for(&self, channels: u8) -> bool {
+        self.frame_bytes_for(channels) > SINGLE_PACKET_PAYLOAD_MAX
+    }
+
+    /// Number of datagrams for a mono frame; stereo callers use the width-aware form.
+    pub const fn wire_packets_per_frame(&self) -> usize {
+        self.wire_packets_per_frame_for(1)
+    }
+
+    /// Number of MTU-safe datagrams in one frame. Stereo 48 kHz/f32 needs
+    /// four; lower rungs naturally need fewer. Every current rung divides on
+    /// an interleaved-frame boundary, so no packet can contain half a sample.
+    pub const fn wire_packets_per_frame_for(&self, channels: u8) -> usize {
+        let bytes = self.frame_bytes_for(channels);
+        let parts = (bytes + SINGLE_PACKET_PAYLOAD_MAX - 1) / SINGLE_PACKET_PAYLOAD_MAX;
+        if parts == 0 {
+            1
+        } else {
+            parts
         }
     }
 }
@@ -1675,12 +1821,16 @@ impl WireFormat {
 ///
 /// 1500 − 28 (IPv4 + UDP) − 40 (`HEADER_LEN`) − 16 (AEAD 标签) = 1416。
 /// 这里取 1200：常见隧道 MTU（WireGuard 1420 / PPPoE 1492）下也不分片。
-/// 超过它的档在线上按 5 ms 分成两个包（`engine.rs` 的 `tx_loop`）——
-/// **`FRAME_MS` 一个字不改，只动线路层的包时长**。
+/// Frames above it are split into equal-duration application datagrams by
+/// `engine.rs::tx_loop`; `FRAME_MS` remains unchanged.
 ///
 /// 这就是 AES67「缩短包时长」那条正解，只用在线路层：AES67 没有我们这种抖动
 /// 缓冲，所以它把「包时长」与「调度节拍」当成一件事；我们不必。
 pub const SINGLE_PACKET_PAYLOAD_MAX: usize = 1200;
+
+pub const MAX_MEDIA_CHANNELS: u8 = 2;
+/// 48 kHz/f32 stereo is the widest negotiated frame: 3840 bytes / 1200.
+pub const MAX_WIRE_PARTS: usize = 4;
 
 /// 质量阶梯。**rung 0 = 最好**（与 `AutoLadder` 的 `rung += 1` 是降档方向一致）。
 ///
@@ -2053,6 +2203,13 @@ mod ladder_tests {
                 "rung {i} 的每帧明文变了"
             );
             assert_eq!(f.kbps(), want_kbps[i], "rung {i} 的音频码率变了");
+            assert_eq!(f.kbps_for(2), want_kbps[i] * 2);
+            assert!(f.wire_packets_per_frame_for(2) <= MAX_WIRE_PARTS);
+            assert_eq!(
+                f.frame_bytes_for(2) % f.wire_packets_per_frame_for(2),
+                0,
+                "stereo rung {i} must split on a scalar/channel boundary"
+            );
             // 分包之后每个数据报装 frame_bytes / n。
             let per_packet = f.frame_bytes() / f.wire_packets_per_frame();
             let ip_datagram = HEADER_LEN + per_packet + AEAD_TAG + IP_UDP;
@@ -2604,6 +2761,40 @@ mod ladder_tests {
         assert_eq!(rung_format(LADDER.len() as u32), *LADDER.last().unwrap());
         assert_eq!(rung_format(u32::MAX), *LADDER.last().unwrap());
     }
+
+    #[test]
+    fn stereo_probe_source_covers_left_right_antiphase_and_dual_frequency() {
+        for pattern in [
+            StereoProbePattern::LeftOnly,
+            StereoProbePattern::RightOnly,
+            StereoProbePattern::AntiPhase,
+            StereoProbePattern::DualFrequency,
+        ] {
+            let mut source = StereoProbeSource::new(pattern, 48_000, 10);
+            let mut frame = Vec::new();
+            assert!(source.next_frame(&mut frame));
+            assert_eq!(source.channels(), 2);
+            assert_eq!(frame.len(), 960);
+            let (mut l_energy, mut r_energy, mut sum_energy) = (0.0f64, 0.0f64, 0.0f64);
+            for pair in frame.chunks_exact(2) {
+                l_energy += pair[0] as f64 * pair[0] as f64;
+                r_energy += pair[1] as f64 * pair[1] as f64;
+                let sum = pair[0] + pair[1];
+                sum_energy += sum as f64 * sum as f64;
+            }
+            match pattern {
+                StereoProbePattern::LeftOnly => assert!(l_energy > 1.0 && r_energy == 0.0),
+                StereoProbePattern::RightOnly => assert!(r_energy > 1.0 && l_energy == 0.0),
+                StereoProbePattern::AntiPhase => assert!(
+                    l_energy > 1.0 && r_energy > 1.0 && sum_energy < 1e-10,
+                    "anti-phase stereo must not be mistaken for silence"
+                ),
+                StereoProbePattern::DualFrequency => {
+                    assert!(l_energy > 1.0 && r_energy > 1.0 && sum_energy > 1.0)
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2741,6 +2932,7 @@ mod telemetry_tests {
             info: fake_backend(),
             raw: Vec::new(),
             fifo: CaptureFifo::new(rate, 10),
+            channels: 1,
         }
     }
 
@@ -2919,7 +3111,10 @@ mod telemetry_tests {
         );
         let fifo = fifo.expect("发送 FIFO 这一级");
         assert_eq!(fifo.id, StageId::SrcFifo);
-        assert_eq!(fifo.samples, 1_440, "安全网把它排回目标水位（3 帧 = 30 ms）");
+        assert_eq!(
+            fifo.samples, 1_440,
+            "the safety net must drain back to target (3 frames = 30 ms)"
+        );
         assert_eq!(fifo.capacity, 48_000);
         assert_eq!(fifo.rate, 48_000);
         assert!(
@@ -3960,7 +4155,11 @@ mod capture_fifo_tests {
             carry = exact - n as f64;
             let raw = vec![0.25f32; n];
             f.tick(&raw, &mut out);
-            assert_eq!(out.len(), frame, "a tick must always emit exactly one frame");
+            assert_eq!(
+                out.len(),
+                frame,
+                "a tick must always emit exactly one frame"
+            );
         }
         f
     }
@@ -3982,7 +4181,11 @@ mod capture_fifo_tests {
         );
         // Without the servo this run drops samples continuously once it hits
         // the cap. Settling means it never has to.
-        assert_eq!(f.dropped(), 0, "a drift the servo can hold must cost no audio");
+        assert_eq!(
+            f.dropped(),
+            0,
+            "a drift the servo can hold must cost no audio"
+        );
         assert!(
             f.corr_ppm() > 50.0,
             "the servo should be leaning against the drift, not idling at 1.0 \
@@ -4048,13 +4251,21 @@ mod capture_fifo_tests {
         let mut out = Vec::new();
         // A 400 ms burst: one stalled reader's worth of backlog arriving at once.
         f.tick(&vec![0.1f32; 48_000 * 400 / 1000], &mut out);
-        assert_eq!(f.resyncs(), 1, "the step should have tripped exactly one resync");
+        assert_eq!(
+            f.resyncs(),
+            1,
+            "the step should have tripped exactly one resync"
+        );
         let depth = f.len() as f64;
         assert!(
             depth <= 480.0 * 3.0 + 1.0,
             "resync left {depth} samples; it must drain back to target"
         );
-        assert_eq!(f.corr_ppm().round(), 0.0, "a resync must restart the loop at 1.0");
+        assert_eq!(
+            f.corr_ppm().round(),
+            0.0,
+            "a resync must restart the loop at 1.0"
+        );
     }
 
     /// Underruns emit silence rather than stalling the send cadence, and the

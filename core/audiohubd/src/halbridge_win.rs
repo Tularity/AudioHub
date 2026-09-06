@@ -98,7 +98,10 @@ pub mod wire {
     /// v6 adds explicit render/capture intent bits to `AH_BIND_REQUEST.flags`.
     /// A v5 driver would ignore them and publish both endpoints, so accepting
     /// it would silently recreate devices the peer cannot serve.
-    pub const PROTOCOL_VERSION: u32 = 6;
+    /// v7 makes the per-endpoint peer/direction identity property mandatory.
+    /// The daemon addresses Windows' own scalar API through that property; a
+    /// v6 driver cannot safely participate in device-volume synchronization.
+    pub const PROTOCOL_VERSION: u32 = 7;
 
     /// `AudioHubIoctl.h:AUDIOHUB_WIN_MAX_SLOTS`, and equal to
     /// `halbridge::HAL_MAX_SLOTS`. The driver's `PcAddAdapterDevice` budget is
@@ -295,7 +298,7 @@ pub mod wire {
     /// even when it was registered from the WAVE port — i.e. reproduce the
     /// M6-2 speaker-loss defect on demand.
     pub const BINDFLAG_LEGACY_UNBIND: u32 = 0x800;
-    /// SET: fail the per-peer pin-name write, so the fallback path and
+    /// SET: fail the per-peer endpoint-name property write, so the fallback path and
     /// [`BINDREPLY_FLAG_NAME_FALLBACK`] can be observed without having to
     /// break the registry by hand.
     pub const BINDFLAG_FAIL_ENDPOINT_NAME: u32 = 0x1000;
@@ -309,8 +312,8 @@ pub mod wire {
     // -- bind reply flags ---------------------------------------------------
 
     /// Set alongside a SUCCESSFUL bind when the peer's own name could not be
-    /// made to appear, so the endpoints carry the INF's generic direction
-    /// words instead.
+    /// made to appear, so the endpoints carry the INF's generic fallback
+    /// labels instead.
     ///
     /// A warning on an OK reply, not a failure: a device with a generic name
     /// is enormously better than no device. Not silent either — with two peers
@@ -482,6 +485,10 @@ pub mod wire {
     /// the daemon must say so instead of believing its own `applied` flag.
     pub const CAP_VOLUMEEVENT: u32 = 0x10;
 
+    pub fn caps_have_volume_event(caps: u32) -> bool {
+        caps & CAP_VOLUMEEVENT != 0
+    }
+
     // -- helpers ------------------------------------------------------------
 
     fn put_u32(buf: &mut [u8], at: usize, v: u32) {
@@ -600,6 +607,12 @@ pub mod wire {
         pub fn has_volume(&self) -> bool {
             self.caps & CAP_VOLUME != 0
         }
+
+        /// [`CAP_VOLUMEEVENT`]: a daemon notify can be surfaced through the
+        /// topology node as a Windows control-change event.
+        pub fn has_volume_event(&self) -> bool {
+            caps_have_volume_event(self.caps)
+        }
     }
 
     pub fn decode_hello_reply(b: &[u8]) -> Option<HelloReply> {
@@ -714,8 +727,8 @@ pub mod wire {
             self.status == STATUS_OK && wanted & !PUB_BOTH == 0 && self.published == wanted
         }
 
-        /// The bind worked, but the devices carry the INF's generic direction
-        /// words rather than this peer's name.
+        /// The bind worked, but the devices carry the INF's generic fallback
+        /// labels rather than this peer's name.
         pub fn endpoint_name_fell_back(&self) -> bool {
             self.flags & BINDREPLY_FLAG_NAME_FALLBACK != 0
         }
@@ -2995,13 +3008,98 @@ pub mod rings {
     }
 }
 
+// ------------------------------------------------------ control-pend state
+
+/// The ownership state of one Windows inverted control call.
+///
+/// Kept outside the Windows-only transport module so the transitions that
+/// decide whether a kernel request still owns our buffers are testable without
+/// loading the driver (or even compiling Windows FFI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPendState {
+    /// `DeviceIoControl` completed inline because the driver already had an
+    /// event queued. The event still belongs to the caller; "not pending" must
+    /// never be confused with "nothing happened".
+    Ready(wire::ControlEvent),
+    /// The kernel still owns the `OVERLAPPED` and output buffer.
+    Outstanding,
+    /// The result was consumed, or the request completed with an error.
+    Complete,
+}
+
+impl ControlPendState {
+    fn from_inline(returned: u32, buf: &[u8]) -> Result<Self, String> {
+        decode_control_pend_completion(returned, buf).map(Self::Ready)
+    }
+
+    fn take_ready(&mut self) -> Option<wire::ControlEvent> {
+        let Self::Ready(event) = *self else {
+            return None;
+        };
+        *self = Self::Complete;
+        Some(event)
+    }
+
+    fn is_outstanding(self) -> bool {
+        matches!(self, Self::Outstanding)
+    }
+
+    fn complete(&mut self) {
+        *self = Self::Complete;
+    }
+}
+
+/// Validate the I/O manager's byte count before interpreting the driver's
+/// fixed-size event. Shared by inline and deferred completions so neither path
+/// can silently accept a short result.
+fn decode_control_pend_completion(returned: u32, buf: &[u8]) -> Result<wire::ControlEvent, String> {
+    if returned as usize != wire::CONTROL_EVENT_BYTES {
+        return Err(format!("pending control call returned {returned} bytes"));
+    }
+    wire::decode_control_event(buf).ok_or_else(|| "undecodable control event".to_string())
+}
+
+/// Drain completed calls and re-arm after every event. The generic shell is
+/// deliberately pure: tests can model `Session::open` receiving an inline
+/// event, more inline completions during re-arm, and the final parked request
+/// without touching Windows.
+fn drain_control_pend<P, E>(
+    pending: &mut Option<P>,
+    mut poll: impl FnMut(&mut P) -> Result<Option<wire::ControlEvent>, E>,
+    mut issue: impl FnMut() -> Result<P, E>,
+) -> Result<Vec<wire::ControlEvent>, E> {
+    let mut out = Vec::new();
+    loop {
+        let Some(call) = pending.as_mut() else {
+            return Ok(out);
+        };
+        match poll(call) {
+            Ok(Some(event)) => {
+                out.push(event);
+                match issue() {
+                    Ok(next) => *pending = Some(next),
+                    Err(error) => {
+                        *pending = None;
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(None) => return Ok(out),
+            Err(error) => {
+                *pending = None;
+                return Err(error);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- transport
 
 #[cfg(windows)]
 pub mod transport {
     //! `CreateFileW` / `DeviceIoControl`, declared by hand.
 
-    use super::wire;
+    use super::{decode_control_pend_completion, wire, ControlPendState};
     use anyhow::{anyhow, Result};
     use std::ffi::c_void;
 
@@ -3194,7 +3292,7 @@ pub mod transport {
                 OpenFail::Refused => {
                     "the driver refused this process: not an interactive logon, or this \
                      executable's path does not match AudioHubDaemonImage in the device \
-                     software key"
+                     hardware key"
                         .into()
                 }
                 OpenFail::Busy => {
@@ -3313,15 +3411,14 @@ pub mod transport {
         Ok(returned)
     }
 
-    /// Issues `CONTROL_PEND` and leaves it outstanding. Returns the machinery
-    /// the caller must keep alive until the IRP completes.
-    ///
-    /// M6-2 has nothing to report over this, but the call exists now so that
-    /// adding volume or IO state later does not force a protocol version bump.
+    /// Issues `CONTROL_PEND`. The returned call is either already Ready because
+    /// the driver had an event queued, or Outstanding and must stay alive until
+    /// the IRP completes.
     pub struct PendingCall {
         _event: Event,
         ov: Box<Overlapped>,
         pub buf: Box<[u8; wire::CONTROL_EVENT_BYTES]>,
+        state: ControlPendState,
         /// A copy of the device handle, so `Drop` can cancel WITHOUT the caller
         /// having to remember to. Never closed here — `Session` owns it, and a
         /// `PendingCall` cannot outlive the `Session` that made it.
@@ -3329,7 +3426,8 @@ pub mod transport {
     }
 
     impl Drop for PendingCall {
-        /// Cancel, then WAIT for the cancellation to land.
+        /// If the IRP is still outstanding, cancel and then WAIT for the
+        /// cancellation to land. Ready and consumed calls own no kernel I/O.
         ///
         /// While the IRP is outstanding the kernel holds pointers into `ov` and
         /// `buf`; freeing them first is a use-after-free that corrupts whatever
@@ -3337,14 +3435,18 @@ pub mod transport {
         /// code. `ov` and `buf` are boxed for exactly this reason: their
         /// addresses must not move while the driver holds them.
         fn drop(&mut self) {
+            if !self.state.is_outstanding() {
+                return;
+            }
             unsafe { CancelIoEx(self.h, self.ov.as_mut()) };
             let mut n: u32 = 0;
             unsafe { GetOverlappedResult(self.h, self.ov.as_mut(), &mut n, 1) };
+            self.state.complete();
         }
     }
 
     impl PendingCall {
-        pub fn issue(h: &Handle) -> Result<Option<PendingCall>> {
+        pub fn issue(h: &Handle) -> Result<PendingCall> {
             let ev = Event::new()?;
             let mut ov = Box::new(Overlapped {
                 event: ev.0,
@@ -3364,20 +3466,26 @@ pub mod transport {
                     ov.as_mut() as *mut Overlapped,
                 )
             };
-            if ok != 0 {
-                // Completed inline — nothing is outstanding.
-                return Ok(None);
-            }
-            let err = unsafe { GetLastError() };
-            if err != ERROR_IO_PENDING {
-                return Err(anyhow!("IOCTL_CONTROL_PEND failed: error {err}"));
-            }
-            Ok(Some(PendingCall {
+            let state = if ok != 0 {
+                // A queued driver event completes the overlapped call inline.
+                // Preserve it as Ready: returning "no pending call" here both
+                // dropped this event and permanently stopped Session re-arm.
+                ControlPendState::from_inline(returned, buf.as_ref())
+                    .map_err(|message| anyhow!("{message}"))?
+            } else {
+                let err = unsafe { GetLastError() };
+                if err != ERROR_IO_PENDING {
+                    return Err(anyhow!("IOCTL_CONTROL_PEND failed: error {err}"));
+                }
+                ControlPendState::Outstanding
+            };
+            Ok(PendingCall {
                 _event: ev,
                 ov,
                 buf,
+                state,
                 h: h.raw(),
-            }))
+            })
         }
 
         /// Non-blocking poll. `Ok(None)` = still pending.
@@ -3389,6 +3497,13 @@ pub mod transport {
         /// IRP into an error — and the caller reacts to an error by dropping
         /// this object, i.e. by freeing buffers the kernel is still holding.
         pub fn poll(&mut self, h: &Handle) -> Result<Option<wire::ControlEvent>> {
+            if let Some(event) = self.state.take_ready() {
+                return Ok(Some(event));
+            }
+            if !self.state.is_outstanding() {
+                return Err(anyhow!("pending control call was already consumed"));
+            }
+
             let mut n: u32 = 0;
             let got = unsafe { GetOverlappedResult(h.raw(), self.ov.as_mut(), &mut n, 0) };
             if got == 0 {
@@ -3396,17 +3511,18 @@ pub mod transport {
                 if err == ERROR_IO_INCOMPLETE || err == ERROR_IO_PENDING {
                     return Ok(None);
                 }
+                // Any result other than INCOMPLETE means the I/O manager no
+                // longer owns our buffers, even when the request failed.
+                self.state.complete();
                 if err == ERROR_OPERATION_ABORTED {
                     return Err(anyhow!("the driver cancelled the pending control call"));
                 }
                 return Err(anyhow!("pending control call failed: error {err}"));
             }
-            if n as usize != wire::CONTROL_EVENT_BYTES {
-                return Err(anyhow!("pending control call returned {n} bytes"));
-            }
-            wire::decode_control_event(self.buf.as_ref())
+            self.state.complete();
+            decode_control_pend_completion(n, self.buf.as_ref())
                 .map(Some)
-                .ok_or_else(|| anyhow!("undecodable control event"))
+                .map_err(|message| anyhow!("{message}"))
         }
     }
 }
@@ -3587,9 +3703,16 @@ pub mod session {
                 );
             }
 
-            // Best effort: a driver that refuses the inverted call is still
-            // perfectly usable for binding.
-            s.pending = PendingCall::issue(&s.handle).unwrap_or(None);
+            // Protocol v7 makes endpoint identity and exact device-volume
+            // synchronization part of the driver contract.  A session without
+            // its inverted control call can still publish devices, but it can
+            // never observe a user's scalar/mute changes; accepting that state
+            // would turn an attach-time error into a permanent silent failure.
+            s.pending = Some(PendingCall::issue(&s.handle).map_err(|error| {
+                SessionError::Handshake(format!(
+                    "arming the driver control-event call failed: {error:#}"
+                ))
+            })?);
 
             Ok(s)
         }
@@ -3727,7 +3850,7 @@ pub mod session {
         /// actually reaches the Windows audio engine. Clear on every driver
         /// built before 2026-08-09.
         pub fn has_volume_event(&self) -> bool {
-            self.caps & wire::CAP_VOLUMEEVENT != 0
+            wire::caps_have_volume_event(self.caps)
         }
 
         /// `IOCTL_STREAMSTAT`: how deep the WAVERT stage is for one endpoint.
@@ -3819,7 +3942,7 @@ pub mod session {
         }
 
         /// True when the driver could only enforce the DACL — i.e. nobody has
-        /// written `AudioHubDaemonImage` into the device software key. Surfaced
+        /// written `AudioHubDaemonImage` into the device hardware key. Surfaced
         /// rather than silently accepted: a degraded check that nobody can see
         /// is the same as no check.
         pub fn identity_check_degraded(&self) -> bool {
@@ -3930,24 +4053,13 @@ pub mod session {
 
         /// Drains whatever the driver has pushed, and re-arms. Empty through
         /// M6-2.
-        pub fn poll_events(&mut self) -> Vec<wire::ControlEvent> {
-            let mut out = Vec::new();
-            loop {
-                let Some(p) = self.pending.as_mut() else {
-                    return out;
-                };
-                match p.poll(&self.handle) {
-                    Ok(Some(ev)) => {
-                        out.push(ev);
-                        self.pending = PendingCall::issue(&self.handle).unwrap_or(None);
-                    }
-                    Ok(None) => return out,
-                    Err(_) => {
-                        self.pending = None;
-                        return out;
-                    }
-                }
-            }
+        pub fn poll_events(&mut self) -> Result<Vec<wire::ControlEvent>> {
+            let handle = &self.handle;
+            super::drain_control_pend(
+                &mut self.pending,
+                |pending| pending.poll(handle),
+                || PendingCall::issue(handle),
+            )
         }
     }
 
@@ -4052,10 +4164,11 @@ mod tests {
         assert_eq!(MAP_REPLY_BYTES, 296);
         assert_eq!(NOTIFY_REQUEST_BYTES, 24);
         assert_eq!(NOTIFY_REPLY_BYTES, 8);
-        // v6 changes the meaning of bind flags, not any struct size.
+        // v6 changes bind-flag meaning and v7 adds a mandatory endpoint
+        // property; neither changes an IOCTL struct size.
         assert_eq!(
-            PROTOCOL_VERSION, 6,
-            "the direction-mask contract is version 6"
+            PROTOCOL_VERSION, 7,
+            "endpoint identity is mandatory in driver protocol 7"
         );
     }
 
@@ -4626,6 +4739,126 @@ mod tests {
         assert_eq!(decode_control_event(&b).unwrap().scalar(), 1.0);
     }
 
+    fn control_event_bytes(event: ControlEvent) -> [u8; CONTROL_EVENT_BYTES] {
+        let mut b = [0u8; CONTROL_EVENT_BYTES];
+        b[0..4].copy_from_slice(&event.kind.to_le_bytes());
+        b[4..8].copy_from_slice(&event.slot.to_le_bytes());
+        b[8..12].copy_from_slice(&event.generation.to_le_bytes());
+        b[12..16].copy_from_slice(&event.flags.to_le_bytes());
+        b[16..20].copy_from_slice(&event.scalar_q16.to_le_bytes());
+        b[20..24].copy_from_slice(&event.state.to_le_bytes());
+        b
+    }
+
+    fn pending_test_event(slot: u32) -> ControlEvent {
+        ControlEvent {
+            kind: EVENT_VOLUME,
+            slot,
+            generation: 40 + slot,
+            flags: EVFLAG_INPUT,
+            scalar_q16: 0x8000,
+            state: 0,
+        }
+    }
+
+    /// A successful inline `DeviceIoControl` is a delivered event, not the
+    /// absence of a request. `PendingCall::poll` consumes this state before it
+    /// asks `GetOverlappedResult`, and Drop must not cancel it.
+    #[test]
+    fn control_pend_inline_completion_is_ready_and_not_cancellable() {
+        let want = pending_test_event(3);
+        let bytes = control_event_bytes(want);
+        let mut state = super::ControlPendState::from_inline(CONTROL_EVENT_BYTES as u32, &bytes)
+            .expect("an exact inline completion");
+
+        assert!(!state.is_outstanding());
+        assert_eq!(state.take_ready(), Some(want));
+        assert_eq!(
+            state.take_ready(),
+            None,
+            "the event is consumed exactly once"
+        );
+        assert!(!state.is_outstanding());
+    }
+
+    /// Both halves of the inline completion contract are checked: the I/O
+    /// manager must report exactly 24 bytes and those bytes must decode as the
+    /// fixed-size control event.
+    #[test]
+    fn control_pend_inline_completion_validates_size_and_decode() {
+        let bytes = control_event_bytes(pending_test_event(4));
+        let short_count =
+            super::ControlPendState::from_inline((CONTROL_EVENT_BYTES - 1) as u32, &bytes)
+                .expect_err("a short I/O result cannot be an event");
+        assert!(short_count.contains("23 bytes"), "{short_count}");
+
+        let undecodable = super::ControlPendState::from_inline(
+            CONTROL_EVENT_BYTES as u32,
+            &bytes[..CONTROL_EVENT_BYTES - 1],
+        )
+        .expect_err("a short buffer cannot decode even with a claimed full count");
+        assert!(undecodable.contains("undecodable"), "{undecodable}");
+    }
+
+    /// Models `Session::open` getting one inline event, `poll_events` getting a
+    /// second while it re-arms, and the third issue finally parking. Every
+    /// ready event is returned and the outstanding call remains installed.
+    #[test]
+    fn control_pend_rearm_drains_inline_chain_then_leaves_one_outstanding() {
+        let first = pending_test_event(1);
+        let second = pending_test_event(2);
+        let first_bytes = control_event_bytes(first);
+        let mut pending = Some(
+            super::ControlPendState::from_inline(CONTROL_EVENT_BYTES as u32, &first_bytes).unwrap(),
+        );
+        let mut rearmed = [
+            super::ControlPendState::Ready(second),
+            super::ControlPendState::Outstanding,
+        ]
+        .into_iter();
+
+        let events = super::drain_control_pend(
+            &mut pending,
+            |state| Ok::<_, ()>(state.take_ready()),
+            || rearmed.next().ok_or(()),
+        )
+        .unwrap();
+
+        assert_eq!(events, vec![first, second]);
+        assert_eq!(pending, Some(super::ControlPendState::Outstanding));
+        assert!(rearmed.next().is_none(), "re-armed exactly once per event");
+    }
+
+    #[test]
+    fn control_pend_failure_is_reported_instead_of_disabling_events_silently() {
+        let mut pending = Some(super::ControlPendState::Outstanding);
+        let error = super::drain_control_pend(
+            &mut pending,
+            |_state| Err::<Option<ControlEvent>, _>("driver event call failed"),
+            || Ok(super::ControlPendState::Outstanding),
+        )
+        .expect_err("the service loop must detach and reopen this session");
+        assert_eq!(error, "driver event call failed");
+        assert!(pending.is_none());
+    }
+
+    /// This is the predicate used by `PendingCall::drop`: Ready and Complete
+    /// own no kernel request; only Outstanding needs cancel-and-wait.
+    #[test]
+    fn control_pend_cancel_ownership_is_true_only_while_outstanding() {
+        let mut ready = super::ControlPendState::Ready(pending_test_event(9));
+        let mut outstanding = super::ControlPendState::Outstanding;
+        let complete = super::ControlPendState::Complete;
+
+        assert!(!ready.is_outstanding());
+        assert!(outstanding.is_outstanding());
+        assert!(!complete.is_outstanding());
+        assert!(ready.take_ready().is_some());
+        outstanding.complete();
+        assert!(!ready.is_outstanding());
+        assert!(!outstanding.is_outstanding());
+    }
+
     // -- MAP_RINGS ----------------------------------------------------------
 
     /// Every field at the byte offset the C header asserts, checked by writing
@@ -5004,7 +5237,7 @@ mod tests {
 
     // -- capabilities -------------------------------------------------------
 
-    /// The two capability bits are independent, and reading one for the other
+    /// The capability bits are independent, and reading one for the other
     /// is the SQUARED-ATTENUATION defect: a driver with rings but no volume
     /// node hands over pre-attenuated samples, and a daemon that took
     /// `has_dataplane` as licence to sync volume would apply the setting twice.
@@ -5012,14 +5245,19 @@ mod tests {
     fn the_capability_bits_are_independent_and_read_from_their_own_bit() {
         assert_eq!(CAP_DATAPLANE.count_ones(), 1);
         assert_eq!(CAP_VOLUME.count_ones(), 1);
+        assert_eq!(CAP_VOLUMEEVENT.count_ones(), 1);
         assert_eq!(CAP_DATAPLANE & CAP_VOLUME, 0);
+        assert_eq!(CAP_DATAPLANE & CAP_VOLUMEEVENT, 0);
+        assert_eq!(CAP_VOLUME & CAP_VOLUMEEVENT, 0);
 
         let hello = |caps: u32| {
             let mut b = [0u8; HELLO_REPLY_BYTES];
             b[12..16].copy_from_slice(&caps.to_le_bytes());
             decode_hello_reply(&b).unwrap()
         };
-        assert!(!hello(0).has_dataplane() && !hello(0).has_volume());
+        assert!(
+            !hello(0).has_dataplane() && !hello(0).has_volume() && !hello(0).has_volume_event()
+        );
         assert!(hello(CAP_DATAPLANE).has_dataplane());
         assert!(
             !hello(CAP_DATAPLANE).has_volume(),
@@ -5030,10 +5268,23 @@ mod tests {
             !hello(CAP_VOLUME).has_dataplane(),
             "a volume node does not imply rings"
         );
+        assert!(hello(CAP_VOLUMEEVENT).has_volume_event());
+        assert!(
+            !hello(CAP_VOLUMEEVENT).has_volume(),
+            "an event path does not imply a volume node"
+        );
+        assert!(
+            !hello(CAP_VOLUME).has_volume_event(),
+            "a volume node does not imply that notify reaches Windows"
+        );
         let both = hello(CAP_DATAPLANE | CAP_VOLUME);
         assert!(both.has_dataplane() && both.has_volume());
         // An unknown future bit must move neither answer.
-        assert!(!hello(0x8000_0000).has_dataplane() && !hello(0x8000_0000).has_volume());
+        assert!(
+            !hello(0x8000_0000).has_dataplane()
+                && !hello(0x8000_0000).has_volume()
+                && !hello(0x8000_0000).has_volume_event()
+        );
     }
 
     // -- ring geometry ------------------------------------------------------

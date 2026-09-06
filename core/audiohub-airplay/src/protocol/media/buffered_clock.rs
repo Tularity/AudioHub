@@ -62,6 +62,9 @@ pub(crate) struct PlaybackAnchor {
     pub(crate) timeline_id: u64,
     pub(crate) remote_time_ns: u64,
     pub(crate) rtp_time: u32,
+    /// Telemetry generation in which the authenticated control anchor was
+    /// accepted. Scheduling must bind this to the frame and mapper tokens.
+    pub(crate) telemetry_token: crate::telemetry::OperationToken,
 }
 
 #[cfg(test)]

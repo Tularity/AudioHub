@@ -118,7 +118,7 @@ static ULONG            g_EventCount    = 0;
 static ULONG64          g_EventsDropped = 0;
 
 //
-// Caller-identity policy, loaded from the device software key at StartDevice.
+// Caller-identity policy, loaded from the device hardware key at StartDevice.
 //
 static ULONG            g_ClientCheck   = AH_CLIENT_CHECK_ACL_ONLY;
 static UNICODE_STRING   g_ExpectedImage = { 0, 0, NULL };
@@ -361,7 +361,7 @@ AhCtlLoadPolicy(
     if (g_ClientCheck < AH_CLIENT_CHECK_IMAGEPATH)
     {
         DPF(D_ERROR, ("[AhCtlLoadPolicy] running at client_check=%u (ACL only): set "
-                      "AudioHubDaemonImage in the device software key to raise it",
+                      "AudioHubDaemonImage in the device hardware key to raise it",
                       g_ClientCheck));
     }
 
@@ -938,8 +938,9 @@ AhCtlDeviceControl(
         }
 
         //
-        // Last line of defence for the v6 invariant. Everything below this
-        // point has already been checked inside perpeer.cpp, but the promise is
+        // Last line of defence for the v6-and-later direction invariant.
+        // Everything below this point has already been checked inside
+        // perpeer.cpp, but the promise is
         // exact equality with the requested render/capture mask -- including
         // legitimate one-direction and zero masks. Re-check it at the boundary
         // where the reply is actually made.

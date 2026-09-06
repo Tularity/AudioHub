@@ -18,6 +18,7 @@
   // so without this the parent's `"exclude": ["src/**/*.test.ts"]` cancels out
   // every path this project `include`s and the whole project typechecks as one
   // file (vitest.config.ts) -- silently, with exit code 0. `check-test-project`
-  // in package.json fails the build if that ever happens again.
+  // in package.json fails the explicit test preflight if that ever happens
+  // again. Production `npm run build` does not load this project.
   "exclude": []
 }

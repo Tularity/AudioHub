@@ -1,6 +1,7 @@
 #!/bin/zsh
 # Build the distributable macOS AudioHub.app (spec-app.md §2).
-#   0) npm install + vite build  (app/frontend -> app/ui, what Tauri embeds)
+#   0) verify provisioned npm dependencies + Vite build
+#      (app/frontend -> app/ui, what Tauri embeds)
 #   1) build audiohubd + internal CLI
 #   2) build/sign the HAL driver and its privileged component package
 #   3) icons: make-icons.py -> sips/iconutil -> icon.icns   (system tools only)
@@ -23,6 +24,14 @@ step() { print -ru2 -- "[audiohub] ==== $* ===="; }
 die()  { print -ru2 -- "[audiohub] ERROR: $*"; exit 1; }
 
 [[ "$(uname -s)" == "Darwin" ]] || die "build-app.sh builds the macOS .app; run it on macOS"
+HOST_ARCH="$(uname -m)"
+EXPECTED_APP_ARCH="${AUDIOHUB_EXPECTED_APP_ARCH:-$HOST_ARCH}"
+case "$EXPECTED_APP_ARCH" in
+  arm64|x86_64) ;;
+  *) die "AUDIOHUB_EXPECTED_APP_ARCH must be arm64 or x86_64" ;;
+esac
+[[ "$HOST_ARCH" == "$EXPECTED_APP_ARCH" ]] \
+  || die "macOS build host architecture is $HOST_ARCH, expected $EXPECTED_APP_ARCH"
 
 # Every official macOS build mutates shared inputs before the App is signed:
 # Vite's app/ui, the target-suffixed sidecars, the driver package whose digest
@@ -68,6 +77,23 @@ fi
 
 TRIPLE="$(rustc -vV | awk '/^host: /{print $2}')"
 [[ -n "$TRIPLE" ]] || die "could not determine host triple from rustc -vV"
+case "$EXPECTED_APP_ARCH:$TRIPLE" in
+  arm64:aarch64-apple-darwin|x86_64:x86_64-apple-darwin) ;;
+  *) die "Rust host triple $TRIPLE does not match native macOS architecture $EXPECTED_APP_ARCH" ;;
+esac
+
+FRONTEND="$APP_DIR/frontend"
+command -v npm >/dev/null 2>&1 \
+  || die "npm not found — provision Node 20.19+ or 22.12+ before BuildOnly"
+node -e '
+const [major, minor] = process.versions.node.split(".").map(Number);
+if (!((major === 20 && minor >= 19) || major > 22 || (major === 22 && minor >= 12))) {
+  process.stderr.write(`unsupported Node ${process.versions.node}; require 20.19+ or 22.12+\n`);
+  process.exit(1);
+}
+' || die "Node does not satisfy the frontend build requirement"
+[[ -d "$FRONTEND/node_modules" ]] \
+  || die "frontend dependencies are not provisioned; run npm ci --ignore-scripts in a separate dependency stage"
 
 # Keep the binary-distribution notices tied to the exact locked dependency
 # graphs being built. The generator is deterministic and refuses unresolved
@@ -102,13 +128,7 @@ node "$ROOT/scripts/generate-third-party-licenses.mjs"
 #     bundled silently — the app would ship whatever was there last time.
 # beforeBuildCommand in tauri.conf.json runs it a second time (cheap, ~1s) so a
 # bare `cargo tauri build` is safe too.
-FRONTEND="$APP_DIR/frontend"
-step "0/5 frontend (npm + vite build -> app/ui)"
-command -v npm >/dev/null 2>&1 || die "npm not found — the UI is a Vite/React build now; install Node 18+"
-if [[ ! -d "$FRONTEND/node_modules" ]]; then
-  print -ru2 -- "[audiohub] node_modules missing; running npm install"
-  ( cd "$FRONTEND" && npm install --no-audit --no-fund )
-fi
+step "0/5 frontend (pre-provisioned npm dependencies + vite build -> app/ui)"
 ( cd "$FRONTEND" && npm run build )
 [[ -f "$APP_DIR/ui/index.html" ]] || die "vite produced no app/ui/index.html"
 print -ru2 -- "[audiohub] frontend: $(ls "$APP_DIR/ui/assets" | tr '\n' ' ')"
@@ -162,10 +182,8 @@ cp -f "$DAEMON" "$TAURI_DIR/binaries/audiohubd-$TRIPLE"
 chmod +x "$TAURI_DIR/binaries/audiohubd-$TRIPLE"
 
 # ------------------------------------------------------------- 4) tauri build
-if ! cargo tauri --version >/dev/null 2>&1; then
-  print -ru2 -- "[audiohub] cargo-tauri not installed; installing (pure Rust, takes a while)"
-  cargo install tauri-cli --version "^2" --locked
-fi
+cargo tauri --version >/dev/null 2>&1 \
+  || die "cargo-tauri is not provisioned; install tauri-cli 2.x before BuildOnly"
 ( cd "$TAURI_DIR" && cargo tauri build --bundles app )
 
 BUNDLE="$TAURI_DIR/target/release/bundle/macos/AudioHub.app"
@@ -244,6 +262,12 @@ SIDE_CLI="$BUNDLE/Contents/MacOS/audiohub"
 [[ -x "$SIDE" ]] || die "daemon not bundled next to the executable ($SIDE) — the .app cannot self-bootstrap"
 [[ -x "$SIDE_CLI" ]] || die "internal CLI not bundled next to the executable ($SIDE_CLI)"
 [[ ! "$EXE" -ef "$SIDE" ]] || die "app executable and daemon resolve to the SAME file — nothing was bundled"
+for MACH_O in "$EXE" "$SIDE" "$SIDE_CLI"; do
+  ARCHS="$(/usr/bin/lipo -archs "$MACH_O" 2>/dev/null)" \
+    || die "could not inspect Mach-O architecture: $MACH_O"
+  [[ "$ARCHS" == "$EXPECTED_APP_ARCH" ]] \
+    || die "$MACH_O has architecture '$ARCHS', expected one thin $EXPECTED_APP_ARCH slice"
+done
 [[ -s "$BUNDLE/Contents/Resources/installer/AudioHubDriver.pkg" ]] \
   || die "driver repair package is missing from the App bundle"
 [[ -x "$BUNDLE/Contents/Resources/installer/install-daemon.sh" ]] \
@@ -256,13 +280,6 @@ cmp -s "$ROOT/NOTICE.md" "$LICENSES/AudioHub-NOTICE.md" \
   || die "AudioHub notices are missing or changed in the bundle"
 cmp -s "$ROOT/THIRD-PARTY-LICENSES.html" "$LICENSES/THIRD-PARTY-LICENSES.html" \
   || die "third-party license report is missing or changed in the bundle"
-# Throwaway config dir: `id` would otherwise materialise a key in the real one.
-PROBE="$(mktemp -d)"
-AUDIOHUB_CONFIG_DIR="$PROBE" "$SIDE_CLI" id --json 2>/dev/null | python3 -c \
-  'import json,sys; sys.exit(0 if json.load(sys.stdin).get("fingerprint") else 1)' \
-  || { rm -rf "$PROBE"; die "bundled CLI did not answer 'id --json'"; }
-rm -rf "$PROBE"
-
 # The package installs only the App. On first launch, the App validates its
 # bundled daemon and asks for one explicit authorization before installing and
 # machine-locally signing the independent runtime service. The driver remains
@@ -275,6 +292,7 @@ DMG="$(zsh "$ROOT/scripts/build-macos-dmg.sh" "$PKG" | tail -n 1)"
 print -ru2 -- "[audiohub] bundle:  $BUNDLE"
 print -ru2 -- "[audiohub] app exe: $EXE"
 print -ru2 -- "[audiohub] daemon:  $SIDE ($(stat -f %z "$SIDE") bytes)"
+print -ru2 -- "[audiohub] app architecture: $EXPECTED_APP_ARCH (HAL package remains universal)"
 print -ru2 -- "[audiohub] pkg:     $PKG"
 print -ru2 -- "[audiohub] dmg:     $DMG"
 print -ru2 -- "[audiohub] open it:  open '$BUNDLE'"

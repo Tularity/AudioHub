@@ -39,6 +39,10 @@ const MAX_PENDING_SYNCS: usize = 128;
 const MAX_CLOCK_SOURCES: usize = 64;
 const SAMPLE_CHANNEL_CAPACITY: usize = 128;
 const MAPPER_WINDOW: Duration = Duration::from_secs(2);
+/// A frame may wait this long for the mapper's initial three-sample window
+/// before `NotReady` becomes a telemetry failure. Audio behavior remains a
+/// hold in both cases.
+pub(crate) const DEADLINE_NOT_READY_WARMUP: Duration = MAPPER_WINDOW;
 const MAPPER_MAX_SAMPLES: usize = 32;
 const MAPPER_MIN_SAMPLES: usize = 3;
 const MAPPER_MAX_OFFSET_STEP_NS: i128 = 250_000_000;
@@ -70,6 +74,7 @@ enum Message {
 struct Announcement {
     grandmaster: u64,
     received_at: Instant,
+    telemetry_token: crate::telemetry::OperationToken,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77,6 +82,7 @@ struct PendingSync {
     received_at: Instant,
     correction_scaled_ns: i64,
     grandmaster: u64,
+    telemetry_token: crate::telemetry::OperationToken,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +90,7 @@ struct PendingFollowUp {
     received_at: Instant,
     correction_scaled_ns: i64,
     origin_ns: u64,
+    telemetry_token: crate::telemetry::OperationToken,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,6 +108,9 @@ pub(crate) struct PtpClockSample {
     pub(crate) grandmaster: u64,
     pub(crate) remote_time_ns: u64,
     pub(crate) received_at: Instant,
+    /// Reset generation captured when Sync entered the observer. A queued
+    /// pre-reset sample must stay inert after a telemetry reset.
+    pub(crate) telemetry_token: crate::telemetry::OperationToken,
 }
 
 /// Authenticated IEEE 1588 identity advertised by the AirPlay sender for
@@ -203,6 +213,7 @@ impl PtpClockSource {
         anchor: PlaybackAnchor,
         packet_rtp: u32,
         sample_rate: u32,
+        _telemetry_token: crate::telemetry::OperationToken,
     ) -> Option<Result<Instant, PtpClockError>> {
         #[cfg(target_os = "macos")]
         if let Some(port) = self.mac_port.as_ref() {
@@ -266,10 +277,14 @@ pub(crate) struct PtpObserver {
     announcements: HashMap<(IpAddr, PortIdentity), Announcement>,
     pending_syncs: HashMap<SyncKey, PendingSync>,
     pending_follow_ups: HashMap<SyncKey, PendingFollowUp>,
-    completed_pairs: HashMap<SyncKey, Instant>,
+    completed_pairs: HashMap<SyncKey, (Instant, crate::telemetry::OperationToken)>,
 }
 
 impl PtpObserver {
+    fn completed_pair_is_duplicate(&self, key: SyncKey) -> bool {
+        self.completed_pairs.contains_key(&key)
+    }
+
     /// Bind the standard AirPlay PTP ports before advertising the receiver.
     /// Failure is fatal: continuing would claim a timing capability that this
     /// process cannot actually observe.
@@ -366,6 +381,8 @@ impl PtpObserver {
         };
         let mut event = [0u8; 256];
         let mut general = [0u8; 512];
+        let mut prune_tick = tokio::time::interval(Duration::from_millis(250));
+        prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 received = event_socket.recv_from(&mut event) => {
@@ -376,24 +393,59 @@ impl PtpObserver {
                     let (length, peer) = received?;
                     self.receive(&general[..length], peer, PTP_GENERAL_PORT, Instant::now());
                 }
+                _ = prune_tick.tick() => {
+                    self.prune(Instant::now());
+                }
             }
         }
     }
 
     fn receive(&mut self, packet: &[u8], peer: SocketAddr, local_port: u16, received_at: Instant) {
+        let telemetry_token = crate::telemetry::operation_token();
         // AirPlay uses symmetric well-known ports. Requiring this also keeps a
         // random LAN datagram from becoming a clock observation accidentally.
         if peer.port() != local_port {
+            crate::telemetry::record_ptp_datagram(
+                telemetry_token,
+                peer.ip(),
+                peer.port(),
+                local_port,
+                None,
+                false,
+                "source_port_mismatch",
+            );
             return;
         }
-        let Ok(message) = parse_message(packet) else {
-            return;
+        let message = match parse_message(packet) {
+            Ok(message) => message,
+            Err(error) => {
+                crate::telemetry::record_ptp_datagram(
+                    telemetry_token,
+                    peer.ip(),
+                    peer.port(),
+                    local_port,
+                    None,
+                    false,
+                    error.telemetry_reason(),
+                );
+                return;
+            }
         };
+        let message_name = message.telemetry_name();
         let expected_port = match message {
             Message::Sync { .. } => PTP_EVENT_PORT,
             Message::Announce { .. } | Message::FollowUp { .. } => PTP_GENERAL_PORT,
         };
         if local_port != expected_port {
+            crate::telemetry::record_ptp_datagram(
+                telemetry_token,
+                peer.ip(),
+                peer.port(),
+                local_port,
+                Some(message_name),
+                false,
+                "message_port_mismatch",
+            );
             return;
         }
 
@@ -412,7 +464,13 @@ impl PtpObserver {
                         .min_by_key(|(_, value)| value.received_at)
                         .map(|(key, _)| *key)
                     {
-                        self.announcements.remove(&oldest);
+                        if let Some(announcement) = self.announcements.remove(&oldest) {
+                            crate::telemetry::record_ptp_pending_disposition(
+                                announcement.telemetry_token,
+                                "announcement_evicted",
+                                1,
+                            );
+                        }
                     }
                 }
                 self.announcements.insert(
@@ -420,7 +478,17 @@ impl PtpObserver {
                     Announcement {
                         grandmaster,
                         received_at,
+                        telemetry_token,
                     },
+                );
+                crate::telemetry::record_ptp_datagram(
+                    telemetry_token,
+                    peer.ip(),
+                    peer.port(),
+                    local_port,
+                    Some(message_name),
+                    true,
+                    "announcement_observed",
                 );
             }
             Message::Sync { header } => {
@@ -429,10 +497,28 @@ impl PtpObserver {
                     source: header.source,
                     sequence: header.sequence,
                 };
-                if self.completed_pairs.contains_key(&key) {
+                if self.completed_pair_is_duplicate(key) {
+                    crate::telemetry::record_ptp_datagram(
+                        telemetry_token,
+                        peer.ip(),
+                        peer.port(),
+                        local_port,
+                        Some(message_name),
+                        false,
+                        "duplicate_completed_pair",
+                    );
                     return;
                 }
                 let Some(announcement) = self.announcements.get(&(peer.ip(), header.source)) else {
+                    crate::telemetry::record_ptp_datagram(
+                        telemetry_token,
+                        peer.ip(),
+                        peer.port(),
+                        local_port,
+                        Some(message_name),
+                        false,
+                        "missing_announcement",
+                    );
                     return;
                 };
                 if self.pending_syncs.len() >= MAX_PENDING_SYNCS {
@@ -442,7 +528,13 @@ impl PtpObserver {
                         .min_by_key(|(_, value)| value.received_at)
                         .map(|(key, _)| *key)
                     {
-                        self.pending_syncs.remove(&oldest);
+                        if let Some(pending) = self.pending_syncs.remove(&oldest) {
+                            crate::telemetry::record_ptp_pending_disposition(
+                                pending.telemetry_token,
+                                "pending_sync_evicted",
+                                1,
+                            );
+                        }
                     }
                 }
                 self.pending_syncs.entry(key).or_insert(PendingSync {
@@ -452,8 +544,18 @@ impl PtpObserver {
                     // when Sync arrived. A subsequent Announce must not
                     // relabel a partly received two-step exchange.
                     grandmaster: announcement.grandmaster,
+                    telemetry_token,
                 });
                 self.emit_completed_pair(key, received_at);
+                crate::telemetry::record_ptp_datagram(
+                    telemetry_token,
+                    peer.ip(),
+                    peer.port(),
+                    local_port,
+                    Some(message_name),
+                    true,
+                    "sync_observed",
+                );
             }
             Message::FollowUp { header, origin_ns } => {
                 let key = SyncKey {
@@ -461,7 +563,16 @@ impl PtpObserver {
                     source: header.source,
                     sequence: header.sequence,
                 };
-                if self.completed_pairs.contains_key(&key) {
+                if self.completed_pair_is_duplicate(key) {
+                    crate::telemetry::record_ptp_datagram(
+                        telemetry_token,
+                        peer.ip(),
+                        peer.port(),
+                        local_port,
+                        Some(message_name),
+                        false,
+                        "duplicate_completed_pair",
+                    );
                     return;
                 }
                 if self.pending_follow_ups.len() >= MAX_PENDING_SYNCS {
@@ -471,7 +582,13 @@ impl PtpObserver {
                         .min_by_key(|(_, value)| value.received_at)
                         .map(|(key, _)| *key)
                     {
-                        self.pending_follow_ups.remove(&oldest);
+                        if let Some(pending) = self.pending_follow_ups.remove(&oldest) {
+                            crate::telemetry::record_ptp_pending_disposition(
+                                pending.telemetry_token,
+                                "pending_follow_up_evicted",
+                                1,
+                            );
+                        }
                     }
                 }
                 self.pending_follow_ups
@@ -480,8 +597,18 @@ impl PtpObserver {
                         received_at,
                         correction_scaled_ns: header.correction_scaled_ns,
                         origin_ns,
+                        telemetry_token,
                     });
                 self.emit_completed_pair(key, received_at);
+                crate::telemetry::record_ptp_datagram(
+                    telemetry_token,
+                    peer.ip(),
+                    peer.port(),
+                    local_port,
+                    Some(message_name),
+                    true,
+                    "follow_up_observed",
+                );
             }
         }
     }
@@ -493,6 +620,7 @@ impl PtpObserver {
         ) else {
             return;
         };
+        let sample_token = sync.telemetry_token;
         let separation = if sync.received_at >= follow_up.received_at {
             sync.received_at.duration_since(follow_up.received_at)
         } else {
@@ -501,6 +629,7 @@ impl PtpObserver {
         self.pending_syncs.remove(&key);
         self.pending_follow_ups.remove(&key);
         if separation > PAIR_LIFETIME {
+            crate::telemetry::record_ptp_pending_disposition(sample_token, "pair_expired", 1);
             return;
         }
 
@@ -508,38 +637,87 @@ impl PtpObserver {
             i128::from(sync.correction_scaled_ns) + i128::from(follow_up.correction_scaled_ns);
         let corrected_scaled = i128::from(follow_up.origin_ns) * 65_536 + correction;
         let Ok(remote_time_ns) = u64::try_from(corrected_scaled.div_euclid(65_536)) else {
+            crate::telemetry::record_ptp_pending_disposition(
+                sample_token,
+                "invalid_time_conversion",
+                1,
+            );
             return;
         };
         if self.completed_pairs.len() >= MAX_PENDING_SYNCS {
             if let Some(oldest) = self
                 .completed_pairs
                 .iter()
-                .min_by_key(|(_, received_at)| *received_at)
+                .min_by_key(|(_, (received_at, _))| *received_at)
                 .map(|(key, _)| *key)
             {
-                self.completed_pairs.remove(&oldest);
+                if let Some((_, token)) = self.completed_pairs.remove(&oldest) {
+                    crate::telemetry::record_ptp_pending_disposition(
+                        token,
+                        "completed_pair_evicted",
+                        1,
+                    );
+                }
             }
         }
-        self.completed_pairs.insert(key, now);
-        let _ = self.samples.send(PtpClockSample {
-            peer: key.peer,
-            grandmaster: sync.grandmaster,
-            remote_time_ns,
-            received_at: sync.received_at,
-        });
+        self.completed_pairs.insert(key, (now, sample_token));
+        let delivered = self
+            .samples
+            .send(PtpClockSample {
+                peer: key.peer,
+                grandmaster: sync.grandmaster,
+                remote_time_ns,
+                received_at: sync.received_at,
+                telemetry_token: sample_token,
+            })
+            .is_ok();
+        crate::telemetry::record_ptp_sample_emitted(sample_token, delivered);
     }
 
     fn prune(&mut self, now: Instant) {
-        self.pending_syncs
-            .retain(|_, sync| now.saturating_duration_since(sync.received_at) <= PAIR_LIFETIME);
-        self.pending_follow_ups.retain(|_, follow_up| {
-            now.saturating_duration_since(follow_up.received_at) <= PAIR_LIFETIME
+        self.pending_syncs.retain(|_, sync| {
+            let keep = now.saturating_duration_since(sync.received_at) <= PAIR_LIFETIME;
+            if !keep {
+                crate::telemetry::record_ptp_pending_disposition(
+                    sync.telemetry_token,
+                    "pending_sync_expired",
+                    1,
+                );
+            }
+            keep
         });
-        self.completed_pairs.retain(|_, completed_at| {
-            now.saturating_duration_since(*completed_at) <= PAIR_LIFETIME
+        self.pending_follow_ups.retain(|_, follow_up| {
+            let keep = now.saturating_duration_since(follow_up.received_at) <= PAIR_LIFETIME;
+            if !keep {
+                crate::telemetry::record_ptp_pending_disposition(
+                    follow_up.telemetry_token,
+                    "pending_follow_up_expired",
+                    1,
+                );
+            }
+            keep
+        });
+        self.completed_pairs.retain(|_, (completed_at, token)| {
+            let keep = now.saturating_duration_since(*completed_at) <= PAIR_LIFETIME;
+            if !keep {
+                crate::telemetry::record_ptp_pending_disposition(
+                    *token,
+                    "completed_pair_expired",
+                    1,
+                );
+            }
+            keep
         });
         self.announcements.retain(|_, announce| {
-            now.saturating_duration_since(announce.received_at) <= ANNOUNCE_LIFETIME
+            let keep = now.saturating_duration_since(announce.received_at) <= ANNOUNCE_LIFETIME;
+            if !keep {
+                crate::telemetry::record_ptp_pending_disposition(
+                    announce.telemetry_token,
+                    "announcement_expired",
+                    1,
+                );
+            }
+            keep
         });
     }
 }
@@ -629,6 +807,27 @@ enum PtpParseError {
     InvalidTimestamp,
 }
 
+impl Message {
+    fn telemetry_name(self) -> &'static str {
+        match self {
+            Self::Announce { .. } => "announce",
+            Self::Sync { .. } => "sync",
+            Self::FollowUp { .. } => "follow_up",
+        }
+    }
+}
+
+impl PtpParseError {
+    fn telemetry_reason(self) -> &'static str {
+        match self {
+            Self::WrongLength => "parse_wrong_length",
+            Self::UnsupportedProfile => "parse_unsupported_profile",
+            Self::UnsupportedMessage => "parse_unsupported_message",
+            Self::InvalidTimestamp => "parse_invalid_timestamp",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PtpClockEstimate {
     pub(crate) local_minus_remote_ns: i128,
@@ -647,15 +846,24 @@ pub(crate) struct PtpClockMapper {
     epoch: Instant,
     peer: IpAddr,
     grandmaster: u64,
+    telemetry_token: crate::telemetry::OperationToken,
     samples: VecDeque<MapperSample>,
 }
 
 impl PtpClockMapper {
-    pub(crate) fn new(peer: IpAddr, grandmaster: u64, epoch: Instant) -> Self {
+    pub(crate) fn new(
+        peer: IpAddr,
+        grandmaster: u64,
+        epoch: Instant,
+        telemetry_token: crate::telemetry::OperationToken,
+        _media_kind: crate::telemetry::MediaKind,
+    ) -> Self {
+        crate::telemetry::record_ptp_mapper_selected(telemetry_token, peer, grandmaster);
         Self {
             epoch,
             peer,
             grandmaster,
+            telemetry_token,
             samples: VecDeque::with_capacity(MAPPER_MAX_SAMPLES),
         }
     }
@@ -665,6 +873,37 @@ impl PtpClockMapper {
     }
 
     pub(crate) fn observe(
+        &mut self,
+        sample: PtpClockSample,
+    ) -> Result<Option<PtpClockEstimate>, PtpClockError> {
+        if self.telemetry_token != sample.telemetry_token {
+            self.telemetry_token = sample.telemetry_token;
+            crate::telemetry::record_ptp_mapper_selected(
+                sample.telemetry_token,
+                self.peer,
+                self.grandmaster,
+            );
+        }
+        let telemetry_token = sample.telemetry_token;
+        let sample_peer = sample.peer;
+        let sample_grandmaster = sample.grandmaster;
+        let result = self.observe_inner(sample);
+        crate::telemetry::record_ptp_mapper_sample(
+            telemetry_token,
+            self.peer,
+            sample_peer,
+            sample_grandmaster,
+            result.is_ok(),
+            matches!(&result, Ok(Some(_))),
+            result
+                .as_ref()
+                .err()
+                .map_or("accepted", PtpClockError::telemetry_reason),
+        );
+        result
+    }
+
+    fn observe_inner(
         &mut self,
         sample: PtpClockSample,
     ) -> Result<Option<PtpClockEstimate>, PtpClockError> {
@@ -709,6 +948,7 @@ impl PtpClockMapper {
         anchor: PlaybackAnchor,
         packet_rtp: u32,
         sample_rate: u32,
+        _telemetry_token: crate::telemetry::OperationToken,
     ) -> Result<Instant, PtpClockError> {
         if anchor.timeline_id != self.grandmaster {
             return Err(PtpClockError::SourceMismatch);
@@ -785,8 +1025,10 @@ fn div_round_nearest(numerator: i128, denominator: i128) -> i128 {
     }
 }
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PtpClockError {
+    GenerationMismatch,
     SourceMismatch,
     NonMonotonicLocalTime,
     OffsetJump,
@@ -801,6 +1043,7 @@ pub(crate) enum PtpClockError {
 impl fmt::Display for PtpClockError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::GenerationMismatch => "PTP sample belongs to another telemetry generation",
             Self::SourceMismatch => "PTP source does not match the authenticated media session",
             Self::NonMonotonicLocalTime => "PTP receive time moved backwards",
             Self::OffsetJump => "PTP offset jumped outside the safety window",
@@ -811,6 +1054,27 @@ impl fmt::Display for PtpClockError {
             Self::MappedTimeOutOfRange => "PTP-mapped time is outside the local timeline",
             Self::PlatformClockUnavailable => "the platform PTP clock could not map this time",
         })
+    }
+}
+
+impl PtpClockError {
+    pub(crate) fn telemetry_bit(self) -> u16 {
+        1u16 << self as u8
+    }
+
+    pub(crate) fn telemetry_reason(&self) -> &'static str {
+        match self {
+            Self::GenerationMismatch => "generation_mismatch",
+            Self::SourceMismatch => "source_mismatch",
+            Self::NonMonotonicLocalTime => "non_monotonic_local_time",
+            Self::OffsetJump => "offset_jump",
+            Self::NotReady => "not_ready",
+            Self::Stale => "stale",
+            Self::InvalidSampleRate => "invalid_sample_rate",
+            Self::AmbiguousRtpDelta => "ambiguous_rtp_delta",
+            Self::MappedTimeOutOfRange => "mapped_time_out_of_range",
+            Self::PlatformClockUnavailable => "platform_clock_unavailable",
+        }
     }
 }
 
@@ -1061,10 +1325,122 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_reset_preserves_ptp_announce_and_pending_pair_state() {
+        let (samples, mut receiver) = broadcast::channel(8);
+        let mut observer = PtpObserver {
+            event_socket: None,
+            general_socket: None,
+            samples,
+            announcements: HashMap::new(),
+            pending_syncs: HashMap::new(),
+            pending_follow_ups: HashMap::new(),
+            completed_pairs: HashMap::new(),
+        };
+        let peer: IpAddr = "192.0.2.10".parse().unwrap();
+        let base = Instant::now();
+        let mut announce = header(MESSAGE_ANNOUNCE, PTP_ANNOUNCE_BYTES, 1, 0);
+        announce[53..61].copy_from_slice(&GRANDMASTER.to_be_bytes());
+        observer.receive(
+            &announce,
+            SocketAddr::new(peer, PTP_GENERAL_PORT),
+            PTP_GENERAL_PORT,
+            base,
+        );
+
+        let sync = header(MESSAGE_SYNC, PTP_SYNC_BYTES, 17, 0);
+        observer.receive(
+            &sync,
+            SocketAddr::new(peer, PTP_EVENT_PORT),
+            PTP_EVENT_PORT,
+            base + Duration::from_millis(1),
+        );
+        crate::telemetry::reset();
+
+        let mut follow = header(MESSAGE_FOLLOW_UP, PTP_SYNC_BYTES, 17, 0);
+        timestamp(&mut follow, 12, 34);
+        observer.receive(
+            &follow,
+            SocketAddr::new(peer, PTP_GENERAL_PORT),
+            PTP_GENERAL_PORT,
+            base + Duration::from_millis(2),
+        );
+
+        let sample = receiver.try_recv().unwrap();
+        assert_eq!(sample.peer, peer);
+        assert_eq!(sample.grandmaster, GRANDMASTER);
+        assert_eq!(sample.remote_time_ns, 12_000_000_034);
+    }
+
+    #[test]
+    fn telemetry_reset_preserves_mapper_samples_and_existing_anchor() {
+        let epoch = Instant::now();
+        let peer: IpAddr = "192.0.2.10".parse().unwrap();
+        let original_token = crate::telemetry::operation_token();
+        let mut mapper = PtpClockMapper::new(
+            peer,
+            GRANDMASTER,
+            epoch,
+            original_token,
+            crate::telemetry::MediaKind::Buffered,
+        );
+        for index in 1..=3u64 {
+            mapper
+                .observe(PtpClockSample {
+                    peer,
+                    grandmaster: GRANDMASTER,
+                    remote_time_ns: index * 1_000,
+                    received_at: epoch + Duration::from_nanos(index * 1_000 + 100),
+                    telemetry_token: original_token,
+                })
+                .unwrap();
+        }
+        let anchor = PlaybackAnchor {
+            timeline_id: GRANDMASTER,
+            remote_time_ns: 10_000,
+            rtp_time: 100,
+            telemetry_token: original_token,
+        };
+
+        crate::telemetry::reset();
+        let current_token = crate::telemetry::operation_token();
+        assert_eq!(
+            mapper
+                .deadline_for_rtp(
+                    epoch + Duration::from_nanos(3_100),
+                    anchor,
+                    100,
+                    44_100,
+                    current_token,
+                )
+                .unwrap(),
+            epoch + Duration::from_nanos(10_100)
+        );
+
+        let estimate = mapper
+            .observe(PtpClockSample {
+                peer,
+                grandmaster: GRANDMASTER,
+                remote_time_ns: 4_000,
+                received_at: epoch + Duration::from_nanos(4_100),
+                telemetry_token: current_token,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(estimate.retained_samples, 4);
+    }
+
+    #[test]
     fn mapper_requires_matching_fresh_grandmaster_and_maps_wrapping_rtp() {
         let epoch = Instant::now();
         let peer: IpAddr = "192.0.2.10".parse().unwrap();
-        let mut mapper = PtpClockMapper::new(peer, GRANDMASTER, epoch);
+        let telemetry_token = crate::telemetry::operation_token();
+        let mut mapper = PtpClockMapper::new(
+            peer,
+            GRANDMASTER,
+            epoch,
+            telemetry_token,
+            crate::telemetry::MediaKind::Realtime,
+        );
         for index in 1..=3u64 {
             let remote = index * 1_000;
             mapper
@@ -1073,6 +1449,7 @@ mod tests {
                     grandmaster: GRANDMASTER,
                     remote_time_ns: remote,
                     received_at: epoch + Duration::from_nanos(remote + 100),
+                    telemetry_token,
                 })
                 .unwrap();
         }
@@ -1080,6 +1457,7 @@ mod tests {
             timeline_id: GRANDMASTER,
             remote_time_ns: 10_000,
             rtp_time: 0xffff_fff0,
+            telemetry_token,
         };
         assert_eq!(
             mapper
@@ -1088,6 +1466,7 @@ mod tests {
                     anchor,
                     0x0000_03f0,
                     44_100,
+                    telemetry_token,
                 )
                 .unwrap(),
             epoch + Duration::from_nanos(10_000 + 23_219_955 + 100)
@@ -1097,7 +1476,8 @@ mod tests {
                 epoch + Duration::from_secs(3),
                 anchor,
                 anchor.rtp_time,
-                44_100
+                44_100,
+                telemetry_token,
             ),
             Err(PtpClockError::Stale)
         );

@@ -181,6 +181,8 @@ impl TonePlayer {
 fn pump(src: &mut SysAudioSource, secs: f32, keep: bool) -> Vec<f32> {
     let mut out = Vec::new();
     let mut frame: Vec<f32> = Vec::new();
+    let mut mono_frame: Vec<f32> = Vec::new();
+    let capture_channels = usize::from(src.channels().clamp(1, 2));
     let start = Instant::now();
     let deadline = start + Duration::from_secs_f32(secs);
     let mut tick = 0u64;
@@ -193,7 +195,13 @@ fn pump(src: &mut SysAudioSource, secs: f32, keep: bool) -> Vec<f32> {
         tick += 1;
         src.next_frame(&mut frame);
         if keep {
-            out.extend_from_slice(&frame);
+            // SysAudioSource is now an interleaved front-pair source. Feeding
+            // that scalar stream directly to a 48 kHz mono detector turns a
+            // duplicated 1 kHz tone into an apparent 500 Hz signal and makes
+            // every volume-independence leg inconclusive. Keep this probe's
+            // historical mono analysis contract explicit at the boundary.
+            crate::downmix_probe_frame(&frame, capture_channels, &mut mono_frame);
+            out.extend_from_slice(&mono_frame);
         }
     }
     out
@@ -368,9 +376,10 @@ pub fn run(args: &ViArgs, backend: &str, json: bool) -> Result<i32> {
     let rate = SysAudioSource::OUT_RATE;
     let mut src = SysAudioSource::new(FRAME_MS, backend)?;
     let capture_rate = src.capture_rate();
+    let capture_channels = usize::from(src.channels().clamp(1, 2));
     crate::info(&format!(
-        "backend {} ({} Hz), volume {:.3}, legs {:.1}s each",
-        info.id, capture_rate, original.scalar, args.secs
+        "backend {} ({} Hz, {} ch), volume {:.3}, legs {:.1}s each",
+        info.id, capture_rate, capture_channels, original.scalar, args.secs
     ));
 
     // Leg 0 — ambient, tone not running. This is the number that stops silence
@@ -514,6 +523,7 @@ pub fn run(args: &ViArgs, backend: &str, json: bool) -> Result<i32> {
             "backend": info.id,
             "excludes_self": info.excludes_self,
             "capture_rate": capture_rate,
+            "capture_channels": capture_channels,
             "sample_rate": rate,
             "device": args.device,
             "tone_hz": args.tone,
@@ -594,6 +604,39 @@ mod tests {
             off.level < AMP * super::NARROWBAND_SCALE * 0.05,
             "a 1200 Hz tone read {:.5} when asked for 1000 Hz; the passband is too wide",
             off.level
+        );
+    }
+
+    /// `SysAudioSource` preserves the Windows front pair. A duplicated stereo
+    /// tone is `L0,R0,L1,R1,...`; treating those scalars as mono halves the
+    /// apparent frequency and makes the narrowband leg detector miss it.
+    #[test]
+    fn volume_legs_analyze_interleaved_stereo_at_the_frame_rate() {
+        const SR: u32 = 48_000;
+        const AMP: f32 = 0.3;
+        let mono = audiohub_core::dsp::gen_sine(1000.0, SR, SR as usize / 2, AMP);
+        let mut interleaved = Vec::with_capacity(mono.len() * 2);
+        for sample in &mono {
+            interleaved.extend_from_slice(&[*sample, *sample]);
+        }
+
+        let mut downmixed = Vec::new();
+        crate::downmix_probe_frame(&interleaved, 2, &mut downmixed);
+        assert_eq!(downmixed.len(), mono.len());
+
+        let measured = super::measure(&downmixed, SR, 1000.0);
+        let want = AMP * super::NARROWBAND_SCALE;
+        let err_db = 20.0 * (measured.level / want).log10();
+        assert!(
+            err_db.abs() <= 0.5,
+            "stereo downmix moved the 1 kHz leg by {err_db:.2} dB"
+        );
+
+        let source = read("volindep.rs");
+        assert!(
+            source
+                .contains("crate::downmix_probe_frame(&frame, capture_channels, &mut mono_frame)"),
+            "pump must downmix each interleaved capture frame before appending a volume leg"
         );
     }
 

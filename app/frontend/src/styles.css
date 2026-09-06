@@ -2251,12 +2251,29 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   animation: blockIn var(--dur) var(--ease-out);
 }
 .volume-box.unadjustable { border-color: rgba(var(--warn-rgb), 0.18); }
+.volume-box.unavailable { border-color: rgba(var(--warn-rgb), 0.22); }
 .volume-row { display: flex; align-items: center; gap: 10px; }
 .vol-val {
   font-size: 11px; color: var(--text-dim); width: 46px;
   text-align: right; flex: none; font-variant-numeric: tabular-nums;
 }
 .vol-note { font-size: 11px; color: var(--warn); }
+
+/* Mode-B endpoint controls live inside the speaker/microphone inventory rows.
+   Keep enough track width for precise changes without forcing the device name
+   or idle state out of the card. */
+.device-volume.volume-box {
+  flex: 1 1 210px; min-width: 180px; max-width: 260px;
+  margin-left: auto; padding: 4px 6px; gap: 3px;
+  background: transparent; border-color: transparent;
+  animation: none;
+}
+.device-volume.volume-box.pending { border-color: rgba(var(--accent-rgb), 0.2); }
+.device-volume.volume-box.unavailable,
+.device-volume.volume-box.unadjustable { border-color: rgba(var(--warn-rgb), 0.22); }
+.device-volume .volume-row { gap: 6px; }
+.device-volume .vol-val { width: 40px; }
+.device-volume .vol-note { line-height: 1.3; text-align: right; }
 
 /* ---- 共享来源 + 捕获后端（plan §7.1 模式 A 的 spk 方向 / §6 多后端） ---- */
 

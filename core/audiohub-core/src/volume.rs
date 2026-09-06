@@ -1,5 +1,6 @@
-//! Default output device volume (spec-m4b §A1) plus the control-plane
-//! ping-pong guard both daemons share.
+//! Default input/output endpoint volume plus the control-plane ping-pong guard
+//! both daemons share. The output API remains the spec-m4b §A1 contract; the
+//! input API uses the same scalar/mute semantics for mode-B microphone sync.
 //!
 //! Deliberately dependency-free: the two real backends are hand-written FFI
 //! (CoreAudio on macOS, COM/IAudioEndpointVolume on Windows) so the
@@ -18,6 +19,33 @@ pub struct VolumeState {
     pub scalar: f32,
     pub muted: bool,
     pub adjustable: bool,
+    /// Whether the endpoint's mute property is independently writable. A
+    /// fixed scalar does not imply a fixed mute (HDMI/aggregate devices often
+    /// split these capabilities), so fallback routing must keep this separate.
+    #[serde(default)]
+    pub mute_adjustable: bool,
+}
+
+/// Which system endpoint owns a volume control.
+///
+/// Kept private because the public API intentionally names input and output
+/// explicitly. Passing a direction at each platform boundary still matters:
+/// the two native APIs use the same volume interface/property names, and a
+/// forgotten data-flow/scope argument otherwise compiles while silently moving
+/// the other endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointFlow {
+    Input,
+    Output,
+}
+
+impl EndpointFlow {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Output => "output",
+        }
+    }
 }
 
 /// `SessionMsg::VolumeSet.src`: the change was made by the sender's own user.
@@ -91,14 +119,82 @@ pub fn get_default_output_volume() -> Result<VolumeState> {
     get_output_volume(None)
 }
 
+/// Default input device volume and mute state.
+///
+/// `adjustable=false` has the same meaning as on the output API: the endpoint
+/// exposes no writable scalar, so callers must not treat `scalar` as a level
+/// they can send back. Reading endpoint volume does not open an audio stream.
+pub fn get_default_input_volume() -> Result<VolumeState> {
+    get_endpoint_volume(EndpointFlow::Input, None)
+}
+
 /// Clamped to 0..=1. Errors when the device has no writable volume, which is
 /// exactly the `adjustable=false` case.
 pub fn set_default_output_volume(scalar: f32) -> Result<()> {
     set_output_volume(None, scalar)
 }
 
+/// Set the default input device volume. Finite values are clamped to `0..=1`;
+/// an endpoint without a writable scalar returns an error.
+pub fn set_default_input_volume(scalar: f32) -> Result<()> {
+    set_endpoint_volume(EndpointFlow::Input, None, scalar)
+}
+
 pub fn set_default_output_mute(muted: bool) -> Result<()> {
     set_output_mute(None, muted)
+}
+
+/// Set the default input device mute control.
+///
+/// An endpoint may expose a writable volume without a writable mute property;
+/// that case is reported as an error rather than being treated as unmuted.
+pub fn set_default_input_mute(muted: bool) -> Result<()> {
+    set_endpoint_mute(EndpointFlow::Input, None, muted)
+}
+
+/// Read one AudioHub-owned virtual MMDevice by authenticated peer identity.
+///
+/// On Windows the driver stamps this peer key into the endpoint property
+/// store before AudioEndpointBuilder publishes it.  The key is deliberately
+/// independent of the friendly name: names are localised, user-visible and
+/// can remain stale across an offline/online rename, while a volume write must
+/// never land on another peer's endpoint.  Other platforms do not use this
+/// lookup and return an explicit error.
+pub fn get_audiohub_peer_endpoint_volume(peer_key: &str, input: bool) -> Result<VolumeState> {
+    imp::get_audiohub_peer(
+        if input {
+            EndpointFlow::Input
+        } else {
+            EndpointFlow::Output
+        },
+        peer_key,
+    )
+}
+
+/// Apply one peer scalar/mute pair through the endpoint API itself, then read
+/// back what Windows exposes to applications.
+///
+/// This is intentionally not a dB conversion in the kernel.  Windows defines
+/// `IAudioEndpointVolume` scalar values using an OS-owned audio-tapered curve
+/// whose shape is not part of the stable API.  Calling the scalar method is
+/// the only way to preserve the exact user-facing control semantics.
+pub fn set_audiohub_peer_endpoint_volume(
+    peer_key: &str,
+    input: bool,
+    scalar: f32,
+    muted: bool,
+) -> Result<VolumeState> {
+    let scalar = normalize_scalar(scalar)?;
+    imp::set_audiohub_peer(
+        if input {
+            EndpointFlow::Input
+        } else {
+            EndpointFlow::Output
+        },
+        peer_key,
+        scalar,
+        muted,
+    )
 }
 
 /// `None` = the system default output, exactly as `get_default_output_volume`.
@@ -106,18 +202,34 @@ pub fn set_default_output_mute(muted: bool) -> Result<()> {
 /// speaker has its own volume control, and reaching it must not require making
 /// it the system default.
 pub fn get_output_volume(dev: Option<&str>) -> Result<VolumeState> {
-    imp::get(dev)
+    get_endpoint_volume(EndpointFlow::Output, dev)
 }
 
 pub fn set_output_volume(dev: Option<&str>, scalar: f32) -> Result<()> {
-    if !scalar.is_finite() {
-        bail!("volume scalar must be finite");
-    }
-    imp::set_volume(dev, scalar.clamp(0.0, 1.0))
+    set_endpoint_volume(EndpointFlow::Output, dev, scalar)
 }
 
 pub fn set_output_mute(dev: Option<&str>, muted: bool) -> Result<()> {
-    imp::set_mute(dev, muted)
+    set_endpoint_mute(EndpointFlow::Output, dev, muted)
+}
+
+fn get_endpoint_volume(flow: EndpointFlow, dev: Option<&str>) -> Result<VolumeState> {
+    imp::get(flow, dev)
+}
+
+fn set_endpoint_volume(flow: EndpointFlow, dev: Option<&str>, scalar: f32) -> Result<()> {
+    imp::set_volume(flow, dev, normalize_scalar(scalar)?)
+}
+
+fn normalize_scalar(scalar: f32) -> Result<f32> {
+    if !scalar.is_finite() {
+        bail!("volume scalar must be finite");
+    }
+    Ok(scalar.clamp(0.0, 1.0))
+}
+
+fn set_endpoint_mute(flow: EndpointFlow, dev: Option<&str>, muted: bool) -> Result<()> {
+    imp::set_mute(flow, dev, muted)
 }
 
 // ------------------------------------ design §4.2: the native dB (gain) path
@@ -385,7 +497,7 @@ impl Drop for OutputVolumeGuard {
 /// Shared so both backends refuse a typo the same way instead of silently
 /// landing on the wrong card.
 #[cfg(any(target_os = "macos", windows))]
-fn match_by_name<T>(devices: Vec<(T, String)>, want: &str) -> Result<T> {
+fn match_by_name<T>(flow: EndpointFlow, devices: Vec<(T, String)>, want: &str) -> Result<T> {
     // Exact first: two cards can differ only in case, and then the case the
     // user typed is the one they meant. Case-insensitive is the fallback, and
     // only when it is unambiguous.
@@ -401,11 +513,13 @@ fn match_by_name<T>(devices: Vec<(T, String)>, want: &str) -> Result<T> {
     match hits.len() {
         1 => Ok(hits.remove(0).0),
         0 => bail!(
-            "no output device named {want:?}; available: {}",
+            "no {} device named {want:?}; available: {}",
+            flow.label(),
             quoted(rest.iter().map(|(_, n)| n))
         ),
         n => bail!(
-            "{n} output devices match {want:?}: {}",
+            "{n} {} devices match {want:?}: {}",
+            flow.label(),
             quoted(hits.iter().map(|(_, n)| n))
         ),
     }
@@ -423,10 +537,10 @@ fn quoted<'a>(names: impl Iterator<Item = &'a String>) -> String {
 
 /// How an error should name the device the caller asked for.
 #[cfg(any(target_os = "macos", windows))]
-fn label(dev: Option<&str>) -> String {
+fn label(flow: EndpointFlow, dev: Option<&str>) -> String {
     match dev {
-        None => "the default output device".to_string(),
-        Some(name) => format!("output device {name:?}"),
+        None => format!("the default {} device", flow.label()),
+        Some(name) => format!("{} device {name:?}", flow.label()),
     }
 }
 
@@ -688,13 +802,17 @@ fn same(a: f32, b: f32) -> bool {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    //! CoreAudio: default output device -> kAudioDevicePropertyVolumeScalar /
-    //! kAudioDevicePropertyMute on the Output scope. Master element first, then
-    //! the per-channel elements; `adjustable` is the property's IsSettable.
-    //! A named device resolves through kAudioHardwarePropertyDevices first; the
-    //! probing below is identical either way.
+    //! CoreAudio: default input/output device ->
+    //! kAudioDevicePropertyVolumeScalar / kAudioDevicePropertyMute on the
+    //! matching scope. Master element first, then the per-channel elements;
+    //! `adjustable` is the property's IsSettable. A named device resolves
+    //! through kAudioHardwarePropertyDevices first; the probing below is
+    //! identical either way.
 
-    use super::{db_to_gain, gain_to_db, label, match_by_name, GainState, VolumeState};
+    use super::{
+        db_to_gain, gain_to_db, label, match_by_name, EndpointFlow, GainState, VolumeState,
+        SAME_EPS,
+    };
     use anyhow::{anyhow, bail, Result};
     use std::ffi::c_void;
 
@@ -717,6 +835,7 @@ mod imp {
     const fn fourcc(s: &[u8; 4]) -> u32 {
         u32::from_be_bytes(*s)
     }
+    const SEL_DEFAULT_INPUT: u32 = fourcc(b"dIn "); // kAudioHardwarePropertyDefaultInputDevice
     const SEL_DEFAULT_OUTPUT: u32 = fourcc(b"dOut"); // kAudioHardwarePropertyDefaultOutputDevice
     const SEL_DEVICES: u32 = fourcc(b"dev#"); // kAudioHardwarePropertyDevices
     const SEL_NAME: u32 = fourcc(b"lnam"); // kAudioObjectPropertyName (= DeviceNameCFString)
@@ -732,6 +851,7 @@ mod imp {
     const SEL_VOLUME_DB_RANGE: u32 = fourcc(b"vdb#"); // kAudioDevicePropertyVolumeRangeDecibels
     const SEL_MUTE: u32 = fourcc(b"mute"); // kAudioDevicePropertyMute
     const SCOPE_GLOBAL: u32 = fourcc(b"glob");
+    const SCOPE_INPUT: u32 = fourcc(b"inpt");
     const SCOPE_OUTPUT: u32 = fourcc(b"outp");
 
     type CFStringRef = *const c_void;
@@ -896,12 +1016,26 @@ mod imp {
         (st == 0).then_some(sz)
     }
 
-    fn default_output_device() -> Result<AudioObjectID> {
-        let a = at(SEL_DEFAULT_OUTPUT, SCOPE_GLOBAL, ELEM_MAIN);
+    fn scope(flow: EndpointFlow) -> u32 {
+        match flow {
+            EndpointFlow::Input => SCOPE_INPUT,
+            EndpointFlow::Output => SCOPE_OUTPUT,
+        }
+    }
+
+    fn default_selector(flow: EndpointFlow) -> u32 {
+        match flow {
+            EndpointFlow::Input => SEL_DEFAULT_INPUT,
+            EndpointFlow::Output => SEL_DEFAULT_OUTPUT,
+        }
+    }
+
+    fn default_device(flow: EndpointFlow) -> Result<AudioObjectID> {
+        let a = at(default_selector(flow), SCOPE_GLOBAL, ELEM_MAIN);
         let dev = get_u32(SYSTEM_OBJECT, &a)
-            .ok_or_else(|| anyhow!("cannot read the default output device"))?;
+            .ok_or_else(|| anyhow!("cannot read the default {} device", flow.label()))?;
         if dev == 0 {
-            bail!("no default output device");
+            bail!("no default {} device", flow.label());
         }
         Ok(dev)
     }
@@ -944,9 +1078,9 @@ mod imp {
         String::from_utf8(buf).ok()
     }
 
-    /// Every device that can play: a present output stream is the same test
-    /// CoreAudio itself uses to decide a device belongs in the output list.
-    fn output_devices() -> Vec<(AudioObjectID, String)> {
+    /// Every device in one data flow. A present stream in that scope is the same
+    /// test CoreAudio itself uses to decide which endpoint list contains it.
+    fn endpoint_devices(flow: EndpointFlow) -> Vec<(AudioObjectID, String)> {
         let a = at(SEL_DEVICES, SCOPE_GLOBAL, ELEM_MAIN);
         let Some(bytes) = prop_size(SYSTEM_OBJECT, &a) else {
             return Vec::new();
@@ -969,23 +1103,23 @@ mod imp {
         ids.truncate(sz as usize / 4);
         ids.into_iter()
             .filter(|&d| {
-                prop_size(d, &at(SEL_STREAMS, SCOPE_OUTPUT, ELEM_MAIN)).is_some_and(|n| n > 0)
+                prop_size(d, &at(SEL_STREAMS, scope(flow), ELEM_MAIN)).is_some_and(|n| n > 0)
             })
             .filter_map(|d| device_name(d).map(|n| (d, n)))
             .collect()
     }
 
-    fn resolve(dev: Option<&str>) -> Result<AudioObjectID> {
+    fn resolve(flow: EndpointFlow, dev: Option<&str>) -> Result<AudioObjectID> {
         match dev {
-            None => default_output_device(),
-            Some(name) => match_by_name(output_devices(), name),
+            None => default_device(flow),
+            Some(name) => match_by_name(flow, endpoint_devices(flow), name),
         }
     }
 
     /// Present channel elements of `selector`, in element order.
-    fn channel_elements(dev: AudioObjectID, selector: u32) -> Vec<PropAddr> {
+    fn channel_elements(flow: EndpointFlow, dev: AudioObjectID, selector: u32) -> Vec<PropAddr> {
         (1..=MAX_CHANNEL_ELEMENTS)
-            .map(|ch| at(selector, SCOPE_OUTPUT, ch))
+            .map(|ch| at(selector, scope(flow), ch))
             .filter(|a| has(dev, a))
             .collect()
     }
@@ -995,26 +1129,36 @@ mod imp {
     /// disagree with the setter — a read-only master over writable channels used
     /// to report `adjustable=false` while `set_volume` happily worked, greying
     /// the slider out for no reason.
-    fn volume_writable(dev: AudioObjectID) -> bool {
-        let master = at(SEL_VOLUME_SCALAR, SCOPE_OUTPUT, ELEM_MAIN);
+    fn volume_writable(flow: EndpointFlow, dev: AudioObjectID) -> bool {
+        let master = at(SEL_VOLUME_SCALAR, scope(flow), ELEM_MAIN);
         if has(dev, &master) && settable(dev, &master) {
             return true;
         }
-        channel_elements(dev, SEL_VOLUME_SCALAR)
+        channel_elements(flow, dev, SEL_VOLUME_SCALAR)
             .iter()
             .any(|a| settable(dev, a))
     }
 
-    pub fn get(target: Option<&str>) -> Result<VolumeState> {
-        let dev = resolve(target)?;
-        let master = at(SEL_VOLUME_SCALAR, SCOPE_OUTPUT, ELEM_MAIN);
-        let adjustable = volume_writable(dev);
+    fn mute_writable(flow: EndpointFlow, dev: AudioObjectID) -> bool {
+        let master = at(SEL_MUTE, scope(flow), ELEM_MAIN);
+        if has(dev, &master) && settable(dev, &master) {
+            return true;
+        }
+        channel_elements(flow, dev, SEL_MUTE)
+            .iter()
+            .any(|a| settable(dev, a))
+    }
+
+    pub fn get(flow: EndpointFlow, target: Option<&str>) -> Result<VolumeState> {
+        let dev = resolve(flow, target)?;
+        let master = at(SEL_VOLUME_SCALAR, scope(flow), ELEM_MAIN);
+        let adjustable = volume_writable(flow, dev);
         let scalar = if has(dev, &master) {
             get_f32(dev, &master).unwrap_or(0.0)
         } else {
             // No master volume: aggregate devices and many HDMI/optical outs
             // land here. Average whatever channels exist.
-            let vals: Vec<f32> = channel_elements(dev, SEL_VOLUME_SCALAR)
+            let vals: Vec<f32> = channel_elements(flow, dev, SEL_VOLUME_SCALAR)
                 .iter()
                 .filter_map(|a| get_f32(dev, a))
                 .collect();
@@ -1026,62 +1170,94 @@ mod imp {
         };
         Ok(VolumeState {
             scalar: scalar.clamp(0.0, 1.0),
-            muted: read_mute(dev),
+            muted: read_mute(flow, dev),
             adjustable,
+            mute_adjustable: mute_writable(flow, dev),
         })
     }
 
     /// Master mute if the device has one, else "any channel is muted". Shared
     /// by the scalar and dB readers so the two cannot come back disagreeing
     /// about whether one device is muted.
-    fn read_mute(dev: AudioObjectID) -> bool {
-        let master = at(SEL_MUTE, SCOPE_OUTPUT, ELEM_MAIN);
+    fn read_mute(flow: EndpointFlow, dev: AudioObjectID) -> bool {
+        let master = at(SEL_MUTE, scope(flow), ELEM_MAIN);
         if has(dev, &master) {
             return get_u32(dev, &master).unwrap_or(0) != 0;
         }
-        channel_elements(dev, SEL_MUTE)
+        channel_elements(flow, dev, SEL_MUTE)
             .iter()
             .filter_map(|a| get_u32(dev, a))
             .any(|v| v != 0)
     }
 
-    pub fn set_volume(target: Option<&str>, scalar: f32) -> Result<()> {
-        let dev = resolve(target)?;
-        let master = at(SEL_VOLUME_SCALAR, SCOPE_OUTPUT, ELEM_MAIN);
+    pub fn set_volume(flow: EndpointFlow, target: Option<&str>, scalar: f32) -> Result<()> {
+        let dev = resolve(flow, target)?;
+        let master = at(SEL_VOLUME_SCALAR, scope(flow), ELEM_MAIN);
         if has(dev, &master) && settable(dev, &master) {
             return set_f32(dev, &master, scalar, "volm");
         }
         let mut wrote = 0usize;
-        for a in channel_elements(dev, SEL_VOLUME_SCALAR) {
+        for a in channel_elements(flow, dev, SEL_VOLUME_SCALAR) {
             if settable(dev, &a) {
                 set_f32(dev, &a, scalar, "volm")?;
                 wrote += 1;
             }
         }
         if wrote == 0 {
-            bail!("{} has no adjustable volume", label(target));
+            bail!("{} has no adjustable volume", label(flow, target));
         }
         Ok(())
     }
 
-    pub fn set_mute(target: Option<&str>, muted: bool) -> Result<()> {
-        let dev = resolve(target)?;
+    pub fn set_mute(flow: EndpointFlow, target: Option<&str>, muted: bool) -> Result<()> {
+        let dev = resolve(flow, target)?;
         let v = u32::from(muted);
-        let master = at(SEL_MUTE, SCOPE_OUTPUT, ELEM_MAIN);
+        let master = at(SEL_MUTE, scope(flow), ELEM_MAIN);
         if has(dev, &master) && settable(dev, &master) {
             return set_u32(dev, &master, v);
         }
         let mut wrote = 0usize;
-        for a in channel_elements(dev, SEL_MUTE) {
+        for a in channel_elements(flow, dev, SEL_MUTE) {
             if settable(dev, &a) {
                 set_u32(dev, &a, v)?;
                 wrote += 1;
             }
         }
         if wrote == 0 {
-            bail!("{} has no mute control", label(target));
+            bail!("{} has no mute control", label(flow, target));
         }
         Ok(())
+    }
+
+    pub fn get_audiohub_peer(_flow: EndpointFlow, _peer_key: &str) -> Result<VolumeState> {
+        bail!("AudioHub peer-key endpoint lookup is only supported on Windows")
+    }
+
+    pub fn set_audiohub_peer(
+        _flow: EndpointFlow,
+        _peer_key: &str,
+        _scalar: f32,
+        _muted: bool,
+    ) -> Result<VolumeState> {
+        bail!("AudioHub peer-key endpoint lookup is only supported on Windows")
+    }
+
+    #[cfg(test)]
+    mod endpoint_flow_tests {
+        use super::*;
+
+        #[test]
+        fn input_and_output_select_different_coreaudio_endpoints_and_scopes() {
+            assert_eq!(default_selector(EndpointFlow::Input), fourcc(b"dIn "));
+            assert_eq!(default_selector(EndpointFlow::Output), fourcc(b"dOut"));
+            assert_eq!(scope(EndpointFlow::Input), fourcc(b"inpt"));
+            assert_eq!(scope(EndpointFlow::Output), fourcc(b"outp"));
+            assert_ne!(
+                default_selector(EndpointFlow::Input),
+                default_selector(EndpointFlow::Output)
+            );
+            assert_ne!(scope(EndpointFlow::Input), scope(EndpointFlow::Output));
+        }
     }
 
     // ------------------------------------------- design §4.2 native dB path
@@ -1100,7 +1276,7 @@ mod imp {
         if has(dev, &master) {
             return vec![master];
         }
-        channel_elements(dev, SEL_VOLUME_DB)
+        channel_elements(EndpointFlow::Output, dev, SEL_VOLUME_DB)
     }
 
     /// True exactly when `set_gain` would find something to write, so
@@ -1112,7 +1288,7 @@ mod imp {
         if has(dev, &master) && settable(dev, &master) {
             return true;
         }
-        channel_elements(dev, SEL_VOLUME_DB)
+        channel_elements(EndpointFlow::Output, dev, SEL_VOLUME_DB)
             .iter()
             .any(|a| settable(dev, a))
     }
@@ -1136,7 +1312,7 @@ mod imp {
         if elems.is_empty() {
             bail!(
                 "{} publishes no dB volume ('vold'), so the native dB path does not apply to it",
-                label(target)
+                label(EndpointFlow::Output, target)
             );
         }
         let dbs: Vec<(u32, f32)> = elems
@@ -1146,7 +1322,7 @@ mod imp {
         let Some(&(first_elem, first_db)) = dbs.first() else {
             bail!(
                 "{} has a dB volume property that will not read",
-                label(target)
+                label(EndpointFlow::Output, target)
             );
         };
         // Averaged in the GAIN domain, not the dB domain. dB is logarithmic,
@@ -1164,29 +1340,32 @@ mod imp {
             applied: db_to_gain(applied_db),
             applied_db,
             range_db: range_of(dev, first_elem),
-            muted: read_mute(dev),
+            muted: read_mute(EndpointFlow::Output, dev),
             adjustable: gain_writable(dev),
         })
     }
 
     pub fn get_gain(target: Option<&str>) -> Result<GainState> {
-        let dev = resolve(target)?;
+        let dev = resolve(EndpointFlow::Output, target)?;
         read_gain(dev, target, None)
     }
 
     pub fn set_gain(target: Option<&str>, gain: f32) -> Result<GainState> {
-        let dev = resolve(target)?;
+        let dev = resolve(EndpointFlow::Output, target)?;
         let master = at(SEL_VOLUME_DB, SCOPE_OUTPUT, ELEM_MAIN);
         let writable: Vec<PropAddr> = if has(dev, &master) && settable(dev, &master) {
             vec![master]
         } else {
-            channel_elements(dev, SEL_VOLUME_DB)
+            channel_elements(EndpointFlow::Output, dev, SEL_VOLUME_DB)
                 .into_iter()
                 .filter(|a| settable(dev, a))
                 .collect()
         };
         if writable.is_empty() {
-            bail!("{} has no writable dB volume", label(target));
+            bail!(
+                "{} has no writable dB volume",
+                label(EndpointFlow::Output, target)
+            );
         }
         for a in &writable {
             // gain 0 has no finite dB, so ask the element for its own floor
@@ -1210,14 +1389,17 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    //! COM by hand: MMDeviceEnumerator -> GetDefaultAudioEndpoint(eRender,
+    //! COM by hand: MMDeviceEnumerator -> GetDefaultAudioEndpoint(flow,
     //! eConsole) -> Activate(IAudioEndpointVolume). A named device swaps the
-    //! middle step for EnumAudioEndpoints + PKEY_Device_FriendlyName. Vtable
-    //! layouts are the frozen ABI of mmdeviceapi.h / endpointvolume.h; slots we
-    //! never call are declared as `usize` so nothing can be invoked through
-    //! them by accident.
+    //! middle step for EnumAudioEndpoints(flow) + PKEY_Device_FriendlyName.
+    //! Vtable layouts are the frozen ABI of mmdeviceapi.h / endpointvolume.h;
+    //! slots we never call are declared as `usize` so nothing can be invoked
+    //! through them by accident.
 
-    use super::{db_to_gain, gain_to_db, label, match_by_name, GainState, VolumeState};
+    use super::{
+        db_to_gain, gain_to_db, label, match_by_name, EndpointFlow, GainState, VolumeState,
+        SAME_EPS,
+    };
     use anyhow::{bail, Result};
     use std::ffi::c_void;
     use std::ptr;
@@ -1264,11 +1446,28 @@ mod imp {
         pid: 14,
     };
 
+    /// AudioHub's private, read-only endpoint identity.  The Windows driver
+    /// writes a versioned peer-fingerprint/direction value to this EP\0
+    /// property before the endpoint is published; AudioEndpointBuilder then
+    /// copies it into the MMDevice property store.  Render/capture enumeration
+    /// independently supplies the expected direction, so a swapped property
+    /// tag fails closed instead of selecting the opposite endpoint.
+    const PKEY_AUDIOHUB_PEER_KEY: PropertyKey = PropertyKey {
+        fmtid: GUID {
+            d1: 0x8CA48324,
+            d2: 0x7D8A,
+            d3: 0x4EFA,
+            d4: [0x8D, 0xD4, 0x7B, 0x75, 0x03, 0xAF, 0x96, 0x4B],
+        },
+        pid: 2,
+    };
+
     const CLSCTX_INPROC_SERVER: u32 = 0x1;
     const CLSCTX_ALL: u32 = 0x17;
     const COINIT_MULTITHREADED: u32 = 0x0;
     const RPC_E_CHANGED_MODE: HRESULT = -2147417850; // 0x80010106
     const E_RENDER: u32 = 0; // EDataFlow::eRender
+    const E_CAPTURE: u32 = 1; // EDataFlow::eCapture
     const E_CONSOLE: u32 = 0; // ERole::eConsole
     const DEVICE_STATE_ACTIVE: u32 = 0x1;
     const STGM_READ: u32 = 0x0;
@@ -1421,9 +1620,18 @@ mod imp {
     }
 
     impl Apartment {
-        fn enter() -> Apartment {
+        fn enter() -> Result<Apartment> {
             let hr = unsafe { CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED) };
-            Apartment { owned: hr >= 0 }
+            if hr >= 0 {
+                return Ok(Apartment { owned: true });
+            }
+            if hr == RPC_E_CHANGED_MODE {
+                // Another library already selected this thread's apartment.
+                // COM is initialized and usable, but that initialization is
+                // not ours to balance.
+                return Ok(Apartment { owned: false });
+            }
+            bail!("CoInitializeEx failed: HRESULT 0x{:08X}", hr as u32)
         }
     }
 
@@ -1486,7 +1694,7 @@ mod imp {
         String::from_utf16(std::slice::from_raw_parts(p, n)).ok()
     }
 
-    fn friendly_name(device: &ComPtr) -> Option<String> {
+    fn string_property(device: &ComPtr, key: &PropertyKey) -> Option<String> {
         let mut store = ComPtr::null();
         let hr = unsafe {
             let v = device.vtbl::<IMMDeviceVtbl>();
@@ -1498,7 +1706,7 @@ mod imp {
         let mut pv = PropVariant::empty();
         let hr = unsafe {
             let v = store.vtbl::<IPropertyStoreVtbl>();
-            ((*v).get_value)(store.0, &PKEY_DEVICE_FRIENDLY_NAME, &mut pv)
+            ((*v).get_value)(store.0, key, &mut pv)
         };
         if hr < 0 || pv.vt != VT_LPWSTR {
             return None;
@@ -1506,22 +1714,44 @@ mod imp {
         unsafe { wide_string(pv.val[0] as *const u16) }
     }
 
-    /// Every active render endpoint, paired with the name the user sees.
-    /// Endpoints whose name will not read are dropped: an unnameable device
-    /// cannot be the one that was asked for.
-    fn render_devices(enumerator: &ComPtr) -> Result<Vec<(ComPtr, String)>> {
+    fn friendly_name(device: &ComPtr) -> Option<String> {
+        string_property(device, &PKEY_DEVICE_FRIENDLY_NAME)
+    }
+
+    fn audiohub_identity(device: &ComPtr) -> Option<String> {
+        string_property(device, &PKEY_AUDIOHUB_PEER_KEY)
+    }
+
+    fn data_flow(flow: EndpointFlow) -> u32 {
+        match flow {
+            EndpointFlow::Input => E_CAPTURE,
+            EndpointFlow::Output => E_RENDER,
+        }
+    }
+
+    /// Every active endpoint in one data flow.  Identity-based AudioHub lookup
+    /// must retain an endpoint even if its display name is temporarily
+    /// unreadable; the private peer-key property, not presentation, decides.
+    fn active_endpoints(enumerator: &ComPtr, flow: EndpointFlow) -> Result<Vec<ComPtr>> {
         let mut coll = ComPtr::null();
         check(
             unsafe {
                 let v = enumerator.vtbl::<IMMDeviceEnumeratorVtbl>();
                 ((*v).enum_audio_endpoints)(
                     enumerator.0,
-                    E_RENDER,
+                    data_flow(flow),
                     DEVICE_STATE_ACTIVE,
                     &mut coll.0,
                 )
             },
-            "EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)",
+            &format!(
+                "EnumAudioEndpoints(e{}, DEVICE_STATE_ACTIVE)",
+                if flow == EndpointFlow::Input {
+                    "Capture"
+                } else {
+                    "Render"
+                }
+            ),
         )?;
         let mut count: u32 = 0;
         check(
@@ -1541,15 +1771,23 @@ mod imp {
             if hr < 0 {
                 continue;
             }
-            if let Some(name) = friendly_name(&dev) {
-                out.push((dev, name));
-            }
+            out.push(dev);
         }
         Ok(out)
     }
 
-    fn endpoint_volume(target: Option<&str>) -> Result<Endpoint> {
-        let apt = Apartment::enter();
+    /// Named lookup is a user-facing compatibility API.  Unlike the private
+    /// peer-key path, an unnameable endpoint cannot be selected by a name the
+    /// caller supplied and is therefore omitted.
+    fn endpoint_devices(enumerator: &ComPtr, flow: EndpointFlow) -> Result<Vec<(ComPtr, String)>> {
+        Ok(active_endpoints(enumerator, flow)?
+            .into_iter()
+            .filter_map(|dev| friendly_name(&dev).map(|name| (dev, name)))
+            .collect())
+    }
+
+    fn endpoint_volume(flow: EndpointFlow, target: Option<&str>) -> Result<Endpoint> {
+        let apt = Apartment::enter()?;
         let mut enumerator = ComPtr::null();
         check(
             unsafe {
@@ -1571,17 +1809,28 @@ mod imp {
                         let v = enumerator.vtbl::<IMMDeviceEnumeratorVtbl>();
                         ((*v).get_default_audio_endpoint)(
                             enumerator.0,
-                            E_RENDER,
+                            data_flow(flow),
                             E_CONSOLE,
                             &mut device.0,
                         )
                     },
-                    "GetDefaultAudioEndpoint(eRender, eConsole)",
+                    &format!(
+                        "GetDefaultAudioEndpoint(e{}, eConsole)",
+                        if flow == EndpointFlow::Input {
+                            "Capture"
+                        } else {
+                            "Render"
+                        }
+                    ),
                 )?;
                 device
             }
-            Some(name) => match_by_name(render_devices(&enumerator)?, name)?,
+            Some(name) => match_by_name(flow, endpoint_devices(&enumerator, flow)?, name)?,
         };
+        activate_endpoint(apt, device)
+    }
+
+    fn activate_endpoint(apt: Apartment, device: ComPtr) -> Result<Endpoint> {
         let mut vol = ComPtr::null();
         check(
             unsafe {
@@ -1599,44 +1848,185 @@ mod imp {
         Ok(Endpoint { vol, _apt: apt })
     }
 
-    pub fn get(target: Option<&str>) -> Result<VolumeState> {
-        let ep = endpoint_volume(target)?;
+    fn valid_peer_key(peer_key: &str) -> bool {
+        peer_key.len() == 16
+            && peer_key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    /// Resolve one AudioHub endpoint without consulting its display name.
+    /// Friendly names can be localised, renamed by the user, or retain an
+    /// offline suffix until AudioEndpointBuilder recreates the endpoint.  The
+    /// driver property is the authenticated peer/direction identity and the
+    /// MMDevice enumerator supplies the data-flow direction independently.
+    fn audiohub_endpoint_volume(flow: EndpointFlow, peer_key: &str) -> Result<Endpoint> {
+        if !valid_peer_key(peer_key) {
+            bail!("AudioHub peer key must be exactly 16 lowercase hexadecimal characters");
+        }
+        let apt = Apartment::enter()?;
+        let mut enumerator = ComPtr::null();
+        check(
+            unsafe {
+                CoCreateInstance(
+                    &CLSID_MM_DEVICE_ENUMERATOR,
+                    ptr::null_mut(),
+                    CLSCTX_INPROC_SERVER,
+                    &IID_IMM_DEVICE_ENUMERATOR,
+                    &mut enumerator.0,
+                )
+            },
+            "CoCreateInstance(MMDeviceEnumerator)",
+        )?;
+
+        let mut matches = Vec::new();
+        let mut catalog = Vec::new();
+        let expected_identity = format!(
+            "v1:{peer_key}:{}",
+            if flow == EndpointFlow::Input {
+                "in"
+            } else {
+                "out"
+            }
+        );
+        for device in active_endpoints(&enumerator, flow)? {
+            let found_identity = audiohub_identity(&device);
+            let name = friendly_name(&device).unwrap_or_else(|| "<unnamed>".to_string());
+            catalog.push(format!(
+                "{} [{}]",
+                name,
+                found_identity
+                    .as_deref()
+                    .unwrap_or("no AudioHub endpoint identity")
+            ));
+            if found_identity.as_deref() == Some(expected_identity.as_str()) {
+                matches.push(device);
+            }
+        }
+        if matches.len() != 1 {
+            bail!(
+                "expected exactly one active AudioHub {} endpoint for peer {}, found {}; available: [{}]",
+                flow.label(),
+                peer_key,
+                matches.len(),
+                catalog.join(", ")
+            );
+        }
+        activate_endpoint(apt, matches.pop().expect("length checked"))
+    }
+
+    fn read_endpoint(ep: &Endpoint) -> Result<VolumeState> {
         let v = unsafe { ep.vol.vtbl::<IAudioEndpointVolumeVtbl>() };
         let mut scalar: f32 = 0.0;
         check(
             unsafe { ((*v).get_master_volume_level_scalar)(ep.vol.0, &mut scalar) },
             "GetMasterVolumeLevelScalar",
         )?;
-        let mut muted: i32 = 0;
-        let muted = match unsafe { ((*v).get_mute)(ep.vol.0, &mut muted) } {
-            hr if hr >= 0 => muted != 0,
-            _ => false, // endpoint without a mute control: never report muted
+        let mut muted_raw: i32 = 0;
+        let (muted, mute_adjustable) = match unsafe { ((*v).get_mute)(ep.vol.0, &mut muted_raw) } {
+            hr if hr >= 0 => (muted_raw != 0, true),
+            _ => (false, false), // endpoint without a mute control
         };
-        // The WASAPI endpoint volume is the shared-mode software volume, so a
-        // successfully activated endpoint is by definition writable.
         Ok(VolumeState {
             scalar: scalar.clamp(0.0, 1.0),
             muted,
             adjustable: true,
+            mute_adjustable,
         })
     }
 
-    pub fn set_volume(target: Option<&str>, scalar: f32) -> Result<()> {
-        let ep = endpoint_volume(target)?;
+    pub fn get(flow: EndpointFlow, target: Option<&str>) -> Result<VolumeState> {
+        let ep = endpoint_volume(flow, target)?;
+        read_endpoint(&ep)
+    }
+
+    pub fn get_audiohub_peer(flow: EndpointFlow, peer_key: &str) -> Result<VolumeState> {
+        let ep = audiohub_endpoint_volume(flow, peer_key)?;
+        read_endpoint(&ep)
+    }
+
+    pub fn set_audiohub_peer(
+        flow: EndpointFlow,
+        peer_key: &str,
+        scalar: f32,
+        muted: bool,
+    ) -> Result<VolumeState> {
+        let ep = audiohub_endpoint_volume(flow, peer_key)?;
         let v = unsafe { ep.vol.vtbl::<IAudioEndpointVolumeVtbl>() };
         check(
             unsafe { ((*v).set_master_volume_level_scalar)(ep.vol.0, scalar, ptr::null()) },
-            &format!("SetMasterVolumeLevelScalar on {}", label(target)),
+            &format!("SetMasterVolumeLevelScalar on AudioHub peer {peer_key}"),
+        )?;
+        check(
+            unsafe { ((*v).set_mute)(ep.vol.0, i32::from(muted), ptr::null()) },
+            &format!("SetMute on AudioHub peer {peer_key}"),
+        )?;
+        let state = read_endpoint(&ep)?;
+        if (state.scalar - scalar).abs() > SAME_EPS {
+            bail!(
+                "AudioHub peer {peer_key} {} endpoint refused scalar={scalar:.6}; read back {:.6}",
+                flow.label(),
+                state.scalar
+            );
+        }
+        if state.muted != muted {
+            bail!(
+                "AudioHub peer {peer_key} {} endpoint refused mute={muted}; read back {}",
+                flow.label(),
+                state.muted
+            );
+        }
+        Ok(state)
+    }
+
+    pub fn set_volume(flow: EndpointFlow, target: Option<&str>, scalar: f32) -> Result<()> {
+        let ep = endpoint_volume(flow, target)?;
+        let v = unsafe { ep.vol.vtbl::<IAudioEndpointVolumeVtbl>() };
+        check(
+            unsafe { ((*v).set_master_volume_level_scalar)(ep.vol.0, scalar, ptr::null()) },
+            &format!("SetMasterVolumeLevelScalar on {}", label(flow, target)),
         )
     }
 
-    pub fn set_mute(target: Option<&str>, muted: bool) -> Result<()> {
-        let ep = endpoint_volume(target)?;
+    pub fn set_mute(flow: EndpointFlow, target: Option<&str>, muted: bool) -> Result<()> {
+        let ep = endpoint_volume(flow, target)?;
         let v = unsafe { ep.vol.vtbl::<IAudioEndpointVolumeVtbl>() };
         check(
             unsafe { ((*v).set_mute)(ep.vol.0, i32::from(muted), ptr::null()) },
-            &format!("SetMute on {}", label(target)),
+            &format!("SetMute on {}", label(flow, target)),
         )
+    }
+
+    #[cfg(test)]
+    mod endpoint_flow_tests {
+        use super::*;
+
+        #[test]
+        fn input_and_output_select_the_correct_mmdevice_data_flow() {
+            assert_eq!(data_flow(EndpointFlow::Input), E_CAPTURE);
+            assert_eq!(data_flow(EndpointFlow::Output), E_RENDER);
+            assert_ne!(
+                data_flow(EndpointFlow::Input),
+                data_flow(EndpointFlow::Output)
+            );
+            assert_eq!(E_CONSOLE, 0, "both flows must use the Console role");
+        }
+
+        #[test]
+        fn audiohub_endpoint_identity_is_the_wire_fingerprint_not_a_name() {
+            assert!(valid_peer_key("0123456789abcdef"));
+            for bad in [
+                "0123456789abcde",
+                "0123456789abcdef0",
+                "0123456789ABCDEf",
+                "0123456789abcdeg",
+                "AudioHub speaker",
+            ] {
+                assert!(!valid_peer_key(bad), "{bad:?}");
+            }
+            assert_eq!(PKEY_AUDIOHUB_PEER_KEY.pid, 2);
+            assert_eq!(PKEY_AUDIOHUB_PEER_KEY.fmtid.d1, 0x8CA48324);
+        }
     }
 
     // ------------------------------------------- design §4.2 native dB path
@@ -1660,7 +2050,10 @@ mod imp {
         let mut db: f32 = 0.0;
         check(
             unsafe { ((*v).get_master_volume_level)(ep.vol.0, &mut db) },
-            &format!("GetMasterVolumeLevel on {}", label(target)),
+            &format!(
+                "GetMasterVolumeLevel on {}",
+                label(EndpointFlow::Output, target)
+            ),
         )?;
         let mut m: i32 = 0;
         let muted = match unsafe { ((*v).get_mute)(ep.vol.0, &mut m) } {
@@ -1681,12 +2074,12 @@ mod imp {
     }
 
     pub fn get_gain(target: Option<&str>) -> Result<GainState> {
-        let ep = endpoint_volume(target)?;
+        let ep = endpoint_volume(EndpointFlow::Output, target)?;
         read_gain(&ep, target, None)
     }
 
     pub fn set_gain(target: Option<&str>, gain: f32) -> Result<GainState> {
-        let ep = endpoint_volume(target)?;
+        let ep = endpoint_volume(EndpointFlow::Output, target)?;
         let range = volume_range_db(&ep);
         // gain 0 has no finite dB, so ask for the endpoint's own floor.
         let want = if gain > 0.0 {
@@ -1707,7 +2100,10 @@ mod imp {
         let v = unsafe { ep.vol.vtbl::<IAudioEndpointVolumeVtbl>() };
         check(
             unsafe { ((*v).set_master_volume_level)(ep.vol.0, db, ptr::null()) },
-            &format!("SetMasterVolumeLevel on {}", label(target)),
+            &format!(
+                "SetMasterVolumeLevel on {}",
+                label(EndpointFlow::Output, target)
+            ),
         )?;
         read_gain(&ep, target, Some(gain))
     }
@@ -1717,15 +2113,29 @@ mod imp {
 
 #[cfg(not(any(target_os = "macos", windows)))]
 mod imp {
-    use super::{GainState, VolumeState};
+    use super::{EndpointFlow, GainState, VolumeState};
     use anyhow::{bail, Result};
 
-    pub fn get(_target: Option<&str>) -> Result<VolumeState> {
+    pub fn get(_flow: EndpointFlow, _target: Option<&str>) -> Result<VolumeState> {
         Ok(VolumeState {
             scalar: 0.0,
             muted: false,
             adjustable: false,
+            mute_adjustable: false,
         })
+    }
+
+    pub fn get_audiohub_peer(_flow: EndpointFlow, _peer_key: &str) -> Result<VolumeState> {
+        bail!("AudioHub peer-key endpoint lookup is only supported on Windows")
+    }
+
+    pub fn set_audiohub_peer(
+        _flow: EndpointFlow,
+        _peer_key: &str,
+        _scalar: f32,
+        _muted: bool,
+    ) -> Result<VolumeState> {
+        bail!("AudioHub peer-key endpoint lookup is only supported on Windows")
     }
 
     /// Errors rather than reporting a level: a platform with no volume backend
@@ -1739,16 +2149,47 @@ mod imp {
         bail!("output volume control is not implemented on this platform");
     }
 
-    pub fn set_volume(_target: Option<&str>, _scalar: f32) -> Result<()> {
-        bail!("output volume control is not implemented on this platform");
+    pub fn set_volume(flow: EndpointFlow, _target: Option<&str>, _scalar: f32) -> Result<()> {
+        bail!(
+            "{} volume control is not implemented on this platform",
+            flow.label()
+        );
     }
 
-    pub fn set_mute(_target: Option<&str>, _muted: bool) -> Result<()> {
-        bail!("output mute control is not implemented on this platform");
+    pub fn set_mute(flow: EndpointFlow, _target: Option<&str>, _muted: bool) -> Result<()> {
+        bail!(
+            "{} mute control is not implemented on this platform",
+            flow.label()
+        );
     }
 }
 
 // ------------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod endpoint_api_tests {
+    use super::*;
+
+    #[test]
+    fn input_api_has_the_same_public_shape_as_the_default_output_api() {
+        let _: fn() -> Result<VolumeState> = get_default_input_volume;
+        let _: fn(f32) -> Result<()> = set_default_input_volume;
+        let _: fn(bool) -> Result<()> = set_default_input_mute;
+
+        assert_eq!(EndpointFlow::Input.label(), "input");
+        assert_eq!(EndpointFlow::Output.label(), "output");
+    }
+
+    #[test]
+    fn both_endpoint_directions_share_finite_clamped_scalar_admission() {
+        assert_eq!(normalize_scalar(-1.0).unwrap(), 0.0);
+        assert_eq!(normalize_scalar(0.25).unwrap(), 0.25);
+        assert_eq!(normalize_scalar(2.0).unwrap(), 1.0);
+        assert!(normalize_scalar(f32::NAN).is_err());
+        assert!(normalize_scalar(f32::INFINITY).is_err());
+        assert!(normalize_scalar(f32::NEG_INFINITY).is_err());
+    }
+}
 
 #[cfg(test)]
 mod mode_a_tests {
@@ -1763,6 +2204,7 @@ mod mode_a_tests {
             scalar,
             muted,
             adjustable: true,
+            mute_adjustable: true,
         }
     }
 
@@ -1863,6 +2305,7 @@ mod mode_a_tests {
             scalar: 0.8,
             muted: true,
             adjustable: true,
+            mute_adjustable: true,
         };
         assert_eq!(
             applied(classify_follow(true, true, BOTH_ON, local)).muted,
@@ -1901,6 +2344,7 @@ mod mode_a_tests {
             scalar: 0.0,
             muted: false,
             adjustable: false,
+            mute_adjustable: false,
         };
         assert!(
             matches!(
@@ -1920,7 +2364,8 @@ mod mode_a_tests {
                 VolumeState {
                     scalar: 0.4,
                     muted: false,
-                    adjustable: false
+                    adjustable: false,
+                    mute_adjustable: false,
                 }
             ),
             FollowAction::Ignore(_)
@@ -1999,7 +2444,8 @@ mod send_gain_authority_tests {
             authority_for(Some(VolumeState {
                 scalar: 0.4,
                 muted: false,
-                adjustable: true
+                adjustable: true,
+                mute_adjustable: true,
             })),
             VolumeAuthority::Peer
         );
@@ -2008,7 +2454,8 @@ mod send_gain_authority_tests {
             authority_for(Some(VolumeState {
                 scalar: 0.0,
                 muted: false,
-                adjustable: false
+                adjustable: false,
+                mute_adjustable: false,
             })),
             VolumeAuthority::SendGain
         );
@@ -2017,7 +2464,8 @@ mod send_gain_authority_tests {
             authority_for(Some(VolumeState {
                 scalar: 0.9,
                 muted: true,
-                adjustable: false
+                adjustable: false,
+                mute_adjustable: false,
             })),
             VolumeAuthority::SendGain
         );

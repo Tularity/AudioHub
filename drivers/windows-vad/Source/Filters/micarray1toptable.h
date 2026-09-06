@@ -20,8 +20,8 @@ Abstract:
 // The inf registers the string under
 // HKR,MediaCategories\%GUID.AhPinIn%,Name in the device software key.
 //
-// Same two extra jobs as AH_PIN_NAME_OUT: the fallback name, and the marker
-// perpeer.cpp matches on when swapping in a peer's derived GUID.
+// Like AH_PIN_NAME_OUT, this static GUID supplies the INF fallback label.
+// Per-peer endpoint names are applied separately to the topology interface.
 //
 // Category stays KSNODETYPE_MICROPHONE_ARRAY (form factor, icon, ranking);
 // only the NAME is ours.

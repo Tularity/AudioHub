@@ -683,9 +683,27 @@ fn cmd_sysaudio(
 
     const FRAME_MS: u64 = 10;
     let rate = SysAudioSource::OUT_RATE;
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(anyhow!("--secs must be finite and non-negative"));
+    }
+    for (name, frequency) in [
+        ("--verify-freq", verify_freq),
+        ("--absent-freq", absent_freq),
+        ("--self-tone", self_tone),
+    ] {
+        if let Some(frequency) = frequency {
+            if !dsp::valid_tone_frequency(rate, frequency) {
+                return Err(anyhow!(
+                    "{name} must be finite and strictly between 0 and {} Hz",
+                    rate / 2
+                ));
+            }
+        }
+    }
     let mut src = SysAudioSource::new(FRAME_MS as u32, backend)?;
     let chosen = src.backend().clone();
     let capture_rate = src.capture_rate();
+    let capture_channels = usize::from(src.channels().clamp(1, 2));
     info(&format!(
         "capturing system audio via {} (excludes_self={}, {} Hz) for {secs}s",
         chosen.id,
@@ -756,6 +774,7 @@ fn cmd_sysaudio(
     let accum_cap = rate as usize * 30;
     let mut accum: Vec<f32> = Vec::new();
     let mut frame: Vec<f32> = Vec::new();
+    let mut probe_frame: Vec<f32> = Vec::new();
     let mut seq = 0u32;
     let mut sent_packets = 0u64;
     let start = Instant::now();
@@ -769,13 +788,14 @@ fn cmd_sysaudio(
         }
         tick += 1;
         src.next_frame(&mut frame);
+        downmix_probe_frame(&frame, capture_channels, &mut probe_frame);
         if accum.len() < accum_cap {
-            accum.extend_from_slice(&frame);
+            accum.extend_from_slice(&probe_frame);
         }
         if let Some(s) = sock.as_ref() {
             // 探针**刻意固定在 s16**：它测的是链路，不是阶梯。位深写出来而不是
             // 隐含在函数名里，`codec` 由它导出 —— 两处若各写各的就是两份线格式。
-            let payload = dsp::encode_pcm(&frame, dsp::WireDepth::S16);
+            let payload = dsp::encode_pcm(&probe_frame, dsp::WireDepth::S16);
             let datagram = Header {
                 kind: Kind::Media,
                 codec: Codec::for_depth(dsp::WireDepth::S16),
@@ -839,8 +859,12 @@ fn cmd_sysaudio(
         (accum.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / accum.len() as f64).sqrt()
     };
     let verdict = verify_freq.map(|f| dsp::verify_tone(&accum, rate, f));
+    let tone_continuity = verify_freq.and_then(|f| dsp::verify_tone_continuity(&accum, rate, f));
     let absent_verdict = absent_freq.map(|f| dsp::verify_tone(&accum, rate, f));
-    let want_ok = verdict.as_ref().map(|v| v.detected).unwrap_or(true);
+    let want_ok = tone_continuity
+        .as_ref()
+        .map(|continuity| continuity.sustained)
+        .unwrap_or(true);
     let absent_ok = !absent_verdict.as_ref().map(|v| v.detected).unwrap_or(false);
     let ok = want_ok && absent_ok;
 
@@ -864,14 +888,18 @@ fn cmd_sysaudio(
             "backend": chosen.id,
             "excludes_self": chosen.excludes_self,
             "capture_rate": capture_rate,
+            "capture_channels": capture_channels,
             "sample_rate": rate,
             "secs": secs,
             "samples": accum.len(),
-            "rms": rms,
+            "rms": rms.is_finite().then_some(rms),
             "sent_packets": sent_packets,
             "played_packets": played,
-            "verdict": verdict,
-            "absent_verdict": absent_verdict,
+            "requested_frequency_hz": verify_freq,
+            "tone_continuity": tone_continuity,
+            "verdict": verdict.as_ref().map(json_safe_tone_verdict),
+            "absent_frequency_hz": absent_freq,
+            "absent_verdict": absent_verdict.as_ref().map(json_safe_tone_verdict),
             // Whatever THIS process played (--self-tone / --play-pull) went out
             // through the play-ring rate servo, so the capture holds the servo's
             // output, not the tone we asked for. A railed servo bends the pitch
@@ -890,6 +918,32 @@ fn cmd_sysaudio(
         return Ok(EXIT_NO_TRAFFIC);
     }
     Ok(0)
+}
+
+fn downmix_probe_frame(interleaved: &[f32], channels: usize, mono: &mut Vec<f32>) {
+    mono.clear();
+    let channels = channels.clamp(1, 2);
+    mono.reserve(interleaved.len() / channels);
+    if channels == 1 {
+        mono.extend_from_slice(interleaved);
+        return;
+    }
+    mono.extend(
+        interleaved
+            .chunks_exact(channels)
+            .map(|frame| (frame[0] + frame[1]) * 0.5),
+    );
+}
+
+fn json_safe_tone_verdict(verdict: &dsp::ToneVerdict) -> serde_json::Value {
+    serde_json::json!({
+        "freq_hz": verdict.freq_hz.is_finite().then_some(verdict.freq_hz),
+        "frequency_semantics": "requested_not_measured",
+        "measured_frequency_hz": null,
+        "snr_db": verdict.snr_db.is_finite().then_some(verdict.snr_db),
+        "detected": verdict.detected,
+        "samples_analyzed": verdict.samples_analyzed,
+    })
 }
 
 fn cmd_selftest(json: bool) -> Result<i32> {
@@ -1403,5 +1457,15 @@ mod cli_parse_tests {
         assert_eq!(secs, 5.0, "the pre-existing --secs default");
         assert_eq!(vi.secs, 2.0, "the volume-independence leg default");
         assert!(!vi.check_volume_independence, "the check must be opt-in");
+    }
+
+    #[test]
+    fn sysaudio_probe_downmixes_interleaved_stereo_before_mono_analysis() {
+        let mut mono = vec![99.0];
+        downmix_probe_frame(&[1.0, 3.0, -2.0, 2.0], 2, &mut mono);
+        assert_eq!(mono, vec![2.0, 0.0]);
+
+        downmix_probe_frame(&[1.0, -2.0], 1, &mut mono);
+        assert_eq!(mono, vec![1.0, -2.0]);
     }
 }

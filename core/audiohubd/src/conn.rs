@@ -474,6 +474,7 @@ fn register_conn(
     let peer = chan.peer().clone();
     let mk = chan.media_keys();
     let conn = Arc::new(ConnShared {
+        connection_id: inner.next_connection_id.fetch_add(1, Ordering::Relaxed),
         fp: peer.fingerprint.clone(),
         peer_ip,
         // Tier 0 is the default assumption and costs nothing to assume: the
@@ -492,6 +493,7 @@ fn register_conn(
         }),
         media_gate: crate::tcpmedia::AttachGate::new(),
         media_attaching: AtomicBool::new(false),
+        registration_ready: AtomicBool::new(false),
         deferred: Mutex::new(VecDeque::new()),
         tx_key: mk.tx,
         rx_key: mk.rx,
@@ -560,6 +562,12 @@ fn register_conn(
     if mux.is_none() {
         crate::tcpmedia::negotiate(inner, &conn);
     }
+    // Published-before-negotiate is required so an incoming media ticket can
+    // resolve this connection. Opening a stream during that interval is not:
+    // it would freeze the provisional UDP path and unheard mono capability for
+    // the session's whole lifetime. Release only after negotiation is final;
+    // the reader then drains ModeState/AudioCapabilities parked in `deferred`.
+    conn.registration_ready.store(true, Ordering::Release);
     Some(conn)
 }
 
@@ -572,6 +580,9 @@ fn audio_capabilities_msg(presence: audiohub_core::audio::DefaultDevicePresence)
     SessionMsg::AudioCapabilities {
         default_input: presence.input,
         default_output: presence.output,
+        max_media_channels: 2,
+        device_volume_version: 1,
+        media_frame_tag_version: 1,
     }
 }
 
@@ -804,8 +815,23 @@ pub(crate) fn announce_mode(inner: &Arc<DaemonInner>, mode: Mode) {
 /// (the tx engine kept blasting media at a dead peer) and connect_peer handing
 /// the zombie back as an online peer.
 pub(crate) fn conn_reader(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
+    let contract_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| loop {
         if inner.shutdown.load(Ordering::SeqCst) || !conn.alive.load(Ordering::SeqCst) {
+            break;
+        }
+        if peer_contract_deadline_expired(
+            conn.registration_ready.load(Ordering::Acquire),
+            *lk(&conn.peer_mode),
+            *lk(&conn.peer_audio_capabilities),
+            Instant::now(),
+            contract_deadline,
+        ) {
+            dlog!(
+                "[audiohubd] peer {} never completed its mode/audio capability contract within \
+                 {HANDSHAKE_TIMEOUT:?}; closing the half-registered connection",
+                conn.fp
+            );
             break;
         }
         // Anything `register_conn` pulled off the channel while it was bringing
@@ -871,6 +897,18 @@ fn owned_session(
     }
 }
 
+/// A verified connection can be replaced while its reader is between the
+/// alive check and message dispatch. Peer-level controls have no stream id to
+/// provide ownership, so they must explicitly prove they are still the one
+/// registered connection for this fingerprint.
+fn current_peer_connection(inner: &DaemonInner, conn: &Arc<ConnShared>) -> bool {
+    conn.alive.load(Ordering::SeqCst)
+        && lk(&inner.state)
+            .conns
+            .get(&conn.fp)
+            .is_some_and(|current| Arc::ptr_eq(current, conn))
+}
+
 /// true = close this connection.
 fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg) -> bool {
     match msg {
@@ -878,6 +916,8 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
             stream_id,
             kind,
             dir,
+            sample_rate,
+            channels,
             media_salt_b64,
             verify_freq,
             source,
@@ -895,6 +935,8 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                 stream_id,
                 &kind,
                 &dir,
+                sample_rate,
+                channels,
                 &media_salt_b64,
                 verify_freq,
                 source.as_deref(),
@@ -1043,6 +1085,7 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
             scalar,
             muted,
             adjustable,
+            mute_adjustable,
         } => {
             // consumer side: the provider told us what its device really reads.
             // The direction check is the mirror of apply_peer_volume's: on a
@@ -1061,15 +1104,30 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                         scalar: scalar.clamp(0.0, 1.0),
                         muted,
                         adjustable,
+                        mute_adjustable: mute_adjustable.unwrap_or(adjustable),
                     };
                     // plan §7.2：对端设备**没有**可写音量时，这条流的音量改由本机
                     // 的发送侧软件增益兑现。判据只看对端这一句话，模式门单独加：
                     // §7.2 说的是「使用端**虚拟设备**自管音量」，而模式 A 没有虚拟
                     // 设备，它的音量故事是 §7.1 的「以对端为准」——两条一起跑就是
                     // 两个机制在动同一个响度（plan §12.5 的双重衰减）。
-                    let fallback = volume::authority_for(Some(state))
-                        == volume::VolumeAuthority::SendGain
-                        && crate::mode_b_in_force(inner);
+                    // Snapshot the connection cell before taking the HAL slot
+                    // lock in `peer_software_gain_authority`. Keeping the
+                    // temporary MutexGuard alive across `bool::then` would
+                    // invert the established haldev -> state -> conn-cell
+                    // order used by reconciliation and device-volume commits.
+                    let peer_device_volume_v1 =
+                        { lk(&conn.peer_audio_capabilities).device_volume_version() >= 1 };
+                    let peer_level = (crate::mode_b_in_force(inner) && peer_device_volume_v1)
+                        .then(|| haldev::peer_software_gain_authority(inner, &conn.fp))
+                        .flatten();
+                    let fallback = peer_level.map_or_else(
+                        || {
+                            volume::authority_for(Some(state)) == volume::VolumeAuthority::SendGain
+                                && crate::mode_b_in_force(inner)
+                        },
+                        |gain| gain.is_some(),
+                    );
                     if fallback {
                         // 接手（幂等；只有第一次真的播种起点）。之后**一个字都
                         // 不写进单元格**：对端每秒都会把它那个冻住的读数（聚合
@@ -1077,6 +1135,16 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                         // 位置拽回去 —— 而 `push_peer_volumes` 会把这个拽回去的
                         // 值一路推到虚拟设备的音量控件上。
                         engage_send_gain(&e);
+                        if let Some(wanted) = peer_level.flatten() {
+                            if let Err(err) = apply_send_gain(&e, wanted.scalar, Some(wanted.muted))
+                            {
+                                dlog!(
+                                    "[audiohubd] stream {}: restore peer-level software gain: \
+                                     {err:#}",
+                                    e.id
+                                );
+                            }
+                        }
                     } else {
                         // 交还（同样幂等）：对端换回能调音量的设备之后，增益斜坡
                         // 回到 1.0，显示值重新由对端的读数驱动。
@@ -1097,6 +1165,69 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
                         follow_peer_volume(inner, &e, state);
                     }
                 }
+            }
+        }
+        SessionMsg::DeviceVolumeSet {
+            endpoint,
+            request_id,
+            scalar,
+            muted,
+        } => apply_peer_device_volume(inner, conn, &endpoint, request_id, scalar, muted),
+        SessionMsg::DeviceVolumeState {
+            endpoint,
+            request_id,
+            revision,
+            scalar,
+            muted,
+            adjustable,
+            mute_adjustable,
+        } => {
+            if !current_peer_connection(inner, conn) {
+                dlog!(
+                    "[audiohubd] ignoring device_volume_state from replaced connection {}",
+                    conn.fp
+                );
+                return false;
+            }
+            let local_consumer = haldev::effective_mode(inner) == Mode::B;
+            let peer_provider = lk(&conn.peer_mode).mode() == Some(Mode::Share);
+            let protocol = lk(&conn.peer_audio_capabilities).device_volume_version() >= 1;
+            let parsed = haldev::DeviceVolumeEndpoint::parse(&endpoint);
+            if !local_consumer || !peer_provider || !protocol {
+                dlog!(
+                    "[audiohubd] ignoring device_volume_state from {}: local_mode={}, \
+                     peer_mode={:?}, protocol={}",
+                    conn.fp,
+                    haldev::effective_mode(inner),
+                    lk(&conn.peer_mode).mode(),
+                    protocol
+                );
+            } else if !scalar.is_finite() {
+                dlog!(
+                    "[audiohubd] ignoring device_volume_state from {}: scalar is not finite",
+                    conn.fp
+                );
+            } else if let Some(endpoint) = parsed {
+                let _ = haldev::accept_peer_device_volume(
+                    inner,
+                    &conn.fp,
+                    endpoint,
+                    conn.connection_id,
+                    revision,
+                    request_id,
+                    VolumeState {
+                        scalar,
+                        muted,
+                        adjustable,
+                        mute_adjustable,
+                    },
+                );
+            } else {
+                dlog!(
+                    "[audiohubd] ignoring device_volume_state from {}: unknown endpoint {:?}",
+                    conn.fp,
+                    endpoint
+                );
             }
         }
         SessionMsg::Ping { t_us } => {
@@ -1166,6 +1297,13 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
             }
         }
         SessionMsg::ModeState { mode } => {
+            if !current_peer_connection(inner, conn) {
+                dlog!(
+                    "[audiohubd] ignoring mode state from replaced connection {}",
+                    conn.fp
+                );
+                return false;
+            }
             let cell = match Mode::parse(&mode) {
                 Some(m) => crate::PeerModeCell::Known(m),
                 None => {
@@ -1196,19 +1334,39 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
         SessionMsg::AudioCapabilities {
             default_input,
             default_output,
+            max_media_channels,
+            device_volume_version,
+            media_frame_tag_version,
         } => {
+            if !current_peer_connection(inner, conn) {
+                dlog!(
+                    "[audiohubd] ignoring audio capabilities from replaced connection {}",
+                    conn.fp
+                );
+                return false;
+            }
             let cell = crate::PeerAudioCapabilitiesCell::Known {
                 default_input,
                 default_output,
+                max_media_channels,
+                device_volume_version,
+                media_frame_tag_version,
             };
             let prev = std::mem::replace(&mut *lk(&conn.peer_audio_capabilities), cell);
             if prev != cell {
                 dlog!(
-                    "[audiohubd] peer {} audio capabilities: default_input={}, default_output={}",
+                    "[audiohubd] peer {} audio capabilities: default_input={}, default_output={}, \
+                    max_media_channels={}, device_volume_version={}, media_frame_tag_version={}",
                     conn.fp,
                     default_input,
-                    default_output
+                    default_output,
+                    max_media_channels,
+                    device_volume_version,
+                    media_frame_tag_version
                 );
+            }
+            if device_volume_version < 1 {
+                haldev::clear_peer_device_volume_protocol(inner, &conn.fp, conn.connection_id);
             }
         }
         SessionMsg::Unpaired {} => {
@@ -1231,6 +1389,131 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
         SessionMsg::Bye {} => return true,
     }
     false
+}
+
+/// Apply a peer-level mode-B endpoint write on the provider.
+///
+/// This handler runs only after pair verification and secure-channel upgrade.
+/// Local Share mode remains the authority gate; the remote mode/capability
+/// checks keep honest mixed-version peers out of a path they cannot complete.
+fn apply_peer_device_volume(
+    inner: &Arc<DaemonInner>,
+    conn: &Arc<ConnShared>,
+    endpoint: &str,
+    request_id: u64,
+    scalar: f32,
+    muted: Option<bool>,
+) {
+    if !current_peer_connection(inner, conn) {
+        dlog!(
+            "[audiohubd] ignoring device_volume_set from replaced connection {}",
+            conn.fp
+        );
+        return;
+    }
+    if haldev::effective_mode(inner) != Mode::Share {
+        dlog!(
+            "[audiohubd] ignoring device_volume_set from {}: this machine is not sharing",
+            conn.fp
+        );
+        return;
+    }
+    if lk(&conn.peer_mode).mode() != Some(Mode::B)
+        || lk(&conn.peer_audio_capabilities).device_volume_version() < 1
+    {
+        dlog!(
+            "[audiohubd] ignoring device_volume_set from {}: peer is not an eligible mode-B \
+             consumer",
+            conn.fp
+        );
+        return;
+    }
+    if !scalar.is_finite() {
+        dlog!(
+            "[audiohubd] ignoring device_volume_set from {}: scalar is not finite",
+            conn.fp
+        );
+        return;
+    }
+    let Some(endpoint) = haldev::DeviceVolumeEndpoint::parse(endpoint) else {
+        dlog!(
+            "[audiohubd] ignoring device_volume_set from {}: unknown endpoint",
+            conn.fp
+        );
+        return;
+    };
+    let scalar = scalar.clamp(0.0, 1.0);
+    // Keep the platform write and readback in one endpoint order, then stamp
+    // the result. Sending happens after the lock: a slow peer must not block
+    // another peer's device write, and the consumer rejects reordered revisions.
+    let mut ordered = match endpoint {
+        haldev::DeviceVolumeEndpoint::DefaultOutput => lk(&inner.device_output_volume_io),
+        haldev::DeviceVolumeEndpoint::DefaultInput => lk(&inner.device_input_volume_io),
+    };
+    if !current_peer_connection(inner, conn)
+        || haldev::effective_mode(inner) != Mode::Share
+        || lk(&conn.peer_mode).mode() != Some(Mode::B)
+        || lk(&conn.peer_audio_capabilities).device_volume_version() < 1
+    {
+        dlog!(
+            "[audiohubd] dropping delayed device_volume_set from {} after its authority changed",
+            conn.fp
+        );
+        return;
+    }
+    let (set_volume, set_mute, readback): (
+        fn(f32) -> Result<()>,
+        fn(bool) -> Result<()>,
+        fn() -> Result<VolumeState>,
+    ) = match endpoint {
+        haldev::DeviceVolumeEndpoint::DefaultOutput => (
+            volume::set_default_output_volume,
+            volume::set_default_output_mute,
+            volume::get_default_output_volume,
+        ),
+        haldev::DeviceVolumeEndpoint::DefaultInput => (
+            volume::set_default_input_volume,
+            volume::set_default_input_mute,
+            volume::get_default_input_volume,
+        ),
+    };
+
+    if let Err(err) = set_volume(scalar) {
+        dlog!(
+            "[audiohubd] peer {}: set {} volume: {err:#}",
+            conn.fp,
+            endpoint.as_wire()
+        );
+    }
+    if let Some(muted) = muted {
+        if let Err(err) = set_mute(muted) {
+            dlog!(
+                "[audiohubd] peer {}: set {} mute: {err:#}",
+                conn.fp,
+                endpoint.as_wire()
+            );
+        }
+    }
+    let Ok(state) = readback() else {
+        dlog!(
+            "[audiohubd] peer {}: cannot read {} after applying device volume",
+            conn.fp,
+            endpoint.as_wire()
+        );
+        return;
+    };
+    *ordered = (*ordered).wrapping_add(1).max(1);
+    let revision = *ordered;
+    drop(ordered);
+    let _ = conn.send_msg(&SessionMsg::DeviceVolumeState {
+        endpoint: endpoint.as_wire().to_string(),
+        request_id: Some(request_id),
+        revision,
+        scalar: state.scalar,
+        muted: state.muted,
+        adjustable: state.adjustable,
+        mute_adjustable: state.mute_adjustable,
+    });
 }
 
 fn notify_pending(conn: &ConnShared, stream_id: u32, res: std::result::Result<(), String>) {
@@ -1423,11 +1706,13 @@ pub(crate) fn set_session_volume(
     // provider's next VolumeState replaces it with what the device really did.
     let last = *lk(&e.volume.state);
     let adjustable = last.map_or(true, |v| v.adjustable);
+    let mute_adjustable = last.map_or(adjustable, |v| v.mute_adjustable);
     let shown = muted.or_else(|| last.map(|v| v.muted)).unwrap_or(false);
     *lk(&e.volume.state) = Some(VolumeState {
         scalar: s,
         muted: shown,
         adjustable,
+        mute_adjustable,
     });
     Ok(())
 }
@@ -1460,6 +1745,7 @@ fn apply_send_gain(e: &SessionEntry, scalar: f32, muted: Option<bool>) -> Result
         scalar,
         muted: m,
         adjustable: false,
+        mute_adjustable: last.is_some_and(|state| state.mute_adjustable),
     });
     Ok(())
 }
@@ -1484,6 +1770,7 @@ fn engage_send_gain(e: &SessionEntry) {
         scalar: 1.0,
         muted: false,
         adjustable: false,
+        mute_adjustable: false,
     });
     dlog!(
         "[audiohubd] stream {}: the peer's output device has no volume we can drive; this side \
@@ -1506,6 +1793,44 @@ fn release_send_gain(e: &SessionEntry) {
          to it (plan §7.2); the send-side gain ramps to unity",
         e.id
     );
+}
+
+/// Apply one peer-level fallback knob to every active mode-B speaker stream
+/// for that peer. The desired state lives in `haldev`, so it survives idle
+/// periods; sessions are merely the current executors of that persistent
+/// intent.
+pub(crate) fn sync_peer_software_gain(
+    inner: &Arc<DaemonInner>,
+    fingerprint: &str,
+    desired: Option<VolumeState>,
+) {
+    let desired = (haldev::effective_mode(inner) == Mode::B)
+        .then_some(desired)
+        .flatten();
+    let sessions: Vec<SessionEntry> = lk(&inner.state)
+        .sessions
+        .values()
+        .filter(|entry| {
+            entry.conn.fp == fingerprint
+                && entry.kind == KIND_SPK
+                && entry.dir == DIR_SEND
+                && entry.volume.enabled
+        })
+        .cloned()
+        .collect();
+    for entry in sessions {
+        if let Some(wanted) = desired {
+            engage_send_gain(&entry);
+            if let Err(err) = apply_send_gain(&entry, wanted.scalar, Some(wanted.muted)) {
+                dlog!(
+                    "[audiohubd] stream {}: apply peer-level software gain: {err:#}",
+                    entry.id
+                );
+            }
+        } else {
+            release_send_gain(&entry);
+        }
+    }
 }
 
 fn decode_media_salt(b64: &str) -> Result<Vec<u8>> {
@@ -1561,6 +1886,7 @@ fn start_tx_stream(
     salt: Vec<u8>,
     path: crate::tcpmedia::MediaPath,
     spec: SourceSpec,
+    channels: u8,
     loss_pct: f32,
     shared: Arc<TxShared>,
 ) -> Result<()> {
@@ -1572,6 +1898,7 @@ fn start_tx_stream(
             salt,
             path,
             spec,
+            channels,
             loss_pct,
             shared,
             ack: Some(ack_tx),
@@ -1608,6 +1935,8 @@ fn handle_remote_open(
     stream_id: u32,
     kind: &str,
     dir: &str,
+    sample_rate: u32,
+    channels: u8,
     media_salt_b64: &str,
     verify_freq: Option<f32>,
     source: Option<&str>,
@@ -1623,6 +1952,12 @@ fn handle_remote_open(
     }
     if kind != KIND_MIC && kind != KIND_SPK {
         bail!("unknown kind {kind}");
+    }
+    if sample_rate != 48_000 {
+        bail!("OpenStream base sample rate must be 48000, got {sample_rate}");
+    }
+    if !(1..=2).contains(&channels) {
+        bail!("OpenStream channels must be 1 or 2, got {channels}");
     }
     let endpoint = required_local_endpoint_for_remote_open(kind, dir, source);
     let endpoint_guard = loop {
@@ -1661,17 +1996,23 @@ fn handle_remote_open(
             // attach and leave a stream saying it travels somewhere it does not.
             let path = conn.current_media_path();
             let media_tier = path.tier_wire();
-            let rx = Arc::new(RxStream::new(
-                stream_id,
-                &conn.rx_key,
-                &salt,
-                verify_freq,
-                kind == KIND_SPK, // spk-recv joins the mixer
-                false,
-                None, // bridging is the local consumer's choice, never the peer's
-                None, // ...and so is the virtual microphone (spec-m5b §5.4)
-                path,
-            ));
+            let media_frame_tag_version =
+                lk(&conn.peer_audio_capabilities).media_frame_tag_version();
+            let rx = Arc::new(
+                RxStream::new(
+                    stream_id,
+                    &conn.rx_key,
+                    &salt,
+                    verify_freq,
+                    kind == KIND_SPK, // spk-recv joins the mixer
+                    false,
+                    None, // bridging is the local consumer's choice, never the peer's
+                    None, // ...and so is the virtual microphone (spec-m5b §5.4)
+                    path,
+                    channels,
+                )
+                .with_media_frame_tag_version(media_frame_tag_version),
+            );
             wr(&inner.rx_table).insert(stream_id, rx.clone());
             let entry = SessionEntry {
                 id: stream_id,
@@ -1717,6 +2058,7 @@ fn handle_remote_open(
                 salt,
                 path,
                 spec,
+                channels,
                 loss.unwrap_or(0.0),
                 shared.clone(),
             )?;
@@ -2057,6 +2399,174 @@ fn source_spec(
     }
 }
 
+fn preferred_source_channels(source: Option<&str>) -> u8 {
+    match source {
+        Some(SOURCE_SYSAUDIO) | Some(SOURCE_HAL_SPEAKER) => 2,
+        _ => 1,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerOpenContract {
+    Waiting,
+    Ready(u8),
+}
+
+fn peer_contract_deadline_expired(
+    registration_ready: bool,
+    mode: crate::PeerModeCell,
+    capabilities: crate::PeerAudioCapabilitiesCell,
+    now: Instant,
+    deadline: Instant,
+) -> bool {
+    registration_ready
+        && (matches!(mode, crate::PeerModeCell::Unheard)
+            || matches!(capabilities, crate::PeerAudioCapabilitiesCell::Unheard))
+        && now >= deadline
+}
+
+fn peer_open_contract(
+    registration_ready: bool,
+    mode: crate::PeerModeCell,
+    capabilities: crate::PeerAudioCapabilitiesCell,
+) -> PeerOpenContract {
+    if !registration_ready
+        || matches!(mode, crate::PeerModeCell::Unheard)
+        || matches!(capabilities, crate::PeerAudioCapabilitiesCell::Unheard)
+    {
+        return PeerOpenContract::Waiting;
+    }
+    // Hearing the mode is part of the registration contract, but it is not a
+    // caller-side authority check.  A non-share peer must receive OpenStream
+    // and refuse it from its own effective-mode gate; otherwise a stale or
+    // forged ModeState could replace the provider's real enforcement decision.
+    // The mode-B coordinator separately selects only known Share peers.
+    PeerOpenContract::Ready(capabilities.max_media_channels())
+}
+
+fn peer_media_channels_for_open(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) -> Result<u8> {
+    // Tier-1 negotiation can legally occupy eight seconds while ModeState and
+    // AudioCapabilities wait in `deferred`. The connection must be visible so
+    // an attach ticket can resolve it, but a stream must not consume that
+    // half-registered connection: doing so freezes its provisional UDP path
+    // and mono fallback for the whole session. Every protocol-compatible peer,
+    // including 1.0.0, sends both advertisements; the old missing channel field
+    // deserialises as one after the real message arrives.
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    loop {
+        if !conn.alive.load(Ordering::Acquire) {
+            bail!("peer connection closed before its audio contract became ready");
+        }
+        let mode = *lk(&conn.peer_mode);
+        let capabilities = *lk(&conn.peer_audio_capabilities);
+        match peer_open_contract(
+            conn.registration_ready.load(Ordering::Acquire),
+            mode,
+            capabilities,
+        ) {
+            PeerOpenContract::Ready(channels) => return Ok(channels),
+            PeerOpenContract::Waiting => {}
+        }
+        if Instant::now() >= deadline {
+            // This exact Arc was published before negotiation so the media
+            // ticket could resolve it. If its contract never followed, leaving
+            // it alive would make every mode-B open wait/skip forever while the
+            // UI still called the peer online.
+            teardown_conn(inner, conn);
+            bail!(
+                "peer connection did not finish media/mode/audio-capability registration within \
+                 {HANDSHAKE_TIMEOUT:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod peer_open_contract_tests {
+    use super::{peer_contract_deadline_expired, peer_open_contract, PeerOpenContract};
+    use crate::{PeerAudioCapabilitiesCell, PeerModeCell};
+    use audiohub_ipc::Mode;
+    use std::time::{Duration, Instant};
+
+    fn capabilities(channels: u8) -> PeerAudioCapabilitiesCell {
+        PeerAudioCapabilitiesCell::Known {
+            default_input: true,
+            default_output: true,
+            max_media_channels: channels,
+            device_volume_version: 1,
+            media_frame_tag_version: 1,
+        }
+    }
+
+    #[test]
+    fn attach_and_both_advertisements_are_one_stream_open_gate() {
+        let share = PeerModeCell::Known(Mode::Share);
+        let stereo = capabilities(2);
+        assert_eq!(
+            peer_open_contract(false, share, stereo),
+            PeerOpenContract::Waiting,
+            "published-before-attach connections must not leak provisional UDP/mono state"
+        );
+        assert_eq!(
+            peer_open_contract(true, PeerModeCell::Unheard, stereo),
+            PeerOpenContract::Waiting
+        );
+        assert_eq!(
+            peer_open_contract(true, share, PeerAudioCapabilitiesCell::Unheard),
+            PeerOpenContract::Waiting
+        );
+        assert_eq!(
+            peer_open_contract(true, share, stereo),
+            PeerOpenContract::Ready(2)
+        );
+    }
+
+    #[test]
+    fn legacy_mono_is_chosen_from_its_message_not_from_a_timeout() {
+        assert_eq!(
+            peer_open_contract(true, PeerModeCell::Known(Mode::Share), capabilities(1)),
+            PeerOpenContract::Ready(1)
+        );
+    }
+
+    #[test]
+    fn a_heard_non_provider_reaches_the_providers_authoritative_open_gate() {
+        for mode in [Mode::A, Mode::B] {
+            assert_eq!(
+                peer_open_contract(true, PeerModeCell::Known(mode), capabilities(2)),
+                PeerOpenContract::Ready(2)
+            );
+        }
+    }
+
+    #[test]
+    fn unheard_contract_expires_but_a_real_legacy_mono_contract_does_not() {
+        let deadline = Instant::now();
+        assert!(!peer_contract_deadline_expired(
+            true,
+            PeerModeCell::Unheard,
+            PeerAudioCapabilitiesCell::Unheard,
+            deadline - Duration::from_millis(1),
+            deadline,
+        ));
+        assert!(peer_contract_deadline_expired(
+            true,
+            PeerModeCell::Known(Mode::Share),
+            PeerAudioCapabilitiesCell::Unheard,
+            deadline,
+            deadline,
+        ));
+        assert!(!peer_contract_deadline_expired(
+            true,
+            PeerModeCell::Known(Mode::Share),
+            capabilities(1),
+            deadline + Duration::from_secs(1),
+            deadline,
+        ));
+    }
+}
+
 pub(crate) fn teardown_stream(inner: &DaemonInner, stream_id: u32, notify_remote: bool) {
     let entry = lk(&inner.state).sessions.remove(&stream_id);
     let Some(e) = entry else { return };
@@ -2177,6 +2687,64 @@ pub(crate) fn ping_and_reap(inner: &Arc<DaemonInner>) {
             continue;
         }
         let _ = c.send_msg(&SessionMsg::Ping { t_us });
+    }
+}
+
+/// Share-side endpoint snapshots for mode-B peers, independent of media
+/// session lifetime. Called once per daemon ticker second so physical volume
+/// and mute changes converge while every virtual device is idle.
+pub(crate) fn poll_peer_device_volumes(inner: &Arc<DaemonInner>) {
+    if haldev::effective_mode(inner) != Mode::Share || inner.shutdown.load(Ordering::SeqCst) {
+        return;
+    }
+    let conns: Vec<Arc<ConnShared>> = lk(&inner.state)
+        .conns
+        .values()
+        .filter(|conn| conn.alive.load(Ordering::SeqCst))
+        .cloned()
+        .collect();
+    let conns: Vec<Arc<ConnShared>> = conns
+        .into_iter()
+        .filter(|conn| lk(&conn.peer_mode).mode() == Some(Mode::B))
+        .filter(|conn| lk(&conn.peer_audio_capabilities).device_volume_version() >= 1)
+        .collect();
+    if conns.is_empty() {
+        return;
+    }
+
+    for endpoint in [
+        haldev::DeviceVolumeEndpoint::DefaultOutput,
+        haldev::DeviceVolumeEndpoint::DefaultInput,
+    ] {
+        // See apply_peer_device_volume: platform reads/writes get a monotonic
+        // endpoint revision. Sends remain outside so one stuck connection
+        // cannot hold every other peer's physical volume control hostage.
+        let mut ordered = match endpoint {
+            haldev::DeviceVolumeEndpoint::DefaultOutput => lk(&inner.device_output_volume_io),
+            haldev::DeviceVolumeEndpoint::DefaultInput => lk(&inner.device_input_volume_io),
+        };
+        let state = match endpoint {
+            haldev::DeviceVolumeEndpoint::DefaultOutput => volume::get_default_output_volume(),
+            haldev::DeviceVolumeEndpoint::DefaultInput => volume::get_default_input_volume(),
+        };
+        let Ok(state) = state else { continue };
+        if !state.scalar.is_finite() {
+            continue;
+        }
+        *ordered = (*ordered).wrapping_add(1).max(1);
+        let revision = *ordered;
+        drop(ordered);
+        for conn in &conns {
+            let _ = conn.send_msg(&SessionMsg::DeviceVolumeState {
+                endpoint: endpoint.as_wire().to_string(),
+                request_id: None,
+                revision,
+                scalar: state.scalar.clamp(0.0, 1.0),
+                muted: state.muted,
+                adjustable: state.adjustable,
+                mute_adjustable: state.mute_adjustable,
+            });
+        }
     }
 }
 
@@ -2611,8 +3179,9 @@ pub(crate) fn connect_peer(
     match register_conn(inner, chan, addr.ip(), initiator_fp, link.clone()) {
         Some(conn) => {
             let i = inner.clone();
-            let c = conn;
-            let _ = std::thread::Builder::new()
+            let c = conn.clone();
+            let reader_link = link.clone();
+            let spawned = std::thread::Builder::new()
                 .name("ahb-conn".into())
                 .spawn(move || {
                     // spec §8: a panic on one conn must not reach the daemon
@@ -2624,10 +3193,18 @@ pub(crate) fn connect_peer(
                     // connection, so the reader ending ends both. Without this
                     // the mux's own two threads would outlive the conn they
                     // serve and sit on a socket nobody reads.
-                    if let Some(l) = &link {
+                    if let Some(l) = &reader_link {
                         l.kill();
                     }
                 });
+            if let Err(err) = spawned {
+                // Registration already published this exact Arc. A failed
+                // reader spawn must retire it now; otherwise it remains alive,
+                // answers every online lookup, and can never consume the peer's
+                // mode/capability contract or any stream response.
+                teardown_conn(inner, &conn);
+                return Err(err).context("spawn control connection reader");
+            }
         }
         // the peer connected to us at the same moment and its conn won: it is
         // already registered under this fingerprint, so callers find it
@@ -2840,6 +3417,17 @@ pub(crate) fn open_session_from(
         .cloned()
         .ok_or_else(|| anyhow!("no live connection to {}", peer.fingerprint))?;
 
+    // Missing capability means a 1.0.0 peer and therefore mono. New peers use
+    // stereo only for sources which carry spatial information; this also keeps
+    // microphone/tone bandwidth identical to 1.0.0.
+    let desired_channels = spec
+        .as_ref()
+        .map(SourceSpec::preferred_channels)
+        .unwrap_or_else(|| preferred_source_channels(params.source.as_deref()));
+    let peer_channels = peer_media_channels_for_open(inner, &conn)?;
+    let media_channels = desired_channels.min(peer_channels).clamp(1, 2);
+    let media_frame_tag_version = lk(&conn.peer_audio_capabilities).media_frame_tag_version();
+
     let stream_id = alloc_stream_id(inner);
     // the same caps a remote opener is held to (B7): locally driven opens must
     // not be the way to starve the 10ms loops either
@@ -2871,17 +3459,21 @@ pub(crate) fn open_session_from(
     // register the receive side before OpenStream goes out so no early media
     // is dropped once the provider accepts
     let rx_arc = if consuming {
-        let rx = Arc::new(RxStream::new(
-            stream_id,
-            &conn.rx_key,
-            &salt,
-            params.verify_freq,
-            false,
-            params.monitor,
-            bridge.clone(),
-            hal_slot,
-            path.clone(),
-        ));
+        let rx = Arc::new(
+            RxStream::new(
+                stream_id,
+                &conn.rx_key,
+                &salt,
+                params.verify_freq,
+                false,
+                params.monitor,
+                bridge.clone(),
+                hal_slot,
+                path.clone(),
+                media_channels,
+            )
+            .with_media_frame_tag_version(media_frame_tag_version),
+        );
         wr(&inner.rx_table).insert(stream_id, rx.clone());
         Some(rx)
     } else {
@@ -2932,6 +3524,7 @@ pub(crate) fn open_session_from(
             salt.to_vec(),
             path,
             spec.expect("validated above"),
+            media_channels,
             params.simulate_loss_pct.unwrap_or(0.0),
             shared.clone(),
         ) {
@@ -2953,7 +3546,7 @@ pub(crate) fn open_session_from(
         kind: params.kind.clone(),
         dir: if consuming { DIR_RECV } else { DIR_SEND }.to_string(),
         sample_rate: 48000,
-        channels: 1,
+        channels: media_channels,
         media_salt_b64: BASE64_STANDARD.encode(salt),
         verify_freq: params.verify_freq,
         source: params.source.clone(),
@@ -2979,14 +3572,6 @@ pub(crate) fn open_session_from(
             bail!("open timed out after {OPEN_TIMEOUT:?}");
         }
     }
-    // The peer has a receiving stream now, so the datagrams have somewhere to
-    // land. Before the table insert below, deliberately: the audio starting is
-    // what the peer is waiting for, and the insert only concerns this daemon's
-    // own bookkeeping.
-    if let Some(shared) = &tx_shared {
-        shared.armed.store(true, Ordering::SeqCst);
-    }
-
     // exactly what a reconnect replays; the fresh stream id and media salt are
     // minted by this function, not carried here (spec-m4c §C)
     let replay = Some(Arc::new(params.clone()));
@@ -3054,6 +3639,20 @@ pub(crate) fn open_session_from(
             "control channel to {} closed while the stream was being opened",
             conn.fp
         );
+    }
+    // Restore a fixed peer output's persistent virtual-device gain BEFORE the
+    // first media packet is armed. Otherwise a knob set while idle would play
+    // at unity until the first per-session volume report (up to one second).
+    if !consuming && params.kind == KIND_SPK && vol_sync {
+        if let Some(desired) = haldev::peer_software_gain_authority(inner, &conn.fp) {
+            sync_peer_software_gain(inner, &conn.fp, desired);
+        }
+    }
+    // The peer accepted and the local entry now exists with its initial gain
+    // installed, so media can leave. Keeping `armed=false` through the setup
+    // above preserves the invariant that no full-volume prefix escapes.
+    if let Some(shared) = &entry.tx {
+        shared.armed.store(true, Ordering::SeqCst);
     }
     // plan §7.1 「静音本机」: the stream is established exactly here — the peer
     // accepted, the source is running and the entry is in the table. Firing it

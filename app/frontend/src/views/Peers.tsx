@@ -16,7 +16,9 @@ import { useState } from 'react';
 import { Icon } from '../components/Icon';
 import { Help, Switch } from '../components/Controls';
 import { WIKI } from '../lib/external';
-import { VolumeControl } from '../components/VolumeControl';
+import {
+  DeviceVolumeControl, VolumeControl, deviceVolumeEndpointFor, deviceVolumeRequest,
+} from '../components/VolumeControl';
 import { BridgeControl } from '../components/BridgeControl';
 import { ShareSourceControl } from '../components/ShareSourceControl';
 import { PeerMetrics } from '../components/PeerMetrics';
@@ -34,7 +36,7 @@ import {
   isModeB, isShareMode, peerAudioDirectionAvailable, peerDeviceRows,
   peerHasNoAudioDirections, halReasonText, peerUnusableText,
 } from '../state/mode';
-import { refreshSessions, rpc } from '../state/connection';
+import { refreshPeers, refreshSessions, rpc } from '../state/connection';
 import type { PeerState, SessionInfo } from '../ipc/types';
 
 // 进行中的通路操作（`${fp}:mic` / `${fp}:spk`），也是开关 pending 态的唯一判据。
@@ -294,6 +296,12 @@ function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
           const ready = d.published && d.observed;
           const state = io ? 'live' : ready ? 'idle' : 'pending';
           const text = io ? t('device.inUse') : ready ? t('device.idle') : t('device.awaiting');
+          const output = d.dir === 'out';
+          const endpoint = deviceVolumeEndpointFor(d.dir);
+          const reported = output ? dev?.out_volume : dev?.in_volume;
+          const volumePending = output ? dev?.out_volume_pending : dev?.in_volume_pending;
+          const volumeActive = !hidden && !!peer.online
+            && peer.peer_mode === 'share' && !peer.peer_unusable;
           return (
             <div
               key={d.dir}
@@ -306,6 +314,30 @@ function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
               <div className="dev-text">
                 <span className="dev-name" title={d.name}>{d.name || t('common.dash')}</span>
               </div>
+              <DeviceVolumeControl
+                peer={fp}
+                endpoint={endpoint}
+                version={dev?.device_volume_version}
+                reported={reported}
+                pending={volumePending}
+                online={!!peer.online}
+                active={volumeActive}
+                inactiveNote={t(hidden
+                  ? 'volume.deviceModeUnavailable'
+                  : 'volume.devicePeerUnavailable')}
+                softwareGain={output && !!dev?.out_volume_software_gain}
+                volumeTestid={`device-volume-${d.dir}-${fp}`}
+                muteTestid={`device-mute-${d.dir}-${fp}`}
+                label={t(output ? 'volume.deviceOutputLabel' : 'volume.deviceInputLabel', {
+                  name: d.name || peer.name || fp,
+                })}
+                onSet={(wanted, params) => rpc(
+                  'peer.set_device_volume',
+                  deviceVolumeRequest(fp, wanted, params),
+                  { silent: true },
+                )}
+                onRefresh={() => { void refreshPeers(); }}
+              />
               <span className={`dev-state ${state}`}>{text}</span>
             </div>
           );
@@ -392,7 +424,7 @@ function PeerCard({ peer, modeB, share }: { peer: PeerState; modeB: boolean; sha
       data-testid={`peer-card-${fp}`}
       tabIndex={0}
       role="button"
-      aria-label={t('peers.card.viewDetail', { name: peer.name || fp })}
+      aria-label={t('peers.card.viewDetail', { name: displayName, fingerprint: fp })}
       onClick={nav}
       onKeyDown={(e) => { if (e.key === 'Enter' && e.target === e.currentTarget) nav(); }}
     >

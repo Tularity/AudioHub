@@ -13,14 +13,15 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_DevNode_Status, SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList,
-    SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
-    SetupDiGetClassDevsW, SetupDiGetDeviceInstallParamsW, SetupDiGetDeviceRegistryPropertyW,
-    SetupDiGetINFClassW, SetupDiOpenDevRegKey, SetupDiSetDeviceRegistryPropertyW,
-    SetupUninstallOEMInfW, UpdateDriverForPlugAndPlayDevicesW, CR_SUCCESS, DICD_GENERATE_ID,
-    DICS_FLAG_GLOBAL, DIF_REGISTERDEVICE, DIF_REMOVE, DIGCF_ALLCLASSES, DIREG_DEV, DI_NEEDREBOOT,
-    DI_NEEDRESTART, DN_HAS_PROBLEM, DN_STARTED, HDEVINFO, INSTALLFLAG_NONINTERACTIVE,
-    SPDRP_HARDWAREID, SPDRP_SERVICE, SP_DEVINFO_DATA, SP_DEVINSTALL_PARAMS_W,
+    CM_Get_DevNode_Status, SetupDiCallClassInstaller, SetupDiCreateDevRegKeyW,
+    SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList,
+    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstallParamsW,
+    SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW, SetupDiOpenDevRegKey,
+    SetupDiSetDeviceRegistryPropertyW, SetupUninstallOEMInfW, UpdateDriverForPlugAndPlayDevicesW,
+    CR_SUCCESS, DICD_GENERATE_ID, DICS_FLAG_GLOBAL, DIF_REGISTERDEVICE, DIF_REMOVE,
+    DIGCF_ALLCLASSES, DIREG_DEV, DI_NEEDREBOOT, DI_NEEDRESTART, DN_HAS_PROBLEM, DN_STARTED,
+    HDEVINFO, INSTALLFLAG_NONINTERACTIVE, SPDRP_HARDWAREID, SPDRP_SERVICE, SP_DEVINFO_DATA,
+    SP_DEVINSTALL_PARAMS_W,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_FILE_NOT_FOUND, ERROR_INF_IN_USE_BY_DEVICES,
@@ -33,8 +34,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegQueryValueExW, RegSetValueExW, HKEY, KEY_QUERY_VALUE, KEY_SET_VALUE,
-    REG_EXPAND_SZ, REG_SZ,
+    RegCloseKey, RegQueryValueExW, RegSetValueExW, HKEY, KEY_QUERY_VALUE, REG_EXPAND_SZ, REG_SZ,
 };
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, DeleteService, OpenSCManagerW, OpenServiceW,
@@ -784,9 +784,15 @@ fn query_device_value(set: HDEVINFO, data: &SP_DEVINFO_DATA, name: &str) -> Opti
 }
 
 fn set_daemon_image(set: HDEVINFO, data: &SP_DEVINFO_DATA, daemon: &Path) -> WinResult<()> {
-    let raw =
-        unsafe { SetupDiOpenDevRegKey(set, data, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_SET_VALUE) };
-    let key = RegistryKey::new(raw, "SetupDiOpenDevRegKey(KEY_SET_VALUE)")?;
+    // A freshly registered root devnode does not necessarily have its DIREG_DEV
+    // hardware key yet. Opening it made every first install fail with
+    // ERROR_KEY_DOES_NOT_EXIST (0xe0000204) and then roll the devnode back.
+    // SetupDiCreateDevRegKeyW is create-or-open, so the same path is correct for
+    // both a new device and an idempotent update of an existing one.
+    let raw = unsafe {
+        SetupDiCreateDevRegKeyW(set, data, DICS_FLAG_GLOBAL, 0, DIREG_DEV, null(), null())
+    };
+    let key = RegistryKey::new(raw, "SetupDiCreateDevRegKeyW(DIREG_DEV)")?;
     let name = wide_str(DAEMON_VALUE);
     let value = wide(daemon.as_os_str());
     let result = unsafe {

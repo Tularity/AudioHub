@@ -8,7 +8,14 @@ ROOT="$(cd "${0:a:h}/.." && pwd)"
 DRIVER_DIR="$ROOT/drivers/macos-hal"
 OUT="$DRIVER_DIR/build/AudioHubDriver.pkg"
 SCRIPTS="$ROOT/app/installer/macos/driver-scripts"
-VERSION="${AUDIOHUB_VERSION:-1.0.0}"
+# Derived, never written twice; see the note in build-macos-pkg.sh.
+VERSION="${AUDIOHUB_VERSION:-}"
+if [[ -z "$VERSION" ]]; then
+  VERSION="$(/usr/bin/plutil -extract version raw -o - "$ROOT/app/src-tauri/tauri.conf.json")" \
+    || { print -u2 -- "[audiohub] ERROR: cannot read version from app/src-tauri/tauri.conf.json"; exit 1; }
+  [[ -n "$VERSION" ]] \
+    || { print -u2 -- "[audiohub] ERROR: empty version in app/src-tauri/tauri.conf.json"; exit 1; }
+fi
 
 if [[ "${AUDIOHUB_RELEASE:-0}" == 1 ]]; then
   [[ "${AUDIOHUB_DRIVER_SIGN_IDENTITY:-}" == Developer\ ID\ Application:* ]] \

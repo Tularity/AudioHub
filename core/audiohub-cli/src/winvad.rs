@@ -65,8 +65,8 @@ pub enum WinvadCmd {
         /// can be observed instead of rolled back
         #[arg(long)]
         skip_rollback: bool,
-        /// fault injection: skip the per-peer pin-name write, so the fallback
-        /// to the INF's generic direction names can be observed
+        /// fault injection: skip the per-peer endpoint-name property write,
+        /// so the INF's generic fallback labels can be observed
         #[arg(long)]
         fail_endpoint_name: bool,
     },

@@ -179,6 +179,12 @@ pub enum CtlCmd {
     },
     /// list active sessions with stats
     Sessions,
+    /// inspect or reset bounded AirPlay receiver diagnostics
+    AirplayTelemetry {
+        /// clear counters and recent events before returning the new snapshot
+        #[arg(long)]
+        reset: bool,
+    },
     /// drive the default-device rebuild path without touching real devices
     SimulateDeviceChange {
         /// which default device to pretend changed
@@ -399,15 +405,16 @@ fn cmd_volume(
         // a named device only ever adds to them.
         None => {
             info(&format!(
-                "output volume scalar={:.3} muted={} adjustable={}",
-                v.scalar, v.muted, v.adjustable
+                "output volume scalar={:.3} muted={} adjustable={} mute_adjustable={}",
+                v.scalar, v.muted, v.adjustable, v.mute_adjustable
             ));
             emit_json(json, &v);
         }
         Some(name) => {
             info(&format!(
-                "output volume device={name:?} scalar={:.3} muted={} adjustable={}",
-                v.scalar, v.muted, v.adjustable
+                "output volume device={name:?} scalar={:.3} muted={} adjustable={} \
+                 mute_adjustable={}",
+                v.scalar, v.muted, v.adjustable, v.mute_adjustable
             ));
             emit_json(
                 json,
@@ -416,6 +423,7 @@ fn cmd_volume(
                     "scalar": v.scalar,
                     "muted": v.muted,
                     "adjustable": v.adjustable,
+                    "mute_adjustable": v.mute_adjustable,
                 }),
             );
         }
@@ -639,6 +647,14 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             (methods::SESSION_SET_VOLUME, p)
         }
         CtlCmd::Sessions => (methods::SESSION_LIST, json!({})),
+        CtlCmd::AirplayTelemetry { reset } => (
+            if *reset {
+                methods::AIRPLAY_TELEMETRY_RESET
+            } else {
+                methods::AIRPLAY_TELEMETRY_GET
+            },
+            json!({}),
+        ),
         CtlCmd::SimulateDeviceChange { kind } => (
             methods::DAEMON_SIMULATE_DEVICE_CHANGE,
             json!({ "kind": kind }),
@@ -1031,10 +1047,11 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 }
                 if let Some(vol) = st.get("volume").filter(|x| !x.is_null()) {
                     extra.push_str(&format!(
-                        " volume[{:.3} muted={} adjustable={}]",
+                        " volume[{:.3} muted={} adjustable={} mute_adjustable={}]",
                         val_f64(vol, "scalar"),
                         val_bool(vol, "muted"),
                         val_bool(vol, "adjustable"),
+                        val_bool(vol, "mute_adjustable"),
                     ));
                 }
                 if let Some(mv) = st.get("mix_verdicts").and_then(Value::as_array) {
@@ -1076,6 +1093,80 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 ));
             }
             info(&format!("{} session(s)", items.len()));
+        }
+        CtlCmd::AirplayTelemetry { .. } => {
+            let counters = v.get("counters").cloned().unwrap_or(Value::Null);
+            let realtime = counters.get("realtime").cloned().unwrap_or(Value::Null);
+            let buffered = counters.get("buffered").cloned().unwrap_or(Value::Null);
+            info(&format!(
+                "AirPlay telemetry schema={} generation={} phase2[requests={} accepted={} \
+                 inflight_gauge={} status_failures={} terminal_failures={} socket_write={} \
+                 prepared_socket_write={} commit={}] peer_list[requests={} committed200={} ignored={} applied={} \
+                 socket_write={} commit={} inflight_gauge={}] media[realtime rx={} decoded={} \
+                 deadline_rejected={} platform={} portable={} warmup={} warmup_platform={} \
+                 warmup_portable={} broadcast_lag={}/{} cross_generation_discard={}/{} \
+                 buffered rx={} decoded={} deadline_rejected={} platform={} portable={} \
+                 warmup={} warmup_platform={} warmup_portable={} broadcast_lag={}/{} \
+                 cross_generation_discard={}/{}] bus[push={} owner_mismatch={} \
+                 output_samples={}] control_sessions={} truncated={} active={} events={}",
+                val_u64(v, "schema_version"),
+                val_u64(v, "reset_generation"),
+                val_u64(&counters, "rtsp_phase2_requests"),
+                val_u64(&counters, "rtsp_phase2_accepted"),
+                val_u64(&counters, "rtsp_phase2_prepared_inflight_gauge"),
+                val_u64(&counters, "rtsp_phase2_failures_total"),
+                val_u64(&counters, "rtsp_phase2_terminal_failures_total"),
+                val_u64(&counters, "rtsp_phase2_socket_write_failures_total"),
+                val_u64(
+                    &counters,
+                    "rtsp_phase2_prepared_socket_write_failures_total"
+                ),
+                val_u64(&counters, "rtsp_phase2_commit_failures_total"),
+                val_u64(&counters, "peer_list_update_requests"),
+                val_u64(&counters, "peer_list_update_response_committed_200"),
+                val_u64(&counters, "peer_list_update_acknowledged_but_ignored"),
+                val_u64(&counters, "peer_list_update_applied_to_session_clock"),
+                val_u64(&counters, "peer_list_update_socket_write_failures_total"),
+                val_u64(&counters, "peer_list_update_commit_failures_total"),
+                val_u64(&counters, "peer_list_update_prepared_inflight_gauge"),
+                val_u64(&realtime, "packets_received"),
+                val_u64(&realtime, "packets_decoded"),
+                val_u64(&realtime, "deadline_rejections_total"),
+                val_u64(&realtime, "deadline_rejections_platform_total"),
+                val_u64(&realtime, "deadline_rejections_portable_mapper_total"),
+                val_u64(&realtime, "deadline_warmup_waits_total"),
+                val_u64(&realtime, "deadline_warmup_waits_platform"),
+                val_u64(&realtime, "deadline_warmup_waits_portable_mapper"),
+                val_u64(&realtime, "ptp_broadcast_lag_events"),
+                val_u64(&realtime, "ptp_broadcast_lag_samples"),
+                val_u64(&realtime, "ptp_cross_generation_discard_events"),
+                val_u64(&realtime, "ptp_cross_generation_discard_samples"),
+                val_u64(&buffered, "packets_received"),
+                val_u64(&buffered, "packets_decoded"),
+                val_u64(&buffered, "deadline_rejections_total"),
+                val_u64(&buffered, "deadline_rejections_platform_total"),
+                val_u64(&buffered, "deadline_rejections_portable_mapper_total"),
+                val_u64(&buffered, "deadline_warmup_waits_total"),
+                val_u64(&buffered, "deadline_warmup_waits_platform"),
+                val_u64(&buffered, "deadline_warmup_waits_portable_mapper"),
+                val_u64(&buffered, "ptp_broadcast_lag_events"),
+                val_u64(&buffered, "ptp_broadcast_lag_samples"),
+                val_u64(&buffered, "ptp_cross_generation_discard_events"),
+                val_u64(&buffered, "ptp_cross_generation_discard_samples"),
+                val_u64(&counters, "pcm_bus_pushes_accepted"),
+                val_u64(&counters, "pcm_bus_pushes_owner_mismatch"),
+                val_u64(&counters, "pcm_bus_output_samples"),
+                v.get("control_sessions")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+                val_bool(v, "control_sessions_truncated"),
+                v.get("active_control_sessions")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+                v.get("recent_events")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+            ));
         }
         CtlCmd::SimulateDeviceChange { kind } => info(&format!(
             "simulated default-{kind} device change (epoch {})",
@@ -1325,6 +1416,17 @@ mod tests {
         let mut v = vec!["audiohub", "ctl", "peer-transport", "--peer", "ab12"];
         v.extend_from_slice(args);
         req(&v)
+    }
+
+    #[test]
+    fn airplay_telemetry_cli_selects_read_or_reset_without_extra_parameters() {
+        let (method, params) = req(&["audiohub", "ctl", "airplay-telemetry"]);
+        assert_eq!(method, methods::AIRPLAY_TELEMETRY_GET);
+        assert_eq!(params, json!({}));
+
+        let (method, params) = req(&["audiohub", "ctl", "airplay-telemetry", "--reset"]);
+        assert_eq!(method, methods::AIRPLAY_TELEMETRY_RESET);
+        assert_eq!(params, json!({}));
     }
 
     /// **`audiohub daemon` with no flag must FOLLOW the stored setting.**

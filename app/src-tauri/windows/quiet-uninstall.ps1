@@ -143,6 +143,11 @@ try {
                 throw 'Unexpected files remain in the AudioHub program directory after uninstall'
             }
 
+            # Release our own directory handle before removing the install root.
+            # PowerShell's provider location and native process CWD can differ.
+            Set-Location -LiteralPath $ProgramFiles64
+            [Environment]::CurrentDirectory = $ProgramFiles64
+
             # Keep uninstall.exe until every other cleanup check/action has
             # succeeded. If deleting the script fails, the standard retry
             # entry still exists; deleting the uninstaller first would destroy

@@ -942,10 +942,32 @@ enum ConnectionProtocol {
 #[derive(Default)]
 struct ClassicConnection {
     challenge: Option<DigestChallenge>,
+    apple_response_retry: Option<ClassicAppleResponseRetry>,
     authenticated: bool,
     auth_failures: u8,
     announced: Option<ClassicAudioConfig>,
     session: Option<String>,
+}
+
+struct ClassicAppleResponseRetry {
+    challenge: Vec<u8>,
+    target: String,
+    response: String,
+}
+
+impl ClassicConnection {
+    fn retry_apple_response(&self, request: &Request, challenge: &[u8]) -> Option<&str> {
+        if self.authenticated
+            || request.method() != "ANNOUNCE"
+            || request.header("Authorization").is_none()
+        {
+            return None;
+        }
+        self.apple_response_retry
+            .as_ref()
+            .filter(|cached| cached.challenge == challenge && cached.target == request.target())
+            .map(|cached| cached.response.as_str())
+    }
 }
 
 impl ConnectionState {
@@ -1366,8 +1388,17 @@ async fn process_one_request(
         .any(|header| header.name().eq_ignore_ascii_case("Apple-Challenge"));
     let apple_response = match unique_apple_challenge(&request) {
         Err(error) => Err(AppleResponseAttemptError::Challenge(error)),
-        Ok(Some(_)) if encrypted || state.plaintext_apple_response_sent => {
-            Err(AppleResponseAttemptError::Repeated)
+        Ok(Some(_)) if encrypted => Err(AppleResponseAttemptError::Repeated),
+        Ok(Some(challenge)) if state.plaintext_apple_response_sent => {
+            if state.protocol == ConnectionProtocol::Classic {
+                state
+                    .classic
+                    .retry_apple_response(&request, challenge)
+                    .map(|response| Some(response.to_owned()))
+                    .ok_or(AppleResponseAttemptError::Repeated)
+            } else {
+                Err(AppleResponseAttemptError::Repeated)
+            }
         }
         Ok(challenge) => match apple_challenge::prepare(challenge, local_addr.ip(), config.mac) {
             Err(error) => Err(AppleResponseAttemptError::Challenge(error)),
@@ -1542,6 +1573,23 @@ async fn process_one_request(
     if let Err(error) = write_response(socket, state.control.as_mut(), &encoded).await {
         outcome.record_response_write_failure(peer.ip(), state.connection_id);
         return Err(error);
+    }
+    if state.protocol == ConnectionProtocol::Classic && request.method() == "ANNOUNCE" {
+        if outcome.response.status == 401 {
+            if let (Ok(Some(response)), Ok(Some(challenge))) =
+                (&apple_response, unique_apple_challenge(&request))
+            {
+                // A Digest retry may repeat its original Apple challenge.
+                // Reuse only the already-written response, never sign again.
+                state.classic.apple_response_retry = Some(ClassicAppleResponseRetry {
+                    challenge: challenge.to_vec(),
+                    target: request.target().to_owned(),
+                    response: response.clone(),
+                });
+            }
+        } else if (200..300).contains(&outcome.response.status) {
+            state.classic.apple_response_retry = None;
+        }
     }
     if (200..300).contains(&outcome.response.status) {
         if let Some(commit) = classic_record_commit {
@@ -5410,6 +5458,122 @@ mod tests {
             assert!(headers.contains("Server: AirTunes/366.0\r\n"));
             assert!(!headers.contains("Apple-Response:"));
             assert_eq!(progress, ConnectionProgress::Close);
+        }
+    }
+
+    #[tokio::test]
+    async fn classic_digest_retry_reuses_only_the_written_matching_apple_response() {
+        use base64::engine::general_purpose::STANDARD;
+        use md5::{Digest as _, Md5};
+        struct TestClassicKey;
+        impl ClassicKeyProvider for TestClassicKey {
+            fn unwrap_key(
+                &self,
+                _: &[u8],
+            ) -> Result<Zeroizing<[u8; 16]>, super::super::airport_express::ClassicKeyError>
+            {
+                Ok(Zeroizing::new([1; 16]))
+            }
+        }
+        for (password, changed_challenge, changed_target, authenticated, expected) in [
+            ("secret", false, false, true, 200),
+            ("wrong", false, false, true, 401),
+            ("secret", true, false, true, 400),
+            ("secret", false, true, true, 400),
+            ("secret", false, false, false, 400),
+        ] {
+            let listener = TokioTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut socket, peer) = listener.accept().await.unwrap();
+            let mut state = test_state();
+            let signer = Arc::new(BlockingAppleResponseProvider::new());
+            signer.release();
+            let mut config = config();
+            config.password = Some("secret".into());
+            config.apple_response = signer.clone();
+            config.classic_key = Arc::new(TestClassicKey);
+            let (events, _event_rx) = mpsc::channel(8);
+            let (volumes, _volume_rx) = watch::channel(None);
+            let challenge = STANDARD.encode([0x55; 16]);
+            let body = format!("v=0\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\na=rsaaeskey:{}\r\na=aesiv:{}\r\n", STANDARD.encode([0x5a; 256]), STANDARD.encode([2; 16]));
+            for step in 0..2 {
+                let target = if step == 1 && changed_target {
+                    "/other"
+                } else {
+                    "/stream"
+                };
+                let value = if step == 1 && changed_challenge {
+                    STANDARD.encode([0x56; 16])
+                } else {
+                    challenge.clone()
+                };
+                let authorization = if step == 1 && authenticated {
+                    let issued = state.classic.challenge.as_ref().unwrap().header_value();
+                    let nonce = issued
+                        .split("nonce=\"")
+                        .nth(1)
+                        .unwrap()
+                        .split('"')
+                        .next()
+                        .unwrap();
+                    let ha1 = format!("{:x}", Md5::digest(format!("lab:raop:{password}")));
+                    let ha2 = format!("{:x}", Md5::digest(format!("ANNOUNCE:{target}")));
+                    let digest = format!("{:x}", Md5::digest(format!("{ha1}:{nonce}:{ha2}")));
+                    format!("Authorization: Digest username=\"lab\", realm=\"raop\", nonce=\"{nonce}\", uri=\"{target}\", response=\"{digest}\"\r\n")
+                } else {
+                    String::new()
+                };
+                let request = format!("ANNOUNCE {target} RTSP/1.0\r\nCSeq: {}\r\nApple-Challenge: {value}\r\n{authorization}Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{body}", step + 1, body.len());
+                state.requests.feed(request.as_bytes()).unwrap();
+                process_one_request(
+                    &mut socket,
+                    peer,
+                    &config,
+                    &events,
+                    &volumes,
+                    &null_output_factory(),
+                    &AtomicU64::new(1),
+                    &AtomicU64::new(0),
+                    &PairSetupLimiter::new(),
+                    &AppleChallengeExecutor::new(),
+                    &mut state,
+                )
+                .await
+                .unwrap();
+                let mut response = Vec::new();
+                timeout(Duration::from_secs(1), async {
+                    while !response_is_complete(&response) {
+                        let mut chunk = [0; 2048];
+                        let count = client.read(&mut chunk).await.unwrap();
+                        assert_ne!(count, 0);
+                        response.extend_from_slice(&chunk[..count]);
+                    }
+                })
+                .await
+                .unwrap();
+                let code = if step == 0 { 401 } else { expected };
+                assert!(response.starts_with(format!("RTSP/1.0 {code} ").as_bytes()));
+                assert_eq!(
+                    signer.entered.load(Ordering::Acquire),
+                    1,
+                    "retry must not perform another RSA signature"
+                );
+                assert_eq!(
+                    response
+                        .windows(b"Apple-Response:".len())
+                        .any(|part| part == b"Apple-Response:"),
+                    code != 400
+                );
+            }
+            if expected == 200 {
+                assert!(state.classic.authenticated);
+                assert!(state.classic.apple_response_retry.is_none());
+                assert!(state.classic.announced.is_some());
+            }
         }
     }
 

@@ -8,46 +8,34 @@ Module Name:
 
 Abstract:
 
-    Declaration of wave miniport tables for the render endpoints.
+    Immutable wave format banks for the render endpoints.
+
 --*/
 
 #ifndef _SIMPLEAUDIOSAMPLE_SPEAKERWAVTABLE_H_
 #define _SIMPLEAUDIOSAMPLE_SPEAKERWAVTABLE_H_
 
+#include "speakerformatbank.h"
+
 //
 // 48 kHz, 16-bit PCM, stereo -- upstream's format, restored.
 //
-// THIS WAS BRIEFLY IEEE FLOAT AND THAT WAS WRONG. MEASURED, on
-// win-audio-debug: with KSDATAFORMAT_SUBTYPE_IEEE_FLOAT on the pins the driver
-// installed cleanly, the devnode came up OK, the KS interfaces registered in
-// all four categories, AhSlotBindSet reported AH_PUB_BOTH -- and the audio
-// endpoint builder created NO endpoint at all. `Get-PnpDevice -Class
-// AudioEndpoint` was empty while AudioEndpointBuilder and audiosrv were both
-// Running. Nothing failed; the endpoint simply never appeared.
+// This was briefly IEEE float, which made the driver and KS interfaces load
+// but prevented AudioEndpointBuilder from creating an endpoint. The WaveRT DPC
+// conversion uses the documented extended-processor-state save/restore path
+// instead, so the public pin remains PCM.
 //
-// The float experiment existed to keep the ring copy free of a format
-// conversion, because that copy runs in the WaveRT timer DPC and on x64 a
-// driver may not touch the FPU at IRQL >= DISPATCH_LEVEL. That problem is real
-// but it has a supported answer -- KeSaveExtendedProcessorState, which is
-// documented callable at IRQL <= DISPATCH_LEVEL precisely for this -- and
-// minwavertstream.cpp now uses it. Publishing a format the endpoint builder
-// refuses is not a trade worth making to avoid one documented API call.
+// The currently wired bank remains exactly that v7 format. The wider constants
+// below prepare descriptor banks only; they do not advertise a wider endpoint
+// until a future transaction selects such a bank.
 //
-#define SPEAKER_DEVICE_MAX_CHANNELS                 2       // Max Channels.
+#define SPEAKER_DEVICE_MAX_CHANNELS                 2
+#define SPEAKER_HOST_MAX_CHANNELS                   2
+#define SPEAKER_HOST_MIN_BITS_PER_SAMPLE            16
+#define SPEAKER_HOST_MAX_BITS_PER_SAMPLE            16
+#define SPEAKER_HOST_MIN_SAMPLE_RATE                48000
+#define SPEAKER_HOST_MAX_SAMPLE_RATE                48000
 
-#define SPEAKER_HOST_MAX_CHANNELS                   2       // Max Channels.
-#define SPEAKER_HOST_MIN_BITS_PER_SAMPLE            16      // Min Bits Per Sample
-#define SPEAKER_HOST_MAX_BITS_PER_SAMPLE            16      // Max Bits Per Sample
-#define SPEAKER_HOST_MIN_SAMPLE_RATE                48000   // Min Sample Rate
-#define SPEAKER_HOST_MAX_SAMPLE_RATE                48000   // Max Sample Rate
-
-//
-// nBlockAlign and nAvgBytesPerSec, derived rather than typed twice. A stale
-// nAvgBytesPerSec is invisible in a device list and shows up as audio that
-// plays at the wrong speed: m_ulDmaMovementRate is taken straight from it
-// (minwavertstream.cpp Init), and every position the driver reports is
-// computed from that.
-//
 #define SPEAKER_HOST_BLOCK_ALIGN \
     (SPEAKER_HOST_MAX_CHANNELS * (SPEAKER_HOST_MAX_BITS_PER_SAMPLE / 8))
 #define SPEAKER_HOST_AVG_BYTES_PER_SEC \
@@ -55,146 +43,138 @@ Abstract:
 
 C_ASSERT(SPEAKER_HOST_BLOCK_ALIGN == 4);
 C_ASSERT(SPEAKER_HOST_AVG_BYTES_PER_SEC == 192000);
+C_ASSERT(AH_SPEAKER_LAYOUT_COUNT == 4);
+C_ASSERT(AH_SPEAKER_FORMAT_BANK_COUNT == 8);
+C_ASSERT(AH_SPEAKER_CHANNEL_MASK_STEREO == KSAUDIO_SPEAKER_STEREO);
+C_ASSERT(AH_SPEAKER_CHANNEL_MASK_5POINT1 == KSAUDIO_SPEAKER_5POINT1_SURROUND);
+C_ASSERT(AH_SPEAKER_CHANNEL_MASK_7POINT1 == KSAUDIO_SPEAKER_7POINT1_SURROUND);
+C_ASSERT(AH_SPEAKER_CHANNEL_MASK_7POINT1POINT4 ==
+    (KSAUDIO_SPEAKER_7POINT1_SURROUND |
+     SPEAKER_TOP_FRONT_LEFT | SPEAKER_TOP_FRONT_RIGHT |
+     SPEAKER_TOP_BACK_LEFT | SPEAKER_TOP_BACK_RIGHT));
 
-//
-// Max # of pin instances.
-//
 #define SPEAKER_MAX_INPUT_SYSTEM_STREAMS            1
 
-//=============================================================================
+//
+// This header is included by more than one Main translation unit. Exactly one
+// of them defines AUDIOHUB_SPEAKER_FORMAT_BANKS_IMPLEMENTATION so the banks
+// have one driver-global address rather than one private copy per include.
+//
+#if defined(AUDIOHUB_SPEAKER_FORMAT_BANKS_IMPLEMENTATION)
 
-static 
-KSDATAFORMAT_WAVEFORMATEXTENSIBLE SpeakerHostPinSupportedDeviceFormats[] =
+typedef struct _AH_SPEAKER_LAYOUT_SPEC
 {
-    { // 0
-        {
-            sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
-            0,
-            0,
-            0,
-            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
-            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
-        },
-        {
-            {
-                WAVE_FORMAT_EXTENSIBLE,
-                SPEAKER_HOST_MAX_CHANNELS,
-                SPEAKER_HOST_MAX_SAMPLE_RATE,
-                SPEAKER_HOST_AVG_BYTES_PER_SEC,
-                SPEAKER_HOST_BLOCK_ALIGN,
-                SPEAKER_HOST_MAX_BITS_PER_SAMPLE,
-                sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
-            },
-            SPEAKER_HOST_MAX_BITS_PER_SAMPLE,
-            KSAUDIO_SPEAKER_STEREO,
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
-        }
-    }
+    ULONG  Layout;
+    USHORT Channels;
+    ULONG  ChannelMask;
+} AH_SPEAKER_LAYOUT_SPEC;
+
+struct _AH_SPEAKER_FORMAT_BANK
+{
+    ULONG SupportedLayoutMask;
+    USHORT MaximumChannels;
+    const PCFILTER_DESCRIPTOR *WaveDescriptor;
+    const PIN_DEVICE_FORMATS_AND_MODES *PinDeviceFormatsAndModes;
+    ULONG PinDeviceFormatsAndModesCount;
+};
+
+typedef struct _AH_SPEAKER_FORMAT_BANK_STORAGE
+{
+    AH_SPEAKER_FORMAT_BANK Public;
+    KSDATAFORMAT_WAVEFORMATEXTENSIBLE Formats[AH_SPEAKER_LAYOUT_COUNT];
+    MODE_AND_DEFAULT_FORMAT Modes[1];
+    PIN_DEVICE_FORMATS_AND_MODES PinDeviceFormatsAndModes[2];
+    KSDATARANGE_AUDIO StreamRanges[AH_SPEAKER_LAYOUT_COUNT];
+    PKSDATARANGE StreamRangePointers[AH_SPEAKER_LAYOUT_COUNT * 2];
+    KSDATARANGE BridgeRange;
+    PKSDATARANGE BridgeRangePointers[1];
+    PCPIN_DESCRIPTOR Pins[2];
+    PCCONNECTION_DESCRIPTOR Connections[1];
+    PCFILTER_DESCRIPTOR FilterDescriptor;
+} AH_SPEAKER_FORMAT_BANK_STORAGE;
+
+static const AH_SPEAKER_LAYOUT_SPEC AhSpeakerLayoutSpecs[AH_SPEAKER_LAYOUT_COUNT] =
+{
+    { AH_SPEAKER_LAYOUT_STEREO,        AH_SPEAKER_CHANNELS_STEREO,        AH_SPEAKER_CHANNEL_MASK_STEREO },
+    { AH_SPEAKER_LAYOUT_5POINT1,       AH_SPEAKER_CHANNELS_5POINT1,       AH_SPEAKER_CHANNEL_MASK_5POINT1 },
+    { AH_SPEAKER_LAYOUT_7POINT1,       AH_SPEAKER_CHANNELS_7POINT1,       AH_SPEAKER_CHANNEL_MASK_7POINT1 },
+    { AH_SPEAKER_LAYOUT_7POINT1POINT4, AH_SPEAKER_CHANNELS_7POINT1POINT4, AH_SPEAKER_CHANNEL_MASK_7POINT1POINT4 },
 };
 
 //
-// Supported modes (only on streaming pins).
+// This is the exact pre-bank stereo format. Every bank starts from this value
+// and changes only channel geometry for its additional canonical layouts.
 //
-static
-MODE_AND_DEFAULT_FORMAT SpeakerHostPinSupportedDeviceModes[] =
+static const KSDATAFORMAT_WAVEFORMATEXTENSIBLE AhSpeakerStereoFormatTemplate =
 {
     {
-        STATIC_AUDIO_SIGNALPROCESSINGMODE_DEFAULT,
-        &SpeakerHostPinSupportedDeviceFormats[0].DataFormat  // 48KHz
-    }
-};
-
-//
-// The entries here must follow the same order as the filter's pin
-// descriptor array.
-//
-static 
-PIN_DEVICE_FORMATS_AND_MODES SpeakerPinDeviceFormatsAndModes[] = 
-{
-    {
-        SystemRenderPin,
-        SpeakerHostPinSupportedDeviceFormats,
-        SIZEOF_ARRAY(SpeakerHostPinSupportedDeviceFormats),
-        SpeakerHostPinSupportedDeviceModes,
-        SIZEOF_ARRAY(SpeakerHostPinSupportedDeviceModes)
-    },
-    {
-        BridgePin,
-        NULL,
-        0,
-        NULL,
-        0
-    }
-};
-
-//=============================================================================
-static
-KSDATARANGE_AUDIO SpeakerPinDataRangesStream[] =
-{
-    { // 0
-        {
-            sizeof(KSDATARANGE_AUDIO),
-            KSDATARANGE_ATTRIBUTES,         // An attributes list follows this data range
-            0,
-            0,
-            STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
-            STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
-            STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
-        },
-        SPEAKER_HOST_MAX_CHANNELS,
-        SPEAKER_HOST_MIN_BITS_PER_SAMPLE,    
-        SPEAKER_HOST_MAX_BITS_PER_SAMPLE,    
-        SPEAKER_HOST_MIN_SAMPLE_RATE,            
-        SPEAKER_HOST_MAX_SAMPLE_RATE             
-    }
-};
-
-static
-PKSDATARANGE SpeakerPinDataRangePointersStream[] =
-{
-    PKSDATARANGE(&SpeakerPinDataRangesStream[0]),
-    PKSDATARANGE(&PinDataRangeAttributeList),
-};
-
-//=============================================================================
-static
-KSDATARANGE SpeakerPinDataRangesBridge[] =
-{
-    {
-        sizeof(KSDATARANGE),
+        sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE),
         0,
         0,
         0,
         STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
-        STATICGUIDOF(KSDATAFORMAT_SUBTYPE_ANALOG),
-        STATICGUIDOF(KSDATAFORMAT_SPECIFIER_NONE)
+        STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
+        STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
+    },
+    {
+        {
+            WAVE_FORMAT_EXTENSIBLE,
+            SPEAKER_HOST_MAX_CHANNELS,
+            SPEAKER_HOST_MAX_SAMPLE_RATE,
+            SPEAKER_HOST_AVG_BYTES_PER_SEC,
+            SPEAKER_HOST_BLOCK_ALIGN,
+            SPEAKER_HOST_MAX_BITS_PER_SAMPLE,
+            sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
+        },
+        SPEAKER_HOST_MAX_BITS_PER_SAMPLE,
+        KSAUDIO_SPEAKER_STEREO,
+        STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM)
     }
 };
 
-static
-PKSDATARANGE SpeakerPinDataRangePointersBridge[] =
+static const KSDATARANGE_AUDIO AhSpeakerStreamRangeTemplate =
 {
-    &SpeakerPinDataRangesBridge[0]
+    {
+        sizeof(KSDATARANGE_AUDIO),
+        KSDATARANGE_ATTRIBUTES,
+        0,
+        0,
+        STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+        STATICGUIDOF(KSDATAFORMAT_SUBTYPE_PCM),
+        STATICGUIDOF(KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
+    },
+    SPEAKER_HOST_MAX_CHANNELS,
+    SPEAKER_HOST_MIN_BITS_PER_SAMPLE,
+    SPEAKER_HOST_MAX_BITS_PER_SAMPLE,
+    SPEAKER_HOST_MIN_SAMPLE_RATE,
+    SPEAKER_HOST_MAX_SAMPLE_RATE
 };
 
-//=============================================================================
-static
-PCPIN_DESCRIPTOR SpeakerWaveMiniportPins[] =
+static const KSDATARANGE AhSpeakerBridgeRangeTemplate =
 {
-    // Wave Out Streaming Pin (Renderer) KSPIN_WAVE_RENDER3_SINK_SYSTEM
+    sizeof(KSDATARANGE),
+    0,
+    0,
+    0,
+    STATICGUIDOF(KSDATAFORMAT_TYPE_AUDIO),
+    STATICGUIDOF(KSDATAFORMAT_SUBTYPE_ANALOG),
+    STATICGUIDOF(KSDATAFORMAT_SPECIFIER_NONE)
+};
+
+static const PCPIN_DESCRIPTOR AhSpeakerPinTemplates[] =
+{
     {
         SPEAKER_MAX_INPUT_SYSTEM_STREAMS,
-        SPEAKER_MAX_INPUT_SYSTEM_STREAMS, 
+        SPEAKER_MAX_INPUT_SYSTEM_STREAMS,
         0,
-        NULL,        // AutomationTable
+        NULL,
         {
             0,
             NULL,
             0,
             NULL,
-            SIZEOF_ARRAY(SpeakerPinDataRangePointersStream),
-            SpeakerPinDataRangePointersStream,
+            0,
+            NULL,
             KSPIN_DATAFLOW_IN,
             KSPIN_COMMUNICATION_SINK,
             &KSCATEGORY_AUDIO,
@@ -202,7 +182,6 @@ PCPIN_DESCRIPTOR SpeakerWaveMiniportPins[] =
             0
         }
     },
-    // Wave Out Bridge Pin (Renderer) KSPIN_WAVE_RENDER3_SOURCE
     {
         0,
         0,
@@ -213,8 +192,8 @@ PCPIN_DESCRIPTOR SpeakerWaveMiniportPins[] =
             NULL,
             0,
             NULL,
-            SIZEOF_ARRAY(SpeakerPinDataRangePointersBridge),
-            SpeakerPinDataRangePointersBridge,
+            0,
+            NULL,
             KSPIN_DATAFLOW_OUT,
             KSPIN_COMMUNICATION_NONE,
             &KSCATEGORY_AUDIO,
@@ -224,22 +203,15 @@ PCPIN_DESCRIPTOR SpeakerWaveMiniportPins[] =
     },
 };
 
-//=============================================================================
-//
-//                   ----------------------------      
-//                   |                          |      
-//  Host Pin     0-->|                          |--> 1 KSPIN_WAVE_RENDER3_SOURCE
-//                   |                          |      
-//                   ----------------------------
-static
-PCCONNECTION_DESCRIPTOR SpeakerWaveMiniportConnections[] =
+static const PCCONNECTION_DESCRIPTOR AhSpeakerConnectionTemplate =
 {
-    { PCFILTER_NODE,            KSPIN_WAVE_RENDER3_SINK_SYSTEM,     PCFILTER_NODE,   KSPIN_WAVE_RENDER3_SOURCE }
+    PCFILTER_NODE,
+    KSPIN_WAVE_RENDER3_SINK_SYSTEM,
+    PCFILTER_NODE,
+    KSPIN_WAVE_RENDER3_SOURCE
 };
 
-//=============================================================================
-static
-PCPROPERTY_ITEM PropertiesSpeakerWaveFilter[] =
+static PCPROPERTY_ITEM PropertiesSpeakerWaveFilter[] =
 {
     {
         &KSPROPSETID_Pin,
@@ -257,22 +229,223 @@ PCPROPERTY_ITEM PropertiesSpeakerWaveFilter[] =
 
 DEFINE_PCAUTOMATION_TABLE_PROP(AutomationSpeakerWaveFilter, PropertiesSpeakerWaveFilter);
 
-//=============================================================================
-static
-PCFILTER_DESCRIPTOR SpeakerWaveMiniportFilterDescriptor =
+static AH_SPEAKER_FORMAT_BANK_STORAGE
+    AhSpeakerFormatBanks[AH_SPEAKER_FORMAT_BANK_COUNT];
+static volatile LONG AhSpeakerFormatBanksState = 0;
+
+#pragma code_seg("PAGE")
+static VOID
+AhSpeakerFormatBankInitializeOne(
+    _Out_ AH_SPEAKER_FORMAT_BANK_STORAGE *Storage,
+    _In_  ULONG SupportedLayoutMask
+    )
 {
-    0,                                              // Version
-    &AutomationSpeakerWaveFilter,                   // AutomationTable
-    sizeof(PCPIN_DESCRIPTOR),                       // PinSize
-    SIZEOF_ARRAY(SpeakerWaveMiniportPins),          // PinCount
-    SpeakerWaveMiniportPins,                        // Pins
-    sizeof(PCNODE_DESCRIPTOR),                      // NodeSize
-    0,                                              // NodeCount
-    NULL,                                           // Nodes
-    SIZEOF_ARRAY(SpeakerWaveMiniportConnections),   // ConnectionCount
-    SpeakerWaveMiniportConnections,                 // Connections
-    0,                                              // CategoryCount
-    NULL                                            // Categories  - use defaults (audio, render, capture)
-};
+    PAGED_CODE();
+
+    RtlZeroMemory(Storage, sizeof(*Storage));
+
+    ULONG formatCount = 0;
+    USHORT maximumChannels = 0;
+
+    for (ULONG layout = 0; layout < AH_SPEAKER_LAYOUT_COUNT; layout++)
+    {
+        if ((SupportedLayoutMask & AH_SPEAKER_LAYOUT_BIT(layout)) == 0)
+        {
+            continue;
+        }
+
+        const AH_SPEAKER_LAYOUT_SPEC *spec = &AhSpeakerLayoutSpecs[layout];
+        ASSERT(spec->Layout == layout);
+        KSDATAFORMAT_WAVEFORMATEXTENSIBLE *format = &Storage->Formats[formatCount];
+        KSDATARANGE_AUDIO *range = &Storage->StreamRanges[formatCount];
+
+        *format = AhSpeakerStereoFormatTemplate;
+        format->WaveFormatExt.Format.nChannels = spec->Channels;
+        format->WaveFormatExt.Format.nBlockAlign =
+            (WORD)(spec->Channels * (SPEAKER_HOST_MAX_BITS_PER_SAMPLE / 8));
+        format->WaveFormatExt.Format.nAvgBytesPerSec =
+            SPEAKER_HOST_MAX_SAMPLE_RATE * format->WaveFormatExt.Format.nBlockAlign;
+        format->WaveFormatExt.dwChannelMask = spec->ChannelMask;
+
+        *range = AhSpeakerStreamRangeTemplate;
+        range->MaximumChannels = spec->Channels;
+        // KS consumes the following pointer as attributes for this range.
+        Storage->StreamRangePointers[formatCount * 2] = (PKSDATARANGE)range;
+        Storage->StreamRangePointers[formatCount * 2 + 1] =
+            (PKSDATARANGE)&PinDataRangeAttributeList;
+
+        if (spec->Channels > maximumChannels)
+        {
+            maximumChannels = spec->Channels;
+        }
+        formatCount++;
+    }
+
+    ASSERT(formatCount != 0);
+    ASSERT(Storage->Formats[0].WaveFormatExt.Format.nChannels ==
+           AH_SPEAKER_CHANNELS_STEREO);
+
+    Storage->Modes[0].Mode = AUDIO_SIGNALPROCESSINGMODE_DEFAULT;
+    Storage->Modes[0].DefaultFormat = &Storage->Formats[0].DataFormat;
+
+    Storage->PinDeviceFormatsAndModes[0].PinType = SystemRenderPin;
+    Storage->PinDeviceFormatsAndModes[0].WaveFormats = Storage->Formats;
+    Storage->PinDeviceFormatsAndModes[0].WaveFormatsCount = formatCount;
+    Storage->PinDeviceFormatsAndModes[0].ModeAndDefaultFormat = Storage->Modes;
+    Storage->PinDeviceFormatsAndModes[0].ModeAndDefaultFormatCount =
+        SIZEOF_ARRAY(Storage->Modes);
+    Storage->PinDeviceFormatsAndModes[1].PinType = BridgePin;
+
+    Storage->BridgeRange = AhSpeakerBridgeRangeTemplate;
+    Storage->BridgeRangePointers[0] = &Storage->BridgeRange;
+
+    Storage->Pins[0] = AhSpeakerPinTemplates[0];
+    Storage->Pins[0].KsPinDescriptor.DataRangesCount = formatCount * 2;
+    Storage->Pins[0].KsPinDescriptor.DataRanges = Storage->StreamRangePointers;
+    Storage->Pins[1] = AhSpeakerPinTemplates[1];
+    Storage->Pins[1].KsPinDescriptor.DataRangesCount =
+        SIZEOF_ARRAY(Storage->BridgeRangePointers);
+    Storage->Pins[1].KsPinDescriptor.DataRanges = Storage->BridgeRangePointers;
+
+    Storage->Connections[0] = AhSpeakerConnectionTemplate;
+
+    Storage->FilterDescriptor.Version = 0;
+    Storage->FilterDescriptor.AutomationTable = &AutomationSpeakerWaveFilter;
+    Storage->FilterDescriptor.PinSize = sizeof(PCPIN_DESCRIPTOR);
+    Storage->FilterDescriptor.PinCount = SIZEOF_ARRAY(Storage->Pins);
+    Storage->FilterDescriptor.Pins = Storage->Pins;
+    Storage->FilterDescriptor.NodeSize = sizeof(PCNODE_DESCRIPTOR);
+    Storage->FilterDescriptor.NodeCount = 0;
+    Storage->FilterDescriptor.Nodes = NULL;
+    Storage->FilterDescriptor.ConnectionCount =
+        SIZEOF_ARRAY(Storage->Connections);
+    Storage->FilterDescriptor.Connections = Storage->Connections;
+    Storage->FilterDescriptor.CategoryCount = 0;
+    Storage->FilterDescriptor.Categories = NULL;
+
+    Storage->Public.SupportedLayoutMask = SupportedLayoutMask;
+    Storage->Public.MaximumChannels = maximumChannels;
+    Storage->Public.WaveDescriptor = &Storage->FilterDescriptor;
+    Storage->Public.PinDeviceFormatsAndModes = Storage->PinDeviceFormatsAndModes;
+    Storage->Public.PinDeviceFormatsAndModesCount =
+        SIZEOF_ARRAY(Storage->PinDeviceFormatsAndModes);
+}
+
+#pragma code_seg("PAGE")
+VOID
+AhSpeakerFormatBanksInitialize(VOID)
+{
+    PAGED_CODE();
+
+    // State 1 reserves the one permitted construction pass; state 2 publishes
+    // the complete pointer graphs. A repeated call never rewrites a bank.
+    if (InterlockedCompareExchange(&AhSpeakerFormatBanksState, 1, 0) != 0)
+    {
+        return;
+    }
+
+    for (ULONG bank = 0; bank < AH_SPEAKER_FORMAT_BANK_COUNT; bank++)
+    {
+        const ULONG supportedLayoutMask = (bank << 1) | AH_SPEAKER_LAYOUT_MASK_STEREO;
+        AhSpeakerFormatBankInitializeOne(
+            &AhSpeakerFormatBanks[bank],
+            supportedLayoutMask);
+    }
+
+    KeMemoryBarrier();
+    InterlockedExchange(&AhSpeakerFormatBanksState, 2);
+}
+
+#pragma code_seg()
+BOOLEAN
+AhSpeakerFormatBankMaskIsValid(
+    _In_ ULONG SupportedLayoutMask
+    )
+{
+    return
+        (SupportedLayoutMask & AH_SPEAKER_LAYOUT_MASK_STEREO) != 0 &&
+        (SupportedLayoutMask & ~AH_SPEAKER_LAYOUT_MASK_ALL) == 0;
+}
+
+#pragma code_seg()
+const AH_SPEAKER_FORMAT_BANK *
+AhSpeakerFormatBankLookup(
+    _In_ ULONG SupportedLayoutMask
+    )
+{
+    if (!AhSpeakerFormatBankMaskIsValid(SupportedLayoutMask) ||
+        InterlockedCompareExchange(&AhSpeakerFormatBanksState, 0, 0) != 2)
+    {
+        return NULL;
+    }
+
+    const ULONG bank = SupportedLayoutMask >> 1;
+    ASSERT(bank < AH_SPEAKER_FORMAT_BANK_COUNT);
+    ASSERT(AhSpeakerFormatBanks[bank].Public.SupportedLayoutMask ==
+           SupportedLayoutMask);
+    return &AhSpeakerFormatBanks[bank].Public;
+}
+
+#pragma code_seg()
+static BOOLEAN
+AhSpeakerFormatBankIsOwned(
+    _In_opt_ const AH_SPEAKER_FORMAT_BANK *Bank
+    )
+{
+    if (Bank == NULL ||
+        InterlockedCompareExchange(&AhSpeakerFormatBanksState, 0, 0) != 2)
+    {
+        return FALSE;
+    }
+
+    for (ULONG bank = 0; bank < AH_SPEAKER_FORMAT_BANK_COUNT; bank++)
+    {
+        if (Bank == &AhSpeakerFormatBanks[bank].Public)
+        {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+#pragma code_seg()
+const PCFILTER_DESCRIPTOR *
+AhSpeakerFormatBankWaveDescriptor(
+    _In_opt_ const AH_SPEAKER_FORMAT_BANK *Bank
+    )
+{
+    return AhSpeakerFormatBankIsOwned(Bank) ? Bank->WaveDescriptor : NULL;
+}
+
+#pragma code_seg()
+const PIN_DEVICE_FORMATS_AND_MODES *
+AhSpeakerFormatBankPinDeviceFormatsAndModes(
+    _In_opt_ const AH_SPEAKER_FORMAT_BANK *Bank
+    )
+{
+    return AhSpeakerFormatBankIsOwned(Bank) ?
+        Bank->PinDeviceFormatsAndModes : NULL;
+}
+
+#pragma code_seg()
+ULONG
+AhSpeakerFormatBankPinDeviceFormatsAndModesCount(
+    _In_opt_ const AH_SPEAKER_FORMAT_BANK *Bank
+    )
+{
+    return AhSpeakerFormatBankIsOwned(Bank) ?
+        Bank->PinDeviceFormatsAndModesCount : 0;
+}
+
+#pragma code_seg()
+USHORT
+AhSpeakerFormatBankMaximumChannels(
+    _In_opt_ const AH_SPEAKER_FORMAT_BANK *Bank
+    )
+{
+    return AhSpeakerFormatBankIsOwned(Bank) ? Bank->MaximumChannels : 0;
+}
+
+#endif // AUDIOHUB_SPEAKER_FORMAT_BANKS_IMPLEMENTATION
 
 #endif // _SIMPLEAUDIOSAMPLE_SPEAKERWAVTABLE_H_

@@ -18,7 +18,9 @@ Abstract:
 
 #include "definitions.h"
 #include "endpoints.h"
+#define AUDIOHUB_SPEAKER_FORMAT_BANKS_IMPLEMENTATION
 #include "minipairs.h"
+#undef AUDIOHUB_SPEAKER_FORMAT_BANKS_IMPLEMENTATION
 #include "perpeer.h"
 #include "ahrings.h"
 
@@ -915,9 +917,9 @@ Routine Description:
 
     Fills the slot's two ENDPOINT_MINIPAIRs from the static templates.
 
-    EVERY DESCRIPTOR IS SHARED -- filters, pin arrays, node tables, connection
-    tables, data ranges, automation tables and the format-and-modes tables.
-    Nothing in them varies per peer.
+    Every render pointer graph comes from a driver-global immutable bank.
+    Slots share the selected bank; nothing inside a bank varies per peer and
+    no bank is rewritten when a slot is rebound.
 
     v3 deep-copied the two TOPOLOGY filters and their pin arrays so that each
     peer's bridge pin could point at a per-peer Name GUID. The name no longer
@@ -931,6 +933,25 @@ Routine Description:
 --*/
 {
     PAGED_CODE();
+
+    const AH_SPEAKER_FORMAT_BANK *renderBank =
+        AhSpeakerFormatBankLookup(AH_SPEAKER_LAYOUT_MASK_STEREO);
+    const PCFILTER_DESCRIPTOR *renderWaveDescriptor =
+        AhSpeakerFormatBankWaveDescriptor(renderBank);
+    const PIN_DEVICE_FORMATS_AND_MODES *renderFormatsAndModes =
+        AhSpeakerFormatBankPinDeviceFormatsAndModes(renderBank);
+    const ULONG renderFormatsAndModesCount =
+        AhSpeakerFormatBankPinDeviceFormatsAndModesCount(renderBank);
+    const USHORT renderMaximumChannels =
+        AhSpeakerFormatBankMaximumChannels(renderBank);
+
+    if (renderWaveDescriptor == NULL ||
+        renderFormatsAndModes == NULL ||
+        renderFormatsAndModesCount == 0 ||
+        renderMaximumChannels != SPEAKER_DEVICE_MAX_CHANNELS)
+    {
+        return STATUS_DEVICE_NOT_READY;
+    }
 
     ULONG displayBytes = 0;
     for (ULONG i = 0; i < AH_DISPLAY_CHARS; i++)
@@ -1005,6 +1026,7 @@ Routine Description:
     //
     // Render pair.
     //
+    Slot->OutFormatBank = renderBank;
     RtlZeroMemory(&Slot->OutPair, sizeof(Slot->OutPair));
     Slot->OutPair.DeviceType                    = eSpeakerDevice;
     Slot->OutPair.TopoName                      = Slot->TopoNameOut;
@@ -1016,12 +1038,16 @@ Routine Description:
     Slot->OutPair.WaveName                      = Slot->WaveNameOut;
     Slot->OutPair.TemplateWaveName              = (PWSTR)AH_TEMPLATE_WAVE_OUT;
     Slot->OutPair.WaveCreateCallback            = CreateMiniportWaveRTSimpleAudioSample;
-    Slot->OutPair.WaveDescriptor                = &SpeakerWaveMiniportFilterDescriptor;
+    // ENDPOINT_MINIPAIR predates const-correct descriptor fields. The bank API
+    // stays const; these casts are confined to the PortCls handoff structure.
+    Slot->OutPair.WaveDescriptor                =
+        const_cast<PCFILTER_DESCRIPTOR *>(renderWaveDescriptor);
     Slot->OutPair.WaveInterfacePropertyCount    = 0;
     Slot->OutPair.WaveInterfaceProperties       = NULL;
-    Slot->OutPair.DeviceMaxChannels             = SPEAKER_DEVICE_MAX_CHANNELS;
-    Slot->OutPair.PinDeviceFormatsAndModes      = SpeakerPinDeviceFormatsAndModes;
-    Slot->OutPair.PinDeviceFormatsAndModesCount = SIZEOF_ARRAY(SpeakerPinDeviceFormatsAndModes);
+    Slot->OutPair.DeviceMaxChannels             = renderMaximumChannels;
+    Slot->OutPair.PinDeviceFormatsAndModes      =
+        const_cast<PIN_DEVICE_FORMATS_AND_MODES *>(renderFormatsAndModes);
+    Slot->OutPair.PinDeviceFormatsAndModesCount = renderFormatsAndModesCount;
     Slot->OutPair.PhysicalConnections           = SpeakerTopologyPhysicalConnections;
     Slot->OutPair.PhysicalConnectionCount       = SIZEOF_ARRAY(SpeakerTopologyPhysicalConnections);
     Slot->OutPair.DeviceFlags                   = ENDPOINT_NO_FLAGS;
@@ -1902,6 +1928,7 @@ AhPerPeerDriverInit(VOID)
 {
     PAGED_CODE();
 
+    AhSpeakerFormatBanksInitialize();
     RtlZeroMemory(g_AhSlots, sizeof(g_AhSlots));
     RtlZeroMemory(g_AhTopoObj, sizeof(g_AhTopoObj));
     RtlZeroMemory((PVOID)g_AhWaveRt, sizeof(g_AhWaveRt));

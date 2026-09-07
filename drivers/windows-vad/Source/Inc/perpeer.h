@@ -22,6 +22,7 @@ Abstract:
 
 #include "common.h"
 #include "AudioHubIoctl.h"
+#include "speakerformatbank.h"
 
 //
 // Template reference strings. These must match the KSNAME_* values in the
@@ -263,6 +264,11 @@ typedef struct _AH_SLOT
 
     SIMPLEAUDIOSAMPLE_DEVPROPERTY   OutTopoProps[1];
     SIMPLEAUDIOSAMPLE_DEVPROPERTY   InTopoProps[1];
+
+    // The selected render bank is driver-global and immutable after
+    // DriverEntry. The slot owns only this selection; no PortCls pointer ever
+    // targets storage that can be rewritten when the slot is rebound.
+    const AH_SPEAKER_FORMAT_BANK *OutFormatBank;
 
     ENDPOINT_MINIPAIR   OutPair;
     ENDPOINT_MINIPAIR   InPair;

@@ -779,7 +779,7 @@ static void AudioHub_NotifyFormatProperties(uint32_t inSlotIndex, uint32_t inGen
     }
 
     AudioObjectPropertyAddress theLayout = { kAudioDevicePropertyPreferredChannelLayout,
-                                             kAudioObjectPropertyScopeGlobal,
+                                             kAudioObjectPropertyScopeOutput,
                                              kAudioObjectPropertyElementMain };
     gPlugIn_Host->PropertiesChanged(gPlugIn_Host, inDeviceID, 1, &theLayout);
 }
@@ -832,7 +832,6 @@ static OSStatus AudioHub_BeginFormatTransaction(AudioHubDevice* inDevice,
 
     AudioHubSlot* theSlot = &gSlots[inDevice->slotIndex];
     uint32_t theEpoch = 0;
-    Boolean theAvailableChanged = false;
     AudioHubBridge_LockRingControl(inDevice->ring);
     pthread_mutex_lock(&gPlugIn_StateMutex);
     if((atomic_load(&theSlot->state) != kSlotBound) || !inDevice->listed ||
@@ -859,10 +858,15 @@ static OSStatus AudioHub_BeginFormatTransaction(AudioHubDevice* inDevice,
         AudioHubBridge_UnlockRingControl(inDevice->ring);
         return kAudioHardwareNoError;
     }
+    if((inRequestID == 0) && (inDevice->formatStage >= kFormatPausing) &&
+       (inDevice->formatStage <= kFormatCommitted))
+    {
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        AudioHubBridge_UnlockRingControl(inDevice->ring);
+        return kAudioHardwareIllegalOperationError;
+    }
     theEpoch = ++inDevice->formatEpochNext;
     inDevice->hostEpochOutstanding = 0;
-    theAvailableChanged = (inDevice->allowedLayouts != inSupportedMask);
-    inDevice->allowedLayouts = inSupportedMask;
     inDevice->pendingLayout = inLayout;
     inDevice->pendingMask = inSupportedMask;
     inDevice->formatEpoch = theEpoch;
@@ -888,12 +892,6 @@ static OSStatus AudioHub_BeginFormatTransaction(AudioHubDevice* inDevice,
     }
     pthread_mutex_unlock(&gPlugIn_StateMutex);
 
-    pthread_mutex_lock(&gPlugIn_StateMutex);
-    if(theAvailableChanged && (inDevice->formatEpoch == theEpoch))
-    {
-        inDevice->formatAvailableDirty = true;
-    }
-    pthread_mutex_unlock(&gPlugIn_StateMutex);
     AudioHubBridge_UnlockRingControl(inDevice->ring);
     return kAudioHardwareNoError;
 }
@@ -903,6 +901,7 @@ static void AudioHub_CommitFormat(uint32_t inEndpoint, uint32_t inEpoch, Boolean
     AudioHubSlot* theSlot = &gSlots[AUDIOHUB_ENDPOINT_SLOT(inEndpoint)];
     AudioHubDevice* theDevice = &theSlot->dev[kAudioHubDir_Out];
     uint32_t theLayout = 0;
+    uint32_t theMask = 0;
     uint64_t theSession = 0;
     uint32_t theGeneration = 0;
     Boolean theReferenceHeld = false;
@@ -932,6 +931,7 @@ static void AudioHub_CommitFormat(uint32_t inEndpoint, uint32_t inEpoch, Boolean
     }
     theDevice->formatStage = kFormatCommitting;
     theLayout = theDevice->pendingLayout;
+    theMask = theDevice->pendingMask;
     theSession = theDevice->formatSessionID;
     theGeneration = atomic_load(&theSlot->generation);
     atomic_fetch_add(&theDevice->inuse, 1);
@@ -968,6 +968,8 @@ static void AudioHub_CommitFormat(uint32_t inEndpoint, uint32_t inEpoch, Boolean
     }
     atomic_store(&theDevice->channelCount, AudioHub_LayoutChannels(theLayout));
     theDevice->currentLayout = theLayout;
+    theDevice->formatAvailableDirty |= (theDevice->allowedLayouts != theMask);
+    theDevice->allowedLayouts = theMask;
     theDevice->formatStage = kFormatCommitted;
     theDevice->formatStartedMsec = AudioHub_NowMsec();
     theDevice->formatCurrentDirty = true;
@@ -1007,7 +1009,9 @@ static void AudioHub_HandleFormat(const AudioHubFormatMsg* inMsg)
         {
             theDevice->formatStage = kFormatAwaitingHost;
             theDevice->formatStartedMsec = AudioHub_NowMsec();
-            theCommitDirectly = (theDevice->pendingLayout == theDevice->currentLayout);
+            // Available formats are configuration too, even at the same ASBD.
+            theCommitDirectly = (theDevice->pendingLayout == theDevice->currentLayout) &&
+                               (theDevice->pendingMask == theDevice->allowedLayouts);
             theQueueHost = !theCommitDirectly && (theDevice->hostEpochOutstanding == 0);
         }
         pthread_mutex_unlock(&gPlugIn_StateMutex);

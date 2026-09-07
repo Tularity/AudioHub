@@ -158,6 +158,12 @@ protected:
     // open and none of them installs a listener).
     //
     ULONGLONG                   m_AhPresentationOffsetFrames;
+    // Fixed-width ring conversion scratch is nonpaged, never a 12 KB DPC
+    // stack array. Native geometry is captured from the validated pin format.
+    float *                     m_AhRenderScratch;
+    ULONG                       m_AhRenderChannels;
+    ULONG                       m_AhRenderBlockAlign;
+    ULONG                       m_AhRenderEpochSeen;
     // Member variable as config params for tone generator
     ULONG                       m_ulHostCaptureToneFrequency;
     // If abs(m_dwHostCaptureToneAmplitude) + abs(m_dwHostCaptureToneDCValue) > 100
@@ -260,4 +266,3 @@ private:
 };
 typedef CMiniportWaveRTStream *PCMiniportWaveRTStream;
 #endif // _SIMPLEAUDIOSAMPLE_MINWAVERTSTREAM_H_
-

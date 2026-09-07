@@ -97,7 +97,7 @@ use crate::{rd, wr};
 pub const HAL_SERVICE_NAME: &str = "com.audiohub.driver";
 
 pub const HAL_RING_MAGIC: u32 = 0x4148_5231; // 'AHR1'
-pub const HAL_RING_VERSION: u32 = if cfg!(target_os = "macos") { 2 } else { 1 };
+pub const HAL_RING_VERSION: u32 = 2;
 pub const HAL_RING_DATA_OFFSET: usize = 64;
 pub const HAL_SAMPLE_RATE: u32 = 48_000;
 pub const HAL_RING_MS: u32 = 500;
@@ -720,8 +720,9 @@ impl HalBridge {
     }
 
     pub(crate) fn supports_output_formats(&self) -> bool {
-        cfg!(target_os = "macos") && self.shared.driver_connected.load(Ordering::Acquire)
-            && self.shared.driver_protocol.load(Ordering::Acquire) == 4
+        self.shared.driver_connected.load(Ordering::Acquire)
+            && ((cfg!(target_os = "macos") && self.shared.driver_protocol.load(Ordering::Acquire) == 4)
+                || (cfg!(windows) && self.shared.driver_protocol.load(Ordering::Acquire) == 8))
     }
 
     pub(crate) fn offer_output_format(&self, slot: u8, generation: u32, mask: u32, layout: u32) {
@@ -735,9 +736,9 @@ impl HalBridge {
     }
 
     fn send_format(&self, message: crate::halformat::Payload) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         return platform::send_format(&self.shared, message);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         { let _ = message; false }
     }
 
@@ -5550,12 +5551,12 @@ mod platform {
             crate::halformat::channels((value & 15) as u32).map(usize::from)
         }
 
-        fn pause_spk(&self, slot: usize) {
+        pub(super) fn pause_spk(&self, slot: usize) {
             let _guard = wr(&self.inner);
             if let Some(format) = self.formats.get(slot) { format.fetch_and(!16, Ordering::Release); }
         }
 
-        fn resume_spk(&self, slot: usize, layout: u32, epoch: u32) -> bool {
+        pub(super) fn resume_spk(&self, slot: usize, layout: u32, epoch: u32) -> bool {
             let guard = wr(&self.inner);
             let Some(pair) = guard.as_ref().and_then(|pairs| pairs.get(slot)) else { return false };
             let Some(channels) = crate::halformat::channels(layout) else { return false };
@@ -6383,39 +6384,10 @@ mod platform {
     }
 
     fn handle_format(shared: &Shared, header: *mut MsgHeader) {
-        use crate::halformat::{Effect, ACCEPTED};
         if unsafe { (*header).bits } & MACH_MSGH_BITS_COMPLEX != 0
             || unsafe { (*header).size } != std::mem::size_of::<FormatMsg>() as u32 { return; }
         let message = unsafe { (*(header as *const FormatMsg)).payload };
-        if !message.valid() || message.session_id != shared.session_id.load(Ordering::Acquire) { return; }
-        let slot = message.endpoint as usize / 2;
-        let state = &shared.slots[slot];
-        if message.generation != state.generation.load(Ordering::Acquire) { return; }
-        let effect = lk(&state.format).receive(message);
-        match effect {
-            Effect::Ignore => return,
-            Effect::Quiesce(_) => {
-                shared.rings.pause_spk(slot);
-                state.output_format.store(((message.epoch as u64) << 8) | message.layout as u64, Ordering::Release);
-                state.format_worker.store(false, Ordering::Release);
-                state.disc_epoch.fetch_add(1, Ordering::Release);
-            }
-            Effect::Accept(message) => {
-                state.output_format.store(((message.epoch as u64) << 8) | message.layout as u64, Ordering::Release);
-                let ack = lk(&state.format).acknowledgement(message, ACCEPTED);
-                if ack.is_none_or(|ack| !send_format(shared, ack)) { lk(&state.format).send_failed(); }
-            }
-            Effect::Publish(message) => {
-                if shared.rings.resume_spk(slot, message.layout, message.epoch) {
-                    state.output_format.store(((message.epoch as u64) << 8) | 16 | message.layout as u64, Ordering::Release);
-                } else { lk(&state.format).send_failed(); }
-            }
-            Effect::Failed => {
-                shared.rings.pause_spk(slot);
-                state.output_format.fetch_and(!16, Ordering::Release);
-            }
-        }
-        *lk(&shared.last_driver_msg) = Some(Instant::now());
+        handle_output_format(shared, message);
     }
 
     pub(super) fn send_format(shared: &Shared, payload: crate::halformat::Payload) -> bool {
@@ -9767,6 +9739,40 @@ mod platform {
 
 // ---------------------------------------------------------------- other platforms
 
+#[cfg(any(target_os = "macos", windows))]
+fn handle_output_format(shared: &Shared, message: crate::halformat::Payload) {
+    use crate::halformat::{Effect, ACCEPTED};
+    if !message.valid() || message.session_id != shared.session_id.load(Ordering::Acquire) { return; }
+    let slot = message.endpoint as usize / 2;
+    let state = &shared.slots[slot];
+    if message.generation != state.generation.load(Ordering::Acquire) { return; }
+    let effect = lk(&state.format).receive(message);
+    match effect {
+        Effect::Ignore => return,
+        Effect::Quiesce(_) => {
+            shared.rings.pause_spk(slot);
+            state.output_format.store(((message.epoch as u64) << 8) | message.layout as u64, Ordering::Release);
+            state.format_worker.store(false, Ordering::Release);
+            state.disc_epoch.fetch_add(1, Ordering::Release);
+        }
+        Effect::Accept(message) => {
+            state.output_format.store(((message.epoch as u64) << 8) | message.layout as u64, Ordering::Release);
+            let ack = lk(&state.format).acknowledgement(message, ACCEPTED);
+            if ack.is_none_or(|ack| !platform::send_format(shared, ack)) { lk(&state.format).send_failed(); }
+        }
+        Effect::Publish(message) => {
+            if shared.rings.resume_spk(slot, message.layout, message.epoch) {
+                state.output_format.store(((message.epoch as u64) << 8) | 16 | message.layout as u64, Ordering::Release);
+            } else { lk(&state.format).send_failed(); }
+        }
+        Effect::Failed => {
+            shared.rings.pause_spk(slot);
+            state.output_format.fetch_and(!16, Ordering::Release);
+        }
+    }
+    *lk(&shared.last_driver_msg) = Some(Instant::now());
+}
+
 #[cfg(not(target_os = "macos"))]
 mod platform {
     use super::*;
@@ -9815,6 +9821,12 @@ mod platform {
         }
         pub fn read_spk(&self, slot: usize, dst: &mut [f32], frames: usize) -> usize {
             self.rings.read_spk(slot, dst, frames)
+        }
+        pub fn pause_spk(&self, slot: usize) {
+            self.rings.pause_spk(slot);
+        }
+        pub fn resume_spk(&self, slot: usize, layout: u32, epoch: u32) -> bool {
+            self.rings.resume_spk(slot, layout, epoch)
         }
         pub fn write_mic(&self, slot: usize, mono: &[f32]) -> Option<usize> {
             self.rings.write_mic(slot, mono)
@@ -10139,6 +10151,11 @@ mod platform {
         // attach holds across mapping move + publication, so there is no gap
         // in which either transition can consume the other's rings.
         shared.rings.rings.detach();
+        for slot in &shared.slots {
+            slot.output_format.store(0, Ordering::Release);
+            slot.format_worker.store(false, Ordering::Release);
+            *lk(&slot.format) = crate::halformat::State::default();
+        }
         drop(session.take());
         shared.driver_connected.store(false, Ordering::Relaxed);
         shared.slot_count.store(0, Ordering::SeqCst);
@@ -10241,6 +10258,12 @@ mod platform {
     /// cannot legitimately be talking about.
     #[cfg(windows)]
     fn map_event(shared: &Shared, ev: wire::ControlEvent) -> Option<HalControlEvent> {
+        if ev.kind == wire::EVENT_FORMAT {
+            if ev.slot == ev.format.endpoint / 2 && ev.generation == ev.format.generation {
+                handle_output_format(shared, ev.format);
+            }
+            return None;
+        }
         let slot = u8::try_from(ev.slot).ok()?;
         if slot as usize >= HAL_MAX_SLOTS {
             return None;
@@ -10356,6 +10379,25 @@ mod platform {
                         at.slot
                     ),
                 );
+                false
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn send_format(shared: &Shared, payload: crate::halformat::Payload) -> bool {
+        if !payload.valid() || payload.session_id != shared.session_id.load(Ordering::Acquire) {
+            return false;
+        }
+        let guard = lk(&shared.rings.session);
+        let Some(session) = guard.as_ref() else { return false };
+        if !session.has_output_formats() { return false; }
+        let failed = WindowsSessionIdentity::capture(shared, session);
+        match session.send_format(payload) {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                detach_failed_session(shared, guard, failed,
+                    &format!("driver format request failed: {error:#}"));
                 false
             }
         }
@@ -10528,6 +10570,13 @@ mod platform {
             .swap(reply.generation, Ordering::AcqRel);
         if previous != reply.generation {
             shared.arm_flush(slot);
+        }
+        if previous != reply.generation || reply.published & wire::PUB_RENDER == 0 {
+            shared.rings.pause_spk(slot as usize);
+            let record = &shared.slots[slot as usize];
+            record.output_format.store(0, Ordering::Release);
+            record.format_worker.store(false, Ordering::Release);
+            *lk(&record.format) = crate::halformat::State::default();
         }
         shared.push_event(HalControlEvent::BindState {
             slot,

@@ -14,6 +14,8 @@ Abstract:
 #ifndef _SIMPLEAUDIOSAMPLE_MINWAVERT_H_
 #define _SIMPLEAUDIOSAMPLE_MINWAVERT_H_
 
+#include "speakerformatbank.h"
+
 //=============================================================================
 // Referenced Forward
 //=============================================================================
@@ -65,6 +67,7 @@ protected:
     ULONG                               m_DeviceFlags;
     eDeviceType                         m_DeviceType;
     PPORTEVENTS                         m_pPortEvents;
+    IPortClsSubdeviceEx *                m_AhSubdeviceEx = NULL;
     PENDPOINT_MINIPAIR                  m_pMiniportPair;
     
 public:
@@ -198,6 +201,8 @@ public:
         _In_ PPCPROPERTY_REQUEST PropertyRequest
     );
 
+    NTSTATUS AhRefreshSpeakerFormats(const AH_SPEAKER_FORMAT_BANK *Bank);
+
     PADAPTERCOMMON GetAdapterCommObj() 
     {
         return m_pAdapterCommon; 
@@ -229,6 +234,7 @@ private:
     // slot index.
     //
     PVOID GetDeviceContext() { return m_DeviceContext; }
+    const KSDATAFORMAT_WAVEFORMATEXTENSIBLE *AhDefaultSpeakerFormat();
 
 #pragma code_seg()
 

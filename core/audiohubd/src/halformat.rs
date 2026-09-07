@@ -1,4 +1,4 @@
-//! Per-speaker format transactions for the macOS HAL v4 bridge.
+//! Per-speaker format transactions for the macOS HAL v4 and Windows VAD v8 bridges.
 
 use audiohub_core::spatial_output::SpeakerLayout;
 use std::time::{Duration, Instant};
@@ -46,7 +46,7 @@ pub(crate) fn valid_mask(mask: u32) -> bool {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct Payload {
+pub struct Payload {
     pub op: u32,
     pub endpoint: u32,
     pub generation: u32,

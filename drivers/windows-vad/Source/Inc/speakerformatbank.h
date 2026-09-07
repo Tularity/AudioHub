@@ -73,4 +73,14 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 USHORT
 AhSpeakerFormatBankMaximumChannels(_In_opt_ const AH_SPEAKER_FORMAT_BANK *Bank);
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+const KSDATAFORMAT_WAVEFORMATEXTENSIBLE *
+AhSpeakerFormatBankFormat(_In_opt_ const AH_SPEAKER_FORMAT_BANK *Bank, _In_ ULONG Layout);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG AhSpeakerLayoutFromChannels(_In_ ULONG Channels);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+ULONG AhSpeakerLayoutChannelMask(_In_ ULONG Layout);
+
 #endif // _AUDIOHUB_SPEAKERFORMATBANK_H_

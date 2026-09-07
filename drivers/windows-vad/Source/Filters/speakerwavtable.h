@@ -216,7 +216,7 @@ static PCPROPERTY_ITEM PropertiesSpeakerWaveFilter[] =
     {
         &KSPROPSETID_Pin,
         KSPROPERTY_PIN_PROPOSEDATAFORMAT,
-        KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT,
+        KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT,
         PropertyHandler_WaveFilter
     },
     {
@@ -227,7 +227,16 @@ static PCPROPERTY_ITEM PropertiesSpeakerWaveFilter[] =
     }
 };
 
-DEFINE_PCAUTOMATION_TABLE_PROP(AutomationSpeakerWaveFilter, PropertiesSpeakerWaveFilter);
+NTSTATUS CMiniportWaveRT_EventHandler_PinCapsChange(_In_ PPCEVENT_REQUEST EventRequest);
+
+static PCEVENT_ITEM EventsSpeakerWaveFilter[] =
+{
+    { &KSEVENTSETID_PinCapsChange, KSEVENT_PINCAPS_FORMATCHANGE,
+      KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT,
+      CMiniportWaveRT_EventHandler_PinCapsChange }
+};
+DEFINE_PCAUTOMATION_TABLE_PROP_EVENT(AutomationSpeakerWaveFilter,
+    PropertiesSpeakerWaveFilter, EventsSpeakerWaveFilter);
 
 static AH_SPEAKER_FORMAT_BANK_STORAGE
     AhSpeakerFormatBanks[AH_SPEAKER_FORMAT_BANK_COUNT];
@@ -444,6 +453,40 @@ AhSpeakerFormatBankMaximumChannels(
     )
 {
     return AhSpeakerFormatBankIsOwned(Bank) ? Bank->MaximumChannels : 0;
+}
+
+#pragma code_seg()
+ULONG AhSpeakerLayoutFromChannels(_In_ ULONG Channels)
+{
+    for (ULONG layout = 0; layout < AH_SPEAKER_LAYOUT_COUNT; ++layout)
+    {
+        if (AhSpeakerLayoutSpecs[layout].Channels == Channels) { return layout; }
+    }
+    return AH_SPEAKER_LAYOUT_COUNT;
+}
+
+#pragma code_seg()
+ULONG AhSpeakerLayoutChannelMask(_In_ ULONG Layout)
+{
+    return Layout < AH_SPEAKER_LAYOUT_COUNT ? AhSpeakerLayoutSpecs[Layout].ChannelMask : 0;
+}
+
+#pragma code_seg()
+const KSDATAFORMAT_WAVEFORMATEXTENSIBLE *
+AhSpeakerFormatBankFormat(_In_opt_ const AH_SPEAKER_FORMAT_BANK *Bank, _In_ ULONG Layout)
+{
+    if (!AhSpeakerFormatBankIsOwned(Bank) || Layout >= AH_SPEAKER_LAYOUT_COUNT ||
+        !(Bank->SupportedLayoutMask & AH_SPEAKER_LAYOUT_BIT(Layout))) { return NULL; }
+    const PIN_DEVICE_FORMATS_AND_MODES *pin = Bank->PinDeviceFormatsAndModes;
+    for (ULONG i = 0; i < pin[0].WaveFormatsCount; ++i)
+    {
+        const KSDATAFORMAT_WAVEFORMATEXTENSIBLE *format = &pin[0].WaveFormats[i];
+        if (format->WaveFormatExt.Format.nChannels == AhSpeakerLayoutSpecs[Layout].Channels)
+        {
+            return format;
+        }
+    }
+    return NULL;
 }
 
 #endif // AUDIOHUB_SPEAKER_FORMAT_BANKS_IMPLEMENTATION

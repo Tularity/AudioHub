@@ -50,6 +50,7 @@
 /// The frozen contract, as pure data. Compiled everywhere so it is testable
 /// everywhere.
 pub mod wire {
+    pub use crate::halformat::Payload as FormatPayload;
     /// `AudioHubIoctl.h:AUDIOHUB_WIN_PROTOCOL_VERSION`.
     ///
     /// An INDEPENDENT namespace from the macOS bridge's version 2. The two
@@ -101,7 +102,9 @@ pub mod wire {
     /// v7 makes the per-endpoint peer/direction identity property mandatory.
     /// The daemon addresses Windows' own scalar API through that property; a
     /// v6 driver cannot safely participate in device-volume synchronization.
-    pub const PROTOCOL_VERSION: u32 = 7;
+    /// v8 adds native PCM output-format transactions and fixes the physical
+    /// speaker ring at 12 lanes so every supported layout fits one mapping.
+    pub const PROTOCOL_VERSION: u32 = 8;
 
     /// `AudioHubIoctl.h:AUDIOHUB_WIN_MAX_SLOTS`, and equal to
     /// `halbridge::HAL_MAX_SLOTS`. The driver's `PcAddAdapterDevice` budget is
@@ -119,11 +122,9 @@ pub mod wire {
 
     // -- ring geometry ------------------------------------------------------
     //
-    // Mirrors `drivers/windows-vad/Source/Inc/AudioHubRing.h`, which is itself
-    // a literal port of the macOS bridge's layout. Every constant below is
-    // therefore ALSO a `halbridge::HAL_*` constant, and the `const _` blocks
-    // are what make a one-sided edit a BUILD failure rather than an audio
-    // failure on a machine that has to be recovered from a checkpoint.
+    // Mirrors `drivers/windows-vad/Source/Inc/AudioHubRing.h`. Shared geometry
+    // remains pinned to `halbridge::HAL_*`; the Windows-only 12-lane speaker
+    // geometry is asserted independently from the legacy macOS stereo values.
     //
     // These are the values the daemon will ACCEPT. The driver reports its own
     // in AH_MAP_REPLY and `rings::WinRings::attach` compares the two for
@@ -137,16 +138,18 @@ pub mod wire {
     pub const RING_SAMPLE_RATE: u32 = 48_000;
     /// 500 ms at 48 kHz.
     pub const RING_FRAMES: u32 = 24_000;
-    pub const SPK_CHANNELS: u32 = 2;
+    /// Physical lanes in every speaker ring. Logical clients use the compact
+    /// first 2/6/8/12 lanes selected by the format handshake.
+    pub const SPK_CHANNELS: u32 = 12;
     pub const MIC_CHANNELS: u32 = 1;
     /// `AUDIOHUB_SPK_BYTES` — the 16K-page-aligned mapped length of an OUT ring.
-    pub const SPK_BYTES: usize = 196_608;
+    pub const SPK_BYTES: usize = 1_163_264;
     /// `AUDIOHUB_MIC_BYTES`.
     pub const MIC_BYTES: usize = 98_304;
     /// `'AHR1'`. Written by the driver at ring creation, checked ONCE by the
     /// daemon at attach.
     pub const RING_MAGIC: u32 = 0x4148_5231;
-    pub const RING_VERSION: u32 = 1;
+    pub const RING_VERSION: u32 = 2;
 
     /// `AH_MAP_REPLY::va` is a fixed array of this many entries; `ring_count`
     /// says how many are meaningful. `AUDIOHUB_RING_INDEX(slot, dir)` is
@@ -165,14 +168,13 @@ pub mod wire {
     const _: () = assert!(RING_DATA_OFFSET == crate::halbridge::HAL_RING_DATA_OFFSET);
     const _: () = assert!(RING_SAMPLE_RATE == crate::halbridge::HAL_SAMPLE_RATE);
     const _: () = assert!(RING_FRAMES == crate::halbridge::HAL_RING_FRAMES);
-    const _: () = assert!(SPK_CHANNELS == crate::halbridge::HAL_SPK_CHANNELS);
     const _: () = assert!(MIC_CHANNELS == crate::halbridge::HAL_MIC_CHANNELS);
-    const _: () = assert!(SPK_BYTES == crate::halbridge::HAL_SPK_BYTES);
     const _: () = assert!(MIC_BYTES == crate::halbridge::HAL_MIC_BYTES);
     const _: () = assert!(RING_MAGIC == crate::halbridge::HAL_RING_MAGIC);
-    // The Windows VAD keeps ring v1 while the macOS HAL advances independently.
     #[cfg(target_os = "windows")]
     const _: () = assert!(RING_VERSION == crate::halbridge::HAL_RING_VERSION);
+    const _: () = assert!(SPK_CHANNELS == 12);
+    const _: () = assert!(SPK_BYTES == 1_163_264);
     // The bound that actually matters: the samples have to fit in the mapping.
     const _: () = assert!(
         SPK_BYTES >= RING_DATA_OFFSET + (RING_FRAMES as usize) * (SPK_CHANNELS as usize) * 4
@@ -223,6 +225,8 @@ pub mod wire {
     /// `IOCTL_AUDIOHUB_STREAMSTAT` (`AudioHubIoctl.h`): how deep the WaveRT
     /// stage is. Read-only telemetry.
     pub const IOCTL_STREAMSTAT: u32 = ah_ioctl(0x808);
+    /// Native PCM output-format transaction.
+    pub const IOCTL_FORMAT: u32 = ah_ioctl(0x809);
 
     // The two new codes as LITERALS, transcribed from the C_ASSERTs at the
     // bottom of AudioHubIoctl.h. `ah_ioctl` is a macro on both sides, so this
@@ -232,6 +236,7 @@ pub mod wire {
     const _: () = assert!(IOCTL_NOTIFY == 0x0022_E018);
     const _: () = assert!(IOCTL_LATENCY == 0x0022_E01C);
     const _: () = assert!(IOCTL_STREAMSTAT == 0x0022_E020);
+    const _: () = assert!(IOCTL_FORMAT == 0x0022_E024);
 
     // -- status codes -------------------------------------------------------
 
@@ -417,7 +422,9 @@ pub mod wire {
     pub const BIND_REPLY_BYTES: usize = 32;
     pub const SLOT_INFO_BYTES: usize = 52;
     pub const QUERY_SLOTS_REPLY_BYTES: usize = 16 + SLOT_INFO_BYTES * MAX_SLOTS;
-    pub const CONTROL_EVENT_BYTES: usize = 24;
+    pub const FORMAT_PAYLOAD_BYTES: usize = 40;
+    pub const FORMAT_REPLY_BYTES: usize = 8;
+    pub const CONTROL_EVENT_BYTES: usize = 24 + FORMAT_PAYLOAD_BYTES;
     pub const MAP_REQUEST_BYTES: usize = 24;
     /// 40 bytes of geometry, then 32 `u64` addresses.
     pub const MAP_REPLY_BYTES: usize = 40 + 8 * RING_SLOTS_MAX;
@@ -430,6 +437,9 @@ pub mod wire {
 
     const _: () = assert!(QUERY_SLOTS_REPLY_BYTES == 848);
     const _: () = assert!(MAP_REPLY_BYTES == 296);
+    const _: () = assert!(CONTROL_EVENT_BYTES == 64);
+    const _: () = assert!(std::mem::size_of::<crate::halformat::Payload>() == 40);
+    const _: () = assert!(std::mem::offset_of!(crate::halformat::Payload, session_id) == 24);
 
     // -- capabilities -------------------------------------------------------
 
@@ -486,6 +496,9 @@ pub mod wire {
     /// With the bit CLEAR, peer -> this machine volume sync does not work and
     /// the daemon must say so instead of believing its own `applied` flag.
     pub const CAP_VOLUMEEVENT: u32 = 0x10;
+    /// `AH_CAP_OUTPUT_FORMATS`: the v8 format transaction and fixed-width
+    /// 12-lane speaker ring are both available.
+    pub const CAP_OUTPUT_FORMATS: u32 = 0x20;
 
     pub fn caps_have_volume_event(caps: u32) -> bool {
         caps & CAP_VOLUMEEVENT != 0
@@ -614,6 +627,10 @@ pub mod wire {
         /// topology node as a Windows control-change event.
         pub fn has_volume_event(&self) -> bool {
             caps_have_volume_event(self.caps)
+        }
+
+        pub fn has_output_formats(&self) -> bool {
+            self.caps & CAP_OUTPUT_FORMATS != 0
         }
     }
 
@@ -845,6 +862,27 @@ pub mod wire {
     pub const EVENT_VOLUME: u32 = 1;
     pub const EVENT_IOSTATE: u32 = 2;
     pub const EVENT_SLOT: u32 = 3;
+    pub const EVENT_FORMAT: u32 = 4;
+
+    pub const FORMAT_OFFER: u32 = 1;
+    pub const FORMAT_QUIESCED: u32 = 2;
+    pub const FORMAT_ACCEPTED: u32 = 3;
+    pub const FORMAT_PREPARE: u32 = 4;
+    pub const FORMAT_COMMITTED: u32 = 5;
+    pub const FORMAT_READY: u32 = 6;
+    pub const FORMAT_ABORTED: u32 = 7;
+
+    const _: () = assert!(FORMAT_OFFER == crate::halformat::OFFER);
+    const _: () = assert!(FORMAT_QUIESCED == crate::halformat::QUIESCED);
+    const _: () = assert!(FORMAT_ACCEPTED == crate::halformat::ACCEPTED);
+    const _: () = assert!(FORMAT_PREPARE == crate::halformat::PREPARE);
+    const _: () = assert!(FORMAT_COMMITTED == crate::halformat::COMMITTED);
+    const _: () = assert!(FORMAT_READY == crate::halformat::READY);
+    const _: () = assert!(FORMAT_ABORTED == crate::halformat::ABORTED);
+
+    pub fn format_op_is_outbound(op: u32) -> bool {
+        matches!(op, FORMAT_OFFER | FORMAT_QUIESCED | FORMAT_ACCEPTED)
+    }
 
     pub const EVFLAG_INPUT: u32 = 0x1;
     pub const EVFLAG_MUTED: u32 = 0x2;
@@ -858,6 +896,7 @@ pub mod wire {
         pub flags: u32,
         pub scalar_q16: u32,
         pub state: u32,
+        pub format: FormatPayload,
     }
 
     impl ControlEvent {
@@ -888,6 +927,52 @@ pub mod wire {
             flags: get_u32(b, 12),
             scalar_q16: get_u32(b, 16),
             state: get_u32(b, 20),
+            format: decode_format_payload(&b[24..64])?,
+        })
+    }
+
+    pub fn encode_format_payload(
+        payload: &FormatPayload,
+    ) -> [u8; FORMAT_PAYLOAD_BYTES] {
+        let mut b = [0u8; FORMAT_PAYLOAD_BYTES];
+        put_u32(&mut b, 0, payload.op);
+        put_u32(&mut b, 4, payload.endpoint);
+        put_u32(&mut b, 8, payload.generation);
+        put_u32(&mut b, 12, payload.layout);
+        put_u32(&mut b, 16, payload.supported_mask);
+        put_u32(&mut b, 20, payload.epoch);
+        put_u64(&mut b, 24, payload.session_id);
+        put_u64(&mut b, 32, payload.request_id);
+        b
+    }
+
+    pub fn decode_format_payload(b: &[u8]) -> Option<FormatPayload> {
+        if b.len() != FORMAT_PAYLOAD_BYTES {
+            return None;
+        }
+        Some(crate::halformat::Payload {
+            op: get_u32(b, 0),
+            endpoint: get_u32(b, 4),
+            generation: get_u32(b, 8),
+            layout: get_u32(b, 12),
+            supported_mask: get_u32(b, 16),
+            epoch: get_u32(b, 20),
+            session_id: get_u64(b, 24),
+            request_id: get_u64(b, 32),
+        })
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FormatReply {
+        pub status: u32,
+    }
+
+    pub fn decode_format_reply(b: &[u8]) -> Option<FormatReply> {
+        if b.len() != FORMAT_REPLY_BYTES || get_u32(b, 4) != 0 {
+            return None;
+        }
+        Some(FormatReply {
+            status: get_u32(b, 0),
         })
     }
 
@@ -965,7 +1050,7 @@ pub mod wire {
         /// these numbers; accepting a capacity the driver invented would aim a
         /// memcpy past the end of the mapping. And "adapt to whatever the
         /// driver says" is not available either — the media plane above is
-        /// fixed at 48 kHz / 2ch out / 1ch in all the way to the socket.
+        /// fixed at 48 kHz with a 12-lane physical output ring and 1ch input.
         pub fn geometry_error(&self) -> Option<String> {
             let want = [
                 (
@@ -1939,6 +2024,12 @@ pub mod rings {
                     rep.sample_rate
                 ));
             }
+            if h.reserved != 0 {
+                return Err(anyhow!(
+                    "the {what} ring header reserved field is {:#x}, expected zero",
+                    h.reserved
+                ));
+            }
             Ok(me)
         }
 
@@ -2075,6 +2166,43 @@ pub mod rings {
             (count, effective)
         }
 
+        /// Reads compact logical frames from the first `active` lanes of each
+        /// fixed-width physical frame without allocating a staging buffer.
+        fn peek_packed(&self, dst: &mut [f32], frames: usize, active: usize) -> (usize, u64) {
+            if active == self.channels as usize {
+                return self.peek(dst, frames);
+            }
+            if active == 0 || active > self.channels as usize {
+                return (0, 0);
+            }
+            let cap = self.capacity as usize;
+            let read = self.r_idx().load(Ordering::Relaxed);
+            let write = self.w_idx().load(Ordering::Acquire);
+            let available = (write.wrapping_sub(read) as usize).min(cap);
+            let base = write.wrapping_sub(available as u64);
+            let count = frames.min(available).min(dst.len() / active);
+            let physical = self.channels as usize;
+            for frame in 0..count {
+                let index = (base.wrapping_add(frame as u64) % cap as u64) as usize;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.data().add(index * physical),
+                        dst.as_mut_ptr().add(frame * active),
+                        active,
+                    );
+                }
+            }
+            (count, base)
+        }
+
+        fn read_packed(&self, dst: &mut [f32], frames: usize, active: usize) -> usize {
+            let (count, base) = self.peek_packed(dst, frames, active);
+            if count != 0 {
+                self.advance(base, count);
+            }
+            count
+        }
+
         /// Moves `read_idx` `frames` on from a [`RingMem::peek`]'s base.
         fn advance(&self, base: u64, frames: usize) {
             self.r_idx()
@@ -2143,6 +2271,9 @@ pub mod rings {
     /// were never made.
     pub struct WinRings {
         inner: RwLock<Option<Box<[RingPair]>>>,
+        /// `(epoch << 8) | ready_bit | layout`, private to the daemon. The
+        /// shared header is writable by the peer and is never format state.
+        formats: [AtomicU64; wire::MAX_SLOTS],
     }
 
     // The pointers are into a mapping owned by the driver and live exactly as
@@ -2162,6 +2293,7 @@ pub mod rings {
         pub fn new() -> WinRings {
             WinRings {
                 inner: RwLock::new(None),
+                formats: std::array::from_fn(|_| AtomicU64::new(0)),
             }
         }
 
@@ -2201,7 +2333,11 @@ pub mod rings {
                 )?;
                 pairs.push(RingPair { spk, mic });
             }
-            *wr(&self.inner) = Some(pairs.into_boxed_slice());
+            let mut guard = wr(&self.inner);
+            for format in &self.formats {
+                format.store(0, Ordering::Release);
+            }
+            *guard = Some(pairs.into_boxed_slice());
             Ok(slots)
         }
 
@@ -2211,7 +2347,11 @@ pub mod rings {
         /// what waits for the mixer and the tx engine to be out of the pages,
         /// and after `CloseHandle` those pages are not ours to touch.
         pub fn detach(&self) {
-            *wr(&self.inner) = None;
+            let mut guard = wr(&self.inner);
+            for format in &self.formats {
+                format.store(0, Ordering::Release);
+            }
+            *guard = None;
         }
 
         pub fn attached(&self) -> bool {
@@ -2227,14 +2367,33 @@ pub mod rings {
         /// take the session mutex. This is that handover, and it is a MOVE:
         /// afterwards exactly one `WinRings` names those pages.
         pub fn move_into(&self, dst: &WinRings) {
-            *wr(&dst.inner) = wr(&self.inner).take();
+            if std::ptr::eq(self, dst) {
+                return;
+            }
+            let (moved, formats) = {
+                let mut source = wr(&self.inner);
+                let moved = source.take();
+                let formats: [u64; wire::MAX_SLOTS] = std::array::from_fn(|slot| {
+                    self.formats[slot].swap(0, Ordering::AcqRel)
+                });
+                (moved, formats)
+            };
+            let mut destination = wr(&dst.inner);
+            *destination = moved;
+            for (slot, value) in formats.into_iter().enumerate() {
+                dst.formats[slot].store(value, Ordering::Release);
+            }
         }
 
         /// 0 with no driver attached (or a slot this driver does not have): the
         /// caller zero-fills, so a missing driver is silence, never a stall.
         pub fn read_spk(&self, slot: usize, dst: &mut [f32], frames: usize) -> usize {
-            match rd(&self.inner).as_ref().and_then(|p| p.get(slot)) {
-                Some(p) => p.spk.read(dst, frames),
+            let guard = rd(&self.inner);
+            let Some(active) = self.active_channels(slot) else {
+                return 0;
+            };
+            match guard.as_ref().and_then(|p| p.get(slot)) {
+                Some(p) => p.spk.read_packed(dst, frames, active),
                 None => 0,
             }
         }
@@ -2250,7 +2409,11 @@ pub mod rings {
         }
 
         pub fn flush_spk_consumer(&self, slot: usize) {
-            if let Some(p) = rd(&self.inner).as_ref().and_then(|p| p.get(slot)) {
+            let guard = rd(&self.inner);
+            if self.active_channels(slot).is_none() {
+                return;
+            }
+            if let Some(p) = guard.as_ref().and_then(|p| p.get(slot)) {
                 p.spk.flush_consumer();
             }
         }
@@ -2262,22 +2425,32 @@ pub mod rings {
             dst: &mut [f32],
             frames: usize,
         ) -> Option<(usize, u64)> {
-            rd(&self.inner)
+            let guard = rd(&self.inner);
+            let active = self.active_channels(slot)?;
+            guard
                 .as_ref()
                 .and_then(|p| p.get(slot))
-                .map(|p| p.spk.peek(dst, frames))
+                .map(|p| p.spk.peek_packed(dst, frames, active))
         }
 
         /// Moves the read pointer on from a [`WinRings::peek_spk`] base.
         pub fn advance_spk(&self, slot: usize, base: u64, frames: usize) {
-            if let Some(p) = rd(&self.inner).as_ref().and_then(|p| p.get(slot)) {
+            let guard = rd(&self.inner);
+            if self.active_channels(slot).is_none() {
+                return;
+            }
+            if let Some(p) = guard.as_ref().and_then(|p| p.get(slot)) {
                 p.spk.advance(base, frames);
             }
         }
 
         /// Drops at most `frames`, returning how many really went.
         pub fn drop_spk(&self, slot: usize, frames: usize) -> usize {
-            rd(&self.inner)
+            let guard = rd(&self.inner);
+            if self.active_channels(slot).is_none() {
+                return 0;
+            }
+            guard
                 .as_ref()
                 .and_then(|p| p.get(slot))
                 .map(|p| p.spk.drop_frames(frames))
@@ -2290,7 +2463,9 @@ pub mod rings {
         /// `None` = no driver attached / no such slot ⇒ this stage does not
         /// exist. NOT 0 ms.
         pub fn spk_readable(&self, slot: usize) -> Option<(u32, u32)> {
-            rd(&self.inner)
+            let guard = rd(&self.inner);
+            self.active_channels(slot)?;
+            guard
                 .as_ref()
                 .and_then(|p| p.get(slot))
                 .map(|p| (p.spk.readable(), p.spk.capacity))
@@ -2309,6 +2484,44 @@ pub mod rings {
                 .as_ref()
                 .and_then(|p| p.get(slot))
                 .map(|p| (p.mic.readable(), p.mic.capacity))
+        }
+
+        fn active_channels(&self, slot: usize) -> Option<usize> {
+            let value = self.formats.get(slot)?.load(Ordering::Acquire);
+            if value & 16 == 0 {
+                return None;
+            }
+            crate::halformat::channels((value & 15) as u32).map(usize::from)
+        }
+
+        /// Stops new logical reads and waits under the exclusive guard until
+        /// every old reader has left the mapping.
+        pub fn pause_spk(&self, slot: usize) {
+            let _guard = wr(&self.inner);
+            if let Some(format) = self.formats.get(slot) {
+                format.fetch_and(!16, Ordering::Release);
+            }
+        }
+
+        /// Flushes the old consumer window while the producer is quiesced,
+        /// then publishes the new private layout/epoch atomically.
+        pub fn resume_spk(&self, slot: usize, layout: u32, epoch: u32) -> bool {
+            let guard = wr(&self.inner);
+            let Some(pair) = guard.as_ref().and_then(|pairs| pairs.get(slot)) else {
+                return false;
+            };
+            let Some(channels) = crate::halformat::channels(layout) else {
+                return false;
+            };
+            if channels as u32 > pair.spk.channels {
+                return false;
+            }
+            pair.spk.flush_consumer();
+            self.formats[slot].store(
+                ((epoch as u64) << 8) | 16 | layout as u64,
+                Ordering::Release,
+            );
+            true
         }
     }
 
@@ -2415,6 +2628,14 @@ pub mod rings {
             }
         }
 
+        fn attach_stereo(rings: &WinRings, rep: &wire::MapReply) -> usize {
+            let slots = rings.attach(rep).expect("well formed rings");
+            for slot in 0..slots {
+                assert!(rings.resume_spk(slot, 0, 1));
+            }
+            slots
+        }
+
         /// Stereo ramp: channel 0 carries the absolute frame index, channel 1
         /// carries index + 0.5, so a swapped channel or an off-by-one frame is
         /// a visibly different NUMBER rather than a plausible one.
@@ -2422,17 +2643,43 @@ pub mod rings {
         /// `f32` is exact for integers below 2^24, and every index used here is
         /// far under that, so equality comparison is legitimate.
         fn stereo_ramp(from: u64, frames: usize) -> Vec<f32> {
-            let mut v = Vec::with_capacity(frames * 2);
+            let mut v = Vec::with_capacity(frames * wire::SPK_CHANNELS as usize);
             for i in 0..frames {
                 let n = (from + i as u64) as f32;
                 v.push(n);
                 v.push(n + 0.5);
+                for lane in 2..wire::SPK_CHANNELS as usize {
+                    v.push(-10_000.0 - lane as f32);
+                }
             }
             v
         }
 
         fn mono_ramp(from: u64, frames: usize) -> Vec<f32> {
             (0..frames).map(|i| (from + i as u64) as f32).collect()
+        }
+
+        fn lane_ramp(from: u64, frames: usize) -> Vec<f32> {
+            let mut out = Vec::with_capacity(frames * wire::SPK_CHANNELS as usize);
+            for frame in 0..frames {
+                for lane in 0..wire::SPK_CHANNELS as usize {
+                    out.push(((from + frame as u64) * 16 + lane as u64) as f32);
+                }
+            }
+            out
+        }
+
+        fn assert_lane_ramp(got: &[f32], from: u64, frames: usize, channels: usize) {
+            assert_eq!(got.len(), frames * channels);
+            for frame in 0..frames {
+                for lane in 0..channels {
+                    assert_eq!(
+                        got[frame * channels + lane],
+                        ((from + frame as u64) * 16 + lane as u64) as f32,
+                        "frame {frame} lane {lane}"
+                    );
+                }
+            }
         }
 
         /// Asserts a stereo buffer is exactly the ramp starting at `from`.
@@ -2461,6 +2708,10 @@ pub mod rings {
             assert!(!r.attached());
             assert_eq!(r.attach(&rep).expect("two well formed slots"), 2);
             assert!(r.attached());
+            assert_eq!(r.spk_readable(0), None, "attach leaves render paused");
+            assert_eq!(r.spk_readable(1), None, "attach leaves render paused");
+            assert!(r.resume_spk(0, 0, 1));
+            assert!(r.resume_spk(1, 0, 1));
             assert_eq!(r.spk_readable(0).map(|(_, c)| c), Some(wire::RING_FRAMES));
             assert_eq!(r.spk_readable(1).map(|(_, c)| c), Some(wire::RING_FRAMES));
             // A slot past what this driver reported is not a ring.
@@ -2489,7 +2740,7 @@ pub mod rings {
             );
             let rep = good_reply(&[&s0, &m0, &s1, &m1]);
             let r = WinRings::new();
-            r.attach(&rep).unwrap();
+            attach_stereo(&r, &rep);
 
             // The driver writes a distinct ramp into each speaker ring.
             s0.view(&rep).write(&stereo_ramp(1000, 64), 64);
@@ -2522,10 +2773,11 @@ pub mod rings {
                     "magic",
                     (|h: &mut RingHeader| h.magic = 0x4148_5232) as fn(&mut RingHeader),
                 ),
-                ("version", |h| h.version = 2),
+                ("version", |h| h.version = 1),
                 ("channels", |h| h.channels = 1),
                 ("capacity", |h| h.capacity_frames = wire::RING_FRAMES - 1),
                 ("sample rate", |h| h.sample_rate = 44_100),
+                ("reserved", |h| h.reserved = 1),
             ] {
                 let (mut spk, mic) = (FakeRing::spk(), FakeRing::mic());
                 mutate(spk.hdr());
@@ -2626,7 +2878,7 @@ pub mod rings {
             let (spk, mic) = (FakeRing::spk(), FakeRing::mic());
             let rep = good_reply(&[&spk, &mic]);
             let r = WinRings::new();
-            r.attach(&rep).unwrap();
+            attach_stereo(&r, &rep);
             let driver = spk.view(&rep);
 
             assert_eq!(driver.write(&stereo_ramp(0, 480), 480), 480);
@@ -2646,13 +2898,76 @@ pub mod rings {
             assert_stereo_ramp(&dst, 480, 480);
         }
 
+        #[test]
+        fn every_supported_layout_reads_compact_first_lanes_across_wrap() {
+            let cap = wire::RING_FRAMES as u64;
+            for (layout, channels) in [(0, 2usize), (1, 6), (2, 8), (3, 12)] {
+                let (mut spk, mic) = (FakeRing::spk(), FakeRing::mic());
+                let rep = good_reply(&[&spk, &mic]);
+                let rings = WinRings::new();
+                assert_eq!(rings.attach(&rep).unwrap(), 1);
+                assert!(rings.resume_spk(0, layout, 70 + layout));
+                spk.set_indices(cap - 2, cap - 2);
+                assert_eq!(spk.view(&rep).write(&lane_ramp(cap - 2, 4), 4), 4);
+
+                let mut out = vec![0.0; 4 * channels];
+                assert_eq!(rings.read_spk(0, &mut out, 4), 4);
+                assert_lane_ramp(&out, cap - 2, 4, channels);
+            }
+        }
+
+        #[test]
+        fn pause_blocks_consumers_and_resume_flushes_the_old_layout() {
+            let (mut spk, mic) = (FakeRing::spk(), FakeRing::mic());
+            let rep = good_reply(&[&spk, &mic]);
+            let rings = WinRings::new();
+            attach_stereo(&rings, &rep);
+            spk.view(&rep).write(&lane_ramp(0, 32), 32);
+            rings.pause_spk(0);
+
+            let before = spk.hdr().read_idx.load(Ordering::SeqCst);
+            let mut out = vec![-1.0; 32 * 2];
+            assert_eq!(rings.read_spk(0, &mut out, 32), 0);
+            assert_eq!(rings.peek_spk(0, &mut out, 32), None);
+            assert_eq!(rings.drop_spk(0, 32), 0);
+            assert_eq!(rings.spk_readable(0), None);
+            assert_eq!(spk.hdr().read_idx.load(Ordering::SeqCst), before);
+            assert_eq!(rings.write_mic(0, &mono_ramp(0, 8)), Some(8));
+
+            assert!(rings.resume_spk(0, 1, 2));
+            assert_eq!(rings.spk_readable(0), Some((0, wire::RING_FRAMES)));
+            spk.view(&rep).write(&lane_ramp(100, 4), 4);
+            let mut surround = vec![0.0; 4 * 6];
+            assert_eq!(rings.read_spk(0, &mut surround, 4), 4);
+            assert_lane_ramp(&surround, 100, 4, 6);
+        }
+
+        #[test]
+        fn live_reads_use_private_geometry_not_poisoned_header_fields() {
+            let (mut spk, mic) = (FakeRing::spk(), FakeRing::mic());
+            let rep = good_reply(&[&spk, &mic]);
+            let rings = WinRings::new();
+            attach_stereo(&rings, &rep);
+            let driver = spk.view(&rep);
+
+            let h = spk.hdr();
+            h.channels = u32::MAX;
+            h.capacity_frames = u32::MAX;
+            h.reserved = u32::MAX;
+            driver.write(&lane_ramp(500, 4), 4);
+
+            let mut out = vec![0.0; 8];
+            assert_eq!(rings.read_spk(0, &mut out, 4), 4);
+            assert_lane_ramp(&out, 500, 4, 2);
+        }
+
         /// The other direction: the daemon writes mono, the driver reads it.
         #[test]
         fn the_microphone_ring_round_trips_mono_frames_in_order() {
             let (spk, mic) = (FakeRing::spk(), FakeRing::mic());
             let rep = good_reply(&[&spk, &mic]);
             let r = WinRings::new();
-            r.attach(&rep).unwrap();
+            attach_stereo(&r, &rep);
             let driver = mic.view(&rep);
 
             assert_eq!(r.write_mic(0, &mono_ramp(0, 480)), Some(480));
@@ -2671,7 +2986,7 @@ pub mod rings {
             let (spk, mic) = (FakeRing::spk(), FakeRing::mic());
             let rep = good_reply(&[&spk, &mic]);
             let r = WinRings::new();
-            r.attach(&rep).unwrap();
+            attach_stereo(&r, &rep);
             let driver = spk.view(&rep);
 
             // Park both indices just short of the physical end.
@@ -2710,7 +3025,7 @@ pub mod rings {
             let (spk, mic) = (FakeRing::spk(), FakeRing::mic());
             let rep = good_reply(&[&spk, &mic]);
             let r = WinRings::new();
-            r.attach(&rep).unwrap();
+            attach_stereo(&r, &rep);
             let driver = spk.view(&rep);
 
             let cap = wire::RING_FRAMES as usize;
@@ -2740,7 +3055,7 @@ pub mod rings {
             let (mut spk, mic) = (FakeRing::spk(), FakeRing::mic());
             let rep = good_reply(&[&spk, &mic]);
             let r = WinRings::new();
-            r.attach(&rep).unwrap();
+            attach_stereo(&r, &rep);
             let driver = spk.view(&rep);
 
             let cap = wire::RING_FRAMES as usize;
@@ -2779,7 +3094,7 @@ pub mod rings {
             let (spk, mic) = (FakeRing::spk(), FakeRing::mic());
             let rep = good_reply(&[&spk, &mic]);
             let r = WinRings::new();
-            r.attach(&rep).unwrap();
+            attach_stereo(&r, &rep);
             let driver = spk.view(&rep);
 
             driver.write(&stereo_ramp(0, 300), 300);
@@ -2839,7 +3154,7 @@ pub mod rings {
             let (mut spk, mic) = (FakeRing::spk(), FakeRing::mic());
             let rep = good_reply(&[&spk, &mic]);
             let r = WinRings::new();
-            r.attach(&rep).unwrap();
+            attach_stereo(&r, &rep);
             let driver = spk.view(&rep);
 
             let cap = wire::RING_FRAMES as usize;
@@ -2882,7 +3197,7 @@ pub mod rings {
             let (spk, mic) = (FakeRing::spk(), FakeRing::mic());
             let rep = good_reply(&[&spk, &mic]);
             let r = WinRings::new();
-            r.attach(&rep).unwrap();
+            attach_stereo(&r, &rep);
             spk.view(&rep).write(&stereo_ramp(0, 200), 200);
 
             assert_eq!(r.drop_spk(0, 60), 60);
@@ -2907,7 +3222,7 @@ pub mod rings {
             let (spk, mic) = (FakeRing::spk(), FakeRing::mic());
             let rep = good_reply(&[&spk, &mic]);
             let r = WinRings::new();
-            r.attach(&rep).unwrap();
+            attach_stereo(&r, &rep);
             let driver = spk.view(&rep);
 
             driver.write(&stereo_ramp(0, 500), 500);
@@ -2927,7 +3242,7 @@ pub mod rings {
             let (spk, mic) = (FakeRing::spk(), FakeRing::mic());
             let rep = good_reply(&[&spk, &mic]);
             let r = WinRings::new();
-            r.attach(&rep).unwrap();
+            attach_stereo(&r, &rep);
 
             spk.view(&rep).write(&stereo_ramp(0, 700), 700);
             r.write_mic(0, &mono_ramp(0, 300));
@@ -2956,7 +3271,7 @@ pub mod rings {
             let (spk, mic) = (FakeRing::spk(), FakeRing::mic());
             let rep = good_reply(&[&spk, &mic]);
             let r = WinRings::new();
-            r.attach(&rep).unwrap();
+            attach_stereo(&r, &rep);
             spk.view(&rep).write(&stereo_ramp(0, 37), 37);
 
             let mut dst = vec![-1.0f32; 480 * 2];
@@ -2993,7 +3308,7 @@ pub mod rings {
             let (spk, mic) = (FakeRing::spk(), FakeRing::mic());
             let rep = good_reply(&[&spk, &mic]);
             let src = WinRings::new();
-            src.attach(&rep).unwrap();
+            attach_stereo(&src, &rep);
             spk.view(&rep).write(&stereo_ramp(4242, 64), 64);
 
             let dst_rings = WinRings::new();
@@ -3687,8 +4002,8 @@ pub mod session {
             //
             //   * the driver claims it and then cannot deliver it — FATAL. A
             //     geometry that disagrees with this build is not something to
-            //     adapt to: the media plane above is fixed at 48 kHz / 2ch out
-            //     / 1ch in all the way to the socket, and the arithmetic that
+            //     adapt to: the mapped plane is fixed at 48 kHz / 12ch out /
+            //     1ch in, and the arithmetic that
             //     indexes these rings is bounded by these constants. The only
             //     available "adaptation" is to memcpy past the end of a kernel
             //     mapping. Same argument as the protocol version's equality
@@ -3791,6 +4106,46 @@ pub mod session {
         /// device attenuates by the square of the setting.
         pub fn has_volume(&self) -> bool {
             self.caps & wire::CAP_VOLUME != 0
+        }
+
+        /// [`wire::CAP_OUTPUT_FORMATS`]: the driver supports v8 native PCM
+        /// format transactions and the fixed-width speaker ring.
+        pub fn has_output_formats(&self) -> bool {
+            self.caps & wire::CAP_OUTPUT_FORMATS != 0
+        }
+
+        /// Sends one daemon-to-driver format acknowledgement or offer.
+        /// `Ok(false)` is a protocol-level refusal; transport and malformed
+        /// replies remain errors so they cannot be mistaken for policy.
+        pub fn send_format(&self, payload: crate::halformat::Payload) -> Result<bool> {
+            if !wire::format_op_is_outbound(payload.op) {
+                return Err(anyhow!("format op {} is not outbound", payload.op));
+            }
+            if payload.session_id != self.session_id {
+                return Err(anyhow!(
+                    "format session {} does not match this session {}",
+                    payload.session_id,
+                    self.session_id
+                ));
+            }
+            if !payload.valid() {
+                return Err(anyhow!("invalid format payload"));
+            }
+            let req = wire::encode_format_payload(&payload);
+            let mut out = [0u8; wire::FORMAT_REPLY_BYTES];
+            let n = transport::ioctl(
+                &self.handle,
+                wire::IOCTL_FORMAT,
+                &req,
+                &mut out,
+                IOCTL_TIMEOUT_MS,
+            )?;
+            if n as usize != wire::FORMAT_REPLY_BYTES {
+                return Err(anyhow!("the format reply was {n} bytes"));
+            }
+            let rep = wire::decode_format_reply(&out)
+                .ok_or_else(|| anyhow!("undecodable format reply"))?;
+            Ok(rep.status == wire::STATUS_OK)
         }
 
         /// `IOCTL_NOTIFY`: the far peer's real device moved, so make the
@@ -4095,6 +4450,9 @@ mod tests {
         assert_eq!(IOCTL_CONTROL_PEND, 0x0022_E010);
         assert_eq!(IOCTL_MAP_RINGS, 0x0022_E014);
         assert_eq!(IOCTL_NOTIFY, 0x0022_E018);
+        assert_eq!(IOCTL_LATENCY, 0x0022_E01C);
+        assert_eq!(IOCTL_STREAMSTAT, 0x0022_E020);
+        assert_eq!(IOCTL_FORMAT, 0x0022_E024);
     }
 
     /// Function codes below 0x800 are reserved for Microsoft; a code that
@@ -4110,6 +4468,9 @@ mod tests {
             IOCTL_CONTROL_PEND,
             IOCTL_MAP_RINGS,
             IOCTL_NOTIFY,
+            IOCTL_LATENCY,
+            IOCTL_STREAMSTAT,
+            IOCTL_FORMAT,
         ] {
             let function = (code >> 2) & 0xFFF;
             assert!(function >= 0x800, "function 0x{function:03X} is reserved");
@@ -4159,18 +4520,19 @@ mod tests {
         // v2: +published
         assert_eq!(SLOT_INFO_BYTES, 52);
         assert_eq!(QUERY_SLOTS_REPLY_BYTES, 848);
-        assert_eq!(CONTROL_EVENT_BYTES, 24);
+        assert_eq!(FORMAT_PAYLOAD_BYTES, 40);
+        assert_eq!(FORMAT_REPLY_BYTES, 8);
+        assert_eq!(CONTROL_EVENT_BYTES, 64);
         // v5: the data plane's two messages. Sizes transcribed from the
         // C_ASSERTs, not computed here.
         assert_eq!(MAP_REQUEST_BYTES, 24);
         assert_eq!(MAP_REPLY_BYTES, 296);
         assert_eq!(NOTIFY_REQUEST_BYTES, 24);
         assert_eq!(NOTIFY_REPLY_BYTES, 8);
-        // v6 changes bind-flag meaning and v7 adds a mandatory endpoint
-        // property; neither changes an IOCTL struct size.
+        // v8 adds the format payload and extends the control event.
         assert_eq!(
-            PROTOCOL_VERSION, 7,
-            "endpoint identity is mandatory in driver protocol 7"
+            PROTOCOL_VERSION, 8,
+            "native output formats are mandatory in driver protocol 8"
         );
     }
 
@@ -4454,7 +4816,7 @@ mod tests {
             decode_query_slots_reply(&[0u8; 784]).is_none(),
             "the v1 size is refused"
         );
-        assert!(decode_control_event(&[0u8; 23]).is_none());
+        assert!(decode_control_event(&[0u8; CONTROL_EVENT_BYTES - 1]).is_none());
     }
 
     // -- peer key -----------------------------------------------------------
@@ -4730,6 +5092,7 @@ mod tests {
         assert!(e.muted());
         assert!(!e.running());
         assert!((e.scalar() - 0.5).abs() < 1e-6);
+        assert_eq!(e.format, crate::halformat::Payload::default());
     }
 
     /// A driver reporting a scalar above 1.0 must be clamped, not trusted: the
@@ -4741,6 +5104,51 @@ mod tests {
         assert_eq!(decode_control_event(&b).unwrap().scalar(), 1.0);
     }
 
+    #[test]
+    fn format_payload_and_event_match_the_v8_offsets() {
+        let payload = crate::halformat::Payload {
+            op: FORMAT_PREPARE,
+            endpoint: 6,
+            generation: 0x1122_3344,
+            layout: 3,
+            supported_mask: 0xF,
+            epoch: 0x5566_7788,
+            session_id: 0x0102_0304_0506_0708,
+            request_id: 0x1112_1314_1516_1718,
+        };
+        let encoded = encode_format_payload(&payload);
+        assert_eq!(&encoded[24..32], &payload.session_id.to_le_bytes());
+        assert_eq!(&encoded[32..40], &payload.request_id.to_le_bytes());
+        assert_eq!(decode_format_payload(&encoded), Some(payload));
+
+        let mut event = [0u8; CONTROL_EVENT_BYTES];
+        event[0..4].copy_from_slice(&EVENT_FORMAT.to_le_bytes());
+        event[24..64].copy_from_slice(&encoded);
+        let decoded = decode_control_event(&event).unwrap();
+        assert_eq!(decoded.kind, EVENT_FORMAT);
+        assert_eq!(decoded.format, payload);
+    }
+
+    #[test]
+    fn format_reply_requires_its_mbz_word_to_be_zero() {
+        let mut reply = [0u8; FORMAT_REPLY_BYTES];
+        reply[0..4].copy_from_slice(&STATUS_BAD_ARGUMENT.to_le_bytes());
+        assert_eq!(decode_format_reply(&reply).unwrap().status, STATUS_BAD_ARGUMENT);
+        reply[4..8].copy_from_slice(&1u32.to_le_bytes());
+        assert!(decode_format_reply(&reply).is_none());
+    }
+
+    #[test]
+    fn only_offer_quiesced_and_accepted_are_outbound_format_ops() {
+        for op in FORMAT_OFFER..=FORMAT_ABORTED {
+            assert_eq!(
+                format_op_is_outbound(op),
+                matches!(op, FORMAT_OFFER | FORMAT_QUIESCED | FORMAT_ACCEPTED),
+                "op {op}"
+            );
+        }
+    }
+
     fn control_event_bytes(event: ControlEvent) -> [u8; CONTROL_EVENT_BYTES] {
         let mut b = [0u8; CONTROL_EVENT_BYTES];
         b[0..4].copy_from_slice(&event.kind.to_le_bytes());
@@ -4749,6 +5157,7 @@ mod tests {
         b[12..16].copy_from_slice(&event.flags.to_le_bytes());
         b[16..20].copy_from_slice(&event.scalar_q16.to_le_bytes());
         b[20..24].copy_from_slice(&event.state.to_le_bytes());
+        b[24..64].copy_from_slice(&encode_format_payload(&event.format));
         b
     }
 
@@ -4760,6 +5169,7 @@ mod tests {
             flags: EVFLAG_INPUT,
             scalar_q16: 0x8000,
             state: 0,
+            format: crate::halformat::Payload::default(),
         }
     }
 
@@ -4784,7 +5194,7 @@ mod tests {
     }
 
     /// Both halves of the inline completion contract are checked: the I/O
-    /// manager must report exactly 24 bytes and those bytes must decode as the
+    /// manager must report exactly 64 bytes and those bytes must decode as the
     /// fixed-size control event.
     #[test]
     fn control_pend_inline_completion_validates_size_and_decode() {
@@ -4792,7 +5202,10 @@ mod tests {
         let short_count =
             super::ControlPendState::from_inline((CONTROL_EVENT_BYTES - 1) as u32, &bytes)
                 .expect_err("a short I/O result cannot be an event");
-        assert!(short_count.contains("23 bytes"), "{short_count}");
+        assert!(
+            short_count.contains(&(CONTROL_EVENT_BYTES - 1).to_string()),
+            "{short_count}"
+        );
 
         let undecodable = super::ControlPendState::from_inline(
             CONTROL_EVENT_BYTES as u32,
@@ -4898,9 +5311,9 @@ mod tests {
         b[8..12].copy_from_slice(&64u32.to_le_bytes()); // data_offset
         b[12..16].copy_from_slice(&24_000u32.to_le_bytes()); // capacity_frames
         b[16..20].copy_from_slice(&48_000u32.to_le_bytes()); // sample_rate
-        b[20..24].copy_from_slice(&2u32.to_le_bytes()); // spk_channels
+        b[20..24].copy_from_slice(&12u32.to_le_bytes()); // spk_channels
         b[24..28].copy_from_slice(&1u32.to_le_bytes()); // mic_channels
-        b[28..32].copy_from_slice(&196_608u32.to_le_bytes()); // spk_bytes @28
+        b[28..32].copy_from_slice(&1_163_264u32.to_le_bytes()); // spk_bytes @28
         b[32..36].copy_from_slice(&98_304u32.to_le_bytes()); // mic_bytes
         b[36..40].copy_from_slice(&0u32.to_le_bytes()); // reserved MBZ
                                                         // va at 40, and it is 8-byte quantities: a 4-byte read here would pick
@@ -4916,9 +5329,9 @@ mod tests {
         assert_eq!(r.data_offset, 64);
         assert_eq!(r.capacity_frames, 24_000);
         assert_eq!(r.sample_rate, 48_000);
-        assert_eq!(r.spk_channels, 2);
+        assert_eq!(r.spk_channels, 12);
         assert_eq!(r.mic_channels, 1);
-        assert_eq!(r.spk_bytes, 196_608);
+        assert_eq!(r.spk_bytes, 1_163_264);
         assert_eq!(r.mic_bytes, 98_304);
         assert_eq!(r.va.len(), RING_SLOTS_MAX);
         for i in 0..RING_SLOTS_MAX {
@@ -5248,9 +5661,11 @@ mod tests {
         assert_eq!(CAP_DATAPLANE.count_ones(), 1);
         assert_eq!(CAP_VOLUME.count_ones(), 1);
         assert_eq!(CAP_VOLUMEEVENT.count_ones(), 1);
+        assert_eq!(CAP_OUTPUT_FORMATS.count_ones(), 1);
         assert_eq!(CAP_DATAPLANE & CAP_VOLUME, 0);
         assert_eq!(CAP_DATAPLANE & CAP_VOLUMEEVENT, 0);
         assert_eq!(CAP_VOLUME & CAP_VOLUMEEVENT, 0);
+        assert_eq!(CAP_OUTPUT_FORMATS & (CAP_DATAPLANE | CAP_VOLUME | CAP_VOLUMEEVENT), 0);
 
         let hello = |caps: u32| {
             let mut b = [0u8; HELLO_REPLY_BYTES];
@@ -5258,7 +5673,10 @@ mod tests {
             decode_hello_reply(&b).unwrap()
         };
         assert!(
-            !hello(0).has_dataplane() && !hello(0).has_volume() && !hello(0).has_volume_event()
+            !hello(0).has_dataplane()
+                && !hello(0).has_volume()
+                && !hello(0).has_volume_event()
+                && !hello(0).has_output_formats()
         );
         assert!(hello(CAP_DATAPLANE).has_dataplane());
         assert!(
@@ -5271,6 +5689,7 @@ mod tests {
             "a volume node does not imply rings"
         );
         assert!(hello(CAP_VOLUMEEVENT).has_volume_event());
+        assert!(hello(CAP_OUTPUT_FORMATS).has_output_formats());
         assert!(
             !hello(CAP_VOLUMEEVENT).has_volume(),
             "an event path does not imply a volume node"

@@ -23,6 +23,8 @@ Abstract:
 #undef AUDIOHUB_SPEAKER_FORMAT_BANKS_IMPLEMENTATION
 #include "perpeer.h"
 #include "ahrings.h"
+#include "ctldevice.h"
+#include "minwavert.h"
 
 //-----------------------------------------------------------------------------
 // State
@@ -66,6 +68,330 @@ static ULONG            g_AhNextGeneration = 1;
 
 #define AH_LOCK()   KeWaitForSingleObject(&g_AhSlotLock, Executive, KernelMode, FALSE, NULL)
 #define AH_UNLOCK() KeReleaseMutex(&g_AhSlotLock, FALSE)
+
+// Control transitions share the slot lifecycle mutex. Render copies take only
+// Gate, which protects a bounded block and makes PREPARE a producer fence.
+// EpochNext is never reset by unbind/rebind or by a daemon restart.
+typedef struct _AH_SPEAKER_STATE
+{
+    KSPIN_LOCK Gate;
+    ULONG Generation;
+    BOOLEAN Published;
+    BOOLEAN Ready;
+    BOOLEAN NotifyOnReady;
+    ULONG Layout;
+    ULONG EpochNext;
+    const AH_SPEAKER_FORMAT_BANK *Bank;
+    AH_FORMAT_PAYLOAD Transaction;
+} AH_SPEAKER_STATE;
+static AH_SPEAKER_STATE g_AhSpeaker[AUDIOHUB_WIN_MAX_SLOTS];
+static ULONGLONG g_AhSpeakerSessionId = 0;
+#define AH_FORMAT_UPDATING 8u // private stage; never sent on the wire
+
+#pragma code_seg()
+const AH_SPEAKER_FORMAT_BANK *AhSpeakerFormatSnapshot(ULONG Slot, PULONG Layout)
+{
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS) { return NULL; }
+    AH_SPEAKER_STATE *state = &g_AhSpeaker[Slot];
+    KIRQL irql;
+    KeAcquireSpinLock(&state->Gate, &irql);
+    const AH_SPEAKER_FORMAT_BANK *bank = state->Bank;
+    if (Layout) { *Layout = state->Layout; }
+    KeReleaseSpinLock(&state->Gate, irql);
+    return bank;
+}
+
+#pragma code_seg()
+BOOLEAN AhSpeakerRenderEnter(ULONG Slot, ULONG Channels, PULONG Epoch, PKIRQL Irql)
+{
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS) { return FALSE; }
+    AH_SPEAKER_STATE *state = &g_AhSpeaker[Slot];
+    KeAcquireSpinLock(&state->Gate, Irql);
+    if (!state->Ready || !state->Published ||
+        state->Layout != AhSpeakerLayoutFromChannels(Channels))
+    {
+        KeReleaseSpinLock(&state->Gate, *Irql);
+        return FALSE;
+    }
+    *Epoch = state->Transaction.epoch;
+    return TRUE;
+}
+
+#pragma code_seg()
+VOID AhSpeakerRenderLeave(ULONG Slot, KIRQL Irql)
+{
+    KeReleaseSpinLock(&g_AhSpeaker[Slot].Gate, Irql);
+}
+
+// Caller owns the lifecycle mutex. A render callback cannot cross this fence.
+static VOID AhSpeakerPauseLocked(ULONG Slot)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&g_AhSpeaker[Slot].Gate, &irql);
+    g_AhSpeaker[Slot].Ready = FALSE;
+    KeReleaseSpinLock(&g_AhSpeaker[Slot].Gate, irql);
+}
+
+#pragma code_seg()
+VOID AhSpeakerFormatBind(ULONG Slot, ULONG Generation, BOOLEAN Published)
+{
+    PAGED_CODE();
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS) { return; }
+    AH_LOCK();
+    if (Generation != g_AhSlots[Slot].Generation)
+    {
+        AH_UNLOCK();
+        return;
+    }
+    AH_SPEAKER_STATE *state = &g_AhSpeaker[Slot];
+    KIRQL irql;
+    KeAcquireSpinLock(&state->Gate, &irql);
+    if (state->Generation != Generation || state->Published != Published)
+    {
+        state->Ready = FALSE;
+        state->NotifyOnReady = FALSE;
+        state->Generation = Generation;
+        state->Published = Published;
+        // Keep the public bank until the replacement contract is committed.
+        // Clearing it here without a PortCls update would leave a stale cache.
+        RtlZeroMemory(&state->Transaction, sizeof(state->Transaction));
+    }
+    KeReleaseSpinLock(&state->Gate, irql);
+    AH_UNLOCK();
+}
+
+#pragma code_seg()
+VOID AhSpeakerFormatDetach(ULONGLONG SessionId)
+{
+    PAGED_CODE();
+    AH_LOCK();
+    g_AhSpeakerSessionId = SessionId;
+    for (ULONG slot = 0; slot < AUDIOHUB_WIN_MAX_SLOTS; ++slot)
+    {
+        KIRQL irql;
+        KeAcquireSpinLock(&g_AhSpeaker[slot].Gate, &irql);
+        g_AhSpeaker[slot].Ready = FALSE;
+        g_AhSpeaker[slot].NotifyOnReady = FALSE;
+        RtlZeroMemory(&g_AhSpeaker[slot].Transaction, sizeof(AH_FORMAT_PAYLOAD));
+        KeReleaseSpinLock(&g_AhSpeaker[slot].Gate, irql);
+    }
+    AH_UNLOCK();
+}
+
+static BOOLEAN AhSameFormatTransaction(const AH_FORMAT_PAYLOAD *A, const AH_FORMAT_PAYLOAD *B)
+{
+    return A->endpoint == B->endpoint && A->generation == B->generation &&
+        A->layout == B->layout && A->supported_mask == B->supported_mask &&
+        A->epoch == B->epoch && A->session_id == B->session_id &&
+        A->request_id == B->request_id;
+}
+
+// Gate is held; the pin-creation path must never take the lifecycle mutex
+// while PortCls owns its pin lock. No foreign callback or allocation here.
+static ULONG AhSpeakerBeginGateHeld(ULONG Slot, const AH_FORMAT_PAYLOAD *Offer, AH_FORMAT_PAYLOAD *Event)
+{
+    AH_SPEAKER_STATE *state = &g_AhSpeaker[Slot];
+    if (!state->Published || state->Generation != Offer->generation)
+    {
+        return AH_STATUS_NOT_BOUND;
+    }
+    if (state->EpochNext == MAXULONG) { return AH_STATUS_INTERNAL; }
+    state->Ready = FALSE;
+    state->NotifyOnReady = FALSE;
+    state->Transaction = *Offer;
+    state->Transaction.epoch = ++state->EpochNext;
+    state->Transaction.op = AH_FORMAT_PREPARE;
+    *Event = state->Transaction;
+    return AH_STATUS_OK;
+}
+
+#pragma code_seg()
+ULONG AhSpeakerFormatControl(const AH_FORMAT_PAYLOAD *Message)
+{
+    PAGED_CODE();
+    if (Message->endpoint >= AUDIOHUB_WIN_MAX_SLOTS * 2 || (Message->endpoint & 1) ||
+        Message->generation == 0 || Message->session_id == 0 ||
+        Message->layout >= AH_SPEAKER_LAYOUT_COUNT ||
+        !AhSpeakerFormatBankMaskIsValid(Message->supported_mask) ||
+        !(Message->supported_mask & AH_SPEAKER_LAYOUT_BIT(Message->layout)))
+    {
+        return AH_STATUS_BAD_ARGUMENT;
+    }
+    const ULONG slot = Message->endpoint / 2;
+    AH_FORMAT_PAYLOAD event = {};
+    PPORTEVENTS portEvents = NULL;
+    ULONG result = AH_STATUS_BAD_ARGUMENT;
+    BOOLEAN commit = FALSE;
+    BOOLEAN notify = FALSE;
+    AH_LOCK();
+    AH_SPEAKER_STATE *state = &g_AhSpeaker[slot];
+    KIRQL irql;
+    KeAcquireSpinLock(&state->Gate, &irql);
+    if (Message->session_id != g_AhSpeakerSessionId)
+    {
+        result = AH_STATUS_STALE_SESSION;
+    }
+    else if (!state->Published || state->Generation != Message->generation ||
+        !g_AhSlots[slot].OutWave || g_AhSlots[slot].Generation != Message->generation)
+    {
+        result = AH_STATUS_NOT_BOUND;
+    }
+    else if (Message->op == AH_FORMAT_OFFER && Message->epoch == 0 && Message->request_id != 0)
+    {
+        result = AhSpeakerBeginGateHeld(slot, Message, &event);
+    }
+    else if (AhSameFormatTransaction(Message, &state->Transaction))
+    {
+        if (Message->op == AH_FORMAT_QUIESCED && state->Transaction.op == AH_FORMAT_PREPARE)
+        {
+            // Reserve the transition against native pin creation while the
+            // lifecycle mutex serializes removal and other IOCTL requests.
+            state->Transaction.op = AH_FORMAT_UPDATING;
+            commit = TRUE;
+        }
+        else if (Message->op == AH_FORMAT_ACCEPTED && state->Transaction.op == AH_FORMAT_COMMITTED)
+        {
+            state->Transaction.op = AH_FORMAT_READY;
+            state->Ready = TRUE;
+            notify = state->NotifyOnReady;
+            state->NotifyOnReady = FALSE;
+            event = state->Transaction;
+            result = AH_STATUS_OK;
+        }
+        else if ((Message->op == AH_FORMAT_QUIESCED && state->Transaction.op == AH_FORMAT_COMMITTED) ||
+                 (Message->op == AH_FORMAT_ACCEPTED && state->Transaction.op == AH_FORMAT_READY))
+        {
+            event = state->Transaction;
+            result = AH_STATUS_OK;
+        }
+    }
+    KeReleaseSpinLock(&state->Gate, irql);
+    if (commit)
+    {
+        // Both sides are fenced. Do not reset indices before QUIESCED, or an
+        // old daemon read can cross the reset and consume a different epoch.
+        AhRingsResetDirection(slot, AUDIOHUB_DIR_OUT);
+        const AH_SPEAKER_FORMAT_BANK *bank = AhSpeakerFormatBankLookup(Message->supported_mask);
+        const BOOLEAN bankChanged = bank != state->Bank;
+        NTSTATUS status = STATUS_DEVICE_NOT_READY;
+        PUNKNOWN unknown = g_AhSlots[slot].OutWaveMiniport;
+        PMINIPORTWAVERT miniport = NULL;
+        if (unknown && NT_SUCCESS(unknown->QueryInterface(IID_IMiniportWaveRT, (PVOID *)&miniport)))
+        {
+            status = static_cast<CMiniportWaveRT *>(miniport)->AhRefreshSpeakerFormats(bank);
+            miniport->Release();
+        }
+        KeAcquireSpinLock(&state->Gate, &irql);
+        if (NT_SUCCESS(status))
+        {
+            state->Bank = bank;
+            state->Layout = Message->layout;
+        }
+        state->Transaction.op = NT_SUCCESS(status) ? AH_FORMAT_COMMITTED : AH_FORMAT_ABORTED;
+        state->NotifyOnReady = NT_SUCCESS(status) &&
+            (bankChanged || Message->request_id != 0);
+        event = state->Transaction;
+        KeReleaseSpinLock(&state->Gate, irql);
+        result = NT_SUCCESS(status) ? AH_STATUS_OK : AH_STATUS_INTERNAL;
+    }
+    // A format-change listener may immediately probe or reopen a pin.
+    // COMMITTED still rejects that pin as busy; notify only after ACCEPTED
+    // makes it READY, so Windows cannot cache a transient format failure.
+    // Native layout-only transactions never notify while holding a pin lock.
+    if (notify)
+    {
+        (VOID)g_AhSlots[slot].OutWave->QueryInterface(IID_IPortEvents, (PVOID *)&portEvents);
+    }
+    AH_UNLOCK();
+    if (event.op) { AhCtlRaiseFormat(&event); }
+    // Never call PortCls event consumers while holding either driver lock.
+    if (portEvents)
+    {
+        portEvents->GenerateEventList((GUID *)&KSEVENTSETID_PinCapsChange,
+            KSEVENT_PINCAPS_FORMATCHANGE, TRUE, KSPIN_WAVE_RENDER3_SINK_SYSTEM, FALSE, 0);
+        portEvents->Release();
+    }
+    return result;
+}
+
+#pragma code_seg()
+NTSTATUS AhSpeakerFormatRequest(ULONG Slot, ULONG Channels)
+{
+    PAGED_CODE();
+    const ULONG layout = AhSpeakerLayoutFromChannels(Channels);
+    if (Slot >= AUDIOHUB_WIN_MAX_SLOTS || layout >= AH_SPEAKER_LAYOUT_COUNT)
+    {
+        return STATUS_NO_MATCH;
+    }
+    AH_FORMAT_PAYLOAD event = {};
+    AH_FORMAT_PAYLOAD pending = {};
+    NTSTATUS status = STATUS_SUCCESS;
+    KIRQL irql;
+    AH_SPEAKER_STATE *state = &g_AhSpeaker[Slot];
+    KeAcquireSpinLock(&state->Gate, &irql);
+    if (!AhSpeakerFormatBankFormat(state->Bank, layout)) { status = STATUS_NO_MATCH; }
+    else if (state->Transaction.op == AH_FORMAT_PREPARE || state->Transaction.op == AH_FORMAT_COMMITTED ||
+             state->Transaction.op == AH_FORMAT_UPDATING)
+    {
+        if (layout != state->Transaction.layout || state->Transaction.request_id != 0)
+        {
+            // An OFFER may need PortCls's pin lock to refresh its ranges.
+            // Do not wait for it while creating a pin with that lock held.
+            status = STATUS_DEVICE_BUSY;
+        }
+        else { pending = state->Transaction; }
+    }
+    else if (state->Ready && state->Layout != layout)
+    {
+        AH_FORMAT_PAYLOAD offer = state->Transaction;
+        offer.op = AH_FORMAT_OFFER;
+        offer.layout = layout;
+        offer.request_id = 0;
+        if (AhSpeakerBeginGateHeld(Slot, &offer, &event) != AH_STATUS_OK)
+        {
+            status = STATUS_DEVICE_NOT_READY;
+        }
+        else { pending = event; }
+    }
+    else if (!state->Ready) { status = STATUS_DEVICE_NOT_READY; }
+    KeReleaseSpinLock(&state->Gate, irql);
+    if (event.op) { AhCtlRaiseFormat(&event); }
+    if (NT_SUCCESS(status) && pending.epoch != 0)
+    {
+        // Only a native layout-only transaction can be waited here; it does
+        // not call UpdatePinDescriptor. A superseding OFFER, detach or rebind
+        // fails this pin creation instead of opening a permanently silent pin.
+        const ULONGLONG deadline = KeQueryInterruptTime() + 20000000ull;
+        for (;;)
+        {
+            KeAcquireSpinLock(&state->Gate, &irql);
+            if (!AhSameFormatTransaction(&state->Transaction, &pending) || !state->Published ||
+                state->Generation != pending.generation || state->Transaction.op == AH_FORMAT_ABORTED)
+            {
+                status = STATUS_DEVICE_NOT_READY;
+            }
+            else if (state->Ready && state->Layout == layout)
+            {
+                KeReleaseSpinLock(&state->Gate, irql);
+                return STATUS_SUCCESS;
+            }
+            else if (KeQueryInterruptTime() >= deadline)
+            {
+                state->Ready = FALSE;
+                state->Transaction.op = AH_FORMAT_ABORTED;
+                event = state->Transaction;
+                status = STATUS_IO_TIMEOUT;
+            }
+            KeReleaseSpinLock(&state->Gate, irql);
+            if (!NT_SUCCESS(status)) { break; }
+            LARGE_INTEGER interval;
+            interval.QuadPart = -100000ll; // 10 ms; bounded, not a busy wait
+            (VOID)KeDelayExecutionThread(KernelMode, FALSE, &interval);
+        }
+        if (status == STATUS_IO_TIMEOUT) { AhCtlRaiseFormat(&event); }
+    }
+    return status;
+}
 
 //
 // DEVPKEY_DeviceInterface_FriendlyName -- {026E516E-B814-414B-83CD-856D6FEF4822}, PID 2.
@@ -906,7 +1232,10 @@ Routine Description:
     return STATUS_SUCCESS;
 }
 
-#pragma code_seg("PAGE")
+// The speaker gate raises IRQL while the initial state is reset. The caller
+// still enters at PASSIVE_LEVEL, but this routine's instructions must remain
+// resident across that critical section.
+#pragma code_seg()
 static NTSTATUS
 AhBuildMinipairs(
     _Inout_ PAH_SLOT Slot
@@ -936,6 +1265,16 @@ Routine Description:
 
     const AH_SPEAKER_FORMAT_BANK *renderBank =
         AhSpeakerFormatBankLookup(AH_SPEAKER_LAYOUT_MASK_STEREO);
+    AH_SPEAKER_STATE *speaker = &g_AhSpeaker[Slot - g_AhSlots];
+    KIRQL irql;
+    KeAcquireSpinLock(&speaker->Gate, &irql);
+    speaker->Ready = FALSE;
+    speaker->NotifyOnReady = FALSE;
+    speaker->Published = FALSE;
+    speaker->Bank = renderBank;
+    speaker->Layout = AH_SPEAKER_LAYOUT_STEREO;
+    RtlZeroMemory(&speaker->Transaction, sizeof(speaker->Transaction));
+    KeReleaseSpinLock(&speaker->Gate, irql);
     const PCFILTER_DESCRIPTOR *renderWaveDescriptor =
         AhSpeakerFormatBankWaveDescriptor(renderBank);
     const PIN_DEVICE_FORMATS_AND_MODES *renderFormatsAndModes =
@@ -1044,7 +1383,7 @@ Routine Description:
         const_cast<PCFILTER_DESCRIPTOR *>(renderWaveDescriptor);
     Slot->OutPair.WaveInterfacePropertyCount    = 0;
     Slot->OutPair.WaveInterfaceProperties       = NULL;
-    Slot->OutPair.DeviceMaxChannels             = renderMaximumChannels;
+    Slot->OutPair.DeviceMaxChannels             = AH_SPEAKER_CHANNELS_7POINT1POINT4;
     Slot->OutPair.PinDeviceFormatsAndModes      =
         const_cast<PIN_DEVICE_FORMATS_AND_MODES *>(renderFormatsAndModes);
     Slot->OutPair.PinDeviceFormatsAndModesCount = renderFormatsAndModesCount;
@@ -1166,7 +1505,7 @@ AhInstallSlotDirection(
     {
         status = g_AhAdapter->InstallEndpointFilters(
             NULL, &Slot->OutPair, &Slot->OutCtx,
-            &Slot->OutTopo, &Slot->OutWave, NULL, NULL);
+            &Slot->OutTopo, &Slot->OutWave, NULL, &Slot->OutWaveMiniport);
         if (NT_SUCCESS(status) && (Slot->OutTopo == NULL || Slot->OutWave == NULL))
         {
             *Stage = AH_STAGE_VERIFY;
@@ -1204,11 +1543,13 @@ AhRemoveSlotDirections(
     ULONG at = AH_STAGE_NONE;
     if ((Directions & AH_PUB_RENDER) && (Slot->OutTopo != NULL || Slot->OutWave != NULL))
     {
+        AhSpeakerPauseLocked((ULONG)(Slot - g_AhSlots));
         NTSTATUS s = g_AhAdapter->RemoveEndpointFilters(
             &Slot->OutPair, Slot->OutTopo, Slot->OutWave, DebugFlags, &at);
         if (!NT_SUCCESS(s)) { first = s; stage = at; }
         SAFE_RELEASE(Slot->OutTopo);
         SAFE_RELEASE(Slot->OutWave);
+        SAFE_RELEASE(Slot->OutWaveMiniport);
         // RemoveEndpointFilters has stopped every WaveRT callback. Reset at
         // this quiet boundary, not before it, or a final callback could refill
         // the otherwise immortal per-slot ring with withdrawn audio.
@@ -1272,6 +1613,8 @@ Routine Description:
         // that reaches this, and it runs before the adapter is Released.
         //
         Slot->OutTopo = Slot->OutWave = Slot->InTopo = Slot->InWave = NULL;
+        Slot->OutWaveMiniport = NULL;
+        AhSpeakerPauseLocked((ULONG)(Slot - g_AhSlots));
         AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_OUT);
         AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_IN);
         //
@@ -1289,6 +1632,7 @@ Routine Description:
 
     if (Slot->OutTopo != NULL || Slot->OutWave != NULL)
     {
+        AhSpeakerPauseLocked((ULONG)(Slot - g_AhSlots));
         NTSTATUS s1 = g_AhAdapter->RemoveEndpointFilters(
             &Slot->OutPair, Slot->OutTopo, Slot->OutWave, DebugFlags, &st);
         if (!NT_SUCCESS(s1) && NT_SUCCESS(firstError)) { firstError = s1; stage = st; }
@@ -1302,6 +1646,7 @@ Routine Description:
 
     SAFE_RELEASE(Slot->OutTopo);
     SAFE_RELEASE(Slot->OutWave);
+    SAFE_RELEASE(Slot->OutWaveMiniport);
     SAFE_RELEASE(Slot->InTopo);
     SAFE_RELEASE(Slot->InWave);
 
@@ -1930,6 +2275,12 @@ AhPerPeerDriverInit(VOID)
 
     AhSpeakerFormatBanksInitialize();
     RtlZeroMemory(g_AhSlots, sizeof(g_AhSlots));
+    RtlZeroMemory(g_AhSpeaker, sizeof(g_AhSpeaker));
+    for (ULONG slot = 0; slot < AUDIOHUB_WIN_MAX_SLOTS; ++slot)
+    {
+        KeInitializeSpinLock(&g_AhSpeaker[slot].Gate);
+        g_AhSpeaker[slot].Bank = AhSpeakerFormatBankLookup(AH_SPEAKER_LAYOUT_MASK_STEREO);
+    }
     RtlZeroMemory(g_AhTopoObj, sizeof(g_AhTopoObj));
     RtlZeroMemory((PVOID)g_AhWaveRt, sizeof(g_AhWaveRt));
     KeInitializeSpinLock(&g_AhTopoLock);

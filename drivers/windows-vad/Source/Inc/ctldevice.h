@@ -81,6 +81,9 @@ VOID AhCtlRaiseEvent(
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID AhCtlRaiseIoState(_In_ ULONG Slot, _In_ BOOLEAN Input, _In_ BOOLEAN Running);
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID AhCtlRaiseFormat(_In_ const AH_FORMAT_PAYLOAD *Message);
+
 //
 // How many events had to be discarded because the queue was full. Reported by
 // the probe: a non-zero value means the daemon is not draining, and every

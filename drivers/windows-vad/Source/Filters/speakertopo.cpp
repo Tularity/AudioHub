@@ -18,6 +18,7 @@ Abstract:
 #include "mintopo.h"
 #include "speakertopo.h"
 #include "speakertoptable.h"
+#include "perpeer.h"
 
 
 #pragma code_seg("PAGE")
@@ -55,14 +56,27 @@ Return Value:
     NTSTATUS            ntStatus = STATUS_INVALID_DEVICE_REQUEST;
     PCMiniportTopology  pMiniport = (PCMiniportTopology)PropertyRequest->MajorTarget;
 
+    // A local copy prevents one peer's channel map from changing every other
+    // speaker's static topology template.
+    KSJACK_DESCRIPTION description = SpeakerJackDescBridge;
+    ULONG slot;
+    BOOLEAN input;
+    if (AhEpContextDecode(pMiniport->GetDeviceContext(), &slot, &input) && !input)
+    {
+        ULONG layout;
+        (VOID)AhSpeakerFormatSnapshot(slot, &layout);
+        description.ChannelMapping = AhSpeakerLayoutChannelMask(layout);
+    }
+    PKSJACK_DESCRIPTION descriptions[] = { NULL, &description };
+
     if (IsEqualGUIDAligned(*PropertyRequest->PropertyItem->Set, KSPROPSETID_Jack))
     {
         if (PropertyRequest->PropertyItem->Id == KSPROPERTY_JACK_DESCRIPTION)
         {
             ntStatus = pMiniport->PropertyHandlerJackDescription(
                 PropertyRequest,
-                ARRAYSIZE(SpeakerJackDescriptions),
-                SpeakerJackDescriptions
+                ARRAYSIZE(descriptions),
+                descriptions
                 );
         }
         else if (PropertyRequest->PropertyItem->Id == KSPROPERTY_JACK_DESCRIPTION2)
@@ -71,7 +85,7 @@ Return Value:
                 PropertyRequest,
                 ARRAYSIZE(SpeakerJackDescriptions),
                 SpeakerJackDescriptions,
-                0 // jack capabilities
+                JACKDESC2_DYNAMIC_FORMAT_CHANGE_CAPABILITY
                 );
         }
     }

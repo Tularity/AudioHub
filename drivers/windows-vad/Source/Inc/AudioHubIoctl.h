@@ -129,7 +129,10 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 // identity to address IAudioEndpointVolume directly; a v6 endpoint has no such
 // property and would make idle scalar/mute synchronization silently fail.
 //
-#define AUDIOHUB_WIN_PROTOCOL_VERSION   7u
+// v8 adds native speaker format transactions, 64-byte control events and a
+// fixed 12-lane float ring. Public pins remain PCM16 with canonical layouts.
+// v7 peers cannot safely read this geometry, so versions must match exactly.
+#define AUDIOHUB_WIN_PROTOCOL_VERSION   8u
 
 //
 // Must equal HAL_MAX_SLOTS in core/audiohubd/src/halbridge.rs. The driver's
@@ -208,6 +211,37 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 // AH_STREAMSTAT_REQUEST for why it is a separate number from the ring.
 //
 #define IOCTL_AUDIOHUB_STREAMSTAT   CTL_CODE(AH_DEVICE_TYPE, 0x808, METHOD_BUFFERED, AH_ACCESS)
+
+// v8 carries native PCM layouts, not encoded Dolby media or licensing claims.
+#define IOCTL_AUDIOHUB_FORMAT       CTL_CODE(AH_DEVICE_TYPE, 0x809, METHOD_BUFFERED, AH_ACCESS)
+
+#define AH_FORMAT_OFFER      1u
+#define AH_FORMAT_QUIESCED   2u
+#define AH_FORMAT_ACCEPTED   3u
+#define AH_FORMAT_PREPARE    4u
+#define AH_FORMAT_COMMITTED  5u
+#define AH_FORMAT_READY      6u
+#define AH_FORMAT_ABORTED    7u
+
+typedef struct _AH_FORMAT_PAYLOAD {
+    UINT32 op;
+    UINT32 endpoint;        // slot * 2; microphone format is unchanged
+    UINT32 generation;
+    UINT32 layout;          // 0/1/2/3 = Stereo/5.1/7.1/7.1.4
+    UINT32 supported_mask;  // bits 0..3; Stereo is mandatory
+    UINT32 epoch;           // driver allocates; never reused in a slot
+    UINT64 session_id;
+    UINT64 request_id;      // 0 for a native application format request
+} AH_FORMAT_PAYLOAD;
+
+typedef struct _AH_FORMAT_REPLY {
+    UINT32 status;          // request accepted; READY is an asynchronous event
+    UINT32 reserved;        // MBZ
+} AH_FORMAT_REPLY;
+
+C_ASSERT(sizeof(AH_FORMAT_PAYLOAD) == 40);
+C_ASSERT(AH_FIELD_OFFSET(AH_FORMAT_PAYLOAD, session_id) == 24);
+C_ASSERT(sizeof(AH_FORMAT_REPLY) == 8);
 
 //=============================================================================
 // Status codes carried INSIDE the reply payload
@@ -377,6 +411,8 @@ typedef struct _AH_HELLO_REPLY {
                                     // expressible at all without refusing to
                                     // bind.
 
+#define AH_CAP_OUTPUT_FORMATS 0x20u // FORMAT transaction and ring v2 are required
+
 #define AH_BIND_CLEAR   0u
 #define AH_BIND_SET     1u
 
@@ -515,6 +551,7 @@ typedef struct _AH_QUERY_SLOTS_REPLY {
 #define AH_EVENT_VOLUME     1u
 #define AH_EVENT_IOSTATE    2u
 #define AH_EVENT_SLOT       3u
+#define AH_EVENT_FORMAT     4u
 
 #define AH_EVFLAG_INPUT     0x1u    // the virtual MICROPHONE, else the speaker
 #define AH_EVFLAG_MUTED     0x2u
@@ -532,6 +569,7 @@ typedef struct _AH_CONTROL_EVENT {
                             // Fixed point, not float: kernel code must not use
                             // the FPU without saving state.
     UINT32 state;           // AH_SLOT_* for AH_EVENT_SLOT, else 0
+    AH_FORMAT_PAYLOAD format; // AH_EVENT_FORMAT only; zero for other events
 } AH_CONTROL_EVENT;
 
 //=============================================================================
@@ -780,7 +818,8 @@ C_ASSERT(sizeof(AH_BIND_REQUEST) == 320);
 C_ASSERT(sizeof(AH_BIND_REPLY) == 32);
 C_ASSERT(sizeof(AH_SLOT_INFO) == 52);
 C_ASSERT(sizeof(AH_QUERY_SLOTS_REPLY) == 848);
-C_ASSERT(sizeof(AH_CONTROL_EVENT) == 24);
+C_ASSERT(sizeof(AH_CONTROL_EVENT) == 64);
+C_ASSERT(AH_FIELD_OFFSET(AH_CONTROL_EVENT, format) == 24);
 C_ASSERT(sizeof(AH_MAP_REQUEST) == 24);
 C_ASSERT(sizeof(AH_MAP_REPLY) == 296);
 C_ASSERT(sizeof(AH_NOTIFY_REQUEST) == 24);
@@ -834,5 +873,6 @@ C_ASSERT(IOCTL_AUDIOHUB_MAP_RINGS    == 0x0022E014);
 C_ASSERT(IOCTL_AUDIOHUB_NOTIFY       == 0x0022E018);
 C_ASSERT(IOCTL_AUDIOHUB_LATENCY      == 0x0022E01C);
 C_ASSERT(IOCTL_AUDIOHUB_STREAMSTAT   == 0x0022E020);
+C_ASSERT(IOCTL_AUDIOHUB_FORMAT       == 0x0022E024);
 
 #endif // _AUDIOHUB_IOCTL_H_

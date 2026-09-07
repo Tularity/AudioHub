@@ -100,6 +100,12 @@ Return Value:
     //
     KeFlushQueuedDpcs();
 
+    if (m_AhRenderScratch)
+    {
+        ExFreePoolWithTag(m_AhRenderScratch, MINWAVERTSTREAM_POOLTAG);
+        m_AhRenderScratch = NULL;
+    }
+
     DPF_ENTER(("[CMiniportWaveRTStream::~CMiniportWaveRTStream]"));
 } // ~CMiniportWaveRTStream
 
@@ -202,6 +208,10 @@ Return Value:
     m_bCapture = FALSE;
     m_ulDmaBufferSize = 0;
     m_pDmaBuffer = NULL;
+    m_AhRenderScratch = NULL;
+    m_AhRenderChannels = 0;
+    m_AhRenderBlockAlign = 0;
+    m_AhRenderEpochSeen = 0;
     m_ulNotificationsPerBuffer = 0;
     m_KsState = KSSTATE_STOP;
     m_pTimer = NULL;
@@ -333,6 +343,20 @@ Return Value:
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlCopyMemory(m_pWfExt, pWfEx, sizeof(WAVEFORMATEX) + pWfEx->cbSize);
+
+    if (!m_bCapture && m_AhSlot < AUDIOHUB_WIN_MAX_SLOTS)
+    {
+        if (AhSpeakerLayoutFromChannels(pWfEx->nChannels) >= AH_SPEAKER_LAYOUT_COUNT ||
+            pWfEx->wBitsPerSample != 16 || pWfEx->nBlockAlign != pWfEx->nChannels * sizeof(SHORT))
+        {
+            return STATUS_NO_MATCH;
+        }
+        m_AhRenderChannels = pWfEx->nChannels;
+        m_AhRenderBlockAlign = pWfEx->nBlockAlign;
+        m_AhRenderScratch = (float *)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+            256u * AUDIOHUB_SPK_CHANNELS * sizeof(float), MINWAVERTSTREAM_POOLTAG);
+        if (!m_AhRenderScratch) { return STATUS_INSUFFICIENT_RESOURCES; }
+    }
 
     m_pbMuted = (PBOOL)ExAllocatePool2(POOL_FLAG_NON_PAGED, m_pWfExt->Format.nChannels * sizeof(BOOL), MINWAVERTSTREAM_POOLTAG);
     if (m_pbMuted == NULL)
@@ -1680,21 +1704,20 @@ Routine Description:
 // modulo the buffer size -- the same window upstream's WriteBytes/ReadBytes
 // used, and the caller advances m_ullLinearPosition past it afterwards.
 //
-// The two directions do NOT share a frame size: the render pin is 16-bit PCM
-// stereo (4 bytes/frame) and the capture pin is 32-bit PCM stereo (8), both
-// inherited from upstream. Publishing one common FLOAT format instead was
+// The two directions do NOT share a frame size: render is native PCM16 with
+// 2/6/8/12 channels and capture remains PCM32 stereo (8 bytes/frame).
+// Publishing one common FLOAT format instead was
 // tried and REVERTED -- see the note at the top of speakerwavtable.h: the
 // endpoint builder silently declines to create an endpoint for it, which
 // presents as a driver that installs perfectly and produces no device.
 //
 //=============================================================================
 
-#define AH_RENDER_BLOCK_ALIGN   4u      // 2ch * int16
 #define AH_CAPTURE_BLOCK_ALIGN  8u      // 2ch * int32
 
 //
-// Frames converted per pass. The scratch lives on the DPC stack, which is
-// small; at the 1 ms timer period a pass moves 48 frames.
+// Frames converted per pass. Render scratch is preallocated nonpaged; the
+// smaller mono capture scratch remains on the stack. No DPC allocation.
 //
 #define AH_CONV_FRAMES          256u
 
@@ -1754,7 +1777,9 @@ Routine Description:
 {
     PAUDIOHUB_RING_HEADER ring = AhRingsHeader(m_AhSlot, AUDIOHUB_DIR_OUT);
 
-    if (ring == NULL || m_pDmaBuffer == NULL || m_ulDmaBufferSize == 0)
+    const ULONG blockAlign = m_AhRenderBlockAlign;
+    if (ring == NULL || m_pDmaBuffer == NULL || m_ulDmaBufferSize == 0 ||
+        !m_AhRenderScratch || blockAlign == 0)
     {
         return;
     }
@@ -1763,16 +1788,16 @@ Routine Description:
     NTSTATUS    st = KeSaveExtendedProcessorState(XSTATE_MASK_LEGACY, &save);
     if (!NT_SUCCESS(st))
     {
-        m_AhFramesShort += ByteDisplacement / AH_RENDER_BLOCK_ALIGN;
+        m_AhFramesShort += ByteDisplacement / blockAlign;
         return;
     }
 
     ULONG bufferOffset = (ULONG)(m_ullLinearPosition % m_ulDmaBufferSize);
 
-    while (ByteDisplacement >= AH_RENDER_BLOCK_ALIGN)
+    while (ByteDisplacement >= blockAlign)
     {
         ULONG run    = min(ByteDisplacement, m_ulDmaBufferSize - bufferOffset);
-        ULONG frames = run / AH_RENDER_BLOCK_ALIGN;
+        ULONG frames = run / blockAlign;
 
         if (frames == 0)
         {
@@ -1789,10 +1814,26 @@ Routine Description:
             frames = AH_CONV_FRAMES;
         }
 
-        float scratch[AH_CONV_FRAMES * AUDIOHUB_SPK_CHANNELS];
+        KIRQL irql;
+        ULONG epoch;
+        if (!AhSpeakerRenderEnter(m_AhSlot, m_AhRenderChannels, &epoch, &irql))
+        {
+            m_AhFramesShort += ByteDisplacement / blockAlign;
+            break;
+        }
+        if (m_AhRenderEpochSeen != epoch)
+        {
+            // Do not forward the displacement spanning the READY edge. The
+            // stream's native frame width itself never changes under a DPC.
+            m_AhRenderEpochSeen = epoch;
+            m_AhFramesShort += ByteDisplacement / blockAlign;
+            AhSpeakerRenderLeave(m_AhSlot, irql);
+            break;
+        }
+        float *scratch = m_AhRenderScratch;
         const SHORT *src = (const SHORT *)(m_pDmaBuffer + bufferOffset);
 
-        for (ULONG i = 0; i < frames * AUDIOHUB_SPK_CHANNELS; i++)
+        for (ULONG frame = 0; frame < frames; ++frame)
         {
             //
             // 1/32768, not 1/32767: it makes the mapping exact for every
@@ -1801,7 +1842,11 @@ Routine Description:
             // inaudible; dividing by 32767 instead sends -32768 below -1.0 and
             // clips on any downstream converter.
             //
-            scratch[i] = (float)src[i] * (1.0f / 32768.0f);
+            for (ULONG channel = 0; channel < AUDIOHUB_SPK_CHANNELS; ++channel)
+            {
+                scratch[frame * AUDIOHUB_SPK_CHANNELS + channel] = channel < m_AhRenderChannels
+                    ? (float)src[frame * m_AhRenderChannels + channel] * (1.0f / 32768.0f) : 0.0f;
+            }
         }
 
         ULONG wrote = AhRingWrite(
@@ -1811,11 +1856,12 @@ Routine Description:
             AUDIOHUB_SPK_CHANNELS,
             scratch,
             frames);
+        AhSpeakerRenderLeave(m_AhSlot, irql);
 
         m_AhFramesMoved += wrote;
         m_AhFramesShort += (frames - wrote);
 
-        ULONG consumed = frames * AH_RENDER_BLOCK_ALIGN;
+        ULONG consumed = frames * blockAlign;
         bufferOffset = (bufferOffset + consumed) % m_ulDmaBufferSize;
         ByteDisplacement -= consumed;
     }
@@ -2186,4 +2232,3 @@ End:
     return;
 }
 //=============================================================================
-

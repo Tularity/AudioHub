@@ -139,11 +139,10 @@ Abstract:
 #define AH_ENDPOINT_NAME_CHARS       (AH_DISPLAY_CHARS + AH_DIRWORD_CHARS + 2)
 
 //
-// Per-slot, per-direction volume storage width. Both endpoints are stereo at
-// the KS level (the microphone's mono ring is splatted to two channels in the
-// DPC), so two cells cover every channel either direction can present.
+// Per-slot, per-direction volume storage width covers the largest speaker
+// layout. The microphone remains stereo at KS level with a mono bridge ring.
 //
-#define AH_VOLUME_MAX_CHANNELS  2
+#define AH_VOLUME_MAX_CHANNELS  12
 
 //
 // What every miniport of a slot receives as its `DeviceContext`. See the note
@@ -276,6 +275,7 @@ typedef struct _AH_SLOT
     // Held between Install and Remove; NULL when not installed.
     PUNKNOWN            OutTopo;
     PUNKNOWN            OutWave;
+    PUNKNOWN            OutWaveMiniport;
     PUNKNOWN            InTopo;
     PUNKNOWN            InWave;
 } AH_SLOT, *PAH_SLOT;
@@ -361,6 +361,20 @@ NTSTATUS AhSlotBindClear(
     _Out_ PAH_OP_RESULT Result);
 
 VOID AhSlotQuery(_Out_ AH_QUERY_SLOTS_REPLY *Reply, _In_ ULONGLONG SessionId);
+
+// Per-speaker format state is private kernel memory, never ring-header data.
+// All control operations are PASSIVE_LEVEL. The DPC holds the short per-slot
+// gate only while copying one bounded block; QUIESCED is also a reader fence.
+VOID AhSpeakerFormatBind(_In_ ULONG Slot, _In_ ULONG Generation, _In_ BOOLEAN Published);
+VOID AhSpeakerFormatDetach(_In_ ULONGLONG SessionId = 0);
+ULONG AhSpeakerFormatControl(_In_ const AH_FORMAT_PAYLOAD *Message);
+NTSTATUS AhSpeakerFormatRequest(_In_ ULONG Slot, _In_ ULONG Channels);
+_IRQL_requires_max_(DISPATCH_LEVEL)
+const AH_SPEAKER_FORMAT_BANK *AhSpeakerFormatSnapshot(_In_ ULONG Slot, _Out_opt_ PULONG Layout);
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN AhSpeakerRenderEnter(_In_ ULONG Slot, _In_ ULONG Channels, _Out_ PULONG Epoch, _Out_ PKIRQL Irql);
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID AhSpeakerRenderLeave(_In_ ULONG Slot, _In_ KIRQL Irql);
 
 //
 // Validators, exported so the IOCTL layer and the tests use ONE implementation.

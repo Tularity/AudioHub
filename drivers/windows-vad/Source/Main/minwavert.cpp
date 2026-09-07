@@ -19,8 +19,52 @@ Abstract:
 #include "minwavert.h"
 #include "minwavertstream.h"
 #include "micarraywavtable.h"
+#include "perpeer.h"
 
 #define EFFECTS_LIST_COUNT 2
+
+#pragma code_seg()
+const KSDATAFORMAT_WAVEFORMATEXTENSIBLE *CMiniportWaveRT::AhDefaultSpeakerFormat()
+{
+    ULONG slot;
+    BOOLEAN input;
+    if (!AhEpContextDecode(m_DeviceContext, &slot, &input) || input) { return NULL; }
+    // Pin probing and exclusive playback must not change the engine's default.
+    const AH_SPEAKER_FORMAT_BANK *bank = AhSpeakerFormatSnapshot(slot, NULL);
+    return AhSpeakerFormatBankFormat(bank, AH_SPEAKER_LAYOUT_STEREO);
+}
+
+#pragma code_seg()
+NTSTATUS CMiniportWaveRT::AhRefreshSpeakerFormats(const AH_SPEAKER_FORMAT_BANK *Bank)
+{
+    PAGED_CODE();
+    const PCFILTER_DESCRIPTOR *descriptor = AhSpeakerFormatBankWaveDescriptor(Bank);
+    const PIN_DEVICE_FORMATS_AND_MODES *formats = AhSpeakerFormatBankPinDeviceFormatsAndModes(Bank);
+    if (!descriptor || !formats || !IsRenderDevice()) { return STATUS_INVALID_PARAMETER; }
+    // Native pin creation can wait for a layout-only transaction while
+    // holding a PortCls pin lock. Its existing immutable bank needs no update.
+    if (descriptor->Pins == m_FilterDesc.Pins) { return STATUS_SUCCESS; }
+    // PortCls caches pin descriptors. Never claim a wider public range was
+    // installed by merely replacing our private pointer. An absent extension
+    // keeps the baseline stereo path but refuses unsupported live expansion.
+    if (!m_AhSubdeviceEx && descriptor->Pins != m_FilterDesc.Pins)
+    {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (m_AhSubdeviceEx)
+    {
+        NTSTATUS status = m_AhSubdeviceEx->UpdatePinDescriptor(KSPIN_WAVE_RENDER3_SINK_SYSTEM,
+            PCUPDATE_PIN_DESC_FLAG_DATARANGES,
+            const_cast<PPCPIN_DESCRIPTOR>(&descriptor->Pins[KSPIN_WAVE_RENDER3_SINK_SYSTEM]));
+        if (!NT_SUCCESS(status)) { return status; }
+    }
+    AcquireFormatsAndModesLock();
+    m_FilterDesc.Pins = descriptor->Pins;
+    m_DeviceFormatsAndModes = const_cast<PIN_DEVICE_FORMATS_AND_MODES *>(formats);
+    m_DeviceFormatsAndModesCount = AhSpeakerFormatBankPinDeviceFormatsAndModesCount(Bank);
+    ReleaseFormatsAndModesLock();
+    return STATUS_SUCCESS;
+}
 
 //=============================================================================
 // CMiniportWaveRT
@@ -150,6 +194,11 @@ Return Value:
         m_pPortEvents->Release();
         m_pPortEvents = NULL;
     }
+    if (m_AhSubdeviceEx)
+    {
+        m_AhSubdeviceEx->Release();
+        m_AhSubdeviceEx = NULL;
+    }
     
     if (m_SystemStreams)
     {
@@ -210,8 +259,6 @@ Arguments:
 
 --*/
 {
-    UNREFERENCED_PARAMETER(PinId);
-
     ULONG                   requiredSize;
 
     PAGED_CODE();
@@ -219,6 +266,35 @@ Arguments:
     if (!IsEqualGUIDAligned(ClientDataRange->Specifier, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX))
     {
         return STATUS_NOT_IMPLEMENTED;
+    }
+
+    if (IsRenderDevice() && PinId == KSPIN_WAVE_RENDER3_SINK_SYSTEM)
+    {
+        // PortCls's generic WAVEFORMATEX result has no channel-position mask.
+        // Return the exact extensible format from the current immutable bank.
+        if (ClientDataRange->FormatSize < sizeof(KSDATARANGE_AUDIO) ||
+            MyDataRange->FormatSize < sizeof(KSDATARANGE_AUDIO)) { return STATUS_NO_MATCH; }
+        const KSDATARANGE_AUDIO *client = (const KSDATARANGE_AUDIO *)ClientDataRange;
+        const KSDATARANGE_AUDIO *driver = (const KSDATARANGE_AUDIO *)MyDataRange;
+        if (client->MaximumChannels != driver->MaximumChannels ||
+            client->MinimumBitsPerSample > 16 || client->MaximumBitsPerSample < 16 ||
+            client->MinimumSampleFrequency > 48000 || client->MaximumSampleFrequency < 48000)
+        {
+            return STATUS_NO_MATCH;
+        }
+        PKSDATAFORMAT_WAVEFORMATEXTENSIBLE formats = NULL;
+        const ULONG count = GetPinSupportedDeviceFormats(PinId, &formats);
+        for (ULONG index = 0; index < count; ++index)
+        {
+            const KSDATAFORMAT_WAVEFORMATEXTENSIBLE *format = &formats[index];
+            if (format->WaveFormatExt.Format.nChannels != client->MaximumChannels) { continue; }
+            *ResultantFormatLength = sizeof(*format);
+            if (OutputBufferLength == 0) { return STATUS_BUFFER_OVERFLOW; }
+            if (OutputBufferLength < sizeof(*format)) { return STATUS_BUFFER_TOO_SMALL; }
+            RtlCopyMemory(ResultantFormat, format, sizeof(*format));
+            return STATUS_SUCCESS;
+        }
+        return STATUS_NO_MATCH;
     }
 
     //If called for the mic array pin, set ResultantFormat to be the endpoint's only supported format.
@@ -411,6 +487,7 @@ Return Value:
     {
         m_pPortEvents = NULL;
     }
+    (VOID)Port_->QueryInterface(IID_IPortClsSubdeviceEx, (PVOID *)&m_AhSubdeviceEx);
     
     return ntStatus;
 } // Init
@@ -487,6 +564,17 @@ Return Value:
     if (NT_SUCCESS(ntStatus))
     {
         ntStatus = IsFormatSupported(Pin, Capture, DataFormat);
+    }
+
+    if (NT_SUCCESS(ntStatus) && !Capture)
+    {
+        ULONG slot;
+        BOOLEAN input;
+        if (AhEpContextDecode(m_DeviceContext, &slot, &input) && !input)
+        {
+            PWAVEFORMATEX format = GetWaveFormatEx(DataFormat);
+            ntStatus = format ? AhSpeakerFormatRequest(slot, format->nChannels) : STATUS_NO_MATCH;
+        }
     }
 
     // Instantiate a stream. Stream must be in
@@ -767,6 +855,15 @@ VOID CMiniportWaveRT::ReleaseFormatsAndModesLock()
 _Use_decl_annotations_
 ULONG CMiniportWaveRT::GetPinSupportedDeviceFormats(_In_ ULONG PinId, _Outptr_opt_result_buffer_(return) KSDATAFORMAT_WAVEFORMATEXTENSIBLE **ppFormats)
 {
+    ULONG slot;
+    BOOLEAN input;
+    if (AhEpContextDecode(m_DeviceContext, &slot, &input) && !input && PinId == KSPIN_WAVE_RENDER3_SINK_SYSTEM)
+    {
+        const PIN_DEVICE_FORMATS_AND_MODES *formats =
+            AhSpeakerFormatBankPinDeviceFormatsAndModes(AhSpeakerFormatSnapshot(slot, NULL));
+        if (ppFormats) { *ppFormats = formats ? formats[PinId].WaveFormats : NULL; }
+        return formats ? formats[PinId].WaveFormatsCount : 0;
+    }
     PPIN_DEVICE_FORMATS_AND_MODES pDeviceFormatsAndModes = NULL;
 
     AcquireFormatsAndModesLock();
@@ -1108,7 +1205,7 @@ CMiniportWaveRT::IsFormatSupported
         if (!IsEqualGUIDAligned(pFormat->DataFormat.MajorFormat, _pDataFormat->MajorFormat)) { continue; }
         if (!IsEqualGUIDAligned(pFormat->DataFormat.SubFormat, _pDataFormat->SubFormat)) { continue; }
         if (!IsEqualGUIDAligned(pFormat->DataFormat.Specifier, _pDataFormat->Specifier)) { continue; }
-        if (pFormat->DataFormat.FormatSize < sizeof(KSDATAFORMAT_WAVEFORMATEX)) { continue; }
+        if (_pDataFormat->FormatSize < sizeof(KSDATAFORMAT_WAVEFORMATEX)) { continue; }
 
         // WAVEFORMATEX VALIDATION
         PWAVEFORMATEX pWaveFormat = reinterpret_cast<PWAVEFORMATEX>(_pDataFormat + 1);
@@ -1120,15 +1217,18 @@ CMiniportWaveRT::IsFormatSupported
         if (pWaveFormat->nChannels  != pFormat->WaveFormatExt.Format.nChannels) { continue; }
         if (pWaveFormat->nSamplesPerSec != pFormat->WaveFormatExt.Format.nSamplesPerSec) { continue; }
         if (pWaveFormat->nBlockAlign != pFormat->WaveFormatExt.Format.nBlockAlign) { continue; }
+        if (pWaveFormat->nAvgBytesPerSec != pFormat->WaveFormatExt.Format.nAvgBytesPerSec) { continue; }
         if (pWaveFormat->wBitsPerSample != pFormat->WaveFormatExt.Format.wBitsPerSample) { continue; }
         if (pWaveFormat->wFormatTag != WAVE_FORMAT_EXTENSIBLE)
         {
+            if (pWaveFormat->nChannels > 2) { continue; }
             ntStatus = STATUS_SUCCESS;
             break;
         }
 
         // WAVEFORMATEXTENSIBLE VALIDATION
         if (pWaveFormat->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) { continue; }
+        if (_pDataFormat->FormatSize < sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE)) { continue; }
 
         PWAVEFORMATEXTENSIBLE pWaveFormatExt = reinterpret_cast<PWAVEFORMATEXTENSIBLE>(pWaveFormat);
         if (pWaveFormatExt->Samples.wValidBitsPerSample != pFormat->WaveFormatExt.Samples.wValidBitsPerSample) { continue; }
@@ -1215,7 +1315,11 @@ CMiniportWaveRT::PropertyHandlerProposedFormat
 
     if (PropertyRequest->Verb & KSPROPERTY_TYPE_GET)
     {
-        ntStatus = STATUS_INVALID_DEVICE_REQUEST;
+        const KSDATAFORMAT_WAVEFORMATEXTENSIBLE *format = AhDefaultSpeakerFormat();
+        if (!format) { return STATUS_INVALID_DEVICE_REQUEST; }
+        RtlCopyMemory(PropertyRequest->Value, format, sizeof(*format));
+        PropertyRequest->ValueSize = sizeof(*format);
+        ntStatus = STATUS_SUCCESS;
     }
     else if (PropertyRequest->Verb & KSPROPERTY_TYPE_SET)
     {
@@ -1269,6 +1373,7 @@ _In_  PPCEVENT_REQUEST EventRequest
             {
                 // Add pincaps format change event to support the force sample rate feature
                 case KSEVENT_PINCAPS_FORMATCHANGE:
+                    if (!m_pPortEvents) { return STATUS_DEVICE_NOT_READY; }
                     m_pPortEvents->AddEventToEventList(EventRequest->EventEntry);
                     break;
                 default:
@@ -1408,7 +1513,9 @@ CMiniportWaveRT::PropertyHandlerProposedFormat2
     //
     // Compute output data buffer.
     //
-    cbMinSize = modeInfo->DefaultFormat->FormatSize;
+    const KSDATAFORMAT_WAVEFORMATEXTENSIBLE *speakerFormat = AhDefaultSpeakerFormat();
+    const KSDATAFORMAT *defaultFormat = speakerFormat ? &speakerFormat->DataFormat : modeInfo->DefaultFormat;
+    cbMinSize = defaultFormat->FormatSize;
     cbMinSize = (cbMinSize + 7) & ~7;
 
     pKsItemsHeaderOut = (PKSMULTIPLE_ITEM)((PBYTE)PropertyRequest->Value + cbMinSize);
@@ -1449,7 +1556,7 @@ CMiniportWaveRT::PropertyHandlerProposedFormat2
     }
 
     // Copy the proposed default format.
-    RtlCopyMemory(PropertyRequest->Value, modeInfo->DefaultFormat, modeInfo->DefaultFormat->FormatSize);
+    RtlCopyMemory(PropertyRequest->Value, defaultFormat, defaultFormat->FormatSize);
 
     // Copy back the attribute list.
     ASSERT(cbItemsList > 0);
@@ -1680,4 +1787,3 @@ exit:
 }
 
 #pragma code_seg()
-

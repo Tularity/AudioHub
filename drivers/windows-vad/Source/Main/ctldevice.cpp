@@ -463,27 +463,10 @@ AhCtlDrainPend(
 //-----------------------------------------------------------------------------
 
 #pragma code_seg()
-VOID
-AhCtlRaiseEvent(
-    _In_ ULONG Kind,
-    _In_ ULONG Slot,
-    _In_ ULONG Generation,
-    _In_ ULONG Flags,
-    _In_ ULONG ScalarQ16,
-    _In_ ULONG State
-    )
+static VOID AhCtlPostEvent(_In_ const AH_CONTROL_EVENT &ev)
 {
     KIRQL irql;
     PIRP  irp = NULL;
-    AH_CONTROL_EVENT ev;
-
-    RtlZeroMemory(&ev, sizeof(ev));
-    ev.kind       = Kind;
-    ev.slot       = Slot;
-    ev.generation = Generation;
-    ev.flags      = Flags;
-    ev.scalar_q16 = ScalarQ16;
-    ev.state      = State;
 
     KeAcquireSpinLock(&g_PendLock, &irql);
 
@@ -544,6 +527,31 @@ AhCtlRaiseEvent(
     g_EventCount++;
 
     KeReleaseSpinLock(&g_PendLock, irql);
+}
+
+#pragma code_seg()
+VOID AhCtlRaiseEvent(ULONG Kind, ULONG Slot, ULONG Generation, ULONG Flags,
+                     ULONG ScalarQ16, ULONG State)
+{
+    AH_CONTROL_EVENT ev = {};
+    ev.kind = Kind;
+    ev.slot = Slot;
+    ev.generation = Generation;
+    ev.flags = Flags;
+    ev.scalar_q16 = ScalarQ16;
+    ev.state = State;
+    AhCtlPostEvent(ev);
+}
+
+#pragma code_seg()
+VOID AhCtlRaiseFormat(_In_ const AH_FORMAT_PAYLOAD *Message)
+{
+    AH_CONTROL_EVENT ev = {};
+    ev.kind = AH_EVENT_FORMAT;
+    ev.slot = Message->endpoint / 2;
+    ev.generation = Message->generation;
+    ev.format = *Message;
+    AhCtlPostEvent(ev);
 }
 
 #pragma code_seg()
@@ -750,6 +758,7 @@ Routine Description:
         == stack->FileObject)
     {
         g_SessionGreeted = FALSE;
+        AhSpeakerFormatDetach();
         AhCtlDrainPend(STATUS_CANCELLED);
 
         //
@@ -852,7 +861,7 @@ AhCtlDeviceControl(
         // image is otherwise indistinguishable from this one on the wire.
         //
         rep->caps             = AH_CAP_DATAPLANE | AH_CAP_VOLUME | AH_CAP_LATENCY
-                              | AH_CAP_STREAMSTAT | AH_CAP_VOLUMEEVENT;
+                              | AH_CAP_STREAMSTAT | AH_CAP_VOLUMEEVENT | AH_CAP_OUTPUT_FORMATS;
         rep->sample_rate      = AUDIOHUB_RING_SAMPLE_RATE;
         rep->out_channels     = AUDIOHUB_SPK_CHANNELS;
         rep->in_channels      = AUDIOHUB_MIC_CHANNELS;
@@ -866,6 +875,7 @@ AhCtlDeviceControl(
         }
 
         g_SessionId++;
+        AhSpeakerFormatDetach(g_SessionId);
         g_SessionGreeted = TRUE;
         rep->status     = AH_STATUS_OK;
         rep->session_id = g_SessionId;
@@ -973,7 +983,23 @@ AhCtlDeviceControl(
         // "OK" the result actually fell.
         //
         rep->flags      = result.Flags;
+        AhSpeakerFormatBind(req.slot, generation,
+            (result.Published & AH_PUB_RENDER) != 0 ? TRUE : FALSE);
         return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+    }
+
+    case IOCTL_AUDIOHUB_FORMAT:
+    {
+        if (inLen != sizeof(AH_FORMAT_PAYLOAD) || outLen != sizeof(AH_FORMAT_REPLY) || buffer == NULL)
+        {
+            return AhCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+        }
+        AH_FORMAT_PAYLOAD request = *(AH_FORMAT_PAYLOAD *)buffer;
+        AH_FORMAT_REPLY *reply = (AH_FORMAT_REPLY *)buffer;
+        RtlZeroMemory(reply, sizeof(*reply));
+        reply->status = !g_SessionGreeted || request.session_id != g_SessionId
+            ? AH_STATUS_STALE_SESSION : AhSpeakerFormatControl(&request);
+        return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*reply));
     }
 
     case IOCTL_AUDIOHUB_QUERY_SLOTS:

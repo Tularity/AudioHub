@@ -929,7 +929,14 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
         }
         SessionMsg::SpatialOutputCapabilities { offer } => {
             if current_peer_connection(inner, conn) {
-                crate::spatial::accept_offer(&mut lk(&conn.peer_spatial_output), offer);
+                let current = {
+                    let mut state = lk(&conn.peer_spatial_output);
+                    crate::spatial::accept_offer(&mut state, offer);
+                    state.clone()
+                };
+                if let Some(current) = current {
+                    crate::spatial::invalidate_peer_transmits(inner, conn.connection_id, &current);
+                }
             }
         }
         SessionMsg::OpenStream {
@@ -2768,6 +2775,7 @@ pub(crate) fn teardown_stream(inner: &DaemonInner, stream_id: u32, notify_remote
         }
     }
     if e.tx.is_some() {
+        if let Some(tx) = &e.tx { tx.revoke_media(); }
         let _ = lk(&inner.tx_cmds).send(TxCmd::Remove { stream_id });
     }
     if notify_remote && e.conn.alive.load(Ordering::SeqCst) {
@@ -3512,7 +3520,7 @@ pub(crate) fn open_session(
     inner: &Arc<DaemonInner>,
     params: &OpenSessionParams,
 ) -> Result<SessionInfo> {
-    open_session_from(inner, params, SessionOrigin::User, OpenCause::Fresh)
+    open_session_from(inner, params, SessionOrigin::User, OpenCause::Fresh, None)
 }
 
 pub(crate) fn open_session_from(
@@ -3520,7 +3528,14 @@ pub(crate) fn open_session_from(
     params: &OpenSessionParams,
     origin: SessionOrigin,
     cause: OpenCause,
+    spatial_layout: Option<audiohub_core::spatial_output::SpeakerLayout>,
 ) -> Result<SessionInfo> {
+    if spatial_layout.is_some() && (origin.slot().is_none() || params.kind != KIND_SPK
+        || params.source.as_deref() != Some(SOURCE_HAL_SPEAKER)
+        || haldev::effective_mode(inner) != Mode::B)
+    {
+        bail!("spatial PCM transmission requires a mode-B virtual speaker source");
+    }
     if params.kind != KIND_MIC && params.kind != KIND_SPK {
         bail!("kind must be '{KIND_MIC}' or '{KIND_SPK}'");
     }
@@ -3617,7 +3632,18 @@ pub(crate) fn open_session_from(
         .map(SourceSpec::preferred_channels)
         .unwrap_or_else(|| preferred_source_channels(params.source.as_deref()));
     let peer_channels = peer_media_channels_for_open(inner, &conn)?;
-    let media_channels = desired_channels.min(peer_channels).clamp(1, 2);
+    let spatial_contract = spatial_layout.map(|layout| {
+        if peer_slot != origin.slot() {
+            bail!("spatial source slot does not belong to the selected peer");
+        }
+        lk(&conn.peer_spatial_output).as_ref()
+            .and_then(|offer| offer.contracts.iter().find(|contract| contract.layout == layout))
+            .cloned().ok_or_else(|| anyhow!("peer has no current contract for the selected spatial layout"))
+    }).transpose()?;
+    if spatial_contract.is_some() && matches!(lk(&inner.peer_transport).get(&conn.fp).send.quality_target(), audiohub_ipc::QualityTarget::Fixed(rung) if rung != 0) {
+        bail!("the selected quality cannot satisfy the 48 kHz/F32 spatial PCM contract");
+    }
+    let media_channels = spatial_contract.as_ref().map_or(desired_channels.min(peer_channels).clamp(1, 2), |c| c.channels());
     let media_frame_tag_version = lk(&conn.peer_audio_capabilities).media_frame_tag_version();
 
     let stream_id = alloc_stream_id(inner);
@@ -3704,7 +3730,15 @@ pub(crate) fn open_session_from(
     // （`the_two_ends_agree_on_what_a_wire_byte_is` 盯的正是这个差）。
     let mut tx_shared: Option<Arc<TxShared>> = None;
     if !consuming {
-        let shared = Arc::new(TxShared::new_on(path.auto_top_rung()));
+        let mut shared = TxShared::new_on(path.auto_top_rung());
+        if let Some(contract) = spatial_contract.clone() {
+            shared = match shared.with_spatial_contract(contract) {
+                Ok(shared) => shared,
+                Err(error) => { unwind(inner, &conn); return Err(error); }
+            };
+            shared.transport.publish_quality(lk(&inner.peer_transport).get(&conn.fp).send.quality_target());
+        }
+        let shared = Arc::new(shared);
         shared.armed.store(false, Ordering::SeqCst);
         if let Err(e) = start_tx_stream(
             inner,
@@ -3730,7 +3764,9 @@ pub(crate) fn open_session_from(
     // 路径——于是「用户在断线期间改的档位会被静默还原成断线前的值」。三个
     // 开流入口（UI / 模式 B 设备协调器 / 断线重放）因此天然一致。
     let (rx_latency, tx_quality) = wire_transport(inner, &conn.fp, consuming);
-    let open = SessionMsg::OpenStream {
+    let open = if let Some(contract) = spatial_contract.clone() {
+        SessionMsg::OpenSpatialStream { stream_id, media_salt_b64: BASE64_STANDARD.encode(salt), contract, rx_latency }
+    } else { SessionMsg::OpenStream {
         stream_id,
         kind: params.kind.clone(),
         dir: if consuming { DIR_RECV } else { DIR_SEND }.to_string(),
@@ -3745,7 +3781,7 @@ pub(crate) fn open_session_from(
         volume_sync: vol_sync,
         rx_latency,
         tx_quality,
-    };
+    }};
     if let Err(e) = conn.send_msg(&open) {
         unwind(inner, &conn);
         return Err(e.context("send OpenStream"));
@@ -3760,6 +3796,13 @@ pub(crate) fn open_session_from(
             unwind(inner, &conn);
             bail!("open timed out after {OPEN_TIMEOUT:?}");
         }
+    }
+    if spatial_contract.as_ref().is_some_and(|contract| {
+        !lk(&conn.peer_spatial_output).as_ref().is_some_and(|offer| offer.contracts.contains(contract))
+    }) {
+        unwind(inner, &conn);
+        let _ = conn.send_msg(&SessionMsg::CloseStream { stream_id });
+        bail!("provider spatial contract changed while the stream was opening");
     }
     // exactly what a reconnect replays; the fresh stream id and media salt are
     // minted by this function, not carried here (spec-m4c §C)
@@ -3813,7 +3856,10 @@ pub(crate) fn open_session_from(
             && st
                 .conns
                 .get(&conn.fp)
-                .map_or(false, |c| Arc::ptr_eq(c, &conn));
+                .map_or(false, |c| Arc::ptr_eq(c, &conn))
+            && spatial_contract.as_ref().is_none_or(|contract| {
+                lk(&conn.peer_spatial_output).as_ref().is_some_and(|offer| offer.contracts.contains(contract))
+            });
         live && reservation.publish(&mut st, entry.clone()).is_ok()
     };
     if !inserted {
@@ -3838,6 +3884,17 @@ pub(crate) fn open_session_from(
     // installed, so media can leave. Keeping `armed=false` through the setup
     // above preserves the invariant that no full-volume prefix escapes.
     if let Some(shared) = &entry.tx {
+        if shared.spatial.is_some() {
+            shared.transport.publish_quality(lk(&inner.peer_transport).get(&conn.fp).send.quality_target());
+            if shared.transport.quality_rung().is_some_and(|rung| rung != 0) {
+                teardown_stream(inner, stream_id, true);
+                bail!("quality target changed before the spatial stream could be armed");
+            }
+        }
+        if shared.media_failed.load(Ordering::Acquire) {
+            teardown_stream(inner, stream_id, true);
+            bail!("media contract failed before the stream could be armed");
+        }
         shared.armed.store(true, Ordering::SeqCst);
     }
     // plan §7.1 「静音本机」: the stream is established exactly here — the peer

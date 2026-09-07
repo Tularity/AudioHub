@@ -492,7 +492,7 @@ fn write_control_frame<W: Write>(
                 link.io.requeue_control_frame(frame);
                 WriteOutcome::Dead
             }
-            WriteOutcome::Dead => WriteOutcome::Dead,
+            WriteOutcome::Dead | WriteOutcome::Revoked => WriteOutcome::Dead,
         },
     )
 }

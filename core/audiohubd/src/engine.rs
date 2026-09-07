@@ -660,6 +660,7 @@ const SEND_IDLE_BACKSTOP: Duration = Duration::from_millis(20);
 /// ——走了就会变成第二个生产者，直接违反 SPSC 契约。
 pub(crate) struct UdpSender {
     q: SpscRing<SendSlot>,
+    revoked_dropped: AtomicU64,
     /// 发送线程句柄。`OnceLock` 而不是 `Mutex`：生产者每 tick 要读它一次，
     /// 那里不许有锁。
     thread: std::sync::OnceLock<std::thread::Thread>,
@@ -676,6 +677,7 @@ impl UdpSender {
                 payload_len: 0,
                 owner: None,
             }),
+            revoked_dropped: AtomicU64::new(0),
             thread: std::sync::OnceLock::new(),
             parked: AtomicBool::new(false),
         }
@@ -692,6 +694,7 @@ impl UdpSender {
         payload_len: usize,
         fill: impl FnOnce(&mut Vec<u8>) -> bool,
     ) -> bool {
+        if !owner.may_transmit() { return false; }
         self.q.produce(|slot| {
             if !fill(&mut slot.buf) {
                 return false;
@@ -739,6 +742,15 @@ impl UdpSender {
     pub(crate) fn capacity(&self) -> usize {
         self.q.capacity()
     }
+
+    pub(crate) fn revoked_dropped(&self) -> u64 {
+        self.revoked_dropped.load(Ordering::Relaxed)
+    }
+}
+
+fn transmit_if_current(owner: Option<&Arc<TxShared>>, send: impl FnOnce() -> bool) -> Option<bool> {
+    if owner.is_some_and(|owner| !owner.may_transmit()) { return None; }
+    Some(send())
 }
 
 /// 媒体发送线程：把 `sendto` 从 10 ms 截止期线程上接过来。
@@ -769,7 +781,10 @@ pub(crate) fn udp_send_loop(inner: Arc<DaemonInner>) {
                                            // one in precisely the variable the keepalive signal reads
                                            // (`autotier`'s `sent_packets > 0` guard), and that signal would
                                            // then be untestable through this hook.
-            let accepted = block_out || inner.udp.send_to(&slot.buf, slot.dest).is_ok();
+            let Some(accepted) = transmit_if_current(owner.as_ref(), || block_out || inner.udp.send_to(&slot.buf, slot.dest).is_ok()) else {
+                inner.media_send.revoked_dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
             if accepted {
                 if let Some(o) = owner {
                     o.sent_packets.fetch_add(1, Ordering::Relaxed);
@@ -1021,9 +1036,285 @@ struct SourceEnt {
     /// 会短暂存在新旧两份）。
     gen: u64,
     frame: Vec<f32>, // one 48k frame per tick, broadcast to all attached streams
+    frame_valid: bool,
     /// 本 tick 读到的各级深度，随 `frame` 一起广播给挂在这个源上的每条流。
     /// 读一次、发 N 份：物理队列只有一份（规格 §7.2 R8）。
     depths: SourceDepths,
+}
+
+fn validate_transmit_layout(
+    shared: &TxShared,
+    requested_channels: u8,
+    source_channels: u8,
+    source_layout: Option<audiohub_core::spatial_output::SpeakerLayout>,
+) -> Result<()> {
+    if let Some(contract) = &shared.spatial {
+        contract.validate()?;
+        if requested_channels != contract.channels() || source_channels != contract.channels()
+            || source_layout != Some(contract.layout)
+        {
+            return Err(anyhow!("source layout does not match the accepted spatial PCM contract"));
+        }
+    } else if source_channels > 2 || source_layout.is_some() {
+        return Err(anyhow!("wide source requires an explicit spatial PCM contract"));
+    }
+    Ok(())
+}
+
+fn send_spatial_frame(
+    udp: &UdpSender,
+    tx: &mut TxStream,
+    source: &SourceEnt,
+    tick_at: Instant,
+    timestamp_us: u64,
+    gained: &mut Vec<f32>,
+) -> bool {
+    use audiohub_net::spatial_media::{encode_fragment, fragment_count};
+    if !tx.shared.may_transmit() {
+        return false;
+    }
+    let contract = tx.shared.spatial.as_ref().expect("spatial transmit branch");
+    let layout = contract.layout;
+    let channels = contract.channels();
+    if let Err(error) = validate_transmit_layout(&tx.shared, tx.channels, source.channels, source.src.speaker_layout()) {
+        tx.shared.fail_media(error.to_string());
+        return false;
+    }
+    if source.src.sample_rate() != 48_000 || !source.frame_valid || source.frame.len() != F48 * channels as usize
+        || source.frame.iter().any(|value| !value.is_finite())
+    {
+        tx.shared.fail_media("spatial source did not provide one complete finite 48 kHz frame".into());
+        return false;
+    }
+    if tx.shared.transport.quality_rung().is_some_and(|rung| rung != 0) {
+        tx.shared.fail_media("selected quality is incompatible with the fixed 48 kHz/F32 spatial contract".into());
+        return false;
+    }
+    let parts = fragment_count(layout);
+    let Some(next_seq) = tx.seq.checked_add(parts as u32) else {
+        tx.shared.fail_media("spatial packet nonce space requires a fresh stream".into());
+        return false;
+    };
+    let Some(next_frame) = tx.media_frame_seq.checked_add(1) else {
+        tx.shared.fail_media("spatial frame sequence requires a fresh stream".into());
+        return false;
+    };
+    if tx.loss.should_drop() {
+        tx.seq = next_seq;
+        tx.media_frame_seq = next_frame;
+        return false;
+    }
+    refresh_dest(tx);
+    tx.gain.set_target(TxShared::gain_of(tx.shared.send_gain.load(Ordering::Relaxed)));
+    let samples = tx.gain.apply_interleaved(&source.frame, 48_000, dsp::WireDepth::F32, channels, gained);
+    let mut queued_any = false;
+    for part in 0..parts {
+        if !tx.shared.may_transmit() { break; }
+        if let Err(error) = encode_fragment(layout, tx.media_frame_seq, part, samples, &mut tx.pay) {
+            tx.shared.fail_media(format!("encode spatial PCM: {error:#}"));
+            return queued_any;
+        }
+        let header = Header {
+            kind: Kind::Media, codec: Codec::PcmF32le, channels, sample_rate: 48_000,
+            session_id: tx.id as u64, stream_id: tx.id, seq: tx.seq,
+            timestamp_us, payload_len: 0,
+        };
+        tx.seq += 1;
+        let seal = |buffer: &mut Vec<u8>| match tx.crypto.seal_into(&header, &tx.pay, buffer) {
+            Ok(()) => true,
+            Err(error) => { tx.shared.fail_media(format!("seal spatial media: {error:#}")); false }
+        };
+        queued_any |= match &tx.path {
+            MediaPath::Udp(destination) => udp.enqueue(*destination, &tx.shared, tx.pay.len(), seal),
+            MediaPath::Tcp(_) | MediaPath::Framed(_) => tx.path.media_link()
+                .is_some_and(|link| link.enqueue(tick_at, &tx.shared, tx.pay.len(), seal)),
+        };
+    }
+    if let Some(link) = tx.path.media_link() {
+        link.wake();
+    }
+    tx.media_frame_seq = next_frame;
+    queued_any
+}
+
+#[cfg(test)]
+mod spatial_transmit_tests {
+    use super::*;
+    use audiohub_core::spatial_output::SpeakerLayout;
+    use audiohub_net::spatial_media::{fragment_count, SpatialMediaContract, SpatialReassembler};
+
+    struct LayoutSource { layout: SpeakerLayout }
+    impl FrameSource for LayoutSource {
+        fn sample_rate(&self) -> u32 { 48_000 }
+        fn channels(&self) -> u8 { self.layout.channels() as u8 }
+        fn speaker_layout(&self) -> Option<SpeakerLayout> { Some(self.layout) }
+        fn next_frame(&mut self, out: &mut Vec<f32>) -> bool {
+            out.clear();
+            out.resize(F48 * self.layout.channels(), 0.0);
+            true
+        }
+    }
+
+    fn fixture(layout: SpeakerLayout) -> (Arc<TxShared>, TxStream, SourceEnt) {
+        let shared = Arc::new(TxShared::new_on(0).with_spatial_contract(SpatialMediaContract {
+            version: 1, provider_revision: 1, endpoint_id: "provider-output".into(),
+            active_format: "native-format".into(), layout,
+        }).unwrap());
+        let mut tx = super::tests::tx_stream_for(&shared);
+        tx.channels = layout.channels() as u8;
+        tx.rung = 0;
+        let source = SourceEnt {
+            src: Src::Frame(Box::new(LayoutSource { layout })), channels: tx.channels,
+            refs: 1, gen: 1, frame: (0..F48 * layout.channels()).map(|n| n as f32 / 10_000.0).collect(),
+            frame_valid: true, depths: NO_DEPTHS,
+        };
+        (shared, tx, source)
+    }
+
+    fn drain(sender: &UdpSender, tx: &TxStream, layout: SpeakerLayout) -> Vec<f32> {
+        let mut assembly = SpatialReassembler::new(layout);
+        let mut frames = Vec::new();
+        let mut count = 0;
+        while sender.q.consume(|slot| {
+            let (header, payload) = tx.crypto.open(&slot.buf).unwrap();
+            assert_eq!(header.channels, layout.channels() as u8);
+            assert_eq!(header.codec, Codec::PcmF32le);
+            assert_eq!(header.sample_rate, 48_000);
+            assert_eq!(header.timestamp_us, 1_234_567);
+            assert_eq!(header.seq, count);
+            assert!(payload.len() <= 1200);
+            assert!(Arc::ptr_eq(slot.owner.as_ref().unwrap(), &tx.shared));
+            frames.extend(assembly.push(&payload).unwrap());
+            count += 1;
+        }) {}
+        assert_eq!(count as usize, fragment_count(layout));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame_seq, 0);
+        frames.remove(0).samples
+    }
+
+    #[test]
+    fn spatial_transmit_queues_authenticated_complete_frames_for_every_layout() {
+        for layout in [SpeakerLayout::Surround51, SpeakerLayout::Surround71, SpeakerLayout::Immersive714] {
+            let (_shared, mut tx, source) = fixture(layout);
+            let sender = UdpSender::new();
+            assert!(send_spatial_frame(&sender, &mut tx, &source, Instant::now(), 1_234_567, &mut Vec::new()));
+            assert_eq!(drain(&sender, &tx, layout), source.frame);
+            assert_eq!(tx.seq as usize, fragment_count(layout));
+            assert_eq!(tx.media_frame_seq, 1);
+        }
+    }
+
+    #[test]
+    fn spatial_transmit_never_sends_before_acceptance_or_after_failure() {
+        let (shared, mut tx, source) = fixture(SpeakerLayout::Surround51);
+        let sender = UdpSender::new();
+        shared.armed.store(false, Ordering::Release);
+        assert!(!send_spatial_frame(&sender, &mut tx, &source, Instant::now(), 1_234_567, &mut Vec::new()));
+        assert_eq!(tx.seq, 0);
+        shared.fail_media("provider contract changed".into());
+        shared.armed.store(true, Ordering::Release);
+        assert!(!send_spatial_frame(&sender, &mut tx, &source, Instant::now(), 1_234_567, &mut Vec::new()));
+        assert!(!sender.q.consume(|_| panic!("unexpected packet")));
+    }
+
+    #[test]
+    fn spatial_transmit_gain_uses_one_gain_for_all_channels_in_each_frame() {
+        let (shared, mut tx, mut source) = fixture(SpeakerLayout::Immersive714);
+        source.frame.fill(0.5);
+        shared.send_gain.store(TxShared::gain_bits(0.0), Ordering::Relaxed);
+        let sender = UdpSender::new();
+        assert!(send_spatial_frame(&sender, &mut tx, &source, Instant::now(), 1_234_567, &mut Vec::new()));
+        let samples = drain(&sender, &tx, SpeakerLayout::Immersive714);
+        for frame in samples.chunks_exact(12) { assert!(frame.iter().all(|sample| *sample == frame[0])); }
+        assert!(samples[0] > *samples.last().unwrap());
+    }
+
+    #[test]
+    fn spatial_transmit_tracks_dropped_frame_identity_and_stops_before_nonce_wrap() {
+        let (shared, mut tx, source) = fixture(SpeakerLayout::Surround71);
+        let sender = UdpSender::new();
+        tx.loss = LossInjector::new(7, 100.0);
+        assert!(!send_spatial_frame(&sender, &mut tx, &source, Instant::now(), 1_234_567, &mut Vec::new()));
+        assert_eq!(tx.seq as usize, fragment_count(SpeakerLayout::Surround71));
+        assert_eq!(tx.media_frame_seq, 1);
+        tx.seq = u32::MAX - 1;
+        assert!(!send_spatial_frame(&sender, &mut tx, &source, Instant::now(), 1_234_567, &mut Vec::new()));
+        assert!(shared.media_failed.load(Ordering::Acquire));
+        assert!(!sender.q.consume(|_| panic!("unexpected packet")));
+    }
+
+    #[test]
+    fn spatial_transmit_refuses_unlabelled_or_changed_source_geometry() {
+        let (shared, mut tx, mut source) = fixture(SpeakerLayout::Immersive714);
+        assert!(validate_transmit_layout(&shared, 12, 12, None).is_err());
+        assert!(validate_transmit_layout(&shared, 2, 12, Some(SpeakerLayout::Immersive714)).is_err());
+        source.frame.pop(); source.frame_valid = false;
+        let sender = UdpSender::new();
+        assert!(!send_spatial_frame(&sender, &mut tx, &source, Instant::now(), 1_234_567, &mut Vec::new()));
+        assert!(shared.media_failed.load(Ordering::Acquire));
+        assert!(!sender.q.consume(|_| panic!("unexpected packet")));
+    }
+
+    #[test]
+    fn spatial_source_admission_failure_releases_its_source_reference() {
+        let (builder, retired) = mpsc::channel();
+        let mut state = TxState::new(builder);
+        let spec = SourceSpec::HalSpeaker { slot: 0 };
+        let (shared, _tx, mut source) = fixture(SpeakerLayout::Immersive714);
+        source.src = Src::Frame(Box::new(ToneSource::new(440.0, 0.1, 48_000, 10)));
+        source.channels = 1;
+        source.refs = 0;
+        state.sources.insert(spec.clone(), source);
+        let (ack, answer) = mpsc::channel();
+        apply_txcmd(&mut state, TxCmd::Add {
+            stream_id: 7, key: [0; 32], salt: vec![0; 16],
+            path: MediaPath::Udp("127.0.0.1:1".parse().unwrap()), spec,
+            channels: 12, loss_pct: 0.0, shared, ack: Some(ack),
+        });
+        assert!(answer.recv().unwrap().is_err());
+        assert!(state.streams.is_empty() && state.sources.is_empty());
+        assert!(matches!(retired.recv().unwrap(), BuildReq::Retire { .. }));
+    }
+
+    #[test]
+    fn spatial_queued_udp_packets_are_revoked_when_the_source_is_removed() {
+        let (shared, mut tx, source) = fixture(SpeakerLayout::Immersive714);
+        let sender = UdpSender::new();
+        assert!(send_spatial_frame(&sender, &mut tx, &source, Instant::now(), 1_234_567, &mut Vec::new()));
+        let (builder, _retired) = mpsc::channel();
+        let mut state = TxState::new(builder);
+        state.sources.insert(tx.spec.clone(), source);
+        state.streams.insert(tx.id, tx);
+        state.remove_stream(7);
+        assert!(!shared.may_transmit());
+        let mut dropped = 0;
+        while sender.q.consume(|slot| {
+            let owner = slot.owner.take();
+            assert_eq!(transmit_if_current(owner.as_ref(), || panic!("revoked audio reached the socket")), None);
+            dropped += 1;
+        }) {}
+        assert_eq!(dropped, 20);
+        assert_eq!(shared.sent_packets.load(Ordering::Relaxed), 0);
+        assert!(!sender.enqueue("127.0.0.1:1".parse().unwrap(), &shared, 1, |_| panic!("revoked producer encoded audio")));
+        assert!(super::tests::fn_body("pub(crate) fn udp_send_loop(").contains("transmit_if_current("));
+    }
+
+    #[test]
+    fn spatial_revocation_during_enqueue_is_caught_before_socket_io() {
+        let (owner, _tx, _source) = fixture(SpeakerLayout::Surround51);
+        let sender = UdpSender::new();
+        assert!(sender.enqueue("127.0.0.1:1".parse().unwrap(), &owner, 1, |buffer| {
+            buffer.clear(); buffer.push(1);
+            owner.revoke_media();
+            true
+        }));
+        assert!(sender.q.consume(|slot| {
+            let owner = slot.owner.take();
+            assert_eq!(transmit_if_current(owner.as_ref(), || panic!("revoked packet reached socket IO")), None);
+        }));
+        assert!(!sender.enqueue("127.0.0.1:1".parse().unwrap(), &owner, 1, |_| panic!("a later fragment was encoded")));
+    }
 }
 
 /// A media source plus the one thing `FrameSource` cannot express: a system
@@ -1058,8 +1349,22 @@ impl Src {
 
     fn channels(&self) -> u8 {
         match self {
-            Src::Frame(f) => f.channels().clamp(1, 2),
+            Src::Frame(f) => f.channels().clamp(1, 12),
             Src::Sys(s) => s.channels(),
+        }
+    }
+
+    fn speaker_layout(&self) -> Option<audiohub_core::spatial_output::SpeakerLayout> {
+        match self {
+            Src::Frame(source) => source.speaker_layout(),
+            Src::Sys(_) => None,
+        }
+    }
+
+    fn sample_rate(&self) -> u32 {
+        match self {
+            Src::Frame(source) => source.sample_rate(),
+            Src::Sys(_) => 48_000,
         }
     }
 
@@ -1671,15 +1976,28 @@ impl TxState {
     }
 
     fn install_stream(&mut self, spec: &SourceSpec, add: PendingAdd) {
+        let source = self.sources.get(spec).expect("source exists before stream installation");
+        let validation = validate_transmit_layout(&add.shared, add.channels, source.channels, source.src.speaker_layout())
+            .and_then(|_| if add.shared.spatial.is_some() && source.src.sample_rate() != 48_000 {
+                Err(anyhow!("spatial source must provide 48 kHz PCM"))
+            } else { Ok(()) });
+        if let Err(error) = validation {
+            if let Some(ack) = add.ack {
+                let _ = ack.send(Err(error.to_string()));
+            }
+            self.release_source(spec);
+            return;
+        }
+        let channels = add.shared.spatial.as_ref().map_or(add.channels.clamp(1, 2), |contract| contract.channels());
         // 钳位与 `tx_loop` 那处同一条理由：加档而不改钳位 = 新档静默不可达。
-        let start_rung = add
+        let start_rung = if add.shared.spatial.is_some() { 0 } else { add
             .shared
             .rung
             .load(Ordering::Relaxed)
-            .min(audiohub_net::media::LADDER.len() as u32 - 1);
+            .min(audiohub_net::media::LADDER.len() as u32 - 1) };
         add.shared
             .media_channels
-            .store(add.channels.clamp(1, 2) as u32, Ordering::Relaxed);
+            .store(channels as u32, Ordering::Relaxed);
         self.streams.insert(
             add.stream_id,
             TxStream {
@@ -1689,7 +2007,7 @@ impl TxState {
                 crypto: MediaCrypto::new_for_stream(&add.key, add.stream_id, &add.salt),
                 path: add.path,
                 spec: spec.clone(),
-                channels: add.channels.clamp(1, 2),
+                channels,
                 loss: LossInjector::new(add.stream_id, add.loss_pct),
                 seq: 0,
                 media_frame_seq: 0,
@@ -1705,7 +2023,7 @@ impl TxState {
                 // `format_mismatch` 每帧递增、整条流一个字都听不见。此前
                 // 之所以没暴露，只是因为起步格恒为 48 kHz 的那一格。
                 rung: start_rung,
-                rs: resampler_for(start_rung, add.channels, [0.0; 2]),
+                rs: if add.shared.spatial.is_some() { None } else { resampler_for(start_rung, channels, [0.0; 2]) },
                 rs_last: [0.0; 2],
                 // 一帧最深档 = 480 × 4 B（f32）。容量随格号变（换档同时改帧长度
                 // 与每样本字节数），按最深档预留就不会在音频线程上扩容。
@@ -1761,6 +2079,7 @@ impl TxState {
 
     fn remove_stream(&mut self, stream_id: u32) {
         if let Some(s) = self.streams.remove(&stream_id) {
+            s.shared.revoke_media();
             // 这条流从此不再被 tick 到，槽再也不会被覆盖 —— 但 `TxShared`
             // 还活着且还在被报告线程读。不清就是把最后一次读数永久钉住。
             clear_send_stages(&s);
@@ -1832,7 +2151,8 @@ impl TxState {
                 channels,
                 refs: waiters.len(),
                 gen: d.gen,
-                frame: Vec::new(),
+                frame: Vec::with_capacity(F48 * channels as usize),
+                frame_valid: true,
                 depths: NO_DEPTHS,
             },
         );
@@ -1865,7 +2185,7 @@ fn apply_txcmd(st: &mut TxState, cmd: TxCmd) {
                 key,
                 salt,
                 path,
-                channels: channels.clamp(1, 2),
+                channels,
                 loss_pct,
                 shared,
                 ack,
@@ -2112,7 +2432,7 @@ pub(crate) fn tx_loop(
     //
     // 它必须是一块**独立**的缓冲，不能就地写回 `staged` 或 `ent.frame`：
     // 后者是扇出的共享帧（改了它，同一个源上的其余流全被带偏，而且逐帧复利）。
-    let mut gained: Vec<f32> = Vec::with_capacity(F48 * 2);
+    let mut gained: Vec<f32> = Vec::with_capacity(F48 * 12);
     loop {
         if inner.shutdown.load(Ordering::SeqCst) {
             return;
@@ -2268,6 +2588,7 @@ pub(crate) fn tx_loop(
             // 恒定挂在总数上，而且看起来完全像一个真实缓冲。
             ent.depths = ent.src.depths();
             let expected = F48 * ent.channels as usize;
+            ent.frame_valid = ent.frame.len() == expected;
             if ent.frame.len() != expected {
                 // An OVER-long frame means the source appended instead of
                 // replacing, and the resize below then re-sends whatever its
@@ -2275,11 +2596,11 @@ pub(crate) fn tx_loop(
                 // the loss rate and the tone probe all stay green. That cost a
                 // full debugging session once; it must never be silent again.
                 debug_assert!(
-                    ent.frame.len() <= expected,
+                    ent.src.speaker_layout().is_some() || ent.frame.len() <= expected,
                     "FrameSource yielded {} samples (> {expected}): it appended instead of replacing",
                     ent.frame.len(),
                 );
-                if ent.frame.len() > expected && slow_tick {
+                if ent.frame.len() > expected && slow_tick && ent.src.speaker_layout().is_none() {
                     dlog!(
                         "[audiohubd] BUG: source yielded {} samples, expected {expected} — \
                          the stream is repeating its first frame",
@@ -2347,6 +2668,14 @@ pub(crate) fn tx_loop(
             // 规格里编了号，却一个发布点都没有** ⇒ 发送侧的 local_ms 系统性短
             // 5 ms，而且没有任何字段标出它缺席。
             publish_send_stages(&tx.shared.stages, &ent.depths);
+            if tx.shared.spatial.is_some() {
+                queued_any |= send_spatial_frame(&inner.media_send, tx, ent, tick_at, ts_us, &mut gained);
+                continue;
+            }
+            if ent.channels > 2 {
+                tx.shared.fail_media("wide source cannot enter the legacy stereo transmit path".into());
+                continue;
+            }
             // 钳位用 `LADDER.len()`，**不是字面量**：位深进阶梯之前这里写的是
             // `.min(3)`，加档而不改它 = 新档**静默不可达**（rung 4/5 被钳成 3，
             // 用户选了 16 kHz 却在发 24 kHz，而没有任何一处会报错）。

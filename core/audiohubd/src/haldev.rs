@@ -2790,6 +2790,7 @@ pub(crate) fn session_worker(inner: Arc<DaemonInner>, rx: mpsc::Receiver<SessCmd
                     &params,
                     SessionOrigin::Hal { slot },
                     conn::OpenCause::Fresh,
+                    None, // The current driver ABI exposes only a stereo speaker ring.
                 );
                 let mut st = lk(&inner.haldev);
                 if out {

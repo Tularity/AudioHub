@@ -418,7 +418,7 @@ fn replay_sessions(inner: &Arc<DaemonInner>, fp: &str, sessions: Vec<PlannedSess
         // session is the same one, so the origin is unchanged, but the moment is
         // not 「与对端建立连接的那一刻」 and a mute the user cancelled must not
         // come back because the link blipped.
-        match conn::open_session_from(inner, &p.params, origin, conn::OpenCause::Replay) {
+        match conn::open_session_from(inner, &p.params, origin, conn::OpenCause::Replay, None) {
             Ok(info) => dlog!(
                 "[audiohubd] peer {fp}: recovered {} session as stream {}",
                 p.params.kind,

@@ -340,6 +340,7 @@ pub(crate) struct TcpMediaLink {
     parked: AtomicBool,
     alive: AtomicBool,
     stale_dropped: AtomicU64,
+    revoked_dropped: AtomicU64,
     frames_written: AtomicU64,
     frames_read: AtomicU64,
     /// Frames that arrived on this connection with a `Kind` other than
@@ -430,6 +431,7 @@ impl TcpMediaLink {
             parked: AtomicBool::new(false),
             alive: AtomicBool::new(true),
             stale_dropped: AtomicU64::new(0),
+            revoked_dropped: AtomicU64::new(0),
             frames_written: AtomicU64::new(0),
             frames_read: AtomicU64::new(0),
             unexpected_kind: AtomicU64::new(0),
@@ -453,7 +455,7 @@ impl TcpMediaLink {
         payload_len: usize,
         fill: impl FnOnce(&mut Vec<u8>) -> bool,
     ) -> bool {
-        if !self.alive.load(Ordering::Relaxed) {
+        if !self.alive.load(Ordering::Relaxed) || !owner.may_transmit() {
             return false;
         }
         self.q.produce(|slot| {
@@ -498,6 +500,10 @@ impl TcpMediaLink {
     /// nowhere else.
     pub(crate) fn stale_dropped(&self) -> u64 {
         self.stale_dropped.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn revoked_dropped(&self) -> u64 {
+        self.revoked_dropped.load(Ordering::Relaxed)
     }
 
     pub(crate) fn frames_written(&self) -> u64 {
@@ -643,6 +649,8 @@ pub(crate) enum WriteOutcome {
     /// Aged past its budget before a single byte reached the socket. The frame
     /// is dropped; the `seq` hole it leaves is what the receiver conceals.
     Stale,
+    /// Revoked before the first byte; unrelated streams retain a valid link.
+    Revoked,
     /// The connection is finished.
     Dead,
 }
@@ -671,8 +679,24 @@ pub(crate) fn write_one_frame<W: Write>(
     hard_at: Instant,
     shutdown: &AtomicBool,
 ) -> WriteOutcome {
+    write_owned_frame(w, buf, stale_at, hard_at, shutdown, None)
+}
+
+fn write_owned_frame<W: Write>(
+    w: &mut W,
+    buf: &[u8],
+    stale_at: Instant,
+    hard_at: Instant,
+    shutdown: &AtomicBool,
+    owner: Option<&TxShared>,
+) -> WriteOutcome {
     let mut off = 0usize;
     while off < buf.len() {
+        // A partially written frame must still finish to preserve framing.
+        // Bytes already committed to the kernel cannot be recalled.
+        if off == 0 && owner.is_some_and(|owner| !owner.may_transmit()) {
+            return WriteOutcome::Revoked;
+        }
         match w.write(&buf[off..]) {
             Ok(0) => return WriteOutcome::Dead, // peer closed
             Ok(n) => off += n,
@@ -717,16 +741,22 @@ impl TokenBucket {
     /// Block until the simulated link is free. Sliced so shutdown is still
     /// noticed promptly; the queue backing up behind this is the point.
     pub(crate) fn gate(&mut self, shutdown: &AtomicBool) {
+        let _ = self.gate_owned(shutdown, None);
+    }
+
+    fn gate_owned(&mut self, shutdown: &AtomicBool, owner: Option<&TxShared>) -> bool {
         if self.bps == 0 {
-            return;
+            return owner.is_none_or(TxShared::may_transmit);
         }
         while let Some(t) = self.next_at {
             let now = Instant::now();
+            if owner.is_some_and(|owner| !owner.may_transmit()) { return false; }
             if now >= t || shutdown.load(Ordering::SeqCst) {
-                return;
+                return true;
             }
             std::thread::sleep((t - now).min(WRITE_SLICE));
         }
+        owner.is_none_or(TxShared::may_transmit)
     }
 
     pub(crate) fn charge(&mut self, bytes: usize) {
@@ -786,6 +816,11 @@ pub(crate) fn write_one_queued<W: Write>(
     let mut seen = None;
     link.q.consume(|slot| {
         let owner = slot.owner.take(); // dropped on THIS thread
+        if owner.as_ref().is_some_and(|owner| !owner.may_transmit()) {
+            link.revoked_dropped.fetch_add(1, Ordering::Relaxed);
+            seen = Some(WriteOutcome::Revoked);
+            return;
+        }
         let queued_at = slot.queued_at;
         // The stale gate's subtraction, reused as the backlog gauge. One
         // reading per dequeue covers a stalled writer too: with
@@ -793,7 +828,11 @@ pub(crate) fn write_one_queued<W: Write>(
         // frame ages out, the gate drops it and the next frame is dequeued
         // already old — so the gauge climbs towards `STALE_BUDGET` rather
         // than freezing at whatever it read before the stall.
-        bucket.gate(shutdown);
+        if !bucket.gate_owned(shutdown, owner.as_deref()) {
+            link.revoked_dropped.fetch_add(1, Ordering::Relaxed);
+            seen = Some(WriteOutcome::Revoked);
+            return;
+        }
         let waited = queued_at.elapsed();
         link.note_wait(waited);
         let stale_at = match give_up_at {
@@ -803,12 +842,13 @@ pub(crate) fn write_one_queued<W: Write>(
         let outcome = if waited > STALE_BUDGET || Instant::now() >= stale_at {
             WriteOutcome::Stale
         } else {
-            write_one_frame(
+            write_owned_frame(
                 w,
                 &slot.buf,
                 stale_at,
                 queued_at + FRAME_COMPLETION_LIMIT,
                 shutdown,
+                owner.as_deref(),
             )
         };
         match outcome {
@@ -828,6 +868,7 @@ pub(crate) fn write_one_queued<W: Write>(
             WriteOutcome::Stale => {
                 link.stale_dropped.fetch_add(1, Ordering::Relaxed);
             }
+            WriteOutcome::Revoked => { link.revoked_dropped.fetch_add(1, Ordering::Relaxed); }
             WriteOutcome::Dead => {}
         }
         seen = Some(outcome);
@@ -1620,6 +1661,77 @@ mod tests {
 
     fn link() -> TcpMediaLink {
         TcpMediaLink::new("fp".into(), "127.0.0.1:1".parse().unwrap(), 0)
+    }
+
+    #[test]
+    fn spatial_revocation_discards_queued_media_without_stalling_other_streams() {
+        let link = link();
+        let dead = Arc::new(TxShared::new());
+        let live = Arc::new(TxShared::new());
+        assert!(push(&link, Instant::now(), &dead, 1));
+        assert!(push(&link, Instant::now(), &live, 2));
+        dead.revoke_media();
+        let mut output = Vec::new();
+        let shutdown = AtomicBool::new(false);
+        let mut bucket = TokenBucket::new(0);
+        assert_eq!(write_one_queued(&link, &mut output, &shutdown, &mut bucket, None), Some(WriteOutcome::Revoked));
+        assert!(output.is_empty());
+        assert_eq!(write_one_queued(&link, &mut output, &shutdown, &mut bucket, None), Some(WriteOutcome::Sent));
+        assert_eq!(output, frame(2));
+        assert_eq!(link.revoked_dropped(), 1);
+        assert_eq!(link.stale_dropped(), 0);
+        assert_eq!(dead.sent_packets.load(Ordering::Relaxed), 0);
+        assert_eq!(live.sent_packets.load(Ordering::Relaxed), 1);
+        assert!(!push(&link, Instant::now(), &dead, 3));
+    }
+
+    #[test]
+    fn spatial_revocation_is_rechecked_after_a_blocked_first_write() {
+        struct RevokeBlocked { owner: Arc<TxShared>, calls: usize }
+        impl Write for RevokeBlocked {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                assert_eq!(self.calls, 1);
+                self.owner.revoke_media();
+                Err(std::io::Error::from(ErrorKind::WouldBlock))
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let link = link();
+        let owner = Arc::new(TxShared::new());
+        assert!(push(&link, Instant::now(), &owner, 1));
+        let mut writer = RevokeBlocked { owner, calls: 0 };
+        assert_eq!(write_one_queued(&link, &mut writer, &AtomicBool::new(false), &mut TokenBucket::new(0), None), Some(WriteOutcome::Revoked));
+        assert_eq!(writer.calls, 1);
+    }
+
+    #[test]
+    fn spatial_revocation_does_not_truncate_a_started_frame() {
+        struct RevokePartial { owner: Arc<TxShared>, bytes: Vec<u8> }
+        impl Write for RevokePartial {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.bytes.is_empty() {
+                    self.bytes.push(bytes[0]);
+                    self.owner.revoke_media();
+                    Ok(1)
+                } else {
+                    self.bytes.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let link = link();
+        let owner = Arc::new(TxShared::new());
+        assert!(push(&link, Instant::now(), &owner, 1));
+        assert!(push(&link, Instant::now(), &owner, 2));
+        let mut writer = RevokePartial { owner, bytes: Vec::new() };
+        let shutdown = AtomicBool::new(false);
+        let mut bucket = TokenBucket::new(0);
+        assert_eq!(write_one_queued(&link, &mut writer, &shutdown, &mut bucket, None), Some(WriteOutcome::Sent));
+        assert_eq!(writer.bytes, frame(1));
+        assert_eq!(write_one_queued(&link, &mut writer, &shutdown, &mut bucket, None), Some(WriteOutcome::Revoked));
+        assert_eq!(writer.bytes, frame(1));
     }
 
     /// `give_up_at` really does shorten the pre-first-byte deadline.

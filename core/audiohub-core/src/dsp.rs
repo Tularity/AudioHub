@@ -875,7 +875,7 @@ impl SendGain {
         if self.is_transparent() {
             return input;
         }
-        let channels = channels.clamp(1, 2) as usize;
+        let channels = channels.clamp(1, 12) as usize;
         out.clear();
         out.reserve(input.len());
         // 每样本的最大位移。`max(1)` 只是不让荒谬的小采样率把步长除成 0

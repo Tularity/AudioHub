@@ -1373,6 +1373,7 @@ fn tcp_media_status(inner: &DaemonInner) -> serde_json::Value {
                     // different questions and only this one explains a rung.
                     "writeq_auto_ms": l.writeq_auto_ms(),
                     "stale_dropped": l.stale_dropped(),
+                    "revoked_dropped": l.revoked_dropped(),
                     "frames_written": l.frames_written(),
                     "frames_read": l.frames_read(),
                     "unexpected_kind": l.unexpected_kind(),
@@ -1588,6 +1589,7 @@ fn latency_guard_status(inner: &DaemonInner) -> Result<serde_json::Value> {
             "queued": inner.media_send.queued(),
             "capacity": inner.media_send.capacity(),
             "dropped": inner.media_send.dropped(),
+            "revoked_dropped": inner.media_send.revoked_dropped(),
         },
         // Tier 1 媒体链路（M8），每对端一条，没有降级的对端这里就是空数组。
         //
@@ -2977,6 +2979,10 @@ pub(crate) struct RemoteStats {
 }
 
 pub(crate) struct TxShared {
+    pub(crate) spatial: Option<audiohub_net::spatial_media::SpatialMediaContract>,
+    pub(crate) media_failed: AtomicBool,
+    pub(crate) media_revoked: AtomicBool,
+    pub(crate) media_failure: Mutex<Option<String>>,
     pub rung: AtomicU32,
     pub media_channels: AtomicU32,
     pub rung_changes: AtomicU32,
@@ -3103,6 +3109,10 @@ impl TxShared {
     /// one rung further along.
     pub(crate) fn new_on(top_rung: u32) -> TxShared {
         TxShared {
+            spatial: None,
+            media_failed: AtomicBool::new(false),
+            media_revoked: AtomicBool::new(false),
+            media_failure: Mutex::new(None),
             // **起步格是 AUTO 的天花板，不是阶梯顶端。**
             //
             // 位深进阶梯之前这两个是同一个数（rung 0 = 48 kHz/s16）。现在
@@ -3144,6 +3154,33 @@ impl TxShared {
             1.0
         };
         g.to_bits()
+    }
+
+    pub(crate) fn with_spatial_contract(mut self, contract: audiohub_net::spatial_media::SpatialMediaContract) -> Result<Self> {
+        contract.validate()?;
+        self.media_channels.store(contract.channels() as u32, Ordering::Relaxed);
+        self.rung.store(0, Ordering::Relaxed);
+        self.spatial = Some(contract);
+        Ok(self)
+    }
+
+    pub(crate) fn fail_media(&self, reason: String) {
+        let mut error = lk(&self.media_failure);
+        if error.is_none() {
+            *error = Some(reason);
+        }
+        self.media_failed.store(true, Ordering::Release);
+        self.revoke_media();
+    }
+
+    pub(crate) fn revoke_media(&self) {
+        self.media_revoked.store(true, Ordering::Release);
+        self.armed.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn may_transmit(&self) -> bool {
+        self.armed.load(Ordering::Acquire) && !self.media_revoked.load(Ordering::Acquire)
+            && !self.media_failed.load(Ordering::Acquire)
     }
 
     /// [`TxShared::gain_bits`] 的逆。哨兵读作 1.0 = 透明。
@@ -4384,7 +4421,7 @@ fn build_session_info_with(
             .map(|rx| rx.channels)
             .or_else(|| {
                 e.tx.as_ref()
-                    .map(|tx| tx.media_channels.load(Ordering::Relaxed).clamp(1, 2) as u8)
+                    .map(|tx| tx.media_channels.load(Ordering::Relaxed).clamp(1, 12) as u8)
             })
             .unwrap_or(1),
         stats: s,
@@ -4537,7 +4574,12 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
                 // `else` 而不是提前 return/continue：这个 `for` 的后面还有音量
                 // 轮询，跳过去会让固定质量档顺手把音量同步也关掉——一个只在
                 // 「选了固定档 + 开了音量同步」时才出现的组合失效。
-                if let Some(rung) = tx.transport.quality_rung() {
+                if tx.spatial.is_some() {
+                    // Spatial version one is an exact 48 kHz/F32 contract.
+                    // Do not silently apply the legacy mono/stereo ladder.
+                    tx.rung.store(0, Ordering::Relaxed);
+                    autos.remove(&e.id);
+                } else if let Some(rung) = tx.transport.quality_rung() {
                     // 用户选的**就是**格号——不再经「速率 → 格号」反查
                     // （48 kHz 在阶梯上出现三次，那个反查已经没有唯一解）。
                     tx.rung.store(rung, Ordering::Relaxed);

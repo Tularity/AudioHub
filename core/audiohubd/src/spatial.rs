@@ -376,6 +376,28 @@ pub(crate) fn reap_failed(inner: &DaemonInner) {
             crate::conn::teardown_stream(inner, rx.stream_id, true);
         }
     }
+    let entries = crate::snapshot_sessions(inner);
+    for entry in entries {
+        if let Some(tx) = &entry.tx {
+            if tx.media_failed.load(Ordering::Acquire) {
+                let reason = lk(&tx.media_failure).clone().unwrap_or_else(|| "media source failed".into());
+                eprintln!("[audiohubd] closing transmit stream {}: {reason}", entry.id);
+                crate::conn::teardown_stream(inner, entry.id, true);
+            }
+        }
+    }
+}
+
+pub(crate) fn invalidate_peer_transmits(inner: &DaemonInner, connection_id: u64, offer: &SpatialOutputOffer) {
+    for entry in crate::snapshot_sessions(inner) {
+        if entry.conn.connection_id != connection_id { continue; }
+        if let Some(tx) = &entry.tx {
+            if tx.spatial.as_ref().is_some_and(|contract| !offer.contracts.contains(contract)) {
+                tx.fail_media("provider spatial PCM contract changed; a new stream is required".into());
+                crate::conn::teardown_stream(inner, entry.id, true);
+            }
+        }
+    }
 }
 
 pub(crate) fn status(inner: &DaemonInner) -> serde_json::Value {

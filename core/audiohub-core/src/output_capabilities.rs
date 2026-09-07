@@ -116,6 +116,18 @@ pub fn default_output_capabilities() -> NativeOutputCapabilities {
     platform::query()
 }
 
+pub(crate) fn start_spatial_output(
+    config: crate::spatial_output::SpatialOutputConfig,
+) -> anyhow::Result<crate::spatial_output::SpatialOutput> {
+    #[cfg(target_os = "windows")]
+    return platform::start_spatial_output(config);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = config;
+        anyhow::bail!("native spatial output is not implemented on this platform")
+    }
+}
+
 #[cfg(target_os = "windows")]
 #[path = "output_capabilities_windows.rs"]
 mod platform;

@@ -4,6 +4,7 @@ pub mod devlat;
 pub mod dsp;
 pub mod latency;
 pub mod output_capabilities;
+pub mod spatial_output;
 pub mod permissions;
 pub mod sysaudio;
 pub mod volindep;

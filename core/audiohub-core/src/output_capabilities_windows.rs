@@ -7,6 +7,10 @@ use std::slice;
 
 use super::{NativeOutputCapabilities, OutputMixFormat, SpatialAudioCapabilities};
 
+#[path = "spatial_output_windows.rs"]
+mod spatial_renderer;
+pub(super) use spatial_renderer::start_spatial_output;
+
 type Hresult = i32;
 
 const COINIT_MULTITHREADED: u32 = 0;
@@ -169,9 +173,15 @@ struct ISpatialAudioClientVtbl {
     get_max_dynamic_object_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> Hresult,
     get_supported_audio_object_format_enumerator: usize,
     get_max_frame_count: usize,
-    is_audio_object_format_supported: usize,
+    is_audio_object_format_supported:
+        unsafe extern "system" fn(*mut c_void, *const WaveFormatEx) -> Hresult,
     is_spatial_audio_stream_available: usize,
-    activate_spatial_audio_stream: usize,
+    activate_spatial_audio_stream: unsafe extern "system" fn(
+        *mut c_void,
+        *const c_void,
+        *const Guid,
+        *mut *mut c_void,
+    ) -> Hresult,
 }
 
 #[repr(C)]

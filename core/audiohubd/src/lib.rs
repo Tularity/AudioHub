@@ -52,6 +52,7 @@ mod rtsafe;
 /// 延迟目标的伺服回路（纯函数 + 一拍驱动）。
 mod servo;
 mod settings;
+mod spatial;
 /// Tier 1（M8 降级链路）：媒体走第二条 TCP 连接。附着、写线程、陈旧闸门、读线程。
 mod tcpmedia;
 /// 传输档位在 daemon 侧的活体状态：用户选了什么、媒体面真的在做什么。
@@ -566,6 +567,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         state: Mutex::new(DaemonState {
             conns: HashMap::new(),
             sessions: HashMap::new(),
+            stream_claims: HashMap::new(),
             pairing: None,
         }),
         rx_table: RwLock::new(HashMap::new()),
@@ -768,6 +770,7 @@ pub(crate) struct PairingMode {
 pub(crate) struct DaemonState {
     pub conns: HashMap<String, Arc<ConnShared>>,
     pub sessions: HashMap<u32, SessionEntry>,
+    pub(crate) stream_claims: HashMap<u32, Arc<conn::StreamClaim>>,
     pub pairing: Option<PairingMode>,
 }
 
@@ -1324,6 +1327,7 @@ pub(crate) fn status_with_hal(
             "native_output".to_string(),
             serde_json::to_value(lk(&inner.native_output).clone())?,
         );
+        obj.insert("spatial_output".to_string(), spatial::status(inner));
     }
     Ok(v)
 }
@@ -1797,6 +1801,7 @@ pub(crate) struct ConnShared {
     pub(crate) peer_audio_capabilities: Mutex<PeerAudioCapabilitiesCell>,
     pub(crate) peer_native_output:
         Mutex<Option<audiohub_core::output_capabilities::NativeOutputObservation>>,
+    pub(crate) peer_spatial_output: Mutex<Option<audiohub_net::secure::SpatialOutputOffer>>,
 }
 
 /// The peer's advertised mode, with "unknown" and "unrecognised" kept apart.
@@ -2637,11 +2642,11 @@ impl PostMix {
         for o in out.iter_mut().skip(n) {
             *o = 0.0;
         }
-        let cap = POST_MIX_CAP * self.channels.clamp(1, 2) as usize;
+        let cap = POST_MIX_CAP * self.channels.clamp(1, 12) as usize;
         if self.fifo.len() > cap {
             let excess = self.fifo.len() - cap;
             self.fifo.drain(..excess);
-            self.dropped += (excess / self.channels.clamp(1, 2) as usize) as u64;
+            self.dropped += (excess / self.channels.clamp(1, 12) as usize) as u64;
         }
     }
 
@@ -2649,7 +2654,7 @@ impl PostMix {
     pub(crate) fn depth(&self) -> StageDepth {
         StageDepth {
             id: StageId::PostMix,
-            samples: (self.fifo.len() / self.channels.clamp(1, 2) as usize) as u32,
+            samples: (self.fifo.len() / self.channels.clamp(1, 12) as usize) as u32,
             capacity: POST_MIX_CAP as u32,
             rate: 48_000, // 解码后固定 48k，与设备速率无关
             dropped: Some(self.dropped),
@@ -2776,6 +2781,7 @@ pub(crate) struct RxStream {
     pub crypto: MediaCrypto,
     pub verify_freq: Option<f32>,
     pub channels: u8,
+    pub(crate) spatial: Option<Mutex<spatial::SpatialReceive>>,
     pub is_spk: bool, // feeds the mixer sum (spk-recv on the provider)
     pub monitor: bool,
     /// Named output device this stream is ALSO rendered into (spec-m4c §B).
@@ -2880,6 +2886,7 @@ impl RxStream {
             verify_freq,
             channels,
             is_spk,
+            spatial: None,
             monitor,
             bridge,
             hal_slot,
@@ -3628,6 +3635,10 @@ fn attach_output_tails(
     rx: &RxStream,
     p: &mut PipelineLatency,
 ) {
+    if let Some(spatial) = &rx.spatial {
+        spatial::append_output_latency(p, lk(spatial).queued_frames());
+        return;
+    }
     let mut pushed = false;
     // 真实默认输出：只有真的往它送音频的流才经历这一级。
     if rx.is_spk || rx.monitor {
@@ -4427,6 +4438,7 @@ fn ticker_loop(inner: Arc<DaemonInner>) {
             // for the reason above — that thread's 200 ms cadence is spoken
             // for.
             autotier::watchdog_pass(&inner);
+            spatial::reap_failed(&inner);
             let epoch = inner.dev_out_epoch.load(Ordering::Relaxed);
             let output_changed = epoch != dev_epoch;
             dev_epoch = epoch;

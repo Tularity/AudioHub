@@ -1443,7 +1443,7 @@ fn convert_channels(input: &[f32], src_channels: u8, dst_channels: u8, out: &mut
 /// 伺服读的 `JitterBuffer::target()` 含欠载惩罚，所以它的输出也是
 /// 有效深度。换算回内部基线必须由 JB 自己做：它才拥有惩罚项，直接
 /// 绕经 `update_target` 会把惩罚再加一次，使“要从 10 降到 9”反而不降。
-fn steer_jitter_target(jb: &mut audiohub_net::media::JitterBuffer, want: u32) {
+pub(crate) fn steer_jitter_target(jb: &mut audiohub_net::media::JitterBuffer, want: u32) {
     jb.set_target_effective(want);
 }
 
@@ -1558,7 +1558,7 @@ pub(crate) fn jb_tuning_for(path: &crate::tcpmedia::MediaPath) -> audiohub_net::
     }
 }
 
-fn reshape_jitter_envelope(
+pub(crate) fn reshape_jitter_envelope(
     st: &mut crate::JbState,
     target: audiohub_ipc::LatencyTarget,
     base: audiohub_net::media::JbTuning,
@@ -3488,6 +3488,10 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
                 c.spread.push(transit);
             }
             let mut decoded = Vec::new();
+            if rx.spatial.is_some() {
+                crate::spatial::receive(&rx, &h, &plain, jit_ms);
+                return;
+            }
             let dec = dsp::decode_pcm_into(&plain, depth, &mut decoded);
             if dec.nonfinite > 0 || dec.ragged > 0 {
                 // f32 档独有的故障面：一个 NaN 经 `mixer_loop` 的求和会扩散成
@@ -5389,6 +5393,10 @@ pub(crate) fn mixer_loop(
         let mut contrib: u32 = 0;
         let mut corr: Option<f64> = None;
         for s in &streams {
+            if s.spatial.is_some() {
+                crate::spatial::render(&inner, s, now_ms);
+                continue;
+            }
             let popped = lk(&s.jbs).jb.pop();
             let frame_len = F48 * s.channels as usize;
             lk(&s.post).advance(popped, &mut frame[..frame_len]);

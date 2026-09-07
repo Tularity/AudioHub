@@ -509,6 +509,7 @@ fn register_conn(
         peer_mode: Mutex::new(crate::PeerModeCell::Unheard),
         peer_audio_capabilities: Mutex::new(crate::PeerAudioCapabilitiesCell::Unheard),
         peer_native_output: Mutex::new(None),
+        peer_spatial_output: Mutex::new(None),
     });
     let mut st = lk(&inner.state);
     let keep_existing = st.conns.get(&conn.fp).map_or(false, |old| {
@@ -550,7 +551,10 @@ fn register_conn(
     });
     let _ = conn.send_msg(&local_audio_capabilities_msg());
     let observation = lk(&inner.native_output).clone();
-    let _ = conn.send_msg(&SessionMsg::NativeOutputCapabilities { observation });
+    let _ = conn.send_msg(&SessionMsg::NativeOutputCapabilities { observation: observation.clone() });
+    let _ = conn.send_msg(&SessionMsg::SpatialOutputCapabilities {
+        offer: crate::spatial::offer_for(&observation),
+    });
     // M8: if this peer is pinned to tier 1, start the media link now — before
     // any stream exists, so the first stream opens straight onto it. A stream
     // that opened first would be pinned to UDP for its whole life (design §5.1
@@ -704,16 +708,15 @@ pub(crate) fn close_peer_sessions_missing_local_endpoints(
 /// state lock after this insertion.
 fn insert_remote_session_if_endpoint_unchanged(
     inner: &DaemonInner,
-    stream_id: u32,
     entry: SessionEntry,
     endpoint_guard: Option<(MissingLocalEndpoint, u64)>,
+    reservation: &StreamReservation<'_>,
 ) -> Result<()> {
     let mut st = lk(&inner.state);
     if let Some((endpoint, started_epoch)) = endpoint_guard {
         endpoint_epoch_still_current_at_commit(endpoint, started_epoch, endpoint.epoch(inner))?;
     }
-    st.sessions.insert(stream_id, entry);
-    Ok(())
+    reservation.publish(&mut st, entry)
 }
 
 fn endpoint_epoch_still_current_at_commit(
@@ -915,6 +918,20 @@ fn current_peer_connection(inner: &DaemonInner, conn: &Arc<ConnShared>) -> bool 
 /// true = close this connection.
 fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg) -> bool {
     match msg {
+        SessionMsg::OpenSpatialStream { stream_id, media_salt_b64, contract, rx_latency } => {
+            let reply = match handle_remote_spatial_open(
+                inner, conn, stream_id, &media_salt_b64, contract, rx_latency.as_deref(),
+            ) {
+                Ok(()) => SessionMsg::AcceptStream { stream_id },
+                Err(error) => SessionMsg::RejectStream { stream_id, reason: format!("{error:#}") },
+            };
+            let _ = conn.send_msg(&reply);
+        }
+        SessionMsg::SpatialOutputCapabilities { offer } => {
+            if current_peer_connection(inner, conn) {
+                crate::spatial::accept_offer(&mut lk(&conn.peer_spatial_output), offer);
+            }
+        }
         SessionMsg::OpenStream {
             stream_id,
             kind,
@@ -1857,30 +1874,133 @@ fn decode_media_salt(b64: &str) -> Result<Vec<u8>> {
 /// Stream-count admission. Each stream costs a fan-out slot in the 10ms tx
 /// scheduler and a jitter buffer + pop in the 10ms mixer, so an unbounded peer
 /// can starve both loops for every other session.
-fn check_stream_admission(st: &DaemonState, conn: &Arc<ConnShared>) -> Result<()> {
-    if st.sessions.len() >= MAX_STREAMS_TOTAL {
-        bail!("daemon stream limit reached ({MAX_STREAMS_TOTAL})");
-    }
-    let mine = st
-        .sessions
-        .values()
-        .filter(|e| Arc::ptr_eq(&e.conn, conn))
-        .count();
-    if mine >= MAX_STREAMS_PER_CONN {
-        bail!("per-connection stream limit reached ({MAX_STREAMS_PER_CONN})");
-    }
-    Ok(())
+pub(crate) struct StreamClaim {
+    connection_id: u64,
 }
 
-fn claim_stream_id(inner: &DaemonInner, conn: &Arc<ConnShared>, stream_id: u32) -> Result<()> {
-    if rd(&inner.rx_table).contains_key(&stream_id) {
+fn reserve_pending_stream(
+    claims: &mut HashMap<u32, Arc<StreamClaim>>,
+    stream_id: u32,
+    connection_id: u64,
+    active_total: usize,
+    active_mine: usize,
+    already_used: bool,
+) -> Result<Arc<StreamClaim>> {
+    if already_used || claims.contains_key(&stream_id) {
         bail!("stream id {stream_id} in use");
     }
-    let st = lk(&inner.state);
-    if st.sessions.contains_key(&stream_id) {
-        bail!("stream id {stream_id} in use");
+    if active_total.saturating_add(claims.len()) >= MAX_STREAMS_TOTAL {
+        bail!("daemon stream limit reached ({MAX_STREAMS_TOTAL})");
     }
-    check_stream_admission(&st, conn)
+    let pending_mine = claims.values().filter(|claim| claim.connection_id == connection_id).count();
+    if active_mine.saturating_add(pending_mine) >= MAX_STREAMS_PER_CONN {
+        bail!("per-connection stream limit reached ({MAX_STREAMS_PER_CONN})");
+    }
+    let claim = Arc::new(StreamClaim { connection_id });
+    claims.insert(stream_id, claim.clone());
+    Ok(claim)
+}
+
+fn release_pending_stream(claims: &mut HashMap<u32, Arc<StreamClaim>>, stream_id: u32, claim: &Arc<StreamClaim>) {
+    if claims.get(&stream_id).is_some_and(|current| Arc::ptr_eq(current, claim)) {
+        claims.remove(&stream_id);
+    }
+}
+
+struct StreamReservation<'a> {
+    inner: &'a DaemonInner,
+    conn: Arc<ConnShared>,
+    stream_id: u32,
+    claim: Arc<StreamClaim>,
+}
+
+impl StreamReservation<'_> {
+    fn publish(&self, state: &mut DaemonState, entry: SessionEntry) -> Result<()> {
+        if entry.id != self.stream_id || !Arc::ptr_eq(&entry.conn, &self.conn)
+            || !state.stream_claims.get(&self.stream_id).is_some_and(|c| Arc::ptr_eq(c, &self.claim))
+        {
+            bail!("stream reservation is no longer owned by this opener");
+        }
+        if !self.conn.alive.load(Ordering::SeqCst)
+            || !state.conns.get(&self.conn.fp).is_some_and(|c| Arc::ptr_eq(c, &self.conn))
+        {
+            bail!("control connection changed while the stream was opening");
+        }
+        if state.sessions.contains_key(&self.stream_id) {
+            bail!("stream id {} was already committed", self.stream_id);
+        }
+        state.sessions.insert(self.stream_id, entry);
+        release_pending_stream(&mut state.stream_claims, self.stream_id, &self.claim);
+        Ok(())
+    }
+}
+
+impl Drop for StreamReservation<'_> {
+    fn drop(&mut self) {
+        release_pending_stream(&mut lk(&self.inner.state).stream_claims, self.stream_id, &self.claim);
+    }
+}
+
+fn claim_stream_id<'a>(inner: &'a DaemonInner, conn: &Arc<ConnShared>, stream_id: u32) -> Result<StreamReservation<'a>> {
+    let mut state = lk(&inner.state);
+    if !conn.alive.load(Ordering::SeqCst)
+        || !state.conns.get(&conn.fp).is_some_and(|current| Arc::ptr_eq(current, conn))
+    {
+        bail!("control connection is no longer current");
+    }
+    let used = state.sessions.contains_key(&stream_id) || rd(&inner.rx_table).contains_key(&stream_id);
+    let total = state.sessions.len();
+    let mine = state.sessions.values().filter(|entry| Arc::ptr_eq(&entry.conn, conn)).count();
+    let claim = reserve_pending_stream(&mut state.stream_claims, stream_id, conn.connection_id, total, mine, used)?;
+    Ok(StreamReservation { inner, conn: conn.clone(), stream_id, claim })
+}
+
+#[cfg(test)]
+mod spatial_admission_tests {
+    use super::*;
+
+    #[test]
+    fn spatial_concurrent_openers_cannot_reserve_the_same_stream_id() {
+        let claims = Arc::new(Mutex::new(HashMap::new()));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (1..=2).map(|owner| {
+            let claims = Arc::clone(&claims);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                reserve_pending_stream(&mut lk(&claims), 42, owner, 0, 0, false).is_ok()
+            })
+        }).collect();
+        barrier.wait();
+        assert_eq!(workers.into_iter().map(|worker| usize::from(worker.join().unwrap())).sum::<usize>(), 1);
+        assert_eq!(lk(&claims).len(), 1);
+    }
+
+    #[test]
+    fn spatial_pending_activations_count_toward_global_and_connection_quotas() {
+        let mut claims = HashMap::new();
+        reserve_pending_stream(&mut claims, 1, 8, MAX_STREAMS_TOTAL - 1, 0, false).unwrap();
+        assert!(reserve_pending_stream(&mut claims, 2, 9, MAX_STREAMS_TOTAL - 1, 0, false).is_err());
+        claims.clear();
+        for id in 0..MAX_STREAMS_PER_CONN as u32 {
+            reserve_pending_stream(&mut claims, id, 8, 0, 0, false).unwrap();
+        }
+        assert!(reserve_pending_stream(&mut claims, 100, 8, 0, 0, false).is_err());
+        assert!(reserve_pending_stream(&mut claims, 100, 9, 0, 0, false).is_ok());
+        assert!(reserve_pending_stream(&mut claims, 101, 10, 0, 0, true).is_err());
+    }
+
+    #[test]
+    fn spatial_failed_opener_cannot_release_a_successor_claim_for_the_same_connection() {
+        let mut claims = HashMap::new();
+        let old = reserve_pending_stream(&mut claims, 42, 8, 0, 0, false).unwrap();
+        release_pending_stream(&mut claims, 42, &old);
+        let new = reserve_pending_stream(&mut claims, 42, 8, 0, 0, false).unwrap();
+        release_pending_stream(&mut claims, 42, &old);
+        assert!(Arc::ptr_eq(claims.get(&42).unwrap(), &new));
+        release_pending_stream(&mut claims, 42, &new);
+        assert!(claims.is_empty());
+    }
 }
 
 /// Starts a local media source for `stream_id` and waits for the tx thread to
@@ -1982,7 +2102,7 @@ fn handle_remote_open(
         break endpoint.zip(after);
     };
     let salt = decode_media_salt(media_salt_b64)?;
-    claim_stream_id(inner, conn, stream_id)?;
+    let reservation = claim_stream_id(inner, conn, stream_id)?;
     // plan §15：档位的初值随 `OpenStream` 一起到，于是从第一个媒体包起对端要的
     // 档位就在生效。只有增量消息的话，这中间有一个窗口跑我们自己的默认值——
     // 那正是「我设的值此刻没有在生效」这一种最难解释的现象。
@@ -2041,7 +2161,7 @@ fn handle_remote_open(
                 media_tier,
             };
             if let Err(e) =
-                insert_remote_session_if_endpoint_unchanged(inner, stream_id, entry, endpoint_guard)
+                insert_remote_session_if_endpoint_unchanged(inner, entry, endpoint_guard, &reservation)
             {
                 // This receive stream became externally reachable when it was
                 // put in rx_table. Undo that publication before rejecting the
@@ -2089,7 +2209,7 @@ fn handle_remote_open(
                 media_tier,
             };
             if let Err(e) =
-                insert_remote_session_if_endpoint_unchanged(inner, stream_id, entry, endpoint_guard)
+                insert_remote_session_if_endpoint_unchanged(inner, entry, endpoint_guard, &reservation)
             {
                 // start_tx_stream already installed the source/stream in the
                 // media engine. No SessionEntry exists yet, so remove it via
@@ -2099,6 +2219,66 @@ fn handle_remote_open(
             }
         }
         other => bail!("unknown dir {other}"),
+    }
+    Ok(())
+}
+
+fn handle_remote_spatial_open(
+    inner: &Arc<DaemonInner>,
+    conn: &Arc<ConnShared>,
+    stream_id: u32,
+    media_salt_b64: &str,
+    contract: audiohub_net::spatial_media::SpatialMediaContract,
+    rx_latency: Option<&str>,
+) -> Result<()> {
+    if let Some(reason) = haldev::refuse_being_used(haldev::effective_mode(inner)) {
+        bail!("{reason}");
+    }
+    let latency = rx_latency.map(|value| {
+        audiohub_ipc::LatencyTarget::parse(value).ok_or_else(|| anyhow!("invalid spatial latency target"))
+    }).transpose()?;
+    crate::spatial::require_current(&contract, &lk(&inner.native_output))?;
+    let salt = decode_media_salt(media_salt_b64)?;
+    let reservation = claim_stream_id(inner, conn, stream_id)?;
+    let output_epoch = inner.dev_out_epoch.load(Ordering::Acquire);
+    let spatial = crate::spatial::SpatialReceive::start(contract.clone(), output_epoch)?;
+    // Native activation is asynchronous; neither a mode change nor a new
+    // observation while it was opening can authorize the old contract.
+    if let Some(reason) = haldev::refuse_being_used(haldev::effective_mode(inner)) {
+        bail!("{reason}");
+    }
+    crate::spatial::require_current(&contract, &lk(&inner.native_output))?;
+    let path = conn.current_media_path();
+    let media_tier = path.tier_wire();
+    let tuning = engine::jb_tuning_for(&path);
+    let mut rx = RxStream::new(
+        stream_id, &conn.rx_key, &salt, None,
+        false, // Native spatial output never enters the ordinary stereo sum.
+        false, None, None, path, 2,
+    );
+    rx.channels = contract.channels();
+    {
+        let state = rx.jbs.get_mut().unwrap_or_else(|e| e.into_inner());
+        state.channels = contract.channels();
+        state.jb = audiohub_net::media::JitterBuffer::with_tuning_channels(2, tuning, contract.channels());
+    }
+    rx.post.get_mut().unwrap_or_else(|e| e.into_inner()).channels = contract.channels();
+    rx.spatial = Some(Mutex::new(spatial));
+    let rx = Arc::new(rx);
+    let pushed = Arc::new(crate::PushedTransport::default());
+    *lk(&pushed.rx_latency) = latency;
+    let entry = SessionEntry {
+        id: stream_id, conn: conn.clone(), kind: KIND_SPK.to_string(), dir: DIR_RECV.to_string(),
+        source: None, rx: Some(rx.clone()), tx: None,
+        volume: Arc::new(VolumeCell::new(true)), replay: None, origin: SessionOrigin::Peer,
+        peer_lat: Arc::new(PeerLatCell::new()), pushed, armed_conn_ms: conn.clock_ms(), media_tier,
+    };
+    wr(&inner.rx_table).insert(stream_id, rx);
+    if let Err(error) = insert_remote_session_if_endpoint_unchanged(
+        inner, entry, Some((MissingLocalEndpoint::DefaultOutput, output_epoch)), &reservation,
+    ) {
+        wr(&inner.rx_table).remove(&stream_id);
+        return Err(error);
     }
     Ok(())
 }
@@ -2579,6 +2759,9 @@ pub(crate) fn teardown_stream(inner: &DaemonInner, stream_id: u32, notify_remote
     let entry = lk(&inner.state).sessions.remove(&stream_id);
     let Some(e) = entry else { return };
     if let Some(rx) = &e.rx {
+        if let Some(spatial) = &rx.spatial {
+            lk(spatial).stop();
+        }
         wr(&inner.rx_table).remove(&stream_id);
         if let Some(name) = &rx.bridge {
             engine::release_bridge(inner, name);
@@ -3244,7 +3427,8 @@ fn alloc_stream_id(inner: &DaemonInner) -> u32 {
         if id == 0 || rd(&inner.rx_table).contains_key(&id) {
             continue;
         }
-        if lk(&inner.state).sessions.contains_key(&id) {
+        let state = lk(&inner.state);
+        if state.sessions.contains_key(&id) || state.stream_claims.contains_key(&id) {
             continue;
         }
         return id;
@@ -3439,10 +3623,7 @@ pub(crate) fn open_session_from(
     let stream_id = alloc_stream_id(inner);
     // the same caps a remote opener is held to (B7): locally driven opens must
     // not be the way to starve the 10ms loops either
-    {
-        let st = lk(&inner.state);
-        check_stream_admission(&st, &conn)?;
-    }
+    let reservation = claim_stream_id(inner, &conn, stream_id)?;
     // Opened before any stream state exists (every later failure path runs
     // `unwind`), and never resolved to the default output: a bridge that
     // silently played out of the speakers would look like it worked while no
@@ -3633,10 +3814,7 @@ pub(crate) fn open_session_from(
                 .conns
                 .get(&conn.fp)
                 .map_or(false, |c| Arc::ptr_eq(c, &conn));
-        if live {
-            st.sessions.insert(stream_id, entry.clone());
-        }
-        live
+        live && reservation.publish(&mut st, entry.clone()).is_ok()
     };
     if !inserted {
         // `unwind` takes the media source down too, so nothing extra is needed

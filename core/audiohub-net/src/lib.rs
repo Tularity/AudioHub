@@ -19,5 +19,6 @@ pub mod muxio;
 pub mod packet;
 pub mod pairing;
 pub mod secure;
+pub mod spatial_media;
 pub mod session;
 pub mod stats;

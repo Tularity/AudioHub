@@ -63,6 +63,9 @@ fn publish(inner: &DaemonInner, capabilities: NativeOutputCapabilities) {
         let _ = peer.send_msg(&SessionMsg::NativeOutputCapabilities {
             observation: observation.clone(),
         });
+        let _ = peer.send_msg(&SessionMsg::SpatialOutputCapabilities {
+            offer: crate::spatial::offer_for(&observation),
+        });
     }
 }
 

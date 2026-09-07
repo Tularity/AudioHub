@@ -689,7 +689,7 @@ impl InterleavedLinearResampler {
     }
 
     fn build(src: u32, dst: u32, channels: u8, servoed: bool) -> Self {
-        let channels = channels.clamp(1, 2) as usize;
+        let channels = channels.clamp(1, 12) as usize;
         let mut lanes = Vec::with_capacity(channels);
         let mut lane_in = Vec::with_capacity(channels);
         let mut lane_out = Vec::with_capacity(channels);

@@ -631,7 +631,7 @@ impl JitterBuffer {
     }
 
     pub fn with_tuning_channels(target: u32, cfg: JbTuning, channels: u8) -> Self {
-        let channels = channels.clamp(1, 2) as usize;
+        let channels = channels.clamp(1, 12) as usize;
         JitterBuffer {
             frames: BTreeMap::new(),
             next_seq: None,

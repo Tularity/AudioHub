@@ -169,9 +169,30 @@ fn legacy_max_media_channels() -> u8 {
     1
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpatialOutputOffer {
+    pub revision: u64,
+    pub contracts: Vec<crate::spatial_media::SpatialMediaContract>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionMsg {
+    /// A separate request prevents older peers from accepting an extension
+    /// they would ignore on an ordinary OpenStream. Missing support is a timeout
+    /// or rejection, never permission to send this payload to a stereo stream.
+    OpenSpatialStream {
+        stream_id: u32,
+        media_salt_b64: String,
+        contract: crate::spatial_media::SpatialMediaContract,
+        #[serde(default)]
+        rx_latency: Option<String>,
+    },
+    /// Accepted fixed-layout PCM contracts, not a Dolby certification claim.
+    /// Raw native observations remain a separate message.
+    SpatialOutputCapabilities {
+        offer: SpatialOutputOffer,
+    },
     OpenStream {
         stream_id: u32,
         kind: String, // "mic" | "spk", from the OpenStream sender's perspective
@@ -1053,6 +1074,28 @@ mod wire_compat_tests {
             _ => panic!("native output message changed kind"),
         }
         assert!(!json.contains("max_media_channels"));
+    }
+
+    #[test]
+    fn spatial_open_is_a_distinct_request_with_an_exact_provider_contract() {
+        let contract = crate::spatial_media::SpatialMediaContract {
+            version: crate::spatial_media::VERSION, provider_revision: 7,
+            endpoint_id: "provider-output".into(), active_format: "native-format".into(),
+            layout: audiohub_core::spatial_output::SpeakerLayout::Immersive714,
+        };
+        let message = SessionMsg::OpenSpatialStream {
+            stream_id: 42, media_salt_b64: "AAAAAAAAAAAAAAAAAAAAAA==".into(),
+            contract: contract.clone(), rx_latency: None,
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&json).unwrap()["type"], "open_spatial_stream");
+        assert!(serde_json::from_str::<LegacySessionMsg>(&json).is_err());
+        let SessionMsg::OpenSpatialStream { contract: decoded, .. } = serde_json::from_str(&json).unwrap() else {
+            panic!("spatial request changed kind");
+        };
+        assert_eq!(decoded, contract);
+        assert_eq!(crate::media::MAX_MEDIA_CHANNELS, 2);
+        assert_eq!(crate::media::MAX_WIRE_PARTS, 4);
     }
 
     #[test]

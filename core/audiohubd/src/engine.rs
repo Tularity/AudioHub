@@ -2470,6 +2470,76 @@ mod spatial_lifecycle_integration_tests {
         (LifecycleDaemon { inner, tx_cmds: tx_recv, remote, dir }, conn)
     }
 
+    fn tier1_connection_shutdown(attach_after_close: bool) {
+        use std::io::Read;
+        use std::net::Shutdown;
+
+        let (mut daemon, conn) = daemon("tier1-shutdown");
+        crate::lk(&daemon.inner.state).conns.insert(conn.fp.clone(), conn.clone());
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut remote = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        remote.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (mut socket, _) = listener.accept().unwrap();
+        let ticket = crate::tcpmedia::mint_ticket_for_test(&daemon.inner, &conn.fp);
+        let (owner, claim) = crate::tcpmedia::claim(&daemon.inner, &mut socket, &ticket).unwrap();
+        assert!(matches!(audiohub_net::control::read_frame(&mut remote).unwrap(), audiohub_net::control::ControlMsg::Ok {}));
+        if attach_after_close {
+            crate::conn::drop_conn(&daemon.inner, &conn.fp, "close before media publication");
+        }
+        let inner = daemon.inner.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = crate::tcpmedia::serve(&inner, &owner, socket, claim);
+            drop(owner);
+            let _ = done_tx.send(result);
+        });
+        let mut published = false;
+        let mut killed_at_teardown = true;
+        if !attach_after_close {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if let MediaPath::Tcp(link) = conn.current_media_path() {
+                    published = true;
+                    crate::conn::drop_conn(&daemon.inner, &conn.fp, "close attached media");
+                    killed_at_teardown = !link.is_alive();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        // An unfixed implementation must fail without leaving socket threads
+        // behind or depending on the test process exiting to release them.
+        if result.is_err() {
+            let _ = remote.shutdown(Shutdown::Both);
+            daemon.inner.shutdown.store(true, Ordering::SeqCst);
+        }
+        reader.join().expect("tier1 reader joins its writer");
+        assert!(attach_after_close || published, "media path never attached");
+        result.expect("closed control connection retained its media socket").unwrap();
+        assert!(killed_at_teardown, "teardown did not kill its attached media link");
+        assert_eq!(remote.read(&mut [0u8; 1]).unwrap(), 0, "media peer did not receive EOF");
+        assert!(!conn.alive.load(Ordering::SeqCst));
+        assert!(crate::lk(&daemon.inner.state).conns.is_empty());
+        let weak = Arc::downgrade(&conn);
+        drop(conn);
+        assert!(weak.upgrade().is_none(), "media worker retained the control connection");
+        assert!(matches!(daemon.remote.recv_timeout(Duration::from_secs(1)).unwrap(), Some(SessionMsg::Bye {})));
+        let closed = daemon.remote.recv_timeout(Duration::from_secs(1))
+            .expect_err("control peer did not receive EOF");
+        assert_eq!(closed.to_string(), "connection closed by peer");
+    }
+
+    #[test]
+    fn tier1_teardown_closes_media_and_releases_control_socket() {
+        tier1_connection_shutdown(false);
+    }
+
+    #[test]
+    fn tier1_attach_after_control_teardown_cannot_orphan_socket_threads() {
+        tier1_connection_shutdown(true);
+    }
+
     fn session(id: u32, conn: &Arc<ConnShared>, tx: &Arc<TxShared>) -> SessionEntry {
         SessionEntry {
             id,

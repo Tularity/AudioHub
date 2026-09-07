@@ -2785,13 +2785,13 @@ pub(crate) fn teardown_stream(inner: &DaemonInner, stream_id: u32, notify_remote
 
 fn teardown_conn(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>) {
     conn.alive.store(false, Ordering::SeqCst);
-    // Tier 2: the control channel and the media path are the same socket, so
-    // this connection ending ends the mux — including when the end came from
-    // this side (`drop_conn`, `ping_and_reap`, a mode change), where nothing on
-    // the mux itself would ever notice. Idempotent, so the reader thread
-    // reaching the same call is harmless.
-    if let crate::tcpmedia::MediaPath::Framed(l) = conn.current_media_path() {
-        l.kill();
+    // Both stream transports own independent reader/writer threads. Tier 1's
+    // serve also retains this ConnShared, so leaving its link alive retains
+    // the old control socket as well. Killing either link is idempotent.
+    match conn.current_media_path() {
+        crate::tcpmedia::MediaPath::Tcp(l) => l.kill(),
+        crate::tcpmedia::MediaPath::Framed(l) => l.kill(),
+        crate::tcpmedia::MediaPath::Udp(_) => {}
     }
     for (_, tx) in lk(&conn.pending).drain() {
         let _ = tx.send(Err("connection closed".into()));

@@ -923,11 +923,22 @@ fn write_loop<W: Write>(link: &TcpMediaLink, w: &mut W, shutdown: &AtomicBool) {
 /// the datagram UDP would have delivered, so there is one decrypt path, one
 /// jitter buffer path, one set of statistics — and the frozen header assertions
 /// in `packet.rs` cover this transport for free.
-fn read_loop(inner: &Arc<DaemonInner>, link: &TcpMediaLink, s: &mut TcpStream, from: SocketAddr) {
+fn read_loop(
+    inner: &Arc<DaemonInner>,
+    conn: &ConnShared,
+    link: &TcpMediaLink,
+    s: &mut TcpStream,
+    from: SocketAddr,
+) {
     let mut dec = FrameDecoder::new();
     let mut scratch = [0u8; 8192];
     loop {
-        if !link.alive.load(Ordering::Relaxed) || inner.shutdown.load(Ordering::SeqCst) {
+        // Teardown can finish before serve publishes its link. The owning
+        // connection remains authoritative even if that teardown saw UDP.
+        if !conn.alive.load(Ordering::SeqCst)
+            || !link.alive.load(Ordering::Relaxed)
+            || inner.shutdown.load(Ordering::SeqCst)
+        {
             return;
         }
         let n = match s.read(&mut scratch) {
@@ -1029,7 +1040,7 @@ pub(crate) fn serve(
     conn.media_gate.announce();
     dlog!("[audiohubd] tier1 media attached to {} via {peer}", conn.fp);
 
-    read_loop(inner, &link, &mut s, peer);
+    read_loop(inner, conn, &link, &mut s, peer);
 
     // Teardown. Order matters: kill first so the writer stops re-queuing, then
     // shut the socket down so a writer parked inside `write` returns.

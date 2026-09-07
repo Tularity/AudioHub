@@ -56,7 +56,7 @@
 // ---------------------------------------------------------------- ring layout
 
 #define AUDIOHUB_RING_MAGIC        0x41485231u // 'AHR1'
-#define AUDIOHUB_RING_VERSION      1u
+#define AUDIOHUB_RING_VERSION      2u
 // Samples start here so the header (40 bytes) never shares a cache line with
 // frame 0; both sides hard-code it rather than deriving it from sizeof().
 #define AUDIOHUB_RING_DATA_OFFSET  64u
@@ -64,13 +64,14 @@
 #define AUDIOHUB_RING_MS           500u
 #define AUDIOHUB_RING_FRAMES       ((AUDIOHUB_SAMPLE_RATE / 1000u) * AUDIOHUB_RING_MS) // 24000
 #define AUDIOHUB_SPK_CHANNELS      2u
+#define AUDIOHUB_SPK_STORAGE_CHANNELS 12u
 #define AUDIOHUB_MIC_CHANNELS      1u
 
 // 16K covers the Apple-silicon page size and is a multiple of the x86_64 4K
 // one, so a single constant keeps both slices' mappings legal.
 #define AUDIOHUB_PAGE_ALIGN(n)     (((n) + 16383u) & ~16383u)
 #define AUDIOHUB_RING_BYTES(ch)    AUDIOHUB_PAGE_ALIGN(AUDIOHUB_RING_DATA_OFFSET + (AUDIOHUB_RING_FRAMES * (ch) * 4u))
-#define AUDIOHUB_SPK_BYTES         AUDIOHUB_RING_BYTES(AUDIOHUB_SPK_CHANNELS)
+#define AUDIOHUB_SPK_BYTES         AUDIOHUB_RING_BYTES(AUDIOHUB_SPK_STORAGE_CHANNELS)
 #define AUDIOHUB_MIC_BYTES         AUDIOHUB_RING_BYTES(AUDIOHUB_MIC_CHANNELS)
 
 // Single producer / single consumer. write_idx and read_idx are free-running
@@ -94,6 +95,9 @@ _Static_assert(offsetof(AudioHubRingHeader, read_idx) == 32, "ring header ABI dr
 _Static_assert(sizeof(AudioHubRingHeader) == 40, "ring header ABI drift");
 _Static_assert(sizeof(AudioHubRingHeader) <= AUDIOHUB_RING_DATA_OFFSET, "header overlaps sample area");
 _Static_assert(AUDIOHUB_RING_FRAMES == 24000u, "500ms @ 48k");
+_Static_assert(AUDIOHUB_SPK_STORAGE_CHANNELS == 12u, "speaker storage ABI drift");
+_Static_assert(AUDIOHUB_SPK_BYTES == 1163264u, "speaker mapping size ABI drift");
+_Static_assert(AUDIOHUB_MIC_BYTES == 98304u, "microphone mapping size ABI drift");
 
 static inline float* AudioHubRing_Data(AudioHubRingHeader* inHeader, uint32_t inDataOffset)
 {
@@ -162,6 +166,54 @@ static inline uint32_t AudioHubRing_Write(AudioHubRingHeader* inHeader, uint32_t
     return theCount;
 }
 
+// Producer side for a fixed-width storage ring carrying a smaller logical
+// interleaved format. The first N lanes hold the logical frame and every other
+// lane is zero, so changing layouts never exposes samples from an older wider
+// format. Geometry is private caller state, exactly like the generic helpers.
+static inline uint32_t AudioHubRing_WriteStrided(AudioHubRingHeader* inHeader,
+                                                 uint32_t inDataOffset,
+                                                 uint32_t inCapacityFrames,
+                                                 uint32_t inStorageChannelCount,
+                                                 uint32_t inLogicalChannelCount,
+                                                 const float* inFrames,
+                                                 uint32_t inFrameCount)
+{
+    if((inFrameCount == 0) || (inCapacityFrames == 0) || (inLogicalChannelCount == 0) ||
+       (inLogicalChannelCount > inStorageChannelCount))
+    {
+        return 0;
+    }
+    const uint64_t theWrite = atomic_load_explicit(&inHeader->write_idx, memory_order_relaxed);
+    const uint64_t theRead  = atomic_load_explicit(&inHeader->read_idx, memory_order_acquire);
+    uint64_t theUsed = theWrite - theRead;
+    if(theUsed > inCapacityFrames)
+    {
+        theUsed = inCapacityFrames;
+    }
+    uint32_t theCount = inCapacityFrames - (uint32_t)theUsed;
+    if(theCount > inFrameCount)
+    {
+        theCount = inFrameCount;
+    }
+    if(theCount == 0)
+    {
+        return 0;
+    }
+
+    float* theData = AudioHubRing_Data(inHeader, inDataOffset);
+    for(uint32_t theFrame = 0; theFrame < theCount; ++theFrame)
+    {
+        const uint32_t theRingFrame = (uint32_t)((theWrite + theFrame) % inCapacityFrames);
+        float* theDestination = theData + ((size_t)theRingFrame * inStorageChannelCount);
+        const float* theSource = inFrames + ((size_t)theFrame * inLogicalChannelCount);
+        memcpy(theDestination, theSource, (size_t)inLogicalChannelCount * sizeof(float));
+        memset(theDestination + inLogicalChannelCount, 0,
+               (size_t)(inStorageChannelCount - inLogicalChannelCount) * sizeof(float));
+    }
+    atomic_store_explicit(&inHeader->write_idx, theWrite + theCount, memory_order_release);
+    return theCount;
+}
+
 // Consumer side. Returns the number of frames actually read; the caller is
 // responsible for filling the remainder with silence.
 static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t inDataOffset, uint32_t inCapacityFrames, uint32_t inChannelCount, float* outFrames, uint32_t inFrameCount)
@@ -220,8 +272,9 @@ static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t 
 #define kAudioHubMsg_Control     0x41480003 // driver -> daemon, fire and forget
 #define kAudioHubMsg_Notify      0x41480004 // daemon -> driver, fire and forget
 #define kAudioHubMsg_Bind        0x41480005 // daemon -> driver, fire and forget
+#define kAudioHubMsg_Format      0x41480006 // bidirectional plain format transaction
 
-// v2: per-peer virtual devices (spec-m5b §4). Compared for EQUALITY by the
+// v4: per-peer virtual devices plus negotiated speaker layouts. Compared for EQUALITY by the
 // driver, in both directions, and a mismatch is a refusal with zero descriptors
 // — never a partial mix. A v2 driver publishes NO devices until a daemon binds
 // a slot, so version skew presents as "zero AudioHub devices in the system"
@@ -230,7 +283,7 @@ static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t 
 // grew 104 -> 472 bytes and the control message 48 -> 56, so a compatibility
 // shim would have to guess which layout it is holding. There is deliberately
 // none.
-#define kAudioHubProtocolVersion 3u
+#define kAudioHubProtocolVersion 4u
 
 // One (spk, mic) ring pair per slot, all created up front and never released;
 // binding a peer to a slot is a metadata operation, so the realtime path never
@@ -337,6 +390,25 @@ static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t 
 #define kAudioHubBindFlag_In      0x4u
 #define kAudioHubBindFlag_Dirs    (kAudioHubBindFlag_Out | kAudioHubBindFlag_In)
 
+// Speaker layouts and their supported-mask bits.
+#define kAudioHubLayout_Stereo          0u
+#define kAudioHubLayout_Surround51      1u
+#define kAudioHubLayout_Surround71      2u
+#define kAudioHubLayout_Immersive714    3u
+#define kAudioHubLayoutCount            4u
+#define kAudioHubLayoutMask(layout)     (1u << (layout))
+#define kAudioHubLayoutMask_All         0x0Fu
+
+// Format transaction ops. Only Offer/Quiesced/Accepted travel daemon->driver;
+// only Prepare/Committed/Ready/Aborted travel driver->daemon.
+#define kAudioHubFormat_Offer       1u
+#define kAudioHubFormat_Quiesced    2u
+#define kAudioHubFormat_Accepted    3u
+#define kAudioHubFormat_Prepare     4u
+#define kAudioHubFormat_Committed   5u
+#define kAudioHubFormat_Ready       6u
+#define kAudioHubFormat_Aborted     7u
+
 // Reply status codes
 #define kAudioHubStatus_OK              0u
 #define kAudioHubStatus_BadVersion      1u
@@ -374,10 +446,10 @@ typedef struct AudioHubHelloRequest
 // distinct objects; `descriptor_counts_well_past_thirty_two_still_fit_one_message`
 // shows 128 works too, so 32 is nowhere near a ceiling.
 //
-// GEOMETRY IS ONE SET OF SCALARS FOR ALL SLOTS. Every out ring is 48k/2ch and
-// every in ring 48k/1ch (risk 8: capability mirroring would need another
-// version bump), so the reply describes them once instead of 32 times. What is
-// per-slot is only the entry port.
+// GEOMETRY IS ONE SET OF SCALARS FOR ALL SLOTS. Every out ring has 48k/12-lane
+// physical storage and every in ring 48k/1ch, so
+// the reply describes immutable mapping geometry once. Current logical speaker
+// layouts are established separately by AudioHubFormatMsg.
 typedef struct AudioHubHelloReply
 {
     mach_msg_header_t          header;
@@ -448,6 +520,19 @@ typedef struct AudioHubBindMsg
     char              in_name[128];
 } AudioHubBindMsg;
 
+typedef struct AudioHubFormatMsg
+{
+    mach_msg_header_t header;
+    uint32_t          op;
+    uint32_t          endpoint;
+    uint32_t          generation;
+    uint32_t          layout;
+    uint32_t          supported_mask;
+    uint32_t          epoch;
+    uint64_t          session_id;
+    uint64_t          request_id;
+} AudioHubFormatMsg;
+
 _Static_assert(sizeof(mach_msg_header_t) == 24, "mach header ABI drift");
 _Static_assert(sizeof(mach_msg_body_t) == 4, "mach body ABI drift");
 _Static_assert(sizeof(mach_msg_port_descriptor_t) == 12, "port descriptor ABI drift");
@@ -455,7 +540,7 @@ _Static_assert(offsetof(AudioHubHelloRequest, control_port) == 28, "hello ABI dr
 _Static_assert(offsetof(AudioHubHelloRequest, protocol_version) == 40, "hello ABI drift");
 _Static_assert(sizeof(AudioHubHelloRequest) == 48, "hello ABI drift");
 
-// The v2 wire sizes below are literals on purpose: they are what the daemon's
+// The frozen wire sizes below are literals on purpose: they are what the daemon's
 // receive buffer, its own mirrored structs and test/tests/halwire.rs are all
 // sized against, so a slot-count edit must be a deliberate, visible change to
 // every one of them rather than something that silently reshapes the message.
@@ -479,6 +564,16 @@ _Static_assert(offsetof(AudioHubBindMsg, in_uid) == 152, "bind ABI drift");
 _Static_assert(offsetof(AudioHubBindMsg, out_name) == 216, "bind ABI drift");
 _Static_assert(offsetof(AudioHubBindMsg, in_name) == 344, "bind ABI drift");
 _Static_assert(sizeof(AudioHubBindMsg) == 472, "bind ABI drift");
+
+_Static_assert(offsetof(AudioHubFormatMsg, op) == 24, "format ABI drift");
+_Static_assert(offsetof(AudioHubFormatMsg, endpoint) == 28, "format ABI drift");
+_Static_assert(offsetof(AudioHubFormatMsg, generation) == 32, "format ABI drift");
+_Static_assert(offsetof(AudioHubFormatMsg, layout) == 36, "format ABI drift");
+_Static_assert(offsetof(AudioHubFormatMsg, supported_mask) == 40, "format ABI drift");
+_Static_assert(offsetof(AudioHubFormatMsg, epoch) == 44, "format ABI drift");
+_Static_assert(offsetof(AudioHubFormatMsg, session_id) == 48, "format ABI drift");
+_Static_assert(offsetof(AudioHubFormatMsg, request_id) == 56, "format ABI drift");
+_Static_assert(sizeof(AudioHubFormatMsg) == 64, "format ABI drift");
 
 #define kAudioHubFlag_Muted     0x1u
 #define kAudioHubFlag_IORunning 0x2u
@@ -520,6 +615,11 @@ _Static_assert(sizeof(AudioHubBindMsg) == 472, "bind ABI drift");
 // devices silently share one ring while every positive test still passes.
 typedef struct BridgeRing BridgeRing;
 
+// Control-plane exclusion only. Never called by an IOProc. If driver state is
+// also needed, acquire this before gPlugIn_StateMutex, never in reverse order.
+void AudioHubBridge_LockRingControl(BridgeRing* inRing);
+void AudioHubBridge_UnlockRingControl(BridgeRing* inRing);
+
 // The ring backing one endpoint (slot*2 + dir), constant for the life of the
 // process. NULL only before the service thread has built them, which is strictly
 // before any Bind can be dispatched, so a bind handler never sees NULL.
@@ -533,13 +633,12 @@ void AudioHubBridge_WriteRing(BridgeRing* inRing, const float* inFrames, uint32_
 // has not supplied (including "no daemon at all").
 void AudioHubBridge_ReadRing(BridgeRing* inRing, float* outFrames, uint32_t inFrameCount, uint32_t inChannelCount);
 
-// Service thread only. Unpublish returns with no IOProc inside the ring, so the
-// three below it are safe to call immediately afterwards.
+// Non-realtime control threads only. Unpublish returns with no IOProc inside the
+// ring, so paused-state mutations below are safe immediately afterwards.
 void AudioHubBridge_PublishRing(BridgeRing* inRing);
 void AudioHubBridge_UnpublishRing(BridgeRing* inRing);
-// Re-stamps the header AND zeroes both indices: only legal on a ring that is
-// unpublished AND that no daemon is looking at, i.e. slot retirement and slot
-// binding. Zeroing write_idx under a live reader makes its next read compute a
+// Re-stamps the header, clears storage and zeroes both indices: only legal on an
+// unpublished ring whose peer has quiesced. Zeroing write_idx under a live reader makes its next read compute a
 // 2^64 backlog, clamp to capacity and replay 500ms of the previous peer's audio
 // (spec-m5b §4.6) — the reason this is not called on disconnect any more.
 void AudioHubBridge_ResetRing(BridgeRing* inRing);
@@ -548,10 +647,14 @@ void AudioHubBridge_ResetRing(BridgeRing* inRing);
 // so the first frames a virtual microphone renders are not the previous
 // session's. Unpublished rings only.
 void AudioHubBridge_FlushRingConsumer(BridgeRing* inRing);
+// Paused speaker rings only. Changes private logical geometry; storage remains
+// twelve lanes and the peer-writable header remains physical geometry.
+int AudioHubBridge_SetSpeakerLayout(BridgeRing* inRing, uint32_t inLayout);
 
-// Non-zero while a daemon is attached. Only the service thread may ask: it is
-// the only thread that can act on the answer without it going stale.
+// Non-zero while a daemon is attached. Use SessionID for transaction identity.
 int AudioHubBridge_SessionActive(void);
+// Active Hello session, or zero while detached. Safe from non-realtime threads.
+uint64_t AudioHubBridge_SessionID(void);
 
 // What one control send did. "Retry" is a full queue — the message was NOT
 // delivered, so the caller must leave its sent marker alone and try again;
@@ -563,6 +666,13 @@ int AudioHubBridge_SessionActive(void);
 #define kAudioHubSend_Retry 1u
 #define kAudioHubSend_Dead  2u
 uint32_t AudioHubBridge_SendControl(uint32_t inOp, uint32_t inEndpoint, uint32_t inGeneration, uint64_t inWord);
+uint32_t AudioHubBridge_SendFormat(uint32_t inOp,
+                                  uint32_t inEndpoint,
+                                  uint32_t inGeneration,
+                                  uint32_t inLayout,
+                                  uint32_t inSupportedMask,
+                                  uint32_t inEpoch,
+                                  uint64_t inRequestID);
 
 // Everything the transport calls back into the driver for. All of these run on
 // the bridge service thread, one at a time, and none of them may block: this is
@@ -580,6 +690,8 @@ typedef struct AudioHubBridgeHooks
     // One Bind, already checked for shape, sender identity and session id. The
     // driver validates slot number and strings, since those need CoreFoundation.
     void (*bind)(const AudioHubBindMsg* inMsg);
+    // Authenticated, shape-checked Offer/Quiesced/Accepted message.
+    void (*format)(const AudioHubFormatMsg* inMsg);
     // The peer's real device reported a new volume. Must NOT post a volume back
     // or the two sides ping-pong forever.
     void (*notify_volume)(uint32_t inEndpoint, uint32_t inGeneration, float inScalar, int inMuted);

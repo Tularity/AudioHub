@@ -125,16 +125,17 @@
 
 typedef struct BridgeRing
 {
+    pthread_mutex_t    controlMutex;
     _Atomic(uint32_t)   inuse;    // IOProc calls in flight
     _Atomic(uint32_t)   valid;    // publish flag; hdr is only usable while set
     AudioHubRingHeader* hdr;      // set once at creation, never changes afterwards
     mach_vm_address_t   addr;
     mach_vm_size_t      size;
     mach_port_t         entry;    // memory entry port we own and hand out per Hello
-    // Geometry, written once at creation and never again. Every bound the
-    // IOProc path indexes with comes from HERE and not from the shared header,
-    // which the peer maps read/write — see AudioHubRing_Write in the header.
-    uint32_t            channels;
+    // Physical geometry is immutable. activeChannels is private logical speaker
+    // state and changes only while valid is clear and inuse has drained.
+    uint32_t            storageChannels;
+    uint32_t            activeChannels; // logical speaker channels; changed only while unpublished
     uint32_t            capacityFrames;
     uint32_t            dataOffset;
 } BridgeRing;
@@ -144,9 +145,19 @@ typedef struct BridgeRing
 // IOProc rule at the top of this file: that is what keeps "an IOProc can never
 // race an unmap" true after the pool grew from one pair to sixteen. Binding a
 // peer to a slot moves no memory; it only changes which device record points
-// here. The whole pool is 16 * (192K + 96K) = 4.5 MiB of zero-fill-on-demand VM,
+// here. The whole pool is about 19 MiB of zero-fill-on-demand VM,
 // so an unused slot costs address space and nothing else.
 static BridgeRing gRings[kAudioHubMaxEndpoints];
+
+void AudioHubBridge_LockRingControl(BridgeRing* inRing)
+{
+    if((inRing != NULL) && (inRing->hdr != NULL)) pthread_mutex_lock(&inRing->controlMutex);
+}
+
+void AudioHubBridge_UnlockRingControl(BridgeRing* inRing)
+{
+    if((inRing != NULL) && (inRing->hdr != NULL)) pthread_mutex_unlock(&inRing->controlMutex);
+}
 
 BridgeRing* AudioHubBridge_RingForEndpoint(uint32_t inEndpoint)
 {
@@ -176,10 +187,6 @@ static inline void bridge_release(BridgeRing* inRing)
 // Service thread only. Returns with no IOProc inside the ring.
 static void bridge_ring_unpublish(BridgeRing* inRing)
 {
-    if(atomic_load(&inRing->valid) == 0)
-    {
-        return;
-    }
     atomic_store(&inRing->valid, 0); // seq_cst: pairs with the IOProc's inuse++
     while(atomic_load(&inRing->inuse) != 0)
     {
@@ -204,30 +211,34 @@ static void bridge_ring_restamp(BridgeRing* inRing)
     inRing->hdr->magic           = AUDIOHUB_RING_MAGIC;
     inRing->hdr->version         = AUDIOHUB_RING_VERSION;
     inRing->hdr->sample_rate     = AUDIOHUB_SAMPLE_RATE;
-    inRing->hdr->channels        = inRing->channels;
+    inRing->hdr->channels        = inRing->storageChannels;
     inRing->hdr->capacity_frames = inRing->capacityFrames;
     inRing->hdr->reserved        = 0;
 }
 
-// Service thread only, and only while the ring is unpublished AND no daemon is
-// looking: the IOProc is the producer of one index and the consumer of the
-// other, so this would be a data race if anything could still be inside
-// AudioHubRing_Write/Read — and zeroing an index under a LIVE peer is worse than
-// a race. The two free-running counters only mean anything relative to each
-// other: drop write_idx to 0 while the daemon's read_idx is at 100000 and its
-// next read computes avail = 0 - 100000, clamps that to one full buffer and
-// hands the peer 500ms of stale audio as if it were new (spec-m5b §4.6). That is
-// why this is reachable from exactly two places — Retiring->Free and Free->Bound
-// — and no longer from bridge_disconnect.
+// Non-realtime only, after unpublish has drained every IOProc and the peer has
+// quiesced. Zeroing one free-running index under a live peer can turn subtraction
+// into a full-buffer stale replay; clearing storage as well is required when a
+// narrower layout follows a wider one. Disconnect itself therefore only
+// unpublishes/restamps, while bind/retire and the format commit own resets.
 void AudioHubBridge_ResetRing(BridgeRing* inRing)
 {
     if((inRing == NULL) || (inRing->hdr == NULL))
     {
         return;
     }
+    AudioHubBridge_LockRingControl(inRing);
+    if((atomic_load(&inRing->valid) != 0) || (atomic_load(&inRing->inuse) != 0))
+    {
+        AudioHubBridge_UnlockRingControl(inRing);
+        return;
+    }
     bridge_ring_restamp(inRing);
+    memset(AudioHubRing_Data(inRing->hdr, inRing->dataOffset), 0,
+           (size_t)inRing->capacityFrames * inRing->storageChannels * sizeof(float));
     atomic_store_explicit(&inRing->hdr->write_idx, 0, memory_order_relaxed);
     atomic_store_explicit(&inRing->hdr->read_idx, 0, memory_order_release);
+    AudioHubBridge_UnlockRingControl(inRing);
 }
 
 // Only the CONSUMER's index, which for an IN ring is ours. Safe against any
@@ -239,15 +250,42 @@ void AudioHubBridge_FlushRingConsumer(BridgeRing* inRing)
     {
         return;
     }
+    AudioHubBridge_LockRingControl(inRing);
     const uint64_t theWrite = atomic_load_explicit(&inRing->hdr->write_idx, memory_order_acquire);
     atomic_store_explicit(&inRing->hdr->read_idx, theWrite, memory_order_release);
+    AudioHubBridge_UnlockRingControl(inRing);
+}
+
+static uint32_t bridge_layout_channels(uint32_t inLayout)
+{
+    static const uint32_t kChannels[kAudioHubLayoutCount] = { 2u, 6u, 8u, 12u };
+    return (inLayout < kAudioHubLayoutCount) ? kChannels[inLayout] : 0u;
+}
+
+int AudioHubBridge_SetSpeakerLayout(BridgeRing* inRing, uint32_t inLayout)
+{
+    AudioHubBridge_LockRingControl(inRing);
+    const uint32_t theChannels = bridge_layout_channels(inLayout);
+    if((inRing == NULL) || (inRing->hdr == NULL) ||
+       (inRing->storageChannels != AUDIOHUB_SPK_STORAGE_CHANNELS) ||
+       (theChannels == 0) || (atomic_load(&inRing->valid) != 0) ||
+       (atomic_load(&inRing->inuse) != 0))
+    {
+        AudioHubBridge_UnlockRingControl(inRing);
+        return 0;
+    }
+    inRing->activeChannels = theChannels;
+    AudioHubBridge_UnlockRingControl(inRing);
+    return 1;
 }
 
 void AudioHubBridge_PublishRing(BridgeRing* inRing)
 {
     if((inRing != NULL) && (inRing->hdr != NULL))
     {
+        AudioHubBridge_LockRingControl(inRing);
         atomic_store(&inRing->valid, 1);
+        AudioHubBridge_UnlockRingControl(inRing);
     }
 }
 
@@ -255,7 +293,9 @@ void AudioHubBridge_UnpublishRing(BridgeRing* inRing)
 {
     if(inRing != NULL)
     {
+        AudioHubBridge_LockRingControl(inRing);
         bridge_ring_unpublish(inRing);
+        AudioHubBridge_UnlockRingControl(inRing);
     }
 }
 
@@ -269,6 +309,12 @@ void AudioHubBridge_UnpublishRing(BridgeRing* inRing)
 // mach_vm_map's `copy` argument below must stay FALSE for the same reason.
 static int bridge_ring_create(BridgeRing* inRing, uint32_t inChannels, mach_vm_size_t inBytes)
 {
+    pthread_mutexattr_t theAttributes;
+    if(pthread_mutexattr_init(&theAttributes) != 0) return 0;
+    const int theAttributeResult = pthread_mutexattr_settype(&theAttributes, PTHREAD_MUTEX_RECURSIVE);
+    const int theMutexResult = theAttributeResult == 0 ? pthread_mutex_init(&inRing->controlMutex, &theAttributes) : theAttributeResult;
+    pthread_mutexattr_destroy(&theAttributes);
+    if(theMutexResult != 0) return 0;
     memory_object_size_t theSize = inBytes;
     mach_port_t theEntry = MACH_PORT_NULL;
     kern_return_t theResult = mach_make_memory_entry_64(mach_task_self(),
@@ -323,7 +369,9 @@ static int bridge_ring_create(BridgeRing* inRing, uint32_t inChannels, mach_vm_s
     inRing->addr           = theAddr;
     inRing->size           = inBytes;
     inRing->entry          = theEntry;
-    inRing->channels       = inChannels;
+    inRing->storageChannels = inChannels;
+    inRing->activeChannels  = (inChannels == AUDIOHUB_SPK_STORAGE_CHANNELS)
+        ? AUDIOHUB_SPK_CHANNELS : inChannels;
     inRing->capacityFrames = AUDIOHUB_RING_FRAMES;
     inRing->dataOffset     = AUDIOHUB_RING_DATA_OFFSET;
     return 1;
@@ -347,10 +395,12 @@ void AudioHubBridge_WriteRing(BridgeRing* inRing, const float* inFrames, uint32_
     {
         return; // no daemon: the frames are simply discarded (plan §7.3)
     }
-    if(theRing->channels == inChannelCount)
+    if((theRing->storageChannels == AUDIOHUB_SPK_STORAGE_CHANNELS) &&
+       (theRing->activeChannels == inChannelCount))
     {
-        AudioHubRing_Write(theRing->hdr, theRing->dataOffset, theRing->capacityFrames, theRing->channels,
-                           inFrames, inFrameCount);
+        AudioHubRing_WriteStrided(theRing->hdr, theRing->dataOffset, theRing->capacityFrames,
+                                  theRing->storageChannels, theRing->activeChannels,
+                                  inFrames, inFrameCount);
     }
     bridge_release(theRing);
 }
@@ -362,9 +412,9 @@ void AudioHubBridge_ReadRing(BridgeRing* inRing, float* outFrames, uint32_t inFr
     BridgeRing* theRing = (inRing != NULL) ? bridge_acquire(inRing) : NULL;
     if(theRing != NULL)
     {
-        if(theRing->channels == inChannelCount)
+        if((theRing->storageChannels == inChannelCount) && (theRing->activeChannels == inChannelCount))
         {
-            theGot = AudioHubRing_Read(theRing->hdr, theRing->dataOffset, theRing->capacityFrames, theRing->channels,
+            theGot = AudioHubRing_Read(theRing->hdr, theRing->dataOffset, theRing->capacityFrames, theRing->storageChannels,
                                        outFrames, inFrameCount);
         }
         bridge_release(theRing);
@@ -402,6 +452,7 @@ static audit_token_t              gPeerToken;
 // a session that no longer exists and is refused instead of retiring a live
 // daemon's slot (spec-m5b §4.4/§4.6).
 static uint64_t                  gSessionID   = 0;
+static _Atomic(uint64_t)         gActiveSessionID = 0;
 
 // Big enough for every inbound message plus the largest trailer the kernel can
 // append. Anything larger is DESTROYED by the kernel and reported as
@@ -427,6 +478,7 @@ typedef union BridgeRcvBuf
     AudioHubHelloRequest hello;
     AudioHubControlMsg   ctl;
     AudioHubBindMsg      bind;
+    AudioHubFormatMsg    format;
     uint8_t              raw[768];
 } BridgeRcvBuf;
 
@@ -436,6 +488,8 @@ _Static_assert(sizeof(BridgeRcvBuf) >= sizeof(AudioHubControlMsg) + sizeof(mach_
                "receive buffer too small for notify + trailer");
 _Static_assert(sizeof(BridgeRcvBuf) >= sizeof(AudioHubBindMsg) + sizeof(mach_msg_max_trailer_t),
                "receive buffer too small for bind + trailer");
+_Static_assert(sizeof(BridgeRcvBuf) >= sizeof(AudioHubFormatMsg) + sizeof(mach_msg_max_trailer_t),
+               "receive buffer too small for format + trailer");
 
 static uint64_t bridge_now_msec(void)
 {
@@ -443,6 +497,9 @@ static uint64_t bridge_now_msec(void)
 }
 
 static kern_return_t bridge_send_raw(uint32_t inOp, uint32_t inEndpoint, uint32_t inGeneration, uint64_t inWord); // defined just below
+static kern_return_t bridge_send_format_raw(uint32_t inOp, uint32_t inEndpoint, uint32_t inGeneration,
+                                            uint32_t inLayout, uint32_t inSupportedMask, uint32_t inEpoch,
+                                            uint64_t inRequestID);
 
 // Consecutive MACH_SEND_TIMED_OUT results on the daemon's control port. A full
 // queue means a wedged daemon rather than a dead one — but only for a bounded
@@ -477,10 +534,18 @@ static void bridge_disconnect(int inTellSuperseded)
         // one slot, and it carries generation 0 for the same reason.
         (void)bridge_send_raw(kAudioHubCtl_Superseded, 0, 0, 0);
     }
+    if(gDaemonPort != MACH_PORT_NULL)
+    {
+        // Make deferred format callbacks fail their session check before any
+        // teardown work can race their paused-ring commit.
+        atomic_store(&gActiveSessionID, 0);
+    }
     for(uint32_t theEndpoint = 0; theEndpoint < kAudioHubMaxEndpoints; ++theEndpoint)
     {
+        AudioHubBridge_LockRingControl(&gRings[theEndpoint]);
         bridge_ring_unpublish(&gRings[theEndpoint]);
         bridge_ring_restamp(&gRings[theEndpoint]);
+        AudioHubBridge_UnlockRingControl(&gRings[theEndpoint]);
     }
     if(gDaemonPort != MACH_PORT_NULL)
     {
@@ -527,6 +592,43 @@ static kern_return_t bridge_send_raw(uint32_t inOp, uint32_t inEndpoint, uint32_
                     MACH_PORT_NULL);
 }
 
+static kern_return_t bridge_send_format_raw(uint32_t inOp, uint32_t inEndpoint, uint32_t inGeneration,
+                                            uint32_t inLayout, uint32_t inSupportedMask, uint32_t inEpoch,
+                                            uint64_t inRequestID)
+{
+    AudioHubFormatMsg theMsg;
+    memset(&theMsg, 0, sizeof(theMsg));
+    theMsg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+    theMsg.header.msgh_size = sizeof(theMsg);
+    theMsg.header.msgh_remote_port = gDaemonPort;
+    theMsg.header.msgh_local_port = MACH_PORT_NULL;
+    theMsg.header.msgh_id = kAudioHubMsg_Format;
+    theMsg.op = inOp;
+    theMsg.endpoint = inEndpoint;
+    theMsg.generation = inGeneration;
+    theMsg.layout = inLayout;
+    theMsg.supported_mask = inSupportedMask;
+    theMsg.epoch = inEpoch;
+    theMsg.session_id = gSessionID;
+    theMsg.request_id = inRequestID;
+    return mach_msg(&theMsg.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(theMsg), 0,
+                    MACH_PORT_NULL, kBridgeSendTimeoutMsec, MACH_PORT_NULL);
+}
+
+static uint32_t bridge_classify_send(kern_return_t inResult)
+{
+    if(inResult == MACH_MSG_SUCCESS)
+    {
+        gSendTimeouts = 0;
+        return kAudioHubSend_OK;
+    }
+    if(inResult != MACH_SEND_TIMED_OUT)
+    {
+        return kAudioHubSend_Dead;
+    }
+    return (++gSendTimeouts < kBridgeMaxSendTimeouts) ? kAudioHubSend_Retry : kAudioHubSend_Dead;
+}
+
 // The driver's drain loop calls this once per pending mailbox. Only a DELIVERED
 // post may advance a sent marker, which is what the three-valued answer is for:
 // advancing it on a timeout silently threw a volume change away with no retry,
@@ -537,22 +639,29 @@ uint32_t AudioHubBridge_SendControl(uint32_t inOp, uint32_t inEndpoint, uint32_t
     {
         return kAudioHubSend_Dead;
     }
-    const kern_return_t theResult = bridge_send_raw(inOp, inEndpoint, inGeneration, inWord);
-    if(theResult == MACH_MSG_SUCCESS)
-    {
-        gSendTimeouts = 0;
-        return kAudioHubSend_OK;
-    }
-    if(theResult != MACH_SEND_TIMED_OUT)
+    return bridge_classify_send(bridge_send_raw(inOp, inEndpoint, inGeneration, inWord));
+}
+
+uint32_t AudioHubBridge_SendFormat(uint32_t inOp, uint32_t inEndpoint, uint32_t inGeneration,
+                                  uint32_t inLayout, uint32_t inSupportedMask, uint32_t inEpoch,
+                                  uint64_t inRequestID)
+{
+    if(gDaemonPort == MACH_PORT_NULL)
     {
         return kAudioHubSend_Dead;
     }
-    return (++gSendTimeouts < kBridgeMaxSendTimeouts) ? kAudioHubSend_Retry : kAudioHubSend_Dead;
+    return bridge_classify_send(bridge_send_format_raw(inOp, inEndpoint, inGeneration, inLayout,
+                                                        inSupportedMask, inEpoch, inRequestID));
 }
 
 int AudioHubBridge_SessionActive(void)
 {
-    return (gDaemonPort != MACH_PORT_NULL) ? 1 : 0;
+    return (atomic_load(&gActiveSessionID) != 0) ? 1 : 0;
+}
+
+uint64_t AudioHubBridge_SessionID(void)
+{
+    return atomic_load(&gActiveSessionID);
 }
 
 // Periodic ring census, service thread only — it just observes the two atomics,
@@ -820,7 +929,7 @@ static void bridge_handle_hello(BridgeRcvBuf* inBuf, mach_msg_size_t inSize, con
     theReply.slot_count = kAudioHubMaxSlots;
     theReply.data_offset = AUDIOHUB_RING_DATA_OFFSET;
     theReply.spk_capacity_frames = AUDIOHUB_RING_FRAMES;
-    theReply.spk_channels = AUDIOHUB_SPK_CHANNELS;
+    theReply.spk_channels = AUDIOHUB_SPK_STORAGE_CHANNELS;
     theReply.mic_capacity_frames = AUDIOHUB_RING_FRAMES;
     theReply.mic_channels = AUDIOHUB_MIC_CHANNELS;
     theReply.sample_rate = AUDIOHUB_SAMPLE_RATE;
@@ -878,6 +987,7 @@ static void bridge_handle_hello(BridgeRcvBuf* inBuf, mach_msg_size_t inSize, con
     gDaemonPort = theDaemon;
     gPeerToken = inTrailer->msgh_audit;
     gSendTimeouts = 0;
+    atomic_store(&gActiveSessionID, gSessionID);
     // Only now do the rings go live: the daemon holds every entry and has been
     // told the layout, so anything the IOProc writes from here on is readable.
     // The driver decides WHICH rings — a slot that is not bound must stay
@@ -960,6 +1070,37 @@ static void bridge_handle_bind(BridgeRcvBuf* inBuf, mach_msg_size_t inSize)
     mach_msg_destroy(&theMsg->header);
 }
 
+static void bridge_handle_format(BridgeRcvBuf* inBuf, mach_msg_size_t inSize)
+{
+    AudioHubFormatMsg* theMsg = &inBuf->format;
+    const int thePlain = ((theMsg->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) == 0);
+    const int theEndpointOK = (theMsg->endpoint < kAudioHubMaxEndpoints) &&
+                              (AUDIOHUB_ENDPOINT_DIR(theMsg->endpoint) == kAudioHubDir_Out);
+    const int theLayoutOK = (theMsg->layout < kAudioHubLayoutCount) &&
+                            ((theMsg->supported_mask & kAudioHubLayoutMask(theMsg->layout)) != 0);
+    const int theMaskOK = ((theMsg->supported_mask & kAudioHubLayoutMask(kAudioHubLayout_Stereo)) != 0) &&
+                          ((theMsg->supported_mask & ~kAudioHubLayoutMask_All) == 0);
+    const int theOpOK = (theMsg->op == kAudioHubFormat_Offer) ||
+                        (theMsg->op == kAudioHubFormat_Quiesced) ||
+                        (theMsg->op == kAudioHubFormat_Accepted);
+    const int theOfferFieldsOK = (theMsg->op != kAudioHubFormat_Offer) ||
+                                 ((theMsg->epoch == 0) && (theMsg->request_id != 0));
+    const int theReplyFieldsOK = (theMsg->op == kAudioHubFormat_Offer) || (theMsg->epoch != 0);
+
+    if(thePlain && (inSize == sizeof(AudioHubFormatMsg)) && theEndpointOK && theLayoutOK && theMaskOK &&
+       theOpOK && theOfferFieldsOK && theReplyFieldsOK && (theMsg->session_id == gSessionID) &&
+       (gHooks != NULL) && (gHooks->format != NULL))
+    {
+        gHooks->format(theMsg);
+    }
+    else
+    {
+        os_log_error(OS_LOG_DEFAULT, kBridgeLog "refused malformed/stale format op %u endpoint %u session %llu",
+                     theMsg->op, theMsg->endpoint, (unsigned long long)theMsg->session_id);
+    }
+    mach_msg_destroy(&theMsg->header);
+}
+
 // Blocks up to kBridgeRecvTimeoutMsec waiting for the first message, then drains
 // what else is queued without waiting again. That first bounded wait is what
 // paces the whole service loop — nothing here may be allowed to spin, a hot loop
@@ -1008,6 +1149,7 @@ static void bridge_serve(void)
                 break;
             case kAudioHubMsg_Notify:
             case kAudioHubMsg_Bind:
+            case kAudioHubMsg_Format:
                 // Both of these steer devices the user can see and hear, so both
                 // must come from the process that actually completed the current
                 // Hello — not merely from someone with the right euid. Anything
@@ -1018,14 +1160,18 @@ static void bridge_serve(void)
                     pid_t thePID = -1;
                     (void)bridge_peer_allowed(theTrailer, &theEUID, &thePID);
                     os_log_error(OS_LOG_DEFAULT, kBridgeLog "refused msg 0x%x from uid %u pid %d: only the "
-                                                            "process that completed the current hello may bind "
-                                                            "or notify",
+                                                            "process that completed the current hello may steer "
+                                                            "the driver",
                                  theBuf.hdr.msgh_id, theEUID, thePID);
                     mach_msg_destroy(&theBuf.hdr);
                 }
                 else if(theBuf.hdr.msgh_id == kAudioHubMsg_Notify)
                 {
                     bridge_handle_notify(&theBuf, theBuf.hdr.msgh_size);
+                }
+                else if(theBuf.hdr.msgh_id == kAudioHubMsg_Format)
+                {
+                    bridge_handle_format(&theBuf, theBuf.hdr.msgh_size);
                 }
                 else
                 {
@@ -1082,14 +1228,14 @@ static void* bridge_thread(void* inArg)
 
     // The whole pool, up front and once. Every ring outlives every daemon and
     // every binding, which is what lets a bind be pure metadata and keeps the
-    // realtime path free of any reclamation scheme (spec-m5b §1). 4.5 MiB of
+    // realtime path free of any reclamation scheme (spec-m5b §1). About 19 MiB of
     // address space; the pages of an unused slot are never touched, so they are
     // never faulted in.
     for(uint32_t theEndpoint = 0; theEndpoint < kAudioHubMaxEndpoints; ++theEndpoint)
     {
         const int theIsInput = (AUDIOHUB_ENDPOINT_DIR(theEndpoint) == kAudioHubDir_In);
         if(!bridge_ring_create(&gRings[theEndpoint],
-                               theIsInput ? AUDIOHUB_MIC_CHANNELS : AUDIOHUB_SPK_CHANNELS,
+                               theIsInput ? AUDIOHUB_MIC_CHANNELS : AUDIOHUB_SPK_STORAGE_CHANNELS,
                                theIsInput ? AUDIOHUB_MIC_BYTES : AUDIOHUB_SPK_BYTES))
         {
             // Nothing to hand a daemon, so there is nothing to serve — and with

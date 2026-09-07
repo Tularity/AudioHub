@@ -97,12 +97,13 @@ use crate::{rd, wr};
 pub const HAL_SERVICE_NAME: &str = "com.audiohub.driver";
 
 pub const HAL_RING_MAGIC: u32 = 0x4148_5231; // 'AHR1'
-pub const HAL_RING_VERSION: u32 = 1;
+pub const HAL_RING_VERSION: u32 = if cfg!(target_os = "macos") { 2 } else { 1 };
 pub const HAL_RING_DATA_OFFSET: usize = 64;
 pub const HAL_SAMPLE_RATE: u32 = 48_000;
 pub const HAL_RING_MS: u32 = 500;
 pub const HAL_RING_FRAMES: u32 = (HAL_SAMPLE_RATE / 1000) * HAL_RING_MS;
 pub const HAL_SPK_CHANNELS: u32 = 2;
+const MAC_SPK_STORAGE_CHANNELS: u32 = 12;
 pub const HAL_MIC_CHANNELS: u32 = 1;
 
 /// 10ms at 48k — the daemon's internal frame, and the chunk the ring helpers
@@ -183,7 +184,7 @@ const MSG_BIND: i32 = 0x4148_0005; // daemon -> driver, fire and forget
 /// those bits and quietly publish both endpoints for a peer that has only one
 /// real audio direction, so this is an equality bump rather than an additive
 /// hint.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = if cfg!(target_os = "macos") { 4 } else { 3 };
 
 /// v1's `AudioHubHelloReply`: 24 header + 4 body + 2 descriptors + 52 payload.
 /// Kept ONLY so a reply of exactly this size can be named as "an old driver is
@@ -631,6 +632,31 @@ pub struct HalBridge {
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct HalFormatLease {
+    shared: Arc<Shared>,
+    pub message: crate::halformat::Payload,
+}
+
+impl HalFormatLease {
+    pub(crate) fn is_current(&self) -> bool {
+        let Some(slot) = self.shared.slots.get(self.message.endpoint as usize / 2) else { return false };
+        let format = slot.output_format.load(Ordering::Acquire);
+        self.shared.session_id.load(Ordering::Acquire) == self.message.session_id
+            && slot.generation.load(Ordering::Acquire) == self.message.generation
+            && (format >> 8) as u32 == self.message.epoch && format & 16 == 0
+    }
+
+    pub(crate) fn finish(&self) {
+        if let Some(slot) = self.shared.slots.get(self.message.endpoint as usize / 2) {
+            if self.shared.session_id.load(Ordering::Acquire) == self.message.session_id
+                && slot.generation.load(Ordering::Acquire) == self.message.generation
+                && (slot.output_format.load(Ordering::Acquire) >> 8) as u32 == self.message.epoch
+            { slot.format_worker.store(false, Ordering::Release); }
+        }
+    }
+}
+
 /// 一条扬声器环这一 tick 的相位误差观测。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpkPhase {
@@ -671,6 +697,62 @@ impl SpkPhaseWindow {
 }
 
 impl HalBridge {
+    pub(crate) fn output_formats_status(&self) -> serde_json::Value {
+        let rows: Vec<_> = self.shared.slots.iter().take(self.shared.slot_count.load(Ordering::Acquire) as usize).enumerate().map(|(slot, record)| {
+            let state = lk(&record.format);
+            serde_json::json!({"slot": slot, "generation": record.generation.load(Ordering::Acquire),
+                "phase": state.phase, "current": state.current, "pending": state.pending,
+                "ready": record.output_format.load(Ordering::Acquire) & 16 != 0})
+        }).collect();
+        serde_json::json!({"supported": self.supports_output_formats(), "slots": rows})
+    }
+    pub(crate) fn take_format_prepare(&self, slot: u8) -> Option<HalFormatLease> {
+        let record = self.shared.slots.get(slot as usize)?;
+        let state = lk(&record.format);
+        if state.phase != crate::halformat::Phase::Preparing { return None; }
+        let message = state.pending?;
+        if record.format_worker.swap(true, Ordering::AcqRel) { return None; }
+        Some(HalFormatLease { shared: Arc::clone(&self.shared), message })
+    }
+    pub(crate) fn output_format(&self, slot: u8) -> Option<(u32, u32)> {
+        let packed = self.shared.slots.get(slot as usize)?.output_format.load(Ordering::Acquire);
+        (packed & 16 != 0).then_some(((packed & 15) as u32, (packed >> 8) as u32))
+    }
+
+    pub(crate) fn supports_output_formats(&self) -> bool {
+        cfg!(target_os = "macos") && self.shared.driver_connected.load(Ordering::Acquire)
+            && self.shared.driver_protocol.load(Ordering::Acquire) == 4
+    }
+
+    pub(crate) fn offer_output_format(&self, slot: u8, generation: u32, mask: u32, layout: u32) {
+        if !self.supports_output_formats() { return; }
+        let Some(state) = self.shared.slots.get(slot as usize) else { return };
+        if state.generation.load(Ordering::Acquire) != generation { return; }
+        let message = lk(&state.format).offer(slot as u32 * 2, generation, self.shared.session_id.load(Ordering::Acquire), mask, layout);
+        if let Some(message) = message {
+            if !self.send_format(message) { lk(&state.format).send_failed(); }
+        }
+    }
+
+    fn send_format(&self, message: crate::halformat::Payload) -> bool {
+        #[cfg(target_os = "macos")]
+        return platform::send_format(&self.shared, message);
+        #[cfg(not(target_os = "macos"))]
+        { let _ = message; false }
+    }
+
+    pub(crate) fn format_quiesced(&self, message: crate::halformat::Payload) -> bool {
+        let Some(slot) = self.shared.slots.get(message.endpoint as usize / 2) else { return false };
+        if self.shared.session_id.load(Ordering::Acquire) != message.session_id
+            || slot.generation.load(Ordering::Acquire) != message.generation { return false; }
+        let ack = lk(&slot.format).acknowledgement(message, crate::halformat::QUIESCED);
+        ack.is_some_and(|ack| self.send_format(ack))
+    }
+
+    pub(crate) fn format_failed(&self, lease: &HalFormatLease) {
+        if lease.is_current() { lk(&self.shared.slots[lease.message.endpoint as usize / 2].format).send_failed(); }
+    }
+
     /// `Ok(None)` means "no bridge here, keep behaving exactly as before":
     /// the driver's mach name does not resolve, mode `off`, or a non-macOS
     /// build. Only `Require` turns the first of those into a live-but-searching
@@ -3717,6 +3799,10 @@ pub(crate) mod dll {
 pub struct HalSpeakerSource {
     bridge: Arc<Shared>,
     slot: u8,
+    channels: usize,
+    format_snapshot: u64,
+    format_generation: u32,
+    format_leased: bool,
     dbg_peak: f32,
     dbg_frames: u32,
     /// 水位控制器（治法 B）。单所有者，只被 tx 线程碰。
@@ -3780,7 +3866,29 @@ impl HalSpeakerSource {
         HalSpeakerSource::with_mode(bridge.shared.clone(), slot, trim::Mode::from_env())
     }
 
+    pub fn new_checked(bridge: &HalBridge, slot: u8) -> Result<HalSpeakerSource> {
+        if bridge.supports_output_formats() && bridge.output_format(slot).is_none() {
+            anyhow::bail!("virtual speaker format is awaiting confirmation");
+        }
+        Ok(Self::new(bridge, slot))
+    }
+
+    fn format_current(&self) -> bool {
+        let strict = self.format_leased || (cfg!(target_os = "macos") && self.bridge.driver_protocol.load(Ordering::Acquire) == 4);
+        if !strict { return true; }
+        self.bridge.slots.get(self.slot as usize).is_some_and(|slot| {
+            slot.output_format.load(Ordering::Acquire) == self.format_snapshot
+                && self.format_snapshot & 16 != 0
+                && slot.generation.load(Ordering::Acquire) == self.format_generation
+                && self.bridge.driver_connected.load(Ordering::Acquire)
+        })
+    }
+
     fn with_mode(bridge: Arc<Shared>, slot: u8, mode: trim::Mode) -> HalSpeakerSource {
+        let format_snapshot = bridge.slots.get(slot as usize).map(|s| s.output_format.load(Ordering::Acquire)).unwrap_or(16);
+        let format_generation = bridge.slots.get(slot as usize).map(|s| s.generation.load(Ordering::Acquire)).unwrap_or(0);
+        let channels = crate::halformat::channels((format_snapshot & 15) as u32).unwrap_or(2) as usize;
+        let format_leased = cfg!(target_os = "macos") && bridge.driver_protocol.load(Ordering::Acquire) == 4;
         let seen_epoch = bridge.attach_epoch.load(Ordering::Acquire);
         let seen_disc = bridge
             .slots
@@ -3796,6 +3904,7 @@ impl HalSpeakerSource {
         HalSpeakerSource {
             bridge,
             slot,
+            channels, format_snapshot, format_generation, format_leased,
             dbg_peak: 0.0,
             dbg_frames: 0,
             ctl: trim::Ctl::new(mode),
@@ -3809,7 +3918,7 @@ impl HalSpeakerSource {
             log_window_us: 0,
             log_in_window: 0,
             log_suppressed: 0,
-            peek_st: vec![0.0; n * HAL_SPK_CHANNELS as usize],
+            peek_st: vec![0.0; n * channels],
         }
     }
 
@@ -3888,7 +3997,7 @@ impl HalSpeakerSource {
         if let Some(deadline) = self.prime_until_us {
             if (avail as usize) < trim::D_TARGET_COLD && now_us < deadline {
                 self.note_short(0, avail, now_us);
-                out.resize(out.len() + HAL_FRAME_48K * HAL_SPK_CHANNELS as usize, 0.0);
+                out.resize(out.len() + HAL_FRAME_48K * self.channels, 0.0);
                 return;
             }
             self.prime_until_us = None;
@@ -3962,8 +4071,8 @@ impl HalSpeakerSource {
         let ext_len = trim::peek_ext(plan);
         let (got, base) = if ext_len > base_len
             && trim::silent_span_interleaved(
-                &self.peek_st[..got * HAL_SPK_CHANNELS as usize],
-                HAL_SPK_CHANNELS as usize,
+                &self.peek_st[..got * self.channels],
+                self.channels,
                 f,
                 trim::X,
                 trim::GATE_SILENT,
@@ -3978,8 +4087,8 @@ impl HalSpeakerSource {
         };
 
         let Some(d) = trim::decide_interleaved(
-            &self.peek_st[..got * HAL_SPK_CHANNELS as usize],
-            HAL_SPK_CHANNELS as usize,
+            &self.peek_st[..got * self.channels],
+            self.channels,
             plan,
         ) else {
             return 0;
@@ -3989,8 +4098,8 @@ impl HalSpeakerSource {
             return 0;
         }
         trim::splice_interleaved(
-            &self.peek_st[..got * HAL_SPK_CHANNELS as usize],
-            HAL_SPK_CHANNELS as usize,
+            &self.peek_st[..got * self.channels],
+            self.channels,
             f,
             trim::X,
             d.tau,
@@ -3999,7 +4108,7 @@ impl HalSpeakerSource {
         );
         debug_assert_eq!(
             out.len(),
-            f * HAL_SPK_CHANNELS as usize,
+            f * self.channels,
             "invariant I1: output is exactly one interleaved stereo frame"
         );
         self.bridge
@@ -4026,7 +4135,7 @@ impl HalSpeakerSource {
     /// Peek `want` interleaved stereo frames and return `(frames, read base)`.
     /// `None` = 没有环 / 不够一帧加最小削减量。
     fn peek_stereo_frames(&mut self, want: usize, avail: u32) -> Option<(usize, u64)> {
-        let ch = HAL_SPK_CHANNELS as usize;
+        let ch = self.channels;
         let n = want.min(avail as usize).min(self.peek_st.len() / ch);
         if n < HAL_FRAME_48K + trim::T_MIN {
             return None;
@@ -4178,6 +4287,7 @@ impl HalSpeakerSource {
 
 impl audiohub_net::media::FrameSource for HalSpeakerSource {
     fn next_frame(&mut self, out: &mut Vec<f32>) -> bool {
+        if !self.format_current() { out.clear(); return false; }
         // FrameSource::next_frame REPLACES `out` (ToneSource/MicSource both open
         // with a clear) while append_spk_frame APPENDS, so without this the
         // engine's shared frame grew every tick and its `resize(F48)` kept the
@@ -4208,7 +4318,15 @@ impl audiohub_net::media::FrameSource for HalSpeakerSource {
     }
 
     fn channels(&self) -> u8 {
-        HAL_SPK_CHANNELS as u8
+        self.channels as u8
+    }
+
+    fn speaker_layout(&self) -> Option<audiohub_core::spatial_output::SpeakerLayout> {
+        self.format_current().then(|| crate::halformat::spatial_layout((self.format_snapshot & 15) as u32)).flatten()
+    }
+
+    fn failed(&self) -> Option<String> {
+        (!self.format_current()).then(|| "virtual speaker format epoch changed or was suspended".into())
     }
     /// 只有虚拟扬声器环一级。`None` = 驱动没附着，那一级**不存在**（不是 0 ms）。
     fn depths(&self) -> audiohub_core::latency::SourceDepths {
@@ -4243,6 +4361,9 @@ impl audiohub_net::media::FrameSource for HalSpeakerSource {
 /// Everything that is per-slot rather than per-bridge. One record per ring
 /// pair, allocated once and never moved.
 struct SlotShared {
+    format: Mutex<crate::halformat::State>,
+    output_format: AtomicU64,
+    format_worker: AtomicBool,
     spk_frames: AtomicU64,
     mic_frames: AtomicU64,
     mic_dropped: AtomicU64,
@@ -4340,6 +4461,9 @@ struct SlotShared {
 impl SlotShared {
     fn new() -> SlotShared {
         SlotShared {
+            format: Mutex::new(crate::halformat::State::default()),
+            output_format: AtomicU64::new(16),
+            format_worker: AtomicBool::new(false),
             spk_frames: AtomicU64::new(0),
             mic_frames: AtomicU64::new(0),
             mic_dropped: AtomicU64::new(0),
@@ -4521,13 +4645,17 @@ impl Shared {
         got
     }
 
-    /// Appends one native interleaved stereo HAL frame. Frame counts and ring
-    /// indices stay in audio frames; only the sample slice is twice as wide.
+    fn spk_channels(&self, slot: u8) -> usize {
+        let value = self.slots.get(slot as usize).map(|s| s.output_format.load(Ordering::Acquire)).unwrap_or(16);
+        crate::halformat::channels((value & 15) as u32).unwrap_or(2) as usize
+    }
+
+    /// Appends one interleaved logical HAL frame; ring indices remain frames.
     fn append_spk_stereo_frame(&self, slot: u8, out: &mut Vec<f32>) -> usize {
         let got = self.read_spk_stereo_chunk(slot, out, HAL_FRAME_48K);
         if got < HAL_FRAME_48K {
             out.resize(
-                out.len() + (HAL_FRAME_48K - got) * HAL_SPK_CHANNELS as usize,
+                out.len() + (HAL_FRAME_48K - got) * self.spk_channels(slot),
                 0.0,
             );
         }
@@ -4535,18 +4663,19 @@ impl Shared {
     }
 
     fn read_spk_stereo_chunk(&self, slot: u8, out: &mut Vec<f32>, frames: usize) -> usize {
+        let channels = self.spk_channels(slot);
         let frames = frames.min(HAL_FRAME_48K);
         if self.take_flush(slot) {
             self.rings.flush_spk_consumer(slot as usize);
         }
         let start = out.len();
-        out.resize(start + frames * HAL_SPK_CHANNELS as usize, 0.0);
+        out.resize(start + frames * channels, 0.0);
         let got = self.rings.read_spk(
             slot as usize,
-            &mut out[start..start + frames * HAL_SPK_CHANNELS as usize],
+            &mut out[start..start + frames * channels],
             frames,
         );
-        out.truncate(start + got * HAL_SPK_CHANNELS as usize);
+        out.truncate(start + got * channels);
         if got > 0 {
             if let Some(c) = self.slots.get(slot as usize) {
                 c.spk_frames.fetch_add(got as u64, Ordering::Relaxed);
@@ -4557,20 +4686,19 @@ impl Shared {
 
     /// Appends at most `frames` (<= HAL_FRAME_48K) mono samples.
     fn read_spk_chunk(&self, slot: u8, out: &mut Vec<f32>, frames: usize) -> usize {
+        let channels = self.spk_channels(slot);
         let frames = frames.min(HAL_FRAME_48K);
         if self.take_flush(slot) {
             self.rings.flush_spk_consumer(slot as usize);
         }
-        let mut scratch = [0.0f32; HAL_FRAME_48K * (HAL_SPK_CHANNELS as usize)];
+        let mut scratch = [0.0f32; HAL_FRAME_48K * 12];
         let got = self.rings.read_spk(
             slot as usize,
-            &mut scratch[..frames * HAL_SPK_CHANNELS as usize],
+            &mut scratch[..frames * channels],
             frames,
         );
         for f in 0..got {
-            let l = scratch[f * 2];
-            let r = scratch[f * 2 + 1];
-            out.push((l + r) * 0.5);
+            out.push(scratch[f * channels..(f + 1) * channels].iter().sum::<f32>() / channels as f32);
         }
         if got > 0 {
             if let Some(c) = self.slots.get(slot as usize) {
@@ -4719,6 +4847,11 @@ mod platform {
         reserved: u32,
         seq: u64,
     }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FormatMsg { header: MsgHeader, payload: crate::halformat::Payload }
+    const _: () = assert!(std::mem::size_of::<FormatMsg>() == 64);
 
     /// daemon -> driver, `AudioHubBindMsg`. Binds one slot to a peer or retires
     /// it; the driver answers on the control port with a `CTL_BIND_STATE`, so
@@ -5188,6 +5321,28 @@ mod platform {
                 .store(base.wrapping_add(frames as u64), Ordering::Release);
         }
 
+        fn peek_packed(&self, dst: &mut [f32], frames: usize, active: usize) -> (usize, u64) {
+            if active == self.channels as usize { return self.peek(dst, frames); }
+            if active == 0 || active > self.channels as usize { return (0, 0); }
+            let cap = self.capacity as usize;
+            let read = self.r_idx().load(Ordering::Relaxed);
+            let write = self.w_idx().load(Ordering::Acquire);
+            let available = (write.wrapping_sub(read) as usize).min(cap);
+            let base = write.wrapping_sub(available as u64);
+            let count = frames.min(available).min(dst.len() / active);
+            for frame in 0..count {
+                let index = (base.wrapping_add(frame as u64) % cap as u64) as usize;
+                unsafe { std::ptr::copy_nonoverlapping(self.data().add(index * self.channels as usize), dst.as_mut_ptr().add(frame * active), active); }
+            }
+            (count, base)
+        }
+
+        fn read_packed(&self, dst: &mut [f32], frames: usize, active: usize) -> usize {
+            let (count, base) = self.peek_packed(dst, frames, active);
+            if count != 0 { self.advance(base, count); }
+            count
+        }
+
         /// Consumer 侧的主动丢弃：把 `read_idx` 前进至多 `frames` 帧，返回真正
         /// 丢掉的帧数。治法 A 用它，不搬运任何样本。
         fn drop_frames(&self, frames: usize) -> usize {
@@ -5265,6 +5420,7 @@ mod platform {
     /// mappings that were never made.
     pub struct Rings {
         inner: std::sync::RwLock<Option<Box<[RingPair]>>>,
+        formats: [AtomicU64; HAL_MAX_SLOTS],
     }
 
     // The pointers are into mappings owned by `RingPair` and live exactly as
@@ -5277,14 +5433,17 @@ mod platform {
         pub fn new() -> Rings {
             Rings {
                 inner: std::sync::RwLock::new(None),
+                formats: std::array::from_fn(|_| AtomicU64::new(16)),
             }
         }
 
         /// 0 with no driver attached (or a slot this driver does not have):
         /// the caller zero-fills, so a missing driver is silence, never a stall.
         pub fn read_spk(&self, slot: usize, dst: &mut [f32], frames: usize) -> usize {
-            match rd(&self.inner).as_ref().and_then(|p| p.get(slot)) {
-                Some(p) => p.spk.read(dst, frames),
+            let guard = rd(&self.inner);
+            let Some(active) = self.active_channels(slot) else { return 0 };
+            match guard.as_ref().and_then(|p| p.get(slot)) {
+                Some(p) => p.spk.read_packed(dst, frames, active),
                 None => 0,
             }
         }
@@ -5300,7 +5459,9 @@ mod platform {
         }
 
         pub fn flush_spk_consumer(&self, slot: usize) {
-            if let Some(p) = rd(&self.inner).as_ref().and_then(|p| p.get(slot)) {
+            let guard = rd(&self.inner);
+            if self.active_channels(slot).is_none() { return; }
+            if let Some(p) = guard.as_ref().and_then(|p| p.get(slot)) {
                 p.spk.flush_consumer();
             }
         }
@@ -5312,22 +5473,28 @@ mod platform {
             dst: &mut [f32],
             frames: usize,
         ) -> Option<(usize, u64)> {
-            rd(&self.inner)
+            let guard = rd(&self.inner);
+            let active = self.active_channels(slot)?;
+            guard
                 .as_ref()
                 .and_then(|p| p.get(slot))
-                .map(|p| p.spk.peek(dst, frames))
+                .map(|p| p.spk.peek_packed(dst, frames, active))
         }
 
         /// 把读指针从一次 `peek_spk` 的基准推进 `frames` 帧。
         pub fn advance_spk(&self, slot: usize, base: u64, frames: usize) {
-            if let Some(p) = rd(&self.inner).as_ref().and_then(|p| p.get(slot)) {
+            let guard = rd(&self.inner);
+            if self.active_channels(slot).is_none() { return; }
+            if let Some(p) = guard.as_ref().and_then(|p| p.get(slot)) {
                 p.spk.advance(base, frames);
             }
         }
 
         /// 治法 A：丢掉至多 `frames` 帧，返回真正丢掉的。
         pub fn drop_spk(&self, slot: usize, frames: usize) -> usize {
-            rd(&self.inner)
+            let guard = rd(&self.inner);
+            if self.active_channels(slot).is_none() { return 0; }
+            guard
                 .as_ref()
                 .and_then(|p| p.get(slot))
                 .map(|p| p.spk.drop_frames(frames))
@@ -5340,7 +5507,9 @@ mod platform {
         ///
         /// `None` = 没有驱动附着 / 没有这个槽 ⇒ 这一级不存在，不是 0 ms。
         pub fn spk_readable(&self, slot: usize) -> Option<(u32, u32)> {
-            rd(&self.inner)
+            let guard = rd(&self.inner);
+            self.active_channels(slot)?;
+            guard
                 .as_ref()
                 .and_then(|p| p.get(slot))
                 .map(|p| (p.spk.readable(), p.spk.capacity))
@@ -5373,6 +5542,26 @@ mod platform {
 
         fn attached(&self) -> bool {
             rd(&self.inner).is_some()
+        }
+
+        fn active_channels(&self, slot: usize) -> Option<usize> {
+            let value = self.formats.get(slot)?.load(Ordering::Acquire);
+            if value & 16 == 0 { return None; }
+            crate::halformat::channels((value & 15) as u32).map(usize::from)
+        }
+
+        fn pause_spk(&self, slot: usize) {
+            let _guard = wr(&self.inner);
+            if let Some(format) = self.formats.get(slot) { format.fetch_and(!16, Ordering::Release); }
+        }
+
+        fn resume_spk(&self, slot: usize, layout: u32, epoch: u32) -> bool {
+            let guard = wr(&self.inner);
+            let Some(pair) = guard.as_ref().and_then(|pairs| pairs.get(slot)) else { return false };
+            let Some(channels) = crate::halformat::channels(layout) else { return false };
+            if channels as u32 > pair.spk.channels { return false; }
+            self.formats[slot].store(((epoch as u64) << 8) | 16 | layout as u64, Ordering::Release);
+            true
         }
     }
 
@@ -5657,6 +5846,8 @@ mod platform {
                 let hdr = buf.header();
                 if unsafe { (*hdr).id } == MSG_CONTROL {
                     handle_control(&shared, hdr);
+                } else if unsafe { (*hdr).id } == crate::halformat::MESSAGE_ID {
+                    handle_format(&shared, hdr);
                 }
                 // Every path disposes of the whole message: mach_msg_destroy is
                 // the only disposal that cannot leak a right we did not expect.
@@ -5815,6 +6006,9 @@ mod platform {
         // next handshake.
         for c in shared.slots.iter() {
             c.generation.store(0, Ordering::Relaxed);
+            c.output_format.store(0, Ordering::Release);
+            c.format_worker.store(false, Ordering::Release);
+            *lk(&c.format) = crate::halformat::State::default();
         }
         *lk(&shared.status_reason) = Some(format!("driver_gone: {why}"));
         shared.push_event(HalControlEvent::Detached);
@@ -5996,7 +6190,7 @@ mod platform {
                     data_offset: rep.data_offset,
                     bytes: rep.spk_bytes,
                 },
-                HAL_SPK_CHANNELS,
+                MAC_SPK_STORAGE_CHANNELS,
                 "speaker",
             );
             let mic = RingMem::attach(
@@ -6045,6 +6239,12 @@ mod platform {
         // the extra latency the flush exists to remove. This way at worst one
         // tick reads before the flush and the next one performs it.
         shared.rings.attach(pairs);
+        for (slot, state) in shared.slots.iter().enumerate() {
+            shared.rings.pause_spk(slot);
+            state.output_format.store(0, Ordering::Release);
+            state.format_worker.store(false, Ordering::Release);
+            *lk(&state.format) = crate::halformat::State::default();
+        }
         shared.spk_flush.store(u16::MAX, Ordering::Release);
         shared.slot_count.store(rep.slot_count, Ordering::Relaxed);
         shared.session_id.store(rep.session_id, Ordering::Relaxed);
@@ -6101,6 +6301,10 @@ mod platform {
                 };
                 let prev = c.generation.swap(msg.generation, Ordering::AcqRel);
                 if prev != msg.generation {
+                    shared.rings.pause_spk(slot);
+                    c.output_format.store(0, Ordering::Release);
+                    c.format_worker.store(false, Ordering::Release);
+                    *lk(&c.format) = crate::halformat::State::default();
                     // The slot was reused (or first bound). The driver resets a
                     // ring only while it is unpublished and cannot know where
                     // OUR read_idx stands, so a consumer that does not jump to
@@ -6176,6 +6380,60 @@ mod platform {
             CTL_HEARTBEAT => {}
             _ => {}
         }
+    }
+
+    fn handle_format(shared: &Shared, header: *mut MsgHeader) {
+        use crate::halformat::{Effect, ACCEPTED};
+        if unsafe { (*header).bits } & MACH_MSGH_BITS_COMPLEX != 0
+            || unsafe { (*header).size } != std::mem::size_of::<FormatMsg>() as u32 { return; }
+        let message = unsafe { (*(header as *const FormatMsg)).payload };
+        if !message.valid() || message.session_id != shared.session_id.load(Ordering::Acquire) { return; }
+        let slot = message.endpoint as usize / 2;
+        let state = &shared.slots[slot];
+        if message.generation != state.generation.load(Ordering::Acquire) { return; }
+        let effect = lk(&state.format).receive(message);
+        match effect {
+            Effect::Ignore => return,
+            Effect::Quiesce(_) => {
+                shared.rings.pause_spk(slot);
+                state.output_format.store(((message.epoch as u64) << 8) | message.layout as u64, Ordering::Release);
+                state.format_worker.store(false, Ordering::Release);
+                state.disc_epoch.fetch_add(1, Ordering::Release);
+            }
+            Effect::Accept(message) => {
+                state.output_format.store(((message.epoch as u64) << 8) | message.layout as u64, Ordering::Release);
+                let ack = lk(&state.format).acknowledgement(message, ACCEPTED);
+                if ack.is_none_or(|ack| !send_format(shared, ack)) { lk(&state.format).send_failed(); }
+            }
+            Effect::Publish(message) => {
+                if shared.rings.resume_spk(slot, message.layout, message.epoch) {
+                    state.output_format.store(((message.epoch as u64) << 8) | 16 | message.layout as u64, Ordering::Release);
+                } else { lk(&state.format).send_failed(); }
+            }
+            Effect::Failed => {
+                shared.rings.pause_spk(slot);
+                state.output_format.fetch_and(!16, Ordering::Release);
+            }
+        }
+        *lk(&shared.last_driver_msg) = Some(Instant::now());
+    }
+
+    pub(super) fn send_format(shared: &Shared, payload: crate::halformat::Payload) -> bool {
+        if !payload.valid() || payload.session_id != shared.session_id.load(Ordering::Acquire) { return false; }
+        let guard = lk(&shared.driver_port);
+        let port = *guard;
+        if port == MACH_PORT_NULL { return false; }
+        let mut message = FormatMsg { header: MsgHeader {
+            bits: msgh_bits(MACH_MSG_TYPE_COPY_SEND, 0), size: std::mem::size_of::<FormatMsg>() as u32,
+            remote: port, local: MACH_PORT_NULL, voucher: MACH_PORT_NULL, id: crate::halformat::MESSAGE_ID,
+        }, payload };
+        let result = unsafe { mach_msg(&mut message.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+            std::mem::size_of::<FormatMsg>() as u32, 0, MACH_PORT_NULL, SEND_TIMEOUT_MS, MACH_PORT_NULL) };
+        drop(guard);
+        if result != MACH_MSG_SUCCESS && result != MACH_SEND_TIMED_OUT {
+            disconnect_port(shared, port, "format message found its port dead");
+        }
+        result == MACH_MSG_SUCCESS
     }
 
     /// Fire-and-forget to the driver's service port. Returns the raw kern
@@ -6510,7 +6768,7 @@ mod platform {
             // definitions asserts these at compile time; restating them
             // here is what makes a deliberate contract change show up as a
             // NAMED test failure rather than as a wall of const-eval errors.
-            assert_eq!(PROTOCOL_VERSION, 3);
+            assert_eq!(PROTOCOL_VERSION, 4);
             assert_eq!(std::mem::size_of::<HelloRequest>(), 48);
             assert_eq!(std::mem::size_of::<HelloReply>(), 472);
             assert_eq!(std::mem::size_of::<ControlMsg>(), 56);
@@ -6614,12 +6872,12 @@ mod platform {
                 slot_count: HAL_MAX_SLOTS as u32,
                 data_offset: HAL_RING_DATA_OFFSET as u32,
                 spk_capacity_frames: HAL_RING_FRAMES,
-                spk_channels: HAL_SPK_CHANNELS,
+                spk_channels: MAC_SPK_STORAGE_CHANNELS,
                 mic_capacity_frames: HAL_RING_FRAMES,
                 mic_channels: HAL_MIC_CHANNELS,
                 sample_rate: HAL_SAMPLE_RATE,
                 session_id: 0x0102_0304_0506_0708,
-                spk_bytes: HAL_SPK_BYTES as u64,
+                spk_bytes: ring_bytes(MAC_SPK_STORAGE_CHANNELS) as u64,
                 mic_bytes: HAL_MIC_BYTES as u64,
             };
             // A distinct name per endpoint: an array that arrived reordered, or
@@ -6649,16 +6907,16 @@ mod platform {
                 assert_eq!(got.entries[i].dtype, MACH_MSG_PORT_DESCRIPTOR);
             }
             assert_eq!(got.status, STATUS_OK);
-            assert_eq!(got.protocol_version, 3);
+            assert_eq!(got.protocol_version, 4);
             assert_eq!(got.slot_count, 16);
             assert_eq!(got.data_offset, 64);
             assert_eq!(got.spk_capacity_frames, HAL_RING_FRAMES);
-            assert_eq!(got.spk_channels, HAL_SPK_CHANNELS);
+            assert_eq!(got.spk_channels, 12);
             assert_eq!(got.mic_capacity_frames, HAL_RING_FRAMES);
             assert_eq!(got.mic_channels, HAL_MIC_CHANNELS);
             assert_eq!(got.sample_rate, HAL_SAMPLE_RATE);
             assert_eq!(got.session_id, 0x0102_0304_0506_0708);
-            assert_eq!(got.spk_bytes, HAL_SPK_BYTES as u64);
+            assert_eq!(got.spk_bytes, 1_163_264);
             assert_eq!(got.mic_bytes, HAL_MIC_BYTES as u64);
 
             // AudioHubBridge.h's _Static_asserts, read off the wire.
@@ -6670,15 +6928,16 @@ mod platform {
                 "the last entry ends at 412"
             );
             assert_eq!(wire.u32_at(412), STATUS_OK, "status @412");
-            assert_eq!(wire.u32_at(416), 3, "protocol_version @416");
+            assert_eq!(wire.u32_at(416), 4, "protocol_version @416");
             assert_eq!(wire.u32_at(420), 16, "slot_count @420");
             assert_eq!(wire.u32_at(424), 64, "data_offset @424");
+            assert_eq!(wire.u32_at(432), 12, "spk_channels @432");
             assert_eq!(wire.u32_at(444), HAL_SAMPLE_RATE, "sample_rate @444");
             // The padding trap: nine u32 from 412 land session_id on 448. Ten
             // or eight would put four bytes of compiler padding here and every
             // number below would be read from the wrong place.
             assert_eq!(wire.u64_at(448), 0x0102_0304_0506_0708, "session_id @448");
-            assert_eq!(wire.u64_at(456), HAL_SPK_BYTES as u64, "spk_bytes @456");
+            assert_eq!(wire.u64_at(456), 1_163_264, "spk_bytes @456");
             assert_eq!(wire.u64_at(464), HAL_MIC_BYTES as u64, "mic_bytes @464");
         }
 
@@ -6829,6 +7088,56 @@ mod platform {
             assert_eq!((at(23_998 * 2), at(23_998 * 2 + 1)), (100.0, 200.0));
             assert_eq!((at(23_999 * 2), at(23_999 * 2 + 1)), (101.0, 201.0));
             assert_eq!((at(0), at(1), at(2), at(3)), (102.0, 202.0, 103.0, 203.0));
+        }
+
+        #[test]
+        fn hal_format_fixed_storage_compacts_each_layout_and_pauses_only_its_reader() {
+            for layout in 0..4 {
+                let channels = crate::halformat::channels(layout).unwrap() as usize;
+                let ds = FakeDriverRing::new(12, ring_bytes(12));
+                let dm = FakeDriverRing::new(1, HAL_MIC_BYTES);
+                let producer = attach_ring(&ds, 12);
+                let rings = Rings::new();
+                rings.attach(vec![RingPair { spk: attach_ring(&ds, 12), mic: attach_ring(&dm, 1) }]);
+                assert!(rings.resume_spk(0, layout, 1));
+                set_idx(&producer, 23_998, 23_998);
+                let input: Vec<f32> = (0..60).map(|i| i as f32).collect();
+                assert_eq!(producer.write(&input, 5), 5);
+                rings.pause_spk(0);
+                let mut output = vec![0.0; 5 * channels];
+                assert_eq!(rings.read_spk(0, &mut output, 5), 0);
+                assert_eq!(producer.hdr().read_idx.load(Ordering::Acquire), 23_998);
+                assert!(rings.write_mic(0, &[0.25]).is_some());
+                assert!(rings.resume_spk(0, layout, 1));
+                assert_eq!(rings.read_spk(0, &mut output, 5), 5);
+                let expected: Vec<f32> = input.chunks_exact(12).flat_map(|frame| frame[..channels].iter().copied()).collect();
+                assert_eq!(output, expected);
+            }
+        }
+
+        #[test]
+        fn hal_format_source_epoch_is_immutable_and_worker_finishes_after_ready() {
+            use audiohub_net::media::FrameSource;
+            let shared = Arc::new(test_shared(Rings::new()));
+            shared.driver_protocol.store(4, Ordering::Release);
+            shared.driver_connected.store(true, Ordering::Release);
+            shared.session_id.store(9, Ordering::Release);
+            shared.slots[0].generation.store(7, Ordering::Release);
+            shared.slots[0].output_format.store((1 << 8) | 16 | 3, Ordering::Release);
+            let source = HalSpeakerSource::with_mode(shared.clone(), 0, trim::Mode::Off);
+            assert_eq!(source.channels(), 12);
+            assert_eq!(source.speaker_layout(), Some(audiohub_core::spatial_output::SpeakerLayout::Immersive714));
+            assert!(source.failed().is_none());
+            shared.slots[0].output_format.store((2 << 8) | 3, Ordering::Release);
+            assert!(source.failed().is_some());
+            shared.slots[0].format_worker.store(true, Ordering::Release);
+            let lease = HalFormatLease { shared: shared.clone(), message: crate::halformat::Payload {
+                endpoint: 0, generation: 7, epoch: 2, session_id: 9, ..Default::default()
+            }};
+            shared.slots[0].output_format.store((2 << 8) | 16 | 3, Ordering::Release);
+            lease.finish();
+            assert!(!shared.slots[0].format_worker.load(Ordering::Acquire));
+            assert!(source.failed().is_some());
         }
 
         #[test]

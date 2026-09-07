@@ -170,6 +170,8 @@ pub mod wire {
     const _: () = assert!(SPK_BYTES == crate::halbridge::HAL_SPK_BYTES);
     const _: () = assert!(MIC_BYTES == crate::halbridge::HAL_MIC_BYTES);
     const _: () = assert!(RING_MAGIC == crate::halbridge::HAL_RING_MAGIC);
+    // The Windows VAD keeps ring v1 while the macOS HAL advances independently.
+    #[cfg(target_os = "windows")]
     const _: () = assert!(RING_VERSION == crate::halbridge::HAL_RING_VERSION);
     // The bound that actually matters: the samples have to fit in the mapping.
     const _: () = assert!(

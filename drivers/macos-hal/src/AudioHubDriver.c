@@ -94,6 +94,9 @@ enum
 // RequestDeviceConfigurationChange, and this names which one it was so
 // PerformDeviceConfigurationChange does not have to guess.
 #define kAudioHubChange_Latency  1ull
+#define kAudioHubChange_FormatTag 0x4148460000000000ull // 'AHF' + endpoint + epoch
+#define kAudioHubChange_FormatPayloadMask ((0x1Full << 32) | 0xFFFFFFFFull)
+#define kFormatTransactionTimeoutMsec 5000u
 
 // One pending control-plane post. Each is a single 64-bit word so a reader can
 // never see the scalar of one post paired with the flags of another; the
@@ -111,6 +114,30 @@ typedef struct AudioHubMailbox
     _Atomic(uint64_t) seq;  // bumped by the poster
     uint64_t          sent; // service thread only; == seq means nothing pending
 } AudioHubMailbox;
+
+typedef enum
+{
+    kFormatIdle = 0,
+    kFormatPausing,
+    kFormatPreparing,
+    kFormatAwaitingHost,
+    kFormatHostRequested,
+    kFormatCommitting,
+    kFormatCommitted,
+    kFormatReady,
+    kFormatFailed
+} AudioHubFormatStage;
+
+typedef struct AudioHubFormatOutbox
+{
+    uint64_t seq;
+    uint64_t sent;
+    uint32_t op;
+    uint32_t layout;
+    uint32_t supportedMask;
+    uint32_t epoch;
+    uint64_t requestID;
+} AudioHubFormatOutbox;
 
 typedef struct AudioHubDevice
 {
@@ -132,7 +159,7 @@ typedef struct AudioHubDevice
     // write path silently writes NOTHING when the caller's channel count
     // disagrees with the ring's, so a drift here would look exactly like a dead
     // daemon.
-    UInt32          channelCount;
+    _Atomic(UInt32) channelCount;
 
     // ---- bound state, guarded by gPlugIn_StateMutex
     BridgeRing*     ring; // this slot's ring for this direction; never re-pointed
@@ -149,6 +176,24 @@ typedef struct AudioHubDevice
     AudioHubMailbox vol;
     AudioHubMailbox io;
     AudioHubMailbox lat; // kAudioHubCtl_LatencyState: what the property REALLY says
+
+    // ---- v4 speaker format transaction, guarded by gPlugIn_StateMutex
+    uint32_t          allowedLayouts;
+    uint32_t          currentLayout;
+    uint32_t          pendingLayout;
+    uint32_t          pendingMask;
+    uint32_t          formatEpochNext; // monotonic for this endpoint; never reset on slot reuse
+    uint32_t          formatEpoch;
+    uint32_t          hostEpochOutstanding;
+    uint64_t          formatRequestID;
+    uint64_t          formatSessionID;
+    uint32_t          formatGeneration;
+    AudioObjectID     formatDeviceID;
+    uint64_t          formatStartedMsec;
+    AudioHubFormatStage formatStage;
+    AudioHubFormatOutbox formatOut;
+    Boolean           formatCurrentDirty;
+    Boolean           formatAvailableDirty;
 
     // ---- mutable state; scalar/mute/streamIsActive guarded by
     // gPlugIn_StateMutex, IO fields guarded by ioMutex
@@ -185,12 +230,12 @@ typedef enum
 
 typedef struct AudioHubSlot
 {
-    SlotState       state;      // service thread only
+    _Atomic(SlotState) state;
     // Bumped on every Free -> Bound transition and stamped on every control
     // message about this slot. It is what lets the daemon throw away a StopIO
     // that was in flight when the slot changed hands, instead of applying it to
     // the new peer and lighting up its microphone indicator (spec-m5b §4.6).
-    uint32_t        generation;
+    _Atomic(uint32_t) generation;
     uint64_t        delistedAtMsec;
     char            peerKey[40];  // fingerprint; log and idempotency only
     AudioHubDevice  dev[kAudioHubDevsPerSlot];
@@ -235,6 +280,14 @@ static _Atomic(uint32_t) gHostReady       = 0;
 // Set by anything that changes the published set, cleared by the one announce
 // at the end of a service pass.
 static _Atomic(uint32_t) gDeviceListDirty = 0;
+
+// A single bounded worker keeps RequestDeviceConfigurationChange off the Mach
+// service thread. The queue is one bit per speaker endpoint, so it cannot grow.
+static pthread_mutex_t gFormatHostMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  gFormatHostCond  = PTHREAD_COND_INITIALIZER;
+static pthread_once_t  gFormatHostOnce  = PTHREAD_ONCE_INIT;
+static uint32_t        gFormatHostQueue = 0;
+static _Atomic(uint32_t) gFormatHostWorkerReady = 0;
 
 // Shared by every device of the same direction: the model UID says "what kind of
 // thing is this", and every AudioHub peer output is the same kind of thing. It
@@ -407,6 +460,26 @@ static inline void AudioHub_Post(AudioHubMailbox* inBox, Float32 inScalar, uint3
     atomic_fetch_add(&inBox->seq, 1);
 }
 
+// gPlugIn_StateMutex held. Format state and its outbox advance together so a
+// timed-out send can be retried without reconstructing fields from a later stage.
+static void AudioHub_PostFormatLocked(AudioHubDevice* inDevice, uint32_t inOp)
+{
+    inDevice->formatOut.op = inOp;
+    inDevice->formatOut.layout = inDevice->pendingLayout;
+    inDevice->formatOut.supportedMask = inDevice->pendingMask;
+    inDevice->formatOut.epoch = inDevice->formatEpoch;
+    inDevice->formatOut.requestID = inDevice->formatRequestID;
+    ++inDevice->formatOut.seq;
+}
+
+static void AudioHub_ClearFormatOutboxLocked(AudioHubDevice* inDevice)
+{
+    const uint64_t theSequence = inDevice->formatOut.seq;
+    memset(&inDevice->formatOut, 0, sizeof(inDevice->formatOut));
+    inDevice->formatOut.seq = theSequence;
+    inDevice->formatOut.sent = theSequence;
+}
+
 // Out direction: hand the mix to the daemon. Discarded while the slot's ring is
 // unpublished (plan §7.3: the device stays selectable, nothing is processed).
 //
@@ -417,14 +490,14 @@ static inline void AudioHub_Post(AudioHubMailbox* inBox, Float32 inScalar, uint3
 // time still passes.
 static void bridge_write_output(AudioHubDevice* inDevice, const Float32* inBuffer, UInt32 inFrameCount)
 {
-    AudioHubBridge_WriteRing(inDevice->ring, inBuffer, inFrameCount, inDevice->channelCount);
+    AudioHubBridge_WriteRing(inDevice->ring, inBuffer, inFrameCount, atomic_load(&inDevice->channelCount));
 }
 
 // In direction: pull the peer's audio. Short reads and "no daemon" both come back
 // as silence, never as a stalled IO cycle.
 static void bridge_read_input(AudioHubDevice* inDevice, Float32* outBuffer, UInt32 inFrameCount)
 {
-    AudioHubBridge_ReadRing(inDevice->ring, outBuffer, inFrameCount, inDevice->channelCount);
+    AudioHubBridge_ReadRing(inDevice->ring, outBuffer, inFrameCount, atomic_load(&inDevice->channelCount));
 }
 
 // Control plane (plan §7.2 forward direction): the local user moved the virtual
@@ -532,6 +605,41 @@ static int AudioHub_FlushMailbox(AudioHubMailbox* inBox, uint32_t inOp, uint32_t
     return (theResult != kAudioHubSend_Dead);
 }
 
+static int AudioHub_FlushFormat(AudioHubSlot* inSlot)
+{
+    AudioHubDevice* theDevice = &inSlot->dev[kAudioHubDir_Out];
+    AudioHubFormatOutbox thePost;
+    uint64_t theSeq = 0;
+    uint32_t theGeneration = 0;
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    if(theDevice->formatOut.seq != theDevice->formatOut.sent)
+    {
+        thePost = theDevice->formatOut;
+        theSeq = thePost.seq;
+        theGeneration = inSlot->generation;
+    }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    if(theSeq == 0)
+    {
+        return 1;
+    }
+
+    const uint32_t theResult = AudioHubBridge_SendFormat(thePost.op, theDevice->endpoint, theGeneration,
+                                                         thePost.layout, thePost.supportedMask,
+                                                         thePost.epoch, thePost.requestID);
+    if(theResult == kAudioHubSend_OK)
+    {
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        if(theDevice->formatOut.seq == theSeq)
+        {
+            theDevice->formatOut.sent = theSeq;
+        }
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+    }
+    return (theResult != kAudioHubSend_Dead);
+}
+
 // Service thread. The slot's CURRENT generation stamps every message, and that is
 // sound rather than lucky: a post can only be made by a caller holding a
 // reference, and retirement clears the mailboxes only after every reference has
@@ -547,6 +655,10 @@ static int AudioHub_FlushOutbox(void)
         const uint32_t theGeneration = theSlot->generation;
         if(!AudioHub_FlushMailbox(&theSlot->bindState, kAudioHubCtl_BindState,
                                   AUDIOHUB_ENDPOINT(theSlotIndex, kAudioHubDir_Out), theGeneration))
+        {
+            return 0;
+        }
+        if(!AudioHub_FlushFormat(theSlot))
         {
             return 0;
         }
@@ -591,6 +703,429 @@ static uint64_t AudioHub_NowMsec(void)
     return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000ull;
 }
 
+static void AudioHub_QueueFormatHostRequest(uint32_t inEndpoint);
+
+static UInt32 AudioHub_LayoutChannels(uint32_t inLayout)
+{
+    static const UInt32 kChannels[kAudioHubLayoutCount] = { 2u, 6u, 8u, 12u };
+    return (inLayout < kAudioHubLayoutCount) ? kChannels[inLayout] : 0u;
+}
+
+static UInt64 AudioHub_FormatChangeAction(uint32_t inEndpoint, uint32_t inEpoch)
+{
+    return kAudioHubChange_FormatTag | ((UInt64)inEndpoint << 32) | (UInt64)inEpoch;
+}
+
+static Boolean AudioHub_DecodeFormatChangeAction(UInt64 inAction, uint32_t* outEndpoint, uint32_t* outEpoch)
+{
+    if((inAction & ~kAudioHubChange_FormatPayloadMask) != kAudioHubChange_FormatTag)
+    {
+        return false;
+    }
+    *outEndpoint = (uint32_t)((inAction >> 32) & 0x1Fu);
+    *outEpoch = (uint32_t)inAction;
+    return (*outEndpoint < kAudioHubMaxEndpoints) &&
+           (AUDIOHUB_ENDPOINT_DIR(*outEndpoint) == kAudioHubDir_Out) && (*outEpoch != 0);
+}
+
+static Boolean AudioHub_FormatNotificationCurrent(uint32_t inSlotIndex, uint32_t inGeneration,
+                                                   AudioObjectID inDeviceID, AudioObjectID inStreamID)
+{
+    const AudioHubSlot* theSlot = &gSlots[inSlotIndex];
+    const AudioHubDevice* theDevice = &theSlot->dev[kAudioHubDir_Out];
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    const Boolean theCurrent = (atomic_load(&theSlot->state) == kSlotBound) &&
+        (atomic_load(&theSlot->generation) == inGeneration) && theDevice->listed &&
+        (atomic_load(&theDevice->live) != 0) &&
+        (AudioHub_ID(&theDevice->deviceID) == inDeviceID) &&
+        (AudioHub_ID(&theDevice->streamID) == inStreamID);
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    return theCurrent;
+}
+
+static void AudioHub_NotifyFormatProperties(uint32_t inSlotIndex, uint32_t inGeneration,
+                                            AudioObjectID inDeviceID, AudioObjectID inStreamID,
+                                            Boolean inAvailableChanged)
+{
+    if((gPlugIn_Host == NULL) || (atomic_load(&gHostReady) == 0) ||
+       !AudioHub_FormatNotificationCurrent(inSlotIndex, inGeneration, inDeviceID, inStreamID))
+    {
+        return;
+    }
+    AudioObjectPropertyAddress theStreamAddresses[4];
+    UInt32 theCount = 0;
+    theStreamAddresses[theCount++] = (AudioObjectPropertyAddress){ kAudioStreamPropertyVirtualFormat,
+                                                                   kAudioObjectPropertyScopeGlobal,
+                                                                   kAudioObjectPropertyElementMain };
+    theStreamAddresses[theCount++] = (AudioObjectPropertyAddress){ kAudioStreamPropertyPhysicalFormat,
+                                                                   kAudioObjectPropertyScopeGlobal,
+                                                                   kAudioObjectPropertyElementMain };
+    if(inAvailableChanged)
+    {
+        theStreamAddresses[theCount++] = (AudioObjectPropertyAddress){ kAudioStreamPropertyAvailableVirtualFormats,
+                                                                       kAudioObjectPropertyScopeGlobal,
+                                                                       kAudioObjectPropertyElementMain };
+        theStreamAddresses[theCount++] = (AudioObjectPropertyAddress){ kAudioStreamPropertyAvailablePhysicalFormats,
+                                                                       kAudioObjectPropertyScopeGlobal,
+                                                                       kAudioObjectPropertyElementMain };
+    }
+    // Object IDs are never reused. A Host call can outlive retirement, but must
+    // not hold a reference that makes the bridge thread wait for that call.
+    gPlugIn_Host->PropertiesChanged(gPlugIn_Host, inStreamID, theCount, theStreamAddresses);
+
+    if(!AudioHub_FormatNotificationCurrent(inSlotIndex, inGeneration, inDeviceID, inStreamID))
+    {
+        return;
+    }
+
+    AudioObjectPropertyAddress theLayout = { kAudioDevicePropertyPreferredChannelLayout,
+                                             kAudioObjectPropertyScopeGlobal,
+                                             kAudioObjectPropertyElementMain };
+    gPlugIn_Host->PropertiesChanged(gPlugIn_Host, inDeviceID, 1, &theLayout);
+}
+
+// gPlugIn_StateMutex held.
+static Boolean AudioHub_FormatMatchesLocked(const AudioHubSlot* inSlot,
+                                            const AudioHubDevice* inDevice,
+                                            const AudioHubFormatMsg* inMsg)
+{
+    return (inMsg->generation == atomic_load(&inSlot->generation)) &&
+           (inMsg->session_id == inDevice->formatSessionID) &&
+           (inMsg->layout == inDevice->pendingLayout) &&
+           (inMsg->supported_mask == inDevice->pendingMask) &&
+           (inMsg->epoch == inDevice->formatEpoch) &&
+           (inMsg->request_id == inDevice->formatRequestID);
+}
+
+// gPlugIn_StateMutex held. Failure deliberately leaves the speaker ring paused.
+static void AudioHub_AbortFormatLocked(AudioHubDevice* inDevice)
+{
+    if((inDevice->formatStage == kFormatIdle) || (inDevice->formatStage == kFormatReady) ||
+       (inDevice->formatStage == kFormatFailed))
+    {
+        return;
+    }
+    inDevice->formatStage = kFormatFailed;
+    // Epochs are never reused; a missing callback must not own the next request.
+    inDevice->hostEpochOutstanding = 0;
+    inDevice->formatStartedMsec = AudioHub_NowMsec();
+    if(inDevice->formatSessionID != 0)
+    {
+        AudioHub_PostFormatLocked(inDevice, kAudioHubFormat_Aborted);
+    }
+}
+
+static OSStatus AudioHub_BeginFormatTransaction(AudioHubDevice* inDevice,
+                                                uint32_t inLayout,
+                                                uint32_t inSupportedMask,
+                                                uint64_t inRequestID,
+                                                uint64_t inSessionID)
+{
+    if(inDevice->isInput || (AudioHub_LayoutChannels(inLayout) == 0) ||
+       ((inSupportedMask & kAudioHubLayoutMask(kAudioHubLayout_Stereo)) == 0) ||
+       ((inSupportedMask & ~kAudioHubLayoutMask_All) != 0) ||
+       ((inSupportedMask & kAudioHubLayoutMask(inLayout)) == 0) ||
+       (inSessionID == 0) || (AudioHubBridge_SessionID() != inSessionID))
+    {
+        return kAudioHardwareIllegalOperationError;
+    }
+
+    AudioHubSlot* theSlot = &gSlots[inDevice->slotIndex];
+    uint32_t theEpoch = 0;
+    Boolean theAvailableChanged = false;
+    AudioHubBridge_LockRingControl(inDevice->ring);
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    if((atomic_load(&theSlot->state) != kSlotBound) || !inDevice->listed ||
+       (atomic_load(&inDevice->live) == 0) || (inDevice->formatEpochNext == UINT32_MAX) ||
+       (AudioHubBridge_SessionID() != inSessionID))
+    {
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        AudioHubBridge_UnlockRingControl(inDevice->ring);
+        return kAudioHardwareIllegalOperationError;
+    }
+    if((inDevice->formatStage >= kFormatPausing) && (inDevice->formatStage <= kFormatCommitted) &&
+       (inDevice->pendingLayout == inLayout) && (inDevice->pendingMask == inSupportedMask) &&
+       (inDevice->formatRequestID == inRequestID) && (inDevice->formatSessionID == inSessionID))
+    {
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        AudioHubBridge_UnlockRingControl(inDevice->ring);
+        return kAudioHardwareNoError;
+    }
+    if((inRequestID == 0) && ((inDevice->currentLayout == inLayout) ||
+       (((inDevice->formatStage >= kFormatPausing) && (inDevice->formatStage <= kFormatCommitted)) &&
+        (inDevice->pendingLayout == inLayout))))
+    {
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        AudioHubBridge_UnlockRingControl(inDevice->ring);
+        return kAudioHardwareNoError;
+    }
+    theEpoch = ++inDevice->formatEpochNext;
+    inDevice->hostEpochOutstanding = 0;
+    theAvailableChanged = (inDevice->allowedLayouts != inSupportedMask);
+    inDevice->allowedLayouts = inSupportedMask;
+    inDevice->pendingLayout = inLayout;
+    inDevice->pendingMask = inSupportedMask;
+    inDevice->formatEpoch = theEpoch;
+    inDevice->formatRequestID = inRequestID;
+    inDevice->formatSessionID = inSessionID;
+    inDevice->formatGeneration = atomic_load(&theSlot->generation);
+    inDevice->formatDeviceID = AudioHub_ID(&inDevice->deviceID);
+    inDevice->formatStartedMsec = AudioHub_NowMsec();
+    inDevice->formatStage = kFormatPausing;
+    AudioHub_ClearFormatOutboxLocked(inDevice);
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    AudioHubBridge_UnpublishRing(inDevice->ring);
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    if((inDevice->formatStage == kFormatPausing) && (inDevice->formatEpoch == theEpoch) &&
+       (inDevice->formatSessionID == inSessionID) && (AudioHubBridge_SessionID() == inSessionID) &&
+       (atomic_load(&theSlot->state) == kSlotBound))
+    {
+        inDevice->formatStage = kFormatPreparing;
+        inDevice->formatStartedMsec = AudioHub_NowMsec();
+        AudioHub_PostFormatLocked(inDevice, kAudioHubFormat_Prepare);
+    }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    if(theAvailableChanged && (inDevice->formatEpoch == theEpoch))
+    {
+        inDevice->formatAvailableDirty = true;
+    }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    AudioHubBridge_UnlockRingControl(inDevice->ring);
+    return kAudioHardwareNoError;
+}
+
+static void AudioHub_CommitFormat(uint32_t inEndpoint, uint32_t inEpoch, Boolean inFromHost)
+{
+    AudioHubSlot* theSlot = &gSlots[AUDIOHUB_ENDPOINT_SLOT(inEndpoint)];
+    AudioHubDevice* theDevice = &theSlot->dev[kAudioHubDir_Out];
+    uint32_t theLayout = 0;
+    uint64_t theSession = 0;
+    uint32_t theGeneration = 0;
+    Boolean theReferenceHeld = false;
+
+    AudioHubBridge_LockRingControl(theDevice->ring);
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    const AudioHubFormatStage theExpected = inFromHost ? kFormatHostRequested : kFormatAwaitingHost;
+    if((theDevice->formatStage != theExpected) || (theDevice->formatEpoch != inEpoch) ||
+       (inFromHost && (theDevice->hostEpochOutstanding != inEpoch)) ||
+       (atomic_load(&theSlot->state) != kSlotBound) ||
+       (atomic_load(&theSlot->generation) != theDevice->formatGeneration) ||
+       (AudioHub_ID(&theDevice->deviceID) != theDevice->formatDeviceID) ||
+       !theDevice->listed || (atomic_load(&theDevice->live) == 0) ||
+       (AudioHubBridge_SessionID() != theDevice->formatSessionID))
+    {
+        if(inFromHost && (theDevice->hostEpochOutstanding == inEpoch))
+        {
+            theDevice->hostEpochOutstanding = 0;
+        }
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        AudioHubBridge_UnlockRingControl(theDevice->ring);
+        return;
+    }
+    if(inFromHost)
+    {
+        theDevice->hostEpochOutstanding = 0;
+    }
+    theDevice->formatStage = kFormatCommitting;
+    theLayout = theDevice->pendingLayout;
+    theSession = theDevice->formatSessionID;
+    theGeneration = atomic_load(&theSlot->generation);
+    atomic_fetch_add(&theDevice->inuse, 1);
+    theReferenceHeld = true;
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    const Boolean theRingReady = AudioHubBridge_SetSpeakerLayout(theDevice->ring, theLayout) != 0;
+    if(theRingReady)
+    {
+        AudioHubBridge_ResetRing(theDevice->ring);
+    }
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    const Boolean theStillCurrent = (theDevice->formatStage == kFormatCommitting) &&
+                                    (theDevice->formatEpoch == inEpoch) &&
+                                    (theDevice->formatSessionID == theSession) &&
+                                    (AudioHubBridge_SessionID() == theSession) &&
+                                    (atomic_load(&theSlot->generation) == theGeneration) &&
+                                    (atomic_load(&theSlot->state) == kSlotBound) &&
+                                    theDevice->listed;
+    if(!theRingReady || !theStillCurrent)
+    {
+        if(!theRingReady && theStillCurrent)
+        {
+            AudioHub_AbortFormatLocked(theDevice);
+        }
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        if(theReferenceHeld)
+        {
+            AudioHub_Release(theDevice);
+        }
+        AudioHubBridge_UnlockRingControl(theDevice->ring);
+        return;
+    }
+    atomic_store(&theDevice->channelCount, AudioHub_LayoutChannels(theLayout));
+    theDevice->currentLayout = theLayout;
+    theDevice->formatStage = kFormatCommitted;
+    theDevice->formatStartedMsec = AudioHub_NowMsec();
+    theDevice->formatCurrentDirty = true;
+    AudioHub_PostFormatLocked(theDevice, kAudioHubFormat_Committed);
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    if(theReferenceHeld)
+    {
+        AudioHub_Release(theDevice);
+    }
+    AudioHubBridge_UnlockRingControl(theDevice->ring);
+}
+
+static void AudioHub_HandleFormat(const AudioHubFormatMsg* inMsg)
+{
+    AudioHubSlot* theSlot = &gSlots[AUDIOHUB_ENDPOINT_SLOT(inMsg->endpoint)];
+    AudioHubDevice* theDevice = &theSlot->dev[kAudioHubDir_Out];
+    if((atomic_load(&theSlot->state) != kSlotBound) ||
+       (inMsg->generation != atomic_load(&theSlot->generation)))
+    {
+        return;
+    }
+
+    if(inMsg->op == kAudioHubFormat_Offer)
+    {
+        (void)AudioHub_BeginFormatTransaction(theDevice, inMsg->layout, inMsg->supported_mask,
+                                              inMsg->request_id, inMsg->session_id);
+        return;
+    }
+
+    if(inMsg->op == kAudioHubFormat_Quiesced)
+    {
+        Boolean theCommitDirectly = false;
+        Boolean theQueueHost = false;
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        if((theDevice->formatStage == kFormatPreparing) &&
+           theDevice->listed && AudioHub_FormatMatchesLocked(theSlot, theDevice, inMsg))
+        {
+            theDevice->formatStage = kFormatAwaitingHost;
+            theDevice->formatStartedMsec = AudioHub_NowMsec();
+            theCommitDirectly = (theDevice->pendingLayout == theDevice->currentLayout);
+            theQueueHost = !theCommitDirectly && (theDevice->hostEpochOutstanding == 0);
+        }
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        if(theCommitDirectly)
+        {
+            AudioHub_CommitFormat(inMsg->endpoint, inMsg->epoch, false);
+        }
+        else if(theQueueHost)
+        {
+            AudioHub_QueueFormatHostRequest(inMsg->endpoint);
+        }
+        return;
+    }
+
+    if(inMsg->op == kAudioHubFormat_Accepted)
+    {
+        Boolean thePublish = false;
+        AudioHubBridge_LockRingControl(theDevice->ring);
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        if((theDevice->formatStage == kFormatCommitted) &&
+           theDevice->listed && AudioHub_FormatMatchesLocked(theSlot, theDevice, inMsg) &&
+           (AudioHubBridge_SessionID() == theDevice->formatSessionID))
+        {
+            theDevice->formatStage = kFormatReady;
+            theDevice->formatStartedMsec = AudioHub_NowMsec();
+            AudioHub_PostFormatLocked(theDevice, kAudioHubFormat_Ready);
+            thePublish = true;
+        }
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        if(thePublish)
+        {
+            AudioHubBridge_PublishRing(theDevice->ring);
+        }
+        AudioHubBridge_UnlockRingControl(theDevice->ring);
+    }
+}
+
+static void AudioHub_CheckFormatTransactions(void)
+{
+    uint32_t theQueueMask = 0;
+    const uint64_t theNow = AudioHub_NowMsec();
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    for(uint32_t theSlotIndex = 0; theSlotIndex < kAudioHubMaxSlots; ++theSlotIndex)
+    {
+        AudioHubDevice* theDevice = &gSlots[theSlotIndex].dev[kAudioHubDir_Out];
+        const Boolean theTimedStage = (theDevice->formatStage >= kFormatPausing) &&
+                                      (theDevice->formatStage <= kFormatCommitted);
+        if(theTimedStage && ((theNow - theDevice->formatStartedMsec) > kFormatTransactionTimeoutMsec))
+        {
+            AudioHub_AbortFormatLocked(theDevice);
+        }
+        else if((theDevice->formatStage == kFormatAwaitingHost) &&
+                (theDevice->hostEpochOutstanding == 0))
+        {
+            theQueueMask |= (1u << theSlotIndex);
+        }
+    }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    for(uint32_t theSlotIndex = 0; theSlotIndex < kAudioHubMaxSlots; ++theSlotIndex)
+    {
+        if((theQueueMask & (1u << theSlotIndex)) != 0)
+        {
+            AudioHub_QueueFormatHostRequest(AUDIOHUB_ENDPOINT(theSlotIndex, kAudioHubDir_Out));
+        }
+    }
+}
+
+static void AudioHub_FlushFormatPropertyNotifications(void)
+{
+    for(uint32_t theSlotIndex = 0; theSlotIndex < kAudioHubMaxSlots; ++theSlotIndex)
+    {
+        AudioHubDevice* theDevice = &gSlots[theSlotIndex].dev[kAudioHubDir_Out];
+        Boolean theNotify = false;
+        Boolean theAvailableChanged = false;
+        uint32_t theGeneration = 0;
+        AudioObjectID theDeviceID = kAudioObjectUnknown;
+        AudioObjectID theStreamID = kAudioObjectUnknown;
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        if((theDevice->formatCurrentDirty || theDevice->formatAvailableDirty) &&
+           (atomic_load(&theDevice->live) != 0))
+        {
+            theNotify = true;
+            theAvailableChanged = theDevice->formatAvailableDirty;
+            theDevice->formatCurrentDirty = false;
+            theDevice->formatAvailableDirty = false;
+            theGeneration = atomic_load(&gSlots[theSlotIndex].generation);
+            theDeviceID = AudioHub_ID(&theDevice->deviceID);
+            theStreamID = AudioHub_ID(&theDevice->streamID);
+        }
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        if(theNotify)
+        {
+            AudioHub_NotifyFormatProperties(theSlotIndex, theGeneration, theDeviceID,
+                                             theStreamID, theAvailableChanged);
+        }
+    }
+}
+
+static void AudioHub_QueueFormatNotifications(void)
+{
+    uint32_t theMask = 0;
+    if(atomic_load(&gFormatHostWorkerReady) == 0) return;
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    for(uint32_t slot = 0; slot < kAudioHubMaxSlots; ++slot)
+    {
+        const AudioHubDevice* device = &gSlots[slot].dev[kAudioHubDir_Out];
+        if(device->formatCurrentDirty || device->formatAvailableDirty) theMask |= 1u << slot;
+    }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    if(theMask != 0)
+    {
+        pthread_mutex_lock(&gFormatHostMutex);
+        gFormatHostQueue |= theMask;
+        pthread_cond_signal(&gFormatHostCond);
+        pthread_mutex_unlock(&gFormatHostMutex);
+    }
+}
+
 // hostTicksPerFrame is what turns the zero-timestamp counter into a host clock,
 // and there is no diagnostic anywhere for getting it wrong: leave it at 0 and
 // theHostTicksPerRingBuffer becomes 0, so GetZeroTimeStamp advances
@@ -623,7 +1158,11 @@ static void AudioHub_InitSlots(void)
             theDevice->dirIndex       = theDir;
             theDevice->endpoint       = AUDIOHUB_ENDPOINT(theSlotIndex, theDir);
             theDevice->isInput        = (theDir == kAudioHubDir_In);
-            theDevice->channelCount   = theDevice->isInput ? AUDIOHUB_MIC_CHANNELS : AUDIOHUB_SPK_CHANNELS;
+            atomic_store(&theDevice->channelCount,
+                         theDevice->isInput ? AUDIOHUB_MIC_CHANNELS : AUDIOHUB_SPK_CHANNELS);
+            theDevice->allowedLayouts = kAudioHubLayoutMask(kAudioHubLayout_Stereo);
+            theDevice->currentLayout  = kAudioHubLayout_Stereo;
+            theDevice->formatStage    = kFormatIdle;
             theDevice->sampleRate     = kDevice_SampleRate;
             theDevice->volumeScalar   = 1.0f;
             theDevice->streamIsActive = true;
@@ -781,8 +1320,21 @@ static void AudioHub_PublishSlotRings(AudioHubSlot* inSlot)
             // session that is over. Rendering it would play up to 500ms of the
             // previous daemon's microphone audio into whatever is recording.
             AudioHubBridge_FlushRingConsumer(theDevice->ring);
+            AudioHubBridge_PublishRing(theDevice->ring);
         }
-        AudioHubBridge_PublishRing(theDevice->ring);
+        else
+        {
+            AudioHubBridge_LockRingControl(theDevice->ring);
+            pthread_mutex_lock(&gPlugIn_StateMutex);
+            const Boolean theReady = (theDevice->formatStage == kFormatReady) &&
+                                     (theDevice->formatSessionID == AudioHubBridge_SessionID());
+            pthread_mutex_unlock(&gPlugIn_StateMutex);
+            if(theReady)
+            {
+                AudioHubBridge_PublishRing(theDevice->ring);
+            }
+            AudioHubBridge_UnlockRingControl(theDevice->ring);
+        }
     }
 }
 
@@ -913,6 +1465,23 @@ static int AudioHub_BindSlot(AudioHubSlot* inSlot, const AudioHubBindMsg* inMsg)
             theDevice->latencyFrames  = 0;
             theDevice->latencyWanted  = 0;
 
+            if(!theDevice->isInput)
+            {
+                atomic_store(&theDevice->channelCount, AUDIOHUB_SPK_CHANNELS);
+                theDevice->allowedLayouts = kAudioHubLayoutMask(kAudioHubLayout_Stereo);
+                theDevice->currentLayout = kAudioHubLayout_Stereo;
+                theDevice->pendingLayout = kAudioHubLayout_Stereo;
+                theDevice->pendingMask = kAudioHubLayoutMask(kAudioHubLayout_Stereo);
+                theDevice->formatEpoch = 0;
+                theDevice->formatRequestID = 0;
+                theDevice->formatSessionID = AudioHubBridge_SessionID();
+                theDevice->formatStartedMsec = 0;
+                theDevice->formatStage = kFormatIdle;
+                theDevice->formatCurrentDirty = false;
+                theDevice->formatAvailableDirty = false;
+                AudioHub_ClearFormatOutboxLocked(theDevice);
+            }
+
             theDevice->vol.sent = 0;
             theDevice->io.sent = 0;
             theDevice->lat.sent = 0;
@@ -944,6 +1513,10 @@ static int AudioHub_BindSlot(AudioHubSlot* inSlot, const AudioHubBindMsg* inMsg)
     // observed mid-read by anyone.
     for(uint32_t theDir = 0; theDir < kAudioHubDevsPerSlot; ++theDir)
     {
+        if(theDir == kAudioHubDir_Out)
+        {
+            (void)AudioHubBridge_SetSpeakerLayout(inSlot->dev[theDir].ring, kAudioHubLayout_Stereo);
+        }
         AudioHubBridge_ResetRing(inSlot->dev[theDir].ring);
     }
     AudioHub_PublishSlotRings(inSlot);
@@ -982,6 +1555,13 @@ static void AudioHub_DelistSlot(AudioHubSlot* inSlot)
     {
         inSlot->dev[theDir].listed = false; // live STAYS 1, on purpose
     }
+    AudioHubDevice* theSpeaker = &inSlot->dev[kAudioHubDir_Out];
+    theSpeaker->formatSessionID = 0;
+    theSpeaker->formatStage = kFormatIdle;
+    theSpeaker->hostEpochOutstanding = 0;
+    theSpeaker->formatCurrentDirty = false;
+    theSpeaker->formatAvailableDirty = false;
+    AudioHub_ClearFormatOutboxLocked(theSpeaker);
     AudioHub_RebuildDeviceListLocked();
     pthread_mutex_unlock(&gPlugIn_StateMutex);
 
@@ -1083,6 +1663,23 @@ static void AudioHub_RetireDueSlots(void)
             theDevice->anchorHostTime = 0;
             theDevice->latencyFrames  = 0;
             theDevice->latencyWanted  = 0;
+            if(!theDevice->isInput)
+            {
+                atomic_store(&theDevice->channelCount, AUDIOHUB_SPK_CHANNELS);
+                theDevice->allowedLayouts = kAudioHubLayoutMask(kAudioHubLayout_Stereo);
+                theDevice->currentLayout = kAudioHubLayout_Stereo;
+                theDevice->pendingLayout = kAudioHubLayout_Stereo;
+                theDevice->pendingMask = kAudioHubLayoutMask(kAudioHubLayout_Stereo);
+                theDevice->formatEpoch = 0;
+                theDevice->formatRequestID = 0;
+                theDevice->formatSessionID = 0;
+                theDevice->formatStartedMsec = 0;
+                theDevice->formatStage = kFormatIdle;
+                theDevice->hostEpochOutstanding = 0;
+                theDevice->formatCurrentDirty = false;
+                theDevice->formatAvailableDirty = false;
+                AudioHub_ClearFormatOutboxLocked(theDevice);
+            }
             atomic_store(&theDevice->vol.word, 0);
             atomic_store(&theDevice->vol.seq, 0);
             atomic_store(&theDevice->io.word, 0);
@@ -1101,6 +1698,10 @@ static void AudioHub_RetireDueSlots(void)
             // Still unpublished, so zeroing the indices is safe — and necessary,
             // so the next peer to take this slot starts from a clean ring rather
             // than half a second of its predecessor's audio.
+            if(theDir == kAudioHubDir_Out)
+            {
+                (void)AudioHubBridge_SetSpeakerLayout(theSlot->dev[theDir].ring, kAudioHubLayout_Stereo);
+            }
             AudioHubBridge_ResetRing(theSlot->dev[theDir].ring);
         }
 
@@ -1508,10 +2109,23 @@ static void AudioHub_ApplyDaemonLatency(uint32_t inEndpoint, uint32_t inGenerati
 
 static void AudioHub_BridgeAttached(void)
 {
+    const uint64_t theSession = AudioHubBridge_SessionID();
     for(uint32_t theSlotIndex = 0; theSlotIndex < kAudioHubMaxSlots; ++theSlotIndex)
     {
-        if(gSlots[theSlotIndex].state == kSlotBound)
+        if(atomic_load(&gSlots[theSlotIndex].state) == kSlotBound)
         {
+            AudioHubDevice* theSpeaker = &gSlots[theSlotIndex].dev[kAudioHubDir_Out];
+            pthread_mutex_lock(&gPlugIn_StateMutex);
+            theSpeaker->formatSessionID = theSession;
+            theSpeaker->pendingLayout = theSpeaker->currentLayout;
+            theSpeaker->pendingMask = theSpeaker->allowedLayouts;
+            theSpeaker->formatEpoch = 0;
+            theSpeaker->formatRequestID = 0;
+            theSpeaker->formatStartedMsec = 0;
+            theSpeaker->formatStage = kFormatIdle;
+            theSpeaker->hostEpochOutstanding = 0;
+            AudioHub_ClearFormatOutboxLocked(theSpeaker);
+            pthread_mutex_unlock(&gPlugIn_StateMutex);
             AudioHub_PublishSlotRings(&gSlots[theSlotIndex]);
         }
     }
@@ -1519,14 +2133,24 @@ static void AudioHub_BridgeAttached(void)
 
 static void AudioHub_BridgeDetached(void)
 {
-    // Nothing to undo. The transport has already unpublished every ring, and the
-    // bindings deliberately survive: removing sixteen devices and putting them
-    // back on every daemon restart would discard the user's chosen default output
-    // each time, silently (spec-m5b §5.7).
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    for(uint32_t theSlotIndex = 0; theSlotIndex < kAudioHubMaxSlots; ++theSlotIndex)
+    {
+        AudioHubDevice* theSpeaker = &gSlots[theSlotIndex].dev[kAudioHubDir_Out];
+        theSpeaker->formatSessionID = 0;
+        theSpeaker->formatStage = kFormatIdle;
+        theSpeaker->hostEpochOutstanding = 0;
+        AudioHub_ClearFormatOutboxLocked(theSpeaker);
+    }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    // The transport already unpublished every ring. Bindings and committed HAL
+    // layouts survive, but speakers wait for a new-session format transaction.
 }
 
 static void AudioHub_BridgeTick(void)
 {
+    AudioHub_CheckFormatTransactions();
+    AudioHub_QueueFormatNotifications();
     AudioHub_RetireDueSlots();
     if(atomic_exchange(&gDeviceListDirty, 0) != 0)
     {
@@ -1539,6 +2163,7 @@ static const AudioHubBridgeHooks gBridgeHooks =
     .attached        = AudioHub_BridgeAttached,
     .detached        = AudioHub_BridgeDetached,
     .bind            = AudioHub_HandleBind,
+    .format          = AudioHub_HandleFormat,
     .notify_volume   = AudioHub_ApplyDaemonVolume,
     .notify_latency  = AudioHub_ApplyDaemonLatency,
     .flush           = AudioHub_FlushOutbox,
@@ -1558,17 +2183,54 @@ static Boolean AudioHub_ScopeMatchesDevice(const AudioHubDevice* inDevice, Audio
     return (inScope == kAudioObjectPropertyScopeGlobal) || (inScope == AudioHub_DeviceScope(inDevice));
 }
 
-static void AudioHub_FillStreamFormat(const AudioHubDevice* inDevice, AudioStreamBasicDescription* outFormat)
+static void AudioHub_FillStreamFormatChannels(UInt32 inChannelCount, AudioStreamBasicDescription* outFormat)
 {
-    outFormat->mSampleRate       = inDevice->sampleRate;
+    outFormat->mSampleRate       = kDevice_SampleRate;
     outFormat->mFormatID         = kAudioFormatLinearPCM;
     outFormat->mFormatFlags      = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked;
-    outFormat->mBytesPerPacket   = sizeof(Float32) * inDevice->channelCount;
+    outFormat->mBytesPerPacket   = sizeof(Float32) * inChannelCount;
     outFormat->mFramesPerPacket  = 1;
-    outFormat->mBytesPerFrame    = sizeof(Float32) * inDevice->channelCount;
-    outFormat->mChannelsPerFrame = inDevice->channelCount;
+    outFormat->mBytesPerFrame    = sizeof(Float32) * inChannelCount;
+    outFormat->mChannelsPerFrame = inChannelCount;
     outFormat->mBitsPerChannel   = 32;
     outFormat->mReserved         = 0;
+}
+
+static void AudioHub_FillStreamFormat(const AudioHubDevice* inDevice, AudioStreamBasicDescription* outFormat)
+{
+    AudioHub_FillStreamFormatChannels(atomic_load(&inDevice->channelCount), outFormat);
+}
+
+static uint32_t AudioHub_LayoutForChannelCount(UInt32 inChannelCount)
+{
+    switch(inChannelCount)
+    {
+        case 2:  return kAudioHubLayout_Stereo;
+        case 6:  return kAudioHubLayout_Surround51;
+        case 8:  return kAudioHubLayout_Surround71;
+        case 12: return kAudioHubLayout_Immersive714;
+        default: return UINT32_MAX;
+    }
+}
+
+static UInt32 AudioHub_AvailableFormatCount(const AudioHubDevice* inDevice)
+{
+    if(inDevice->isInput)
+    {
+        return 1;
+    }
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    const uint32_t theMask = inDevice->allowedLayouts;
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    UInt32 theCount = 0;
+    for(uint32_t theLayout = 0; theLayout < kAudioHubLayoutCount; ++theLayout)
+    {
+        if((theMask & kAudioHubLayoutMask(theLayout)) != 0)
+        {
+            ++theCount;
+        }
+    }
+    return theCount;
 }
 
 static Float32 AudioHub_ClampScalar(Float32 inValue)
@@ -1669,6 +2331,125 @@ static AudioServerPlugInDriverInterface gAudioServerPlugInDriverInterface =
 static AudioServerPlugInDriverInterface* gAudioServerPlugInDriverInterfacePtr = &gAudioServerPlugInDriverInterface;
 static AudioServerPlugInDriverRef        gAudioServerPlugInDriverRef          = &gAudioServerPlugInDriverInterfacePtr;
 
+static void AudioHub_QueueFormatHostRequest(uint32_t inEndpoint)
+{
+    if((inEndpoint >= kAudioHubMaxEndpoints) ||
+       (AUDIOHUB_ENDPOINT_DIR(inEndpoint) != kAudioHubDir_Out))
+    {
+        return;
+    }
+    if(atomic_load(&gFormatHostWorkerReady) == 0)
+    {
+        AudioHubDevice* theDevice = &gSlots[AUDIOHUB_ENDPOINT_SLOT(inEndpoint)].dev[kAudioHubDir_Out];
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        AudioHub_AbortFormatLocked(theDevice);
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        return;
+    }
+    pthread_mutex_lock(&gFormatHostMutex);
+    gFormatHostQueue |= (1u << AUDIOHUB_ENDPOINT_SLOT(inEndpoint));
+    pthread_cond_signal(&gFormatHostCond);
+    pthread_mutex_unlock(&gFormatHostMutex);
+}
+
+static void* AudioHub_FormatHostThread(void* inArg)
+{
+    (void)inArg;
+    pthread_setname_np("com.audiohub.hal.format");
+    for(;;)
+    {
+        pthread_mutex_lock(&gFormatHostMutex);
+        while(gFormatHostQueue == 0)
+        {
+            pthread_cond_wait(&gFormatHostCond, &gFormatHostMutex);
+        }
+        uint32_t theSlotIndex = 0;
+        while((theSlotIndex < kAudioHubMaxSlots) &&
+              ((gFormatHostQueue & (1u << theSlotIndex)) == 0))
+        {
+            ++theSlotIndex;
+        }
+        gFormatHostQueue &= ~(1u << theSlotIndex);
+        pthread_mutex_unlock(&gFormatHostMutex);
+        AudioHub_FlushFormatPropertyNotifications();
+
+        AudioHubSlot* theSlot = &gSlots[theSlotIndex];
+        AudioHubDevice* theDevice = &theSlot->dev[kAudioHubDir_Out];
+        uint32_t theEpoch = 0;
+        AudioObjectID theDeviceID = kAudioObjectUnknown;
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        if((theDevice->formatStage == kFormatAwaitingHost) &&
+           (theDevice->hostEpochOutstanding == 0) &&
+           (theDevice->formatSessionID != 0) &&
+           (AudioHubBridge_SessionID() == theDevice->formatSessionID) &&
+           (atomic_load(&theSlot->state) == kSlotBound))
+        {
+            theEpoch = theDevice->formatEpoch;
+            theDevice->hostEpochOutstanding = theEpoch;
+            theDevice->formatStage = kFormatHostRequested;
+            theDevice->formatStartedMsec = AudioHub_NowMsec();
+            theDeviceID = AudioHub_ID(&theDevice->deviceID);
+        }
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        if(theEpoch == 0)
+        {
+            continue;
+        }
+
+        const OSStatus theResult = (gPlugIn_Host != NULL)
+            ? gPlugIn_Host->RequestDeviceConfigurationChange(
+                  gPlugIn_Host, theDeviceID,
+                  AudioHub_FormatChangeAction(theDevice->endpoint, theEpoch), NULL)
+            : kAudioHardwareUnspecifiedError;
+        if(theResult != kAudioHardwareNoError)
+        {
+            Boolean theQueueNewer = false;
+            pthread_mutex_lock(&gPlugIn_StateMutex);
+            if(theDevice->hostEpochOutstanding == theEpoch)
+            {
+                theDevice->hostEpochOutstanding = 0;
+            }
+            if((theDevice->formatEpoch == theEpoch) &&
+               (theDevice->formatStage == kFormatHostRequested))
+            {
+                AudioHub_AbortFormatLocked(theDevice);
+            }
+            else if(theDevice->formatStage == kFormatAwaitingHost)
+            {
+                theQueueNewer = true;
+            }
+            pthread_mutex_unlock(&gPlugIn_StateMutex);
+            if(theQueueNewer)
+            {
+                AudioHub_QueueFormatHostRequest(theDevice->endpoint);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void AudioHub_StartFormatHostWorkerOnce(void)
+{
+    pthread_attr_t theAttr;
+    pthread_attr_init(&theAttr);
+    pthread_attr_setdetachstate(&theAttr, PTHREAD_CREATE_DETACHED);
+    pthread_t theThread;
+    if(pthread_create(&theThread, &theAttr, AudioHub_FormatHostThread, NULL) == 0)
+    {
+        atomic_store(&gFormatHostWorkerReady, 1);
+    }
+    else
+    {
+        os_log_error(OS_LOG_DEFAULT, kAudioHubDriverLog "could not start format host worker");
+    }
+    pthread_attr_destroy(&theAttr);
+}
+
+static void AudioHub_StartFormatHostWorker(void)
+{
+    pthread_once(&gFormatHostOnce, AudioHub_StartFormatHostWorkerOnce);
+}
+
 // CFPlugIn factory, registered by name for kAudioHubDriver_FactoryUUIDString in Info.plist.
 void* AudioHubDriver_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID);
 void* AudioHubDriver_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID)
@@ -1754,6 +2535,7 @@ static OSStatus AudioHubDriver_Initialize(AudioServerPlugInDriverRef inDriver, A
     }
     gPlugIn_Host = inHost;
     AudioHub_InitSlots();
+    AudioHub_StartFormatHostWorker();
 
     // Starts the private bridge thread. It never fails the initialization: a
     // daemon that is missing (or arrives an hour later) must leave a plug-in
@@ -1831,15 +2613,46 @@ static OSStatus AudioHubDriver_RemoveDeviceClient(AudioServerPlugInDriverRef inD
 
 static OSStatus AudioHubDriver_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt64 inChangeAction, void* inChangeInfo)
 {
-    // The sample rate is fixed at 48kHz, so kAudioHubChange_Latency (StopIO,
-    // after installing a newly measured value) is the only action anything ever
-    // requests. The timing recompute runs unconditionally anyway: it was here
-    // before there were any actions at all, to keep the mechanism honest, and
-    // it is cheap and idempotent.
+    // Layout transactions use epoch-tagged actions. Legacy latency actions
+    // retain the fixed-48kHz timing recompute below.
     (void)inChangeInfo;
     if(inDriver != gAudioServerPlugInDriverRef)
     {
         return kAudioHardwareBadObjectError;
+    }
+    uint32_t theFormatEndpoint = 0;
+    uint32_t theFormatEpoch = 0;
+    if(AudioHub_DecodeFormatChangeAction(inChangeAction, &theFormatEndpoint, &theFormatEpoch))
+    {
+        AudioHubSlot* theSlot = &gSlots[AUDIOHUB_ENDPOINT_SLOT(theFormatEndpoint)];
+        AudioHubDevice* theSpeaker = &theSlot->dev[kAudioHubDir_Out];
+        Boolean theCommit = false;
+        Boolean theQueueNewer = false;
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        if((theSpeaker->hostEpochOutstanding == theFormatEpoch) &&
+           (theSpeaker->formatEpoch == theFormatEpoch) &&
+           (theSpeaker->formatStage == kFormatHostRequested) &&
+           (AudioHub_ID(&theSpeaker->deviceID) == inDeviceObjectID) &&
+           (AudioHubBridge_SessionID() == theSpeaker->formatSessionID) &&
+           (atomic_load(&theSlot->state) == kSlotBound))
+        {
+            theCommit = true;
+        }
+        else if(theSpeaker->hostEpochOutstanding == theFormatEpoch)
+        {
+            theSpeaker->hostEpochOutstanding = 0;
+            theQueueNewer = (theSpeaker->formatStage == kFormatAwaitingHost);
+        }
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        if(theCommit)
+        {
+            AudioHub_CommitFormat(theFormatEndpoint, theFormatEpoch, true);
+        }
+        else if(theQueueNewer)
+        {
+            AudioHub_QueueFormatHostRequest(theFormatEndpoint);
+        }
+        return kAudioHardwareNoError;
     }
     AudioHubDevice* theDevice = AudioHub_AcquireByDeviceID(inDeviceObjectID);
     if(theDevice == NULL)
@@ -1863,11 +2676,38 @@ static OSStatus AudioHubDriver_PerformDeviceConfigurationChange(AudioServerPlugI
 
 static OSStatus AudioHubDriver_AbortDeviceConfigurationChange(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt64 inChangeAction, void* inChangeInfo)
 {
-    (void)inChangeAction;
     (void)inChangeInfo;
     if(inDriver != gAudioServerPlugInDriverRef)
     {
         return kAudioHardwareBadObjectError;
+    }
+    uint32_t theFormatEndpoint = 0;
+    uint32_t theFormatEpoch = 0;
+    if(AudioHub_DecodeFormatChangeAction(inChangeAction, &theFormatEndpoint, &theFormatEpoch))
+    {
+        (void)inDeviceObjectID;
+        AudioHubDevice* theSpeaker = &gSlots[AUDIOHUB_ENDPOINT_SLOT(theFormatEndpoint)].dev[kAudioHubDir_Out];
+        Boolean theQueueNewer = false;
+        pthread_mutex_lock(&gPlugIn_StateMutex);
+        if(theSpeaker->hostEpochOutstanding == theFormatEpoch)
+        {
+            theSpeaker->hostEpochOutstanding = 0;
+        }
+        if((theSpeaker->formatEpoch == theFormatEpoch) &&
+           (theSpeaker->formatStage == kFormatHostRequested))
+        {
+            AudioHub_AbortFormatLocked(theSpeaker);
+        }
+        else if(theSpeaker->formatStage == kFormatAwaitingHost)
+        {
+            theQueueNewer = true;
+        }
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        if(theQueueNewer)
+        {
+            AudioHub_QueueFormatHostRequest(theFormatEndpoint);
+        }
+        return kAudioHardwareNoError;
     }
     AudioHubDevice* theDevice = AudioHub_AcquireByDeviceID(inDeviceObjectID);
     if(theDevice == NULL)
@@ -2139,8 +2979,18 @@ static OSStatus AudioHub_GetDevicePropertyDataSize(const AudioHubDevice* inDevic
             *outDataSize = 2 * sizeof(UInt32);
             break;
         case kAudioDevicePropertyPreferredChannelLayout:
-            *outDataSize = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) + (inDevice->channelCount * sizeof(AudioChannelDescription)));
+        {
+            UInt32 theChannelCount = AUDIOHUB_MIC_CHANNELS;
+            if(!inDevice->isInput)
+            {
+                pthread_mutex_lock(&gPlugIn_StateMutex);
+                theChannelCount = AudioHub_LayoutChannels(inDevice->currentLayout);
+                pthread_mutex_unlock(&gPlugIn_StateMutex);
+            }
+            *outDataSize = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) +
+                                    (theChannelCount * sizeof(AudioChannelDescription)));
             break;
+        }
         default:
             return kAudioHardwareUnknownPropertyError;
     }
@@ -2393,31 +3243,74 @@ static OSStatus AudioHub_GetDevicePropertyData(AudioHubDevice* inDevice, const A
         case kAudioDevicePropertyPreferredChannelsForStereo:
             if(inDataSize < (2 * sizeof(UInt32))) return kAudioHardwareBadPropertySizeError;
             ((UInt32*)outData)[0] = 1;
-            ((UInt32*)outData)[1] = (inDevice->channelCount > 1) ? 2 : 1;
+            ((UInt32*)outData)[1] = (atomic_load(&inDevice->channelCount) > 1) ? 2 : 1;
             *outDataSize = 2 * sizeof(UInt32);
             break;
         case kAudioDevicePropertyPreferredChannelLayout:
         {
-            UInt32 theACLSize = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) + (inDevice->channelCount * sizeof(AudioChannelDescription)));
+            static const AudioChannelLabel kStereo[] = {
+                kAudioChannelLabel_Left, kAudioChannelLabel_Right
+            };
+            static const AudioChannelLabel kSurround51[] = {
+                kAudioChannelLabel_Left, kAudioChannelLabel_Right, kAudioChannelLabel_Center,
+                kAudioChannelLabel_LFEScreen, kAudioChannelLabel_LeftSurround, kAudioChannelLabel_RightSurround
+            };
+            static const AudioChannelLabel kSurround71[] = {
+                kAudioChannelLabel_Left, kAudioChannelLabel_Right, kAudioChannelLabel_Center,
+                kAudioChannelLabel_LFEScreen, kAudioChannelLabel_RearSurroundLeft,
+                kAudioChannelLabel_RearSurroundRight, kAudioChannelLabel_LeftSurround,
+                kAudioChannelLabel_RightSurround
+            };
+            static const AudioChannelLabel kImmersive714[] = {
+                kAudioChannelLabel_Left, kAudioChannelLabel_Right, kAudioChannelLabel_Center,
+                kAudioChannelLabel_LFEScreen, kAudioChannelLabel_RearSurroundLeft,
+                kAudioChannelLabel_RearSurroundRight, kAudioChannelLabel_LeftSurround,
+                kAudioChannelLabel_RightSurround, kAudioChannelLabel_VerticalHeightLeft,
+                kAudioChannelLabel_VerticalHeightRight, kAudioChannelLabel_TopBackLeft,
+                kAudioChannelLabel_TopBackRight
+            };
+            const AudioChannelLabel* theLabels = NULL;
+            UInt32 theChannelCount = 0;
+            if(inDevice->isInput)
+            {
+                theChannelCount = 1;
+            }
+            else
+            {
+                pthread_mutex_lock(&gPlugIn_StateMutex);
+                const uint32_t theLayout = inDevice->currentLayout;
+                pthread_mutex_unlock(&gPlugIn_StateMutex);
+                theChannelCount = AudioHub_LayoutChannels(theLayout);
+                switch(theLayout)
+                {
+                    case kAudioHubLayout_Stereo:       theLabels = kStereo; break;
+                    case kAudioHubLayout_Surround51:   theLabels = kSurround51; break;
+                    case kAudioHubLayout_Surround71:   theLabels = kSurround71; break;
+                    case kAudioHubLayout_Immersive714: theLabels = kImmersive714; break;
+                    default: return kAudioHardwareUnspecifiedError;
+                }
+            }
+            UInt32 theACLSize = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) +
+                                         (theChannelCount * sizeof(AudioChannelDescription)));
             if(inDataSize < theACLSize) return kAudioHardwareBadPropertySizeError;
             AudioChannelLayout* theACL = (AudioChannelLayout*)outData;
             theACL->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
             theACL->mChannelBitmap = 0;
-            theACL->mNumberChannelDescriptions = inDevice->channelCount;
-            for(UInt32 theIndex = 0; theIndex < inDevice->channelCount; ++theIndex)
+            theACL->mNumberChannelDescriptions = theChannelCount;
+            for(UInt32 theIndex = 0; theIndex < theChannelCount; ++theIndex)
             {
                 AudioChannelDescription* theDescription = &theACL->mChannelDescriptions[theIndex];
                 theDescription->mChannelFlags = 0;
                 theDescription->mCoordinates[0] = 0.0f;
                 theDescription->mCoordinates[1] = 0.0f;
                 theDescription->mCoordinates[2] = 0.0f;
-                if(inDevice->channelCount == 1)
+                if(inDevice->isInput)
                 {
                     theDescription->mChannelLabel = kAudioChannelLabel_Mono;
                 }
                 else
                 {
-                    theDescription->mChannelLabel = (theIndex == 0) ? kAudioChannelLabel_Left : kAudioChannelLabel_Right;
+                    theDescription->mChannelLabel = theLabels[theIndex];
                 }
             }
             *outDataSize = theACLSize;
@@ -2508,7 +3401,7 @@ static OSStatus AudioHub_IsStreamPropertySettable(const AudioObjectPropertyAddre
     return kAudioHardwareNoError;
 }
 
-static OSStatus AudioHub_GetStreamPropertyDataSize(const AudioObjectPropertyAddress* inAddress, UInt32* outDataSize)
+static OSStatus AudioHub_GetStreamPropertyDataSize(const AudioHubDevice* inDevice, const AudioObjectPropertyAddress* inAddress, UInt32* outDataSize)
 {
     switch(inAddress->mSelector)
     {
@@ -2536,7 +3429,7 @@ static OSStatus AudioHub_GetStreamPropertyDataSize(const AudioObjectPropertyAddr
             break;
         case kAudioStreamPropertyAvailableVirtualFormats:
         case kAudioStreamPropertyAvailablePhysicalFormats:
-            *outDataSize = sizeof(AudioStreamRangedDescription);
+            *outDataSize = AudioHub_AvailableFormatCount(inDevice) * (UInt32)sizeof(AudioStreamRangedDescription);
             break;
         default:
             return kAudioHardwareUnknownPropertyError;
@@ -2617,15 +3510,27 @@ static OSStatus AudioHub_GetStreamPropertyData(AudioHubDevice* inDevice, const A
         case kAudioStreamPropertyAvailableVirtualFormats:
         case kAudioStreamPropertyAvailablePhysicalFormats:
         {
-            UInt32 theNumberItemsToFetch = inDataSize / sizeof(AudioStreamRangedDescription);
-            if(theNumberItemsToFetch > 1)
+            const UInt32 theCapacity = inDataSize / (UInt32)sizeof(AudioStreamRangedDescription);
+            UInt32 theNumberItemsToFetch = 0;
+            uint32_t theMask = kAudioHubLayoutMask(kAudioHubLayout_Stereo);
+            if(!inDevice->isInput)
             {
-                theNumberItemsToFetch = 1;
+                pthread_mutex_lock(&gPlugIn_StateMutex);
+                theMask = inDevice->allowedLayouts;
+                pthread_mutex_unlock(&gPlugIn_StateMutex);
             }
-            if(theNumberItemsToFetch > 0)
+            AudioStreamRangedDescription* theDescriptions = (AudioStreamRangedDescription*)outData;
+            for(uint32_t theLayout = 0;
+                (theLayout < kAudioHubLayoutCount) && (theNumberItemsToFetch < theCapacity); ++theLayout)
             {
-                AudioStreamRangedDescription* theDescription = (AudioStreamRangedDescription*)outData;
-                AudioHub_FillStreamFormat(inDevice, &theDescription->mFormat);
+                if((theMask & kAudioHubLayoutMask(theLayout)) == 0)
+                {
+                    continue;
+                }
+                AudioStreamRangedDescription* theDescription = &theDescriptions[theNumberItemsToFetch++];
+                const UInt32 theChannels = inDevice->isInput ? AUDIOHUB_MIC_CHANNELS
+                                                              : AudioHub_LayoutChannels(theLayout);
+                AudioHub_FillStreamFormatChannels(theChannels, &theDescription->mFormat);
                 theDescription->mSampleRateRange.mMinimum = kDevice_SampleRate;
                 theDescription->mSampleRateRange.mMaximum = kDevice_SampleRate;
             }
@@ -2663,21 +3568,33 @@ static OSStatus AudioHub_SetStreamPropertyData(AudioHubDevice* inDevice, const A
         {
             if(inDataSize != sizeof(AudioStreamBasicDescription)) return kAudioHardwareBadPropertySizeError;
             const AudioStreamBasicDescription* theNewFormat = (const AudioStreamBasicDescription*)inData;
-            AudioStreamBasicDescription theCurrentFormat;
-            AudioHub_FillStreamFormat(inDevice, &theCurrentFormat);
-            if((theNewFormat->mFormatID != theCurrentFormat.mFormatID) ||
-               (theNewFormat->mFormatFlags != theCurrentFormat.mFormatFlags) ||
-               (theNewFormat->mSampleRate != theCurrentFormat.mSampleRate) ||
-               (theNewFormat->mBytesPerPacket != theCurrentFormat.mBytesPerPacket) ||
-               (theNewFormat->mFramesPerPacket != theCurrentFormat.mFramesPerPacket) ||
-               (theNewFormat->mBytesPerFrame != theCurrentFormat.mBytesPerFrame) ||
-               (theNewFormat->mChannelsPerFrame != theCurrentFormat.mChannelsPerFrame) ||
-               (theNewFormat->mBitsPerChannel != theCurrentFormat.mBitsPerChannel))
+            AudioStreamBasicDescription theExpectedFormat;
+            AudioHub_FillStreamFormatChannels(theNewFormat->mChannelsPerFrame, &theExpectedFormat);
+            if((theNewFormat->mFormatID != theExpectedFormat.mFormatID) ||
+               (theNewFormat->mFormatFlags != theExpectedFormat.mFormatFlags) ||
+               (theNewFormat->mSampleRate != theExpectedFormat.mSampleRate) ||
+               (theNewFormat->mBytesPerPacket != theExpectedFormat.mBytesPerPacket) ||
+               (theNewFormat->mFramesPerPacket != theExpectedFormat.mFramesPerPacket) ||
+               (theNewFormat->mBytesPerFrame != theExpectedFormat.mBytesPerFrame) ||
+               (theNewFormat->mBitsPerChannel != theExpectedFormat.mBitsPerChannel))
             {
                 return kAudioDeviceUnsupportedFormatError;
             }
-            // identical to the one and only supported format: nothing to change
-            break;
+            if(inDevice->isInput)
+            {
+                return (theNewFormat->mChannelsPerFrame == AUDIOHUB_MIC_CHANNELS)
+                    ? kAudioHardwareNoError : kAudioDeviceUnsupportedFormatError;
+            }
+            const uint32_t theLayout = AudioHub_LayoutForChannelCount(theNewFormat->mChannelsPerFrame);
+            pthread_mutex_lock(&gPlugIn_StateMutex);
+            const uint32_t theSupportedMask = inDevice->allowedLayouts;
+            pthread_mutex_unlock(&gPlugIn_StateMutex);
+            if((theLayout == UINT32_MAX) || ((theSupportedMask & kAudioHubLayoutMask(theLayout)) == 0))
+            {
+                return kAudioDeviceUnsupportedFormatError;
+            }
+            return AudioHub_BeginFormatTransaction(inDevice, theLayout, theSupportedMask, 0,
+                                                   AudioHubBridge_SessionID());
         }
         default:
             if(!AudioHub_HasStreamProperty(inAddress))
@@ -3046,7 +3963,7 @@ static OSStatus AudioHubDriver_GetPropertyDataSize(AudioServerPlugInDriverRef in
             theAnswer = AudioHub_GetDevicePropertyDataSize(theDevice, inAddress, outDataSize);
             break;
         case kObjectKind_Stream:
-            theAnswer = AudioHub_GetStreamPropertyDataSize(inAddress, outDataSize);
+            theAnswer = AudioHub_GetStreamPropertyDataSize(theDevice, inAddress, outDataSize);
             break;
         case kObjectKind_VolumeControl:
         case kObjectKind_MuteControl:

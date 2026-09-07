@@ -28,6 +28,7 @@ pub mod halbridge;
 /// developed on, not only on the target.
 pub mod halbridge_win;
 pub mod haldev;
+mod halformat;
 mod ipcserv;
 /// `hal_mic` 生产侧水位闸门（纯状态机 + 一条不变式）。
 pub mod micgate;
@@ -1328,6 +1329,7 @@ pub(crate) fn status_with_hal(
             serde_json::to_value(lk(&inner.native_output).clone())?,
         );
         obj.insert("spatial_output".to_string(), spatial::status(inner));
+        obj.insert("hal_output_formats".to_string(), inner.hal().map(|hal| hal.output_formats_status()).unwrap_or(serde_json::Value::Null));
     }
     Ok(v)
 }

@@ -1080,6 +1080,9 @@ pub trait FrameSource {
         None
     }
 
+    /// Permanent source-contract failure, distinct from an ordinary idle tick.
+    fn failed(&self) -> Option<String> { None }
+
     /// 本源在「交给发送调度器之前」还压着多少音频（规格 §3.2 的级 1 / 3 / 3′）。
     ///
     /// 默认 `NO_DEPTHS` = 这个源没有任何可观测的排队。`ToneSource` 就属此类：

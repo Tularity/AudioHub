@@ -2683,7 +2683,8 @@ fn coordinate_sessions(inner: &Arc<DaemonInner>, tx: &mpsc::Sender<SessCmd>) {
         // out of the system and holding somebody's microphone open for it would
         // be exactly backwards.
         let alive = rec.state == Some(HalSlotState::Bound);
-        let want_out = alive
+        let format_ready = inner.hal().is_none_or(|hal| !hal.supports_output_formats() || hal.output_format(slot as u8).is_some());
+        let want_out = alive && format_ready
             && rec.published_directions & HAL_PUBLISH_OUT != 0
             && (rec.io_out || lingering(rec.io_out_off_since, LINGER_OUT));
         let want_in = alive
@@ -2790,7 +2791,7 @@ pub(crate) fn session_worker(inner: Arc<DaemonInner>, rx: mpsc::Receiver<SessCmd
                     &params,
                     SessionOrigin::Hal { slot },
                     conn::OpenCause::Fresh,
-                    None, // The current driver ABI exposes only a stereo speaker ring.
+                    if out { inner.hal().and_then(|hal| hal.output_format(slot)).and_then(|(layout, _)| crate::halformat::spatial_layout(layout)) } else { None },
                 );
                 let mut st = lk(&inner.haldev);
                 if out {
@@ -2857,6 +2858,55 @@ pub(crate) fn session_worker(inner: Arc<DaemonInner>, rx: mpsc::Receiver<SessCmd
 
 // ---------------------------------------------------------------- loop
 
+fn coordinate_output_formats(inner: &Arc<DaemonInner>, hal: &halbridge::HalBridge) {
+    if !hal.supports_output_formats() { return; }
+    let records: Vec<_> = {
+        let state = lk(&inner.haldev);
+        state.slots.iter().enumerate().filter(|(_, rec)| rec.state == Some(HalSlotState::Bound) && rec.published_directions & HAL_PUBLISH_OUT != 0)
+            .map(|(slot, rec)| (slot as u8, rec.generation, rec.fingerprint.clone())).collect()
+    };
+    for (slot, generation, fingerprint) in records {
+        let conn = lk(&inner.state).conns.get(&fingerprint).cloned();
+        let mut mask = crate::halformat::STEREO_MASK;
+        let quality = lk(&inner.peer_transport).get(&fingerprint).send.quality_target();
+        if !matches!(quality, audiohub_ipc::QualityTarget::Fixed(rung) if rung != 0) {
+            if let Some(conn) = conn.filter(|conn| conn.alive.load(Ordering::Acquire)) {
+                if let Some(offer) = lk(&conn.peer_spatial_output).as_ref() {
+                    for contract in &offer.contracts { mask |= 1 << crate::halformat::layout_id(contract.layout); }
+                }
+            }
+        }
+        let desired = hal.output_format(slot).map(|(layout, _)| layout).filter(|layout| mask & (1 << layout) != 0).unwrap_or(0);
+        hal.offer_output_format(slot, generation, mask, desired);
+        let Some(lease) = hal.take_format_prepare(slot) else { continue };
+        let worker_lease = lease.clone();
+        let owner = Arc::clone(inner);
+        let spawned = std::thread::Builder::new().name("ahb-hal-format".into()).spawn(move || {
+            let mut acknowledged = false;
+            if worker_lease.is_current() {
+                for entry in crate::snapshot_sessions(&owner) {
+                    if entry.conn.fp == fingerprint && entry.replay.as_ref().is_some_and(|params| params.source.as_deref() == Some(SOURCE_HAL_SPEAKER)) {
+                        if let Some(tx) = &entry.tx { tx.fail_media("virtual speaker format is changing".into()); }
+                    }
+                }
+                let (reply, done) = mpsc::channel();
+                if lk(&owner.tx_cmds).send(crate::engine::TxCmd::QuiesceHal { lease: worker_lease.clone(), ack: reply }).is_ok()
+                    && done.recv_timeout(Duration::from_secs(1)) == Ok(true)
+                {
+                    for _ in 0..3 {
+                        if owner.shutdown.load(Ordering::Acquire) || !worker_lease.is_current() { break; }
+                        if owner.hal().is_some_and(|hal| hal.format_quiesced(worker_lease.message)) { acknowledged = true; break; }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+            if !acknowledged { if let Some(hal) = owner.hal() { hal.format_failed(&worker_lease); } }
+            worker_lease.finish();
+        });
+        if spawned.is_err() { lease.finish(); }
+    }
+}
+
 /// 200ms: fast enough that a device selection feels immediate, slow enough that
 /// the CoreAudio enumeration behind it (once a second) is free.
 ///
@@ -2883,6 +2933,7 @@ pub(crate) fn coordinator_loop(inner: Arc<DaemonInner>, tx: mpsc::Sender<SessCmd
             observed = observe();
         }
         reconcile(&inner, &hal, observed.as_ref());
+        coordinate_output_formats(&inner, &hal);
         // Order matters, and it is the same one the old single-pair tick used:
         // the driver's own change is dispatched (and recorded as "the control
         // already reads this") BEFORE the peer's state is pushed back, so a

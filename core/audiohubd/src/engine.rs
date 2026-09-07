@@ -862,6 +862,10 @@ impl SourceSpec {
 }
 
 pub(crate) enum TxCmd {
+    QuiesceHal {
+        lease: crate::halbridge::HalFormatLease,
+        ack: mpsc::Sender<bool>,
+    },
     Add {
         stream_id: u32,
         key: [u8; 32],
@@ -1371,7 +1375,7 @@ impl Src {
     /// `Some(reason)` once the source can never produce audio again.
     fn failed(&self) -> Option<String> {
         match self {
-            Src::Frame(_) => None,
+            Src::Frame(source) => source.failed(),
             Src::Sys(s) => s.cap.failed(),
         }
     }
@@ -1640,9 +1644,9 @@ fn build_source(
                     keep / per_ms,
                 );
             }
-            Src::Frame(Box::new(crate::halbridge::HalSpeakerSource::new(
+            Src::Frame(Box::new(crate::halbridge::HalSpeakerSource::new_checked(
                 &hal, *slot,
-            )))
+            )?))
         }
     })
 }
@@ -2169,6 +2173,24 @@ impl TxState {
 /// 现在它只做三件常数时间的事：查表、推一条请求进通道、（源已在时）装流。
 fn apply_txcmd(st: &mut TxState, cmd: TxCmd) {
     match cmd {
+        TxCmd::QuiesceHal { lease, ack } => {
+            if !lease.is_current() { let _ = ack.send(false); return; }
+            let slot = (lease.message.endpoint / 2) as u8;
+            let spec = SourceSpec::HalSpeaker { slot };
+            let ids: Vec<_> = st.streams.iter().filter(|(_, stream)| stream.spec == spec).map(|(id, _)| *id).collect();
+            for id in ids {
+                if let Some(stream) = st.streams.get(&id) { stream.shared.fail_media("virtual speaker format is changing".into()); }
+                st.remove_stream(id);
+            }
+            if let Some(pending) = st.pending.get_mut(&spec) {
+                for waiter in pending.waiters.drain(..) {
+                    waiter.shared.fail_media("virtual speaker format is changing".into());
+                    if let Some(reply) = waiter.ack { let _ = reply.send(Err("virtual speaker format is changing".into())); }
+                }
+            }
+            if let Some(source) = st.sources.remove(&spec) { st.retire(spec, source.gen, source.src); }
+            let _ = ack.send(lease.is_current());
+        }
         TxCmd::Add {
             stream_id,
             key,

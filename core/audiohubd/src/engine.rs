@@ -2280,6 +2280,395 @@ fn reap_dead_sources(inner: &DaemonInner, st: &mut TxState) {
     }
 }
 
+#[cfg(test)]
+mod spatial_lifecycle_integration_tests {
+    use super::*;
+    use crate::{
+        airplay, haldev, peer_transport, quality, servo, ClockFilter, ConnShared,
+        DaemonState, PeerAudioCapabilitiesCell, PeerLatCell, PeerModeCell, PushedTransport,
+        SessionEntry, SessionOrigin, VolumeCell,
+    };
+    use audiohub_core::latency::{DriftTracker, StageSlot};
+    use audiohub_core::spatial_output::SpeakerLayout;
+    use audiohub_net::identity::{LocalIdentity, PairedPeer};
+    use audiohub_net::secure::{SecureChannel, SessionMsg};
+    use audiohub_net::spatial_media::SpatialMediaContract;
+    use std::collections::{HashMap, VecDeque};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+    use std::sync::{Arc, Mutex, Once, RwLock};
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
+
+    struct LifecycleDaemon {
+        inner: Arc<DaemonInner>,
+        tx_cmds: mpsc::Receiver<TxCmd>,
+        remote: crate::mux::ControlChan,
+        dir: PathBuf,
+    }
+
+    impl Drop for LifecycleDaemon {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    struct LifecycleSource {
+        layout: Option<SpeakerLayout>,
+        failure: Option<&'static str>,
+    }
+
+    impl FrameSource for LifecycleSource {
+        fn sample_rate(&self) -> u32 { 48_000 }
+
+        fn channels(&self) -> u8 {
+            self.layout.map_or(1, |layout| layout.channels() as u8)
+        }
+
+        fn speaker_layout(&self) -> Option<SpeakerLayout> { self.layout }
+
+        fn next_frame(&mut self, out: &mut Vec<f32>) -> bool {
+            out.clear();
+            out.resize(F48 * self.channels() as usize, 0.25);
+            true
+        }
+
+        fn failed(&self) -> Option<String> { self.failure.map(str::to_string) }
+    }
+
+    fn fixture_dir(tag: &str) -> PathBuf {
+        let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ahb-spatial-lifecycle-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create lifecycle fixture directory");
+        dir
+    }
+
+    fn peer_of(identity: &LocalIdentity) -> PairedPeer {
+        PairedPeer {
+            name: identity.name.clone(),
+            fingerprint: identity.fingerprint.clone(),
+            public_key_b64: identity.public_key_b64(),
+            last_addr: None,
+            port: 0,
+            added_unix: 0,
+            alias: None,
+        }
+    }
+
+    fn connection(dir: &std::path::Path, connection_id: u64) -> (LocalIdentity, Arc<ConnShared>, crate::mux::ControlChan) {
+        let local = LocalIdentity::load_or_create_at(Some(&dir.join("local")))
+            .expect("local identity");
+        let peer_identity = LocalIdentity::load_or_create_at(Some(&dir.join("peer")))
+            .expect("peer identity");
+        let local_peer = peer_of(&local);
+        let remote_peer = peer_of(&peer_identity);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("control listener");
+        let address = listener.local_addr().expect("control listener address");
+        let responder = std::thread::spawn(move || -> anyhow::Result<crate::mux::ControlChan> {
+            let (stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+            SecureChannel::establish_responder(stream.into(), &peer_identity, &local_peer)
+        });
+        let stream = TcpStream::connect(address).expect("connect control fixture");
+        stream.set_read_timeout(Some(Duration::from_secs(2))).expect("initiator read timeout");
+        stream.set_write_timeout(Some(Duration::from_secs(2))).expect("initiator write timeout");
+        let channel: crate::mux::ControlChan =
+            SecureChannel::establish_initiator(stream.into(), &local, &remote_peer)
+                .expect("establish control fixture");
+        let remote = responder.join().expect("control responder thread").expect("establish responder");
+        let keys = channel.media_keys();
+        let conn = Arc::new(ConnShared {
+            connection_id,
+            fp: remote_peer.fingerprint.clone(),
+            peer: remote_peer,
+            chan: Mutex::new(channel),
+            tx_key: keys.tx,
+            rx_key: keys.rx,
+            peer_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            media_path: Mutex::new(MediaPath::Udp("127.0.0.1:1".parse().unwrap())),
+            media_gate: crate::tcpmedia::AttachGate::new(),
+            media_attaching: AtomicBool::new(false),
+            registration_ready: AtomicBool::new(true),
+            deferred: Mutex::new(VecDeque::new()),
+            initiator_fp: local.fingerprint.clone(),
+            created: Instant::now(),
+            pending: Mutex::new(HashMap::new()),
+            alive: AtomicBool::new(true),
+            last_rx_ms: AtomicU64::new(0),
+            clock: Mutex::new(ClockFilter::new()),
+            clock_warned: AtomicBool::new(false),
+            peer_mode: Mutex::new(PeerModeCell::Unheard),
+            peer_audio_capabilities: Mutex::new(PeerAudioCapabilitiesCell::Unheard),
+            peer_native_output: Mutex::new(None),
+            peer_spatial_output: Mutex::new(None),
+        });
+        (local, conn, remote)
+    }
+
+    fn daemon(tag: &str) -> (LifecycleDaemon, Arc<ConnShared>) {
+        let dir = fixture_dir(tag);
+        let (identity, conn, remote) = connection(&dir, 41);
+        let (tx_send, tx_recv) = mpsc::channel();
+        let (mix_send, _mix_recv) = mpsc::channel();
+        let inner = Arc::new(DaemonInner {
+            id: RwLock::new(identity),
+            cfg_dir: dir.clone(),
+            control_port: 0,
+            ipc_port: 0,
+            token: "fixture-only".into(),
+            udp: UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("lifecycle UDP socket"),
+            media_send: UdpSender::new(),
+            tx_bps: 0,
+            udp_block: UdpBlock::OFF,
+            start: Instant::now(),
+            state: Mutex::new(DaemonState {
+                conns: HashMap::new(),
+                sessions: HashMap::new(),
+                stream_claims: HashMap::new(),
+                pairing: None,
+            }),
+            rx_table: RwLock::new(HashMap::new()),
+            tx_cmds: Mutex::new(tx_send),
+            mix_cmds: Mutex::new(mix_send),
+            mix_ring: Mutex::new(VecDeque::new()),
+            store_lock: Mutex::new(()),
+            settings_write_lock: Mutex::new(()),
+            device_output_volume_io: Mutex::new(0),
+            device_input_volume_io: Mutex::new(0),
+            native_output: Mutex::new(Default::default()),
+            shutdown: AtomicBool::new(false),
+            cleanup: Once::new(),
+            announce_guard: Mutex::new(None),
+            announce_fault: false,
+            airplay: airplay::AirPlayController::new(false, dir.clone()),
+            halbridge: Mutex::new(None),
+            settings: Mutex::new(Default::default()),
+            peer_transport: Mutex::new(peer_transport::PeerTransportStore::default()),
+            servo_site: Mutex::new(servo::ServoSite::default()),
+            haldev: Mutex::new(haldev::HalDevState::new(haldev::SlotTable::new())),
+            hal_sess: Mutex::new(None),
+            hal_mic_io: std::array::from_fn(|_| AtomicBool::new(true)),
+            media_tickets: Mutex::new(Vec::new()),
+            preauth: AtomicUsize::new(0),
+            next_connection_id: AtomicU64::new(42),
+            recon: Mutex::new(HashMap::new()),
+            dev_in_epoch: AtomicU64::new(0),
+            dev_out_epoch: Arc::new(AtomicU64::new(0)),
+            devices: crate::DeviceInventory::with_scanner(|| (Vec::new(), Vec::new())),
+            dev_lat: crate::devlats::DevLatCache::new(),
+            play_ring: StageSlot::new(),
+            site_playback: SitePlaybackProbe::new(),
+            play_drift: Mutex::new(DriftTracker::new()),
+            mix_clip: quality::ClipMeter::new(),
+            mix_meter: quality::MixMeter::new(),
+        });
+        (LifecycleDaemon { inner, tx_cmds: tx_recv, remote, dir }, conn)
+    }
+
+    fn session(id: u32, conn: &Arc<ConnShared>, tx: &Arc<TxShared>) -> SessionEntry {
+        SessionEntry {
+            id,
+            conn: conn.clone(),
+            kind: "mic".into(),
+            dir: crate::DIR_SEND.into(),
+            source: Some("test-frame-source".into()),
+            rx: None,
+            tx: Some(tx.clone()),
+            volume: Arc::new(VolumeCell::new(false)),
+            replay: None,
+            origin: SessionOrigin::Peer,
+            peer_lat: Arc::new(PeerLatCell::new()),
+            pushed: Arc::new(PushedTransport::default()),
+            armed_conn_ms: 0,
+            media_tier: "tier0",
+        }
+    }
+
+    fn contract(layout: SpeakerLayout) -> SpatialMediaContract {
+        SpatialMediaContract {
+            version: 1,
+            provider_revision: 7,
+            endpoint_id: "provider-output".into(),
+            active_format: "native-format".into(),
+            layout,
+        }
+    }
+
+    fn spatial_stream(id: u32, owner: &Arc<TxShared>, contract: &SpatialMediaContract) -> (TxStream, SourceEnt) {
+        let mut stream = super::tests::tx_stream_for(owner);
+        stream.id = id;
+        stream.crypto = MediaCrypto::new_for_stream(&[0; 32], id, &[0; 16]);
+        stream.spec = SourceSpec::HalSpeaker { slot: id as u8 };
+        stream.channels = contract.channels();
+        stream.rung = 0;
+        let channels = contract.channels();
+        let source = SourceEnt {
+            src: Src::Frame(Box::new(LifecycleSource {
+                layout: Some(contract.layout),
+                failure: None,
+            })),
+            channels,
+            refs: 1,
+            gen: id as u64,
+            frame: vec![0.25; F48 * channels as usize],
+            frame_valid: true,
+            depths: NO_DEPTHS,
+        };
+        (stream, source)
+    }
+
+    fn drain_queued_media(
+        inner: &Arc<DaemonInner>,
+        tcp: Option<&crate::tcpmedia::TcpMediaLink>,
+        revoked: &Arc<TxShared>,
+        live: &Arc<TxShared>,
+    ) -> (u64, u64) {
+        let rejected = if let Some(link) = tcp {
+            let mut output = Vec::new();
+            let mut bucket = crate::tcpmedia::TokenBucket::new(0);
+            let shutdown = AtomicBool::new(false);
+            while let Some(outcome) = crate::tcpmedia::write_one_queued(
+                link, &mut output, &shutdown, &mut bucket, None,
+            ) {
+                assert!(matches!(outcome, crate::tcpmedia::WriteOutcome::Revoked | crate::tcpmedia::WriteOutcome::Sent));
+            }
+            assert!(!output.is_empty(), "unaffected TCP media never reached the writer");
+            assert_eq!(link.stale_dropped(), 0);
+            link.revoked_dropped()
+        } else {
+            // The real consumer drains already queued datagrams before its
+            // shutdown check. No background worker or sleep is required.
+            inner.shutdown.store(true, Ordering::SeqCst);
+            udp_send_loop(inner.clone());
+            assert_eq!(inner.media_send.queued(), 0);
+            inner.media_send.revoked_dropped()
+        };
+        assert_eq!(revoked.sent_packets.load(Ordering::Relaxed), 0);
+        (rejected, live.sent_packets.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn provider_offer_revocation_tears_down_only_the_stale_session_and_rejects_its_queue() {
+        for tier in 0..=2 {
+            let (mut daemon, conn) = daemon("offer");
+            let sink = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("media receiver");
+            let destination = sink.local_addr().unwrap();
+            let mux_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("mux fixture listener");
+            let tcp = (tier != 0).then(|| Arc::new(crate::tcpmedia::TcpMediaLink::new_for_test(conn.fp.clone(), destination)));
+            let path = match tier {
+                0 => MediaPath::Udp(destination),
+                1 => MediaPath::Tcp(tcp.as_ref().unwrap().clone()),
+                _ => MediaPath::Framed(crate::mux::MuxLink::new_for_test(tcp.as_ref().unwrap().clone(), mux_listener.local_addr().unwrap())),
+            };
+            let stale_contract = contract(SpeakerLayout::Surround51);
+            let current_contract = contract(SpeakerLayout::Surround71);
+            let stale = Arc::new(TxShared::new_on(0).with_spatial_contract(stale_contract.clone()).unwrap());
+            let current = Arc::new(TxShared::new_on(0).with_spatial_contract(current_contract.clone()).unwrap());
+            let (mut stale_stream, stale_source) = spatial_stream(11, &stale, &stale_contract);
+            let (mut current_stream, current_source) = spatial_stream(12, &current, &current_contract);
+            stale_stream.path = path.clone();
+            current_stream.path = path;
+            assert!(send_spatial_frame(&daemon.inner.media_send, &mut stale_stream, &stale_source, Instant::now(), 1, &mut Vec::new()));
+            assert!(send_spatial_frame(&daemon.inner.media_send, &mut current_stream, &current_source, Instant::now(), 2, &mut Vec::new()));
+            {
+                let mut state = crate::lk(&daemon.inner.state);
+                state.sessions.insert(11, session(11, &conn, &stale));
+                state.sessions.insert(12, session(12, &conn, &current));
+            }
+
+            let offer = audiohub_net::secure::SpatialOutputOffer {
+                revision: 7,
+                contracts: vec![current_contract],
+            };
+            crate::spatial::invalidate_peer_transmits(&daemon.inner, conn.connection_id + 1, &offer);
+            assert_eq!(crate::snapshot_sessions(&daemon.inner).len(), 2);
+            assert!(stale.may_transmit() && current.may_transmit());
+            assert!(daemon.tx_cmds.try_recv().is_err());
+            crate::spatial::invalidate_peer_transmits(
+                &daemon.inner,
+                conn.connection_id,
+                &offer,
+            );
+
+            let sessions = crate::snapshot_sessions(&daemon.inner);
+            assert_eq!(sessions.iter().map(|entry| entry.id).collect::<Vec<_>>(), [12]);
+            assert!(stale.media_failed.load(Ordering::Acquire));
+            assert!(!stale.may_transmit());
+            assert!(current.may_transmit());
+            assert!(matches!(daemon.tx_cmds.try_recv(), Ok(TxCmd::Remove { stream_id: 11 })));
+            assert!(daemon.tx_cmds.try_recv().is_err());
+            assert!(matches!(daemon.remote.recv_timeout(Duration::from_secs(1)).unwrap(), Some(SessionMsg::CloseStream { stream_id: 11 })));
+            let (rejected, sent) = drain_queued_media(&daemon.inner, tcp.as_deref(), &stale, &current);
+            assert_eq!(rejected, audiohub_net::spatial_media::fragment_count(SpeakerLayout::Surround51) as u64);
+            assert_eq!(sent, audiohub_net::spatial_media::fragment_count(SpeakerLayout::Surround71) as u64);
+        }
+    }
+
+    #[test]
+    fn dead_source_reaping_tears_down_its_session_and_preserves_another_source_queue() {
+        let (mut daemon, conn) = daemon("source-death");
+        let sink = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("media receiver");
+        let destination = sink.local_addr().unwrap();
+        let dead_owner = Arc::new(TxShared::new());
+        let live_owner = Arc::new(TxShared::new());
+        let dead_spec = SourceSpec::Mic;
+        let live_spec = SourceSpec::tone(440.0);
+        let mut dead_stream = super::tests::tx_stream_for(&dead_owner);
+        dead_stream.id = 21;
+        dead_stream.spec = dead_spec.clone();
+        let mut live_stream = super::tests::tx_stream_for(&live_owner);
+        live_stream.id = 22;
+        live_stream.spec = live_spec.clone();
+        let (builder, retired) = mpsc::channel();
+        let mut tx_state = TxState::new(builder);
+        tx_state.streams.insert(21, dead_stream);
+        tx_state.streams.insert(22, live_stream);
+        tx_state.sources.insert(dead_spec.clone(), SourceEnt {
+            src: Src::Frame(Box::new(LifecycleSource { layout: None, failure: Some("capture owner exited") })),
+            channels: 1, refs: 1, gen: 21, frame: vec![0.0; F48], frame_valid: true, depths: NO_DEPTHS,
+        });
+        tx_state.sources.insert(live_spec.clone(), SourceEnt {
+            src: Src::Frame(Box::new(LifecycleSource { layout: None, failure: None })),
+            channels: 1, refs: 1, gen: 22, frame: vec![0.0; F48], frame_valid: true, depths: NO_DEPTHS,
+        });
+        {
+            let mut state = crate::lk(&daemon.inner.state);
+            state.sessions.insert(21, session(21, &conn, &dead_owner));
+            state.sessions.insert(22, session(22, &conn, &live_owner));
+        }
+        assert!(daemon.inner.media_send.enqueue(destination, &dead_owner, 1, |buffer| {
+            buffer.clear(); buffer.push(21); true
+        }));
+        assert!(daemon.inner.media_send.enqueue(destination, &live_owner, 1, |buffer| {
+            buffer.clear(); buffer.push(22); true
+        }));
+
+        reap_dead_sources(&daemon.inner, &mut tx_state);
+
+        let sessions = crate::snapshot_sessions(&daemon.inner);
+        assert_eq!(sessions.iter().map(|entry| entry.id).collect::<Vec<_>>(), [22]);
+        assert!(!dead_owner.may_transmit());
+        assert!(live_owner.may_transmit());
+        assert!(!tx_state.streams.contains_key(&21));
+        assert!(tx_state.streams.contains_key(&22));
+        assert!(!tx_state.sources.contains_key(&dead_spec));
+        assert!(tx_state.sources.contains_key(&live_spec));
+        assert!(matches!(daemon.tx_cmds.try_recv(), Ok(TxCmd::Remove { stream_id: 21 })));
+        assert!(daemon.tx_cmds.try_recv().is_err());
+        assert!(matches!(retired.try_recv(), Ok(BuildReq::Retire { spec, gen: 21, .. }) if spec == dead_spec));
+        assert!(retired.try_recv().is_err());
+        assert!(matches!(daemon.remote.recv_timeout(Duration::from_secs(1)).unwrap(), Some(SessionMsg::CloseStream { stream_id: 21 })));
+        let (rejected, sent) = drain_queued_media(&daemon.inner, None, &dead_owner, &live_owner);
+        assert_eq!(rejected, 1);
+        assert_eq!(sent, 1);
+    }
+}
+
 /// **治法 A**：跳 tick 时把被跳过的那些帧从每一级消费侧队列里读走丢掉。
 /// 返回丢掉的总量（帧/样本，用于埋点）。
 ///

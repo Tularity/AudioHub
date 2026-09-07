@@ -40,6 +40,7 @@ mod mode_tests;
 /// Tier 2（M8 降级链路）：控制流与两个方向的媒体复用在**一条**连接上。
 /// 读线程分发、写调度与控制信用额度。
 mod mux;
+mod output_caps;
 /// plan §15：每对端 × 每方向的传输档位（持久化 + 失效隔离）。
 mod peer_transport;
 mod quality;
@@ -575,6 +576,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         settings_write_lock: Mutex::new(()),
         device_output_volume_io: Mutex::new(0),
         device_input_volume_io: Mutex::new(0),
+        native_output: Mutex::new(Default::default()),
         shutdown: AtomicBool::new(false),
         cleanup: Once::new(),
         announce_guard: Mutex::new(announce_guard),
@@ -703,6 +705,13 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     {
         let i = inner.clone();
         threads.push(spawn(
+            "ahb-output-caps",
+            Box::new(move || output_caps::watch_loop(i)),
+        )?);
+    }
+    {
+        let i = inner.clone();
+        threads.push(spawn(
             "ahb-ipc",
             Box::new(move || ipcserv::accept_loop(i, ipc_listener)),
         )?);
@@ -811,6 +820,7 @@ pub(crate) struct DaemonInner {
     /// locks; consumers use the revision to discard a reordered old snapshot.
     pub(crate) device_output_volume_io: Mutex<u64>,
     pub(crate) device_input_volume_io: Mutex<u64>,
+    pub(crate) native_output: Mutex<audiohub_core::output_capabilities::NativeOutputObservation>,
     pub shutdown: AtomicBool,
     cleanup: Once,
     pub announce_guard: Mutex<Option<AnnounceGuard>>,
@@ -1310,6 +1320,10 @@ pub(crate) fn status_with_hal(
     if let Some(obj) = v.as_object_mut() {
         obj.insert("hal".to_string(), serde_json::to_value(hal_status(inner))?);
         obj.insert("latency_guard".to_string(), latency_guard_status(inner)?);
+        obj.insert(
+            "native_output".to_string(),
+            serde_json::to_value(lk(&inner.native_output).clone())?,
+        );
     }
     Ok(v)
 }
@@ -1781,6 +1795,8 @@ pub(crate) struct ConnShared {
     /// presentation/device coordination; OpenStream acceptance is enforced by
     /// the machine that owns the endpoint.
     pub(crate) peer_audio_capabilities: Mutex<PeerAudioCapabilitiesCell>,
+    pub(crate) peer_native_output:
+        Mutex<Option<audiohub_core::output_capabilities::NativeOutputObservation>>,
 }
 
 /// The peer's advertised mode, with "unknown" and "unrecognised" kept apart.

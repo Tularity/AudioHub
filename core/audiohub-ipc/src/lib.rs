@@ -1435,6 +1435,9 @@ pub struct PeerState {
     /// The same unknown/false distinction and no-persistence rule apply.
     #[serde(default)]
     pub peer_default_output: Option<bool>,
+    /// Native facts reported by this live peer, not an enabled AudioHub media mode.
+    #[serde(default)]
+    pub peer_native_output: Option<audiohub_core::output_capabilities::NativeOutputObservation>,
     /// This peer has told us it is in a mode that cannot serve us.
     ///
     /// Carried rather than derived by the UI from `peer_mode`, because the two

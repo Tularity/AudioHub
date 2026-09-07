@@ -508,6 +508,7 @@ fn register_conn(
         clock_warned: AtomicBool::new(false),
         peer_mode: Mutex::new(crate::PeerModeCell::Unheard),
         peer_audio_capabilities: Mutex::new(crate::PeerAudioCapabilitiesCell::Unheard),
+        peer_native_output: Mutex::new(None),
     });
     let mut st = lk(&inner.state);
     let keep_existing = st.conns.get(&conn.fp).map_or(false, |old| {
@@ -548,6 +549,8 @@ fn register_conn(
         mode: haldev::effective_mode(inner).as_str().to_string(),
     });
     let _ = conn.send_msg(&local_audio_capabilities_msg());
+    let observation = lk(&inner.native_output).clone();
+    let _ = conn.send_msg(&SessionMsg::NativeOutputCapabilities { observation });
     // M8: if this peer is pinned to tier 1, start the media link now — before
     // any stream exists, so the first stream opens straight onto it. A stream
     // that opened first would be pinned to UDP for its whole life (design §5.1
@@ -1367,6 +1370,11 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
             }
             if device_volume_version < 1 {
                 haldev::clear_peer_device_volume_protocol(inner, &conn.fp, conn.connection_id);
+            }
+        }
+        SessionMsg::NativeOutputCapabilities { observation } => {
+            if current_peer_connection(inner, conn) {
+                crate::output_caps::accept_remote(&mut lk(&conn.peer_native_output), observation);
             }
         }
         SessionMsg::Unpaired {} => {

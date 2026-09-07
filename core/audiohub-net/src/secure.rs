@@ -483,6 +483,12 @@ pub enum SessionMsg {
     /// （此处原有注释写的是「老对端解析失败会丢弃通道」，与实现相反。若将来
     /// 有人照那句话把行为改回断连，上面这条保证会静默失效。）
     Unpaired {},
+    /// Raw native default-output facts. These are not a promise that the
+    /// network/mixer accepts spatial objects, multichannel PCM, or passthrough.
+    /// Older peers skip this additive message and retain their existing media contract.
+    NativeOutputCapabilities {
+        observation: audiohub_core::output_capabilities::NativeOutputObservation,
+    },
     /// 消费者 -> 提供者：这条流上**执行器在你那一侧**的档位，照办（plan §15）。
     ///
     /// # 字段名说的是执行器，不是用户看到的「收 / 发」
@@ -1027,6 +1033,26 @@ mod wire_compat_tests {
             saturated: true,
             drift_sps: Some(0.0),
         }
+    }
+
+    #[test]
+    fn native_output_facts_are_additive_and_do_not_change_media_capabilities() {
+        let observation = audiohub_core::output_capabilities::NativeOutputObservation {
+            revision: 7,
+            capabilities: audiohub_core::output_capabilities::NativeOutputCapabilities::Unavailable,
+        };
+        let message = SessionMsg::NativeOutputCapabilities {
+            observation: observation.clone(),
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(serde_json::from_str::<LegacySessionMsg>(&json).is_err());
+        match serde_json::from_str::<SessionMsg>(&json).unwrap() {
+            SessionMsg::NativeOutputCapabilities {
+                observation: decoded,
+            } => assert_eq!(decoded, observation),
+            _ => panic!("native output message changed kind"),
+        }
+        assert!(!json.contains("max_media_channels"));
     }
 
     #[test]

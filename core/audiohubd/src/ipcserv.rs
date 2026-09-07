@@ -413,6 +413,7 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                             peer_mode: None,
                             peer_default_input: None,
                             peer_default_output: None,
+                            peer_native_output: None,
                             peer_unusable: false,
                         }),
                 )?
@@ -1285,6 +1286,7 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
                 peer_mode: cell.mode(),
                 peer_default_input: capabilities.default_input(),
                 peer_default_output: capabilities.default_output(),
+                peer_native_output: live.and_then(|conn| lk(&conn.peer_native_output).clone()),
                 peer_unusable: cell.unusable(),
                 reconnecting,
                 // The third state, and it is only meaningful while the peer is

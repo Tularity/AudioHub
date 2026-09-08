@@ -655,6 +655,14 @@ client.on('event:stats', (data) => actions.pushStats(data));
 // 用户很可能刚在系统设置里点完授权切回来：那边的改动不会通知我们，只能自己复查。
 function reprobeOnReturn(): void {
   if (document.hidden) return;
+  // Login startup can finish after the first read-only service probe. A
+  // stopped gate has no timer retry; recheck when the user returns without
+  // starting a service they deliberately stopped or racing a lifecycle action.
+  const state = getState();
+  if (isTauri() && !nativeLifecycleOperation && state.conn === 'offline' &&
+      state.connError?.kind === 'stopped') {
+    void connectDaemon({ background: true });
+  }
   void refreshPermissions();
 }
 

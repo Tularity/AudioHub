@@ -39,6 +39,8 @@ const MAC_DAEMON_IDENTIFIER: &str = "com.audiohub.daemon";
 const MAC_DAEMON_INSTALLER_SHA256: &str = env!("AUDIOHUB_DAEMON_INSTALLER_SHA256");
 #[cfg(target_os = "macos")]
 const MAC_USER_LIFECYCLE_LOCK: &str = "service-lifecycle.lock";
+#[cfg(target_os = "macos")]
+const MAC_USER_UI_LOCK: &str = "app-instance.lock";
 #[cfg(target_os = "windows")]
 const WIN_TASK: &str = "AudioHubDaemon";
 const INSTALLED_MARKER: &str = "service-installed-v1";
@@ -110,6 +112,135 @@ pub(crate) fn lock_mac_lifecycle() -> Result<MacLifecycleGuard, DaemonError> {
         };
         DaemonError::new("service-conflict", message).with_detail(error.to_string())
     })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) enum MacUiInstance {
+    Primary(MacUiOwner),
+    Secondary(MacUiProcessMarker),
+    Unmanaged,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct MacUiOwner {
+    _ui: MacLifecycleGuard,
+    _process: MacUiProcessMarker,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct MacUiProcessMarker {
+    guard: MacLifecycleGuard,
+    path: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacUiProcessMarker {
+    fn drop(&mut self) {
+        if let (Ok(held), Ok(current)) = (self.guard.file.metadata(), std::fs::symlink_metadata(&self.path)) {
+            if held.dev() == current.dev() && held.ino() == current.ino() {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_ui_process_marker_path(pid: u32, started: MacProcessStart) -> PathBuf {
+    config_dir().join(format!("app-instance-{pid}-{}-{}.lock", started.seconds, started.micros))
+}
+
+#[cfg(target_os = "macos")]
+fn has_mac_ui_process_marker(owner: &MacManagedOwner) -> bool {
+    let path = mac_ui_process_marker_path(owner.pid, owner.started);
+    let Ok(file) = OpenOptions::new().read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(path) else { return false; };
+    let Ok(metadata) = file.metadata() else { return false; };
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        return false;
+    }
+    // A stale file alone is not a live marker. The PID/start-bound process
+    // retains this flock until it exits, even during a slow service bootstrap.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    locked != 0
+        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+}
+
+/// Keep one resident UI while allowing a fresh LaunchServices process to
+/// consume each explicit login request. Older installed UIs have no flock, so
+/// recognize their completed AppKit launch before creating another window.
+#[cfg(target_os = "macos")]
+pub(crate) fn enter_mac_ui_instance() -> Result<MacUiInstance, DaemonError> {
+    use objc2_app_kit::NSRunningApplication;
+    use objc2_foundation::{NSDate, NSRunLoop};
+
+    let expected = Path::new(MAC_APP).join("Contents/MacOS/audiohub-app");
+    if !std::env::current_exe().is_ok_and(|exe| same_path(&exe, &expected)) {
+        return Ok(MacUiInstance::Unmanaged);
+    }
+    let pid = std::process::id();
+    let started = mac_process_start(pid).ok_or_else(|| {
+        DaemonError::new("service-conflict", "Could not identify this AudioHub instance")
+    })?;
+    let path = mac_ui_process_marker_path(pid, started);
+    let marker = MacUiProcessMarker {
+        guard: open_mac_lifecycle_lock(&path, true).map_err(|error| {
+            DaemonError::new("service-conflict", "Could not identify this AudioHub UI process")
+                .with_detail(error.to_string())
+        })?,
+        path,
+    };
+    let guard = match open_mac_lifecycle_lock(&config_dir().join(MAC_USER_UI_LOCK), true) {
+        Ok(guard) => guard,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Ok(MacUiInstance::Secondary(marker));
+        }
+        Err(error) => {
+            return Err(DaemonError::new("service-conflict", "Could not establish the AudioHub UI owner")
+                .with_detail(error.to_string()));
+        }
+    };
+    let mut pending = Vec::new();
+    for pid in mac_all_pids().map_err(|error| {
+        DaemonError::new("service-conflict", "Could not inspect existing AudioHub instances")
+            .with_detail(error.to_string())
+    })? {
+        if pid == std::process::id() || !mac_process_owned_by_current_user(pid) {
+            continue;
+        }
+        if !mac_process_image(pid).is_some_and(|image| same_path(&image, &expected)) {
+            continue;
+        }
+        let Some(started) = mac_process_start(pid) else {
+            if !mac_pid_alive(pid) {
+                continue;
+            }
+            return Err(DaemonError::new("service-conflict", "Could not identify an existing AudioHub instance"));
+        };
+        pending.push(MacManagedOwner { endpoint: None, pid, image: expected.clone(), started });
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !pending.is_empty() {
+        pending.retain(|owner| mac_owner_still_running(owner) && !has_mac_ui_process_marker(owner));
+        for owner in &pending {
+            if NSRunningApplication::runningApplicationWithProcessIdentifier(owner.pid as i32)
+                .is_some_and(|app| app.isFinishedLaunching() && !app.isTerminated())
+                && mac_owner_still_running(owner)
+            {
+                return Ok(MacUiInstance::Secondary(marker));
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(DaemonError::new("service-conflict", "Another AudioHub instance has not finished launching"));
+        }
+        // Only unmarked legacy processes remain. Advance AppKit's observable
+        // launch state while retaining exclusive ownership of the new UI.
+        NSRunLoop::currentRunLoop().runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.05));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(MacUiInstance::Primary(MacUiOwner { _ui: guard, _process: marker }))
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -966,8 +1097,13 @@ fn stop_scanned_verified_mac_owners(exclude_pid: Option<u32>) -> Result<usize, D
 /// ready merely because its IPC port accepts TCP.
 #[cfg(target_os = "macos")]
 pub(crate) fn stop_mac_daemon_for_driver_install_unlocked(
-    _guard: &MacLifecycleGuard,
+    guard: &MacLifecycleGuard,
 ) -> Result<bool, DaemonError> {
+    stop_mac_daemon_unlocked(guard)
+}
+
+#[cfg(target_os = "macos")]
+fn stop_mac_daemon_unlocked(_guard: &MacLifecycleGuard) -> Result<bool, DaemonError> {
     let Some(endpoint) = read_endpoint_raw() else {
         return Ok(stop_scanned_verified_mac_owners(None)? > 0);
     };
@@ -975,7 +1111,7 @@ pub(crate) fn stop_mac_daemon_for_driver_install_unlocked(
     if inspection.state == MacEndpointState::Foreign {
         return Err(mac_service_conflict(
             "Another process owns the AudioHub service endpoint",
-            "Driver installation refused to stop an unverified process",
+            "AudioHub refused to stop an unverified process",
         ));
     }
     if inspection.state == MacEndpointState::Gone {
@@ -985,6 +1121,28 @@ pub(crate) fn stop_mac_daemon_for_driver_install_unlocked(
     stop_verified_mac_owner(&owner)?;
     stop_scanned_verified_mac_owners(None)?;
     Ok(true)
+}
+
+/// A user Stop waits for an already accepted start, then stops its exact
+/// verified result. Starts remain nonblocking and never queue behind Stop.
+#[cfg(target_os = "macos")]
+pub(crate) fn stop_mac_daemon_blocking() -> Result<(), DaemonError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let path = config_dir().join(MAC_USER_LIFECYCLE_LOCK);
+    let guard = loop {
+        match open_mac_lifecycle_lock(&path, true) {
+            Ok(guard) => break guard,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => {
+                return Err(DaemonError::new("stop-failed", "Could not enter the AudioHub stop transaction")
+                    .with_detail(error.to_string()));
+            }
+        }
+    };
+    stop_mac_daemon_unlocked(&guard).map(|_| ())
 }
 
 #[cfg(target_os = "macos")]
@@ -1072,8 +1230,9 @@ fn activate_mac_daemon_blocking_unlocked(
 
 #[cfg(target_os = "macos")]
 pub(crate) fn start_mac_daemon_blocking() -> Result<IpcEndpointJson, DaemonError> {
-    let guard = lock_mac_lifecycle()?;
-    start_mac_daemon_blocking_unlocked(&guard)
+    // An explicit Start also repairs an older login command. Bootstrap keeps
+    // marker + missing registration as the user's existing opt-out.
+    package_bootstrap_blocking()
 }
 
 #[cfg(target_os = "macos")]
@@ -1796,7 +1955,7 @@ mod tests {
         let valid = format!(
             r#"<plist version="1.0"><dict>
 <key>Label</key><string>{MAC_LABEL}</string>
-<key>ProgramArguments</key><array><string>/usr/bin/open</string><string>-g</string><string>/Applications/AudioHub.app</string><string>--args</string><string>--background</string></array>
+<key>ProgramArguments</key><array><string>/usr/bin/open</string><string>-g</string><string>-n</string><string>/Applications/AudioHub.app</string><string>--args</string><string>--background</string></array>
 <key>RunAtLoad</key><true/>
 <key>ProcessType</key><string>Interactive</string>
 </dict></plist>"#

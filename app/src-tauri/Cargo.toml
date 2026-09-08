@@ -44,6 +44,7 @@ objc2-app-kit = { version = "0.3", features = [
   # icon.rs: NSApplication.applicationIconImage, fed an NSImage built from raw
   # RGBA. NSGraphics carries NSDeviceRGBColorSpace.
   "NSApplication",
+  "NSRunningApplication",
   "NSImage",
   "NSImageRep",
   "NSBitmapImageRep",

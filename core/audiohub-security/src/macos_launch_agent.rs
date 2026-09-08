@@ -225,11 +225,15 @@ pub fn inspect_macos_launch_agent_plist(
         Some(PlistValue::Array(arguments)) => Some(arguments),
         _ => None,
     };
-    // Preserve the actual App argument for diagnostics even when a different
-    // contract field is stale. Duplicate ProgramArguments are deliberately
-    // ambiguous and therefore produce no target.
-    let target = arguments.and_then(|arguments| match arguments.get(2) {
-        Some(PlistValue::String(target)) => Some(target.clone()),
+    // Keep the target of either known layout for diagnostics. The old layout
+    // is stale; ambiguous or malformed action arrays have no inferred target.
+    let target = arguments.and_then(|arguments| match arguments.as_slice() {
+        [PlistValue::String(open), PlistValue::String(global), PlistValue::String(new_instance), PlistValue::String(target), PlistValue::String(args), PlistValue::String(background)]
+            if open == "/usr/bin/open" && global == "-g" && new_instance == "-n"
+                && args == "--args" && background == "--background" => Some(target.clone()),
+        [PlistValue::String(open), PlistValue::String(global), PlistValue::String(target), PlistValue::String(args), PlistValue::String(background)]
+            if open == "/usr/bin/open" && global == "-g"
+                && args == "--args" && background == "--background" => Some(target.clone()),
         _ => None,
     });
 
@@ -238,6 +242,7 @@ pub fn inspect_macos_launch_agent_plist(
         [
             "/usr/bin/open".to_string(),
             "-g".to_string(),
+            "-n".to_string(),
             app.display().to_string(),
             "--args".to_string(),
             "--background".to_string(),
@@ -306,7 +311,7 @@ mod tests {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>{LABEL}</string>
-<key>ProgramArguments</key><array><string>/usr/bin/open</string><string>-g</string><string>{APP}</string><string>--args</string><string>--background</string></array>
+<key>ProgramArguments</key><array><string>/usr/bin/open</string><string>-g</string><string>-n</string><string>{APP}</string><string>--args</string><string>--background</string></array>
 <key>RunAtLoad</key><true/>
 <key>ProcessType</key><string>Interactive</string>
 </dict></plist>"#
@@ -381,6 +386,27 @@ mod tests {
         let result = inspect_macos_launch_agent_plist(&changed, LABEL, Some(Path::new(APP)));
         assert!(!result.current);
         assert_eq!(result.target.as_deref(), Some(APP));
+    }
+
+    #[test]
+    fn the_old_launch_layout_is_stale_but_keeps_its_target_for_diagnostics() {
+        let body = valid().replace("<string>-n</string>", "");
+        let result = inspect_macos_launch_agent_plist(&body, LABEL, Some(Path::new(APP)));
+        assert!(!result.current);
+        assert_eq!(result.target.as_deref(), Some(APP));
+    }
+
+    #[test]
+    fn malformed_argument_layouts_do_not_invent_a_target() {
+        for body in [
+            valid().replace("<string>-n</string>", "<true/>"),
+            valid().replace("<string>--args</string>", "<string>--wrong</string>"),
+            valid().replace("</array>", "<string>--extra</string></array>"),
+        ] {
+            let result = inspect_macos_launch_agent_plist(&body, LABEL, Some(Path::new(APP)));
+            assert!(!result.current);
+            assert_eq!(result.target, None);
+        }
     }
 
     #[test]

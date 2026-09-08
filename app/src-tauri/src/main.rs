@@ -1266,8 +1266,17 @@ fn shutdown_daemon_blocking() {
 
 #[tauri::command]
 async fn stop_daemon_and_quit(app: AppHandle) {
-    let _ = tauri::async_runtime::spawn_blocking(shutdown_daemon_blocking).await;
+    let _ = tauri::async_runtime::spawn_blocking(stop_daemon_for_user_blocking).await;
     app.exit(0);
+}
+
+fn stop_daemon_for_user_blocking() {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = service::stop_mac_daemon_blocking() {
+        warn(&format!("stop-daemon: {}", error.message));
+    }
+    #[cfg(not(target_os = "macos"))]
+    shutdown_daemon_blocking();
 }
 
 /// macOS has its own status item built on the crates underneath Tauri, because
@@ -1420,6 +1429,25 @@ mod command_timeout_tests {
 
 fn main() {
     let background_launch = std::env::args_os().any(|arg| arg == "--background");
+    #[cfg(target_os = "macos")]
+    let mut _ui_guard = match service::enter_mac_ui_instance() {
+        Ok(service::MacUiInstance::Primary(guard)) => Some(guard),
+        Ok(service::MacUiInstance::Unmanaged) => None,
+        Ok(service::MacUiInstance::Secondary(_process_marker)) => {
+            if background_launch {
+                if let Err(error) = service::package_bootstrap_blocking() {
+                    warn(&format!("background daemon start failed: {}", error.message));
+                    drop(_process_marker);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Err(error) => {
+            warn(&format!("AudioHub UI startup failed: {}", error.message));
+            std::process::exit(1);
+        }
+    };
     #[cfg(target_os = "windows")]
     let installer_bootstrap = std::env::args_os().any(|arg| arg == "--installer-bootstrap");
     #[cfg(not(target_os = "windows"))]
@@ -1466,7 +1494,7 @@ fn main() {
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
                         let _ =
-                            tauri::async_runtime::spawn_blocking(shutdown_daemon_blocking).await;
+                            tauri::async_runtime::spawn_blocking(stop_daemon_for_user_blocking).await;
                         app.exit(0);
                     });
                 }
@@ -1538,7 +1566,7 @@ fn main() {
                 tauri::async_runtime::spawn(async move {
                     #[cfg(target_os = "macos")]
                     let task =
-                        tauri::async_runtime::spawn_blocking(service::start_mac_daemon_blocking);
+                        tauri::async_runtime::spawn_blocking(service::package_bootstrap_blocking);
                     #[cfg(not(target_os = "macos"))]
                     let task = tauri::async_runtime::spawn_blocking(ensure_daemon_blocking);
                     match task.await {
@@ -1575,11 +1603,13 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(|_app, _event| {
+    app.run(move |_app, _event| {
         // 退出前把网页服务的监听端口交回系统。进程退出时内核也会回收，但显式停一下
         // 才能保证「退出界面」后端口立刻可被下一次启动重新绑定。
         if let RunEvent::Exit = _event {
             webui::shutdown();
+            #[cfg(target_os = "macos")]
+            drop(_ui_guard.take());
         }
         // Dock click with every window hidden must bring the UI back. macOS
         // only: `RunEvent::Reopen` is the dock's own event and the variant does

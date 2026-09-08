@@ -149,6 +149,7 @@ fn xml_escape(s: &str) -> String {
 /// 表达过的意图被系统撤销，比不自启严重得多。
 #[allow(dead_code)] // 见模块开头：另一半平台的载荷靠单测保活
 fn mac_plist(label: &str, app: &Path) -> String {
+    // A fresh App process receives --background; the App handles secondaries.
     let app = std::fs::canonicalize(app).unwrap_or_else(|_| app.to_path_buf());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -161,6 +162,7 @@ fn mac_plist(label: &str, app: &Path) -> String {
 	<array>
 		<string>/usr/bin/open</string>
 		<string>-g</string>
+		<string>-n</string>
 		<string>{app}</string>
 		<string>--args</string>
 		<string>--background</string>
@@ -941,6 +943,10 @@ mod tests {
         assert!(
             body.contains("<string>-g</string>"),
             "登录时会抢焦点：{body}"
+        );
+        assert!(
+            body.contains("<string>-n</string>"),
+            "login must start a fresh App process: {body}"
         );
         assert!(
             body.contains("<string>/Applications/AudioHub.app</string>"),

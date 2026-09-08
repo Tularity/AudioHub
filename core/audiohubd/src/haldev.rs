@@ -1882,6 +1882,37 @@ pub(crate) fn refuse_being_used(mode: Mode) -> Option<String> {
 /// UIDs the SYSTEM currently publishes for us. `None` when the device list
 /// could not be read at all.
 fn observe() -> Option<HashSet<String>> {
+    #[cfg(windows)]
+    {
+        observed_windows_endpoints(audiohub_core::volume::list_audiohub_peer_endpoints())
+    }
+    #[cfg(not(windows))]
+    observe_device_uids()
+}
+
+#[cfg(any(windows, test))]
+fn observed_windows_endpoints(
+    endpoints: anyhow::Result<Vec<audiohub_core::volume::AudioHubEndpointPresence>>,
+) -> Option<HashSet<String>> {
+    let mut counts = HashMap::new();
+    for endpoint in endpoints.ok()? {
+        let uid = if endpoint.input {
+            uid_in(&endpoint.peer_key)
+        } else {
+            uid_out(&endpoint.peer_key)
+        };
+        *counts.entry(uid).or_insert(0usize) += 1;
+    }
+    Some(
+        counts
+            .into_iter()
+            .filter_map(|(uid, count)| (count == 1).then_some(uid))
+            .collect(),
+    )
+}
+
+#[cfg(not(windows))]
+fn observe_device_uids() -> Option<HashSet<String>> {
     let all = audiohub_core::audio::list_devices_detailed();
     if all.is_empty() {
         // Not "nothing of ours is published" — "I cannot see". A real Mac
@@ -3437,6 +3468,51 @@ mod tests {
         assert!(
             plan_binds(&[d], &slots, None).is_empty(),
             "'I cannot see the device list' must not read as 'nothing is published'"
+        );
+    }
+
+    #[test]
+    fn windows_endpoint_presence_distinguishes_absence_from_failure() {
+        assert_eq!(observed_windows_endpoints(Ok(vec![])), Some(HashSet::new()));
+        assert_eq!(
+            observed_windows_endpoints(Err(anyhow::anyhow!("incomplete inventory"))),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_endpoint_presence_is_directional_and_rejects_duplicates() {
+        use audiohub_core::volume::AudioHubEndpointPresence;
+        let output = AudioHubEndpointPresence {
+            peer_key: "0123456789abcdef".to_owned(),
+            input: false,
+        };
+        let input = AudioHubEndpointPresence { input: true, ..output.clone() };
+        let other = AudioHubEndpointPresence {
+            peer_key: "fedcba9876543210".to_owned(),
+            input: false,
+        };
+        assert_eq!(
+            observed_windows_endpoints(Ok(vec![output.clone()])),
+            Some(HashSet::from([uid_out(&output.peer_key)]))
+        );
+        assert_eq!(
+            observed_windows_endpoints(Ok(vec![input.clone()])),
+            Some(HashSet::from([uid_in(&input.peer_key)]))
+        );
+        assert_eq!(
+            observed_windows_endpoints(Ok(vec![output.clone(), input.clone(), other.clone()])),
+            Some(HashSet::from([
+                uid_out(&output.peer_key), uid_in(&input.peer_key), uid_out(&other.peer_key),
+            ]))
+        );
+        assert_eq!(
+            observed_windows_endpoints(Ok(vec![output.clone(), output, input.clone()])),
+            Some(HashSet::from([uid_in(&input.peer_key)]))
+        );
+        assert_eq!(
+            observed_windows_endpoints(Ok(vec![input.clone(), input, other.clone()])),
+            Some(HashSet::from([uid_out(&other.peer_key)]))
         );
     }
 

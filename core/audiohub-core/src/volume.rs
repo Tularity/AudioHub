@@ -171,6 +171,45 @@ pub fn get_audiohub_peer_endpoint_volume(peer_key: &str, input: bool) -> Result<
     )
 }
 
+/// One active Windows MMDevice with a valid driver-owned peer identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioHubEndpointPresence {
+    pub peer_key: String,
+    pub input: bool,
+}
+
+/// Read publication independently of binding acknowledgements or audio IO.
+/// Duplicate identities are retained for the caller to reject. An error means
+/// the inventory is incomplete, not that the endpoints have disappeared.
+#[cfg(windows)]
+pub fn list_audiohub_peer_endpoints() -> Result<Vec<AudioHubEndpointPresence>> {
+    imp::list_audiohub_peer_endpoints()
+}
+
+#[cfg(any(windows, test))]
+fn valid_peer_key(peer_key: &str) -> bool {
+    peer_key.len() == 16
+        && peer_key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+#[cfg(any(windows, test))]
+fn parse_audiohub_endpoint_identity(
+    identity: &str,
+    flow: EndpointFlow,
+) -> Option<AudioHubEndpointPresence> {
+    let (peer_key, direction) = identity.strip_prefix("v1:")?.split_once(':')?;
+    let input = flow == EndpointFlow::Input;
+    if !valid_peer_key(peer_key) || direction != if input { "in" } else { "out" } {
+        return None;
+    }
+    Some(AudioHubEndpointPresence {
+        peer_key: peer_key.to_owned(),
+        input,
+    })
+}
+
 /// Apply one peer scalar/mute pair through the endpoint API itself, then read
 /// back what Windows exposes to applications.
 ///
@@ -1397,8 +1436,8 @@ mod imp {
     //! through them by accident.
 
     use super::{
-        db_to_gain, gain_to_db, label, match_by_name, EndpointFlow, GainState, VolumeState,
-        SAME_EPS,
+        db_to_gain, gain_to_db, label, match_by_name, parse_audiohub_endpoint_identity,
+        valid_peer_key, AudioHubEndpointPresence, EndpointFlow, GainState, VolumeState, SAME_EPS,
     };
     use anyhow::{bail, Result};
     use std::ffi::c_void;
@@ -1695,23 +1734,31 @@ mod imp {
     }
 
     fn string_property(device: &ComPtr, key: &PropertyKey) -> Option<String> {
+        read_string_property(device, key).ok().flatten()
+    }
+
+    fn read_string_property(device: &ComPtr, key: &PropertyKey) -> Result<Option<String>> {
         let mut store = ComPtr::null();
         let hr = unsafe {
             let v = device.vtbl::<IMMDeviceVtbl>();
             ((*v).open_property_store)(device.0, STGM_READ, &mut store.0)
         };
-        if hr < 0 {
-            return None;
+        check(hr, "IMMDevice::OpenPropertyStore")?;
+        if store.0.is_null() {
+            bail!("IMMDevice::OpenPropertyStore returned a null store");
         }
         let mut pv = PropVariant::empty();
         let hr = unsafe {
             let v = store.vtbl::<IPropertyStoreVtbl>();
             ((*v).get_value)(store.0, key, &mut pv)
         };
-        if hr < 0 || pv.vt != VT_LPWSTR {
-            return None;
+        check(hr, "IPropertyStore::GetValue")?;
+        if pv.vt != VT_LPWSTR {
+            return Ok(None);
         }
-        unsafe { wide_string(pv.val[0] as *const u16) }
+        let value = unsafe { wide_string(pv.val[0] as *const u16) }
+            .ok_or_else(|| anyhow::anyhow!("IPropertyStore returned an invalid string"))?;
+        Ok(Some(value))
     }
 
     fn friendly_name(device: &ComPtr) -> Option<String> {
@@ -1753,6 +1800,9 @@ mod imp {
                 }
             ),
         )?;
+        if coll.0.is_null() {
+            bail!("EnumAudioEndpoints returned a null collection");
+        }
         let mut count: u32 = 0;
         check(
             unsafe {
@@ -1768,8 +1818,9 @@ mod imp {
                 let v = coll.vtbl::<IMMDeviceCollectionVtbl>();
                 ((*v).item)(coll.0, i, &mut dev.0)
             };
-            if hr < 0 {
-                continue;
+            check(hr, "IMMDeviceCollection::Item")?;
+            if dev.0.is_null() {
+                bail!("IMMDeviceCollection::Item returned a null device");
             }
             out.push(dev);
         }
@@ -1848,11 +1899,35 @@ mod imp {
         Ok(Endpoint { vol, _apt: apt })
     }
 
-    fn valid_peer_key(peer_key: &str) -> bool {
-        peer_key.len() == 16
-            && peer_key
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    pub fn list_audiohub_peer_endpoints() -> Result<Vec<AudioHubEndpointPresence>> {
+        let _apt = Apartment::enter()?;
+        let mut enumerator = ComPtr::null();
+        check(
+            unsafe {
+                CoCreateInstance(
+                    &CLSID_MM_DEVICE_ENUMERATOR,
+                    ptr::null_mut(),
+                    CLSCTX_INPROC_SERVER,
+                    &IID_IMM_DEVICE_ENUMERATOR,
+                    &mut enumerator.0,
+                )
+            },
+            "CoCreateInstance(MMDeviceEnumerator)",
+        )?;
+        if enumerator.0.is_null() {
+            bail!("CoCreateInstance returned a null MMDeviceEnumerator");
+        }
+        let mut found = Vec::new();
+        for flow in [EndpointFlow::Output, EndpointFlow::Input] {
+            for device in active_endpoints(&enumerator, flow)? {
+                if let Some(identity) = read_string_property(&device, &PKEY_AUDIOHUB_PEER_KEY)? {
+                    if let Some(endpoint) = parse_audiohub_endpoint_identity(&identity, flow) {
+                        found.push(endpoint);
+                    }
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Resolve one AudioHub endpoint without consulting its display name.
@@ -2169,6 +2244,56 @@ mod imp {
 #[cfg(test)]
 mod endpoint_api_tests {
     use super::*;
+
+    #[test]
+    fn peer_endpoint_presence_requires_the_native_flow_and_exact_identity() {
+        for (flow, suffix, input) in [
+            (EndpointFlow::Output, "out", false),
+            (EndpointFlow::Input, "in", true),
+        ] {
+            let identity = format!("v1:0123456789abcdef:{suffix}");
+            assert_eq!(
+                parse_audiohub_endpoint_identity(&identity, flow),
+                Some(AudioHubEndpointPresence {
+                    peer_key: "0123456789abcdef".to_owned(),
+                    input,
+                })
+            );
+            let opposite = if input {
+                EndpointFlow::Output
+            } else {
+                EndpointFlow::Input
+            };
+            assert_eq!(parse_audiohub_endpoint_identity(&identity, opposite), None);
+        }
+    }
+
+    #[test]
+    fn peer_endpoint_presence_rejects_malformed_and_presentation_identities() {
+        for identity in [
+            "",
+            "AudioHub Virtual Audio",
+            "AudioHub:0123456789abcdef:out",
+            "v2:0123456789abcdef:out",
+            "v1:0123456789ABCDEF:out",
+            "v1:0123456789abcdeg:out",
+            "v1:0123456789abcde:out",
+            "v1:0123456789abcdef0:out",
+            "v1:0123456789abcdef:out:extra",
+            "v1:0123456789abcdef:out ",
+            "v1:0123456789abcdef:",
+            "v1:0123456789abcdef:render",
+        ] {
+            assert_eq!(
+                parse_audiohub_endpoint_identity(identity, EndpointFlow::Output), None,
+                "{identity:?}"
+            );
+            assert_eq!(
+                parse_audiohub_endpoint_identity(identity, EndpointFlow::Input), None,
+                "{identity:?}"
+            );
+        }
+    }
 
     #[test]
     fn input_api_has_the_same_public_shape_as_the_default_output_api() {

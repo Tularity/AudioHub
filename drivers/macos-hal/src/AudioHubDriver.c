@@ -128,6 +128,13 @@ typedef enum
     kFormatFailed
 } AudioHubFormatStage;
 
+typedef enum
+{
+    kFormatPreferenceNone = 0,
+    kFormatPreferenceAutomatic,
+    kFormatPreferenceManual
+} AudioHubFormatPreference;
+
 typedef struct AudioHubFormatOutbox
 {
     uint64_t seq;
@@ -180,6 +187,9 @@ typedef struct AudioHubDevice
     // ---- v4 speaker format transaction, guarded by gPlugIn_StateMutex
     uint32_t          allowedLayouts;
     uint32_t          currentLayout;
+    uint32_t          preferredLayout;
+    AudioHubFormatPreference formatPreference;
+    Boolean           formatPendingHostChoice;
     uint32_t          pendingLayout;
     uint32_t          pendingMask;
     uint32_t          formatEpochNext; // monotonic for this endpoint; never reset on slot reuse
@@ -806,6 +816,7 @@ static void AudioHub_AbortFormatLocked(AudioHubDevice* inDevice)
         return;
     }
     inDevice->formatStage = kFormatFailed;
+    inDevice->formatPendingHostChoice = false;
     // Epochs are never reused; a missing callback must not own the next request.
     inDevice->hostEpochOutstanding = 0;
     inDevice->formatStartedMsec = AudioHub_NowMsec();
@@ -813,6 +824,34 @@ static void AudioHub_AbortFormatLocked(AudioHubDevice* inDevice)
     {
         AudioHub_PostFormatLocked(inDevice, kAudioHubFormat_Aborted);
     }
+}
+
+// gPlugIn_StateMutex held. A temporary capability loss must not erase a choice.
+static uint32_t AudioHub_SelectOfferedLayoutLocked(const AudioHubDevice* inDevice,
+                                                   uint32_t inSupportedMask)
+{
+    if((inDevice->formatPreference != kFormatPreferenceNone) &&
+       ((inSupportedMask & kAudioHubLayoutMask(inDevice->preferredLayout)) != 0))
+    {
+        return inDevice->preferredLayout;
+    }
+    const Boolean theFirstSpatialOffer =
+        (inDevice->formatPreference == kFormatPreferenceNone) &&
+        (inDevice->allowedLayouts == kAudioHubLayoutMask(kAudioHubLayout_Stereo)) &&
+        (inSupportedMask != kAudioHubLayoutMask(kAudioHubLayout_Stereo));
+    if(!theFirstSpatialOffer &&
+       ((inSupportedMask & kAudioHubLayoutMask(inDevice->currentLayout)) != 0))
+    {
+        return inDevice->currentLayout;
+    }
+    for(uint32_t theLayout = kAudioHubLayoutCount; theLayout > 0; --theLayout)
+    {
+        if((inSupportedMask & kAudioHubLayoutMask(theLayout - 1)) != 0)
+        {
+            return theLayout - 1;
+        }
+    }
+    return kAudioHubLayout_Stereo;
 }
 
 static OSStatus AudioHub_BeginFormatTransaction(AudioHubDevice* inDevice,
@@ -842,6 +881,12 @@ static OSStatus AudioHub_BeginFormatTransaction(AudioHubDevice* inDevice,
         AudioHubBridge_UnlockRingControl(inDevice->ring);
         return kAudioHardwareIllegalOperationError;
     }
+    if(inRequestID != 0)
+    {
+        // Select under the transaction lock so a committed host choice cannot
+        // race a separately computed daemon-offer target.
+        inLayout = AudioHub_SelectOfferedLayoutLocked(inDevice, inSupportedMask);
+    }
     if((inDevice->formatStage >= kFormatPausing) && (inDevice->formatStage <= kFormatCommitted) &&
        (inDevice->pendingLayout == inLayout) && (inDevice->pendingMask == inSupportedMask) &&
        (inDevice->formatRequestID == inRequestID) && (inDevice->formatSessionID == inSessionID))
@@ -850,10 +895,18 @@ static OSStatus AudioHub_BeginFormatTransaction(AudioHubDevice* inDevice,
         AudioHubBridge_UnlockRingControl(inDevice->ring);
         return kAudioHardwareNoError;
     }
-    if((inRequestID == 0) && ((inDevice->currentLayout == inLayout) ||
-       (((inDevice->formatStage >= kFormatPausing) && (inDevice->formatStage <= kFormatCommitted)) &&
-        (inDevice->pendingLayout == inLayout))))
+    if((inRequestID == 0) && (inDevice->currentLayout == inLayout))
     {
+        pthread_mutex_unlock(&gPlugIn_StateMutex);
+        AudioHubBridge_UnlockRingControl(inDevice->ring);
+        return kAudioHardwareNoError;
+    }
+    if((inRequestID == 0) && (inDevice->formatStage >= kFormatPausing) &&
+       (inDevice->formatStage <= kFormatCommitted) && (inDevice->pendingLayout == inLayout))
+    {
+        // A host choosing the pending target endorses it, but an aborted
+        // transaction must not replace the last committed preference.
+        inDevice->formatPendingHostChoice = true;
         pthread_mutex_unlock(&gPlugIn_StateMutex);
         AudioHubBridge_UnlockRingControl(inDevice->ring);
         return kAudioHardwareNoError;
@@ -869,6 +922,7 @@ static OSStatus AudioHub_BeginFormatTransaction(AudioHubDevice* inDevice,
     inDevice->hostEpochOutstanding = 0;
     inDevice->pendingLayout = inLayout;
     inDevice->pendingMask = inSupportedMask;
+    inDevice->formatPendingHostChoice = false;
     inDevice->formatEpoch = theEpoch;
     inDevice->formatRequestID = inRequestID;
     inDevice->formatSessionID = inSessionID;
@@ -966,6 +1020,19 @@ static void AudioHub_CommitFormat(uint32_t inEndpoint, uint32_t inEpoch, Boolean
         AudioHubBridge_UnlockRingControl(theDevice->ring);
         return;
     }
+    if((theDevice->formatRequestID == 0) || theDevice->formatPendingHostChoice)
+    {
+        theDevice->preferredLayout = theLayout;
+        theDevice->formatPreference = kFormatPreferenceManual;
+    }
+    else if((theDevice->formatPreference == kFormatPreferenceNone) &&
+            (theDevice->allowedLayouts == kAudioHubLayoutMask(kAudioHubLayout_Stereo)) &&
+            (theMask != kAudioHubLayoutMask(kAudioHubLayout_Stereo)))
+    {
+        theDevice->preferredLayout = theLayout;
+        theDevice->formatPreference = kFormatPreferenceAutomatic;
+    }
+    theDevice->formatPendingHostChoice = false;
     atomic_store(&theDevice->channelCount, AudioHub_LayoutChannels(theLayout));
     theDevice->currentLayout = theLayout;
     theDevice->formatAvailableDirty |= (theDevice->allowedLayouts != theMask);
@@ -1166,6 +1233,9 @@ static void AudioHub_InitSlots(void)
                          theDevice->isInput ? AUDIOHUB_MIC_CHANNELS : AUDIOHUB_SPK_CHANNELS);
             theDevice->allowedLayouts = kAudioHubLayoutMask(kAudioHubLayout_Stereo);
             theDevice->currentLayout  = kAudioHubLayout_Stereo;
+            theDevice->preferredLayout = kAudioHubLayout_Stereo;
+            theDevice->formatPreference = kFormatPreferenceNone;
+            theDevice->formatPendingHostChoice = false;
             theDevice->formatStage    = kFormatIdle;
             theDevice->sampleRate     = kDevice_SampleRate;
             theDevice->volumeScalar   = 1.0f;
@@ -1474,6 +1544,9 @@ static int AudioHub_BindSlot(AudioHubSlot* inSlot, const AudioHubBindMsg* inMsg)
                 atomic_store(&theDevice->channelCount, AUDIOHUB_SPK_CHANNELS);
                 theDevice->allowedLayouts = kAudioHubLayoutMask(kAudioHubLayout_Stereo);
                 theDevice->currentLayout = kAudioHubLayout_Stereo;
+                theDevice->preferredLayout = kAudioHubLayout_Stereo;
+                theDevice->formatPreference = kFormatPreferenceNone;
+                theDevice->formatPendingHostChoice = false;
                 theDevice->pendingLayout = kAudioHubLayout_Stereo;
                 theDevice->pendingMask = kAudioHubLayoutMask(kAudioHubLayout_Stereo);
                 theDevice->formatEpoch = 0;
@@ -1672,6 +1745,9 @@ static void AudioHub_RetireDueSlots(void)
                 atomic_store(&theDevice->channelCount, AUDIOHUB_SPK_CHANNELS);
                 theDevice->allowedLayouts = kAudioHubLayoutMask(kAudioHubLayout_Stereo);
                 theDevice->currentLayout = kAudioHubLayout_Stereo;
+                theDevice->preferredLayout = kAudioHubLayout_Stereo;
+                theDevice->formatPreference = kFormatPreferenceNone;
+                theDevice->formatPendingHostChoice = false;
                 theDevice->pendingLayout = kAudioHubLayout_Stereo;
                 theDevice->pendingMask = kAudioHubLayoutMask(kAudioHubLayout_Stereo);
                 theDevice->formatEpoch = 0;
@@ -2121,6 +2197,7 @@ static void AudioHub_BridgeAttached(void)
             AudioHubDevice* theSpeaker = &gSlots[theSlotIndex].dev[kAudioHubDir_Out];
             pthread_mutex_lock(&gPlugIn_StateMutex);
             theSpeaker->formatSessionID = theSession;
+            theSpeaker->formatPendingHostChoice = false;
             theSpeaker->pendingLayout = theSpeaker->currentLayout;
             theSpeaker->pendingMask = theSpeaker->allowedLayouts;
             theSpeaker->formatEpoch = 0;
@@ -2142,6 +2219,7 @@ static void AudioHub_BridgeDetached(void)
     {
         AudioHubDevice* theSpeaker = &gSlots[theSlotIndex].dev[kAudioHubDir_Out];
         theSpeaker->formatSessionID = 0;
+        theSpeaker->formatPendingHostChoice = false;
         theSpeaker->formatStage = kFormatIdle;
         theSpeaker->hostEpochOutstanding = 0;
         AudioHub_ClearFormatOutboxLocked(theSpeaker);

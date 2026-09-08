@@ -871,6 +871,7 @@ static OSStatus AudioHub_BeginFormatTransaction(AudioHubDevice* inDevice,
 
     AudioHubSlot* theSlot = &gSlots[inDevice->slotIndex];
     uint32_t theEpoch = 0;
+    Boolean thePendingHostChoice = false;
     AudioHubBridge_LockRingControl(inDevice->ring);
     pthread_mutex_lock(&gPlugIn_StateMutex);
     if((atomic_load(&theSlot->state) != kSlotBound) || !inDevice->listed ||
@@ -883,9 +884,18 @@ static OSStatus AudioHub_BeginFormatTransaction(AudioHubDevice* inDevice,
     }
     if(inRequestID != 0)
     {
-        // Select under the transaction lock so a committed host choice cannot
-        // race a separately computed daemon-offer target.
-        inLayout = AudioHub_SelectOfferedLayoutLocked(inDevice, inSupportedMask);
+        // An OFFER can overtake an unsent host PREPARE. Carry its valid target
+        // into the new epoch without committing the preference early.
+        thePendingHostChoice =
+            (inDevice->formatStage >= kFormatPausing) && (inDevice->formatStage <= kFormatCommitted) &&
+            ((inDevice->formatRequestID == 0) || inDevice->formatPendingHostChoice) &&
+            (inDevice->formatSessionID == inSessionID) &&
+            (inDevice->formatGeneration == atomic_load(&theSlot->generation)) &&
+            (inDevice->formatDeviceID == AudioHub_ID(&inDevice->deviceID)) &&
+            ((AudioHub_NowMsec() - inDevice->formatStartedMsec) <= kFormatTransactionTimeoutMsec) &&
+            ((inSupportedMask & kAudioHubLayoutMask(inDevice->pendingLayout)) != 0);
+        inLayout = thePendingHostChoice ? inDevice->pendingLayout
+                                       : AudioHub_SelectOfferedLayoutLocked(inDevice, inSupportedMask);
     }
     if((inDevice->formatStage >= kFormatPausing) && (inDevice->formatStage <= kFormatCommitted) &&
        (inDevice->pendingLayout == inLayout) && (inDevice->pendingMask == inSupportedMask) &&
@@ -922,7 +932,7 @@ static OSStatus AudioHub_BeginFormatTransaction(AudioHubDevice* inDevice,
     inDevice->hostEpochOutstanding = 0;
     inDevice->pendingLayout = inLayout;
     inDevice->pendingMask = inSupportedMask;
-    inDevice->formatPendingHostChoice = false;
+    inDevice->formatPendingHostChoice = thePendingHostChoice;
     inDevice->formatEpoch = theEpoch;
     inDevice->formatRequestID = inRequestID;
     inDevice->formatSessionID = inSessionID;

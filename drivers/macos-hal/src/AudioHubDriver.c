@@ -3270,8 +3270,9 @@ static OSStatus AudioHub_GetDevicePropertyData(AudioHubDevice* inDevice, const A
                 kAudioChannelLabel_LFEScreen, kAudioChannelLabel_RearSurroundLeft,
                 kAudioChannelLabel_RearSurroundRight, kAudioChannelLabel_LeftSurround,
                 kAudioChannelLabel_RightSurround, kAudioChannelLabel_VerticalHeightLeft,
-                kAudioChannelLabel_VerticalHeightRight, kAudioChannelLabel_TopBackLeft,
-                kAudioChannelLabel_TopBackRight
+                // Atmos uses TopRear; the legacy TopBack labels do not map to its height channels.
+                kAudioChannelLabel_VerticalHeightRight, kAudioChannelLabel_LeftTopRear,
+                kAudioChannelLabel_RightTopRear
             };
             const AudioChannelLabel* theLabels = NULL;
             UInt32 theChannelCount = 0;

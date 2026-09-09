@@ -8,47 +8,33 @@
 
 !define AUDIOHUB_WINDOWS_HOOK_DIR "${__FILEDIR__}"
 
-LangString AudioHubDriverPayloadOptIn ${LANG_ENGLISH} "AudioHubVad payload copied; virtual audio activation remains opt-in."
-LangString AudioHubDriverPayloadOptIn ${LANG_SIMPCHINESE} "已复制 AudioHubVad；虚拟音频仍需用户主动安装。"
-LangString AudioHubProtectOwnerFailed ${LANG_ENGLISH} "Could not assign protected AudioHub ownership: $1"
-LangString AudioHubProtectOwnerFailed ${LANG_SIMPCHINESE} "无法设置 AudioHub 受保护的所有者：$1"
-LangString AudioHubProtectAclFailed ${LANG_ENGLISH} "Could not protect AudioHub files: $1"
-LangString AudioHubProtectAclFailed ${LANG_SIMPCHINESE} "无法保护 AudioHub 文件：$1"
-LangString AudioHubDriverRemovePrompt ${LANG_ENGLISH} "AudioHub virtual audio is installed.$\r$\n$\r$\nRemove its driver too? Choosing No cancels uninstall so the driver never loses its required daemon."
-LangString AudioHubDriverRemovePrompt ${LANG_SIMPCHINESE} "已安装 AudioHub 虚拟音频。$\r$\n$\r$\n是否同时移除驱动？选择“否”将取消卸载，以免驱动失去所需的后台服务。"
-LangString AudioHubUninstallCancelled ${LANG_ENGLISH} "AudioHub uninstall cancelled; the App, daemon, and driver remain installed."
-LangString AudioHubUninstallCancelled ${LANG_SIMPCHINESE} "已取消卸载；App、后台服务和驱动均保持安装。"
-LangString AudioHubDriverRemoveReboot ${LANG_ENGLISH} "Windows must restart before AudioHubVad can be removed safely.$\r$\n$\r$\nAudioHub, its daemon, scheduled task, and driver were kept. Restart Windows, then run uninstall again."
-LangString AudioHubDriverRemoveReboot ${LANG_SIMPCHINESE} "必须重启 Windows，才能安全移除 AudioHubVad。$\r$\n$\r$\nAudioHub、后台服务、计划任务和驱动均已保留。请重启 Windows 后再次运行卸载程序。"
-LangString AudioHubDriverRemoveFailed ${LANG_ENGLISH} "Windows could not safely remove the AudioHub virtual audio driver.$\r$\n$\r$\n$1$\r$\n$\r$\nThe App and daemon were kept so you can retry."
-LangString AudioHubDriverRemoveFailed ${LANG_SIMPCHINESE} "Windows 无法安全移除 AudioHub 虚拟音频驱动。$\r$\n$\r$\n$1$\r$\n$\r$\nApp 和后台服务已保留，可稍后重试。"
-LangString AudioHubUserCleanupFailed ${LANG_ENGLISH} "AudioHub could not remove this user's background-service lifecycle files. The App was kept so reinstall cannot silently inherit a broken startup state."
-LangString AudioHubUserCleanupFailed ${LANG_SIMPCHINESE} "无法清理当前用户的后台服务生命周期文件。App 已保留，以免重装时继承错误的启动状态。"
-LangString AudioHubGracefulStopTimeout ${LANG_ENGLISH} "The graceful shutdown request did not answer in time; falling back to the exact-path process sweep."
-LangString AudioHubGracefulStopTimeout ${LANG_SIMPCHINESE} "优雅关停请求未在预期时间内返回；改用精确路径进程清扫。"
+; Tauri includes hooks before MUI_LANGUAGE defines LANG_ENGLISH.
+; Pin English (US) explicitly so early strings enter the correct table.
+
+LangString AudioHubDriverPayloadOptIn 1033 "AudioHubVad payload copied; virtual audio activation remains opt-in."
+LangString AudioHubProtectOwnerFailed 1033 "Could not assign protected AudioHub ownership: $1"
+LangString AudioHubProtectAclFailed 1033 "Could not protect AudioHub files: $1"
+LangString AudioHubDriverRemovePrompt 1033 "AudioHub virtual audio is installed.$\r$\n$\r$\nRemove its driver too? Choosing No cancels uninstall so the driver never loses its required daemon."
+LangString AudioHubUninstallCancelled 1033 "AudioHub uninstall cancelled; the App, daemon, and driver remain installed."
+LangString AudioHubDriverRemoveReboot 1033 "Windows must restart before AudioHubVad can be removed safely.$\r$\n$\r$\nAudioHub, its daemon, scheduled task, and driver were kept. Restart Windows, then run uninstall again."
+LangString AudioHubDriverRemoveFailed 1033 "Windows could not safely remove the AudioHub virtual audio driver.$\r$\n$\r$\n$1$\r$\n$\r$\nThe App and daemon were kept so you can retry."
+LangString AudioHubUserCleanupFailed 1033 "AudioHub could not remove this user's background-service lifecycle files. The App was kept so reinstall cannot silently inherit a broken startup state."
+LangString AudioHubGracefulStopTimeout 1033 "The graceful shutdown request did not answer in time; falling back to the exact-path process sweep."
 ; One message used to cover six unrelated failures, which is exactly what made
 ; the 2026-08-16 uninstall report impossible to place. Same fix as the bootstrap
 ; strings above: each site says which step failed.
-LangString AudioHubStopHandshakeSetupFailed ${LANG_ENGLISH} "AudioHub could not prepare the shutdown handshake file. No program files were changed; start the installer again to retry."
-LangString AudioHubStopHandshakeSetupFailed ${LANG_SIMPCHINESE} "无法准备关停握手文件。程序文件尚未更改；请重新运行安装程序重试。"
-LangString AudioHubStopHandshakeLaunchFailed ${LANG_ENGLISH} "AudioHub could not run the shutdown request as the logged-on user. No program files were changed; start the installer again to retry."
-LangString AudioHubStopHandshakeLaunchFailed ${LANG_SIMPCHINESE} "无法以当前登录用户身份执行关停请求。程序文件尚未更改；请重新运行安装程序重试。"
-LangString AudioHubProcessSweepFailed ${LANG_ENGLISH} "An installed AudioHub process is still running and could not be stopped. No program files were changed; start the installer again to retry."
-LangString AudioHubProcessSweepFailed ${LANG_SIMPCHINESE} "仍有已安装的 AudioHub 进程在运行且无法停止。程序文件尚未更改；请重新运行安装程序重试。"
+LangString AudioHubStopHandshakeSetupFailed 1033 "AudioHub could not prepare the shutdown handshake file. No program files were changed; start the installer again to retry."
+LangString AudioHubStopHandshakeLaunchFailed 1033 "AudioHub could not run the shutdown request as the logged-on user. No program files were changed; start the installer again to retry."
+LangString AudioHubProcessSweepFailed 1033 "An installed AudioHub process is still running and could not be stopped. No program files were changed; start the installer again to retry."
 ; Four different things can go wrong here and they used to share one message,
 ; which made a real failure report (2026-08-16) impossible to place: the text
 ; said the service could not be registered, when in fact it had been and only
 ; the answer was lost. Each path now names itself.
-LangString AudioHubBootstrapFailed ${LANG_ENGLISH} "AudioHub was copied, but its background service could not be registered and started. Installation stopped instead of reporting a partial setup."
-LangString AudioHubBootstrapFailed ${LANG_SIMPCHINESE} "AudioHub 已复制，但无法注册并启动后台服务。安装已停止，不会把不完整的状态报告为成功。"
-LangString AudioHubBootstrapNoHandoff ${LANG_ENGLISH} "AudioHub was copied, but the installer could not hand the setup step to your user account. Installation stopped instead of reporting a partial setup."
-LangString AudioHubBootstrapNoHandoff ${LANG_SIMPCHINESE} "AudioHub 已复制，但安装程序无法把设置步骤交给当前用户账户。安装已停止，不会把不完整的状态报告为成功。"
-LangString AudioHubBootstrapNoLaunch ${LANG_ENGLISH} "AudioHub was copied, but it could not be started to finish setup. Installation stopped instead of reporting a partial setup."
-LangString AudioHubBootstrapNoLaunch ${LANG_SIMPCHINESE} "AudioHub 已复制，但无法启动它来完成设置。安装已停止，不会把不完整的状态报告为成功。"
-LangString AudioHubBootstrapTimeout ${LANG_ENGLISH} "AudioHub was copied and started, but it did not report the result of registering its background service within 30 seconds. Installation stopped instead of reporting a partial setup. Check app.log in %APPDATA%\AudioHub, then run the installer again."
-LangString AudioHubBootstrapTimeout ${LANG_SIMPCHINESE} "AudioHub 已复制并启动，但 30 秒内没有回报后台服务的注册结果。安装已停止，不会把不完整的状态报告为成功。请查看 %APPDATA%\AudioHub 下的 app.log，然后重新运行安装程序。"
-LangString AudioHubInstallDirRejected ${LANG_ENGLISH} "AudioHub can only use its dedicated Program Files directory. The selected or existing directory is unsafe, redirected, or belongs to another product."
-LangString AudioHubInstallDirRejected ${LANG_SIMPCHINESE} "AudioHub 只能安装到 Program Files 下的专用目录。当前目录不安全、被重定向或属于其它程序。"
+LangString AudioHubBootstrapFailed 1033 "AudioHub was copied, but its background service could not be registered and started. Installation stopped instead of reporting a partial setup."
+LangString AudioHubBootstrapNoHandoff 1033 "AudioHub was copied, but the installer could not hand the setup step to your user account. Installation stopped instead of reporting a partial setup."
+LangString AudioHubBootstrapNoLaunch 1033 "AudioHub was copied, but it could not be started to finish setup. Installation stopped instead of reporting a partial setup."
+LangString AudioHubBootstrapTimeout 1033 "AudioHub was copied and started, but it did not report the result of registering its background service within 30 seconds. Installation stopped instead of reporting a partial setup. Check app.log in %APPDATA%\AudioHub, then run the installer again."
+LangString AudioHubInstallDirRejected 1033 "AudioHub can only use its dedicated Program Files directory. The selected or existing directory is unsafe, redirected, or belongs to another product."
 
 ; Keep non-trivial PowerShell in a real UTF-8 script. Passing nested quoted
 ; source through NSIS -> CreateProcess -> powershell.exe -Command strips the

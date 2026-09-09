@@ -27,8 +27,7 @@
       "nsis": {
         "installMode": "perMachine",
         "languages": [
-          "English",
-          "SimpChinese"
+          "English"
         ],
         "installerHooks": "windows/nsis-hooks.nsh"
       }

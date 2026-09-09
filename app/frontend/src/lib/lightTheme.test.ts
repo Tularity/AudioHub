@@ -200,9 +200,8 @@ describe('light palette clears WCAG on the surfaces text lands on', () => {
   });
 
   it('keeps the primary button legible now that its fill is flat', () => {
-    // The gradient is gone, so the text sits on --accent itself, not on the
-    // lighter --accent-lift end that used to be under the first line of glyphs.
-    expect(ratio(token('--on-accent'), token('--accent'))).toBeGreaterThanOrEqual(4.5);
+    // Solid controls use the fill ink, while links retain the text accent.
+    expect(ratio(token('--on-accent'), token('--accent-fill'))).toBeGreaterThanOrEqual(4.5);
   });
 
   it('keeps placeholder text above AA on the input fill', () => {
@@ -553,7 +552,7 @@ describe('light theme does not paint glows with text-contrast colours', () => {
     // Three wash the page lighter (--bg-rgb), one washed it darker (--sh-rgb).
     // Either is defensible; having both means "a layer opened" has two opposite
     // readings inside one app.
-    const scrims = ['.confirm-mask', '#gate', '#overlay', '.sheet-scrim'];
+    const scrims = ['.confirm-mask::before', '#gate', '#overlay', '.sheet-scrim::before'];
     const inkOf = (sel: string) => {
       const hits = ALL.filter((r) => parts(r.selector).some((p) => p === sel || p.endsWith(` ${sel}`)))
         .map((r) => decl(r.body, 'background') ?? decl(r.body, 'background-color'))

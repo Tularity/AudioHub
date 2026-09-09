@@ -320,6 +320,7 @@ function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
                 version={dev?.device_volume_version}
                 reported={reported}
                 pending={volumePending}
+                activity={{ kind: state, text }}
                 online={!!peer.online}
                 active={volumeActive}
                 inactiveNote={t(hidden
@@ -338,7 +339,6 @@ function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
                 )}
                 onRefresh={() => { void refreshPeers(); }}
               />
-              <span className={`dev-state ${state}`}>{text}</span>
             </div>
           );
         })}

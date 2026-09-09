@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  clearPointerOrigin, installPointerOrigin, layoutRect, notePointerOrigin,
+  clearPointerOrigin, consumeActivationOrigin, installPointerOrigin, layoutRect, notePointerOrigin,
   originPercent, recentPointerOrigin, ORIGIN_MAX_AGE_MS,
 } from './pointerOrigin';
 
@@ -23,6 +23,17 @@ describe('the recorded press expires', () => {
 
   it('reports nothing before any press', () => {
     expect(recentPointerOrigin(5000)).toBeNull();
+  });
+
+  it('does not reuse one opening action for a second dialog', () => {
+    notePointerOrigin({ x: 120, y: 40 }, 1000);
+    expect(consumeActivationOrigin(1000)?.point).toEqual({ x: 120, y: 40 });
+    expect(consumeActivationOrigin(1001)).toBeNull();
+  });
+
+  it('rejects an expired activation even when a stale element remains focused', () => {
+    notePointerOrigin({ x: 120, y: 40 }, 1000);
+    expect(consumeActivationOrigin(1001 + ORIGIN_MAX_AGE_MS)).toBeNull();
   });
 });
 
@@ -183,5 +194,13 @@ describe('the installer', () => {
 
   it('is a no-op with no target', () => {
     expect(() => installPointerOrigin(null)()).not.toThrow();
+  });
+
+  it('clears an earlier click when keyboard navigation changes the context', () => {
+    const target = fakeTarget();
+    installPointerOrigin(target as never, () => 500);
+    target.handlers[0]({ clientX: 7, clientY: 9 });
+    target.handlers[1]({ key: 'Tab' });
+    expect(consumeActivationOrigin(500)).toBeNull();
   });
 });

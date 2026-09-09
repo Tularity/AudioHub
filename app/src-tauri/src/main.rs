@@ -20,6 +20,7 @@ use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 
 mod driver_install;
 mod icon;
+mod permission_settings;
 #[cfg(target_os = "macos")]
 mod mac_chrome;
 #[cfg(target_os = "macos")]
@@ -1099,6 +1100,31 @@ fn open_external_url(url: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Open one fixed privacy destination through macOS, without a webview or shell.
+#[tauri::command]
+async fn open_permission_settings(id: String) -> Result<bool, String> {
+    let (url, direct) = permission_settings::destination(&id)?;
+    #[cfg(target_os = "macos")]
+    {
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut command = Command::new("/usr/bin/open");
+            command.args(["-b", "com.apple.systempreferences", url])
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+            let output = command_output_with_timeout(&mut command, Duration::from_secs(5))
+                .map_err(|error| format!("Could not open System Settings: {error}"))?;
+            if !output.status.success() {
+                return Err(format!("System Settings launch failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+            }
+            Ok(direct)
+        }).await.map_err(|error| error.to_string())?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (url, direct);
+        Err("Permission settings navigation is available only on macOS".into())
+    }
+}
+
 /// Windows caption buttons. macOS keeps its real traffic lights, so the
 /// frontend only renders these where the OS puts its controls on the trailing
 /// edge (`lib/platform.ts`); the commands themselves are platform-neutral.
@@ -1470,6 +1496,7 @@ fn main() {
             toggle_window_zoom,
             show_window_menu,
             open_external_url,
+            open_permission_settings,
             minimize_window,
             hide_window,
             is_window_maximized,

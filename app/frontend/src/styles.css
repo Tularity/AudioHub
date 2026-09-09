@@ -67,6 +67,7 @@
   --text: #e8eaf0;
   --text-dim: #9aa3b2;
   --accent: #31c8b0;
+  --accent-fill: var(--accent);
   --danger: #e5484d;
   --ok: #46c46b;
   --warn: #e0a83f;
@@ -76,6 +77,7 @@
   /* 上面五个色相的 rgb 三元组。改颜色要**两处一起改**，色相与它的色阶才不会走散。 */
   --bg-rgb: 15, 17, 21;
   --accent-rgb: 49, 200, 176;
+  --accent-fill-rgb: var(--accent-rgb);
   --danger-rgb: 229, 72, 77;
   --ok-rgb: 70, 196, 107;
   --warn-rgb: 224, 168, 63;
@@ -229,185 +231,48 @@
      #nav.contracted for why the 3px `top` move cannot. */
   --glass-shadow-settled: 0 1px 3px rgba(var(--sh-rgb), .22), 0 8px 20px -14px rgba(var(--sh-rgb), .4);
 
-  /* 动作短而有回弹。--ease-spring 带一点过冲，用在「出现」；--ease-out 用在状态过渡。 */
-  /* Scope note (spec-motion §3): --ease-spring is no longer the general-purpose
-     entrance curve. It is reserved for (a) the tail of a user action that
-     carried momentum (toggle knob, slider release) and (b) surfaces that grow
-     out of the pointer origin (sheet, popover). Apple's rule is "momentum earns
-     bounce"; M3 says ordinary transitions should not use bouncy springs. */
-  --ease-spring: cubic-bezier(.34, 1.42, .5, 1);
-  /* An expo-out: peak speed immediately, then a long glide. That makes it the
-     right curve for *entrances* (arriving from nowhere) and the wrong one for
-     movement that starts from rest -- see --ease-move. */
-  --ease-out: cubic-bezier(.22, 1, .36, 1);
+  /* Motion roles: feedback, state, floating surfaces, dialogs, navigation. */
+  --dur-micro: 170ms;
+  --dur-state: 410ms;
+  --dur-pop-in: 420ms;
+  --dur-pop-out: 420ms;
+  --dur-pop-fade: 230ms;
+  --dur-dialog-in: 470ms;
+  --dur-dialog-out: 540ms;
+  --dur-dialog-fade: 250ms;
+  --dur-dialog-fade-out: 300ms;
+  --dur-surface-in: 420ms;
+  --dur-nav: 420ms;
+  --dur-theme: 420ms;
+  --dur-telemetry: 400ms;
 
-  /* ---- Duration scale (spec-motion §3) -------------------------------------
-   *
-   * Five steps. Every number below already existed somewhere in this file and
-   * was chosen deliberately at the time; this block promotes those five and
-   * retires the fifteen ad-hoc literals that had accumulated around them.
-   * Nothing is imported from an outside scale.
-   *
-   * Why a scale rather than one number: the four systems surveyed (Material 3 /
-   * Apple HIG / IBM Carbon / Fluent 2) disagree about the "default" duration by
-   * 67% and about the ceiling by 2x, yet converge tightly *per category*.
-   * Choosing per category is defensible; choosing one number for everything is
-   * not. Selection is a discrete lookup by surface class, not a distance
-   * formula -- both published rate laws (~1000px/s and Apple's
-   * NSWindowResizeTime ~750pt/s) judge this app's best animation, the ~100px
-   * .nav-marker at 340ms, to be too slow. Rate laws do not hold at this scale. */
+  --ease-enter: cubic-bezier(.16, 1, .3, 1);
+  --ease-move: cubic-bezier(.4, 0, .2, 1);
+  --ease-exit: cubic-bezier(.4, 0, 1, 1);
+  --ease-expand: cubic-bezier(.2, 0, 0, 1);
+  --ease-fade: cubic-bezier(0, 0, .2, 1);
+  --ease-feedback: var(--ease-fade);
+  --transition-dialog:
+    transform var(--dur-dialog-in) var(--ease-enter),
+    opacity var(--dur-dialog-fade) var(--ease-fade);
+  --transition-dialog-out:
+    transform var(--dur-dialog-out) var(--ease-enter),
+    opacity var(--dur-dialog-fade-out) var(--ease-fade);
 
-  /* 100ms -- pure colour / opacity / fill feedback: hover, tag recolour, .dot.
-     The single value all four systems converge on (Carbon fast-02 110ms plus
-     its 90-120ms review band, Fluent durationFaster 100ms, M3 short2 100ms,
-     NN/g "simple feedback" 100ms). No geometry moves, so there is no trajectory
-     to read and nothing longer buys anything. */
-  --dur-1: .1s;
+  /* Compatibility aliases keep existing state declarations concise while the
+     semantic roles above remain the source of truth. */
+  --dur-1: var(--dur-micro);
+  --dur: var(--dur-state);
+  --ease-out: var(--ease-fade);
 
-  /* 170ms -- every exit / dismissal, and every press (a press is a brief "leave
-     and come back", so it shares the exit step).
-     ⚠ This is SHEET_EXIT_MS (lib/sheet.ts). lib/sheet.test.ts reads this
-     stylesheet and asserts the two .closing animations equal it *exactly*, so
-     the value is .17s rather than a rounder .18s. Changing it means changing
-     lib/sheet.ts, two CSS declarations and the test together.
-     It falls inside every published exit band (M3 200, Material 1 195,
-     Fluent 200, NN/g 200-250). */
-  --dur-2: .2s;
-
-  /* 220ms -- in-place state change: border/background swaps, focus halo,
-     chevron rotation, disclosure blocks inside a card.
-     ⚠ Original name and original value, kept byte for byte. It is referenced
-     ~22 times, and 220ms is the defensive middle of the 67% spread between
-     Carbon 150 / Fluent 200 / WinUI 250 / M3 250.
-     ⚠ Do NOT slow this down in an attempt to make motion more visible. What it
-     drives is overwhelmingly colour and opacity: a colour transition has no
-     path, no acceleration, nothing for an easing curve to express, so there is
-     no trajectory to be made legible. Stretching it does not reveal anything --
-     it only smears the state change and makes the UI feel like it is trailing
-     the pointer. Curve legibility comes from travel distance, not from time;
-     the lever for that is --enter-shift / --enter-scale below. */
-  --dur: .22s;
-
-  /* 340ms -- every entrance: sheet, popover, view, list row, a block of
-     explanation that has just appeared. Already the duration of .nav-marker,
-     sheetGrow, .onboarding and .overlay-card, i.e. the animations in this file
-     that were judged to work. 340/170 = 2:1, the ratio in M3's published
-     enter/exit pairing (emphasized-decelerate 400 / emphasized-accelerate 200). */
-  --dur-4: .34s;
-
-  /* 420ms -- whole-window / whole-view: theme reveal, view switch.
-     = REVEAL_DURATION_MS (lib/reveal.ts), which was itself moved 480 -> 420 on
-     2026-08-14 with its reasoning recorded there. Bracketed by Carbon slow-01
-     400 below and the Fluent 500 / M3 long2 500 ceiling above. */
-  --dur-5: .42s;
-
-  /* 400ms -- deliberately NOT a member of the scale above and not a perceptual
-     duration at all. It is a low-pass filter over the 1Hz stats tick for the
-     flex-grow band segments; see the comment at .metric-band for why per-frame
-     animation would only jitter. It has a name purely so nobody "tidies" it
-     into --dur-5 and nobody reads it as a considered piece of motion design. */
-  --dur-telemetry: .4s;
-
-  /* ---- Easing (spec-motion §3) ---------------------------------------------
-   *
-   * The two curves below fill real gaps: this file had no exit curve and no
-   * start-from-rest curve, so --ease-out (a decelerate) was doing both jobs.
-   * On an exit that is semantically backwards -- leaving should accelerate. */
-
-  /* Permanent departure: toast dismissal, confirm close, an error block that is
-     resolved. = M3 emphasized-accelerate. It ends at peak speed, which is
-     precisely what gives the impression the component cannot be retrieved.
-     ⚠ Anything that can be re-opened (sheet, popover, a collapsible section)
-     must NOT use it -- those keep --ease-out. That is an M3 semantic rule, not
-     a stylistic preference, and lib/motion.test.ts enforces it. */
-  --ease-in: cubic-bezier(.3, 0, .8, .15);
-
-  /* M3 `standard-accelerate`. The ORDINARY exit curve, distinct from
-     `--ease-in` (`emphasized-accelerate`), which M3 reserves for departures
-     that should read as permanent. A sheet can be re-opened, so it gets this
-     one -- but it still has to ACCELERATE: measured 2026-08-14, a sheet leaving
-     on `--ease-out` was 76% gone 42ms into a 170ms exit, i.e. over before the
-     eye could follow it. A decelerate curve on an exit puts all the travel
-     where nobody is looking yet. */
-  --ease-exit: cubic-bezier(.3, 0, 1, 1);
-
-  /* 退场几何专用：**近似匀速**，两端只做很轻的收敛。
-     这不是从任何设计体系抄来的——四家给的退场曲线全是加速或减速，而实测证明两者
-     在这里都会让后半程变成静止：`--ease-move`（减速）下卡片在最后 150ms 里只动了
-     19px / 3.4%，眼睛读作「停住了，然后没了」。要让一次离开被看清，行程必须铺满
-     整段时间，而铺满就意味着接近匀速。 */
-  --ease-depart: cubic-bezier(.35, .12, .65, .88);
-
-  /* How long the scrim leads the sheet card by. Not decoration: the press that
-     opens a sheet can be at the far edge of the window while the card opens in
-     the centre, and a saccade plus fixation costs 150-250ms. The scrim's
-     whole-window luminance change is what pulls the eye; the card must still
-     have travel left when the eye arrives. Measured 2026-08-14 frame by frame:
-     with no lead the card was 83% through its travel at 85ms. */
-  --sheet-lead: 130ms;
-
-  /* 卡片自己那段入场的时长。与 `--dur-4` 分开，是因为它必须和 `--sheet-lead`
-     一起加总到一个人能接受的总时长：130 + 280 = 410ms。 */
-  --sheet-grow: 280ms;
-
-  /* 换页时旧帧退场的时长，**同时**是新帧的入场延迟——这一个数就把「新页面在旧页面
-     走完之后才开始」写死了。两帧同时半透明地叠着会读作「糊了一下」，那是这次要
-     避开的形态。 */
-  --nav-out: 130ms;
-
-  /* 换页滑动的行程与方向。
-     方向 = 两个视图在**导航胶囊**上的相对位置（lib/viewTransition.ts 的
-     `navDirection`）：点右边的页签，内容就从右边进来，与胶囊里 marker 的滑动同向
-     ——内容的运动方向必须等于你在导航条上移动的方向，这才是「切换」的空间读感，
-     macOS 系统设置切窗格就是这个行为。+1 = 新内容从右进，-1 = 从左进。
-     这里的值只是**默认**：真正的符号由 `navigateWithTransition` 在拍快照之前
-     写到 <html> 的内联样式上，结束时移除、回落到这里。
-     两轴各一个无量纲符号（-1 / 0 / 1）：横向切页走 x；进出详情走 y——下钻是
-     「详情从底部浮上来」、返回是「详情沉下去、主面板从上面回来」（用户 2026-08-15
-     裁定：下钻的隐喻是垂直的，不是横向的）。
-     120px ≈ 视图宽度的 11%：远高于 8px 幅度门槛，又不至于读成整页横抛。 */
+  /* Navigation keeps the route-derived sign while using a short, familiar
+     content shift. Generic entrances stay subtle and do not zoom the layout. */
   --nav-dx: 1;
   --nav-dy: 0;
-  --nav-shift: 120px;
-
-  /* 菜单项级联的步进：第 N 项延迟 N × 22ms 淡入。22 而不是更圆的数：
-     它只是节拍不是感知时长，错开 60Hz 的整数倍反而更顺。 */
-  --stagger: 22ms;
-
-  /* The mirror of `--sheet-lead`, and it points the other way. On the way IN the
-     scrim leads, because a whole-window luminance change is the only thing that
-     can pull the eye to a card opening in the centre. On the way OUT the scrim
-     must TRAIL: measured 2026-08-14, a scrim fading on `--ease-out` was 90% gone
-     by 87ms while the card had moved 5%, so the eye spent the whole exit
-     watching the background come back and never saw the card leave. Holding the
-     backdrop still gives the card something quiet to move against. */
-  --sheet-trail: 160ms;
-
-  /* In-place movement / size change, where both endpoints are already on
-     screen. = M3 web `standard` (also M3's official single-segment CSS
-     fallback for `emphasized`). The x1=.2 supplies the "starting from rest"
-     segment that --ease-out, peaking instantly, does not have. */
-  --ease-move: cubic-bezier(.2, 0, 0, 1);
-
-  /* ---- Amplitude (spec-motion §2.3, §3) ------------------------------------
-   *
-   * A curve's character is a *percentage of its travel*, which makes travel the
-   * multiplier on whether the curve can be perceived at all. Measured:
-   * --ease-spring peaks at ~1.057, i.e. it overshoots by ~5.7% of the distance
-   * covered. On a 4% deformation that overshoot is 0.23px -- sub-pixel, and so
-   * physically un-renderable. Lengthening the duration of a 4% deformation buys
-   * nothing; it yields a slow animation that is still invisible.
-   *
-   * Hard rule: a geometric animation must travel >= 8px or >= 8% scale. Below
-   * that, drop the geometry and transition opacity alone rather than leaving an
-   * invisible move in the file. The floor is interpolated from this repo's own
-   * hits and misses, not from published data -- nobody publishes this number:
-   *   scale     failed at 0.6% and 4%; worked at 10%, 12%, 28%
-   *   translate failed at 2px, 3px, 4px; worked at 10px, 14px, ~100px
-   * lib/motion.test.ts turns this into an assertion over entrance keyframes. */
-  --lift: 6px;         /* hover lift; the shadow swap alongside does the rest */
-  --enter-shift: 12px; /* entrance translate -- clear of the 8px floor */
-  --enter-scale: .88;  /* entrance scale: 12% of travel, in the comfortable band */
+  --nav-shift: 20px;
+  --lift: 4px;
+  --enter-shift: 6px;
+  --enter-scale: .96;
 
   /* 浮动头部。系统在顶栏里占掉的那一段——**哪一端被占，取决于平台**：
      macOS 的红绿灯在前缘，Windows 的最小化/最大化/关闭在后缘。所以不写
@@ -457,106 +322,25 @@
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
-/* ---- 浅色 ----
- * 只覆盖颜色，**一条几何都不动**：圆角、间距、时长、平台让位量全部继承自上面。
- * 于是「浅色下布局跑了」这种 bug 在结构上不可能发生。
- *
- * 四个语义色不是把深色那四个拿来直接用。#31c8b0 在 #eceef3 上只有 2.2:1，做正文
- * 色不合格——而它在本文件里有 25 处是当**文字颜色**用的。所以浅色侧各自压暗一档。
- *
- * 取值同样是**量出来的**，而且量的底色不是画布，是**画布叠上水印之后**的最亮处
- * ——正文有一部分（页脚那两条常驻说明）就落在卡片之外、水印之上，验收标准照抄
- * docs/design-ui-chrome.md §5.2.1：叠加后的等级不得比叠加前低。
- * 第一版取了 --text-dim #464e5c，画布上 7.22:1 过 AAA，叠上水印掉到 6.77:1
- * ——**跌出 AAA**，正是那一节写下来要防的情况。所以整组再压一档：
- *
- *   （左：纯画布 #eceef3；右：画布 + .042 水印，即 rgb(227,233,237)）
- *   --text-dim #3f4756 → 8.05:1 / 7.62:1   AAA 两处都保住
- *   --accent   #0a6d5f → 5.38:1 / 5.09:1   AA
- *   --ok       #18763a → 4.90:1 / 4.64:1   AA
- *   --danger   #c12e35 → 4.88:1 / 4.62:1   AA
- *   --warn     #955802 → 4.92:1 / 4.67:1   AA
- *
- * 改这五个值之前请重新量一次，**并且要量水印那一列**。
- *
- * ---- 为什么这三个值又动了一次：色相本身站不住 ----
- *
- * 上一版把它们压到 5.0–5.4，比 AA 的 4.5 多留了将近一档余量。省下来的不是安全边际，
- * 是**明度**：整组落在 L* 40.7–42.7，而画布是 L* 93。四个语义色于是在浅底上读成
- * 四团一样重的深色块，彼此只靠色相区分——其中 --warn 的 h=80° 在 L* 41 上根本不是
- * 「琥珀」，是**橄榄褐**。用户点名的「延迟数字」正是这一个：延迟落在 120–300 ms
- * 时数字取 --warn，22px 的「≥143 ms」在白卡上是一行泥。
- *
- * 参照物（本轮实测，来源见报告）——所有权威的浅色语义色都落在 L* 47–50：
- *   Apple HIG（Increased Contrast, light）  Yellow #a16a00 L*49.4 · Orange #c55300 L*49.6
- *                                          Green  #008932 L*49.6 · Red    #e9152d L*49.6
- *   IBM Carbon（light status）              Yellow60 #8e6a00 L*47.1 · Orange60 #ba4e00 L*46.8
- *                                          Red60    #da1e28 L*47.0
- *   本文件（改前）                          L* 40.7 – 42.7   ← 比两家都暗 5–9 个 L*
- *
- * 差距的来源可以算清楚，不必猜：Apple / Carbon 是按 **4.5:1 对纯白**定的，我们是按
- * **4.5:1 对画布叠水印**（rgb 227,233,237）定的。同一个 #a16a00 在白底上 4.59:1，
- * 在我们的画布上只有 3.95:1——**够不着我们的线**。所以「比 Apple 暗」这件事有一半是
- * 结构性的（画布不是白的），不是调错了。
- *
- * ⇒ 于是本轮的做法是分两头：
- *   ① 文字这一档**守住原判据不放宽**（4.5:1 对叠水印画布），只把余量花光：
- *      从 5.0–5.4 收到 4.6–4.7，换回 2.0–2.9 个 L* 和更高的彩度，并把 --warn 的色相
- *      从 80°（橄榄）拉到 69°（琥珀）。能拿的只有这么多，这是这条判据下的上限。
- *   ② 真正的位移交给**标记层**（:root 里的 --*-mark）：那些点、条、竖线不是文字，
- *      按 3:1 收就能站到 L* 53–55，比文字档亮 11–14 个 L*。
- * 用户看到的「颜色偏深」，大头在 ②，不在 ①。
- *
- * 三个语义色的 4.5:1 判据**没有**放宽——它们仍要服务 10–12px 的标签与说明文字。
- * 而上面那句「本轮不去主张 .metric-val 是大号文本」后来被**量翻了**：22px/650 的
- * 笔画比 WCAG 自己认可的最轻一档大号文本（18.66/700）还重 1.2–1.4 倍，且在本文件的
- * 字体栈下 650 与 700 渲染出的是同一批像素。所以延迟数字已经改走标记层，
- * 判据 3:1——完整的量法与数据见 `.metric-val.tone-*` 那一处的注释。
- *
- * 投影另起一套而不是只换墨色：深色下的 .68 黑放到白底上是一团脏，浅色投影要
- * **更浅、更散、带一点冷调**（#0f172a 而不是纯黑），这是浅色界面能不能读作干净的
- * 分水岭。--sh-rgb 与几条复合投影因此一起覆盖。
- *
- * ---- 玻璃：浅色走**磨砂**，不走通透 ----
- *
- * Apple 自己在 26.1 把这件事变成了用户可选项，两档的官方名字是 **Clear / Tinted**
- * （iOS/iPadOS：设置 > 显示与亮度 > Liquid Glass；macOS：系统设置 > 外观 >
- * Liquid Glass）。Apple 对 Tinted 的原话是 "more contrast and increased opacity"。
- * 本项目**固定走 Tinted 那一档的读感**——不是去对齐系统当前的设定（系统也没有开放
- * 任何 API 让人读到这个偏好，Apple DTS 明确不建议按它调 UI），而是因为浅色底下
- * 透出来的是**亮的内容**，通透一分就多一分花字。
- *
- *   · .72 → .86   透过去的还剩一点位置感，但已经不参与前景的对比度
- *   · blur 20 → 13px  底色都快不透明了，模糊再开大只是在烧 GPU：
- *     backdrop-filter 的开销随**被模糊的面积**走，而这层是常驻的
- *   · saturate 180% → 115%  那 180% 是补深色下模糊吃掉的彩度；这里只剩 14% 的
- *     底透得过来，补彩度已经没有对象
- *   · 顶部那道白色径向高光**整条删掉**——见下面「为什么浅色不能用光影」
- *
- * 与 Apple 自家浅色玻璃的实测对照（apple.com 的 nav.globalnav，2026-08 实测）：
- * 它是 `rgba(255,255,255,.8)` + `blur(20px) saturate(1.8)`，而且**零边框、零投影**。
- * 不透明度这一档我们比它还厚一点（.86），方向一致；模糊按上面的理由收窄；
- * 边框我们**保留**一条发丝——Apple 那条 nav 是网页，不必考虑 Windows 的
- * forced-colors：那个模式会把 backdrop-filter 与 box-shadow 全部剥掉，届时这条
- * 1px 实边是胶囊唯一还看得见的轮廓。它是可访问性兜底，不是装饰。
- */
 :root[data-theme="light"] {
   color-scheme: light;
 
-  --bg: #eceef3;
+  --bg: #f6f7f9;
   --bg-1: #ffffff;
-  --bg-2: #f3f5f9;
+  --bg-2: #f4f5f7;
   --text: #171a21;
   --text-dim: #3f4756;
   --accent: #0a6d5f;
+  --accent-fill: #0c8271;
   --danger: #c12e35;
   --ok: #18763a;
   --warn: #955802;
   --line: rgba(15, 23, 42, .09);
   --line-strong: rgba(15, 23, 42, .14);
 
-  --bg-rgb: 236, 238, 243;
+  --bg-rgb: 246, 247, 249;
   --accent-rgb: 10, 109, 95;
+  --accent-fill-rgb: 12, 130, 113;
   --danger-rgb: 193, 46, 53;
   --ok-rgb: 24, 118, 58;
   --warn-rgb: 149, 88, 2;
@@ -575,22 +359,10 @@
 
   --track: #d6dae3;
   --trough: #e2e6ed;
-  /* 「静音 / 禁用 / 离线」的实心填充。原值 #98a1b1 对画布只有 2.24:1——**禁用**控件
-     可以这样（WCAG 把 inactive component 排除在外），但同一个 token 还画着
-     `.dot.offline`，而「离线」是一个**要被读出来的状态**，归 SC 1.4.11 的 3:1 管。
-     #7a8393 → 对叠水印画布 3.12:1、对白卡 3.82:1。顺带把静音滑条的填充也带出来了：
-     L* 66 的灰压在 L* 87 的轨道上原本几乎看不见「填到哪儿了」。 */
   --fill-muted: #7a8393;
   --fill-faint: #c3cad6;
   --knob: #ffffff;
   --thumb: #ffffff;
-  /* 占位符也是**要读的字**（「IP 或 IP:端口」「对方 PIN」告诉用户该填什么），
-     不是装饰，所以它归 WCAG 1.4.3 管。原值 #8b95a5 压在输入框底色 #eceef3 上只有
-     2.61:1，连 AA 都够不着——这一条是这次做输入框材质时量出来的，不是新引入的。
-     #616a7a → 4.70:1（AA）。明度阶仍然分得开：--text 15.00 > --text-dim 8.05 >
-     占位符 4.70，占位符一眼还是「浅一档的提示」，不会被误读成已填内容。
-     ⚠ 与深色侧的 --placeholder 不是同一个值也不该被合并：底色不同，各自量各自的。
-     深色那条曾长期停在 3.40:1（不达标），已在本轮修到 4.77:1，见 :root 里它的注释。 */
   --placeholder: #616a7a;
   --on-accent: #ffffff;
   --accent-lift: #0f8474;
@@ -612,53 +384,19 @@
   --hue-buffer: #bc6803;
   --hue-capture: #0b8a73;
 
-  /* ---- 标记层：语义色当图形画的那一档（说明见 :root） ----
-   * 判据 3:1 对**画布叠水印**（最差的一面）；实测 3.09–3.27，对白卡 3.79–4.01。
-   * 四个都落在 L* 53.2–54.8，比文字档整整亮 11–14 个 L*——那正是「状态点终于是个
-   * 颜色，而不是一粒黑渣」的差额。
-   *
-   * 与各自的文字档 ΔE00 = 10.8–14.1：够远，一眼看得出更亮；又够近，仍读作**同一个
-   * 语义**，不会被当成第五、第六种状态色。
-   *
-   * --accent-mark 与 --ring **是同一个值，这是故意的**：两者要回答的是同一道题
-   * ——「强调色当图形画、对浅底 3:1」——同一道题不该有两个答案。--ring 那一档已经
-   * 在上一轮量过两列（白卡 4.10:1 / 画布 3.41:1，见下面 --ring 的说明），直接复用它
-   * 就不必再解一次，也堵死了两个 token 将来各飘各的。改其中一个请连带改另一个。 */
   --ok-mark: #349448;
   --accent-mark: #0e8f7c;
   --warn-mark: #ba7301;
   --danger-mark: #e9484e;
 
-  --shadow: 0 1px 2px rgba(var(--sh-rgb), .06), 0 8px 24px -8px rgba(var(--sh-rgb), .12);
-  --shadow-lift: 0 2px 6px rgba(var(--sh-rgb), .08), 0 16px 40px -12px rgba(var(--sh-rgb), .18);
-  --shadow-modal: 0 32px 80px -16px rgba(var(--sh-rgb), .24);
-  --glass-shadow: 0 2px 6px rgba(var(--sh-rgb), .07), 0 18px 44px -12px rgba(var(--sh-rgb), .18);
+  --shadow: 0 1px 2px rgba(var(--sh-rgb), .04), 0 6px 18px -8px rgba(var(--sh-rgb), .08);
+  --shadow-lift: 0 2px 5px rgba(var(--sh-rgb), .06), 0 12px 30px -12px rgba(var(--sh-rgb), .12);
+  --shadow-modal: 0 24px 64px -20px rgba(var(--sh-rgb), .18);
+  --glass-shadow: 0 1px 3px rgba(var(--sh-rgb), .05), 0 12px 30px -14px rgba(var(--sh-rgb), .11);
   /* Light counterpart of --glass-shadow-settled; same two-layer shape. */
-  --glass-shadow-settled: 0 1px 3px rgba(var(--sh-rgb), .05), 0 8px 20px -14px rgba(var(--sh-rgb), .12);
-  --shadow-knob: 0 1px 2px rgba(var(--sh-rgb), .16);
+  --glass-shadow-settled: 0 1px 2px rgba(var(--sh-rgb), .04), 0 6px 16px -14px rgba(var(--sh-rgb), .08);
+  --shadow-knob: none;
 
-  /* ---- 环的墨色：**不复用 --accent** ----
-   * 上面那五个语义色是按**正文对比度**定的，所以在浅色下全部是压暗过的深色。
-   * 拿 #0a6d5f 去画一圈 2px 的焦点环，得到的不是「青色的环」而是「黑色的环」
-   * ——这就是用户看到的「开关外围发光偏黑」。
-   *
-   * 所以这里另取一档：**更亮、更饱和**。它只当线用、不当字用，验收因此走 WCAG 2.2
-   * 的非文本 3:1（SC 1.4.11 / 2.4.13），不走正文的 4.5:1。而且**两侧都要量**——
-   * 焦点环会同时出现在白卡（#ffffff）与画布（#eceef3）上：
-   *   #0e8f7c  对 #ffffff 4.10:1 ／ 对 #eceef3 3.41:1   两侧都过 3:1
-   * 再亮一档（#12a08a）画布那一侧就掉到 2.79:1，所以这是上限附近的取值，
-   * 改它之前请重新量**两列**。
-   *
-   * 半透明的那两档 alpha 是**解出来的**，不是估的。墨色提亮以后同 alpha 会更淡，
-   * 但更亮的墨色叠上去也更不容易变脏，两件事互相抵消，所以取值目标定成：
-   *   **压在白底上的明度差与旧值持平，而彩度尽量高**——「不比以前暗，但明显是青的」。
-   * 白底上 alpha a 的明度差与彩度（都按 sRGB 通道值算）：
-   *   旧墨 #0a6d5f：Δ = −168.1a，chroma = 99a
-   *   新墨 #0e8f7c：Δ = −140.8a，chroma = 129a
-   * 令两者 Δ 相等即可解出 a：
-   *   --halo       .2   → .24   （Δ −33.6 → −33.8，chroma 19.8 → 31.0，+57%）
-   *   --halo-soft  .133 → .16   （Δ −22.4 → −22.5，chroma 13.2 → 20.6，+56%）
-   * 实测值见本轮报告，与这两行算的一致。 */
   --ring: #0e8f7c;
   --ring-rgb: 14, 143, 124;
   --halo: rgba(var(--ring-rgb), .24);
@@ -741,13 +479,35 @@
 :root[data-theme="light"] .peer-card:hover { box-shadow: var(--shadow-lift); }
 :root[data-theme="light"] .btn { box-shadow: none; }
 
-/* 主按钮：**扁平实底**。深色下它是 180° 渐变 + 顶缘 30% 白 + 一圈强调色辉光，
-   三样叠在一起在白底上就是一枚上世纪的塑料胶囊（用户点名的那两枚）。
-   浅色下只保留「一块颜色」——层次由它与白卡之间 5.4:1 的明度差承担，不由光承担。 */
 :root[data-theme="light"] .btn.primary {
-  background: var(--accent);
+  background: var(--accent-fill);
   box-shadow: none;
 }
+
+/* Filled accent controls use a brighter ink than accent text. Their white
+   labels still clear AA; links and compact labels keep the darker text token. */
+:root[data-theme="light"] .switch { border-color: var(--line); box-shadow: none; }
+:root[data-theme="light"] .switch.on { background: var(--accent-fill); border-color: var(--accent-fill); }
+:root[data-theme="light"] .switch.pending { box-shadow: none; }
+:root[data-theme="light"] .switch .knob { box-shadow: none; }
+:root[data-theme="light"] .meter-fill,
+:root[data-theme="light"] .vol-bar-fill {
+  background: linear-gradient(90deg, var(--accent-fill), var(--accent-glow));
+}
+:root[data-theme="light"] .vol-slider:not(.muted)::-webkit-slider-runnable-track {
+  background: linear-gradient(90deg, var(--accent-fill) 0 var(--vol, 0%), var(--track) var(--vol, 0%) 100%);
+}
+:root[data-theme="light"] .vol-slider::-webkit-slider-thumb {
+  border: 1px solid var(--edge-strong);
+  box-shadow: none;
+}
+:root[data-theme="light"] .vol-slider::-moz-range-progress,
+:root[data-theme="light"] .stop-fill,
+:root[data-theme="light"] .stop-slider[aria-busy="true"] ~ .stop-track .stop-thumb,
+:root[data-theme="light"] .overlay-wave i { background: var(--accent-fill); }
+:root[data-theme="light"] .vol-slider::-moz-range-thumb,
+:root[data-theme="light"] .stop-thumb { border: 1px solid var(--edge-strong); }
+:root[data-theme="light"] .ring-fg { stroke: var(--accent-fill); }
 
 /* ---- ② 取消「凹槽」：所有模拟内凹的 inset 暗影 ---- */
 
@@ -788,15 +548,15 @@
    状态的可辨识度，不是立体感——它四边等宽。 */
 :root[data-theme="light"] .nav-marker,
 :root[data-theme="light"] .seg.on {
-  background: rgba(var(--accent-rgb), .10);
-  box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), .22);
+  background: rgba(var(--accent-fill-rgb), .10);
+  box-shadow: inset 0 0 0 1px rgba(var(--accent-fill-rgb), .22);
 }
 
 /* 顶栏右上那一簇（外观 / 语言 / 状态）也是玻璃，同样只留暗环。 */
 :root[data-theme="light"] #chrome-controls {
   box-shadow:
-    0 6px 18px -6px rgba(var(--sh-rgb), .16),
-    inset 0 0 0 .5px rgba(var(--sh-rgb), .12);
+    0 5px 16px -8px rgba(var(--sh-rgb), .10),
+    inset 0 0 0 .5px rgba(var(--sh-rgb), .10);
 }
 
 /* ════════ ④ 取消「污渍」：在浅底上比背景暗的**外**发光 ════════
@@ -816,19 +576,6 @@
  * 或者干脆换掉表达（呼吸从光晕改成不透明度）。
  */
 
-/* ---- ④a 上一轮把输入框的焦点态**自己压掉了**（WCAG 2.4.7 A 级失败） ----
- *
- * `:root[data-theme="light"] .input` 是 (0,3,0)，`.input:focus` 只有 (0,2,0)：
- * 那条覆盖里的 `box-shadow: none` 与 `border-color: var(--line)` 把聚焦态的**两笔**
- * 全吃掉了，于是浅色下聚焦的输入框和没聚焦的**一模一样**。当时留的注释写着
- * 「聚焦环保留：那是状态，不是材质」——意图是对的，特异度算错了。实测（探针见
- * docs §9.6）：浅色 `.input:focus` 的环 Δ = 0，即根本没画出来。
- * `.select` 同病，只是它那条覆盖没写 box-shadow，所以只丢了 border-color。
- *
- * 补回来时描边取**实色** --ring 而不是半透明：这两条是**功能性**焦点指示，要按
- * WCAG 2.2 的非文本 3:1（SC 1.4.11）收，而 3px 的 --halo-soft 只有 1.3:1，独自
- * 担不起。实色 --ring 对白卡 4.10:1、对输入框自身的底 #eceef3 3.41:1，两侧都过
- * ——光晕退回它该待的位置：一层烘托，不是指示本身。 */
 :root[data-theme="light"] .input:focus {
   border-color: var(--ring);
   box-shadow: 0 0 0 3px var(--halo-soft);
@@ -851,7 +598,6 @@
   0%, 100% { opacity: 1; }
   50% { opacity: .32; }
 }
-:root[data-theme="light"] .dot.online,
 :root[data-theme="light"] .dot.connecting,
 :root[data-theme="light"] .peer-inbound .dot.live,
 :root[data-theme="light"] .pair-steps li.doing .step-dot { animation-name: breathe-flat; }
@@ -895,7 +641,7 @@
  * 同一个应用里四选一必须统一，否则「打开一个浮层」这件事有两种相反的读感。
  * 三比一，所以让速查表跟大多数走。深色下两种墨色都近黑，本来就看不出区别，
  * 因此改动只落在浅色侧。 */
-:root[data-theme="light"] .sheet-scrim { background: rgba(var(--bg-rgb), .6); }
+:root[data-theme="light"] .sheet-scrim::before { background: rgba(var(--bg-rgb), .6); }
 
 /* ---- 「降低透明度」：把磨砂推到底 ----
  * 系统级开关（macOS：辅助功能 > 显示 > 降低透明度；Windows：透明效果）。Apple 对
@@ -987,9 +733,6 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  /* 二级菜单打开时整页**退一层**（下面 body:has 那条）。420ms 的缓慢回退读作
-     纵深变化而不是一次动作，与 sheet 的入场（130+280ms）首尾相叠。 */
-  transition: transform var(--dur-5) var(--ease-move);
   /* 右侧主内容保留滚轮、触控板和键盘滚动，但不常驻一条装饰性滑槽。
      只隐藏这一个容器：授权门、Sheet 和横向表格各自的滚动条仍是可见的。 */
   scrollbar-width: none;
@@ -998,24 +741,6 @@ code, .mono { font-family: var(--mono); font-size: .92em; }
   padding: calc(var(--chrome-h) + 20px) 28px 32px;
 }
 
-/* ---- 二级菜单打开时，页面退一层 ----
-
-   这是把换页动画的成功配方移植到 sheet 的最后一块：**旧主角让位**。换页时旧帧
-   滑走、新帧进来；sheet 打开时旧主角就是当前页面——它退到后面一层（缩到 .98 并被
-   遮罩压暗），sheet 从按下的点浮到前面来，纵深关系一目了然。在此之前 sheet 开场的
-   前 130ms 里只有遮罩在变暗，没有任何**物体**在动，读作延迟而不是引导。
-
-   幅度 2%（1120px 视图上边缘约 11px）**低于 8px/8% 门槛且刻意如此**：那条门槛管的
-   是「要被眼睛跟随轨迹的主角运动」，退层是环境变化——它的职责是建立纵深，不是被
-   盯着看。配角的运动必须小于主角，否则两个都想当主角。
-
-   选择器认 `body >` 直接子级：Sheet 组件 portal 到 body（Sheet.tsx 的注释解释了
-   为什么 portal 是承重的——#view-root 一旦有 transform 就会俘获 fixed 后代）。
-   `.closing` 一挂上，这条规则立即失效，页面与 sheet 的收缩同时开始回位；`:has`
-   在两个发行内核（WKWebView ≥ Safari 15.4、Chromium ≥ 105）上都远低于基线。 */
-body:has(> .sheet-scrim:not(.closing)) #view-root {
-  transform: scale(.98);
-}
 #view-root::-webkit-scrollbar {
   display: none;
   width: 0;
@@ -1186,7 +911,7 @@ body[data-window-controls="right"]:not(.app-captions) { --chrome-trail: 0px; }
     inset 0 1px 0 rgba(var(--hl-rgb), .16),
     inset 0 0 0 1px rgba(var(--accent-rgb), 0.25);
   transform: translateX(calc(var(--nav-index, 0) * 100%));
-  transition: transform var(--dur-4) var(--ease-spring);
+  transition: transform var(--dur-nav) var(--ease-enter);
   pointer-events: none;
 }
 #nav.contracted .nav-marker { top: 4px; bottom: 4px; left: 4px; width: calc((100% - 8px) / var(--nav-count, 4)); }
@@ -1201,7 +926,7 @@ body[data-window-controls="right"]:not(.app-captions) { --chrome-trail: 0px; }
   cursor: pointer;
   /* `padding` is in the list because #nav.contracted shrinks it (below): without
      it half the contraction gesture animated and half snapped. */
-  transition: color var(--dur) var(--ease-out), transform var(--dur-2) var(--ease-out),
+  transition: color var(--dur-micro) var(--ease-feedback), transform var(--dur-micro) var(--ease-feedback),
     padding var(--dur) var(--ease-move);
 }
 .nav-item svg { width: 16px; height: 16px; flex: none; }
@@ -1211,7 +936,7 @@ body[data-window-controls="right"]:not(.app-captions) { --chrome-trail: 0px; }
    scale(.93), not .96: at 4% the spring's ~5.7% overshoot lands at 0.23px on a
    typical target, which is sub-pixel and cannot render. .chrome-btn already
    uses .9 and was judged legible. */
-.nav-item:active { transform: scale(.93); }
+.nav-item:active { translate: 0 1px; }
 #nav.contracted .nav-item { padding: 7px 15px; }
 
 /* 视图标题不再占一条 chrome 带（胶囊已经在说「你在哪一页」）。留在 DOM 里给读屏
@@ -1227,22 +952,10 @@ body[data-window-controls="right"]:not(.app-captions) { --chrome-trail: 0px; }
 .view {
   display: flex; flex-direction: column; gap: 16px;
   max-width: 1120px; margin: 0 auto;
-  animation: viewIn var(--dur-4) var(--ease-move);
+  animation: viewIn var(--dur-state) var(--ease-enter);
 }
-/* Apple 的原则是「玻璃靠调制折射量出现，而不是靠淡入」。纯 CSS 折射不可得，
-   所以退一步：位移比透明度走得更远，读感上更接近「材质到位」而不是「图层淡入」。 */
-/* spec-motion §4: the `scale(.994)` that used to sit here was a 0.6% change --
-   ~6.7px on a 1120px view, spread over the whole surface, i.e. invisible under
-   any curve. It has been removed rather than enlarged: this keyframe is shared
-   by in-card disclosures where a scaling card would read as a zoom, and the
-   translate alone already clears the amplitude floor. Widest-reaching animation
-   in the app (it plays on every page change), so it is also the one where a
-   sub-threshold move cost the most. */
 @keyframes viewIn {
   from { opacity: 0; transform: translateY(var(--enter-shift)); }
-  /* 18%：与 `sheetGrow` 同一条纪律——面板必须在还剩大半行程时就已经完全可见，
-     否则前半段的运动根本没有被看见（用户 2026-08-15：「只有行程过半才可见」）。 */
-  18% { opacity: 1; }
   to { opacity: 1; transform: none; }
 }
 
@@ -1305,14 +1018,14 @@ body[data-window-controls="right"] #chrome-controls {
   padding: 0; border: none; border-radius: 50%;
   background: transparent; color: var(--text-dim);
   cursor: pointer;
-  transition: background var(--dur) var(--ease-out), color var(--dur) var(--ease-out),
-    transform var(--dur-2) var(--ease-out);
+  transition: background var(--dur-micro) var(--ease-feedback), color var(--dur-micro) var(--ease-feedback),
+    transform var(--dur-micro) var(--ease-feedback);
 }
 .chrome-btn svg { width: 15px; height: 15px; display: block; }
 .chrome-btn:hover { background: var(--fill-3); color: var(--text); }
 .chrome-btn.open { background: var(--fill-4); color: var(--text); }
 /* 与导航项同一条 gel 反馈。 */
-.chrome-btn:active { transform: scale(.9); }
+.chrome-btn:active { translate: 0 1px; }
 /* 状态那一枚只装一个圆点，没有图标笔画可以变色，hover 的反馈只剩底色。 */
 .chrome-btn.status:hover { color: var(--text-dim); }
 
@@ -1347,25 +1060,17 @@ body[data-window-controls="right"] #chrome-controls {
   /* 指纹要能选中复制；顶栏整体禁用了选择，这里单独放开。 */
   -webkit-user-select: text;
   user-select: text;
-  /* 起手略缩、略上——「从按钮里长出来」，不是「从天上掉下来」。
-
-     缩放量 2026-08-14 从 .96 抬到 .88。.96 是 4% 的形变，配上 220ms 在任何曲线下
-     都只读作「闪了一下」；曲线的非线性要被看见，先得有足够的位移让它表现。
-     `transform-origin` 已经钉在触发按钮那一角，所以放大量越大越像从按钮里长出来。 */
   opacity: 0;
   visibility: hidden;
-  transform: translateY(-14px) scale(.70);
+  transform: translateY(-4px) scale(.96);
   transform-origin: top right;
-  /* 与二级菜单同一套节奏（用户 2026-08-15 认可后要求跟进），只是尺度更小：
-       · 关闭方向 —— 几何 200ms 走 `--ease-depart`（近似匀速，行程铺满整段），
-         不透明度**延后 100ms 才开始**，让形变先被看见。同一条纪律治好了 sheet
-         「移动到一半就消失」。
-       · `visibility` 的延时必须等于**最长**的那一段（200ms），否则命中区在淡出
-         还没完成时就撤了，出现「看得见但点不到」的一帧。 */
+  /* Floating surfaces leave toward their anchor; visibility is released after
+     the 420ms geometry settles, while opacity finishes first. */
   transition:
-    opacity 140ms var(--ease-depart) 60ms,
-    transform var(--dur-2) var(--ease-depart),
-    visibility 0s linear var(--dur-2);
+    opacity var(--dur-pop-fade) var(--ease-fade),
+    transform var(--dur-pop-out) var(--ease-enter),
+    visibility 0s linear var(--dur-pop-out);
+  pointer-events: none;
 }
 /* ⚠ `:not(.sel-pop)` 是承重的，不是洁癖。
    这条镜像只对**顶栏图标簇**成立：Windows 把标题按钮画在后缘，于是那一簇跑到左上，
@@ -1396,12 +1101,10 @@ body[data-window-controls="right"] .chrome-pop:not(.sel-pop) {
   opacity: 1;
   visibility: visible;
   transform: none;
-  /* 打开方向与关闭相反：不透明度**领先**（100ms 就实心），几何再用 `--sheet-grow`
-     的 280ms 慢慢走完。sheet 的入场关键帧在 18% 处就把 opacity 拉满，是同一件事的
-     keyframe 写法——面板必须在还剩大半行程时就已经完全可见。 */
+  pointer-events: auto;
   transition:
-    opacity var(--dur-1) var(--ease-out),
-    transform var(--sheet-grow) var(--ease-move),
+    opacity var(--dur-pop-fade) var(--ease-fade),
+    transform var(--dur-pop-in) var(--ease-enter),
     visibility 0s;
 }
 
@@ -1440,7 +1143,7 @@ body[data-window-controls="right"] .chrome-pop:not(.sel-pop) {
   /* `.on` changes colour as well as background; without `color` here picking a
      language faded the background in while the text snapped. font-weight is
      also on `.on` and is not animatable -- ignored on purpose. */
-  transition: background var(--dur) var(--ease-out), color var(--dur-1) var(--ease-out);
+  transition: background var(--dur-micro) var(--ease-feedback), color var(--dur-micro) var(--ease-feedback);
 }
 .pop-item:hover { background: var(--fill-3); }
 /* 选中项走**三个通道**：强调色 + 加粗 + 一层底色。只靠颜色一条在色觉障碍下会消失，
@@ -1466,7 +1169,7 @@ body[data-window-controls="right"] .chrome-pop:not(.sel-pop) {
   display: flex; align-items: center; justify-content: center;
   border: none; background: transparent; color: var(--text-dim);
   cursor: default; /* 系统标题按钮不给手型 */
-  transition: background var(--dur) var(--ease-out), color var(--dur) var(--ease-out);
+  transition: background var(--dur-micro) var(--ease-feedback), color var(--dur-micro) var(--ease-feedback);
 }
 /* 10×10 的方角字形。Segoe MDL2 的 chrome 字形是直角细线，圆角的最小化横杠挨着
    真·系统 UI 会显得像玩具。 */
@@ -1496,7 +1199,7 @@ body[data-window-controls="right"] .chrome-pop:not(.sel-pop) {
      session row and every permission row. */
   transition: background var(--dur-1) var(--ease-out), border-color var(--dur-1) var(--ease-out);
 }
-.dot.online { background: var(--ok-mark); animation: breathe 2.4s ease-in-out infinite; }
+.dot.online { background: var(--ok-mark); }
 .dot.offline { background: var(--fill-muted); }
 .dot.connecting { background: var(--accent-mark); animation: breathe 1.2s ease-in-out infinite; }
 /* The glow colour follows the dot instead of being hard-coded to --ok-rgb.
@@ -1571,13 +1274,13 @@ body[data-window-controls="right"] .chrome-pop:not(.sel-pop) {
      shadow, and without these two every enable/disable flip in the app was a
      hard cut. That covers Sheet save/cancel, ShortcutSheet, PermissionRow and
      PairSheet's dirty-form feedback. */
-  transition: filter var(--dur) var(--ease-out), transform var(--dur-2) var(--ease-out),
-    background var(--dur) var(--ease-out), border-color var(--dur) var(--ease-out),
-    opacity var(--dur) var(--ease-out), box-shadow var(--dur) var(--ease-out);
+  transition: filter var(--dur-micro) var(--ease-feedback), transform var(--dur-micro) var(--ease-feedback),
+    background var(--dur-micro) var(--ease-feedback), border-color var(--dur-micro) var(--ease-feedback),
+    opacity var(--dur-state) var(--ease-move), box-shadow var(--dur-state) var(--ease-move);
 }
 .btn:hover { filter: brightness(1.18); }
 /* scale(.93): see .nav-item:active -- 4% is sub-pixel once the curve is applied. */
-.btn:active { transform: scale(.93); }
+.btn:active { translate: 0 1px; }
 .btn.primary {
   background: linear-gradient(180deg, var(--accent-lift), var(--accent));
   color: var(--on-accent); border-color: transparent; font-weight: 650;
@@ -1596,7 +1299,7 @@ body[data-window-controls="right"] .chrome-pop:not(.sel-pop) {
 .btn.pending { animation: switch-pending 1.1s ease-in-out infinite; }
 .btn.looks-disabled { opacity: .55; cursor: not-allowed; }
 .btn.looks-disabled:hover { filter: none; }
-.btn.looks-disabled:active { transform: none; }
+.btn.looks-disabled:active { translate: none; }
 .btn .ico svg, .ico svg { width: 15px; height: 15px; display: block; }
 .ico { display: inline-flex; flex: none; }
 
@@ -1657,12 +1360,12 @@ body[data-window-controls="right"] .chrome-pop:not(.sel-pop) {
 
    `chev` 这枚图标本身**朝右**（它原本是给 `.peer-chev` 那种「进入详情」用的），
    所以下拉要先转 90° 才朝下。展开时转到 −90°（朝上）而不是 +270°：两者视觉终点
-   相同，但 −90° 走的是**逆时针**回到起点方向的短弧，长弧会让箭头在 220ms 里绕过
+   相同，但 −90° 走的是**逆时针**回到起点方向的短弧，长弧会让箭头在短时长里绕过
    整整三个象限，看起来像在转圈而不是在翻。 */
 .sel-chev {
   display: inline-flex; flex: none; color: var(--text-dim);
   transform: rotate(90deg);
-  transition: transform var(--dur) var(--ease-spring), color var(--dur) var(--ease-out);
+  transition: transform var(--dur-state) var(--ease-move), color var(--dur-micro) var(--ease-feedback);
 }
 .sel-chev svg { width: 13px; height: 13px; display: block; }
 .sel.open .sel-chev { transform: rotate(-90deg); color: var(--text); }
@@ -1688,22 +1391,12 @@ body .sel-pop.up {
   top: auto; bottom: calc(100% + 6px);
   transform-origin: bottom right;
 }
-body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
+body .sel-pop.up:not(.open) { transform: translateY(4px) scale(.96); }
 
 /* 不可选的行**留在列表里**：对捕获后端和虚拟声卡而言，那一行的文字就是「为什么
    选不了」的唯一说明。压暗 + 禁用光标，但不隐藏。 */
 .pop-item.off { opacity: .45; cursor: not-allowed; }
 .pop-item.off:hover { background: transparent; }
-
-/* 菜单项级联：面板打开时行**依次**淡入（第 N 项延迟 N×22ms）。纯不透明度、无几何
-   ——带位移的级联会被幅度门槛要求 ≥8px，而 8px × 逐项错峰在 137px 高的小面板里
-   读作果冻。`--i` 由渲染处按下标注入（LocaleControl / Select）；没注入的面板
-   （状态浮层的键值对）回落到 0 = 无级联，整体随面板出现。
-   `backwards` 让排队中的项停在透明帧，而不是先闪现再消失。 */
-@keyframes popItem { from { opacity: 0; } to { opacity: 1; } }
-.chrome-pop.open .pop-item {
-  animation: popItem var(--dur-1) var(--ease-out) calc(var(--i, 0) * var(--stagger)) backwards;
-}
 
 .form-row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
 .field { display: flex; flex-direction: column; gap: 5px; }
@@ -1735,18 +1428,14 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   border-radius: 11px; padding: 0;
   background: var(--track); border: 1px solid var(--line-strong);
   cursor: pointer;
-  transition: background var(--dur) var(--ease-out), border-color var(--dur) var(--ease-out);
+  transition: background var(--dur-micro) var(--ease-fade), border-color var(--dur-micro) var(--ease-fade);
 }
-/* The knob travels 16px, 42% of a 38px track -- a real distance, and the one
-   place in this file where an expo-out was most obviously the wrong curve: it
-   packed ~80% of the journey into the first 60ms and crawled the rest.
-   A toggle knob is the textbook case for Apple's "momentum earns bounce" rule,
-   so it takes --ease-spring; at 16px the ~5.7% overshoot is ~0.9px and lands. */
+/* The knob uses the standard movement curve with no overshoot. */
 .switch .knob {
   position: absolute; top: 2px; left: 2px;
   width: 16px; height: 16px; border-radius: 50%;
   background: var(--knob);
-  transition: transform var(--dur) var(--ease-spring), background var(--dur) var(--ease-out);
+  transition: transform var(--dur-state) var(--ease-enter), background var(--dur-micro) var(--ease-fade);
 }
 .switch.on { background: var(--accent); border-color: transparent; }
 .switch.on .knob { transform: translateX(16px); background: var(--on-accent); }
@@ -1808,9 +1497,9 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
      most emotional weight in the product -- it arrived with no animation at all.
      Cards are keyed by fingerprint, so this plays once when a card is really
      new, not on every re-render. */
-  animation: viewIn var(--dur-4) var(--ease-move);
-  transition: transform var(--dur) var(--ease-out), box-shadow var(--dur) var(--ease-out),
-    border-color var(--dur) var(--ease-out);
+  animation: viewIn var(--dur-surface-in) var(--ease-enter);
+  transition: transform var(--dur-micro) var(--ease-feedback), box-shadow var(--dur-micro) var(--ease-feedback),
+    border-color var(--dur-micro) var(--ease-feedback);
 }
 /* --lift (6px), not 2px: at 2px the shadow swap was doing all of the visual work
    and the move was below the perceptual floor. */
@@ -1827,13 +1516,11 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
 .peer-fp {
   font-size: 10px; font-weight: 400; color: var(--text-dim);
   opacity: .5; letter-spacing: .02em; flex: none;
-  transition: opacity var(--dur) var(--ease-out);
+  transition: opacity var(--dur-micro) var(--ease-feedback);
 }
 .peer-card:hover .peer-fp { opacity: .85; }
 /* 整张卡片一直是 role="button"，却对视觉用户没有任何线索——这枚 `⟩` 就是那条线索。 */
-/* --ease-spring on the transform to match `.sel-chev`, which carries the same
-   "this opens" meaning and already uses it. */
-.peer-chev { color: var(--text-dim); opacity: .45; flex: none; transition: transform var(--dur) var(--ease-spring), opacity var(--dur) var(--ease-out); }
+.peer-chev { color: var(--text-dim); opacity: .45; flex: none; transition: transform var(--dur-micro) var(--ease-feedback), opacity var(--dur-micro) var(--ease-feedback); }
 .peer-chev svg { width: 16px; height: 16px; }
 /* 6px rather than 2px: the opacity half of this was the only half being seen. */
 .peer-card:hover .peer-chev { opacity: .9; transform: translateX(6px); }
@@ -1990,7 +1677,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
    ⚠ `--dur-1`, not `--dur`. This is the one place in the sheet where a
    transition hangs off a value that updates **once a second**, and spec-motion's
    own rule for that case is "nothing above --dur-1 on a 1Hz surface". It was
-   written at --dur (220ms) and a probe run with realistic jitter caught it
+   written at the ordinary state duration and a probe run with realistic jitter caught it
    firing 9 times in 12s -- a grade oscillating near a threshold turns a
    soften-the-edge transition into a continuous colour pulse, which is what the
    user reported on 2026-08-15 as "components seem to flicker". At 100ms the
@@ -2038,7 +1725,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   border-left: 3px solid var(--warn-mark);
   /* This banner only ever appears to report bad news, and both of its siblings
      in the metrics block already had entrances. */
-  animation: blockIn var(--dur) var(--ease-out);
+  animation: blockIn var(--dur-state) var(--ease-enter);
 }
 /* 传输形态本身：与「未含对方主机」同一套语言（warn 色小字），比它重一档字重
    ——那句是对读数范围的警告，这一句是读数为什么变差的**原因**。 */
@@ -2112,11 +1799,18 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
 .metric-detail, .dir-detail {
   display: flex; flex-direction: column; gap: 2px;
   border-top: 1px solid var(--line); padding-top: 8px;
-  /* --dur (220ms), not the old 180ms: an in-place disclosure is exactly the case
-     that needs to be slow enough to be followed, and this was taking the
-     shortest viewIn in the app. */
-  animation: viewIn var(--dur) var(--ease-move);
+  animation: none;
 }
+.disclosure {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition: grid-template-rows var(--dur-pop-in) var(--ease-expand),
+    opacity var(--dur-pop-fade) var(--ease-fade);
+}
+.disclosure[data-open] { grid-template-rows: 1fr; opacity: 1; }
+.disclosure-clip { min-height: 0; overflow: hidden; }
+@starting-style { .disclosure[data-open] { grid-template-rows: 0fr; opacity: 0; } }
 /* 一级 = 两行：第一行 名称/主机/ms，第二行是可换行的事实标签。
    改版前四条事实全挤在一个 nowrap + ellipsis 的 .stage-note 里，第一条说明就把整行
    占满，饱和 / 丢弃量 / 漂移在实际渲染里从未被看见过——字段接上了但看不到，
@@ -2168,7 +1862,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   /* The comment above calls this the one line on the card that must not be
      skipped, yet `.peer-reconnect` below -- less important -- was the one with
      an entrance. Replays via the `hidden` toggle (see `[hidden]`). */
-  animation: blockIn var(--dur-4) var(--ease-out);
+  animation: blockIn var(--dur-state) var(--ease-enter);
 }
 .peer-inbound .ico svg { width: 14px; height: 14px; }
 .peer-inbound .dot.live { background: var(--warn-mark); animation: breathe-warn 1.6s ease-in-out infinite; }
@@ -2198,14 +1892,10 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   font-size: 12px; color: var(--accent);
   background: rgba(var(--accent-rgb), 0.063); border: 1px solid rgba(var(--accent-rgb), 0.18);
   border-radius: var(--radius-sm); padding: 6px 10px;
-  animation: blockIn var(--dur) var(--ease-out);
+  animation: blockIn var(--dur-state) var(--ease-enter);
 }
 .reconnect-text { flex: 1; min-width: 0; font-variant-numeric: tabular-nums; }
-/* A block appearing inside a card. This replaces `reconnectIn` and `volIn`,
-   which were byte-for-byte identical definitions of the same 4px move; 4px is
-   below the amplitude floor, so both were fading in with an invisible drift
-   attached. Named for the role rather than for the first caller, since it now
-   has several. */
+/* A small directional entrance shared by transient blocks inside cards. */
 @keyframes blockIn {
   from { opacity: 0; transform: translateY(calc(var(--enter-shift) * -1)); }
   to { opacity: 1; transform: none; }
@@ -2214,7 +1904,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
 
 /* Its sibling `.peer-devices` animated in on a mode switch and this stack did
    not, in the same gesture. */
-.peer-toggles { display: flex; flex-direction: column; gap: 8px; animation: blockIn var(--dur) var(--ease-out); }
+.peer-toggles { display: flex; flex-direction: column; gap: 8px; animation: blockIn var(--dur-state) var(--ease-enter); }
 .toggle-row { display: flex; align-items: center; gap: 10px; }
 .toggle-row .ico { color: var(--text-dim); }
 .toggle-label { flex: 1; font-size: 13px; }
@@ -2248,7 +1938,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   padding: 8px 10px;
   background: var(--bg-2); border: 1px solid var(--line);
   border-radius: var(--radius-sm);
-  animation: blockIn var(--dur) var(--ease-out);
+  animation: blockIn var(--dur-state) var(--ease-enter);
 }
 .volume-box.unadjustable { border-color: rgba(var(--warn-rgb), 0.18); }
 .volume-box.unavailable { border-color: rgba(var(--warn-rgb), 0.22); }
@@ -2361,13 +2051,13 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   border-radius: 8px; cursor: pointer;
   background: transparent; color: var(--text-dim);
   border: 1px solid var(--line-strong);
-  transition: color var(--dur-1) var(--ease-out), background var(--dur-1) var(--ease-out),
-    border-color var(--dur-1) var(--ease-out), transform var(--dur-2) var(--ease-out);
+  transition: color var(--dur-micro) var(--ease-feedback), background var(--dur-micro) var(--ease-feedback),
+    border-color var(--dur-micro) var(--ease-feedback), transform var(--dur-micro) var(--ease-feedback);
 }
 .icon-btn:hover:not(:disabled) { color: var(--text); background: var(--fill-1); }
 /* It was the only button class with no press deformation; .btn, .nav-item and
    .chrome-btn all have one. */
-.icon-btn:active:not(:disabled) { transform: scale(.93); }
+.icon-btn:active:not(:disabled) { translate: 0 1px; }
 .icon-btn:disabled { opacity: .45; cursor: not-allowed; }
 .icon-btn.on { color: var(--danger); border-color: rgba(var(--danger-rgb), 0.333); background: rgba(var(--danger-rgb), 0.078); }
 /* 常驻危险色的图标按钮（详情头那枚「解除配对」入口）。与 `.on` 分开是因为那是
@@ -2397,7 +2087,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   width: 14px; height: 14px; margin-top: -4px;
   border-radius: 50%; background: var(--thumb); border: none;
   box-shadow: var(--shadow-knob);
-  transition: transform var(--dur-2) var(--ease-out), box-shadow var(--dur-2) var(--ease-out), background var(--dur-2) var(--ease-out);
+  transition: transform var(--dur-micro) var(--ease-feedback), box-shadow var(--dur-micro) var(--ease-feedback), background var(--dur-micro) var(--ease-feedback);
 }
 .vol-slider:hover:not(:disabled)::-webkit-slider-thumb { transform: scale(1.15); }
 .vol-slider:active:not(:disabled)::-webkit-slider-thumb { transform: scale(1.25); box-shadow: 0 0 0 4px var(--halo); }
@@ -2558,7 +2248,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
 
 .pair-active { display: flex; flex-direction: column; gap: 16px; align-items: center; padding: 8px 0; }
 
-.pin-display { display: flex; gap: 8px; justify-content: center; perspective: 500px; }
+.pin-display { display: flex; gap: 8px; justify-content: center; }
 .pin-digit {
   width: 44px; height: 58px;
   display: flex; align-items: center; justify-content: center;
@@ -2567,12 +2257,6 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   background: var(--bg-2); border: 1px solid var(--line-strong);
   border-radius: var(--radius-sm);
   box-shadow: inset 0 -14px 22px rgba(var(--sh-rgb), .28);
-  animation: digitFlip var(--dur-4) var(--ease-out) backwards;
-  animation-delay: calc(var(--i) * 70ms);
-}
-@keyframes digitFlip {
-  from { transform: rotateX(-90deg); opacity: 0; }
-  to { transform: none; opacity: 1; }
 }
 
 .ring-wrap { display: flex; justify-content: center; }
@@ -2605,8 +2289,8 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   display: flex; flex-direction: column; gap: 4px; align-items: stretch;
   text-align: left; padding: 12px 14px; cursor: pointer;
   background: var(--bg-2); color: var(--text); font-family: inherit;
-  transition: transform var(--dur) var(--ease-out), box-shadow var(--dur) var(--ease-out),
-    border-color var(--dur) var(--ease-out);
+  transition: transform var(--dur-micro) var(--ease-feedback), box-shadow var(--dur-micro) var(--ease-feedback),
+    border-color var(--dur-micro) var(--ease-feedback);
 }
 /* --lift, matching .peer-card:hover -- same gesture, same amplitude. */
 .disc-item:hover { transform: translateY(calc(var(--lift) * -1)); border-color: var(--line-strong); box-shadow: 0 10px 26px rgba(var(--sh-rgb), .3); }
@@ -2678,18 +2362,12 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
 .proto-session-list {
   list-style: none; display: flex; flex-direction: column; gap: 8px;
 }
-/* The only surface in the app that changes with no user action at all (a 3s
-   poll), which makes the entrance the sole cue that something arrived. The 70ms
-   stagger copies `.pin-digit`; --i comes from the list index in
-   ShareProtocols.tsx. `backwards` holds the from-state during the delay,
-   otherwise a staggered row flashes at full opacity first. */
 .proto-session {
   display: flex; align-items: center; gap: 12px;
   padding: 12px 14px;
   border: 1px solid var(--line); border-radius: var(--radius-sm);
   background: var(--fill-faint);
-  animation: viewIn var(--dur-4) var(--ease-move) backwards;
-  animation-delay: calc(var(--i, 0) * 70ms);
+  animation: viewIn var(--dur-state) var(--ease-enter);
 }
 /* Decoded asynchronously, so it used to pop in at full opacity and shove the
    text beside it sideways. Fading it is the difference between "loaded" and
@@ -2699,7 +2377,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   border-radius: 8px; object-fit: cover;
   background: var(--fill-soft);
   box-shadow: inset 0 0 0 1px var(--line);
-  animation: fadeIn var(--dur) var(--ease-out);
+  animation: fadeIn var(--dur-state) var(--ease-enter);
 }
 .proto-session-body {
   min-width: 0; flex: 1;
@@ -2820,27 +2498,20 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
 .stop-fill {
   position: absolute; left: 0; top: 6px; height: 6px;
   border-radius: 3px; background: var(--accent);
-  transition: width var(--dur) var(--ease-spring);
+  transition: width var(--dur-state) var(--ease-move);
 }
 .stop-thumb {
   position: absolute; top: 2px; width: 14px; height: 14px;
   margin-left: -7px; border-radius: 50%;
   background: var(--thumb);
   box-shadow: var(--shadow-knob);
-  /* All four on the scale now; `left` keeps --dur/--ease-spring (the snap-back
-     to a detent is momentum, which is what earns the overshoot), the other three
-     move from a stray .15s to --dur-2. The hover scale(1.15) and drag
-     scale(1.25) are already well over the amplitude floor. */
-  transition: left var(--dur) var(--ease-spring), transform var(--dur-2) var(--ease-out),
-    box-shadow var(--dur-2) var(--ease-out), background var(--dur-2) var(--ease-out);
+  transition: left var(--dur-state) var(--ease-move), transform var(--dur-micro) var(--ease-feedback),
+    box-shadow var(--dur-micro) var(--ease-feedback), background var(--dur-micro) var(--ease-feedback);
 }
 .stop-slider-row:hover .stop-thumb { transform: scale(1.15); }
 
-/* **拖动中关掉位置过渡**：留着的话 thumb 会以 220 ms 的延迟追手指。
-   回弹正是靠松手那一刻这个属性消失、同时位置跳到整数档而发生的 —— 换句话说，
-   「无极」与「回弹」是同一条 transition 的开与关，不是两套代码。
-   prefers-reduced-motion 下 styles.css 末尾那条全局规则把过渡整个关掉 ⇒
-   回弹退化为瞬时归位，终态一致。 */
+/* Dragging disables interpolation so the thumb follows the pointer directly;
+   releasing restores the 410ms detent movement. */
 .stop-slider-row[data-dragging] .stop-thumb,
 .stop-slider-row[data-dragging] .stop-fill { transition: none; }
 .stop-slider-row[data-dragging] .stop-thumb {
@@ -2855,7 +2526,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
 
 .stop-slider:disabled ~ .stop-track .stop-fill { background: var(--track); }
 .stop-slider:disabled ~ .stop-track .stop-thumb { background: var(--fill-muted); box-shadow: none; }
-/* 请求还在路上：thumb 已经回弹到目标档，但要看得出「尚未落定」——旁边的值
+/* 请求还在路上：thumb 已经回到目标档，但要看得出「尚未落定」——旁边的值
    标签同时仍停在 daemon 确认过的那一档上。 */
 .stop-slider[aria-busy="true"] ~ .stop-track .stop-thumb { background: var(--accent); }
 
@@ -2872,11 +2543,8 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
 .stop-tick.on { background: var(--accent-mark); }
 /* 不可用档照画不误，只是明显更暗：不画出来，用户就无从知道「本机缺了什么」。
    title（由 JS 给）说明原因，但刻度不接指针事件，所以滑条本身也带一份 title。 */
-/* Known and deliberate half-and-half: `background` transitions (above) while
-   `height` and `bottom` snap. Both are 1px changes, which is far below the
-   amplitude floor -- adding them to the transition list would animate something
-   nobody can see. Recorded rather than fixed so the asymmetry does not get
-   re-reported as a bug. */
+/* Background transitions while the 1px height and bottom adjustments snap;
+   interpolating those geometry changes adds no useful feedback. */
 .stop-tick.off { background: var(--track); height: 3px; bottom: 2px; }
 
 .stop-slider-val {
@@ -2921,7 +2589,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   justify-content: space-between;
   gap: 14px;
   margin-top: 10px;
-  animation: blockIn var(--dur) var(--ease-out);
+  animation: blockIn var(--dur-state) var(--ease-enter);
 }
 
 @media (max-width: 720px) {
@@ -2946,7 +2614,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   font-size: 12px; color: var(--warn);
   background: rgba(var(--warn-rgb), 0.06); border: 1px solid rgba(var(--warn-rgb), 0.18); border-radius: 8px;
   padding: 8px 12px;
-  animation: blockIn var(--dur) var(--ease-out);
+  animation: blockIn var(--dur-state) var(--ease-enter);
 }
 /* settings.set 在飞：整组禁用，避免连点发出两次写、回包乱序停在错的档上 */
 /* The opacity transition lives on `.segmented` itself: snapping to 60% and back
@@ -2979,7 +2647,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   /* Settings.tsx requires this warning to keep its visual weight after being
      folded into a longer block; appearing instantly is precisely the weakening
      that note is guarding against. */
-  animation: viewIn var(--dur-4) var(--ease-move);
+  animation: viewIn var(--dur-state) var(--ease-enter);
 }
 .web-warn[hidden] { display: none; }
 .web-warn-title { font-size: 13px; color: var(--danger); }
@@ -2998,7 +2666,7 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
      global `[hidden] { display: none !important }` means going back to `flex`
      restarts the animation. This is the verified pattern the other
      hidden-driven entrances in this file copy. */
-  animation: viewIn var(--dur) var(--ease-move);
+  animation: viewIn var(--dur-state) var(--ease-enter);
 }
 /* `.dev-head`（「系统设备」标题行）已随 DOM 一起删除：两行带 🔊/🎤 图标的设备名
    本来就自明，标题只是又一个不承载信息的方框。 */
@@ -3022,6 +2690,8 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
 .dev-state.live { color: var(--accent); }
 .dev-state.idle { color: var(--text-dim); }
 .dev-state.pending { color: var(--warn); }
+.device-activity { min-width: 6.5em; text-align: right; }
+.device-activity.syncing { color: var(--text-dim); }
 .dev-note { font-size: 11.5px; color: var(--text-dim); line-height: 1.55; }
 .dev-note.warn { color: var(--warn); }
 /* 原 `.dev-foot`（每张卡片各印一遍的长脚注）已随 DOM 一起删除：那句话现在只在
@@ -3064,18 +2734,22 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
    原值 55 只压得过前两者；2026-08-10 之后「重置指纹」「解除配对」这类危险按钮开在
    Sheet **里面**，55 会让它们弹出的确认框整个被 Sheet 的遮罩盖住。 */
 .confirm-mask {
-  position: fixed; inset: 0; z-index: 62;
+  position: fixed; inset: 0; z-index: 90;
   display: flex; align-items: center; justify-content: center;
   padding: 24px;
+  isolation: isolate;
+}
+.confirm-mask::before {
+  content: "";
+  position: absolute; inset: 0; z-index: -1;
   background: rgba(var(--bg-rgb), .72);
   backdrop-filter: blur(6px);
-  /* 时长**刻意等于** `--sheet-lead`：卡片就在遮罩变暗的那一刻开始长。
-     这两个数是同一件事的两面——「底什么时候准备好」——所以共用一个 token。 */
-  animation: fadeIn var(--sheet-lead) var(--ease-out);
+  -webkit-backdrop-filter: blur(6px);
+  opacity: 1;
+  transition: opacity var(--dur-dialog-fade) var(--ease-fade);
 }
-/* 模态卡片属于控件层，玻璃在这里是正当的。注意它的祖先 .confirm-mask 自己带
-   backdrop-filter，按 backdrop root 规则这张卡采样到的只是遮罩之后的结果——所以
-   这里**不再叠一层 backdrop-filter**（叠了也只会更平），改用带高光的实心面。 */
+/* The scrim pseudo-element supplies blur behind the card. Its opacity must
+   never multiply the moving card's opacity or conceal the beginning of travel. */
 .confirm-card {
   width: 440px; max-width: 100%;
   padding: 26px;
@@ -3084,17 +2758,23 @@ body .sel-pop.up:not(.open) { transform: translateY(14px) scale(.70); }
   border-radius: 20px;
   box-shadow: var(--shadow-modal), var(--glass-edge);
   display: flex; flex-direction: column; gap: 12px;
-  animation: sheetIn var(--dur-4) var(--ease-spring);
+  transform-origin: center;
+  opacity: 1;
+  transform: translate(0, 0) scale(1);
+  transition: var(--transition-dialog);
 }
-/* spec-motion §4: scale was .97 -- a 3% change, which put it in the same
-   invisible band as the old viewIn. `.sheet-card` was moved off this keyframe
-   onto `sheetGrow` (.72) on 2026-08-14 for exactly this reason; the three
-   consumers here were left behind. `--enter-scale` (.88, 12%) is the same
-   correction, sized for a centred modal rather than one growing out of the
-   pointer. The 14px translate already cleared the floor and is unchanged. */
 @keyframes sheetIn {
-  from { opacity: 0; transform: translateY(14px) scale(var(--enter-scale)); }
+  from { opacity: 0; transform: translateY(var(--enter-shift)) scale(var(--enter-scale)); }
   to { opacity: 1; transform: none; }
+}
+.confirm-mask.closing::before {
+  opacity: 0;
+  transition-duration: var(--dur-dialog-fade-out);
+}
+.confirm-mask.closing .confirm-card {
+  opacity: 0;
+  transform: translate(var(--dialog-x, 0px), var(--dialog-y, 0px)) scale(.15);
+  transition: var(--transition-dialog-out);
 }
 .confirm-title { font-size: 16px; font-weight: 650; }
 .confirm-body { font-size: 13px; color: var(--text-dim); line-height: 1.65; }
@@ -3198,7 +2878,7 @@ canvas.spark { width: 160px; height: 36px; display: block; }
   overflow-y: auto;
   background: rgba(var(--bg-rgb), .92);
   backdrop-filter: blur(6px);
-  animation: fadeIn var(--dur-2) var(--ease-out);
+  animation: fadeIn var(--dur-surface-in) var(--ease-enter);
 }
 #gate[hidden] { display: none !important; }
 
@@ -3223,7 +2903,7 @@ body.is-tauri .gate-drag {
   border-radius: 22px;
   box-shadow: var(--shadow-modal), var(--glass-edge);
   gap: 20px;
-  animation: sheetIn var(--dur-4) var(--ease-spring);
+  animation: sheetIn var(--dur-surface-in) var(--ease-enter);
 }
 
 .gate-head { display: flex; gap: 14px; align-items: flex-start; }
@@ -3239,13 +2919,8 @@ body.is-tauri .gate-drag {
 .gate-sub { margin-top: 6px; font-size: 13px; color: var(--text-dim); }
 
 .perm-list { display: flex; flex-direction: column; gap: 10px; }
-/* First screen a new user ever sees. The 70ms stagger is the `.pin-digit`
-   pattern, which had been written but never used on a real list; --i is the map
-   index from Onboarding.tsx. Scoped to `.perm-list` so the same row inside the
-   permissions Sheet is unaffected. */
 .perm-list > .perm-row {
-  animation: viewIn var(--dur-4) var(--ease-move) backwards;
-  animation-delay: calc(var(--i, 0) * 70ms);
+  animation: viewIn var(--dur-state) var(--ease-enter);
 }
 
 .perm-row {
@@ -3298,7 +2973,7 @@ body.is-tauri .gate-drag {
   display: flex; align-items: center; justify-content: center;
   background: rgba(var(--bg-rgb), .78);
   backdrop-filter: blur(6px);
-  animation: fadeIn var(--dur-2) var(--ease-out);
+  animation: fadeIn var(--dur-surface-in) var(--ease-enter);
 }
 #overlay[hidden] { display: none; }
 
@@ -3311,7 +2986,7 @@ body.is-tauri .gate-drag {
   box-shadow: var(--shadow-modal), var(--glass-edge);
   text-align: center;
   display: flex; flex-direction: column; gap: 12px; align-items: center;
-  animation: sheetIn var(--dur-4) var(--ease-spring);
+  animation: sheetIn var(--dur-surface-in) var(--ease-enter);
 }
 .overlay-ico { color: var(--fill-faint); }
 .overlay-ico svg { width: 40px; height: 40px; }
@@ -3356,21 +3031,15 @@ body.is-tauri .gate-drag {
   border: 1px solid var(--edge);
   box-shadow: var(--glass-shadow), var(--glass-edge);
   font-size: 13px; max-width: 380px;
-  /* Entrance and exit are deliberately asymmetric now: 340ms in on a decelerate,
-     170ms out on --ease-in. A toast leaving is a permanent departure, and M3's
-     rule for that is an accelerate curve -- ending at peak speed is what makes
-     it read as gone rather than merely hidden. It was previously the same 300ms
-     decelerate in both directions. */
-  animation: toastIn var(--dur-4) var(--ease-spring);
-  transition: opacity var(--dur-2) var(--ease-in), transform var(--dur-2) var(--ease-in);
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity var(--dur-pop-fade) var(--ease-fade), transform var(--dur-pop-out) var(--ease-enter);
 }
 .toast.ok { border-color: rgba(var(--ok-rgb), 0.333); color: var(--ok); }
 .toast.error { border-color: rgba(var(--danger-rgb), 0.333); color: var(--danger); }
 .toast.warn { border-color: rgba(var(--warn-rgb), 0.333); color: var(--warn); }
-/* 8px out to match the 12px in; the old 6-vs-8 split had no reason behind it. */
-.toast.out { opacity: 0; transform: translateY(8px); }
-/* 12px, up from 8px: 8px sat right on the perceptual floor. */
-@keyframes toastIn { from { opacity: 0; transform: translateY(var(--enter-shift)); } to { opacity: 1; transform: none; } }
+.toast.out { opacity: 0; transform: translateY(var(--nav-shift)); }
+@starting-style { .toast { opacity: 0; transform: translateY(var(--nav-shift)); } }
 
 /* ---- 动画全局关闭 ---- */
 
@@ -3388,6 +3057,24 @@ body.is-tauri .gate-drag {
   .vol-slider::-moz-range-thumb {
     animation: none !important;
     transition: none !important;
+  }
+  ::view-transition-group(root),
+  ::view-transition-image-pair(root),
+  ::view-transition-old(root),
+  ::view-transition-new(root),
+  ::view-transition-group(page),
+  ::view-transition-image-pair(page),
+  ::view-transition-old(page),
+  ::view-transition-new(page) {
+    animation: none !important;
+    transition: none !important;
+  }
+  /* Closing layers remain mounted briefly for lifecycle symmetry; hide their
+     terminal state immediately when motion is reduced. */
+  .sheet-scrim.closing,
+  .confirm-mask.closing {
+    opacity: 0 !important;
+    visibility: hidden !important;
   }
 }
 
@@ -3419,18 +3106,9 @@ html[data-vt="theme"]::view-transition-new(root) {
   mix-blend-mode: normal;
 }
 
-/* ---- 换页过渡（lib/viewTransition.ts） ----
- *
- * 方向性滑动，不是 fade-through。2026-08-15 之前这里写着「这几个视图互不隶属、没有
- * 方向可言」——那个推理是错的：方向不必来自层级，**导航胶囊本身就是横排的**，视图
- * 的左右位置是既成的空间事实。点右边的页签，内容从右边进来、旧内容向左让开，与
- * 胶囊里 marker 的滑动同向；卡片进详情是下钻（从右进），返回是退出（从左回）。
- * 原地淡入缩放没有方向、没有可跟随的轨迹，与「切换」这个空间动作对不上——用户
- * 整轮反馈的直觉就是这一句。
- *
- * 旧帧先走完再让新帧进场（`--sheet-lead` 之外的第二处「先后而非同时」）：两帧同时
- * 半透明地叠着，读起来是「糊了一下」，这正是 2026-08-15 那轮 sheet 上学到的同一件事。
- */
+/* ---- Navigation transitions (lib/viewTransition.ts) ----
+ * Route order still determines the axis and sign. Old and new snapshots move
+ * together on the shared 420ms navigation clock. */
 /* ⚠ 只有**内容区**参与过渡，顶栏不参与。
 
    `startViewTransition()` 默认把整个文档拍成一张叫 `root` 的快照，于是导航胶囊、
@@ -3461,47 +3139,38 @@ html[data-vt="nav"]::view-transition-old(page),
 html[data-vt="nav"]::view-transition-new(page) {
   mix-blend-mode: normal;
 }
+/* The browser also animates snapshot bounds; keep that implicit animation on
+   the same clock and curve as the content instead of its default 250ms ease. */
+html[data-vt="nav"]::view-transition-group(page) {
+  animation-duration: var(--dur-nav);
+  animation-timing-function: var(--ease-enter);
+}
 html[data-vt="nav"]::view-transition-old(page) {
-  animation: navOut var(--nav-out) var(--ease-depart) forwards;
+  animation: navOut var(--dur-nav) var(--ease-enter) forwards,
+    fadeOut var(--dur-pop-fade) var(--ease-fade) forwards;
 }
 html[data-vt="nav"]::view-transition-new(page) {
-  animation: navIn var(--sheet-grow) var(--ease-move) var(--nav-out) backwards;
+  animation: navIn var(--dur-nav) var(--ease-enter) both,
+    fadeIn var(--dur-pop-fade) var(--ease-fade) both;
 }
 @keyframes navOut {
-  /* 旧帧朝**让位方向**滑一小段（新内容来向的反方向，约 48px）同时淡出。位移是
-     0.4 倍而不是等量：它的职责只是快速让位并交代方向，真正的轨迹表达全在 navIn
-     ——两帧都走全程会在中段实心相叠，读成「两页在打架」。 */
-  from { opacity: 1; transform: none; }
+  from { transform: none; }
   to {
-    opacity: 0;
     transform: translate(
-      calc(var(--nav-shift) * var(--nav-dx) * -0.4),
-      calc(var(--nav-shift) * var(--nav-dy) * -0.4));
+      calc(var(--nav-shift) * var(--nav-dx) * -0.5),
+      calc(var(--nav-shift) * var(--nav-dy) * -0.5));
   }
 }
 @keyframes navIn {
-  /* 新帧从来向滑入全程。与 `sheetGrow` / `viewIn` 同一条纪律：不透明度在 20% 就
-     到位，剩下八成行程全部以全实心呈现，否则「只有行程过半才可见」。 */
   from {
-    opacity: 0;
     transform: translate(
       calc(var(--nav-shift) * var(--nav-dx)),
       calc(var(--nav-shift) * var(--nav-dy)));
   }
-  20% { opacity: 1; }
-  to { opacity: 1; transform: none; }
+  to { transform: none; }
 }
+@keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
 
-/* 换页由伪元素接管时，视图自己那条 `viewIn` 必须让位——否则同一次切换会播两遍
-   （伪元素一遍、真实 DOM 一遍）。降级路径下没有 `data-vt`，`viewIn` 照常生效。
-
-   ⚠ 压制手段必须是 `animation-duration: 0s`，**不能**是 `animation: none`。
-   过渡结束时 `data-vt` 被移除，这条规则随之失效；如果失效意味着 animation-name
-   从 none 变回 viewIn，CSS 会把动画**从头再播一遍**——实测 2026-08-15：t=458ms
-   （恰是 data-vt 清除的那一帧）viewIn 重新 START，内容先跳到 +12px 再花 230ms
-   爬回来，就是用户报的「动画结束后整体往上抖一下」。改 duration 则 name 从未
-   变化：规则失效时动画的挂载时刻已过去 ~450ms，超过恢复后的 340ms 时长，动画
-   按新时间轴早已完成，一帧都不会播。 */
 html[data-vt="nav"] .view { animation-duration: 0s; }
 /* 新帧压在旧帧之上。规范里同一 image-pair 内 new 本就画在 old 之后，写出来是为了
    不依赖那条隐含次序——它一旦被别处的 z-index 破坏，症状是圆圈里什么都不变。 */
@@ -3769,7 +3438,7 @@ html[data-vt="nav"] .view { animation-duration: 0s; }
   font-size: 12px; line-height: 1.5;
   /* Direct answer to the keystroke the user just pressed -- causality is exactly
      what motion is for here. */
-  animation: blockIn var(--dur) var(--ease-out);
+  animation: blockIn var(--dur-state) var(--ease-enter);
 }
 .sc-conflict span { flex: 1 1 260px; }
 
@@ -3780,10 +3449,16 @@ html[data-vt="nav"] .view { animation-duration: 0s; }
 .sheet-scrim {
   position: fixed; inset: 0; z-index: 60;
   display: flex; align-items: center; justify-content: center;
+  isolation: isolate;
+}
+.sheet-scrim::before {
+  content: "";
+  position: absolute; inset: 0; z-index: -1;
   background: rgba(var(--sh-rgb), .45);
   backdrop-filter: blur(3px);
   -webkit-backdrop-filter: blur(3px);
-  animation: fadeIn var(--dur-2) var(--ease-out);
+  opacity: 1;
+  transition: opacity var(--dur-dialog-fade) var(--ease-fade);
 }
 @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
 
@@ -3796,92 +3471,40 @@ html[data-vt="nav"] .view { animation-duration: 0s; }
   border: 1px solid var(--line);
   box-shadow: 0 24px 60px -20px rgba(var(--sh-rgb), .7);
 
-  /* 从**按下的那一点**长出来。两个自定义属性由 `Sheet.tsx` 的 layout effect 在首帧
-     绘制之前写进来（最近一次 pointerdown → 触发控件中心 → 卡片中心，三级回退），
-     缺省值让没有来源时退回中心缩放。
-
-     ⚠ 这里原来是 `viewIn .22s`，而 `viewIn` 的缩放是 `.994 → 1`——**0.6%**。那个量
-     在任何曲线下都看不出来，于是曲线换成什么都"没有生效"。真正让非线性可见的是
-     位移量本身：`.72 → 1` 配 `--ease-spring`（带过冲）才读得出"弹出来"。 */
-  transform-origin: var(--sheet-ox, 50%) var(--sheet-oy, 50%);
-  /* 70ms 的延迟是**承重的，不是修饰**。
-     用户按下的按钮可能在屏幕另一端（「添加对端」在右上角），而卡片开在正中。一次
-     扫视加落点需要 150-250ms，所以先动的必须是**遮罩**——整窗的明度变化是唯一能
-     把视线牵过来的东西——卡片再在视线到位之后长出来。
-     2026-08-14 实测（Playwright 逐帧）：不延迟时卡片在 85ms 就走完 83% 的行程，
-     眼睛到位时动画已经结束，表现为「和没有动画一样」。 */
-  animation: sheetGrow var(--sheet-grow) var(--ease-move) var(--sheet-lead) backwards;
+  /* The opening offset is already inline when @starting-style is resolved. */
+  transform-origin: center;
+  opacity: 1;
+  transform: translate(0, 0) scale(1);
+  transition: var(--transition-dialog);
 }
-@keyframes sheetGrow {
-  from { opacity: 0; transform: scale(.72); }
-  /* 18%，不是 45%。
-     用户 2026-08-15 的描述是「似乎只有行程过半才可见」——这是字面准确的：实测
-     t=84ms 时 opacity 仍是 0、t=250ms（全程 73%）才到 1，于是前半段的运动**根本
-     没有被看见**，无论曲线多好。不透明度必须在运动的最开头就退场让位，剩下 82%
-     的行程全部以全实心呈现。 */
-  18% { opacity: 1; }
-  to { opacity: 1; transform: none; }
+@starting-style {
+  .sheet-card, .confirm-card {
+    opacity: 0;
+    transform: translate(var(--dialog-x, 0px), var(--dialog-y, 0px)) scale(.15);
+  }
+  .sheet-scrim::before, .confirm-mask::before {
+    opacity: 0;
+  }
 }
 
-/* 退场。React 卸载是同步的，所以这段时间是 `Sheet.tsx` 用 `SHEET_EXIT_MS` 拖出来的
-   ——那个常量必须与这里的 .2s 一致，`sheet.test.ts` 读样式表钉住。
-
-   退场用 `--ease-out` 而不是 `--ease-spring`：回缩时过冲意味着先胀大一下再消失，
-   像是被按了一下才走，而用户此刻已经做完决定了。 */
-/* ⚠ These two keep a literal .17s instead of var(--dur-2), even though the two
-   values are identical. sheet.test.ts parses the duration straight out of this
-   stylesheet with /animation:[^;]*?([\d.]+)s/ and compares it to SHEET_EXIT_MS;
-   a var() reference has no digits for it to read and the test would fail. The
-   literal is the interface to that test, not an oversight. */
-.sheet-scrim.closing {
-  /* 延迟 90ms、只用剩下的 110ms 淡出 —— 见 `--sheet-trail`。总时长仍在
-     `SHEET_EXIT_MS` 之内，所以卸载时刻不变。 */
-  /* 160ms 延迟 + 140ms 淡出 = 300ms，正好是 `SHEET_EXIT_MS`。
-     顺序是承重的：**卡片先走完（220ms），遮罩才撤**。反过来（遮罩先退）会让卡片
-     在运动中途失去暗底——深色卡片压在深色应用上没有对比度，读作「移动到一半就
-     消失了」，那正是用户 2026-08-15 报的现象。 */
-  animation: fadeOut 140ms var(--ease-out) var(--sheet-trail) forwards;
-  /* 退场这 200ms 里不再接受点击：面板还在屏幕上，点它却已经什么都不做了。 */
-  pointer-events: none;
+/* Exit uses its own slower pair. Interrupted entrances still reverse from the
+   current pose, and opacity settles before the geometry. */
+.sheet-scrim.closing::before {
+  opacity: 0;
+  transition-duration: var(--dur-dialog-fade-out);
 }
-/* 关场用 `--ease-move` 而**不是** `--ease-exit`，这与「退场要加速」的设计体系惯例
-   相反，理由是那条惯例的前提在这里不成立：它假定退场不需要被看见。
-
-   开场与关场的注意力位置是**反的**。开场时眼睛还在刚按下的那颗按钮上，卡片开在
-   中央，所以要靠遮罩牵引、并把行程铺开；关场时眼睛**已经在卡片上**——此刻最不该
-   做的就是慢起步。实测 2026-08-14：`--ease-exit` 的加速曲线让卡片前 60ms 几乎不动
-   （scale 0.999@23ms、0.991@41ms），200ms 里真正在动的只剩约 140ms，低于调研给的
-   200ms 可读下限，于是读作「瞬间消失」。 */
-.sheet-scrim.closing .sheet-card { animation: sheetShrink 220ms var(--ease-depart) forwards; }
-@keyframes fadeOut { from { opacity: 1 } to { opacity: 0 } }
-@keyframes sheetShrink {
-  from { opacity: 1; transform: none; }
-  /* 不透明度**殿后**，与入场正好相反：先保持实心让形变被看见，最后才消失。
-     两者同时走的结果是卡片在还没动起来之前就已经淡得看不见了——退场因此读作
-     「啪一下没了」，这正是 2026-08-14 用户报的「关闭时更为严重」。
-
-     ⚠ 必须在 **88%** 就归零，不能拖到 `to`。React 在 `SHEET_EXIT_MS` 整点卸载，
-     而 CSS 的关键帧段是各自缓动的：`--ease-exit` 是加速曲线，把不透明度的大部分
-     降幅压在最后一段，实测 187ms 时还剩 0.41 就被卸载切掉了——收尾变成一次 pop，
-     正是这个动画要消灭的东西。留 12% 的余量让它先归零再被移除。 */
-  /* ⚠ 这一段自带 `linear`，是**关键帧段各自缓动**这条 CSS 规则的直接后果。
-     实测 2026-08-14：写成 `55%{opacity:1} 88%{opacity:0}` 时，名义上有 99ms 的淡出，
-     但那一段同样套用外层的前载曲线，实际 0.83 → 0.24 只用了 **25ms**——这个塌陷
-     就是用户反复报的「瞬间消失」，而我前几轮一直在调总时长，方向全错。
-     段内改 `linear` 之后，这 120ms 是匀速淡出的，看得见它在退。 */
-  /* 不透明度**压到最后 25%** 才开始退。
-     这是 2026-08-14 第四轮才找对的地方：前三轮我一直在调时长与曲线，而实测的
-     包围盒说明白了——卡片只从 560px 缩到 412px（26%），最后靠不透明度归零收场。
-     **一次原地淡出，无论多平滑，读出来都是「消失」而不是「离开」。** 淡出必须
-     退到配角位置，主角是几何。 */
-  72% { opacity: 1; animation-timing-function: linear; }
-  /* 收到 **.28**，不是与入场对称的 .72。
-     入场的 .72 → 1 成立，是因为它在**进入视野**；同一个量反过来放在离场上完全
-     不够——26% 的收缩配上淡出，淡出必然压过它。收到 .28 意味着卡片明确地缩回
-     `--sheet-ox/--sheet-oy` 那一点，也就是**当初按下的那颗按钮**里去：那是一个
-     目的地，而不是一次原地褪色。有目的地才叫离开。 */
-  to { opacity: 0; transform: scale(.28); }
+.sheet-scrim.closing .sheet-card {
+  opacity: 0;
+  transform: translate(var(--dialog-x, 0px), var(--dialog-y, 0px)) scale(.15);
+  transition: var(--transition-dialog-out);
 }
+.pair-alternatives { display: flex; flex-wrap: wrap; gap: 8px; }
+.pair-entry { display: flex; flex-direction: column; gap: 14px; }
+.pair-entry .input { width: 100%; }
+.pair-target-address { margin: 0; color: var(--text-dim); overflow-wrap: anywhere; }
+.pair-request-state { margin: 0; font-size: 12px; color: var(--accent); }
+.form-error { margin: 0; color: var(--danger); font-size: 12px; line-height: 1.5; }
+.disc-item:disabled { cursor: not-allowed; opacity: .65; transform: none; }
 .sheet-title { margin: 0 0 12px; font-size: 15px; }
 .sheet-row {
   display: flex; align-items: center; justify-content: space-between; gap: 16px;

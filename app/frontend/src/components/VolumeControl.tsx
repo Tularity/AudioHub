@@ -295,6 +295,11 @@ export function volumeUsability(
 
 type VolumeTarget = number | string;
 
+interface DeviceActivity {
+  kind: 'live' | 'idle' | 'pending';
+  text: string;
+}
+
 interface VolumeSurfaceProps {
   volumeTestid: string;
   muteTestid: string;
@@ -308,6 +313,7 @@ interface VolumeSurfaceProps {
   unavailableNote?: string;
   waitingNote?: string;
   pendingNote?: string;
+  activity?: DeviceActivity;
   onSet: (target: VolumeTarget, params: VolumeWriteParams) => Promise<unknown>;
   /** Mode-B peer state has no stats push; refresh twice after the debounced tail. */
   onRefresh?: () => void;
@@ -326,6 +332,7 @@ function VolumeSurface({
   unavailableNote,
   waitingNote,
   pendingNote,
+  activity,
   onSet,
   onRefresh,
 }: VolumeSurfaceProps) {
@@ -590,6 +597,9 @@ function VolumeSurface({
   const muted = !!(cur && cur.muted);
   const pendingVisible = !!pendingNote
     && (pending || !!scalarPin.current || !!mutePin.current);
+  // Keep ordinary device writes in the existing activity slot. Errors and
+  // offline/unsupported explanations still get their own readable note.
+  const pendingInActivity = !!activity && available && pendingVisible;
 
   // 滑块是**非受控**的，值由这个 effect 有条件地写回：拖动中（指针按住，或本地意图
   // 仍在压制回声）绝不覆盖，否则每秒一帧的 stats 会把滑块从手指下抢走。受控写法
@@ -604,7 +614,7 @@ function VolumeSurface({
 
   let note = '';
   if (errAt.current && Date.now() - errAt.current < ERR_MS) note = t('volume.failed');
-  else if (pendingVisible && pendingNote) note = pendingNote;
+  else if (pendingVisible && pendingNote && !pendingInActivity) note = pendingNote;
   else if (!available) note = unavailableNote || t('volume.noSync');
   // 兜底生效时也要说一句，但说的是**另一件事**：不是「调不了」，而是「对端调不了，
   // 所以由本机接管」——用户据此才明白线上此刻带着音量。
@@ -622,52 +632,65 @@ function VolumeSurface({
   const mLabel = muted ? t('volume.unmute') : t('volume.mute');
 
   return (
-    <div
-      className={`volume-box${compact ? ' device-volume' : ''}${!available ? ' unavailable' : ''}${reported && !usable ? ' unadjustable' : ''}${pendingVisible ? ' pending' : ''}`}
-      data-testid={`${volumeTestid}-box`}
-      hidden={target == null}
-      // 对端卡片整体可点击（进入详情）：控件里的点击绝不能冒泡上去。
-      onClick={(e) => e.stopPropagation()}
-    >
-      <div className="volume-row">
-        <button
-          type="button"
-          className={`icon-btn vol-mute${muted ? ' on' : ''}`}
-          data-testid={muteTestid}
-          aria-pressed={muted}
-          aria-label={mLabel}
-          title={mLabel}
-          disabled={!muteUsable}
-          onClick={(e) => {
-            e.stopPropagation();
-            if (!cur || target == null) return;
-            schedule(cur.scalar, !cur.muted);
-          }}
-        >
-          <Icon name={muted ? 'mute' : 'spk'} />
-        </button>
-        <input
-          ref={sliderRef}
-          type="range"
-          min={0}
-          max={100}
-          step={1}
-          defaultValue={0}
-          className={`vol-slider${muted ? ' muted' : ''}`}
-          data-testid={volumeTestid}
-          aria-label={sliderLabel}
-          disabled={!usable}
-          onPointerDown={() => { held.current = true; }}
-          onBlur={release}
-          // muted 传 null = 不下发 muted 字段：拖动音量不该改变对端静音态。
-          onChange={(e) => schedule(e.currentTarget.valueAsNumber / 100, null)}
-        />
-        <span className="vol-val" data-testid={`${volumeTestid}-value`}>
-          {cur ? (muted ? t('volume.muted') : t('volume.pct', { n: pct })) : t('common.dash')}
-        </span>
+    <>
+      <div
+        className={`volume-box${compact ? ' device-volume' : ''}${!available ? ' unavailable' : ''}${reported && !usable ? ' unadjustable' : ''}${pendingVisible ? ' pending' : ''}`}
+        data-testid={`${volumeTestid}-box`}
+        hidden={target == null}
+        // 对端卡片整体可点击（进入详情）：控件里的点击绝不能冒泡上去。
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="volume-row">
+          <button
+            type="button"
+            className={`icon-btn vol-mute${muted ? ' on' : ''}`}
+            data-testid={muteTestid}
+            aria-pressed={muted}
+            aria-label={mLabel}
+            title={mLabel}
+            disabled={!muteUsable}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (!cur || target == null) return;
+              schedule(cur.scalar, !cur.muted);
+            }}
+          >
+            <Icon name={muted ? 'mute' : 'spk'} />
+          </button>
+          <input
+            ref={sliderRef}
+            type="range"
+            min={0}
+            max={100}
+            step={1}
+            defaultValue={0}
+            className={`vol-slider${muted ? ' muted' : ''}`}
+            data-testid={volumeTestid}
+            aria-label={sliderLabel}
+            disabled={!usable}
+            onPointerDown={() => { held.current = true; }}
+            onBlur={release}
+            // muted 传 null = 不下发 muted 字段：拖动音量不该改变对端静音态。
+            onChange={(e) => schedule(e.currentTarget.valueAsNumber / 100, null)}
+          />
+          <span className="vol-val" data-testid={`${volumeTestid}-value`}>
+            {cur ? (muted ? t('volume.muted') : t('volume.pct', { n: pct })) : t('common.dash')}
+          </span>
+        </div>
+        <p className="vol-note" data-testid={`${volumeTestid}-note`} hidden={!note}>{note}</p>
       </div>
-      <p className="vol-note" data-testid={`${volumeTestid}-note`} hidden={!note}>{note}</p>
-    </div>
+      {activity && (
+        <span
+          className={`dev-state device-activity ${pendingInActivity ? 'syncing' : activity.kind}`}
+          data-testid={`${volumeTestid}-activity`}
+          data-syncing={pendingInActivity || undefined}
+          title={activity.text}
+          aria-live="polite"
+        >
+          {pendingInActivity ? pendingNote : activity.text}
+        </span>
+      )}
+    </>
   );
 }
 
@@ -711,6 +734,7 @@ export function DeviceVolumeControl({
   active,
   softwareGain,
   inactiveNote,
+  activity,
   onSet,
   onRefresh,
 }: {
@@ -726,6 +750,7 @@ export function DeviceVolumeControl({
   active: boolean;
   softwareGain?: boolean;
   inactiveNote?: string;
+  activity?: DeviceActivity;
   onSet: (endpoint: DeviceVolumeEndpoint, params: VolumeWriteParams) => Promise<unknown>;
   onRefresh: () => void;
 }) {
@@ -748,6 +773,7 @@ export function DeviceVolumeControl({
         : inactiveNote || t('volume.deviceModeUnavailable')}
       waitingNote={t('volume.deviceWaiting')}
       pendingNote={t(active ? 'volume.devicePending' : 'volume.deviceQueued')}
+      activity={activity}
       onSet={(_target, params) => onSet(endpoint, params)}
       onRefresh={onRefresh}
     />

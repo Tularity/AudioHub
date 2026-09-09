@@ -41,6 +41,7 @@ import { fmt } from '../lib/fmt';
 import { t, joinPhrases } from '../i18n';
 import { stageChips } from '../lib/stagefacts';
 import { Meter } from './Controls';
+import { Disclosure } from './Disclosure';
 import {
   LATENCY_SEGMENTS, LATENCY_STAGES, SEGMENT_LABEL, QUALITY_PARTS,
   QUALITY_PART_DESC, QUALITY_PART_NAME,
@@ -650,7 +651,7 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
         <Meter testid={`level-${dir}-${fp}`} value={(kbps || 0) / 900} />
         <span className="stream-rate">{t('peers.card.kbps', { v: fmt.kbps(kbps) })}</span>
       </div>
-      {open ? (
+      <Disclosure open={open}>
         <div className="dir-detail" id={`latency-detail-${dir}-${fp}`} data-testid={`latency-detail-${dir}-${fp}`}>
           <LatencyBand fp={fp} dir={dir} lat={lat} />
           {LATENCY_STAGES.map((s) => (
@@ -679,7 +680,7 @@ function DirBlock({ fp, dir, list, open, onToggle, ready }: {
           <p className="metric-foot gov" data-testid={`latency-gov-${dir}-${fp}`}>{t(govKey)}</p>
           <QualityParts fp={fp} dir={dir} q={q} />
         </div>
-      ) : null}
+      </Disclosure>
     </div>
   );
 }

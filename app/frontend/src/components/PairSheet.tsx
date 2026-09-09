@@ -14,7 +14,7 @@
 // 扫描循环与配对窗口的到期熄灯**不在这个文件里**（见 state/discovery.ts）：
 // 它们不该随着关面板、切页面而停。这里只剩订阅与渲染。
 
-import { useEffect, useReducer, useRef, useState } from 'react';
+import { useEffect, useId, useReducer, useRef, useState } from 'react';
 import { Icon } from './Icon';
 import { Help } from './Controls';
 import { Sheet } from './Sheet';
@@ -23,7 +23,7 @@ import { fmt } from '../lib/fmt';
 import { WIKI } from '../lib/external';
 import { classifyPeerAddr } from '../lib/peerAddr';
 import { t, joinPhrases } from '../i18n';
-import type { MsgKey } from '../i18n';
+import { discoveredAddress } from '../lib/pairing';
 import { useTick } from '../lib/hooks';
 import { discoverKey, isStale, remainingSecs, visibleResults } from '../lib/discovery';
 import {
@@ -40,8 +40,6 @@ const RING_C = 2 * Math.PI * RING_R;
 /** 重算「陈旧」并清掉过期条目的节拍。比 RESULT_STALE_MS 密得多，够它准点变灰。 */
 const STALE_TICK_MS = 15_000;
 
-type StepState = 'idle' | 'running' | 'done' | 'failed';
-const STEPS: MsgKey[] = ['pair.step.connect', 'pair.step.verifyPin', 'pair.step.exchangeKeys', 'pair.step.done'];
 
 /**
  * 「让对方找到我」——配对窗口。
@@ -127,204 +125,171 @@ export function BeDiscoveredSheet({ onClose }: { onClose: () => void }) {
   );
 }
 
-/**
- * 「添加对端」——发现 + 发起配对，外加「已配对主机按指纹重连」。
- *
- * 两件事共处一扇面板是有意的：从用户的角度它们是同一个意图（「让这台主机出现在
- * 我的列表里」），只是一条走首次配对、一条走已有信任。分成两个入口的代价是用户
- * 得先知道自己属于哪一类，而那正是他打开这扇面板要问的问题。
- */
+type PairTarget = { name: string; address: string; fingerprint?: string; paired?: boolean };
+
 export function AddPeerSheet({ onClose }: { onClose: () => void }) {
   const running = useStore((s) => s.discover.running);
   const results = useStore((s) => s.discover.results);
-  const [addr, setAddr] = useState('');
-  const [pin, setPin] = useState('');
-  const [steps, setSteps] = useState<StepState>('idle');
-  const [cliHint, setCliHint] = useState('');
-  const [busy, setBusy] = useState(false);
-  const pinRef = useRef<HTMLInputElement>(null);
-  const addrRef = useRef<HTMLInputElement>(null);
+  const peers = useStore((s) => s.peers);
+  const [target, setTarget] = useState<PairTarget | null>(null);
+  const [reconnect, setReconnect] = useState<PairTarget | null>(null);
+  const [closing, setClosing] = useState(false);
   const [, bump] = useReducer((x: number) => x + 1, 0);
-
-  // 扫描窗口的剩余秒数自己在走，需要一个节拍。
   useTick(1000, running);
 
-  // 开面板自动起扫。**返回的不是「停止扫描」**——扫描不随面板关闭而停；只记一笔
-  // 「什么时候关的」，供冷却期判断用（见 state/discovery.ts）。
-  useEffect(() => {
-    maybeAutoScan();
-    return notePairPanelLeft;
-  }, []);
-
-  // daemon 还没连上就打开这扇面板时，上面那次自动起扫会被「conn !== 'online'」挡掉，
-  // 而挡掉之后没有任何东西会再试一次——用户看到的是一扇永远不扫的面板。
-  // 订阅只活到面板关闭为止，所以它不会在面板关着时悄悄开扫。
+  useEffect(() => { maybeAutoScan(); return notePairPanelLeft; }, []);
   useEffect(() => useStore.subscribe((s, prev) => {
     if (s.conn === 'online' && prev.conn !== 'online') maybeAutoScan();
   }), []);
-
-  // 过期清理 + 陈旧态重算。不扫描时也要跑：一台刚才还在的主机不会因为我们停了扫描
-  // 就一直显示成「刚刚见过」。
   useEffect(() => {
     const id = setInterval(() => { pruneResults(); bump(); }, STALE_TICK_MS);
     return () => clearInterval(id);
   }, []);
 
-  // 进度是**诚实的粗粒度**：daemon 的 peers.pair 是一次同步 RPC，中间没有事件，
-  // 所以只标「进行中 / 全部完成 / 失败」，绝不假装能看见握手的每一步。
-  const stepCls = steps === 'idle' ? '' : steps === 'running' ? ' doing' : steps === 'done' ? ' done' : ' failed';
-
-  async function doPair() {
-    if (busy) return;
-    const a = addr.trim();
-    const p = pin.trim();
-    if (!a) { toast(t('pair.right.needAddr'), 'warn'); addrRef.current?.focus(); return; }
-    // **配对不走 WebSocket**，所以 URL 在这一格里是被拒的，且拒得早。
-    // 让它发出去只会换回一条 daemon 侧的握手报错——用户看到的是「配对失败：
-    // unexpected first frame」，而真正该说的话是「这一步请用 IP:端口」。
-    const shape = classifyPeerAddr(a);
-    if (shape.kind !== 'direct') {
-      toast(
-        shape.kind === 'badUrl'
-          ? t(`addr.badUrl.${shape.reason}`, { addr: a })
-          : t('addr.pairNotOverWs'),
-        'warn',
-      );
-      addrRef.current?.focus();
-      return;
-    }
-    if (!p) { toast(t('pair.right.needPin'), 'warn'); pinRef.current?.focus(); return; }
-    if (isTauri()) {
-      try { await ensureDaemon(); } catch { /* 连接失败会在下一步报出来 */ }
-    }
-    setBusy(true);
-    setCliHint('');
-    setSteps('running');
-    try {
-      // 配对成功后 daemon 会立刻为这台对端分配槽位并下发虚拟设备（模式 B），
-      // 所以这里必须刷新对端列表——设备清单与卡片都靠它。
-      const peer = await rpc<PeerState>('peers.pair', { addr: a, pin: p });
-      setSteps('done');
-      toast(t('pair.right.done', { name: (peer && (peer.display_name || peer.name)) || a }), 'ok');
-      setPin('');
-      await refreshPeers();
-      // 新卡片就在面板背后，关掉面板才看得见——原来这里是 navigate('peers')，
-      // 现在主面板本来就是宿主页。
-      onClose();
-    } catch (e) {
-      setSteps('failed');
-      console.error('[audiohub] pairing failed', e);
-      setCliHint(t('pair.right.failed'));
-    } finally {
-      setBusy(false);
-    }
-  }
-
   const now = Date.now();
   const list = visibleResults(results, now);
+  const finishPair = () => { setTarget(null); setReconnect(null); setClosing(true); };
 
   return (
-    <Sheet
-      testid="add-peer-sheet"
-      title={t('peers.addManual')}
+    <Sheet testid="add-peer-sheet" title={t('peers.addManual')}
       help={<Help label={t('wiki.discovery')} url={WIKI.discovery} testid="pair-help" />}
-      onClose={onClose}
-      wide
-    >
+      onClose={onClose} closeRequested={closing} wide>
       <div className="pair-panel" data-testid="pair-block">
         <div className="scan-row">
-          <button
-            className={`btn${running ? ' primary' : ''}`} type="button" data-testid="discover-run"
-            onClick={toggleScan}
-          >
+          <button className={`btn${running ? ' primary' : ''}`} type="button" data-testid="discover-run" onClick={toggleScan}>
             <Icon name="scan" />{running ? t('pair.right.stopScan') : t('pair.right.scan')}
           </button>
           <span className="spinner" hidden={!running} />
-          {/* 窗口会自己到点收工，所以「还剩多久」是状态，不是装饰。 */}
           <span className="scan-remain" data-testid="discover-deadline" hidden={!running}>
             {t('pair.right.remain', { n: fmt.int(remainingSecs(scanDeadlineAt(), now)) })}
           </span>
         </div>
-
+        <p className="muted small">{t('pair.selectDevice')}</p>
         <div className="disc-list" data-testid="discover-list">
           {list.map((d) => {
             const key = discoverKey(d);
             const stale = isStale(d, now);
-            const a = d.addrs && d.addrs.length
-              ? `${d.addrs[0]}:${d.port}`
-              : t('pair.right.portOnly', { port: String(d.port ?? '') });
+            const address = discoveredAddress(d.addrs?.[0], d.port);
+            const known = peers.find(p => p.fingerprint === d.fingerprint);
+            const paired = !!known || !!d.paired;
+            const name = known?.display_name || d.name || d.instance || t('pair.right.unknownHost');
             return (
-              <button
-                key={key} className={`disc-item card${stale ? ' stale' : ''}`} type="button"
-                data-testid={`discover-item-${key}`}
+              <button key={key} className={`disc-item card${stale ? ' stale' : ''}`} type="button"
+                data-testid={`discover-item-${key}`} disabled={!address || (paired && !d.fingerprint)}
                 onClick={() => {
-                  if (d.addrs && d.addrs.length) setAddr(`${d.addrs[0]}:${d.port}`);
-                  pinRef.current?.focus();
-                }}
-              >
+                  if (!address) return;
+                  const selected = { name, address, fingerprint: d.fingerprint, paired };
+                  if (paired) setReconnect(selected); else setTarget(selected);
+                }}>
                 <div className="disc-main">
-                  <strong>{d.name || d.instance || t('pair.right.unknownHost')}</strong>
+                  <strong>{name}</strong>
                   <span className="disc-tags">
-                    {d.paired
-                      ? <span className="tag ok">{t('pair.right.paired')}</span>
-                      : <span className="tag">{t('pair.right.unpaired')}</span>}
-                    {/* 「陈旧」是状态：一条四分钟前见过的记录不许和两秒前刚答复的
-                        长成同一个样子。 */}
-                    {stale
-                      ? <span className="tag" data-testid={`discover-item-stale-${key}`}>{t('pair.right.stale')}</span>
-                      : null}
+                    <span className={`tag${paired ? ' ok' : ''}`}>{t(paired ? 'pair.right.paired' : 'pair.right.unpaired')}</span>
+                    {stale ? <span className="tag" data-testid={`discover-item-stale-${key}`}>{t('pair.right.stale')}</span> : null}
                   </span>
                 </div>
-                {/* 地址与指纹是两条并列短语，分隔符由语料给（原来这里硬编码着 ` · `）。 */}
-                <div className="disc-sub">{joinPhrases([a, d.fingerprint ? fmt.fp(d.fingerprint, 12) : null])}</div>
+                <div className="disc-sub">{joinPhrases([address || t('pair.noAddress'), d.fingerprint ? fmt.fp(d.fingerprint, 12) : null])}</div>
               </button>
             );
           })}
         </div>
-        <p className="muted" data-testid="discover-empty" hidden={list.length > 0}>
-          {t('pair.right.empty')}
-        </p>
-
+        <p className="muted" data-testid="discover-empty" hidden={list.length > 0}>{t('pair.right.empty')}</p>
         <div className="divider" />
-        <div className="manual-pair">
-          <div className="form-row">
-            <label className="field grow">
-              <span className="field-label">{t('pair.right.addrLabel')}</span>
-              <input
-                ref={addrRef} className="input" data-testid="manual-pair-addr"
-                placeholder={t('pair.right.addrPlaceholder')} autoComplete="off" spellCheck="false"
-                value={addr} onChange={(e) => setAddr(e.currentTarget.value)}
-              />
-            </label>
-            <label className="field">
-              <span className="field-label">{t('pair.right.pinLabel')}</span>
-              <input
-                ref={pinRef} className="input pin-input" data-testid="manual-pair-pin"
-                placeholder={t('pair.right.pinPlaceholder')} inputMode="numeric" maxLength={8} autoComplete="off"
-                value={pin} onChange={(e) => setPin(e.currentTarget.value)}
-              />
-            </label>
-            <span className="field-btn">
-              <button
-                className="btn primary" type="button" data-testid="manual-pair-btn"
-                disabled={busy} onClick={() => void doPair()}
-              >
-                {busy ? t('pair.right.going') : t('pair.right.go')}
-              </button>
-            </span>
-          </div>
-          {/* 只在配对失败时可见 */}
-          <p className="cli-hint" data-testid="pair-cli-hint" hidden={!cliHint}>{cliHint}</p>
-          <ol className="pair-steps" data-testid="pair-progress">
-            {STEPS.map((k) => (
-              <li key={k} className={stepCls.trim() || undefined}><span className="step-dot" />{t(k)}</li>
-            ))}
-          </ol>
+        <div className="pair-alternatives">
+          <button className="btn" type="button" data-testid="manual-pair-open"
+            onClick={() => setTarget({ name: '', address: '' })}>{t('pair.manual')}</button>
+          <button className="btn ghost" type="button" data-testid="reconnect-open"
+            onClick={() => setReconnect({ name: '', address: '' })}>{t('peers.form.reconnectTitle')}</button>
         </div>
-
-        <div className="divider" />
-        <ReconnectForm onClose={onClose} />
       </div>
+      {target ? <PairingSheet target={target} onCancel={() => setTarget(null)} onSuccess={finishPair} /> : null}
+      {reconnect ? <ReconnectSheet target={reconnect} onCancel={() => setReconnect(null)} onSuccess={finishPair} /> : null}
+    </Sheet>
+  );
+}
+
+/** The selected target stays fixed while discovery refreshes behind this layer. */
+function PairingSheet({ target, onCancel, onSuccess }: {
+  target: PairTarget; onCancel: () => void; onSuccess: () => void;
+}) {
+  const [addr, setAddr] = useState(target.address);
+  const [pin, setPin] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [completed, setCompleted] = useState(false);
+  const busyRef = useRef(false);
+  const pinRef = useRef<HTMLInputElement>(null);
+  const addrRef = useRef<HTMLInputElement>(null);
+  const manual = !target.address;
+  const formId = useId();
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (busyRef.current || completed) return;
+    const address = addr.trim(), code = pin.trim();
+    if (!address) { setError(t('pair.right.needAddr')); addrRef.current?.focus(); return; }
+    const shape = classifyPeerAddr(address);
+    if (shape.kind !== 'direct') {
+      setError(shape.kind === 'badUrl' ? t(`addr.badUrl.${shape.reason}`, { addr: address }) : t('addr.pairNotOverWs'));
+      addrRef.current?.focus(); return;
+    }
+    if (!code) { setError(t('pair.right.needPin')); pinRef.current?.focus(); return; }
+    busyRef.current = true;
+    setBusy(true); setError('');
+    try {
+      if (isTauri()) await ensureDaemon();
+      const peer = await rpc<PeerState>('peers.pair', { addr: address, pin: code }, { silent: true });
+      toast(t('pair.right.done', { name: peer?.display_name || peer?.name || address }), 'ok');
+      setPin(''); setCompleted(true);
+      // Trust is established once peers.pair returns. A later list poll must
+      // not keep a successful PIN request waiting on another network round trip.
+      void refreshPeers();
+    } catch {
+      setError(t('pair.right.failed'));
+      pinRef.current?.focus();
+    } finally {
+      busyRef.current = false; setBusy(false);
+    }
+  }
+
+  return (
+    <Sheet testid="pair-device-sheet" title={target.name ? t('pair.withDevice', { name: target.name }) : t('pair.manual')}
+      onClose={completed ? onSuccess : onCancel} closeRequested={completed} dismissDisabled={busy || completed}
+      dismissLabel={t('common.cancel')} initialFocusRef={manual ? addrRef : pinRef}
+      primaryAction={<button className="btn primary" type="submit" form={formId} data-testid="manual-pair-btn" disabled={busy || completed}>
+        {busy ? t('pair.right.going') : t('pair.right.go')}
+      </button>}>
+      <form id={formId} className="pair-entry" onSubmit={submit} aria-busy={busy}>
+        {manual ? <label className="field">
+          <span className="field-label">{t('pair.right.addrLabel')}</span>
+          <input ref={addrRef} className="input" data-testid="manual-pair-addr" value={addr}
+            placeholder={t('pair.right.addrPlaceholder')} onChange={e => setAddr(e.currentTarget.value)}
+            disabled={busy || completed} autoComplete="off" spellCheck={false} />
+        </label> : <p className="pair-target-address mono" data-testid="pair-selected-address">{target.address}</p>}
+        <p className="muted small">{t('pair.pinInstruction')}</p>
+        <label className="field">
+          <span className="field-label">{t('pair.right.pinLabel')}</span>
+          <input ref={pinRef} className="input pin-input" data-testid="manual-pair-pin" value={pin}
+            placeholder={t('pair.right.pinPlaceholder')} onChange={e => setPin(e.currentTarget.value)}
+            inputMode="numeric" maxLength={8} autoComplete="one-time-code" disabled={busy || completed} />
+        </label>
+        <p className="pair-request-state" data-testid="pair-progress" role="status" hidden={!busy}>{t('pair.right.going')}</p>
+        <p className="form-error" data-testid="pair-cli-hint" role="alert" hidden={!error}>{error}</p>
+      </form>
+    </Sheet>
+  );
+}
+
+function ReconnectSheet({ target, onCancel, onSuccess }: {
+  target: PairTarget; onCancel: () => void; onSuccess: () => void;
+}) {
+  const [pending, setPending] = useState(false);
+  const [completed, setCompleted] = useState(false);
+  return (
+    <Sheet testid="reconnect-sheet" title={target.name || t('peers.form.reconnectTitle')}
+      onClose={completed ? onSuccess : onCancel} closeRequested={completed} dismissDisabled={pending || completed}>
+      {target.paired ? <p className="muted small">{t('pair.alreadyTrusted')}</p> : null}
+      <ReconnectForm onClose={() => setCompleted(true)} initialPeer={target.fingerprint} initialAddr={target.address} onPending={setPending} />
     </Sheet>
   );
 }
@@ -337,15 +302,19 @@ export function AddPeerSheet({ onClose }: { onClose: () => void }) {
  * 把它折进「添加对端」而不是留在主面板上一张常驻表单里，是因为它一年用不到一次，
  * 却在主面板顶上占着一整行。
  */
-function ReconnectForm({ onClose }: { onClose: () => void }) {
+function ReconnectForm({ onClose, initialPeer = '', initialAddr = '', onPending }: {
+  onClose: () => void; initialPeer?: string; initialAddr?: string; onPending: (pending: boolean) => void;
+}) {
   const peers = useStore((s) => s.peers);
   const peerRef = useRef<HTMLInputElement>(null);
-  const [addr, setAddr] = useState('');
-  const [peerVal, setPeerVal] = useState('');
+  const [addr, setAddr] = useState(initialAddr);
+  const [peerVal, setPeerVal] = useState(initialPeer);
   const [pending, setPending] = useState(false);
+  const pendingRef = useRef(false);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (pendingRef.current) return;
     const peer = peerVal.trim();
     const a = addr.trim();
     if (!peer) {
@@ -366,7 +335,7 @@ function ReconnectForm({ onClose }: { onClose: () => void }) {
       toast(t('addr.wssUnsupported'), 'warn');
       return;
     }
-    setPending(true);
+    pendingRef.current = true; setPending(true); onPending(true);
     try {
       // 超时由 ipc/client.ts 的方法级表给出（daemon 最坏 TCP 5s + 握手 10s）。
       await rpc('peers.connect', a ? { peer, addr: a } : { peer });
@@ -375,7 +344,7 @@ function ReconnectForm({ onClose }: { onClose: () => void }) {
       onClose();
       void refreshPeers();
     } catch { /* rpc 已 toast */ } finally {
-      setPending(false);
+      pendingRef.current = false; setPending(false); onPending(false);
     }
   };
 

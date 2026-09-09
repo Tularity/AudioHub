@@ -39,17 +39,39 @@ export const ORIGIN_CLAMP = 1.5;
 
 let last: Point | null = null;
 let lastAt = -Infinity;
+export interface ActivationOrigin {
+  point: Point;
+  element: HTMLElement | null;
+  rect: Rect | null;
+  at: number;
+}
+let activation: ActivationOrigin | null = null;
 
 /** Record a press. Exported for tests; production goes through the installer. */
-export function notePointerOrigin(p: Point, now: number): void {
+export function notePointerOrigin(p: Point, now: number, element: HTMLElement | null = null): void {
   last = p;
   lastAt = now;
+  const r = element?.getBoundingClientRect();
+  activation = {
+    point: p, element, at: now,
+    rect: r && r.width > 0 && r.height > 0
+      ? { left: r.left, top: r.top, width: r.width, height: r.height }
+      : null,
+  };
 }
 
 /** Forget any recorded press. Tests use it; so does a locale/theme swap. */
 export function clearPointerOrigin(): void {
   last = null;
   lastAt = -Infinity;
+  activation = null;
+}
+
+/** A modal consumes its opening action so a later automatic modal cannot reuse it. */
+export function consumeActivationOrigin(now: number): ActivationOrigin | null {
+  const source = activation;
+  activation = null;
+  return source && now >= source.at && now - source.at <= ORIGIN_MAX_AGE_MS ? source : null;
 }
 
 /** The last press, if it is recent enough to still explain what is opening. */
@@ -134,8 +156,8 @@ export function layoutRect(el: LayoutBox): Rect {
 }
 
 interface OriginTarget {
-  addEventListener(type: string, handler: (e: PointerEvent) => void, options?: unknown): void;
-  removeEventListener(type: string, handler: (e: PointerEvent) => void, options?: unknown): void;
+  addEventListener(type: string, handler: EventListener, options?: boolean): void;
+  removeEventListener(type: string, handler: EventListener, options?: boolean): void;
 }
 
 /**
@@ -149,14 +171,32 @@ export function installPointerOrigin(
   now: () => number = () => Date.now(),
 ): () => void {
   if (!target) return () => {};
-  const handler = (e: PointerEvent) => {
+  const sourceElement = (target: EventTarget | null) => typeof Element !== 'undefined' && target instanceof Element
+    ? target.closest<HTMLElement>('button, a[href], [role="button"], [role="option"], [role="menuitem"]')
+    : null;
+  const handler: EventListener = (event) => {
+    const e = event as PointerEvent;
     // Synthetic clicks (keyboard Space/Enter on a button) arrive with no real
     // coordinates. Recording 0,0 would animate every keyboard-opened panel out
     // of the top-left corner.
     if (!Number.isFinite(e.clientX) || !Number.isFinite(e.clientY)) return;
     if (e.clientX === 0 && e.clientY === 0) return;
-    notePointerOrigin({ x: e.clientX, y: e.clientY }, now());
+    notePointerOrigin({ x: e.clientX, y: e.clientY }, now(), sourceElement(e.target));
+  };
+  const keyboard: EventListener = (event) => {
+    activation = null;
+    const e = event as KeyboardEvent;
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const element = sourceElement(e.target);
+    if (!element) return;
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    notePointerOrigin({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }, now(), element);
   };
   target.addEventListener('pointerdown', handler, true);
-  return () => target.removeEventListener('pointerdown', handler, true);
+  target.addEventListener('keydown', keyboard, true);
+  return () => {
+    target.removeEventListener('pointerdown', handler, true);
+    target.removeEventListener('keydown', keyboard, true);
+  };
 }

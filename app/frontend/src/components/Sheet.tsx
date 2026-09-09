@@ -18,37 +18,22 @@
 // `:focus-within` 立刻又把它打开，表现为「Esc 按不掉」。这里不出现任何 `:focus-*`
 // 驱动的开合。
 
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import type { ReactNode } from 'react';
+import type { ReactNode, RefObject } from 'react';
 import { t } from '../i18n';
 import { isEscape } from '../lib/shortcuts';
 import { isRecordingCapture } from '../lib/shortcutHost';
 import { isConfirmOpen } from './ConfirmDialog';
-import { sheetEscapeCloses, trapIndex, FOCUSABLE_SELECTOR, SHEET_EXIT_MS } from '../lib/sheet';
-import { layoutRect, originPercent, recentPointerOrigin } from '../lib/pointerOrigin';
-import type { Point } from '../lib/pointerOrigin';
-import { originOfElement } from '../lib/reveal';
+import { isModalFocusable, sheetEscapeCloses, trapIndex, FOCUSABLE_SELECTOR } from '../lib/sheet';
+import { dialogStyle, useExitMotion, useDialogOpening } from '../lib/dialogMotion';
+import type { DialogPose } from '../lib/dialogMotion';
+import { prefersReducedMotion } from '../lib/viewTransition';
+import { inertSiblings } from '../lib/modalInert';
 
-/**
- * Point the card's growth/shrink at `p`, expressed against the box it has right
- * now.
- *
- * `layoutRect` rather than `getBoundingClientRect`: the entry animation is
- * declared `backwards`, so its `scale(.72)` is already in force when the layout
- * effect runs, and measuring the rendered box puts the origin ~1.39× too far
- * from the centre. The full measurement is on `layoutRect`.
- */
-function applyOrigin(card: HTMLElement, p: Point): void {
-  const { ox, oy } = originPercent(layoutRect(card), p);
-  card.style.setProperty('--sheet-ox', `${ox.toFixed(2)}%`);
-  card.style.setProperty('--sheet-oy', `${oy.toFixed(2)}%`);
-}
+const SheetDepth = createContext(0);
 
-export function Sheet({
-  testid, title, help, children, footer, primaryAction, dismissLabel,
-  dismissDisabled = false, onClose, auto = false, wide = false,
-}: {
+interface SheetProps {
   testid: string;
   title: string;
   /** 标题右边那枚 `?`。与页面上的区块标题同一个形状。 */
@@ -67,8 +52,29 @@ export function Sheet({
   auto?: boolean;
   /** 行内还挂着动作按钮的面板（权限）要更宽，否则状态标签会被挤到换行。 */
   wide?: boolean;
-}) {
+  /** Close through the same animation as Escape; used after successful work. */
+  closeRequested?: boolean;
+  initialFocusRef?: RefObject<HTMLElement | null>;
+}
+
+export function Sheet(props: SheetProps) {
+  const pose = useDialogOpening();
+  const depth = useContext(SheetDepth);
+  return pose ? (
+    <SheetDepth.Provider value={depth + 1}>
+      <SheetContent {...props} pose={pose} depth={depth} />
+    </SheetDepth.Provider>
+  ) : null;
+}
+
+function SheetContent({
+  testid, title, help, children, footer, primaryAction, dismissLabel,
+  dismissDisabled = false, onClose, auto = false, wide = false, pose, depth,
+  closeRequested = false, initialFocusRef,
+}: SheetProps & { pose: DialogPose; depth: number }) {
   const cardRef = useRef<HTMLDivElement | null>(null);
+  const maskRef = useRef<HTMLDivElement | null>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
   const titleId = useId();
 
   // `onClose` 走 ref，**下面那个 effect 的依赖数组必须留空**。
@@ -97,65 +103,44 @@ export function Sheet({
   // 配对窗口）。ref 而不是 state 做判断，因为三条路都在同一帧里。
   const [closing, setClosing] = useState(false);
   const closingRef = useRef(false);
-  // The press this card grew out of, kept so the exit can be re-aimed at it.
-  const pressRef = useRef<Point | null>(null);
+  const closedRef = useRef(false);
+  const finishClose = useCallback(() => {
+    if (!closingRef.current || closedRef.current) return;
+    closedRef.current = true;
+    closeRef.current();
+  }, []);
+  useExitMotion(closing, cardRef, maskRef, finishClose);
   const requestClose = useCallback(() => {
     if (closingRef.current) return;
     closingRef.current = true;
-    // Re-express the origin against the box the card has NOW.
-    //
-    // A percentage is only a point once you know which box it is a percentage
-    // of, and the card's box changes after mount: its height follows its
-    // content, and content that arrives a tick late (a list the daemon has not
-    // answered for yet) grows it. Because the card is flex-centred, growing
-    // moves its top edge up as well, so the mount-time percentage no longer
-    // points where it did. Measured 2026-08-15: on the first open after a cold
-    // load the「Add peer」card was 484px tall when the layout effect ran and
-    // 586px once settled, which put the exit origin 52px above the button.
-    //
-    // Doing it here rather than watching for resizes is deliberate: this is the
-    // only moment the value is about to be used for the exit, and by now the
-    // card has been on screen long enough to have settled.
-    const card = cardRef.current;
-    if (card && pressRef.current) applyOrigin(card, pressRef.current);
+    if (prefersReducedMotion(window)) {
+      finishClose();
+      return;
+    }
     setClosing(true);
-    window.setTimeout(() => closeRef.current(), SHEET_EXIT_MS);
-  }, []);
+  }, [finishClose]);
   const requestCloseRef = useRef(requestClose);
   requestCloseRef.current = requestClose;
-
-  // 从**按下的那一点**长出来。
-  //
-  // `useLayoutEffect` 而不是 `useEffect`：入场动画从第一帧就开始，而 transform-origin
-  // 必须在那一帧之前写进去，否则第一帧是从中心缩放的，随后跳到正确的原点——那一跳
-  // 比没有动画更难看。layout effect 在 DOM 变更之后、绘制之前跑，正好。
-  //
-  // 取点的优先级：最近一次按下 → 触发它的那个控件的中心 → 卡片自身中心。第二条覆盖
-  // 键盘打开（Space/Enter 产生的 click 没有真实坐标），第三条是兜底。
-  useLayoutEffect(() => {
-    const card = cardRef.current;
-    if (!card) return;
-    // 此刻焦点还在触发它的控件上——下面那个 effect 才把焦点移进卡片。
-    const p = recentPointerOrigin(Date.now())
-      ?? originOfElement(document.activeElement);
-    if (!p) return;
-    pressRef.current = p;
-    applyOrigin(card, p);
-  }, []);
+  useEffect(() => { if (closeRequested) requestClose(); }, [closeRequested, requestClose]);
 
   useEffect(() => {
     const card = cardRef.current;
     // 触发它的那个按钮。存在这里而不是靠调用方传，是因为**每一个** Sheet 都要还，
     // 靠约定去还等于迟早有一个忘了还。
-    const opener = document.activeElement as HTMLElement | null;
+    const opener = returnFocusRef.current ?? document.activeElement as HTMLElement | null;
+    returnFocusRef.current = opener;
+    const mask = maskRef.current;
+    const overlay = document.getElementById('overlay');
+    const releaseBackground = mask ? inertSiblings(mask, overlay ? [overlay] : [], true) : () => {};
+    const topSheet = () => Array.from(document.querySelectorAll('.sheet-scrim')).at(-1) === mask;
 
     const focusables = (): HTMLElement[] => (card
-      ? Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
+      ? Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(isModalFocusable)
       : []);
 
     // 打开时把焦点移进卡片。没有任何可聚焦元素时退到卡片本身（它带 tabIndex=-1），
     // 否则读屏会停在面板外面读背景内容。
-    const first = focusables()[0];
+    const first = initialFocusRef?.current ?? focusables()[0];
     if (first) first.focus();
     else card?.focus();
 
@@ -169,6 +154,7 @@ export function Sheet({
       // here avoids the older Sheet trap briefly pulling focus behind the
       // confirmation before the later-registered Confirm handler corrects it.
       if (isConfirmOpen()) return;
+      if (!topSheet()) return;
       if (isEscape(e)) {
         // Esc 不一定归这一层——录制态与开在上面的确认框都比它更内层。判据是纯函数，
         // 有单测；这里只负责问。
@@ -196,9 +182,15 @@ export function Sheet({
     document.addEventListener('keydown', onKey, true);
     return () => {
       document.removeEventListener('keydown', onKey, true);
+      releaseBackground();
       // 焦点归还。`isConnected` 是必要的：触发按钮可能随这次操作一起消失
       // （例如「重置指纹」之后那一行整个换了内容）。
-      if (opener && opener.isConnected && typeof opener.focus === 'function') opener.focus();
+      // A forced parent unmount cleans up several layers in one commit. Wait
+      // until all of their inert locks are released before choosing the opener.
+      queueMicrotask(() => {
+        if (opener?.isConnected && !opener.closest('[inert]')
+          && document.getElementById('overlay')?.hidden !== false) opener.focus({ preventScroll: true });
+      });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 见上：依赖数组必须留空。
   }, []);
@@ -215,17 +207,24 @@ export function Sheet({
   // semantically.
   return createPortal(
     <div
+      ref={maskRef}
       className={`sheet-scrim${closing ? ' closing' : ''}`}
+      style={{ zIndex: 60 + depth * 2 }}
+      data-sheet-depth={depth}
       data-testid={testid}
       data-auto={auto ? 'on' : undefined}
       // 点遮罩关闭，**仅当点的就是遮罩本身**。卡片内部的点击不许穿透过来——
       // 误关是小事，误确认才是大事（与 ConfirmDialog 同一条判据）。
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !dismissDisabled) requestClose();
+        if (e.target === e.currentTarget && !dismissDisabled
+          && Array.from(document.querySelectorAll('.sheet-scrim')).at(-1) === e.currentTarget
+          && !isConfirmOpen()) requestClose();
       }}
     >
       <div
         className={`sheet-card${wide ? ' wide' : ''}`}
+        style={dialogStyle(pose)}
+        inert={closing}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

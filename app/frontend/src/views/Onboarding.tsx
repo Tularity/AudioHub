@@ -12,12 +12,13 @@ import { Icon } from '../components/Icon';
 import { Help } from '../components/Controls';
 import { PermissionRow } from '../components/PermissionRow';
 import { toast } from '../components/Toasts';
-import { openExternal, WIKI } from '../lib/external';
+import { WIKI } from '../lib/external';
+import { openPermissionSettings } from '../lib/permissionSettings';
 import { chromeContextMenu, chromeMouseDown } from '../lib/drag';
 import { t, listFormat } from '../i18n';
 import { actions, getState, useStore } from '../state/store';
 import {
-  actionOf, isBlocking, permissionManual, permissionName, requestQueue,
+  actionOf, isBlocking, permissionName, requestQueue,
 } from '../state/permissions';
 import type { PermissionState } from '../state/permissions';
 import { refreshPermissions, rpc } from '../state/connection';
@@ -72,21 +73,15 @@ export function OnboardingGate() {
     }
   }
 
-  function openSettings(p: PermissionState) {
-    const manual = permissionManual(p);
-    if (!p.settingsUrl) {
-      toast(manual ? t('perm.openManual', { manual }) : t('perm.noSettingsUrl'), 'warn');
-      return;
-    }
-    void openExternal(p.settingsUrl);
-    // 深链能否打开取决于 webview 与系统，所以路径文案照给不误——
-    // 用户不该因为一个链接没反应就无路可走。
-    if (manual) toast(t('perm.settingsFallback', { manual }), 'info');
+  async function openSettings(p: PermissionState) {
+    actions.setPermissionBusy(p.id);
+    try { await openPermissionSettings(p); }
+    finally { actions.setPermissionBusy(null); }
   }
 
   function onAction(p: PermissionState) {
     if (actionOf(p) === 'request') void request(p);
-    else openSettings(p);
+    else void openSettings(p);
   }
 
   const hint = busy

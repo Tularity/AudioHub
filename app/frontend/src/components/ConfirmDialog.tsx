@@ -5,11 +5,15 @@
 // 命令式 API（`await confirmDialog({...})`）保持不变：调用点在事件处理器里，
 // 改成声明式会把「问一句再做」拆成两段状态机，得不偿失。
 
-import { useEffect, useId, useRef, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react';
+import { createPortal } from 'react-dom';
 import { t } from '../i18n';
 import { isEscape } from '../lib/shortcuts';
-import { FOCUSABLE_SELECTOR, trapIndex } from '../lib/sheet';
+import { isModalFocusable, FOCUSABLE_SELECTOR, trapIndex } from '../lib/sheet';
 import { inertSiblings } from '../lib/modalInert';
+import { prefersReducedMotion } from '../lib/viewTransition';
+import { captureDialogPose, dialogStyle, useExitMotion } from '../lib/dialogMotion';
+import type { DialogPose } from '../lib/dialogMotion';
 
 export interface ConfirmOpts {
   title: string;
@@ -20,9 +24,10 @@ export interface ConfirmOpts {
   testid?: string;
 }
 
-interface Live extends ConfirmOpts { resolve: (v: boolean) => void }
+interface Live extends ConfirmOpts { id: number; pose: DialogPose; resolve: (v: boolean) => void }
 
 let current: Live | null = null;
+let nextId = 1;
 const listeners = new Set<() => void>();
 const emit = () => { for (const fn of [...listeners]) fn(); };
 const subscribe = (fn: () => void) => { listeners.add(fn); return () => listeners.delete(fn); };
@@ -42,7 +47,7 @@ export function isConfirmOpen(): boolean {
 export function confirmDialog(opts: ConfirmOpts): Promise<boolean> {
   if (current) return Promise.resolve(false); // 同时只允许一个，避免叠层
   return new Promise<boolean>((resolve) => {
-    current = { ...opts, resolve };
+    current = { ...opts, id: nextId++, pose: captureDialogPose(), resolve };
     emit();
   });
 }
@@ -57,10 +62,32 @@ function done(v: boolean): void {
 
 export function ConfirmHost() {
   const live = useSyncExternalStore(subscribe, () => current);
+  return live ? <ConfirmCard key={live.id} live={live} /> : null;
+}
+
+function ConfirmCard({ live }: { live: Live }) {
   const maskRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
   const okRef = useRef<HTMLButtonElement>(null);
   const titleId = useId();
+  const [closing, setClosing] = useState(false);
+  const answerRef = useRef<boolean | null>(null);
+  const finishedRef = useRef(false);
+  const finishClose = useCallback(() => {
+    if (answerRef.current === null || finishedRef.current) return;
+    finishedRef.current = true;
+    if (current === live) done(answerRef.current);
+  }, [live]);
+  useExitMotion(closing, cardRef, maskRef, finishClose);
+  const requestDone = useCallback((answer: boolean) => {
+    if (answerRef.current !== null) return;
+    answerRef.current = answer;
+    if (prefersReducedMotion(window)) {
+      finishClose();
+      return;
+    }
+    setClosing(true);
+  }, [finishClose]);
 
   useEffect(() => {
     if (!live) return;
@@ -76,7 +103,7 @@ export function ConfirmHost() {
       : () => undefined;
     const overlayVisible = () => overlay?.hidden === false;
     const focusables = (): HTMLElement[] => (card
-      ? Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
+      ? Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(isModalFocusable)
       : []);
     const focusDialog = () => {
       if (overlayVisible()) return;
@@ -106,7 +133,7 @@ export function ConfirmHost() {
         e.preventDefault();
         e.stopPropagation();
         e.stopImmediatePropagation();
-        done(false);
+        requestDone(false);
         return;
       }
       if (e.key !== 'Tab' || !card) return;
@@ -136,23 +163,25 @@ export function ConfirmHost() {
       // node would steal the screen reader cursor from that higher-priority UI.
       if (opener?.isConnected && !opener.closest('[inert]')) opener.focus();
     };
-  }, [live]);
+  }, [live, requestDone]);
 
   if (!live) return null;
   const testid = live.testid || 'confirm';
   const lines = (Array.isArray(live.body) ? live.body : [live.body]).filter(Boolean) as string[];
 
-  return (
+  return createPortal(
     <div
       ref={maskRef}
-      className="confirm-mask"
+      className={`confirm-mask${closing ? ' closing' : ''}`}
       data-testid={testid}
       // 点遮罩 = 取消。点卡片内部不能穿透过去（危险操作误关掉是小事，误确认才是大事）。
-      onClick={(e) => { if (e.target === e.currentTarget) done(false); }}
+      onClick={(e) => { if (e.target === e.currentTarget) requestDone(false); }}
     >
       <div
         ref={cardRef}
         className="confirm-card"
+        style={dialogStyle(live.pose)}
+        inert={closing}
         role="alertdialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -161,7 +190,7 @@ export function ConfirmHost() {
         <h2 className="confirm-title" id={titleId}>{live.title}</h2>
         {lines.map((line, i) => <p className="confirm-body" key={i}>{line}</p>)}
         <div className="confirm-actions">
-          <button className="btn" type="button" data-testid={`${testid}-cancel`} onClick={() => done(false)}>
+          <button className="btn" type="button" data-testid={`${testid}-cancel`} onClick={() => requestDone(false)}>
             {live.cancelText || t('common.cancel')}
           </button>
           <button
@@ -169,12 +198,13 @@ export function ConfirmHost() {
             className={`btn ${live.danger ? 'danger' : 'primary'}`}
             type="button"
             data-testid={`${testid}-ok`}
-            onClick={() => done(true)}
+            onClick={() => requestDone(true)}
           >
             {live.confirmText || t('common.ok')}
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

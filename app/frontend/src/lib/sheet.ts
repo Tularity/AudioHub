@@ -3,21 +3,11 @@
 // 两条都从组件里抽出来，是因为它们各自对应一次真机事故，而事故的形状是「谁先注册
 // 谁先吃到键」这种不可能在组件测试里稳定复现的东西——抽成纯函数才能钉住。
 
-/**
- * 退场动画的时长（毫秒）。
- *
- * React 卸载是同步的，所以「关」这个动作原本**没有动画**：面板在按下的那一帧就消失。
- * Sheet 现在自己拖住这段时间——先加 `.closing`，等这么久再真的调用 `onClose`。
- *
- * 这个数必须与 `styles.css` 里 `.sheet-scrim.closing` / `.sheet-card` 退场动画的
- * 时长一致，由 `sheet.test.ts` 直接读样式表钉住。不一致的表现分两种，都很难看：
- * 数小了面板被拦腰截断，数大了面板已经不见却还挡着一段时间的点击。
- *
- * 略短于入场（.34s），但**不能短很多**：2026-08-14 用户报「关闭仍表现为瞬间消失」，
- * 200ms 里被加速曲线的慢起步吃掉 60ms，实际可见运动只剩 140ms，低于调研给的 200ms
- * 可读下限。关场时眼睛已经在卡片上，它是要被看见的。
- */
-export const SHEET_EXIT_MS = 300;
+/** Hidden ancestors must not leave unreachable controls inside a modal's tab ring. */
+export function isModalFocusable(element: HTMLElement): boolean {
+  return !element.closest('[hidden], [inert]') && element.getClientRects().length > 0
+    && getComputedStyle(element).visibility !== 'hidden';
+}
 
 /**
  * 这一层 Sheet 该不该吃掉这次 Escape。

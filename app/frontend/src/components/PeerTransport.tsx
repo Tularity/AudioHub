@@ -448,6 +448,10 @@ function PeerDevices({ peer }: { peer: PeerState }) {
                 version={device?.device_volume_version}
                 reported={reported}
                 pending={volumePending}
+                activity={{
+                  kind: r.io ? 'live' : r.published && r.observed ? 'idle' : 'pending',
+                  text: r.io ? t('device.inUse') : r.published && r.observed ? t('device.idle') : t('device.awaiting'),
+                }}
                 online={!!peer.online}
                 active={active}
                 inactiveNote={inactiveNote}
@@ -464,9 +468,6 @@ function PeerDevices({ peer }: { peer: PeerState }) {
                 )}
                 onRefresh={() => { void refreshPeers(); }}
               />
-              <span className={`dev-state ${r.io ? 'live' : r.published && r.observed ? 'idle' : 'pending'}`}>
-                {r.io ? t('device.inUse') : r.published && r.observed ? t('device.idle') : t('device.awaiting')}
-              </span>
             </div>
           );
         })}

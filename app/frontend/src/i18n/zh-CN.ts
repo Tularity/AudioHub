@@ -680,6 +680,12 @@ export const zhCN = {
   // 配对窗口开着时入口按钮的样子。一个悄悄开着的窗口必须在一级界面上看得见。
   'pair.armed': '配对中 · 剩余 {n} 秒',
   'pair.right.scan': '开始扫描',
+  'pair.selectDevice': '选择要配对或重新连接的设备。',
+  'pair.manual': '手动输入地址',
+  'pair.withDevice': '与 {name} 配对',
+  'pair.pinInstruction': '请输入对方设备 AudioHub 中显示的 PIN。',
+  'pair.noAddress': '未报告可连接的地址',
+  'pair.alreadyTrusted': '此设备已配对，将使用已有信任重新连接，无需输入 PIN。',
   'pair.right.stopScan': '停止扫描',
   // 扫描窗口会自己到点收工，剩余时间是状态。
   'pair.right.remain': '剩余 {n} 秒',
@@ -1258,6 +1264,8 @@ export const zhCN = {
   'perm.requesting': '请求中…',
   'perm.action.request': '授权',
   'perm.action.openSettings': '打开系统设置',
+  'perm.openInApp': '请在需要修改系统权限的设备上打开 AudioHub 应用。',
+  'perm.settingsOpenFailed': '未能打开系统设置，请手动前往：{manual}',
   'perm.action.checkSettings': '在系统设置中检查',
   'perm.status.granted': '已授权',
   'perm.status.denied': '未授权',

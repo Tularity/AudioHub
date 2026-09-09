@@ -18,11 +18,11 @@ import { useSyncExternalStore } from 'react';
 import { Help } from './Controls';
 import { PermissionRow } from './PermissionRow';
 import { Sheet } from './Sheet';
-import { toast } from './Toasts';
-import { openExternal, WIKI } from '../lib/external';
+import { WIKI } from '../lib/external';
+import { openPermissionSettings } from '../lib/permissionSettings';
 import { pendingSignature, writePermSeen } from '../lib/permIntro';
 import { t } from '../i18n';
-import { actionOf, permissionManual } from '../state/permissions';
+import { actionOf } from '../state/permissions';
 import type { PermissionState } from '../state/permissions';
 import { actions, getState, useStore } from '../state/store';
 import { refreshPermissions, rpc } from '../state/connection';
@@ -78,13 +78,9 @@ function PermissionsSheet({ auto }: { auto: boolean }) {
       }
       return;
     }
-    const manual = permissionManual(p);
-    if (p.settingsUrl) {
-      void openExternal(p.settingsUrl);
-      if (manual) toast(t('perm.settingsFallback', { manual }), 'info');
-    } else {
-      toast(manual ? t('perm.openManual', { manual }) : t('perm.noSettingsUrl'), 'warn');
-    }
+    actions.setPermissionBusy(p.id);
+    try { await openPermissionSettings(p); }
+    finally { actions.setPermissionBusy(null); }
   }
 
   const note = perms.list.length ? ''

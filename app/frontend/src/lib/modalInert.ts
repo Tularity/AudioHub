@@ -72,6 +72,7 @@ const registry = createInertRegistry<HTMLElement>();
 export function inertSiblings(
   modal: HTMLElement,
   except: readonly HTMLElement[] = [],
+  onlyEarlier = false,
 ): () => void {
   const host = modal.parentElement;
   if (!host) return () => undefined;
@@ -80,6 +81,8 @@ export function inertSiblings(
   const held = new Set<HTMLElement>();
   const acquire = (node: Element) => {
     if (!(node instanceof HTMLElement) || excluded.has(node) || held.has(node)) return;
+    // A Sheet owns the layers below it. A later nested Sheet must stay usable.
+    if (onlyEarlier && !(node.compareDocumentPosition(modal) & Node.DOCUMENT_POSITION_FOLLOWING)) return;
     held.add(node);
     registry.acquire(node);
   };

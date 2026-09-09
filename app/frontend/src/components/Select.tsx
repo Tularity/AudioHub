@@ -35,7 +35,7 @@
 // so its own rows stop it too — a card that navigated away mid-selection was
 // the original bug that put `onClick={(e) => e.stopPropagation()}` on the box.
 
-import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { Icon } from './Icon';
 import { useDismiss } from '../lib/dismiss';
 
@@ -97,7 +97,7 @@ export function Select<T extends string>({
   // `#view-root` scrolls, so an unflipped panel is not clipped — it just grows
   // the scroll height and the user has to scroll to see what they opened.
   const [up, setUp] = useState(false);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) return;
     const el = pop.current;
     const anchor = btn.current;

@@ -149,7 +149,7 @@ export const enUS = {
   'metric.latency.valueLower': '≥{ms} ms',
   'metric.latency.none': '—',
   'metric.latency.measuring': 'Measuring…',
-  'metric.latency.unsupported': 'Peer too old · No latency data',
+  'metric.latency.unsupported': 'Latency unavailable · Incomplete measurements',
   'metric.latency.grade.imperceptible': 'Instant',
   'metric.latency.grade.conversational': 'Good',
   'metric.latency.grade.noticeable': 'Delayed',

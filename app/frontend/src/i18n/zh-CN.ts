@@ -201,7 +201,7 @@ export const zhCN = {
   'metric.latency.valueLower': '≥{ms} ms',
   'metric.latency.none': '—',
   'metric.latency.measuring': '测量中…',
-  'metric.latency.unsupported': '对端版本较旧，无法测量',
+  'metric.latency.unsupported': '延迟不可用 · 测量数据不完整',
   'metric.latency.grade.imperceptible': '几乎无感',
   'metric.latency.grade.conversational': '可用于对话',
   'metric.latency.grade.noticeable': '明显延迟',

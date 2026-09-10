@@ -166,7 +166,7 @@ audiohub_upgrade_stop_done:
 
   ; Re-check after Tauri copied the payload and wrote its product registration.
   ; This proves there is still no junction for recursive ACL operations to
-  ; traverse and that a non-empty tree is registered to this product.
+  ; traverse and that any product registration matches this fixed directory.
   !insertmacro AudioHubValidateInstallDirectory
 
   ; NSIS normally copies uninstall.exe to %TEMP% and returns from the original

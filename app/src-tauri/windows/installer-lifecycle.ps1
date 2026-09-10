@@ -54,25 +54,19 @@ if ($Mode -eq 'ValidateInstallDir') {
 
     if (([IO.DirectoryInfo]$Root).GetFileSystemInfos().Count -ne 0) {
         $Product = Get-ItemProperty -LiteralPath 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AudioHub' -ErrorAction SilentlyContinue
-        $Registered = if ($Product) { Get-NormalizedPath ([string]$Product.InstallLocation) } else { '' }
-        if (-not $Product -or $Product.DisplayName -ne 'AudioHub' -or
-            -not [String]::Equals($Registered, $Root, [StringComparison]::OrdinalIgnoreCase)) {
-            # Name what is in the way. This check is the right one — an
-            # unregistered non-empty directory really might belong to something
-            # else — but on its own it told the user nothing they could act on,
-            # and the usual cause is leftovers a previous uninstall did not own
-            # (2026-08-16: hand-copied binaries and their .bak files blocked a
-            # reinstall with no clue as to which files mattered).
-            $Names = ([IO.DirectoryInfo]$Root).GetFileSystemInfos() |
-                Select-Object -First 12 -ExpandProperty Name
-            $List = ($Names -join ', ')
-            if (([IO.DirectoryInfo]$Root).GetFileSystemInfos().Count -gt 12) {
-                $List = "$List, ..."
+        if ($Product) {
+            $Registered = Get-NormalizedPath ([string]$Product.InstallLocation)
+            if ($Product.DisplayName -ne 'AudioHub' -or
+                -not [String]::Equals($Registered, $Root, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'the existing product registration does not match the fixed AudioHub directory'
             }
-            throw ("the dedicated AudioHub directory is non-empty but is not a registered " +
-                   "AudioHub installation. Remove $Root and run this installer again. " +
-                   "It currently contains: $List")
         }
+        # NSIS can remove the registration before its running uninstaller is
+        # deleted. A cancelled/failed install can leave files too. Missing
+        # registration is therefore a recoverable state, not proof of another
+        # product. The fixed-path and whole-tree reparse checks above still
+        # apply. Let the normal payload copy replace remnants; never execute
+        # a leftover uninstaller or purge user configuration to repair setup.
     }
     exit 0
 }

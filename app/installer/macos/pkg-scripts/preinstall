@@ -1,0 +1,54 @@
+#!/bin/sh
+# Close only executable images inside the bundle being replaced. The separately
+# authorized daemon runtime and HAL driver are not part of this transaction.
+set -eu
+
+fail() { echo "AudioHub preinstall: $*" >&2; exit 1; }
+[ "${3:-/}" = / ] || fail 'Install on the running macOS system volume.'
+APP='/Applications/AudioHub.app'
+for path in /Applications "$APP" "$APP/Contents" "$APP/Contents/MacOS" \
+    "$APP/Contents/Info.plist" "$APP/Contents/MacOS/audiohub-app" \
+    "$APP/Contents/MacOS/audiohubd" "$APP/Contents/MacOS/audiohub"; do
+    [ ! -L "$path" ] || fail "Refusing a symbolic link: $path"
+done
+if [ -e "$APP" ]; then
+    identifier=$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$APP/Contents/Info.plist" 2>/dev/null) \
+        || fail 'The existing application has no readable bundle identifier.'
+    [ "$identifier" = com.audiohub.app ] || fail 'The existing bundle is not AudioHub.'
+fi
+
+installed_pids() {
+    /bin/ps -ww -axo pid=,comm= | /usr/bin/awk -v prefix="$APP/Contents/MacOS/" '
+        $2 == prefix "audiohub-app" || $2 == prefix "audiohubd" ||
+        $2 == prefix "audiohub" { print $1 }
+    '
+}
+
+signal_installed() {
+    for pid in $(installed_pids); do
+        # Revalidate each PID immediately before signalling it.
+        executable=$(/bin/ps -ww -p "$pid" -o comm= 2>/dev/null || true)
+        case "$executable" in
+            "$APP/Contents/MacOS/audiohub-app"|"$APP/Contents/MacOS/audiohubd"|"$APP/Contents/MacOS/audiohub")
+                echo "AudioHub preinstall: $1 pid $pid"
+                /bin/kill "-$1" "$pid" 2>/dev/null || true
+                ;;
+        esac
+    done
+}
+
+wait_for_exit() {
+    count=0
+    while [ -n "$(installed_pids)" ]; do
+        [ "$count" -lt "$1" ] || return 1
+        /bin/sleep 0.25
+        count=$((count + 1))
+    done
+}
+
+signal_installed TERM
+if ! wait_for_exit 32; then
+    signal_installed KILL
+    wait_for_exit 12 || fail 'An old AudioHub process is still running; no payload was replaced.'
+fi
+exit 0

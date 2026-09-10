@@ -136,7 +136,12 @@ app_args=(
   --identifier com.audiohub.app.pkg
   --version "$VERSION"
   --component-plist "$COMPONENTS"
+  --scripts "$WORK/scripts"
 )
+# Do not enable the historical app-scripts directory: its service installer is
+# outside the App-only authorization boundary. Stage exactly this one hook.
+/bin/mkdir "$WORK/scripts"
+/usr/bin/install -m 0755 "$ROOT/app/installer/macos/pkg-scripts/preinstall" "$WORK/scripts/preinstall"
 if [[ -n "${AUDIOHUB_INSTALLER_IDENTITY:-}" ]]; then
   app_args+=(--sign "$AUDIOHUB_INSTALLER_IDENTITY")
 fi
@@ -200,15 +205,7 @@ done < "$PAYLOAD_LIST"
 
 EXPANDED="$WORK/expanded"
 /usr/sbin/pkgutil --expand-full "$CANDIDATE" "$EXPANDED"
-if /usr/bin/find "$EXPANDED" -type d -name Scripts -print -quit | /usr/bin/grep -q .; then
-  print -u2 -- "final package contains lifecycle scripts; it must install only the App"
-  exit 1
-fi
-if /usr/bin/find "$EXPANDED" -type f -name PackageInfo -exec /usr/bin/grep -El '<scripts>|<relocate>' {} + \
-  | /usr/bin/grep -q .; then
-  print -u2 -- "final package contains scripts or a relocatable App rule"
-  exit 1
-fi
+/bin/zsh "$ROOT/scripts/verify-macos-app-pkg.sh" "$EXPANDED"
 EXPANDED_APP="$EXPANDED/AudioHubApp.pkg/Payload/AudioHub.app"
 [[ -d "$EXPANDED_APP" ]] || { print -u2 -- "expanded package has no AudioHub.app"; exit 1; }
 /usr/bin/codesign --verify --deep --strict "$EXPANDED_APP" \

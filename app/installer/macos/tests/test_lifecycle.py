@@ -21,6 +21,8 @@ DMG_BUILDER = ROOT / "scripts/build-macos-dmg.sh"
 UNINSTALLER = ROOT / "app/installer/macos/uninstall.applescript"
 DRIVER_INSTALLER = ROOT / "app/src-tauri/src/driver_install.rs"
 DRIVER_POSTINSTALL = ROOT / "app/installer/macos/driver-scripts/postinstall"
+APP_PREINSTALL = ROOT / "app/installer/macos/pkg-scripts/preinstall"
+PKG_VERIFIER = ROOT / "scripts/verify-macos-app-pkg.sh"
 LIFECYCLE_LOCK = "/var/run/com.audiohub.lifecycle.lock"
 
 
@@ -89,7 +91,7 @@ class LifecycleStaticTests(unittest.TestCase):
         self.assertNotIn("PKG_PREINSTALL", dmg)
         self.assertNotIn("PKG_POSTINSTALL", dmg)
         self.assertNotIn("app-scripts", dmg)
-        self.assertIn('-type d -name Scripts', dmg)
+        self.assertIn('verify-macos-app-pkg.sh', dmg)
         self.assertIn("installer must contain only AudioHub.app", dmg)
         self.assertIn('ditto --norsrc --noextattr --noacl --noqtn', dmg)
         self.assertIn('"$PKG" "$STAGE/Install AudioHub.pkg"', dmg)
@@ -120,10 +122,10 @@ class LifecycleStaticTests(unittest.TestCase):
         self.assertIn('hdiutil verify "$CANDIDATE"', self.dmg_builder)
         self.assertIn('notarytool submit "$CANDIDATE"', self.dmg_builder)
 
-    def test_pkg_builder_has_an_app_only_scriptless_payload_contract(self) -> None:
+    def test_pkg_builder_has_an_app_only_payload_and_shutdown_preinstall(self) -> None:
         source = self.pkg_builder
-        self.assertNotIn("--scripts", source)
-        self.assertNotIn("app-scripts", source)
+        self.assertIn('--scripts "$WORK/scripts"', source)
+        self.assertIn('pkg-scripts/preinstall', source)
         self.assertIn('--install-location /Applications', source)
         self.assertIn('--component-plist "$COMPONENTS"', source)
         self.assertIn('--norsrc --noextattr --noacl --noqtn', source)
@@ -131,8 +133,7 @@ class LifecycleStaticTests(unittest.TestCase):
         self.assertIn('.|./AudioHub.app|./AudioHub.app/*)', source)
         self.assertIn('._*|*/._*', source)
         self.assertIn('pkgutil --expand-full "$CANDIDATE"', source)
-        self.assertIn('-type d -name Scripts', source)
-        self.assertIn("<scripts>|<relocate>", source)
+        self.assertIn('verify-macos-app-pkg.sh', source)
         self.assertIn('codesign --verify --deep --strict "$EXPANDED_APP"', source)
 
         with APP_COMPONENTS.open("rb") as stream:
@@ -141,6 +142,40 @@ class LifecycleStaticTests(unittest.TestCase):
         self.assertEqual(components[0]["RootRelativeBundlePath"], "AudioHub.app")
         self.assertIs(components[0]["BundleIsRelocatable"], False)
         self.assertIs(components[0]["BundleHasStrictIdentifier"], True)
+
+    def test_package_verifier_rejects_additional_or_modified_lifecycle_hooks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="audiohub-pkg-check-") as tmp:
+            component = Path(tmp) / "AudioHubApp.pkg"
+            scripts = component / "Scripts"
+            scripts.mkdir(parents=True)
+            hook = scripts / "preinstall"
+            original = APP_PREINSTALL.read_bytes()
+            hook.write_bytes(original)
+            (component / "PackageInfo").write_text(
+                '<pkg-info relocatable="false"><relocate/><scripts><preinstall file="./preinstall"/></scripts></pkg-info>'
+            )
+            def verify() -> int:
+                return subprocess.run(["/bin/zsh", str(PKG_VERIFIER), tmp],
+                                      capture_output=True).returncode
+            self.assertEqual(verify(), 0)
+            (scripts / "postinstall").write_text("#!/bin/sh\nexit 0\n")
+            self.assertNotEqual(verify(), 0)
+            (scripts / "postinstall").unlink()
+            hook.write_bytes(original + b"\necho modified\n")
+            self.assertNotEqual(verify(), 0)
+            hook.write_bytes(original)
+            (component / "PackageInfo").write_text(
+                '<pkg-info relocatable="false"><relocate><bundle id="com.audiohub.app"/></relocate>'
+                '<scripts><preinstall file="./preinstall"/></scripts></pkg-info>'
+            )
+            self.assertNotEqual(verify(), 0)
+
+    def test_preinstall_refuses_another_volume_before_process_actions(self) -> None:
+        subprocess.run(["/bin/sh", "-n", str(APP_PREINSTALL)], check=True)
+        result = subprocess.run(["/bin/sh", str(APP_PREINSTALL), "unused.pkg",
+                                 "/Applications", "/Volumes/OtherSystem"], capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"running macOS system volume", result.stderr)
 
     def test_daemon_installer_is_fixed_argument_free_and_never_resigns_the_app(self) -> None:
         source = self.daemon_installer

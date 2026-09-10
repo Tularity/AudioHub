@@ -75,21 +75,10 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# A DMG is one release unit: never wrap an older, script-bearing or relocatable
-# PKG with a freshly compiled uninstaller. The outer installer has one job:
-# place AudioHub.app in /Applications. Service and driver setup are explicit
-# App actions after launch, so PackageKit must have no hidden lifecycle hooks.
+# The only lifecycle hook closes old images in the App bundle before copying.
+# Service and driver setup remain explicit App actions after launch.
 /usr/sbin/pkgutil --expand-full "$PKG" "$WORK/pkg-preflight"
-if /usr/bin/find "$WORK/pkg-preflight" -type d -name Scripts -print -quit \
-  | /usr/bin/grep -q .; then
-  print -u2 -- "installer package contains lifecycle scripts; rebuild the PKG"
-  exit 1
-fi
-if /usr/bin/find "$WORK/pkg-preflight" -type f -name PackageInfo \
-  -exec /usr/bin/grep -El '<scripts>|<relocate>' {} + | /usr/bin/grep -q .; then
-  print -u2 -- "installer package contains scripts or relocate metadata; rebuild the PKG"
-  exit 1
-fi
+/bin/zsh "$ROOT/scripts/verify-macos-app-pkg.sh" "$WORK/pkg-preflight"
 PKG_PAYLOAD="$WORK/pkg-preflight-payload-files"
 /usr/sbin/pkgutil --payload-files "$PKG" >"$PKG_PAYLOAD"
 APP_ROOT_SEEN=0

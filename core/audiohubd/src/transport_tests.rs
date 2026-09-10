@@ -206,7 +206,7 @@ impl Node {
             .iter()
             .find_map(|e| {
                 e.tx.as_ref()
-                    .map(|t| t.rung.load(std::sync::atomic::Ordering::Relaxed))
+                    .map(|t| t.committed_rung.load(std::sync::atomic::Ordering::Relaxed))
             })
     }
 

@@ -12,3 +12,4 @@ pub(crate) mod ptp;
 #[cfg(target_os = "macos")]
 pub(crate) mod ptp_macos;
 pub(crate) mod setup;
+mod timer;

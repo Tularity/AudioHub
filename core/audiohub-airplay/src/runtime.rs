@@ -1704,6 +1704,12 @@ impl PcmOutput for Ap2Sink {
     fn flush(&mut self) {
         self.0.flush();
     }
+
+    fn output_timing(&self) -> Option<crate::bus::OutputTiming> {
+        let mut timing = self.0.shared.bus.output_timing()?;
+        timing.lead = timing.lead.checked_add(self.0.converter.delay())?;
+        Some(timing)
+    }
 }
 
 async fn forward_ap2(
@@ -1954,6 +1960,18 @@ mod tests {
         assert_eq!(read.copied, 1);
         assert_eq!(read.session_id, Some(ingress.session_id));
         assert_eq!(out, [[0.5, -0.5]]);
+    }
+
+    #[test]
+    fn sink_timing_counts_its_filter_delay_once_before_and_after_flush() {
+        let shared = test_shared();
+        shared.bus.publish_output_timing(7, Duration::from_millis(25), false);
+        let mut sink = Ap2Sink(PcmIngress::new_ap2(Arc::clone(&shared), 92, test_peer()));
+        let expected = Duration::from_millis(25) + Duration::from_secs_f64(64.0 / 44_100.0);
+        let timing = sink.output_timing().unwrap();
+        assert_eq!((timing.epoch, timing.lead), (7, expected));
+        sink.flush();
+        assert_eq!(sink.output_timing().unwrap().lead, expected);
     }
 
     fn remote_state(stream_id: u64, dacp_id: &str, active_remote: &str) -> Ap2RemoteControlState {

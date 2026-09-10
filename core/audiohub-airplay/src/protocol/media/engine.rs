@@ -65,6 +65,7 @@ const TIMING_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) trait PcmOutput: Send {
     fn write(&mut self, samples: &[i16], telemetry_token: crate::telemetry::OperationToken);
     fn flush(&mut self);
+    fn output_timing(&self) -> Option<crate::bus::OutputTiming>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1752,6 +1753,7 @@ mod tests {
     struct TestOutput(Arc<Mutex<OutputState>>);
 
     impl PcmOutput for TestOutput {
+        fn output_timing(&self) -> Option<crate::bus::OutputTiming> { None }
         fn write(&mut self, samples: &[i16], _telemetry_token: crate::telemetry::OperationToken) {
             let mut state = self.0.lock().unwrap();
             state.writes += 1;

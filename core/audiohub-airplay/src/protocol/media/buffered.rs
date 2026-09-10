@@ -64,6 +64,10 @@ const MAX_BLOCKS_PER_PUMP: usize = 64;
 const MAX_PENDING_PTP_SAMPLES: usize = 32;
 const MAX_CLOCKED_FUTURE: Duration = Duration::from_secs(30);
 const MAX_CLOCKED_LATENESS: Duration = Duration::from_millis(500);
+// Once the local output is modelled, an entire mixer quantum missed before
+// scheduling is already stale. Keep the wider bound only for legacy fallback
+// and for skipping expensive decoding across a long outage.
+const MAX_SYNCHRONIZED_LATENESS: Duration = Duration::from_millis(10);
 // The default PCM bus primes five 10 ms frames. Feed it this far ahead of the
 // network presentation deadline so the platform output starts on the anchor.
 const PCM_OUTPUT_LEAD: Duration = Duration::from_millis(50);
@@ -548,6 +552,7 @@ struct Type103Engine {
     output: Box<dyn PcmOutput>,
     commands: mpsc::Receiver<BufferedCommand>,
     playing: bool,
+    playback_timer: Option<super::timer::PlaybackTimer>,
     flush_boundary: Option<WirePoint>,
     deferred_flushes: Vec<DeferredFlush>,
     last_sequence: Option<u32>,
@@ -562,6 +567,9 @@ struct Type103Engine {
     queued_wire_bytes: usize,
     ready_frame: Option<ReadyFrame>,
     playback_anchor: Option<PlaybackAnchor>,
+    output_lead: Duration,
+    output_epoch: Option<u64>,
+    output_started: bool,
     ptp_source: PtpClockSource,
     ptp_samples: broadcast::Receiver<PtpClockSample>,
     pending_ptp_samples: VecDeque<PtpClockSample>,
@@ -570,6 +578,7 @@ struct Type103Engine {
     ptp_clock_logged: bool,
     authenticated_block_seen: bool,
     decoded_block_seen: bool,
+    decoder_needs_reset: bool,
     /// Blocks discarded since the last frame actually delivered.
     ///
     /// A discard used to cost a decode, a `decoder.reset()` and an
@@ -643,6 +652,7 @@ impl Type103Engine {
             output,
             commands,
             playing: false,
+            playback_timer: None,
             flush_boundary: None,
             deferred_flushes: Vec::with_capacity(MAX_DEFERRED_FLUSHES),
             last_sequence: None,
@@ -653,6 +663,9 @@ impl Type103Engine {
             queued_wire_bytes: 0,
             ready_frame: None,
             playback_anchor: None,
+            output_lead: PCM_OUTPUT_LEAD,
+            output_epoch: None,
+            output_started: false,
             ptp_source: prepared.ptp_source,
             ptp_samples: prepared.ptp_samples,
             pending_ptp_samples: VecDeque::with_capacity(MAX_PENDING_PTP_SAMPLES),
@@ -661,6 +674,7 @@ impl Type103Engine {
             ptp_clock_logged: false,
             authenticated_block_seen: false,
             decoded_block_seen: false,
+            decoder_needs_reset: false,
             late_run_blocks: 0,
             late_run_first: None,
             clock_unavailable_since: None,
@@ -680,6 +694,33 @@ impl Type103Engine {
         }
         self.sync_diagnostic_events += 1;
         true
+    }
+
+    /// Latch per output instance and resume. Continuously feeding the current
+    /// queue depth back into the release deadline would chase our own buffering.
+    fn refresh_output_lead(&mut self) {
+        let Some(timing) = self.output.output_timing() else { return; };
+        let same_output = self.output_epoch == Some(timing.epoch);
+        if same_output && self.output_started { return; }
+        if timing.lead > Duration::from_secs(2) { return; }
+        let replacement = !same_output && (self.output_epoch.is_some() || self.output_started);
+        self.output_epoch = Some(timing.epoch);
+        self.output_lead = timing.lead;
+        if replacement {
+            // A different output instance has a different tail and an empty
+            // device queue. Discard only already-staged bus PCM, not the
+            // authenticated media or decoder state, then reschedule from RTP.
+            self.output.flush();
+            self.output_started = false;
+            self.sync_schedule_pending = true;
+            self.sync_write_pending = true;
+            self.sync_last_deadline = None;
+        }
+        if !same_output && self.take_sync_diagnostic() {
+            log::info!(target: "audiohub_airplay::airplay2",
+                "AirPlay sync_diag event=output_timing peer={} utc_ns={} output_epoch={} lead_ns={} estimated={} replacement={}",
+                self.peer_ip, sync_utc_ns(), timing.epoch, timing.lead.as_nanos(), timing.estimated, replacement);
+        }
     }
 
     async fn run(&mut self) -> RunExit {
@@ -848,7 +889,9 @@ impl Type103Engine {
                     }
                 }
                 _ = time::sleep_until(sleep_deadline), if has_deadline => {
-                    self.deliver_ready_frame();
+                    // Waking does not prove the old deadline is still valid.
+                    // Loop back through clock/epoch/lateness validation before
+                    // handing PCM to the output, including after a CPU stall.
                 }
                 sample = self.ptp_samples.recv() => {
                     self.observe_ptp_sample(sample);
@@ -927,6 +970,11 @@ impl Type103Engine {
                     Ok(())
                 };
                 if result.is_ok() {
+                    if playing {
+                        self.playback_timer.get_or_insert_with(super::timer::PlaybackTimer::acquire);
+                    } else {
+                        self.playback_timer = None;
+                    }
                     self.sync_anchor_generation = self.sync_anchor_generation.wrapping_add(1);
                     self.sync_schedule_pending = playing;
                     self.sync_write_pending = playing;
@@ -979,6 +1027,7 @@ impl Type103Engine {
                             dropped,
                         );
                         self.playing = false;
+                        self.playback_timer = None;
                         self.playback_anchor = None;
                         self.flush_boundary = None;
                         self.deferred_flushes.clear();
@@ -1005,6 +1054,7 @@ impl Type103Engine {
                             dropped,
                         );
                         self.playing = false;
+                        self.playback_timer = None;
                         self.playback_anchor = None;
                         self.flush_boundary = (!boundary_reached).then_some(until);
                         self.deferred_flushes.clear();
@@ -1079,6 +1129,7 @@ impl Type103Engine {
 
     fn reset_decoded_output(&mut self) {
         self.decoder.reset();
+        self.decoder_needs_reset = false;
         self.output.flush();
     }
 
@@ -1104,6 +1155,12 @@ impl Type103Engine {
                 "rate anchor network time exceeds the supported timeline",
             )
         })?;
+        if !self.playing {
+            self.output_epoch = None;
+            self.output_lead = PCM_OUTPUT_LEAD;
+            self.output_started = false;
+        }
+        self.refresh_output_lead();
         self.playback_anchor = Some(PlaybackAnchor {
             timeline_id,
             remote_time_ns,
@@ -1372,6 +1429,7 @@ impl Type103Engine {
                 continue;
             }
             if self.timestamp_is_late(block.header.timestamp, block.telemetry_token) {
+                self.decoder_needs_reset = true;
                 crate::telemetry::record_predecode_late_drop(
                     block.telemetry_token,
                     crate::telemetry::MediaKind::Buffered,
@@ -1381,6 +1439,10 @@ impl Type103Engine {
                 }
                 self.late_run_blocks = self.late_run_blocks.saturating_add(1);
                 continue;
+            }
+            if self.decoder_needs_reset {
+                self.decoder.reset();
+                self.decoder_needs_reset = false;
             }
             let pcm = match self.decoder.decode(block.header.timestamp, &block.payload) {
                 Ok(pcm) => {
@@ -1443,6 +1505,7 @@ impl Type103Engine {
         timestamp: u32,
         telemetry_token: crate::telemetry::OperationToken,
     ) -> Option<std::time::Instant> {
+        self.refresh_output_lead();
         let Some(anchor) = self.playback_anchor else {
             crate::telemetry::record_scheduler_wait(
                 telemetry_token,
@@ -1476,7 +1539,7 @@ impl Type103Engine {
             ),
         };
         match deadline {
-            Ok(deadline) => Some(deadline.checked_sub(PCM_OUTPUT_LEAD).unwrap_or(now)),
+            Ok(deadline) => Some(deadline.checked_sub(self.output_lead).unwrap_or(now)),
             Err(error) => {
                 // `ready_schedule` owns per-frame deadline telemetry. This
                 // helper is also used by predecode and periodic lead probes;
@@ -1535,6 +1598,7 @@ impl Type103Engine {
     }
 
     fn ready_schedule(&mut self) -> ReadySchedule {
+        self.refresh_output_lead();
         let Some((ready_timestamp, telemetry_token)) = self
             .ready_frame
             .as_ref()
@@ -1580,7 +1644,12 @@ impl Type103Engine {
         match deadline {
             Ok(deadline) => {
                 self.note_clock_available();
-                let deadline = deadline.checked_sub(PCM_OUTPUT_LEAD).unwrap_or(now);
+                let deadline = deadline.checked_sub(self.output_lead).unwrap_or(now);
+                let max_lateness = if self.output_epoch.is_some() {
+                    MAX_SYNCHRONIZED_LATENESS
+                } else {
+                    MAX_CLOCKED_LATENESS
+                };
                 if deadline > now + MAX_CLOCKED_FUTURE {
                     crate::telemetry::record_future_safety_wait(
                         telemetry_token,
@@ -1591,7 +1660,7 @@ impl Type103Engine {
                         "AirPlay 2 PTP media deadline exceeded the 30 second safety limit"
                     );
                     ReadySchedule::Wait
-                } else if now.saturating_duration_since(deadline) <= MAX_CLOCKED_LATENESS {
+                } else if now.saturating_duration_since(deadline) <= max_lateness {
                     if self.sync_write_pending {
                         self.sync_last_deadline = Some((ready_timestamp, deadline));
                     }
@@ -1607,7 +1676,7 @@ impl Type103Engine {
                                 target: "audiohub_airplay::airplay2",
                                 "AirPlay sync_diag event=first_scheduled peer={} generation={} utc_ns={} rtp_time={} submit_lead_ns={} output_lead_ns={} source={:?}",
                                 self.peer_ip, self.sync_anchor_generation, sync_utc_ns(),
-                                ready_timestamp, submit_lead_ns, PCM_OUTPUT_LEAD.as_nanos(), deadline_source,
+                                ready_timestamp, submit_lead_ns, self.output_lead.as_nanos(), deadline_source,
                             );
                         }
                     }
@@ -1703,10 +1772,9 @@ impl Type103Engine {
                     ready.timestamp,
                     self.last_clock_outage_ms
                 );
-                // One discontinuity, one decoder reset. The output bus keeps
-                // what it already holds: flushing it here is what turned a skip
-                // into a collapsed buffer.
-                self.decoder.reset();
+                // Predecode skips reset history before the next decode.
+                // Decoded-but-late frames already advanced that history; a
+                // reset here would corrupt the following overlap window.
             }
             crate::telemetry::record_media_output(
                 ready.telemetry_token,
@@ -1717,7 +1785,10 @@ impl Type103Engine {
             self.sync_write_pending = false;
             let started = sync_write.then(|| (std::time::Instant::now(), sync_utc_ns()));
             self.output.write(&ready.pcm, ready.telemetry_token);
+            self.output_started = true;
             if let Some((started, write_utc_ns)) = started {
+                let peak_i16 = ready.pcm.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+                let first_signal_sample = ready.pcm.iter().position(|s| s.unsigned_abs() > 8);
                 let submit_lateness_ns = self
                     .sync_last_deadline
                     .filter(|(timestamp, _)| *timestamp == ready.timestamp)
@@ -1730,9 +1801,9 @@ impl Type103Engine {
                     });
                 log::info!(
                     target: "audiohub_airplay::airplay2",
-                    "AirPlay sync_diag event=first_output_write peer={} generation={} utc_ns={} rtp_time={} samples={} submit_lateness_ns={:?} write_duration_ns={}",
+                    "AirPlay sync_diag event=first_output_write peer={} generation={} utc_ns={} rtp_time={} samples={} submit_lateness_ns={:?} output_lead_ns={} write_duration_ns={} peak_i16={} first_signal_sample={:?}",
                     self.peer_ip, self.sync_anchor_generation, write_utc_ns, ready.timestamp,
-                    ready.pcm.len(), submit_lateness_ns, started.elapsed().as_nanos(),
+                    ready.pcm.len(), submit_lateness_ns, self.output_lead.as_nanos(), started.elapsed().as_nanos(), peak_i16, first_signal_sample,
                 );
             }
         }
@@ -2590,6 +2661,7 @@ mod tests {
     struct OutputState {
         writes: Vec<Vec<i16>>,
         flushes: usize,
+        timing: Option<crate::bus::OutputTiming>,
     }
 
     struct TestOutput(Arc<Mutex<OutputState>>);
@@ -2601,6 +2673,10 @@ mod tests {
 
         fn flush(&mut self) {
             self.0.lock().unwrap().flushes += 1;
+        }
+
+        fn output_timing(&self) -> Option<crate::bus::OutputTiming> {
+            self.0.lock().unwrap().timing
         }
     }
 
@@ -2683,6 +2759,20 @@ mod tests {
         let state = Arc::new(Mutex::new(OutputState::default()));
         let (_tx, rx) = mpsc::channel(4);
         let mut engine = Type103Engine::new(prepared, Box::new(TestOutput(Arc::clone(&state))), rx);
+        state.lock().unwrap().timing = Some(crate::bus::OutputTiming {
+            epoch: 1, lead: Duration::from_millis(120), estimated: true,
+        });
+        engine.refresh_output_lead();
+        assert_eq!(engine.output_lead, Duration::from_millis(120));
+        engine.output_started = true;
+        state.lock().unwrap().timing.as_mut().unwrap().lead = Duration::from_millis(200);
+        engine.refresh_output_lead();
+        assert_eq!(engine.output_lead, Duration::from_millis(120), "must not chase the current queue depth");
+        state.lock().unwrap().timing.as_mut().unwrap().epoch = 2;
+        engine.refresh_output_lead();
+        assert_eq!(engine.output_lead, Duration::from_millis(200));
+        assert_eq!(state.lock().unwrap().flushes, 1);
+        assert!(!engine.output_started);
         let token = crate::telemetry::operation_token();
         let (reply, result) = oneshot::channel();
         engine.apply_command(BufferedCommand::SetRate {
@@ -2692,6 +2782,7 @@ mod tests {
         });
         result.await.unwrap().unwrap();
         assert_eq!(engine.sync_anchor_generation, 1);
+        assert!(engine.playback_timer.is_some());
         assert!(engine.sync_schedule_pending && engine.sync_write_pending);
 
         let pcm = vec![123, -456, 789, -321];
@@ -2740,6 +2831,7 @@ mod tests {
         result.await.unwrap().unwrap();
         assert!(!engine.sync_schedule_pending && !engine.sync_write_pending);
         assert!(!engine.playing);
+        assert!(engine.playback_timer.is_none());
         engine.sync_diagnostic_events = 64;
         assert!(!engine.take_sync_diagnostic());
     }
@@ -2873,6 +2965,60 @@ mod tests {
         );
         drop(guard);
         assert!(!handle.is_finished());
+        handle.abort().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn synchronized_start_drops_late_pcm_but_preserves_decoder_history() {
+        let (ports, handle, state, ptp, peer, base) = controlled_harness().await;
+        state.lock().unwrap().timing = Some(crate::bus::OutputTiming {
+            epoch: 1, lead: Duration::from_millis(120), estimated: true,
+        });
+        let mut sender = TcpStream::connect((Ipv4Addr::LOCALHOST, ports.data_port)).await.unwrap();
+        handle.set_rate(test_rate(true)).await.unwrap();
+        publish_ptp_burst(&ptp, peer, base).await;
+        let timestamp = ((base.elapsed().as_nanos() + 250_000_000)
+            * u128::from(BUFFERED_SAMPLE_RATE) / 1_000_000_000) as u32;
+        sender.write_all(&framed(&make_packet(1, 0, OWNED_AAC_FRAME_HEX, [201; 8]))).await.unwrap();
+        sender.write_all(&framed(&make_packet(2, timestamp, OWNED_AAC_FRAME_HEX, [202; 8]))).await.unwrap();
+        wait_for(|| !state.lock().unwrap().writes.is_empty()).await;
+        let frame = hex::decode(OWNED_AAC_FRAME_HEX).unwrap();
+        let mut reference = AacLcDecoder::new().unwrap();
+        reference.decode(0, &frame).unwrap();
+        let expected = reference.decode(timestamp, &frame).unwrap();
+        let next_timestamp = timestamp + SAMPLES_PER_AAC_FRAME as u32;
+        let next_expected = reference.decode(next_timestamp, &frame).unwrap();
+        sender.write_all(&framed(&make_packet(3, next_timestamp, OWNED_AAC_FRAME_HEX, [203; 8]))).await.unwrap();
+        wait_for(|| state.lock().unwrap().writes.len() >= 2).await;
+        {
+            let output = state.lock().unwrap();
+            assert_eq!(output.writes.len(), 2, "already-late first frame must not be played");
+            assert_eq!(output.writes[0], expected);
+            assert_eq!(output.writes[1], next_expected, "delivery must not reset AAC overlap history");
+            assert_eq!(output.flushes, 0, "discarded preroll must not flush already-staged output");
+        }
+        handle.abort().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delayed_timer_wakeup_rechecks_pcm_lateness() {
+        let (ports, handle, state, ptp, peer, base) = controlled_harness().await;
+        state.lock().unwrap().timing = Some(crate::bus::OutputTiming {
+            epoch: 1, lead: Duration::from_millis(120), estimated: true,
+        });
+        let mut sender = TcpStream::connect((Ipv4Addr::LOCALHOST, ports.data_port)).await.unwrap();
+        handle.set_rate(test_rate(true)).await.unwrap();
+        publish_ptp_burst(&ptp, peer, base).await;
+        let timestamp = ((base.elapsed().as_nanos() + 200_000_000)
+            * u128::from(BUFFERED_SAMPLE_RATE) / 1_000_000_000) as u32;
+        sender.write_all(&framed(&make_packet(1, timestamp, OWNED_AAC_FRAME_HEX, [211; 8]))).await.unwrap();
+        time::sleep(Duration::from_millis(25)).await;
+        assert!(state.lock().unwrap().writes.is_empty());
+        // Deliberately stall this single-threaded test runtime across the
+        // armed deadline. The media task must not publish its stale ready PCM.
+        std::thread::sleep(Duration::from_millis(250));
+        time::sleep(Duration::from_millis(20)).await;
+        assert!(state.lock().unwrap().writes.is_empty(), "wakeup delivered a stale frame");
         handle.abort().await;
     }
 

@@ -80,7 +80,8 @@ use anyhow::{bail, Context, Result};
 use base64::prelude::*;
 
 use audiohub_core::audio::{self, DeviceChangeWatcher, DeviceKind};
-use audiohub_core::dsp::{self, InterleavedLinearResampler};
+use audiohub_core::dsp;
+use audiohub_core::fixed_rate::{FixedRateRx, DELAY_FRAMES as WIRE_DELAY_FRAMES};
 #[cfg(test)]
 use audiohub_core::latency::LatSource;
 use audiohub_core::latency::{DevLatency, DriftTracker, DropMode, StageDepth, StageId, StageSlot};
@@ -2555,9 +2556,8 @@ fn peer_window_median(win: &VecDeque<PeerReport>) -> Option<f64> {
 pub(crate) struct JbState {
     pub jb: JitterBuffer,
     pub channels: u8,
-    pub rs_rate: u32,
-    pub rs: Option<InterleavedLinearResampler>,
-    pub rs_last: [f32; 2], // last decoded frame; seeds the next resampler
+    pub rs: FixedRateRx,
+    pub rs_frame_seq: Option<u32>,
     pub jit_win: Vec<f32>, // per-packet transit deltas (ms) for p95
     pub pushes: u32,
     pub last_dropped: u64, // starvation detector (expected-seq raced ahead)
@@ -2700,6 +2700,7 @@ pub(crate) struct RxCell {
     /// **不许兜底成 `S16`**：位深进阶梯之前线上恒为 16 位，所以那个兜底今天
     /// 碰巧是对的，而它正是遥测里 `wire_depth` 这个字段要消灭的那种猜测。
     pub last_depth: Option<audiohub_core::dsp::WireDepth>,
+    last_format_seq: Option<u32>,
     /// 包头声明的格式与载荷长度对不上、因而被丢弃的包数（lifetime）。
     ///
     /// **必须单独计数**：`DecodeStats.ragged` 对这件事完全免疫（一帧的三个合法
@@ -2743,6 +2744,17 @@ pub(crate) struct IntervalStats {
 }
 
 impl RxCell {
+    /// Commit metadata only for a validated, accepted ordinary PCM packet.
+    pub(crate) fn note_wire_format(&mut self, seq: u32, rate: u32, depth: audiohub_core::dsp::WireDepth) {
+        if self.last_format_seq.is_some_and(|previous| {
+            let distance = seq.wrapping_sub(previous);
+            distance == 0 || distance >= (1 << 31)
+        }) { return; }
+        self.last_format_seq = Some(seq);
+        self.last_rate = rate;
+        self.last_depth = Some(depth);
+    }
+
     pub(crate) fn note_jitter(&mut self, jit_ms: f32) {
         self.iv_jit_sum += jit_ms as f64;
         self.iv_jit_n += 1;
@@ -2898,9 +2910,8 @@ impl RxStream {
             jbs: Mutex::new(JbState {
                 jb: JitterBuffer::with_tuning_channels(2, jb_tuning, channels),
                 channels,
-                rs_rate: 48000,
-                rs: None,
-                rs_last: [0.0; 2],
+                rs: FixedRateRx::new(channels, 48_000),
+                rs_frame_seq: None,
                 jit_win: Vec::new(),
                 pushes: 0,
                 last_dropped: 0,
@@ -2922,6 +2933,7 @@ impl RxStream {
                 first: None,
                 last_rate: 48000,
                 last_depth: None,
+                last_format_seq: None,
                 format_mismatch: 0,
                 auth_failed: 0,
                 prev_transit: None,
@@ -2986,6 +2998,8 @@ pub(crate) struct TxShared {
     pub(crate) media_revoked: AtomicBool,
     pub(crate) media_failure: Mutex<Option<String>>,
     pub rung: AtomicU32,
+    /// Actual wire format, published by the transmitter after prefiltering.
+    pub committed_rung: AtomicU32,
     pub media_channels: AtomicU32,
     pub rung_changes: AtomicU32,
     pub sent_packets: AtomicU64,
@@ -3126,6 +3140,7 @@ impl TxShared {
             // 实测：写 0 时 `the_send_latency_lands_on_the_peers_buffer_and_
             // nowhere_local` 从 1.4 s 变成 25 s 甚至超时。
             rung: AtomicU32::new(top_rung),
+            committed_rung: AtomicU32::new(top_rung),
             media_channels: AtomicU32::new(1),
             rung_changes: AtomicU32::new(0),
             sent_packets: AtomicU64::new(0),
@@ -3162,6 +3177,7 @@ impl TxShared {
         contract.validate()?;
         self.media_channels.store(contract.channels() as u32, Ordering::Relaxed);
         self.rung.store(0, Ordering::Relaxed);
+        self.committed_rung.store(0, Ordering::Relaxed);
         self.spatial = Some(contract);
         Ok(self)
     }
@@ -3287,11 +3303,16 @@ pub(crate) fn dev_lats_snapshot(inner: &DaemonInner) -> devlats::DevLats {
 /// `device_listing_snapshot` **逐字相同**（两个方向相加）：任一方向的默认设备
 /// 变了都要重查，因为一条流的头和尾分别挂在两边。
 fn refresh_dev_lats(inner: &DaemonInner) -> devlats::DevLats {
+    let output_epoch = inner.dev_out_epoch.load(Ordering::Relaxed);
     let epoch = inner
         .dev_in_epoch
         .load(Ordering::Relaxed)
-        .wrapping_add(inner.dev_out_epoch.load(Ordering::Relaxed));
-    inner.dev_lat.read(epoch)
+        .wrapping_add(output_epoch);
+    let lats = inner.dev_lat.read(epoch);
+    let after = inner.dev_out_epoch.load(Ordering::Relaxed);
+    inner.airplay.update_output_device_latency(after,
+        if output_epoch == after { lats.output } else { audiohub_core::latency::DevLatency::unavailable() });
+    lats
 }
 
 pub(crate) struct StreamLat<'a> {
@@ -3587,16 +3608,18 @@ fn build_pipeline_from(
         // 级 6：抖动缓冲。用 **contiguous** 而不是 depth——乱序时 depth 把
         // 「洞之后的帧」也算进去，那些帧并不会以 100 帧/秒被放出来，拿它算驻留
         // 时间会高估（规格 §7.2 R10）。
-        let (contiguous, target) = {
+        let (contiguous, target, conversion_delay) = {
             let st = lk(&rx.jbs);
-            (st.jb.contiguous(), st.jb.target())
+            (st.jb.contiguous(), st.jb.target(), if st.rs_frame_seq.is_some() { WIRE_DELAY_FRAMES as u32 } else { 0 })
         };
         let post = lk(&rx.post).depth();
         let jb = StageDepth {
             id: StageId::JitterBuf,
-            samples: contiguous * F48_PER_FRAME,
+            // The wire-rate reconstruction filter immediately precedes this
+            // queue; its group delay remains even when the queue is empty.
+            samples: contiguous * F48_PER_FRAME + conversion_delay,
             // 硬上限是 target+6 帧（`pop` 里的修剪条件），不是某个固定常数。
-            capacity: (target + 6) * F48_PER_FRAME,
+            capacity: (target + 6) * F48_PER_FRAME + conversion_delay,
             rate: 48_000,
             // JB 的 dropped 是**帧**计数（late arrivals + catch-up drops），
             // 与本结构的「样本」单位不同，换算过去会造成量纲错觉；它以
@@ -4311,11 +4334,10 @@ fn build_session_info_with(
     }
     if let Some(tx) = &e.tx {
         s.sent_packets = tx.sent_packets.load(Ordering::Relaxed);
-        s.rung = tx.rung.load(Ordering::Relaxed);
+        s.rung = tx.committed_rung.load(Ordering::Relaxed);
         s.rung_changes = tx.rung_changes.load(Ordering::Relaxed);
-        // 发送侧的线上格式就是格号对应的那一档——`engine.rs` 的 tx_loop 用同一个
-        // `rung_format(tx.rung)` 既建重采样器、又写进包头（采样率 + codec），
-        // 所以这里没有第二个真值源。
+        // A requested downshift prefilters one old-rate packet before the
+        // transmitter commits the new header. Report the actual wire format.
         let f = audiohub_net::media::rung_format(s.rung);
         wire_rate = Some(f.rate_hz);
         wire_depth = Some(f.depth);

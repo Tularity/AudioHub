@@ -7,6 +7,7 @@ license = "Apache-2.0"
 description = "AudioHub's cross-platform, audio-only AirPlay receiver adapter"
 
 [dependencies]
+audiohub-dsp = { path = "../audiohub-dsp" }
 aes = { version = "0.8", features = ["zeroize"] }
 alac = { version = "0.5", default-features = false }
 audiohub-security = { path = "../audiohub-security" }

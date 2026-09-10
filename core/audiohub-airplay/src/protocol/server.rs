@@ -267,6 +267,10 @@ impl PcmOutput for CompletionOutput {
             inner.flush();
         }
     }
+
+    fn output_timing(&self) -> Option<crate::bus::OutputTiming> {
+        self.inner.as_ref().and_then(|inner| inner.output_timing())
+    }
 }
 
 impl Drop for CompletionOutput {
@@ -5055,6 +5059,7 @@ mod tests {
     fn null_output_factory() -> PcmOutputFactory {
         struct NullOutput;
         impl PcmOutput for NullOutput {
+            fn output_timing(&self) -> Option<crate::bus::OutputTiming> { None }
             fn write(
                 &mut self,
                 _samples: &[i16],
@@ -5138,6 +5143,23 @@ mod tests {
         assert!(decrypted_response
             .windows(b"bplist00".len())
             .any(|window| window == b"bplist00"));
+    }
+
+    #[test]
+    fn media_completion_wrapper_forwards_output_timing() {
+        struct TimedOutput;
+        impl PcmOutput for TimedOutput {
+            fn write(&mut self, _: &[i16], _: crate::telemetry::OperationToken) {}
+            fn flush(&mut self) {}
+            fn output_timing(&self) -> Option<crate::bus::OutputTiming> {
+                Some(crate::bus::OutputTiming { epoch: 7, lead: Duration::from_millis(125), estimated: true })
+            }
+        }
+        let (finished, _) = watch::channel(false);
+        let mut output = CompletionOutput { inner: Some(Box::new(TimedOutput)), finished };
+        assert_eq!(output.output_timing(), TimedOutput.output_timing());
+        output.inner.take();
+        assert_eq!(output.output_timing(), None);
     }
 
     #[tokio::test]

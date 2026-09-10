@@ -1186,6 +1186,10 @@ pub struct DeviceClock {
     consumed: AtomicU64,
     /// 最后一次回调的时刻（纳秒 since base）。
     last_cb_ns: AtomicU64,
+    // Exact last callback size, not the rolling maximum used by the servo.
+    last_cb_frames: AtomicUsize,
+    // Covers ring consumption and its paired callback timestamp/size.
+    output_phase: AtomicU64,
     /// `playback − callback`：写进去的数据预计多久之后真的被 DAC 播出——
     /// 也就是 Snapcast `stream.cpp:305` 那个 `outputBufferDacTime`。
     dac_lag_ns: AtomicU64,
@@ -1210,6 +1214,8 @@ impl DeviceClock {
             base: Instant::now(),
             consumed: AtomicU64::new(0),
             last_cb_ns: AtomicU64::new(0),
+            last_cb_frames: AtomicUsize::new(0),
+            output_phase: AtomicU64::new(0),
             dac_lag_ns: AtomicU64::new(0),
             block_max: AtomicUsize::new(0),
             cb_count: AtomicU64::new(0),
@@ -1220,6 +1226,7 @@ impl DeviceClock {
     /// 输出回调每次调用后报一次。`got < wanted` 就是一次欠载。
     fn note_callback(&self, now: Instant, wanted: usize, got: usize, dac_lag: Option<Duration>) {
         self.consumed.fetch_add(got as u64, Ordering::Relaxed);
+        self.last_cb_frames.store(wanted, Ordering::Relaxed);
         self.last_cb_ns.store(
             now.saturating_duration_since(self.base).as_nanos() as u64,
             Ordering::Relaxed,
@@ -1262,6 +1269,17 @@ impl DeviceClock {
     fn underruns(&self) -> u64 {
         self.underruns.load(Ordering::Relaxed)
     }
+
+    fn begin_output_callback(&self) -> OutputCallbackPhase<'_> {
+        self.output_phase.fetch_add(1, Ordering::AcqRel);
+        OutputCallbackPhase(self)
+    }
+}
+
+struct OutputCallbackPhase<'a>(&'a DeviceClock);
+
+impl Drop for OutputCallbackPhase<'_> {
+    fn drop(&mut self) { self.0.output_phase.fetch_add(1, Ordering::Release); }
 }
 
 /// 速率伺服的全部整定量与状态。单位一律是**设备速率样本**。
@@ -2228,6 +2246,31 @@ impl AudioTx {
         self.resampler.as_ref().map_or(0, InterleavedVarResampler::output_delay_frames)
     }
 
+    /// Estimate when a newly enqueued frame reaches the device, using a
+    /// caller-owned device-tail observation. A stalled callback is unknown,
+    /// never an excuse to silently substitute a zero hardware delay.
+    pub fn output_delay(&self, device_tail: Duration) -> Option<Duration> {
+        self.output_delay_at(device_tail, Instant::now())
+    }
+
+    fn output_delay_at(&self, device_tail: Duration, now: Instant) -> Option<Duration> {
+        let phase = self.dev.output_phase.load(Ordering::Acquire);
+        if phase & 1 != 0 { return None; }
+        let age = self.dev.since_last_callback(now)?;
+        if age > Duration::from_millis(100) { return None; }
+        let rate = f64::from(self.dev_rate);
+        let callback_frames = self.dev.last_cb_frames.load(Ordering::Relaxed) as f64;
+        // The ring has already lost the callback's block, but that block is
+        // still ahead of newly appended samples. Device-tail calibration is
+        // the delay to the beginning of that native block, not its end.
+        let pending = (f64::from(self.queued()) + callback_frames - age.as_secs_f64() * rate).max(0.0);
+        std::sync::atomic::fence(Ordering::Acquire);
+        if phase != self.dev.output_phase.load(Ordering::Relaxed) { return None; }
+        Some(device_tail + Duration::from_secs_f64(
+            (pending + f64::from(self.resample_delay_frames())) / rate,
+        ))
+    }
+
     /// 环容量（样本）。播放环恰好 = 1 秒设备速率。
     pub fn capacity(&self) -> u32 {
         (self.prod.capacity().get() / self.channels as usize) as u32
@@ -2355,6 +2398,49 @@ impl AudioTx {
     }
 }
 
+#[cfg(test)]
+mod output_presentation_phase_tests {
+    use super::*;
+
+    #[test]
+    fn the_transferred_callback_block_remains_ahead_of_new_ring_samples() {
+        let (mut tx, mut sink) = AudioTx::detached_for_test(48_000);
+        tx.push(&vec![0.1; 960]);
+        let callback = tx.dev.base + Duration::from_millis(1);
+        assert_eq!(sink.drain_at(480, callback, None), 480);
+        // The native queue already held 40 ms before this callback. The
+        // callback transferred another 10 ms out of our software ring, which
+        // still has 10 ms left. A newly appended sample follows all three.
+        assert_eq!(tx.output_delay_at(Duration::from_millis(40), callback), Some(Duration::from_millis(60)));
+        assert_eq!(tx.output_delay_at(Duration::from_millis(40), callback + Duration::from_millis(5)), Some(Duration::from_millis(55)));
+    }
+
+    #[test]
+    fn empty_ring_still_waits_for_the_latest_native_callback_block() {
+        let (tx, mut sink) = AudioTx::detached_for_test(48_000);
+        assert_eq!(tx.output_delay(Duration::from_millis(10)), None);
+        let callback = tx.dev.base + Duration::from_millis(1);
+        sink.drain_at(960, callback, None);
+        let next = callback + Duration::from_millis(20);
+        sink.drain_at(240, next, None);
+        // Use the latest five-millisecond callback, not the startup maximum.
+        assert_eq!(tx.output_delay_at(Duration::from_millis(10), next), Some(Duration::from_millis(15)));
+        assert_eq!(tx.output_delay_at(Duration::from_millis(10), next + Duration::from_millis(2)), Some(Duration::from_millis(13)));
+        assert_eq!(tx.output_delay_at(Duration::from_millis(10), next + Duration::from_millis(101)), None);
+    }
+
+    #[test]
+    fn an_inflight_callback_cannot_publish_a_mixed_queue_and_timestamp() {
+        let (tx, mut sink) = AudioTx::detached_for_test(48_000);
+        let callback = tx.dev.base + Duration::from_millis(1);
+        sink.drain_at(480, callback, None);
+        let phase = tx.dev.begin_output_callback();
+        assert_eq!(tx.output_delay_at(Duration::from_millis(10), callback), None);
+        drop(phase);
+        assert_eq!(tx.output_delay_at(Duration::from_millis(10), callback), Some(Duration::from_millis(20)));
+    }
+}
+
 /// 测试用的播放环消费端，站在声卡输出回调的位置上。见
 /// [`AudioTx::detached_for_test`]。
 #[doc(hidden)]
@@ -2378,6 +2464,7 @@ impl PlayRingSink {
     /// DAC 滞后、欠载。`now` 是虚拟时间，见 [`AudioTx::push_at`]。
     #[doc(hidden)]
     pub fn drain_at(&mut self, n: usize, now: Instant, dac_lag: Option<Duration>) -> usize {
+        let _phase = self.dev.begin_output_callback();
         let mut buf = vec![0.0f32; n];
         let got = self.cons.pop_slice(&mut buf);
         self.dev.note_callback(now, n, got, dac_lag);
@@ -2500,6 +2587,7 @@ impl LivePlayback {
             &health,
             channels,
             move |samples, info| {
+                let _phase = dev_cb.begin_output_callback();
                 let got = cons.pop_slice(samples);
                 for m in &mut samples[got..] {
                     *m = 0.0; // underrun -> silence

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "core/audiohub-airplay",
     "core/audiohub-core",
+    "core/audiohub-dsp",
     "core/audiohub-security",
     "core/audiohub-net",
     "core/audiohub-ipc",

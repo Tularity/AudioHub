@@ -1,5 +1,7 @@
 use crate::AUDIOHUB_RATE;
+use audiohub_dsp::ClockResampler;
 use std::io;
+use std::time::Duration;
 
 /// Stateful interleaved-i16 to native 48 kHz stereo-frame converter.
 ///
@@ -33,6 +35,12 @@ impl StreamingStereoPcmConverter {
     /// Append native 48 kHz stereo frames to `out`.
     pub fn process_i16(&mut self, input: &[i16], out: &mut Vec<[f32; 2]>) {
         self.core.process_i16(input, out);
+    }
+
+    /// Fixed content delay of the reconstruction filter, including at 48 kHz.
+    /// A clock correction never switches between different content timelines.
+    pub fn delay(&self) -> Duration {
+        Duration::from_secs_f64(self.core.resampler.delay_frames() as f64 / self.core.input_rate as f64)
     }
 
     /// Drop partial input/interpolation state after a sender seek or flush.
@@ -88,9 +96,10 @@ struct StreamingFrameConverter {
     partial_frame: [f32; 2],
     partial_sum: f32,
     partial_channels: u8,
-    source_index: u64,
-    next_output_position: f64,
-    previous: Option<[f32; 2]>,
+    resampler: ClockResampler,
+    seed_pending: bool,
+    input_frames: Vec<f32>,
+    output_frames: Vec<f32>,
     correction_ppm: f64,
 }
 
@@ -100,6 +109,12 @@ impl StreamingFrameConverter {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "AirPlay stream reported a zero sample rate",
+            ));
+        }
+        if input_rate > AUDIOHUB_RATE * 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AirPlay PCM conversion exceeds the supported 8:1 downsampling ratio",
             ));
         }
         if channels == 0 {
@@ -114,9 +129,10 @@ impl StreamingFrameConverter {
             partial_frame: [0.0; 2],
             partial_sum: 0.0,
             partial_channels: 0,
-            source_index: 0,
-            next_output_position: 0.0,
-            previous: None,
+            resampler: ClockResampler::new(input_rate, AUDIOHUB_RATE, 2),
+            seed_pending: true,
+            input_frames: Vec::with_capacity(4096),
+            output_frames: Vec::with_capacity(8192),
             correction_ppm: 0.0,
         })
     }
@@ -130,17 +146,18 @@ impl StreamingFrameConverter {
     }
 
     fn process_i16(&mut self, input: &[i16], out: &mut Vec<[f32; 2]>) {
+        self.input_frames.clear();
         for &sample in input {
             let sample = sample as f32 / 32_768.0;
             match self.channels {
-                1 => self.push_frame([sample, sample], out),
+                1 => self.input_frames.extend_from_slice(&[sample, sample]),
                 2 => {
                     self.partial_frame[self.partial_channels as usize] = sample;
                     self.partial_channels += 1;
                     if self.partial_channels == 2 {
                         let frame = self.partial_frame;
                         self.partial_channels = 0;
-                        self.push_frame(frame, out);
+                        self.input_frames.extend_from_slice(&frame);
                     }
                 }
                 _ => {
@@ -150,49 +167,34 @@ impl StreamingFrameConverter {
                         let mono = self.partial_sum / self.channels as f32;
                         self.partial_sum = 0.0;
                         self.partial_channels = 0;
-                        self.push_frame([mono, mono], out);
+                        self.input_frames.extend_from_slice(&[mono, mono]);
                     }
                 }
             }
         }
+        if self.input_frames.is_empty() { return; }
+        if self.seed_pending {
+            // A seek has no trustworthy earlier waveform. Extend its first
+            // actual frame into the missing past rather than inventing a zero
+            // ramp. This preserves DC; real transitions retain the FIR delay.
+            self.resampler.reset_seeded(&self.input_frames[..2]);
+            self.seed_pending = false;
+        }
+        // Positive feedback correction requests more output frames. The
+        // common kernel takes input-frames/output-frame, hence the reciprocal.
+        self.resampler.set_correction(1.0 / (1.0 + self.correction_ppm * 1e-6));
+        self.output_frames.clear();
+        self.resampler.process(&self.input_frames, &mut self.output_frames);
+        out.extend(self.output_frames.chunks_exact(2).map(|frame| [frame[0], frame[1]]));
     }
 
     fn flush(&mut self) {
         self.partial_frame = [0.0; 2];
         self.partial_sum = 0.0;
         self.partial_channels = 0;
-        self.source_index = 0;
-        self.next_output_position = 0.0;
-        self.previous = None;
-    }
-
-    fn step(&self) -> f64 {
-        let effective_output_rate = AUDIOHUB_RATE as f64 * (1.0 + self.correction_ppm * 1e-6);
-        self.input_rate as f64 / effective_output_rate.max(1.0)
-    }
-
-    fn push_frame(&mut self, frame: [f32; 2], out: &mut Vec<[f32; 2]>) {
-        let current_position = self.source_index as f64;
-        self.source_index = self.source_index.saturating_add(1);
-
-        let Some(previous) = self.previous.replace(frame) else {
-            // Preserve the first real frame. Interpolating against invented
-            // silence would create a small click/fade at every FLUSH.
-            out.push(frame);
-            self.next_output_position = self.step();
-            return;
-        };
-
-        let previous_position = current_position - 1.0;
-        while self.next_output_position <= current_position {
-            let fraction = (self.next_output_position - previous_position) as f32;
-            let fraction = fraction.clamp(0.0, 1.0);
-            out.push([
-                previous[0] + (frame[0] - previous[0]) * fraction,
-                previous[1] + (frame[1] - previous[1]) * fraction,
-            ]);
-            self.next_output_position += self.step();
-        }
+        self.input_frames.clear();
+        self.output_frames.clear();
+        self.seed_pending = true;
     }
 }
 
@@ -271,13 +273,62 @@ mod tests {
         let mut converter = StreamingStereoPcmConverter::new(48_000, 1).unwrap();
         let mut out = Vec::new();
         converter.process_i16(&[16_384, -8_192], &mut out);
-        assert_eq!(out, [[0.5, 0.5], [-0.25, -0.25]]);
+        let delay = converter.core.resampler.delay_frames();
+        converter.process_i16(&vec![0; delay], &mut out);
+        assert_eq!(&out[delay..delay + 2], &[[0.5, 0.5], [-0.25, -0.25]]);
+        assert!(out.iter().all(|frame| frame[0] == frame[1]));
     }
 
     #[test]
     fn stereo_converter_rejects_multichannel_without_layout() {
         let error = StreamingStereoPcmConverter::new(48_000, 3).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn conversion_rejects_rates_beyond_the_filter_support() {
+        assert!(StreamingStereoPcmConverter::new(AUDIOHUB_RATE * 8 + 1, 2).is_err());
+        assert!(StreamingPcmConverter::new(u32::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn treble_and_sampling_images_are_not_changed_by_linear_interpolation() {
+        let mut converter = StreamingStereoPcmConverter::new(44_100, 2).unwrap();
+        let input: Vec<i16> = (0..44_100).flat_map(|n| {
+            let sample = (0.2 * (std::f64::consts::TAU * 20_000.0 * n as f64 / 44_100.0).sin() * 32767.0).round() as i16;
+            [sample, 0]
+        }).collect();
+        let mut out = Vec::new();
+        for chunk in input.chunks(2048) { converter.process_i16(chunk, &mut out); }
+        let window = &out[4800..43200];
+        let amplitude = |hz: f64| {
+            let (real, imag) = window.iter().enumerate().fold((0.0, 0.0), |(r, i), (n, sample)| {
+                let phase = std::f64::consts::TAU * hz * n as f64 / 48_000.0;
+                (r + sample[0] as f64 * phase.cos(), i + sample[0] as f64 * phase.sin())
+            });
+            2.0 * real.hypot(imag) / window.len() as f64
+        };
+        assert!((20.0 * (amplitude(20_000.0) / 0.2).log10()).abs() < 0.01);
+        assert!(amplitude(23_900.0) < 0.00002, "the input sampling image entered the output band");
+        assert!(out.iter().all(|frame| frame[1] == 0.0));
+    }
+
+    #[test]
+    fn flush_discards_partial_channels_and_history_but_reuses_the_filter() {
+        let mut converter = StreamingStereoPcmConverter::new(44_100, 2).unwrap();
+        let mut out = Vec::new();
+        converter.process_i16(&stereo(24_000, -24_000, 500), &mut out);
+        converter.process_i16(&[20_000], &mut out);
+        converter.flush();
+        out.clear();
+        converter.process_i16(&stereo(8192, -16384, 500), &mut out);
+        assert!(out.iter().all(|frame| *frame == [0.25, -0.5]));
+        assert_eq!(converter.delay(), Duration::from_secs_f64(64.0 / 44_100.0));
+        let mut clone = converter.clone();
+        let next = stereo(3000, -4000, 300);
+        let mut expected = Vec::new(); let mut actual = Vec::new();
+        converter.process_i16(&next, &mut expected); clone.process_i16(&next, &mut actual);
+        assert_eq!(expected, actual);
     }
 
     #[test]

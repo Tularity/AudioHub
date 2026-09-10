@@ -76,6 +76,7 @@ version = "1.0.1"
 dependencies = [
  "aes",
  "alac",
+ "audiohub-dsp",
  "audiohub-security",
  "base64",
  "cbc",
@@ -124,6 +125,7 @@ name = "audiohub-core"
 version = "1.0.1"
 dependencies = [
  "anyhow",
+ "audiohub-dsp",
  "block2",
  "cpal",
  "dispatch2",
@@ -138,6 +140,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "audiohub-dsp"
+version = "1.0.1"
 
 [[package]]
 name = "audiohub-ipc"

@@ -4,6 +4,7 @@ version = "1.0.1"
 edition = "2021"
 
 [dependencies]
+audiohub-dsp = { path = "../audiohub-dsp" }
 cpal = "0.16"
 ringbuf = "0.4"
 serde = { version = "1", features = ["derive"] }

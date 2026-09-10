@@ -14,7 +14,8 @@ use anyhow::{anyhow, Context, Result};
 use audiohub_core::audio::{
     self, AudioTx, LiveCapture, LivePlayback, PlaybackConfigSnapshot, PlaybackMonitor,
 };
-use audiohub_core::dsp::{self, InterleavedLinearResampler, ToneVerdict};
+use audiohub_core::dsp::{self, ToneVerdict};
+use audiohub_core::fixed_rate::{self, FixedRateRx, FixedRateTx};
 use audiohub_core::latency::{DropMode, SourceDepths, StageDepth, StageId, StageSlot, NO_DEPTHS};
 use audiohub_core::sysaudio::{self, SysAudioCapture};
 use audiohub_net::media::{
@@ -1006,8 +1007,7 @@ struct TxStream {
     media_frame_seq: u64,
     rung: u32,
     channels: u8,
-    rs: Option<InterleavedLinearResampler>, // 48k -> rung rate
-    rs_last: [f32; 2],                      // last source frame; seeds the next resampler
+    rs: Option<FixedRateTx>, // Absent only for the separate spatial wire path.
     /// 这一帧（或半帧）的线上载荷。**长期复用**：`dsp::encode_pcm` 每 tick 每流
     /// 分配一个 `Vec` 是本轮第 3 项要消灭的东西。
     ///
@@ -1651,70 +1651,45 @@ fn build_source(
     })
 }
 
-/// Creates a resampler for the new rate that continues from `last`, so a rung
-/// switch mid-stream cannot inject the zero sample (audible click) a fresh
-/// resampler would interpolate from.
-/// The resampler a send stream needs on `rung`, or `None` when it needs none.
-///
-/// **The criterion is the sample RATE, not the rung number**: after the
-/// bit-depth ladder, rungs 0/1/2 are all 48 kHz, so `rung != 0` would build a
-/// pointless 48→48 resampler for two of them. Extracted so that the install
-/// path and the rung-switch path cannot disagree about it — they used to be one
-/// site because a stream always started on a 48 kHz rung, which stopped being
-/// true when AUTO's ceiling became per-transport.
-fn resampler_for(rung: u32, channels: u8, last: [f32; 2]) -> Option<InterleavedLinearResampler> {
-    let f = audiohub_net::media::rung_format(rung);
-    (f.rate_hz != MicSource::OUT_RATE)
-        .then(|| seeded_interleaved_resampler(MicSource::OUT_RATE, f.rate_hz, channels, last))
+/// All ordinary rungs share one content timeline, including the 48 kHz
+/// pure-delay path. Rebuilding on each rate change would discard real history.
+fn resampler_for(rung: u32, channels: u8) -> FixedRateTx {
+    FixedRateTx::new(channels, audiohub_net::media::rung_format(rung).rate_hz)
 }
 
-fn seeded_interleaved_resampler(
-    src_rate: u32,
-    dst_rate: u32,
-    channels: u8,
-    last: [f32; 2],
-) -> InterleavedLinearResampler {
-    let mut rs = InterleavedLinearResampler::new(src_rate, dst_rate, channels);
-    let mut discard = Vec::new();
-    rs.process(&last[..channels.clamp(1, 2) as usize], &mut discard);
-    rs
+/// Commit a format only after its converter has selected the actual wire rate.
+fn select_wire_rung(tx: &mut TxStream, wanted: u32) {
+    let wanted_rate = audiohub_net::media::rung_format(wanted).rate_hz;
+    let rate = tx.rs.as_mut().expect("ordinary stream has a converter").select_rate(wanted_rate);
+    let actual = if rate == wanted_rate { wanted } else { tx.rung };
+    if actual != tx.rung {
+        tx.rung = actual;
+        let parts = audiohub_net::media::rung_format(actual).wire_packets_per_frame_for(tx.channels) as u32;
+        tx.seq = align_wire_seq(tx.seq, parts);
+    }
+    tx.shared.committed_rung.store(tx.rung, Ordering::Relaxed);
 }
 
-/// Convert one decoded wire frame to the mixer's 48 kHz timeline.
-///
-/// A 48 kHz frame bypasses the resampler, but it must also invalidate any
-/// converter left by an earlier lower-rate rung. That converter did not consume
-/// the bypassed frames; reusing it when the wire later returns to the same lower
-/// rate would interpolate from an old phase and an old sample instead of from
-/// the immediately preceding 48 kHz frame.
+/// Convert ordered complete wire frames; absent frames must not make stale
+/// history adjacent to a new packet. The JB still owns concealment and timing.
 fn resample_received_frame(
-    rs: &mut Option<InterleavedLinearResampler>,
-    rs_rate: &mut u32,
-    rs_last: [f32; 2],
+    rs: &mut FixedRateRx,
+    previous_seq: &mut Option<u32>,
+    frame_seq: u32,
     frame_rate: u32,
-    frame_channels: u8,
+    concealed: bool,
     raw: Vec<f32>,
 ) -> Vec<f32> {
-    if frame_rate == MicSource::OUT_RATE {
-        *rs = None;
-        *rs_rate = MicSource::OUT_RATE;
-        return raw;
+    if let Some(previous) = *previous_seq {
+        let distance = frame_seq.wrapping_sub(previous);
+        if distance == 0 || distance > i32::MAX as u32 { return Vec::new(); }
+        if distance != 1 { rs.reset(); }
     }
-    if *rs_rate != frame_rate || rs.is_none() {
-        // Continue from the last decoded frame: a mid-stream rate change must
-        // not interpolate up from zero.
-        *rs = Some(seeded_interleaved_resampler(
-            frame_rate,
-            MicSource::OUT_RATE,
-            frame_channels,
-            rs_last,
-        ));
-        *rs_rate = frame_rate;
-    }
-    let mut out = Vec::with_capacity((F48 + 8) * frame_channels as usize);
-    rs.as_mut()
-        .expect("non-48 kHz has a resampler")
-        .process(&raw, &mut out);
+    *previous_seq = Some(frame_seq);
+    if concealed { rs.reset(); }
+    let mut out = Vec::with_capacity(F48_STEREO);
+    rs.process(&raw, frame_rate, &mut out);
+    if concealed { rs.reset(); }
     out
 }
 
@@ -2002,6 +1977,7 @@ impl TxState {
         add.shared
             .media_channels
             .store(channels as u32, Ordering::Relaxed);
+        add.shared.committed_rung.store(start_rung, Ordering::Relaxed);
         self.streams.insert(
             add.stream_id,
             TxStream {
@@ -2027,8 +2003,7 @@ impl TxState {
                 // `format_mismatch` 每帧递增、整条流一个字都听不见。此前
                 // 之所以没暴露，只是因为起步格恒为 48 kHz 的那一格。
                 rung: start_rung,
-                rs: if add.shared.spatial.is_some() { None } else { resampler_for(start_rung, channels, [0.0; 2]) },
-                rs_last: [0.0; 2],
+                rs: if add.shared.spatial.is_some() { None } else { Some(resampler_for(start_rung, channels)) },
                 // 一帧最深档 = 480 × 4 B（f32）。容量随格号变（换档同时改帧长度
                 // 与每样本字节数），按最深档预留就不会在音频线程上扩容。
                 pay: Vec::with_capacity(F48_STEREO * 4),
@@ -2874,6 +2849,7 @@ pub(crate) fn tx_loop(
     builder: mpsc::Sender<BuildReq>,
     built: mpsc::Receiver<BuildDone>,
 ) {
+    fixed_rate::prepare();
     let mut st = TxState::new(builder);
     // Lifted out of the daemon mutex once, here, so the tick itself never
     // touches that lock; the bridge is installed before any thread starts and
@@ -3165,23 +3141,17 @@ pub(crate) fn tx_loop(
                 .rung
                 .load(Ordering::Relaxed)
                 .min(audiohub_net::media::LADDER.len() as u32 - 1);
-            if want != tx.rung {
-                tx.rung = want;
-                let last = tx.rs_last;
-                // 只有 48 kHz 的那几格不需要重采样。判据是**采样率**，不是格号：
-                // 位深进阶梯之后 rung 0/1/2 全是 48 kHz，写 `want != 0` 会给
-                // 48 kHz/24 bit 和 48 kHz/16 bit 白建一个 48→48 的重采样器。
-                let f = audiohub_net::media::rung_format(want);
-                tx.rs = resampler_for(want, tx.channels, last);
-                // Align the first packet of a format epoch to its part count.
-                // The receiver uses this boundary to freeze an epoch-relative
-                // frame base and then derives each part from the raw sequence.
-                // Without alignment, observing part 1 before part 0 would make
-                // the boundary ambiguous and could permanently pair chunks from
-                // adjacent frames. At most `parts - 1` raw sequence values are
-                // skipped; packet statistics deliberately retain those holes.
-                let parts = f.wire_packets_per_frame_for(tx.channels) as u32;
-                tx.seq = align_wire_seq(tx.seq, parts);
+            select_wire_rung(tx, want);
+            {
+                // Fixed wire conversion runs after source framing. Account
+                // for its group delay without changing the source's FIFO or
+                // the clock servo error. This stage uses the 48 kHz source clock.
+                let mut stage = send_pace_for(&ent.depths).unwrap_or(StageDepth {
+                    id: StageId::SendPace, samples: 0, capacity: 0,
+                    rate: MicSource::OUT_RATE, dropped: Some(0), drop_mode: DropMode::None,
+                });
+                stage.samples = stage.samples.saturating_add(fixed_rate::DELAY_FRAMES as u32);
+                tx.shared.stages[SEND_PACE_SLOT].store(Some(stage));
             }
             let wire_input: &[f32] = if ent.channels == tx.channels {
                 &ent.frame
@@ -3189,9 +3159,6 @@ pub(crate) fn tx_loop(
                 convert_channels(&ent.frame, ent.channels, tx.channels, &mut converted);
                 &converted
             };
-            if let Some(last) = wire_input.chunks_exact(tx.channels as usize).last() {
-                tx.rs_last[..tx.channels as usize].copy_from_slice(last);
-            }
             let fmt = audiohub_net::media::rung_format(tx.rung);
             let rate = fmt.rate_hz;
             // 重采样输出写进**循环级**的暂存，不再是每条流一个字段。
@@ -3646,6 +3613,8 @@ struct WireFormatTransition {
     /// A tagged transition exceeded the exact 64-frame window or carried an
     /// inconsistent tag, so it was conservatively re-anchored adjacent.
     frame_tag_fallback: bool,
+    /// Only a proven adjacent source frame may reuse waveform history.
+    history_contiguous: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3766,6 +3735,7 @@ impl WireFormatTimeline {
                 to: format,
                 to_parts: parts,
                 frame_tag_fallback,
+                history_contiguous: exact_advance == Some(1),
             };
             let frame_base = epoch
                 .frame_base
@@ -3935,7 +3905,7 @@ impl ReassembledWireBatch {
 /// not per scalar, so stereo channels cannot receive different envelopes.
 fn finalize_partial_wire_frame(pending: crate::PartialWireFrame) -> Option<ReassembledWireFrame> {
     let parts = pending.parts;
-    if !(2..=audiohub_net::media::MAX_WIRE_PARTS).contains(&parts) {
+    if !(1..=audiohub_net::media::MAX_WIRE_PARTS).contains(&parts) {
         return None;
     }
     let present = pending.chunks[..parts]
@@ -4108,18 +4078,7 @@ fn collect_wire_chunk(
     decoded: Vec<f32>,
 ) -> ReassembledWireBatch {
     let mut ready = ReassembledWireBatch::new();
-    if parts == 1 {
-        assembly.clear();
-        ready.push(ReassembledWireFrame {
-            frame_seq,
-            sample_rate,
-            channels,
-            samples: decoded,
-            partial_conceal: false,
-        });
-        return ready;
-    }
-    if parts > audiohub_net::media::MAX_WIRE_PARTS || part >= parts {
+    if parts == 0 || parts > audiohub_net::media::MAX_WIRE_PARTS || part >= parts {
         return ready;
     }
 
@@ -4279,8 +4238,10 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
                 // both get counted: the payload is what the bit-depth rung
                 // changes, `dg.len()` is what the link actually carries.
                 c.rx.on_packet(h.seq, h.timestamp_us, arrival, plain.len(), dg.len());
-                c.last_rate = h.sample_rate;
-                c.last_depth = Some(depth);
+                if rx.spatial.is_some() {
+                    c.last_rate = h.sample_rate;
+                    c.last_depth = Some(depth);
+                }
                 let transit = arrival as i64 - h.timestamp_us as i64;
                 if let Some(p) = c.prev_transit {
                     jit_ms = (transit - p).unsigned_abs() as f32 / 1000.0;
@@ -4400,6 +4361,12 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
                 // its learned target, and its concealment history. The stable
                 // local frame clock makes a rebuild both unnecessary and harmful.
                 st.partial.clear();
+                if !change.history_contiguous {
+                    // The JB's conservative adjacent fallback is not proof of
+                    // waveform adjacency. Keep this invalidation until the
+                    // first complete frame of the new epoch reaches the SRC.
+                    st.rs.reset();
+                }
                 if change.frame_tag_fallback {
                     dlog!(
                         "[audiohubd] stream {} media frame tag could not prove a format-boundary \
@@ -4446,21 +4413,10 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
                     // cannot account for this upstream concealment itself.
                     st.half_conceal = st.half_conceal.saturating_add(1);
                 }
-                let last_frame = raw
-                    .chunks_exact(frame_channels as usize)
-                    .last()
-                    .map(|frame| {
-                        let mut last = [0.0; 2];
-                        last[..frame_channels as usize].copy_from_slice(frame);
-                        last
-                    });
-                let rs_last = st.rs_last;
-                let crate::JbState { rs, rs_rate, .. } = &mut *st;
+                debug_assert_eq!(frame_channels, st.channels);
+                let crate::JbState { rs, rs_frame_seq, .. } = &mut *st;
                 let frame =
-                    resample_received_frame(rs, rs_rate, rs_last, frame_rate, frame_channels, raw);
-                if let Some(last) = last_frame {
-                    st.rs_last = last;
-                }
+                    resample_received_frame(rs, rs_frame_seq, frame_seq, frame_rate, partial_conceal, raw);
                 // Empty frames never enter the JB: `push` would consume a
                 // sequence number while carrying no audio, which is worse than
                 // leaving the sequence absent for ordinary PLC.
@@ -4581,6 +4537,10 @@ pub(crate) fn handle_datagram(inner: &DaemonInner, dg: &[u8], from: SocketAddr) 
                     }
                 }
             }
+            drop(st);
+            // Do not nest the statistics and jitter-buffer locks. A delayed
+            // publisher also cannot roll back a newer accepted wire sequence.
+            lk(&rx.stats).note_wire_format(h.seq, h.sample_rate, depth);
         }
         Kind::PullReq => {
             // Receiver keepalive. spec-m4a §3 freezes the media destination as
@@ -6159,6 +6119,11 @@ pub(crate) fn mixer_loop(
         );
         let site_output_requested =
             airplay_local || streams.iter().any(|stream| stream.is_spk || stream.monitor);
+        let output_timing = playback.as_ref().and_then(|p| {
+            let (tail, estimated) = airplay.device_tail(dev_epoch)?;
+            Some((p.tx.output_delay(tail)?, estimated))
+        });
+        airplay.publish_output_timing(playback_transitions.generation, output_timing);
         if site_output_requested && playback.is_none() {
             request_site_playback_open(
                 &inner.site_playback,
@@ -6607,76 +6572,58 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rx_48k_bypass_invalidates_a_parked_resampler_before_returning_to_the_same_rate() {
-        const LOW_RATE: u32 = 32_000;
-        const CHANNELS: u8 = 2;
+    fn rx_fixed_timeline_preserves_recent_history_and_rejects_stale_packets() {
+        let mut rs = FixedRateRx::new(2, 48_000);
+        let mut seq = None;
+        let first = vec![0.25; F48_STEREO];
+        let got = resample_received_frame(&mut rs, &mut seq, 10, 48_000, false, first);
+        assert!(got[..fixed_rate::DELAY_FRAMES * 2].iter().all(|v| *v == 0.0));
+        assert!(got[fixed_rate::DELAY_FRAMES * 2..].iter().all(|v| *v == 0.25));
+        assert!(resample_received_frame(&mut rs, &mut seq, 9, 48_000, false, vec![-0.9; F48_STEREO]).is_empty());
+        let next = resample_received_frame(&mut rs, &mut seq, 11, 48_000, false, vec![0.5; F48_STEREO]);
+        assert!(next[..fixed_rate::DELAY_FRAMES * 2].iter().all(|v| *v == 0.25));
+        let gap = resample_received_frame(&mut rs, &mut seq, 13, 48_000, false, vec![0.5; F48_STEREO]);
+        assert!(gap[..fixed_rate::DELAY_FRAMES * 2].iter().all(|v| *v == 0.0));
+    }
 
-        let mut rs = None;
-        let mut rs_rate = MicSource::OUT_RATE;
-        let mut first_low = Vec::with_capacity(320 * CHANNELS as usize);
-        for _ in 0..320 {
-            first_low.extend_from_slice(&[0.9, -0.9]);
+    #[test]
+    fn wire_format_commit_follows_prefilter_without_consuming_a_media_frame() {
+        let shared = Arc::new(TxShared::new_on(2));
+        let mut tx = tx_stream_for(&shared);
+        tx.rung = 2;
+        tx.seq = 11;
+        let mut samples = Vec::new();
+        for (wanted, expected) in [(5, 2), (2, 2), (5, 2), (5, 5), (0, 0), (1, 1)] {
+            let before_seq = tx.seq;
+            let before_frame = tx.media_frame_seq;
+            select_wire_rung(&mut tx, wanted);
+            let fmt = audiohub_net::media::rung_format(expected);
+            assert_eq!(tx.rung, expected);
+            assert_eq!(shared.committed_rung.load(Ordering::Relaxed), expected);
+            assert_eq!(tx.media_frame_seq, before_frame);
+            assert_eq!(tx.seq, if before_seq % fmt.wire_packets_per_frame_for(1) as u32 == 0 {
+                before_seq
+            } else { align_wire_seq(before_seq, fmt.wire_packets_per_frame_for(1) as u32) });
+            tx.rs.as_mut().unwrap().process(&vec![0.1; F48], &mut samples);
+            assert_eq!(samples.len(), fmt.rate_hz as usize / 100);
+            tx.seq = tx.seq.wrapping_add(fmt.wire_packets_per_frame_for(1) as u32);
+            tx.media_frame_seq += 1;
         }
-        let _ = resample_received_frame(
-            &mut rs,
-            &mut rs_rate,
-            [0.0; 2],
-            LOW_RATE,
-            CHANNELS,
-            first_low,
-        );
-        assert!(
-            rs.is_some(),
-            "the first lower-rate frame did not build a converter"
-        );
-        assert_eq!(rs_rate, LOW_RATE);
+    }
 
-        let bypass_last = [0.25, -0.75];
-        let mut bypass = vec![0.0; F48_STEREO];
-        bypass[F48_STEREO - 2..].copy_from_slice(&bypass_last);
-        let bypass_expected = bypass.clone();
-        let bypassed = resample_received_frame(
-            &mut rs,
-            &mut rs_rate,
-            [0.9, -0.9],
-            MicSource::OUT_RATE,
-            CHANNELS,
-            bypass,
-        );
-        assert_eq!(
-            bypassed, bypass_expected,
-            "48 kHz stopped being a bit-exact bypass"
-        );
-        assert!(
-            rs.is_none(),
-            "a converter which skipped the 48 kHz frame remained reusable"
-        );
-        assert_eq!(
-            rs_rate,
-            MicSource::OUT_RATE,
-            "the converter's rate identity did not cross the bypass boundary"
-        );
-
-        let mut next_low = Vec::with_capacity(320 * CHANNELS as usize);
-        for _ in 0..320 {
-            next_low.extend_from_slice(&[0.1, 0.2]);
-        }
-        let got = resample_received_frame(
-            &mut rs,
-            &mut rs_rate,
-            bypass_last,
-            LOW_RATE,
-            CHANNELS,
-            next_low.clone(),
-        );
-        let mut fresh =
-            seeded_interleaved_resampler(LOW_RATE, MicSource::OUT_RATE, CHANNELS, bypass_last);
-        let mut expected = Vec::new();
-        fresh.process(&next_low, &mut expected);
-        assert_eq!(
-            got, expected,
-            "returning to the same lower rate reused phase/history from before the 48 kHz span"
-        );
+    #[test]
+    fn accepted_wire_metadata_cannot_be_rolled_back_by_a_delayed_publisher() {
+        let rx = RxStream::new(7, &[0; 32], &[0; 16], None, true, false, None, None,
+            MediaPath::Udp("127.0.0.1:1".parse().unwrap()), 2);
+        let mut stats = lk(&rx.stats);
+        stats.note_wire_format(u32::MAX - 1, 48_000, dsp::WireDepth::S24);
+        stats.note_wire_format(1, 16_000, dsp::WireDepth::S16);
+        stats.note_wire_format(u32::MAX, 48_000, dsp::WireDepth::F32);
+        assert_eq!((stats.last_rate, stats.last_depth), (16_000, Some(dsp::WireDepth::S16)));
+        let body = fn_body("pub(crate) fn handle_datagram(");
+        let commit = body.find("note_wire_format(").unwrap();
+        assert!(commit > body.find("st.wire_timeline.locate(").unwrap());
+        assert!(commit > body.find("drop(st);").unwrap());
     }
 
     #[test]
@@ -7741,8 +7688,7 @@ pub(crate) mod tests {
             seq: 0,
             media_frame_seq: 0,
             rung: audiohub_net::media::AUTO_TOP_RUNG,
-            rs: None,
-            rs_last: [0.0; 2],
+            rs: Some(resampler_for(audiohub_net::media::AUTO_TOP_RUNG, 1)),
             pay: Vec::with_capacity(F48_STEREO * 4),
             dest_epoch_seen: 0,
             gain: dsp::SendGain::new(),
@@ -9315,17 +9261,11 @@ mod start_rung_tests {
     fn every_rung_that_needs_a_resampler_gets_one_at_install_time() {
         for rung in 0..LADDER.len() as u32 {
             let rate = rung_format(rung).rate_hz;
-            assert_eq!(
-                resampler_for(rung, 2, [0.0; 2]).is_some(),
-                rate != MicSource::OUT_RATE,
-                "rung {rung} is {rate} Hz: a stream installed here would put {} samples on the \
-                 wire under a header declaring {rate} Hz",
-                if rate == MicSource::OUT_RATE {
-                    "the right number of"
-                } else {
-                    "48 kHz"
-                }
-            );
+            let mut converter = resampler_for(rung, 2);
+            assert_eq!(converter.select_rate(rate), rate);
+            let mut out = Vec::new();
+            converter.process(&vec![0.0; F48_STEREO], &mut out);
+            assert_eq!(out.len(), rate as usize / 100 * 2, "rung {rung} payload/header mismatch");
         }
     }
 
@@ -9346,7 +9286,7 @@ mod start_rung_tests {
         let body = &src[at..at + src[at..].find("\n    }\n").expect("no end of method")];
         let body = tests::strip_comments(body);
         assert!(
-            body.contains("rs: resampler_for(start_rung"),
+            body.contains("rs: if add.shared.spatial.is_some() { None } else { Some(resampler_for(start_rung"),
             "install_stream no longer derives the resampler from the rung it installs"
         );
         assert!(
@@ -9542,6 +9482,18 @@ mod wire_split_tests {
     }
 
     #[test]
+    fn an_untagged_format_boundary_never_proves_waveform_adjacency() {
+        let mut timeline = WireFormatTimeline::default();
+        timeline.locate(100, 1_000_000, rung_format(4), 1).unwrap();
+        let position = timeline.locate(110, 1_100_000, rung_format(5), 1).unwrap();
+        assert!(!position.transition.unwrap().history_contiguous);
+        let body = tests::fn_body("pub(crate) fn handle_datagram(");
+        let begin = body.find("if !change.history_contiguous").unwrap();
+        let end = body[begin..].find("st.rs.reset();").unwrap() + begin;
+        assert!(end < body.find("collect_wire_chunk(").unwrap());
+    }
+
+    #[test]
     fn stereo_auto_crosses_a_real_two_part_to_one_part_boundary() {
         let rung_2 = rung_format(2);
         let rung_3 = rung_format(3);
@@ -9572,6 +9524,7 @@ mod wire_split_tests {
                 to: rung_4,
                 to_parts: 1,
                 frame_tag_fallback: false,
+                history_contiguous: true,
             })
         );
         assert_eq!(
@@ -9860,6 +9813,7 @@ mod wire_split_tests {
             .unwrap();
         assert_eq!(new.frame_seq, old.frame_seq.wrapping_add(1));
         assert!(new.transition.unwrap().frame_tag_fallback);
+        assert!(!new.transition.unwrap().history_contiguous);
 
         let following = timeline
             .locate(
@@ -9886,6 +9840,7 @@ mod wire_split_tests {
             .unwrap();
         assert_eq!(new.frame_seq, old.frame_seq.wrapping_add(64));
         assert!(!new.transition.unwrap().frame_tag_fallback);
+        assert!(!new.transition.unwrap().history_contiguous);
     }
 
     #[test]
@@ -10092,6 +10047,17 @@ mod wire_split_tests {
 
     fn take_batch(batch: ReassembledWireBatch) -> Vec<ReassembledWireFrame> {
         batch.frames.into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn single_packet_frames_preserve_history_order_across_one_frame_reordering() {
+        let mut assembly = WireFrameAssembly::default();
+        assert_eq!(collect_test_chunk(&mut assembly, 10, 0, 1).len, 1);
+        assert_eq!(collect_test_chunk(&mut assembly, 12, 0, 1).len, 0);
+        let ready = take_batch(collect_test_chunk(&mut assembly, 11, 0, 1));
+        assert_eq!(ready.iter().map(|f| f.frame_seq).collect::<Vec<_>>(), [11, 12]);
+        assert!(ready.iter().all(|f| !f.partial_conceal));
+        assert_eq!(collect_test_chunk(&mut assembly, 10, 0, 1).len, 0);
     }
 
     /// N+1 part 0 is ordinary cross-frame reorder, not proof that N is lost.

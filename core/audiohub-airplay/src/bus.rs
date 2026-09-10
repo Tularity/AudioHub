@@ -1,7 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
+use std::time::{Duration, Instant};
+
+/// A receiver-owned estimate, not a claim of exact acoustic presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputTiming {
+    pub epoch: u64,
+    /// Total protocol-to-output lead, including this bus's startup cushion.
+    pub lead: Duration,
+    pub estimated: bool,
+}
 
 /// AudioHub's internal sample rate.
 pub const AUDIOHUB_RATE: u32 = 48_000;
@@ -84,6 +94,12 @@ struct Inner {
     // from a real disconnect without waiting for the producer.
     active_session: AtomicU64,
     state: Mutex<State>,
+    timing_base: Instant,
+    timing_version: AtomicU64,
+    timing_epoch: AtomicU64,
+    timing_delay_us: AtomicU64,
+    timing_updated_ns: AtomicU64,
+    timing_estimated: AtomicBool,
 }
 
 /// A bounded 48 kHz stereo-frame PCM bus with independent reader cursors.
@@ -112,6 +128,12 @@ impl PcmBus {
             inner: Arc::new(Inner {
                 config,
                 active_session: AtomicU64::new(0),
+                timing_base: Instant::now(),
+                timing_version: AtomicU64::new(0),
+                timing_epoch: AtomicU64::new(0),
+                timing_delay_us: AtomicU64::new(0),
+                timing_updated_ns: AtomicU64::new(0),
+                timing_estimated: AtomicBool::new(true),
                 state: Mutex::new(State {
                     frames: VecDeque::with_capacity(config.capacity_samples),
                     base_seq: 0,
@@ -151,6 +173,35 @@ impl PcmBus {
     /// overlap, the most recently created sink wins.
     pub fn active_session(&self) -> Option<u64> {
         session_from_wire(self.inner.active_session.load(Ordering::Acquire))
+    }
+
+    /// Single writer: the application's local output owner. No locks, waits or
+    /// allocation on its mixer thread. Epoch zero invalidates the observation.
+    pub fn publish_output_timing(&self, epoch: u64, downstream: Duration, estimated: bool) {
+        let epoch = if downstream <= Duration::from_secs(1) { epoch } else { 0 };
+        let inner = &self.inner;
+        inner.timing_version.fetch_add(1, Ordering::AcqRel);
+        inner.timing_epoch.store(epoch, Ordering::Relaxed);
+        inner.timing_delay_us.store(downstream.as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        inner.timing_updated_ns.store(inner.timing_base.elapsed().as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        inner.timing_estimated.store(estimated, Ordering::Relaxed);
+        inner.timing_version.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn output_timing(&self) -> Option<OutputTiming> {
+        let inner = &self.inner;
+        let version = inner.timing_version.load(Ordering::Acquire);
+        if version & 1 != 0 { return None; }
+        let epoch = inner.timing_epoch.load(Ordering::Relaxed);
+        let delay_us = inner.timing_delay_us.load(Ordering::Relaxed);
+        let updated = inner.timing_updated_ns.load(Ordering::Relaxed);
+        let estimated = inner.timing_estimated.load(Ordering::Relaxed);
+        let now = inner.timing_base.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        std::sync::atomic::fence(Ordering::Acquire);
+        if epoch == 0 || now.saturating_sub(updated) > 250_000_000
+            || version != inner.timing_version.load(Ordering::Relaxed) { return None; }
+        let cushion = Duration::from_secs_f64(self.inner.config.prebuffer_samples as f64 / AUDIOHUB_RATE as f64);
+        Some(OutputTiming { epoch, lead: Duration::from_micros(delay_us) + cushion, estimated })
     }
 
     pub(crate) fn activate(&self, session_id: u64) {
@@ -503,6 +554,26 @@ mod tests {
             prebuffer_samples: 0,
             max_correction_ppm: 500,
         })
+    }
+
+    #[test]
+    fn output_timing_is_bounded_fresh_and_includes_the_bus_cushion() {
+        let bus = PcmBus::new(BusConfig::default());
+        assert_eq!(bus.output_timing(), None);
+        bus.publish_output_timing(7, Duration::from_millis(65), true);
+        let timing = bus.output_timing().unwrap();
+        assert_eq!(timing.epoch, 7);
+        assert_eq!(timing.lead, Duration::from_millis(115));
+        assert!(timing.estimated);
+        bus.publish_output_timing(8, Duration::from_secs(2), false);
+        assert_eq!(bus.output_timing(), None);
+        bus.publish_output_timing(8, Duration::from_millis(20), false);
+        bus.inner.timing_version.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(bus.output_timing(), None);
+        bus.inner.timing_version.fetch_add(1, Ordering::Release);
+        assert_eq!(bus.output_timing().unwrap().epoch, 8);
+        bus.publish_output_timing(0, Duration::ZERO, true);
+        assert_eq!(bus.output_timing(), None);
     }
 
     #[test]

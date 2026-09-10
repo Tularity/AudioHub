@@ -1783,6 +1783,9 @@ pub(crate) struct LiveStatus {
 /// Owns the currently running receiver. Reconfiguration is serialized because
 /// `settings.set` is served by one thread per IPC connection.
 pub(crate) struct AirPlayController {
+    output_device_version: AtomicU64,
+    output_device_epoch: AtomicU64,
+    output_device_timing: AtomicU64,
     advertise: bool,
     /// Stable AP2 identity is kept under the exact daemon config root (which
     /// may be test- or environment-overridden), never under a second platform
@@ -1807,6 +1810,9 @@ pub(crate) struct AirPlayController {
 impl AirPlayController {
     pub(crate) fn new(advertise: bool, config_dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
+            output_device_version: AtomicU64::new(0),
+            output_device_epoch: AtomicU64::new(0),
+            output_device_timing: AtomicU64::new(0),
             advertise,
             airplay2_identity_path: config_dir.join("airplay2-identity"),
             airplay2_port_path: config_dir.join(AIRPLAY2_PORT_FILE),
@@ -2681,7 +2687,25 @@ impl AirPlayController {
             controller: Arc::clone(self),
             bus_epoch: 0,
             reader: None,
+            bus: None,
         }
+    }
+
+    /// Called by the non-realtime device-latency refresher. The low bits keep
+    /// estimate provenance alongside its value in one atomic publication.
+    pub(crate) fn update_output_device_latency(&self, epoch: u64, value: audiohub_core::latency::DevLatency) {
+        use audiohub_core::latency::LatSource;
+        let encoded = match value.source {
+            LatSource::Api | LatSource::Assumed => value.ms()
+                .filter(|ms| ms.is_finite() && (0.0..=1000.0).contains(ms))
+                .map(|ms| ((ms * 1000.0).ceil() as u64) << 2 | if value.source == LatSource::Api { 1 } else { 3 })
+                .unwrap_or(0),
+            LatSource::Unavailable | LatSource::Unreliable => 0,
+        };
+        self.output_device_version.fetch_add(1, Ordering::AcqRel);
+        self.output_device_timing.store(encoded, Ordering::Relaxed);
+        self.output_device_epoch.store(epoch, Ordering::Relaxed);
+        self.output_device_version.fetch_add(1, Ordering::Release);
     }
 
     fn bus_snapshot(&self) -> (u64, Option<PcmBus>) {
@@ -2833,6 +2857,7 @@ pub(crate) struct LocalReader {
     controller: Arc<AirPlayController>,
     bus_epoch: u64,
     reader: Option<PcmReader>,
+    bus: Option<PcmBus>,
 }
 
 impl LocalReader {
@@ -2841,7 +2866,8 @@ impl LocalReader {
         if current_epoch != self.bus_epoch {
             let (bus_epoch, bus) = self.controller.bus_snapshot();
             self.bus_epoch = bus_epoch;
-            self.reader = bus.map(|bus| bus.subscribe());
+            self.reader = bus.as_ref().map(|bus| bus.subscribe());
+            self.bus = bus;
         }
         match self.reader.as_mut() {
             Some(reader) => reader.read_stereo_into(out),
@@ -2854,6 +2880,27 @@ impl LocalReader {
                     session_id: None,
                     epoch: 0,
                 }
+            }
+        }
+    }
+
+    pub(crate) fn device_tail(&self, epoch: u64) -> Option<(Duration, bool)> {
+        let version = self.controller.output_device_version.load(Ordering::Acquire);
+        if version & 1 != 0 { return None; }
+        let before = self.controller.output_device_epoch.load(Ordering::Acquire);
+        let timing = self.controller.output_device_timing.load(Ordering::Relaxed);
+        let after = self.controller.output_device_epoch.load(Ordering::Acquire);
+        std::sync::atomic::fence(Ordering::Acquire);
+        if before != epoch || after != epoch || timing & 1 == 0
+            || version != self.controller.output_device_version.load(Ordering::Relaxed) { return None; }
+        Some((Duration::from_micros(timing >> 2), timing & 2 != 0))
+    }
+
+    pub(crate) fn publish_output_timing(&self, epoch: u64, downstream: Option<(Duration, bool)>) {
+        if let Some(bus) = &self.bus {
+            match downstream {
+                Some((delay, estimated)) => bus.publish_output_timing(epoch, delay, estimated),
+                None => bus.publish_output_timing(0, Duration::ZERO, true),
             }
         }
     }

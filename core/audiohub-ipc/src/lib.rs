@@ -893,7 +893,8 @@ pub struct QualityStats {
     /// 这与 Q1「窗口不够就整体 None」的口径也自相矛盾（同一个函数上下两行）。
     #[serde(default)]
     pub clip_ratio: Option<f64>,
-    /// `20*log10(pre_clip_peak / 0.8)`，负值表示根本没碰到削顶阈值。
+    /// Peak excess relative to the active clipping threshold; negative means
+    /// headroom remains. Single routed streams use 1.0, mixed output uses 0.8.
     /// `None` 的含义同 `clip_ratio`。
     #[serde(default)]
     pub clip_excess_db: Option<f64>,
@@ -963,14 +964,15 @@ pub struct QualityStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MixHealth {
     pub window_s: f64,
-    /// 求和后、`soft_clip` 之前 |v| > 0.8 的采样占比。
+    /// Fraction above the active output-protection threshold before protection.
     ///
     /// **`None` = 削顶页还没攒满，「还没测」**——与 `Some(0.0)`（「测了，没有一个
     /// 样本越界」）是两个不同的结论。这里曾经 `unwrap_or(0.0)`，把启动后头 10 秒
     /// 的空窗报成「混音正常」。
     #[serde(default)]
     pub clip_ratio: Option<f64>,
-    /// `20*log10(pre_clip_peak / 0.8)`。`None` 的含义同 `clip_ratio`。
+    /// Peak excess relative to the active protection threshold. `None` has
+    /// the same meaning as `clip_ratio`.
     #[serde(default)]
     pub clip_excess_db: Option<f64>,
     /// 本窗口内单 tick 参与求和的最大流数。

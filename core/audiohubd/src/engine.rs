@@ -4672,13 +4672,11 @@ fn soft_clip(s: f32) -> f32 {
     }
 }
 
-/// A single AirPlay source must remain amplitude-transparent: its sender dB is
-/// represented by the receiver's native output control, not by a second
-/// sample-domain gain or limiter. Multiple local contributors still use the
-/// site's frozen soft-knee protection. Clamp is only a final malformed-sample
-/// guard; decoded network-audio i16 and the linear resampler are already in this range.
-fn protect_output_sample(sample: f32, sole_airplay: bool) -> f32 {
-    if sole_airplay {
+/// A single routed source must remain amplitude-transparent. Native endpoint
+/// controls own its volume; legitimate full-scale peaks are not mix overload.
+/// Multiple contributors retain the existing soft-knee overload protection.
+fn protect_output_sample(sample: f32, single_source: bool) -> f32 {
+    if single_source {
         sample.clamp(-1.0, 1.0)
     } else {
         soft_clip(sample)
@@ -5934,8 +5932,10 @@ fn apply_site_playback_build_results(
 pub(crate) fn ring_depth_before_push(id: StageId, tx: &AudioTx) -> StageDepth {
     StageDepth {
         id,
-        samples: tx.queued(),
-        capacity: tx.capacity(),
+        // This output stage includes the converter immediately ahead of the
+        // ring. Its fixed group delay must not disappear from the total.
+        samples: tx.queued().saturating_add(tx.resample_delay_frames()),
+        capacity: tx.capacity().saturating_add(tx.resample_delay_frames()),
         rate: tx.dev_rate(),
         dropped: Some(tx.dropped()),
         drop_mode: DropMode::Newest,
@@ -5970,6 +5970,7 @@ struct BridgeOut {
     tx: AudioTx,
     refs: usize,
     buf: [f32; F48_STEREO],
+    contributors: u32,
     /// 本 tick **推之前**读到的环深度（级 8′ `bridge_ring`）。
     ///
     /// 存在这里而不是当场发布，是因为发布要按**流**做（一个桥可被多条流引用），
@@ -5995,6 +5996,7 @@ fn apply_mixcmd(cmd: MixCmd, bridges: &mut HashMap<String, BridgeOut>) {
                             tx,
                             refs: 0,
                             buf: [0.0; F48_STEREO],
+                            contributors: 0,
                             depth: None,
                         })
                     })
@@ -6069,6 +6071,7 @@ pub(crate) fn mixer_loop(
     // in there as well. `dirty` keeps the clearing cost proportional to the
     // buckets actually used rather than to 16 * 480 floats per 10ms tick.
     let mut hal_bufs = vec![[0.0f32; F48]; crate::haldev::HAL_MAX_SLOTS];
+    let mut hal_contributors = [0u32; crate::haldev::HAL_MAX_SLOTS];
     let mut hal_dirty: u16 = 0;
     // `hal_mic` 水位闸门，每槽一份（见 `micgate` 的模块文档）。
     //
@@ -6193,8 +6196,10 @@ pub(crate) fn mixer_loop(
             }
         }
         hal_dirty = 0;
+        hal_contributors.fill(0);
         for b in bridges.values_mut() {
             b.buf.fill(0.0);
+            b.contributors = 0;
         }
         let mut any_spk = false;
         let mut any_mon = false;
@@ -6214,7 +6219,7 @@ pub(crate) fn mixer_loop(
             // Q2 的可归属那一半（规格 §4.6）：测点在 advance 之后、加进任何
             // 目的地之前。这回答的是「我这一路送进来多响」，是**求和前**的量，
             // 与站点级的求和后削顶是两个不同的问题。
-            s.clip.feed(now_ms, &stereo);
+            s.clip.feed_routed(now_ms, &stereo, true);
             if let Some(ring) = s.ring.as_ref() {
                 let mut r = lk(ring);
                 r.extend(stereo.chunks_exact(2).map(|f| (f[0] + f[1]) * 0.5));
@@ -6227,6 +6232,7 @@ pub(crate) fn mixer_loop(
             // one decoded frame may feed the virtual card AND the local output
             if let Some(name) = s.bridge.as_ref() {
                 if let Some(b) = bridges.get_mut(name) {
+                    b.contributors += 1;
                     for i in 0..F48_STEREO {
                         b.buf[i] += stereo[i];
                     }
@@ -6237,6 +6243,9 @@ pub(crate) fn mixer_loop(
             // (spec-m5b §5.4). The bucket is chosen by the PEER's slot, so two
             // peers' audio can never meet.
             add_to_hal_bucket(s.hal_slot, &stereo, &mut hal_bufs, &mut hal_dirty);
+            if let Some(slot) = s.hal_slot {
+                if let Some(count) = hal_contributors.get_mut(slot as usize) { *count += 1; }
+            }
             if s.is_spk || s.monitor {
                 // 送本机真实输出的那一集合：`out = soft_clip(mix + mon)`。
                 // 站点级削顶正是在这里发生的，所以重复流判据也只看这一集合。
@@ -6274,12 +6283,13 @@ pub(crate) fn mixer_loop(
             any_spk = true;
         }
         inner.mix_meter.feed(now_ms, contrib, corr);
-        let sole_airplay = airplay_local && contrib == 1;
+        let single_source = contrib == 1;
         for b in bridges.values_mut() {
             // 站点级削顶计入点 1/3：桥接到第三方虚拟声卡（规格 §4.6）。
             // 喂的是**削顶之前**的 buf——削顶之后再量就永远量不到越界。
-            inner.mix_clip.feed(now_ms, &b.buf);
-            let out: Vec<f32> = b.buf.iter().map(|&v| soft_clip(v)).collect();
+            inner.mix_clip.feed_routed(now_ms, &b.buf, b.contributors == 1);
+            let out: Vec<f32> = b.buf.iter()
+                .map(|&v| protect_output_sample(v, b.contributors == 1)).collect();
             // 级 8′ `bridge_ring`：桥接流的尾级。**推之前**读（见
             // `ring_depth_before_push`）。这一整秒的环此前完全没有建模——桥接流
             // 的 `local_ms` 只有 jitter_buf + post_mix，静默漏掉它。
@@ -6350,9 +6360,9 @@ pub(crate) fn mixer_loop(
                     continue;
                 }
                 // 站点级削顶计入点 2/3：写进某个对端的虚拟麦克风。
-                inner.mix_clip.feed(now_ms, &hal_bufs[slot]);
+                inner.mix_clip.feed_routed(now_ms, &hal_bufs[slot], hal_contributors[slot] == 1);
                 for i in 0..F48 {
-                    out[i] = soft_clip(hal_bufs[slot][i]);
+                    out[i] = protect_output_sample(hal_bufs[slot][i], hal_contributors[slot] == 1);
                 }
                 h.write_mic_mono(slot as u8, &out[..plan.allow as usize]);
             }
@@ -6363,7 +6373,7 @@ pub(crate) fn mixer_loop(
             // 会让每一路 spk 流的削顶被重复计数一次，凭空虚增一倍。
             let clipped: Vec<f32> = mix
                 .iter()
-                .map(|&sample| protect_output_sample(sample, sole_airplay))
+                .map(|&sample| protect_output_sample(sample, single_source))
                 .collect();
             let probe: Vec<f32> = clipped
                 .chunks_exact(2)
@@ -6439,9 +6449,9 @@ pub(crate) fn mixer_loop(
                 }
                 // 站点级削顶计入点 3/3：真实默认输出。这是最重要的一个——
                 // 「两路重复流相加」的破音就出现在这里。同样喂削顶**之前**的和。
-                inner.mix_clip.feed(now_ms, &out);
+                inner.mix_clip.feed_routed(now_ms, &out, single_source);
                 for sample in &mut out {
-                    *sample = protect_output_sample(*sample, sole_airplay);
+                    *sample = protect_output_sample(*sample, single_source);
                 }
                 // 播放环深度（规格 §3.2 的级 8）。**`push` 之前**读：读到的是
                 // 排在这一帧前面的样本数，也就是这一帧的驻留时间。之前这里是
@@ -6670,7 +6680,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sole_airplay_is_amplitude_transparent_but_mixed_output_stays_protected() {
+    fn single_source_is_amplitude_transparent_but_mixed_output_stays_protected() {
         for sample in [-1.0f32, -0.95, 0.0, 0.95, 1.0] {
             assert_eq!(protect_output_sample(sample, true), sample);
         }
@@ -7412,12 +7422,12 @@ pub(crate) mod tests {
         let [first, second] = src.depths();
         let d = first.expect("发送 FIFO 这一级必须存在");
         assert_eq!(d.id, StageId::SrcFifo);
-        assert_eq!(d.samples, 0);
-        assert_eq!(d.capacity, 48_000, "1 秒 @48k");
+        assert_eq!(d.samples, 64);
+        assert_eq!(d.capacity, 48_064);
         assert_eq!(d.rate, 48_000, "FIFO 在重采样之后，恒为 48k");
         assert_eq!(d.dropped, Some(0), "本进程数得出来，0 是真读数");
         assert_eq!(d.drop_mode, DropMode::Oldest);
-        assert_eq!(d.ms(), Some(0.0));
+        assert_eq!(d.ms(), Some(64.0 / 48.0));
         assert!(
             second.is_none(),
             "后端自己的内部缓冲从这里读不到 —— 不报，而不是报 0（规格 §7.2 R11）"

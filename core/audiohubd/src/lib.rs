@@ -3675,7 +3675,8 @@ fn attach_output_tails(
     p: &mut PipelineLatency,
 ) {
     if let Some(spatial) = &rx.spatial {
-        spatial::append_output_latency(p, lk(spatial).queued_frames());
+        let spatial = lk(spatial);
+        spatial::append_output_latency(p, spatial.queued_frames(), spatial.resample_delay_frames());
         return;
     }
     let mut pushed = false;

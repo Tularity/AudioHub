@@ -321,7 +321,7 @@ export interface QualityStats {
   /** 二级证据，**不参与定级**：解释等级为何低，不定义等级。 */
   underruns?: number;
   jb_dropped?: number;
-  /** Q2：本流送进混音前 |v| > 0.8 的采样占比。`null` = 这一页还没攒满。 */
+  /** Fraction above the active protection threshold; null means no complete window. */
   clip_ratio?: number | null;
   clip_excess_db?: number | null;
   /**

@@ -1128,155 +1128,47 @@ impl Dll {
     }
 }
 
-/// 变比率重采样器：4 点 Catmull-Rom（三次 Hermite）。
-///
-/// # 为什么不是现成的 `dsp::LinearResampler`
-///
-/// 机制上它**够用**：相位累加器 + 跨块携带的历史样本都在，`step` 就是一个
-/// `f64`，改它就是改比率——伺服不需要任何新依赖就能跑起来。真正的问题在质量：
-///
-/// 线性插值的幅频响应**随小数相位 φ 变化**。φ=0 时是恒等（0 dB），φ=0.5 时
-/// 在 f/fs 处衰减 `20·log10(cos(πf/fs))`：10 kHz@48k 是 −2.0 dB，15 kHz 是
-/// −5.1 dB。而比率≈1 时 φ **缓慢扫过 [0,1)**，扫一圈需要 `1/|corr−1|` 个样本
-/// ——500 ppm 时约 42 ms（≈24 Hz），典型 20 ppm 时约 1 s。于是高频内容会以
-/// 亚赫兹到几十赫兹的速率「呼吸」，在镲片/齿音上是能听出来的。
-///
-/// 这不是线性插值特有的缺陷之外的东西：**任何**比率≈1 的分数延迟器都要扫相位，
-/// 区别在于好核的幅度对 φ 几乎不敏感。Catmull-Rom 是 15 行、零依赖、无授权
-/// 问题的教科书核，把上面两个数字压到 −0.53 dB / −2.5 dB（见
-/// `cubic_beats_linear_on_the_phase_swept_hf_droop`，那条测试是实测不是引用）。
-///
-/// 再往上就要窗 sinc（`rubato` / `soxr`）——**本轮不引入**：CPU 与依赖的代价
-/// 换来的是 20 kHz 附近最后那 2 dB，与「唯一还在无界积累的病灶」不成比例。
-/// 若将来听感走查发现 HF 呼吸仍可闻，换核只需要动这个 struct，环路一行不改。
-///
-/// # 数据结构
-///
-/// 虚拟输入序列 `v = [hist[0], hist[1], hist[2]] ++ input`。输出位置 `p`
-/// 在 `v` 坐标里，`i = floor(p)`，取 4 点窗口 `v[i-1..=i+2]` 在 `v[i]` 与
-/// `v[i+1]` 之间插值 ⇒ 必须 `1 ≤ i ≤ v.len()−3`，即 `p ∈ [1, n+1)`。
-/// 收尾时 `phase = p − n`，恰好落回 `[1, 1+step)`，不变式自洽。
-pub struct VarResampler {
-    /// 标称步长 = src_rate / dst_rate（输入样本 / 输出样本）。
-    nominal: f64,
-    /// 实际步长 = nominal / corr。
-    step: f64,
-    /// 见 struct 文档：不变式 `phase ≥ 1`。
-    phase: f64,
-    hist: [f32; 3],
-}
+/// Band-limited clock matching with the playback servo's inverse convention.
+pub struct VarResampler(crate::resample::ClockResampler);
 
 impl VarResampler {
-    pub fn new(src: u32, dst: u32) -> VarResampler {
-        let nominal = src as f64 / dst.max(1) as f64;
-        VarResampler {
-            nominal,
-            step: nominal,
-            phase: 1.0,
-            hist: [0.0; 3],
+    pub fn new(src: u32, dst: u32) -> Self {
+        Self(crate::resample::ClockResampler::new(src, dst, 1))
+    }
+
+    pub fn set_correction(&mut self, corr: f64) {
+        // Playback consumes fewer source frames when its correction increases.
+        if corr.is_finite() && corr > 0.0 {
+            self.0.set_correction(1.0 / corr);
         }
     }
 
-    /// 施加 DLL 的修正因子。
-    ///
-    /// **方向推导（写错就是正反馈）**：`step` 是「每产出一个输出样本消耗多少
-    /// 输入样本」。`step` 变大 ⇒ 同样多的输入产出**更少**的输出 ⇒ 写进环里的
-    /// 少了 ⇒ 水位下降。所以 `step = nominal / corr`：`corr < 1` ⇒ 步长变大
-    /// ⇒ 水位下降。与 `PlayServo` 的 `err = downstream − target` 串起来正好是
-    /// 负反馈，见那边的推导。
-    pub fn set_correction(&mut self, corr: f64) {
-        self.step = self.nominal / corr;
-    }
-
-    pub fn step(&self) -> f64 {
-        self.step
-    }
+    pub fn step(&self) -> f64 { self.0.step() }
 
     pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        let n = input.len();
-        if n == 0 {
-            return;
-        }
-        let hist = self.hist;
-        let at = |idx: usize| -> f32 {
-            if idx < 3 {
-                hist[idx]
-            } else {
-                input[idx - 3]
-            }
-        };
-        let vlen = n + 3;
-        let mut p = self.phase;
-        // i = floor(p) 必须满足 i+2 ≤ vlen−1，即 p < (vlen−3)+1 = n+1。
-        let limit = (n + 1) as f64;
-        while p < limit {
-            let i = p as usize; // p ≥ 1 保证 i ≥ 1
-            let t = (p - i as f64) as f32;
-            let y0 = at(i - 1);
-            let y1 = at(i);
-            let y2 = at(i + 1);
-            let y3 = at(i + 2);
-            // Catmull-Rom：t=0 精确返回 y1（所以 step==1 且 phase 整数时是
-            // 逐样本无损直通，只差一个固定的两样本延迟）。
-            let a0 = y1;
-            let a1 = 0.5 * (y2 - y0);
-            let a2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
-            let a3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
-            out.push(((a3 * t + a2) * t + a1) * t + a0);
-            p += self.step;
-        }
-        // 新历史 = v 的最后三个。必须在改 self.hist 之前全部取出来。
-        let h = [at(vlen - 3), at(vlen - 2), at(vlen - 1)];
-        self.hist = h;
-        // p 的坐标原点右移 n 个输入样本。`max(1.0)` 只在 n < step 的病态小块
-        // 下才生效（我们的块恒为 480），保住 `phase ≥ 1` 不变式。
-        self.phase = (p - n as f64).max(1.0);
+        self.0.process(input, out);
     }
 }
 
-/// Retains independent cubic interpolation history per interleaved channel.
-/// Identical step/phase evolution keeps lanes frame-aligned.
-pub struct InterleavedVarResampler {
-    channels: usize,
-    lanes: Vec<VarResampler>,
-    lane_in: Vec<Vec<f32>>,
-    lane_out: Vec<Vec<f32>>,
-}
+/// One interpolation phase and coefficient table for independent stereo lanes.
+pub struct InterleavedVarResampler(crate::resample::ClockResampler);
 
 impl InterleavedVarResampler {
     pub fn new(src: u32, dst: u32, channels: u8) -> Self {
-        let channels = channels.clamp(1, 2) as usize;
-        Self {
-            channels,
-            lanes: (0..channels).map(|_| VarResampler::new(src, dst)).collect(),
-            lane_in: (0..channels).map(|_| Vec::new()).collect(),
-            lane_out: (0..channels).map(|_| Vec::new()).collect(),
-        }
+        Self(crate::resample::ClockResampler::new(src, dst, channels.clamp(1, 2)))
     }
 
     pub fn set_correction(&mut self, corr: f64) {
-        for lane in &mut self.lanes {
-            lane.set_correction(corr);
+        if corr.is_finite() && corr > 0.0 {
+            self.0.set_correction(1.0 / corr);
         }
     }
 
     pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        let frames = input.len() / self.channels;
-        for ch in 0..self.channels {
-            self.lane_in[ch].clear();
-            self.lane_in[ch].reserve(frames);
-            self.lane_in[ch].extend((0..frames).map(|f| input[f * self.channels + ch]));
-            self.lane_out[ch].clear();
-            self.lanes[ch].process(&self.lane_in[ch], &mut self.lane_out[ch]);
-        }
-        let out_frames = self.lane_out.iter().map(Vec::len).min().unwrap_or(0);
-        out.reserve(out_frames * self.channels);
-        for frame in 0..out_frames {
-            for ch in 0..self.channels {
-                out.push(self.lane_out[ch][frame]);
-            }
-        }
+        self.0.process(input, out);
     }
+
+    fn output_delay_frames(&self) -> u32 { self.0.output_delay_frames() }
 }
 
 /// 声卡侧发布给伺服的观测量。写者是输出回调（实时线程），读者是
@@ -2328,6 +2220,12 @@ impl AudioTx {
     /// 整数样本计数，单机单时钟内读取，**无任何估计成分**。
     pub fn queued(&self) -> u32 {
         (self.prod.occupied_len() / self.channels as usize) as u32
+    }
+
+    /// Fixed interpolation delay, separate from mutable queue occupancy and
+    /// never fed back as a queue error to the clock servo.
+    pub fn resample_delay_frames(&self) -> u32 {
+        self.resampler.as_ref().map_or(0, InterleavedVarResampler::output_delay_frames)
     }
 
     /// 环容量（样本）。播放环恰好 = 1 秒设备速率。
@@ -5049,10 +4947,9 @@ mod rate_servo {
         );
     }
 
-    /// 比率恰为 1 且不修正时，`VarResampler` 是**逐样本无损**的（只差固定的
-    /// 两样本延迟）——不然「伺服关着也要过一遍插值」就是白白掉音质。
+    /// Unity preserves samples after the band-limited kernel's fixed delay.
     #[test]
-    fn the_cubic_kernel_is_lossless_at_unity_ratio() {
+    fn the_clock_kernel_is_lossless_at_unity_ratio() {
         let mut rs = VarResampler::new(48_000, 48_000);
         let x: Vec<f32> = (0..1_000)
             .map(|n| ((n * 37) % 101) as f32 / 101.0 - 0.5)
@@ -5061,14 +4958,14 @@ mod rate_servo {
         rs.process(&x[..500], &mut y);
         rs.process(&x[500..], &mut y);
         assert_eq!(y.len(), x.len(), "1:1 ⇒ 样本数一一对应");
-        for (i, (&a, &b)) in x[..x.len() - 2].iter().zip(&y[2..]).enumerate() {
+        for (i, (&a, &b)) in x[..x.len() - 64].iter().zip(&y[64..]).enumerate() {
             assert!((a - b).abs() < 1e-6, "第 {i} 个样本 {a} != {b}");
         }
     }
 
     /// 分块处理必须等价于整块处理：跨块的历史与相位都得带过去。
     #[test]
-    fn the_cubic_kernel_is_block_split_invariant() {
+    fn the_clock_kernel_is_block_split_invariant() {
         let x: Vec<f32> = (0..3_000).map(|n| (n as f32 * 0.017).sin()).collect();
         let mut whole = Vec::new();
         VarResampler::new(48_000, 44_100).process(&x, &mut whole);

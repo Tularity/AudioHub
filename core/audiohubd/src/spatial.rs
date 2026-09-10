@@ -3,7 +3,7 @@
 use crate::{lk, rd, DaemonInner, RxStream};
 use anyhow::{bail, Result};
 use audiohub_core::audio::Dll;
-use audiohub_core::dsp::InterleavedLinearResampler;
+use audiohub_core::resample::ClockResampler;
 use audiohub_core::output_capabilities::{
     NativeOutputCapabilities, NativeOutputObservation, SpatialAudioCapabilities,
 };
@@ -154,7 +154,7 @@ pub(crate) struct SpatialReceive {
     concealed_fragments: u64,
     next_tuning: Instant,
     dll: Dll,
-    resampler: InterleavedLinearResampler,
+    resampler: ClockResampler,
     corrected: Vec<f32>,
     rate_correction: f64,
     last_render: Instant,
@@ -172,7 +172,7 @@ impl SpatialReceive {
             assembly: SpatialReassembler::new(contract.layout),
             frame: vec![0.0; FRAME_FRAMES * contract.channels() as usize],
             corrected: Vec::with_capacity((FRAME_FRAMES + 2) * contract.channels() as usize),
-            resampler: InterleavedLinearResampler::servoed(48_000, 48_000, contract.channels()),
+            resampler: ClockResampler::new(48_000, 48_000, contract.channels()),
             contract,
             output_epoch,
             output,
@@ -201,6 +201,8 @@ impl SpatialReceive {
     pub(crate) fn queued_frames(&self) -> usize {
         self.output.queued_frames()
     }
+
+    pub(crate) fn resample_delay_frames(&self) -> u32 { self.resampler.output_delay_frames() }
 
     pub(crate) fn status(&self) -> serde_json::Value {
         serde_json::json!({
@@ -428,13 +430,15 @@ pub(crate) fn status(inner: &DaemonInner) -> serde_json::Value {
 pub(crate) fn append_output_latency(
     pipeline: &mut audiohub_ipc::PipelineLatency,
     queued_frames: usize,
+    resample_delay_frames: u32,
 ) {
     use audiohub_core::latency::{DevLatency, DropMode, StageDepth, StageId};
     pipeline.stages.push(crate::to_ipc_stage(
         StageDepth {
             id: StageId::PlayRing,
-            samples: queued_frames as u32,
-            capacity: audiohub_core::spatial_output::SPATIAL_QUEUE_FRAMES as u32,
+            samples: (queued_frames as u32).saturating_add(resample_delay_frames),
+            capacity: (audiohub_core::spatial_output::SPATIAL_QUEUE_FRAMES as u32)
+                .saturating_add(resample_delay_frames),
             rate: 48_000,
             dropped: None,
             drop_mode: DropMode::Newest,
@@ -606,18 +610,21 @@ mod tests {
 
     #[test]
     fn spatial_rate_conversion_preserves_all_twelve_lane_histories() {
-        let mut resampler = InterleavedLinearResampler::servoed(48_000, 48_000, 12);
+        let mut resampler = ClockResampler::new(48_000, 48_000, 12);
         resampler.set_correction(1.0002);
         let input: Vec<f32> = (0..FRAME_FRAMES * 12)
             .map(|n| (n % 12) as f32 / 16.0)
             .collect();
         let mut output = Vec::new();
+        let mut frames_seen = 0;
         for _ in 0..8 {
             output.clear();
             resampler.process(&input, &mut output);
             assert_eq!(resampler.channels(), 12);
             assert_eq!(output.len() % 12, 0);
-            for frame in output.chunks_exact(12).skip(1) {
+            for frame in output.chunks_exact(12) {
+                frames_seen += 1;
+                if frames_seen <= resampler.delay_frames() * 2 { continue; }
                 for (channel, sample) in frame.iter().enumerate() {
                     assert!((*sample - channel as f32 / 16.0).abs() < 1e-6);
                 }
@@ -632,10 +639,10 @@ mod tests {
                 "side": "recv", "stages": [], "peer_stages": [], "confidence": "localOnly",
             }))
             .unwrap();
-        append_output_latency(&mut pipeline, 960);
-        assert_eq!(pipeline.local_ms, Some(20.0));
+        append_output_latency(&mut pipeline, 960, 64);
+        assert_eq!(pipeline.local_ms, Some(1024.0 / 48.0));
         assert_eq!(pipeline.stages[0].id, "play_ring");
-        assert_eq!(pipeline.stages[0].samples, 960);
+        assert_eq!(pipeline.stages[0].samples, 1024);
         assert_eq!(crate::devlats::dev_sum_ms(pipeline.dev), None);
         assert_eq!(
             crate::compose_sum_ms(pipeline.local_ms, Some(1.0), Some(0.0), pipeline.dev, None),

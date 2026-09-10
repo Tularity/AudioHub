@@ -12,7 +12,7 @@ use sha2::Sha256;
 use zeroize::Zeroize;
 
 use audiohub_core::audio::{AudioRx, Dll, LiveCapture};
-use audiohub_core::dsp::InterleavedLinearResampler;
+use audiohub_core::resample::ClockResampler;
 use audiohub_core::latency::{DropMode, SourceDepths, StageDepth, StageId, NO_DEPTHS};
 use audiohub_core::sysaudio::{self, BackendInfo, SysAudioCapture};
 
@@ -1303,7 +1303,7 @@ impl CaptureServoCell {
 
 pub struct CaptureFifo {
     fifo: VecDeque<f32>,
-    resampler: InterleavedLinearResampler,
+    resampler: ClockResampler,
     staged: Vec<f32>,
     channels: usize,
     dll: Dll,
@@ -1351,11 +1351,8 @@ impl CaptureFifo {
         let frame_samples = (Self::OUT_RATE as u64 * frame_ms as u64 / 1000) as usize;
         CaptureFifo {
             fifo: VecDeque::new(),
-            // `servoed`, never `new`: equal nominal rates are exactly the case
-            // that needs bending most (two "48 kHz" crystals disagree by tens
-            // of ppm), and `new` would hand back a passthrough that silently
-            // ignores every correction.
-            resampler: InterleavedLinearResampler::servoed(
+            // Clock matching remains active even at equal nominal rates.
+            resampler: ClockResampler::new(
                 src_rate,
                 Self::OUT_RATE,
                 channels as u8,
@@ -1425,6 +1422,8 @@ impl CaptureFifo {
     pub fn corr_ppm(&self) -> f64 {
         (self.corr - 1.0) * 1e6
     }
+
+    fn resample_delay_frames(&self) -> u32 { self.resampler.output_delay_frames() }
 
     /// One tick: take everything the backend produced, emit exactly one frame,
     /// and close the loop on what is left over.
@@ -1585,8 +1584,10 @@ impl FrameSource for MicSource {
             }),
             Some(StageDepth {
                 id: StageId::SrcFifo,
-                samples: self.fifo_len(),
-                capacity: self.fifo_cap(),
+                // Include the upstream converter's fixed group delay in this
+                // source stage, without changing the FIFO servo observation.
+                samples: self.fifo_len().saturating_add(self.fifo.resample_delay_frames()),
+                capacity: self.fifo_cap().saturating_add(self.fifo.resample_delay_frames()),
                 rate: Self::OUT_RATE,
                 dropped: Some(self.dropped()),
                 drop_mode: DropMode::Oldest,
@@ -1685,8 +1686,8 @@ impl FrameSource for SysAudioSource {
         [
             Some(StageDepth {
                 id: StageId::SrcFifo,
-                samples: self.fifo_len(),
-                capacity: self.fifo_cap(),
+                samples: self.fifo_len().saturating_add(self.fifo.resample_delay_frames()),
+                capacity: self.fifo_cap().saturating_add(self.fifo.resample_delay_frames()),
                 rate: Self::OUT_RATE,
                 dropped: Some(self.dropped()),
                 drop_mode: DropMode::Oldest,
@@ -2985,9 +2986,10 @@ mod telemetry_tests {
         // FIFO 那一级此刻是空的，但它必须**存在**（0 样本 ≠ 这一级不存在）。
         let fifo = fifo.expect("麦克风源必须报发送 FIFO 这一级");
         assert_eq!(fifo.id, StageId::SrcFifo);
-        assert_eq!(fifo.samples, 0);
+        let converter_delay = mic.fifo.resample_delay_frames();
+        assert_eq!(fifo.samples, converter_delay);
         assert_eq!(fifo.rate, MicSource::OUT_RATE, "FIFO 已经是 48k 了");
-        assert_eq!(fifo.capacity, 48_000, "1 秒 @48k");
+        assert_eq!(fifo.capacity, 48_000 + converter_delay);
         assert_eq!(
             fifo.drop_mode,
             DropMode::Oldest,
@@ -3065,10 +3067,10 @@ mod telemetry_tests {
         let [cap, fifo] = mic.depths();
         let cap = cap.expect("采集环这一级");
         let fifo = fifo.expect("发送 FIFO 这一级");
-        assert_eq!(fifo.samples, 48_000);
+        assert_eq!(fifo.samples, 48_000 + mic.fifo.resample_delay_frames());
         assert_eq!(
             fifo.ms(),
-            Some(1000.0),
+            Some((48_000 + mic.fifo.resample_delay_frames()) as f64 / 48.0),
             "满载的 1 秒发送 FIFO = 1000 ms —— 这一级要是不报，用户的那一秒就没人说"
         );
         assert!(fifo.saturated());
@@ -3093,7 +3095,7 @@ mod telemetry_tests {
         mic.next_frame(&mut out);
         assert_eq!(
             mic.depths()[1].unwrap().ms(),
-            Some(30.0),
+            Some((1_440 + mic.fifo.resample_delay_frames()) as f64 / 48.0),
             "满载的 FIFO 必须被重同步回目标水位，而不是永久驻留在 1 秒"
         );
     }
@@ -3121,16 +3123,16 @@ mod telemetry_tests {
         let fifo = fifo.expect("发送 FIFO 这一级");
         assert_eq!(fifo.id, StageId::SrcFifo);
         assert_eq!(
-            fifo.samples, 1_440,
+            fifo.samples, 1_440 + src.fifo.resample_delay_frames(),
             "the safety net must drain back to target (3 frames = 30 ms)"
         );
-        assert_eq!(fifo.capacity, 48_000);
+        assert_eq!(fifo.capacity, 48_000 + src.fifo.resample_delay_frames());
         assert_eq!(fifo.rate, 48_000);
         assert!(
             !fifo.saturated(),
             "过量生产必须被排掉而不是顶到容量上限：饱和就是那个 1 秒延迟缺陷"
         );
-        assert_eq!(fifo.ms(), Some(30.0));
+        assert_eq!(fifo.ms(), Some((1_440 + src.fifo.resample_delay_frames()) as f64 / 48.0));
         assert_eq!(
             fifo.drop_mode,
             DropMode::Oldest,
@@ -3176,7 +3178,7 @@ mod telemetry_tests {
         // 爬**——空 FIFO 没有余量吸收一次迟到的唤醒，那正是要治的另一半。爬升
         // 必须是有界的：不许越过目标。
         assert!(
-            fifo.samples <= 1_440,
+            fifo.samples <= 1_440 + src.fifo.resample_delay_frames(),
             "水位只该朝目标爬，不该越过它，got {}",
             fifo.samples
         );

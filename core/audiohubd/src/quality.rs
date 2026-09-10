@@ -168,7 +168,8 @@ pub(crate) struct ClipWindow {
     pub span_s: f64,
     pub samples: u64,
     pub over: u64,
-    /// 削顶**之前**的峰值。
+    /// Peak normalized to the legacy 0.8 reference after accounting for the
+    /// active protection threshold. This is not a raw dBFS peak measurement.
     pub peak: f32,
 }
 
@@ -244,15 +245,28 @@ impl ClipMeter {
     /// 本身同阶（那里已经在做 480 次加法），可以接受；除法与格式化全部留给
     /// 报告线程。
     pub(crate) fn feed(&self, now_ms: u64, frame: &[f32]) {
+        self.feed_with_threshold(now_ms, frame, CLIP_THRESHOLD);
+    }
+
+    pub(crate) fn feed_routed(&self, now_ms: u64, frame: &[f32], single_source: bool) {
+        if single_source {
+            self.feed_with_threshold(now_ms, frame, 1.0);
+        } else {
+            self.feed(now_ms, frame);
+        }
+    }
+
+    fn feed_with_threshold(&self, now_ms: u64, frame: &[f32], threshold: f32) {
         let mut over = 0u64;
         let mut peak = 0.0f32;
         for &v in frame {
             let a = v.abs();
-            if a > CLIP_THRESHOLD {
+            if a > threshold {
                 over += 1;
             }
-            if a > peak {
-                peak = a;
+            let normalized = a * (CLIP_THRESHOLD / threshold);
+            if normalized > peak {
+                peak = normalized;
             }
         }
         self.cur_samples
@@ -837,6 +851,22 @@ mod tests {
     }
 
     // ---- Q2 削顶 ----
+
+    #[test]
+    fn routed_clip_meter_uses_the_actual_protection_threshold() {
+        let single = ClipMeter::new();
+        let mixed = ClipMeter::new();
+        for now in [1, 10002] {
+            single.feed_routed(now, &[0.95; 480], true);
+            mixed.feed_routed(now, &[0.95; 480], false);
+        }
+        let single = single.window().unwrap();
+        let mixed = mixed.window().unwrap();
+        assert_eq!(single.over, 0);
+        assert!(single.excess_db() < 0.0);
+        assert_eq!(mixed.over, mixed.samples);
+        assert!(mixed.excess_db() > 0.0);
+    }
 
     #[test]
     fn the_clip_meter_serves_only_complete_pages() {

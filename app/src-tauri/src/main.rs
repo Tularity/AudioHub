@@ -938,10 +938,24 @@ struct MacAppMenuItems {
 
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
+        #[cfg(target_os = "macos")]
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+}
+
+fn hide_to_tray(window: &tauri::Window) -> tauri::Result<()> {
+    window.hide()?;
+    #[cfg(target_os = "macos")]
+    if window.label() == MAIN_WINDOW {
+        // Keep the status item alive without leaving a windowless Dock entry.
+        window
+            .app_handle()
+            .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1140,7 +1154,7 @@ fn minimize_window(window: tauri::Window) -> Result<(), String> {
 
 #[tauri::command]
 fn hide_window(window: tauri::Window) -> Result<(), String> {
-    window.hide().map_err(|e| e.to_string())
+    hide_to_tray(&window).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1540,12 +1554,12 @@ fn main() {
             // gated behind tauri's `unstable` feature, and the chrome helpers
             // take a `Window` because `on_window_event` hands them one.
             if let Some(_wv) = app.get_webview_window(MAIN_WINDOW) {
+                let _w = AsRef::<tauri::Webview>::as_ref(&_wv).window();
                 if background_launch || installer_bootstrap {
-                    let _ = _wv.hide();
+                    let _ = hide_to_tray(&_w);
                 }
                 #[cfg(target_os = "windows")]
                 win_chrome::silence_webview_context_menu(&_wv);
-                let _w = AsRef::<tauri::Webview>::as_ref(&_wv).window();
                 #[cfg(target_os = "macos")]
                 mac_chrome::apply(&_w);
                 #[cfg(target_os = "windows")]
@@ -1615,7 +1629,7 @@ fn main() {
             match event {
                 WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
-                    let _ = window.hide();
+                    let _ = hide_to_tray(window);
                 }
                 // No macOS arm here on purpose. `mac_chrome` no longer writes
                 // any geometry — it declares the window's *style* once, and

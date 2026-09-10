@@ -37,7 +37,7 @@ use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
@@ -91,6 +91,19 @@ const TLV_FLAGS: u8 = 0x13;
 const PAIR_SETUP_METHOD: u8 = 0x00;
 const TRANSIENT_PAIRING_FLAG: u8 = 0x10;
 const DEFAULT_TRANSIENT_PIN: &str = "3939";
+
+/// Opt-in, bounded timeline diagnostics. Never log control bodies or secrets.
+pub(super) fn sync_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("AUDIOHUB_AIRPLAY_SYNC_DIAGNOSTICS").as_deref() == Ok("1"))
+}
+
+pub(super) fn sync_utc_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos())
+}
 
 pub(crate) struct ServerConfig {
     name: String,
@@ -911,6 +924,7 @@ struct ConnectionState {
     protocol: ConnectionProtocol,
     classic: ClassicConnection,
     connection_id: crate::telemetry::ConnectionId,
+    sync_diagnostic_events: u8,
     peer_ip: IpAddr,
     requests: RequestDecoder,
     pairing: Option<PairSetupServer>,
@@ -991,6 +1005,7 @@ impl ConnectionState {
             connection_id,
             peer_ip,
             requests,
+            sync_diagnostic_events: 0,
             pairing: None,
             control: None,
             event_keys: None,
@@ -1374,6 +1389,13 @@ async fn process_one_request(
     let Some(mut request) = read_next_request(socket, state).await? else {
         return Ok(ConnectionProgress::Eof);
     };
+    let sync_start = (sync_diagnostics_enabled()
+        && state.sync_diagnostic_events < 64
+        && matches!(
+            request.method(),
+            "SETUP" | "RECORD" | "SETRATEANCHORTIME" | "FLUSHBUFFERED" | "TEARDOWN"
+        ))
+    .then(|| (Instant::now(), sync_utc_ns()));
     crate::telemetry::register_control_session(
         crate::telemetry::operation_token(),
         peer.ip(),
@@ -1537,6 +1559,15 @@ async fn process_one_request(
         }
     }
 
+    if let Some((started, received_utc_ns)) = sync_start {
+        state.sync_diagnostic_events += 1;
+        log::info!(
+            target: "audiohub_airplay::airplay2",
+            "AirPlay sync_diag event=control_applied peer={} connection_id={:?} method={} received_utc_ns={} applied_utc_ns={} elapsed_ns={} status={}",
+            peer.ip(), state.connection_id, request.method(), received_utc_ns,
+            sync_utc_ns(), started.elapsed().as_nanos(), outcome.response.status,
+        );
+    }
     outcome.record_phase2_prepared(peer.ip(), state.connection_id);
     outcome.record_peer_list_prepared(peer.ip(), state.connection_id);
 

@@ -7,6 +7,7 @@
 //! codec or channel-layout fallbacks; expanding the advertised profile must be
 //! accompanied by an explicit decoder path here.
 
+use super::super::server::{sync_diagnostics_enabled, sync_utc_ns};
 use super::buffered_clock::{network_time_nanos, PlaybackAnchor};
 use super::engine::PcmOutput;
 use super::ptp::{PtpClockError, PtpClockMapper, PtpClockSample, PtpClockSource};
@@ -588,6 +589,11 @@ struct Type103Engine {
     clock_unavailable_since: Option<std::time::Instant>,
     last_clock_outage_ms: u64,
     housekeeping_ticks: u32,
+    sync_diagnostic_events: u8,
+    sync_anchor_generation: u64,
+    sync_schedule_pending: bool,
+    sync_write_pending: bool,
+    sync_last_deadline: Option<(u32, std::time::Instant)>,
 }
 
 struct AuthenticatedBlock {
@@ -660,7 +666,20 @@ impl Type103Engine {
             clock_unavailable_since: None,
             last_clock_outage_ms: 0,
             housekeeping_ticks: 0,
+            sync_diagnostic_events: 0,
+            sync_anchor_generation: 0,
+            sync_schedule_pending: false,
+            sync_write_pending: false,
+            sync_last_deadline: None,
         }
+    }
+
+    fn take_sync_diagnostic(&mut self) -> bool {
+        if !sync_diagnostics_enabled() || self.sync_diagnostic_events >= 64 {
+            return false;
+        }
+        self.sync_diagnostic_events += 1;
+        true
     }
 
     async fn run(&mut self) -> RunExit {
@@ -908,6 +927,10 @@ impl Type103Engine {
                     Ok(())
                 };
                 if result.is_ok() {
+                    self.sync_anchor_generation = self.sync_anchor_generation.wrapping_add(1);
+                    self.sync_schedule_pending = playing;
+                    self.sync_write_pending = playing;
+                    self.sync_last_deadline = None;
                     if state_changed {
                         self.playing = playing;
                         if !playing {
@@ -920,6 +943,15 @@ impl Type103Engine {
                         telemetry_token,
                         crate::telemetry::MediaKind::Buffered,
                         "invalid_anchor",
+                    );
+                }
+                if self.take_sync_diagnostic() {
+                    log::info!(
+                        target: "audiohub_airplay::airplay2",
+                        "AirPlay sync_diag event=rate_applied peer={} generation={} utc_ns={} playing={} changed={} accepted={} rtp_time={:?} network_secs={:?} network_frac={:?} timeline_id={:?}",
+                        self.peer_ip, self.sync_anchor_generation, sync_utc_ns(), playing,
+                        state_changed, result.is_ok(), anchor.rtp_time, anchor.network_time_secs,
+                        anchor.network_time_frac, anchor.timeline_id,
                     );
                 }
                 let _ = reply.send(result);
@@ -1025,6 +1057,19 @@ impl Type103Engine {
                         }
                     }
                 };
+                if result.is_ok() && !matches!(request, BufferedFlush::Deferred { .. }) {
+                    self.sync_schedule_pending = false;
+                    self.sync_write_pending = false;
+                    self.sync_last_deadline = None;
+                }
+                if self.take_sync_diagnostic() {
+                    log::info!(
+                        target: "audiohub_airplay::airplay2",
+                        "AirPlay sync_diag event=flush_applied peer={} generation={} utc_ns={} request={:?} accepted={} playing={}",
+                        self.peer_ip, self.sync_anchor_generation, sync_utc_ns(), request,
+                        result.is_ok(), self.playing,
+                    );
+                }
                 let _ = reply.send(result);
                 CommandResult::Continue
             }
@@ -1547,6 +1592,25 @@ impl Type103Engine {
                     );
                     ReadySchedule::Wait
                 } else if now.saturating_duration_since(deadline) <= MAX_CLOCKED_LATENESS {
+                    if self.sync_write_pending {
+                        self.sync_last_deadline = Some((ready_timestamp, deadline));
+                    }
+                    if self.sync_schedule_pending {
+                        self.sync_schedule_pending = false;
+                        if self.take_sync_diagnostic() {
+                            let submit_lead_ns = if deadline >= now {
+                                deadline.duration_since(now).as_nanos() as i128
+                            } else {
+                                -(now.duration_since(deadline).as_nanos() as i128)
+                            };
+                            log::info!(
+                                target: "audiohub_airplay::airplay2",
+                                "AirPlay sync_diag event=first_scheduled peer={} generation={} utc_ns={} rtp_time={} submit_lead_ns={} output_lead_ns={} source={:?}",
+                                self.peer_ip, self.sync_anchor_generation, sync_utc_ns(),
+                                ready_timestamp, submit_lead_ns, PCM_OUTPUT_LEAD.as_nanos(), deadline_source,
+                            );
+                        }
+                    }
                     ReadySchedule::DeliverAt(Instant::from_std(deadline))
                 } else {
                     ReadySchedule::DropLate
@@ -1649,7 +1713,28 @@ impl Type103Engine {
                 crate::telemetry::MediaKind::Buffered,
                 ready.pcm.len(),
             );
+            let sync_write = self.sync_write_pending && self.take_sync_diagnostic();
+            self.sync_write_pending = false;
+            let started = sync_write.then(|| (std::time::Instant::now(), sync_utc_ns()));
             self.output.write(&ready.pcm, ready.telemetry_token);
+            if let Some((started, write_utc_ns)) = started {
+                let submit_lateness_ns = self
+                    .sync_last_deadline
+                    .filter(|(timestamp, _)| *timestamp == ready.timestamp)
+                    .map(|(_, deadline)| {
+                        if started >= deadline {
+                            started.duration_since(deadline).as_nanos() as i128
+                        } else {
+                            -(deadline.duration_since(started).as_nanos() as i128)
+                        }
+                    });
+                log::info!(
+                    target: "audiohub_airplay::airplay2",
+                    "AirPlay sync_diag event=first_output_write peer={} generation={} utc_ns={} rtp_time={} samples={} submit_lateness_ns={:?} write_duration_ns={}",
+                    self.peer_ip, self.sync_anchor_generation, write_utc_ns, ready.timestamp,
+                    ready.pcm.len(), submit_lateness_ns, started.elapsed().as_nanos(),
+                );
+            }
         }
     }
 
@@ -2585,6 +2670,78 @@ mod tests {
             network_time_frac: playing.then_some(0),
             timeline_id: playing.then_some(1),
         }
+    }
+
+    #[tokio::test]
+    async fn sync_diagnostics_follow_accepted_anchors_without_changing_pcm() {
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9_000);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9_001);
+        let prepared =
+            PreparedType103::prepare(local, peer, valid_setup(), PtpClockSource::test_source())
+                .await
+                .unwrap();
+        let state = Arc::new(Mutex::new(OutputState::default()));
+        let (_tx, rx) = mpsc::channel(4);
+        let mut engine = Type103Engine::new(prepared, Box::new(TestOutput(Arc::clone(&state))), rx);
+        let token = crate::telemetry::operation_token();
+        let (reply, result) = oneshot::channel();
+        engine.apply_command(BufferedCommand::SetRate {
+            anchor: test_rate(true),
+            telemetry_token: token,
+            reply,
+        });
+        result.await.unwrap().unwrap();
+        assert_eq!(engine.sync_anchor_generation, 1);
+        assert!(engine.sync_schedule_pending && engine.sync_write_pending);
+
+        let pcm = vec![123, -456, 789, -321];
+        engine.ready_frame = Some(ReadyFrame {
+            sequence: 0,
+            timestamp: 0,
+            pcm: pcm.clone(),
+            wire_bytes: 0,
+            telemetry_token: token,
+            deadline_not_ready_since: None,
+            deadline_warmup_reported: false,
+            deadline_failure_reasons: 0,
+        });
+        engine.deliver_ready_frame();
+        assert!(!engine.sync_write_pending);
+        assert_eq!(state.lock().unwrap().writes, vec![pcm]);
+
+        let (reply, result) = oneshot::channel();
+        engine.apply_command(BufferedCommand::SetRate {
+            anchor: BufferedRateAnchor {
+                rtp_time: None,
+                ..test_rate(true)
+            },
+            telemetry_token: token,
+            reply,
+        });
+        assert!(result.await.unwrap().is_err());
+        assert_eq!(engine.sync_anchor_generation, 1);
+        assert!(!engine.sync_write_pending);
+
+        let (reply, result) = oneshot::channel();
+        engine.apply_command(BufferedCommand::SetRate {
+            anchor: test_rate(true),
+            telemetry_token: token,
+            reply,
+        });
+        result.await.unwrap().unwrap();
+        assert_eq!(engine.sync_anchor_generation, 2);
+        assert!(engine.sync_write_pending);
+        let (reply, result) = oneshot::channel();
+        engine.apply_command(BufferedCommand::Flush {
+            request: BufferedFlush::All,
+            telemetry_token: token,
+            reply,
+        });
+        result.await.unwrap().unwrap();
+        assert!(!engine.sync_schedule_pending && !engine.sync_write_pending);
+        assert!(!engine.playing);
+        engine.sync_diagnostic_events = 64;
+        assert!(!engine.take_sync_diagnostic());
     }
 
     async fn wait_for(mut predicate: impl FnMut() -> bool) {

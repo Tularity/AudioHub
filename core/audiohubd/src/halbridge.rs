@@ -239,6 +239,30 @@ const NOTIFY_LATENCY: u32 = 3;
 /// and regression N14 asserts it, so it is a contract rather than a message.
 pub const REASON_PROTOCOL_MISMATCH: &str = "driver_protocol_mismatch";
 
+#[cfg(any(windows, test))]
+fn keep_windows_bridge_after_open_failure(mode: HalBridgeMode, driver_present: bool) -> bool {
+    mode == HalBridgeMode::Require || (mode == HalBridgeMode::Auto && driver_present)
+}
+
+#[cfg(any(windows, test))]
+fn windows_driver_failure_reason(protocol: Option<u32>, detail: &str) -> String {
+    if protocol.is_some() { REASON_PROTOCOL_MISMATCH.to_string() } else { detail.to_string() }
+}
+
+#[test]
+fn windows_auto_keeps_a_present_incompatible_driver_for_update() {
+    assert!(keep_windows_bridge_after_open_failure(HalBridgeMode::Auto, true));
+    assert!(!keep_windows_bridge_after_open_failure(HalBridgeMode::Auto, false));
+    assert!(keep_windows_bridge_after_open_failure(HalBridgeMode::Require, false));
+    assert!(!keep_windows_bridge_after_open_failure(HalBridgeMode::Off, true));
+}
+
+#[test]
+fn windows_version_failure_uses_the_public_mismatch_reason() {
+    assert_eq!(windows_driver_failure_reason(Some(8), "driver speaks protocol 8"), REASON_PROTOCOL_MISMATCH);
+    assert_eq!(windows_driver_failure_reason(None, "access denied"), "access denied");
+}
+
 const BIND_CLEAR: u32 = 0;
 const BIND_SET: u32 = 1;
 
@@ -9971,23 +9995,23 @@ mod platform {
             return Ok(None);
         }
 
-        // The gate for `Auto`: can we open the control device right now? A
-        // machine without the driver is the ordinary case (every CI box, every
-        // Windows machine before installation) and must stay silent.
-        let first = match Session::open() {
-            Ok(s) => Some(s),
+        // A genuinely absent driver keeps Auto disabled. A present driver with
+        // an incompatible protocol must retain its diagnosis and retry owner,
+        // so installing the matching package can recover without a lost bridge.
+        let (first, initial_error) = match Session::open() {
+            Ok(s) => (Some(s), None),
             Err(e) => {
-                if cfg.mode != HalBridgeMode::Require {
+                if !keep_windows_bridge_after_open_failure(cfg.mode, e.driver_present()) {
                     return Ok(None);
                 }
                 dlog!("[audiohubd] HAL bridge: {} ; will keep looking", e.text());
-                None
+                (None, Some(e))
             }
         };
 
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
-            driver_found: AtomicBool::new(first.is_some()),
+            driver_found: AtomicBool::new(first.is_some() || initial_error.as_ref().is_some_and(|e| e.driver_present())),
             driver_connected: AtomicBool::new(false),
             slots: std::array::from_fn(|_| SlotShared::new()),
             last_driver_msg: Mutex::new(None),
@@ -9997,8 +10021,11 @@ mod platform {
             session_id: AtomicU64::new(0),
             attach_epoch: AtomicU64::new(0),
             slot_count: AtomicU32::new(0),
-            driver_protocol: AtomicU32::new(0),
-            status_reason: Mutex::new(Some("no driver attached yet".to_string())),
+            driver_protocol: AtomicU32::new(initial_error.as_ref().and_then(|e| e.driver_protocol()).unwrap_or(0)),
+            status_reason: Mutex::new(Some(initial_error.as_ref().map_or_else(
+                || "no driver attached yet".to_string(),
+                |e| windows_driver_failure_reason(e.driver_protocol(), &e.text()),
+            ))),
             bind_failures: AtomicU64::new(0),
             last_bind_error: Mutex::new(None),
             endpoint_name_fallbacks: AtomicU64::new(0),
@@ -10200,7 +10227,7 @@ mod platform {
                         shared
                             .driver_protocol
                             .store(e.driver_protocol().unwrap_or(0), Ordering::Relaxed);
-                        *lk(&shared.status_reason) = Some(e.text());
+                        *lk(&shared.status_reason) = Some(windows_driver_failure_reason(e.driver_protocol(), &e.text()));
                     }
                 }
             } else {

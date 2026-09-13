@@ -667,9 +667,8 @@ pub const ORIGIN_USER: &str = "user";
 pub const ORIGIN_HAL: &str = "hal";
 pub const ORIGIN_PEER: &str = "peer";
 
-/// Health of the macOS HAL bridge, reported by `daemon.status` as `hal`.
-/// Absent/null everywhere the bridge does not exist (any non-macOS host, or a
-/// macOS host without the LaunchDaemon), which is the normal case.
+/// Health of the platform's virtual-device bridge, reported as `hal` by
+/// `daemon.status`. Absent/null when no bridge is available on this host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HalStatus {
     /// launchd handed us the mach name: the driver can find us.

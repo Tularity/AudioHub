@@ -132,7 +132,10 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 // v8 adds native speaker format transactions, 64-byte control events and a
 // fixed 12-lane float ring. Public pins remain PCM16 with canonical layouts.
 // v7 peers cannot safely read this geometry, so versions must match exactly.
-#define AUDIOHUB_WIN_PROTOCOL_VERSION   8u
+// v9 requires safe PCM32 microphone quantization. A v8 driver can turn a
+// legitimate +1 sample into negative full scale. Message layouts are unchanged,
+// but accepting that older behavior would silently retain the audio defect.
+#define AUDIOHUB_WIN_PROTOCOL_VERSION   9u
 
 //
 // Must equal HAL_MAX_SLOTS in core/audiohubd/src/halbridge.rs. The driver's

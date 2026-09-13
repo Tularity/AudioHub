@@ -104,7 +104,9 @@ pub mod wire {
     /// v6 driver cannot safely participate in device-volume synchronization.
     /// v8 adds native PCM output-format transactions and fixes the physical
     /// speaker ring at 12 lanes so every supported layout fits one mapping.
-    pub const PROTOCOL_VERSION: u32 = 8;
+    /// v9 requires finite PCM32 microphone quantization with explicit endpoint
+    /// saturation. Layouts are unchanged, but v8 can silently invert +1 peaks.
+    pub const PROTOCOL_VERSION: u32 = 9;
 
     /// `AudioHubIoctl.h:AUDIOHUB_WIN_MAX_SLOTS`, and equal to
     /// `halbridge::HAL_MAX_SLOTS`. The driver's `PcAddAdapterDevice` budget is
@@ -4531,8 +4533,8 @@ mod tests {
         assert_eq!(NOTIFY_REPLY_BYTES, 8);
         // v8 adds the format payload and extends the control event.
         assert_eq!(
-            PROTOCOL_VERSION, 8,
-            "native output formats are mandatory in driver protocol 8"
+            PROTOCOL_VERSION, 9,
+            "safe PCM32 microphone quantization is mandatory in driver protocol 9"
         );
     }
 

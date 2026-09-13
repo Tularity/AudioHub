@@ -1285,6 +1285,22 @@ impl DaemonInner {
 
 /// Bridge health for `daemon.status`. `None` (serialised as null) is the
 /// normal answer: no macOS HAL bridge on this host.
+const fn expected_hal_driver_protocol() -> u32 {
+    if cfg!(windows) {
+        halbridge_win::wire::PROTOCOL_VERSION
+    } else {
+        halbridge::PROTOCOL_VERSION
+    }
+}
+
+#[test]
+fn hal_status_uses_the_platform_driver_protocol() {
+    #[cfg(windows)]
+    assert_eq!(expected_hal_driver_protocol(), 9);
+    #[cfg(target_os = "macos")]
+    assert_eq!(expected_hal_driver_protocol(), 4);
+}
+
 pub(crate) fn hal_status(inner: &DaemonInner) -> Option<audiohub_ipc::HalStatus> {
     inner.hal().map(|h| {
         let s = h.status();
@@ -1301,7 +1317,7 @@ pub(crate) fn hal_status(inner: &DaemonInner) -> Option<audiohub_ipc::HalStatus>
             mic_frames: s.mic_frames,
             mic_dropped: s.mic_dropped,
             last_driver_msg_secs: s.last_driver_msg_secs,
-            protocol_version: halbridge::PROTOCOL_VERSION,
+            protocol_version: expected_hal_driver_protocol(),
             driver_protocol_version: s.driver_protocol_version,
             status_reason: s.status_reason.clone(),
             bind_failures: s.bind_failures,

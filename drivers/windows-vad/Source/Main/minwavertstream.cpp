@@ -1940,17 +1940,21 @@ Routine Description:
 
         for (ULONG f = 0; f < got; f++)
         {
-            //
-            // Clamped BEFORE the cast. A float arriving even slightly outside
-            // [-1, 1) -- which a peer's mixer can legitimately produce -- would
-            // otherwise wrap to the opposite sign as an integer. That is not
-            // distortion, it is a full-scale click.
-            //
-            float v = mono[f];
-            if (v >  1.0f) { v =  1.0f; }
-            if (v < -1.0f) { v = -1.0f; }
-
-            LONG s = (LONG)(v * 2147483647.0f);
+            // Classify the object representation before floating-point work;
+            // a floating NaN comparison is not a reliable /fp:fast guard.
+            C_ASSERT(sizeof(float) == sizeof(ULONG));
+            ULONG sampleBits;
+            RtlCopyMemory(&sampleBits, &mono[f], sizeof(sampleBits));
+            LONG s = 0;
+            if ((sampleBits & 0x7f800000u) != 0x7f800000u)
+            {
+                float v = mono[f];
+                // The old float scale rounds to 2^31. Assign endpoints as
+                // integers so +1 cannot enter an out-of-range signed cast.
+                if (v >= 1.0f) { s = 2147483647L; }
+                else if (v <= -1.0f) { s = (-2147483647L - 1L); }
+                else { s = (LONG)(v * 2147483647.0f); }
+            }
             dst[2 * f]     = s;
             dst[2 * f + 1] = s;
         }

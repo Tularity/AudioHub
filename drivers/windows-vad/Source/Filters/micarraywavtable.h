@@ -19,14 +19,12 @@ Abstract:-
 // Mic array range.
 //
 //
-// 48 kHz, 32-bit IEEE FLOAT, 2 channels. See the note in speakerwavtable.h for
-// why float and not PCM: the ring<->WaveRT copy runs in a DPC and must not
-// convert.
+// KS capture is 48 kHz, signed PCM32, 2 channels. The bridge ring holds mono
+// float32; AhPullCapture converts under a saved floating-point/SSE context.
 //
 // The CHANNEL COUNT stays at 2 even though the microphone ring is MONO
-// (AUDIOHUB_MIC_CHANNELS == 1, matching macOS). The mono sample is splatted to
-// both channels in the DPC, which is an integer copy of 4-byte units and so
-// still touches no FPU. Publishing a 1-channel endpoint instead would have
+// (AUDIOHUB_MIC_CHANNELS == 1, matching macOS). The converted integer sample
+// is copied to both channels in the DPC. Publishing a 1-channel endpoint would have
 // been tidier here and would have meant changing the mic-array GEOMETRY
 // descriptor, a property Windows reads and validates -- a bigger change, in a
 // direction (capture) that is not on the M6-3 critical path.

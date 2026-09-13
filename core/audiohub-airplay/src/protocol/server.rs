@@ -255,6 +255,16 @@ struct CompletionOutput {
 }
 
 impl PcmOutput for CompletionOutput {
+    fn discard(&mut self, samples: &[i16], token: crate::telemetry::OperationToken) {
+        self.inner.as_mut().expect("live PCM output").discard(samples, token);
+    }
+    fn write_timed(&mut self, samples: &[i16], token: crate::telemetry::OperationToken, timing: crate::bus::PcmWriteTiming) {
+        self.inner
+            .as_mut()
+            .expect("live PCM output")
+            .write_timed(samples, token, timing);
+    }
+
     fn write(&mut self, samples: &[i16], token: crate::telemetry::OperationToken) {
         self.inner
             .as_mut()
@@ -5059,6 +5069,8 @@ mod tests {
     fn null_output_factory() -> PcmOutputFactory {
         struct NullOutput;
         impl PcmOutput for NullOutput {
+            fn discard(&mut self, _: &[i16], _: crate::telemetry::OperationToken) {}
+            fn write_timed(&mut self, _: &[i16], _: crate::telemetry::OperationToken, _: crate::bus::PcmWriteTiming) {}
             fn output_timing(&self) -> Option<crate::bus::OutputTiming> { None }
             fn write(
                 &mut self,
@@ -5149,10 +5161,12 @@ mod tests {
     fn media_completion_wrapper_forwards_output_timing() {
         struct TimedOutput;
         impl PcmOutput for TimedOutput {
+            fn discard(&mut self, _: &[i16], _: crate::telemetry::OperationToken) {}
+            fn write_timed(&mut self, _: &[i16], _: crate::telemetry::OperationToken, _: crate::bus::PcmWriteTiming) {}
             fn write(&mut self, _: &[i16], _: crate::telemetry::OperationToken) {}
             fn flush(&mut self) {}
             fn output_timing(&self) -> Option<crate::bus::OutputTiming> {
-                Some(crate::bus::OutputTiming { epoch: 7, lead: Duration::from_millis(125), estimated: true })
+                Some(crate::bus::OutputTiming { epoch: 7, lead: Duration::from_millis(125), staging_slack: Duration::ZERO, estimated: true })
             }
         }
         let (finished, _) = watch::channel(false);
@@ -5160,6 +5174,50 @@ mod tests {
         assert_eq!(output.output_timing(), TimedOutput.output_timing());
         output.inner.take();
         assert_eq!(output.output_timing(), None);
+    }
+
+    #[test]
+    fn media_completion_wrapper_preserves_timed_pcm_and_epoch() {
+        struct TimedSink {
+            bus: crate::bus::PcmBus,
+            untimed: Arc<AtomicU64>,
+        }
+        impl PcmOutput for TimedSink {
+            fn discard(&mut self, _: &[i16], _: crate::telemetry::OperationToken) {}
+            fn write(&mut self, _: &[i16], _: crate::telemetry::OperationToken) {
+                self.untimed.fetch_add(1, Ordering::Relaxed);
+            }
+            fn write_timed(&mut self, samples: &[i16], token: crate::telemetry::OperationToken, timing: crate::bus::PcmWriteTiming) {
+                let frames: Vec<_> = samples.chunks_exact(2)
+                    .map(|s| [f32::from(s[0]) / 32768.0, f32::from(s[1]) / 32768.0]).collect();
+                assert!(self.bus.push_timed_with_token(1, &frames, token, Some(timing)));
+            }
+            fn flush(&mut self) { self.bus.flush(1); }
+            fn output_timing(&self) -> Option<crate::bus::OutputTiming> { self.bus.output_timing() }
+        }
+        let bus=crate::bus::PcmBus::new(crate::bus::BusConfig::default());
+        let mut reader=bus.subscribe();
+        bus.activate(1);
+        let at=std::time::Instant::now();
+        let mut frame=[[0.0;2];8];
+        reader.read_stereo_timed(&mut frame, 7, None);
+        bus.publish_output_timing(7, Duration::from_millis(20), true);
+        let untimed=Arc::new(AtomicU64::new(0));
+        let (finished, _)=watch::channel(false);
+        let mut wrapper=CompletionOutput { inner:Some(Box::new(TimedSink {bus:bus.clone(),untimed:untimed.clone()})), finished };
+        let input=[8192i16,-8192].repeat(16);
+        wrapper.write_timed(&input, crate::telemetry::operation_token(), crate::bus::PcmWriteTiming {epoch:7,presentation:at});
+        assert_eq!(untimed.load(Ordering::Relaxed), 0, "the production wrapper must not erase timed writes");
+        let read=reader.read_stereo_timed(&mut frame,7,Some(at-Duration::from_nanos(62_500)));
+        assert_eq!((read.copied,read.silence,read.late),(5,3,0));
+        assert_eq!(&frame[..3], &[[0.0;2];3]);
+        assert_eq!(&frame[3..], &[[0.25,-0.25];5]);
+        wrapper.flush();
+        reader.read_stereo_timed(&mut frame,8,None);
+        bus.publish_output_timing(8,Duration::from_millis(20),true);
+        wrapper.write_timed(&input,crate::telemetry::operation_token(),crate::bus::PcmWriteTiming {epoch:8,presentation:at});
+        assert_eq!(reader.read_stereo_timed(&mut frame,8,Some(at)).copied,8);
+        assert_eq!(frame, [[0.25,-0.25];8]);
     }
 
     #[tokio::test]

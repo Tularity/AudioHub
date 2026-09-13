@@ -1,16 +1,26 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, TryLockError, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// A receiver-owned estimate, not a claim of exact acoustic presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputTiming {
+    /// Changes when the output presentation timeline is invalidated, including
+    /// a scheduling discontinuity which does not replace the native stream.
     pub epoch: u64,
     /// Total protocol-to-output lead, including this bus's startup cushion.
     pub lead: Duration,
+    /// Configured staging cushion only; excludes downstream and converter delay.
+    pub staging_slack: Duration,
     pub estimated: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PcmWriteTiming {
+    pub epoch: u64,
+    pub presentation: Instant,
 }
 
 /// AudioHub's internal sample rate.
@@ -67,31 +77,50 @@ impl BusConfig {
     }
 }
 
-#[derive(Debug)]
-struct ReaderState {
-    cursor: u64,
-    epoch: u64,
-    primed: bool,
-    dropped_pending: u64,
+// All concurrently accessed ring/control/feedback fields use SeqCst. Payload
+// remains atomic even when a reader subsequently rejects a torn slot snapshot.
+#[derive(Debug, Default)]
+struct AtomicFrame {
+    sequence: AtomicU64,
+    lr: AtomicU64,
+    time_ns: AtomicU64,
+    step: AtomicU64,
+    end: AtomicU64,
+    presentation_epoch: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct Feedback {
+    version: AtomicU64,
+    cursor: AtomicU64,
+    epoch: AtomicU64,
+    presentation_epoch: AtomicU64,
+    primed: AtomicBool,
+    retired: AtomicBool,
 }
 
 #[derive(Debug)]
 struct State {
-    frames: VecDeque<[f32; 2]>,
-    base_seq: u64,
     next_seq: u64,
     epoch: u64,
     active_session: Option<u64>,
     next_reader: u64,
-    readers: HashMap<u64, ReaderState>,
+    readers: HashMap<u64, Arc<Feedback>>,
+    presentation_epoch: u64,
+    timed: bool,
 }
 
 #[derive(Debug)]
 struct Inner {
     config: BusConfig,
-    // Zero means idle; runtime session ids start at one. This mirrors the
-    // mutex-owned field so deadline readers can distinguish lock contention
-    // from a real disconnect without waiting for the producer.
+    slots: Box<[AtomicFrame]>,
+    head: AtomicU64,
+    floor: AtomicU64,
+    reset_seq: AtomicU64,
+    control: AtomicU64,
+    timed: AtomicBool,
+    presentation_epoch: AtomicU64,
+    required_presentation_epoch: AtomicU64,
     active_session: AtomicU64,
     state: Mutex<State>,
     timing_base: Instant,
@@ -100,6 +129,32 @@ struct Inner {
     timing_delay_us: AtomicU64,
     timing_updated_ns: AtomicU64,
     timing_estimated: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+struct FrameSnapshot {
+    lr: [f32; 2],
+    time_ns: i64,
+    step: f64,
+    end: u64,
+    presentation_epoch: u64,
+}
+
+impl Inner {
+    fn frame(&self, q: u64) -> Option<FrameSnapshot> {
+        let expected = q.checked_mul(2)?.checked_add(2)?;
+        let slot = &self.slots[q as usize % self.slots.len()];
+        if slot.sequence.load(Ordering::SeqCst) != expected { return None; }
+        let lr = slot.lr.load(Ordering::SeqCst);
+        let frame = FrameSnapshot {
+            lr: [f32::from_bits(lr as u32), f32::from_bits((lr >> 32) as u32)],
+            time_ns: slot.time_ns.load(Ordering::SeqCst) as i64,
+            step: f64::from_bits(slot.step.load(Ordering::SeqCst)),
+            end: slot.end.load(Ordering::SeqCst),
+            presentation_epoch: slot.presentation_epoch.load(Ordering::SeqCst),
+        };
+        (slot.sequence.load(Ordering::SeqCst) == expected).then_some(frame)
+    }
 }
 
 /// A bounded 48 kHz stereo-frame PCM bus with independent reader cursors.
@@ -127,6 +182,14 @@ impl PcmBus {
         Self {
             inner: Arc::new(Inner {
                 config,
+                slots: (0..config.capacity_samples).map(|_| AtomicFrame::default()).collect(),
+                head: AtomicU64::new(0),
+                floor: AtomicU64::new(0),
+                reset_seq: AtomicU64::new(0),
+                control: AtomicU64::new(0),
+                timed: AtomicBool::new(false),
+                presentation_epoch: AtomicU64::new(0),
+                required_presentation_epoch: AtomicU64::new(0),
                 active_session: AtomicU64::new(0),
                 timing_base: Instant::now(),
                 timing_version: AtomicU64::new(0),
@@ -135,13 +198,14 @@ impl PcmBus {
                 timing_updated_ns: AtomicU64::new(0),
                 timing_estimated: AtomicBool::new(true),
                 state: Mutex::new(State {
-                    frames: VecDeque::with_capacity(config.capacity_samples),
-                    base_seq: 0,
+
                     next_seq: 0,
                     epoch: 0,
                     active_session: None,
                     next_reader: 1,
                     readers: HashMap::new(),
+                    presentation_epoch: 0,
+                    timed: false,
                 }),
             }),
         }
@@ -151,28 +215,27 @@ impl PcmBus {
     pub fn subscribe(&self) -> PcmReader {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let id = state.next_reader;
-        state.next_reader = state.next_reader.wrapping_add(1).max(1);
-        let cursor = state.next_seq;
-        let epoch = state.epoch;
-        state.readers.insert(
-            id,
-            ReaderState {
-                cursor,
-                epoch,
-                primed: false,
-                dropped_pending: 0,
-            },
-        );
+        state.next_reader = state.next_reader.checked_add(1).expect("PCM reader ids exhausted");
+        state.readers.retain(|_, r| !r.retired.load(Ordering::SeqCst));
+        let feedback = Arc::new(Feedback::default());
+        feedback.cursor.store(state.next_seq, Ordering::SeqCst);
+        state.readers.insert(id, feedback.clone());
         PcmReader {
             inner: Arc::downgrade(&self.inner),
             id,
+            feedback,
+            cursor: state.next_seq,
+            epoch: state.epoch,
+            presentation_epoch: self.inner.required_presentation_epoch.load(Ordering::SeqCst),
+            primed: false,
+            needs_timed_realign: false,
         }
     }
 
     /// Session whose samples currently own the bus. When protocol sessions
     /// overlap, the most recently created sink wins.
     pub fn active_session(&self) -> Option<u64> {
-        session_from_wire(self.inner.active_session.load(Ordering::Acquire))
+        session_from_wire(self.inner.active_session.load(Ordering::SeqCst))
     }
 
     /// Single writer: the application's local output owner. No locks, waits or
@@ -180,51 +243,54 @@ impl PcmBus {
     pub fn publish_output_timing(&self, epoch: u64, downstream: Duration, estimated: bool) {
         let epoch = if downstream <= Duration::from_secs(1) { epoch } else { 0 };
         let inner = &self.inner;
-        inner.timing_version.fetch_add(1, Ordering::AcqRel);
-        inner.timing_epoch.store(epoch, Ordering::Relaxed);
-        inner.timing_delay_us.store(downstream.as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
-        inner.timing_updated_ns.store(inner.timing_base.elapsed().as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
-        inner.timing_estimated.store(estimated, Ordering::Relaxed);
-        inner.timing_version.fetch_add(1, Ordering::Release);
+        let version = inner.timing_version.load(Ordering::SeqCst);
+        let Some(next_version) = version.checked_add(2) else {
+            inner.timing_version.store(u64::MAX, Ordering::SeqCst);
+            return;
+        };
+        inner.timing_version.store(next_version - 1, Ordering::SeqCst);
+        inner.timing_epoch.store(epoch, Ordering::SeqCst);
+        inner.timing_delay_us.store(downstream.as_micros().min(u64::MAX as u128) as u64, Ordering::SeqCst);
+        inner.timing_updated_ns.store(inner.timing_base.elapsed().as_nanos().min(u64::MAX as u128) as u64, Ordering::SeqCst);
+        inner.timing_estimated.store(estimated, Ordering::SeqCst);
+        inner.timing_version.store(next_version, Ordering::SeqCst);
     }
 
     pub(crate) fn output_timing(&self) -> Option<OutputTiming> {
         let inner = &self.inner;
-        let version = inner.timing_version.load(Ordering::Acquire);
+        let version = inner.timing_version.load(Ordering::SeqCst);
         if version & 1 != 0 { return None; }
-        let epoch = inner.timing_epoch.load(Ordering::Relaxed);
-        let delay_us = inner.timing_delay_us.load(Ordering::Relaxed);
-        let updated = inner.timing_updated_ns.load(Ordering::Relaxed);
-        let estimated = inner.timing_estimated.load(Ordering::Relaxed);
+        let epoch = inner.timing_epoch.load(Ordering::SeqCst);
+        let delay_us = inner.timing_delay_us.load(Ordering::SeqCst);
+        let updated = inner.timing_updated_ns.load(Ordering::SeqCst);
+        let estimated = inner.timing_estimated.load(Ordering::SeqCst);
         let now = inner.timing_base.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        std::sync::atomic::fence(Ordering::Acquire);
+        std::sync::atomic::fence(Ordering::SeqCst);
         if epoch == 0 || now.saturating_sub(updated) > 250_000_000
-            || version != inner.timing_version.load(Ordering::Relaxed) { return None; }
+            || version != inner.timing_version.load(Ordering::SeqCst) { return None; }
         let cushion = Duration::from_secs_f64(self.inner.config.prebuffer_samples as f64 / AUDIOHUB_RATE as f64);
-        Some(OutputTiming { epoch, lead: Duration::from_micros(delay_us) + cushion, estimated })
+        Some(OutputTiming { epoch, lead: Duration::from_micros(delay_us) + cushion, staging_slack: cushion, estimated })
     }
 
     pub(crate) fn activate(&self, session_id: u64) {
         debug_assert_ne!(session_id, 0, "zero is the inactive-session sentinel");
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        reset_locked(&mut state, Some(session_id));
-        self.inner
-            .active_session
-            .store(session_id, Ordering::Release);
+        state.timed = false;
+        reset_locked(&self.inner, &mut state, Some(session_id));
     }
 
     pub(crate) fn end(&self, session_id: u64) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.active_session == Some(session_id) {
-            reset_locked(&mut state, None);
-            self.inner.active_session.store(0, Ordering::Release);
+            reset_locked(&self.inner, &mut state, None);
+            self.inner.active_session.store(0, Ordering::SeqCst);
         }
     }
 
     pub(crate) fn flush(&self, session_id: u64) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.active_session == Some(session_id) {
-            reset_locked(&mut state, Some(session_id));
+            reset_locked(&self.inner, &mut state, Some(session_id));
         }
     }
 
@@ -239,8 +305,32 @@ impl PcmBus {
         frames: &[[f32; 2]],
         telemetry_token: crate::telemetry::OperationToken,
     ) -> bool {
+        self.push_timed_with_token(session_id, frames, telemetry_token, None)
+    }
+
+    pub(crate) fn push_timed_with_token(
+        &self,
+        session_id: u64,
+        frames: &[[f32; 2]],
+        telemetry_token: crate::telemetry::OperationToken,
+        timing: Option<PcmWriteTiming>,
+    ) -> bool {
+        self.push_resampled_with_token(session_id, frames, telemetry_token, timing, 1.0 / AUDIOHUB_RATE as f64)
+    }
+
+    pub(crate) fn push_resampled_with_token(
+        &self,
+        session_id: u64,
+        frames: &[[f32; 2]],
+        telemetry_token: crate::telemetry::OperationToken,
+        timing: Option<PcmWriteTiming>,
+        frame_seconds: f64,
+    ) -> bool {
         if frames.is_empty() {
             return true;
+        }
+        if !frame_seconds.is_finite() || frame_seconds <= 0.0 {
+            return false;
         }
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.active_session != Some(session_id) {
@@ -256,41 +346,49 @@ impl PcmBus {
             return false;
         }
 
-        for &frame in frames {
-            state.frames.push_back([
-                if frame[0].is_finite() { frame[0] } else { 0.0 },
-                if frame[1].is_finite() { frame[1] } else { 0.0 },
-            ]);
-            state.next_seq = state.next_seq.saturating_add(1);
+        let inner = &self.inner;
+        let gate = inner.required_presentation_epoch.load(Ordering::SeqCst);
+        if timing.is_some_and(|t| t.epoch == 0 || t.epoch != gate) { return false; }
+        let Some(end) = state.next_seq.checked_add(frames.len() as u64)
+            .filter(|end| *end <= u64::MAX / 2) else { return false; };
+        // Validate the entire time range before changing the ring.
+        let first_ns = timing.map(|t| signed_seconds(t.presentation, inner.timing_base) * 1e9);
+        let last_ns = first_ns.map(|ns| ns + (frames.len() - 1) as f64 * frame_seconds * 1e9);
+        if first_ns.into_iter().chain(last_ns).any(|ns| !ns.is_finite() || ns <= i64::MIN as f64 || ns >= i64::MAX as f64) { return false; }
+        if timing.is_some() && (!state.timed || state.presentation_epoch != gate) {
+            state.timed = true;
+            state.presentation_epoch = gate;
+            reset_locked(inner, &mut state, Some(session_id));
         }
-
-        let overflow = state
-            .frames
-            .len()
-            .saturating_sub(self.inner.config.capacity_samples);
-        if overflow != 0 {
-            state.frames.drain(..overflow);
-            state.base_seq = state.base_seq.saturating_add(overflow as u64);
-            let base = state.base_seq;
-            for reader in state.readers.values_mut() {
-                if reader.cursor < base {
-                    reader.dropped_pending = reader
-                        .dropped_pending
-                        .saturating_add(base.saturating_sub(reader.cursor));
-                    reader.cursor = base;
-                }
-            }
+        if state.epoch == u64::MAX { return false; }
+        state.readers.retain(|_, r| !r.retired.load(Ordering::SeqCst));
+        let old_floor = inner.floor.load(Ordering::SeqCst);
+        for (index, &frame) in frames.iter().enumerate() {
+            let q = state.next_seq;
+            // Eviction precedes touching a target slot; unrelated appends never
+            // change the control version used to validate a whole read.
+            let floor = inner.reset_seq.load(Ordering::SeqCst)
+                .max((q + 1).saturating_sub(inner.slots.len() as u64));
+            inner.floor.store(floor, Ordering::SeqCst);
+            let slot = &inner.slots[q as usize % inner.slots.len()];
+            slot.sequence.store(q * 2 + 1, Ordering::SeqCst);
+            let left = if frame[0].is_finite() { frame[0] } else { 0.0 };
+            let right = if frame[1].is_finite() { frame[1] } else { 0.0 };
+            slot.lr.store(left.to_bits() as u64 | ((right.to_bits() as u64) << 32), Ordering::SeqCst);
+            slot.time_ns.store(first_ns.map(|ns| (ns + index as f64 * frame_seconds * 1e9).round() as i64 as u64).unwrap_or(0), Ordering::SeqCst);
+            slot.step.store(frame_seconds.to_bits(), Ordering::SeqCst);
+            slot.end.store(end, Ordering::SeqCst);
+            slot.presentation_epoch.store(timing.map(|t| t.epoch).unwrap_or(0), Ordering::SeqCst);
+            slot.sequence.store(q * 2 + 2, Ordering::SeqCst);
+            state.next_seq += 1;
+            inner.head.store(state.next_seq, Ordering::SeqCst);
         }
+        let overflow = inner.floor.load(Ordering::SeqCst).saturating_sub(old_floor) as usize;
+        let accepted = timing.is_none() || inner.required_presentation_epoch.load(Ordering::SeqCst) == gate;
         let active_session = state.active_session;
         drop(state);
-        crate::telemetry::record_pcm_bus_push(
-            telemetry_token,
-            session_id,
-            active_session,
-            frames.len(),
-            overflow,
-        );
-        true
+        crate::telemetry::record_pcm_bus_push(telemetry_token, session_id, active_session, frames.len(), overflow);
+        accepted
     }
 
     /// Feedback for the streaming resampler. The fastest primed reader is the
@@ -299,12 +397,18 @@ impl PcmBus {
     /// paced, this loop only cancels the residual oscillator mismatch.
     pub(crate) fn correction_ppm(&self) -> f64 {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        let fill = state
-            .readers
-            .values()
-            .filter(|r| r.primed && r.epoch == state.epoch)
-            .map(|r| state.next_seq.saturating_sub(r.cursor))
-            .min();
+        let fill = state.readers.values().filter_map(|r| {
+            let version = r.version.load(Ordering::SeqCst);
+            let cursor = r.cursor.load(Ordering::SeqCst);
+            let epoch = r.epoch.load(Ordering::SeqCst);
+            let gate = r.presentation_epoch.load(Ordering::SeqCst);
+            let primed = r.primed.load(Ordering::SeqCst);
+            if version & 1 != 0 || version != r.version.load(Ordering::SeqCst)
+                || r.retired.load(Ordering::SeqCst) || !primed || epoch != state.epoch
+                || (state.timed && gate != self.inner.required_presentation_epoch.load(Ordering::SeqCst)) {
+                None
+            } else { Some(state.next_seq.saturating_sub(cursor.max(self.inner.floor.load(Ordering::SeqCst)))) }
+        }).min();
         let Some(fill) = fill else {
             return 0.0;
         };
@@ -328,24 +432,29 @@ impl PcmBus {
         state
             .readers
             .get(&reader_id)
-            .map(|r| state.next_seq.saturating_sub(r.cursor))
+            .map(|r| state.next_seq.saturating_sub(r.cursor.load(Ordering::SeqCst).max(self.inner.floor.load(Ordering::SeqCst))))
             .unwrap_or(0)
     }
 }
 
-fn reset_locked(state: &mut State, active_session: Option<u64>) {
-    state.frames.clear();
-    state.base_seq = state.next_seq;
-    state.epoch = state.epoch.wrapping_add(1);
+fn reset_locked(inner: &Inner, state: &mut State, active_session: Option<u64>) {
+    // Exhaustion permanently closes this instance; generations are never reused.
+    let Some(epoch) = state.epoch.checked_add(2) else {
+        state.epoch = u64::MAX;
+        state.active_session = None;
+        inner.control.store(u64::MAX, Ordering::SeqCst);
+        inner.active_session.store(0, Ordering::SeqCst);
+        return;
+    };
+    inner.control.store(epoch - 1, Ordering::SeqCst);
+    state.epoch = epoch;
     state.active_session = active_session;
-    let cursor = state.next_seq;
-    let epoch = state.epoch;
-    for reader in state.readers.values_mut() {
-        reader.cursor = cursor;
-        reader.epoch = epoch;
-        reader.primed = false;
-        reader.dropped_pending = 0;
-    }
+    inner.reset_seq.store(state.next_seq, Ordering::SeqCst);
+    inner.floor.store(state.next_seq, Ordering::SeqCst);
+    inner.active_session.store(active_session.unwrap_or(0), Ordering::SeqCst);
+    inner.timed.store(state.timed, Ordering::SeqCst);
+    inner.presentation_epoch.store(state.presentation_epoch, Ordering::SeqCst);
+    inner.control.store(epoch, Ordering::SeqCst);
 }
 
 /// Result of one non-blocking PCM bus read.
@@ -357,6 +466,9 @@ pub struct PcmRead {
     pub silence: usize,
     /// Stereo frames this reader lost to overflow since its last read.
     pub dropped: u64,
+    /// Frames intentionally skipped while aligning a timed startup/resume.
+    /// Unlike `dropped`, these were not lost to bounded-bus overflow.
+    pub late: u64,
     /// Active AirPlay session, if any.
     pub session_id: Option<u64>,
     /// Changes on a new stream or flush.
@@ -368,13 +480,20 @@ pub struct PcmRead {
 pub struct PcmReader {
     inner: Weak<Inner>,
     id: u64,
+    feedback: Arc<Feedback>,
+    cursor: u64,
+    epoch: u64,
+    presentation_epoch: u64,
+    primed: bool,
+    // Real missing output slots require fresh timestamp alignment.
+    needs_timed_realign: bool,
 }
 
 impl PcmReader {
     /// Fill legacy mono output without blocking by explicitly downmixing L/R.
     pub fn read_into(&mut self, out: &mut [f32]) -> PcmRead {
         out.fill(0.0);
-        self.read_frames(out.len(), |index, frame| {
+        self.read_frames(out.len(), None, |index, frame| {
             out[index] = (frame[0] + frame[1]) * 0.5;
         })
     }
@@ -382,12 +501,26 @@ impl PcmReader {
     /// Fill native stereo frames without blocking. Unavailable frames are silent.
     pub fn read_stereo_into(&mut self, out: &mut [[f32; 2]]) -> PcmRead {
         out.fill([0.0; 2]);
-        self.read_frames(out.len(), |index, frame| out[index] = frame)
+        self.read_frames(out.len(), None, |index, frame| out[index] = frame)
+    }
+
+    /// Align only startup/recovery to the next output block's content time.
+    /// Established readers retain continuous samples and smooth clock correction.
+    /// Untimed protocols keep their original prebuffer semantics.
+    pub fn read_stereo_timed(
+        &mut self,
+        out: &mut [[f32; 2]],
+        presentation_epoch: u64,
+        next_output: Option<Instant>,
+    ) -> PcmRead {
+        out.fill([0.0; 2]);
+        self.read_frames(out.len(), Some((presentation_epoch, next_output)), |index, frame| out[index] = frame)
     }
 
     fn read_frames(
         &mut self,
         frame_count: usize,
+        timing: Option<(u64, Option<Instant>)>,
         mut write_frame: impl FnMut(usize, [f32; 2]),
     ) -> PcmRead {
         let telemetry_token = crate::telemetry::operation_token();
@@ -398,6 +531,7 @@ impl PcmReader {
                     copied: 0,
                     silence: frame_count,
                     dropped: 0,
+                    late: 0,
                     session_id: None,
                     epoch: 0,
                 },
@@ -405,106 +539,131 @@ impl PcmReader {
                 false,
             );
         };
-        let active_session_hint = session_from_wire(inner.active_session.load(Ordering::Acquire));
-        // This reader runs on AudioHub's 10 ms deadline thread. A concurrent
-        // A network-media write must never park that thread: retain the cursor
-        // and emit one silent frame, then catch up on the next tick.
-        let mut state = match inner.state.try_lock() {
-            Ok(state) => state,
-            Err(TryLockError::WouldBlock) => {
-                return finish_read(
-                    telemetry_token,
-                    PcmRead {
-                        copied: 0,
-                        silence: frame_count,
-                        dropped: 0,
-                        session_id: active_session_hint,
-                        epoch: 0,
-                    },
-                    true,
-                    false,
-                );
+        if let Some((gate, _)) = timing {
+            inner.required_presentation_epoch.store(gate, Ordering::SeqCst);
+        }
+        let epoch = inner.control.load(Ordering::SeqCst);
+        let gate = inner.required_presentation_epoch.load(Ordering::SeqCst);
+        let session = session_from_wire(inner.active_session.load(Ordering::SeqCst));
+        let reset = inner.reset_seq.load(Ordering::SeqCst);
+        let floor = inner.floor.load(Ordering::SeqCst);
+        let head = inner.head.load(Ordering::SeqCst);
+        let stream_timed = inner.timed.load(Ordering::SeqCst);
+        let installed_gate = inner.presentation_epoch.load(Ordering::SeqCst);
+        let timed = timing.is_some() && stream_timed;
+        let mut read = PcmRead { copied: 0, silence: frame_count, dropped: 0, late: 0, session_id: session, epoch };
+        if epoch & 1 != 0 || epoch != inner.control.load(Ordering::SeqCst) {
+            read.epoch = 0;
+            self.primed = false;
+            return finish_read(telemetry_token, read, false, false);
+        }
+        if self.epoch != epoch {
+            self.cursor = reset;
+            self.epoch = epoch;
+            self.primed = false;
+        }
+        if stream_timed && self.presentation_epoch != gate {
+            self.primed = false;
+        }
+        self.presentation_epoch = gate;
+        if timed && self.needs_timed_realign {
+            self.primed = false;
+            self.needs_timed_realign = false;
+        }
+        if self.cursor < floor {
+            read.dropped = floor - self.cursor;
+            self.cursor = floor;
+            if timed { self.primed = false; }
+        }
+        let mut waiting = session.is_none() || (stream_timed && installed_gate != gate);
+        let mut leading = 0;
+        if !waiting && !self.primed && timed {
+            if let Some(at) = timing.and_then(|(_, at)| at) {
+                let target_ns = signed_seconds(at, inner.timing_base) * 1e9;
+                // At most capacity snapshots: every iteration advances a span
+                // or stops. Each slot owns its exact converted PTS and step.
+                for _ in 0..inner.slots.len() {
+                    if self.cursor >= head { break; }
+                    let Some(frame) = inner.frame(self.cursor) else {
+                        // A concurrently evicted alignment slot does not
+                        // authorize copying its neighbors without a PTS check.
+                        // Re-sample the floor and align on the next bounded read.
+                        waiting = true;
+                        break;
+                    };
+                    if frame.presentation_epoch != gate { waiting = true; break; }
+                    let seconds = (target_ns - frame.time_ns as f64) / 1e9;
+                    let delta = (seconds / frame.step).round();
+                    if delta < 0.0 {
+                        leading = (-seconds * AUDIOHUB_RATE as f64).round().max(0.0).min(frame_count as f64) as usize;
+                        waiting = leading == frame_count;
+                        break;
+                    }
+                    let skip = (delta as u64).min(frame.end.min(head).saturating_sub(self.cursor));
+                    self.cursor += skip;
+                    read.late += skip;
+                    if self.cursor < frame.end || skip == 0 { break; }
+                }
+            } else { waiting = true; }
+        }
+        let unread = head.saturating_sub(self.cursor);
+        waiting |= !self.primed && !timed && unread < inner.config.prebuffer_samples as u64;
+        let wanted = frame_count - leading;
+        let mut lost = false;
+        if !waiting {
+            let available = unread.min(wanted as u64) as usize;
+            for i in 0..available {
+                let q = self.cursor;
+                match inner.frame(q) {
+                    Some(frame) if !stream_timed || frame.presentation_epoch == gate => {
+                        write_frame(leading + i, frame.lr);
+                        read.copied += 1;
+                    }
+                    Some(_) => { lost = true; }
+                    None => { read.dropped += 1; lost = true; }
+                }
+                self.cursor += 1;
             }
-            Err(TryLockError::Poisoned(error)) => error.into_inner(),
-        };
-        let active_session = state.active_session;
-        let epoch = state.epoch;
-        let next_seq = state.next_seq;
-        let base_seq = state.base_seq;
-        let prebuffer = inner.config.prebuffer_samples as u64;
-
-        let Some(reader) = state.readers.get_mut(&self.id) else {
-            let read = PcmRead {
-                copied: 0,
-                silence: frame_count,
-                dropped: 0,
-                session_id: active_session,
-                epoch,
-            };
-            drop(state);
-            return finish_read(telemetry_token, read, false, false);
-        };
-
-        if reader.epoch != epoch {
-            reader.cursor = base_seq;
-            reader.epoch = epoch;
-            reader.primed = false;
-            reader.dropped_pending = 0;
+            self.primed = read.copied == wanted && wanted != 0;
+            if available < wanted || lost { self.primed = false; }
         }
-        if reader.cursor < base_seq {
-            reader.dropped_pending = reader
-                .dropped_pending
-                .saturating_add(base_seq.saturating_sub(reader.cursor));
-            reader.cursor = base_seq;
+        // The final control/gate check is the read linearization point. A real
+        // reset invalidates all writes to the caller, never a normal append.
+        if inner.control.load(Ordering::SeqCst) != epoch
+            || (stream_timed && inner.required_presentation_epoch.load(Ordering::SeqCst) != gate) {
+            for i in 0..frame_count { write_frame(i, [0.0; 2]); }
+            self.primed = false;
+            read.copied = 0;
+            read.dropped = 0;
+            read.late = 0;
+            read.epoch = 0;
         }
-
-        let unread = next_seq.saturating_sub(reader.cursor);
-        if active_session.is_none() || (!reader.primed && unread < prebuffer) {
-            let read = PcmRead {
-                copied: 0,
-                silence: frame_count,
-                dropped: std::mem::take(&mut reader.dropped_pending),
-                session_id: active_session,
-                epoch,
-            };
-            let _ = reader;
-            drop(state);
-            return finish_read(telemetry_token, read, false, false);
-        }
-        reader.primed = true;
-
-        let copied = (unread as usize).min(frame_count);
-        let offset = reader.cursor.saturating_sub(base_seq) as usize;
-        reader.cursor = reader.cursor.saturating_add(copied as u64);
-        if copied < frame_count {
-            // Rebuffer after an underrun. Otherwise every later block would
-            // be played one callback late and latency would ratchet upward.
-            reader.primed = false;
-            reader.cursor = next_seq;
-        }
-        let dropped = std::mem::take(&mut reader.dropped_pending);
-        // End the mutable reader borrow before indexing the ring itself.
-        let _ = reader;
-        for (dst_index, src_index) in (0..copied).zip(offset..) {
-            write_frame(
-                dst_index,
-                state.frames.get(src_index).copied().unwrap_or([0.0; 2]),
-            );
-        }
-        let read = PcmRead {
-            copied,
-            silence: frame_count - copied,
-            dropped,
-            session_id: active_session,
-            epoch,
-        };
-        drop(state);
-        finish_read(telemetry_token, read, false, copied < frame_count)
+        read.silence = frame_count - read.copied;
+        let feedback = &self.feedback;
+        let version = feedback.version.load(Ordering::SeqCst);
+        if let Some(next) = version.checked_add(2) {
+            feedback.version.store(next - 1, Ordering::SeqCst);
+            feedback.cursor.store(self.cursor, Ordering::SeqCst);
+            feedback.epoch.store(self.epoch, Ordering::SeqCst);
+            feedback.presentation_epoch.store(self.presentation_epoch, Ordering::SeqCst);
+            feedback.primed.store(self.primed, Ordering::SeqCst);
+            feedback.version.store(next, Ordering::SeqCst);
+        } else { feedback.retired.store(true, Ordering::SeqCst); }
+        let underrun = !waiting && !lost && read.epoch != 0 && read.copied < wanted;
+        finish_read(telemetry_token, read, false, underrun)
     }
 
     #[cfg(test)]
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+}
+
+fn signed_seconds(at: Instant, origin: Instant) -> f64 {
+    if at >= origin {
+        at.duration_since(origin).as_secs_f64()
+    } else {
+        -origin.duration_since(at).as_secs_f64()
     }
 }
 
@@ -514,8 +673,7 @@ fn finish_read(
     lock_contention: bool,
     underrun: bool,
 ) -> PcmRead {
-    // Callers that acquired the PCM state release it first. Even the atomic
-    // telemetry handshake therefore never lengthens the bus critical section.
+    // Reads never acquire the writer mutex; telemetry uses a bounded token handshake.
     crate::telemetry::record_pcm_bus_read(
         token,
         read.copied,
@@ -533,14 +691,7 @@ fn session_from_wire(value: u64) -> Option<u64> {
 
 impl Drop for PcmReader {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.upgrade() {
-            inner
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .readers
-                .remove(&self.id);
-        }
+        self.feedback.retired.store(true, Ordering::SeqCst);
     }
 }
 
@@ -556,6 +707,188 @@ mod tests {
         })
     }
 
+    fn indexed_frames(count: usize) -> Vec<[f32; 2]> {
+        (1..=count).map(|i| [i as f32, -(i as f32)]).collect()
+    }
+
+    #[test]
+    fn timed_start_places_pcm_inside_a_block_and_preserves_continuity() {
+        let bus = tiny_bus();
+        let mut reader = bus.subscribe();
+        bus.activate(7);
+        let start = Instant::now();
+        let mut out = [[0.0; 2]; 8];
+        reader.read_stereo_timed(&mut out, 1, None);
+        let source = indexed_frames(32);
+        assert!(bus.push_timed_with_token(7, &source, crate::telemetry::operation_token(), Some(PcmWriteTiming { epoch: 1, presentation: start })));
+        let read = reader.read_stereo_timed(&mut out, 1, Some(start - Duration::from_nanos(62_500)));
+        assert_eq!((read.copied, read.silence, read.late), (5, 3, 0));
+        assert_eq!(&out[..3], &[[0.0; 2]; 3]);
+        assert_eq!(&out[3..], &source[..5]);
+        // A missing native phase snapshot must not mute an established stream.
+        let read = reader.read_stereo_timed(&mut out, 1, None);
+        assert_eq!((read.copied, read.late), (8, 0));
+        assert_eq!(&out, &source[5..13]);
+        // Timing jitter does not force repeated sample skips after startup.
+        reader.read_stereo_timed(&mut out, 1, Some(start + Duration::from_millis(10)));
+        assert_eq!(&out, &source[13..21]);
+    }
+
+    #[test]
+    fn timed_start_skips_late_samples_without_calling_them_overflow() {
+        let bus = tiny_bus();
+        let mut reader = bus.subscribe();
+        bus.activate(7);
+        let start = Instant::now();
+        let mut out = [[0.0; 2]; 8];
+        reader.read_stereo_timed(&mut out, 1, None);
+        let source = indexed_frames(16);
+        bus.push_timed_with_token(7, &source, crate::telemetry::operation_token(), Some(PcmWriteTiming { epoch: 1, presentation: start }));
+        let read = reader.read_stereo_timed(&mut out, 1, Some(start + Duration::from_nanos(62_500)));
+        assert_eq!((read.copied, read.late, read.dropped), (8, 3, 0));
+        assert_eq!(&out, &source[3..11]);
+    }
+
+    #[test]
+    fn timed_epoch_fences_old_pcm_and_old_writes_before_protocol_flush() {
+        let bus = tiny_bus();
+        let mut reader = bus.subscribe();
+        bus.activate(7);
+        let start = Instant::now();
+        let mut out = [[0.0; 2]; 8];
+        reader.read_stereo_timed(&mut out, 1, None);
+        let old = PcmWriteTiming { epoch: 1, presentation: start };
+        bus.push_timed_with_token(7, &indexed_frames(32), crate::telemetry::operation_token(), Some(old));
+        assert_eq!(reader.read_stereo_timed(&mut out, 1, Some(start)).copied, 8);
+        assert_eq!(reader.read_stereo_timed(&mut out, 2, Some(start)).copied, 0);
+        assert_eq!(out, [[0.0; 2]; 8]);
+        assert!(!bus.push_timed_with_token(7, &indexed_frames(32), crate::telemetry::operation_token(), Some(old)));
+        bus.flush(7);
+        let fresh = [[-0.5, 0.5]; 32];
+        assert!(bus.push_timed_with_token(7, &fresh, crate::telemetry::operation_token(), Some(PcmWriteTiming { epoch: 2, presentation: start })));
+        assert_eq!(reader.read_stereo_timed(&mut out, 2, Some(start)).copied, 8);
+        assert_eq!(out, [[-0.5, 0.5]; 8]);
+    }
+
+    #[test]
+    fn contended_timed_read_consumes_the_complete_output_slot() {
+        let bus = tiny_bus();
+        let mut reader = bus.subscribe();
+        bus.activate(7);
+        let start = Instant::now();
+        let mut out = [[0.0; 2]; 8];
+        reader.read_stereo_timed(&mut out, 1, None);
+        let source = indexed_frames(32);
+        assert!(bus.push_timed_with_token(7, &source, crate::telemetry::operation_token(), Some(PcmWriteTiming { epoch: 1, presentation: start })));
+        assert_eq!(reader.read_stereo_timed(&mut out, 1, Some(start)).copied, 8);
+        let locked = bus.inner.state.lock().unwrap();
+        let missed = reader.read_stereo_timed(&mut out, 1, Some(start + Duration::from_secs_f64(8.0/48_000.0)));
+        assert_eq!((missed.copied, missed.silence), (8, 0));
+        assert_eq!(&out, &source[8..16]);
+        drop(locked);
+        let recovered = reader.read_stereo_timed(&mut out, 1, Some(start + Duration::from_secs_f64(16.0/48_000.0)));
+        assert_eq!((recovered.copied, recovered.late), (8, 0));
+        assert_eq!(&out, &source[16..24]);
+        assert_eq!(reader.read_stereo_timed(&mut out, 1, None).copied, 8);
+        assert_eq!(&out, &source[24..32]);
+    }
+
+    #[test]
+    fn timed_contention_preserves_continuity_without_a_fresh_target() {
+        let bus = tiny_bus();
+        let mut reader = bus.subscribe();
+        bus.activate(7);
+        let start = Instant::now();
+        let mut out = [[0.0; 2]; 8];
+        reader.read_stereo_timed(&mut out, 1, None);
+        let source = indexed_frames(40);
+        bus.push_timed_with_token(7, &source, crate::telemetry::operation_token(), Some(PcmWriteTiming { epoch: 1, presentation: start }));
+        reader.read_stereo_timed(&mut out, 1, Some(start));
+        let locked = bus.inner.state.lock().unwrap();
+        reader.read_stereo_timed(&mut out, 1, None);
+        drop(locked);
+        assert_eq!(&out, &source[8..16]);
+        assert_eq!(reader.read_stereo_timed(&mut out, 1, None).copied, 8);
+        assert_eq!(&out, &source[16..24]);
+        let recovered = reader.read_stereo_timed(&mut out, 1, Some(start + Duration::from_secs_f64(24.0/48_000.0)));
+        assert_eq!((recovered.copied, recovered.late), (8, 0));
+        assert_eq!(&out, &source[24..32]);
+    }
+
+    #[test]
+    fn partial_timed_start_counts_the_silence_already_presented() {
+        let bus = tiny_bus();
+        let mut reader = bus.subscribe();
+        bus.activate(7);
+        let start = Instant::now();
+        let mut out = [[0.0; 2]; 8];
+        reader.read_stereo_timed(&mut out, 1, None);
+        let source = indexed_frames(24);
+        let token = crate::telemetry::operation_token();
+        assert!(bus.push_timed_with_token(7, &source[..4], token, Some(PcmWriteTiming { epoch: 1, presentation: start })));
+        let first = reader.read_stereo_timed(&mut out, 1, Some(start));
+        assert_eq!((first.copied, first.silence), (4, 4));
+        assert_eq!(&out[..4], &source[..4]);
+        assert_eq!(&out[4..], &[[0.0; 2]; 4]);
+        assert!(bus.push_timed_with_token(7, &source[4..], token, Some(PcmWriteTiming { epoch: 1, presentation: start + Duration::from_secs_f64(4.0 / 48_000.0) })));
+        let next = reader.read_stereo_timed(&mut out, 1, Some(start + Duration::from_secs_f64(8.0 / 48_000.0)));
+        assert_eq!((next.copied, next.late), (8, 4));
+        assert_eq!(&out, &source[8..16]);
+    }
+
+    #[test]
+    fn timed_writes_cannot_advance_the_output_owners_epoch() {
+        let bus = tiny_bus();
+        let mut reader = bus.subscribe();
+        bus.activate(7);
+        let start = Instant::now();
+        let mut out = [[0.0; 2]; 8];
+        reader.read_stereo_timed(&mut out, 1, None);
+        let first = PcmWriteTiming { epoch: 1, presentation: start };
+        assert!(bus.push_timed_with_token(7, &indexed_frames(16), crate::telemetry::operation_token(), Some(first)));
+        reader.read_stereo_timed(&mut out, 1, Some(start));
+        bus.flush(7);
+        let newer = [[-0.25, 0.25]; 16];
+        let timing = PcmWriteTiming { epoch: 2, presentation: start };
+        assert!(!bus.push_timed_with_token(7, &newer, crate::telemetry::operation_token(), Some(timing)));
+        assert_eq!(reader.read_stereo_timed(&mut out, 2, Some(start)).copied, 0);
+        bus.publish_output_timing(2, Duration::from_millis(20), true);
+        assert_eq!(bus.output_timing().unwrap().epoch, 2);
+        assert!(bus.push_timed_with_token(7, &newer, crate::telemetry::operation_token(), Some(timing)));
+        assert_eq!(reader.read_stereo_timed(&mut out, 2, Some(start)).copied, 8);
+        assert_eq!(out, [[-0.25, 0.25]; 8]);
+    }
+
+    #[test]
+    fn timed_reader_keeps_untimed_protocols_live_without_an_epoch_ack() {
+        let bus = tiny_bus();
+        let mut reader = bus.subscribe();
+        bus.activate(7);
+        let source = indexed_frames(16);
+        bus.push(7, &source);
+        let mut out = [[0.0; 2]; 8];
+        assert_eq!(reader.read_stereo_timed(&mut out, 7, None).copied, 8);
+        assert_eq!(&out, &source[..8]);
+        assert_eq!(reader.read_stereo_timed(&mut out, 8, None).copied, 8);
+        assert_eq!(&out, &source[8..]);
+    }
+
+    #[test]
+    fn timed_start_uses_available_pcm_at_its_deadline_not_a_count_threshold() {
+        let bus = PcmBus::new(BusConfig::default());
+        let mut reader = bus.subscribe();
+        bus.activate(7);
+        let start = Instant::now();
+        let mut out = [[0.0; 2]; 480];
+        reader.read_stereo_timed(&mut out, 1, None);
+        let source = vec![[0.25, -0.25]; 1024];
+        bus.push_timed_with_token(7, &source, crate::telemetry::operation_token(), Some(PcmWriteTiming { epoch: 1, presentation: start }));
+        assert_eq!(reader.read_stereo_timed(&mut out, 1, Some(start - Duration::from_millis(20))).copied, 0);
+        assert_eq!(reader.read_stereo_timed(&mut out, 1, None).copied, 0);
+        assert_eq!(reader.read_stereo_timed(&mut out, 1, Some(start)).copied, 480);
+        assert_eq!(out, [[0.25, -0.25]; 480]);
+    }
+
     #[test]
     fn output_timing_is_bounded_fresh_and_includes_the_bus_cushion() {
         let bus = PcmBus::new(BusConfig::default());
@@ -568,9 +901,9 @@ mod tests {
         bus.publish_output_timing(8, Duration::from_secs(2), false);
         assert_eq!(bus.output_timing(), None);
         bus.publish_output_timing(8, Duration::from_millis(20), false);
-        bus.inner.timing_version.fetch_add(1, Ordering::AcqRel);
+        bus.inner.timing_version.fetch_add(1, Ordering::SeqCst);
         assert_eq!(bus.output_timing(), None);
-        bus.inner.timing_version.fetch_add(1, Ordering::Release);
+        bus.inner.timing_version.fetch_add(1, Ordering::SeqCst);
         assert_eq!(bus.output_timing().unwrap().epoch, 8);
         bus.publish_output_timing(0, Duration::ZERO, true);
         assert_eq!(bus.output_timing(), None);
@@ -690,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_contention_and_active_stream_underrun_are_distinct_failures() {
+    fn writer_lock_does_not_count_as_contention_during_real_underrun() {
         let telemetry_before = crate::telemetry::snapshot().counters;
         let bus = tiny_bus();
         let mut reader = bus.subscribe();
@@ -708,12 +1041,8 @@ mod tests {
         assert_eq!(underrun.silence, 6);
 
         let telemetry_after = crate::telemetry::snapshot().counters;
-        assert!(
-            telemetry_after.pcm_bus_lock_contention_reads
-                >= telemetry_before
-                    .pcm_bus_lock_contention_reads
-                    .saturating_add(1)
-        );
+        assert_eq!(telemetry_after.pcm_bus_lock_contention_reads,
+            telemetry_before.pcm_bus_lock_contention_reads);
         assert!(
             telemetry_after.pcm_bus_underrun_reads
                 >= telemetry_before.pcm_bus_underrun_reads.saturating_add(1)
@@ -774,18 +1103,14 @@ mod tests {
         let guard = bus.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = [[1.0; 2]; 2];
         let report = reader.read_stereo_into(&mut out);
-        assert_eq!(report.copied, 0);
-        assert_eq!(report.silence, 2);
+        assert_eq!(report.copied, 2);
+        assert_eq!(report.silence, 0);
         assert_eq!(report.session_id, Some(1), "contention is not a disconnect");
-        assert_eq!(out, [[0.0; 2]; 2]);
+        assert_eq!(out, [[0.25, -0.25], [0.5, -0.5]]);
         drop(guard);
 
-        assert_eq!(reader.read_stereo_into(&mut out).copied, 2);
-        assert_eq!(
-            out,
-            [[0.25, -0.25], [0.5, -0.5]],
-            "content remains queued after contention"
-        );
+        assert_eq!(reader.read_stereo_into(&mut out).copied, 0);
+        assert_eq!(out, [[0.0; 2]; 2]);
     }
 
     #[test]

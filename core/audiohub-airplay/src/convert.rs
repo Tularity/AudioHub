@@ -14,6 +14,14 @@ pub struct StreamingStereoPcmConverter {
     core: StreamingFrameConverter,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConvertedTiming {
+    /// Relative to the start of this input slice, in source-clock seconds.
+    pub offset_seconds: f64,
+    /// Source-clock seconds represented by one reconstructed output frame.
+    pub frame_seconds: f64,
+}
+
 impl StreamingStereoPcmConverter {
     pub fn new(input_rate: u32, channels: u8) -> io::Result<Self> {
         if channels > 2 {
@@ -35,6 +43,14 @@ impl StreamingStereoPcmConverter {
     /// Append native 48 kHz stereo frames to `out`.
     pub fn process_i16(&mut self, input: &[i16], out: &mut Vec<[f32; 2]>) {
         self.core.process_i16(input, out);
+    }
+
+    pub(crate) fn process_i16_with_timing(
+        &mut self,
+        input: &[i16],
+        out: &mut Vec<[f32; 2]>,
+    ) -> Option<ConvertedTiming> {
+        self.core.process_i16(input, out)
     }
 
     /// Fixed content delay of the reconstruction filter, including at 48 kHz.
@@ -145,7 +161,8 @@ impl StreamingFrameConverter {
         };
     }
 
-    fn process_i16(&mut self, input: &[i16], out: &mut Vec<[f32; 2]>) {
+    fn process_i16(&mut self, input: &[i16], out: &mut Vec<[f32; 2]>) -> Option<ConvertedTiming> {
+        let partial_offset = self.partial_channels as f64 / self.channels as f64;
         self.input_frames.clear();
         for &sample in input {
             let sample = sample as f32 / 32_768.0;
@@ -172,7 +189,7 @@ impl StreamingFrameConverter {
                 }
             }
         }
-        if self.input_frames.is_empty() { return; }
+        if self.input_frames.is_empty() { return None; }
         if self.seed_pending {
             // A seek has no trustworthy earlier waveform. Extend its first
             // actual frame into the missing past rather than inventing a zero
@@ -183,9 +200,14 @@ impl StreamingFrameConverter {
         // Positive feedback correction requests more output frames. The
         // common kernel takes input-frames/output-frame, hence the reciprocal.
         self.resampler.set_correction(1.0 / (1.0 + self.correction_ppm * 1e-6));
+        let timing = ConvertedTiming {
+            offset_seconds: (self.resampler.next_source_position() - partial_offset) / self.input_rate as f64,
+            frame_seconds: self.resampler.step() / self.input_rate as f64,
+        };
         self.output_frames.clear();
         self.resampler.process(&self.input_frames, &mut self.output_frames);
         out.extend(self.output_frames.chunks_exact(2).map(|frame| [frame[0], frame[1]]));
+        (!self.output_frames.is_empty()).then_some(timing)
     }
 
     fn flush(&mut self) {

@@ -1432,6 +1432,10 @@ mod tests {
     struct NetworkOutput(Arc<Mutex<NetworkOutputState>>);
 
     impl media::engine::PcmOutput for NetworkOutput {
+        fn discard(&mut self, _: &[i16], _: crate::telemetry::OperationToken) {}
+        fn write_timed(&mut self, samples: &[i16], token: crate::telemetry::OperationToken, _: crate::bus::PcmWriteTiming) {
+            self.write(samples, token);
+        }
         fn output_timing(&self) -> Option<crate::bus::OutputTiming> { None }
         fn write(&mut self, samples: &[i16], _: crate::telemetry::OperationToken) {
             self.0

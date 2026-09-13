@@ -4676,6 +4676,7 @@ fn push_mix(inner: &DaemonInner, samples: &[f32]) {
 }
 
 const SITE_CALLBACK_STALL_THRESHOLD: Duration = Duration::from_millis(250);
+const SITE_SCHEDULER_RECOVERY_GRACE: Duration = Duration::from_millis(30);
 const UNKNOWN_CALLBACK_AGE_US: u64 = u64::MAX;
 const SITE_PLAYBACK_RETRY_MIN: Duration = Duration::from_millis(250);
 const SITE_PLAYBACK_RETRY_MAX: Duration = Duration::from_secs(2);
@@ -5498,16 +5499,22 @@ pub(crate) fn site_playback_status(probe: &SitePlaybackProbe) -> serde_json::Val
 
 struct SitePlaybackTransitions {
     generation: u64,
+    presentation_epoch: u64,
     phase: SitePlaybackPhase,
     opened_at: Option<Instant>,
+    scheduler_recovery_until: Option<Instant>,
+    last_mixer_observation: Option<Instant>,
 }
 
 impl SitePlaybackTransitions {
     fn new() -> Self {
         Self {
             generation: 0,
+            presentation_epoch: 0,
             phase: SitePlaybackPhase::Closed,
             opened_at: None,
+            scheduler_recovery_until: None,
+            last_mixer_observation: None,
         }
     }
 
@@ -5520,8 +5527,11 @@ impl SitePlaybackTransitions {
     ) {
         let config = playback.config_snapshot();
         self.generation = probe.reopened(config, reason);
+        self.presentation_epoch = self.presentation_epoch.wrapping_add(1).max(1);
         self.phase = SitePlaybackPhase::Starting;
         self.opened_at = Some(now);
+        self.scheduler_recovery_until = None;
+        self.last_mixer_observation = Some(now);
         dlog!(
             "[audiohubd] site playback opened generation={} reason={} source={}Hz/{}ch \
              device={}Hz/{}ch/{} buffer={}",
@@ -5539,6 +5549,42 @@ impl SitePlaybackTransitions {
     fn closed(&mut self) {
         self.phase = SitePlaybackPhase::Closed;
         self.opened_at = None;
+        self.scheduler_recovery_until = None;
+        self.last_mixer_observation = None;
+    }
+
+    fn observe_mixer_progress(&mut self, now: Instant) {
+        if self.last_mixer_observation.is_some_and(|last| {
+            now.saturating_duration_since(last) > Duration::from_millis(100)
+        }) {
+            self.scheduler_resumed(now);
+        }
+        self.last_mixer_observation = Some(now);
+    }
+
+    fn scheduler_resumed(&mut self, now: Instant) {
+        if self.scheduler_recovery_until.is_none() {
+            self.scheduler_recovery_until = Some(now + SITE_SCHEDULER_RECOVERY_GRACE);
+            // Late RTP packets are discarded by the protocol scheduler, but
+            // its already-converted bus PCM also belongs to the old timeline.
+            // A new presentation epoch asks that scheduler to flush/re-anchor
+            // without destroying a native stream whose callbacks can resume.
+            self.presentation_epoch = self.presentation_epoch.wrapping_add(1).max(1);
+        }
+    }
+
+    fn retire_cause(&mut self, phase: SitePlaybackPhase, now: Instant) -> Option<SitePlaybackRetireCause> {
+        let cause = site_playback_retire_cause(phase);
+        if cause == Some(SitePlaybackRetireCause::CallbackStall)
+            && self.scheduler_recovery_until.is_some_and(|until| now < until)
+        {
+            // A process-wide scheduling pause also pauses the native callback.
+            // Let it run once before interpreting its old timestamp as a
+            // broken device. A callback-only outage receives no such grace.
+            return None;
+        }
+        if phase != SitePlaybackPhase::Stalled { self.scheduler_recovery_until = None; }
+        cause
     }
 
     fn observe(
@@ -5548,8 +5594,11 @@ impl SitePlaybackTransitions {
         tx: &AudioTx,
         now: Instant,
     ) -> SitePlaybackPhase {
+        // This is called twice in a mixer iteration. A scheduling pause may
+        // resume at either call, before the next top-of-loop lateness check.
+        self.observe_mixer_progress(now);
         let callback_count = tx.output_callback_count();
-        let callback_age = tx.last_output_callback_age();
+        let callback_age = tx.last_output_callback_age_at(now);
         let no_callback_age = self
             .opened_at
             .map(|opened| now.saturating_duration_since(opened));
@@ -5691,7 +5740,7 @@ fn observe_and_retire_unhealthy_site_playback(
             SITE_PLAYBACK_RETRY_MIN.as_millis(),
         );
     }
-    let Some(cause) = site_playback_retire_cause(phase) else {
+    let Some(cause) = transitions.retire_cause(phase, now) else {
         return false;
     };
 
@@ -6096,8 +6145,6 @@ pub(crate) fn mixer_loop(
         // 之后**：`margin` 买的是「醒来晚了多少」，不是「整 tick 丢没丢」。
         MIX_LATE.record(sleep_until(deadline));
         let streams: Vec<Arc<RxStream>> = rd(&inner.rx_table).values().cloned().collect();
-        let airplay_read = airplay.read_into(&mut airplay_frame);
-        let airplay_local = airplay_read.session_id.is_some();
         apply_site_playback_build_results(
             &inner.site_playback,
             &mut playback,
@@ -6117,13 +6164,40 @@ pub(crate) fn mixer_loop(
             &mut playback_retry,
             Instant::now(),
         );
+        let site_active = airplay.has_active_session()
+            || streams.iter().any(|s| s.spatial.is_none() && (s.is_spk || s.monitor));
+        let output_observed_at = Instant::now();
+        let mut prepared = if site_active {
+            playback.as_mut().and_then(|p| p.tx.prepare_push_at(F48_STEREO, output_observed_at))
+        } else {
+            None
+        };
+        let prepared_epoch = playback_transitions.presentation_epoch;
+        let output_timing = playback.as_ref().filter(|_| prepared.is_some()).and_then(|p| {
+            let fallback = airplay.device_tail(dev_epoch);
+            Some((
+                p.tx.output_delay_with_fallback_at(fallback.map(|value| value.0), output_observed_at)?,
+                fallback.map(|value| value.1).unwrap_or(true),
+            ))
+        });
+        let next_output = output_timing.and_then(|(delay, _)| output_observed_at.checked_add(delay));
+        if prepared.as_ref().is_some_and(|ticket| ticket.timing_discontinuity()) {
+            // Pad or an observed-quantum callback short read broke the timeline.
+            // Re-align before selecting PCM; transient unknown alone does not.
+            airplay.cancel_output_read(playback_transitions.presentation_epoch);
+        }
+        // Invalidate the old PCM timeline before exposing a new epoch to the
+        // producer. A contended read did not acknowledge that invalidation.
+        let airplay_read = airplay.read_into(&mut airplay_frame, playback_transitions.presentation_epoch, next_output);
+        if airplay_read.epoch != 0 {
+            airplay.publish_output_timing(playback_transitions.presentation_epoch, output_timing);
+        }
+        if airplay_read.late != 0 {
+            dlog!("[audiohubd] AirPlay timed startup skipped {} late frames", airplay_read.late);
+        }
+        let airplay_local = airplay_read.session_id.is_some();
         let site_output_requested =
             airplay_local || streams.iter().any(|stream| stream.is_spk || stream.monitor);
-        let output_timing = playback.as_ref().and_then(|p| {
-            let (tail, estimated) = airplay.device_tail(dev_epoch)?;
-            Some((p.tx.output_delay(tail)?, estimated))
-        });
-        airplay.publish_output_timing(playback_transitions.generation, output_timing);
         if site_output_requested && playback.is_none() {
             request_site_playback_open(
                 &inner.site_playback,
@@ -6423,11 +6497,17 @@ pub(crate) fn mixer_loop(
                 // push 之后读，恒定多算一整帧 ≈ 10 ms（刚推进去的 480 个样本
                 // 不用等自己），而且因为恒定，看起来完全像一个真实的缓冲。
                 publish_play_ring(&inner.play_ring, tx);
-                tx.push(&out);
-                have_play_ring = true;
+                if prepared_epoch == playback_transitions.presentation_epoch {
+                    if let Some(ticket) = prepared.take() {
+                        have_play_ring = tx.commit_push(ticket, &out);
+                    }
+                }
             }
         }
         if !have_play_ring {
+            // Discard this tick after an owner/epoch change. Re-arm the same
+            // reader, so consumed old-timeline PCM cannot prime the next tick.
+            airplay.cancel_output_read(playback_transitions.presentation_epoch);
             inner.play_ring.store(None);
         }
         // 每条流的两条**并行**尾级（桥接虚拟声卡 / 虚拟麦克风）。每 tick 都写，
@@ -6762,6 +6842,64 @@ pub(crate) mod tests {
             Some(SitePlaybackRetireCause::StreamError)
         );
         assert_eq!(site_playback_retire_cause(SitePlaybackPhase::Running), None);
+    }
+
+    #[test]
+    fn global_scheduler_pause_gets_one_bounded_callback_recovery_window() {
+        let now = Instant::now();
+        let mut transitions = SitePlaybackTransitions::new();
+        assert_eq!(transitions.retire_cause(SitePlaybackPhase::Stalled, now), Some(SitePlaybackRetireCause::CallbackStall));
+        transitions.scheduler_resumed(now);
+        assert_eq!(transitions.retire_cause(SitePlaybackPhase::Stalled, now), None);
+        assert_eq!(transitions.retire_cause(SitePlaybackPhase::Stalled, now + Duration::from_millis(29)), None);
+        transitions.scheduler_resumed(now + Duration::from_millis(29));
+        assert_eq!(transitions.retire_cause(SitePlaybackPhase::Stalled, now + Duration::from_millis(30)), Some(SitePlaybackRetireCause::CallbackStall));
+    }
+
+    #[test]
+    fn scheduler_grace_never_masks_fatal_errors_or_a_later_device_stall() {
+        let now = Instant::now();
+        let mut transitions = SitePlaybackTransitions::new();
+        transitions.scheduler_resumed(now);
+        assert_eq!(transitions.retire_cause(SitePlaybackPhase::Dead, now), Some(SitePlaybackRetireCause::StreamError));
+        transitions.scheduler_resumed(now);
+        assert_eq!(transitions.retire_cause(SitePlaybackPhase::Running, now), None);
+        assert_eq!(transitions.retire_cause(SitePlaybackPhase::Stalled, now), Some(SitePlaybackRetireCause::CallbackStall));
+        transitions.scheduler_resumed(now);
+        transitions.closed();
+        assert_eq!(transitions.retire_cause(SitePlaybackPhase::Stalled, now), Some(SitePlaybackRetireCause::CallbackStall));
+    }
+
+    #[test]
+    fn a_pause_mid_iteration_is_seen_before_the_final_health_check() {
+        let now = Instant::now();
+        let mut transitions = SitePlaybackTransitions::new();
+        transitions.observe_mixer_progress(now);
+        assert_eq!(transitions.retire_cause(SitePlaybackPhase::Running, now), None);
+        let resumed = now + Duration::from_millis(270);
+        transitions.observe_mixer_progress(resumed);
+        assert_eq!(transitions.retire_cause(SitePlaybackPhase::Stalled, resumed), None);
+        transitions.observe_mixer_progress(resumed + Duration::from_millis(1));
+        assert_eq!(transitions.retire_cause(SitePlaybackPhase::Stalled, resumed + Duration::from_millis(1)), None);
+        assert_eq!(transitions.retire_cause(SitePlaybackPhase::Stalled, resumed + Duration::from_millis(30)), Some(SitePlaybackRetireCause::CallbackStall));
+    }
+
+    #[test]
+    fn scheduler_discontinuity_invalidates_presentation_without_reopening_device() {
+        let now = Instant::now();
+        let mut transitions = SitePlaybackTransitions::new();
+        transitions.generation = 7;
+        transitions.presentation_epoch = 9;
+        transitions.scheduler_resumed(now);
+        assert_eq!(transitions.generation, 7);
+        assert_eq!(transitions.presentation_epoch, 10);
+        transitions.scheduler_resumed(now + Duration::from_millis(1));
+        assert_eq!(transitions.presentation_epoch, 10);
+        transitions.retire_cause(SitePlaybackPhase::Running, now + Duration::from_millis(2));
+        transitions.scheduler_resumed(now + Duration::from_millis(200));
+        assert_eq!(transitions.presentation_epoch, 11);
+        transitions.closed();
+        assert_eq!(transitions.presentation_epoch, 11, "an old protocol epoch must never be reused");
     }
 
     #[test]

@@ -2861,7 +2861,7 @@ pub(crate) struct LocalReader {
 }
 
 impl LocalReader {
-    pub(crate) fn read_into(&mut self, out: &mut [[f32; 2]]) -> PcmRead {
+    fn refresh_bus(&mut self) {
         let current_epoch = self.controller.bus_epoch.load(Ordering::Acquire);
         if current_epoch != self.bus_epoch {
             let (bus_epoch, bus) = self.controller.bus_snapshot();
@@ -2869,19 +2869,38 @@ impl LocalReader {
             self.reader = bus.as_ref().map(|bus| bus.subscribe());
             self.bus = bus;
         }
+    }
+
+    pub(crate) fn has_active_session(&mut self) -> bool {
+        self.refresh_bus();
+        self.bus.as_ref().and_then(PcmBus::active_session).is_some()
+    }
+
+    pub(crate) fn read_into(&mut self, out: &mut [[f32; 2]], presentation_epoch: u64, next_output: Option<std::time::Instant>) -> PcmRead {
+        self.refresh_bus();
         match self.reader.as_mut() {
-            Some(reader) => reader.read_stereo_into(out),
+            Some(reader) => reader.read_stereo_timed(out, presentation_epoch, next_output),
             None => {
                 out.fill([0.0; 2]);
                 PcmRead {
                     copied: 0,
                     silence: out.len(),
                     dropped: 0,
+                    late: 0,
                     session_id: None,
                     epoch: 0,
                 }
             }
         }
+    }
+
+    pub(crate) fn cancel_output_read(&mut self, presentation_epoch: u64) {
+        if let Some(reader) = self.reader.as_mut() {
+            // A zero-length waiting read resets the existing timed read gate
+            // without subscribing, allocating, or consuming another frame.
+            reader.read_stereo_timed(&mut [], presentation_epoch, None);
+        }
+        self.publish_output_timing(presentation_epoch, None);
     }
 
     pub(crate) fn device_tail(&self, epoch: u64) -> Option<(Duration, bool)> {

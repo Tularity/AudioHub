@@ -112,6 +112,12 @@ impl ClockResampler {
         self.step
     }
 
+    /// Source position of the next output frame, relative to the next input
+    /// block. Includes the FIR history and the carried fractional phase.
+    pub fn next_source_position(&self) -> f64 {
+        self.phase_index as f64 + self.phase_fraction - (self.half * 2 - 1) as f64
+    }
+
     /// A clock servo, not a playback-speed control. Invalid updates preserve
     /// the last valid ratio and can never create a zero-progress output loop.
     pub fn set_correction(&mut self, correction: f64) {

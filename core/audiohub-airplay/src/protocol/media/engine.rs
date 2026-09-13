@@ -63,7 +63,18 @@ const TIMING_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 /// The caller's operation token follows the decoded block through conversion
 /// so a reset cannot relabel an already scheduled frame as current PCM.
 pub(crate) trait PcmOutput: Send {
+    /// Advance conversion with actual input while discarding only its output.
+    /// Wrappers must forward this explicitly; it must never flush staged PCM.
+    fn discard(&mut self, samples: &[i16], telemetry_token: crate::telemetry::OperationToken);
     fn write(&mut self, samples: &[i16], telemetry_token: crate::telemetry::OperationToken);
+    // Every wrapper must explicitly preserve timed delivery. A default that
+    // delegates to write() silently removes the output's presentation contract.
+    fn write_timed(
+        &mut self,
+        samples: &[i16],
+        telemetry_token: crate::telemetry::OperationToken,
+        timing: crate::bus::PcmWriteTiming,
+    );
     fn flush(&mut self);
     fn output_timing(&self) -> Option<crate::bus::OutputTiming>;
 }
@@ -1753,6 +1764,10 @@ mod tests {
     struct TestOutput(Arc<Mutex<OutputState>>);
 
     impl PcmOutput for TestOutput {
+        fn discard(&mut self, _: &[i16], _: crate::telemetry::OperationToken) {}
+        fn write_timed(&mut self, samples: &[i16], token: crate::telemetry::OperationToken, _: crate::bus::PcmWriteTiming) {
+            self.write(samples, token);
+        }
         fn output_timing(&self) -> Option<crate::bus::OutputTiming> { None }
         fn write(&mut self, samples: &[i16], _telemetry_token: crate::telemetry::OperationToken) {
             let mut state = self.0.lock().unwrap();

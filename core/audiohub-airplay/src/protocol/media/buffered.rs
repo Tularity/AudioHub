@@ -64,10 +64,22 @@ const MAX_BLOCKS_PER_PUMP: usize = 64;
 const MAX_PENDING_PTP_SAMPLES: usize = 32;
 const MAX_CLOCKED_FUTURE: Duration = Duration::from_secs(30);
 const MAX_CLOCKED_LATENESS: Duration = Duration::from_millis(500);
-// Once the local output is modelled, an entire mixer quantum missed before
-// scheduling is already stale. Keep the wider bound only for legacy fallback
-// and for skipping expensive decoding across a long outage.
-const MAX_SYNCHRONIZED_LATENESS: Duration = Duration::from_millis(10);
+
+fn advance_skipped_aac(output: &mut dyn PcmOutput, token: crate::telemetry::OperationToken) {
+    output.discard(&[0; SAMPLES_PER_AAC_FRAME as usize * BUFFERED_CHANNELS], token);
+}
+
+fn release_is_too_far_future(deadline: std::time::Instant, now: std::time::Instant) -> bool {
+    deadline > now + MAX_CLOCKED_FUTURE
+}
+fn decoded_packet_is_late(lateness: Duration, staging_slack: Option<Duration>, samples: usize) -> bool {
+    let Some(slack) = staging_slack else { return lateness > MAX_CLOCKED_LATENESS; };
+    // Release = P - downstream - cushion - FIR. Converted content starts
+    // at P - FIR, so FIR cancels. Keep a packet while any of its span may
+    // still reach output; the timed bus handles the expired prefix.
+    let span = Duration::from_secs_f64((samples / BUFFERED_CHANNELS) as f64 / BUFFERED_SAMPLE_RATE as f64);
+    lateness > slack.saturating_add(span)
+}
 // The default PCM bus primes five 10 ms frames. Feed it this far ahead of the
 // network presentation deadline so the platform output starts on the anchor.
 const PCM_OUTPUT_LEAD: Duration = Duration::from_millis(50);
@@ -569,6 +581,7 @@ struct Type103Engine {
     playback_anchor: Option<PlaybackAnchor>,
     output_lead: Duration,
     output_epoch: Option<u64>,
+    staging_slack: Duration,
     output_started: bool,
     ptp_source: PtpClockSource,
     ptp_samples: broadcast::Receiver<PtpClockSample>,
@@ -621,6 +634,7 @@ struct ReadyFrame {
     deadline_not_ready_since: Option<std::time::Instant>,
     deadline_warmup_reported: bool,
     deadline_failure_reasons: u16,
+    presentation: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,6 +679,7 @@ impl Type103Engine {
             playback_anchor: None,
             output_lead: PCM_OUTPUT_LEAD,
             output_epoch: None,
+            staging_slack: Duration::ZERO,
             output_started: false,
             ptp_source: prepared.ptp_source,
             ptp_samples: prepared.ptp_samples,
@@ -696,20 +711,24 @@ impl Type103Engine {
         true
     }
 
-    /// Latch per output instance and resume. Continuously feeding the current
-    /// queue depth back into the release deadline would chase our own buffering.
+    /// Keep the release cushion ahead of the current native output budget.
+    /// The mixer consumes fixed-size blocks even during a bus underrun, so this
+    /// observation excludes our staging queue. Latching the first value can
+    /// starve a recovered reader while valid media waits for its old release time.
+    /// Updating the budget must not reset PCM or converter history; only a new
+    /// presentation epoch invalidates that history through the existing contract.
     fn refresh_output_lead(&mut self) {
         let Some(timing) = self.output.output_timing() else { return; };
         let same_output = self.output_epoch == Some(timing.epoch);
-        if same_output && self.output_started { return; }
-        if timing.lead > Duration::from_secs(2) { return; }
+        if timing.lead > Duration::from_secs(2) || timing.staging_slack > timing.lead { return; }
         let replacement = !same_output && (self.output_epoch.is_some() || self.output_started);
         self.output_epoch = Some(timing.epoch);
         self.output_lead = timing.lead;
+        self.staging_slack = timing.staging_slack;
         if replacement {
-            // A different output instance has a different tail and an empty
-            // device queue. Discard only already-staged bus PCM, not the
-            // authenticated media or decoder state, then reschedule from RTP.
+            // A new native output or a scheduler discontinuity invalidates
+            // already-staged bus PCM. Keep authenticated media and decoder
+            // state, then reschedule from the unchanged RTP anchor.
             self.output.flush();
             self.output_started = false;
             self.sync_schedule_pending = true;
@@ -868,8 +887,11 @@ impl Type103Engine {
                 ReadySchedule::DeliverAt(deadline) => Some(deadline),
                 ReadySchedule::Wait | ReadySchedule::DropLate => None,
             };
-            let has_deadline = self.playing_is_current() && deadline.is_some();
+            let preparation_pending = self.playing_is_current()
+                && self.ready_frame.is_none() && !self.queued_blocks.is_empty();
+            let has_deadline = self.playing_is_current() && (deadline.is_some() || preparation_pending);
             let sleep_deadline = deadline.unwrap_or_else(|| {
+                if preparation_pending { return Instant::now(); }
                 Instant::now()
                     .checked_add(Duration::from_secs(24 * 60 * 60))
                     .expect("one day fits tokio Instant")
@@ -892,6 +914,8 @@ impl Type103Engine {
                     // Waking does not prove the old deadline is still valid.
                     // Loop back through clock/epoch/lateness validation before
                     // handing PCM to the output, including after a CPU stall.
+                    // A bounded preparation pass also resumes here, after the
+                    // biased command arm has had a chance to cancel or flush.
                 }
                 sample = self.ptp_samples.recv() => {
                     self.observe_ptp_sample(sample);
@@ -1400,7 +1424,9 @@ impl Type103Engine {
             return Ok(());
         }
 
-        loop {
+        // Advancing PCM history is real DSP work, even without AAC decoding.
+        // Return to the command/deadline select after a bounded queue slice.
+        for _ in 0..MAX_BLOCKS_PER_PUMP {
             if let Some(ready) = self.ready_frame.as_ref() {
                 let point = WirePoint {
                     sequence: ready.sequence,
@@ -1430,6 +1456,9 @@ impl Type103Engine {
             }
             if self.timestamp_is_late(block.header.timestamp, block.telemetry_token) {
                 self.decoder_needs_reset = true;
+                // One authenticated AAC block has 1024 source frames. Advance
+                // PCM history with a bounded block, independently of AAC reset.
+                advance_skipped_aac(self.output.as_mut(), block.telemetry_token);
                 crate::telemetry::record_predecode_late_drop(
                     block.telemetry_token,
                     crate::telemetry::MediaKind::Buffered,
@@ -1476,6 +1505,7 @@ impl Type103Engine {
                 deadline_not_ready_since: None,
                 deadline_warmup_reported: false,
                 deadline_failure_reasons: 0,
+                presentation: None,
             });
         }
         let Some(ready) = self.ready_frame.as_ref() else {
@@ -1555,8 +1585,8 @@ impl Type103Engine {
     /// Whether this block is already past the drop tolerance, decided **before**
     /// it is decoded.
     ///
-    /// Discarding in timestamp space turns a multi-second catch-up from one AAC
-    /// decode per 23 ms of skipped audio into pointer arithmetic. The block has
+    /// Discarding in timestamp space avoids AAC decoding during catch-up. Each
+    /// skip still advances PCM conversion with one bounded zero block. The block has
     /// already passed `apply_deferred_flushes` and the nonce ledger by the time
     /// this runs, so nothing security-relevant is skipped with it.
     fn timestamp_is_late(
@@ -1566,7 +1596,19 @@ impl Type103Engine {
     ) -> bool {
         let now = std::time::Instant::now();
         match self.deadline_for(timestamp, telemetry_token) {
-            Some(deadline) => now.saturating_duration_since(deadline) > MAX_CLOCKED_LATENESS,
+            Some(deadline) => {
+                let late = now.saturating_duration_since(deadline);
+                let span = Duration::from_secs_f64(SAMPLES_PER_AAC_FRAME as f64 / BUFFERED_SAMPLE_RATE as f64);
+                // Unlike discard(actual PCM), zero substitution loses input
+                // still contributing to later FIR output. Cover the filter's
+                // full support: 2*lead-cushion = cushion+2*downstream+2*FIR.
+                // This is deliberately conservative without guessing the
+                // downstream/filter split of the output's total lead.
+                let history_budget = self.output_lead.saturating_mul(2)
+                    .saturating_sub(self.staging_slack).saturating_add(span);
+                late > MAX_CLOCKED_LATENESS
+                    && (self.output_epoch.is_none() || late > history_budget)
+            }
             None => false,
         }
     }
@@ -1644,13 +1686,13 @@ impl Type103Engine {
         match deadline {
             Ok(deadline) => {
                 self.note_clock_available();
+                // Preserve the content deadline before subtracting the
+                // protocol release cushion and downstream output delay.
+                if let Some(ready) = self.ready_frame.as_mut() {
+                    ready.presentation = Some(deadline);
+                }
                 let deadline = deadline.checked_sub(self.output_lead).unwrap_or(now);
-                let max_lateness = if self.output_epoch.is_some() {
-                    MAX_SYNCHRONIZED_LATENESS
-                } else {
-                    MAX_CLOCKED_LATENESS
-                };
-                if deadline > now + MAX_CLOCKED_FUTURE {
+                if release_is_too_far_future(deadline, now) {
                     crate::telemetry::record_future_safety_wait(
                         telemetry_token,
                         crate::telemetry::MediaKind::Buffered,
@@ -1660,7 +1702,7 @@ impl Type103Engine {
                         "AirPlay 2 PTP media deadline exceeded the 30 second safety limit"
                     );
                     ReadySchedule::Wait
-                } else if now.saturating_duration_since(deadline) <= max_lateness {
+                } else if !decoded_packet_is_late(now.saturating_duration_since(deadline), self.output_epoch.map(|_| self.staging_slack), self.ready_frame.as_ref().unwrap().pcm.len()) {
                     if self.sync_write_pending {
                         self.sync_last_deadline = Some((ready_timestamp, deadline));
                     }
@@ -1730,6 +1772,7 @@ impl Type103Engine {
     }
 
     fn drop_late_ready_frame(&mut self) {
+        if !self.playing_is_current() { return; }
         let Some(ready) = self.ready_frame.take() else {
             return;
         };
@@ -1741,13 +1784,7 @@ impl Type103Engine {
             self.late_run_first = Some((ready.sequence, ready.timestamp));
         }
         self.late_run_blocks = self.late_run_blocks.saturating_add(1);
-        // Deliberately no `reset_decoded_output()` here. The discontinuity is
-        // real and the decoder must not bridge across it, but that is one reset
-        // for the whole run — settled in `deliver_ready_frame` — not one per
-        // discarded frame. Per-frame it also flushed the PCM bus, and that
-        // throws away audio already staged for the speaker and re-arms the
-        // reader prebuffer, so the repair cost far more than the audio it
-        // dropped.
+        self.output.discard(&ready.pcm, ready.telemetry_token);
     }
 
     fn deliver_ready_frame(&mut self) {
@@ -1784,7 +1821,11 @@ impl Type103Engine {
             let sync_write = self.sync_write_pending && self.take_sync_diagnostic();
             self.sync_write_pending = false;
             let started = sync_write.then(|| (std::time::Instant::now(), sync_utc_ns()));
-            self.output.write(&ready.pcm, ready.telemetry_token);
+            if let (Some(presentation), Some(epoch)) = (ready.presentation, self.output_epoch) {
+                self.output.write_timed(&ready.pcm, ready.telemetry_token, crate::bus::PcmWriteTiming { epoch, presentation });
+            } else {
+                self.output.write(&ready.pcm, ready.telemetry_token);
+            }
             self.output_started = true;
             if let Some((started, write_utc_ns)) = started {
                 let peak_i16 = ready.pcm.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
@@ -2660,6 +2701,7 @@ mod tests {
     #[derive(Default)]
     struct OutputState {
         writes: Vec<Vec<i16>>,
+        write_timings: Vec<crate::bus::PcmWriteTiming>,
         flushes: usize,
         timing: Option<crate::bus::OutputTiming>,
     }
@@ -2667,6 +2709,7 @@ mod tests {
     struct TestOutput(Arc<Mutex<OutputState>>);
 
     impl PcmOutput for TestOutput {
+        fn discard(&mut self, _: &[i16], _: crate::telemetry::OperationToken) {}
         fn write(&mut self, samples: &[i16], _telemetry_token: crate::telemetry::OperationToken) {
             self.0.lock().unwrap().writes.push(samples.to_vec());
         }
@@ -2677,6 +2720,11 @@ mod tests {
 
         fn output_timing(&self) -> Option<crate::bus::OutputTiming> {
             self.0.lock().unwrap().timing
+        }
+
+        fn write_timed(&mut self, samples: &[i16], token: crate::telemetry::OperationToken, timing: crate::bus::PcmWriteTiming) {
+            self.0.lock().unwrap().write_timings.push(timing);
+            self.write(samples, token);
         }
     }
 
@@ -2760,14 +2808,22 @@ mod tests {
         let (_tx, rx) = mpsc::channel(4);
         let mut engine = Type103Engine::new(prepared, Box::new(TestOutput(Arc::clone(&state))), rx);
         state.lock().unwrap().timing = Some(crate::bus::OutputTiming {
-            epoch: 1, lead: Duration::from_millis(120), estimated: true,
+            epoch: 1, lead: Duration::from_millis(120), staging_slack: Duration::ZERO, estimated: true,
         });
         engine.refresh_output_lead();
         assert_eq!(engine.output_lead, Duration::from_millis(120));
         engine.output_started = true;
         state.lock().unwrap().timing.as_mut().unwrap().lead = Duration::from_millis(200);
         engine.refresh_output_lead();
-        assert_eq!(engine.output_lead, Duration::from_millis(120), "must not chase the current queue depth");
+        assert_eq!(engine.output_lead, Duration::from_millis(200));
+        assert!(engine.output_started, "a budget update must preserve the active PCM timeline");
+        assert_eq!(state.lock().unwrap().flushes, 0);
+        state.lock().unwrap().timing.as_mut().unwrap().lead = Duration::from_millis(80);
+        engine.refresh_output_lead();
+        assert_eq!(engine.output_lead, Duration::from_millis(80));
+        assert!(engine.output_started);
+        assert_eq!(state.lock().unwrap().flushes, 0);
+        state.lock().unwrap().timing.as_mut().unwrap().lead = Duration::from_millis(200);
         state.lock().unwrap().timing.as_mut().unwrap().epoch = 2;
         engine.refresh_output_lead();
         assert_eq!(engine.output_lead, Duration::from_millis(200));
@@ -2786,6 +2842,7 @@ mod tests {
         assert!(engine.sync_schedule_pending && engine.sync_write_pending);
 
         let pcm = vec![123, -456, 789, -321];
+        let presentation = std::time::Instant::now() + Duration::from_millis(200);
         engine.ready_frame = Some(ReadyFrame {
             sequence: 0,
             timestamp: 0,
@@ -2795,10 +2852,14 @@ mod tests {
             deadline_not_ready_since: None,
             deadline_warmup_reported: false,
             deadline_failure_reasons: 0,
+            presentation: Some(presentation),
         });
         engine.deliver_ready_frame();
         assert!(!engine.sync_write_pending);
         assert_eq!(state.lock().unwrap().writes, vec![pcm]);
+        let stamp = state.lock().unwrap().write_timings[0];
+        assert_eq!(stamp.epoch, 2);
+        assert_eq!(stamp.presentation, presentation);
 
         let (reply, result) = oneshot::channel();
         engine.apply_command(BufferedCommand::SetRate {
@@ -2972,7 +3033,7 @@ mod tests {
     async fn synchronized_start_drops_late_pcm_but_preserves_decoder_history() {
         let (ports, handle, state, ptp, peer, base) = controlled_harness().await;
         state.lock().unwrap().timing = Some(crate::bus::OutputTiming {
-            epoch: 1, lead: Duration::from_millis(120), estimated: true,
+            epoch: 1, lead: Duration::from_millis(120), staging_slack: Duration::ZERO, estimated: true,
         });
         let mut sender = TcpStream::connect((Ipv4Addr::LOCALHOST, ports.data_port)).await.unwrap();
         handle.set_rate(test_rate(true)).await.unwrap();
@@ -3004,7 +3065,7 @@ mod tests {
     async fn a_delayed_timer_wakeup_rechecks_pcm_lateness() {
         let (ports, handle, state, ptp, peer, base) = controlled_harness().await;
         state.lock().unwrap().timing = Some(crate::bus::OutputTiming {
-            epoch: 1, lead: Duration::from_millis(120), estimated: true,
+            epoch: 1, lead: Duration::from_millis(120), staging_slack: Duration::ZERO, estimated: true,
         });
         let mut sender = TcpStream::connect((Ipv4Addr::LOCALHOST, ports.data_port)).await.unwrap();
         handle.set_rate(test_rate(true)).await.unwrap();

@@ -1174,10 +1174,9 @@ impl InterleavedVarResampler {
 /// 声卡侧发布给伺服的观测量。写者是输出回调（实时线程），读者是
 /// `AudioTx::push`（mixer 线程）。
 ///
-/// 全部用 `Relaxed`：这是一个**估计器**，不是同步原语。最坏情况是把上一个
-/// 回调的 `consumed` 和这一个回调的时刻凑成一对，误差上界是一个声卡周期，
-/// 而 `Dll` 的 `w0` 前置平滑器正是为这一类噪声准备的。用 `SeqCst` 会在实时
-/// 回调里加内存栅栏，代价真实、收益为零。
+/// Output readers validate relaxed payload reads against `output_phase`.
+/// The writer's release fence and readers' acquire fences also cover a
+/// payload read from a callback that started after the initial phase read.
 #[derive(Debug)]
 pub struct DeviceClock {
     /// `Instant` 不是原子的，所以时刻一律以「相对 base 的纳秒」发布。
@@ -1193,6 +1192,10 @@ pub struct DeviceClock {
     /// `playback − callback`：写进去的数据预计多久之后真的被 DAC 播出——
     /// 也就是 Snapcast `stream.cpp:305` 那个 `outputBufferDacTime`。
     dac_lag_ns: AtomicU64,
+    /// Same-stream WASAPI delay measured by the output callback, if available.
+    /// `u64::MAX` means the native clock was not qualified for this callback.
+    native_output_delay_ns: AtomicU64,
+    native_output_observed_ns: AtomicU64,
     /// 近 `BLOCK_WINDOW` 次回调里取走的最大样本数（声卡周期），用来定目标
     /// 水位的下限。
     ///
@@ -1200,6 +1203,9 @@ pub struct DeviceClock {
     /// 全程最大会让那一次把目标水位**永久**顶高——正是本项目在治的那种棘轮。
     /// 窗口一满就从当前值重新起算，异常值约 1.3 秒后自然老化掉。
     block_max: AtomicUsize,
+    // Callback-owned payload covered by output_phase; zero means unknown.
+    quantum_frames: AtomicUsize,
+    quantum_observed_ns: AtomicU64,
     cb_count: AtomicU64,
     /// 环里不够回调取、被补了静音的次数。
     underruns: AtomicU64,
@@ -1217,7 +1223,11 @@ impl DeviceClock {
             last_cb_frames: AtomicUsize::new(0),
             output_phase: AtomicU64::new(0),
             dac_lag_ns: AtomicU64::new(0),
+            native_output_delay_ns: AtomicU64::new(u64::MAX),
+            native_output_observed_ns: AtomicU64::new(0),
             block_max: AtomicUsize::new(0),
+            quantum_frames: AtomicUsize::new(0),
+            quantum_observed_ns: AtomicU64::new(0),
             cb_count: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
         })
@@ -1225,15 +1235,27 @@ impl DeviceClock {
 
     /// 输出回调每次调用后报一次。`got < wanted` 就是一次欠载。
     fn note_callback(&self, now: Instant, wanted: usize, got: usize, dac_lag: Option<Duration>) {
+        self.note_callback_with_native(now, wanted, got, dac_lag, None);
+    }
+
+    fn note_callback_with_native(&self, now: Instant, wanted: usize, got: usize, dac_lag: Option<Duration>, native: Option<(Instant, Duration)>) {
+        let now_ns = now.saturating_duration_since(self.base).as_nanos() as u64;
         self.consumed.fetch_add(got as u64, Ordering::Relaxed);
         self.last_cb_frames.store(wanted, Ordering::Relaxed);
-        self.last_cb_ns.store(
-            now.saturating_duration_since(self.base).as_nanos() as u64,
-            Ordering::Relaxed,
-        );
+        self.last_cb_ns.store(now_ns, Ordering::Relaxed);
         if let Some(d) = dac_lag {
             self.dac_lag_ns
                 .store(d.as_nanos() as u64, Ordering::Relaxed);
+        }
+        let native = native.filter(|(_, delay)| *delay <= Duration::from_secs(2))
+            .and_then(|(at, delay)| at.checked_duration_since(self.base).map(|since| (since, delay)));
+        // A duplicate device-clock position is normal WASAPI quantization. Keep
+        // the last qualified sample and let the read side expire it by age;
+        // switching to the cross-stream estimate for one callback creates a
+        // visible presentation step.
+        if let Some((at, delay)) = native {
+            self.native_output_observed_ns.store(at.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+            self.native_output_delay_ns.store(delay.as_nanos() as u64, Ordering::Relaxed);
         }
         let n = self.cb_count.fetch_add(1, Ordering::Relaxed);
         if n % Self::BLOCK_WINDOW == 0 || wanted > self.block_max.load(Ordering::Relaxed) {
@@ -1262,6 +1284,38 @@ impl DeviceClock {
         ns * rate as f64 / 1e9
     }
 
+    fn native_output_delay(&self) -> Option<(Instant, Duration)> {
+        let ns = self.native_output_delay_ns.load(Ordering::Relaxed);
+        if ns == u64::MAX { return None; }
+        let observed = self.native_output_observed_ns.load(Ordering::Relaxed);
+        Some((self.base.checked_add(Duration::from_nanos(observed))?, Duration::from_nanos(ns)))
+    }
+
+    fn note_quantum(&self, observation: Option<(Instant, u32)>) {
+        let observation = observation.and_then(|(at, frames)|
+            at.checked_duration_since(self.base).map(|age| (age, frames)));
+        let (age, frames) = observation.unwrap_or((Duration::ZERO, 0));
+        self.quantum_observed_ns.store(age.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        self.quantum_frames.store(frames as usize, Ordering::Relaxed);
+    }
+
+    fn processing_quantum(&self, now: Instant) -> Option<usize> {
+        let frames = self.quantum_frames.load(Ordering::Relaxed);
+        let at = self.quantum_observed_ns.load(Ordering::Relaxed);
+        let age = now.checked_duration_since(self.base)
+            .and_then(|d| d.checked_sub(Duration::from_nanos(at)));
+        if frames > 0 && age.is_some_and(|a| a <= Duration::from_millis(250)) {
+            Some(frames)
+        } else {
+            None
+        }
+    }
+
+    fn processing_block(&self, now: Instant) -> usize {
+        // Unknown, failed, future or expired: keep the actual-callback window.
+        self.processing_quantum(now).unwrap_or_else(|| self.block_max())
+    }
+
     fn block_max(&self) -> usize {
         self.block_max.load(Ordering::Relaxed)
     }
@@ -1272,6 +1326,10 @@ impl DeviceClock {
 
     fn begin_output_callback(&self) -> OutputCallbackPhase<'_> {
         self.output_phase.fetch_add(1, Ordering::AcqRel);
+        // Publish the odd version before any ring or clock payload write.
+        // A reader observing any such write synchronizes with this fence
+        // before its final phase check, even for relaxed clock atomics.
+        std::sync::atomic::fence(Ordering::Release);
         OutputCallbackPhase(self)
     }
 }
@@ -1298,6 +1356,10 @@ pub struct PlayServo {
     decay_period: u32,
     /// 惩罚项的基准：上一次记账时的 `dev.underruns()`。
     underrun_seen: u64,
+    // A fresh short read can break timing without crossing the Pad threshold.
+    timing_gap: bool,
+    recovery_pending: Option<RecoveryReason>,
+    recovery_padded: bool,
     /// 距离下一次衰减还剩多少次更新。
     decay_left: u32,
     /// 喂进 DLL 之前把 err 钳到这个幅度（PipeWire `max_error`）。
@@ -1448,6 +1510,9 @@ impl PlayServo {
             underrun_cap: ms(cap_ms),
             decay_period: Self::decay_updates(),
             underrun_seen: 0,
+            timing_gap: false,
+            recovery_pending: Some(RecoveryReason::Cold),
+            recovery_padded: false,
             decay_left: Self::decay_updates(),
             max_error: ms(Self::MAX_ERROR_MS),
             max_resync: ms(Self::MAX_RESYNC_MS),
@@ -1485,7 +1550,11 @@ impl PlayServo {
 }
 
 /// 环路对本块的裁决。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryReason { Cold, NativeShortRead }
+
 enum ServoAction {
+    Frozen,
     /// 正常写。
     Go,
     /// 深端硬跳：整块丢掉（drop-newest，但是**有意的、被计数的**）。
@@ -1923,7 +1992,33 @@ impl PlaybackMonitor {
     }
 }
 
+/// One non-cloneable reservation for this producer. Dropping it cancels the
+/// input block; already published Pad silence remains in the ring. Recovery
+/// remains pending until a nonempty complete input write commits.
+pub struct PreparedPush {
+    owner: Arc<AtomicBool>,
+    samples: usize,
+    skip: bool,
+    timing_discontinuity: bool,
+    accepted_underruns: Option<u64>,
+}
+
+impl PreparedPush {
+    /// An uncommitted output gap needs timed realignment. Canceled or empty
+    /// writes retain the notification; a complete real input commit consumes it.
+    pub fn timing_discontinuity(&self) -> bool {
+        self.timing_discontinuity
+    }
+}
+
+impl Drop for PreparedPush {
+    fn drop(&mut self) {
+        self.owner.store(false, Ordering::Release);
+    }
+}
+
 pub struct AudioTx {
+    prepared: Arc<AtomicBool>,
     prod: HeapProd<f32>,
     channels: u8,
     /// 伺服关闭且收发同速率时是 `None`（逐样本直通，与加伺服之前逐字同构）；
@@ -1962,26 +2057,76 @@ impl AudioTx {
     /// 跑完，而走的仍然是同一条生产路径、同一个真 `HeapRb`、同一个真重采样器。
     #[doc(hidden)]
     pub fn push_at(&mut self, samples: &[f32], now: Instant) {
-        let frames = samples.len() / self.channels.clamp(1, 2) as usize;
+        if let Some(prepared) = self.prepare_push_at(samples.len(), now) {
+            self.commit_push(prepared, samples);
+        }
+    }
+
+    /// Prepare only an active output block, before selecting timed input.
+    /// The single producer publishes real Pad writes before timing is sampled.
+    /// No callback lock, retry, or allocation is needed for this reservation.
+    pub fn prepare_push_at(&mut self, samples: usize, now: Instant) -> Option<PreparedPush> {
+        if self.prepared.swap(true, Ordering::Acquire) {
+            return None;
+        }
+        let mut prepared = PreparedPush { owner: self.prepared.clone(), samples, skip: false, timing_discontinuity: false, accepted_underruns: None };
+        let frames = samples / self.channels.clamp(1, 2) as usize;
         if self.servo.enabled {
-            match self.servo_step(frames, now) {
-                ServoAction::Skip => return, // 深端硬跳：本块整块不写
-                ServoAction::Pad(n) => self.write_silence(n),
-                ServoAction::Go => {}
+            let action = self.servo_step(frames, now);
+            if !matches!(action, ServoAction::Frozen) {
+                prepared.accepted_underruns = Some(self.servo.underrun_seen);
+                match action {
+                    ServoAction::Skip => prepared.skip = true,
+                    ServoAction::Pad(n) => {
+                        let wrote = self.write_silence(n);
+                        if wrote != 0 {
+                            self.servo.recovery_padded = true;
+                            self.servo.timing_gap = true;
+                            self.servo.rearm_capture();
+                            if let Some(rs) = self.resampler.as_mut() {
+                                rs.set_correction(self.servo.corr);
+                            }
+                            PLAY_SERVO.resync_padded.fetch_add(wrote as u64, Ordering::Relaxed);
+                            PLAY_SERVO.resync_events.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    _ => {}
+                }
+                prepared.timing_discontinuity = self.servo.timing_gap;
             }
         }
-        match self.resampler.as_mut() {
-            None => {
-                let wrote = self.prod.push_slice(samples);
-                self.note_short_write(samples.len(), wrote);
-            }
+        Some(prepared)
+    }
+
+    /// Consume the reservation exactly once. Wrong owner or size drops this
+    /// input without touching SRC history; dropping the ticket releases its owner.
+    pub fn commit_push(&mut self, prepared: PreparedPush, samples: &[f32]) -> bool {
+        if !Arc::ptr_eq(&self.prepared, &prepared.owner) || samples.len() != prepared.samples {
+            return false;
+        }
+        if prepared.skip {
+            return true;
+        }
+        let (wanted, wrote) = match self.resampler.as_mut() {
+            None => (samples.len(), self.prod.push_slice(samples)),
             Some(rs) => {
                 self.staging.clear();
                 rs.process(samples, &mut self.staging);
-                let wrote = self.prod.push_slice(&self.staging);
-                self.note_short_write(self.staging.len(), wrote);
+                (self.staging.len(), self.prod.push_slice(&self.staging))
             }
+        };
+        self.note_short_write(wanted, wrote);
+        // Only a validated ticket with a complete, nonempty real SRC write
+        // establishes output. Cancel, Skip, zero output and short writes retain
+        // recovery. A newer callback is still unseen and belongs to next prepare.
+        if prepared.accepted_underruns == Some(self.servo.underrun_seen)
+            && wrote >= self.channels as usize && wrote == wanted
+        {
+            self.servo.recovery_pending = None;
+            self.servo.recovery_padded = false;
+            self.servo.timing_gap = false;
         }
+        true
     }
 
     /// 跑一次环路。返回本块该怎么处理。
@@ -2041,8 +2186,42 @@ impl AudioTx {
     ///
     /// 守这条的是 `flipping_the_error_sign_turns_the_servo_into_a_divergence_engine`。
     fn servo_step(&mut self, n_in: usize, now: Instant) -> ServoAction {
+        // One bounded attempt: reject overlap before changing any controller
+        // state. The ring producer refreshes its consumer index with Acquire.
+        let phase = self.dev.output_phase.load(Ordering::Acquire);
+        if phase & 1 != 0 { return ServoAction::Frozen; }
         let rate = self.dev_rate as f64;
         let dac = self.dev.dac_lag_samples(self.dev_rate);
+        let seen = self.dev.underruns();
+        let quantum = self.dev.processing_quantum(now);
+        let block = quantum.unwrap_or_else(|| self.dev.block_max());
+        let ring = self.prod.occupied_len() as f64 / self.channels as f64;
+        let last = self.dev.last_cb_ns.load(Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Acquire);
+        if phase != self.dev.output_phase.load(Ordering::Relaxed) {
+            return ServoAction::Frozen;
+        }
+        // `now` is sampled by the caller and can precede this callback.
+        // Do not turn a future timestamp into a zero-age measurement.
+        let age = now.checked_duration_since(self.dev.base)
+            .and_then(|d| d.checked_sub(Duration::from_nanos(last)));
+        let inflight = match age {
+            Some(d) if last != 0 && d <= Duration::from_millis(250) => d.as_secs_f64() * rate,
+            _ => {
+                PLAY_SERVO.stalled.fetch_add(1, Ordering::Relaxed);
+                return ServoAction::Frozen;
+            }
+        };
+        // Native zero fill breaks timing on every backend, independently of
+        // quantum and Pad. Retain it until real input commits; canceled tickets
+        // must not consume recovery. Change state only after snapshot validation.
+        if seen > self.servo.underrun_seen {
+            self.servo.timing_gap = true;
+            if self.servo.recovery_pending != Some(RecoveryReason::Cold) {
+                self.servo.recovery_pending = Some(RecoveryReason::NativeShortRead);
+            }
+            self.servo.recovery_padded = false;
+        }
         // ---- 欠载惩罚：目标定低了会自己长回来（自动回退）----
         //
         // `play_ring` 是全链路里**唯一**「我们主动定低就会立刻可闻」的一级：
@@ -2053,7 +2232,6 @@ impl AudioTx {
         // 捕获期（开流后 ≈4 s、每次硬跳之后重新计时）**不记账**：那时环是空的，
         // 欠载是冷启动的结构性产物（progress.md 2026-08-03 已确证根因是冷启动
         // 空环而非排空过头），把它算成「目标定低了」会让目标一开机就被顶满。
-        let seen = self.dev.underruns();
         if self.servo.capture_left > 0 {
             self.servo.underrun_seen = seen;
         } else if seen > self.servo.underrun_seen {
@@ -2072,7 +2250,6 @@ impl AudioTx {
         // 每 tick 重算，**上下都跟**——不写成「只涨不落」。只涨不落就是一个
         // 棘轮：一次异常的大回调会把目标永久抬高，而这正是本项目在治的病。
         // 目标降下来时多出的那点水位由细调正常吐掉（几毫秒，几秒内完事）。
-        let block = self.dev.block_max();
         if block > 0 {
             // `dac + block` 是**结构下限**（谷值恰好为 0，每个回调刚好取满）；
             // `margin` 是生产侧调度迟到的余量；`underrun_extra` 是实测回退。
@@ -2093,26 +2270,12 @@ impl AudioTx {
             self.servo.dll.set_bw(bw, n_out, self.dev_rate);
         }
         // ---- 误差信号 ----
-        let ring = self.prod.occupied_len() as f64 / self.channels as f64;
-        let inflight = match self.dev.since_last_callback(now) {
-            // 回调停摆（设备刚开、被拔掉、或者线程饿死）：读数不可信，
-            // 宁可不动也不要拿一个错的量去积分。
-            Some(d) if d > Duration::from_millis(250) => {
-                PLAY_SERVO.stalled.fetch_add(1, Ordering::Relaxed);
-                return ServoAction::Go;
-            }
-            Some(d) => d.as_secs_f64() * rate,
-            None => {
-                PLAY_SERVO.stalled.fetch_add(1, Ordering::Relaxed);
-                return ServoAction::Go;
-            }
-        };
         let downstream = ring - inflight + dac;
         // ★ 符号推导见上。`error_sign` 恒为 +1.0，只有那条守着这个减号的测试
         //   会把它翻成 −1.0。
         let err = (downstream - self.servo.target) * self.servo.error_sign;
         // ---- 三档：死区内喂 DLL / 钳位后喂 DLL / 硬跳 ----
-        let mut action = ServoAction::Go;
+        let action = ServoAction::Go;
         // 进入条件是 `err > max_resync`，**退出条件是 `err ≤ 0`**——两个不同的
         // 阈值，这不是笔误：
         //
@@ -2137,30 +2300,16 @@ impl AudioTx {
             self.servo.resyncing_deep = false;
             self.servo.rearm_capture();
             PLAY_SERVO.resync_events.fetch_add(1, Ordering::Relaxed);
-        } else if downstream < self.servo.starve_mark() {
-            // 浅端硬跳（`expand`）。触发线见 `PlayServo::starve_mark`
-            // ——以本文件的整定（target≈30 ms、max_resync=150 ms）实际生效的是
-            // **半个目标**，因为 1.000 秒的环根本容不下一个 150 ms 的下溢。
-            //
-            // 为什么需要它，而不是让细调慢慢补：500 ppm 只能补 0.5 ms/s，
-            // 把 15 ms 的亏空补回来要 30 秒，这 30 秒里环一直贴着底反复欠载。
-            // 它同时承担**开流冷启动**——刚打开时环是空的，没有这一跳，
-            // 头一分钟全在欠载。
-            //
-            // 补的是静音而不是插值出来的音频：样本本来就不存在，声卡刚刚已经
-            // 播了等长的静音，这里只是把「谁来补、补多少」从声卡手里收回来，
-            // 好让水位重新可控。
+        } else if self.servo.recovery_pending.is_some()
+            && !self.servo.recovery_padded
+            && downstream < self.servo.starve_mark()
+        {
+            // Cold output or a proven callback gap may restore the existing
+            // target. Shallow continuous output instead keeps normal DLL state
+            // and accepts real input, including catch-up ticks.
             let need = (self.servo.target - downstream).max(0.0).round() as usize;
-            if need > 0 {
-                PLAY_SERVO
-                    .resync_padded
-                    .fetch_add(need as u64, Ordering::Relaxed);
-                PLAY_SERVO.resync_events.fetch_add(1, Ordering::Relaxed);
-                action = ServoAction::Pad(need);
-            }
-            self.servo.rearm_capture();
             self.publish(err, downstream);
-            return action;
+            return ServoAction::Pad(need);
         }
         // ---- 细调 ----
         // 钳位与积分**必须一起做**（`Dll::update_clamped`，不是 `update` 之后
@@ -2211,7 +2360,7 @@ impl AudioTx {
         );
     }
 
-    fn write_silence(&mut self, n: usize) {
+    fn write_silence(&mut self, n: usize) -> usize {
         // 分块写，避免为一次重同步分配一整秒的零。
         let mut left = n * self.channels as usize;
         let chunk = [0.0f32; 960];
@@ -2223,6 +2372,7 @@ impl AudioTx {
             }
             left -= wrote;
         }
+        (n * self.channels as usize - left) / self.channels as usize
     }
 
     fn note_short_write(&self, wanted: usize, wrote: usize) {
@@ -2253,22 +2403,42 @@ impl AudioTx {
         self.output_delay_at(device_tail, Instant::now())
     }
 
-    fn output_delay_at(&self, device_tail: Duration, now: Instant) -> Option<Duration> {
+    /// Use one observation instant for both delay estimation and absolute
+    /// presentation scheduling of the next pushed block.
+    pub fn output_delay_at(&self, device_tail: Duration, now: Instant) -> Option<Duration> {
+        self.output_delay_with_fallback_at(Some(device_tail), now)
+    }
+
+    /// Prefer a qualified delay from this exact native stream. The fallback is
+    /// the older endpoint calibration and remains explicitly estimated.
+    pub fn output_delay_with_fallback_at(&self, device_tail: Option<Duration>, now: Instant) -> Option<Duration> {
         let phase = self.dev.output_phase.load(Ordering::Acquire);
         if phase & 1 != 0 { return None; }
-        let age = self.dev.since_last_callback(now)?;
+        let last = self.dev.last_cb_ns.load(Ordering::Relaxed);
+        if last == 0 { return None; }
+        let elapsed = now.checked_duration_since(self.dev.base)?;
+        let age = elapsed.checked_sub(Duration::from_nanos(last))?;
         if age > Duration::from_millis(100) { return None; }
         let rate = f64::from(self.dev_rate);
         let callback_frames = self.dev.last_cb_frames.load(Ordering::Relaxed) as f64;
         // The ring has already lost the callback's block, but that block is
         // still ahead of newly appended samples. Device-tail calibration is
         // the delay to the beginning of that native block, not its end.
-        let pending = (f64::from(self.queued()) + callback_frames - age.as_secs_f64() * rate).max(0.0);
+        let queued_and_callback = f64::from(self.queued()) + callback_frames;
+        let filter_frames = f64::from(self.resample_delay_frames());
+        let native = self.dev.native_output_delay();
         std::sync::atomic::fence(Ordering::Acquire);
         if phase != self.dev.output_phase.load(Ordering::Relaxed) { return None; }
-        Some(device_tail + Duration::from_secs_f64(
-            (pending + f64::from(self.resample_delay_frames())) / rate,
-        ))
+        let pending = (queued_and_callback - age.as_secs_f64() * rate).max(0.0);
+        if let Some((observed_at, native_tail)) = native {
+            if now.checked_duration_since(observed_at).is_some_and(|age| age <= Duration::from_millis(100)) {
+                // The native sample selects the stream-local tail estimate;
+                // the latest callback still advances the queued content.
+                // Its elapsed age already reduces the total queue above.
+                return Some(native_tail + Duration::from_secs_f64((pending + filter_frames) / rate));
+            }
+        }
+        Some(device_tail? + Duration::from_secs_f64((pending + filter_frames) / rate))
     }
 
     /// 环容量（样本）。播放环恰好 = 1 秒设备速率。
@@ -2296,7 +2466,14 @@ impl AudioTx {
     /// Reading it has no effect on the playback servo; the owner may use the
     /// snapshot to retire and replace a stalled stream.
     pub fn last_output_callback_age(&self) -> Option<Duration> {
-        self.dev.since_last_callback(Instant::now())
+        self.last_output_callback_age_at(Instant::now())
+    }
+
+    /// Use the same observation instant as the caller's scheduling-gap check.
+    /// A process pause between the two reads must not make one look current
+    /// while the other already includes the entire suspension interval.
+    pub fn last_output_callback_age_at(&self, now: Instant) -> Option<Duration> {
+        self.dev.since_last_callback(now)
     }
 
     /// **测试用**：不开设备，造一个与 `LivePlayback::on_device` 同构的播放环
@@ -2328,6 +2505,7 @@ impl AudioTx {
         let dev = DeviceClock::new();
         (
             AudioTx {
+                prepared: Arc::new(AtomicBool::new(false)),
                 prod,
                 channels: 1,
                 resampler: servo.then(|| InterleavedVarResampler::new(48_000, dev_rate, 1)),
@@ -2403,6 +2581,32 @@ mod output_presentation_phase_tests {
     use super::*;
 
     #[test]
+    fn elapsed_time_does_not_move_a_queued_samples_presentation_deadline() {
+        let (mut tx, mut sink) = AudioTx::detached_for_test(48_000);
+        tx.push(&vec![0.1; 960]);
+        let callback = tx.dev.base + Duration::from_millis(1);
+        sink.drain_at(480, callback, None);
+        tx.dev.note_callback_with_native(callback, 480, 480, None, Some((callback, Duration::from_millis(37))));
+        // At t0 the device owns 37 + 10 ms and the software ring owns 10 ms.
+        // Without another callback/write, t + remaining must be invariant.
+        let expected = callback + Duration::from_millis(57);
+        let observed = callback + Duration::from_millis(5);
+        let remaining = tx.output_delay_with_fallback_at(None, observed).unwrap();
+        assert_eq!(observed + remaining, expected);
+    }
+
+    #[test]
+    fn native_queue_delay_accounts_for_elapsed_callback_time() {
+        let (mut tx, mut sink) = AudioTx::detached_for_test(48_000);
+        tx.push(&vec![0.1; 960]);
+        let callback = tx.dev.base + Duration::from_millis(1);
+        sink.drain_at(480, callback, None);
+        tx.dev.note_callback_with_native(callback, 480, 480, None, Some((callback, Duration::from_millis(37))));
+        assert_eq!(tx.output_delay_with_fallback_at(None, callback), Some(Duration::from_millis(57)));
+        assert_eq!(tx.output_delay_with_fallback_at(None, callback + Duration::from_millis(5)), Some(Duration::from_millis(52)));
+    }
+
+    #[test]
     fn the_transferred_callback_block_remains_ahead_of_new_ring_samples() {
         let (mut tx, mut sink) = AudioTx::detached_for_test(48_000);
         tx.push(&vec![0.1; 960]);
@@ -2413,6 +2617,46 @@ mod output_presentation_phase_tests {
         // still has 10 ms left. A newly appended sample follows all three.
         assert_eq!(tx.output_delay_at(Duration::from_millis(40), callback), Some(Duration::from_millis(60)));
         assert_eq!(tx.output_delay_at(Duration::from_millis(40), callback + Duration::from_millis(5)), Some(Duration::from_millis(55)));
+    }
+
+    #[test]
+    fn same_stream_native_delay_preempts_fallback_and_stale_observations_expire() {
+        let (mut tx, mut sink) = AudioTx::detached_for_test(48_000);
+        tx.push(&vec![0.1; 960]);
+        let callback = tx.dev.base + Duration::from_millis(1);
+        assert_eq!(sink.drain_at(480, callback, None), 480);
+        tx.dev.note_callback_with_native(
+            callback,
+            480,
+            480,
+            None,
+            Some((callback, Duration::from_millis(37))),
+        );
+        let native = tx.output_delay_with_fallback_at(
+            Some(Duration::from_millis(100)),
+            callback,
+        ).expect("qualified same-stream timing should be used");
+        assert!(native < Duration::from_millis(70), "native timing must preempt the fallback");
+
+        tx.dev.note_callback_with_native(callback + Duration::from_millis(200), 480, 480, None, None);
+        let fallback = tx.output_delay_with_fallback_at(
+            Some(Duration::from_millis(100)),
+            callback + Duration::from_millis(201),
+        ).expect("fresh callback should use the bounded fallback");
+        assert!(fallback > Duration::from_millis(100));
+    }
+
+    #[test]
+    fn duplicate_native_positions_do_not_switch_to_the_cross_stream_fallback() {
+        let (mut tx, mut sink) = AudioTx::detached_for_test(48_000);
+        tx.push(&vec![0.1; 960]);
+        let callback = tx.dev.base + Duration::from_millis(1);
+        sink.drain_at(480, callback, None);
+        tx.dev.note_callback_with_native(callback, 480, 480, None, Some((callback, Duration::from_millis(37))));
+        tx.dev.note_callback_with_native(callback + Duration::from_millis(10), 480, 480, None, None);
+        let delay = tx.output_delay_with_fallback_at(Some(Duration::from_millis(100)), callback + Duration::from_millis(10)).unwrap();
+        assert!(delay < Duration::from_millis(70), "duplicate position must retain native timing");
+        assert!(delay > Duration::from_millis(50), "the retained native tail must remain in the estimate");
     }
 
     #[test]
@@ -2439,6 +2683,16 @@ mod output_presentation_phase_tests {
         drop(phase);
         assert_eq!(tx.output_delay_at(Duration::from_millis(10), callback), Some(Duration::from_millis(20)));
     }
+
+    #[test]
+    fn callback_age_uses_the_supplied_observation_instant() {
+        let (tx, mut sink) = AudioTx::detached_for_test(48_000);
+        let callback = tx.dev.base + Duration::from_millis(1);
+        sink.drain_at(480, callback, None);
+        assert_eq!(tx.last_output_callback_age_at(callback + Duration::from_millis(9)), Some(Duration::from_millis(9)));
+        assert_eq!(tx.last_output_callback_age_at(callback), Some(Duration::ZERO));
+    }
+
 }
 
 /// 测试用的播放环消费端，站在声卡输出回调的位置上。见
@@ -2597,11 +2851,18 @@ impl LivePlayback {
                 // 两个时刻；平台给不出时它们相等，`duration_since` 得 0，
                 // 于是这一项自然退化成「不计」而不是乱猜。
                 let ts = info.timestamp();
-                dev_cb.note_callback(
+                #[cfg(windows)]
+                let native_delay = info.native_buffer_delay();
+                #[cfg(not(windows))]
+                let native_delay = None;
+                #[cfg(windows)]
+                dev_cb.note_quantum(info.processing_quantum());
+                dev_cb.note_callback_with_native(
                     Instant::now(),
                     samples.len() / channels as usize,
                     got / channels as usize,
                     ts.playback.duration_since(&ts.callback),
+                    native_delay,
                 );
             },
         )?;
@@ -2614,6 +2875,7 @@ impl LivePlayback {
                 config: config_snapshot,
             },
             AudioTx {
+                prepared: Arc::new(AtomicBool::new(false)),
                 prod,
                 channels,
                 // 伺服开着 ⇒ 重采样器**必须**在场，哪怕 src_rate == dev_rate：

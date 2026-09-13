@@ -1672,14 +1672,32 @@ impl PcmIngress {
     }
 
     fn write(&mut self, pcm: &[i16], telemetry_token: crate::telemetry::OperationToken) {
+        self.write_timed(pcm, telemetry_token, None);
+    }
+
+    fn write_timed(&mut self, pcm: &[i16], telemetry_token: crate::telemetry::OperationToken, timing: Option<crate::bus::PcmWriteTiming>) {
         self.staged.clear();
         self.converter
             .set_correction_ppm(self.shared.bus.correction_ppm());
-        self.converter.process_i16(pcm, &mut self.staged);
+        let converted = self.converter.process_i16_with_timing(pcm, &mut self.staged);
+        let mapped = timing.zip(converted).and_then(|(timing, converted)| {
+            // Each input block carries a fresh source-clock presentation.
+            // Include the FIR history and fractional phase, not just its
+            // nominal delay or the cumulative count of converted frames.
+            let offset = Duration::from_secs_f64(converted.offset_seconds.abs());
+            let presentation = if converted.offset_seconds < 0.0 {
+                timing.presentation.checked_sub(offset)
+            } else {
+                timing.presentation.checked_add(offset)
+            }?;
+            Some((crate::bus::PcmWriteTiming { epoch: timing.epoch, presentation }, converted.frame_seconds))
+        });
         // Rejected writes belong to an older overlapping protocol session.
         self.shared
             .bus
-            .push_with_token(self.session_id, &self.staged, telemetry_token);
+            .push_resampled_with_token(self.session_id, &self.staged, telemetry_token,
+                mapped.map(|(timing, _)| timing),
+                mapped.map_or(1.0 / crate::AUDIOHUB_RATE as f64, |(_, seconds)| seconds));
     }
 
     fn flush(&mut self) {
@@ -1697,12 +1715,22 @@ impl Drop for PcmIngress {
 struct Ap2Sink(PcmIngress);
 
 impl PcmOutput for Ap2Sink {
+    fn discard(&mut self, pcm: &[i16], _token: crate::telemetry::OperationToken) {
+        self.0.staged.clear();
+        self.0.converter.set_correction_ppm(self.0.shared.bus.correction_ppm());
+        self.0.converter.process_i16(pcm, &mut self.0.staged);
+        self.0.staged.clear();
+    }
     fn write(&mut self, pcm: &[i16], telemetry_token: crate::telemetry::OperationToken) {
         self.0.write(pcm, telemetry_token);
     }
 
     fn flush(&mut self) {
         self.0.flush();
+    }
+
+    fn write_timed(&mut self, pcm: &[i16], telemetry_token: crate::telemetry::OperationToken, timing: crate::bus::PcmWriteTiming) {
+        self.0.write_timed(pcm, telemetry_token, Some(timing));
     }
 
     fn output_timing(&self) -> Option<crate::bus::OutputTiming> {
@@ -1942,6 +1970,26 @@ mod tests {
 
     fn test_peer() -> SocketAddr {
         std::net::SocketAddrV6::new("fe80::1234".parse().unwrap(), 7000, 0, 7).into()
+    }
+
+    #[test]
+    fn timed_sink_subtracts_converter_delay_and_reanchors_after_flush() {
+        let shared = test_shared();
+        let mut sink = Ap2Sink(PcmIngress::new_ap2(Arc::clone(&shared), 93, test_peer()));
+        let mut reader = shared.bus.subscribe();
+        let mut out = [[0.0; 2]; 8];
+        reader.read_stereo_timed(&mut out, 9, None);
+        let first_input = std::time::Instant::now();
+        let pcm = [8192, -8192].repeat(128);
+        for presentation in [first_input, first_input + Duration::from_millis(10)] {
+            sink.flush();
+            sink.write_timed(&pcm, crate::telemetry::operation_token(), crate::bus::PcmWriteTiming { epoch: 9, presentation });
+            let next_output = presentation - sink.0.converter.delay() - Duration::from_nanos(62_500);
+            let read = reader.read_stereo_timed(&mut out, 9, Some(next_output));
+            assert_eq!((read.copied, read.silence, read.late), (5, 3, 0));
+            assert_eq!(&out[..3], &[[0.0; 2]; 3]);
+            assert_eq!(&out[3..], &[[0.25, -0.25]; 5]);
+        }
     }
 
     #[test]

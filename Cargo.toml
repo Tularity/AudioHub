@@ -11,7 +11,12 @@ members = [
     "core/audiohubd",
     "tools/audiohub-vad-helper",
 ]
-exclude = ["test"]
+exclude = ["test", "vendor/cpal-0.16.0"]
+
+[patch.crates-io]
+# Keep the pinned CPAL release while carrying the minimal Windows same-stream
+# output timing metadata required by AudioTx. Other hosts retain CPAL's None.
+cpal = { path = "vendor/cpal-0.16.0" }
 
 [profile.release]
 opt-level = 3

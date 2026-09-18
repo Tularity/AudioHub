@@ -746,7 +746,8 @@ impl HalBridge {
     pub(crate) fn supports_output_formats(&self) -> bool {
         self.shared.driver_connected.load(Ordering::Acquire)
             && ((cfg!(target_os = "macos") && self.shared.driver_protocol.load(Ordering::Acquire) == 4)
-                || (cfg!(windows) && self.shared.driver_protocol.load(Ordering::Acquire) == 8))
+                || (cfg!(windows) && self.shared.driver_protocol.load(Ordering::Acquire)
+                    == crate::halbridge_win::wire::PROTOCOL_VERSION))
     }
 
     pub(crate) fn offer_output_format(&self, slot: u8, generation: u32, mask: u32, layout: u32) {

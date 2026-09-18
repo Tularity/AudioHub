@@ -597,11 +597,13 @@ fn daemon_log_tail(from: u64, max: usize) -> String {
     let Ok(mut f) = std::fs::File::open(daemon_log_path()) else {
         return String::new();
     };
-    if f.seek(SeekFrom::Start(from)).is_err() {
+    let len = f.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let from = if from > len { 0 } else { from };
+    if f.seek(SeekFrom::Start(from.max(len.saturating_sub(max as u64)))).is_err() {
         return String::new();
     }
     let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() {
+    if f.take(max as u64).read_to_end(&mut buf).is_err() {
         return String::new();
     }
     String::from_utf8_lossy(&buf[buf.len().saturating_sub(max)..]).into_owned()
@@ -712,6 +714,7 @@ fn ensure_daemon_blocking() -> Result<IpcEndpointJson, DaemonError> {
         cmd.arg("daemon");
     }
     spawn_without_console(&mut cmd);
+    cmd.env("AUDIOHUB_MANAGED_LOG", "1");
     let mut child = cmd
         .stdin(Stdio::null())
         // The daemon's one stdout JSON line only appears with --json, which is

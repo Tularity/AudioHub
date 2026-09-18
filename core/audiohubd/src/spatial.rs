@@ -371,7 +371,7 @@ pub(crate) fn reap_failed(inner: &DaemonInner) {
             state.failure.clone().or_else(|| state.output.failure())
         });
         if let Some(reason) = failure {
-            eprintln!(
+            crate::dlog!(
                 "[audiohubd] closing spatial stream {}: {reason}",
                 rx.stream_id
             );
@@ -383,7 +383,7 @@ pub(crate) fn reap_failed(inner: &DaemonInner) {
         if let Some(tx) = &entry.tx {
             if tx.media_failed.load(Ordering::Acquire) {
                 let reason = lk(&tx.media_failure).clone().unwrap_or_else(|| "media source failed".into());
-                eprintln!("[audiohubd] closing transmit stream {}: {reason}", entry.id);
+                crate::dlog!("[audiohubd] closing transmit stream {}: {reason}", entry.id);
                 crate::conn::teardown_stream(inner, entry.id, true);
             }
         }

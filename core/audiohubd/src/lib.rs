@@ -30,6 +30,7 @@ pub mod halbridge_win;
 pub mod haldev;
 mod halformat;
 mod ipcserv;
+mod log_retention;
 /// `hal_mic` 生产侧水位闸门（纯状态机 + 一条不变式）。
 pub mod micgate;
 /// plan §7.1 模式 A 两个音量开关的接线测试（执行器是本机真设备，故守卫调用点）。
@@ -650,9 +651,10 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     // 塞行，写手不在的话它们只会积到环满然后丢。
     {
         let i = inner.clone();
+        let retention = log_retention::LogRetention::for_app(&inner.cfg_dir);
         threads.push(spawn(
             "ahb-rtlog",
-            Box::new(move || rtlog::writer_loop(|| i.shutdown.load(Ordering::SeqCst))),
+            Box::new(move || rtlog::writer_loop(|| i.shutdown.load(Ordering::SeqCst), retention)),
         )?);
     }
     {

@@ -162,7 +162,9 @@ fn drain_all(scratch: &mut String) -> usize {
     let queues: Vec<Arc<Queue>> = crate::lk(&QUEUES).clone();
     let mut n = 0;
     for q in &queues {
-        loop {
+        // A producer may refill continuously. Bound each pass so retention,
+        // other queues and the shutdown check cannot be starved.
+        for _ in 0..q.ring.len() {
             let mut at = Duration::ZERO;
             // 拷进**写手自己的**缓冲，而不是把槽里的 `String` 拿走：拿走会让
             // 槽退回空串，下一次 `produce` 就得重新为它分配容量 —— 那正好把
@@ -209,11 +211,14 @@ fn reap_dead_queues() {
 }
 
 /// 落盘线程。`stop` 为真且队列排空后返回。
-pub(crate) fn writer_loop(stop: impl Fn() -> bool) {
+pub(crate) fn writer_loop(stop: impl Fn() -> bool, mut retention: Option<crate::log_retention::LogRetention>) {
     let mut scratch = String::with_capacity(LINE_BYTES);
     loop {
         let n = drain_all(&mut scratch);
         reap_dead_queues();
+        if let Some(retention) = retention.as_mut() {
+            retention.maintain();
+        }
         if stop() {
             // 关机宽限：`stop()` 为真的那一刻，两条音频循环多半还在跑最后几个
             // tick，而它们退出前记的行（「跳 tick」「欠载结束」）恰恰是排查

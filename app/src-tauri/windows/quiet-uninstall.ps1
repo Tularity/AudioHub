@@ -115,10 +115,11 @@ try {
         $Process.WaitForExit()
         $ExitCode = $Process.ExitCode
 
-        # Non-zero means fail-closed or reboot-required. Preserve the exact
-        # retry environment untouched. Only a zero result enters the
-        # independently verified commit cleanup below.
-        if ($ExitCode -eq 0) {
+        # 3010 means the product removal committed and Windows still needs to
+        # unload its already-removed driver. Verify and finish program cleanup
+        # just as for zero, while preserving the restart-required result.
+        # Every other non-zero result retains the retry environment.
+        if ($ExitCode -eq 0 -or $ExitCode -eq 3010) {
             # The direct `_?=` executable cannot delete itself. Remove it only
             # after independently proving the actual product uninstall committed.
             $RemainingProduct = $Machine.OpenSubKey($UninstallKeyPath)
@@ -158,7 +159,6 @@ try {
             }
             Remove-Item -LiteralPath $Uninstaller -Force -ErrorAction Stop
             [IO.Directory]::Delete($CanonicalInstallDir, $false)
-            $ExitCode = 0
         }
     } finally {
         $Machine.Dispose()

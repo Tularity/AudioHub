@@ -257,10 +257,14 @@ if ($RebootBranchStart -lt 0 -or $RebootBranchEnd -lt 0) {
     throw 'driver reboot-required uninstall branch is missing'
 }
 $RebootBranch = $NsisHooksText.Substring($RebootBranchStart, $RebootBranchEnd - $RebootBranchStart)
-foreach ($Required in @('SetRebootFlag true', 'SetErrorLevel 25', 'Quit')) {
+foreach ($Required in @('SetRebootFlag true')) {
     if (-not $RebootBranch.Contains($Required)) {
-        throw "driver exit 25 must abort the whole uninstall and preserve its retry environment: $Required"
+        throw "completed driver removal must preserve the Windows restart requirement: $Required"
     }
+}
+if ($RebootBranch -match '(?m)^\s*(Quit|Abort|SetErrorLevel 25)\s*$' -or
+    -not $NsisHooksText.Contains('SetErrorLevel 3010')) {
+    throw 'completed driver removal must continue product cleanup and report restart-required success'
 }
 foreach ($Required in @(
     'StrCpy $INSTDIR "$PROGRAMFILES64\${PRODUCTNAME}"',
@@ -276,7 +280,7 @@ foreach ($Required in @(
     '[Microsoft.Win32.RegistryView]::Registry64',
     '[Security.Principal.WindowsBuiltInRole]::Administrator',
     "`$Start.Arguments = '/S _?=' + `$CanonicalInstallDir",
-    'if ($ExitCode -eq 0)',
+    'if ($ExitCode -eq 0 -or $ExitCode -eq 3010)',
     "`$Machine.OpenSubKey(`$UninstallKeyPath)",
     'Remove-Item -LiteralPath $Uninstaller',
     'exit $ExitCode'

@@ -16,7 +16,7 @@ LangString AudioHubProtectOwnerFailed 1033 "Could not assign protected AudioHub 
 LangString AudioHubProtectAclFailed 1033 "Could not protect AudioHub files: $1"
 LangString AudioHubDriverRemovePrompt 1033 "AudioHub virtual audio is installed.$\r$\n$\r$\nRemove its driver too? Choosing No cancels uninstall so the driver never loses its required daemon."
 LangString AudioHubUninstallCancelled 1033 "AudioHub uninstall cancelled; the App, daemon, and driver remain installed."
-LangString AudioHubDriverRemoveReboot 1033 "Windows must restart before AudioHubVad can be removed safely.$\r$\n$\r$\nAudioHub, its daemon, scheduled task, and driver were kept. Restart Windows, then run uninstall again."
+LangString AudioHubDriverRemoveReboot 1033 "Windows has removed the AudioHubVad devices and driver package. Restart Windows to finish unloading the driver.$\r$\n$\r$\nAudioHub uninstall will continue. You do not need to run it again after restarting."
 LangString AudioHubDriverRemoveFailed 1033 "Windows could not safely remove the AudioHub virtual audio driver.$\r$\n$\r$\n$1$\r$\n$\r$\nThe App and daemon were kept so you can retry."
 LangString AudioHubUserCleanupFailed 1033 "AudioHub could not remove this user's background-service lifecycle files. The App was kept so reinstall cannot silently inherit a broken startup state."
 LangString AudioHubGracefulStopTimeout 1033 "The graceful shutdown request did not answer in time; falling back to the exact-path process sweep."
@@ -376,18 +376,11 @@ audiohub_uninstall_stop_done:
     ${If} $0 == 25
       DetailPrint "$(AudioHubDriverRemoveReboot)"
       SetRebootFlag true
-      ; A pending driver removal is not a successful product uninstall. Keep
-      ; the exact helper/daemon/task layout intact so the user can reboot and
-      ; safely retry instead of leaving a daemonless kernel driver behind.
-      SetErrorLevel 25
-      IfSilent audiohub_driver_reboot_abort audiohub_driver_reboot_prompt
-audiohub_driver_reboot_prompt:
-      MessageBox MB_OK|MB_ICONEXCLAMATION "$(AudioHubDriverRemoveReboot)" /SD IDOK
-audiohub_driver_reboot_abort:
-      ; `Abort` inside the uninstall section leaves NSIS's process result at
-      ; success even after SetErrorLevel. `Quit` preserves the product just as
-      ; atomically but also returns 25 to automation and Windows management.
-      Quit
+      ; The helper returns 25 from uninstall only after independently proving
+      ; that every matching device and published driver package is gone. The
+      ; remaining kernel/service unload is already owned by Windows. Continue
+      ; removing the App and lifecycle entries now; retaining them merely
+      ; forced a second invocation after reboot. Other failures still abort.
     ${ElseIf} $0 != 0
       MessageBox MB_OK|MB_ICONSTOP "$(AudioHubDriverRemoveFailed)" /SD IDOK
       Abort
@@ -499,5 +492,9 @@ audiohub_preuninstall_done:
     !insertmacro AudioHubExtractLifecycleScript
     nsExec::ExecToLog '"$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\audiohub-installer-lifecycle.ps1" -Mode PurgeInstallDir -InstallDir "$PROGRAMFILES64\${PRODUCTNAME}" -ExpectedInstallDir "$PROGRAMFILES64\${PRODUCTNAME}"'
     Pop $0
+    ; Report successful removal with a pending Windows restart. Do not report
+    ; ordinary success while an old kernel image may still be resident.
+    IfRebootFlag 0 +2
+      SetErrorLevel 3010
   ${EndIf}
 !macroend

@@ -12,6 +12,9 @@ pub(super) async fn dispatch(
     state: &mut ConnectionState,
 ) -> DispatchOutcome {
     if has_ambiguous_cseq(request) {
+        if request.method() == "SETUP" {
+            log::warn!("AirPlay SETUP rejected reason=ambiguous_cseq peer={peer}");
+        }
         return DispatchOutcome::close(response_for(request, 400, "Bad Request"));
     }
     let pair =

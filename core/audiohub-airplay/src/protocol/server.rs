@@ -1466,6 +1466,9 @@ async fn process_one_request(
         }
         Err(AppleResponseAttemptError::Challenge(AppleChallengeError::MalformedChallenge))
         | Err(AppleResponseAttemptError::Repeated) => {
+            if request.method() == "SETUP" {
+                log::warn!("AirPlay SETUP rejected reason=apple_challenge peer={peer} encrypted={encrypted}");
+            }
             DispatchOutcome::close(response_for(&request, 400, "Bad Request"))
         }
         Err(AppleResponseAttemptError::Challenge(
@@ -2260,6 +2263,9 @@ async fn dispatch_request(
     connection_id: crate::telemetry::ConnectionId,
 ) -> DispatchOutcome {
     if has_ambiguous_cseq(request) {
+        if request.method() == "SETUP" {
+            log::warn!("AirPlay SETUP rejected reason=ambiguous_cseq peer={peer}");
+        }
         return DispatchOutcome::close(response_for(request, 400, "Bad Request"));
     }
 
@@ -2549,6 +2555,7 @@ async fn setup_response(
         .windows(b"streams".len())
         .any(|window| window == b"streams");
     if !has_content_type(request, BINARY_PLIST_CONTENT_TYPE) {
+        log::warn!("AirPlay SETUP rejected reason=content_type peer={peer}");
         let outcome = DispatchOutcome::close(response_for(request, 400, "Bad Request"));
         return if phase2_like {
             outcome.with_phase2_telemetry(
@@ -2564,10 +2571,15 @@ async fn setup_response(
     let setup = match parse_setup(request.body()) {
         Ok(setup) => setup,
         Err(ParseSetupError::Phase2(reason)) => {
+            log::warn!("AirPlay SETUP rejected reason={reason} peer={peer}");
             return DispatchOutcome::close(response_for(request, 400, "Bad Request"))
                 .with_phase2_telemetry(telemetry_token, None, 400, reason);
         }
-        Err(ParseSetupError::Unclassified) => {
+        Err(ParseSetupError::Unclassified(reason)) => {
+            log::warn!(
+                "AirPlay SETUP rejected reason={reason} peer={peer} shape={}",
+                safe_setup_shape(request)
+            );
             let outcome = DispatchOutcome::close(response_for(request, 400, "Bad Request"));
             return if phase2_like {
                 outcome.with_phase2_telemetry(
@@ -2658,6 +2670,7 @@ async fn setup_response(
                     let setup = match setup::parse_phase2(request.body()) {
                         Ok(setup) => setup,
                         Err(_) => {
+                            log::warn!("AirPlay SETUP rejected reason=realtime_setup_parse_failed peer={peer}");
                             return DispatchOutcome::close(response_for(
                                 request,
                                 400,
@@ -2917,11 +2930,26 @@ async fn setup_response(
                 }
                 Some("PTP") => {
                     let Some(remote_timing_peer) = timing_peer.as_ref() else {
+                        log::warn!("AirPlay SETUP rejected reason=missing_timing_peer peer={peer}");
                         return DispatchOutcome::close(response_for(request, 400, "Bad Request"));
                     };
+                    let peers_without_addresses = timing_peer_list.iter()
+                        .filter(|peer| peer.addresses.is_empty()).count();
+                    if remote_timing_peer.addresses.is_empty() || peers_without_addresses != 0 {
+                        log::info!(
+                            "AirPlay PTP optional address metadata control_peer={peer} sender_addresses={} peers_without_addresses={peers_without_addresses}",
+                            remote_timing_peer.addresses.len()
+                        );
+                    }
                     let remote_match = match remote_timing_peer.match_for(local_timing_peer_id) {
                         Ok(remote_match) => remote_match,
                         Err(()) => {
+                            let case_only_match = remote_timing_peer.receive_matching.as_ref()
+                                .is_some_and(|matching| matching.clock_ports.keys()
+                                    .any(|id| id.eq_ignore_ascii_case(local_timing_peer_id)));
+                            log::warn!(
+                                "AirPlay SETUP rejected reason=clock_port_receiver_id_missing peer={peer} case_only_match={case_only_match}"
+                            );
                             return DispatchOutcome::close(response_for(
                                 request,
                                 400,
@@ -3032,7 +3060,7 @@ enum ParsedSetup {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParseSetupError {
-    Unclassified,
+    Unclassified(&'static str),
     Phase2(&'static str),
 }
 
@@ -3067,10 +3095,12 @@ impl ParsedTimingPeer {
 
 fn parse_setup(body: &[u8]) -> Result<ParsedSetup, ParseSetupError> {
     if body.len() < 8 || !body.starts_with(b"bplist00") {
-        return Err(ParseSetupError::Unclassified);
+        return Err(ParseSetupError::Unclassified("binary_plist_header"));
     }
-    let value = Value::from_reader(Cursor::new(body)).map_err(|_| ParseSetupError::Unclassified)?;
-    let dictionary = value.as_dictionary().ok_or(ParseSetupError::Unclassified)?;
+    let value = Value::from_reader(Cursor::new(body))
+        .map_err(|_| ParseSetupError::Unclassified("binary_plist_decode"))?;
+    let dictionary = value.as_dictionary()
+        .ok_or(ParseSetupError::Unclassified("plist_root_not_dictionary"))?;
 
     if let Some(streams) = dictionary.get("streams") {
         let phase2_error = || ParseSetupError::Phase2("phase2_stream_envelope_invalid");
@@ -3098,19 +3128,19 @@ fn parse_setup(body: &[u8]) -> Result<ParsedSetup, ParseSetupError> {
         .get("timingProtocol")
         .and_then(Value::as_string)
         .filter(|value| matches!(*value, "NTP" | "PTP" | "None"))
-        .ok_or(ParseSetupError::Unclassified)?
+        .ok_or(ParseSetupError::Unclassified("timing_protocol"))?
         .to_owned();
     let timing_port = match dictionary.get("timingPort") {
         Some(value) => Some(
             value
                 .as_unsigned_integer()
                 .filter(|port| *port <= u64::from(u16::MAX))
-                .ok_or(ParseSetupError::Unclassified)?,
+                .ok_or(ParseSetupError::Unclassified("timing_port"))?,
         ),
         None => None,
     };
     let remote_control_only = match dictionary.get("isRemoteControlOnly") {
-        Some(value) => value.as_boolean().ok_or(ParseSetupError::Unclassified)?,
+        Some(value) => value.as_boolean().ok_or(ParseSetupError::Unclassified("remote_control_only"))?,
         None => false,
     };
     let supports_event_volume = dictionary
@@ -3118,19 +3148,19 @@ fn parse_setup(body: &[u8]) -> Result<ParsedSetup, ParseSetupError> {
         .and_then(Value::as_string)
         .is_some_and(source_version_supports_event_volume);
     validate_ignored_session_encryption_fields(dictionary)
-        .map_err(|_| ParseSetupError::Unclassified)?;
+        .map_err(ParseSetupError::Unclassified)?;
 
     let timing_peer = if timing_protocol == "PTP" {
         Some(
             parse_timing_peer_info(dictionary.get("timingPeerInfo"))
-                .map_err(|_| ParseSetupError::Unclassified)?,
+                .map_err(ParseSetupError::Unclassified)?,
         )
     } else {
         None
     };
     let timing_peer_list = if timing_protocol == "PTP" {
         parse_timing_peer_list(dictionary.get("timingPeerList"))
-            .map_err(|_| ParseSetupError::Unclassified)?
+            .map_err(ParseSetupError::Unclassified)?
     } else {
         Vec::new()
     };
@@ -3139,7 +3169,7 @@ fn parse_setup(body: &[u8]) -> Result<ParsedSetup, ParseSetupError> {
         "NTP" if timing_port.is_some_and(|port| port != 0) && !remote_control_only => {}
         "PTP" if timing_port.is_none() && !remote_control_only && !timing_peer_list.is_empty() => {}
         "None" if timing_port.is_none() && remote_control_only => {}
-        _ => return Err(ParseSetupError::Unclassified),
+        _ => return Err(ParseSetupError::Unclassified("timing_protocol_port_or_role_combination")),
     }
 
     let remote_timing_port = timing_port
@@ -3193,28 +3223,28 @@ fn plist_unsigned(dictionary: &Dictionary, key: &str) -> Result<u64, ()> {
         .ok_or(())
 }
 
-fn validate_ignored_session_encryption_fields(dictionary: &Dictionary) -> Result<(), ()> {
+fn validate_ignored_session_encryption_fields(dictionary: &Dictionary) -> Result<(), &'static str> {
     let ekey = match dictionary.get("ekey") {
-        Some(value) => Some(value.as_data().ok_or(())?),
+        Some(value) => Some(value.as_data().ok_or("session_ekey_type")?),
         None => None,
     };
     let eiv = match dictionary.get("eiv") {
-        Some(value) => Some(value.as_data().ok_or(())?),
+        Some(value) => Some(value.as_data().ok_or("session_eiv_type")?),
         None => None,
     };
     if ekey.is_some() != eiv.is_some() {
-        return Err(());
+        return Err("session_ekey_eiv_pair");
     }
 
     let Some(ekey) = ekey else {
         return if dictionary.contains_key("et") {
-            Err(())
+            Err("session_et_without_keys")
         } else {
             Ok(())
         };
     };
     if eiv.is_none_or(|value| value.len() != 16) {
-        return Err(());
+        return Err("session_eiv_length");
     }
 
     // These phase-one fields are not used by the type-96 media path (the
@@ -3226,26 +3256,30 @@ fn validate_ignored_session_encryption_fields(dictionary: &Dictionary) -> Result
         Some(value) => match value.as_unsigned_integer() {
             Some(0) if ekey.len() == 16 => Ok(()),
             Some(32) if ekey.len() == 72 => Ok(()),
-            _ => Err(()),
+            _ => Err("session_et_key_shape"),
         },
         None if matches!(ekey.len(), 16 | 72) => Ok(()),
-        None => Err(()),
+        None => Err("session_ekey_length"),
     }
 }
 
-fn parse_timing_peer_info(value: Option<&Value>) -> Result<ParsedTimingPeer, ()> {
-    let dictionary = value.and_then(Value::as_dictionary).ok_or(())?;
+fn parse_timing_peer_info(value: Option<&Value>) -> Result<ParsedTimingPeer, &'static str> {
+    let dictionary = value.and_then(Value::as_dictionary).ok_or("timing_peer_dictionary")?;
     let id = dictionary
         .get("ID")
         .and_then(Value::as_string)
         .filter(|identifier| !identifier.is_empty() && identifier.len() <= 255)
-        .ok_or(())?
+        .ok_or("timing_peer_id")?
         .to_owned();
-    let addresses = dictionary
-        .get("Addresses")
-        .and_then(Value::as_array)
-        .filter(|addresses| !addresses.is_empty() && addresses.len() <= 64)
-        .ok_or(())?;
+    // This list is optional discovery metadata, not the timing source. The
+    // session binds to its authenticated control peer even if no addresses
+    // are advertised. Preserve supplied-field type and size validation.
+    let addresses: &[Value] = match dictionary.get("Addresses") {
+        None => &[],
+        Some(Value::Array(values)) if values.len() <= 64 => values.as_slice(),
+        Some(Value::Array(_)) => return Err("timing_peer_addresses_limit"),
+        Some(_) => return Err("timing_peer_addresses_type"),
+    };
     let addresses = addresses
         .iter()
         .map(|address| {
@@ -3253,22 +3287,22 @@ fn parse_timing_peer_info(value: Option<&Value>) -> Result<ParsedTimingPeer, ()>
                 .as_string()
                 .filter(|address| !address.is_empty() && address.len() <= 255)
                 .map(str::to_owned)
-                .ok_or(())
+                .ok_or("timing_peer_address_entry")
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     let supports_override = match dictionary.get("SupportsClockPortMatchingOverride") {
-        Some(value) => value.as_boolean().ok_or(())?,
+        Some(value) => value.as_boolean().ok_or("timing_peer_override_type")?,
         None => false,
     };
     let clock_identity = dictionary
         .get("ClockID")
         .map(plist_u64_bit_pattern)
-        .transpose()?;
+        .transpose().map_err(|_| "timing_peer_clock_id_type")?;
     let clock_ports = dictionary
         .get("ClockPorts")
         .map(parse_clock_ports)
-        .transpose()?;
+        .transpose().map_err(|_| "timing_peer_clock_ports_shape")?;
     // AirPlaySupport uses the complete ClockID/ClockPorts tuple when present;
     // the Supports... boolean is exchanged as capability metadata but is not
     // the runtime gate. Some deployed senders publish true before their tuple
@@ -3282,7 +3316,7 @@ fn parse_timing_peer_info(value: Option<&Value>) -> Result<ParsedTimingPeer, ()>
                 clock_ports,
             })
         }
-        _ => return Err(()),
+        _ => return Err("timing_peer_clock_tuple"),
     };
 
     Ok(ParsedTimingPeer {
@@ -3295,11 +3329,11 @@ fn parse_timing_peer_info(value: Option<&Value>) -> Result<ParsedTimingPeer, ()>
     })
 }
 
-fn parse_timing_peer_list(value: Option<&Value>) -> Result<Vec<ParsedTimingPeer>, ()> {
+fn parse_timing_peer_list(value: Option<&Value>) -> Result<Vec<ParsedTimingPeer>, &'static str> {
     let peers = value
         .and_then(Value::as_array)
         .filter(|peers| !peers.is_empty() && peers.len() <= 64)
-        .ok_or(())?;
+        .ok_or("timing_peer_list_shape")?;
     peers
         .iter()
         .map(|peer| parse_timing_peer_info(Some(peer)))
@@ -3804,6 +3838,36 @@ fn safe_control_plist_shape(request: &Request) -> String {
                 _ => "other",
             };
             format!("{key}:{kind}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+// Only fixed field names, scalar protocol metadata and data lengths may reach
+// this diagnostic. Never emit opaque key bytes or arbitrary sender strings.
+fn safe_setup_shape(request: &Request) -> String {
+    let Ok(dictionary) = parse_control_binary_plist(request) else {
+        return "invalid-binary-plist".to_owned();
+    };
+    ["timingProtocol", "timingPort", "isRemoteControlOnly", "et", "ekey", "eiv",
+        "timingPeerInfo", "timingPeerList"]
+        .iter()
+        .map(|key| {
+            let shape = match dictionary.get(*key) {
+                None => "absent".to_owned(),
+                Some(Value::Boolean(value)) if *key == "isRemoteControlOnly" => value.to_string(),
+                Some(Value::Boolean(_)) => "bool".to_owned(),
+                Some(Value::Integer(value)) if matches!(*key, "et" | "timingPort") => format!("integer({value})"),
+                Some(Value::Integer(_)) => "integer".to_owned(),
+                Some(Value::String(value)) if *key == "timingProtocol"
+                    && matches!(value.as_str(), "PTP" | "NTP" | "None") => value.clone(),
+                Some(Value::String(value)) => format!("string({})", value.len()),
+                Some(Value::Data(value)) => format!("data({})", value.len()),
+                Some(Value::Array(value)) => format!("array({})", value.len()),
+                Some(Value::Dictionary(value)) => format!("dict({})", value.len()),
+                Some(_) => "other".to_owned(),
+            };
+            format!("{key}={shape}")
         })
         .collect::<Vec<_>>()
         .join(",")

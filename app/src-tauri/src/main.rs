@@ -26,6 +26,8 @@ mod mac_chrome;
 #[cfg(target_os = "macos")]
 mod mac_tray;
 mod service;
+#[cfg(windows)]
+mod win_daemon;
 mod webui;
 #[cfg(target_os = "windows")]
 mod win_chrome;
@@ -225,7 +227,17 @@ fn read_endpoint_raw() -> Option<IpcEndpointJson> {
 }
 
 fn read_endpoint() -> Option<IpcEndpointJson> {
-    read_endpoint_raw().filter(|ep| ep.ipc_version == IPC_VERSION)
+    #[cfg(windows)]
+    win_daemon::release_exited_image();
+    let ep = read_endpoint_raw().filter(|ep| ep.ipc_version == IPC_VERSION)?;
+    #[cfg(windows)]
+    {
+        win_daemon::check(&ep).ok()?;
+        if !endpoint_alive(&ep) || read_endpoint_raw().as_ref() != Some(&ep) {
+            return None;
+        }
+    }
+    Some(ep)
 }
 
 fn port_alive(port: u16) -> bool {
@@ -622,6 +634,13 @@ fn spawn_lock() -> &'static Mutex<()> {
 fn ensure_daemon_blocking() -> Result<IpcEndpointJson, DaemonError> {
     let _serialised = spawn_lock().lock().unwrap_or_else(|e| e.into_inner());
 
+    #[cfg(windows)]
+    if let Some(ep) = read_endpoint_raw() {
+        if endpoint_alive(&ep) && ep.ipc_version == IPC_VERSION {
+            win_daemon::check(&ep)?;
+        }
+    }
+
     // Idempotence: a healthy daemon is never restarted. On macOS a listening
     // port alone is insufficient: ipc.json already carries the PID, so bind it
     // to the exact root-owned, signed runtime image selected by this App. The
@@ -693,6 +712,9 @@ fn ensure_daemon_blocking() -> Result<IpcEndpointJson, DaemonError> {
         DaemonError::new("no-binary", "未找到 audiohub 服务程序").with_detail(detail)
     })?;
 
+    #[cfg(windows)]
+    let _spawn_image = win_daemon::check_spawn(&bin)?;
+
     let (log_sink, log_from, log_note) = match open_daemon_log() {
         Ok((f, at)) => (
             Stdio::from(f),
@@ -754,6 +776,15 @@ fn ensure_daemon_blocking() -> Result<IpcEndpointJson, DaemonError> {
             }
         }
 
+        #[cfg(windows)]
+        if let Some(ep) = read_endpoint_raw() {
+            if endpoint_alive(&ep) && ep.ipc_version == IPC_VERSION {
+                if let Err(error) = win_daemon::check(&ep) {
+                    let _ = terminate_spawned_child_async(child, "unmatched daemon");
+                    return Err(error);
+                }
+            }
+        }
         if let Some(ep) = read_endpoint() {
             #[cfg(target_os = "macos")]
             if service::mac_endpoint_state(&ep) == service::MacEndpointState::CurrentReady {
@@ -1271,6 +1302,13 @@ fn quit_ui(app: AppHandle) {
 /// Best effort `daemon.shutdown` over IPC (that is exactly what `ctl shutdown`
 /// sends), then quit. A failure here must not trap the user in the app.
 fn shutdown_daemon_blocking() {
+    #[cfg(windows)]
+    if let Some(ep) = read_endpoint_raw() {
+        if win_daemon::check(&ep).is_err() {
+            warn("stop-daemon: refused an unverified Windows service");
+            return;
+        }
+    }
     // `ctl shutdown` is a CLI subcommand: audiohubd does not have it. Since
     // daemon_binary() now prefers audiohubd, pick the CLI explicitly here — the
     // two sit side by side in every layout that ships them.

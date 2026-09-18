@@ -1396,8 +1396,15 @@ fn status_blocking() -> DaemonServiceStatus {
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn daemon_running() -> bool {
-    read_endpoint()
-        .as_ref()
+    // A rejected build can still own the port; it must not look stopped.
+    #[cfg(windows)]
+    let endpoint = {
+        super::win_daemon::release_exited_image();
+        super::read_endpoint_raw()
+    };
+    #[cfg(not(windows))]
+    let endpoint = read_endpoint();
+    endpoint.as_ref()
         .map(endpoint_alive)
         .unwrap_or(false)
 }
@@ -1667,6 +1674,12 @@ pub(crate) async fn restart_daemon_service() -> Result<IpcEndpointJson, DaemonEr
     let task = tauri::async_runtime::spawn_blocking(restart_mac_daemon_blocking);
     #[cfg(not(target_os = "macos"))]
     let task = tauri::async_runtime::spawn_blocking(|| {
+        #[cfg(windows)]
+        if let Some(ep) = super::read_endpoint_raw() {
+            if endpoint_alive(&ep) {
+                super::win_daemon::check(&ep)?;
+            }
+        }
         super::shutdown_daemon_blocking();
         if !wait_for_daemon_exit(std::time::Duration::from_secs(8)) {
             return Err(DaemonError::new(

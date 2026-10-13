@@ -3190,6 +3190,10 @@ impl Handshake {
 }
 
 /// Fires the callback whenever the system default device of `kind` changes.
+/// On Windows it also fires when any audio endpoint is added, removed, or
+/// changes state (active / unplugged / not present): wireless microphone
+/// receivers often come back under the same default endpoint id, so a
+/// default-only watch would miss the reconnect and leave a dead capture open.
 /// Dropping it deregisters the platform listener and joins the worker, so the
 /// callback provably cannot run once `drop` has returned.
 pub struct DeviceChangeWatcher {
@@ -3393,6 +3397,11 @@ mod watch_imp {
     //! Vtable layout is the frozen ABI of mmdeviceapi.h; the object is a normal
     //! refcounted COM object, so MMDevAPI's own reference keeps it alive for as
     //! long as it needs and the last Release frees it.
+    //!
+    //! Default-device changes are filtered by data-flow + console role. Endpoint
+    //! add / remove / state changes do not carry a flow, so they wake every
+    //! watcher that registered: the Fanout collapses bursts, and a spurious
+    //! rebuild of the other direction is cheaper than a permanently silent mic.
 
     use super::{DeviceKind, Fanout};
     use anyhow::{bail, Result};
@@ -3548,13 +3557,21 @@ mod watch_imp {
         }
     }
 
-    unsafe extern "system" fn nc_state(_t: *mut c_void, _id: *const u16, _s: u32) -> HRESULT {
+    /// Endpoint arrival / departure / plug state. No data-flow is supplied, so
+    /// every registered watcher is woken; see the module comment.
+    unsafe extern "system" fn nc_state(this: *mut c_void, _id: *const u16, _s: u32) -> HRESULT {
+        let c = &*(this as *const NotifyClient);
+        c.fanout.signal();
         S_OK
     }
-    unsafe extern "system" fn nc_added(_t: *mut c_void, _id: *const u16) -> HRESULT {
+    unsafe extern "system" fn nc_added(this: *mut c_void, _id: *const u16) -> HRESULT {
+        let c = &*(this as *const NotifyClient);
+        c.fanout.signal();
         S_OK
     }
-    unsafe extern "system" fn nc_removed(_t: *mut c_void, _id: *const u16) -> HRESULT {
+    unsafe extern "system" fn nc_removed(this: *mut c_void, _id: *const u16) -> HRESULT {
+        let c = &*(this as *const NotifyClient);
+        c.fanout.signal();
         S_OK
     }
     unsafe extern "system" fn nc_prop(

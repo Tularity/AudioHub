@@ -1604,6 +1604,198 @@ pub(crate) fn source_builder_loop(
     }
 }
 
+/// `IAudioClient::Initialize` 返回「系统资源不足」，或这次打开一直不返回。
+/// 普通的「没有默认输入设备」不走端点重置。
+fn mic_failure_warrants_endpoint_cycle(err: &str) -> bool {
+    err.contains("0x800705AA")
+        || err.contains("microphone open timed out")
+        || err.contains("previous microphone open is still stuck")
+}
+
+/// 两次禁用再启用之间至少隔这么久。
+const MIC_ENDPOINT_CYCLE_INTERVAL: Duration = Duration::from_secs(60);
+/// 这个窗口里最多动这么多次端点。到顶之后只记日志。
+const MIC_ENDPOINT_CYCLE_LIMIT: usize = 3;
+const MIC_ENDPOINT_CYCLE_WINDOW: Duration = Duration::from_secs(60 * 60);
+/// 一次打开允许卡在 WASAPI 里的时间。到点建源线程继续走，那次调用自己结束。
+const MIC_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CyclePermit {
+    Allow,
+    TooSoon,
+    OverLimit,
+}
+
+/// 默认采集端点「禁用再启用」的次数账。
+struct MicEndpointCycleBudget {
+    cycles: Vec<Instant>,
+    cap_logged_at: Option<Instant>,
+}
+
+impl MicEndpointCycleBudget {
+    const fn new() -> Self {
+        Self {
+            cycles: Vec::new(),
+            cap_logged_at: None,
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.cycles
+            .retain(|t| now.saturating_duration_since(*t) < MIC_ENDPOINT_CYCLE_WINDOW);
+    }
+
+    fn permit(&mut self, now: Instant) -> CyclePermit {
+        self.prune(now);
+        if self.cycles.len() >= MIC_ENDPOINT_CYCLE_LIMIT {
+            return CyclePermit::OverLimit;
+        }
+        if self
+            .cycles
+            .last()
+            .is_some_and(|t| now.saturating_duration_since(*t) < MIC_ENDPOINT_CYCLE_INTERVAL)
+        {
+            return CyclePermit::TooSoon;
+        }
+        CyclePermit::Allow
+    }
+
+    fn record(&mut self, now: Instant) {
+        self.cycles.push(now);
+    }
+
+    /// 上限拒绝至少隔一个最小间隔才再记一行，避免对端每 2 秒重试把日志打满。
+    fn note_over_limit(&mut self, now: Instant) -> bool {
+        let due = self
+            .cap_logged_at
+            .map(|t| now.saturating_duration_since(t) >= MIC_ENDPOINT_CYCLE_INTERVAL)
+            .unwrap_or(true);
+        if due {
+            self.cap_logged_at = Some(now);
+        }
+        due
+    }
+}
+
+fn endpoint_cycle_budget() -> std::sync::MutexGuard<'static, MicEndpointCycleBudget> {
+    static BUDGET: Mutex<MicEndpointCycleBudget> = Mutex::new(MicEndpointCycleBudget::new());
+    BUDGET.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// 上一次打开还卡在 `Initialize` 里时为 true。第二次打开要等它自己返回。
+static MIC_OPEN_INFLIGHT: AtomicBool = AtomicBool::new(false);
+
+struct ClearMicOpenInflight;
+
+impl Drop for ClearMicOpenInflight {
+    fn drop(&mut self) {
+        MIC_OPEN_INFLIGHT.store(false, Ordering::Release);
+    }
+}
+
+fn wait_mic_open_idle(timeout: Duration) -> bool {
+    let start = Instant::now();
+    while MIC_OPEN_INFLIGHT.load(Ordering::Acquire) {
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+/// 在工作线程上打开默认麦，最多等 [`MIC_OPEN_TIMEOUT`]。
+///
+/// Windows 上 `IAudioClient::Initialize` 可以一直不返回。建源线程只有一条，
+/// 卡在那里之后，后面的打开、收尸、死流重试全部排队。超时之后这次系统调用
+/// 继续在工作线程上跑完（取消不了），但建源线程不再等它。工作线程还没返回时
+/// 不再开第二次，避免叠出更多 `0x800705AA`。
+#[cfg(windows)]
+fn open_default_mic_bounded(frame_ms: u32) -> Result<(MicSource, LiveCapture)> {
+    fn assert_send<T: Send>(v: T) -> T {
+        v
+    }
+    if MIC_OPEN_INFLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        anyhow::bail!("previous microphone open is still stuck");
+    }
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("audiohub-mic-open".into())
+        .spawn(move || {
+            let _clear = ClearMicOpenInflight;
+            let result = MicSource::open(frame_ms).context("start microphone capture");
+            let _ = tx.send(assert_send(result));
+        });
+    if let Err(e) = spawned {
+        MIC_OPEN_INFLIGHT.store(false, Ordering::Release);
+        return Err(e).context("spawn microphone open");
+    }
+    match rx.recv_timeout(MIC_OPEN_TIMEOUT) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!("microphone open timed out")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("microphone open ended without a result")
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_default_mic(frame_ms: u32) -> Result<(MicSource, LiveCapture)> {
+    let first = open_default_mic_bounded(frame_ms);
+    let Some(why) = first.as_ref().err().map(|err| format!("{err:#}")) else {
+        return first;
+    };
+    if !mic_failure_warrants_endpoint_cycle(&why) {
+        return first;
+    }
+    let now = Instant::now();
+    let attempt = {
+        let mut budget = endpoint_cycle_budget();
+        match budget.permit(now) {
+            CyclePermit::TooSoon => return first,
+            CyclePermit::OverLimit => {
+                if budget.note_over_limit(now) {
+                    dlog!(
+                        "[audiohubd] 麦克风端点禁用再启用已达上限（近 1 小时内 \
+                         {MIC_ENDPOINT_CYCLE_LIMIT} 次），这次只记录，不再动端点：{why}"
+                    );
+                }
+                return first;
+            }
+            CyclePermit::Allow => {
+                budget.record(now);
+                budget.cycles.len()
+            }
+        }
+    };
+    match audiohub_core::capture_reset::cycle_default_capture_endpoint() {
+        Ok(()) => dlog!(
+            "[audiohubd] 麦克风打开失败（{why}），禁用再启用默认采集端点后重试\
+             （近 1 小时内第 {attempt}/{MIC_ENDPOINT_CYCLE_LIMIT} 次）"
+        ),
+        Err(e) => {
+            dlog!("[audiohubd] 禁用再启用默认采集端点失败：{e:#}");
+            return first;
+        }
+    }
+    if !wait_mic_open_idle(Duration::from_secs(1)) {
+        dlog!("[audiohubd] 上一次麦克风打开仍卡在系统调用里，不再叠开");
+        return first;
+    }
+    open_default_mic_bounded(frame_ms)
+}
+
+#[cfg(not(windows))]
+fn open_default_mic(frame_ms: u32) -> Result<(MicSource, LiveCapture)> {
+    MicSource::open(frame_ms).context("start microphone capture")
+}
+
 fn build_source(
     inner: &DaemonInner,
     spec: &SourceSpec,
@@ -1618,9 +1810,9 @@ fn build_source(
             FRAME_MS as u32,
         ))),
         SourceSpec::Mic => {
-            // cpal 流留在**这条**线程上；跨线程走的只有 `AudioRx`。
-            let (src, cap) =
-                MicSource::open(FRAME_MS as u32).context("start microphone capture")?;
+            // cpal 流留在建源线程的 `caps` 里；跨线程走的只有 `AudioRx`。
+            // Windows 上打开本身可以放到工作线程并限时，见 `open_default_mic`。
+            let (src, cap) = open_default_mic(FRAME_MS as u32)?;
             caps.insert((spec.clone(), gen), cap);
             Src::Frame(Box::new(src))
         }
@@ -1933,6 +2125,9 @@ struct PendingBuild {
     /// 由 `on_build_done` 判断）：一次设备变更重建（源已在表里，不需要 waiter），
     /// 或者等的人都撤了（成品直接收尸）。
     waiters: Vec<PendingAdd>,
+    /// `false`：打开失败后先停在这里，等下一次输入设备通知再发 `Build`。
+    /// 没有在途的建源请求。
+    in_flight: bool,
 }
 
 /// `tx_loop` 的全部可变状态。
@@ -1981,6 +2176,7 @@ impl TxState {
             PendingBuild {
                 gen,
                 waiters: Vec::new(),
+                in_flight: true,
             },
         );
         let _ = self.builder.send(BuildReq::Build { spec, gen });
@@ -2104,6 +2300,21 @@ impl TxState {
         for p in self.pending.values_mut() {
             p.waiters.retain(|w| w.stream_id != stream_id);
         }
+        // 停着等设备的那条，人走光了就不能再留：下一次设备通知会把它打开。
+        // 已经在途的不删，成品回来时按「没人等」收尸。
+        self.pending
+            .retain(|_, p| p.in_flight || !p.waiters.is_empty());
+    }
+
+    fn start_parked_build(&mut self, spec: &SourceSpec) {
+        let gen = self.new_gen();
+        let pending = self.pending.get_mut(spec).expect("parked build");
+        pending.gen = gen;
+        pending.in_flight = true;
+        let _ = self.builder.send(BuildReq::Build {
+            spec: spec.clone(),
+            gen,
+        });
     }
 
     /// 建源线程交回一个成品（或一个失败）。
@@ -2124,6 +2335,25 @@ impl TxState {
                         "[audiohubd] {} 重建失败（{why}）；保留原来的采集",
                         d.spec.label()
                     );
+                } else if matches!(d.spec, SourceSpec::Mic)
+                    && !waiters.is_empty()
+                    && mic_failure_warrants_endpoint_cycle(&why)
+                {
+                    // 端点还没能打开。人还在等的话先别把失败交回去：下一次输入
+                    // 设备通知（包括刚做的禁用再启用）会再发一次 Build。
+                    // 对端的 ack 超时仍然会把 waiter 撤掉。
+                    dlog!(
+                        "[audiohubd] 麦克风打开失败（{why}）；保留等待，等输入设备变化后再开"
+                    );
+                    self.pending.insert(
+                        d.spec,
+                        PendingBuild {
+                            gen: 0,
+                            waiters,
+                            in_flight: false,
+                        },
+                    );
+                    return;
                 }
                 for w in waiters {
                     if let Some(a) = w.ack {
@@ -2227,8 +2457,13 @@ fn apply_txcmd(st: &mut TxState, cmd: TxCmd) {
                 return;
             }
             // 已经有人在等同一个源：搭车，不再开第二次设备。
-            if let Some(p) = st.pending.get_mut(&spec) {
-                p.waiters.push(add);
+            // 停着等设备通知的那条除外——这次 Add 本身就是一次新的打开请求。
+            if st.pending.contains_key(&spec) {
+                let start = !st.pending[&spec].in_flight;
+                st.pending.get_mut(&spec).expect("pending").waiters.push(add);
+                if start {
+                    st.start_parked_build(&spec);
+                }
                 return;
             }
             let gen = st.new_gen();
@@ -2237,6 +2472,7 @@ fn apply_txcmd(st: &mut TxState, cmd: TxCmd) {
                 PendingBuild {
                     gen,
                     waiters: vec![add],
+                    in_flight: true,
                 },
             );
             let _ = st.builder.send(BuildReq::Build { spec, gen });
@@ -2816,13 +3052,19 @@ fn drain_skipped_ticks(
 ///
 /// 变的只有一件事：**开设备这件事不再发生在这条线程上**。
 fn request_mic_rebuild(st: &mut TxState) {
-    if !st.sources.contains_key(&SourceSpec::Mic) {
-        dlog!("[audiohubd] input device changed; no microphone source to rebuild");
+    if let Some(pending) = st.pending.get(&SourceSpec::Mic) {
+        if pending.in_flight {
+            // 上一次重建还没回来。再发一次只会白开一次设备，并让两个成品互相覆盖。
+            dlog!("[audiohubd] input device changed; 上一次麦克风重建还在进行中，本次略过");
+            return;
+        }
+        // 第一次打开失败，表里还没有麦克风源。设备回来了就再开。
+        st.start_parked_build(&SourceSpec::Mic);
+        dlog!("[audiohubd] input device changed; 麦克风还没打开，已请求重新打开");
         return;
     }
-    if st.pending.contains_key(&SourceSpec::Mic) {
-        // 上一次重建还没回来。再发一次只会白开一次设备，并让两个成品互相覆盖。
-        dlog!("[audiohubd] input device changed; 上一次麦克风重建还在进行中，本次略过");
+    if !st.sources.contains_key(&SourceSpec::Mic) {
+        dlog!("[audiohubd] input device changed; no microphone source to rebuild");
         return;
     }
     st.request_build(SourceSpec::Mic);
@@ -9238,6 +9480,96 @@ pub(crate) mod deadline_thread_guards {
         assert_eq!(
             ack1.try_recv().unwrap(),
             Err("no default input device".into())
+        );
+    }
+
+    /// 端点打不开（`0x800705AA`）且表里还没有麦克风 ⇒ 先别把失败交回去。
+    /// 输入设备通知到来时再开。人撤了，这条停着的请求也必须消失。
+    #[test]
+    fn a_wedged_mic_open_waits_for_the_input_device_and_leaves_when_nobody_does() {
+        let (bs, br) = mpsc::channel();
+        let mut st = TxState::new(bs);
+        let (c1, ack1) = add_cmd(1, SourceSpec::Mic);
+        apply_txcmd(&mut st, c1);
+        let BuildReq::Build { gen, .. } = br.try_recv().unwrap() else {
+            panic!()
+        };
+        st.on_build_done(BuildDone {
+            spec: SourceSpec::Mic,
+            gen,
+            result: Err("start microphone capture: 系统资源不足 (0x800705AA)".into()),
+        });
+        assert!(
+            ack1.try_recv().is_err(),
+            "端点还没回来就把失败交给了等的人"
+        );
+        assert!(st.sources.is_empty());
+        assert!(br.try_recv().is_err(), "失败当场又开了一次设备");
+
+        request_mic_rebuild(&mut st);
+        assert!(
+            matches!(br.try_recv(), Ok(BuildReq::Build { spec: SourceSpec::Mic, .. })),
+            "设备回来了却没有重新打开"
+        );
+        assert!(ack1.try_recv().is_err(), "重新打开还没结果就回了 ack");
+
+        let (bs, br) = mpsc::channel();
+        let mut st = TxState::new(bs);
+        let (c1, _ack1) = add_cmd(1, SourceSpec::Mic);
+        apply_txcmd(&mut st, c1);
+        let BuildReq::Build { gen, .. } = br.try_recv().unwrap() else {
+            panic!()
+        };
+        st.on_build_done(BuildDone {
+            spec: SourceSpec::Mic,
+            gen,
+            result: Err("start microphone capture: 系统资源不足 (0x800705AA)".into()),
+        });
+        apply_txcmd(&mut st, TxCmd::Remove { stream_id: 1 });
+        request_mic_rebuild(&mut st);
+        assert!(
+            br.try_recv().is_err(),
+            "等人走了还在设备通知上重新打开麦克风"
+        );
+        assert!(st.pending.is_empty());
+    }
+
+    /// 禁用再启用有间隔，也有一小时内的次数上限。到顶之后记下来，不再放行。
+    #[test]
+    fn endpoint_cycle_stops_at_the_hourly_cap() {
+        let t0 = Instant::now();
+        let mut budget = MicEndpointCycleBudget::new();
+        assert_eq!(budget.permit(t0), CyclePermit::Allow);
+        budget.record(t0);
+        assert_eq!(
+            budget.permit(t0 + Duration::from_secs(30)),
+            CyclePermit::TooSoon
+        );
+        assert_eq!(
+            budget.permit(t0 + MIC_ENDPOINT_CYCLE_INTERVAL),
+            CyclePermit::Allow
+        );
+
+        let mut budget = MicEndpointCycleBudget::new();
+        for i in 0..MIC_ENDPOINT_CYCLE_LIMIT {
+            let at = t0 + MIC_ENDPOINT_CYCLE_INTERVAL * i as u32;
+            assert_eq!(budget.permit(at), CyclePermit::Allow, "第 {} 次", i + 1);
+            budget.record(at);
+        }
+        let blocked = t0 + MIC_ENDPOINT_CYCLE_INTERVAL * MIC_ENDPOINT_CYCLE_LIMIT as u32;
+        assert_eq!(budget.permit(blocked), CyclePermit::OverLimit);
+        assert!(budget.note_over_limit(blocked), "到顶的第一次应该记下来");
+        assert!(
+            !budget.note_over_limit(blocked + Duration::from_secs(10)),
+            "同一个间隔里重复记"
+        );
+        assert!(budget.note_over_limit(blocked + MIC_ENDPOINT_CYCLE_INTERVAL));
+
+        let aged = t0 + MIC_ENDPOINT_CYCLE_WINDOW + MIC_ENDPOINT_CYCLE_INTERVAL;
+        assert_eq!(
+            budget.permit(aged),
+            CyclePermit::Allow,
+            "窗口滑走之后应该还能再动一次端点"
         );
     }
 

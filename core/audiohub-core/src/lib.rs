@@ -1,5 +1,4 @@
 pub mod audio;
-pub mod capture_reset;
 pub mod devcal;
 pub mod devlat;
 pub mod dsp;

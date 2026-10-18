@@ -14,7 +14,8 @@
     the hash of the unsigned image and the package fails validation at install
     time.
 
-        1. create (or reuse) the test certificate, export .pfx + .cer
+        1. create (or reuse) the test certificate, export the public .cer only (the private key stays in the cert store;
+           no .pfx is ever written)
         2. signtool sign  -> AudioHubVad.sys
         3. Inf2Cat        -> AudioHubVad.cat   (regenerated, not reused)
         4. signtool sign  -> AudioHubVad.cat
@@ -52,7 +53,6 @@ param(
     [string] $PackageDir,
     [string] $CertSubject   = 'CN=AudioHub Test Signing',
     [string] $CertFriendly  = 'AudioHub Test Signing',
-    [string] $PfxPassword   = 'audiohub-test',
     [string] $WdkVersion    = '10.0.26100.6584',
     [string] $SdkCppVersion = '10.0.26100.1',
     [string] $KitVersion    = '10.0.26100.0',
@@ -79,6 +79,8 @@ foreach ($t in @($signtool, $inf2cat)) { if (-not (Test-Path $t)) { throw "tool 
 $certDir = Join-Path $root '_build\testcert'
 New-Item -ItemType Directory -Path $certDir -Force | Out-Null
 $pfxPath = Join-Path $certDir 'AudioHubVad-TestCert.pfx'
+# Older versions of this script exported a password-protected .pfx; never leave one behind.
+if (Test-Path $pfxPath) { Remove-Item $pfxPath -Force }
 $cerPath = Join-Path $certDir 'AudioHubVad-TestCert.cer'
 
 $cert = Get-ChildItem Cert:\CurrentUser\My |
@@ -103,17 +105,15 @@ else {
     Write-Host "sign-test: reusing existing certificate $($cert.Thumbprint)"
 }
 
-$pw = ConvertTo-SecureString -String $PfxPassword -Force -AsPlainText
-Export-PfxCertificate  -Cert $cert -FilePath $pfxPath -Password $pw -Force | Out-Null
 Export-Certificate     -Cert $cert -FilePath $cerPath -Type CERT -Force   | Out-Null
 Write-Host "sign-test: thumbprint $($cert.Thumbprint)"
-Write-Host "sign-test: exported $cerPath"
+Write-Host "sign-test: exported $cerPath (signing from Cert:\CurrentUser\My by thumbprint)"
 
 # ------------------------------------------------------------------ 2. .sys
 # /ph adds page hashes, which is what the WDK's own signing step does for
 # kernel images. No /t: test signatures are not timestamped (and timestamping
 # would make the build depend on network reachability).
-& $signtool sign /v /fd sha256 /ph /f $pfxPath /p $PfxPassword $sys
+& $signtool sign /v /fd sha256 /ph /sha1 $($cert.Thumbprint) /s My $sys
 if ($LASTEXITCODE -ne 0) { throw "signtool failed on $sys (exit $LASTEXITCODE)" }
 
 # ---------------------------------------------------------------- 3. catalog
@@ -127,7 +127,7 @@ if (-not (Test-Path $cat)) {
 }
 
 # ------------------------------------------------------------------ 4. .cat
-& $signtool sign /v /fd sha256 /f $pfxPath /p $PfxPassword $cat
+& $signtool sign /v /fd sha256 /sha1 $($cert.Thumbprint) /s My $cat
 if ($LASTEXITCODE -ne 0) { throw "signtool failed on $cat (exit $LASTEXITCODE)" }
 
 # ----------------------------------------------------------------- 5. verify

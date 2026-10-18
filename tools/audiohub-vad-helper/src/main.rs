@@ -18,6 +18,18 @@ fn usage() -> DriverReport {
         expected_daemon_image: None,
         win32_error: None,
         detail: "usage: audiohub-vad-helper.exe status|install|uninstall".into(),
+        child_devices: 0,
+        present_child_devices: 0,
+        phantom_child_devices: 0,
+        removed_child_devices: 0,
+        root_driver_model: None,
+        root_inf_section: None,
+        bus_model_active: false,
+        previous_root_driver_model: None,
+        migration_reboot_required: false,
+        daemon_processes_stopped: 0,
+        daemon_still_running: false,
+        daemon_restart_required: false,
     }
 }
 

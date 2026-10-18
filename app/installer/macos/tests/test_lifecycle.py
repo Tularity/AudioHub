@@ -208,7 +208,18 @@ class LifecycleStaticTests(unittest.TestCase):
         self.assertIn('/bin/launchctl asuser "$CONSOLE_UID" \\', source)
         self.assertIn('/usr/bin/sudo -n -H -u "#$CONSOLE_UID" -- \\', source)
         self.assertIn('/usr/bin/env -i \\', source)
-        self.assertIn('--timestamp=none --options=0 --pagesize=4096', source)
+        # Hardened runtime + exactly the microphone entitlement (the HAL driver
+        # requires CS_RUNTIME before it accepts physical presentation).
+        self.assertIn('--timestamp=none --options runtime --pagesize=4096', source)
+        self.assertNotIn('--timestamp=none --options=0 --pagesize=4096', source)
+        self.assertEqual(source.count('--entitlements "$SIGN_ENTITLEMENTS"'), 2)
+        self.assertIn(
+            "DAEMON_ENTITLEMENTS_JSON='{\"com.apple.security.device.audio-input\":true}'", source
+        )
+        self.assertIn('SIGN_ENTITLEMENTS="$SIGN_SESSION_ROOT/daemon.entitlements"', source)
+        self.assertIn('write_daemon_entitlements "$SIGN_ENTITLEMENTS" || return 1', source)
+        # The integrity canonicalisation still compares unhardened ad-hoc forms.
+        self.assertIn('/usr/bin/codesign --sign - --force --timestamp=none --options=0', source)
 
         snapshot = source.index(
             'install -o root -g wheel -m 0700 "$CONSOLE_PAYLOAD" "$SIGNED_SNAPSHOT"'
@@ -224,12 +235,16 @@ class LifecycleStaticTests(unittest.TestCase):
         self.assertIn('canonicalize_daemon_content "$ORIGINAL_CANONICAL"', source)
         self.assertIn('canonicalize_daemon_content "$SIGNED_CANONICAL"', source)
         self.assertIn('/usr/bin/cmp -s "$ORIGINAL_CANONICAL" "$SIGNED_CANONICAL"', source)
-        self.assertIn('/usr/bin/codesign -d --entitlements :- "$SIGNED_SNAPSHOT"', source)
-        self.assertIn('[ ! -s "$SIGNED_ENTITLEMENTS" ]', source)
-        self.assertIn("flags=0x0\\(none\\)", source)
+        self.assertIn('daemon_signature_shape_is_valid "$SIGNED_SNAPSHOT"', source)
+        self.assertIn('daemon_signature_shape_is_valid "$daemon" "$WORK/version-shape"', source)
+        self.assertIn('/usr/bin/codesign -d --entitlements :- "$shape_daemon"', source)
+        self.assertIn('[ "$shape_json" = "$DAEMON_ENTITLEMENTS_JSON" ]', source)
+        self.assertIn("flags=0x10000\\(runtime\\)", source)
+        self.assertNotIn("flags=0x0\\(none\\)", source)
         self.assertIn("Page size=4096", source)
         self.assertIn("TeamIdentifier=not set", source)
-        self.assertIn("Runtime Version|Launch Constraints?|Library Constraints?", source)
+        self.assertIn("^Runtime Version=", source)
+        self.assertIn("(Launch Constraints?|Library Constraints?)", source)
 
     def test_daemon_installer_secures_identity_and_rolls_back_activation(self) -> None:
         source = self.daemon_installer
@@ -425,6 +440,7 @@ class LifecycleFixtureTests(unittest.TestCase):
         existing_identity: bool = False,
         existing_payload: bool = False,
         fail_sign: bool = False,
+        legacy_sign: bool = False,
         fail_activate: bool = False,
         lock_busy: bool = False,
     ) -> tuple[str, dict[str, str], dict[str, Path]]:
@@ -541,6 +557,9 @@ class LifecycleFixtureTests(unittest.TestCase):
         write_executable(
             stub / "plutil",
             r"""
+            if [ "$1:$2" = "-convert:json" ]; then
+              exec /usr/bin/plutil "$@"
+            fi
             [ "$1:$2" = "-extract:CFBundleIdentifier" ] || exit 2
             echo com.audiohub.app
             """,
@@ -629,6 +648,7 @@ class LifecycleFixtureTests(unittest.TestCase):
               FIXTURE_ACTION_LOG="$FIXTURE_ACTION_LOG" \
               FIXTURE_LOGIN_KEYCHAIN="$FIXTURE_LOGIN_KEYCHAIN" \
               FIXTURE_FAIL_SIGN="$FIXTURE_FAIL_SIGN" \
+              FIXTURE_SIGN_LEGACY="$FIXTURE_SIGN_LEGACY" \
               FIXTURE_FAIL_ACTIVATE="$FIXTURE_FAIL_ACTIVATE" \
               FIXTURE_LOCK_BUSY="$FIXTURE_LOCK_BUSY" \
               FIXTURE_FINAL="$FIXTURE_FINAL" \
@@ -733,14 +753,31 @@ class LifecycleFixtureTests(unittest.TestCase):
             stub / "codesign",
             r"""
             { printf 'codesign'; printf ' %s' "$@"; printf '\n'; } >>"$FIXTURE_ACTION_LOG"
+            last=
+            for argument in "$@"; do last="$argument"; done
             if [ "$1" = "-d" ]; then
+              # A real signature's shape: hardened runtime and the entitlement
+              # only for an image this stub signed with both (FIXTURE-RUNTIME).
+              hardened=0
+              /usr/bin/grep -qx 'FIXTURE-RUNTIME' "$last" 2>/dev/null && hardened=1
               for argument in "$@"; do
-                [ "$argument" = "--entitlements" ] && exit 0
+                if [ "$argument" = "--entitlements" ]; then
+                  [ "$hardened" = 1 ] || exit 0
+                  printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+                    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+                    '<plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>'
+                  exit 0
+                fi
               done
               {
                 echo 'Identifier=com.audiohub.daemon'
-                echo 'CodeDirectory v=20500 size=123 flags=0x0(none) hashes=1+2 location=embedded'
+                if [ "$hardened" = 1 ]; then
+                  echo 'CodeDirectory v=20500 size=123 flags=0x10000(runtime) hashes=1+2 location=embedded'
+                else
+                  echo 'CodeDirectory v=20500 size=123 flags=0x0(none) hashes=1+2 location=embedded'
+                fi
                 echo 'Page size=4096'
+                [ "$hardened" = 1 ] && echo 'Runtime Version=14.0.0'
                 echo 'TeamIdentifier=not set'
                 echo 'Internal requirements count=1 size=88'
               } >&2
@@ -751,15 +788,21 @@ class LifecycleFixtureTests(unittest.TestCase):
             sign_identity=
             previous=
             dryrun=0
+            runtime=0
+            entitled=0
             for argument in "$@"; do
               target="$argument"
               [ "$previous" = "--sign" ] && sign_identity="$argument"
+              [ "$previous" = "--options" ] && [ "$argument" = "runtime" ] && runtime=1
+              if [ "$previous" = "--entitlements" ]; then
+                /usr/bin/grep -q 'com.apple.security.device.audio-input' "$argument" && entitled=1
+              fi
               [ "$argument" = "--dryrun" ] && dryrun=1
               previous="$argument"
             done
 
             if [ "$1" = "--remove-signature" ]; then
-              /usr/bin/sed '/^FIXTURE-CODESIGN:/d' "$target" >"$target.fixture-next" || exit
+              /usr/bin/sed '/^FIXTURE-CODESIGN:/d; /^FIXTURE-RUNTIME$/d' "$target" >"$target.fixture-next" || exit
               /bin/cat "$target.fixture-next" >"$target" || exit
               /bin/rm -f "$target.fixture-next"
               exit 0
@@ -771,7 +814,13 @@ class LifecycleFixtureTests(unittest.TestCase):
                 [ "$FIXTURE_FAIL_SIGN" = 1 ] && exit 9
               fi
               [ "$dryrun" = 1 ] && exit 0
+              /usr/bin/sed '/^FIXTURE-RUNTIME$/d' "$target" >"$target.fixture-next" || exit
+              /bin/cat "$target.fixture-next" >"$target" || exit
+              /bin/rm -f "$target.fixture-next"
               printf 'FIXTURE-CODESIGN:%s\n' "$sign_identity" >>"$target"
+              if [ "$runtime" = 1 ] && [ "$entitled" = 1 ] && [ "$FIXTURE_SIGN_LEGACY" != 1 ]; then
+                printf 'FIXTURE-RUNTIME\n' >>"$target"
+              fi
             fi
             exit 0
             """,
@@ -843,6 +892,7 @@ class LifecycleFixtureTests(unittest.TestCase):
             "FIXTURE_ACTION_LOG": str(action_log),
             "FIXTURE_LOGIN_KEYCHAIN": str(login_keychain),
             "FIXTURE_FAIL_SIGN": "1" if fail_sign else "0",
+            "FIXTURE_SIGN_LEGACY": "1" if legacy_sign else "0",
             "FIXTURE_FAIL_ACTIVATE": "1" if fail_activate else "0",
             "FIXTURE_LOCK_BUSY": "1" if lock_busy else "0",
             "FIXTURE_FINAL": str(final),
@@ -933,6 +983,69 @@ class LifecycleFixtureTests(unittest.TestCase):
             )
             self.assertFalse(any(paths["base"].glob(".install.*")))
             self.assertFalse(any(paths["base"].glob(".previous.*")))
+
+    def test_daemon_install_signs_with_hardened_runtime_and_the_microphone_entitlement(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="audiohub-daemon-runtime-", dir="/private/tmp") as raw_tmp:
+            script, env, paths = self._make_daemon_install_fixture(Path(raw_tmp))
+            first = subprocess.run(
+                ["/bin/sh"], input=script, text=True, env=env, capture_output=True, timeout=30
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            installed = (paths["final"] / "audiohubd").read_text(encoding="utf-8").splitlines()
+            self.assertIn("FIXTURE-RUNTIME", installed)
+            actions = paths["actions"].read_text(encoding="utf-8").splitlines()
+            signs = [line for line in actions if line.startswith("codesign --force --sign")]
+            self.assertEqual(len(signs), 1)
+            self.assertIn("--options runtime", signs[0])
+            self.assertRegex(signs[0], r"--entitlements /private/tmp/com\.audiohub\.sign\.[^ ]+/daemon\.entitlements ")
+            probes = [line for line in actions if "--dryrun" in line and "codesign" in line]
+            self.assertTrue(probes and all("--options runtime" in line for line in probes), probes)
+            self.assertFalse(any(Path("/private/tmp").glob("com.audiohub.sign.*/daemon.entitlements")))
+
+    def test_daemon_install_refuses_a_signature_without_hardened_runtime(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="audiohub-daemon-legacy-sign-", dir="/private/tmp") as raw_tmp:
+            script, env, paths = self._make_daemon_install_fixture(Path(raw_tmp), legacy_sign=True)
+            result = subprocess.run(
+                ["/bin/sh"], input=script, text=True, env=env, capture_output=True, timeout=30
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not self-sign the AudioHub daemon", result.stderr)
+            self.assertFalse((paths["final"] / "audiohubd").exists())
+            self.assertFalse(paths["current"].exists())
+            self.assertFalse(any(paths["base"].glob(".install.*")))
+
+    def test_daemon_install_resigns_a_version_signed_without_hardened_runtime(self) -> None:
+        # An installer older than 1.0.2 signed with --options=0 and no
+        # entitlements; such a version directory must be re-signed, not reused.
+        with tempfile.TemporaryDirectory(prefix="audiohub-daemon-legacy-version-", dir="/private/tmp") as raw_tmp:
+            script, env, paths = self._make_daemon_install_fixture(Path(raw_tmp))
+            first = subprocess.run(
+                ["/bin/sh"], input=script, text=True, env=env, capture_output=True, timeout=30
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            daemon = paths["final"] / "audiohubd"
+            daemon.chmod(0o755)
+            legacy = "".join(
+                line for line in daemon.read_text(encoding="utf-8").splitlines(keepends=True)
+                if line.strip() != "FIXTURE-RUNTIME"
+            )
+            daemon.write_text(legacy, encoding="utf-8")
+            daemon.chmod(0o555)
+            signed_record = paths["final"] / "signed.sha256"
+            signed_record.chmod(0o644)
+            signed_record.write_text(hashlib.sha256(daemon.read_bytes()).hexdigest() + "\n", encoding="utf-8")
+            signed_record.chmod(0o444)
+
+            repaired = subprocess.run(
+                ["/bin/sh"], input=script, text=True, env=env, capture_output=True, timeout=30
+            )
+            self.assertEqual(repaired.returncode, 0, repaired.stderr)
+            self.assertIn("FIXTURE-RUNTIME", daemon.read_text(encoding="utf-8").splitlines())
+            actions = paths["actions"].read_text(encoding="utf-8")
+            self.assertEqual(
+                sum(line.startswith("codesign --force --sign") for line in actions.splitlines()), 2
+            )
+            self.assertFalse(any(paths["base"].glob(".install.*")))
 
     def test_daemon_install_rebuilds_version_when_signed_record_is_damaged(self) -> None:
         with tempfile.TemporaryDirectory(

@@ -1867,6 +1867,7 @@ mod tests {
                 port: 47_810,
                 token: "test".into(),
                 pid: 42,
+                started: None,
             }),
             pid: 42,
             image: PathBuf::from("/managed/old/audiohubd"),

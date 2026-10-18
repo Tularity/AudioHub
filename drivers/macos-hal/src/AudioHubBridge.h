@@ -267,12 +267,20 @@ static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t 
 //               send right on it from bootstrap_look_up)
 //   Bind        daemon -> the same service port, fire and forget: binds or
 //               clears one slot's peer metadata (spec-m5b §4.2)
+//   Presentation daemon -> the same service port, fire and forget: Virtual or
+//               Physical presentation of one endpoint (1.0.2 design §6.4)
 #define kAudioHubMsg_Hello       0x41480001 // daemon -> driver, expects a reply
 #define kAudioHubMsg_HelloReply  0x41480002 // driver -> daemon, carries every memory entry
 #define kAudioHubMsg_Control     0x41480003 // driver -> daemon, fire and forget
 #define kAudioHubMsg_Notify      0x41480004 // daemon -> driver, fire and forget
 #define kAudioHubMsg_Bind        0x41480005 // daemon -> driver, fire and forget
 #define kAudioHubMsg_Format      0x41480006 // bidirectional plain format transaction
+// daemon -> driver, fire and forget, answered by kAudioHubCtl_PresentationState.
+// ADDITIVE, NOT A VERSION BUMP (same reasoning as kAudioHubCtl_LatencyState): a
+// driver that predates this message destroys it in bridge_serve's default arm,
+// never answers, and the daemon treats every device as Virtual — which is
+// exactly what that driver shows anyway.
+#define kAudioHubMsg_Presentation 0x41480007
 
 // v4: per-peer virtual devices plus negotiated speaker layouts. Compared for EQUALITY by the
 // driver, in both directions, and a mismatch is a refusal with zero descriptors
@@ -355,6 +363,19 @@ static inline uint32_t AudioHubRing_Read(AudioHubRingHeader* inHeader, uint32_t 
 // "this driver never acknowledged a latency" after a bounded number of tries.
 // "The send returned KERN_SUCCESS" is not evidence the property changed.
 #define kAudioHubCtl_LatencyState 6u
+// The driver's answer to kAudioHubMsg_Presentation, and its unprompted account
+// of an endpoint's presentation whenever a slot's state is replayed (a fresh
+// or idempotent Bind). It reports what the property getters return NOW, never
+// an echo of the request.
+//   payload: endpoint = the endpoint concerned, generation = that slot's stamp,
+//            scalar_bits = the EFFECTIVE kAudioDevicePropertyTransportType
+//            (a fourcc, 'virt' while Virtual),
+//            flags = kAudioHubPresentFlag_* | kAudioHubFlag_IsInput
+//                    | (reason << kAudioHubPresentReasonShift)
+//                    | (request_id & 0xFFFF) << kAudioHubPresentRequestShift.
+// A daemon that never receives one after a BindState is talking to a driver
+// that predates presentation: it must present that endpoint as Virtual.
+#define kAudioHubCtl_PresentationState 7u
 
 // Slot states carried in kAudioHubCtl_BindState's scalar_bits.
 #define kAudioHubSlot_Free       0u
@@ -575,6 +596,106 @@ _Static_assert(offsetof(AudioHubFormatMsg, session_id) == 48, "format ABI drift"
 _Static_assert(offsetof(AudioHubFormatMsg, request_id) == 56, "format ABI drift");
 _Static_assert(sizeof(AudioHubFormatMsg) == 64, "format ABI drift");
 
+// ---------------------------------------------------------------- presentation
+//
+// PHYSICAL PRESENTATION (docs/physical-presentation-1.0.2-design.md §6). The
+// daemon may ask the driver to make one endpoint look like the sharer's real
+// device: TransportType, Name, Manufacturer, ModelUID, the stream's
+// TerminalType and RelatedDevices change; DeviceUID, ClockDomain, Latency and
+// SafetyOffset never do (they stay truthful about the network path).
+//
+// TWO CLASSES ONLY. Virtual is today's device exactly; Physical carries a
+// descriptor. There is no partial presentation: any field the driver does not
+// accept turns the whole request into Virtual, with the reason in the ack.
+//
+// THE DRIVER, NOT THE DAEMON, HAS THE LAST WORD. Physical is accepted only from
+// a session whose caller passed the strong check (AudioHubBridge.c,
+// bridge_check_caller): signed com.audiohub.daemon, certificate pinned by the
+// installer, executable under the service versions directory, hardened runtime.
+// Anything else is answered with Virtual + kAudioHubPresentFlag_Forced, so a
+// same-user process that wins a Hello can still only publish devices that SAY
+// they are virtual — the pre-1.0.2 surface, not a new one.
+#define kAudioHubPresent_Virtual    0u
+#define kAudioHubPresent_Physical   1u
+
+// Icon kinds. Carried and validated so the wire does not need to change when
+// icon resources ship; this driver publishes no kAudioDevicePropertyIcon.
+#define kAudioHubPresentIcon_None       0u
+#define kAudioHubPresentIcon_Speakers   1u
+#define kAudioHubPresentIcon_Headphones 2u
+#define kAudioHubPresentIcon_Headset    3u
+#define kAudioHubPresentIcon_Microphone 4u
+#define kAudioHubPresentIcon_Count      5u
+
+// kAudioHubCtl_PresentationState flags. Bit 2 is kAudioHubFlag_IsInput, shared
+// with the other control ops; bits 8..15 carry a kAudioHubPresentReason_*, bits
+// 16..31 the low 16 bits of the request id the state answers (0 = an
+// unprompted replay that has not processed any request of this binding).
+#define kAudioHubPresentFlag_Physical       0x01u // the getters present Physical right now
+#define kAudioHubPresentFlag_Forced         0x10u // Physical was requested and refused
+#define kAudioHubPresentFlag_CallerVerified 0x20u // this session passed the strong caller check
+#define kAudioHubPresentReasonShift         8u
+#define kAudioHubPresentReasonMask          0xFFu
+#define kAudioHubPresentRequestShift        16u
+
+// Why an endpoint is Virtual. 1..15 are caller-check outcomes (also what
+// AudioHubBridge_SessionCallerCheck returns), 16.. are descriptor rejections.
+#define kAudioHubPresentReason_None                 0u
+#define kAudioHubPresentReason_CallerNoSession      1u
+#define kAudioHubPresentReason_CallerNoCode         2u  // SecCodeCopyGuestWithAttributes failed
+#define kAudioHubPresentReason_CallerPinUnavailable 3u  // pin file missing, unsafe or malformed
+#define kAudioHubPresentReason_CallerRequirement    4u  // identifier / certificate mismatch
+#define kAudioHubPresentReason_CallerPath           5u  // not under the service versions directory
+#define kAudioHubPresentReason_CallerNotRuntime     6u  // no hardened runtime (CS_RUNTIME)
+#define kAudioHubPresentReason_CallerInvalid        7u  // csops failed or CS_VALID clear
+#define kAudioHubPresentReason_BadClass             16u
+#define kAudioHubPresentReason_BadTransport         17u
+#define kAudioHubPresentReason_BadTerminal          18u
+#define kAudioHubPresentReason_BadIcon              19u
+#define kAudioHubPresentReason_BadName              20u
+#define kAudioHubPresentReason_BadManufacturer      21u
+#define kAudioHubPresentReason_BadModel             22u
+#define kAudioHubPresentReason_NotListed            23u // that direction is not published
+
+// Every presented ModelUID is "<prefix><model_suffix>", so a presentation can
+// never claim another vendor's model namespace.
+#define kAudioHubPresentModelPrefix "AudioHub_Remote_"
+
+// daemon -> driver. Plain, fixed size, fire and forget. The strings are
+// FIXED-SIZE and the receiver terminates them itself, as for Bind. Ignored
+// fields (everything but klass) are still validated when klass is Physical and
+// ignored when it is Virtual.
+typedef struct AudioHubPresentationMsg
+{
+    mach_msg_header_t header;
+    uint32_t          endpoint;      // slot*2 + dir
+    uint32_t          generation;    // must equal the slot's current stamp
+    uint64_t          session_id;    // the HelloReply's
+    uint32_t          klass;         // kAudioHubPresent_*
+    uint32_t          transport;     // kAudioDeviceTransportType* fourcc, whitelisted
+    uint32_t          terminal_type; // kAudioStreamTerminalType*, 0 = the direction's default
+    uint32_t          icon_kind;     // kAudioHubPresentIcon_*
+    uint32_t          related_group; // 0 = not related to the sibling direction
+    uint32_t          request_id;    // daemon-chosen; echoed (low 16 bits) in the ack
+    char              name[128];     // UTF-8 kAudioObjectPropertyName while Physical; "" = keep the Bind name
+    char              manufacturer[64];
+    char              model_suffix[32]; // [A-Za-z0-9]+, appended to kAudioHubPresentModelPrefix
+} AudioHubPresentationMsg;
+
+_Static_assert(offsetof(AudioHubPresentationMsg, endpoint) == 24, "presentation ABI drift");
+_Static_assert(offsetof(AudioHubPresentationMsg, generation) == 28, "presentation ABI drift");
+_Static_assert(offsetof(AudioHubPresentationMsg, session_id) == 32, "presentation ABI drift");
+_Static_assert(offsetof(AudioHubPresentationMsg, klass) == 40, "presentation ABI drift");
+_Static_assert(offsetof(AudioHubPresentationMsg, transport) == 44, "presentation ABI drift");
+_Static_assert(offsetof(AudioHubPresentationMsg, terminal_type) == 48, "presentation ABI drift");
+_Static_assert(offsetof(AudioHubPresentationMsg, icon_kind) == 52, "presentation ABI drift");
+_Static_assert(offsetof(AudioHubPresentationMsg, related_group) == 56, "presentation ABI drift");
+_Static_assert(offsetof(AudioHubPresentationMsg, request_id) == 60, "presentation ABI drift");
+_Static_assert(offsetof(AudioHubPresentationMsg, name) == 64, "presentation ABI drift");
+_Static_assert(offsetof(AudioHubPresentationMsg, manufacturer) == 192, "presentation ABI drift");
+_Static_assert(offsetof(AudioHubPresentationMsg, model_suffix) == 256, "presentation ABI drift");
+_Static_assert(sizeof(AudioHubPresentationMsg) == 288, "presentation ABI drift");
+
 #define kAudioHubFlag_Muted     0x1u
 #define kAudioHubFlag_IORunning 0x2u
 #define kAudioHubFlag_IsInput   0x4u
@@ -655,6 +776,11 @@ int AudioHubBridge_SetSpeakerLayout(BridgeRing* inRing, uint32_t inLayout);
 int AudioHubBridge_SessionActive(void);
 // Active Hello session, or zero while detached. Safe from non-realtime threads.
 uint64_t AudioHubBridge_SessionID(void);
+// The strong caller check of the CURRENT session, evaluated once when its Hello
+// was accepted: kAudioHubPresentReason_None if the caller may present devices
+// as Physical, otherwise the caller-check reason (CallerNoSession while
+// detached). Service thread only — it reads state that thread owns.
+uint32_t AudioHubBridge_SessionCallerCheck(void);
 
 // What one control send did. "Retry" is a full queue — the message was NOT
 // delivered, so the caller must leave its sent marker alone and try again;
@@ -700,6 +826,9 @@ typedef struct AudioHubBridgeHooks
     // the daemon has no other way to learn whether the property actually moved,
     // and a silent no-op is precisely what this whole mechanism exists to end.
     void (*notify_latency)(uint32_t inEndpoint, uint32_t inGeneration, uint32_t inFrames);
+    // One Presentation, already checked for shape, sender identity and session.
+    // Like notify_latency it MUST answer, with kAudioHubCtl_PresentationState.
+    void (*presentation)(const AudioHubPresentationMsg* inMsg);
     // Drain the per-device outboxes. Returns non-zero while the daemon is alive.
     int (*flush)(void);
     // End of one service pass: retire whatever is due and announce a device-list

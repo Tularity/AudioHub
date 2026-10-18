@@ -510,6 +510,7 @@ fn register_conn(
         peer_audio_capabilities: Mutex::new(crate::PeerAudioCapabilitiesCell::Unheard),
         peer_native_output: Mutex::new(None),
         peer_spatial_output: Mutex::new(None),
+        peer_device_facts: Mutex::new(Default::default()),
     });
     let mut st = lk(&inner.state);
     let keep_existing = st.conns.get(&conn.fp).map_or(false, |old| {
@@ -590,6 +591,9 @@ fn audio_capabilities_msg(presence: audiohub_core::audio::DefaultDevicePresence)
         max_media_channels: 2,
         device_volume_version: 1,
         media_frame_tag_version: 1,
+        // Every role advertises it: the provider publishes facts, the consumer
+        // receives them, and one machine can be either (design §4.2).
+        device_facts_version: audiohub_core::device_facts::DEVICE_FACTS_VERSION,
     }
 }
 
@@ -1358,12 +1362,20 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
             // that actually has to stop is already stopped by the machine that
             // owns the devices.
         }
+        SessionMsg::DeviceFacts { observation } => {
+            // Peer-level, like NativeOutputCapabilities: only the one
+            // registered connection for this fingerprint may set it.
+            if current_peer_connection(inner, conn) {
+                crate::device_facts_pub::accept_remote(inner, conn, observation);
+            }
+        }
         SessionMsg::AudioCapabilities {
             default_input,
             default_output,
             max_media_channels,
             device_volume_version,
             media_frame_tag_version,
+            device_facts_version,
         } => {
             if !current_peer_connection(inner, conn) {
                 dlog!(
@@ -1395,6 +1407,9 @@ fn handle_msg(inner: &Arc<DaemonInner>, conn: &Arc<ConnShared>, msg: SessionMsg)
             if device_volume_version < 1 {
                 haldev::clear_peer_device_volume_protocol(inner, &conn.fp, conn.connection_id);
             }
+            // Sends our current facts the first time this peer turns out to
+            // understand them; a version-0 peer is never sent any (design §4.2).
+            crate::device_facts_pub::note_peer_version(inner, conn, device_facts_version);
         }
         SessionMsg::NativeOutputCapabilities { observation } => {
             if current_peer_connection(inner, conn) {

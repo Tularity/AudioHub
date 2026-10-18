@@ -1279,6 +1279,18 @@ fn install_driver_blocking(app: &AppHandle) -> Result<DriverInstallResult, Drive
 fn install_driver_blocking(app: &AppHandle) -> Result<DriverInstallResult, DriverInstallError> {
     let result = platform::install(app)?;
     if result.reboot_required || result.state == "installed_unavailable" {
+        // The elevated helper stops the bundled daemon before replacing a
+        // protocol v11 bus package (its open control handle would pin the old
+        // image). When the update still ends in a restart request, bring the
+        // daemon back so the user is not left without a service until reboot.
+        // Idempotent: a daemon that was never stopped is left alone.
+        #[cfg(windows)]
+        if let Err(error) = super::ensure_daemon_blocking() {
+            super::warn(&format!(
+                "driver install: daemon restart after a reboot-required update failed: {}",
+                error.detail.as_deref().unwrap_or(&error.message)
+            ));
+        }
         return Ok(result);
     }
 

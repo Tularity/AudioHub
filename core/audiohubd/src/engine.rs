@@ -1422,8 +1422,10 @@ impl SysAudioFrames {
         [
             Some(StageDepth {
                 id: StageId::SrcFifo,
-                samples: self.fifo.len(),
-                capacity: self.fifo.capacity(),
+                // The converter's group delay is queued audio too, matching
+                // what MicSource/SysAudioSource report.
+                samples: self.fifo.len().saturating_add(self.fifo.resample_delay_frames()),
+                capacity: self.fifo.capacity().saturating_add(self.fifo.resample_delay_frames()),
                 rate: 48_000,
                 dropped: Some(self.fifo.dropped()),
                 drop_mode: DropMode::Oldest,
@@ -2417,6 +2419,7 @@ mod spatial_lifecycle_integration_tests {
             peer_audio_capabilities: Mutex::new(PeerAudioCapabilitiesCell::Unheard),
             peer_native_output: Mutex::new(None),
             peer_spatial_output: Mutex::new(None),
+            peer_device_facts: Mutex::new(Default::default()),
         });
         (local, conn, remote)
     }
@@ -2452,6 +2455,7 @@ mod spatial_lifecycle_integration_tests {
             device_output_volume_io: Mutex::new(0),
             device_input_volume_io: Mutex::new(0),
             native_output: Mutex::new(Default::default()),
+            device_facts: crate::device_facts_pub::LocalFacts::new(),
             shutdown: AtomicBool::new(false),
             cleanup: Once::new(),
             announce_guard: Mutex::new(None),
@@ -6113,6 +6117,10 @@ pub(crate) fn mixer_loop(
     // here, so the tick itself never touches that lock; the bridge is installed
     // before any thread starts and is never replaced.
     let hal = inner.hal();
+    // Physical-presentation mismatch gate (docs/physical-presentation-1.0.2-
+    // design.md §5.4), lifted out of the haldev mutex once, here: per slot
+    // the tick reads one relaxed atomic. Never replaced after start-up.
+    let mic_presentation_gate = crate::haldev::mic_presentation_gate(&inner);
     // ONE BUCKET PER SLOT, not one shared buffer.
     //
     // The version this replaces summed every `hal` stream into a single `hal_buf`
@@ -6445,6 +6453,10 @@ pub(crate) fn mixer_loop(
                 for i in 0..F48 {
                     out[i] = protect_output_sample(hal_bufs[slot][i], hal_contributors[slot] == 1);
                 }
+                // The device may still LOOK physical while the peer's facts no
+                // longer say so: write silence (same cadence, same water level)
+                // until the presentation catches up.
+                crate::presentation::silence_if_gated(mic_presentation_gate.is_gated(slot), &mut out);
                 h.write_mic_mono(slot as u8, &out[..plan.allow as usize]);
             }
         }
@@ -7161,7 +7173,7 @@ pub(crate) mod tests {
             .find("playback.as_mut()")
             .expect("real-output playback access is missing");
         let push = output
-            .find("tx.push(&out)")
+            .find("tx.commit_push(ticket, &out)")
             .expect("real-output push is missing");
         assert!(
             first_epoch < completion
@@ -7573,12 +7585,20 @@ pub(crate) mod tests {
             src.next_frame(&mut out);
         }
         let d = src.depths()[0].expect("发送 FIFO 这一级");
-        assert_eq!(d.samples, 1_440, "安全网排回目标水位（3 帧 = 30 ms）");
+        // The reported depth includes the converter's fixed group delay.
+        assert_eq!(
+            d.samples,
+            1_440 + src.fifo.resample_delay_frames(),
+            "安全网排回目标水位（3 帧 = 30 ms）"
+        );
         assert!(
             !d.saturated(),
             "过量生产必须被排掉而不是顶到容量上限：饱和就是那个 1 秒延迟缺陷"
         );
-        assert_eq!(d.ms(), Some(30.0));
+        assert_eq!(
+            d.ms(),
+            Some((1_440 + src.fifo.resample_delay_frames()) as f64 / 48.0)
+        );
         assert_eq!(d.drop_mode, DropMode::Oldest);
         // 收支守恒，容差留给伺服正在弯的重采样比。
         let accounted = 20 * 480 + 1_440 + d.dropped.unwrap() as i64;
@@ -7741,7 +7761,7 @@ pub(crate) mod tests {
     #[test]
     fn the_probe_tap_is_not_counted_in_site_clipping() {
         // 拆开写，免得这条断言自己被自己数进去。
-        let needle = concat!("mix_clip", ".feed(");
+        let needle = concat!("mix_clip", ".feed_routed(");
         let src = include_str!("engine.rs");
         let n = src.matches(needle).count();
         assert_eq!(
@@ -8020,7 +8040,21 @@ pub(crate) mod tests {
             let cut = src
                 .find("\n#[cfg(test)]\npub(crate) mod tests {")
                 .expect("找不到测试模块的起点 —— code() 会把测试自己的字面量也扫进去");
-            strip_comments(&src[..cut])
+            // Earlier `#[cfg(test)] mod …` blocks (e.g. the spatial lifecycle
+            // integration tests) also call production APIs such as
+            // `media_send.enqueue(`; they are not production call sites.
+            let mut prod = String::new();
+            let mut rest = &src[..cut];
+            while let Some(at) = rest.find("\n#[cfg(test)]\nmod ") {
+                prod.push_str(&rest[..at]);
+                let after = &rest[at + 1..];
+                let end = after
+                    .find("\n}\n")
+                    .expect("a test-only module has no closing brace at column 0");
+                rest = &after[end + 3..];
+            }
+            prod.push_str(rest);
+            strip_comments(&prod)
         })
     }
 
@@ -8400,9 +8434,12 @@ pub(crate) mod tests {
         );
         // 以 FIFO 现有长度封顶，而且**留下一帧的工作储备**：生产者在同一段时间
         // 里也停了的话，无脑排到底就是把一个延迟问题换成一个欠载问题。
-        let rest = src.depths()[0].unwrap().samples as usize;
+        // The reported depth includes the converter's fixed group delay, which
+        // no drain can remove; measure what is drainable from the FIFO itself.
+        let delay = src.fifo.resample_delay_frames() as usize;
+        let rest = src.depths()[0].unwrap().samples as usize - delay;
         assert_eq!(src.drain_skipped(10 * rest), rest - F48);
-        assert_eq!(src.depths()[0].unwrap().samples as usize, F48);
+        assert_eq!(src.depths()[0].unwrap().samples as usize, F48 + delay);
         assert_eq!(
             src.drain_skipped(4_800),
             0,

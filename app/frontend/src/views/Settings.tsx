@@ -290,11 +290,7 @@ function ModeOptionsCard({ writing, noSettings, onPush }: {
       />
       {mode === MODE_A ? <ModeAOptions writing={writing} noSettings={noSettings} onPush={onPush} /> : null}
       {mode === MODE_B ? <ModeBOptions writing={writing} noSettings={noSettings} onPush={onPush} /> : null}
-      {mode === MODE_SHARE ? (
-        <p className="muted small" data-testid="settings-mode-options-none">
-          {t('settings.modeOptions.shareNone')}
-        </p>
-      ) : null}
+      {mode === MODE_SHARE ? <ShareOptions writing={writing} noSettings={noSettings} onPush={onPush} /> : null}
     </section>
   );
 }
@@ -387,6 +383,33 @@ function ModeAOptions({ writing, noSettings, onPush }: {
   );
 }
 
+// Share mode: the one local option is what this machine tells its peers about
+// its own default devices. It is also a privacy switch, so the note names what
+// is sent (and what never is) right under the title instead of in a wiki page.
+function ShareOptions({ writing, noSettings, onPush }: {
+  writing: number;
+  noSettings: boolean;
+  onPush: (patch: Partial<DaemonSettings>) => Promise<boolean>;
+}) {
+  const ds = useStore((s) => s.daemonSettings);
+  return (
+    <SettingRow
+      title={t('settings.presentation.providerTitle')}
+      note={t('settings.presentation.providerNote')}
+      control={(
+        <Switch
+          testid="settings-share-device-facts"
+          label={t('settings.presentation.providerTitle')}
+          checked={!!(ds && ds.share_device_facts)}
+          pending={writing > 0}
+          disabled={noSettings}
+          onToggle={(want) => void onPush({ share_device_facts: want })}
+        />
+      )}
+    />
+  );
+}
+
 function ModeBOptions({ writing, noSettings, onPush }: {
   writing: number;
   noSettings: boolean;
@@ -420,6 +443,20 @@ function ModeBOptions({ writing, noSettings, onPush }: {
             pending={writing > 0}
             disabled={noSettings}
             onToggle={(want) => void onPush({ mark_offline_devices: want })}
+          />
+        )}
+      />
+      <SettingRow
+        title={t('settings.presentation.consumerTitle')}
+        note={t('settings.presentation.consumerNote')}
+        control={(
+          <Switch
+            testid="settings-present-physical"
+            label={t('settings.presentation.consumerTitle')}
+            checked={!!(ds && ds.present_physical_devices)}
+            pending={writing > 0}
+            disabled={noSettings}
+            onToggle={(want) => void onPush({ present_physical_devices: want })}
           />
         )}
       />

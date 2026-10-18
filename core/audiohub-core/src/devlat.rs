@@ -302,6 +302,10 @@ fn worse(a: LatSource, b: LatSource) -> LatSource {
 
 /// 查一个设备的固有延迟。**只读属性**，不开流、不改路由、不触发权限。
 pub fn query(kind: DeviceKind, target: DevTarget<'_>) -> DevLatencyParts {
+    #[cfg(feature = "fake-audio")]
+    if let Some(world) = crate::audio::fake::active() {
+        return world.devlat_query(kind, target);
+    }
     imp::query(kind, target)
 }
 

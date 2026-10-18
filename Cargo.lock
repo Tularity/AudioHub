@@ -72,7 +72,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "audiohub-airplay"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "aes",
  "alac",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "audiohub-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "audiohub-core",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "audiohub-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "audiohub-dsp",
@@ -139,25 +139,27 @@ dependencies = [
  "ringbuf",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
 name = "audiohub-dsp"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "audiohub-ipc"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "audiohub-core",
  "audiohub-net",
+ "libc",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "audiohub-net"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "audiohub-core",
@@ -181,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "audiohub-security"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "quick-xml",
  "windows-sys 0.52.0",
@@ -189,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "audiohub-vad-helper"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -199,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "audiohubd"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "audiohub-airplay",
@@ -214,6 +216,7 @@ dependencies = [
  "rand_core",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tungstenite",
 ]

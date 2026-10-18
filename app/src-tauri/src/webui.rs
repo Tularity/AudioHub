@@ -924,8 +924,10 @@ mod tests {
         std::fs::write(
             cfg.join("ipc.json"),
             format!(
-                r#"{{"ipc_version":{},"port":54321,"token":"tok-abc","pid":4242}}"#,
+                // The owner must be a live process or the endpoint reads as stale.
+                r#"{{"ipc_version":{},"port":54321,"token":"tok-abc","pid":{}}}"#,
                 crate::IPC_VERSION,
+                std::process::id(),
             ),
         )
         .unwrap();

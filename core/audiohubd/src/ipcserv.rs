@@ -395,6 +395,7 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                             awaiting_inbound: false,
                             retry_in_s: None,
                             hal_device: None,
+                            presentation: None,
                             hal_reason: None,
                             display_name: String::new(),
                             // 同上：这一刻它已经不在 store 里，没有档位可报。
@@ -647,6 +648,12 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                 }
                 set_bool!("mode_a_volume_sync", mode_a_volume_sync);
                 set_bool!("mode_a_mute_local", mode_a_mute_local);
+                // Provider-side physical presentation switch (design §5.3).
+                // The publication loop reads the live record each pass.
+                set_bool!("share_device_facts", share_device_facts);
+                // Consumer-side switch: the next haldev reconcile pass reads
+                // the live record and re-evaluates every peer.
+                set_bool!("present_physical_devices", present_physical_devices);
                 if let Some(v) = params.get("discovery_announce").and_then(Value::as_bool) {
                     next.discovery_announce = v;
                 }
@@ -1116,10 +1123,64 @@ fn dispatch(inner: &Arc<DaemonInner>, method: &str, params: &Value) -> Result<Va
                     "applied": applied.as_wire(),
                 })
             }
+            #[cfg(feature = "fake-audio")]
+            crate::fake_ipc::STATUS => serde_json::to_value(fake_world()?.status())?,
+            #[cfg(feature = "fake-audio")]
+            crate::fake_ipc::INJECT => {
+                let action: audiohub_core::audio::fake::FakeInject =
+                    serde_json::from_value(params.clone())
+                        .map_err(|e| anyhow::anyhow!("invalid fake injection: {e}"))?;
+                dlog!("[audiohubd] fake audio injection: {action:?}");
+                serde_json::to_value(fake_world()?.inject(action)?)?
+            }
+            #[cfg(feature = "fake-audio")]
+            crate::fake_ipc::SINK_STATS => {
+                let uid = params
+                    .get("uid")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing 'uid'"))?;
+                let freq = params.get("freq").and_then(Value::as_f64);
+                let window_ms = params
+                    .get("window_ms")
+                    .and_then(Value::as_u64)
+                    .map_or(200, |v| v.clamp(10, 2000) as u32);
+                serde_json::to_value(fake_world()?.sink_stats(uid, freq, window_ms)?)?
+            }
+            // Test-only classifier override (design §8.2). Absent from release
+            // builds altogether: there the method falls through to "unknown".
+            #[cfg(feature = "facts-injection")]
+            methods::TEST_FACTS_INJECT => {
+                use audiohub_core::device_facts::{Direction, DirectionFacts};
+                let direction = match params.get("direction").and_then(Value::as_str) {
+                    Some("input") => Direction::Input,
+                    Some("output") => Direction::Output,
+                    _ => anyhow::bail!("'direction' must be 'input' or 'output'"),
+                };
+                let facts = match params.get("facts") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(
+                        serde_json::from_value::<DirectionFacts>(v.clone())
+                            .map_err(|e| anyhow::anyhow!("invalid 'facts': {e}"))?,
+                    ),
+                };
+                let cleared = facts.is_none();
+                let generation = crate::device_facts_pub::inject(inner, direction, facts)?;
+                dlog!(
+                    "[audiohubd] TEST facts injection: {direction:?} {} (generation {generation})",
+                    if cleared { "cleared" } else { "overridden" }
+                );
+                json!({ "direction": direction, "generation": generation, "cleared": cleared })
+            }
             other => anyhow::bail!("unknown method '{other}'"),
         })
     })();
     r.map_err(|e| format!("{e:#}"))
+}
+
+#[cfg(feature = "fake-audio")]
+fn fake_world() -> anyhow::Result<Arc<audiohub_core::audio::fake::World>> {
+    audiohub_core::audio::fake::active()
+        .ok_or_else(|| anyhow::anyhow!("no fake audio world is active in this daemon"))
 }
 
 /// `DaemonSettings` = what is stored plus what is derived. `effective_mode`,
@@ -1175,6 +1236,8 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         quality_stops: audiohub_ipc::transport::quality_stops(),
         hal_capacity: capacity as u8,
         hal_used: used as u8,
+        share_device_facts: s.share_device_facts,
+        present_physical_devices: s.present_physical_devices,
         // 报的是**生效值**（与 daemon.status 的 name 同一个），不是存盘的覆盖：
         // `AUDIOHUB_NAME` 生效时两者不一样，而界面显示的必须是这台机器现在真的
         // 叫什么。「用户存过什么」由下面那个 source 区分。
@@ -1237,10 +1300,61 @@ fn peer_transport_view(
     v
 }
 
+/// One direction of `presentation::PresentationState::status_json` as the
+/// wire view. Reads `current` (what is in force) and `reason` (why the target
+/// is what it is); a missing or malformed entry yields `None` for the whole
+/// peer rather than a half-filled view.
+fn direction_presentation(
+    dir: &Value,
+    windows_names: bool,
+) -> Option<audiohub_ipc::DirectionPresentation> {
+    let current = dir.get("current")?;
+    let class = current.get("class")?.as_str()?;
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_string);
+    let physical = class == "physical";
+    let name = if !physical {
+        None
+    } else if windows_names {
+        let w = dir.get("windows");
+        let endpoint = text(w.and_then(|w| w.get("endpoint_desc")));
+        let adapter = text(w.and_then(|w| w.get("adapter_name")));
+        match (endpoint, adapter) {
+            (Some(e), Some(a)) => Some(format!("{e} ({a})")),
+            (Some(e), None) => Some(e),
+            _ => text(dir.get("name")),
+        }
+    } else {
+        text(dir.get("name"))
+    };
+    Some(audiohub_ipc::DirectionPresentation {
+        class: class.to_string(),
+        name,
+        transport: text(current.get("transport")).filter(|_| physical),
+        form_factor: text(current.get("form_factor")).filter(|_| physical),
+        reason: text(dir.get("reason")).unwrap_or_default(),
+        pending_republish: dir
+            .get("pending_republish")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn peer_presentation(status: &Value, fp: &str) -> Option<audiohub_ipc::PeerPresentation> {
+    let peer = status.get("peers")?.get(fp)?;
+    let windows = cfg!(windows);
+    Some(audiohub_ipc::PeerPresentation {
+        out: direction_presentation(peer.get("output")?, windows)?,
+        input: direction_presentation(peer.get("input")?, windows)?,
+    })
+}
+
 fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
     let store = PeerStore::load_at(Some(&inner.cfg_dir))?;
     let recon = crate::reconnect::snapshot(inner);
     let hal = lk(&inner.haldev);
+    // Read once under the haldev lock already held here (never through
+    // `haldev::presentation_status`, which would lock it again).
+    let presentation_status = hal.presentation.status_json();
     let st = lk(&inner.state);
     Ok(store
         .list()
@@ -1297,6 +1411,9 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
                         .dial_policy(&p.fingerprint)
                         .may_dial(),
                 retry_in_s,
+                presentation: hal_device
+                    .as_ref()
+                    .and_then(|_| peer_presentation(&presentation_status, &p.fingerprint)),
                 hal_device,
                 hal_reason: hal.reasons.get(&p.fingerprint).cloned(),
                 display_name: hal
@@ -1322,8 +1439,9 @@ fn peer_states(inner: &Arc<DaemonInner>) -> anyhow::Result<Vec<PeerState>> {
 
 #[cfg(test)]
 mod tests {
-    use super::origin_allowed;
+    use super::{direction_presentation, origin_allowed, peer_presentation};
     use audiohub_ipc::PermissionKind;
+    use serde_json::json;
 
     /// The gate page reads these field names; a rename here is a UI break.
     /// Doubles as proof that probing never prompts — this runs deviceless in
@@ -1381,5 +1499,39 @@ mod tests {
         assert!(!origin_allowed("file://"));
         assert!(!origin_allowed("null"));
         assert!(!origin_allowed(""));
+    }
+
+    #[test]
+    fn presentation_status_maps_to_the_wire_view() {
+        let status = json!({"peers": {"fp1": {
+            "output": {
+                "current": {"class": "physical", "transport": "usb", "form_factor": "headphones"},
+                "reason": "physical", "pending_republish": false,
+                "name": "Jabra (Peer)",
+                "windows": {"endpoint_desc": "Headphones", "adapter_name": "Jabra – Peer"}
+            },
+            "input": {
+                "current": {"class": "virtual"},
+                "reason": "provider_opt_out", "pending_republish": true,
+                "name": null, "windows": {}
+            }
+        }}});
+        let mac = peer_presentation(&status, "fp1").unwrap();
+        assert_eq!(mac.out.class, "physical");
+        // peer_presentation picks the platform's own naming half.
+        let expected_name = if cfg!(windows) { "Headphones (Jabra – Peer)" } else { "Jabra (Peer)" };
+        assert_eq!(mac.out.name.as_deref(), Some(expected_name));
+        assert_eq!(mac.out.transport.as_deref(), Some("usb"));
+        assert_eq!(mac.out.form_factor.as_deref(), Some("headphones"));
+        assert_eq!(mac.input.class, "virtual");
+        assert_eq!(mac.input.name, None);
+        assert_eq!(mac.input.reason, "provider_opt_out");
+        assert!(mac.input.pending_republish);
+        let win = direction_presentation(&status["peers"]["fp1"]["output"], true).unwrap();
+        assert_eq!(win.name.as_deref(), Some("Headphones (Jabra – Peer)"));
+        let mac_named = direction_presentation(&status["peers"]["fp1"]["output"], false).unwrap();
+        assert_eq!(mac_named.name.as_deref(), Some("Jabra (Peer)"));
+        assert!(peer_presentation(&status, "other").is_none());
+        assert!(peer_presentation(&json!({"peers": {"fp1": {"output": {}}}}), "fp1").is_none());
     }
 }

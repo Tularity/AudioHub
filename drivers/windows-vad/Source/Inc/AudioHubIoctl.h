@@ -135,7 +135,26 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 // v9 requires safe PCM32 microphone quantization. A v8 driver can turn a
 // legitimate +1 sample into negative full scale. Message layouts are unchanged,
 // but accepting that older behavior would silently retain the audio defect.
-#define AUDIOHUB_WIN_PROTOCOL_VERSION   9u
+//
+// v10: PHYSICAL DEVICE PRESENTATION (1.0.2 Phase 1). AH_BIND_REQUEST grows a
+// per-direction AH_PRESENTATION: virtual (today's look) or physical (endpoint
+// name, form factor via the bridge pin category, and a presentation key that
+// becomes part of the device-interface reference string). The reply reports
+// what was actually installed per direction and whether a physical request
+// was forced virtual by the caller check. A v9 driver would reject the larger
+// request outright, but the bump keeps the contract an equality test.
+//
+// v11: PER-PEER CHILD DEVNODES (1.0.2 Phase 2). The root devnode
+// ROOT\AudioHubVad is now a bus; every peer's endpoints live on child devnodes
+// AUDIOHUB\PeerEndpoint that the bus enumerates, one per presentation unit,
+// each with its own ContainerId and FriendlyName. Publication therefore became
+// ASYNCHRONOUS: a Set that has to wait for Plug and Play replies
+// AH_STATUS_PENDING with `published` = what is installed right now, and the
+// rest arrives through AH_EVENT_PUBLISHED and QUERY_SLOTS (which grew a
+// per-slot `flags`). AH_PRESENTATION.group and .adapter_name are now used, for
+// virtual directions as well. A v10 daemon would read PENDING as a failure and
+// a v10 driver would ignore the child naming fields, so versions must match.
+#define AUDIOHUB_WIN_PROTOCOL_VERSION   11u
 
 //
 // Must equal HAL_MAX_SLOTS in core/audiohubd/src/halbridge.rs. The driver's
@@ -158,6 +177,17 @@ typedef uint16_t WCHAR;   // MSVC's wchar_t is 16-bit; clang's is 32-bit, so the
 // driver forces display[AH_DISPLAY_CHARS-1] = 0 regardless.
 //
 #define AH_DISPLAY_CHARS                128u
+
+//
+// v10 presentation key: SHA-256(fingerprint || device_token || form factor)
+// truncated to 4 bytes, as AH_PRESKEY_CHARS lowercase hex digits. The buffer
+// leaves room without another protocol version.
+//
+#define AH_PRESKEY_CHARS                8u
+#define AH_PRESKEY_BUF                  24u
+
+// Phase 2 informational manufacturer, UTF-16 units INCLUDING the terminator.
+#define AH_MFG_CHARS                    64u
 
 //=============================================================================
 // Device naming
@@ -269,6 +299,15 @@ C_ASSERT(sizeof(AH_FORMAT_REPLY) == 8);
 // requested. The status describes disagreement with the request, not popcount.
 //
 #define AH_STATUS_PARTIAL           8u
+//
+// v11. The Set was ACCEPTED and recorded, but at least one requested direction
+// waits for its child devnode to be enumerated and started by Plug and Play.
+// `published` is the subset installed so far; it is never a failure. The rest
+// is reported by AH_EVENT_PUBLISHED and QUERY_SLOTS, and an identical re-Set
+// answers PENDING again until it can answer OK. A requested direction whose
+// install FAILED is still AH_STATUS_PARTIAL, never PENDING.
+//
+#define AH_STATUS_PENDING           9u
 
 //=============================================================================
 // Where a bind failed, and which directions are actually published.
@@ -289,6 +328,11 @@ C_ASSERT(sizeof(AH_FORMAT_REPLY) == 8);
 #define AH_STAGE_UNREGISTER         7u  // UnregisterSubdevice
 #define AH_STAGE_ENDPOINT_NAME      8u  // writing PKEY_Device_DeviceDesc into
                                         // the interface's EP\0 key
+#define AH_STAGE_PRESENTATION       9u  // v10: a malformed AH_PRESENTATION
+                                        // (status AH_STATUS_BAD_ARGUMENT)
+#define AH_STAGE_ENUMERATE          10u // v11: the bus could not create or
+                                        // track a child devnode (table full,
+                                        // pool, IoCreateDevice)
 
 //
 // Set alongside a SUCCESSFUL bind when the per-peer endpoint name could not be
@@ -303,6 +347,22 @@ C_ASSERT(sizeof(AH_FORMAT_REPLY) == 8);
 // the same shape of lie in a smaller size.
 //
 #define AH_BINDREPLY_FLAG_NAME_FALLBACK 0x1u
+
+//
+// v10. A physical presentation was requested while the driver's caller check
+// is weaker than AH_CLIENT_CHECK_IMAGEPATH, so the direction was installed
+// VIRTUAL instead (design 7.6). Any interactive user can reach the control
+// device under the ACL-only policy; a physical look must never be something
+// such a caller can create.
+//
+#define AH_BINDREPLY_FLAG_PRESENTATION_FORCED_VIRTUAL 0x2u
+//
+// v10. What the slot actually presents per direction after this call: set =
+// physical, clear = virtual. Reported on every successful Set so the daemon's
+// account of the look is closed-loop rather than inferred from what it asked.
+//
+#define AH_BINDREPLY_FLAG_RENDER_PHYSICAL   0x4u
+#define AH_BINDREPLY_FLAG_CAPTURE_PHYSICAL  0x8u
 
 //
 // One bit per possible direction. In v6 the success invariant is exact equality
@@ -415,6 +475,14 @@ typedef struct _AH_HELLO_REPLY {
                                     // bind.
 
 #define AH_CAP_OUTPUT_FORMATS 0x20u // FORMAT transaction and ring v2 are required
+#define AH_CAP_PRESENTATION 0x40u   // v10: AH_BIND_REQUEST.presentation is
+                                    // honoured. Physical requests are still
+                                    // forced virtual unless client_check is
+                                    // at least AH_CLIENT_CHECK_IMAGEPATH.
+#define AH_CAP_CHILD_DEVNODES 0x80u // v11: endpoints live on per-unit child
+                                    // devnodes (AUDIOHUB\PeerEndpoint), Set
+                                    // may answer AH_STATUS_PENDING and
+                                    // AH_EVENT_PUBLISHED is raised.
 
 #define AH_BIND_CLEAR   0u
 #define AH_BIND_SET     1u
@@ -482,6 +550,65 @@ typedef struct _AH_HELLO_REPLY {
      AH_BINDFLAG_SKIP_ROLLBACK | AH_BINDFLAG_LEGACY_UNBIND | \
      AH_BINDFLAG_FAIL_ENDPOINT_NAME)
 
+//
+// v10 per-direction presentation.
+//
+#define AH_PRES_VIRTUAL     0u
+#define AH_PRES_PHYSICAL    1u
+
+#define AH_PRES_RENDER      0u      // AH_BIND_REQUEST.presentation[] index
+#define AH_PRES_CAPTURE     1u
+
+//
+// The EndpointFormFactor values (mmdeviceapi.h) a physical presentation may
+// carry. The driver derives the topology bridge pin's KS category from the
+// pair (direction, form factor), and Windows derives the endpoint's
+// FormFactor/JackSubType/icon from that category:
+//
+//   render  AH_FF_SPEAKERS   -> KSNODETYPE_SPEAKER
+//           AH_FF_HEADPHONES -> KSNODETYPE_HEADPHONES
+//           AH_FF_HEADSET    -> KSNODETYPE_HEADSET_SPEAKERS
+//           AH_FF_HANDSET    -> KSNODETYPE_HANDSET
+//   capture AH_FF_MICROPHONE -> KSNODETYPE_MICROPHONE
+//           AH_FF_HEADSET    -> KSNODETYPE_HEADSET_MICROPHONE
+//           AH_FF_HANDSET    -> KSNODETYPE_HANDSET
+//
+// Virtual stays KSNODETYPE_SPEAKER / KSNODETYPE_MICROPHONE_ARRAY. Every other
+// value is refused (HDMI_INTERFACE leaks its name after uninstall; a digital
+// display is presented as speakers by the daemon).
+//
+#define AH_FF_SPEAKERS      1u
+#define AH_FF_HEADPHONES    3u
+#define AH_FF_MICROPHONE    4u
+#define AH_FF_HEADSET       5u
+#define AH_FF_HANDSET       6u
+
+typedef struct _AH_PRESENTATION {
+    UINT32 klass;                       // AH_PRES_*
+    UINT32 form_factor;                 // AH_FF_* when physical; ignored when virtual
+    UINT32 group;                       // v11: equal non-zero on two
+                                        // PHYSICAL directions => both live on
+                                        // one child devnode (one device in
+                                        // Settings). Ignored when virtual:
+                                        // every virtual direction of a peer
+                                        // shares the peer's "v" child.
+    UINT32 reserved;                    // MBZ
+    CHAR   key[AH_PRESKEY_BUF];         // "" when virtual; [0-9a-f]{8} when
+                                        // physical. Appended to the reference
+                                        // strings as "-p<key>".
+    WCHAR  endpoint_desc[AH_DISPLAY_CHARS]; // EP\0 PKEY_Device_DeviceDesc.
+                                        // Physical: required, non-empty.
+                                        // v11 virtual: optional; empty falls
+                                        // back to `display`.
+    WCHAR  adapter_name[AH_DISPLAY_CHARS];  // v11: the child devnode's
+                                        // FriendlyName, i.e. the bracketed half
+                                        // of the endpoint name and the device
+                                        // name in Settings. Physical: required.
+                                        // Virtual: optional, `display` when
+                                        // empty. No control characters.
+    WCHAR  manufacturer[AH_MFG_CHARS];      // informational only, unused
+} AH_PRESENTATION;
+
 typedef struct _AH_BIND_REQUEST {
     UINT32 op;                          // AH_BIND_SET | AH_BIND_CLEAR
     UINT32 slot;                        // 0 .. slot_count-1
@@ -498,6 +625,9 @@ typedef struct _AH_BIND_REQUEST {
                                         // DEVPKEY_DeviceInterface_FriendlyName.
                                         // Direction remains structural (render
                                         // vs capture), not part of the name.
+                                        // Used for a VIRTUAL direction only.
+    AH_PRESENTATION presentation[2];    // v10: [AH_PRES_RENDER], [AH_PRES_CAPTURE].
+                                        // CLEAR ignores it (send zeros).
 } AH_BIND_REQUEST;
 
 typedef struct _AH_BIND_REPLY {
@@ -520,6 +650,13 @@ typedef struct _AH_BIND_REPLY {
 // is what lets it detect a slot it leaked (Set with no Clear) after a restart.
 //=============================================================================
 
+//
+// v11 AH_SLOT_INFO.flags: the AH_BINDREPLY_FLAG_* bits the last Set would
+// report for this slot, plus AH_SLOTINFO_FLAG_PENDING while `published` is
+// still short of the requested mask (child devnodes not started yet).
+//
+#define AH_SLOTINFO_FLAG_PENDING    0x100u
+
 typedef struct _AH_SLOT_INFO {
     UINT32 state;                       // AH_SLOT_*
     UINT32 generation;
@@ -528,6 +665,8 @@ typedef struct _AH_SLOT_INFO {
                                         // pointers stand right now. Any mask is
                                         // valid in v6; reconciliation compares
                                         // it with the peer's requested mask.
+    UINT32 flags;                       // v11: AH_BINDREPLY_FLAG_* |
+                                        // AH_SLOTINFO_FLAG_PENDING
 } AH_SLOT_INFO;
 
 typedef struct _AH_QUERY_SLOTS_REPLY {
@@ -555,6 +694,17 @@ typedef struct _AH_QUERY_SLOTS_REPLY {
 #define AH_EVENT_IOSTATE    2u
 #define AH_EVENT_SLOT       3u
 #define AH_EVENT_FORMAT     4u
+//
+// v11. A bound slot's published mask changed OUTSIDE a Set: a child devnode
+// started (and the driver installed the directions waiting for it) or went
+// away (disable, driver update, removal). Field use for this kind:
+//   generation  the slot's current stamp
+//   state       AH_SLOT_*
+//   flags       AH_BINDREPLY_FLAG_* as a Set would report them now
+//               (NOT AH_EVFLAG_*)
+//   scalar_q16  the AH_PUB_* mask now published (NOT a volume)
+//
+#define AH_EVENT_PUBLISHED  5u
 
 #define AH_EVFLAG_INPUT     0x1u    // the virtual MICROPHONE, else the speaker
 #define AH_EVFLAG_MUTED     0x2u
@@ -817,10 +967,11 @@ typedef struct _AH_STREAMSTAT_REPLY {
 
 C_ASSERT(sizeof(AH_HELLO_REQUEST) == 16);
 C_ASSERT(sizeof(AH_HELLO_REPLY) == 40);
-C_ASSERT(sizeof(AH_BIND_REQUEST) == 320);
+C_ASSERT(sizeof(AH_PRESENTATION) == 680);
+C_ASSERT(sizeof(AH_BIND_REQUEST) == 1680);
 C_ASSERT(sizeof(AH_BIND_REPLY) == 32);
-C_ASSERT(sizeof(AH_SLOT_INFO) == 52);
-C_ASSERT(sizeof(AH_QUERY_SLOTS_REPLY) == 848);
+C_ASSERT(sizeof(AH_SLOT_INFO) == 56);
+C_ASSERT(sizeof(AH_QUERY_SLOTS_REPLY) == 912);
 C_ASSERT(sizeof(AH_CONTROL_EVENT) == 64);
 C_ASSERT(AH_FIELD_OFFSET(AH_CONTROL_EVENT, format) == 24);
 C_ASSERT(sizeof(AH_MAP_REQUEST) == 24);
@@ -849,6 +1000,7 @@ C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REPLY, nt_status) == 20);
 C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REPLY, published) == 24);
 C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REPLY, flags) == 28);
 C_ASSERT(AH_FIELD_OFFSET(AH_SLOT_INFO, published) == 48);
+C_ASSERT(AH_FIELD_OFFSET(AH_SLOT_INFO, flags) == 52);
 
 C_ASSERT(AH_FIELD_OFFSET(AH_HELLO_REPLY, session_id) == 16);
 C_ASSERT(AH_FIELD_OFFSET(AH_HELLO_REPLY, sample_rate) == 24);
@@ -857,6 +1009,14 @@ C_ASSERT(AH_FIELD_OFFSET(AH_HELLO_REPLY, client_check) == 36);
 C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REQUEST, session_id) == 16);
 C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REQUEST, peer_key) == 24);
 C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REQUEST, display) == 64);
+C_ASSERT(AH_FIELD_OFFSET(AH_BIND_REQUEST, presentation) == 320);
+C_ASSERT(AH_FIELD_OFFSET(AH_PRESENTATION, form_factor) == 4);
+C_ASSERT(AH_FIELD_OFFSET(AH_PRESENTATION, group) == 8);
+C_ASSERT(AH_FIELD_OFFSET(AH_PRESENTATION, reserved) == 12);
+C_ASSERT(AH_FIELD_OFFSET(AH_PRESENTATION, key) == 16);
+C_ASSERT(AH_FIELD_OFFSET(AH_PRESENTATION, endpoint_desc) == 40);
+C_ASSERT(AH_FIELD_OFFSET(AH_PRESENTATION, adapter_name) == 296);
+C_ASSERT(AH_FIELD_OFFSET(AH_PRESENTATION, manufacturer) == 552);
 
 C_ASSERT(AH_FIELD_OFFSET(AH_SLOT_INFO, peer_key) == 8);
 C_ASSERT(AH_FIELD_OFFSET(AH_QUERY_SLOTS_REPLY, session_id) == 8);

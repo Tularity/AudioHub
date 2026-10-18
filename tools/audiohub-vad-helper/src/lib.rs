@@ -70,6 +70,21 @@ impl DriverState {
     }
 }
 
+/// Which INF model the root devnode `ROOT\AudioHubVad` is bound to, derived
+/// from its driver key (`InfSection`, falling back to `DriverDesc`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootDriverModel {
+    /// Protocol v11 and later: the root is the WDM bus (`AUDIOHUBBUS`) that
+    /// owns the control device and enumerates `AUDIOHUB\PeerEndpoint` children.
+    Bus,
+    /// Protocol v10 ("VAD10"): the root itself was the PortCls adapter
+    /// (`AUDIOHUBVAD_SA`) and the control device lived for the image lifetime.
+    Adapter,
+    /// A driver is bound but its section is neither known AudioHub model.
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DriverReport {
     pub operation: &'static str,
@@ -86,6 +101,36 @@ pub struct DriverReport {
     pub expected_daemon_image: Option<String>,
     pub win32_error: Option<u32>,
     pub detail: String,
+    /// Every `AUDIOHUB\PeerEndpoint` devnode known to PnP, present or not.
+    pub child_devices: u32,
+    /// The subset of `child_devices` that is currently present.
+    pub present_child_devices: u32,
+    /// Non-present (phantom) `AUDIOHUB\PeerEndpoint` devnodes.
+    pub phantom_child_devices: u32,
+    /// Uninstall only: child devnodes (present or phantom) removed by the
+    /// explicit sweep that follows root removal.
+    pub removed_child_devices: u32,
+    /// Model of the package-bound root devnode, if one is bound.
+    pub root_driver_model: Option<RootDriverModel>,
+    /// Raw `InfSection` of the package-bound root devnode's driver key.
+    pub root_inf_section: Option<String>,
+    /// The bound root runs the bus model, is started, and its control link is
+    /// published, without a pending restart.
+    pub bus_model_active: bool,
+    /// Install only: the root model observed before the package update.
+    pub previous_root_driver_model: Option<RootDriverModel>,
+    /// Install only: a v10 adapter root was updated and Windows requires a
+    /// restart before the v11 bus model takes over.
+    pub migration_reboot_required: bool,
+    /// Install only: exact-image daemon processes stopped so that nothing
+    /// held the control device while the driver package changed.
+    pub daemon_processes_stopped: u32,
+    /// Install only: an exact-image daemon process was still running when the
+    /// package update started (it could not be stopped).
+    pub daemon_still_running: bool,
+    /// Install only: the helper stopped the daemon; the caller (the App) must
+    /// start it again in the interactive user's session.
+    pub daemon_restart_required: bool,
 }
 
 impl DriverReport {
@@ -138,6 +183,18 @@ fn unsupported(operation: &'static str) -> DriverReport {
         expected_daemon_image: None,
         win32_error: None,
         detail: "AudioHubVad installation is available only on Windows".into(),
+        child_devices: 0,
+        present_child_devices: 0,
+        phantom_child_devices: 0,
+        removed_child_devices: 0,
+        root_driver_model: None,
+        root_inf_section: None,
+        bus_model_active: false,
+        previous_root_driver_model: None,
+        migration_reboot_required: false,
+        daemon_processes_stopped: 0,
+        daemon_still_running: false,
+        daemon_restart_required: false,
     }
 }
 
@@ -207,9 +264,26 @@ mod tests {
             expected_daemon_image: Some(r"C:\Program Files\AudioHub\audiohubd.exe".into()),
             win32_error: None,
             detail: "driver package is installed but the device is unavailable".into(),
+            child_devices: 3,
+            present_child_devices: 1,
+            phantom_child_devices: 2,
+            removed_child_devices: 0,
+            root_driver_model: Some(RootDriverModel::Bus),
+            root_inf_section: Some("AUDIOHUBBUS".into()),
+            bus_model_active: false,
+            previous_root_driver_model: Some(RootDriverModel::Adapter),
+            migration_reboot_required: true,
+            daemon_processes_stopped: 0,
+            daemon_still_running: false,
+            daemon_restart_required: false,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains(r#""state":"installed_unavailable""#));
         assert!(json.contains(r#""problem_codes":[52]"#));
+        assert!(json.contains(r#""child_devices":3"#));
+        assert!(json.contains(r#""phantom_child_devices":2"#));
+        assert!(json.contains(r#""root_driver_model":"bus""#));
+        assert!(json.contains(r#""previous_root_driver_model":"adapter""#));
+        assert!(json.contains(r#""migration_reboot_required":true"#));
     }
 }

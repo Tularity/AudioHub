@@ -18,6 +18,14 @@ CERTIFICATE_RECORD="$SIGNING/certificate.sha1"
 LIFECYCLE_LOCK='/var/run/com.audiohub.lifecycle.lock'
 IDENTITY_LABEL='AudioHub Local Code Signing'
 DAEMON_IDENTIFIER='com.audiohub.daemon'
+# The runtime daemon is signed with the HARDENED RUNTIME. The AudioHub HAL
+# driver lets only a hardened-runtime com.audiohub.daemon, signed by the pinned
+# local certificate and installed under $VERSIONS, present devices as physical
+# (docs/physical-presentation-1.0.2-design.md §6.6, spike S7): without the
+# runtime a same-user DYLD_INSERT_LIBRARIES injection keeps the process valid
+# and lets foreign code borrow its identity. Under the runtime, microphone
+# capture needs exactly one entitlement, and nothing else is granted.
+DAEMON_ENTITLEMENTS_JSON='{"com.apple.security.device.audio-input":true}'
 CONSOLE_USER=
 CONSOLE_UID=
 CONSOLE_GID=
@@ -535,6 +543,59 @@ parse_keychain_search_list() {
   done < "$output"
 }
 
+# The entitlements plist the daemon is signed with. Written by root into the
+# root-owned 0711 signing session directory, so the login user's codesign can
+# read it by name but cannot replace it; the signed result is checked against
+# DAEMON_ENTITLEMENTS_JSON regardless.
+write_daemon_entitlements() {
+  entitlements_path="$1"
+  entitlements_stage="$entitlements_path.stage"
+  path_exists "$entitlements_path" && return 1
+  path_exists "$entitlements_stage" && return 1
+  /usr/bin/printf '%s\n' \
+    '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    '<plist version="1.0">' \
+    '<dict>' \
+    '	<key>com.apple.security.device.audio-input</key>' \
+    '	<true/>' \
+    '</dict>' \
+    '</plist>' > "$entitlements_stage" || return 1
+  /usr/bin/install -o root -g wheel -m 0644 "$entitlements_stage" "$entitlements_path" || return 1
+  /bin/rm -f "$entitlements_stage" || return 1
+  safe_root_file "$entitlements_path" && root_wheel_owned "$entitlements_path" \
+    && mode_is "$entitlements_path" 0644
+}
+
+# Non-zero unless $1 carries exactly the signature shape this installer
+# produces: hardened runtime and nothing else in the CodeDirectory flags, 4K
+# pages, no team, one internal requirement, a runtime version, no launch or
+# library constraints, and exactly DAEMON_ENTITLEMENTS_JSON. $2 is a fresh,
+# root-private scratch prefix. Used both right after signing and whenever an
+# existing versioned daemon is considered for reuse, so an image signed by an
+# older installer (no runtime, no entitlement) is re-signed instead of kept.
+SHAPE_SEQUENCE=0
+daemon_signature_shape_is_valid() {
+  shape_daemon="$1"
+  SHAPE_SEQUENCE=$((SHAPE_SEQUENCE + 1))
+  shape_metadata="$2.metadata.$SHAPE_SEQUENCE"
+  shape_entitlements="$2.entitlements.$SHAPE_SEQUENCE"
+  /usr/bin/codesign -d --verbose=4 "$shape_daemon" \
+    >/dev/null 2> "$shape_metadata" || return 1
+  /usr/bin/grep -Eq '^CodeDirectory .* flags=0x10000\(runtime\) ' "$shape_metadata" \
+    && /usr/bin/grep -qx 'Page size=4096' "$shape_metadata" \
+    && /usr/bin/grep -qx 'TeamIdentifier=not set' "$shape_metadata" \
+    && /usr/bin/grep -Eq '^Internal requirements count=1 size=[0-9]+$' "$shape_metadata" \
+    && /usr/bin/grep -Eq '^Runtime Version=[0-9]+([.][0-9]+)*$' "$shape_metadata" \
+    && ! /usr/bin/grep -Eq '^(Launch Constraints?|Library Constraints?)=' "$shape_metadata" \
+    || return 1
+  /usr/bin/codesign -d --entitlements :- "$shape_daemon" \
+    > "$shape_entitlements" 2>/dev/null || return 1
+  [ -s "$shape_entitlements" ] || return 1
+  shape_json=$(/usr/bin/plutil -convert json -o - "$shape_entitlements" 2>/dev/null) || return 1
+  [ "$shape_json" = "$DAEMON_ENTITLEMENTS_JSON" ]
+}
+
 canonicalize_daemon_content() {
   canonical="$1"
   /usr/bin/codesign --remove-signature "$canonical" >/dev/null 2>&1 \
@@ -574,6 +635,8 @@ sign_as_console_user() {
     || return 1
   SIGN_SESSION_OBJECT=$(/usr/bin/stat -f '%d:%i' "$SIGN_SESSION_ROOT" 2>/dev/null || true)
   [ -n "$SIGN_SESSION_OBJECT" ] || return 1
+  SIGN_ENTITLEMENTS="$SIGN_SESSION_ROOT/daemon.entitlements"
+  write_daemon_entitlements "$SIGN_ENTITLEMENTS" || return 1
 
   CONSOLE_SESSION="$SIGN_SESSION_ROOT/session"
   /usr/bin/install -d -o root -g wheel -m 0700 "$CONSOLE_SESSION" || return 1
@@ -636,13 +699,15 @@ sign_as_console_user() {
   SIGN_RESULT=0
   if [ "$sign_mode" = probe ]; then
     as_console_user /usr/bin/codesign --sign "$CERTIFICATE_SHA1" \
-      --dryrun --force --timestamp=none --options=0 --pagesize=4096 \
+      --dryrun --force --timestamp=none --options runtime --pagesize=4096 \
+      --entitlements "$SIGN_ENTITLEMENTS" \
       --keychain "$CONSOLE_KEYCHAIN" \
       --identifier "$DAEMON_IDENTIFIER" "$CONSOLE_PAYLOAD" \
       || SIGN_RESULT=$?
   else
     as_console_user /usr/bin/codesign --force --sign "$CERTIFICATE_SHA1" \
-      --timestamp=none --options=0 --pagesize=4096 --keychain "$CONSOLE_KEYCHAIN" \
+      --timestamp=none --options runtime --pagesize=4096 \
+      --entitlements "$SIGN_ENTITLEMENTS" --keychain "$CONSOLE_KEYCHAIN" \
       --identifier "$DAEMON_IDENTIFIER" "$CONSOLE_PAYLOAD" \
       || SIGN_RESULT=$?
   fi
@@ -683,20 +748,8 @@ sign_as_console_user() {
       -R "=identifier \"$DAEMON_IDENTIFIER\" and certificate leaf = H\"$CERTIFICATE_SHA1\"" \
       "$SIGNED_SNAPSHOT" >/dev/null 2>&1 || return 1
 
-    SIGNED_METADATA="$WORK/signed-metadata.$SIGN_SEQUENCE"
-    /usr/bin/codesign -d --verbose=4 "$SIGNED_SNAPSHOT" \
-      >/dev/null 2> "$SIGNED_METADATA" || return 1
-    /usr/bin/grep -Eq '^CodeDirectory .* flags=0x0\(none\) ' "$SIGNED_METADATA" \
-      && /usr/bin/grep -qx 'Page size=4096' "$SIGNED_METADATA" \
-      && /usr/bin/grep -qx 'TeamIdentifier=not set' "$SIGNED_METADATA" \
-      && /usr/bin/grep -Eq '^Internal requirements count=1 size=[0-9]+$' "$SIGNED_METADATA" \
-      && ! /usr/bin/grep -Eq '^(Runtime Version|Launch Constraints?|Library Constraints?)=' "$SIGNED_METADATA" \
+    daemon_signature_shape_is_valid "$SIGNED_SNAPSHOT" "$WORK/signed-shape.$SIGN_SEQUENCE" \
       || return 1
-
-    SIGNED_ENTITLEMENTS="$WORK/signed-entitlements.$SIGN_SEQUENCE"
-    /usr/bin/codesign -d --entitlements :- "$SIGNED_SNAPSHOT" \
-      > "$SIGNED_ENTITLEMENTS" 2>/dev/null || return 1
-    [ ! -s "$SIGNED_ENTITLEMENTS" ] || return 1
 
     SIGNED_CANONICAL="$WORK/signed-canonical.$SIGN_SEQUENCE"
     /usr/bin/install -o root -g wheel -m 0700 "$SIGNED_SNAPSHOT" "$SIGNED_CANONICAL" \
@@ -909,7 +962,8 @@ version_state_is_valid() {
   [ "$STORED_SIGNED_SHA" = "$ACTUAL_SIGNED_SHA" ] || return 1
   /usr/bin/codesign --verify --strict \
     -R "=identifier \"$DAEMON_IDENTIFIER\" and certificate leaf = H\"$CERTIFICATE_SHA1\"" \
-    "$daemon" >/dev/null 2>&1
+    "$daemon" >/dev/null 2>&1 || return 1
+  daemon_signature_shape_is_valid "$daemon" "$WORK/version-shape"
 }
 
 FINAL_VALID=0

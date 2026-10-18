@@ -1,11 +1,19 @@
 [package]
 name = "audiohub-cli"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 
 [[bin]]
 name = "audiohub"
 path = "src/main.rs"
+
+[features]
+# Test-only fake audio backend: forwards to the daemon library and adds the
+# `ctl fake ...` subcommands. Never part of a shipped binary.
+fake-audio = ["audiohubd/fake-audio", "audiohub-core/fake-audio"]
+# Test-only device-facts injection: forwards to the daemon library and adds
+# `ctl test-facts inject`. Never part of a shipped binary.
+facts-injection = ["audiohubd/facts-injection", "audiohub-ipc/facts-injection"]
 
 [dependencies]
 audiohub-core = { path = "../audiohub-core" }

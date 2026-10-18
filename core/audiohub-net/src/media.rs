@@ -1423,7 +1423,9 @@ impl CaptureFifo {
         (self.corr - 1.0) * 1e6
     }
 
-    fn resample_delay_frames(&self) -> u32 { self.resampler.output_delay_frames() }
+    /// Fixed group delay of the rate converter in output frames; part of the
+    /// queued audio every source reports alongside the FIFO length.
+    pub fn resample_delay_frames(&self) -> u32 { self.resampler.output_delay_frames() }
 
     /// One tick: take everything the backend produced, emit exactly one frame,
     /// and close the loop on what is left over.

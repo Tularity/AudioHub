@@ -69,6 +69,23 @@ pub enum WinvadCmd {
         /// so the INF's generic fallback labels can be observed
         #[arg(long)]
         fail_endpoint_name: bool,
+        /// v11: which directions to request: both (default), render,
+        /// capture or none.
+        #[arg(long, default_value = "both")]
+        directions: String,
+        /// v11: the two `AH_PRESENTATION`s as JSON, `[render, capture]`, each
+        /// `{"klass":0|1,"form_factor":N,"group":N,"key":"8hex",
+        /// "endpoint_desc":"..","adapter_name":".."}` (missing fields = 0 /
+        /// empty). Omit for two bare virtual presentations. A physical one is
+        /// installed virtual unless the driver's image-path caller check
+        /// accepts this process.
+        #[arg(long)]
+        presentation_json: Option<String>,
+        /// v11: after a PENDING reply, poll QUERY_SLOTS up to this many
+        /// milliseconds for the slot to publish the requested mask. 0 = do
+        /// not wait. Timing out fails the probe.
+        #[arg(long, default_value_t = 0)]
+        wait_ms: u64,
     },
     /// One `BIND_CLEAR`. `--generation 0` means "whatever is there now".
     Clear {
@@ -185,6 +202,72 @@ fn volmap_json(scalar: Option<f32>, steps: u32) -> serde_json::Value {
 /// Protocol v6 permits a bound peer to request any subset of the two endpoint
 /// directions, including no endpoint at all. Non-bound states must still hold
 /// no endpoint, and unknown state or direction bits are never coherent.
+/// `--directions` for `probe winvad set`.
+#[cfg(any(windows, test))]
+fn parse_directions(s: &str) -> Result<u8> {
+    use audiohubd::halbridge::{HAL_PUBLISH_IN, HAL_PUBLISH_OUT};
+    Ok(match s {
+        "both" => HAL_PUBLISH_OUT | HAL_PUBLISH_IN,
+        "render" => HAL_PUBLISH_OUT,
+        "capture" => HAL_PUBLISH_IN,
+        "none" => 0,
+        other => anyhow::bail!("--directions must be both, render, capture or none, not {other:?}"),
+    })
+}
+
+/// `--presentation-json` for `probe winvad set`.
+#[cfg(any(windows, test))]
+fn parse_presentations(
+    text: &str,
+) -> Result<[audiohubd::halbridge_win::wire::WirePresentation; 2]> {
+    use audiohubd::halbridge_win::wire::WirePresentation;
+    let v: serde_json::Value = serde_json::from_str(text)?;
+    let arr = v
+        .as_array()
+        .filter(|a| a.len() == 2)
+        .ok_or_else(|| anyhow::anyhow!("--presentation-json must be a two-element array"))?;
+    let one = |o: &serde_json::Value| -> Result<WirePresentation> {
+        let obj = o
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("each presentation must be an object"))?;
+        for k in obj.keys() {
+            if !["klass", "form_factor", "group", "key", "endpoint_desc", "adapter_name", "manufacturer"]
+                .contains(&k.as_str())
+            {
+                anyhow::bail!("unknown presentation field {k:?}");
+            }
+        }
+        let num = |k: &str| -> Result<u32> {
+            match obj.get(k) {
+                None => Ok(0),
+                Some(n) => n
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| anyhow::anyhow!("{k} must be a u32")),
+            }
+        };
+        let text = |k: &str| -> Result<String> {
+            match obj.get(k) {
+                None => Ok(String::new()),
+                Some(t) => t
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("{k} must be a string")),
+            }
+        };
+        Ok(WirePresentation {
+            klass: num("klass")?,
+            form_factor: num("form_factor")?,
+            group: num("group")?,
+            key: text("key")?,
+            endpoint_desc: text("endpoint_desc")?,
+            adapter_name: text("adapter_name")?,
+            manufacturer: text("manufacturer")?,
+        })
+    };
+    Ok([one(&arr[0])?, one(&arr[1])?])
+}
+
 #[cfg(any(windows, test))]
 fn slot_publication_is_coherent(state: u32, published: u32) -> bool {
     use audiohubd::halbridge_win::wire;
@@ -281,6 +364,9 @@ pub fn dispatch(cmd: WinvadCmd, json: bool) -> Result<i32> {
             fail_capture,
             skip_rollback,
             fail_endpoint_name,
+            ref directions,
+            ref presentation_json,
+            wait_ms,
         } => {
             let mut flags = 0u32;
             if fail_render {
@@ -295,17 +381,73 @@ pub fn dispatch(cmd: WinvadCmd, json: bool) -> Result<i32> {
             if fail_endpoint_name {
                 flags |= wire::BINDFLAG_FAIL_ENDPOINT_NAME;
             }
-            let wanted = wire::requested_publication(SET_DIRECTIONS);
-            let r =
-                session.bind_set_with(slot, peer_key, display, online, SET_DIRECTIONS, flags)?;
+            let dirs = if directions == "both" {
+                SET_DIRECTIONS
+            } else {
+                parse_directions(directions)?
+            };
+            let presentation = match presentation_json {
+                Some(t) => parse_presentations(t)?,
+                None => Default::default(),
+            };
+            let wanted = wire::requested_publication(dirs);
+            let r = session.bind_set_probe(
+                slot,
+                peer_key,
+                display,
+                online,
+                dirs,
+                &presentation,
+                flags,
+            )?;
             gate = Some(wire::bind_outcome(Some(wanted), &r));
+            // v11: a PENDING Set completes asynchronously. The probe can wait
+            // for the driver's own account (QUERY_SLOTS) to reach the request,
+            // and reports how long that took -- the asynchronous half of the
+            // contract, observable without the daemon.
+            let mut waited = serde_json::Value::Null;
+            if wait_ms > 0 && r.status == wire::STATUS_PENDING && gate == Some(Ok(())) {
+                let start = std::time::Instant::now();
+                let mut last = r.published;
+                let mut done = false;
+                while start.elapsed().as_millis() < u128::from(wait_ms) {
+                    let q = session.query_slots()?;
+                    if let Some(info) = q.slots.get(slot as usize) {
+                        last = info.published;
+                        if info.state == wire::SLOT_BOUND
+                            && info.published == wanted
+                            && info.flags & wire::SLOTINFO_FLAG_PENDING == 0
+                        {
+                            done = true;
+                            break;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                waited = serde_json::json!({
+                    "completed": done,
+                    "elapsed_ms": start.elapsed().as_millis() as u64,
+                    "published": last,
+                    "published_label": wire::published_label(last),
+                });
+                if !done {
+                    gate = Some(Err(format!(
+                        "slot {slot} still published {} after {wait_ms} ms; wanted {}",
+                        wire::published_label(last),
+                        wire::published_label(wanted)
+                    )));
+                }
+            }
             serde_json::json!({
                 "op": "set",
                 "slot": slot,
                 "peer_key": peer_key,
                 "display": display,
                 "debug_flags": flags,
+                "directions": directions,
+                "presentation_sent": presentation_json.is_some(),
                 "reply": bind_reply_json(&r),
+                "waited": waited,
             })
         }
         WinvadCmd::Clear {
@@ -422,6 +564,9 @@ pub fn dispatch(cmd: WinvadCmd, json: bool) -> Result<i32> {
             "peer_key": s.peer_key,
             "published": s.published,
             "published_label": wire::published_label(s.published),
+            // v11: AH_BINDREPLY_FLAG_* | AH_SLOTINFO_FLAG_PENDING.
+            "flags": s.flags,
+            "pending": s.flags & wire::SLOTINFO_FLAG_PENDING != 0,
             // Compatibility field consumed by the Windows regression harness:
             // in v6 "whole" means the state and exact publication mask are
             // coherent, not that every bound peer necessarily has both
@@ -470,6 +615,10 @@ fn bind_reply_json(r: &audiohubd::halbridge_win::wire::BindReply) -> serde_json:
         // so a harness reads it as a field rather than having to notice its
         // absence.
         "endpoint_name_fallback": r.endpoint_name_fell_back(),
+        "pending": r.status == wire::STATUS_PENDING,
+        "render_physical": r.presents_physical(wire::PRES_RENDER),
+        "capture_physical": r.presents_physical(wire::PRES_CAPTURE),
+        "presentation_forced_virtual": r.presentation_forced_virtual(),
     })
 }
 
@@ -489,6 +638,35 @@ mod tests {
             wire::bind_direction_flags(SET_DIRECTIONS),
             wire::BINDFLAG_WANT_MASK
         );
+    }
+
+    #[test]
+    fn probe_directions_and_presentations_parse_strictly() {
+        assert_eq!(parse_directions("both").unwrap(), SET_DIRECTIONS);
+        assert_eq!(
+            wire::requested_publication(parse_directions("render").unwrap()),
+            wire::PUB_RENDER
+        );
+        assert_eq!(
+            wire::requested_publication(parse_directions("capture").unwrap()),
+            wire::PUB_CAPTURE
+        );
+        assert_eq!(parse_directions("none").unwrap(), 0);
+        assert!(parse_directions("out").is_err());
+
+        let p = parse_presentations(
+            r#"[{"klass":1,"form_factor":3,"group":7,"key":"0a1b2c3d",
+                 "endpoint_desc":"Headphones","adapter_name":"Jabra – WIN-30"},{}]"#,
+        )
+        .unwrap();
+        assert!(p[0].is_physical());
+        assert_eq!((p[0].form_factor, p[0].group), (3, 7));
+        assert_eq!(p[0].adapter_name, "Jabra \u{2013} WIN-30");
+        assert!(p[0].valid_for(true));
+        assert_eq!(p[1], Default::default());
+        assert!(parse_presentations("[{}]").is_err());
+        assert!(parse_presentations(r#"[{"bogus":1},{}]"#).is_err());
+        assert!(parse_presentations(r#"[{"klass":-1},{}]"#).is_err());
     }
 
     #[test]

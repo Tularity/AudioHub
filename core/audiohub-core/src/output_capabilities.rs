@@ -113,12 +113,18 @@ impl SpatialAudioCapabilities {
 /// Reads properties only. It must not initialize an audio stream or prompt for
 /// microphone, screen-recording, or administrator permission.
 pub fn default_output_capabilities() -> NativeOutputCapabilities {
+    #[cfg(feature = "fake-audio")]
+    if let Some(world) = crate::audio::fake::active() {
+        return world.output_capabilities();
+    }
     platform::query()
 }
 
 pub(crate) fn start_spatial_output(
     config: crate::spatial_output::SpatialOutputConfig,
 ) -> anyhow::Result<crate::spatial_output::SpatialOutput> {
+    #[cfg(feature = "fake-audio")]
+    crate::audio::fake::refuse_native("output_capabilities::start_spatial_output")?;
     #[cfg(target_os = "windows")]
     return platform::start_spatial_output(config);
     #[cfg(not(target_os = "windows"))]

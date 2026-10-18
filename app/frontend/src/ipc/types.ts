@@ -226,6 +226,33 @@ export interface PeerHalDevice {
   device_volume_version?: number;
 }
 
+/**
+ * One direction of a peer's virtual device as the system sees it
+ * (`PeerState.presentation`, docs/physical-presentation-1.0.2-design.md §5.5).
+ *
+ * `class` is what is in force *now*. `reason` is why the target look is what it
+ * is, so every `virtual` carries its explanation; unknown codes must render a
+ * generic line, never be dropped. `pending_republish` = the target differs and
+ * has not been applied yet.
+ */
+export interface DirectionPresentation {
+  class: 'physical' | 'virtual' | string;
+  /** Final system-listed device name (physical only). */
+  name?: string | null;
+  /** snake_case PhysicalTransport: usb, built_in, hdmi, ... (physical only). */
+  transport?: string | null;
+  /** snake_case FormFactor: speakers, headphones, headset, ... (physical only). */
+  form_factor?: string | null;
+  reason?: string;
+  pending_republish?: boolean;
+}
+
+/** `PeerState.presentation`: `out` = speaker, `in` = microphone. */
+export interface PeerPresentation {
+  out?: DirectionPresentation;
+  in?: DirectionPresentation;
+}
+
 export interface PeerState {
   fingerprint: string;
   name?: string;
@@ -239,6 +266,8 @@ export interface PeerState {
   added_unix?: number;
   public_key_b64?: string;
   hal_device?: PeerHalDevice | null;
+  /** Physical-vs-virtual look of `hal_device`; absent on an older daemon. */
+  presentation?: PeerPresentation | null;
   hal_reason?: string | null;
   /**
    * 对端上报的模式（plan §13 推论 1）。
@@ -849,6 +878,17 @@ export interface DaemonSettings {
   quality_stops?: QualityStop[];
   remove_virtual_on_disconnect?: boolean;
   mark_offline_devices?: boolean;
+  /**
+   * Provider side of physical presentation: publish this machine's default
+   * device description (name, kind, transport; never a hardware id) to paired
+   * peers. Absent (older daemon) reads as off.
+   */
+  share_device_facts?: boolean;
+  /**
+   * Consumer side: mirror a peer's real default device in the virtual-device
+   * list when the peer shares it and the driver supports it. Absent reads as off.
+   */
+  present_physical_devices?: boolean;
   /** 原生系统表面使用的已解析语种；仅本地 Tauri App 写入。 */
   native_locale?: 'zh-CN' | 'en-US' | string;
   /**

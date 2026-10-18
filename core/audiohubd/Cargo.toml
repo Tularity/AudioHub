@@ -1,6 +1,6 @@
 [package]
 name = "audiohubd"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 
 [lib]
@@ -10,6 +10,17 @@ path = "src/lib.rs"
 [[bin]]
 name = "audiohubd"
 path = "src/main.rs"
+
+[features]
+# Test-only fake audio backend; see audiohub-core's `fake-audio`. Adds the
+# `debug.fake.*` IPC methods and makes the daemon install a fake device world
+# (AUDIOHUB_FAKE_AUDIO) instead of touching any real audio device.
+fake-audio = ["audiohub-core/fake-audio"]
+# Test-only device-facts injection (docs/physical-presentation-1.0.2-design.md
+# §8): the `test.facts.inject` IPC method on the provider, acceptance of
+# injected-origin facts on the consumer, and the AUDIOHUB_FACTS_INJECTION_*
+# link-time marker. build.rs refuses it when AUDIOHUB_RELEASE_BUILD=1.
+facts-injection = ["audiohub-ipc/facts-injection"]
 
 [dependencies]
 audiohub-airplay = { path = "../audiohub-airplay" }
@@ -26,6 +37,9 @@ base64 = "0.22"
 subtle = "2" # constant-time IPC token compare
 mdns-sd = "0.13"
 log = "0.4"
+# Windows presentation key (docs/physical-presentation-1.0.2-design.md §7.4);
+# same version the rest of the workspace already locks.
+sha2 = "0.10"
 
 # unix only: pid liveness for ipc.json ownership + SIGTERM/SIGINT handling.
 # NOTE: gated so the windows-gnu build keeps its raw-dylib-free dep graph.

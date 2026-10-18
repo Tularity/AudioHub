@@ -47,6 +47,8 @@ M6-1 阶段**只改名字与标识，不动任何音频逻辑**（`.cpp` / `.h` 
 | `Source/Main/common.cpp` | `ConnectTopologies` 之后**重新武装**两个 KS 接口；`InstallEndpointFilters` / `RemoveEndpointFilters` / `DisconnectTopologies` 如实报告部分失败 | M6-2 D3 |
 | `Source/Inc/AudioHubIoctl.h` | 当前协议 **7**：支持按方向发布端点，并要求每个端点带不可变的对端/方向 identity；以 `AH_STAGE_ENDPOINT_NAME` / `AH_BINDFLAG_FAIL_ENDPOINT_NAME` / `AH_BINDREPLY_FLAG_NAME_FALLBACK` 表达端点属性与命名结果 | M6-2 及后续修订 |
 | `Source/Inc/perpeer.h` / `Source/Main/perpeer.cpp` | **每对端设备名与 identity**：以指纹派生接口 reference string，把 daemon 生成的标签写入两个 topology 接口各自的 `EP\0` `PKEY_Device_DeviceDesc`，并写入 `v1:<指纹>:out|in` 私有属性；identity 写入失败会在发布前回滚并拒绝 bind，解绑时清除两类属性 | M6-2 D2 及后续修订 |
+| **`Source/Inc/bus.h` / `Source/Main/bus.cpp`** | **新增（1.0.2 Phase 2，协议 11）**。同一驱动镜像的总线角色：`ROOT\AudioHubVad` 上的总线 FDO（拥有控制设备生命周期）枚举 `AUDIOHUB\PeerEndpoint` 子 PDO，每个呈现单元一个；在内核计算 ContainerId；PnP/电源/WMI 路由 | 1.0.2 T7 |
+| `Source/Main/adapter.cpp` / `common.cpp` | 根 devnode 交给总线；每个子 devnode 各有一个 PortCls 适配器；去掉适配器单例与保存到文件功能 | 1.0.2 T7 |
 
 音频逻辑（`minwavert` / `minwavertstream` / `mintopo` / `basetopo`）**至今一行未改**。
 
@@ -55,21 +57,32 @@ M6-1 阶段**只改名字与标识，不动任何音频逻辑**（`.cpp` / `.h` 
 对外标识（安装/验收要用的判据）：
 
 ```
-硬件 ID       ROOT\AudioHubVad
+硬件 ID       ROOT\AudioHubVad        (根 devnode，总线；设备描述 AudioHub Audio Bus，协议 11 起)
+子硬件 ID     AUDIOHUB\PeerEndpoint   (每个对端呈现单元一个子 devnode，实例 <16位指纹>-<v|r|c|rc>)
 服务名        AudioHubVad          (Win32_SystemDriver 里的 Name)
 驱动文件      audiohubvad.sys
 INF / CAT     AudioHubVad.inf / AudioHubVad.cat
-设备描述      AudioHub Virtual Audio      (devnode，不是端点)
+设备描述      AudioHub Network Audio      (子 devnode 的 INF 描述，FriendlyName 由驱动按对端写入；VAD10 前为 AudioHub Virtual Audio)
 控制设备      \\.\AudioHubVadCtl          (daemon 用 CreateFileW 打开)
 Class         MEDIA {4d36e96c-e325-11ce-bfc1-08002be10318}
 
 端点          未配对时为 0 个。
               每台对端按它实际具备的默认输入/输出增加 0–2 个；接口引用串是
-                  AhWaveOut-<16位指纹> / AhTopoOut-<16位指纹>
+                  AhWaveOut-<16位指纹> / AhTopoOut-<16位指纹>          （虚拟）
                   AhWaveIn -<16位指纹> / AhTopoIn -<16位指纹>
-              每个方向的端点属性都写同一个可见名称「AudioHub – <对端主机名>」；
-              输出/输入由 Windows 的设备分类、数据流与图标区分，不再在名称末尾重复。
+                  AhWaveOut-<16位指纹>-p<外观键8位> 等                 （物理，外观键由 daemon 计算）
+              协议 11：端点名 = 「<EP\0 DeviceDesc> (<子 devnode FriendlyName>)」。
+                  虚拟单元：EP\0 为「扬声器/麦克风」类名词，FriendlyName 为「AudioHub – <对端主机名>」；
+                  物理单元：EP\0 为对端设备描述（不含对端名），FriendlyName 为「<适配器名> – <对端主机名>」；
+                  对端没给适配器名（macOS 共享端）的独立 R/C 单元：EP\0 为外形名词，FriendlyName 为「<设备名> – <对端主机名>」。
+              ContainerId = UUIDv5({b966078c-4d5c-4bbd-9ba0-acaf8e7205b1}, "<指纹>-<单元键>")，由驱动计算。
 ```
+
+> **协议 11（1.0.2 Phase 2）为什么要子 devnode**：下面「括号那半来自 devnode FriendlyName」
+> 的结论意味着共享一个根 devnode 永远无法按对端区分名称与容器。协议 11 让驱动自己当总线，
+> 为每个呈现单元枚举一个子 devnode（`AUDIOHUB\PeerEndpoint`），每个子 devnode 有自己的
+> FriendlyName 与 ContainerId，Settings 与浏览器据此分组。厂商硬件身份（VID/PID、硬件 ID、
+> 厂商 UID）一律不复制：硬件 ID、实例 ID 与 ContainerId 都在 AudioHub 自有命名空间内。
 
 > **引用串用对端指纹而不是槽位号**，这是本阶段最重要的正确性决定：
 > 引用串决定 endpoint ID，而 endpoint ID 是 Windows 挂载「系统默认设备选择 /
@@ -144,7 +157,7 @@ x64\Release\package\             # MSBuild 的原始输出
   AudioHubVad.sys / .inf / .cat
 _build\testcert\
   AudioHubVad-TestCert.cer       # 拿去装到测试机
-  AudioHubVad-TestCert.pfx       # 私钥，禁止提交
+  # (不再导出 .pfx：sign-test.ps1 直接按指纹从证书库签名)
 _build\dist\                     # ★ 下一阶段只需要这一个目录
   AudioHubVad.sys / .inf / .cat + AudioHubVad-TestCert.cer
 ```
@@ -154,14 +167,14 @@ _build\dist\                     # ★ 下一阶段只需要这一个目录
 与 30-win 构建流程已永久废止，构建产物仍不进仓库。
 
 > 构建**不是**逐位可复现的：`.sys` 带 PE 时间戳，每次重新编译都会变；
-> `.inf` 的 `DriverVer` 由 stampinf 打成构建时刻；`.cat` 每次 Inf2Cat 都重新生成。
+> `.inf` 的 `DriverVer` 按下文“DriverVer”一节的规则由提交时间（或构建时刻）推出；`.cat` 每次 Inf2Cat 都重新生成。
 > 只有「同一个 `.sys` 重新签名」才会得到相同哈希。
 > 需要认某一份产物时，认 `_build\dist\` 里那次跑出来的哈希，不要跨构建比对。
 
 ### 两个脚本各自的强制校验
 
 `build.ps1` 在 MSBuild 之后会断言产物存在且非空，并断言生成出来的 INF 里确实含有
-`ROOT\AudioHubVad` / `AudioHub Virtual Audio` / `AudioHubVad.cat`；任何一条不满足就让构建失败。
+`ROOT\AudioHubVad` / `AUDIOHUB\PeerEndpoint` / `AUDIOHUBVAD_SA.DeviceDesc="AudioHub Network Audio"` / `AUDIOHUBBUS.DeviceDesc="AudioHub Audio Bus"` / `AudioHubVad.cat`；任何一条不满足就让构建失败。
 半成品驱动包「静默成功」正是坏 `.sys` 混上测试机的典型路径。
 
 `sign-test.ps1` 的顺序不可调换：**先签 `.sys` → 再跑 Inf2Cat 生成 `.cat` → 最后签 `.cat`**。
@@ -228,22 +241,52 @@ worker 进程，那些进程持有 `_build\vctargets\v170\Microsoft.Build.CPPTas
 `Access to the path 'Microsoft.Build.CPPTasks.Common.dll' is denied`。
 `wdk-vs-shim.ps1` 另有一层防御：默认复用已存在的副本而不是先删再拷，只有 `-Force` 才整棵重建。
 
-### DriverVer 的日期必须按 UTC 给，不能用 stampinf 的默认值
+### DriverVer：每次构建自动递增，不手改
 
-stampinf 默认（`%(Inf.TimeStamp)` = `*`）写的是**构建机本地日期**，而 inf2cat 拿 **UTC**
-判「是不是未来日期」。旧 30-win 实测在 UTC+10 时，**本地时间 10:00 之前发起的构建**
-会编译链接全过、卡在打包这一步；当前专用 VM 构建仍保留同一 UTC 防御：
+`DriverVer` 的日期和四段版本号都由 `build.ps1` 从同一个 UTC 时刻 T 推出，经
+`/p:AudioHubDriverVerDate=` 与 `/p:AudioHubDriverVersion=` 传给 `Main.vcxproj` 里 `Inf`
+项的 `DateStamp` / `TimeStamp` 元数据（`TimeStamp` 其实是 stampinf 的 `-v` 版本号）。
+`Main.vcxproj` 没有默认值：不经 `build.ps1` 直接跑 MSBuild 会报错退出。
+
+规则：
+
+| 项 | 取值 |
+|---|---|
+| T | 设置了 `SOURCE_DATE_EPOCH`（整数秒）就用它；否则若 `drivers/windows-vad` 下已跟踪文件没有未提交改动，用 git `HEAD` 的提交时间（committer time）；否则（脏树或没有 git）用当前 UTC 时间并打警告 |
+| 日期 | T 的 UTC 日期减一天，`MM/dd/yyyy`（固定 InvariantCulture） |
+| 版本 | `<产品版本 x.y.z>.<T 的 UTC 当日秒数 ÷ 2，向下取整>`，第四段范围 0–43199；x.y.z 取自 `app/src-tauri/tauri.conf.json` 的 `version`（可用 `-VersionBase` 覆盖） |
+
+性质：
+
+- Windows 对同等匹配的驱动包先比 `DriverVer` 日期、再比版本号，所以（日期，版本）的顺序与 T
+  完全一致（2 秒分辨率）。T 越晚，`DriverVer` 越大。
+- 同一个提交重复构建得到同一个 `DriverVer`（确定性）。`.sys` 本身不是逐位可复现的，但源码相同。
+- 不同提交按提交时间递增。CI（`actions/checkout`，构建产物都在 `.gitignore` 里）走提交时间。
+- 回归套件 `ahr build --worktree` 的快照提交沿用基准提交的时间戳（为了同一棵树得到同一个
+  快照 sha），所以套件的 Windows 驱动步骤在快照提交上显式设置 `SOURCE_DATE_EPOCH` 为构建时刻，
+  驱动产物再按 `drivers/windows-vad` 子树哈希复用；即同一棵驱动源码树在缓存里只有一个
+  `DriverVer`，换了源码就是更晚的 `DriverVer`。
+- 局限：在比已发布提交更早的提交上构建（例如旧分支补丁），`DriverVer` 也更早，Windows 不会用它
+  替换已安装的更新包。发行构建必须来自比上一个发行更新的提交。
+- `scripts/build-windows-installer.ps1` 会检查 INF 的 `DriverVer` 前三段等于产品版本。
+- 守护进程与安装助手判断“驱动是否匹配”只看驱动协议号（HELLO 里的
+  `AUDIOHUB_WIN_PROTOCOL_VERSION`）与助手内嵌的载荷哈希，不看 `DriverVer`，所以版本号自动递增
+  不影响这些检查。
+
+为什么日期要比 T 早一天：stampinf 默认（`%(Inf.TimeStamp)` = `*`）写的是**构建机本地日期**，
+而 inf2cat 拿 **UTC** 判「是不是未来日期」。旧 30-win 实测在 UTC+10 时，**本地时间 10:00
+之前发起的构建**会编译链接全过、卡在打包这一步：
 
 ```
 22.9.7: DriverVer set to a date in the future (postdated DriverVer not allowed)
 error MSB6006: "inf2cat.exe" exited with code -2.
 ```
 
-即构建的可重复性取决于一天里的钟点。`build.ps1` 因此显式算一个
-`[DateTime]::UtcNow.AddDays(-1)` 的日期，经 `/p:AudioHubDriverVerDate=` 传给
-`Main.vcxproj` 里 `Inf` 项的 `DateStamp` 元数据（**不是** `TimeStamp`——那是 `-v`
-版本号，填日期进去会得到 `Invalid version '08/01/2026.0.0.0'`）。
-往回退一天对地球上任何时区都必定是过去，于是打包不再依赖构建发生在何时何地。
+往回退一天对任何时区都必定是过去，也容忍提交机与构建机之间的小时钟偏差。T 比构建机 UTC
+时钟晚一天以上时，`build.ps1` 直接报错。
+
+背景：T7（2026-10-17）两个同日测试构建都打成 `1.0.2.1`，重装后 Windows 选回了较旧的包，
+重启后加载的是旧 `.sys`。
 
 ---
 
@@ -304,6 +347,8 @@ signtool verify /pa /v AudioHubVad.sys
 # 虚拟声卡是 root 枚举设备。注意 pnputil /add-driver /install 不会替你创建 root devnode，
 # 必须用 devcon（devcon.exe 就在 WDK NuGet 包里）。
 devcon.exe install AudioHubVad.inf ROOT\AudioHubVad
+# 协议 11：子 devnode AUDIOHUB\PeerEndpoint 由驱动在配对后自行枚举，安装时无需单独创建；
+# 卸载必须连同子 devnode（含已断开的幻影实例）一起移除，见 tools/audiohub-vad-helper。
 ```
 
 `devcon.exe` 路径：

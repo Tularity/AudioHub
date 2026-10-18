@@ -190,6 +190,12 @@ impl LocalIdentity {
     /// `dir`, when given, overrides AUDIOHUB_CONFIG_DIR / platform default
     /// (lets one process host several isolated daemon instances).
     pub fn load_or_create_at(dir: Option<&Path>) -> Result<Self> {
+        Self::load_or_create_with_env(dir, &std::env::var("AUDIOHUB_NAME").unwrap_or_default())
+    }
+
+    /// `env_name` is the value of AUDIOHUB_NAME, passed in so tests need not
+    /// mutate the process-global environment.
+    fn load_or_create_with_env(dir: Option<&Path>, env_name: &str) -> Result<Self> {
         let base = dir.map(Path::to_path_buf).unwrap_or_else(Self::config_dir);
         secure_private_directory(&base)
             .with_context(|| format!("secure private directory {}", base.display()))?;
@@ -210,7 +216,7 @@ impl LocalIdentity {
                 //
                 // Priority lives in `resolve_name` (pure, and tested there).
                 let name = resolve_name(
-                    &std::env::var("AUDIOHUB_NAME").unwrap_or_default(),
+                    env_name,
                     file.name_override.as_deref(),
                     &local_hostname(),
                     &file.name,
@@ -221,7 +227,16 @@ impl LocalIdentity {
             Err(error) => return Err(error).with_context(|| format!("secure {}", path.display())),
         }
         let signing_key = SigningKey::generate(&mut rand_core::OsRng);
-        let mut name = local_hostname();
+        // Same priority as an existing file: AUDIOHUB_NAME wins over the host
+        // name. It is deliberately NOT persisted as `name_override` (that field
+        // records a choice made in Settings), so dropping the variable later
+        // falls back to the host name.
+        let mut name = resolve_name(
+            env_name,
+            None,
+            &local_hostname(),
+            "",
+        );
         if name.is_empty() {
             name = "audiohub".to_string();
         }
@@ -578,6 +593,23 @@ mod name_tests {
         // scrub — including the env var, which regress sets by hand.
         assert_eq!(resolve_name("a\nb", Some("stored"), "host", "file"), "ab");
         assert_eq!(resolve_name("", Some(" pad "), "host", "file"), "pad");
+    }
+
+    #[test]
+    fn a_fresh_identity_honours_the_environment_name() {
+        let dir = scratch("freshenv");
+        let id = LocalIdentity::load_or_create_with_env(Some(&dir), "AHR-Prov").expect("identity");
+        assert_eq!(id.name, "AHR-Prov", "env outranks the host name on first creation");
+        // Not persisted as a Settings choice: without the variable the host name wins.
+        let again = LocalIdentity::load_or_create_with_env(Some(&dir), "").expect("reload");
+        assert_eq!(again.name, local_hostname());
+        assert_eq!(again.fingerprint, id.fingerprint);
+        // Blank is "unset".
+        let dir2 = scratch("freshblank");
+        let blank = LocalIdentity::load_or_create_with_env(Some(&dir2), "  ").expect("identity");
+        assert_eq!(blank.name, local_hostname());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]

@@ -34,6 +34,8 @@ param(
     [string] $SdkCppVersion = '10.0.26100.1',
     [string] $KitVersion    = '10.0.26100.0',
     [string] $PackagesRoot  = "$env:UserProfile\.nuget\packages",
+    # Product version x.y.z for DriverVer. Empty: read app\src-tauri\tauri.conf.json.
+    [string] $VersionBase   = '',
     [switch] $Clean
 )
 
@@ -59,19 +61,86 @@ if (-not (Test-Path $msbuild)) { throw "64-bit MSBuild not found at $msbuild (it
 
 $target = if ($Clean) { 'Rebuild' } else { 'Build' }
 
-# DriverVer date, in UTC, deliberately NOT "today on this machine".
+# DriverVer: date AND four-part version, both derived from one UTC instant T.
 #
-# stampinf's default (%(Inf.TimeStamp) = "*") writes the builder's LOCAL date,
-# while inf2cat rejects a DriverVer it considers postdated against UTC. 30-win
-# runs at UTC+10, so every build started before 10:00 local time produced a
-# driver that compiled and linked and then failed packaging with
+# Windows ranks equally-matching driver packages by DriverVer date first and
+# version second. Two packages with the same DriverVer are a tie, and PnP may
+# then keep (or go back to) the OLDER package's files: T7 saw a reboot load a
+# stale AudioHubVad.sys after two same-day builds both stamped 1.0.2.1. So every
+# build with different driver sources must stamp a strictly larger DriverVer,
+# without anyone editing a version by hand.
+#
+#   T       = SOURCE_DATE_EPOCH, if set (explicit, e.g. a build harness)
+#             else the git HEAD committer time, if drivers\windows-vad has no
+#                  uncommitted changes to tracked files (deterministic: the
+#                  same commit always gets the same DriverVer)
+#             else the current UTC time (dirty or non-git tree; warned)
+#   date    = UTC calendar date of T, minus one day
+#   version = <x.y.z>.<floor(UTC seconds-of-day of T / 2)>   (0..43199)
+#
+# (date, version) therefore orders exactly like T at 2-second resolution, so a
+# later commit (or a later explicit epoch) always yields a larger DriverVer. x.y.z
+# is the product version from tauri.conf.json.
+#
+# Why the date is one day BEFORE T's UTC date: stampinf's default writes the
+# builder's LOCAL date, while inf2cat rejects a DriverVer it considers postdated
+# against UTC. 30-win runs at UTC+10, so every build started before 10:00 local
+# time once failed packaging with
 #
 #   22.9.7: DriverVer set to a date in the future (postdated DriverVer not allowed)
 #
-# i.e. the build was reproducible only after mid-morning. One day back from the
-# UTC date is unambiguously in the past for any timezone on earth, which makes
-# the packaging step independent of when and where it runs.
-$driverVerDate = [DateTime]::UtcNow.AddDays(-1).ToString('MM/dd/yyyy')
+# One day back from a UTC date at or before "now" is in the past for any
+# timezone and tolerates small clock skew between the commit and build hosts.
+$inv = [Globalization.CultureInfo]::InvariantCulture
+$driverVerSource = $null
+$driverVerEpoch = $null
+if ($env:SOURCE_DATE_EPOCH) {
+    if ($env:SOURCE_DATE_EPOCH -notmatch '^[0-9]{1,12}$') { throw "SOURCE_DATE_EPOCH must be a non-negative integer of seconds, got '$env:SOURCE_DATE_EPOCH'" }
+    $driverVerEpoch = [int64]$env:SOURCE_DATE_EPOCH
+    $driverVerSource = 'SOURCE_DATE_EPOCH'
+} elseif (Get-Command git.exe -ErrorAction SilentlyContinue) {
+    # Native stderr must not become a terminating error under 'Stop'.
+    $savedEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $ct = & git.exe -C $root log -1 --format=%ct HEAD 2>$null
+    $ctExit = $LASTEXITCODE
+    $dirty = & git.exe -C $root status --porcelain --untracked-files=no -- . 2>$null
+    $dirtyExit = $LASTEXITCODE
+    $ErrorActionPreference = $savedEap
+    if ($ctExit -eq 0 -and $dirtyExit -eq 0 -and "$ct" -match '^[0-9]+$') {
+        if (-not $dirty) {
+            $driverVerEpoch = [int64]"$ct"
+            $driverVerSource = 'git HEAD committer time'
+        } else {
+            Write-Warning 'build: drivers\windows-vad has uncommitted changes; DriverVer uses the current UTC time (not reproducible).'
+        }
+    } else {
+        Write-Warning 'build: no usable git HEAD; DriverVer uses the current UTC time (not reproducible).'
+    }
+}
+if ($null -eq $driverVerEpoch) {
+    $driverVerEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $driverVerSource = 'current UTC time'
+}
+$driverVerInstant = [DateTimeOffset]::FromUnixTimeSeconds($driverVerEpoch).UtcDateTime
+$driverVerDay = $driverVerInstant.Date.AddDays(-1)
+if ($driverVerDay -gt [DateTime]::UtcNow.Date) {
+    throw ("build: DriverVer instant {0:o} ({1}) lies more than a day in the future of this machine's UTC clock; Inf2Cat would reject it" -f $driverVerInstant, $driverVerSource)
+}
+$driverVerDate = $driverVerDay.ToString('MM/dd/yyyy', $inv)
+$driverVerRevision = [int][Math]::Floor($driverVerInstant.TimeOfDay.TotalSeconds / 2)
+
+if (-not $VersionBase) {
+    $tauriConf = Join-Path $root '..\..\app\src-tauri\tauri.conf.json'
+    if (-not (Test-Path -LiteralPath $tauriConf)) { throw "build: $tauriConf not found; pass -VersionBase x.y.z" }
+    $VersionBase = [string]((Get-Content -LiteralPath $tauriConf -Raw | ConvertFrom-Json).version)
+}
+if ($VersionBase -notmatch '^([0-9]{1,5})\.([0-9]{1,5})\.([0-9]{1,5})$' -or
+    [int]$Matches[1] -gt 65535 -or [int]$Matches[2] -gt 65535 -or [int]$Matches[3] -gt 65535) {
+    throw "build: product version '$VersionBase' is not x.y.z with fields 0..65535"
+}
+$driverVersion = '{0}.{1}' -f $VersionBase, $driverVerRevision
+Write-Host ("build: DriverVer = {0},{1}  (T = {2:yyyy-MM-ddTHH:mm:ssZ} from {3})" -f $driverVerDate, $driverVersion, $driverVerInstant, $driverVerSource)
 
 $msbuildArgs = @(
     $sln,
@@ -84,6 +153,7 @@ $msbuildArgs = @(
     "/p:AudioHubSdkCppVersion=$SdkCppVersion",
     '/p:SignMode=Off',
     "/p:AudioHubDriverVerDate=$driverVerDate",
+    "/p:AudioHubDriverVersion=$driverVersion",
     '/m',
     # /nr:false is not optional here. With node reuse on (the default) MSBuild
     # leaves worker processes alive after the build, and those workers keep a
@@ -111,11 +181,20 @@ foreach ($f in $expected) {
 }
 
 $inf = Get-Content (Join-Path $pkgDir 'AudioHubVad.inf') -Raw
-foreach ($needle in @('ROOT\AudioHubVad', 'AudioHub Virtual Audio', 'AudioHubVad.cat')) {
+# v11: the root devnode is the bus, every peer presentation unit a child.
+foreach ($needle in @('ROOT\AudioHubVad', 'AUDIOHUB\PeerEndpoint', 'AUDIOHUBVAD_SA.DeviceDesc="AudioHub Network Audio"', 'AUDIOHUBBUS.DeviceDesc="AudioHub Audio Bus"', 'AudioHubVad.cat', '%AudioHubMfgName%=AUDIOHUBVAD')) {
     if ($inf -notmatch [regex]::Escape($needle)) { throw "build: generated INF does not contain '$needle'" }
+}
+# W6: a manufacturer key shared with an Include= INF (wdmaudio.inf defines
+# MfgName="Microsoft") made DEVPKEY_Device_Manufacturer read "Microsoft".
+if ($inf -match '(?im)^\s*MfgName\s*=') { throw "build: generated INF defines the string key MfgName, which collides with wdmaudio.inf" }
+# The stamped DriverVer must be exactly the one computed above.
+$stamped = [regex]::Match($inf, '(?im)^\s*DriverVer\s*=\s*([0-9/]+)\s*,\s*([0-9.]+)\s*$')
+if (-not $stamped.Success -or $stamped.Groups[1].Value -ne $driverVerDate -or $stamped.Groups[2].Value -ne $driverVersion) {
+    throw "build: generated INF DriverVer '$($stamped.Value)' differs from the computed $driverVerDate,$driverVersion"
 }
 
 Write-Host ""
-Write-Host "build: OK -> $pkgDir"
+Write-Host "build: OK -> $pkgDir (DriverVer $driverVerDate,$driverVersion)"
 Get-ChildItem $pkgDir -File | ForEach-Object { "  {0,10}  {1}" -f $_.Length, $_.Name } | Write-Host
 Write-Output $pkgDir

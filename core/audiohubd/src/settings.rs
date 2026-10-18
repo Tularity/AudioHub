@@ -83,6 +83,18 @@ fn announce_by_default() -> bool {
     true
 }
 
+/// `share_device_facts` defaults ON (design §12 Q4). Named function for the
+/// same reason as [`announce_by_default`]: absent must mean the same as fresh.
+fn share_device_facts_by_default() -> bool {
+    true
+}
+
+/// `present_physical_devices` defaults ON (design §5.3). Same named-function
+/// rule: absent must mean the same as fresh.
+fn present_physical_devices_by_default() -> bool {
+    true
+}
+
 /// Exactly the fields this daemon owns. `effective_mode`, `hal_capacity` and
 /// `hal_used` are NOT here: they are derived at read time from what the driver
 /// is actually doing, and persisting a derived value is how the two ends come
@@ -140,6 +152,19 @@ pub(crate) struct StoredSettings {
     /// Empty follows the daemon identity (`AudioHub — <name>`).
     #[serde(default)]
     pub airplay_name: String,
+    /// Provider side of physical device presentation (design §3.5, §5.3):
+    /// publish the physical/virtual classification of this machine's default
+    /// devices, and for physical ones their display name/vendor, to paired
+    /// peers. Off publishes both directions as virtual and sends no names.
+    /// Additive field: no settings-version bump.
+    #[serde(default = "share_device_facts_by_default")]
+    pub share_device_facts: bool,
+    /// Consumer side of physical device presentation (design §5.1, §5.3):
+    /// present a peer's virtual device like the provider's real default
+    /// device when its facts allow it. Off presents every peer virtually.
+    /// Additive field: no settings-version bump.
+    #[serde(default = "present_physical_devices_by_default")]
+    pub present_physical_devices: bool,
 }
 
 fn default_native_locale() -> String {
@@ -198,6 +223,14 @@ impl Default for StoredSettings {
             discovery_announce: announce_by_default(),
             airplay_enabled: false,
             airplay_name: String::new(),
+            // ON (design §12 Q4): the names involved are the same class of
+            // information as the host name already announced, and the switch
+            // is reversible.
+            share_device_facts: share_device_facts_by_default(),
+            // ON (design §5.3): it only changes how a device this machine
+            // already has is presented, never what may be opened, and every
+            // doubt still falls back to the virtual look.
+            present_physical_devices: present_physical_devices_by_default(),
             // **AUTO，不是「最低」**，尽管 plan §5 写的是「默认建议延迟固定取
             // 最低」。理由是行为守恒，不是偏好：
             //
@@ -622,6 +655,67 @@ mod tests {
             got.version, SETTINGS_VERSION,
             "读回来要按本 build 的版本重写"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `share_device_facts` survives the file both ways, and a file written
+    /// before it existed reads as ON without disturbing the mode.
+    #[test]
+    fn the_share_device_facts_switch_survives_the_file_and_defaults_on() {
+        let dir = tmp("devfacts");
+        for want in [false, true, false] {
+            let s = StoredSettings {
+                share_device_facts: want,
+                ..StoredSettings::default()
+            };
+            s.save(&dir).expect("save");
+            let got = StoredSettings::load(&dir);
+            assert_eq!(got.share_device_facts, want);
+            assert_eq!(got, s);
+        }
+        std::fs::write(
+            dir.join("settings.json"),
+            br#"{"version":6,"mode":"b","remove_virtual_on_disconnect":false,
+                 "mark_offline_devices":true}"#,
+        )
+        .expect("write v6");
+        let old = StoredSettings::load(&dir);
+        assert!(old.share_device_facts, "absent must read as the fresh default (on)");
+        assert_eq!(old.mode, Mode::B);
+        assert!(StoredSettings::default().share_device_facts);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `present_physical_devices` survives the file both ways, and a file
+    /// written before it existed reads as ON without disturbing anything else.
+    #[test]
+    fn the_present_physical_devices_switch_survives_the_file_and_defaults_on() {
+        let dir = tmp("presentphys");
+        for want in [false, true, false] {
+            let s = StoredSettings {
+                present_physical_devices: want,
+                ..StoredSettings::default()
+            };
+            s.save(&dir).expect("save");
+            let got = StoredSettings::load(&dir);
+            assert_eq!(got.present_physical_devices, want);
+            assert_eq!(got, s);
+        }
+        std::fs::write(
+            dir.join("settings.json"),
+            br#"{"version":6,"mode":"b","remove_virtual_on_disconnect":false,
+                 "mark_offline_devices":true,"share_device_facts":false}"#,
+        )
+        .expect("write v6");
+        let old = StoredSettings::load(&dir);
+        assert!(
+            old.present_physical_devices,
+            "absent must read as the fresh default (on)"
+        );
+        assert!(!old.share_device_facts);
+        assert_eq!(old.mode, Mode::B);
+        assert_eq!(old.version, SETTINGS_VERSION);
+        assert!(StoredSettings::default().present_physical_devices);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

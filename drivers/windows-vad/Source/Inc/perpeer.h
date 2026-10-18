@@ -7,8 +7,15 @@ Module Name:
 Abstract:
 
     Per-peer virtual audio endpoints: one pair of KS filters (speaker + mic)
-    for every paired AudioHub peer, installed and removed AT RUNTIME inside a
-    single root devnode.
+    for every paired AudioHub peer, installed and removed AT RUNTIME.
+
+    v11 (1.0.2 Phase 2): the endpoints no longer live on the root devnode. The
+    root ROOT\AudioHubVad is a bus (bus.cpp) and every peer's directions are
+    hosted on child devnodes AUDIOHUB\PeerEndpoint, one per PRESENTATION UNIT
+    (see AH_UNIT_* below), each a PortCls adapter of its own. This file keeps
+    the slot table, decides which unit hosts which direction, and installs a
+    direction on its host child the moment both exist -- inside the Set if the
+    child is already running, otherwise when the child starts.
 
     This is the sysvad Bluetooth-HFP / USB-sideband shape, not SwDeviceCreate:
     SwDeviceCreate requires Administrator ("The calling process must have
@@ -32,7 +39,14 @@ Abstract:
 // second-level (EP\0, FX\0) parameters out of. A template interface is never
 // enabled and never becomes an endpoint.
 //
-// The interface actually published for a peer is "<template>-<fingerprint>".
+// The interface actually published for a peer is "<template>-<fingerprint>"
+// while that direction presents VIRTUAL (identical to 1.0.1, so a virtual
+// peer keeps its endpoint id across the upgrade), and
+// "<template>-<fingerprint>-p<key8>" while it presents PHYSICAL (v10). The
+// key is part of the identity because Windows caches an endpoint's name, form
+// factor and icon per endpoint id: a different look needs a different id, and
+// changing back to an earlier look returns the earlier id together with the
+// default-device and per-application settings the system kept for it.
 //
 #define AH_TEMPLATE_TOPO_OUT    L"AhTopoOut"
 #define AH_TEMPLATE_WAVE_OUT    L"AhWaveOut"
@@ -40,8 +54,8 @@ Abstract:
 #define AH_TEMPLATE_WAVE_IN     L"AhWaveIn"
 
 //
-// "AhTopoOut-" (10) + 16 hex + NUL = 27. 64 leaves room and keeps the slot
-// record's arithmetic obvious.
+// "AhTopoOut-" (10) + 16 hex + "-p" + 8 hex + NUL = 37. 64 leaves room and
+// keeps the slot record's arithmetic obvious.
 //
 #define AH_REFSTRING_MAX        64
 
@@ -56,8 +70,12 @@ Abstract:
 //
 //   1. DEVPKEY_DeviceInterface_FriendlyName on the KS interface. The value
 //      lands in the registry verbatim and no endpoint name uses it. (The
-//      bracketed half comes from the DEVNODE's FriendlyName, of which there is
-//      exactly one for all peers, so that half can never carry a peer name.)
+//      bracketed half comes from the DEVNODE's FriendlyName. Until v10 there
+//      was exactly one devnode for all peers; since v11 every presentation
+//      unit is its own child devnode with its own FriendlyName, and the bus
+//      sets it at the child's AddDevice -- spike S6.) v11 still writes the
+//      interface property, as a copy of the host devnode's name, so the two
+//      never disagree for a reader that looks at the interface.
 //
 //   2. The pin name, KsPinDescriptor.Name -> MediaCategories\<GUID>\Name.
 //      This one works -- FOR CAPTURE ONLY. Step 3 of the audio endpoint
@@ -96,9 +114,21 @@ Abstract:
 //
 // and the endpoint reads
 //
-//     <daemon peer label> (AudioHub Virtual Audio)
+//     <EP\0 label> (<child devnode FriendlyName>)
 //
-// whose leading run is byte-identical to the macOS name that plan 7.1 froze.
+// v11: the child devnode's FriendlyName is per presentation unit and
+// daemon-composed (AH_PRESENTATION.adapter_name, e.g. "Realtek(R) Audio –
+// WIN-30" for a physical unit, "AudioHub – WIN-30" for the virtual one), so
+// the bracketed half carries the peer and two peers never share it (S6:
+// identical devnode names make Windows prefix the endpoints "N- "). A
+// physical presentation writes the daemon-composed endpoint half, e.g.
+// "Headphones", and moves the bridge pin off the default category (see
+// AH_PRESENTATION in AudioHubIoctl.h). EP\0 still overrides the builder's
+// name for every category used, measured in spike S2. The child INF
+// DeviceDesc, "AudioHub Network Audio", is only the fallback.
+//
+// The bracketed half of a virtual unit is byte-identical to the macOS device
+// name that plan 7.1 froze ("AudioHub – <peer>").
 //
 // WHY THIS IS THE SYMMETRIC FIX, and the pin name was not:
 //
@@ -176,6 +206,60 @@ typedef struct _AH_EP_CONTEXT
 // premature free is a use-after-free whose symptom is a bugcheck ten peers
 // later. Static storage makes that failure mode unrepresentable.
 //
+//
+// v10: one direction's installed presentation. Klass == AH_PRES_VIRTUAL means
+// today's look; FormFactor, Key and Desc are zero/empty then.
+//
+typedef struct _AH_SLOT_PRESENTATION
+{
+    ULONG   Klass;                      // AH_PRES_*
+    ULONG   FormFactor;                 // AH_FF_* when physical, else 0
+    ULONG   Group;                      // v11: physical grouping, 0 when virtual
+    CHAR    Key[AH_PRESKEY_BUF];        // NUL-terminated [0-9a-f]{8} when physical
+    WCHAR   Desc[AH_DISPLAY_CHARS];     // EP\0 name; v11: may be set when virtual
+    WCHAR   AdapterName[AH_DISPLAY_CHARS]; // v11: child devnode FriendlyName
+} AH_SLOT_PRESENTATION, *PAH_SLOT_PRESENTATION;
+
+//
+// v11 PRESENTATION UNITS. A unit is one child devnode, i.e. one "device" in
+// Settings and one Chromium groupId. A peer has at most two:
+//
+//   AH_UNIT_V   every VIRTUAL direction of the peer (both, usually)
+//   AH_UNIT_R   a physical render direction on a device of its own
+//   AH_UNIT_C   a physical capture direction on a device of its own
+//   AH_UNIT_RC  physical render AND capture whose AH_PRESENTATION.group is the
+//               same non-zero value (a headset is one device)
+//
+// The unit code is part of the child's instance id ("<fp>-v", "<fp>-r", ...),
+// so a direction keeps its devnode across presentation-key changes while the
+// unit kind stays the same; the presentation key itself still lives only in
+// the interface reference strings (v10) and in the ContainerId input.
+//
+#define AH_UNIT_NONE    0u
+#define AH_UNIT_V       1u
+#define AH_UNIT_R       2u
+#define AH_UNIT_C       3u
+#define AH_UNIT_RC      4u
+
+//
+// "<16 hex>-rc" is 19 characters; the buffer leaves room and keeps the
+// arithmetic obvious.
+//
+#define AH_INSTANCE_ID_CHARS    32u
+
+typedef struct _AH_UNIT_SPEC
+{
+    ULONG   Slot;
+    ULONG   Unit;                       // AH_UNIT_*
+    ULONG   Directions;                 // AH_PUB_* this unit hosts
+    CHAR    PeerKey[AH_PEERKEY_BUF];
+    CHAR    KeyR[AH_PRESKEY_BUF];       // physical render key, "" otherwise
+    CHAR    KeyC[AH_PRESKEY_BUF];       // physical capture key, "" otherwise
+    WCHAR   InstanceId[AH_INSTANCE_ID_CHARS];
+    WCHAR   FriendlyName[AH_DISPLAY_CHARS];
+    GUID    ContainerId;                // UUIDv5(NS, "<fp>-<unitkey>"), bus.cpp
+} AH_UNIT_SPEC, *PAH_UNIT_SPEC;
+
 typedef struct _AH_SLOT
 {
     ULONG               State;          // AH_SLOT_FREE | AH_SLOT_BOUND
@@ -202,11 +286,17 @@ typedef struct _AH_SLOT
     WCHAR               NameOut[AH_ENDPOINT_NAME_CHARS];
     WCHAR               NameIn[AH_ENDPOINT_NAME_CHARS];
 
-    // TRUE once this slot owns the endpoint-property write attempt. Raised
-    // before the first mandatory identity write, so a Set that fails after
-    // writing only one direction still removes every name/identity value it
-    // may have created; cleared after cleanup.
-    BOOLEAN             NamesWritten;
+    // v11: per direction, TRUE once this slot may have written the name and
+    // identity values into the EP\0 store of the CURRENT reference strings on
+    // the host child (index AH_PRES_RENDER / AH_PRES_CAPTURE). Raised before
+    // the first write and cleared when the values are taken back.
+    BOOLEAN             NamesWritten[2];
+
+    // v11: per direction, the topology interface FriendlyName (the bracketed
+    // half of the endpoint name): the host child's devnode FriendlyName as it
+    // was when the direction was installed. The topology property buffer
+    // points here; PortCls reads it at PcRegisterSubdevice.
+    WCHAR               IfName[2][AH_DISPLAY_CHARS];
 
     // TRUE when this slot's endpoints are published under the INF's generic
     // fallback labels instead of the peer's. Reported to the daemon as
@@ -254,12 +344,20 @@ typedef struct _AH_SLOT
     AH_EP_CONTEXT       OutCtx;
     AH_EP_CONTEXT       InCtx;
 
+    // v10: what each direction presents, [AH_PRES_RENDER], [AH_PRES_CAPTURE].
+    // Stored when the direction's reference strings are built, so it always
+    // describes the identity the CURRENT reference strings carry, published
+    // or not.
+    AH_SLOT_PRESENTATION Pres[2];
+
     // NOTE: there are deliberately NO per-slot filter descriptors here. v3 kept
     // a private copy of each TOPOLOGY filter and its pin array so the bridge
-    // pin's KsPinDescriptor.Name could point at a per-peer GUID. The name no
-    // longer travels through the pin, so every descriptor is shared again --
-    // which also retires the lifetime hazard that copy created (PortCls holds
-    // these pointers for as long as the device object lives).
+    // pin's KsPinDescriptor.Name could point at a per-peer GUID. v10 needs a
+    // different bridge pin CATEGORY per presentation, and gets it from a small
+    // set of driver-global copies, one per category, built once at DriverEntry
+    // and never written again (perpeer.cpp g_AhTopoVariants). A slot only
+    // selects one, so no PortCls-held pointer ever targets storage that a
+    // rebind rewrites -- the lifetime hazard the v3 copies had.
 
     SIMPLEAUDIOSAMPLE_DEVPROPERTY   OutTopoProps[1];
     SIMPLEAUDIOSAMPLE_DEVPROPERTY   InTopoProps[1];
@@ -278,6 +376,25 @@ typedef struct _AH_SLOT
     PUNKNOWN            OutWaveMiniport;
     PUNKNOWN            InTopo;
     PUNKNOWN            InWave;
+
+    // v11: which unit each WANTED direction belongs to (AH_UNIT_NONE when the
+    // direction is not wanted), and the child devnode that hosts it while its
+    // ports are held. HostPdo/HostAdapter are valid exactly while the host
+    // child's adapter is registered (perpeer.cpp g_AhHosts), which is also
+    // when the port pointers above may be non-NULL.
+    ULONG               UnitOf[2];
+    PDEVICE_OBJECT      HostPdo[2];
+    PADAPTERCOMMON      HostAdapter[2];
+
+    // v11: the units UnitOf[] names, render's first, exactly as handed to the
+    // bus (instance id, ContainerId, FriendlyName included).
+    AH_UNIT_SPEC        Units[2];
+    ULONG               UnitCount;
+
+    // v11: the last install failure of a wanted direction, kept so a Set that
+    // follows an asynchronous (child start) failure can report it.
+    ULONG               LastStage;
+    NTSTATUS            LastNtStatus;
 } AH_SLOT, *PAH_SLOT;
 
 //
@@ -286,21 +403,19 @@ typedef struct _AH_SLOT
 VOID AhPerPeerDriverInit(VOID);
 
 //
-// Called from StartDevice once the adapter exists, and from PnpHandler's
-// REMOVE / SURPRISE_REMOVAL / STOP_DEVICE branches BEFORE the adapter is
-// Cleanup()'d and Released. Detaching tears every published endpoint down
-// first: leaving a slot holding port pointers past the adapter's death is
-// failure mode B3.
+// v11 CHILD ADAPTERS. Called from a child devnode's StartDevice once its
+// adapter exists, and from PnpHandler's REMOVE / SURPRISE_REMOVAL /
+// STOP_DEVICE branches for a CHILD FDO, BEFORE the adapter is Cleanup()'d and
+// Released. Start installs every waiting direction this child hosts; detach
+// removes every direction installed on it (leaving a slot holding port
+// pointers past the adapter's death is failure mode B3). Neither changes a
+// slot's binding: the daemon's pairing state is not the devnode's state.
 //
-NTSTATUS AhPerPeerAttachAdapter(_In_ PDEVICE_OBJECT DeviceObject, _In_ PADAPTERCOMMON Adapter);
-VOID     AhPerPeerDetachAdapter(VOID);
-
+// Start never fails the child: a child with no working endpoint still starts,
+// because the bus, not the install, decides how long the devnode lives.
 //
-// TRUE once an adapter is attached. Bind IOCTLs answer AH_STATUS_NO_ADAPTER
-// until then, and the daemon retries -- the daemon can legitimately start
-// before the devnode does.
-//
-BOOLEAN  AhPerPeerAdapterReady(VOID);
+NTSTATUS AhPerPeerChildStart(_In_ PDEVICE_OBJECT Fdo, _In_ PADAPTERCOMMON Adapter);
+VOID     AhPerPeerChildDetach(_In_ PDEVICE_OBJECT Fdo);
 
 //
 // Where an operation failed and what it left behind. Every bind path fills one
@@ -342,10 +457,17 @@ typedef struct _AH_OP_RESULT
 //    IGNORED, so a Clear delayed past a re-bind cannot cut down the binding
 //    that replaced it.
 //
+//
+// Presentation must be the request's two entries, already terminated, and
+// already forced virtual by the caller when the caller check does not allow a
+// physical look (ctldevice.cpp). Malformed entries are refused here with
+// AH_STATUS_BAD_ARGUMENT / AH_STAGE_PRESENTATION before anything changes.
+//
 NTSTATUS AhSlotBindSet(
     _In_  ULONG   Slot,
     _In_z_ PCSTR  PeerKey,
     _In_  PCWSTR  Display,
+    _In_reads_(2) const AH_PRESENTATION *Presentation,
     _In_  ULONG   Flags,
     _Out_ PULONG  Generation,
     _Out_ PULONG  State,
@@ -365,7 +487,6 @@ VOID AhSlotQuery(_Out_ AH_QUERY_SLOTS_REPLY *Reply, _In_ ULONGLONG SessionId);
 // Per-speaker format state is private kernel memory, never ring-header data.
 // All control operations are PASSIVE_LEVEL. The DPC holds the short per-slot
 // gate only while copying one bounded block; QUIESCED is also a reader fence.
-VOID AhSpeakerFormatBind(_In_ ULONG Slot, _In_ ULONG Generation, _In_ BOOLEAN Published);
 VOID AhSpeakerFormatDetach(_In_ ULONGLONG SessionId = 0);
 ULONG AhSpeakerFormatControl(_In_ const AH_FORMAT_PAYLOAD *Message);
 NTSTATUS AhSpeakerFormatRequest(_In_ ULONG Slot, _In_ ULONG Channels);

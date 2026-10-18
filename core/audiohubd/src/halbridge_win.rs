@@ -106,7 +106,22 @@ pub mod wire {
     /// speaker ring at 12 lanes so every supported layout fits one mapping.
     /// v9 requires finite PCM32 microphone quantization with explicit endpoint
     /// saturation. Layouts are unchanged, but v8 can silently invert +1 peaks.
-    pub const PROTOCOL_VERSION: u32 = 9;
+    /// v10 is PHYSICAL DEVICE PRESENTATION (1.0.2 Phase 1): the bind request
+    /// grows one [`WirePresentation`] per direction ([`PRESENTATION_BYTES`]
+    /// each, at [`PRESENTATION_OFFSET`]), the reply reports what each
+    /// direction actually presents ([`BINDREPLY_FLAG_RENDER_PHYSICAL`],
+    /// [`BINDREPLY_FLAG_CAPTURE_PHYSICAL`]) and whether a physical request was
+    /// forced virtual by the caller check
+    /// ([`BINDREPLY_FLAG_PRESENTATION_FORCED_VIRTUAL`]).
+    /// v11 is PER-PEER CHILD DEVNODES (1.0.2 Phase 2): every presentation
+    /// unit is its own child devnode (`AUDIOHUB\PeerEndpoint`) with its own
+    /// ContainerId and FriendlyName, so publication is asynchronous. A Set
+    /// that must wait for Plug and Play answers [`STATUS_PENDING`] with the
+    /// subset installed so far; the rest arrives as [`EVENT_PUBLISHED`] and in
+    /// [`SlotInfo::flags`] ([`SLOTINFO_FLAG_PENDING`]). The presentation's
+    /// `group` and `adapter_name` are used, the latter for virtual directions
+    /// too.
+    pub const PROTOCOL_VERSION: u32 = 11;
 
     /// `AudioHubIoctl.h:AUDIOHUB_WIN_MAX_SLOTS`, and equal to
     /// `halbridge::HAL_MAX_SLOTS`. The driver's `PcAddAdapterDevice` budget is
@@ -118,6 +133,29 @@ pub mod wire {
     pub const PEERKEY_BUF: usize = 40;
     /// UTF-16 code units INCLUDING the terminator.
     pub const DISPLAY_CHARS: usize = 128;
+
+    // -- v10 presentation ---------------------------------------------------
+
+    /// `AH_PRESKEY_CHARS`: lowercase hex digits of a presentation key.
+    pub const PRESKEY_CHARS: usize = 8;
+    /// `AH_PRESKEY_BUF`.
+    pub const PRESKEY_BUF: usize = 24;
+    /// `AH_MFG_CHARS`, UTF-16 units including the terminator.
+    pub const MFG_CHARS: usize = 64;
+    pub const PRES_VIRTUAL: u32 = 0;
+    pub const PRES_PHYSICAL: u32 = 1;
+    /// `AH_PRES_RENDER` / `AH_PRES_CAPTURE`: indices into the request's array.
+    pub const PRES_RENDER: usize = 0;
+    pub const PRES_CAPTURE: usize = 1;
+    /// `AH_FF_*`: the EndpointFormFactor values a physical direction may carry.
+    pub const FF_SPEAKERS: u32 = 1;
+    pub const FF_HEADPHONES: u32 = 3;
+    pub const FF_MICROPHONE: u32 = 4;
+    pub const FF_HEADSET: u32 = 5;
+    pub const FF_HANDSET: u32 = 6;
+    /// The driver's whitelist, per direction (`AhPresentationCategory`).
+    pub const FF_RENDER: [u32; 4] = [FF_SPEAKERS, FF_HEADPHONES, FF_HEADSET, FF_HANDSET];
+    pub const FF_CAPTURE: [u32; 3] = [FF_MICROPHONE, FF_HEADSET, FF_HANDSET];
 
     /// `\\.\AudioHubVadCtl`.
     pub const CTL_PATH: &str = r"\\.\AudioHubVadCtl";
@@ -255,6 +293,12 @@ pub mod wire {
     /// behind. A one-bit `published` value is not itself partial in v6: it is a
     /// valid success when that was the requested capability.
     pub const STATUS_PARTIAL: u32 = 8;
+    /// v11: the Set was accepted and recorded, but at least one requested
+    /// direction waits for its child devnode. `published` is a subset of the
+    /// request, nothing failed, and the rest follows through
+    /// [`EVENT_PUBLISHED`]. An identical re-Set answers PENDING again until it
+    /// can answer OK, without moving the generation.
+    pub const STATUS_PENDING: u32 = 9;
 
     pub fn status_label(v: u32) -> &'static str {
         match v {
@@ -267,6 +311,7 @@ pub mod wire {
             STATUS_INTERNAL => "driver internal error",
             STATUS_NOT_BOUND => "slot not bound",
             STATUS_PARTIAL => "published directions differ from the request",
+            STATUS_PENDING => "accepted; waiting for the device to be enumerated",
             _ => "unknown status",
         }
     }
@@ -329,6 +374,12 @@ pub mod wire {
     /// paired it means two identically named speakers, and the user needs
     /// somewhere that explains why.
     pub const BINDREPLY_FLAG_NAME_FALLBACK: u32 = 0x1;
+    /// v10: a physical presentation was requested while the driver's caller
+    /// check is below [`CLIENT_CHECK_IMAGEPATH`]; it was installed VIRTUAL.
+    pub const BINDREPLY_FLAG_PRESENTATION_FORCED_VIRTUAL: u32 = 0x2;
+    /// v10: what each direction presents after the call (set = physical).
+    pub const BINDREPLY_FLAG_RENDER_PHYSICAL: u32 = 0x4;
+    pub const BINDREPLY_FLAG_CAPTURE_PHYSICAL: u32 = 0x8;
 
     // -- failure stages -----------------------------------------------------
 
@@ -341,6 +392,10 @@ pub mod wire {
     pub const STAGE_DISCONNECT: u32 = 6;
     pub const STAGE_UNREGISTER: u32 = 7;
     pub const STAGE_ENDPOINT_NAME: u32 = 8;
+    /// v10: the driver refused a malformed presentation.
+    pub const STAGE_PRESENTATION: u32 = 9;
+    /// v11: the bus could not create or track a child devnode.
+    pub const STAGE_ENUMERATE: u32 = 10;
 
     pub fn stage_label(v: u32) -> &'static str {
         match v {
@@ -353,6 +408,8 @@ pub mod wire {
             STAGE_DISCONNECT => "unregistering the physical connection",
             STAGE_UNREGISTER => "unregistering the subdevice",
             STAGE_ENDPOINT_NAME => "applying the per-peer device name",
+            STAGE_PRESENTATION => "validating the requested presentation",
+            STAGE_ENUMERATE => "enumerating the device's child devnode",
             _ => "unknown stage",
         }
     }
@@ -420,9 +477,13 @@ pub mod wire {
 
     pub const HELLO_REQUEST_BYTES: usize = 16;
     pub const HELLO_REPLY_BYTES: usize = 40;
-    pub const BIND_REQUEST_BYTES: usize = 320;
+    /// `sizeof(AH_PRESENTATION)`.
+    pub const PRESENTATION_BYTES: usize = 680;
+    /// `FIELD_OFFSET(AH_BIND_REQUEST, presentation)`.
+    pub const PRESENTATION_OFFSET: usize = 320;
+    pub const BIND_REQUEST_BYTES: usize = PRESENTATION_OFFSET + 2 * PRESENTATION_BYTES;
     pub const BIND_REPLY_BYTES: usize = 32;
-    pub const SLOT_INFO_BYTES: usize = 52;
+    pub const SLOT_INFO_BYTES: usize = 56;
     pub const QUERY_SLOTS_REPLY_BYTES: usize = 16 + SLOT_INFO_BYTES * MAX_SLOTS;
     pub const FORMAT_PAYLOAD_BYTES: usize = 40;
     pub const FORMAT_REPLY_BYTES: usize = 8;
@@ -437,7 +498,9 @@ pub mod wire {
     pub const STREAMSTAT_REQUEST_BYTES: usize = 16;
     pub const STREAMSTAT_REPLY_BYTES: usize = 32;
 
-    const _: () = assert!(QUERY_SLOTS_REPLY_BYTES == 848);
+    const _: () = assert!(QUERY_SLOTS_REPLY_BYTES == 912);
+    const _: () = assert!(BIND_REQUEST_BYTES == 1680);
+    const _: () = assert!(PRESENTATION_BYTES == 16 + PRESKEY_BUF + 2 * DISPLAY_CHARS * 2 + MFG_CHARS * 2);
     const _: () = assert!(MAP_REPLY_BYTES == 296);
     const _: () = assert!(CONTROL_EVENT_BYTES == 64);
     const _: () = assert!(std::mem::size_of::<crate::halformat::Payload>() == 40);
@@ -501,6 +564,14 @@ pub mod wire {
     /// `AH_CAP_OUTPUT_FORMATS`: the v8 format transaction and fixed-width
     /// 12-lane speaker ring are both available.
     pub const CAP_OUTPUT_FORMATS: u32 = 0x20;
+    /// `AH_CAP_PRESENTATION` (v10): the bind request's presentation is
+    /// honoured. A physical look additionally needs a caller check of at
+    /// least [`CLIENT_CHECK_IMAGEPATH`].
+    pub const CAP_PRESENTATION: u32 = 0x40;
+    /// `AH_CAP_CHILD_DEVNODES` (v11): endpoints live on per-unit child
+    /// devnodes, a Set may answer [`STATUS_PENDING`] and [`EVENT_PUBLISHED`]
+    /// is raised.
+    pub const CAP_CHILD_DEVNODES: u32 = 0x80;
 
     pub fn caps_have_volume_event(caps: u32) -> bool {
         caps & CAP_VOLUMEEVENT != 0
@@ -688,12 +759,90 @@ pub mod wire {
         /// prefix applied here there is no call site left that can forget it,
         /// and the test below feeds the encoder what the daemon really produces.
         pub peer_display: &'a str,
+        /// v10, `[PRES_RENDER, PRES_CAPTURE]`. A Clear sends the default
+        /// (virtual, all zero).
+        pub presentation: [WirePresentation; 2],
+    }
+
+    /// One direction's `AH_PRESENTATION`. The default is today's virtual look.
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+    pub struct WirePresentation {
+        pub klass: u32,
+        /// One of [`FF_RENDER`] / [`FF_CAPTURE`] when physical; ignored by
+        /// the driver when virtual.
+        pub form_factor: u32,
+        /// v11: equal non-zero on two PHYSICAL directions puts both on one
+        /// child devnode (one device in Settings). Ignored for virtual
+        /// directions, which always share the peer's virtual unit.
+        pub group: u32,
+        /// [`PRESKEY_CHARS`] lowercase hex when physical, empty when virtual.
+        pub key: String,
+        /// The EP\0 `PKEY_Device_DeviceDesc` of a physical direction, at
+        /// most `DISPLAY_CHARS - 1` UTF-16 units after clamping.
+        pub endpoint_desc: String,
+        /// v11: the child devnode's FriendlyName (the bracketed half of the
+        /// endpoint name and the device name in Settings). Required when
+        /// physical; optional when virtual (the driver falls back to the
+        /// display name).
+        pub adapter_name: String,
+        pub manufacturer: String,
+    }
+
+    impl WirePresentation {
+        pub fn is_physical(&self) -> bool {
+            self.klass == PRES_PHYSICAL
+        }
+
+        /// The driver's rules (`AhNormalizePresentation`), so a request that
+        /// passes here is refused there only for what this side cannot know.
+        pub fn valid_for(&self, render: bool) -> bool {
+            let text_ok = |t: &str| !t.chars().any(|c| c.is_control());
+            if !text_ok(&self.endpoint_desc) || !text_ok(&self.adapter_name) {
+                return false;
+            }
+            match self.klass {
+                PRES_VIRTUAL => self.key.is_empty(),
+                PRES_PHYSICAL => {
+                    let ff_ok = if render {
+                        FF_RENDER.contains(&self.form_factor)
+                    } else {
+                        FF_CAPTURE.contains(&self.form_factor)
+                    };
+                    ff_ok
+                        && valid_presentation_key(&self.key)
+                        && !self.endpoint_desc.is_empty()
+                        && !self.adapter_name.is_empty()
+                }
+                _ => false,
+            }
+        }
+    }
+
+    /// Exactly [`PRESKEY_CHARS`] lowercase hex digits: the key becomes part
+    /// of a device-interface reference string.
+    pub fn valid_presentation_key(s: &str) -> bool {
+        s.len() == PRESKEY_CHARS
+            && s.bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum BindEncodeError {
         BadPeerKey,
         SlotOutOfRange,
+        /// A presentation the driver would refuse; a policy bug, never sent.
+        BadPresentation,
+    }
+
+    fn put_presentation(b: &mut [u8], at: usize, p: &WirePresentation) {
+        put_u32(b, at, p.klass);
+        put_u32(b, at + 4, p.form_factor);
+        put_u32(b, at + 8, p.group);
+        put_u32(b, at + 12, 0); // reserved MBZ
+        put_ascii(b, at + 16, PRESKEY_BUF, &p.key);
+        put_utf16(b, at + 40, &clamp_utf16(&p.endpoint_desc, DISPLAY_CHARS));
+        put_utf16(b, at + 296, &clamp_utf16(&p.adapter_name, DISPLAY_CHARS));
+        put_utf16(b, at + 552, &clamp_utf16(&p.manufacturer, MFG_CHARS));
     }
 
     pub fn encode_bind_request(
@@ -704,6 +853,11 @@ pub mod wire {
         }
         if (req.slot as usize) >= MAX_SLOTS {
             return Err(BindEncodeError::SlotOutOfRange);
+        }
+        if !req.presentation[PRES_RENDER].valid_for(true)
+            || !req.presentation[PRES_CAPTURE].valid_for(false)
+        {
+            return Err(BindEncodeError::BadPresentation);
         }
         let mut b = [0u8; BIND_REQUEST_BYTES];
         put_u32(&mut b, 0, req.op);
@@ -720,6 +874,9 @@ pub mod wire {
             crate::haldev::device_name_stem(req.peer_display)
         };
         put_utf16(&mut b, 64, &clamp_utf16(&display, DISPLAY_CHARS));
+        for (i, p) in req.presentation.iter().enumerate() {
+            put_presentation(&mut b, PRESENTATION_OFFSET + i * PRESENTATION_BYTES, p);
+        }
         Ok(b)
     }
 
@@ -748,10 +905,34 @@ pub mod wire {
             self.status == STATUS_OK && wanted & !PUB_BOTH == 0 && self.published == wanted
         }
 
+        /// v11: an accepted Set still waiting for Plug and Play. Valid only
+        /// when what IS published is a subset of the request.
+        pub fn pending_toward(&self, wanted: u32) -> bool {
+            self.status == STATUS_PENDING
+                && wanted & !PUB_BOTH == 0
+                && self.published & !wanted == 0
+        }
+
         /// The bind worked, but the devices carry the INF's generic fallback
         /// labels rather than this peer's name.
         pub fn endpoint_name_fell_back(&self) -> bool {
             self.flags & BINDREPLY_FLAG_NAME_FALLBACK != 0
+        }
+
+        /// v10: what direction `index` ([`PRES_RENDER`] / [`PRES_CAPTURE`])
+        /// presents after the call, by the driver's own account.
+        pub fn presents_physical(&self, index: usize) -> bool {
+            let bit = if index == PRES_RENDER {
+                BINDREPLY_FLAG_RENDER_PHYSICAL
+            } else {
+                BINDREPLY_FLAG_CAPTURE_PHYSICAL
+            };
+            self.flags & bit != 0
+        }
+
+        /// v10: a physical request was installed virtual by the caller rule.
+        pub fn presentation_forced_virtual(&self) -> bool {
+            self.flags & BINDREPLY_FLAG_PRESENTATION_FORCED_VIRTUAL != 0
         }
 
         /// One line a status view can show verbatim.
@@ -779,6 +960,25 @@ pub mod wire {
     /// the encoder was tested with a well-formed input while the PRODUCER of
     /// that input was never checked.
     pub fn bind_outcome(wanted: Option<u32>, r: &BindReply) -> Result<(), String> {
+        // v11: a SET may be accepted before Plug and Play has started the
+        // child devnodes. That is success for the call -- the binding is
+        // recorded and `published` is the truth so far -- but never for a
+        // CLEAR, and never with a direction the request did not ask for.
+        if let Some(want) = wanted {
+            if r.status == STATUS_PENDING {
+                if r.pending_toward(want) {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "the driver accepted the request as pending but published {} (0x{:x}), \
+                     outside the requested {} (0x{:x}) — treating it as a failure",
+                    published_label(r.published),
+                    r.published,
+                    published_label(want),
+                    want,
+                ));
+            }
+        }
         if r.status != STATUS_OK {
             return Err(r.failure_text());
         }
@@ -823,7 +1023,15 @@ pub mod wire {
         /// reconciliation compares it with that peer's requested capability
         /// rather than assuming every bound slot must publish both.
         pub published: u32,
+        /// v11: the [`BINDREPLY_FLAG_NAME_FALLBACK`] /
+        /// [`BINDREPLY_FLAG_RENDER_PHYSICAL`] / [`BINDREPLY_FLAG_CAPTURE_PHYSICAL`]
+        /// bits a Set would report now, plus [`SLOTINFO_FLAG_PENDING`] while
+        /// `published` is still short of the requested mask.
+        pub flags: u32,
     }
+
+    /// v11 `AH_SLOTINFO_FLAG_PENDING`.
+    pub const SLOTINFO_FLAG_PENDING: u32 = 0x100;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct QuerySlotsReply {
@@ -850,6 +1058,7 @@ pub mod wire {
                 // value is compared, never re-sent.
                 peer_key: String::from_utf8_lossy(&key[..end]).into_owned(),
                 published: get_u32(b, at + 8 + PEERKEY_BUF),
+                flags: get_u32(b, at + 12 + PEERKEY_BUF),
             });
         }
         Some(QuerySlotsReply {
@@ -865,6 +1074,12 @@ pub mod wire {
     pub const EVENT_IOSTATE: u32 = 2;
     pub const EVENT_SLOT: u32 = 3;
     pub const EVENT_FORMAT: u32 = 4;
+    /// v11: a bound slot's published mask changed outside a Set (a child
+    /// devnode started, or went away). For this kind `flags` carries
+    /// `BINDREPLY_FLAG_*` (NOT `EVFLAG_*`) and `scalar_q16` carries the
+    /// `PUB_*` mask now published (NOT a volume); see
+    /// [`ControlEvent::as_published_reply`].
+    pub const EVENT_PUBLISHED: u32 = 5;
 
     pub const FORMAT_OFFER: u32 = 1;
     pub const FORMAT_QUIESCED: u32 = 2;
@@ -915,6 +1130,25 @@ pub mod wire {
         /// kernel code must not touch the FPU without saving its state.
         pub fn scalar(&self) -> f32 {
             (self.scalar_q16 as f32 / 65536.0).clamp(0.0, 1.0)
+        }
+
+        /// v11: an [`EVENT_PUBLISHED`] read as the reply a Set would give now,
+        /// so one consumer handles both. `None` for every other kind and for a
+        /// mask outside [`PUB_BOTH`].
+        pub fn as_published_reply(&self) -> Option<BindReply> {
+            if self.kind != EVENT_PUBLISHED || self.scalar_q16 & !PUB_BOTH != 0 {
+                return None;
+            }
+            Some(BindReply {
+                status: STATUS_OK,
+                slot: self.slot,
+                generation: self.generation,
+                state: self.state,
+                stage: STAGE_NONE,
+                nt_status: 0,
+                published: self.scalar_q16,
+                flags: self.flags,
+            })
         }
     }
 
@@ -4311,6 +4545,10 @@ pub mod session {
         /// `peer_display` is the prefix-free disambiguated peer label
         /// ("WIN-30" or "WIN-30 (Offline)"). The `AudioHub – ` prefix is added
         /// by `wire::encode_bind_request`; adding it here as well would double it.
+        ///
+        /// `presentation` is the v10 per-direction look; the driver installs a
+        /// physical one only for a session that passed its image-path check
+        /// and reports what it did in the reply flags.
         pub fn bind_set(
             &self,
             slot: u8,
@@ -4318,8 +4556,9 @@ pub mod session {
             peer_display: &str,
             online: bool,
             directions: u8,
+            presentation: &[wire::WirePresentation; 2],
         ) -> Result<wire::BindReply> {
-            self.bind_set_with(slot, peer_key, peer_display, online, directions, 0)
+            self.bind_set_full(slot, peer_key, peer_display, online, directions, presentation, 0)
         }
 
         /// `debug_flags` is `wire::BINDFLAG_FAIL_*` / `SKIP_ROLLBACK`, and is
@@ -4336,6 +4575,54 @@ pub mod session {
             directions: u8,
             debug_flags: u32,
         ) -> Result<wire::BindReply> {
+            self.bind_set_full(
+                slot,
+                peer_key,
+                peer_display,
+                online,
+                directions,
+                &Default::default(),
+                debug_flags,
+            )
+        }
+
+        /// `probe winvad set` only: an explicit presentation and direction
+        /// mask together with debug flags, so the driver's child-devnode and
+        /// presentation paths can be exercised without a paired peer. The
+        /// daemon never calls this.
+        #[allow(clippy::too_many_arguments)]
+        pub fn bind_set_probe(
+            &self,
+            slot: u8,
+            peer_key: &str,
+            peer_display: &str,
+            online: bool,
+            directions: u8,
+            presentation: &[wire::WirePresentation; 2],
+            debug_flags: u32,
+        ) -> Result<wire::BindReply> {
+            self.bind_set_full(
+                slot,
+                peer_key,
+                peer_display,
+                online,
+                directions,
+                presentation,
+                debug_flags,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn bind_set_full(
+            &self,
+            slot: u8,
+            peer_key: &str,
+            peer_display: &str,
+            online: bool,
+            directions: u8,
+            presentation: &[wire::WirePresentation; 2],
+            debug_flags: u32,
+        ) -> Result<wire::BindReply> {
             let wanted = wire::bind_direction_flags(directions);
             let req = wire::BindRequest {
                 op: wire::BIND_SET,
@@ -4349,6 +4636,7 @@ pub mod session {
                 session_id: self.session_id,
                 peer_key,
                 peer_display,
+                presentation: presentation.clone(),
             };
             let buf = wire::encode_bind_request(&req)
                 .map_err(|e| anyhow!("cannot encode bind set: {e:?}"))?;
@@ -4377,6 +4665,7 @@ pub mod session {
                 session_id: self.session_id,
                 peer_key: "0000000000000000",
                 peer_display: "",
+                presentation: Default::default(),
             };
             let buf = wire::encode_bind_request(&req)
                 .map_err(|e| anyhow!("cannot encode bind clear: {e:?}"))?;
@@ -4513,15 +4802,18 @@ mod tests {
     fn struct_sizes_match_the_header() {
         assert_eq!(HELLO_REQUEST_BYTES, 16);
         assert_eq!(HELLO_REPLY_BYTES, 40);
-        assert_eq!(BIND_REQUEST_BYTES, 320);
+        // v10: 320 bytes of v9 fields, then two 680-byte AH_PRESENTATIONs.
+        assert_eq!(BIND_REQUEST_BYTES, 1680);
+        assert_eq!(PRESENTATION_OFFSET, 320);
+        assert_eq!(PRESENTATION_BYTES, 680);
         // v2: +stage +nt_status +published +reserved
         // v3: that trailing reserved word became `flags` — same SIZE, new
         //     meaning, which is precisely why it needed a version and not an
         //     append: the bytes cannot tell the two apart.
         assert_eq!(BIND_REPLY_BYTES, 32);
-        // v2: +published
-        assert_eq!(SLOT_INFO_BYTES, 52);
-        assert_eq!(QUERY_SLOTS_REPLY_BYTES, 848);
+        // v2: +published; v11: +flags
+        assert_eq!(SLOT_INFO_BYTES, 56);
+        assert_eq!(QUERY_SLOTS_REPLY_BYTES, 912);
         assert_eq!(FORMAT_PAYLOAD_BYTES, 40);
         assert_eq!(FORMAT_REPLY_BYTES, 8);
         assert_eq!(CONTROL_EVENT_BYTES, 64);
@@ -4533,8 +4825,8 @@ mod tests {
         assert_eq!(NOTIFY_REPLY_BYTES, 8);
         // v8 adds the format payload and extends the control event.
         assert_eq!(
-            PROTOCOL_VERSION, 9,
-            "safe PCM32 microphone quantization is mandatory in driver protocol 9"
+            PROTOCOL_VERSION, 11,
+            "v11 publishes through per-unit child devnodes and may answer PENDING"
         );
     }
 
@@ -4743,6 +5035,7 @@ mod tests {
             session_id: 0x5555_5555_6666_6666,
             peer_key: "0123456789abcdef",
             peer_display: "AB",
+            presentation: Default::default(),
         };
         let b = encode_bind_request(&req).expect("valid");
 
@@ -4773,6 +5066,275 @@ mod tests {
             b[end..320].iter().all(|&c| c == 0),
             "display must be NUL terminated and padded"
         );
+        // v10: a default (virtual) presentation is all zero.
+        assert!(
+            b[320..].iter().all(|&c| c == 0),
+            "a virtual presentation must encode as zeros"
+        );
+    }
+
+    fn physical(ff: u32, key: &str, desc: &str) -> WirePresentation {
+        WirePresentation {
+            klass: PRES_PHYSICAL,
+            form_factor: ff,
+            group: 0x0102_0304,
+            key: key.to_string(),
+            endpoint_desc: desc.to_string(),
+            adapter_name: "Realtek(R) Audio \u{2013} WIN-30".to_string(),
+            manufacturer: "Realtek".to_string(),
+        }
+    }
+
+    fn utf16_at(b: &[u8], at: usize, units: usize) -> String {
+        let v: Vec<u16> = b[at..at + units * 2]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let end = v.iter().position(|&u| u == 0).expect("terminated");
+        assert!(v[end..].iter().all(|&u| u == 0), "padded with NUL");
+        String::from_utf16(&v[..end]).unwrap()
+    }
+
+    /// Every `AH_PRESENTATION` field at the offset the header asserts
+    /// (`klass` 0, `form_factor` 4, `group` 8, `reserved` 12, `key` 16,
+    /// `endpoint_desc` 40, `adapter_name` 296, `manufacturer` 552), for both
+    /// array entries.
+    #[test]
+    fn presentation_fields_land_at_the_header_offsets() {
+        let req = BindRequest {
+            op: BIND_SET,
+            slot: 3,
+            flags: BINDFLAG_ONLINE | BINDFLAG_WANT_RENDER | BINDFLAG_WANT_CAPTURE,
+            generation: 0,
+            session_id: 7,
+            peer_key: "0123456789abcdef",
+            peer_display: "WIN-30",
+            presentation: [
+                physical(FF_HEADPHONES, "a1b2c3d4", "Headphones (WIN-30)"),
+                physical(FF_HEADSET, "0f0e0d0c", "Headset Microphone (WIN-30)"),
+            ],
+        };
+        let b = encode_bind_request(&req).expect("valid");
+        assert_eq!(b.len(), 1680);
+        for (i, (ff, key, desc)) in [
+            (FF_HEADPHONES, "a1b2c3d4", "Headphones (WIN-30)"),
+            (FF_HEADSET, "0f0e0d0c", "Headset Microphone (WIN-30)"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = 320 + i * 680;
+            assert_eq!(&b[at..at + 4], &PRES_PHYSICAL.to_le_bytes(), "klass {i}");
+            assert_eq!(&b[at + 4..at + 8], &ff.to_le_bytes(), "form_factor {i}");
+            assert_eq!(&b[at + 8..at + 12], &0x0102_0304u32.to_le_bytes(), "group {i}");
+            assert_eq!(&b[at + 12..at + 16], &[0u8; 4], "reserved {i}");
+            assert_eq!(&b[at + 16..at + 24], key.as_bytes(), "key {i}");
+            assert!(b[at + 24..at + 40].iter().all(|&c| c == 0), "key padding {i}");
+            assert_eq!(utf16_at(&b, at + 40, 128), desc);
+            assert_eq!(utf16_at(&b, at + 296, 128), "Realtek(R) Audio \u{2013} WIN-30");
+            assert_eq!(utf16_at(&b, at + 552, 64), "Realtek");
+        }
+    }
+
+    /// The driver's whitelist, enforced before anything reaches it: a
+    /// request the driver would refuse is a policy bug and is never sent.
+    #[test]
+    fn encode_refuses_a_presentation_the_driver_would_refuse() {
+        let base = |presentation: [WirePresentation; 2]| BindRequest {
+            op: BIND_SET,
+            slot: 0,
+            flags: BINDFLAG_WANT_RENDER | BINDFLAG_WANT_CAPTURE,
+            generation: 0,
+            session_id: 1,
+            peer_key: "0123456789abcdef",
+            peer_display: "x",
+            presentation,
+        };
+        let v = WirePresentation::default();
+        let ok = [physical(FF_SPEAKERS, "a1b2c3d4", "Speakers (x)"), physical(FF_MICROPHONE, "a1b2c3d4", "Mic (x)")];
+        assert!(encode_bind_request(&base(ok.clone())).is_ok());
+        let bad_cases = [
+            // a digital display is presented as speakers by the policy, never sent as 9
+            [physical(9, "a1b2c3d4", "TV (x)"), v.clone()],
+            // a microphone form factor on the render side
+            [physical(FF_MICROPHONE, "a1b2c3d4", "x"), v.clone()],
+            // headphones on the capture side
+            [v.clone(), physical(FF_HEADPHONES, "a1b2c3d4", "x")],
+            // keys: uppercase, short, long, path separator
+            [physical(FF_SPEAKERS, "A1B2C3D4", "x"), v.clone()],
+            [physical(FF_SPEAKERS, "a1b2c3", "x"), v.clone()],
+            [physical(FF_SPEAKERS, "a1b2c3d4e", "x"), v.clone()],
+            [physical(FF_SPEAKERS, "a1b2\\3d4", "x"), v.clone()],
+            // no endpoint name, or a control character in it
+            [physical(FF_SPEAKERS, "a1b2c3d4", ""), v.clone()],
+            [physical(FF_SPEAKERS, "a1b2c3d4", "a\nb"), v.clone()],
+            // virtual with a key, unknown class
+            [WirePresentation { key: "a1b2c3d4".into(), ..v.clone() }, v.clone()],
+            [WirePresentation { klass: 2, ..v.clone() }, v.clone()],
+        ];
+        for (i, p) in bad_cases.into_iter().enumerate() {
+            assert_eq!(
+                encode_bind_request(&base(p)),
+                Err(BindEncodeError::BadPresentation),
+                "case {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn bind_reply_reports_the_presentation_per_direction() {
+        let mut b = [0u8; BIND_REPLY_BYTES];
+        b[28..32].copy_from_slice(
+            &(BINDREPLY_FLAG_RENDER_PHYSICAL | BINDREPLY_FLAG_PRESENTATION_FORCED_VIRTUAL)
+                .to_le_bytes(),
+        );
+        let r = decode_bind_reply(&b).unwrap();
+        assert!(r.presents_physical(PRES_RENDER));
+        assert!(!r.presents_physical(PRES_CAPTURE));
+        assert!(r.presentation_forced_virtual());
+        assert!(!r.endpoint_name_fell_back());
+        let bits = [
+            BINDREPLY_FLAG_NAME_FALLBACK,
+            BINDREPLY_FLAG_PRESENTATION_FORCED_VIRTUAL,
+            BINDREPLY_FLAG_RENDER_PHYSICAL,
+            BINDREPLY_FLAG_CAPTURE_PHYSICAL,
+        ];
+        let mut seen = 0u32;
+        for bit in bits {
+            assert_eq!(bit.count_ones(), 1);
+            assert_eq!(seen & bit, 0, "reply flags overlap");
+            seen |= bit;
+        }
+        assert_eq!(CAP_PRESENTATION.count_ones(), 1);
+        assert_eq!(CAP_PRESENTATION & (CAP_DATAPLANE | CAP_VOLUME | CAP_LATENCY
+            | CAP_STREAMSTAT | CAP_VOLUMEEVENT | CAP_OUTPUT_FORMATS), 0);
+        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(stage_label(STAGE_PRESENTATION), "validating the requested presentation");
+    }
+
+    // -- v11 child devnodes ------------------------------------------------
+
+    fn reply(status: u32, published: u32) -> BindReply {
+        BindReply {
+            status,
+            slot: 0,
+            generation: 9,
+            state: SLOT_BOUND,
+            stage: STAGE_NONE,
+            nt_status: 0,
+            published,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn v11_constants_match_the_header() {
+        assert_eq!(STATUS_PENDING, 9);
+        assert_eq!(STAGE_ENUMERATE, 10);
+        assert_eq!(EVENT_PUBLISHED, 5);
+        assert_eq!(CAP_CHILD_DEVNODES, 0x80);
+        assert_eq!(SLOTINFO_FLAG_PENDING, 0x100);
+        assert_eq!(CAP_CHILD_DEVNODES.count_ones(), 1);
+        assert_eq!(
+            CAP_CHILD_DEVNODES
+                & (CAP_DATAPLANE | CAP_VOLUME | CAP_LATENCY | CAP_STREAMSTAT
+                    | CAP_VOLUMEEVENT | CAP_OUTPUT_FORMATS | CAP_PRESENTATION),
+            0
+        );
+        // The slot-info pending bit must not collide with any reply flag it
+        // is reported alongside.
+        assert_eq!(
+            SLOTINFO_FLAG_PENDING
+                & (BINDREPLY_FLAG_NAME_FALLBACK | BINDREPLY_FLAG_PRESENTATION_FORCED_VIRTUAL
+                    | BINDREPLY_FLAG_RENDER_PHYSICAL | BINDREPLY_FLAG_CAPTURE_PHYSICAL),
+            0
+        );
+        assert_ne!(status_label(STATUS_PENDING), "unknown status");
+        assert_ne!(stage_label(STAGE_ENUMERATE), "unknown stage");
+    }
+
+    #[test]
+    fn a_pending_set_is_accepted_only_toward_a_subset_of_the_request() {
+        for wanted in [0, PUB_RENDER, PUB_CAPTURE, PUB_BOTH] {
+            for published in [0, PUB_RENDER, PUB_CAPTURE, PUB_BOTH] {
+                let r = reply(STATUS_PENDING, published);
+                let ok = published & !wanted == 0;
+                assert_eq!(
+                    bind_outcome(Some(wanted), &r).is_ok(),
+                    ok,
+                    "pending published 0x{published:x} toward 0x{wanted:x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pending_reply_never_completes_a_clear() {
+        assert!(bind_outcome(None, &reply(STATUS_PENDING, 0)).is_err());
+    }
+
+    #[test]
+    fn partial_stays_a_failure_even_with_a_subset_published() {
+        assert!(bind_outcome(Some(PUB_BOTH), &reply(STATUS_PARTIAL, PUB_RENDER)).is_err());
+    }
+
+    #[test]
+    fn query_slots_reads_the_v11_flags_at_offset_52() {
+        let mut b = [0u8; QUERY_SLOTS_REPLY_BYTES];
+        let at = 16 + 2 * SLOT_INFO_BYTES;
+        b[at..at + 4].copy_from_slice(&SLOT_BOUND.to_le_bytes());
+        b[at + 48..at + 52].copy_from_slice(&PUB_RENDER.to_le_bytes());
+        b[at + 52..at + 56]
+            .copy_from_slice(&(SLOTINFO_FLAG_PENDING | BINDREPLY_FLAG_RENDER_PHYSICAL).to_le_bytes());
+        let r = decode_query_slots_reply(&b).expect("well formed");
+        assert_eq!(r.slots[2].published, PUB_RENDER);
+        assert_eq!(r.slots[2].flags, SLOTINFO_FLAG_PENDING | BINDREPLY_FLAG_RENDER_PHYSICAL);
+        assert_eq!(r.slots[3].flags, 0);
+    }
+
+    #[test]
+    fn a_published_event_reads_as_the_reply_a_set_would_give() {
+        let mut b = [0u8; CONTROL_EVENT_BYTES];
+        b[0..4].copy_from_slice(&EVENT_PUBLISHED.to_le_bytes());
+        b[4..8].copy_from_slice(&4u32.to_le_bytes());
+        b[8..12].copy_from_slice(&33u32.to_le_bytes());
+        b[12..16].copy_from_slice(&BINDREPLY_FLAG_CAPTURE_PHYSICAL.to_le_bytes());
+        b[16..20].copy_from_slice(&PUB_BOTH.to_le_bytes());
+        b[20..24].copy_from_slice(&SLOT_BOUND.to_le_bytes());
+        let ev = decode_control_event(&b).expect("well formed");
+        let r = ev.as_published_reply().expect("a published event");
+        assert_eq!(r.slot, 4);
+        assert_eq!(r.generation, 33);
+        assert_eq!(r.state, SLOT_BOUND);
+        assert_eq!(r.published, PUB_BOTH);
+        assert!(r.presents_physical(PRES_CAPTURE));
+        assert!(!r.presents_physical(PRES_RENDER));
+
+        // Any other kind, or a mask outside the two directions, is not one.
+        b[16..20].copy_from_slice(&0x4u32.to_le_bytes());
+        assert!(decode_control_event(&b).unwrap().as_published_reply().is_none());
+        b[0..4].copy_from_slice(&EVENT_VOLUME.to_le_bytes());
+        b[16..20].copy_from_slice(&PUB_BOTH.to_le_bytes());
+        assert!(decode_control_event(&b).unwrap().as_published_reply().is_none());
+    }
+
+    #[test]
+    fn a_physical_presentation_needs_an_adapter_name_and_no_text_may_carry_controls() {
+        let mut p = physical(FF_HEADPHONES, "0a1b2c3d", "Headphones");
+        p.adapter_name = String::new();
+        assert!(!p.valid_for(true), "v11 physical needs the child devnode name");
+        p.adapter_name = "Realtek(R) Audio \u{2013} WIN-30".into();
+        assert!(p.valid_for(true));
+        p.adapter_name = "bad\nname".into();
+        assert!(!p.valid_for(true));
+
+        let mut v = WirePresentation::default();
+        assert!(v.valid_for(true), "a bare virtual presentation is still valid");
+        v.endpoint_desc = "Speakers".into();
+        v.adapter_name = "AudioHub \u{2013} WIN-30".into();
+        assert!(v.valid_for(true));
+        v.adapter_name = "tab\there".into();
+        assert!(!v.valid_for(true));
     }
 
     #[test]
@@ -4818,6 +5380,10 @@ mod tests {
             decode_query_slots_reply(&[0u8; 784]).is_none(),
             "the v1 size is refused"
         );
+        assert!(
+            decode_query_slots_reply(&[0u8; 848]).is_none(),
+            "the v10 size (no per-slot flags) is refused"
+        );
         assert!(decode_control_event(&[0u8; CONTROL_EVENT_BYTES - 1]).is_none());
     }
 
@@ -4852,6 +5418,7 @@ mod tests {
             session_id: 1,
             peer_key: "not-hex",
             peer_display: "x",
+            presentation: Default::default(),
         };
         assert_eq!(encode_bind_request(&bad), Err(BindEncodeError::BadPeerKey));
     }
@@ -4866,6 +5433,7 @@ mod tests {
             session_id: 1,
             peer_key: "0123456789abcdef",
             peer_display: "x",
+            presentation: Default::default(),
         };
         assert_eq!(
             encode_bind_request(&bad),
@@ -4967,6 +5535,7 @@ mod tests {
             session_id: 9,
             peer_key: "0123456789abcdef",
             peer_display,
+            presentation: Default::default(),
         };
         let b = encode_bind_request(&req).unwrap();
         let units: Vec<u16> = b[64..320]

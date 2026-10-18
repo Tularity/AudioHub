@@ -1,6 +1,6 @@
 [package]
 name = "audiohub-vad-helper"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "Elevated, fixed-purpose installer for AudioHubVad on Windows"
@@ -23,6 +23,7 @@ windows-sys = { version = "0.52", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Registry",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Services",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

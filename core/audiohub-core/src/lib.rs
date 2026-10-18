@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod devcal;
+pub mod device_facts;
 pub mod devlat;
 pub mod dsp;
 pub mod fixed_rate;

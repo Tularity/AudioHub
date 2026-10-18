@@ -135,6 +135,11 @@ print -ru2 -- "[audiohub] frontend: $(ls "$APP_DIR/ui/assets" | tr '\n' ' ')"
 
 # ------------------------------------------------------------- 1) daemon + CLI
 step "1/5 build daemon and internal CLI"
+# A release build must not contain test-only features: audiohubd's build.rs
+# fails the build if `facts-injection` is enabled under this flag.
+if [[ "${AUDIOHUB_RELEASE:-0}" == 1 ]]; then
+  export AUDIOHUB_RELEASE_BUILD=1
+fi
 cargo build --release --manifest-path "$ROOT/Cargo.toml" -p audiohub-cli -p audiohubd
 CLI="$ROOT/target/release/audiohub"
 DAEMON="$ROOT/target/release/audiohubd"

@@ -1,6 +1,6 @@
 [package]
 name = "audiohub-core"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 
 [dependencies]
@@ -9,6 +9,16 @@ cpal = "0.16"
 ringbuf = "0.4"
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
+# device_facts.rs: one-way device token (design §2(c)). Already in the lock via
+# audiohub-net; no new crate enters the graph.
+sha2 = "0.10"
+
+[features]
+# Test-only fake audio backend for the regression suite (src/audio_fake.rs).
+# Off by default and never enabled by any normal dependency edge; it refuses to
+# compile without debug assertions, so a release-profile build cannot carry it.
+# Build it with `--profile regress`.
+fake-audio = []
 
 # 只在测试里用：latency.rs 要断言几个 serde 取值与前端字面量逐字一致
 # （规格 §3.5 的 IPC 契约）。不进运行时依赖图。

@@ -164,6 +164,12 @@ impl OutputCalibration {
 /// `SafetyOffset` / `kAudioStreamPropertyLatency` **免开流可读**
 /// （`devlat::imp` 已经在读），根本不需要标定。给 mac 也开一条流是纯风险。
 pub fn calibrate_output(target: DevTarget<'_>) -> Result<OutputCalibration, String> {
+    // The fake backend models no calibration: answer like a platform that
+    // does not need one, without opening anything.
+    #[cfg(feature = "fake-audio")]
+    if crate::audio::fake::active().is_some() {
+        return Err("fake audio backend: output calibration is not modeled".to_string());
+    }
     imp::calibrate_output(target)
 }
 

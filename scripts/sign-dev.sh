@@ -34,6 +34,14 @@ sh "$(dirname "$0")/guard-running-image.sh" \
 
 IDENTITY="${AUDIOHUB_SIGN_IDENTITY:-AudioHub Dev}"
 
+DAEMON_ENTITLEMENTS="$(mktemp -t audiohub-daemon-entitlements)"
+trap 'rm -f "$DAEMON_ENTITLEMENTS"' EXIT
+cat >"$DAEMON_ENTITLEMENTS" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>
+PLIST
+
 # Two explicit calls, no data structure: an associative array silently iterated
 # one pair, and a "path|id" split then hit zsh's `|` pattern alternation. Both
 # failures were quiet — the CLI just stayed ad-hoc signed while the script
@@ -46,6 +54,9 @@ sign_one() {  # $1 binary  $2 pinned identifier
   local args=(--force --sign "$IDENTITY" --identifier "$2")
   if [[ "$IDENTITY" == Developer\ ID\ Application:* ]]; then
     args+=(--options runtime --timestamp)
+    # Under the hardened runtime the daemon may only open the microphone when
+    # it carries the audio-input entitlement; without it capture is silent.
+    [[ "$2" == com.audiohub.daemon ]] && args+=(--entitlements "$DAEMON_ENTITLEMENTS")
   fi
   codesign "${args[@]}" "$1"
   print -- "[audiohub] signed $(basename "$1") as $2"

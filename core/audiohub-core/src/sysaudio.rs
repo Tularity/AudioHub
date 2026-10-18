@@ -681,6 +681,8 @@ pub fn resolve_backend(id: &str) -> Result<BackendInfo> {
 }
 
 pub fn start_backend(id: &str) -> Result<Box<dyn SysAudioCapture>> {
+    #[cfg(feature = "fake-audio")]
+    crate::audio::fake::refuse_native("sysaudio::start_backend")?;
     let b = resolve_backend(id)?;
     // Declined first, and worded differently on purpose: "not available" invites
     // a retry (upgrade the OS, grant consent, plug the device back in) and a
@@ -823,6 +825,10 @@ fn slug(name: &str) -> String {
 /// config (let alone a stream) is what triggers TCC on macOS.
 fn device_names() -> Vec<String> {
     use cpal::traits::{DeviceTrait, HostTrait};
+    #[cfg(feature = "fake-audio")]
+    if let Some(world) = crate::audio::fake::active() {
+        return world.all_device_names();
+    }
     let mut out: Vec<String> = Vec::new();
     let host = cpal::default_host();
     if let Ok(devs) = host.devices() {

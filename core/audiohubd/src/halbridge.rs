@@ -234,6 +234,33 @@ const NOTIFY_PING: u32 = 2;
 /// ceiling would be the only thing between that and CoreAudio.
 const NOTIFY_LATENCY: u32 = 3;
 
+/// `kAudioHubMsg_Presentation` (daemon -> driver), docs/physical-presentation-
+/// 1.0.2-design.md §6.4. ADDITIVE like `CTL_LATENCY_STATE`: a driver that
+/// predates it destroys the message unread and never answers, and a device the
+/// driver never acknowledged is presented as Virtual — which is what that
+/// driver shows anyway. No protocol bump, so HAL4 stays HAL4.
+const MSG_PRESENTATION: i32 = 0x4148_0007;
+/// `kAudioHubCtl_PresentationState` (driver -> daemon): what the property
+/// getters of one endpoint return NOW. `scalar_bits` = the effective transport
+/// fourcc (plain `u32`), `flags` = `PRESENT_FLAG_*` | `FLAG_IS_INPUT` |
+/// reason << 8 | (request id & 0xFFFF) << 16. Sent in answer to every
+/// presentation request and, unprompted, whenever the driver replays a slot's
+/// state after a Bind — which is how this side learns that the driver
+/// understands presentation before it has asked for anything.
+const CTL_PRESENTATION_STATE: u32 = 7;
+const PRESENT_VIRTUAL: u32 = 0;
+const PRESENT_PHYSICAL: u32 = 1;
+const PRESENT_FLAG_PHYSICAL: u32 = 0x01;
+const PRESENT_FLAG_FORCED: u32 = 0x10;
+const PRESENT_FLAG_CALLER_VERIFIED: u32 = 0x20;
+const PRESENT_REASON_SHIFT: u32 = 8;
+const PRESENT_REASON_MASK: u32 = 0xFF;
+const PRESENT_REQUEST_SHIFT: u32 = 16;
+/// `kAudioHubPresentModelPrefix`: every presented ModelUID is this plus a
+/// `[A-Za-z0-9]{1,31}` suffix, so no presentation can claim another vendor's
+/// model namespace. The driver re-imposes the prefix itself.
+pub const HAL_PRESENT_MODEL_PREFIX: &str = "AudioHub_Remote_";
+
 /// `hal.status_reason` for "a driver is installed but speaks another protocol".
 /// The UI keys its third driver state off this exact string (spec-m5b §6.2),
 /// and regression N14 asserts it, so it is a contract rather than a message.
@@ -1147,6 +1174,70 @@ impl HalBridge {
         self.shared.notify_latency(at, generation, frames);
     }
 
+    /// Ask the driver to present `at` as `want` (design §6.4). IDEMPOTENT and
+    /// closed-loop: the same wish for the same generation is a no-op; a new one
+    /// is sent at once and re-sent by the bridge's service thread until the
+    /// driver acknowledges it (or, after a bounded number of tries, the driver
+    /// is declared not to support presentation). Read the outcome with
+    /// [`HalBridge::presentation_status`] — never assume the wish took effect.
+    ///
+    /// `generation` is the slot's current stamp (the one the last `BindState`
+    /// reported). A wish for any other generation is never sent, so a stale
+    /// wish cannot outlive the binding it was made for; re-state it for the new
+    /// generation. The wish survives a driver re-attach and is re-sent once the
+    /// re-Bind re-establishes the same generation.
+    ///
+    /// Errors are policy bugs (a descriptor the driver would refuse anyway);
+    /// nothing is stored for them and the endpoint keeps its previous wish.
+    pub fn set_presentation(
+        &self,
+        at: HalEndpoint,
+        generation: u32,
+        want: HalPresentation,
+    ) -> std::result::Result<(), HalPresentError> {
+        if let HalPresentation::Physical(d) = &want {
+            d.validate(at.input)?;
+        }
+        let Some(cell) = self.shared.present_state(at) else {
+            return Ok(());
+        };
+        #[cfg(feature = "facts-injection")]
+        if lk(cell).test_override {
+            return Ok(());
+        }
+        let changed = lk(cell).set_want(generation, want);
+        if changed {
+            // First attempt right now instead of on the next service pass.
+            self.shared.drive_presentations(Instant::now());
+        }
+        Ok(())
+    }
+
+    /// The driver's account of `at`'s presentation for the slot's current
+    /// generation. `effective` is the only field a safety decision may use.
+    pub fn presentation_status(&self, at: HalEndpoint) -> HalPresentationStatus {
+        let generation = self
+            .shared
+            .slots
+            .get(at.slot as usize)
+            .map(|s| s.generation.load(Ordering::Acquire))
+            .unwrap_or(0);
+        match self.shared.present_state(at) {
+            Some(cell) => lk(cell).status(generation, cfg!(any(target_os = "macos", windows))),
+            None => PresentState::default().status(0, false),
+        }
+    }
+
+    /// WINDOWS: `(protocol, caps, client_check)` of the attached control
+    /// session, or `None` while there is none. What the presentation policy
+    /// may rely on: a physical look needs protocol 10 with
+    /// `CAP_PRESENTATION`, and the driver forces every physical request
+    /// virtual below `CLIENT_CHECK_IMAGEPATH`.
+    #[cfg(windows)]
+    pub fn windows_presentation_capability(&self) -> Option<(u32, u32, u32)> {
+        platform::windows_presentation_capability(&self.shared)
+    }
+
     /// Binds `slot` to a peer, or re-states an existing binding. IDEMPOTENT by
     /// contract: same slot + same UIDs is a no-op on the driver's side except
     /// for the state replay, so this is what a daemon restart sends instead of
@@ -1196,6 +1287,12 @@ pub struct HalBindRequest {
     /// bit0 of the wire `flags`: the peer is connected. Logging only on the
     /// driver's side — a device is published either way (plan §7.3).
     pub online: bool,
+    /// WINDOWS (VAD10), `[render, capture]`: the presentation each direction
+    /// should install with, carried on the Bind itself (design §7.3). The
+    /// driver reports what it actually installed in the reply, recorded as the
+    /// endpoint's presentation acknowledgement. macOS ignores it and carries
+    /// presentation on its own message (`set_presentation`).
+    pub win_presentation: [crate::halbridge_win::wire::WirePresentation; 2],
 }
 
 impl Drop for HalBridge {
@@ -1204,6 +1301,801 @@ impl Drop for HalBridge {
         if let Some(j) = lk(&self.thread).take() {
             let _ = j.join();
         }
+    }
+}
+
+// ---------------------------------------------------------------- presentation (1.0.2)
+//
+// docs/physical-presentation-1.0.2-design.md §6.4. The consumer policy
+// (`presentation.rs`) decides WHAT an endpoint should look like; this module
+// only carries that decision to the driver and reports, closed-loop, what the
+// driver actually did. The driver has the last word: it refuses Physical from
+// any session whose caller fails its strong check (signed com.audiohub.daemon,
+// pinned certificate, installed path, hardened runtime) and from any descriptor
+// outside its whitelist, and says so in the ack.
+//
+// THE SAFE READING. `HalPresentationStatus::effective` is Virtual unless the
+// driver has acknowledged Physical for the slot's CURRENT generation. Every
+// caller that has to be conservative — above all the "presentation mismatch ->
+// mute the microphone" gate (design §5.4) — reads that, never what it asked
+// for.
+
+/// The `kAudioDeviceTransportType*` fourccs a Physical presentation may carry:
+/// exactly the driver's whitelist (`AudioHub_PresentTransportAllowed`). Virtual
+/// is not among them (it is not physical), nor are Bluetooth/BLE, AirPlay,
+/// aggregates, AVB or Continuity — the policy maps a sharer's Bluetooth device
+/// to USB before it gets here (design §6.2, `presentation::mac::transport_for`).
+pub const HAL_PRESENT_TRANSPORTS: [u32; 7] = [
+    u32::from_be_bytes(*b"bltn"),
+    u32::from_be_bytes(*b"usb "),
+    u32::from_be_bytes(*b"hdmi"),
+    u32::from_be_bytes(*b"dprt"),
+    u32::from_be_bytes(*b"thun"),
+    u32::from_be_bytes(*b"pci "),
+    u32::from_be_bytes(*b"1394"),
+];
+/// `kAudioStreamTerminalType*` the driver accepts on an OUTPUT stream (0, the
+/// direction's default, is always accepted).
+pub const HAL_PRESENT_OUTPUT_TERMINALS: [u32; 7] = [
+    u32::from_be_bytes(*b"spkr"),
+    u32::from_be_bytes(*b"hdph"),
+    u32::from_be_bytes(*b"rspk"),
+    u32::from_be_bytes(*b"line"),
+    u32::from_be_bytes(*b"spdf"),
+    u32::from_be_bytes(*b"hdmi"),
+    u32::from_be_bytes(*b"dprt"),
+];
+/// ... and on an INPUT stream.
+pub const HAL_PRESENT_INPUT_TERMINALS: [u32; 5] = [
+    u32::from_be_bytes(*b"micr"),
+    u32::from_be_bytes(*b"hmic"),
+    u32::from_be_bytes(*b"rmic"),
+    u32::from_be_bytes(*b"line"),
+    u32::from_be_bytes(*b"spdf"),
+];
+/// `kAudioHubPresentIcon_Count`: icon kinds are 0 (none) ..= 4 (microphone).
+/// Carried and validated so the wire does not change when icon resources ship;
+/// the 1.0.2 driver publishes no device icon.
+pub const HAL_PRESENT_ICON_COUNT: u32 = 5;
+
+/// Everything a Physical presentation of one endpoint says — field for field
+/// `presentation::mac::MacPresentationTarget` plus the name, so the policy can
+/// fill it straight from that target. DeviceUID, latency, safety offset and
+/// clock domain are not here: they never change with the presentation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HalPhysicalDescriptor {
+    /// A [`HAL_PRESENT_TRANSPORTS`] fourcc.
+    pub transport: u32,
+    /// `kAudioObjectPropertyName` while Physical, or EMPTY to keep whatever
+    /// the Bind/rename path set (the current policy carries
+    /// `presentation::mac_device_name` there, so it passes ""). A non-empty
+    /// name is shown only while the driver presents Physical; while Virtual —
+    /// including a refused request — the device shows the Bind name. At most
+    /// 127 bytes of UTF-8; longer is cut on a character boundary.
+    pub name: String,
+    /// `kAudioObjectPropertyManufacturer` while Physical; at most 63 bytes, cut
+    /// the same way. "Unknown" when the sharer has none (policy Q10).
+    pub manufacturer: String,
+    /// The complete ModelUID: [`HAL_PRESENT_MODEL_PREFIX`] + `[A-Za-z0-9]{1,31}`
+    /// (`MacPresentationTarget::model_uid`).
+    pub model_uid: String,
+    /// A terminal type allowed for the direction, or 0 for its default.
+    pub terminal_type: u32,
+    /// Both directions of a slot name each other in RelatedDevices (one browser
+    /// groupId) only when both are Physical with the SAME non-zero group. 0 =
+    /// never related to the sibling.
+    pub related_group: u32,
+    /// `kAudioHubPresentIcon_*`, below [`HAL_PRESENT_ICON_COUNT`].
+    pub icon_kind: u32,
+}
+
+/// Why a descriptor cannot be sent. Every case is a policy bug, not something
+/// to retry; the endpoint keeps its previous wish and the caller should present
+/// Virtual.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HalPresentError {
+    BadTransport,
+    TerminalNotForDirection,
+    BadIcon,
+    EmptyManufacturer,
+    ControlCharacter,
+    BadModelUid,
+}
+
+impl HalPhysicalDescriptor {
+    /// The same rules the driver applies (`AudioHub_EvaluatePresentation`), so a
+    /// descriptor that passes here is refused there only for what this side
+    /// cannot know: the caller check, or a direction the driver does not list.
+    pub fn validate(&self, input: bool) -> std::result::Result<(), HalPresentError> {
+        if !HAL_PRESENT_TRANSPORTS.contains(&self.transport) {
+            return Err(HalPresentError::BadTransport);
+        }
+        let terminals: &[u32] = if input {
+            &HAL_PRESENT_INPUT_TERMINALS
+        } else {
+            &HAL_PRESENT_OUTPUT_TERMINALS
+        };
+        if self.terminal_type != 0 && !terminals.contains(&self.terminal_type) {
+            return Err(HalPresentError::TerminalNotForDirection);
+        }
+        if self.icon_kind >= HAL_PRESENT_ICON_COUNT {
+            return Err(HalPresentError::BadIcon);
+        }
+        if self.manufacturer.is_empty() {
+            return Err(HalPresentError::EmptyManufacturer);
+        }
+        let control = |s: &str| s.chars().any(|c| c.is_control());
+        if control(&self.name) || control(&self.manufacturer) {
+            return Err(HalPresentError::ControlCharacter);
+        }
+        let suffix = self
+            .model_uid
+            .strip_prefix(HAL_PRESENT_MODEL_PREFIX)
+            .ok_or(HalPresentError::BadModelUid)?;
+        if suffix.is_empty() || suffix.len() > 31 || !suffix.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(HalPresentError::BadModelUid);
+        }
+        Ok(())
+    }
+}
+
+/// What the daemon asks one endpoint to look like.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum HalPresentation {
+    Virtual,
+    Physical(HalPhysicalDescriptor),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HalPresentClass {
+    Virtual,
+    Physical,
+}
+
+/// `kAudioHubPresentReason_*`: why an endpoint is Virtual. The `Caller*` values
+/// come from the driver's strong caller check of this daemon's session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HalPresentReason {
+    None,
+    CallerNoSession,
+    CallerNoCode,
+    CallerPinUnavailable,
+    CallerRequirement,
+    CallerPath,
+    CallerNotRuntime,
+    CallerInvalid,
+    BadClass,
+    BadTransport,
+    BadTerminal,
+    BadIcon,
+    BadName,
+    BadManufacturer,
+    BadModel,
+    NotListed,
+    Unknown(u8),
+}
+
+impl HalPresentReason {
+    fn from_wire(v: u32) -> HalPresentReason {
+        use HalPresentReason::*;
+        match v {
+            0 => None,
+            1 => CallerNoSession,
+            2 => CallerNoCode,
+            3 => CallerPinUnavailable,
+            4 => CallerRequirement,
+            5 => CallerPath,
+            6 => CallerNotRuntime,
+            7 => CallerInvalid,
+            16 => BadClass,
+            17 => BadTransport,
+            18 => BadTerminal,
+            19 => BadIcon,
+            20 => BadName,
+            21 => BadManufacturer,
+            22 => BadModel,
+            23 => NotListed,
+            other => Unknown(other as u8),
+        }
+    }
+
+    /// Stable machine-readable label (logs, IPC `reason`, regression evidence).
+    pub fn label(self) -> &'static str {
+        use HalPresentReason::*;
+        match self {
+            None => "none",
+            CallerNoSession => "caller_no_session",
+            CallerNoCode => "caller_no_code",
+            CallerPinUnavailable => "caller_pin_unavailable",
+            CallerRequirement => "caller_requirement",
+            CallerPath => "caller_path",
+            CallerNotRuntime => "caller_not_runtime",
+            CallerInvalid => "caller_invalid",
+            BadClass => "bad_class",
+            BadTransport => "bad_transport",
+            BadTerminal => "bad_terminal",
+            BadIcon => "bad_icon",
+            BadName => "bad_name",
+            BadManufacturer => "bad_manufacturer",
+            BadModel => "bad_model",
+            NotListed => "not_listed",
+            Unknown(_) => "unknown",
+        }
+    }
+}
+
+/// One `kAudioHubCtl_PresentationState`, decoded. Generation-filtered on
+/// receipt like every other slot message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HalPresentationAck {
+    pub generation: u32,
+    pub class: HalPresentClass,
+    /// The effective `kAudioDevicePropertyTransportType` ('virt' while Virtual).
+    pub transport_fourcc: u32,
+    /// Physical was asked for and the driver imposed Virtual ("forced_virtual").
+    pub forced_virtual: bool,
+    pub reason: HalPresentReason,
+    /// The driver's strong caller check passed for this daemon's session.
+    pub caller_verified: bool,
+    /// Low 16 bits of the request this answers; 0 = an unprompted replay.
+    pub request_id: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalPresentSupport {
+    /// Nothing heard yet for the slot's current generation.
+    Unknown,
+    /// The driver acknowledged a presentation (or replayed one) for it.
+    Supported,
+    /// No platform support, or the driver never answered a bounded number of
+    /// requests: it predates presentation. Treat as Virtual.
+    Unsupported,
+}
+
+/// The closed-loop account of one endpoint, for the policy and for status.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HalPresentationStatus {
+    /// What this daemon last asked for, for the slot's current generation.
+    pub wanted: Option<HalPresentClass>,
+    /// What the endpoint ACTUALLY presents, conservatively: Physical only when
+    /// acknowledged Physical for the current generation.
+    pub effective: HalPresentClass,
+    /// The latest request has been answered.
+    pub converged: bool,
+    pub support: HalPresentSupport,
+    /// The last acknowledgement for the current generation, if any.
+    pub ack: Option<HalPresentationAck>,
+}
+
+/// Re-send an unanswered request after this long...
+const PRESENT_RESEND_AFTER: Duration = Duration::from_millis(500);
+/// ...at most this many times before concluding the driver predates
+/// presentation (about four seconds of silence, while every Bind it answered
+/// in the meantime proves it is alive).
+const PRESENT_MAX_TRIES: u32 = 8;
+
+/// Per-endpoint presentation loop state, behind a mutex in [`SlotShared`].
+#[derive(Debug, Default)]
+struct PresentState {
+    /// (generation, request) this daemon wants, None = never asked.
+    want: Option<(u32, HalPresentation)>,
+    /// Request id of `want` (non-zero, wraps skipping 0).
+    request_id: u16,
+    next_id: u16,
+    tries: u32,
+    last_sent: Option<Instant>,
+    gave_up: bool,
+    ack: Option<HalPresentationAck>,
+    /// TEST BUILDS ONLY: the wish came from the regression's presentation
+    /// file and the policy's `set_presentation` must not overwrite it.
+    #[cfg(feature = "facts-injection")]
+    test_override: bool,
+}
+
+impl PresentState {
+    fn allocate_id(&mut self) -> u16 {
+        self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.next_id = 1;
+        }
+        self.next_id
+    }
+
+    /// Forget every acknowledgement and send attempt (the session or the slot's
+    /// generation changed); the wish itself survives so the loop re-sends it.
+    fn reset_delivery(&mut self) {
+        self.ack = None;
+        self.tries = 0;
+        self.last_sent = None;
+        self.gave_up = false;
+    }
+
+    fn set_want(&mut self, generation: u32, want: HalPresentation) -> bool {
+        if matches!(&self.want, Some((g, w)) if *g == generation && *w == want) {
+            return false;
+        }
+        self.want = Some((generation, want));
+        self.request_id = self.allocate_id();
+        self.tries = 0;
+        self.last_sent = None;
+        self.gave_up = false;
+        true
+    }
+
+    fn converged(&self, generation: u32) -> bool {
+        matches!((&self.want, self.ack), (Some((g, _)), Some(a))
+            if *g == generation && a.generation == generation && a.request_id == self.request_id)
+    }
+
+    /// Whether the loop should (re-)send now. Advances the attempt bookkeeping
+    /// when it says yes.
+    fn due(&mut self, generation: u32, now: Instant) -> bool {
+        let Some((g, _)) = &self.want else {
+            return false;
+        };
+        if *g != generation || generation == 0 || self.converged(generation) {
+            return false;
+        }
+        if let Some(t) = self.last_sent {
+            if now.duration_since(t) < PRESENT_RESEND_AFTER {
+                return false;
+            }
+        }
+        if self.tries >= PRESENT_MAX_TRIES {
+            self.gave_up = true;
+            return false;
+        }
+        self.tries += 1;
+        self.last_sent = Some(now);
+        true
+    }
+
+    fn status(&self, generation: u32, platform_supported: bool) -> HalPresentationStatus {
+        let ack = self.ack.filter(|a| generation != 0 && a.generation == generation);
+        let wanted = match &self.want {
+            Some((g, w)) if *g == generation => Some(match w {
+                HalPresentation::Virtual => HalPresentClass::Virtual,
+                HalPresentation::Physical(_) => HalPresentClass::Physical,
+            }),
+            _ => None,
+        };
+        let support = if !platform_supported {
+            HalPresentSupport::Unsupported
+        } else if ack.is_some() {
+            HalPresentSupport::Supported
+        } else if self.gave_up {
+            HalPresentSupport::Unsupported
+        } else {
+            HalPresentSupport::Unknown
+        };
+        HalPresentationStatus {
+            wanted,
+            effective: match ack {
+                Some(a) if a.class == HalPresentClass::Physical => HalPresentClass::Physical,
+                _ => HalPresentClass::Virtual,
+            },
+            converged: self.converged(generation),
+            support,
+            ack,
+        }
+    }
+}
+
+/// Decodes one `CTL_PRESENTATION_STATE` control payload.
+fn decode_presentation_ack(generation: u32, scalar_bits: u32, flags: u32) -> HalPresentationAck {
+    let physical = flags & PRESENT_FLAG_PHYSICAL != 0;
+    HalPresentationAck {
+        generation,
+        class: if physical {
+            HalPresentClass::Physical
+        } else {
+            HalPresentClass::Virtual
+        },
+        transport_fourcc: scalar_bits,
+        forced_virtual: flags & PRESENT_FLAG_FORCED != 0,
+        reason: HalPresentReason::from_wire((flags >> PRESENT_REASON_SHIFT) & PRESENT_REASON_MASK),
+        caller_verified: flags & PRESENT_FLAG_CALLER_VERIFIED != 0,
+        request_id: (flags >> PRESENT_REQUEST_SHIFT) as u16,
+    }
+}
+
+/// TEST BUILDS ONLY (`facts-injection`; build.rs refuses that feature in a
+/// release build, so none of this exists in a shipped daemon). Lets the VM
+/// regression drive presentations end to end through the REAL installed daemon
+/// and driver — the strong caller check can only be exercised by the genuine
+/// signed, installed binary — before the consumer policy is wired in.
+///
+/// Reads `<config dir>/test-hal-presentation.json` whenever its mtime changes:
+///
+/// ```text
+/// [{"slot": 0, "input": false, "class": "physical", "transport": "usb ",
+///   "name": "...", "manufacturer": "...", "model_uid": "AudioHub_Remote_Headphones",
+///   "terminal": "hdph", "related_group": 1, "icon": 2},
+///  {"slot": 0, "input": true, "class": "virtual"}]
+/// ```
+///
+/// and keeps `<config dir>/test-hal-presentation.status.json` current with the
+/// [`HalPresentationStatus`] of every endpoint that has a wish or an ack.
+/// An endpoint listed in the file is owned by it: the policy's
+/// `set_presentation` leaves it alone until the file changes or is removed.
+#[cfg(all(target_os = "macos", feature = "facts-injection"))]
+mod test_presentation {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    struct Seen {
+        mtime: Option<SystemTime>,
+        status: String,
+    }
+
+    static SEEN: Mutex<Seen> = Mutex::new(Seen {
+        mtime: None,
+        status: String::new(),
+    });
+
+    fn dir() -> PathBuf {
+        audiohub_net::identity::LocalIdentity::config_dir()
+    }
+
+    fn parse_entry(v: &serde_json::Value) -> Option<(HalEndpoint, HalPresentation)> {
+        let slot = v.get("slot")?.as_u64()? as u8;
+        let input = v.get("input")?.as_bool()?;
+        let at = HalEndpoint { slot, input };
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        if s("class") != "physical" {
+            return Some((at, HalPresentation::Virtual));
+        }
+        // Fourccs as 4-character strings ("usb ", "hdph"), exactly what the
+        // driver receives; validation happens below, as in production.
+        let fourcc = |k: &str| -> u32 {
+            let v = s(k);
+            let b = v.as_bytes();
+            if b.len() == 4 {
+                u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+            } else {
+                0
+            }
+        };
+        Some((
+            at,
+            HalPresentation::Physical(HalPhysicalDescriptor {
+                transport: fourcc("transport"),
+                name: s("name"),
+                manufacturer: s("manufacturer"),
+                model_uid: s("model_uid"),
+                terminal_type: fourcc("terminal"),
+                related_group: v.get("related_group").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+                icon_kind: v.get("icon").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+            }),
+        ))
+    }
+
+    fn status_json(shared: &Shared) -> String {
+        let mut out = Vec::new();
+        for slot in 0..HAL_MAX_SLOTS {
+            let generation = shared.slots[slot].generation.load(Ordering::Acquire);
+            for input in [false, true] {
+                let st = lk(&shared.slots[slot].present[input as usize]).status(generation, true);
+                if st.wanted.is_none() && st.ack.is_none() {
+                    continue;
+                }
+                let ack = st.ack.map(|a| {
+                    serde_json::json!({
+                        "generation": a.generation,
+                        "class": format!("{:?}", a.class).to_lowercase(),
+                        "transport": fourcc_str(a.transport_fourcc),
+                        "forced_virtual": a.forced_virtual,
+                        "reason": a.reason.label(),
+                        "caller_verified": a.caller_verified,
+                        "request_id": a.request_id,
+                    })
+                });
+                out.push(serde_json::json!({
+                    "slot": slot,
+                    "input": input,
+                    "generation": generation,
+                    "wanted": st.wanted.map(|c| format!("{c:?}").to_lowercase()),
+                    "effective": format!("{:?}", st.effective).to_lowercase(),
+                    "converged": st.converged,
+                    "support": format!("{:?}", st.support).to_lowercase(),
+                    "ack": ack,
+                }));
+            }
+        }
+        serde_json::Value::Array(out).to_string()
+    }
+
+    pub(super) fn poll(shared: &Shared) {
+        let path = dir().join("test-hal-presentation.json");
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let mut seen = lk(&SEEN);
+        if mtime != seen.mtime {
+            seen.mtime = mtime;
+            // Every change of the file (removal included) hands all endpoints
+            // back to the policy first; the entries below take them again.
+            for s in shared.slots.iter() {
+                for p in s.present.iter() {
+                    lk(p).test_override = false;
+                }
+            }
+            match std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            {
+                Some(serde_json::Value::Array(entries)) => {
+                    for e in &entries {
+                        let Some((at, want)) = parse_entry(e) else {
+                            dlog!("[audiohubd] hal TEST presentation: unparsable entry {e}");
+                            continue;
+                        };
+                        let Some(cell) = shared.present_state(at) else {
+                            continue;
+                        };
+                        let generation =
+                            shared.slots[at.slot as usize].generation.load(Ordering::Acquire);
+                        if let HalPresentation::Physical(d) = &want {
+                            if let Err(err) = d.validate(at.input) {
+                                dlog!("[audiohubd] hal TEST presentation: {err:?} for {at:?}");
+                                continue;
+                            }
+                        }
+                        let mut st = lk(cell);
+                        st.set_want(generation, want);
+                        st.test_override = true;
+                        dlog!("[audiohubd] hal TEST presentation: wish set for {at:?} gen {generation}");
+                    }
+                }
+                _ if mtime.is_none() => {} // removed: the policy owns every endpoint again
+                _ => dlog!("[audiohubd] hal TEST presentation: {} is not a JSON array", path.display()),
+            }
+        }
+        let status = status_json(shared);
+        if status != seen.status {
+            let tmp = dir().join("test-hal-presentation.status.json.tmp");
+            if std::fs::write(&tmp, &status).is_ok()
+                && std::fs::rename(&tmp, dir().join("test-hal-presentation.status.json")).is_ok()
+            {
+                seen.status = status;
+            }
+        }
+    }
+}
+
+/// Renders a fourcc for logs and evidence ("usb ", "virt").
+pub fn fourcc_str(v: u32) -> String {
+    v.to_be_bytes()
+        .iter()
+        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '?' })
+        .collect()
+}
+
+impl Shared {
+    fn present_state(&self, at: HalEndpoint) -> Option<&Mutex<PresentState>> {
+        self.slots.get(at.slot as usize).map(|s| &s.present[at.input as usize])
+    }
+
+    /// Every endpoint whose request is due goes out once; called from the
+    /// platform service loop on every pass while a driver is attached.
+    fn drive_presentations(&self, now: Instant) {
+        for slot in 0..HAL_MAX_SLOTS {
+            let generation = self.slots[slot].generation.load(Ordering::Acquire);
+            for input in [false, true] {
+                let at = HalEndpoint {
+                    slot: slot as u8,
+                    input,
+                };
+                let send = {
+                    let mut st = lk(&self.slots[slot].present[input as usize]);
+                    if st.due(generation, now) {
+                        st.want.as_ref().map(|(_, w)| (w.clone(), st.request_id, st.tries))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((want, request_id, tries)) = send {
+                    if tries > 1 {
+                        dlog!(
+                            "[audiohubd] hal: re-sending presentation for slot {slot} {} (try {tries})",
+                            if input { "in" } else { "out" }
+                        );
+                    }
+                    platform::send_presentation(self, at, generation, &want, request_id);
+                }
+            }
+        }
+    }
+
+    /// The session ended: the driver resets every endpoint to Virtual, so
+    /// nothing acknowledged before is true any more.
+    fn reset_presentation_delivery(&self) {
+        for s in self.slots.iter() {
+            for p in s.present.iter() {
+                lk(p).reset_delivery();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    fn headphones() -> HalPhysicalDescriptor {
+        HalPhysicalDescriptor {
+            transport: u32::from_be_bytes(*b"usb "),
+            name: "Headphones (WIN-30)".into(),
+            manufacturer: "Unknown".into(),
+            model_uid: "AudioHub_Remote_Headphones".into(),
+            terminal_type: u32::from_be_bytes(*b"hdph"),
+            related_group: 0,
+            icon_kind: 2,
+        }
+    }
+
+    fn ack(generation: u32, physical: bool, request_id: u16) -> HalPresentationAck {
+        decode_presentation_ack(
+            generation,
+            if physical { u32::from_be_bytes(*b"usb ") } else { u32::from_be_bytes(*b"virt") },
+            (if physical { PRESENT_FLAG_PHYSICAL } else { 0 })
+                | PRESENT_FLAG_CALLER_VERIFIED
+                | ((request_id as u32) << PRESENT_REQUEST_SHIFT),
+        )
+    }
+
+    #[test]
+    fn the_wire_constants_mirror_the_header() {
+        assert_eq!(MSG_PRESENTATION, 0x4148_0007);
+        assert_eq!(CTL_PRESENTATION_STATE, 7);
+        // kAudioDeviceTransportType* / kAudioStreamTerminalType* values.
+        assert_eq!(HAL_PRESENT_TRANSPORTS[1], 0x7573_6220, "usb ");
+        assert_eq!(HAL_PRESENT_TRANSPORTS[0], 0x626c_746e, "bltn");
+        assert_eq!(HAL_PRESENT_TRANSPORTS[6], 0x3133_3934, "1394");
+        assert!(!HAL_PRESENT_TRANSPORTS.contains(&u32::from_be_bytes(*b"virt")));
+        assert!(!HAL_PRESENT_TRANSPORTS.contains(&u32::from_be_bytes(*b"blue")));
+        assert!(!HAL_PRESENT_TRANSPORTS.contains(&u32::from_be_bytes(*b"airp")));
+        assert_eq!(HAL_PRESENT_OUTPUT_TERMINALS[0], 0x7370_6b72, "spkr");
+        assert_eq!(HAL_PRESENT_INPUT_TERMINALS[1], 0x686d_6963, "hmic");
+        assert_eq!(HAL_PRESENT_ICON_COUNT, 5);
+        assert_eq!(fourcc_str(u32::from_be_bytes(*b"usb ")), "usb ");
+    }
+
+    #[test]
+    fn an_ack_decodes_every_field() {
+        let flags = PRESENT_FLAG_FORCED
+            | FLAG_IS_INPUT
+            | (6 << PRESENT_REASON_SHIFT)
+            | (0xABCD << PRESENT_REQUEST_SHIFT);
+        let a = decode_presentation_ack(4, u32::from_be_bytes(*b"virt"), flags);
+        assert_eq!(a.class, HalPresentClass::Virtual);
+        assert!(a.forced_virtual && !a.caller_verified);
+        assert_eq!(a.reason, HalPresentReason::CallerNotRuntime);
+        assert_eq!(a.reason.label(), "caller_not_runtime");
+        assert_eq!(a.request_id, 0xABCD);
+        assert_eq!(a.generation, 4);
+        assert_eq!(HalPresentReason::from_wire(99), HalPresentReason::Unknown(99));
+    }
+
+    #[test]
+    fn validation_matches_the_driver_rules() {
+        assert_eq!(headphones().validate(false), Ok(()));
+        assert_eq!(headphones().validate(true), Err(HalPresentError::TerminalNotForDirection));
+        let mut d = headphones();
+        d.model_uid = "AudioHub_PeerOutput".into();
+        assert_eq!(d.validate(false), Err(HalPresentError::BadModelUid));
+        d.model_uid = "AudioHub_Remote_Head-phones".into();
+        assert_eq!(d.validate(false), Err(HalPresentError::BadModelUid));
+        d.model_uid = format!("{HAL_PRESENT_MODEL_PREFIX}{}", "A".repeat(32));
+        assert_eq!(d.validate(false), Err(HalPresentError::BadModelUid));
+        let mut d = headphones();
+        d.name = "a\nb".into();
+        assert_eq!(d.validate(false), Err(HalPresentError::ControlCharacter));
+        d.name = String::new();
+        assert_eq!(d.validate(false), Ok(()), "an empty name keeps the Bind name");
+        let mut d = headphones();
+        d.manufacturer = String::new();
+        assert_eq!(d.validate(false), Err(HalPresentError::EmptyManufacturer));
+        let mut d = headphones();
+        d.terminal_type = u32::from_be_bytes(*b"hmic");
+        assert_eq!(d.validate(true), Ok(()));
+        d.terminal_type = 0;
+        assert_eq!(d.validate(true), Ok(()), "0 is the direction's default");
+        d.terminal_type = u32::from_be_bytes(*b"tty_");
+        assert_eq!(d.validate(true), Err(HalPresentError::TerminalNotForDirection));
+        let mut d = headphones();
+        d.transport = u32::from_be_bytes(*b"blue");
+        assert_eq!(d.validate(false), Err(HalPresentError::BadTransport));
+        d.transport = u32::from_be_bytes(*b"virt");
+        assert_eq!(d.validate(false), Err(HalPresentError::BadTransport));
+        let mut d = headphones();
+        d.icon_kind = 5;
+        assert_eq!(d.validate(false), Err(HalPresentError::BadIcon));
+    }
+
+    /// The closed loop: send, re-send, converge, give up, and above all the
+    /// conservative `effective` reading.
+    #[test]
+    fn the_loop_converges_and_reads_conservatively() {
+        let t0 = Instant::now();
+        let mut st = PresentState::default();
+        let s = st.status(5, true);
+        assert_eq!((s.wanted, s.effective, s.support), (None, HalPresentClass::Virtual, HalPresentSupport::Unknown));
+
+        assert!(st.set_want(5, HalPresentation::Physical(headphones())));
+        assert!(!st.set_want(5, HalPresentation::Physical(headphones())), "the same wish is idempotent");
+        let id = st.request_id;
+        assert!(st.due(5, t0), "a new wish is due at once");
+        assert!(!st.due(5, t0 + Duration::from_millis(100)), "and not again before the resend delay");
+        assert!(!st.due(4, t0 + Duration::from_secs(1)), "never for another generation");
+
+        // Asked for Physical, nothing acknowledged yet: still Virtual.
+        let s = st.status(5, true);
+        assert_eq!(s.wanted, Some(HalPresentClass::Physical));
+        assert_eq!(s.effective, HalPresentClass::Virtual);
+        assert!(!s.converged);
+
+        // An unprompted replay (request 0) proves support, not convergence.
+        st.ack = Some(ack(5, false, 0));
+        let s = st.status(5, true);
+        assert_eq!(s.support, HalPresentSupport::Supported);
+        assert!(!s.converged && s.effective == HalPresentClass::Virtual);
+        assert!(st.due(5, t0 + Duration::from_secs(1)), "an unanswered request is re-sent");
+
+        st.ack = Some(ack(5, true, id));
+        let s = st.status(5, true);
+        assert!(s.converged);
+        assert_eq!(s.effective, HalPresentClass::Physical);
+        assert!(s.ack.unwrap().caller_verified);
+        assert!(!st.due(5, t0 + Duration::from_secs(5)), "a converged wish is not re-sent");
+
+        // An ack for another generation says nothing about this one.
+        assert_eq!(st.status(6, true).effective, HalPresentClass::Virtual);
+        assert_eq!(st.status(6, true).wanted, None);
+
+        // Withdrawal: until the driver confirms, the endpoint still counts as
+        // Physical (that is the mismatch window the microphone gate covers).
+        assert!(st.set_want(5, HalPresentation::Virtual));
+        let s = st.status(5, true);
+        assert_eq!(s.wanted, Some(HalPresentClass::Virtual));
+        assert_eq!(s.effective, HalPresentClass::Physical);
+        assert!(!s.converged);
+        st.ack = Some(ack(5, false, st.request_id));
+        assert_eq!(st.status(5, true).effective, HalPresentClass::Virtual);
+
+        // A session end forgets the ack but keeps the wish.
+        st.reset_delivery();
+        assert_eq!(st.status(5, true).wanted, Some(HalPresentClass::Virtual));
+        assert!(st.status(5, true).ack.is_none());
+
+        // Non-macOS: always unsupported, always Virtual.
+        assert_eq!(st.status(5, false).support, HalPresentSupport::Unsupported);
+    }
+
+    #[test]
+    fn a_driver_that_never_answers_is_declared_unsupported() {
+        let t0 = Instant::now();
+        let mut st = PresentState::default();
+        st.set_want(3, HalPresentation::Physical(headphones()));
+        let mut sends = 0;
+        for i in 0..40 {
+            if st.due(3, t0 + PRESENT_RESEND_AFTER * i) {
+                sends += 1;
+            }
+        }
+        assert_eq!(sends, PRESENT_MAX_TRIES);
+        let s = st.status(3, true);
+        assert_eq!(s.support, HalPresentSupport::Unsupported);
+        assert_eq!(s.effective, HalPresentClass::Virtual);
+        // A new wish starts a fresh attempt budget.
+        st.set_want(3, HalPresentation::Virtual);
+        assert!(st.due(3, t0 + PRESENT_RESEND_AFTER * 41));
+        assert_eq!(st.status(3, true).support, HalPresentSupport::Unknown);
+    }
+
+    #[test]
+    fn request_ids_skip_zero() {
+        let mut st = PresentState { next_id: u16::MAX, ..PresentState::default() };
+        assert_eq!(st.allocate_id(), 1, "0 is reserved for unprompted replays");
     }
 }
 
@@ -4482,6 +5374,9 @@ struct SlotShared {
     /// 只在两次读之间**只有生产者动过**时才成立，排空之后那个差值是垃圾，
     /// 喂进 `MaxDrawdown` 递推会把欠载边界永久抬高。
     disc_epoch: AtomicU64,
+
+    /// Physical-presentation loop per endpoint, `[out, in]` (design §6.4).
+    present: [Mutex<PresentState>; 2],
 }
 
 impl SlotShared {
@@ -4521,6 +5416,7 @@ impl SlotShared {
             last_trim_us: AtomicU64::new(0),
             last_trim_frames: AtomicU32::new(0),
             underrun_start_us: AtomicU64::new(0),
+            present: [Mutex::new(PresentState::default()), Mutex::new(PresentState::default())],
         }
     }
 
@@ -4873,6 +5769,43 @@ mod platform {
         reserved: u32,
         seq: u64,
     }
+
+    /// daemon -> driver, `AudioHubPresentationMsg` (design §6.4). Plain, fixed
+    /// size; the receiver terminates the strings itself.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct PresentationMsg {
+        header: MsgHeader,
+        endpoint: u32,
+        generation: u32,
+        session_id: u64,
+        klass: u32,
+        transport: u32,
+        terminal_type: u32,
+        icon_kind: u32,
+        related_group: u32,
+        request_id: u32,
+        name: [u8; 128],
+        manufacturer: [u8; 64],
+        model_suffix: [u8; 32],
+    }
+
+    // Mirrors the presentation _Static_asserts in AudioHubBridge.h one for one.
+    const _: () = {
+        assert!(std::mem::offset_of!(PresentationMsg, endpoint) == 24);
+        assert!(std::mem::offset_of!(PresentationMsg, generation) == 28);
+        assert!(std::mem::offset_of!(PresentationMsg, session_id) == 32);
+        assert!(std::mem::offset_of!(PresentationMsg, klass) == 40);
+        assert!(std::mem::offset_of!(PresentationMsg, transport) == 44);
+        assert!(std::mem::offset_of!(PresentationMsg, terminal_type) == 48);
+        assert!(std::mem::offset_of!(PresentationMsg, icon_kind) == 52);
+        assert!(std::mem::offset_of!(PresentationMsg, related_group) == 56);
+        assert!(std::mem::offset_of!(PresentationMsg, request_id) == 60);
+        assert!(std::mem::offset_of!(PresentationMsg, name) == 64);
+        assert!(std::mem::offset_of!(PresentationMsg, manufacturer) == 192);
+        assert!(std::mem::offset_of!(PresentationMsg, model_suffix) == 256);
+        assert!(std::mem::size_of::<PresentationMsg>() == 288);
+    };
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -5917,6 +6850,9 @@ mod platform {
                     }
                 }
                 expire_silent_driver(&shared, now);
+                shared.drive_presentations(now);
+                #[cfg(feature = "facts-injection")]
+                test_presentation::poll(&shared);
                 continue;
             }
 
@@ -6036,6 +6972,8 @@ mod platform {
             c.format_worker.store(false, Ordering::Release);
             *lk(&c.format) = crate::halformat::State::default();
         }
+        // The driver returns every endpoint to Virtual when a session ends.
+        shared.reset_presentation_delivery();
         *lk(&shared.status_reason) = Some(format!("driver_gone: {why}"));
         shared.push_event(HalControlEvent::Detached);
         dlog!("[audiohubd] HAL driver gone ({why}); virtual devices are on their own");
@@ -6327,6 +7265,11 @@ mod platform {
                 };
                 let prev = c.generation.swap(msg.generation, Ordering::AcqRel);
                 if prev != msg.generation {
+                    // A presentation acknowledged for another generation says
+                    // nothing about this one; any wish for it is re-sent.
+                    for p in c.present.iter() {
+                        lk(p).reset_delivery();
+                    }
                     shared.rings.pause_spk(slot);
                     c.output_format.store(0, Ordering::Release);
                     c.format_worker.store(false, Ordering::Release);
@@ -6346,7 +7289,7 @@ mod platform {
                     published: directions_from_bind_flags(msg.flags),
                 });
             }
-            CTL_VOLUME | CTL_IO_STATE | CTL_LATENCY_STATE => {
+            CTL_VOLUME | CTL_IO_STATE | CTL_LATENCY_STATE | CTL_PRESENTATION_STATE => {
                 let Some(at) = HalEndpoint::from_wire(msg.endpoint) else {
                     return;
                 };
@@ -6393,6 +7336,24 @@ mod platform {
                             frames: msg.scalar_bits,
                             pending: msg.flags & FLAG_LATENCY_PENDING != 0,
                         });
+                    }
+                    // Kept in the endpoint's loop state rather than queued as an
+                    // event: the policy reads it as a level (what the getters
+                    // say now), and a stale queued edge would be wrong.
+                    // `scalar_bits` is a plain fourcc, never float bits.
+                    CTL_PRESENTATION_STATE => {
+                        let ack = decode_presentation_ack(msg.generation, msg.scalar_bits, msg.flags);
+                        if ack.forced_virtual {
+                            dlog!(
+                                "[audiohubd] hal: slot {} {} presented as virtual: driver refused physical ({})",
+                                at.slot,
+                                if at.input { "in" } else { "out" },
+                                ack.reason.label()
+                            );
+                        }
+                        if let Some(cell) = shared.present_state(at) {
+                            lk(cell).ack = Some(ack);
+                        }
                     }
                     _ => {
                         shared.push_event(HalControlEvent::IoState {
@@ -6612,6 +7573,91 @@ mod platform {
         )
     }
 
+    /// Builds the wire form of one presentation request. Pure, so the layout
+    /// and the encoding are testable without a driver.
+    fn presentation_msg(
+        at: HalEndpoint,
+        generation: u32,
+        session_id: u64,
+        want: &HalPresentation,
+        request_id: u16,
+    ) -> PresentationMsg {
+        let mut msg = PresentationMsg {
+            header: MsgHeader::default(),
+            endpoint: at.to_wire(),
+            generation,
+            session_id,
+            klass: PRESENT_VIRTUAL,
+            transport: u32::from_be_bytes(*b"virt"),
+            terminal_type: 0,
+            icon_kind: 0,
+            related_group: 0,
+            request_id: request_id as u32,
+            name: [0; 128],
+            manufacturer: [0; 64],
+            model_suffix: [0; 32],
+        };
+        if let HalPresentation::Physical(d) = want {
+            msg.klass = PRESENT_PHYSICAL;
+            msg.transport = d.transport;
+            msg.terminal_type = d.terminal_type;
+            msg.icon_kind = d.icon_kind;
+            msg.related_group = d.related_group;
+            msg.name = fixed_cstr(&d.name);
+            msg.manufacturer = fixed_cstr(&d.manufacturer);
+            msg.model_suffix =
+                fixed_cstr(d.model_uid.strip_prefix(HAL_PRESENT_MODEL_PREFIX).unwrap_or(""));
+        }
+        msg
+    }
+
+    /// Fire and forget; the answer is a `CTL_PRESENTATION_STATE`. A full queue
+    /// or a dead port simply leaves the request unacknowledged and the loop
+    /// re-sends it; only a dead port ends the session.
+    pub fn send_presentation(
+        shared: &Shared,
+        at: HalEndpoint,
+        generation: u32,
+        want: &HalPresentation,
+        request_id: u16,
+    ) {
+        let g = lk(&shared.driver_port);
+        if *g == MACH_PORT_NULL {
+            return;
+        }
+        let port = *g;
+        let mut msg = presentation_msg(
+            at,
+            generation,
+            shared.session_id.load(Ordering::Relaxed),
+            want,
+            request_id,
+        );
+        msg.header = MsgHeader {
+            bits: msgh_bits(MACH_MSG_TYPE_COPY_SEND, 0),
+            size: std::mem::size_of::<PresentationMsg>() as u32,
+            remote: port,
+            local: MACH_PORT_NULL,
+            voucher: MACH_PORT_NULL,
+            id: MSG_PRESENTATION,
+        };
+        let kr = unsafe {
+            mach_msg(
+                &mut msg.header,
+                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                std::mem::size_of::<PresentationMsg>() as u32,
+                0,
+                MACH_PORT_NULL,
+                SEND_TIMEOUT_MS,
+                MACH_PORT_NULL,
+            )
+        };
+        drop(g);
+        if kr != MACH_MSG_SUCCESS && kr != MACH_SEND_TIMED_OUT {
+            disconnect_port(shared, port, "presentation found its port dead");
+        }
+    }
+
     pub fn send_bind_clear(shared: &Shared, slot: u8, generation: u32) -> bool {
         send_bind(
             shared,
@@ -6638,6 +7684,56 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The bytes a presentation request puts on the wire, at the offsets
+        /// AudioHubBridge.h asserts (the const asserts pin the offsets; this
+        /// pins what is written into them).
+        #[test]
+        fn presentation_request_encodes_the_driver_contract() {
+            let want = HalPresentation::Physical(HalPhysicalDescriptor {
+                transport: u32::from_be_bytes(*b"usb "),
+                name: "Jabra Evolve2 65 (WIN-30)".into(),
+                manufacturer: "GN Audio A/S".into(),
+                model_uid: "AudioHub_Remote_Headset".into(),
+                terminal_type: u32::from_be_bytes(*b"hmic"),
+                related_group: 7,
+                icon_kind: 3,
+            });
+            let msg = presentation_msg(HalEndpoint::mic(3), 42, 99, &want, 0xBEEF);
+            let raw: [u8; 288] = unsafe { std::mem::transmute(msg) };
+            let u32_at = |o: usize| u32::from_ne_bytes(raw[o..o + 4].try_into().unwrap());
+            assert_eq!(u32_at(24), 7, "endpoint = slot*2 + 1");
+            assert_eq!(u32_at(28), 42);
+            assert_eq!(u64::from_ne_bytes(raw[32..40].try_into().unwrap()), 99);
+            assert_eq!(u32_at(40), PRESENT_PHYSICAL);
+            assert_eq!(u32_at(44), u32::from_be_bytes(*b"usb "));
+            assert_eq!(u32_at(48), u32::from_be_bytes(*b"hmic"));
+            assert_eq!(u32_at(52), 3, "kAudioHubPresentIcon_Headset");
+            assert_eq!(u32_at(56), 7);
+            assert_eq!(u32_at(60), 0xBEEF);
+            assert_eq!(&raw[64..64 + 25], b"Jabra Evolve2 65 (WIN-30)");
+            assert_eq!(raw[64 + 25], 0);
+            assert_eq!(&raw[192..192 + 12], b"GN Audio A/S");
+            assert_eq!(&raw[256..256 + 8], b"Headset\0", "only the suffix travels; the driver owns the prefix");
+
+            let virt = presentation_msg(HalEndpoint::out(0), 1, 2, &HalPresentation::Virtual, 5);
+            assert_eq!(virt.klass, PRESENT_VIRTUAL);
+            assert_eq!(virt.transport, u32::from_be_bytes(*b"virt"));
+            assert!(virt.name.iter().all(|&b| b == 0) && virt.model_suffix.iter().all(|&b| b == 0));
+
+            // A name longer than the field is cut on a character boundary with
+            // the terminator kept, never as invalid UTF-8.
+            let long = HalPresentation::Physical(HalPhysicalDescriptor {
+                name: "é".repeat(100),
+                ..match want {
+                    HalPresentation::Physical(d) => d,
+                    HalPresentation::Virtual => unreachable!(),
+                }
+            });
+            let m = presentation_msg(HalEndpoint::out(0), 1, 2, &long, 5);
+            let end = m.name.iter().position(|&b| b == 0).unwrap();
+            assert!(end <= 127 && std::str::from_utf8(&m.name[..end]).is_ok());
+        }
 
         /// Stands in for the driver: creates a ring the way AudioHubBridge.c's
         /// `bridge_ring_create` does — a MAP_MEM_NAMED_CREATE object, mapped
@@ -9952,6 +11048,17 @@ mod platform {
         false
     }
 
+    /// Physical presentation is macOS-only in this bridge (Windows Phase 1 has
+    /// its own VAD10 path, design §7); status reports `Unsupported` here.
+    pub fn send_presentation(
+        _shared: &Shared,
+        _at: HalEndpoint,
+        _generation: u32,
+        _want: &HalPresentation,
+        _request_id: u16,
+    ) {
+    }
+
     // ------------------------------------------------------------- windows
 
     #[cfg(windows)]
@@ -10085,7 +11192,7 @@ mod platform {
             // visible rather than assumed.
             dlog!(
                 "[audiohubd] hal: the driver is enforcing client_check={check} (ACL only). \
-                 Set AudioHubDaemonImage in the device software key to pin the daemon's \
+                 Set AudioHubDaemonImage in the root devnode's hardware key to pin the daemon's \
                  image path."
             );
         }
@@ -10292,6 +11399,10 @@ mod platform {
             }
             return None;
         }
+        if ev.kind == wire::EVENT_PUBLISHED {
+            handle_published_event(shared, ev);
+            return None;
+        }
         let slot = u8::try_from(ev.slot).ok()?;
         if slot as usize >= HAL_MAX_SLOTS {
             return None;
@@ -10484,20 +11595,86 @@ mod platform {
         // by leaving it out — and the result was every endpoint labelled with
         // a bare host name. There is deliberately nothing at this call site
         // left to get wrong.
-        bind_call(shared, req.slot, Some(req.directions), |s| {
+        let ok = bind_call(shared, req.slot, Some(req.directions), |s| {
             s.bind_set(
                 req.slot,
                 &req.peer_key,
                 &req.display,
                 req.online,
                 req.directions,
+                &req.win_presentation,
             )
-        })
+        });
+        if ok {
+            dlog!(
+                "[audiohubd] hal: slot {} presentation sent render={} capture={}",
+                req.slot,
+                if req.win_presentation[0].is_physical() { "physical" } else { "virtual" },
+                if req.win_presentation[1].is_physical() { "physical" } else { "virtual" },
+            );
+        }
+        ok
     }
 
     #[cfg(windows)]
     pub fn send_bind_clear(shared: &Shared, slot: u8, generation: u32) -> bool {
         bind_call(shared, slot, None, |s| s.bind_clear(slot, generation))
+    }
+
+    #[cfg(windows)]
+    pub fn windows_presentation_capability(shared: &Shared) -> Option<(u32, u32, u32)> {
+        lk(&shared.rings.session)
+            .as_ref()
+            .map(|s| (s.driver_protocol, s.caps, s.client_check))
+    }
+
+    /// v10: records what a successful Set says each direction presents as the
+    /// endpoint's presentation acknowledgement, so `presentation_status`
+    /// answers on Windows exactly as it does for the macOS driver's ack. The
+    /// Bind carries the request synchronously, so this ack describes the
+    /// state after the request the caller just sent; `forced_virtual` is the
+    /// driver's caller rule (design §7.6), `caller_verified` the image-path
+    /// level the session runs at.
+    #[cfg(windows)]
+    fn record_windows_presentation(
+        shared: &Shared,
+        slot: u8,
+        reply: &wire::BindReply,
+        caller_verified: bool,
+    ) {
+        let Some(record) = shared.slots.get(slot as usize) else {
+            return;
+        };
+        let forced = reply.presentation_forced_virtual();
+        for (index, cell) in record.present.iter().enumerate() {
+            let physical = reply.presents_physical(index);
+            lk(cell).ack = Some(HalPresentationAck {
+                generation: reply.generation,
+                class: if physical {
+                    HalPresentClass::Physical
+                } else {
+                    HalPresentClass::Virtual
+                },
+                transport_fourcc: 0,
+                forced_virtual: forced && !physical,
+                reason: if forced && !physical {
+                    // The image pin (AudioHubDaemonImage) is what raises the
+                    // driver to CLIENT_CHECK_IMAGEPATH; without it the caller
+                    // check cannot vouch for this session.
+                    HalPresentReason::CallerPinUnavailable
+                } else {
+                    HalPresentReason::None
+                },
+                caller_verified,
+                request_id: 0,
+            });
+        }
+        if forced {
+            dlog!(
+                "[audiohubd] hal: slot {slot}: the driver installed a physical presentation as \
+                 VIRTUAL (caller check below image path)"
+            );
+        }
     }
 
     /// Runs one bind IOCTL and turns the reply into the same `BindState` the
@@ -10524,6 +11701,8 @@ mod platform {
             return false;
         };
         let failed = WindowsSessionIdentity::capture(shared, s);
+        let caller_verified = s.client_check >= wire::CLIENT_CHECK_IMAGEPATH
+            && s.caps & wire::CAP_PRESENTATION != 0;
 
         let reply = match f(s) {
             Ok(r) => r,
@@ -10565,7 +11744,69 @@ mod platform {
             return false;
         }
         *lk(&shared.last_bind_error) = None;
+        if reply.status == wire::STATUS_PENDING {
+            dlog!(
+                "[audiohubd] hal: slot {slot} bind accepted; published {} so far, the rest \
+                 waits for its device to be enumerated",
+                wire::published_label(reply.published)
+            );
+        }
+        apply_bind_reply(shared, slot, &reply, requested.is_some(), caller_verified);
+        true
+    }
 
+    /// v11: a bound slot's published mask moved outside a Set (a child
+    /// devnode started or went away). Applied exactly like the reply a Set
+    /// would give now, so the coordinator sees one shape of truth.
+    ///
+    /// Only for the generation the daemon already holds: an event raised
+    /// before a re-Set must not roll the slot back to its older stamp. A
+    /// newer one that overtook its own Set reply is dropped too; the reply,
+    /// and if needed the coordinator's next re-Set (at most a second later),
+    /// carry the same information.
+    #[cfg(windows)]
+    fn handle_published_event(shared: &Shared, ev: wire::ControlEvent) {
+        let Some(reply) = ev.as_published_reply() else {
+            return;
+        };
+        let Ok(slot) = u8::try_from(ev.slot) else {
+            return;
+        };
+        if slot as usize >= HAL_MAX_SLOTS {
+            return;
+        }
+        let current = shared.slots[slot as usize].generation.load(Ordering::Acquire);
+        if current == 0 || reply.generation != current || reply.state != wire::SLOT_BOUND {
+            dlog!(
+                "[audiohubd] hal: dropping Windows published event for slot {} at generation \
+                 {} (current {})",
+                slot,
+                reply.generation,
+                current
+            );
+            return;
+        }
+        let caller_verified = lk(&shared.rings.session).as_ref().map_or(false, |s| {
+            s.client_check >= wire::CLIENT_CHECK_IMAGEPATH && s.caps & wire::CAP_PRESENTATION != 0
+        });
+        dlog!(
+            "[audiohubd] hal: slot {} now publishes {}",
+            slot,
+            wire::published_label(reply.published)
+        );
+        apply_bind_reply(shared, slot, &reply, true, caller_verified);
+    }
+
+    /// The part of a bind reply (or a published event) that changes the
+    /// bridge's state once the reply has been judged believable.
+    #[cfg(windows)]
+    fn apply_bind_reply(
+        shared: &Shared,
+        slot: u8,
+        reply: &wire::BindReply,
+        set: bool,
+        caller_verified: bool,
+    ) {
         if reply.endpoint_name_fell_back() {
             // Not a failure: the devices are published and usable. But with
             // more than one peer paired it means two speakers with the same
@@ -10599,6 +11840,9 @@ mod platform {
         if previous != reply.generation {
             shared.arm_flush(slot);
         }
+        if set && state == HalSlotState::Bound {
+            record_windows_presentation(shared, slot, reply, caller_verified);
+        }
         if previous != reply.generation || reply.published & wire::PUB_RENDER == 0 {
             shared.rings.pause_spk(slot as usize);
             let record = &shared.slots[slot as usize];
@@ -10621,7 +11865,6 @@ mod platform {
             }),
         });
         *lk(&shared.last_driver_msg) = Some(Instant::now());
-        true
     }
 
     #[cfg(all(test, windows))]

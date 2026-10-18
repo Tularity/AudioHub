@@ -43,10 +43,62 @@ enum TopCmd {
         #[command(subcommand)]
         cmd: ProbeCmd,
     },
+    /// Read-only views of this machine's audio devices.
+    Devices {
+        #[command(subcommand)]
+        cmd: DevicesCmd,
+    },
     #[command(flatten)]
     M3(m3::M3Cmd),
     #[command(flatten)]
     M4(ctl::M4Cmd),
+}
+
+#[derive(Subcommand)]
+enum DevicesCmd {
+    /// Physical/virtual classification of the current default input and
+    /// output (docs/physical-presentation-1.0.2-design.md §3). Property reads
+    /// only: no stream is opened, no permission is requested, no daemon is
+    /// contacted.
+    ///
+    /// Prints one JSON document on stdout. With --raw it is the raw property
+    /// snapshot the classifier consumes — the shape classifier test fixtures
+    /// are recorded in. It contains vendor identity (hardware IDs, devnode
+    /// instance IDs, CoreAudio UIDs) and is LOCAL ONLY: never sent to a peer;
+    /// review it before sharing. Without --raw it is the classification as a
+    /// provider would publish it; its device tokens are computed against a
+    /// fixed CLI-only fingerprint, so they differ from the daemon's.
+    Facts {
+        #[arg(long)]
+        raw: bool,
+    },
+}
+
+/// Fingerprint used for `devices facts` without --raw. Only the opaque
+/// device tokens depend on it.
+const DEVICES_FACTS_CLI_FP: &str = "audiohub-cli-local";
+
+fn cmd_devices(cmd: DevicesCmd, json: bool) -> Result<i32> {
+    match cmd {
+        DevicesCmd::Facts { raw } => {
+            let snapshot = audiohub_core::device_facts::probe_raw();
+            let value = if raw {
+                serde_json::to_value(&snapshot)?
+            } else {
+                serde_json::to_value(audiohub_core::device_facts::classify_raw(
+                    &snapshot,
+                    DEVICES_FACTS_CLI_FP,
+                ))?
+            };
+            let text = if json {
+                serde_json::to_string(&value)?
+            } else {
+                serde_json::to_string_pretty(&value)?
+            };
+            println!("{text}");
+            Ok(0)
+        }
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -215,6 +267,7 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.cmd {
         TopCmd::Probe { cmd } => dispatch(cmd, cli.json),
+        TopCmd::Devices { cmd } => cmd_devices(cmd, cli.json),
         TopCmd::M3(cmd) => m3::dispatch(cmd, cli.json),
         TopCmd::M4(cmd) => ctl::dispatch(cmd, cli.json),
     };

@@ -2692,6 +2692,36 @@ body .sel-pop.up:not(.open) { transform: translateY(4px) scale(.96); }
 .dev-state.pending { color: var(--warn); }
 .device-activity { min-width: 6.5em; text-align: right; }
 .device-activity.syncing { color: var(--text-dim); }
+/* Physical-vs-virtual indicator under a device name (lib/presentation.ts). The
+   dot carries the state: green = shown as the peer's real hardware, dim =
+   AudioHub virtual look, breathing amber = a change is queued. Colour moves with
+   --dur-1 like .tag; the entrance reuses blockIn so a late-arriving verdict does
+   not pop in. */
+.dev-row { flex-wrap: wrap; row-gap: 3px; }
+.dev-presentation {
+  /* A full-width line below the row's controls, indented under the name. */
+  flex: 0 0 100%; box-sizing: border-box; padding-left: 26px;
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  font-size: 11px; line-height: 1.4; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  transition: color var(--dur-1) var(--ease-out);
+  animation: blockIn var(--dur-state) var(--ease-enter);
+}
+.dev-presentation-dot {
+  width: 6px; height: 6px; border-radius: 50%; flex: none;
+  background: var(--text-dim); opacity: 0.55;
+  transition: background var(--dur-1) var(--ease-out), opacity var(--dur-1) var(--ease-out);
+}
+.dev-presentation.physical { color: var(--ok); }
+.dev-presentation.physical .dev-presentation-dot { background: var(--ok-mark, var(--ok)); opacity: 1; }
+.dev-presentation.to-physical,
+.dev-presentation.to-virtual { color: var(--warn); }
+.dev-presentation.to-physical .dev-presentation-dot,
+.dev-presentation.to-virtual .dev-presentation-dot {
+  background: var(--warn-mark, var(--warn)); opacity: 1;
+  /* Opacity pulse (not the glow keyframes): safe in both themes. */
+  animation: breathe-flat 1.6s ease-in-out infinite;
+}
 .dev-note { font-size: 11.5px; color: var(--text-dim); line-height: 1.55; }
 .dev-note.warn { color: var(--warn); }
 /* 原 `.dev-foot`（每张卡片各印一遍的长脚注）已随 DOM 一起删除：那句话现在只在

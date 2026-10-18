@@ -836,21 +836,42 @@ static ENUMERATOR: OnceLock<Enumerator> = OnceLock::new();
 
 fn get_enumerator() -> &'static Enumerator {
     ENUMERATOR.get_or_init(|| {
-        // COM initialization is thread local, but we only need to have COM initialized in the
-        // thread we create the objects in
-        com::com_initialized();
-
-        // building the devices enumerator object
+        // AudioHub patch: the enumerator is cached for the whole process and used from
+        // every thread, so it must not belong to the apartment of whichever thread
+        // happened to call first. Upstream created it in that thread's STA, which the
+        // thread-local `com_initialized()` guard uninitializes when the thread exits.
+        // When that was the process's last COM apartment, COM unloaded every
+        // in-process server DLL regardless of outstanding references, MMDevApi.dll
+        // included, and the next call through the cached pointer read a vtable in
+        // unmapped memory (STATUS_ACCESS_VIOLATION in EnumAudioEndpoints, seen in
+        // multi-test processes on a Windows host without audio endpoints, where no
+        // stream thread keeps COM alive).
+        //
+        // Pin the process MTA for the lifetime of the process (exactly as long as
+        // this static lives; the cookie is intentionally never released) and create
+        // the enumerator in that MTA on a short-lived helper thread, so the object
+        // and the DLL that implements it belong to an apartment that never ends.
         unsafe {
-            let enumerator = Com::CoCreateInstance::<_, Audio::IMMDeviceEnumerator>(
-                &Audio::MMDeviceEnumerator,
-                None,
-                Com::CLSCTX_ALL,
-            )
-            .unwrap();
-
-            Enumerator(enumerator)
+            Com::CoIncrementMTAUsage().expect("cpal: CoIncrementMTAUsage failed");
         }
+        std::thread::Builder::new()
+            .name("cpal_wasapi_enumerator".into())
+            .spawn(|| unsafe {
+                // Joins the MTA pinned above; balanced so only the pin remains.
+                let joined = Com::CoInitializeEx(None, Com::COINIT_MULTITHREADED).is_ok();
+                let enumerator = Com::CoCreateInstance::<_, Audio::IMMDeviceEnumerator>(
+                    &Audio::MMDeviceEnumerator,
+                    None,
+                    Com::CLSCTX_ALL,
+                );
+                if joined {
+                    Com::CoUninitialize();
+                }
+                Enumerator(enumerator.expect("cpal: CoCreateInstance(MMDeviceEnumerator) failed"))
+            })
+            .expect("cpal: failed to spawn the enumerator thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     })
 }
 

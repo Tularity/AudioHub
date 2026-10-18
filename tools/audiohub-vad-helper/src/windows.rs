@@ -16,23 +16,26 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_DevNode_Status, SetupDiCallClassInstaller, SetupDiCreateDevRegKeyW,
     SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList,
     SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstallParamsW,
-    SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW, SetupDiOpenDevRegKey,
-    SetupDiSetDeviceRegistryPropertyW, SetupUninstallOEMInfW, UpdateDriverForPlugAndPlayDevicesW,
-    CR_SUCCESS, DICD_GENERATE_ID, DICS_FLAG_GLOBAL, DIF_REGISTERDEVICE, DIF_REMOVE,
-    DIGCF_ALLCLASSES, DIREG_DEV, DI_NEEDREBOOT, DI_NEEDRESTART, DN_HAS_PROBLEM, DN_STARTED,
-    HDEVINFO, INSTALLFLAG_NONINTERACTIVE, SPDRP_HARDWAREID, SPDRP_SERVICE, SP_DEVINFO_DATA,
-    SP_DEVINSTALL_PARAMS_W,
+    SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW,
+    SetupDiOpenDevRegKey, SetupDiSetDeviceRegistryPropertyW, SetupUninstallOEMInfW,
+    UpdateDriverForPlugAndPlayDevicesW, CR_SUCCESS, DICD_GENERATE_ID, DICS_FLAG_GLOBAL,
+    DIF_REGISTERDEVICE, DIF_REMOVE, DIGCF_ALLCLASSES, DIREG_DEV, DIREG_DRV, DI_NEEDREBOOT,
+    DI_NEEDRESTART, DN_HAS_PROBLEM, DN_STARTED, HDEVINFO, INSTALLFLAG_NONINTERACTIVE,
+    SPDRP_HARDWAREID, SPDRP_SERVICE, SP_DEVINFO_DATA, SP_DEVINSTALL_PARAMS_W,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_FILE_NOT_FOUND, ERROR_INF_IN_USE_BY_DEVICES,
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA, ERROR_NO_MORE_ITEMS,
-    ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, FILETIME, HANDLE,
-    INVALID_HANDLE_VALUE,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
+    ERROR_NO_MORE_ITEMS, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, FILETIME,
+    HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::{
     GetTokenInformation, TokenElevation, SC_HANDLE, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegQueryValueExW, RegSetValueExW, HKEY, KEY_QUERY_VALUE, REG_EXPAND_SZ, REG_SZ,
 };
@@ -43,11 +46,29 @@ use windows_sys::Win32::System::Services::{
 use windows_sys::Win32::System::SystemInformation::{
     GetSystemTimeAsFileTime, GetTickCount64, GetWindowsDirectoryW,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess,
+    WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+};
 
-use crate::{DriverReport, DriverState};
+use crate::{DriverReport, DriverState, RootDriverModel};
 
+/// Root devnode created by this helper. From protocol v11 it binds the
+/// `AUDIOHUBBUS` model: a WDM bus FDO that owns the control device.
 const HARDWARE_ID: &str = r"ROOT\AudioHubVad";
+/// Hardware/device id of every child devnode the v11 bus enumerates, one per
+/// peer presentation unit (`AUDIOHUBVAD_SA`, a PortCls adapter).
+const CHILD_HARDWARE_ID: &str = r"AUDIOHUB\PeerEndpoint";
+/// Device instance paths of those children are `AUDIOHUB\PeerEndpoint\<id>`.
+/// Matched as well so a phantom whose HardwareID value was lost is still swept.
+const CHILD_INSTANCE_PREFIX: &str = r"AUDIOHUB\PeerEndpoint\";
+const BUS_INF_SECTION: &str = "AUDIOHUBBUS";
+const ADAPTER_INF_SECTION: &str = "AUDIOHUBVAD_SA";
+const BUS_DRIVER_DESC: &str = "AudioHub Audio Bus";
+/// DriverDesc of the v10 root adapter ("AudioHub Virtual Audio") and of the
+/// v11 child adapter model ("AudioHub Network Audio").
+const ADAPTER_DRIVER_DESCS: [&str; 2] = ["AudioHub Virtual Audio", "AudioHub Network Audio"];
 const SERVICE_NAME: &str = "AudioHubVad";
 const CONTROL_DOS_NAME: &str = "AudioHubVadCtl";
 const DAEMON_VALUE: &str = "AudioHubDaemonImage";
@@ -222,6 +243,13 @@ struct Snapshot {
     reboot_pending: bool,
     control_link_present: bool,
     problem_codes: Vec<u32>,
+    /// `AUDIOHUB\PeerEndpoint` devnodes, present or phantom.
+    child_devices: u32,
+    present_child_devices: u32,
+    /// Driver-key facts of the first package-bound root devnode.
+    root_inf_section: Option<String>,
+    root_driver_desc: Option<String>,
+    root_inf_path: Option<String>,
 }
 
 impl Snapshot {
@@ -229,8 +257,34 @@ impl Snapshot {
         self.installed_devices != 0 || self.published_packages != 0 || self.service_present
     }
 
+    fn root_model(&self) -> Option<RootDriverModel> {
+        if self.installed_devices == 0 {
+            return None;
+        }
+        classify_root_model(
+            self.root_inf_section.as_deref(),
+            self.root_driver_desc.as_deref(),
+        )
+    }
+
+    fn phantom_child_devices(&self) -> u32 {
+        self.child_devices
+            .saturating_sub(self.present_child_devices)
+    }
+
     fn available(&self) -> bool {
-        self.installed_devices != 0 && self.started_devices != 0 && self.control_link_present
+        // A root still bound to the v10 adapter model publishes a control link
+        // that speaks the previous protocol. It is installed but not usable by
+        // this release; reporting it unavailable is what lets the App offer
+        // the reinstall that migrates it to the v11 bus.
+        self.installed_devices != 0
+            && self.started_devices != 0
+            && self.control_link_present
+            && self.root_model() != Some(RootDriverModel::Adapter)
+    }
+
+    fn bus_model_active(&self, reboot_required: bool) -> bool {
+        !reboot_required && self.available() && self.root_model() == Some(RootDriverModel::Bus)
     }
 
     fn daemon_image_configured(&self) -> bool {
@@ -242,7 +296,8 @@ impl Snapshot {
             DriverState::RebootRequired
         } else if self.available() {
             DriverState::Ready
-        } else if self.package_installed() || self.matching_devices != 0 {
+        } else if self.package_installed() || self.matching_devices != 0 || self.child_devices != 0
+        {
             DriverState::InstalledUnavailable
         } else {
             DriverState::Absent
@@ -453,15 +508,22 @@ fn published_inf_name(name: &OsStr) -> Option<String> {
     Some(lower)
 }
 
-fn is_audiohub_driver_inf(contents: &str) -> bool {
-    // Driver-store INFs are trusted machine files, but still require several
-    // independent package identifiers before their published name is handed
-    // to SetupUninstallOEMInfW. Whitespace and case are insignificant in INF.
-    let compact: String = contents
+/// Whitespace and case are insignificant in the INF directives matched here.
+fn compact_inf(contents: &str) -> String {
+    contents
         .chars()
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
-        .collect();
+        .collect()
+}
+
+fn is_audiohub_driver_inf(contents: &str) -> bool {
+    // Driver-store INFs are trusted machine files, but still require several
+    // independent package identifiers before their published name is handed
+    // to SetupUninstallOEMInfW. This deliberately matches both the v10 package
+    // (root adapter only) and the v11 package (root bus + child adapters) so
+    // uninstall and upgrade evict every previously published AudioHub INF.
+    let compact = compact_inf(contents);
     [
         r"root\audiohubvad",
         "classguid={4d36e96c-e325-11ce-bfc1-08002be10318}",
@@ -472,6 +534,82 @@ fn is_audiohub_driver_inf(contents: &str) -> bool {
     ]
     .iter()
     .all(|needle| compact.contains(needle))
+}
+
+/// Returns the first declaration the bundled payload INF lacks, or `None`
+/// when it is the protocol v11 package: the root id bound to the bus model and
+/// the child id bound to the per-peer adapter model, in one INF.
+fn payload_inf_missing(contents: &str) -> Option<&'static str> {
+    let compact = compact_inf(contents);
+    [
+        (r"root\audiohubvad", r"ROOT\AudioHubVad"),
+        (r"audiohub\peerendpoint", r"AUDIOHUB\PeerEndpoint"),
+        (
+            r"=audiohubbus,root\audiohubvad",
+            r"AUDIOHUBBUS model for ROOT\AudioHubVad",
+        ),
+        (
+            r"=audiohubvad_sa,audiohub\peerendpoint",
+            r"AUDIOHUBVAD_SA model for AUDIOHUB\PeerEndpoint",
+        ),
+        ("audiohubvad.sys", "AudioHubVad.sys"),
+        ("audiohubvad.cat", "AudioHubVad.cat"),
+        ("servicebinary", "ServiceBinary"),
+    ]
+    .into_iter()
+    .find(|(needle, _)| !compact.contains(*needle))
+    .map(|(_, label)| label)
+}
+
+/// True when a REG_MULTI_SZ hardware-id list (UTF-16 units, NUL separated)
+/// contains `id`. PnP ids compare case-insensitively.
+fn multi_sz_contains_id(units: &[u16], id: &str) -> bool {
+    units
+        .split(|&v| v == 0)
+        .filter(|part| !part.is_empty())
+        .map(String::from_utf16_lossy)
+        .any(|candidate| candidate.eq_ignore_ascii_case(id))
+}
+
+fn is_child_instance_id(instance_id: &str) -> bool {
+    instance_id.len() > CHILD_INSTANCE_PREFIX.len()
+        && instance_id.is_char_boundary(CHILD_INSTANCE_PREFIX.len())
+        && instance_id[..CHILD_INSTANCE_PREFIX.len()].eq_ignore_ascii_case(CHILD_INSTANCE_PREFIX)
+}
+
+/// Install section names may carry a platform decoration (`AUDIOHUBBUS.NT`);
+/// compare only the undecorated base.
+fn inf_section_base(section: &str) -> &str {
+    section.split('.').next().unwrap_or(section).trim()
+}
+
+fn classify_root_model(
+    inf_section: Option<&str>,
+    driver_desc: Option<&str>,
+) -> Option<RootDriverModel> {
+    if let Some(section) = inf_section.filter(|value| !value.trim().is_empty()) {
+        let base = inf_section_base(section);
+        return Some(if base.eq_ignore_ascii_case(BUS_INF_SECTION) {
+            RootDriverModel::Bus
+        } else if base.eq_ignore_ascii_case(ADAPTER_INF_SECTION) {
+            RootDriverModel::Adapter
+        } else {
+            RootDriverModel::Other
+        });
+    }
+    let desc = driver_desc
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(if desc.eq_ignore_ascii_case(BUS_DRIVER_DESC) {
+        RootDriverModel::Bus
+    } else if ADAPTER_DRIVER_DESCS
+        .iter()
+        .any(|known| desc.eq_ignore_ascii_case(known))
+    {
+        RootDriverModel::Adapter
+    } else {
+        RootDriverModel::Other
+    })
 }
 
 fn published_audiohub_infs() -> WinResult<BTreeSet<String>> {
@@ -579,18 +717,13 @@ fn locate_payload() -> WinResult<Payload> {
 
     let inf_bytes = fs::read(&files[0])
         .map_err(|e| WinFailure::message(format!("cannot read {INF_NAME}: {e}")))?;
-    let inf = decode_inf(&inf_bytes).to_ascii_lowercase();
-    for expected in [
-        r"root\audiohubvad",
-        "audiohubvad.sys",
-        "audiohubvad.cat",
-        "servicebinary",
-    ] {
-        if !inf.contains(expected) {
-            return Err(WinFailure::message(format!(
-                "{INF_NAME} does not declare the fixed AudioHubVad package ({expected})"
-            )));
-        }
+    if let Some(missing) = payload_inf_missing(&decode_inf(&inf_bytes)) {
+        // A v10 INF (root adapter only, no child id) is a valid AudioHub
+        // package but not the driver this helper's daemon speaks to. Refuse it
+        // before any device or driver-store state is changed.
+        return Err(WinFailure::message(format!(
+            "{INF_NAME} is not the protocol v11 AudioHubVad bus package (missing {missing})"
+        )));
     }
 
     locks.push(lock_and_verify(&daemon, EXPECTED_DAEMON_SHA256)?);
@@ -694,21 +827,68 @@ fn property_string(
     Ok(Some(String::from_utf16_lossy(&units[..end])))
 }
 
-fn hardware_matches(set: HDEVINFO, data: &SP_DEVINFO_DATA) -> WinResult<bool> {
+fn hardware_matches(set: HDEVINFO, data: &SP_DEVINFO_DATA, id: &str) -> WinResult<bool> {
     let Some(bytes) = get_device_property(set, data, SPDRP_HARDWAREID)? else {
         return Ok(false);
     };
-    let units = utf16_units(&bytes);
-    Ok(units
-        .split(|&v| v == 0)
-        .filter(|part| !part.is_empty())
-        .map(String::from_utf16_lossy)
-        .any(|id| id.eq_ignore_ascii_case(HARDWARE_ID)))
+    Ok(multi_sz_contains_id(&utf16_units(&bytes), id))
 }
 
+fn device_instance_id(set: HDEVINFO, data: &SP_DEVINFO_DATA) -> WinResult<String> {
+    // Device instance ids are bounded by MAX_DEVICE_ID_LEN (200 characters).
+    let mut buffer = vec![0u16; 512];
+    let mut needed = 0u32;
+    if unsafe {
+        SetupDiGetDeviceInstanceIdW(
+            set,
+            data,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(WinFailure::api("SetupDiGetDeviceInstanceIdW"));
+    }
+    let end = buffer.iter().position(|&v| v == 0).unwrap_or(buffer.len());
+    Ok(String::from_utf16_lossy(&buffer[..end]))
+}
+
+fn root_matches(set: HDEVINFO, data: &SP_DEVINFO_DATA) -> WinResult<bool> {
+    hardware_matches(set, data, HARDWARE_ID)
+}
+
+fn child_matches(set: HDEVINFO, data: &SP_DEVINFO_DATA) -> WinResult<bool> {
+    if hardware_matches(set, data, CHILD_HARDWARE_ID)? {
+        return Ok(true);
+    }
+    // The instance-path fallback only widens the sweep; an unreadable id on
+    // some unrelated devnode must not abort the whole status scan.
+    Ok(device_instance_id(set, data)
+        .map(|id| is_child_instance_id(&id))
+        .unwrap_or(false))
+}
+
+/// Root devnodes (`ROOT\AudioHubVad`), present or not.
 fn with_matching_devices(
+    callback: impl FnMut(HDEVINFO, &SP_DEVINFO_DATA) -> WinResult<()>,
+) -> WinResult<u32> {
+    with_devices(root_matches, callback)
+}
+
+/// Child devnodes (`AUDIOHUB\PeerEndpoint`), present or phantom.
+fn with_child_devices(
+    callback: impl FnMut(HDEVINFO, &SP_DEVINFO_DATA) -> WinResult<()>,
+) -> WinResult<u32> {
+    with_devices(child_matches, callback)
+}
+
+fn with_devices(
+    matches: fn(HDEVINFO, &SP_DEVINFO_DATA) -> WinResult<bool>,
     mut callback: impl FnMut(HDEVINFO, &SP_DEVINFO_DATA) -> WinResult<()>,
 ) -> WinResult<u32> {
+    // No DIGCF_PRESENT: non-present (phantom) devnodes must be counted and
+    // removed as well, otherwise a stale registry devnode survives uninstall.
     let set = DeviceInfoSet::new(
         unsafe { SetupDiGetClassDevsW(null(), null(), 0, DIGCF_ALLCLASSES) },
         "SetupDiGetClassDevsW",
@@ -729,7 +909,7 @@ fn with_matching_devices(
             });
         }
         index += 1;
-        if hardware_matches(set.0, &data)? {
+        if matches(set.0, &data)? {
             matched += 1;
             callback(set.0, &data)?;
         }
@@ -737,9 +917,17 @@ fn with_matching_devices(
     Ok(matched)
 }
 
-fn query_device_value(set: HDEVINFO, data: &SP_DEVINFO_DATA, name: &str) -> Option<String> {
+/// Reads a REG_SZ value from the device hardware key (`DIREG_DEV`) or the
+/// driver key (`DIREG_DRV`, whose `InfSection`/`DriverDesc`/`InfPath` values
+/// the class installer writes for the bound driver).
+fn query_device_value(
+    set: HDEVINFO,
+    data: &SP_DEVINFO_DATA,
+    key_type: u32,
+    name: &str,
+) -> Option<String> {
     let raw =
-        unsafe { SetupDiOpenDevRegKey(set, data, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_QUERY_VALUE) };
+        unsafe { SetupDiOpenDevRegKey(set, data, DICS_FLAG_GLOBAL, 0, key_type, KEY_QUERY_VALUE) };
     let key = RegistryKey::new(raw, "SetupDiOpenDevRegKey").ok()?;
     let name = wide_str(name);
     let mut kind = 0u32;
@@ -883,6 +1071,8 @@ fn remove_service() -> WinResult<bool> {
 
 fn scan(expected_daemon: Option<&Path>) -> WinResult<Snapshot> {
     let mut snapshot = Snapshot::default();
+    let mut root_facts_recorded = false;
+    let mut root_facts_from_present = false;
     snapshot.control_link_present = control_link_present();
     snapshot.matching_devices = with_matching_devices(|set, data| {
         let service = property_string(set, data, SPDRP_SERVICE)?;
@@ -900,14 +1090,24 @@ fn scan(expected_daemon: Option<&Path>) -> WinResult<Snapshot> {
         if package_bound {
             snapshot.installed_devices += 1;
             if let Some(expected) = expected_daemon {
-                if query_device_value(set, data, DAEMON_VALUE)
+                if query_device_value(set, data, DIREG_DEV, DAEMON_VALUE)
                     .as_deref()
                     .is_some_and(|actual| actual.eq_ignore_ascii_case(&expected.to_string_lossy()))
                 {
                     snapshot.configured_devices += 1;
                 }
-            } else if query_device_value(set, data, DAEMON_VALUE).is_some() {
+            } else if query_device_value(set, data, DIREG_DEV, DAEMON_VALUE).is_some() {
                 snapshot.configured_devices += 1;
+            }
+            // Record the first bound root's driver identity. Prefer a present
+            // root: a phantom root left by an older install must not mask the
+            // model of the devnode actually running.
+            if !root_facts_recorded || (present && !root_facts_from_present) {
+                snapshot.root_inf_section = query_device_value(set, data, DIREG_DRV, "InfSection");
+                snapshot.root_driver_desc = query_device_value(set, data, DIREG_DRV, "DriverDesc");
+                snapshot.root_inf_path = query_device_value(set, data, DIREG_DRV, "InfPath");
+                root_facts_recorded = true;
+                root_facts_from_present = present;
             }
         }
         let has_problem = status & DN_HAS_PROBLEM != 0 || problem != 0;
@@ -919,11 +1119,49 @@ fn scan(expected_daemon: Option<&Path>) -> WinResult<Snapshot> {
         }
         Ok(())
     })?;
+    let mut present_children = 0u32;
+    snapshot.child_devices = with_child_devices(|_set, data| {
+        let mut status = 0u32;
+        let mut problem = 0u32;
+        if unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, data.DevInst, 0) }
+            == CR_SUCCESS
+        {
+            present_children += 1;
+        }
+        Ok(())
+    })?;
+    snapshot.present_child_devices = present_children;
     snapshot.published_packages = published_audiohub_infs()?.len() as u32;
     snapshot.service_present = service_present()?;
     snapshot.reboot_pending = reboot_pending();
     snapshot.problem_codes.sort_unstable();
     Ok(snapshot)
+}
+
+/// Report fields derived from one snapshot that every constructor fills the
+/// same way. Install/uninstall-specific fields are set by their callers.
+struct SnapshotExtras {
+    child_devices: u32,
+    present_child_devices: u32,
+    phantom_child_devices: u32,
+    root_driver_model: Option<RootDriverModel>,
+    root_inf_section: Option<String>,
+    bus_model_active: bool,
+}
+
+fn snapshot_extras(snapshot: &Snapshot, reboot_required: bool) -> SnapshotExtras {
+    SnapshotExtras {
+        child_devices: snapshot.child_devices,
+        present_child_devices: snapshot.present_child_devices,
+        phantom_child_devices: snapshot.phantom_child_devices(),
+        root_driver_model: snapshot.root_model(),
+        root_inf_section: if snapshot.installed_devices != 0 {
+            snapshot.root_inf_section.clone()
+        } else {
+            None
+        },
+        bus_model_active: snapshot.bus_model_active(reboot_required),
+    }
 }
 
 fn report_from_snapshot(
@@ -936,6 +1174,7 @@ fn report_from_snapshot(
     let package_installed = snapshot.package_installed();
     let driver_available = snapshot.available();
     let daemon_image_configured = snapshot.daemon_image_configured();
+    let extras = snapshot_extras(&snapshot, reboot_required);
     let mut state = snapshot.state();
     if reboot_required {
         state = DriverState::RebootRequired;
@@ -954,7 +1193,15 @@ fn report_from_snapshot(
             }
         }
         DriverState::InstalledUnavailable => {
-            if snapshot.matching_devices != 0
+            if snapshot.child_devices != 0
+                && snapshot.matching_devices == 0
+                && !snapshot.package_installed()
+            {
+                format!(
+                    "{} AudioHub child devnode(s) ({CHILD_HARDWARE_ID}) remain without a root device or package",
+                    snapshot.child_devices
+                )
+            } else if snapshot.matching_devices != 0
                 && snapshot.installed_devices == 0
                 && snapshot.published_packages == 0
             {
@@ -967,6 +1214,9 @@ fn report_from_snapshot(
                 && snapshot.published_packages == 0
             {
                 "the AudioHubVad SCM service remains without a bound device or driver-store package"
+                    .into()
+            } else if extras.root_driver_model == Some(RootDriverModel::Adapter) {
+                "the root device still runs the protocol v10 AudioHubVad adapter; install this release's driver to migrate it to the v11 bus"
                     .into()
             } else if snapshot.problem_codes.is_empty() {
                 "driver package is installed but the device or control link is unavailable".into()
@@ -995,6 +1245,18 @@ fn report_from_snapshot(
         expected_daemon_image: expected_daemon.map(|path| path.to_string_lossy().into_owned()),
         win32_error: None,
         detail,
+        child_devices: extras.child_devices,
+        present_child_devices: extras.present_child_devices,
+        phantom_child_devices: extras.phantom_child_devices,
+        removed_child_devices: 0,
+        root_driver_model: extras.root_driver_model,
+        root_inf_section: extras.root_inf_section,
+        bus_model_active: extras.bus_model_active,
+        previous_root_driver_model: None,
+        migration_reboot_required: false,
+        daemon_processes_stopped: 0,
+        daemon_still_running: false,
+        daemon_restart_required: false,
     }
 }
 
@@ -1009,6 +1271,7 @@ fn failure_report(
     let package_installed = snapshot.package_installed();
     let driver_available = snapshot.available();
     let daemon_image_configured = snapshot.daemon_image_configured();
+    let extras = snapshot_extras(&snapshot, false);
     DriverReport {
         operation,
         state,
@@ -1024,6 +1287,18 @@ fn failure_report(
         expected_daemon_image: expected_daemon.map(|path| path.to_string_lossy().into_owned()),
         win32_error: failure.code,
         detail: failure.detail,
+        child_devices: extras.child_devices,
+        present_child_devices: extras.present_child_devices,
+        phantom_child_devices: extras.phantom_child_devices,
+        removed_child_devices: 0,
+        root_driver_model: extras.root_driver_model,
+        root_inf_section: extras.root_inf_section,
+        bus_model_active: extras.bus_model_active,
+        previous_root_driver_model: None,
+        migration_reboot_required: false,
+        daemon_processes_stopped: 0,
+        daemon_still_running: false,
+        daemon_restart_required: false,
     }
 }
 
@@ -1043,21 +1318,40 @@ fn configure_matching_devices(daemon: &Path) -> WinResult<u32> {
     Ok(present)
 }
 
+/// DIF_REMOVE one enumerated devnode and report whether Windows asked for a
+/// restart to finish it. Works for present and non-present devnodes alike.
+fn remove_device(set: HDEVINFO, data: &SP_DEVINFO_DATA) -> WinResult<bool> {
+    if unsafe { SetupDiCallClassInstaller(DIF_REMOVE, set, data) } == 0 {
+        return Err(WinFailure::api("SetupDiCallClassInstaller(DIF_REMOVE)"));
+    }
+    let mut params: SP_DEVINSTALL_PARAMS_W = unsafe { zeroed() };
+    params.cbSize = size_of::<SP_DEVINSTALL_PARAMS_W>() as u32;
+    if unsafe { SetupDiGetDeviceInstallParamsW(set, data, &mut params) } == 0 {
+        return Err(WinFailure::api("SetupDiGetDeviceInstallParamsW"));
+    }
+    Ok(params.Flags & (DI_NEEDREBOOT as u32 | DI_NEEDRESTART as u32) != 0)
+}
+
 fn remove_matching_devices() -> WinResult<bool> {
     let mut reboot_required = false;
     with_matching_devices(|set, data| {
-        if unsafe { SetupDiCallClassInstaller(DIF_REMOVE, set, data) } == 0 {
-            return Err(WinFailure::api("SetupDiCallClassInstaller(DIF_REMOVE)"));
-        }
-        let mut params: SP_DEVINSTALL_PARAMS_W = unsafe { zeroed() };
-        params.cbSize = size_of::<SP_DEVINSTALL_PARAMS_W>() as u32;
-        if unsafe { SetupDiGetDeviceInstallParamsW(set, data, &mut params) } == 0 {
-            return Err(WinFailure::api("SetupDiGetDeviceInstallParamsW"));
-        }
-        reboot_required |= params.Flags & (DI_NEEDREBOOT as u32 | DI_NEEDRESTART as u32) != 0;
+        reboot_required |= remove_device(set, data)?;
         Ok(())
     })?;
     Ok(reboot_required)
+}
+
+/// Sweep every `AUDIOHUB\PeerEndpoint` devnode. Removing the present bus root
+/// already removes its present children through PnP, but their registry
+/// devnodes stay behind as phantoms (as do children of earlier sessions). Run
+/// after root removal on a fresh enumeration. Returns (removed, reboot).
+fn remove_child_devices() -> WinResult<(u32, bool)> {
+    let mut reboot_required = false;
+    let removed = with_child_devices(|set, data| {
+        reboot_required |= remove_device(set, data)?;
+        Ok(())
+    })?;
+    Ok((removed, reboot_required))
 }
 
 fn uninstall_published_inf(name: &str) -> WinResult<()> {
@@ -1094,6 +1388,7 @@ fn name_to_string(name: &[u16]) -> String {
 }
 
 fn removed_report(snapshot: Snapshot, expected_daemon: &Path) -> DriverReport {
+    let extras = snapshot_extras(&snapshot, false);
     DriverReport {
         operation: "uninstall",
         state: DriverState::Removed,
@@ -1109,6 +1404,18 @@ fn removed_report(snapshot: Snapshot, expected_daemon: &Path) -> DriverReport {
         expected_daemon_image: Some(expected_daemon.to_string_lossy().into_owned()),
         win32_error: None,
         detail: "AudioHubVad devices and published driver-store packages were removed".into(),
+        child_devices: extras.child_devices,
+        present_child_devices: extras.present_child_devices,
+        phantom_child_devices: extras.phantom_child_devices,
+        removed_child_devices: 0,
+        root_driver_model: extras.root_driver_model,
+        root_inf_section: extras.root_inf_section,
+        bus_model_active: extras.bus_model_active,
+        previous_root_driver_model: None,
+        migration_reboot_required: false,
+        daemon_processes_stopped: 0,
+        daemon_still_running: false,
+        daemon_restart_required: false,
     }
 }
 
@@ -1250,6 +1557,178 @@ pub fn install() -> DriverReport {
         }
     }
 
+    let mut context = InstallContext::default();
+    let report = install_elevated(&payload, &mut context);
+    finish_install(report, &context)
+}
+
+/// Install-only facts gathered around the package update.
+#[derive(Debug, Default)]
+struct InstallContext {
+    previous_model: Option<RootDriverModel>,
+    daemon_stopped: u32,
+    daemon_still_running: bool,
+}
+
+fn finish_install(mut report: DriverReport, context: &InstallContext) -> DriverReport {
+    report.previous_root_driver_model = context.previous_model;
+    report.daemon_processes_stopped = context.daemon_stopped;
+    report.daemon_still_running = context.daemon_still_running;
+    report.daemon_restart_required = context.daemon_stopped != 0;
+    // VAD10 -> v11: the v10 image keeps its control device for the whole image
+    // lifetime, so Windows normally cannot swap it until the next boot.
+    report.migration_reboot_required =
+        context.previous_model == Some(RootDriverModel::Adapter) && report.reboot_required;
+    if report.migration_reboot_required {
+        report.detail = format!(
+            "{}; restart Windows to finish migrating the root device from the v10 adapter to the v11 bus",
+            report.detail
+        );
+    }
+    if context.daemon_stopped != 0 {
+        report.detail = format!(
+            "{}; stopped {} AudioHub daemon process(es) before the driver update; the daemon must be started again",
+            report.detail, context.daemon_stopped
+        );
+    }
+    if context.daemon_still_running {
+        report.detail = format!(
+            "{}; an AudioHub daemon process could not be stopped and may still hold the control device",
+            report.detail
+        );
+    }
+    report
+}
+
+/// True when the published INF bound to the root devnode is byte-identical to
+/// the bundled payload INF, i.e. the update cannot change the driver. Any
+/// uncertainty answers false so the caller takes the safe path.
+fn payload_already_bound(snapshot: &Snapshot, payload_inf: &Path) -> bool {
+    let Some(name) = snapshot
+        .root_inf_path
+        .as_deref()
+        .and_then(|name| published_inf_name(OsStr::new(name)))
+    else {
+        return false;
+    };
+    let Ok(directory) = windows_inf_directory() else {
+        return false;
+    };
+    match (fs::read(directory.join(name)), fs::read(payload_inf)) {
+        (Ok(bound), Ok(payload)) => bound == payload,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Default)]
+struct DaemonStop {
+    stopped: u32,
+    remaining: u32,
+}
+
+fn process_image_path(process: HANDLE) -> Option<String> {
+    let mut buffer = vec![0u16; 32_768];
+    let mut size = buffer.len() as u32;
+    if unsafe {
+        QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut size)
+    } == 0
+    {
+        return None;
+    }
+    let size = (size as usize).min(buffer.len());
+    Some(
+        OsString::from_wide(&buffer[..size])
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Stop every process whose kernel-reported image is exactly the bundled
+/// daemon. The driver's caller check admits only that image to the control
+/// device, so these are the only processes that can pin the bus FDO (and with
+/// it the driver image) across a package update. Same-named binaries at any
+/// other path are never touched. A process that exits is guaranteed to have
+/// closed its handles before it becomes signalled.
+fn stop_daemon_processes(daemon: &Path) -> WinResult<DaemonStop> {
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(WinFailure::api("CreateToolhelp32Snapshot"));
+    }
+    let processes = KernelHandle(raw);
+    let expected = daemon.to_string_lossy().into_owned();
+    let own_pid = std::process::id();
+    let mut outcome = DaemonStop::default();
+    let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    let mut more = unsafe { Process32FirstW(processes.0, &mut entry) } != 0;
+    if !more {
+        let code = unsafe { GetLastError() };
+        if code != ERROR_NO_MORE_FILES {
+            return Err(WinFailure {
+                code: Some(code),
+                detail: "Process32FirstW failed".into(),
+            });
+        }
+    }
+    while more {
+        let end = entry
+            .szExeFile
+            .iter()
+            .position(|&v| v == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+        let pid = entry.th32ProcessID;
+        if pid != 0 && pid != own_pid && name.eq_ignore_ascii_case(DAEMON_NAME) {
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                    0,
+                    pid,
+                )
+            };
+            if handle == 0 {
+                // ERROR_INVALID_PARAMETER: the process already exited. Any
+                // other failure leaves a same-named process unverified; count
+                // it conservatively instead of claiming the device is free.
+                if unsafe { GetLastError() } != ERROR_INVALID_PARAMETER {
+                    outcome.remaining += 1;
+                }
+            } else {
+                let process = KernelHandle(handle);
+                match process_image_path(process.0) {
+                    Some(image) if image.eq_ignore_ascii_case(&expected) => {
+                        let terminated = unsafe { TerminateProcess(process.0, 1) } != 0;
+                        if terminated
+                            && unsafe { WaitForSingleObject(process.0, 5_000) } == WAIT_OBJECT_0
+                        {
+                            outcome.stopped += 1;
+                        } else {
+                            outcome.remaining += 1;
+                        }
+                    }
+                    Some(_) => {}
+                    None => outcome.remaining += 1,
+                }
+            }
+        }
+        more = unsafe { Process32NextW(processes.0, &mut entry) } != 0;
+        if !more {
+            let code = unsafe { GetLastError() };
+            if code != ERROR_NO_MORE_FILES {
+                return Err(WinFailure {
+                    code: Some(code),
+                    detail: "Process32NextW failed".into(),
+                });
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+fn install_elevated(payload: &Payload, context: &mut InstallContext) -> DriverReport {
+    let before = scan(Some(&payload.daemon)).ok();
+    context.previous_model = before.as_ref().and_then(Snapshot::root_model);
+
     let mut created: Option<CreatedDevice> = None;
     match configure_matching_devices(&payload.daemon) {
         Ok(0) => match create_root_device(&payload.inf, &payload.daemon) {
@@ -1273,6 +1752,38 @@ pub fn install() -> DriverReport {
                 scan(Some(&payload.daemon)).ok(),
                 Some(&payload.daemon),
             )
+        }
+    }
+
+    // Reboot-free upgrade: a v11+ bus root deletes its control device at
+    // REMOVE, so once no daemon holds it PnP can restart the root and unload
+    // the old image. Only a bus root that will actually receive a different
+    // package needs this; a v10 adapter root keeps its control device for the
+    // image lifetime, so stopping the daemon would interrupt audio without
+    // avoiding the restart that migration requires anyway.
+    if let Some(before) = before.as_ref() {
+        if before.installed_devices != 0
+            && context.previous_model == Some(RootDriverModel::Bus)
+            && !payload_already_bound(before, &payload.inf)
+        {
+            match stop_daemon_processes(&payload.daemon) {
+                Ok(stop) => {
+                    context.daemon_stopped = stop.stopped;
+                    context.daemon_still_running = stop.remaining != 0;
+                }
+                Err(error) => {
+                    if let Some(device) = created.as_mut() {
+                        device.remove();
+                    }
+                    return failure_report(
+                        "install",
+                        DriverState::InstallFailed,
+                        error,
+                        scan(Some(&payload.daemon)).ok(),
+                        Some(&payload.daemon),
+                    );
+                }
+            }
         }
     }
 
@@ -1300,6 +1811,18 @@ pub fn install() -> DriverReport {
         if code == ERROR_NO_MORE_ITEMS {
             if let Ok(snapshot) = scan(Some(&payload.daemon)) {
                 if snapshot.installed_devices != 0 {
+                    // A marker written earlier in this same boot (for example
+                    // by the VAD10 -> v11 update) still stands: the new driver
+                    // is staged but the old image runs until restart. Only a
+                    // marker from a previous boot is stale and cleared.
+                    if snapshot.reboot_pending {
+                        return report_from_snapshot(
+                            "install",
+                            snapshot,
+                            Some(&payload.daemon),
+                            false,
+                        );
+                    }
                     if let Err(error) = set_reboot_marker(false) {
                         return failure_report(
                             "install",
@@ -1334,7 +1857,8 @@ pub fn install() -> DriverReport {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match scan(Some(&payload.daemon)) {
-            Ok(snapshot) if snapshot.available() || Instant::now() >= deadline => {
+            // A restart request cannot be satisfied by waiting; report it now.
+            Ok(snapshot) if snapshot.available() || reboot != 0 || Instant::now() >= deadline => {
                 if let Err(error) = set_reboot_marker(reboot != 0) {
                     return failure_report(
                         "install",
@@ -1427,6 +1951,29 @@ pub fn uninstall() -> DriverReport {
             )
         }
     };
+    // Children only after the root: removing the present bus first lets PnP
+    // tear down the live child stacks in order; this sweep then deletes the
+    // remaining (now phantom) child devnodes and any older phantoms.
+    let removed_children = match remove_child_devices() {
+        Ok((removed, reboot)) => {
+            reboot_required |= reboot;
+            removed
+        }
+        Err(error) => {
+            let mut report = failure_report(
+                "uninstall",
+                DriverState::RemoveFailed,
+                error,
+                scan(Some(&payload.daemon)).ok(),
+                Some(&payload.daemon),
+            );
+            report.detail = format!(
+                "{} while removing {CHILD_HARDWARE_ID} child devnodes",
+                report.detail
+            );
+            return report;
+        }
+    };
     // Remove the fixed SCM service before asking SetupAPI to evict its package.
     // An orphan service can keep the image/package in use even after the root
     // devnode disappeared; DeleteService either clears it now or explicitly
@@ -1481,32 +2028,35 @@ pub fn uninstall() -> DriverReport {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match scan(Some(&payload.daemon)) {
+            // Any remaining AUDIOHUB\PeerEndpoint devnode, present or phantom,
+            // keeps the uninstall from being reported clean.
             Ok(snapshot)
                 if snapshot.matching_devices == 0
+                    && snapshot.child_devices == 0
                     && snapshot.published_packages == 0
                     && ((!snapshot.control_link_present && !snapshot.service_present)
                         || reboot_required) =>
             {
-                if reboot_required {
-                    return report_from_snapshot(
-                        "uninstall",
-                        snapshot,
-                        Some(&payload.daemon),
-                        true,
-                    );
-                }
-                return removed_report(snapshot, &payload.daemon);
+                let mut report = if reboot_required {
+                    report_from_snapshot("uninstall", snapshot, Some(&payload.daemon), true)
+                } else {
+                    removed_report(snapshot, &payload.daemon)
+                };
+                report.removed_child_devices = removed_children;
+                return report;
             }
             Ok(snapshot) if Instant::now() >= deadline => {
-                return failure_report(
+                let mut report = failure_report(
                     "uninstall",
                     DriverState::RemoveFailed,
                     WinFailure::message(
-                        "AudioHubVad devices, control link, or driver-store package remained after removal",
+                        "AudioHubVad devices, child devnodes, control link, or driver-store package remained after removal",
                     ),
                     Some(snapshot),
                     Some(&payload.daemon),
-                )
+                );
+                report.removed_child_devices = removed_children;
+                return report;
             }
             Ok(_) => thread::sleep(Duration::from_millis(100)),
             Err(error) => {
@@ -1529,6 +2079,14 @@ mod tests {
     #[test]
     fn fixed_identifiers_match_the_driver_contract() {
         assert_eq!(HARDWARE_ID, r"ROOT\AudioHubVad");
+        // drivers/windows-vad/Source/Main/AudioHubVad.inx binds this id to the
+        // AUDIOHUBVAD_SA child model; the bus driver reports it from
+        // IRP_MN_QUERY_ID for every peer presentation unit.
+        assert_eq!(CHILD_HARDWARE_ID, r"AUDIOHUB\PeerEndpoint");
+        assert_eq!(CHILD_INSTANCE_PREFIX, format!("{CHILD_HARDWARE_ID}\\"));
+        assert_eq!(BUS_INF_SECTION, "AUDIOHUBBUS");
+        assert_eq!(ADAPTER_INF_SECTION, "AUDIOHUBVAD_SA");
+        assert_eq!(BUS_DRIVER_DESC, "AudioHub Audio Bus");
         assert_eq!(SERVICE_NAME, "AudioHubVad");
         assert_eq!(CONTROL_DOS_NAME, "AudioHubVadCtl");
         assert_eq!(DAEMON_VALUE, "AudioHubDaemonImage");
@@ -1569,6 +2127,186 @@ mod tests {
         assert!(!is_audiohub_driver_inf(
             &inf.replace("ROOT\\AudioHubVad", "ROOT\\SomeOtherDevice")
         ));
+    }
+
+    const V10_INF: &str = r#"
+        [Version]
+        ClassGuid = {4D36E96C-E325-11CE-BFC1-08002BE10318}
+        CatalogFile = AudioHubVad.cat
+        [AUDIOHUBVAD.NTamd64.10.0...22000]
+        %AUDIOHUBVAD_SA.DeviceDesc%=AUDIOHUBVAD_SA, ROOT\AudioHubVad
+        [AUDIOHUBVAD_SA.NT.Services]
+        AddService=AudioHubVad,0x00000002,AudioHubVad_Service_Inst
+        [AudioHubVad_Service_Inst]
+        ServiceBinary=%13%\audiohubvad.sys
+        [Strings]
+        ProviderName = "AudioHub"
+        AUDIOHUBVAD_SA.DeviceDesc="AudioHub Virtual Audio"
+    "#;
+
+    const V11_INF: &str = r#"
+        [Version]
+        ClassGuid = {4D36E96C-E325-11CE-BFC1-08002BE10318}
+        CatalogFile = AudioHubVad.cat
+        [AUDIOHUBVAD.NTamd64.10.0...22000]
+        ; ROOT\AudioHubVad -- the BUS
+        %AUDIOHUBBUS.DeviceDesc%=AUDIOHUBBUS, ROOT\AudioHubVad
+        %AUDIOHUBVAD_SA.DeviceDesc%=AUDIOHUBVAD_SA, AUDIOHUB\PeerEndpoint
+        [AUDIOHUBBUS.NT.Services]
+        AddService=AudioHubVad,0x00000002,AudioHubVad_Service_Inst
+        [AudioHubVad_Service_Inst]
+        ServiceBinary=%13%\audiohubvad.sys
+        [Strings]
+        ProviderName = "AudioHub"
+        AUDIOHUBVAD_SA.DeviceDesc="AudioHub Network Audio"
+        AUDIOHUBBUS.DeviceDesc="AudioHub Audio Bus"
+    "#;
+
+    #[test]
+    fn payload_inf_must_be_the_v11_bus_package() {
+        assert_eq!(payload_inf_missing(V11_INF), None);
+        // Case and whitespace are insignificant in INF directives.
+        assert_eq!(payload_inf_missing(&V11_INF.to_ascii_uppercase()), None);
+        // v10: same root id but no child id and the root bound to the adapter.
+        assert_eq!(payload_inf_missing(V10_INF), Some(r"AUDIOHUB\PeerEndpoint"));
+        // The child id alone is not enough: each id must bind its own model.
+        let swapped = V11_INF
+            .replace("=AUDIOHUBBUS, ROOT", "=AUDIOHUBVAD_SA, ROOT")
+            .replace("=AUDIOHUBVAD_SA, AUDIOHUB", "=AUDIOHUBBUS, AUDIOHUB");
+        assert_eq!(
+            payload_inf_missing(&swapped),
+            Some(r"AUDIOHUBBUS model for ROOT\AudioHubVad")
+        );
+    }
+
+    #[test]
+    fn driver_store_match_covers_v10_and_v11_packages() {
+        // Uninstall and upgrade must keep finding packages published by every
+        // earlier AudioHub driver generation.
+        assert!(is_audiohub_driver_inf(V10_INF));
+        assert!(is_audiohub_driver_inf(V11_INF));
+        assert!(!is_audiohub_driver_inf(&V11_INF.replace(
+            "ProviderName = \"AudioHub\"",
+            "ProviderName = \"Other\""
+        )));
+    }
+
+    fn multi_sz(ids: &[&str]) -> Vec<u16> {
+        let mut units = Vec::new();
+        for id in ids {
+            units.extend(id.encode_utf16());
+            units.push(0);
+        }
+        units.push(0);
+        units
+    }
+
+    #[test]
+    fn hardware_id_lists_match_root_and_child_ids_exactly() {
+        let child = multi_sz(&[r"AUDIOHUB\PeerEndpoint"]);
+        assert!(multi_sz_contains_id(&child, CHILD_HARDWARE_ID));
+        assert!(!multi_sz_contains_id(&child, HARDWARE_ID));
+
+        let lower = multi_sz(&[r"audiohub\peerendpoint", r"AUDIOHUB\Other"]);
+        assert!(multi_sz_contains_id(&lower, CHILD_HARDWARE_ID));
+
+        let root = multi_sz(&[r"ROOT\AudioHubVad"]);
+        assert!(multi_sz_contains_id(&root, HARDWARE_ID));
+        assert!(!multi_sz_contains_id(&root, CHILD_HARDWARE_ID));
+
+        // Prefixes and suffixes are different ids.
+        let near = multi_sz(&[r"AUDIOHUB\PeerEndpointX", r"XAUDIOHUB\PeerEndpoint"]);
+        assert!(!multi_sz_contains_id(&near, CHILD_HARDWARE_ID));
+        assert!(!multi_sz_contains_id(&[], CHILD_HARDWARE_ID));
+    }
+
+    #[test]
+    fn child_instance_paths_are_matched_by_their_enumerator_prefix() {
+        assert!(is_child_instance_id(
+            r"AUDIOHUB\PeerEndpoint\0123456789ABCDEF-rc"
+        ));
+        assert!(is_child_instance_id(
+            r"audiohub\peerendpoint\0123456789abcdef-v"
+        ));
+        assert!(!is_child_instance_id(r"AUDIOHUB\PeerEndpoint\"));
+        assert!(!is_child_instance_id(r"AUDIOHUB\PeerEndpointX\abc"));
+        assert!(!is_child_instance_id(r"ROOT\AudioHubVad\0000"));
+        assert!(!is_child_instance_id(r"AUDIOHUB"));
+    }
+
+    #[test]
+    fn root_model_comes_from_the_driver_key() {
+        assert_eq!(
+            classify_root_model(Some("AUDIOHUBBUS"), None),
+            Some(RootDriverModel::Bus)
+        );
+        assert_eq!(
+            classify_root_model(Some("audiohubbus.NT"), Some("AudioHub Virtual Audio")),
+            Some(RootDriverModel::Bus)
+        );
+        assert_eq!(
+            classify_root_model(Some("AUDIOHUBVAD_SA"), None),
+            Some(RootDriverModel::Adapter)
+        );
+        assert_eq!(
+            classify_root_model(Some("SomethingElse"), None),
+            Some(RootDriverModel::Other)
+        );
+        // InfSection unavailable: fall back to the INF model DriverDesc.
+        assert_eq!(
+            classify_root_model(None, Some("AudioHub Audio Bus")),
+            Some(RootDriverModel::Bus)
+        );
+        assert_eq!(
+            classify_root_model(Some(" "), Some("AudioHub Virtual Audio")),
+            Some(RootDriverModel::Adapter)
+        );
+        assert_eq!(classify_root_model(None, None), None);
+    }
+
+    #[test]
+    fn snapshot_state_accounts_for_child_devnodes_and_the_root_model() {
+        // Phantom children alone are leftover AudioHub state, never "absent".
+        let leftovers = Snapshot {
+            child_devices: 3,
+            present_child_devices: 1,
+            ..Snapshot::default()
+        };
+        assert_eq!(leftovers.phantom_child_devices(), 2);
+        assert_eq!(leftovers.state(), DriverState::InstalledUnavailable);
+
+        let bus = Snapshot {
+            matching_devices: 1,
+            present_devices: 1,
+            started_devices: 1,
+            installed_devices: 1,
+            control_link_present: true,
+            root_inf_section: Some("AUDIOHUBBUS".into()),
+            ..Snapshot::default()
+        };
+        assert_eq!(bus.root_model(), Some(RootDriverModel::Bus));
+        assert_eq!(bus.state(), DriverState::Ready);
+        assert!(bus.bus_model_active(false));
+        assert!(!bus.bus_model_active(true));
+
+        // A started v10 adapter root speaks the previous protocol: installed,
+        // not available, so the App offers the migrating reinstall.
+        let adapter = Snapshot {
+            root_inf_section: Some("AUDIOHUBVAD_SA".into()),
+            ..bus
+        };
+        assert_eq!(adapter.root_model(), Some(RootDriverModel::Adapter));
+        assert!(!adapter.available());
+        assert_eq!(adapter.state(), DriverState::InstalledUnavailable);
+        assert!(!adapter.bus_model_active(false));
+
+        // No bound package: the driver key of an unbound devnode is ignored.
+        let unbound = Snapshot {
+            matching_devices: 1,
+            root_inf_section: Some("AUDIOHUBBUS".into()),
+            ..Snapshot::default()
+        };
+        assert_eq!(unbound.root_model(), None);
     }
 
     #[test]

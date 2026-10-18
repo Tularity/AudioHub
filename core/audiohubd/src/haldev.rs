@@ -50,6 +50,7 @@ use crate::halbridge::{
     self, HalBindRequest, HalControlEvent, HalEndpoint, HalSlotState, HAL_PUBLISH_BOTH,
     HAL_PUBLISH_IN, HAL_PUBLISH_OUT,
 };
+use crate::presentation::{self, CachedFacts, Presentation, PresentationState};
 use crate::{conn, dlog, lk, DaemonInner, DaemonState, SessionOrigin};
 
 pub const HAL_MAX_SLOTS: usize = halbridge::HAL_MAX_SLOTS;
@@ -99,7 +100,7 @@ pub fn device_name_stem(display: &str) -> String {
 /// text: input/output is already a structural property in both operating
 /// systems and the UI uses distinct icons.  Identity and routing remain the
 /// direction-specific UIDs below, never the display string.
-fn offline_mark(locale: &str) -> &'static str {
+pub(crate) fn offline_mark(locale: &str) -> &'static str {
     if locale == "en-US" {
         NAME_OFFLINE_EN_US
     } else {
@@ -209,7 +210,16 @@ struct SlotEntry {
     /// latter explicitly has neither endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     directions: Option<u8>,
+    /// v4: the peer's last accepted DeviceFacts (design §4.5), so a restart
+    /// or reconnect presents the same look instead of flapping through
+    /// virtual. Absent in v1–v3 files and for peers that never sent facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    facts: Option<CachedFacts>,
 }
+
+/// v4 added `facts`. v3 files load unchanged with no persisted facts (those
+/// peers present virtually until their facts arrive).
+const SLOT_FILE_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SlotFile {
@@ -232,6 +242,8 @@ pub struct SlotTable {
     /// peer that disconnected before its first capability advert into an
     /// explicit "has neither endpoint" peer.
     directions: Vec<Option<u8>>,
+    /// Last accepted DeviceFacts per slot's peer (file v4, design §4.5).
+    facts: Vec<Option<CachedFacts>>,
 }
 
 impl SlotTable {
@@ -239,6 +251,7 @@ impl SlotTable {
         SlotTable {
             assign: vec![None; HAL_MAX_SLOTS],
             directions: vec![None; HAL_MAX_SLOTS],
+            facts: vec![None; HAL_MAX_SLOTS],
         }
     }
 
@@ -270,6 +283,8 @@ impl SlotTable {
                     None if file_version <= 1 => Some(HAL_PUBLISH_BOTH),
                     None => None,
                 };
+                // Re-validated: this file is outside the daemon's control.
+                t.facts[s] = e.facts.map(CachedFacts::sanitized);
             }
         }
         t
@@ -277,7 +292,7 @@ impl SlotTable {
 
     pub fn save(&self, dir: &Path) -> Result<()> {
         let file = SlotFile {
-            version: 3,
+            version: SLOT_FILE_VERSION,
             slots: self
                 .assign
                 .iter()
@@ -287,6 +302,7 @@ impl SlotTable {
                         slot: s as u8,
                         fingerprint: fp.clone(),
                         directions: self.directions[s].map(|mask| mask & HAL_PUBLISH_BOTH),
+                        facts: self.facts[s].clone(),
                     })
                 })
                 .collect(),
@@ -319,6 +335,7 @@ impl SlotTable {
             .position(Option::is_none)?;
         self.assign[free] = Some(fingerprint.to_string());
         self.directions[free] = None;
+        self.facts[free] = None;
         Some(free as u8)
     }
 
@@ -342,7 +359,26 @@ impl SlotTable {
         let s = self.slot_of(fingerprint)?;
         self.assign[s as usize] = None;
         self.directions[s as usize] = None;
+        self.facts[s as usize] = None;
         Some(s)
+    }
+
+    /// The persisted DeviceFacts of a peer that owns a slot.
+    pub(crate) fn facts_of(&self, fingerprint: &str) -> Option<&CachedFacts> {
+        self.slot_of(fingerprint)
+            .and_then(|s| self.facts[s as usize].as_ref())
+    }
+
+    /// `true` = the stored facts changed (and the table must be saved). A
+    /// peer without a slot has nothing to persist into.
+    pub(crate) fn set_facts(&mut self, fingerprint: &str, facts: Option<CachedFacts>) -> bool {
+        let Some(slot) = self.slot_of(fingerprint) else {
+            return false;
+        };
+        let cell = &mut self.facts[slot as usize];
+        let changed = *cell != facts;
+        *cell = facts;
+        changed
     }
 
     /// Drops assignments for peers that are no longer paired at all. Called on
@@ -355,6 +391,7 @@ impl SlotTable {
                 if !paired.contains(fp.as_str()) {
                     *slot = None;
                     self.directions[index] = None;
+                    self.facts[index] = None;
                     changed = true;
                 }
             }
@@ -371,7 +408,9 @@ impl SlotTable {
     /// written back is one that comes back different after a restart — which is
     /// the single failure this whole persistence exists to prevent.
     fn same_as(&self, other: &SlotTable) -> bool {
-        self.assign == other.assign && self.directions == other.directions
+        self.assign == other.assign
+            && self.directions == other.directions
+            && self.facts == other.facts
     }
 }
 
@@ -399,6 +438,16 @@ pub struct DesiredDevice {
     /// Virtual directions this peer can actually serve.
     pub directions: u8,
     pub online: bool,
+    /// `[OUT, IN]` (design §5.1): what the platform layer should present
+    /// for each direction right now (`PresentationState::current`). A
+    /// physical entry also replaces the matching name above (macOS carries
+    /// names on the Bind path). Always Virtual until a driver reports that it
+    /// can present physical devices.
+    pub(crate) presentation: [Presentation; 2],
+    /// `[OUT, IN]`: the Windows VAD10 form of `presentation` (key, form
+    /// factor, endpoint name), filled in by `apply_presentation`. Plain data
+    /// like `display`; macOS never reads it.
+    pub(crate) win_presentation: [crate::halbridge_win::wire::WirePresentation; 2],
 }
 
 impl DesiredDevice {
@@ -413,6 +462,7 @@ impl DesiredDevice {
             display: self.display.clone(),
             directions: self.directions,
             online: self.online,
+            win_presentation: self.win_presentation.clone(),
         }
     }
 }
@@ -944,6 +994,9 @@ pub struct SlotRec {
     /// Direction mask carried by the last successful send attempt.
     pub sent_directions: u8,
     pub sent_online: bool,
+    /// `DesiredDevice::presentation` at the last successful send attempt. A
+    /// difference is an in-place re-Set, like a rename.
+    pub(crate) sent_presentation: [Presentation; 2],
     /// A `Set` with those strings has been put on the wire.
     pub sent: bool,
     /// A `Clear` is in flight and the slot has not reported Free yet.
@@ -1516,6 +1569,7 @@ pub fn plan_binds(
             || rec.sent_in_name != d.in_name
             || rec.sent_directions != d.directions
             || rec.sent_online != d.online
+            || rec.sent_presentation != d.presentation
         {
             // Same UID, new name: an in-place rename on the driver's side.
             actions.push(BindAction::Set(d.to_bind()));
@@ -1595,6 +1649,9 @@ pub(crate) struct HalDevState {
     pub display: HashMap<String, String>,
     /// fingerprint -> why it has no devices.
     pub reasons: HashMap<String, String>,
+    /// Consumer-side physical presentation (design §5): decisions, applied
+    /// state, the microphone mismatch gate and the rebuild scheduler.
+    pub(crate) presentation: PresentationState,
     last_set: Vec<Option<Instant>>,
     clear_at: Vec<Option<Instant>>,
     open_at: Vec<Option<Instant>>,
@@ -1611,6 +1668,7 @@ impl HalDevState {
             attach_epoch: 0,
             display: HashMap::new(),
             reasons: HashMap::new(),
+            presentation: PresentationState::new(),
             last_set: vec![None; HAL_MAX_SLOTS],
             clear_at: vec![None; HAL_MAX_SLOTS],
             open_at: vec![None; HAL_MAX_SLOTS],
@@ -2045,6 +2103,8 @@ pub(crate) fn compute_desired(
             display: device_display_name(&name, marked_offline, &native_locale),
             directions,
             online,
+            presentation: [Presentation::Virtual, Presentation::Virtual],
+            win_presentation: Default::default(),
         });
     }
     PassInputs {
@@ -2059,6 +2119,10 @@ pub(crate) fn compute_desired(
 /// CoreAudio calls) can run on its own slower cadence.
 fn reconcile(inner: &DaemonInner, hal: &halbridge::HalBridge, observed: Option<&HashSet<String>>) {
     let capacity = hal.slot_count();
+    // Read before the haldev lock: the capability lives behind the bridge's
+    // own session lock.
+    #[cfg(windows)]
+    let win_driver = win_driver_presentation(hal.windows_presentation_capability());
     let mut st = lk(&inner.haldev);
     st.capacity = capacity;
 
@@ -2077,6 +2141,10 @@ fn reconcile(inner: &DaemonInner, hal: &halbridge::HalBridge, observed: Option<&
         }
         st.last_set.iter_mut().for_each(|t| *t = None);
         st.clear_at.iter_mut().for_each(|t| *t = None);
+        // Whatever the driver presented before is no longer known (it may
+        // have kept a physical look): the microphone gate treats that as
+        // possibly physical until the driver reports again.
+        st.presentation.mark_all_unknown();
         dlog!("[audiohubd] hal: driver re-attached ({capacity} slots); re-stating every binding");
     }
 
@@ -2085,15 +2153,50 @@ fn reconcile(inner: &DaemonInner, hal: &halbridge::HalBridge, observed: Option<&
     // an assignment that comes back different after a restart.
     let table_before = st.table.clone();
     let PassInputs {
-        desired,
+        mut desired,
         display,
         reasons,
         paired,
     } = compute_desired(inner, capacity, &mut st.table);
     st.table.retain(&paired);
-    let table_changed = !st.table.same_as(&table_before);
     st.display = display;
     st.reasons = reasons;
+    // Presentation (design §5) is decided for every paired peer, after the
+    // slot assignment above so persisted facts land in the right entry.
+    let now = Instant::now();
+    let mut fingerprints: Vec<String> = paired.iter().cloned().collect();
+    fingerprints.sort();
+    // Windows: the decision needs the driver's capability THIS pass. Learned
+    // only after the first Set, the first pass after an attach decided
+    // Virtual and re-stated every physical slot as virtual.
+    #[cfg(windows)]
+    st.presentation.set_driver(win_driver);
+    evaluate_presentation_locked(inner, &mut st, &fingerprints, now);
+    // Windows (design §4.5): an unknown driver account (start, re-attach, new
+    // pairing) publishes the decided physical look directly.
+    #[cfg(windows)]
+    for fp in &fingerprints {
+        st.presentation.adopt_physical_when_unknown(fp);
+    }
+    let table_changed = !st.table.same_as(&table_before);
+    let (mark_offline, locale) = {
+        let s = lk(&inner.settings);
+        (s.mark_offline_devices, s.native_locale.clone())
+    };
+    for d in desired.iter_mut() {
+        let label = st
+            .display
+            .get(&d.fingerprint)
+            .cloned()
+            .unwrap_or_else(|| d.fingerprint.clone());
+        apply_presentation(
+            d,
+            st.presentation.current(&d.fingerprint),
+            &label,
+            mark_offline && !d.online,
+            &locale,
+        );
+    }
 
     // The slot table is the assignment; the records carry the identity we last
     // put on the wire. Keep the two in step BEFORE planning, so a slot whose
@@ -2126,7 +2229,6 @@ fn reconcile(inner: &DaemonInner, hal: &halbridge::HalBridge, observed: Option<&
         }
     }
 
-    let now = Instant::now();
     for (i, at) in st.clear_at.clone().iter().enumerate() {
         if let Some(t) = at {
             if now.duration_since(*t) > CLEAR_TIMEOUT {
@@ -2156,7 +2258,11 @@ fn reconcile(inner: &DaemonInner, hal: &halbridge::HalBridge, observed: Option<&
                 // device-list announcement).
                 let renaming = st.slots[s].sent_out_name != req.out_name
                     || st.slots[s].sent_in_name != req.in_name
-                    || st.slots[s].sent_directions != req.directions;
+                    || st.slots[s].sent_directions != req.directions
+                    || desired
+                        .iter()
+                        .find(|d| d.slot == req.slot)
+                        .is_some_and(|d| st.slots[s].sent_presentation != d.presentation);
                 renaming || now.duration_since(t) >= SET_COOLDOWN
             }
             BindAction::Clear { .. } => true,
@@ -2181,6 +2287,9 @@ fn reconcile(inner: &DaemonInner, hal: &halbridge::HalBridge, observed: Option<&
                 rec.sent_in_name = req.in_name.clone();
                 rec.sent_directions = req.directions;
                 rec.sent_online = req.online;
+                if let Some(d) = desired.iter().find(|d| d.slot == req.slot) {
+                    rec.sent_presentation = d.presentation.clone();
+                }
                 rec.sent = true;
                 rec.acked = false;
                 st.last_set[req.slot as usize] = Some(now);
@@ -2196,9 +2305,370 @@ fn reconcile(inner: &DaemonInner, hal: &halbridge::HalBridge, observed: Option<&
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    drive_mac_presentation(inner, hal, &desired);
+    #[cfg(windows)]
+    drive_win_presentation(inner, hal, &desired);
     if table_changed {
         save_table(inner);
     }
+}
+
+/// macOS (T5 glue, design §6.4): carry each bound endpoint's presentation to
+/// the HAL driver and feed the driver's account back into the policy. The
+/// bridge is closed-loop on its own (idempotent wish, re-send until
+/// acknowledged); this only translates. Wishes are computed under the haldev
+/// lock and handed to the bridge outside it, because a wish that changed is
+/// sent at once and a mach send may wait for its timeout.
+///
+/// - The name is NOT sent here: it already travels on the Bind/rename path
+///   (`apply_presentation`), so the descriptor's name stays empty and the
+///   driver keeps the Bind name.
+/// - `mark_applied` reports what the driver PRESENTS: Virtual whenever the
+///   acknowledgement for the current generation says so (also a refused
+///   request), the requested presentation once a Physical request converged.
+/// - The driver's capability is the session's strong caller check, which every
+///   acknowledgement carries (the driver replays one per endpoint after each
+///   Bind, before anything was asked): verified -> Supported, acknowledged but
+///   unverified -> CallerCheckInsufficient, never acknowledged -> Unsupported.
+#[cfg(target_os = "macos")]
+fn drive_mac_presentation(inner: &DaemonInner, hal: &halbridge::HalBridge, desired: &[DesiredDevice]) {
+    use audiohub_core::device_facts::Direction;
+    use halbridge::{HalPhysicalDescriptor, HalPresentClass, HalPresentation};
+    use presentation::mac;
+
+    struct Wish {
+        fingerprint: String,
+        direction: Direction,
+        at: HalEndpoint,
+        generation: u32,
+        requested: Presentation,
+        want: HalPresentation,
+    }
+    let wishes: Vec<Wish> = {
+        let st = lk(&inner.haldev);
+        let mut v = Vec::new();
+        for d in desired {
+            let rec = &st.slots[d.slot as usize];
+            if rec.state != Some(HalSlotState::Bound) || rec.fingerprint != d.fingerprint || rec.generation == 0 {
+                continue;
+            }
+            let group = presentation::related_group(&d.presentation[presentation::OUT], &d.presentation[presentation::IN]);
+            for (direction, index, bit) in [
+                (Direction::Output, presentation::OUT, HAL_PUBLISH_OUT),
+                (Direction::Input, presentation::IN, HAL_PUBLISH_IN),
+            ] {
+                if rec.published_directions & bit == 0 {
+                    continue;
+                }
+                let target = mac::target(direction, &d.presentation[index], group);
+                let want = if target.klass == mac::KLASS_PHYSICAL {
+                    HalPresentation::Physical(HalPhysicalDescriptor {
+                        transport: target.transport,
+                        name: String::new(),
+                        manufacturer: target.manufacturer.clone(),
+                        model_uid: target.model_uid(direction),
+                        terminal_type: target.terminal_type,
+                        related_group: target.related_group,
+                        icon_kind: target.icon_kind,
+                    })
+                } else {
+                    HalPresentation::Virtual
+                };
+                v.push(Wish {
+                    fingerprint: d.fingerprint.clone(),
+                    direction,
+                    at: HalEndpoint {
+                        slot: d.slot,
+                        input: direction == Direction::Input,
+                    },
+                    generation: rec.generation,
+                    requested: d.presentation[index].clone(),
+                    want,
+                });
+            }
+        }
+        v
+    };
+
+    let mut statuses = Vec::with_capacity(wishes.len());
+    for w in wishes {
+        if let Err(err) = hal.set_presentation(w.at, w.generation, w.want) {
+            // A descriptor the driver would refuse anyway; the endpoint keeps
+            // its previous wish and the policy keeps seeing the driver's ack.
+            dlog!("[audiohubd] hal: presentation for slot {} not sent: {err:?}", w.at.slot);
+        }
+        statuses.push((w.fingerprint, w.direction, w.requested, hal.presentation_status(w.at)));
+    }
+
+    let mut st = lk(&inner.haldev);
+    let (mut acked, mut verified) = (false, false);
+    for (fingerprint, direction, requested, status) in statuses {
+        let Some(ack) = status.ack else {
+            continue;
+        };
+        acked = true;
+        verified |= ack.caller_verified;
+        if status.effective == HalPresentClass::Virtual {
+            st.presentation.mark_applied(&fingerprint, direction, Presentation::Virtual);
+        } else if status.converged {
+            st.presentation.mark_applied(&fingerprint, direction, requested);
+        }
+    }
+    st.presentation.set_driver(if verified {
+        presentation::DriverPresentation::Supported
+    } else if acked {
+        presentation::DriverPresentation::CallerCheckInsufficient
+    } else {
+        presentation::DriverPresentation::Unsupported
+    });
+}
+
+/// Windows (T6 glue, design §7.3–§7.6): the presentation already travelled on
+/// each Bind (`DesiredDevice::win_presentation`), and the driver's reply
+/// recorded what each direction actually presents as the endpoint's ack
+/// (`halbridge::record_windows_presentation`). This feeds that account back
+/// into the policy, the same way `drive_mac_presentation` does:
+///
+/// - `mark_applied` reports what the driver PRESENTS for the current
+///   generation: Virtual whenever the ack says so (also a request the caller
+///   rule forced virtual), else the presentation the last successful Set
+///   carried — the one this ack answers, because the Bind is synchronous.
+/// - The capability is the session's: the current protocol with `CAP_PRESENTATION` and
+///   an image-path caller check -> Supported; the same below image path ->
+///   CallerCheckInsufficient (the driver would force every physical request
+///   virtual); anything else -> Unsupported. Anything but Supported makes the
+///   policy present Virtual, so physical requests are never even sent then.
+/// - Rebuild timing stays with the policy's `RebuildTracker`
+///   (`WINDOWS_POLICY`): a changed presentation only reaches the driver once
+///   the tracker issued it, through `PresentationState::current`.
+#[cfg(windows)]
+fn drive_win_presentation(inner: &DaemonInner, hal: &halbridge::HalBridge, desired: &[DesiredDevice]) {
+    use audiohub_core::device_facts::Direction;
+    use halbridge::HalPresentClass;
+
+    struct Seen {
+        fingerprint: String,
+        direction: Direction,
+        sent: Presentation,
+        status: halbridge::HalPresentationStatus,
+    }
+    let wishes: Vec<(String, Direction, HalEndpoint, Presentation)> = {
+        let st = lk(&inner.haldev);
+        let mut v = Vec::new();
+        for d in desired {
+            let rec = &st.slots[d.slot as usize];
+            if rec.state != Some(HalSlotState::Bound) || rec.fingerprint != d.fingerprint || !rec.sent {
+                continue;
+            }
+            for (direction, index, bit) in [
+                (Direction::Output, presentation::OUT, HAL_PUBLISH_OUT),
+                (Direction::Input, presentation::IN, HAL_PUBLISH_IN),
+            ] {
+                if rec.published_directions & bit == 0 {
+                    continue;
+                }
+                v.push((
+                    d.fingerprint.clone(),
+                    direction,
+                    HalEndpoint {
+                        slot: d.slot,
+                        input: direction == Direction::Input,
+                    },
+                    rec.sent_presentation[index].clone(),
+                ));
+            }
+        }
+        v
+    };
+    let seen: Vec<Seen> = wishes
+        .into_iter()
+        .map(|(fingerprint, direction, at, sent)| Seen {
+            fingerprint,
+            direction,
+            sent,
+            status: hal.presentation_status(at),
+        })
+        .collect();
+    let capability = hal.windows_presentation_capability();
+
+    let mut st = lk(&inner.haldev);
+    for s in seen {
+        let Some(ack) = s.status.ack else {
+            continue;
+        };
+        if ack.class == HalPresentClass::Virtual {
+            st.presentation.mark_applied(&s.fingerprint, s.direction, Presentation::Virtual);
+        } else if s.sent.is_physical() {
+            st.presentation.mark_applied(&s.fingerprint, s.direction, s.sent);
+        } else {
+            // The driver presents a physical look this daemon did not send in
+            // its last Set (a bind from before a restart that has not been
+            // re-stated yet). Leave the account Unknown; the next Set fixes it.
+            dlog!(
+                "[audiohubd] hal: {} {:?} presents physical without a matching request",
+                s.fingerprint,
+                s.direction
+            );
+        }
+    }
+    st.presentation.set_driver(win_driver_presentation(capability));
+}
+
+/// What the attached Windows driver allows (design §7.6): physical only on
+/// the current protocol (v11) with `AH_CAP_PRESENTATION` and the image-path caller
+/// check in force; the capability without that check is reported apart so
+/// the UI can say why everything stays virtual.
+#[cfg(windows)]
+fn win_driver_presentation(capability: Option<(u32, u32, u32)>) -> presentation::DriverPresentation {
+    use crate::halbridge_win::wire;
+    match capability {
+        Some((protocol, caps, check))
+            if protocol == wire::PROTOCOL_VERSION && caps & wire::CAP_PRESENTATION != 0 =>
+        {
+            if check >= wire::CLIENT_CHECK_IMAGEPATH {
+                presentation::DriverPresentation::Supported
+            } else {
+                presentation::DriverPresentation::CallerCheckInsufficient
+            }
+        }
+        _ => presentation::DriverPresentation::Unsupported,
+    }
+}
+
+/// Put the presentation the platform layer should show into one desired
+/// device: the `[OUT, IN]` array itself, and for each physical direction the
+/// mirrored name (design §5.2; macOS carries names on the Bind path, Windows
+/// ignores these two fields and takes its names from the presentation).
+fn apply_presentation(
+    d: &mut DesiredDevice,
+    current: [Presentation; 2],
+    label: &str,
+    marked_offline: bool,
+    locale: &str,
+) {
+    if let Some(desc) = current[presentation::OUT].descriptor() {
+        d.out_name = presentation::mac_device_name(desc, label, marked_offline, locale);
+    }
+    if let Some(desc) = current[presentation::IN].descriptor() {
+        d.in_name = presentation::mac_device_name(desc, label, marked_offline, locale);
+    }
+    // Windows (design §7.3/§7.4): the bind carries each direction's form
+    // factor, key and endpoint name. A target that cannot be built fails
+    // closed to virtual inside `win::target`.
+    let group = presentation::related_group(&current[presentation::OUT], &current[presentation::IN]);
+    let names = presentation::win::NameCtx {
+        peer_label: label,
+        locale,
+    };
+    for (index, direction) in [
+        (presentation::OUT, audiohub_core::device_facts::Direction::Output),
+        (presentation::IN, audiohub_core::device_facts::Direction::Input),
+    ] {
+        d.win_presentation[index] =
+            presentation::win::target(direction, &d.fingerprint, &current[index], group, &names).to_wire();
+    }
+    d.presentation = current;
+}
+
+/// One presentation pass over `fingerprints` (design §5). The caller holds
+/// the haldev lock; `st.display` must already be this pass's labels. Lock
+/// order is the one `compute_desired` already uses: haldev, then the daemon
+/// state (inside `peer_facts`), and settings on its own. Returns whether the
+/// persisted facts changed.
+fn evaluate_presentation_locked(
+    inner: &DaemonInner,
+    st: &mut HalDevState,
+    fingerprints: &[String],
+    now: Instant,
+) -> bool {
+    let (enabled, mark_offline, locale) = {
+        let s = lk(&inner.settings);
+        (
+            s.present_physical_devices,
+            s.mark_offline_devices,
+            s.native_locale.clone(),
+        )
+    };
+    let peers: Vec<presentation::PeerInputs> = fingerprints
+        .iter()
+        .map(|fp| {
+            let view = crate::device_facts_pub::peer_facts(inner, fp);
+            let slot = st.table.slot_of(fp);
+            let rec = slot
+                .and_then(|s| st.slots.get(usize::from(s)))
+                .filter(|r| r.fingerprint == *fp);
+            presentation::PeerInputs {
+                fingerprint: fp.clone(),
+                slot,
+                label: st.display.get(fp).cloned().unwrap_or_else(|| fp.clone()),
+                marked_offline: mark_offline && view.is_none(),
+                cached: st.table.facts_of(fp).cloned(),
+                idle: [
+                    !rec.is_some_and(|r| r.io_out),
+                    !rec.is_some_and(|r| r.io_in),
+                ],
+                view,
+            }
+        })
+        .collect();
+    let outcome = st.presentation.evaluate(presentation::EvalInputs {
+        now,
+        consumer_enabled: enabled,
+        accept_injected: crate::device_facts_pub::ACCEPT_INJECTED,
+        locale,
+        peers,
+    });
+    let mut changed = false;
+    for (fp, update) in outcome.cache {
+        changed |= match update {
+            presentation::CacheUpdate::Set(facts) => st.table.set_facts(&fp, Some(facts)),
+            presentation::CacheUpdate::Clear => st.table.set_facts(&fp, None),
+        };
+    }
+    changed
+}
+
+/// A presentation pass outside the coordinator: same decisions, same gate,
+/// for a daemon without a HAL bridge (tests). The coordinator runs the
+/// locked half inside every reconcile.
+#[cfg_attr(
+    not(all(test, feature = "fake-audio", feature = "facts-injection")),
+    allow(dead_code)
+)]
+pub(crate) fn evaluate_presentation(inner: &DaemonInner) {
+    let peers = PeerStore::load_at(Some(&inner.cfg_dir))
+        .map(|s| s.list().to_vec())
+        .unwrap_or_default();
+    let display = display_names(
+        &peers
+            .iter()
+            .map(|p| NameInput {
+                fingerprint: p.fingerprint.clone(),
+                base: base_name(p),
+                added_unix: p.added_unix,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let fingerprints: Vec<String> = peers.iter().map(|p| p.fingerprint.clone()).collect();
+    let changed = {
+        let mut st = lk(&inner.haldev);
+        st.display = display;
+        evaluate_presentation_locked(inner, &mut st, &fingerprints, Instant::now())
+    };
+    if changed {
+        save_table(inner);
+    }
+}
+
+/// The mixer's lock-free view of the microphone mismatch gate (design §5.4).
+pub(crate) fn mic_presentation_gate(inner: &DaemonInner) -> Arc<presentation::MicPresentationGate> {
+    lk(&inner.haldev).presentation.gate()
+}
+
+/// `daemon.status.presentation`.
+pub(crate) fn presentation_status(inner: &DaemonInner) -> serde_json::Value {
+    lk(&inner.haldev).presentation.status_json()
 }
 
 pub(crate) fn save_table(inner: &DaemonInner) {
@@ -3031,6 +3501,8 @@ mod tests {
             display: name.to_string(),
             directions: HAL_PUBLISH_BOTH,
             online: true,
+            presentation: [Presentation::Virtual, Presentation::Virtual],
+            win_presentation: Default::default(),
         }
     }
 
@@ -3253,13 +3725,138 @@ mod tests {
         table.save(&dir).expect("save");
 
         let json = std::fs::read_to_string(SlotTable::path(&dir)).expect("read");
-        assert!(json.contains("\"version\": 3"));
+        assert!(json.contains(&format!("\"version\": {SLOT_FILE_VERSION}")));
         let restored = SlotTable::load(&dir);
         assert_eq!(restored.slot_of("unknown-peer"), Some(0));
         assert_eq!(restored.directions_of("unknown-peer"), None);
         assert_eq!(restored.directions_of("empty-peer"), Some(0));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn physical_facts(token: &str) -> audiohub_core::device_facts::DirectionFacts {
+        audiohub_core::device_facts::DirectionFacts::physical(
+            audiohub_core::device_facts::PhysicalDescriptor {
+                transport: audiohub_core::device_facts::PhysicalTransport::Usb,
+                form_factor: audiohub_core::device_facts::FormFactor::Headset,
+                name: "Jabra Evolve2 65".into(),
+                endpoint_desc: None,
+                adapter_name: None,
+                manufacturer: Some("Jabra".into()),
+                device_token: token.into(),
+                group: 1,
+            },
+        )
+    }
+
+    fn slot_dir(tag: &str) -> PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ahb-slots-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    /// v3 -> v4 (design §4.5): a v3 file loads with its assignments and
+    /// direction masks intact and no persisted facts; saving writes v4, and
+    /// facts survive the round trip. An invalid persisted record is
+    /// sanitised to virtual on load, never trusted.
+    #[test]
+    fn a_v3_slot_file_migrates_to_v4_and_persisted_facts_round_trip() {
+        let dir = slot_dir("v4");
+        std::fs::write(
+            SlotTable::path(&dir),
+            br#"{"version":3,"slots":[{"slot":2,"fingerprint":"peer-a","directions":3},
+                                       {"slot":5,"fingerprint":"peer-b"}]}"#,
+        )
+        .expect("write v3");
+        let mut table = SlotTable::load(&dir);
+        assert_eq!(table.slot_of("peer-a"), Some(2));
+        assert_eq!(table.directions_of("peer-a"), Some(HAL_PUBLISH_BOTH));
+        assert_eq!(table.directions_of("peer-b"), None);
+        assert!(table.facts_of("peer-a").is_none() && table.facts_of("peer-b").is_none());
+
+        let facts = CachedFacts::new(
+            physical_facts("0123456789abcdef"),
+            audiohub_core::device_facts::DirectionFacts::virtual_("transport_virtual"),
+        );
+        let before = table.clone();
+        assert!(table.set_facts("peer-a", Some(facts.clone())));
+        assert!(!table.same_as(&before), "a facts change must be persisted");
+        assert!(
+            !table.set_facts("peer-a", Some(facts.clone())),
+            "unchanged is not a change"
+        );
+        assert!(!table.set_facts("no-slot", Some(facts.clone())));
+        table.save(&dir).expect("save");
+        let json = std::fs::read_to_string(SlotTable::path(&dir)).expect("read");
+        assert!(json.contains("\"version\": 4"), "{json}");
+        let restored = SlotTable::load(&dir);
+        assert_eq!(restored.facts_of("peer-a"), Some(&facts));
+        assert_eq!(restored.directions_of("peer-a"), Some(HAL_PUBLISH_BOTH));
+        assert!(restored.facts_of("peer-b").is_none());
+
+        // Tampered record: loads as virtual("invalid_facts").
+        let tampered = json.replace("0123456789abcdef", "NOT-A-TOKEN-XXXX");
+        std::fs::write(SlotTable::path(&dir), tampered).expect("write tampered");
+        let t = SlotTable::load(&dir);
+        let input = &t.facts_of("peer-a").expect("record kept").input;
+        assert_eq!(
+            input.class,
+            audiohub_core::device_facts::DeviceClass::Virtual
+        );
+        assert_eq!(
+            input.reason,
+            audiohub_core::device_facts::reason::INVALID_FACTS
+        );
+
+        // Forgetting the peer forgets its facts; a re-pairing starts clean.
+        let mut t = restored;
+        t.release("peer-a");
+        assert_eq!(t.assign("peer-a", 16), Some(0));
+        assert!(t.facts_of("peer-a").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_presentation_change_is_an_in_place_set_and_names_follow_a_physical_look() {
+        let mut d = want(0, "aaaa", "WIN-30");
+        let slots = {
+            let mut s = empty_slots();
+            s[0] = published(&d, 3);
+            s
+        };
+        assert!(plan_binds(&[d.clone()], &slots, Some(&seen(&[&d]))).is_empty());
+        let facts = physical_facts("0123456789abcdef");
+        let look = Presentation::Physical(facts.physical.clone().expect("physical"));
+        apply_presentation(
+            &mut d,
+            [Presentation::Virtual, look.clone()],
+            "WIN-30",
+            false,
+            "en-US",
+        );
+        assert_eq!(d.in_name, "Jabra Evolve2 65 (WIN-30)");
+        assert_eq!(
+            d.out_name,
+            device_names("WIN-30", false, "zh-CN").0,
+            "virtual half untouched"
+        );
+        let actions = plan_binds(&[d.clone()], &slots, Some(&seen(&[&d])));
+        assert!(
+            matches!(actions.as_slice(), [BindAction::Set(req)] if req.slot == 0 && req.in_uid == uid_in("aaaa")),
+            "{actions:?}"
+        );
+        apply_presentation(
+            &mut d,
+            [Presentation::Virtual, look],
+            "WIN-30",
+            true,
+            "zh-CN",
+        );
+        assert_eq!(d.in_name, "Jabra Evolve2 65 (WIN-30)（离线）");
     }
 
     /// The persistence trigger. A pass that hands a peer a slot MUST write the

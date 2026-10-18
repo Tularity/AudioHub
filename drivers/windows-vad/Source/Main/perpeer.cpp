@@ -25,6 +25,7 @@ Abstract:
 #include "ahrings.h"
 #include "ctldevice.h"
 #include "minwavert.h"
+#include "bus.h"
 
 //-----------------------------------------------------------------------------
 // State
@@ -32,16 +33,29 @@ Abstract:
 
 static AH_SLOT          g_AhSlots[AUDIOHUB_WIN_MAX_SLOTS];
 static KMUTEX           g_AhSlotLock;
-static PADAPTERCOMMON   g_AhAdapter     = NULL;
-static PDEVICE_OBJECT   g_AhDeviceObject = NULL;
 static BOOLEAN          g_AhInitialised = FALSE;
 
 //
-// The PDO. Needed for two registry paths: reading the INF's static
-// MediaCategories entries out of the driver software key, and reaching each
-// per-peer device interface's own key to write the endpoint name into it.
+// v11 HOSTS: the child devnodes whose PortCls adapter is running. An entry is
+// added by AhPerPeerChildStart and removed by AhPerPeerChildDetach, both under
+// the slot lock, so while that lock is held an entry's PDO and adapter are
+// alive: the child FDO -- and with it the adapter -- cannot be removed before
+// its detach, and the PDO cannot be deleted while its FDO is attached.
 //
-static PDEVICE_OBJECT   g_AhPdo = NULL;
+// The PDO is needed for two registry paths: reading the INF's static
+// MediaCategories entries out of the child's driver software key, and reaching
+// each per-peer device interface's own key (interfaces are registered against
+// the PDO of the adapter that installs them) to write the endpoint name.
+//
+typedef struct _AH_HOST
+{
+    PDEVICE_OBJECT  Pdo;        // NULL = free entry
+    PDEVICE_OBJECT  Fdo;
+    PADAPTERCOMMON  Adapter;
+    AH_UNIT_SPEC    Spec;       // what the bus said this child is, at start
+} AH_HOST, *PAH_HOST;
+
+static AH_HOST          g_AhHosts[AH_BUS_MAX_CHILDREN];
 
 //
 // The generic fallback labels, READ BACK from the INF's static MediaCategories
@@ -65,6 +79,40 @@ static BOOLEAN          g_AhDirWordsOk = FALSE;
 // tenant match slot 3's current stamp.
 //
 static ULONG            g_AhNextGeneration = 1;
+
+//
+// v10 TOPOLOGY VARIANTS: the bridge pin categories a physical presentation can
+// select, other than the two the shared templates already carry
+// (KSNODETYPE_SPEAKER / KSNODETYPE_MICROPHONE_ARRAY).
+//
+// Each entry is a deep copy of the shared topology filter descriptor and its
+// pin array with ONLY the bridge pin's KsPinDescriptor.Category replaced; every
+// other pointer (automation tables, nodes, connections, data ranges) still
+// targets the immutable shared templates. Built once at DriverEntry and never
+// written again: PortCls keeps the descriptor pointers for as long as a
+// subdevice lives, and a slot rebind must never rewrite storage that a still-
+// referenced subdevice points into. Slots only select a variant.
+//
+#define AH_TOPO_MAX_PINS    8u
+
+typedef struct _AH_TOPO_VARIANT
+{
+    BOOLEAN             Render;
+    ULONG               FormFactor;     // AH_FF_*
+    BOOLEAN             Ready;
+    PCFILTER_DESCRIPTOR Filter;
+    PCPIN_DESCRIPTOR    Pins[AH_TOPO_MAX_PINS];
+} AH_TOPO_VARIANT;
+
+static AH_TOPO_VARIANT  g_AhTopoVariants[] =
+{
+    { TRUE,  AH_FF_HEADPHONES },
+    { TRUE,  AH_FF_HEADSET    },
+    { TRUE,  AH_FF_HANDSET    },
+    { FALSE, AH_FF_MICROPHONE },
+    { FALSE, AH_FF_HEADSET    },
+    { FALSE, AH_FF_HANDSET    },
+};
 
 #define AH_LOCK()   KeWaitForSingleObject(&g_AhSlotLock, Executive, KernelMode, FALSE, NULL)
 #define AH_UNLOCK() KeReleaseMutex(&g_AhSlotLock, FALSE)
@@ -132,17 +180,22 @@ static VOID AhSpeakerPauseLocked(ULONG Slot)
     KeReleaseSpinLock(&g_AhSpeaker[Slot].Gate, irql);
 }
 
+// v11: the speaker format machinery follows what the slot ACTUALLY publishes,
+// read under the slot lock by every path that changes it -- the Set and Clear
+// as well as a child devnode starting or going away. Publication is
+// asynchronous now, so a value copied out of a Bind reply and applied after
+// the lock was dropped could already be stale. Caller owns the slot lock.
+static ULONG AhSlotPublishedMask(_In_ const AH_SLOT *Slot);
+
 #pragma code_seg()
-VOID AhSpeakerFormatBind(ULONG Slot, ULONG Generation, BOOLEAN Published)
+static VOID AhSpeakerFormatSyncLocked(ULONG Slot)
 {
     PAGED_CODE();
     if (Slot >= AUDIOHUB_WIN_MAX_SLOTS) { return; }
-    AH_LOCK();
-    if (Generation != g_AhSlots[Slot].Generation)
-    {
-        AH_UNLOCK();
-        return;
-    }
+    const AH_SLOT *slot = &g_AhSlots[Slot];
+    const ULONG Generation = slot->Generation;
+    const BOOLEAN Published = (slot->State == AH_SLOT_BOUND &&
+                               (AhSlotPublishedMask(slot) & AH_PUB_RENDER) != 0) ? TRUE : FALSE;
     AH_SPEAKER_STATE *state = &g_AhSpeaker[Slot];
     KIRQL irql;
     KeAcquireSpinLock(&state->Gate, &irql);
@@ -157,7 +210,6 @@ VOID AhSpeakerFormatBind(ULONG Slot, ULONG Generation, BOOLEAN Published)
         RtlZeroMemory(&state->Transaction, sizeof(state->Transaction));
     }
     KeReleaseSpinLock(&state->Gate, irql);
-    AH_UNLOCK();
 }
 
 #pragma code_seg()
@@ -499,6 +551,7 @@ Routine Description:
 #pragma code_seg("PAGE")
 static NTSTATUS
 AhOpenMediaCategories(
+    _In_  PDEVICE_OBJECT Pdo,
     _In_  ULONG       Location,
     _In_  ACCESS_MASK Access,
     _Out_ PHANDLE     Key
@@ -531,16 +584,18 @@ Routine Description:
 
     if (Location == AH_MEDIACAT_SOFTWAREKEY)
     {
-        if (g_AhPdo == NULL)
+        if (Pdo == NULL)
         {
             return STATUS_DEVICE_NOT_READY;
         }
         //
         // PLUGPLAY_REGKEY_DRIVER, not _DEVICE: HKR inside a DDInstall AddReg
         // section is the DRIVER software key, and that is where the INF put the
-        // static MediaCategories entries this has to sit beside.
+        // static MediaCategories entries this has to sit beside. v11: the
+        // child devnode's software key -- the INF section with these entries
+        // is the children's, not the bus's.
         //
-        status = IoOpenDeviceRegistryKey(g_AhPdo, PLUGPLAY_REGKEY_DRIVER, Access, &root);
+        status = IoOpenDeviceRegistryKey(Pdo, PLUGPLAY_REGKEY_DRIVER, Access, &root);
         if (!NT_SUCCESS(status))
         {
             return status;
@@ -571,6 +626,7 @@ Routine Description:
 #pragma code_seg("PAGE")
 static NTSTATUS
 AhReadPinNameValue(
+    _In_  PDEVICE_OBJECT Pdo,
     _In_  const GUID *Guid,
     _Out_writes_z_(Chars) PWSTR Out,
     _In_  ULONG       Chars
@@ -596,7 +652,7 @@ Routine Description:
     for (ULONG loc = 0; loc < AH_MEDIACAT_COUNT; loc++)
     {
         HANDLE mediaCat = NULL;
-        NTSTATUS status = AhOpenMediaCategories(loc, KEY_READ, &mediaCat);
+        NTSTATUS status = AhOpenMediaCategories(Pdo, loc, KEY_READ, &mediaCat);
         if (!NT_SUCCESS(status))
         {
             continue;
@@ -694,6 +750,7 @@ AhOpenOrCreateSubkey(
 #pragma code_seg("PAGE")
 static NTSTATUS
 AhOpenEndpointParams(
+    _In_   PDEVICE_OBJECT Pdo,
     _In_z_ PCWSTR  ReferenceString,
     _In_   BOOLEAN Create,
     _Out_  PHANDLE Key
@@ -713,6 +770,12 @@ Routine Description:
     MigrateDeviceInterfaceTemplateParameters reaches the template's key exactly
     this way, so this is the house pattern rather than a new trick.
 
+    v11: Pdo is the HOST CHILD's PDO. PortCls registers a subdevice's
+    interfaces against the PDO of the adapter that installs it, so the EP\0
+    store an endpoint is built from belongs to the child devnode that hosts the
+    direction, and the same reference string on another child is another
+    interface (and another endpoint id).
+
     Called BEFORE the filters are installed, which matters twice over. The
     interface is not yet enabled, so the value is in place before any endpoint
     can be built from it; and the later template migration adds the template's
@@ -730,7 +793,7 @@ Routine Description:
 
     *Key = NULL;
 
-    if (g_AhPdo == NULL)
+    if (Pdo == NULL)
     {
         return STATUS_DEVICE_NOT_READY;
     }
@@ -742,7 +805,7 @@ Routine Description:
     RtlZeroMemory(&symlink, sizeof(symlink));
 
     NTSTATUS status = IoRegisterDeviceInterface(
-        g_AhPdo, &KSCATEGORY_AUDIO, &refString, &symlink);
+        Pdo, &KSCATEGORY_AUDIO, &refString, &symlink);
     if (!NT_SUCCESS(status))
     {
         return status;
@@ -775,6 +838,7 @@ Routine Description:
 #pragma code_seg("PAGE")
 static NTSTATUS
 AhWriteEndpointName(
+    _In_   PDEVICE_OBJECT Pdo,
     _In_z_ PCWSTR ReferenceString,
     _In_z_ PCWSTR Name
     )
@@ -782,7 +846,7 @@ AhWriteEndpointName(
     PAGED_CODE();
 
     HANDLE   ep     = NULL;
-    NTSTATUS status = AhOpenEndpointParams(ReferenceString, TRUE, &ep);
+    NTSTATUS status = AhOpenEndpointParams(Pdo, ReferenceString, TRUE, &ep);
     if (!NT_SUCCESS(status))
     {
         return status;
@@ -805,6 +869,7 @@ AhWriteEndpointName(
 #pragma code_seg("PAGE")
 static NTSTATUS
 AhWriteEndpointPeerKey(
+    _In_   PDEVICE_OBJECT Pdo,
     _In_z_ PCWSTR ReferenceString,
     _In_z_ PCSTR  PeerKey,
     _In_z_ PCWSTR DirectionTag
@@ -813,7 +878,7 @@ AhWriteEndpointPeerKey(
     PAGED_CODE();
 
     HANDLE ep = NULL;
-    NTSTATUS status = AhOpenEndpointParams(ReferenceString, TRUE, &ep);
+    NTSTATUS status = AhOpenEndpointParams(Pdo, ReferenceString, TRUE, &ep);
     if (!NT_SUCCESS(status))
     {
         return status;
@@ -844,6 +909,7 @@ AhWriteEndpointPeerKey(
 #pragma code_seg("PAGE")
 static VOID
 AhClearEndpointName(
+    _In_   PDEVICE_OBJECT Pdo,
     _In_z_ PCWSTR ReferenceString
     )
 /*++
@@ -864,7 +930,7 @@ Routine Description:
     PAGED_CODE();
 
     HANDLE   ep     = NULL;
-    NTSTATUS status = AhOpenEndpointParams(ReferenceString, FALSE, &ep);
+    NTSTATUS status = AhOpenEndpointParams(Pdo, ReferenceString, FALSE, &ep);
     if (!NT_SUCCESS(status))
     {
         return;
@@ -883,13 +949,14 @@ Routine Description:
 #pragma code_seg("PAGE")
 static VOID
 AhClearEndpointPeerKey(
+    _In_   PDEVICE_OBJECT Pdo,
     _In_z_ PCWSTR ReferenceString
     )
 {
     PAGED_CODE();
 
     HANDLE ep = NULL;
-    NTSTATUS status = AhOpenEndpointParams(ReferenceString, FALSE, &ep);
+    NTSTATUS status = AhOpenEndpointParams(Pdo, ReferenceString, FALSE, &ep);
     if (!NT_SUCCESS(status))
     {
         return;
@@ -909,7 +976,7 @@ AhClearEndpointPeerKey(
 #pragma code_seg("PAGE")
 static NTSTATUS
 AhComposeEndpointName(
-    _In_z_ PCWSTR Display,
+    _In_z_ PCWSTR Source,
     _In_z_ PCWSTR DirectionWord,
     _Out_writes_z_(Chars) PWSTR Out,
     _In_   ULONG  Chars
@@ -918,18 +985,18 @@ AhComposeEndpointName(
 
 Routine Description:
 
-    Copies the daemon-composed peer label verbatim. Render and capture use the
-    SAME label; Windows already separates them into output and input device
-    lists, and their endpoint identities and data-flow directions remain
-    distinct. DirectionWord is retained only because the INF values remain the
-    generic fallback when this per-peer property cannot be written.
+    Copies the daemon-composed endpoint half verbatim: the physical endpoint
+    half for a physical direction (v10), and for a virtual one the daemon's
+    endpoint_desc when it sent one (v11, e.g. the localized "Speakers") or the
+    peer label otherwise. DirectionWord is retained only because the INF values
+    remain the generic fallback when this per-peer property cannot be written.
 
 --*/
 {
     PAGED_CODE();
 
     UNREFERENCED_PARAMETER(DirectionWord);
-    return RtlStringCchCopyW(Out, Chars, Display);
+    return RtlStringCchCopyW(Out, Chars, Source);
 }
 
 //
@@ -954,7 +1021,20 @@ typedef struct _AH_NAME_TARGET
     PCWSTR  DirectionWord;      // from the INF, read back at attach
     PCWSTR  IdentityTag;        // "out" or "in", never localised
     PWSTR   Name;               // where the composed name is kept
+    PCWSTR  Source;             // the endpoint half (AH_NAME_SOURCE)
+    ULONG   PubBit;             // AH_PUB_* of this direction
+    ULONG   Index;              // AH_PRES_* of this direction
 } AH_NAME_TARGET;
+
+//
+// The visible endpoint half of one direction. Physical: the composed
+// AH_PRESENTATION.endpoint_desc (v10). Virtual: v11's endpoint_desc when the
+// daemon sent one, else the peer label exactly as 1.0.1 used it.
+//
+#define AH_NAME_SOURCE(Slot, Index) \
+    (((Slot)->Pres[(Index)].Klass == AH_PRES_PHYSICAL || (Slot)->Pres[(Index)].Desc[0] != L'\0') \
+        ? (PCWSTR)(Slot)->Pres[(Index)].Desc \
+        : (PCWSTR)(Slot)->Display)
 
 #pragma code_seg("PAGE")
 static VOID
@@ -969,149 +1049,152 @@ AhNameTargets(
     Targets[0].DirectionWord   = g_AhDirWordOut;
     Targets[0].IdentityTag     = L"out";
     Targets[0].Name            = Slot->NameOut;
+    Targets[0].Source          = AH_NAME_SOURCE(Slot, AH_PRES_RENDER);
+    Targets[0].PubBit          = AH_PUB_RENDER;
+    Targets[0].Index           = AH_PRES_RENDER;
 
     Targets[1].ReferenceString = Slot->TopoNameIn;
     Targets[1].DirectionWord   = g_AhDirWordIn;
     Targets[1].IdentityTag     = L"in";
     Targets[1].Name            = Slot->NameIn;
+    Targets[1].Source          = AH_NAME_SOURCE(Slot, AH_PRES_CAPTURE);
+    Targets[1].PubBit          = AH_PUB_CAPTURE;
+    Targets[1].Index           = AH_PRES_CAPTURE;
 }
 
 #pragma code_seg("PAGE")
 static VOID
 AhRemoveEndpointNames(
-    _Inout_ PAH_SLOT Slot
+    _Inout_ PAH_SLOT       Slot,
+    _In_    ULONG          Directions,
+    _In_    PDEVICE_OBJECT Pdo
     )
 /*++
 
 Routine Description:
 
-    Removes every endpoint name and peer-identity value this slot wrote.
+    Removes the name and peer-identity values this slot wrote for the selected
+    directions from the CURRENT reference strings on the host child Pdo.
 
-    Called from the ONE teardown routine rather than from each of its three
-    call sites, so "unpairing leaves no registry litter carrying somebody's
-    host name" cannot be true at two of them and false at the third.
+    v11: called for every INTENTIONAL removal of a direction -- unpairing, a
+    presentation change that gives the direction new reference strings, the
+    direction moving to another unit, the capability being withdrawn -- while
+    the host child is still alive. The old interface stays registered (the
+    kernel cannot unregister it) and its endpoint stays known as not present,
+    but it must not keep somebody's host name or an identity that could be
+    mistaken for a live endpoint's. They are removed AFTER the endpoints,
+    because until the endpoints are gone the names are what is displayed.
 
 --*/
 {
     PAGED_CODE();
-
-    if (!Slot->NamesWritten)
-    {
-        return;
-    }
 
     AH_NAME_TARGET targets[AH_NAME_DIRECTIONS];
     AhNameTargets(Slot, targets);
 
     for (ULONG i = 0; i < AH_NAME_DIRECTIONS; i++)
     {
-        AhClearEndpointName(targets[i].ReferenceString);
-        AhClearEndpointPeerKey(targets[i].ReferenceString);
+        if ((Directions & targets[i].PubBit) == 0 || !Slot->NamesWritten[targets[i].Index])
+        {
+            continue;
+        }
+        AhClearEndpointName(Pdo, targets[i].ReferenceString);
+        AhClearEndpointPeerKey(Pdo, targets[i].ReferenceString);
+        Slot->NamesWritten[targets[i].Index] = FALSE;
     }
-
-    Slot->NamesWritten = FALSE;
     //
     // NameFallback is deliberately NOT cleared here. Its lifetime belongs to
-    // AhApplyEndpointNames, which resets it at the top of every attempt.
+    // the bind: reset on a fresh one, raised by any direction's failure.
 }
 
 #pragma code_seg("PAGE")
 static NTSTATUS
 AhApplyEndpointNames(
-    _Inout_ PAH_SLOT Slot,
-    _In_    ULONG    Flags
+    _Inout_ PAH_SLOT       Slot,
+    _In_    ULONG          Directions,
+    _In_    PDEVICE_OBJECT Pdo,
+    _In_    ULONG          Flags
     )
 /*++
 
 Routine Description:
 
-    Writes the authenticated peer key to both topology-interface EP\0 stores,
-    then copies this slot's visible label to both endpoint-name buffers.
+    Writes the authenticated peer key into the selected directions' topology
+    EP\0 stores on the host child Pdo, then the visible endpoint half.
+
+    v11: called per direction, immediately before that direction's filters are
+    installed on its host child -- the interface only exists once its host
+    does. "Before" stays load-bearing: PcRegisterSubdevice is the step that
+    ENABLES the interface, the endpoint builder acts on the arrival edge, and
+    the composed name is CACHED per endpoint id, so a name written afterwards
+    is a race whose losing side is permanent for that peer.
 
     Peer identity is mandatory: user mode uses it to address exactly one
-    MMDevice for scalar volume synchronization. A generic display name is a
-    usable degradation; an endpoint with no identity could receive another
-    peer's volume or silently stop synchronizing, so that failure aborts the
-    bind and is rolled back.
+    MMDevice for scalar volume synchronization. An endpoint with no identity
+    could receive another peer's volume or silently stop synchronizing, so
+    that failure fails the install of the direction.
 
-    Sets Slot->NameFallback when the peer's name could NOT be made to appear, in
-    which case the endpoints come up under the system's generic fallback labels.
-    That is a real degradation -- with two peers paired the user sees two
-    identically named speakers -- so it travels back to the daemon as
-    AH_BINDREPLY_FLAG_NAME_FALLBACK rather than being absorbed here.
-
-    Failing the whole bind for a PRESENTATION error was considered and rejected:
-    a device with a generic name is far more useful than no device. Identity is
-    the opposite trade: no safe user-mode control path exists without it.
+    A name that cannot be written is a usable degradation instead: the
+    endpoint comes up under the system's generic fallback label, and
+    Slot->NameFallback travels back to the daemon as
+    AH_BINDREPLY_FLAG_NAME_FALLBACK rather than being absorbed here. (Since
+    v11 two directions may live on two devnodes, so naming is per direction
+    and no longer all-or-nothing across the pair.)
 
 --*/
 {
     PAGED_CODE();
 
-    Slot->NameFallback = FALSE;
-
     AH_NAME_TARGET targets[AH_NAME_DIRECTIONS];
     AhNameTargets(Slot, targets);
 
-    // Anything written has to be removable, so the flag goes up BEFORE the
-    // first mandatory identity write rather than after the last.
-    Slot->NamesWritten = TRUE;
     for (ULONG i = 0; i < AH_NAME_DIRECTIONS; i++)
     {
-        NTSTATUS st = AhWriteEndpointPeerKey(targets[i].ReferenceString,
-                                             Slot->PeerKey,
-                                             targets[i].IdentityTag);
+        if ((Directions & targets[i].PubBit) == 0)
+        {
+            continue;
+        }
+
+        // Anything written has to be removable, so the flag goes up BEFORE the
+        // first write rather than after the last.
+        Slot->NamesWritten[targets[i].Index] = TRUE;
+        NTSTATUS st = AhWriteEndpointPeerKey(Pdo, targets[i].ReferenceString,
+                                             Slot->PeerKey, targets[i].IdentityTag);
         if (!NT_SUCCESS(st))
         {
             DPF(D_ERROR, ("[AhApplyEndpointNames] peer identity %u failed 0x%x", i, st));
-            AhRemoveEndpointNames(Slot);
+            AhRemoveEndpointNames(Slot, targets[i].PubBit, Pdo);
             return st;
         }
-    }
 
-    if (Flags & AH_BINDFLAG_FAIL_ENDPOINT_NAME)
-    {
-        // The negative control affects presentation only. Identity remains
-        // present because a fallback-named endpoint must still be safe to use.
-        Slot->NameFallback = TRUE;
-        return STATUS_SUCCESS;
-    }
-
-    for (ULONG i = 0; i < AH_NAME_DIRECTIONS; i++)
-    {
-        NTSTATUS st = AhComposeEndpointName(Slot->Display, targets[i].DirectionWord,
-                                            targets[i].Name, AH_ENDPOINT_NAME_CHARS);
-        if (!NT_SUCCESS(st))
+        if (Flags & AH_BINDFLAG_FAIL_ENDPOINT_NAME)
         {
-            DPF(D_ERROR, ("[AhApplyEndpointNames] compose %u failed 0x%x", i, st));
+            // The negative control affects presentation only. Identity remains
+            // present because a fallback-named endpoint must still be safe to use.
+            AhClearEndpointName(Pdo, targets[i].ReferenceString);
             Slot->NameFallback = TRUE;
-            return STATUS_SUCCESS;
+            continue;
         }
-    }
 
-    for (ULONG i = 0; i < AH_NAME_DIRECTIONS; i++)
-    {
-        NTSTATUS st = AhWriteEndpointName(targets[i].ReferenceString, targets[i].Name);
+        st = AhComposeEndpointName(targets[i].Source, targets[i].DirectionWord,
+                                   targets[i].Name, AH_ENDPOINT_NAME_CHARS);
+        if (NT_SUCCESS(st))
+        {
+            st = AhWriteEndpointName(Pdo, targets[i].ReferenceString, targets[i].Name);
+        }
         if (!NT_SUCCESS(st))
         {
             //
-            // ALL OR NOTHING, for the same reason the install is: one direction
-            // named after the peer and the other not is a device pair that lies
-            // about what it is. Take back whatever landed FIRST, then record the
-            // decision. Clear presentation only: the mandatory identity is
-            // independent and must survive a generic-name fallback.
+            // Clear presentation only: the mandatory identity is independent
+            // and must survive a generic-name fallback.
             //
-            DPF(D_ERROR, ("[AhApplyEndpointNames] write %u failed 0x%x", i, st));
-            for (ULONG j = 0; j < AH_NAME_DIRECTIONS; j++)
-            {
-                AhClearEndpointName(targets[j].ReferenceString);
-            }
+            DPF(D_ERROR, ("[AhApplyEndpointNames] name %u failed 0x%x", i, st));
+            AhClearEndpointName(Pdo, targets[i].ReferenceString);
             Slot->NameFallback = TRUE;
-            return STATUS_SUCCESS;
+            continue;
         }
+        DPF(D_TERSE, ("[AhApplyEndpointNames] %S", targets[i].Name));
     }
-
-    DPF(D_TERSE, ("[AhApplyEndpointNames] %S / %S", Slot->NameOut, Slot->NameIn));
     return STATUS_SUCCESS;
 }
 
@@ -1182,6 +1265,280 @@ AhPeerKeyLength(
 }
 
 #pragma code_seg("PAGE")
+static const GUID *
+AhPresentationCategory(
+    _In_ BOOLEAN Render,
+    _In_ ULONG   FormFactor
+    )
+/*++
+
+Routine Description:
+
+    v10: the bridge pin category of a PHYSICAL direction, derived from the
+    pair (direction, form factor) -- the daemon never names a KS GUID. NULL for
+    every pair outside the whitelist in AudioHubIoctl.h (AH_FF_*).
+
+--*/
+{
+    PAGED_CODE();
+
+    if (Render)
+    {
+        switch (FormFactor)
+        {
+        case AH_FF_SPEAKERS:   return &KSNODETYPE_SPEAKER;
+        case AH_FF_HEADPHONES: return &KSNODETYPE_HEADPHONES;
+        case AH_FF_HEADSET:    return &KSNODETYPE_HEADSET_SPEAKERS;
+        case AH_FF_HANDSET:    return &KSNODETYPE_HANDSET;
+        default:               return NULL;
+        }
+    }
+    switch (FormFactor)
+    {
+    case AH_FF_MICROPHONE: return &KSNODETYPE_MICROPHONE;
+    case AH_FF_HEADSET:    return &KSNODETYPE_HEADSET_MICROPHONE;
+    case AH_FF_HANDSET:    return &KSNODETYPE_HANDSET;
+    default:               return NULL;
+    }
+}
+
+#pragma code_seg("PAGE")
+static PCFILTER_DESCRIPTOR *
+AhPresentationTopology(
+    _In_ BOOLEAN Render,
+    _In_ ULONG   Klass,
+    _In_ ULONG   FormFactor
+    )
+/*++
+
+Routine Description:
+
+    v10: the topology filter descriptor one direction installs with. Virtual
+    and physical speakers use the shared speaker template (its bridge pin is
+    already KSNODETYPE_SPEAKER); virtual capture uses the shared microphone
+    array template. Every other physical look selects one of the immutable
+    variants built at DriverEntry. NULL = not presentable.
+
+--*/
+{
+    PAGED_CODE();
+
+    if (Klass == AH_PRES_VIRTUAL)
+    {
+        return Render ? &SpeakerTopoMiniportFilterDescriptor
+                      : &MicArray1TopoMiniportFilterDescriptor;
+    }
+    if (Klass != AH_PRES_PHYSICAL || AhPresentationCategory(Render, FormFactor) == NULL)
+    {
+        return NULL;
+    }
+    if (Render && FormFactor == AH_FF_SPEAKERS)
+    {
+        return &SpeakerTopoMiniportFilterDescriptor;
+    }
+    for (ULONG i = 0; i < ARRAYSIZE(g_AhTopoVariants); i++)
+    {
+        AH_TOPO_VARIANT *v = &g_AhTopoVariants[i];
+        if (v->Render == Render && v->FormFactor == FormFactor)
+        {
+            return v->Ready ? &v->Filter : NULL;
+        }
+    }
+    return NULL;
+}
+
+#pragma code_seg("PAGE")
+static VOID
+AhBuildTopologyVariants(VOID)
+/*++
+
+Routine Description:
+
+    Builds g_AhTopoVariants once, at DriverEntry, before any slot can select
+    one. A variant whose template does not have exactly one bridge pin of the
+    expected category stays not Ready, and a physical request for it is then
+    refused rather than installed with the wrong category.
+
+--*/
+{
+    PAGED_CODE();
+
+    for (ULONG i = 0; i < ARRAYSIZE(g_AhTopoVariants); i++)
+    {
+        AH_TOPO_VARIANT *v = &g_AhTopoVariants[i];
+        const PCFILTER_DESCRIPTOR *src = v->Render ? &SpeakerTopoMiniportFilterDescriptor
+                                                   : &MicArray1TopoMiniportFilterDescriptor;
+        const GUID *match = v->Render ? &KSNODETYPE_SPEAKER : &KSNODETYPE_MICROPHONE_ARRAY;
+        const GUID *replace = AhPresentationCategory(v->Render, v->FormFactor);
+
+        v->Ready = FALSE;
+        if (replace == NULL || src->PinCount > AH_TOPO_MAX_PINS ||
+            src->PinSize != sizeof(PCPIN_DESCRIPTOR))
+        {
+            DPF(D_ERROR, ("[AhBuildTopologyVariants] variant %u unusable", i));
+            continue;
+        }
+
+        v->Filter = *src;
+        ULONG replaced = 0;
+        for (ULONG p = 0; p < src->PinCount; p++)
+        {
+            v->Pins[p] = src->Pins[p];
+            if (v->Pins[p].KsPinDescriptor.Category != NULL &&
+                IsEqualGUID(*v->Pins[p].KsPinDescriptor.Category, *match))
+            {
+                v->Pins[p].KsPinDescriptor.Category = replace;
+                replaced++;
+            }
+        }
+        v->Filter.Pins = v->Pins;
+        v->Ready = (replaced == 1) ? TRUE : FALSE;
+        if (!v->Ready)
+        {
+            DPF(D_ERROR, ("[AhBuildTopologyVariants] variant %u replaced %u bridge pins", i, replaced));
+        }
+    }
+}
+
+//
+// v11: a REG_SZ / FriendlyName the user reads may not carry control
+// characters. Empty is accepted here; the callers decide whether it may be.
+//
+#pragma code_seg("PAGE")
+static BOOLEAN
+AhIsDisplayText(
+    _In_reads_(AH_DISPLAY_CHARS) PCWSTR Text
+    )
+{
+    PAGED_CODE();
+
+    for (ULONG i = 0; i < AH_DISPLAY_CHARS && Text[i] != L'\0'; i++)
+    {
+        WCHAR c = Text[i];
+        if (c < 0x20 || c == 0x7f)
+        {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+#pragma code_seg("PAGE")
+static BOOLEAN
+AhNormalizePresentation(
+    _In_  BOOLEAN                Render,
+    _In_  const AH_PRESENTATION *In,
+    _Out_ PAH_SLOT_PRESENTATION  Out
+    )
+/*++
+
+Routine Description:
+
+    Validates one direction of the request and reduces it to what the slot
+    stores. The caller has already terminated every string field. FALSE =
+    malformed; nothing about the slot may change then.
+
+    A physical look is accepted only with a whitelisted form factor for the
+    direction, a key of exactly AH_PRESKEY_CHARS lowercase hex digits (it
+    becomes part of a device-interface reference string), a non-empty endpoint
+    name and (v11) a non-empty child devnode name, neither with control
+    characters (they become a REG_SZ the endpoint builder displays and a
+    FriendlyName). A virtual look carries no identity of its own; v11 lets it
+    carry an endpoint half and a devnode name, both optional.
+
+--*/
+{
+    PAGED_CODE();
+
+    RtlZeroMemory(Out, sizeof(*Out));
+
+    if (In->reserved != 0 ||
+        !AhIsDisplayText(In->endpoint_desc) ||
+        !AhIsDisplayText(In->adapter_name))
+    {
+        return FALSE;
+    }
+    if (In->klass == AH_PRES_VIRTUAL)
+    {
+        if (In->key[0] != '\0')
+        {
+            return FALSE;
+        }
+        Out->Klass = AH_PRES_VIRTUAL;
+        //
+        // group is meaningless for a virtual direction: every virtual
+        // direction of a peer shares the peer's "v" unit.
+        //
+        (VOID)RtlStringCchCopyW(Out->Desc, AH_DISPLAY_CHARS, In->endpoint_desc);
+        (VOID)RtlStringCchCopyW(Out->AdapterName, AH_DISPLAY_CHARS, In->adapter_name);
+        return TRUE;
+    }
+    if (In->klass != AH_PRES_PHYSICAL ||
+        AhPresentationTopology(Render, AH_PRES_PHYSICAL, In->form_factor) == NULL)
+    {
+        return FALSE;
+    }
+
+    for (ULONG i = 0; i < AH_PRESKEY_BUF; i++)
+    {
+        CHAR c = In->key[i];
+        if (i < AH_PRESKEY_CHARS)
+        {
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            {
+                return FALSE;
+            }
+        }
+        else if (c != '\0')
+        {
+            return FALSE;
+        }
+    }
+
+    if (In->endpoint_desc[0] == L'\0' || In->adapter_name[0] == L'\0')
+    {
+        return FALSE;
+    }
+
+    Out->Klass      = AH_PRES_PHYSICAL;
+    Out->FormFactor = In->form_factor;
+    Out->Group      = In->group;
+    RtlCopyMemory(Out->Key, In->key, AH_PRESKEY_CHARS);
+    Out->Key[AH_PRESKEY_CHARS] = '\0';
+    NTSTATUS st = RtlStringCchCopyW(Out->Desc, AH_DISPLAY_CHARS, In->endpoint_desc);
+    if (!NT_SUCCESS(st))
+    {
+        return FALSE;
+    }
+    st = RtlStringCchCopyW(Out->AdapterName, AH_DISPLAY_CHARS, In->adapter_name);
+    if (!NT_SUCCESS(st))
+    {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+//
+// v10: whether two stored presentations need DIFFERENT endpoints. The name is
+// deliberately not part of it: Windows caches a name per endpoint id, so a
+// rename under the same key could not take effect anyway, and rebuilding for it
+// would cycle a live endpoint for nothing.
+//
+#pragma code_seg("PAGE")
+static BOOLEAN
+AhSamePresentationIdentity(
+    _In_ const AH_SLOT_PRESENTATION *A,
+    _In_ const AH_SLOT_PRESENTATION *B
+    )
+{
+    PAGED_CODE();
+
+    return (A->Klass == B->Klass &&
+            A->FormFactor == B->FormFactor &&
+            strncmp(A->Key, B->Key, AH_PRESKEY_BUF) == 0) ? TRUE : FALSE;
+}
+
+#pragma code_seg("PAGE")
 static NTSTATUS
 AhBuildRefStrings(
     _Inout_ PAH_SLOT Slot,
@@ -1191,7 +1548,10 @@ AhBuildRefStrings(
 
 Routine Description:
 
-    "AhTopoOut-a1b2c3d4e5f60718" and its three siblings.
+    "AhTopoOut-a1b2c3d4e5f60718" and its three siblings, built from the
+    slot's stored presentation: a physical direction appends "-p<key8>"
+    (v10), so a different look is a different endpoint id and an earlier look
+    returns its earlier id. A virtual direction keeps the 1.0.1 string.
 
     The suffix is the PEER FINGERPRINT, never the slot number. With the slot
     number, freeing slot 3 and giving it to a different peer would hand that
@@ -1208,21 +1568,41 @@ Routine Description:
     // RtlStringCbPrintfW's %S on a CHAR* in kernel mode converts ANSI to
     // UTF-16 one byte at a time, which is exactly right for a hex string.
     //
-    struct { PWSTR Buffer; PCWSTR Template; } map[] = {
-        { Slot->TopoNameOut, AH_TEMPLATE_TOPO_OUT },
-        { Slot->WaveNameOut, AH_TEMPLATE_WAVE_OUT },
-        { Slot->TopoNameIn,  AH_TEMPLATE_TOPO_IN  },
-        { Slot->WaveNameIn,  AH_TEMPLATE_WAVE_IN  },
+    struct { PWSTR Buffer; PCWSTR Template; ULONG Pres; } map[] = {
+        { Slot->TopoNameOut, AH_TEMPLATE_TOPO_OUT, AH_PRES_RENDER  },
+        { Slot->WaveNameOut, AH_TEMPLATE_WAVE_OUT, AH_PRES_RENDER  },
+        { Slot->TopoNameIn,  AH_TEMPLATE_TOPO_IN,  AH_PRES_CAPTURE },
+        { Slot->WaveNameIn,  AH_TEMPLATE_WAVE_IN,  AH_PRES_CAPTURE },
     };
 
     for (ULONG i = 0; i < ARRAYSIZE(map); i++)
     {
-        NTSTATUS st = RtlStringCbPrintfW(
-            map[i].Buffer,
-            AH_REFSTRING_MAX * sizeof(WCHAR),
-            L"%s-%S",
-            map[i].Template,
-            PeerKey);
+        const AH_SLOT_PRESENTATION *pres = &Slot->Pres[map[i].Pres];
+        NTSTATUS st;
+        if (pres->Klass == AH_PRES_PHYSICAL)
+        {
+            //
+            // The key was validated as exactly AH_PRESKEY_CHARS lowercase hex
+            // digits (AhNormalizePresentation): no path separator can reach
+            // IoRegisterDeviceInterface through it either.
+            //
+            st = RtlStringCbPrintfW(
+                map[i].Buffer,
+                AH_REFSTRING_MAX * sizeof(WCHAR),
+                L"%s-%S-p%S",
+                map[i].Template,
+                PeerKey,
+                pres->Key);
+        }
+        else
+        {
+            st = RtlStringCbPrintfW(
+                map[i].Buffer,
+                AH_REFSTRING_MAX * sizeof(WCHAR),
+                L"%s-%S",
+                map[i].Template,
+                PeerKey);
+        }
         if (!NT_SUCCESS(st))
         {
             return st;
@@ -1419,6 +1799,36 @@ Routine Description:
 }
 
 #pragma code_seg("PAGE")
+static VOID
+AhSelectTopology(
+    _Inout_ PAH_SLOT Slot
+    )
+/*++
+
+Routine Description:
+
+    v10: points each minipair at the topology descriptor its stored
+    presentation needs. Only ever selects among immutable descriptors, so it
+    is safe to call for a direction that is live: an unchanged presentation
+    selects the pointer it already holds.
+
+--*/
+{
+    PAGED_CODE();
+
+    PCFILTER_DESCRIPTOR *out = AhPresentationTopology(
+        TRUE, Slot->Pres[AH_PRES_RENDER].Klass, Slot->Pres[AH_PRES_RENDER].FormFactor);
+    PCFILTER_DESCRIPTOR *in = AhPresentationTopology(
+        FALSE, Slot->Pres[AH_PRES_CAPTURE].Klass, Slot->Pres[AH_PRES_CAPTURE].FormFactor);
+    //
+    // Validated before it was stored; the fallback only keeps a pointer that
+    // can never be NULL if that invariant were ever broken.
+    //
+    Slot->OutPair.TopoDescriptor = (out != NULL) ? out : &SpeakerTopoMiniportFilterDescriptor;
+    Slot->InPair.TopoDescriptor  = (in  != NULL) ? in  : &MicArray1TopoMiniportFilterDescriptor;
+}
+
+#pragma code_seg("PAGE")
 static ULONG
 AhSlotPublishedMask(
     _In_ const AH_SLOT *Slot
@@ -1472,14 +1882,244 @@ AhWantedPublishedMask(
     return mask;
 }
 
-// Install exactly one requested direction. The minipairs and endpoint-name
-// properties are prepared before this is called. Keeping this operation
-// directional is what lets a capability change remove a microphone without
-// cycling the peer's still-selected speaker endpoint.
+//
+// AH_PUB_RENDER -> AH_PRES_RENDER, AH_PUB_CAPTURE -> AH_PRES_CAPTURE.
+//
+#define AH_DIR_INDEX(Direction) (((Direction) == AH_PUB_RENDER) ? AH_PRES_RENDER : AH_PRES_CAPTURE)
+
+//-----------------------------------------------------------------------------
+// v11 presentation units and hosts
+//-----------------------------------------------------------------------------
+
+//
+// Which unit each wanted direction belongs to (perpeer.h AH_UNIT_*). Pure.
+//
+#pragma code_seg("PAGE")
+static VOID
+AhComputeUnits(
+    _In_reads_(2)  const AH_SLOT_PRESENTATION *Pres,
+    _In_           ULONG Want,
+    _Out_writes_(2) PULONG UnitOf
+    )
+{
+    PAGED_CODE();
+
+    const BOOLEAN r  = (Want & AH_PUB_RENDER)  ? TRUE : FALSE;
+    const BOOLEAN c  = (Want & AH_PUB_CAPTURE) ? TRUE : FALSE;
+    const BOOLEAN rp = (r && Pres[AH_PRES_RENDER].Klass  == AH_PRES_PHYSICAL) ? TRUE : FALSE;
+    const BOOLEAN cp = (c && Pres[AH_PRES_CAPTURE].Klass == AH_PRES_PHYSICAL) ? TRUE : FALSE;
+
+    UnitOf[AH_PRES_RENDER]  = (r && !rp) ? AH_UNIT_V : AH_UNIT_NONE;
+    UnitOf[AH_PRES_CAPTURE] = (c && !cp) ? AH_UNIT_V : AH_UNIT_NONE;
+
+    if (rp && cp &&
+        Pres[AH_PRES_RENDER].Group != 0 &&
+        Pres[AH_PRES_RENDER].Group == Pres[AH_PRES_CAPTURE].Group)
+    {
+        UnitOf[AH_PRES_RENDER]  = AH_UNIT_RC;
+        UnitOf[AH_PRES_CAPTURE] = AH_UNIT_RC;
+    }
+    else
+    {
+        if (rp) { UnitOf[AH_PRES_RENDER]  = AH_UNIT_R; }
+        if (cp) { UnitOf[AH_PRES_CAPTURE] = AH_UNIT_C; }
+    }
+}
+
+//
+// Builds the slot's wanted units (render's first) from its stored
+// presentation, peer key and UnitOf[]. Caller holds the slot lock.
+//
+#pragma code_seg("PAGE")
+static NTSTATUS
+AhBuildSlotUnits(
+    _Inout_ PAH_SLOT Slot
+    )
+{
+    PAGED_CODE();
+
+    RtlZeroMemory(Slot->Units, sizeof(Slot->Units));
+    Slot->UnitCount = 0;
+
+    for (ULONG idx = 0; idx < 2; idx++)
+    {
+        const ULONG unit = Slot->UnitOf[idx];
+        if (unit == AH_UNIT_NONE)
+        {
+            continue;
+        }
+        BOOLEAN seen = FALSE;
+        for (ULONG u = 0; u < Slot->UnitCount; u++)
+        {
+            if (Slot->Units[u].Unit == unit) { seen = TRUE; }
+        }
+        if (seen)
+        {
+            continue;
+        }
+
+        PAH_UNIT_SPEC spec = &Slot->Units[Slot->UnitCount];
+        spec->Slot = (ULONG)(Slot - g_AhSlots);
+        spec->Unit = unit;
+        RtlCopyMemory(spec->PeerKey, Slot->PeerKey, AH_PEERKEY_BUF);
+        if (Slot->UnitOf[AH_PRES_RENDER] == unit)  { spec->Directions |= AH_PUB_RENDER; }
+        if (Slot->UnitOf[AH_PRES_CAPTURE] == unit) { spec->Directions |= AH_PUB_CAPTURE; }
+        if (unit == AH_UNIT_R || unit == AH_UNIT_RC)
+        {
+            RtlCopyMemory(spec->KeyR, Slot->Pres[AH_PRES_RENDER].Key, AH_PRESKEY_BUF);
+        }
+        if (unit == AH_UNIT_C || unit == AH_UNIT_RC)
+        {
+            RtlCopyMemory(spec->KeyC, Slot->Pres[AH_PRES_CAPTURE].Key, AH_PRESKEY_BUF);
+        }
+
+        //
+        // The devnode name: the first hosted direction's adapter name, render
+        // first. A virtual unit without one keeps the peer label, so the
+        // bracketed half is never empty and never shared by two peers (S6:
+        // equal devnode names make Windows prefix the endpoints "N- ").
+        //
+        PCWSTR name = NULL;
+        for (ULONG d = 0; d < 2 && name == NULL; d++)
+        {
+            if (Slot->UnitOf[d] == unit && Slot->Pres[d].AdapterName[0] != L'\0')
+            {
+                name = Slot->Pres[d].AdapterName;
+            }
+        }
+        (VOID)RtlStringCchCopyW(spec->FriendlyName, AH_DISPLAY_CHARS,
+                                (name != NULL) ? name : Slot->Display);
+
+        NTSTATUS st = AhBusFinishUnitSpec(spec);
+        if (!NT_SUCCESS(st))
+        {
+            RtlZeroMemory(Slot->Units, sizeof(Slot->Units));
+            Slot->UnitCount = 0;
+            return st;
+        }
+        Slot->UnitCount++;
+    }
+    return STATUS_SUCCESS;
+}
+
+#pragma code_seg("PAGE")
+static BOOLEAN
+AhSameUnit(
+    _In_ const AH_UNIT_SPEC *A,
+    _In_ const AH_UNIT_SPEC *B
+    )
+{
+    PAGED_CODE();
+
+    UNICODE_STRING a, b;
+    RtlInitUnicodeString(&a, A->InstanceId);
+    RtlInitUnicodeString(&b, B->InstanceId);
+    return (A->Slot == B->Slot &&
+            RtlEqualUnicodeString(&a, &b, TRUE) &&
+            RtlEqualMemory(&A->ContainerId, &B->ContainerId, sizeof(GUID))) ? TRUE : FALSE;
+}
+
+//
+// The wanted unit spec of one direction, NULL when the direction is not
+// wanted. Caller holds the slot lock.
+//
+#pragma code_seg("PAGE")
+static const AH_UNIT_SPEC *
+AhSlotUnitOf(
+    _In_ const AH_SLOT *Slot,
+    _In_ ULONG          Index
+    )
+{
+    PAGED_CODE();
+
+    for (ULONG u = 0; u < Slot->UnitCount; u++)
+    {
+        if (Slot->Units[u].Unit == Slot->UnitOf[Index])
+        {
+            return &Slot->Units[u];
+        }
+    }
+    return NULL;
+}
+
+//
+// The running host child of one wanted direction, NULL while Plug and Play
+// has not started it yet. Caller holds the slot lock.
+//
+#pragma code_seg("PAGE")
+static PAH_HOST
+AhFindHost(
+    _In_ const AH_SLOT *Slot,
+    _In_ ULONG          Index
+    )
+{
+    PAGED_CODE();
+
+    const AH_UNIT_SPEC *want = AhSlotUnitOf(Slot, Index);
+    if (want == NULL)
+    {
+        return NULL;
+    }
+    for (ULONG h = 0; h < AH_BUS_MAX_CHILDREN; h++)
+    {
+        if (g_AhHosts[h].Pdo != NULL && AhSameUnit(&g_AhHosts[h].Spec, want))
+        {
+            return &g_AhHosts[h];
+        }
+    }
+    return NULL;
+}
+
+//
+// What a Set (or AH_EVENT_PUBLISHED) reports about a bound slot beyond the
+// published mask.
+//
+#pragma code_seg("PAGE")
+static ULONG
+AhSlotReplyFlags(
+    _In_ const AH_SLOT *Slot
+    )
+{
+    PAGED_CODE();
+
+    ULONG flags = 0;
+    if (Slot->State != AH_SLOT_BOUND)
+    {
+        return 0;
+    }
+    if (Slot->NameFallback)                                    { flags |= AH_BINDREPLY_FLAG_NAME_FALLBACK; }
+    if (Slot->Pres[AH_PRES_RENDER].Klass  == AH_PRES_PHYSICAL) { flags |= AH_BINDREPLY_FLAG_RENDER_PHYSICAL; }
+    if (Slot->Pres[AH_PRES_CAPTURE].Klass == AH_PRES_PHYSICAL) { flags |= AH_BINDREPLY_FLAG_CAPTURE_PHYSICAL; }
+    return flags;
+}
+
+//
+// v11: tell the daemon the slot's published mask moved outside a Set.
+// Caller holds the slot lock. AhCtlRaiseEvent takes only a spin lock.
+//
+#pragma code_seg("PAGE")
+static VOID
+AhRaisePublishedLocked(
+    _In_ ULONG Slot
+    )
+{
+    PAGED_CODE();
+
+    const AH_SLOT *s = &g_AhSlots[Slot];
+    AhCtlRaiseEvent(AH_EVENT_PUBLISHED, Slot, s->Generation, AhSlotReplyFlags(s),
+                    AhSlotPublishedMask(s), s->State);
+}
+
+// Install exactly one requested direction on its host child. The minipairs
+// are prepared before this is called; the endpoint name and identity are
+// written here, into the host's interface, immediately before the filters
+// exist. Keeping this operation directional is what lets a capability change
+// remove a microphone without cycling the peer's still-selected speaker.
 static NTSTATUS
 AhInstallSlotDirection(
     _Inout_ PAH_SLOT Slot,
     _In_    ULONG    Direction,
+    _In_    PAH_HOST Host,
     _In_    ULONG    Flags,
     _Out_   PULONG   Stage
     )
@@ -1487,7 +2127,10 @@ AhInstallSlotDirection(
     PAGED_CODE();
 
     const BOOLEAN render = (Direction == AH_PUB_RENDER);
+    const ULONG idx = AH_DIR_INDEX(Direction);
     const ULONG slot = (ULONG)(Slot - g_AhSlots);
+
+    *Stage = AH_STAGE_NONE;
 
     // Per-slot rings are immortal across endpoint publication changes. Start
     // each restored direction empty so it cannot replay samples queued before
@@ -1500,10 +2143,39 @@ AhInstallSlotDirection(
         return STATUS_UNSUCCESSFUL;
     }
 
-    NTSTATUS status;
+    //
+    // The host is recorded BEFORE anything is written into it, so a failure
+    // anywhere below can be cleaned up through AhRemoveSlotDirections.
+    //
+    Slot->HostPdo[idx]     = Host->Pdo;
+    Slot->HostAdapter[idx] = Host->Adapter;
+
+    //
+    // The bracketed half of the endpoint name is the host devnode's name, so
+    // the endpoint and the device in Settings say the same thing (S6). Copied
+    // into the slot so the buffer PortCls reads is ours and stable.
+    //
+    {
+        PCWSTR src = (Host->Spec.FriendlyName[0] != L'\0') ? Host->Spec.FriendlyName : Slot->Display;
+        (VOID)RtlStringCchCopyW(Slot->IfName[idx], AH_DISPLAY_CHARS, src);
+        Slot->IfName[idx][AH_DISPLAY_CHARS - 1] = L'\0';
+        size_t chars = 0;
+        (VOID)RtlStringCchLengthW(Slot->IfName[idx], AH_DISPLAY_CHARS, &chars);
+        SIMPLEAUDIOSAMPLE_DEVPROPERTY *prop = render ? &Slot->OutTopoProps[0] : &Slot->InTopoProps[0];
+        prop->Buffer     = Slot->IfName[idx];
+        prop->BufferSize = (ULONG)((chars + 1) * sizeof(WCHAR));
+    }
+
+    NTSTATUS status = AhApplyEndpointNames(Slot, Direction, Host->Pdo, Flags);
+    if (!NT_SUCCESS(status))
+    {
+        *Stage = AH_STAGE_ENDPOINT_NAME;
+        return status;
+    }
+
     if (render)
     {
-        status = g_AhAdapter->InstallEndpointFilters(
+        status = Host->Adapter->InstallEndpointFilters(
             NULL, &Slot->OutPair, &Slot->OutCtx,
             &Slot->OutTopo, &Slot->OutWave, NULL, &Slot->OutWaveMiniport);
         if (NT_SUCCESS(status) && (Slot->OutTopo == NULL || Slot->OutWave == NULL))
@@ -1515,7 +2187,7 @@ AhInstallSlotDirection(
     }
     else
     {
-        status = g_AhAdapter->InstallEndpointFilters(
+        status = Host->Adapter->InstallEndpointFilters(
             NULL, &Slot->InPair, &Slot->InCtx,
             &Slot->InTopo, &Slot->InWave, NULL, NULL);
         if (NT_SUCCESS(status) && (Slot->InTopo == NULL || Slot->InWave == NULL))
@@ -1528,11 +2200,28 @@ AhInstallSlotDirection(
     return status;
 }
 
+//
+// Removes the selected directions from their host children.
+//
+// ClearNames: TRUE for every INTENTIONAL removal (unpair, presentation or
+// unit change, capability withdrawn) -- the name and identity values go after
+// the endpoints, while the host is still alive. FALSE when the host itself is
+// going away (child detach): the values stay with that devnode's interface
+// and are rewritten if it starts again.
+//
+// The ORDER inside RemoveEndpointFilters (disconnect topologies, then
+// unregister wave, then unregister topology) is fixed by
+// CAdapterCommon::RemoveEndpointFilters and must not be second-guessed here.
+// Returns the FIRST failure; the port references are released either way --
+// a failed unregister is a leak inside PortCls, and holding our reference on
+// top of it would add a second, larger one.
+//
 static NTSTATUS
 AhRemoveSlotDirections(
     _Inout_ PAH_SLOT Slot,
     _In_    ULONG    Directions,
     _In_    ULONG    DebugFlags,
+    _In_    BOOLEAN  ClearNames,
     _Out_   PULONG   FailStage
     )
 {
@@ -1540,125 +2229,172 @@ AhRemoveSlotDirections(
 
     NTSTATUS first = STATUS_SUCCESS;
     ULONG stage = AH_STAGE_NONE;
-    ULONG at = AH_STAGE_NONE;
-    if ((Directions & AH_PUB_RENDER) && (Slot->OutTopo != NULL || Slot->OutWave != NULL))
+    const ULONG slot = (ULONG)(Slot - g_AhSlots);
+
+    for (ULONG direction = AH_PUB_RENDER; direction <= AH_PUB_CAPTURE; direction <<= 1)
     {
-        AhSpeakerPauseLocked((ULONG)(Slot - g_AhSlots));
-        NTSTATUS s = g_AhAdapter->RemoveEndpointFilters(
-            &Slot->OutPair, Slot->OutTopo, Slot->OutWave, DebugFlags, &at);
-        if (!NT_SUCCESS(s)) { first = s; stage = at; }
-        SAFE_RELEASE(Slot->OutTopo);
-        SAFE_RELEASE(Slot->OutWave);
-        SAFE_RELEASE(Slot->OutWaveMiniport);
+        if ((Directions & direction) == 0)
+        {
+            continue;
+        }
+        const BOOLEAN render = (direction == AH_PUB_RENDER);
+        const ULONG idx = AH_DIR_INDEX(direction);
+        PADAPTERCOMMON adapter = Slot->HostAdapter[idx];
+        PDEVICE_OBJECT pdo     = Slot->HostPdo[idx];
+        PUNKNOWN *topo = render ? &Slot->OutTopo : &Slot->InTopo;
+        PUNKNOWN *wave = render ? &Slot->OutWave : &Slot->InWave;
+
+        if (render)
+        {
+            AhSpeakerPauseLocked(slot);
+        }
+        if (*topo != NULL || *wave != NULL)
+        {
+            if (adapter != NULL)
+            {
+                ULONG at = AH_STAGE_NONE;
+                NTSTATUS st = adapter->RemoveEndpointFilters(
+                    render ? &Slot->OutPair : &Slot->InPair, *topo, *wave, DebugFlags, &at);
+                if (!NT_SUCCESS(st) && NT_SUCCESS(first)) { first = st; stage = at; }
+                SAFE_RELEASE(*topo);
+                SAFE_RELEASE(*wave);
+                if (render) { SAFE_RELEASE(Slot->OutWaveMiniport); }
+            }
+            else
+            {
+                //
+                // Unreachable by construction (ports are only ever held with a
+                // host recorded). If it ever happens the adapter that owned the
+                // ports is gone; touching them would be a use-after-free.
+                //
+                DPF(D_ERROR, ("[AhRemoveSlotDirections] slot %u dir 0x%x held without a host",
+                              slot, direction));
+                *topo = NULL;
+                *wave = NULL;
+                if (render) { Slot->OutWaveMiniport = NULL; }
+            }
+        }
         // RemoveEndpointFilters has stopped every WaveRT callback. Reset at
         // this quiet boundary, not before it, or a final callback could refill
         // the otherwise immortal per-slot ring with withdrawn audio.
-        AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_OUT);
-    }
-    if ((Directions & AH_PUB_CAPTURE) && (Slot->InTopo != NULL || Slot->InWave != NULL))
-    {
-        NTSTATUS s = g_AhAdapter->RemoveEndpointFilters(
-            &Slot->InPair, Slot->InTopo, Slot->InWave, DebugFlags, &at);
-        if (!NT_SUCCESS(s) && NT_SUCCESS(first)) { first = s; stage = at; }
-        SAFE_RELEASE(Slot->InTopo);
-        SAFE_RELEASE(Slot->InWave);
-        AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_IN);
+        AhRingsResetDirection(slot, render ? AUDIOHUB_DIR_OUT : AUDIOHUB_DIR_IN);
+
+        if (pdo != NULL)
+        {
+            if (ClearNames)
+            {
+                AhRemoveEndpointNames(Slot, direction, pdo);
+            }
+            else
+            {
+                // The values stay with the departing devnode; we can no longer
+                // reach them, so nothing here claims to own them any more.
+                Slot->NamesWritten[idx] = FALSE;
+            }
+        }
+        Slot->HostPdo[idx]     = NULL;
+        Slot->HostAdapter[idx] = NULL;
     }
     *FailStage = stage;
     return first;
 }
 
+//
+// Installs every wanted direction whose host child is running and that is not
+// held yet. A failure is cleaned up per direction (never the surviving one)
+// unless AH_BINDFLAG_SKIP_ROLLBACK asks to leave it visible, and recorded in
+// LastStage/LastNtStatus. Returns the first failure. Caller holds the lock.
+//
 #pragma code_seg("PAGE")
 static NTSTATUS
-AhRemoveSlotEndpoints(
+AhInstallWaitingDirections(
     _Inout_ PAH_SLOT Slot,
-    _In_    ULONG    DebugFlags,
-    _Out_opt_ PULONG FailStage
+    _In_opt_ PAH_HOST OnlyHost,
+    _Out_   PULONG   FailStage
     )
-/*++
-
-Routine Description:
-
-    Tears one slot's two endpoints down. Caller holds the lock and has already
-    checked that an adapter is attached.
-
-    The ORDER inside RemoveEndpointFilters (disconnect topologies, then
-    unregister wave, then unregister topology) is fixed by
-    CAdapterCommon::RemoveEndpointFilters and must not be second-guessed here:
-    "Failure to unregister the subdevice's physical connections can cause
-    memory leaks".
-
-    Returns the FIRST failure. The port references are released either way --
-    a failed unregister is a leak inside PortCls, and holding our reference on
-    top of it would add a second, larger one.
-
-    The slot's endpoint-name values go here too, and not at the three call
-    sites: "unpairing leaves no registry litter carrying somebody's host name"
-    must not be true at two of them and false at the third. They are removed
-    AFTER the endpoints, because until the endpoints are gone the names are
-    still what the system is displaying.
-
---*/
 {
     PAGED_CODE();
 
-    if (FailStage != NULL) { *FailStage = AH_STAGE_NONE; }
-
-    if (g_AhAdapter == NULL)
+    NTSTATUS first = STATUS_SUCCESS;
+    *FailStage = AH_STAGE_NONE;
+    if (Slot->State != AH_SLOT_BOUND)
     {
-        //
-        // The adapter went away first. The port objects it owned died with it;
-        // releasing them here would be a use-after-free. Drop the references
-        // without touching them -- AhPerPeerDetachAdapter is the only path
-        // that reaches this, and it runs before the adapter is Released.
-        //
-        Slot->OutTopo = Slot->OutWave = Slot->InTopo = Slot->InWave = NULL;
-        Slot->OutWaveMiniport = NULL;
-        AhSpeakerPauseLocked((ULONG)(Slot - g_AhSlots));
-        AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_OUT);
-        AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_IN);
-        //
-        // The registry entries outlive the adapter and are still ours to
-        // remove: they live under the PDO's software key and the machine-wide
-        // key, neither of which the adapter owns.
-        //
-        AhRemoveEndpointNames(Slot);
         return STATUS_SUCCESS;
     }
 
-    NTSTATUS firstError = STATUS_SUCCESS;
-    ULONG    stage      = AH_STAGE_NONE;
-    ULONG    st         = AH_STAGE_NONE;
-
-    if (Slot->OutTopo != NULL || Slot->OutWave != NULL)
+    const ULONG want = AhWantedPublishedMask(Slot->Flags);
+    for (ULONG direction = AH_PUB_RENDER; direction <= AH_PUB_CAPTURE; direction <<= 1)
     {
-        AhSpeakerPauseLocked((ULONG)(Slot - g_AhSlots));
-        NTSTATUS s1 = g_AhAdapter->RemoveEndpointFilters(
-            &Slot->OutPair, Slot->OutTopo, Slot->OutWave, DebugFlags, &st);
-        if (!NT_SUCCESS(s1) && NT_SUCCESS(firstError)) { firstError = s1; stage = st; }
+        if ((want & direction) == 0 || (AhSlotHeldMask(Slot) & direction) != 0)
+        {
+            continue;
+        }
+        const ULONG idx = AH_DIR_INDEX(direction);
+        PAH_HOST host = AhFindHost(Slot, idx);
+        if (host == NULL || (OnlyHost != NULL && host != OnlyHost))
+        {
+            continue;
+        }
+        ULONG stage = AH_STAGE_NONE;
+        NTSTATUS st = AhInstallSlotDirection(Slot, direction, host, Slot->Flags, &stage);
+        if (NT_SUCCESS(st))
+        {
+            continue;
+        }
+        DPF(D_ERROR, ("[AhInstallWaitingDirections] slot %u direction 0x%x failed 0x%x (stage %u)",
+                      (ULONG)(Slot - g_AhSlots), direction, st, stage));
+        if (!(Slot->Flags & AH_BINDFLAG_SKIP_ROLLBACK))
+        {
+            ULONG cleanupStage = AH_STAGE_NONE;
+            NTSTATUS cleanup = AhRemoveSlotDirections(Slot, direction, 0, TRUE, &cleanupStage);
+            if (!NT_SUCCESS(cleanup))
+            {
+                st = cleanup;
+                stage = AH_STAGE_ROLLBACK;
+            }
+        }
+        Slot->LastStage    = (stage == AH_STAGE_NONE) ? AH_STAGE_VERIFY : stage;
+        Slot->LastNtStatus = st;
+        if (NT_SUCCESS(first))
+        {
+            first = st;
+            *FailStage = Slot->LastStage;
+        }
     }
-    if (Slot->InTopo != NULL || Slot->InWave != NULL)
-    {
-        NTSTATUS s2 = g_AhAdapter->RemoveEndpointFilters(
-            &Slot->InPair, Slot->InTopo, Slot->InWave, DebugFlags, &st);
-        if (!NT_SUCCESS(s2) && NT_SUCCESS(firstError)) { firstError = s2; stage = st; }
-    }
+    return first;
+}
 
-    SAFE_RELEASE(Slot->OutTopo);
-    SAFE_RELEASE(Slot->OutWave);
-    SAFE_RELEASE(Slot->OutWaveMiniport);
-    SAFE_RELEASE(Slot->InTopo);
-    SAFE_RELEASE(Slot->InWave);
+//
+// Takes a slot completely down: every direction off its host with names and
+// identity cleared, every unit unplugged, the record emptied. Caller holds
+// the lock. Returns the first removal failure.
+//
+#pragma code_seg("PAGE")
+static NTSTATUS
+AhTeardownSlot(
+    _Inout_ PAH_SLOT Slot,
+    _In_    ULONG    DebugFlags,
+    _Out_   PULONG   FailStage
+    )
+{
+    PAGED_CODE();
 
-    // A slot can be handed to another peer without remapping the shared ring
-    // table. Never let that next tenant inherit the previous tenant's audio.
-    AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_OUT);
-    AhRingsResetDirection((ULONG)(Slot - g_AhSlots), AUDIOHUB_DIR_IN);
+    const ULONG slot = (ULONG)(Slot - g_AhSlots);
+    NTSTATUS st = AhRemoveSlotDirections(Slot, AH_PUB_BOTH, DebugFlags, TRUE, FailStage);
 
-    AhRemoveEndpointNames(Slot);
+    RtlZeroMemory(Slot->UnitOf, sizeof(Slot->UnitOf));
+    RtlZeroMemory(Slot->Units, sizeof(Slot->Units));
+    Slot->UnitCount = 0;
+    (VOID)AhBusSetSlotUnits(slot, NULL, 0);
 
-    if (FailStage != NULL) { *FailStage = stage; }
-    return firstError;
+    Slot->State = AH_SLOT_FREE;
+    Slot->Flags = 0;
+    RtlZeroMemory(Slot->PeerKey, sizeof(Slot->PeerKey));
+    RtlZeroMemory(Slot->Pres, sizeof(Slot->Pres));
+    Slot->LastStage = AH_STAGE_NONE;
+    Slot->LastNtStatus = STATUS_SUCCESS;
+    AhSpeakerFormatSyncLocked(slot);
+    return st;
 }
 
 //-----------------------------------------------------------------------------
@@ -2276,6 +3012,7 @@ AhPerPeerDriverInit(VOID)
     AhSpeakerFormatBanksInitialize();
     RtlZeroMemory(g_AhSlots, sizeof(g_AhSlots));
     RtlZeroMemory(g_AhSpeaker, sizeof(g_AhSpeaker));
+    RtlZeroMemory(g_AhHosts, sizeof(g_AhHosts));
     for (ULONG slot = 0; slot < AUDIOHUB_WIN_MAX_SLOTS; ++slot)
     {
         KeInitializeSpinLock(&g_AhSpeaker[slot].Gate);
@@ -2285,81 +3022,114 @@ AhPerPeerDriverInit(VOID)
     RtlZeroMemory((PVOID)g_AhWaveRt, sizeof(g_AhWaveRt));
     KeInitializeSpinLock(&g_AhTopoLock);
     KeInitializeMutex(&g_AhSlotLock, 0);
-    g_AhAdapter = NULL;
-    g_AhDeviceObject = NULL;
+    AhBuildTopologyVariants();
     g_AhNextGeneration = 1;
+    g_AhDirWordsOk = FALSE;
     g_AhInitialised = TRUE;
 }
 
 #pragma code_seg("PAGE")
 NTSTATUS
-AhPerPeerAttachAdapter(
-    _In_ PDEVICE_OBJECT DeviceObject,
+AhPerPeerChildStart(
+    _In_ PDEVICE_OBJECT Fdo,
     _In_ PADAPTERCOMMON Adapter
     )
 {
     PAGED_CODE();
 
-    NTSTATUS status = STATUS_SUCCESS;
-
     ASSERT(g_AhInitialised);
+
+    PDEVICE_OBJECT pdo = Adapter->GetPhysicalDeviceObject();
+    AH_UNIT_SPEC spec;
+    if (pdo == NULL || !AhBusChildSpec(pdo, &spec))
+    {
+        //
+        // Only bus children are adapters since v11. Not failing: a devnode
+        // that cannot start is worse than one that publishes nothing.
+        //
+        DPF(D_ERROR, ("[AhPerPeerChildStart] FDO %p is not on an AudioHub child", Fdo));
+        return STATUS_SUCCESS;
+    }
 
     AH_LOCK();
 
-    if (g_AhAdapter != NULL)
+    PAH_HOST host = NULL;
+    for (ULONG h = 0; h < AH_BUS_MAX_CHILDREN; h++)
     {
-        //
-        // Root enumeration produces exactly one devnode, so this cannot
-        // legitimately happen. Refusing loudly beats quietly serving whichever
-        // adapter happened to arrive last.
-        //
-        DPF(D_ERROR, ("[AhPerPeerAttachAdapter] a second adapter tried to attach; refused"));
-        status = STATUS_DEVICE_ALREADY_ATTACHED;
+        if (g_AhHosts[h].Pdo == pdo)
+        {
+            // A restart without a detach would be a PnP ordering we never
+            // expect; take the newest adapter rather than a dangling one.
+            host = &g_AhHosts[h];
+            break;
+        }
     }
-    else
+    for (ULONG h = 0; host == NULL && h < AH_BUS_MAX_CHILDREN; h++)
     {
-        g_AhDeviceObject = DeviceObject;
-        g_AhAdapter = Adapter;
-        g_AhPdo = Adapter->GetPhysicalDeviceObject();
-        //
-        // No AddRef: the reference the device extension holds is what keeps the
-        // adapter alive, and PnpHandler tears us down before releasing it.
-        //
+        if (g_AhHosts[h].Pdo == NULL)
+        {
+            host = &g_AhHosts[h];
+        }
+    }
+    if (host == NULL)
+    {
+        AH_UNLOCK();
+        DPF(D_ERROR, ("[AhPerPeerChildStart] host table full; %S publishes nothing",
+                      spec.InstanceId));
+        return STATUS_SUCCESS;
+    }
+    host->Pdo     = pdo;
+    host->Fdo     = Fdo;
+    host->Adapter = Adapter;
+    host->Spec    = spec;
 
+    if (!g_AhDirWordsOk)
+    {
         //
-        // Read the generic fallback labels back out of the INF's own static
+        // The generic fallback labels, read back out of the INF's own static
         // MediaCategories entries. They remain the fallback if writing the
-        // per-peer name fails; the happy path does not append them.
+        // per-peer name fails; the happy path does not use them. NOT fatal.
         //
-        NTSTATUS o = AhReadPinNameValue(&AH_PIN_NAME_OUT, g_AhDirWordOut, AH_DIRWORD_CHARS);
-        NTSTATUS i = AhReadPinNameValue(&AH_PIN_NAME_IN,  g_AhDirWordIn,  AH_DIRWORD_CHARS);
+        NTSTATUS o = AhReadPinNameValue(pdo, &AH_PIN_NAME_OUT, g_AhDirWordOut, AH_DIRWORD_CHARS);
+        NTSTATUS i = AhReadPinNameValue(pdo, &AH_PIN_NAME_IN,  g_AhDirWordIn,  AH_DIRWORD_CHARS);
         g_AhDirWordsOk = (BOOLEAN)(NT_SUCCESS(o) && NT_SUCCESS(i));
         if (!g_AhDirWordsOk)
         {
-            //
-            // NOT fatal: the per-peer PKEY_Device_DeviceDesc path does not
-            // depend on these values. If that path later fails too, Windows's
-            // built-in endpoint naming is the last fallback.
-            //
-            DPF(D_ERROR, ("[AhPerPeerAttachAdapter] INF fallback names unreadable "
-                          "(0x%x / 0x%x)", o, i));
+            DPF(D_ERROR, ("[AhPerPeerChildStart] INF fallback names unreadable (0x%x / 0x%x)", o, i));
         }
-        else
-        {
-            DPF(D_TERSE, ("[AhPerPeerAttachAdapter] fallback labels '%S' / '%S'",
-                          g_AhDirWordOut, g_AhDirWordIn));
-        }
+    }
 
-        DPF(D_TERSE, ("[AhPerPeerAttachAdapter] ready, %u slots", AUDIOHUB_WIN_MAX_SLOTS));
+    //
+    // Every direction that was waiting for exactly this child goes in now.
+    // The names were decided at the Set; they are written into this child's
+    // interfaces immediately before each filter exists.
+    //
+    ULONG slot = spec.Slot;
+    if (slot < AUDIOHUB_WIN_MAX_SLOTS)
+    {
+        PAH_SLOT s = &g_AhSlots[slot];
+        ULONG before = AhSlotPublishedMask(s);
+        ULONG stage = AH_STAGE_NONE;
+        (VOID)AhInstallWaitingDirections(s, host, &stage);
+        ULONG after = AhSlotPublishedMask(s);
+        DPF(D_TERSE, ("[AhPerPeerChildStart] %S slot %u published 0x%x -> 0x%x",
+                      spec.InstanceId, slot, before, after));
+        if (after != before)
+        {
+            AhSpeakerFormatSyncLocked(slot);
+            AhRaisePublishedLocked(slot);
+        }
     }
 
     AH_UNLOCK();
-    return status;
+    return STATUS_SUCCESS;
 }
 
 #pragma code_seg("PAGE")
 VOID
-AhPerPeerDetachAdapter(VOID)
+AhPerPeerChildDetach(
+    _In_ PDEVICE_OBJECT Fdo
+    )
 {
     PAGED_CODE();
 
@@ -2370,44 +3140,59 @@ AhPerPeerDetachAdapter(VOID)
 
     AH_LOCK();
 
-    for (ULONG i = 0; i < AUDIOHUB_WIN_MAX_SLOTS; i++)
+    PAH_HOST host = NULL;
+    for (ULONG h = 0; h < AH_BUS_MAX_CHILDREN; h++)
     {
-        if (g_AhSlots[i].State != AH_SLOT_FREE)
+        if (g_AhHosts[h].Pdo != NULL && g_AhHosts[h].Fdo == Fdo)
         {
-            (VOID)AhRemoveSlotEndpoints(&g_AhSlots[i], 0, NULL);
-            g_AhSlots[i].State = AH_SLOT_FREE;
-            RtlZeroMemory(g_AhSlots[i].PeerKey, sizeof(g_AhSlots[i].PeerKey));
+            host = &g_AhHosts[h];
+            break;
         }
     }
-
-    g_AhAdapter = NULL;
-    g_AhDeviceObject = NULL;
-    //
-    // Cleared LAST: AhRemoveSlotEndpoints above needs it to reach the software
-    // key, and a stale PDO here would be handed to IoOpenDeviceRegistryKey
-    // after the devnode has gone.
-    //
-    g_AhPdo = NULL;
-    g_AhDirWordsOk = FALSE;
-
-    AH_UNLOCK();
-}
-
-#pragma code_seg("PAGE")
-BOOLEAN
-AhPerPeerAdapterReady(VOID)
-{
-    PAGED_CODE();
-
-    if (!g_AhInitialised)
+    if (host == NULL)
     {
-        return FALSE;
+        AH_UNLOCK();
+        return;
     }
 
-    AH_LOCK();
-    BOOLEAN ready = (g_AhAdapter != NULL);
+    //
+    // Every direction installed on this child goes FIRST, while the adapter
+    // that owns the port objects is still alive. A slot still holding port
+    // pointers after Cleanup()/Release() is a dangling reference, and the
+    // bugcheck it produces names none of the code that caused it. The slot's
+    // BINDING is untouched: the daemon still has this peer paired, and the
+    // directions go back in when the child starts again.
+    //
+    for (ULONG slot = 0; slot < AUDIOHUB_WIN_MAX_SLOTS; slot++)
+    {
+        PAH_SLOT s = &g_AhSlots[slot];
+        ULONG directions = 0;
+        for (ULONG direction = AH_PUB_RENDER; direction <= AH_PUB_CAPTURE; direction <<= 1)
+        {
+            if (s->HostPdo[AH_DIR_INDEX(direction)] == host->Pdo)
+            {
+                directions |= direction;
+            }
+        }
+        if (directions == 0)
+        {
+            continue;
+        }
+        ULONG stage = AH_STAGE_NONE;
+        NTSTATUS st = AhRemoveSlotDirections(s, directions, 0, FALSE, &stage);
+        if (!NT_SUCCESS(st))
+        {
+            DPF(D_ERROR, ("[AhPerPeerChildDetach] slot %u remove 0x%x failed 0x%x stage %u",
+                          slot, directions, st, stage));
+        }
+        AhSpeakerFormatSyncLocked(slot);
+        AhRaisePublishedLocked(slot);
+    }
+
+    DPF(D_TERSE, ("[AhPerPeerChildDetach] %S detached", host->Spec.InstanceId));
+    RtlZeroMemory(host, sizeof(*host));
+
     AH_UNLOCK();
-    return ready;
 }
 
 //-----------------------------------------------------------------------------
@@ -2420,6 +3205,7 @@ AhSlotBindSet(
     _In_  ULONG   Slot,
     _In_z_ PCSTR  PeerKey,
     _In_  PCWSTR  Display,
+    _In_reads_(2) const AH_PRESENTATION *Presentation,
     _In_  ULONG   Flags,
     _Out_ PULONG  Generation,
     _Out_ PULONG  State,
@@ -2430,27 +3216,43 @@ AhSlotBindSet(
 
 Routine Description:
 
-    Publishes exactly the endpoint directions requested for one peer.
+    Records exactly the endpoint directions requested for one peer, and
+    publishes as many of them as can be published now.
 
-    The invariant this routine exists to guarantee:
+    v11: every direction belongs to a presentation unit (AH_UNIT_*), and a
+    unit is a child devnode the bus enumerates. The Set:
 
-        AhStatus == AH_STATUS_OK  =>
-            Result->Published == AhWantedPublishedMask(Flags)
+      1. takes down every held direction that must move -- not wanted any
+         more, a presentation identity change (new reference strings), or a
+         different unit (a different devnode or container) -- with its names;
+      2. stores the new desired state and hands the slot's units to the bus,
+         which plugs and unplugs child devnodes and asks Plug and Play to
+         re-enumerate;
+      3. installs, right here, every wanted direction whose unit's child is
+         already running.
 
-    A single endpoint is intentional when the remote machine has only that
-    default direction.  An UNREQUESTED or missing requested endpoint is the
-    failure.  Fresh-bind failures roll back what this call installed; changing
-    an existing peer's mask preserves directions that were not being changed.
+    What remains waits for its child to start (AhPerPeerChildStart), and is
+    reported by AH_EVENT_PUBLISHED. The invariant this routine guarantees:
 
-    The one escape hatch is AH_BINDFLAG_SKIP_ROLLBACK, which exists so a test
-    can OBSERVE the partial state (reported as AH_STATUS_PARTIAL, never as OK).
+        AhStatus == AH_STATUS_OK      => Result->Published == wanted mask
+        AhStatus == AH_STATUS_PENDING => Result->Published is a subset of it,
+                                         nothing failed, the rest is coming
+
+    A failed install or removal is AH_STATUS_PARTIAL, never PENDING. Unlike
+    v10 a failed FRESH bind is not rolled back to a free slot: the pairing is
+    the daemon's, the slot stays bound, and the next identical Set retries the
+    failed direction. AH_BINDFLAG_SKIP_ROLLBACK still leaves a half-install
+    visible instead of cleaning it.
+
+    The generation moves only when what is wanted changes (fresh bind, mask,
+    presentation identity or unit), never for an identical re-Set: the daemon
+    re-Sets every second while a Set answers PENDING.
 
 --*/
 {
     PAGED_CODE();
 
     NTSTATUS status = STATUS_SUCCESS;
-    ULONG    stage  = AH_STAGE_NONE;
 
     *Generation = 0;
     *State      = AH_SLOT_FREE;
@@ -2470,6 +3272,20 @@ Routine Description:
         return STATUS_INVALID_PARAMETER;
     }
 
+    //
+    // Validated and reduced BEFORE the lock and before anything changes, so a
+    // malformed presentation is refused without touching the slot.
+    //
+    AH_SLOT_PRESENTATION pres[2];
+    if (!AhNormalizePresentation(TRUE,  &Presentation[AH_PRES_RENDER],  &pres[AH_PRES_RENDER]) ||
+        !AhNormalizePresentation(FALSE, &Presentation[AH_PRES_CAPTURE], &pres[AH_PRES_CAPTURE]))
+    {
+        DPF(D_ERROR, ("[AhSlotBindSet] slot %u malformed presentation", Slot));
+        Result->Stage = AH_STAGE_PRESENTATION;
+        *AhStatus = AH_STATUS_BAD_ARGUMENT;
+        return STATUS_INVALID_PARAMETER;
+    }
+
     if (Flags & AH_BINDFLAG_DEBUG_MASK)
     {
         //
@@ -2483,300 +3299,258 @@ Routine Description:
 
     PAH_SLOT s = &g_AhSlots[Slot];
     const ULONG want = AhWantedPublishedMask(Flags);
+    ULONG failStage = AH_STAGE_NONE;
+    NTSTATUS failStatus = STATUS_SUCCESS;
 
-    if (g_AhAdapter == NULL)
+    if (!AhBusReady())
     {
         *AhStatus = AH_STATUS_NO_ADAPTER;
         status = STATUS_DEVICE_NOT_READY;
         goto Done;
     }
 
-    if (s->State == AH_SLOT_BOUND)
+    if (s->State == AH_SLOT_BOUND && strncmp(s->PeerKey, PeerKey, AH_PEERKEY_BUF) != 0)
     {
-        if (strncmp(s->PeerKey, PeerKey, AH_PEERKEY_BUF) == 0)
+        //
+        // Same slot, different peer. The daemon is supposed to Clear first;
+        // doing it here keeps the driver's table authoritative either way.
+        //
+        DPF(D_TERSE, ("[AhSlotBindSet] slot %u re-targeted; removing previous peer", Slot));
+        ULONG tdStage = AH_STAGE_NONE;
+        (VOID)AhTeardownSlot(s, 0, &tdStage);
+    }
+
+    const BOOLEAN fresh = (s->State != AH_SLOT_BOUND) ? TRUE : FALSE;
+    BOOLEAN changed = fresh;
+
+    ULONG unitOf[2];
+    AhComputeUnits(pres, want, unitOf);
+
+    if (!fresh)
+    {
+        //
+        // Same peer. Decide which held directions must come down before the
+        // new state is stored -- their names live under the CURRENT reference
+        // strings on the CURRENT host.
+        //
+        const ULONG held = AhSlotHeldMask(s);
+        const ULONG have = AhSlotPublishedMask(s);
+        const ULONG oldWant = AhWantedPublishedMask(s->Flags);
+
+        ULONG rebuild = 0;
+        if (!AhSamePresentationIdentity(&s->Pres[AH_PRES_RENDER], &pres[AH_PRES_RENDER]))
         {
-            ULONG have = AhSlotPublishedMask(s);
-            ULONG held = AhSlotHeldMask(s);
-            if (have == want && held == have)
-            {
-                //
-                // Idempotent re-Set. The daemon re-Sets whenever a peer's
-                // online flag moves, and under "paired means published" that
-                // flag does not change anything the driver publishes.
-                // Re-registering or rewriting the PERSISTENT FriendlyName
-                // property here would turn every connect/disconnect into
-                // registry churn.
-                //
-                // Renaming a LIVE endpoint is deliberately not attempted:
-                // sysvad has never changed the FriendlyName of an
-                // already-enabled interface, and the only way to force a
-                // refresh -- disable the interface and re-enable it -- puts the
-                // endpoint into DEVICE_STATE_NOTPRESENT and makes Windows move
-                // the user's default-device choice elsewhere.
-                //
-                s->Flags    = Flags;
-                *Generation = s->Generation;
-                *State      = AH_SLOT_BOUND;
-                *AhStatus   = AH_STATUS_OK;
-                Result->Published = have;
-                //
-                // Re-reported on EVERY Set, not only the first. The daemon
-                // re-Sets whenever a peer goes on or offline, and a warning
-                // that appears once and then disappears is a warning nobody
-                // acts on.
-                //
-                if (s->NameFallback)
-                {
-                    Result->Flags |= AH_BINDREPLY_FLAG_NAME_FALLBACK;
-                }
-                goto Done;
-            }
+            rebuild |= AH_PUB_RENDER;
+        }
+        if (!AhSamePresentationIdentity(&s->Pres[AH_PRES_CAPTURE], &pres[AH_PRES_CAPTURE]))
+        {
+            rebuild |= AH_PUB_CAPTURE;
+        }
 
-            //
-            // Same peer, different advertised capabilities. Change only the
-            // directions that differ: cycling the surviving endpoint would
-            // make Windows move a user's default-device selection away from it.
-            //
-            ULONG changedStage = AH_STAGE_NONE;
-            // Remove every now-unwanted complete direction AND every broken
-            // half-install. A broken requested direction must be clean before
-            // InstallEndpointFilters can safely retry it.
-            ULONG remove = (have & ~want) | (held & ~have);
-            NTSTATUS changed = AhRemoveSlotDirections(s, remove, 0, &changedStage);
-            for (ULONG direction = AH_PUB_RENDER; NT_SUCCESS(changed) && direction <= AH_PUB_CAPTURE; direction <<= 1)
+        //
+        // A held direction also moves when its unit's devnode changes without
+        // its own identity changing: an "rc" unit's instance id and container
+        // name carry BOTH keys, so the other direction's key moving it is a
+        // different devnode. (A FriendlyName change is applied in place by the
+        // bus; it never moves a direction.)
+        //
+        ULONG move = 0;
+        for (ULONG direction = AH_PUB_RENDER; direction <= AH_PUB_CAPTURE; direction <<= 1)
+        {
+            const ULONG idx = AH_DIR_INDEX(direction);
+            const ULONG other = (idx == AH_PRES_RENDER) ? AH_PRES_CAPTURE : AH_PRES_RENDER;
+            if ((held & direction) == 0)
             {
-                if ((want & direction) != 0 && (AhSlotPublishedMask(s) & direction) == 0)
-                {
-                    changed = AhInstallSlotDirection(s, direction, Flags, &changedStage);
-                    if (!NT_SUCCESS(changed))
-                    {
-                        // InstallEndpointFilters can fail after returning one
-                        // of the two port pointers. The fresh-bind path below
-                        // removes the whole slot; this reconcile path must
-                        // explicitly clean only the direction it just tried so
-                        // the peer's surviving endpoint is not cycled.
-                        ULONG cleanupStage = AH_STAGE_NONE;
-                        NTSTATUS cleanup = AhRemoveSlotDirections(s, direction, 0, &cleanupStage);
-                        if (!NT_SUCCESS(cleanup))
-                        {
-                            DPF(D_ERROR, ("[AhSlotBindSet] slot %u direction 0x%x "
-                                          "cleanup failed 0x%x (stage %u)",
-                                          Slot, direction, cleanup, cleanupStage));
-                            changed = cleanup;
-                            changedStage = AH_STAGE_ROLLBACK;
-                        }
-                    }
-                }
+                continue;
             }
-            Result->Published = AhSlotPublishedMask(s);
-            if (!NT_SUCCESS(changed) || Result->Published != want)
+            if ((want & direction) == 0 || (rebuild & direction) != 0 ||
+                unitOf[idx] != s->UnitOf[idx])
             {
-                Result->Stage = (changedStage == AH_STAGE_NONE) ? AH_STAGE_VERIFY : changedStage;
-                Result->NtStatus = NT_SUCCESS(changed) ? STATUS_UNSUCCESSFUL : changed;
-                *Generation = s->Generation;
-                *State = AH_SLOT_BOUND;
-                *AhStatus = AH_STATUS_PARTIAL;
-                goto Done;
+                move |= direction;
+                continue;
             }
+            if (unitOf[idx] == AH_UNIT_RC &&
+                !RtlEqualMemory(pres[other].Key, s->Pres[other].Key, AH_PRESKEY_BUF))
+            {
+                move |= direction;
+            }
+        }
 
-            // Fence late IO/volume events from a direction that disappeared
-            // and came back while preserving every endpoint object that stayed.
-            s->Generation = g_AhNextGeneration++;
-            if (g_AhNextGeneration == 0) { g_AhNextGeneration = 1; }
-            s->Flags = Flags;
-            *Generation = s->Generation;
-            *State = AH_SLOT_BOUND;
-            *AhStatus = AH_STATUS_OK;
-            if (s->NameFallback) { Result->Flags |= AH_BINDREPLY_FLAG_NAME_FALLBACK; }
+        // Plus every broken half-install: it must be clean before
+        // InstallEndpointFilters can safely retry that direction.
+        ULONG remove = move | (held & ~have);
+        if (remove != 0)
+        {
+            ULONG removeStage = AH_STAGE_NONE;
+            NTSTATUS st = AhRemoveSlotDirections(s, remove, 0, TRUE, &removeStage);
+            if (!NT_SUCCESS(st))
+            {
+                failStage = (removeStage == AH_STAGE_NONE) ? AH_STAGE_UNREGISTER : removeStage;
+                failStatus = st;
+            }
+            DPF(D_TERSE, ("[AhSlotBindSet] slot %u took down 0x%x (rebuild 0x%x)",
+                          Slot, remove, rebuild));
+        }
+
+        if (want != oldWant || rebuild != 0 || move != 0 ||
+            unitOf[AH_PRES_RENDER] != s->UnitOf[AH_PRES_RENDER] ||
+            unitOf[AH_PRES_CAPTURE] != s->UnitOf[AH_PRES_CAPTURE])
+        {
+            changed = TRUE;
+        }
+    }
+    else
+    {
+        RtlZeroMemory(s->PeerKey, sizeof(s->PeerKey));
+        RtlCopyMemory(s->PeerKey, PeerKey, keyLen);
+
+        RtlZeroMemory(s->Display, sizeof(s->Display));
+        status = RtlStringCchCopyW(s->Display, AH_DISPLAY_CHARS, Display);
+        if (status == STATUS_BUFFER_OVERFLOW)
+        {
+            //
+            // Truncation is fine, an unterminated buffer is not.
+            //
+            status = STATUS_SUCCESS;
+        }
+        s->Display[AH_DISPLAY_CHARS - 1] = L'\0';
+        if (!NT_SUCCESS(status))
+        {
+            RtlZeroMemory(s->PeerKey, sizeof(s->PeerKey));
+            *AhStatus = AH_STATUS_BAD_ARGUMENT;
             goto Done;
         }
-        else
+        if (s->Display[0] == L'\0')
         {
             //
-            // Same slot, different peer. The daemon is supposed to Clear first;
-            // doing it here keeps the driver's table authoritative either way.
+            // An empty name would make Windows compose "Speakers ()". Fall
+            // back to something that at least identifies the peer.
             //
-            DPF(D_TERSE, ("[AhSlotBindSet] slot %u re-targeted; removing previous peer", Slot));
-            (VOID)AhRemoveSlotEndpoints(s, 0, NULL);
-            s->State = AH_SLOT_FREE;
+            (VOID)RtlStringCchPrintfW(s->Display, AH_DISPLAY_CHARS, L"AudioHub %S", s->PeerKey);
         }
+        RtlZeroMemory(s->NamesWritten, sizeof(s->NamesWritten));
+        RtlZeroMemory(s->HostPdo, sizeof(s->HostPdo));
+        RtlZeroMemory(s->HostAdapter, sizeof(s->HostAdapter));
+        s->NameFallback = FALSE;
     }
 
-    RtlZeroMemory(s->PeerKey, sizeof(s->PeerKey));
-    RtlCopyMemory(s->PeerKey, PeerKey, keyLen);
-
-    RtlZeroMemory(s->Display, sizeof(s->Display));
-    status = RtlStringCchCopyW(s->Display, AH_DISPLAY_CHARS, Display);
-    if (status == STATUS_BUFFER_OVERFLOW)
-    {
-        //
-        // Truncation is fine, an unterminated buffer is not. RtlStringCchCopyW
-        // terminates on overflow, and the explicit store below is the belt to
-        // that braces.
-        //
-        status = STATUS_SUCCESS;
-    }
-    s->Display[AH_DISPLAY_CHARS - 1] = L'\0';
-    if (!NT_SUCCESS(status))
-    {
-        *AhStatus = AH_STATUS_BAD_ARGUMENT;
-        goto Done;
-    }
-
-    if (s->Display[0] == L'\0')
-    {
-        //
-        // An empty FriendlyName would make Windows compose "Speakers ()".
-        // Fall back to something that at least identifies the peer.
-        //
-        (VOID)RtlStringCchPrintfW(s->Display, AH_DISPLAY_CHARS, L"AudioHub %S", s->PeerKey);
-    }
-
+    //
+    // The new desired state. The presentation decides the reference strings
+    // (deterministic: an unchanged direction rebuilds the strings it already
+    // has), the topology variant and the units.
+    //
+    s->Pres[AH_PRES_RENDER]  = pres[AH_PRES_RENDER];
+    s->Pres[AH_PRES_CAPTURE] = pres[AH_PRES_CAPTURE];
     status = AhBuildRefStrings(s, s->PeerKey);
     if (!NT_SUCCESS(status))
     {
         Result->Stage = AH_STAGE_REFSTRINGS;
         Result->NtStatus = status;
         *AhStatus = AH_STATUS_INTERNAL;
+        if (fresh)
+        {
+            RtlZeroMemory(s->PeerKey, sizeof(s->PeerKey));
+            RtlZeroMemory(s->Pres, sizeof(s->Pres));
+        }
         goto Done;
     }
-
-    //
-    // AFTER the reference strings (the name is written into the interface those
-    // strings identify) and BEFORE the filters exist.
-    //
-    // "Before" is load-bearing and not merely tidy. PcRegisterSubdevice is the
-    // step that ENABLES the interface, and the endpoint builder acts on the
-    // arrival edge; a name written afterwards is a race whose losing side is a
-    // device published under the wrong name with nothing to say so. Worse, the
-    // composed name is CACHED per endpoint id, so losing that race once is
-    // permanent for that peer rather than something the next bind repairs.
-    //
-    status = AhApplyEndpointNames(s, Flags);
-    if (!NT_SUCCESS(status))
+    if (fresh)
     {
-        Result->Stage = AH_STAGE_ENDPOINT_NAME;
-        Result->NtStatus = status;
-        *AhStatus = AH_STATUS_INTERNAL;
-        goto Done;
-    }
-    if (s->NameFallback)
-    {
-        Result->Flags |= AH_BINDREPLY_FLAG_NAME_FALLBACK;
-    }
-
-    status = AhBuildMinipairs(s);
-    if (!NT_SUCCESS(status))
-    {
-        Result->Stage = AH_STAGE_ENDPOINT_NAME;
-        Result->NtStatus = status;
-        *AhStatus = AH_STATUS_INTERNAL;
-        AhRemoveEndpointNames(s);
-        goto Done;
-    }
-
-    // Install only the directions the peer advertised, render first. Zero is a
-    // valid mask: the pairing keeps its stable slot but publishes no endpoint.
-    for (ULONG direction = AH_PUB_RENDER; direction <= AH_PUB_CAPTURE; direction <<= 1)
-    {
-        if ((want & direction) == 0) { continue; }
-        status = AhInstallSlotDirection(s, direction, Flags, &stage);
+        status = AhBuildMinipairs(s);
         if (!NT_SUCCESS(status))
         {
-            DPF(D_ERROR, ("[AhSlotBindSet] slot %u direction 0x%x install failed 0x%x (stage %u)",
-                          Slot, direction, status, stage));
-            goto Failed;
+            Result->Stage = AH_STAGE_ENDPOINT_NAME;
+            Result->NtStatus = status;
+            *AhStatus = AH_STATUS_INTERNAL;
+            RtlZeroMemory(s->PeerKey, sizeof(s->PeerKey));
+            RtlZeroMemory(s->Pres, sizeof(s->Pres));
+            goto Done;
         }
     }
+    AhSelectTopology(s);
 
-    //
-    // The invariant, checked rather than assumed.
-    //
-    Result->Published = AhSlotPublishedMask(s);
-    if (Result->Published != want)
+    s->UnitOf[AH_PRES_RENDER]  = unitOf[AH_PRES_RENDER];
+    s->UnitOf[AH_PRES_CAPTURE] = unitOf[AH_PRES_CAPTURE];
+    status = AhBuildSlotUnits(s);
+    if (NT_SUCCESS(status))
     {
-        status = STATUS_UNSUCCESSFUL;
-        stage  = AH_STAGE_VERIFY;
-        DPF(D_ERROR, ("[AhSlotBindSet] slot %u published=0x%x, wanted=0x%x",
-                      Slot, Result->Published, want));
-        goto Failed;
+        status = AhBusSetSlotUnits(Slot, s->Units, s->UnitCount);
     }
-
-    s->Generation = g_AhNextGeneration++;
-    if (g_AhNextGeneration == 0)
+    if (!NT_SUCCESS(status) && NT_SUCCESS(failStatus))
     {
-        g_AhNextGeneration = 1;     // 0 means "no generation" on the wire
+        failStage = AH_STAGE_ENUMERATE;
+        failStatus = status;
+    }
+    status = STATUS_SUCCESS;
+
+    if (fresh)
+    {
+        s->State = AH_SLOT_BOUND;
+        s->LastStage = AH_STAGE_NONE;
+        s->LastNtStatus = STATUS_SUCCESS;
+    }
+    if (changed)
+    {
+        s->Generation = g_AhNextGeneration++;
+        if (g_AhNextGeneration == 0)
+        {
+            g_AhNextGeneration = 1;     // 0 means "no generation" on the wire
+        }
     }
     s->Flags = Flags;
-    s->State = AH_SLOT_BOUND;
 
+    //
+    // Whatever can be published now, is.
+    //
+    {
+        ULONG installStage = AH_STAGE_NONE;
+        NTSTATUS st = AhInstallWaitingDirections(s, NULL, &installStage);
+        if (!NT_SUCCESS(st) && NT_SUCCESS(failStatus))
+        {
+            failStage = installStage;
+            failStatus = st;
+        }
+    }
+
+    Result->Published = AhSlotPublishedMask(s);
     *Generation = s->Generation;
     *State      = AH_SLOT_BOUND;
-    *AhStatus   = AH_STATUS_OK;
-
-    DPF(D_TERSE, ("[AhSlotBindSet] slot %u -> '%S' gen %u published 0x%x flags 0x%x",
-                  Slot, s->NameFallback ? s->Display : s->NameOut,
-                  s->Generation, Result->Published, Result->Flags));
-    goto Done;
-
-Failed:
-    Result->Stage    = stage;
-    Result->NtStatus = status;
-
-    if (Flags & AH_BINDFLAG_SKIP_ROLLBACK)
+    if (!NT_SUCCESS(failStatus))
     {
-        //
-        // Test-only: leave the wreckage visible. Still never AH_STATUS_OK.
-        //
-        // The slot stays BOUND even though the bind failed, because the driver
-        // is still HOLDING port objects: marking it FREE here would make the
-        // next AhSlotBindClear take its "already gone" early return and leave
-        // the surviving half published with nothing in the table pointing at
-        // it. A state that no Clear can clean up is a worse test artefact than
-        // the one being tested.
-        //
-        Result->Published = AhSlotPublishedMask(s);
-        s->Generation = g_AhNextGeneration++;
-        if (g_AhNextGeneration == 0) { g_AhNextGeneration = 1; }
-        s->State    = AH_SLOT_BOUND;
-        *Generation = s->Generation;
-        *State      = AH_SLOT_BOUND;
-        *AhStatus   = AH_STATUS_PARTIAL;
-        DPF(D_ERROR, ("[AhSlotBindSet] slot %u rollback SKIPPED by request; published=0x%x",
-                      Slot, Result->Published));
-        goto Done;
+        Result->Stage    = (failStage == AH_STAGE_NONE) ? AH_STAGE_VERIFY : failStage;
+        Result->NtStatus = failStatus;
+        *AhStatus = AH_STATUS_PARTIAL;
     }
-
+    else if (Result->Published == want && AhSlotHeldMask(s) == want)
     {
-        ULONG rbStage = AH_STAGE_NONE;
-        NTSTATUS rb = AhRemoveSlotEndpoints(s, 0, &rbStage);
-        Result->Published = AhSlotPublishedMask(s);
-        s->State = AH_SLOT_FREE;
-        RtlZeroMemory(s->PeerKey, sizeof(s->PeerKey));
-
-        if (!NT_SUCCESS(rb) || Result->Published != 0)
-        {
-            //
-            // The rollback itself failed. This is strictly worse than the
-            // original failure and must not be reported with the original
-            // failure's vocabulary: the daemon has to know that something is
-            // still published under this peer's identity.
-            //
-            Result->Stage    = AH_STAGE_ROLLBACK;
-            Result->NtStatus = NT_SUCCESS(rb) ? STATUS_UNSUCCESSFUL : rb;
-            *AhStatus        = AH_STATUS_PARTIAL;
-            DPF(D_ERROR, ("[AhSlotBindSet] slot %u ROLLBACK FAILED 0x%x stage %u published 0x%x",
-                          Slot, rb, rbStage, Result->Published));
-        }
-        else
-        {
-            *AhStatus = AH_STATUS_INTERNAL;
-        }
-        *State = AH_SLOT_FREE;
+        *AhStatus = AH_STATUS_OK;
     }
+    else
+    {
+        *AhStatus = AH_STATUS_PENDING;
+    }
+    AhSpeakerFormatSyncLocked(Slot);
+
+    DPF(D_TERSE, ("[AhSlotBindSet] slot %u gen %u status %u published 0x%x want 0x%x units %u",
+                  Slot, s->Generation, *AhStatus, Result->Published, want, s->UnitCount));
 
 Done:
+    //
+    // What the slot presents, on every answer about a bound slot -- the
+    // daemon's account of the look is the driver's, never its own request.
+    //
+    if (*State == AH_SLOT_BOUND)
+    {
+        Result->Flags |= AhSlotReplyFlags(s);
+    }
     AH_UNLOCK();
+    //
+    // FriendlyName changes marked by AhBusSetSlotUnits are written only now,
+    // with the slot lock released: a child START/REMOVE waits on that lock
+    // while Plug and Play holds its own, and the property write may wait on
+    // Plug and Play (bus.h).
+    //
+    AhBusFlushRenames();
     return status;
 }
 
@@ -2838,19 +3612,14 @@ AhSlotBindClear(
         goto Done;
     }
 
-    if (g_AhAdapter == NULL)
     {
-        *AhStatus = AH_STATUS_NO_ADAPTER;
-        goto Done;
-    }
-
-    {
+        //
+        // v11: allowed whether or not the bus is running. The directions come
+        // off their hosts with their names, and the units are unplugged: an
+        // unpaired peer's devices leave the system (plan 7.3).
+        //
         ULONG stage = AH_STAGE_NONE;
-        NTSTATUS st = AhRemoveSlotEndpoints(s, Flags, &stage);
-
-        s->State = AH_SLOT_FREE;
-        s->Flags = 0;
-        RtlZeroMemory(s->PeerKey, sizeof(s->PeerKey));
+        NTSTATUS st = AhTeardownSlot(s, Flags, &stage);
 
         *State = AH_SLOT_FREE;
         Result->Published = AhSlotPublishedMask(s);
@@ -2877,6 +3646,7 @@ AhSlotBindClear(
 
 Done:
     AH_UNLOCK();
+    AhBusFlushRenames();     // after AH_UNLOCK, never inside it (bus.h)
     return STATUS_SUCCESS;
 }
 
@@ -2897,10 +3667,17 @@ AhSlotQuery(
     AH_LOCK();
     for (ULONG i = 0; i < AUDIOHUB_WIN_MAX_SLOTS; i++)
     {
-        Reply->slots[i].state      = g_AhSlots[i].State;
-        Reply->slots[i].generation = g_AhSlots[i].Generation;
-        Reply->slots[i].published  = AhSlotPublishedMask(&g_AhSlots[i]);
-        RtlCopyMemory(Reply->slots[i].peer_key, g_AhSlots[i].PeerKey, AH_PEERKEY_BUF);
+        const AH_SLOT *s = &g_AhSlots[i];
+        Reply->slots[i].state      = s->State;
+        Reply->slots[i].generation = s->Generation;
+        Reply->slots[i].published  = AhSlotPublishedMask(s);
+        Reply->slots[i].flags      = AhSlotReplyFlags(s);
+        if (s->State == AH_SLOT_BOUND &&
+            Reply->slots[i].published != AhWantedPublishedMask(s->Flags))
+        {
+            Reply->slots[i].flags |= AH_SLOTINFO_FLAG_PENDING;
+        }
+        RtlCopyMemory(Reply->slots[i].peer_key, s->PeerKey, AH_PEERKEY_BUF);
     }
     AH_UNLOCK();
 }

@@ -481,6 +481,13 @@ pub enum SessionMsg {
         /// alignment even across raw-sequence wrap.
         #[serde(default)]
         media_frame_tag_version: u8,
+        /// Version of the `DeviceFacts` contract this peer sends and
+        /// understands (`audiohub_core::device_facts::DEVICE_FACTS_VERSION`).
+        /// 0 = this peer neither sends nor understands DeviceFacts (1.0.1 and
+        /// older). Absence is the safe default here: a consumer that has no
+        /// facts presents the peer's devices as virtual, exactly as today.
+        #[serde(default)]
+        device_facts_version: u8,
     },
     /// "I have unpaired from you." Sent immediately before `Bye` when the local
     /// user removes a pairing while the channel is up (plan §7.1, ruled in
@@ -509,6 +516,16 @@ pub enum SessionMsg {
     /// Older peers skip this additive message and retain their existing media contract.
     NativeOutputCapabilities {
         observation: audiohub_core::output_capabilities::NativeOutputObservation,
+    },
+    /// Provider -> consumer: physical/virtual classification of my CURRENT default
+    /// input and output, plus descriptive facts for physical ones. Affordance only:
+    /// it changes how a consumer PRESENTS its virtual device, never what any
+    /// machine is allowed to open. Additive variant: no PROTOCOL_VERSION bump
+    /// (an old peer skips it, see `Unpaired`). Sent only to peers advertising
+    /// `AudioCapabilities.device_facts_version >= 1`; a receiver must still
+    /// run `DeviceFactsObservation::sanitized` before trusting it.
+    DeviceFacts {
+        observation: audiohub_core::device_facts::DeviceFactsObservation,
     },
     /// 消费者 -> 提供者：这条流上**执行器在你那一侧**的档位，照办（plan §15）。
     ///
@@ -1106,6 +1123,7 @@ mod wire_compat_tests {
             max_media_channels: 2,
             device_volume_version: 1,
             media_frame_tag_version: 1,
+            device_facts_version: 1,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(
@@ -1116,7 +1134,8 @@ mod wire_compat_tests {
                 "default_output": true,
                 "max_media_channels": 2,
                 "device_volume_version": 1,
-                "media_frame_tag_version": 1
+                "media_frame_tag_version": 1,
+                "device_facts_version": 1
             })
         );
         let back: SessionMsg = serde_json::from_value(json).unwrap();
@@ -1128,6 +1147,7 @@ mod wire_compat_tests {
                 max_media_channels: 2,
                 device_volume_version: 1,
                 media_frame_tag_version: 1,
+                device_facts_version: 1,
             }
         ));
 
@@ -1145,6 +1165,7 @@ mod wire_compat_tests {
                 max_media_channels: 1,
                 device_volume_version: 0,
                 media_frame_tag_version: 0,
+                device_facts_version: 0,
             }
         ));
 
@@ -1393,6 +1414,183 @@ mod wire_compat_tests {
         let json = r#"{"type":"stage_report","stream_id":1,"seq_us":1,"stages":[
             {"id":"src_fifo","samples":48000,"rate":48000}]}"#;
         assert!(serde_json::from_str::<SessionMsg>(json).is_err());
+    }
+
+    fn sample_device_facts() -> audiohub_core::device_facts::DeviceFactsObservation {
+        use audiohub_core::device_facts::*;
+        DeviceFactsObservation {
+            revision: 4,
+            input: DirectionFacts::virtual_(reason::CAPTURE_FORM_FACTOR),
+            output: DirectionFacts::physical(PhysicalDescriptor {
+                transport: PhysicalTransport::Usb,
+                form_factor: FormFactor::Headphones,
+                name: "Jabra Evolve2 65".into(),
+                endpoint_desc: Some("Headphones".into()),
+                adapter_name: Some("Jabra Evolve2 65".into()),
+                manufacturer: Some("Jabra".into()),
+                device_token: "0123456789abcdef".into(),
+                group: 1,
+            }),
+        }
+    }
+
+    /// The wire shape of `DeviceFacts` is pinned: tag, payload key and the
+    /// snake_case enum spellings a 1.0.2 consumer of any build will read.
+    #[test]
+    fn device_facts_round_trips_with_a_pinned_wire_shape() {
+        let observation = sample_device_facts();
+        let msg = SessionMsg::DeviceFacts {
+            observation: observation.clone(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "device_facts");
+        assert_eq!(json["observation"]["revision"], 4);
+        assert_eq!(json["observation"]["input"]["class"], "virtual");
+        assert_eq!(json["observation"]["output"]["physical"]["transport"], "usb");
+        let SessionMsg::DeviceFacts { observation: back } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("device facts changed kind");
+        };
+        assert_eq!(back, observation);
+        assert!(back.is_valid());
+    }
+
+    /// An old peer (no `DeviceFacts` variant) cannot decode the message. That
+    /// is the safe outcome: `recv_timeout` counts it in `bad_session_msgs` and
+    /// skips it. It must fail, not be mistaken for another variant.
+    #[test]
+    fn a_peer_that_predates_device_facts_rejects_it_and_that_is_the_safe_outcome() {
+        let json = serde_json::to_string(&SessionMsg::DeviceFacts {
+            observation: sample_device_facts(),
+        })
+        .unwrap();
+        assert!(serde_json::from_str::<LegacySessionMsg>(&json).is_err());
+    }
+
+    /// `device_facts_version` absent (1.0.1 and older) decodes as 0, the value
+    /// that means "never send DeviceFacts to this peer, present it as virtual".
+    /// An extra field in the other direction is ignored by an old decoder.
+    #[test]
+    fn missing_device_facts_version_decodes_as_zero_and_old_decoders_ignore_it() {
+        let v101 = serde_json::json!({
+            "type": "audio_capabilities",
+            "default_input": true,
+            "default_output": true,
+            "max_media_channels": 2,
+            "device_volume_version": 1,
+            "media_frame_tag_version": 1
+        });
+        let SessionMsg::AudioCapabilities {
+            device_facts_version,
+            max_media_channels,
+            ..
+        } = serde_json::from_value(v101).unwrap()
+        else {
+            panic!("audio capabilities changed kind");
+        };
+        assert_eq!(device_facts_version, 0);
+        assert_eq!(max_media_channels, 2);
+
+        /// The 1.0.1 shape of `AudioCapabilities`, to show an old peer still
+        /// parses our capability message with the new field present.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum V101SessionMsg {
+            AudioCapabilities {
+                default_input: bool,
+                default_output: bool,
+                #[serde(default)]
+                max_media_channels: u8,
+                #[serde(default)]
+                device_volume_version: u8,
+                #[serde(default)]
+                media_frame_tag_version: u8,
+            },
+        }
+        let ours = serde_json::to_string(&SessionMsg::AudioCapabilities {
+            default_input: true,
+            default_output: false,
+            max_media_channels: 2,
+            device_volume_version: 1,
+            media_frame_tag_version: 1,
+            device_facts_version: audiohub_core::device_facts::DEVICE_FACTS_VERSION,
+        })
+        .unwrap();
+        let V101SessionMsg::AudioCapabilities {
+            default_input,
+            default_output,
+            max_media_channels,
+            device_volume_version,
+            media_frame_tag_version,
+        } = serde_json::from_str(&ours).expect("an old peer must still parse our capabilities");
+        assert!(default_input && !default_output);
+        assert_eq!(
+            (max_media_channels, device_volume_version, media_frame_tag_version),
+            (2, 1, 1)
+        );
+    }
+
+    /// Two ends of a real `SecureChannel` (same cipher/nonce/framing code as
+    /// production) over an in-memory transport, keyed symmetrically.
+    fn channel_pair() -> (
+        SecureChannel<crate::memduplex::MemDuplex>,
+        SecureChannel<crate::memduplex::MemDuplex>,
+    ) {
+        let (a, b) = crate::memduplex::MemDuplex::pair();
+        let peer = PairedPeer {
+            name: "peer".into(),
+            fingerprint: "fp".into(),
+            public_key_b64: String::new(),
+            last_addr: None,
+            port: 0,
+            added_unix: 0,
+            alias: None,
+        };
+        let ss = [7u8; 32];
+        let (ni, nr) = ([1u8; 16], [2u8; 16]);
+        (
+            SecureChannel::from_parts(a, derive_keys(&ss, &ni, &nr, true), peer.clone()),
+            SecureChannel::from_parts(b, derive_keys(&ss, &ni, &nr, false), peer),
+        )
+    }
+
+    /// The connection survives a message the receiver cannot decode, and the
+    /// message after it is delivered. The skipped payload is the real
+    /// `DeviceFacts` JSON with its tag replaced by one this build does not
+    /// know, which is exactly what a 1.0.1 receiver sees when a 1.0.2 provider
+    /// sends `device_facts` (see `Unpaired` and `recv_timeout`).
+    #[test]
+    fn an_undecodable_device_facts_message_is_skipped_and_the_channel_survives() {
+        let (mut tx, mut rx) = channel_pair();
+        let real = serde_json::to_string(&SessionMsg::DeviceFacts {
+            observation: sample_device_facts(),
+        })
+        .unwrap();
+        let unknown = real.replace("\"device_facts\"", "\"device_facts_from_a_newer_build\"");
+        assert_ne!(real, unknown);
+
+        tx.send(&SessionMsg::Ping { t_us: 1 }).unwrap();
+        tx.send_raw_payload(unknown.as_bytes()).unwrap();
+        tx.send(&SessionMsg::DeviceFacts {
+            observation: sample_device_facts(),
+        })
+        .unwrap();
+        tx.send(&SessionMsg::Ping { t_us: 2 }).unwrap();
+
+        let next = |rx: &mut SecureChannel<crate::memduplex::MemDuplex>| {
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("channel must stay up")
+                .expect("message before the deadline")
+        };
+        assert!(matches!(next(&mut rx), SessionMsg::Ping { t_us: 1 }));
+        // The unknown variant is skipped silently; the real one decodes here.
+        match next(&mut rx) {
+            SessionMsg::DeviceFacts { observation } => assert_eq!(observation, sample_device_facts()),
+            other => panic!("expected DeviceFacts, got {other:?}"),
+        }
+        assert!(matches!(next(&mut rx), SessionMsg::Ping { t_us: 2 }));
+        assert_eq!(rx.bad_session_msgs(), 1);
+        assert!(!rx.is_poisoned());
     }
 
     /// 线上**没有** `ms` 字段：`ms` 只能由收方从 `samples`/`rate` 重算。

@@ -25,6 +25,7 @@ Abstract:
 #include "perpeer.h"
 #include "ctldevice.h"
 #include "ahrings.h"
+#include "bus.h"
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
@@ -48,10 +49,12 @@ _Dispatch_type_(IRP_MJ_PNP)
 DRIVER_DISPATCH PnpHandler;
 
 //
-// Rendering streams are not saved to a file by default. Use the registry value 
-// DoNotCreateDataFiles (DWORD) = 0 to override this default.
+// Rendering streams are never saved to a file. v11: the sample's registry
+// override (DoNotCreateDataFiles = 0) is gone with the CSaveData work items
+// it needed -- they were one set per DRIVER, and with one PortCls adapter per
+// child devnode a per-adapter Init/Destroy of driver-global state is a race.
 //
-DWORD g_DoNotCreateDataFiles = 1;  // default is off.
+DWORD g_DoNotCreateDataFiles = 1;  // always off
 DWORD g_DisableToneGenerator = 0;  // default is to generate tones.
 UNICODE_STRING g_RegistryPath;      // This is used to store the registry settings path for the driver
 
@@ -216,7 +219,6 @@ Returns:
     HANDLE                      DriverKey;
     RTL_QUERY_REGISTRY_TABLE    paramTable[] = {
     // QueryRoutine     Flags                                               Name                     EntryContext             DefaultType                                                    DefaultData              DefaultLength
-        { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"DoNotCreateDataFiles", &g_DoNotCreateDataFiles, (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD, &g_DoNotCreateDataFiles, sizeof(ULONG)},
         { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"DisableToneGenerator", &g_DisableToneGenerator, (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD, &g_DisableToneGenerator, sizeof(ULONG)},
         { NULL,   0,                                                        NULL,                    NULL,                    0,                                                             NULL,                    0}
     };
@@ -256,7 +258,6 @@ Returns:
     //
     // Dump settings.
     //
-    DPF(D_VERBOSE, ("DoNotCreateDataFiles: %u", g_DoNotCreateDataFiles));
     DPF(D_VERBOSE, ("DisableToneGenerator: %u", g_DisableToneGenerator));
 
     if (DriverKey)
@@ -378,19 +379,21 @@ Return Value:
     AhRingsDriverInit();
 
     //
-    // Control plane. A failure here is NOT fatal: a driver that loads without
-    // it publishes nothing and is harmless, while a driver that refuses to load
-    // takes the devnode down and has to be recovered by hand on a test machine
-    // that only answers over SSH.
+    // v11 bus role (spike S4). The order is load-bearing:
     //
-    {
-        NTSTATUS ctlStatus = AhCtlCreateDevice(DriverObject);
-        if (!NT_SUCCESS(ctlStatus))
-        {
-            DPF(D_ERROR, ("AhCtlCreateDevice failed 0x%x; driver loads without a control plane",
-                          ctlStatus));
-        }
-    }
+    //   1. PcInitializeAdapterDriver filled the table (above);
+    //   2. PnpHandler hooked IRP_MJ_PNP (above);
+    //   3. the control plane hooks CREATE/CLOSE/CLEANUP/DEVICE_CONTROL;
+    //   4. the bus router goes in LAST and saves the whole table as it stands,
+    //      handing every IRP that is not for the bus FDO or a child PDO to the
+    //      entries above.
+    //
+    // The control DEVICE itself is created by the bus FDO's AddDevice and
+    // deleted at its REMOVE, so it no longer pins the image.
+    //
+    AhBusDriverInit();
+    AhCtlHookDispatch(DriverObject);
+    AhBusInstallRouter(DriverObject);
 
     //
     // All done.
@@ -455,19 +458,37 @@ Return Value:
     NTSTATUS        ntStatus;
     ULONG           maxObjects;
 
-    DPF(D_TERSE, ("[AddDevice]"));
+    //
+    // v11: one image, two AddDevice roles. The root devnode ROOT\AudioHubVad
+    // becomes the bus (bus.cpp); every child the bus enumerates
+    // (AUDIOHUB\PeerEndpoint) becomes a PortCls adapter, as the single root
+    // adapter used to be.
+    //
+    if (!AhBusIsChildPdo(PhysicalDeviceObject))
+    {
+        DPF(D_TERSE, ("[AddDevice] root devnode: bus"));
+        return AhBusAddDevice(DriverObject, PhysicalDeviceObject);
+    }
+
+    DPF(D_TERSE, ("[AddDevice] child devnode: adapter"));
+
+    //
+    // S6: the child's FriendlyName goes on BEFORE any endpoint of it exists;
+    // it is the bracketed half of every endpoint name of this child.
+    //
+    AhBusChildAddDevice(PhysicalDeviceObject);
 
     //
     // THE ONE-SHOT BUDGET. PcAddAdapterDevice's MaxObjects "sets the upper
     // limit to the total number of miniport objects that the adapter driver can
     // instantiate", it is passed exactly once, and it cannot be raised later.
     //
-    // 4 miniports per peer (render topology + render wave + capture topology +
-    // capture wave) times AUDIOHUB_WIN_MAX_SLOTS. The sample's g_MaxMiniports
-    // is 4 -- enough for ONE peer -- and the failure when it runs out surfaces
-    // inside PcRegisterSubdevice as an error that says nothing about peers.
+    // A child hosts at most one peer's directions: 4 miniports (render
+    // topology + render wave + capture topology + capture wave). Twice that,
+    // so a direction moving off and back onto the same child inside one Set
+    // can never meet a budget that has not yet seen the removal.
     //
-    maxObjects = g_MaxAudioHubMiniports;
+    maxObjects = 2 * AUDIOHUB_MINIPORTS_PER_PEER;
 
     // Tell the class driver to add the device.
     //
@@ -600,27 +621,12 @@ Return Value:
     IF_FAILED_JUMP(ntStatus, Exit);
 
     //
-    // Caller-identity policy lives in the DEVICE hardware key, which only an
-    // administrator can write, so it can only be read once we have a PDO.
+    // NO endpoints are installed here unless a paired peer is already waiting
+    // for exactly this child: its directions go in now, with their names
+    // (perpeer.cpp). The caller-identity policy is the bus's business now
+    // (the ROOT devnode's hardware key).
     //
-    {
-        PDEVICE_OBJECT pdo = NULL;
-        PcGetPhysicalDeviceObject(DeviceObject, &pdo);
-        if (pdo != NULL)
-        {
-            AhCtlLoadPolicy(pdo);
-        }
-        else
-        {
-            DPF(D_ERROR, ("[StartDevice] no PDO; caller-identity check stays ACL-only"));
-        }
-    }
-
-    //
-    // NO endpoints are installed here. They appear one pair at a time, as
-    // peers are paired, via IOCTL_AUDIOHUB_BIND_SET (perpeer.cpp).
-    //
-    ntStatus = AhPerPeerAttachAdapter(DeviceObject, pAdapterCommon);
+    ntStatus = AhPerPeerChildStart(DeviceObject, pAdapterCommon);
     IF_FAILED_JUMP(ntStatus, Exit);
 
 Exit:
@@ -701,7 +707,7 @@ Return Value:
         // Cleanup()/Release() is a dangling reference, and the bugcheck it
         // produces names none of the code that caused it.
         //
-        AhPerPeerDetachAdapter();
+        AhPerPeerChildDetach(_DeviceObject);
 
         if (ext->m_pCommon != NULL)
         {

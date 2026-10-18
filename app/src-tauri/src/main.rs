@@ -19,6 +19,7 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 
 mod driver_install;
+mod endpoint_owner;
 mod icon;
 mod permission_settings;
 #[cfg(target_os = "macos")]
@@ -163,6 +164,9 @@ struct IpcEndpointJson {
     port: u16,
     token: String,
     pid: u32,
+    /// Daemon's kernel start time, see `endpoint_owner`.
+    #[serde(default)]
+    started: Option<u64>,
 }
 
 /// Failure taxonomy for the UI: each kind maps to different actionable copy in
@@ -221,9 +225,29 @@ fn config_dir() -> PathBuf {
 }
 
 /// Whatever ipc.json currently says, including a version we cannot speak.
+///
+/// A file whose recorded PID is gone, or now belongs to an unrelated process
+/// (PID reuse after a crash or power loss), is stale: it is removed and reported
+/// as absent. Nothing about the process holding the PID is touched.
 fn read_endpoint_raw() -> Option<IpcEndpointJson> {
-    let bytes = std::fs::read(config_dir().join("ipc.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    read_endpoint_file(&config_dir().join("ipc.json"), endpoint_owner::process_start)
+}
+
+fn read_endpoint_file(
+    path: &std::path::Path,
+    probe: impl Fn(u32) -> endpoint_owner::ProcStart,
+) -> Option<IpcEndpointJson> {
+    let bytes = std::fs::read(path).ok()?;
+    let ep: IpcEndpointJson = serde_json::from_slice(&bytes).ok()?;
+    if endpoint_owner::is_stale(ep.started, probe(ep.pid)) {
+        // Only delete the exact file we judged: a daemon starting right now may
+        // already have replaced it.
+        if std::fs::read(path).is_ok_and(|now| now == bytes) {
+            let _ = std::fs::remove_file(path);
+        }
+        return None;
+    }
+    Some(ep)
 }
 
 fn read_endpoint() -> Option<IpcEndpointJson> {
@@ -1709,4 +1733,67 @@ fn main() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod stale_endpoint_tests {
+    use super::*;
+    use endpoint_owner::ProcStart;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "ah-app-ipc-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write(path: &std::path::Path, started: Option<u64>) {
+        let ep = IpcEndpointJson {
+            ipc_version: IPC_VERSION,
+            port: 1,
+            token: "t".into(),
+            pid: 4240,
+            started,
+        };
+        std::fs::write(path, serde_json::to_vec(&ep).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn pid_reused_by_an_unrelated_process_is_stale_and_removed() {
+        let d = scratch("reuse");
+        let f = d.join("ipc.json");
+        write(&f, Some(100));
+        // The PID now runs something that started at a different time (svchost).
+        let got = read_endpoint_file(&f, |_| ProcStart::Started(999));
+        assert!(got.is_none());
+        assert!(!f.exists(), "stale file must be cleaned up");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_owning_daemon_is_kept() {
+        let d = scratch("owner");
+        let f = d.join("ipc.json");
+        write(&f, Some(100));
+        let got = read_endpoint_file(&f, |_| ProcStart::Started(100)).expect("live owner");
+        assert_eq!(got.pid, 4240);
+        assert!(f.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_missing_process_is_stale_but_an_unprovable_one_is_kept() {
+        let d = scratch("gone");
+        let f = d.join("ipc.json");
+        write(&f, Some(100));
+        assert!(read_endpoint_file(&f, |_| ProcStart::Missing).is_none());
+        write(&f, Some(100));
+        assert!(read_endpoint_file(&f, |_| ProcStart::Unknown).is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

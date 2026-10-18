@@ -183,6 +183,25 @@ typedef struct AudioHubDevice
     AudioHubMailbox vol;
     AudioHubMailbox io;
     AudioHubMailbox lat; // kAudioHubCtl_LatencyState: what the property REALLY says
+    AudioHubMailbox pres; // kAudioHubCtl_PresentationState: what the getters REALLY return
+
+    // ---- presentation (docs/physical-presentation-1.0.2-design.md §6), guarded
+    // by gPlugIn_StateMutex. The all-Virtual state is the binding's own record:
+    // while presentClass is Virtual every getter answers exactly what it
+    // answered before 1.0.2, and the three strings below are NULL. A record is
+    // returned to that state on bind, on retirement, when its direction is
+    // withdrawn and when the daemon session ends (AudioHub_ResetPresentation).
+    uint32_t        presentClass;        // kAudioHubPresent_*, EFFECTIVE
+    uint32_t        presentTransport;    // effective kAudioDevicePropertyTransportType
+    uint32_t        presentTerminal;     // effective kAudioStreamPropertyTerminalType
+    uint32_t        presentIcon;         // kAudioHubPresentIcon_*, recorded only
+    uint32_t        presentRelatedGroup; // 0 = never related to the sibling while Physical
+    uint32_t        presentReason;       // kAudioHubPresentReason_* of the last request
+    Boolean         presentForced;       // the last request asked for Physical and was refused
+    uint32_t        presentRequestID;    // last request processed in this binding, 0 = none
+    CFStringRef     presentName;         // +1 while Physical, else NULL
+    CFStringRef     presentManufacturer; // +1 while Physical, else NULL
+    CFStringRef     presentModelUID;     // +1 while Physical, else NULL
 
     // ---- v4 speaker format transaction, guarded by gPlugIn_StateMutex
     uint32_t          allowedLayouts;
@@ -596,6 +615,60 @@ static void bridge_latency_state(AudioHubDevice* inDevice)
     atomic_fetch_add(&inDevice->lat.seq, 1);
 }
 
+// ---------------------------------------------------------------- presentation basics
+
+static UInt32 AudioHub_DefaultTerminal(const AudioHubDevice* inDevice)
+{
+    return inDevice->isInput ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker;
+}
+
+// gPlugIn_StateMutex held (or the record is not reachable yet). Back to the
+// binding's own Virtual record; the caller announces whatever changed.
+static void AudioHub_ResetPresentationLocked(AudioHubDevice* inDevice)
+{
+    if(inDevice->presentName != NULL)         { CFRelease(inDevice->presentName);         inDevice->presentName = NULL; }
+    if(inDevice->presentManufacturer != NULL) { CFRelease(inDevice->presentManufacturer); inDevice->presentManufacturer = NULL; }
+    if(inDevice->presentModelUID != NULL)     { CFRelease(inDevice->presentModelUID);     inDevice->presentModelUID = NULL; }
+    inDevice->presentClass        = kAudioHubPresent_Virtual;
+    inDevice->presentTransport    = kAudioDeviceTransportTypeVirtual;
+    inDevice->presentTerminal     = AudioHub_DefaultTerminal(inDevice);
+    inDevice->presentIcon         = kAudioHubPresentIcon_None;
+    inDevice->presentRelatedGroup = 0;
+    inDevice->presentReason       = kAudioHubPresentReason_None;
+    inDevice->presentForced       = false;
+    inDevice->presentRequestID    = 0;
+}
+
+// The ack half of kAudioHubMsg_Presentation, and the replay of an endpoint's
+// presentation when a slot's state is restated. Reports what the getters answer
+// NOW; never the request. Service thread only (it consults the session's caller
+// check, which that thread owns), NO lock held.
+static void bridge_presentation_state(AudioHubDevice* inDevice)
+{
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    uint32_t theFlags = (inDevice->presentClass == kAudioHubPresent_Physical) ? kAudioHubPresentFlag_Physical : 0u;
+    if(inDevice->presentForced)
+    {
+        theFlags |= kAudioHubPresentFlag_Forced;
+    }
+    theFlags |= (inDevice->presentReason & kAudioHubPresentReasonMask) << kAudioHubPresentReasonShift;
+    theFlags |= (inDevice->presentRequestID & 0xFFFFu) << kAudioHubPresentRequestShift;
+    const uint32_t theTransport = inDevice->presentTransport;
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    if(inDevice->isInput)
+    {
+        theFlags |= kAudioHubFlag_IsInput;
+    }
+    if(AudioHubBridge_SessionCallerCheck() == kAudioHubPresentReason_None)
+    {
+        theFlags |= kAudioHubPresentFlag_CallerVerified;
+    }
+    // A fourcc travels in the scalar slot as a PLAIN uint32, like the latency
+    // frame count: AudioHub_Post's Float32 parameter would mangle it.
+    atomic_store(&inDevice->pres.word, ((uint64_t)theFlags << 32) | (uint64_t)theTransport);
+    atomic_fetch_add(&inDevice->pres.seq, 1);
+}
+
 // Returns non-zero while the daemon is still reachable. Only a DELIVERED post
 // advances the sent marker: a send that merely timed out was not delivered, and
 // marking it sent used to throw the volume change away with no retry.
@@ -677,7 +750,9 @@ static int AudioHub_FlushOutbox(void)
             AudioHubDevice* theDevice = &theSlot->dev[theDir];
             if(!AudioHub_FlushMailbox(&theDevice->vol, kAudioHubCtl_Volume, theDevice->endpoint, theGeneration) ||
                !AudioHub_FlushMailbox(&theDevice->io, kAudioHubCtl_IOState, theDevice->endpoint, theGeneration) ||
-               !AudioHub_FlushMailbox(&theDevice->lat, kAudioHubCtl_LatencyState, theDevice->endpoint, theGeneration))
+               !AudioHub_FlushMailbox(&theDevice->lat, kAudioHubCtl_LatencyState, theDevice->endpoint, theGeneration) ||
+               !AudioHub_FlushMailbox(&theDevice->pres, kAudioHubCtl_PresentationState, theDevice->endpoint,
+                                      theGeneration))
             {
                 return 0;
             }
@@ -1250,6 +1325,7 @@ static void AudioHub_InitSlots(void)
             theDevice->sampleRate     = kDevice_SampleRate;
             theDevice->volumeScalar   = 1.0f;
             theDevice->streamIsActive = true;
+            AudioHub_ResetPresentationLocked(theDevice);
             pthread_mutex_init(&theDevice->ioMutex, NULL);
         }
     }
@@ -1273,6 +1349,25 @@ static void AudioHub_RebuildDeviceListLocked(void)
     gDeviceListCount = theCount;
 }
 
+// gPlugIn_StateMutex held. Whether the two halves of a slot name each other in
+// kAudioDevicePropertyRelatedDevices (which is what makes a browser give them
+// one groupId). Virtual: always, as before 1.0.2. Physical: only when both are
+// Physical with the same non-zero group, i.e. when the sharer's own input and
+// output belong to one device (design §6.1). A mixed pair is never related: a
+// physical-looking microphone grouped with a virtual speaker would describe a
+// device that does not exist.
+static Boolean AudioHub_SlotHalvesRelatedLocked(const AudioHubSlot* inSlot)
+{
+    const AudioHubDevice* theOut = &inSlot->dev[kAudioHubDir_Out];
+    const AudioHubDevice* theIn  = &inSlot->dev[kAudioHubDir_In];
+    if((theOut->presentClass == kAudioHubPresent_Virtual) && (theIn->presentClass == kAudioHubPresent_Virtual))
+    {
+        return true;
+    }
+    return (theOut->presentClass == kAudioHubPresent_Physical) && (theIn->presentClass == kAudioHubPresent_Physical) &&
+           (theOut->presentRelatedGroup != 0) && (theOut->presentRelatedGroup == theIn->presentRelatedGroup);
+}
+
 // gPlugIn_StateMutex held. RelatedDevices is a view of the slot's CURRENTLY
 // published halves, not of the two records reserved for it. A delisted record
 // deliberately stays alive for StopIO, but exposing its id through a listed
@@ -1284,11 +1379,12 @@ static UInt32 AudioHub_CopyRelatedDeviceIDsLocked(const AudioHubDevice* inDevice
                                                   UInt32 inCapacity)
 {
     const AudioHubSlot* theSlot = &gSlots[inDevice->slotIndex];
+    const Boolean thePairRelated = AudioHub_SlotHalvesRelatedLocked(theSlot);
     UInt32 theCount = 0;
     for(uint32_t theDir = 0; theDir < kAudioHubDevsPerSlot; ++theDir)
     {
         const AudioHubDevice* theDevice = &theSlot->dev[theDir];
-        if(!theDevice->listed)
+        if(!theDevice->listed || ((theDevice != inDevice) && !thePairRelated))
         {
             continue;
         }
@@ -1297,6 +1393,24 @@ static UInt32 AudioHub_CopyRelatedDeviceIDsLocked(const AudioHubDevice* inDevice
             outDeviceIDs[theCount] = AudioHub_ID(&theDevice->deviceID);
         }
         ++theCount;
+    }
+    return theCount;
+}
+
+// gPlugIn_StateMutex held. The ids of the slot's listed halves, i.e. every
+// device whose RelatedDevices can change when the slot's shape does. Not
+// AudioHub_CopyRelatedDeviceIDsLocked: an unrelated (physical) pair lists
+// only itself there, and the sibling would then never be told.
+static UInt32 AudioHub_CopyListedDeviceIDsLocked(const AudioHubSlot* inSlot,
+                                                 AudioObjectID outDeviceIDs[kAudioHubDevsPerSlot])
+{
+    UInt32 theCount = 0;
+    for(uint32_t theDir = 0; theDir < kAudioHubDevsPerSlot; ++theDir)
+    {
+        if(inSlot->dev[theDir].listed)
+        {
+            outDeviceIDs[theCount++] = AudioHub_ID(&inSlot->dev[theDir].deviceID);
+        }
     }
     return theCount;
 }
@@ -1372,6 +1486,7 @@ static void AudioHub_ReplaySlotState(AudioHubSlot* inSlot)
         theDevice->vol.sent = 0;
         theDevice->io.sent = 0;
         theDevice->lat.sent = 0;
+        theDevice->pres.sent = 0;
         bridge_volume_changed(theDevice, theScalar, theMuted);
         bridge_io_state_changed(theDevice, theRunning);
         // The latency the property answers survives a daemon restart (it lives
@@ -1381,6 +1496,13 @@ static void AudioHub_ReplaySlotState(AudioHubSlot* inSlot)
         // playing through would see "acked 0", conclude the driver ignored it,
         // and report a failure that is not happening.
         bridge_latency_state(theDevice);
+        // The presentation the getters answer, unprompted. This is also how a
+        // daemon learns that this driver understands presentation at all —
+        // and, through kAudioHubPresentFlag_CallerVerified, whether this
+        // session may ask for Physical — before it has sent anything. A driver
+        // that predates presentation never sends this, which the daemon reads
+        // as "present Virtual".
+        bridge_presentation_state(theDevice);
     }
 }
 
@@ -1548,6 +1670,9 @@ static int AudioHub_BindSlot(AudioHubSlot* inSlot, const AudioHubBindMsg* inMsg)
             // and keeping it would declare one machine's distance for another's.
             theDevice->latencyFrames  = 0;
             theDevice->latencyWanted  = 0;
+            // A new binding is a new peer: it starts Virtual and only becomes
+            // Physical through a Presentation of its own (design §6.4).
+            AudioHub_ResetPresentationLocked(theDevice);
 
             if(!theDevice->isInput)
             {
@@ -1572,12 +1697,15 @@ static int AudioHub_BindSlot(AudioHubSlot* inSlot, const AudioHubBindMsg* inMsg)
             theDevice->vol.sent = 0;
             theDevice->io.sent = 0;
             theDevice->lat.sent = 0;
+            theDevice->pres.sent = 0;
             atomic_store(&theDevice->vol.word, 0);
             atomic_store(&theDevice->vol.seq, 0);
             atomic_store(&theDevice->io.word, 0);
             atomic_store(&theDevice->io.seq, 0);
             atomic_store(&theDevice->lat.word, 0);
             atomic_store(&theDevice->lat.seq, 0);
+            atomic_store(&theDevice->pres.word, 0);
+            atomic_store(&theDevice->pres.seq, 0);
 
             atomic_store(&theDevice->live, 1); // last: everything above is visible by now
         }
@@ -1750,6 +1878,7 @@ static void AudioHub_RetireDueSlots(void)
             theDevice->anchorHostTime = 0;
             theDevice->latencyFrames  = 0;
             theDevice->latencyWanted  = 0;
+            AudioHub_ResetPresentationLocked(theDevice);
             if(!theDevice->isInput)
             {
                 atomic_store(&theDevice->channelCount, AUDIOHUB_SPK_CHANNELS);
@@ -1776,9 +1905,12 @@ static void AudioHub_RetireDueSlots(void)
             atomic_store(&theDevice->io.seq, 0);
             atomic_store(&theDevice->lat.word, 0);
             atomic_store(&theDevice->lat.seq, 0);
+            atomic_store(&theDevice->pres.word, 0);
+            atomic_store(&theDevice->pres.seq, 0);
             theDevice->vol.sent = 0;
             theDevice->io.sent = 0;
             theDevice->lat.sent = 0;
+            theDevice->pres.sent = 0;
         }
         AudioHub_RebuildDeviceListLocked();
         pthread_mutex_unlock(&gPlugIn_StateMutex);
@@ -1909,13 +2041,18 @@ static void AudioHub_UpdateSlotDirections(AudioHubSlot* inSlot, uint32_t inFlags
         theDevice->listed = theWanted;
         if(theWanted) theAdded |= (1u << theDir);
         else          theRemoved |= (1u << theDir);
+        if(!theWanted)
+        {
+            // A withdrawn direction forgets its presentation, so a capability
+            // that later returns starts Virtual like any new endpoint.
+            AudioHub_ResetPresentationLocked(theDevice);
+        }
     }
     if((theAdded | theRemoved) != 0)
     {
         AudioHub_RebuildDeviceListLocked();
         theGeneration = inSlot->generation;
-        theRelatedChangedCount = AudioHub_CopyRelatedDeviceIDsLocked(
-            &inSlot->dev[kAudioHubDir_Out], theRelatedChanged, kAudioHubDevsPerSlot);
+        theRelatedChangedCount = AudioHub_CopyListedDeviceIDsLocked(inSlot, theRelatedChanged);
     }
     pthread_mutex_unlock(&gPlugIn_StateMutex);
 
@@ -2195,6 +2332,454 @@ static void AudioHub_ApplyDaemonLatency(uint32_t inEndpoint, uint32_t inGenerati
     bridge_latency_state(theDevice);
 }
 
+// ---------------------------------------------------------------- presentation
+//
+// docs/physical-presentation-1.0.2-design.md §6.4–§6.6. The daemon asks for an
+// endpoint's presentation; the driver decides what it actually is. Everything
+// below is fail-closed: an unverified caller, an unknown class, a transport or
+// terminal type outside the whitelist, or any string that is not plain UTF-8
+// turns the WHOLE request into Virtual, and the ack says which rule it was.
+// DeviceUID, ClockDomain, Latency, SafetyOffset and IsHidden are not part of a
+// presentation at all: they describe the network path and stay truthful.
+
+// Transport types a Physical presentation may carry. Virtual is excluded
+// because it is not physical; Bluetooth/BLE, AirPlay, Continuity, AVB and the
+// aggregates are excluded because macOS and applications attach behaviour to
+// them (HFP switching, AirPlay latency, aggregation) that would act on a
+// device which is none of those things (design §6.2/§6.5). The daemon maps a
+// sharer's Bluetooth device to USB before it ever gets here.
+static Boolean AudioHub_PresentTransportAllowed(uint32_t inTransport)
+{
+    switch(inTransport)
+    {
+        case kAudioDeviceTransportTypeBuiltIn:
+        case kAudioDeviceTransportTypeUSB:
+        case kAudioDeviceTransportTypeHDMI:
+        case kAudioDeviceTransportTypeDisplayPort:
+        case kAudioDeviceTransportTypeThunderbolt:
+        case kAudioDeviceTransportTypePCI:
+        case kAudioDeviceTransportTypeFireWire:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// 0 means "this direction's default". TTY and LFE types are refused: they
+// select teletype or subwoofer handling that has nothing to do with a remote
+// endpoint. The receiver types stay: they are how a sharer's handset presents.
+static Boolean AudioHub_PresentTerminalAllowed(Boolean inIsInput, uint32_t inTerminal)
+{
+    if(inTerminal == 0)
+    {
+        return true;
+    }
+    if(inIsInput)
+    {
+        switch(inTerminal)
+        {
+            case kAudioStreamTerminalTypeMicrophone:
+            case kAudioStreamTerminalTypeHeadsetMicrophone:
+            case kAudioStreamTerminalTypeReceiverMicrophone:
+            case kAudioStreamTerminalTypeLine:
+            case kAudioStreamTerminalTypeDigitalAudioInterface:
+                return true;
+            default:
+                return false;
+        }
+    }
+    switch(inTerminal)
+    {
+        case kAudioStreamTerminalTypeSpeaker:
+        case kAudioStreamTerminalTypeHeadphones:
+        case kAudioStreamTerminalTypeReceiverSpeaker:
+        case kAudioStreamTerminalTypeLine:
+        case kAudioStreamTerminalTypeDigitalAudioInterface:
+        case kAudioStreamTerminalTypeHDMI:
+        case kAudioStreamTerminalTypeDisplayPort:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// A presented string out of a fixed-size wire field: terminated HERE, non-empty,
+// free of control characters, valid UTF-8. NULL on any violation.
+static CFStringRef AudioHub_CopyPresentString(const char* inField, size_t inCapacity)
+{
+    char theBuffer[256];
+    if((inCapacity == 0) || (inCapacity > sizeof(theBuffer)))
+    {
+        return NULL;
+    }
+    memcpy(theBuffer, inField, inCapacity);
+    theBuffer[inCapacity - 1] = '\0';
+    const size_t theLength = strlen(theBuffer);
+    if(theLength == 0)
+    {
+        return NULL;
+    }
+    for(size_t theIndex = 0; theIndex < theLength; ++theIndex)
+    {
+        const unsigned char theByte = (unsigned char)theBuffer[theIndex];
+        if((theByte < 0x20u) || (theByte == 0x7Fu))
+        {
+            return NULL;
+        }
+    }
+    return CFStringCreateWithBytes(NULL, (const UInt8*)theBuffer, (CFIndex)theLength, kCFStringEncodingUTF8, false);
+}
+
+// "<prefix><suffix>" with a [A-Za-z0-9]{1,31} suffix, or NULL. The prefix is the
+// driver's, so no presentation can claim another vendor's model namespace.
+static CFStringRef AudioHub_CopyPresentModelUID(const char* inSuffix, size_t inCapacity)
+{
+    char theBuffer[64];
+    if((inCapacity == 0) || (inCapacity > sizeof(theBuffer)))
+    {
+        return NULL;
+    }
+    memcpy(theBuffer, inSuffix, inCapacity);
+    theBuffer[inCapacity - 1] = '\0';
+    const size_t theLength = strlen(theBuffer);
+    if(theLength == 0)
+    {
+        return NULL;
+    }
+    for(size_t theIndex = 0; theIndex < theLength; ++theIndex)
+    {
+        const char theChar = theBuffer[theIndex];
+        if(!(((theChar >= 'A') && (theChar <= 'Z')) || ((theChar >= 'a') && (theChar <= 'z')) ||
+             ((theChar >= '0') && (theChar <= '9'))))
+        {
+            return NULL;
+        }
+    }
+    return CFStringCreateWithFormat(NULL, NULL, CFSTR("%s%s"), kAudioHubPresentModelPrefix, theBuffer);
+}
+
+// One evaluated request. The strings are +1 and owned by whoever holds this.
+typedef struct AudioHubPresentation
+{
+    uint32_t    klass;
+    uint32_t    transport;
+    uint32_t    terminal;
+    uint32_t    icon;
+    uint32_t    relatedGroup;
+    uint32_t    reason;
+    Boolean     forced;
+    CFStringRef name;
+    CFStringRef manufacturer;
+    CFStringRef modelUID;
+} AudioHubPresentation;
+
+static void AudioHub_ReleasePresentation(AudioHubPresentation* ioPresentation)
+{
+    if(ioPresentation->name != NULL)         { CFRelease(ioPresentation->name);         ioPresentation->name = NULL; }
+    if(ioPresentation->manufacturer != NULL) { CFRelease(ioPresentation->manufacturer); ioPresentation->manufacturer = NULL; }
+    if(ioPresentation->modelUID != NULL)     { CFRelease(ioPresentation->modelUID);     ioPresentation->modelUID = NULL; }
+}
+
+// The whole verdict for one request, as a pure function of its inputs so it can
+// be tested without a host, a session or a daemon. inCallerCheck is the
+// session's AudioHubBridge_SessionCallerCheck(). The caller check is consulted
+// BEFORE the descriptor, so an unverified sender learns nothing about which of
+// its fields would have been accepted.
+static void AudioHub_EvaluatePresentation(Boolean inIsInput,
+                                          Boolean inListed,
+                                          uint32_t inCallerCheck,
+                                          const AudioHubPresentationMsg* inMsg,
+                                          AudioHubPresentation* outPresentation)
+{
+    memset(outPresentation, 0, sizeof(*outPresentation));
+    outPresentation->klass     = kAudioHubPresent_Virtual;
+    outPresentation->transport = kAudioDeviceTransportTypeVirtual;
+    outPresentation->terminal  = inIsInput ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker;
+    outPresentation->icon      = kAudioHubPresentIcon_None;
+    outPresentation->reason    = kAudioHubPresentReason_None;
+    if(inMsg->klass == kAudioHubPresent_Virtual)
+    {
+        return;
+    }
+
+    uint32_t theReason = kAudioHubPresentReason_None;
+    if(inMsg->klass != kAudioHubPresent_Physical)
+    {
+        theReason = kAudioHubPresentReason_BadClass;
+    }
+    else if(!inListed)
+    {
+        theReason = kAudioHubPresentReason_NotListed;
+    }
+    else if(inCallerCheck != kAudioHubPresentReason_None)
+    {
+        theReason = inCallerCheck;
+    }
+    else if(!AudioHub_PresentTransportAllowed(inMsg->transport))
+    {
+        theReason = kAudioHubPresentReason_BadTransport;
+    }
+    else if(!AudioHub_PresentTerminalAllowed(inIsInput, inMsg->terminal_type))
+    {
+        theReason = kAudioHubPresentReason_BadTerminal;
+    }
+    else if(inMsg->icon_kind >= kAudioHubPresentIcon_Count)
+    {
+        theReason = kAudioHubPresentReason_BadIcon;
+    }
+    // An EMPTY name is not an error: the endpoint then keeps the name its Bind
+    // gave it (the daemon may carry the presented name on the Bind/rename
+    // path instead). A non-empty one must be clean.
+    else if((inMsg->name[0] != '\0') &&
+            ((outPresentation->name = AudioHub_CopyPresentString(inMsg->name, sizeof(inMsg->name))) == NULL))
+    {
+        theReason = kAudioHubPresentReason_BadName;
+    }
+    else if((outPresentation->manufacturer =
+                 AudioHub_CopyPresentString(inMsg->manufacturer, sizeof(inMsg->manufacturer))) == NULL)
+    {
+        theReason = kAudioHubPresentReason_BadManufacturer;
+    }
+    else if((outPresentation->modelUID =
+                 AudioHub_CopyPresentModelUID(inMsg->model_suffix, sizeof(inMsg->model_suffix))) == NULL)
+    {
+        theReason = kAudioHubPresentReason_BadModel;
+    }
+
+    if(theReason != kAudioHubPresentReason_None)
+    {
+        AudioHub_ReleasePresentation(outPresentation);
+        outPresentation->reason = theReason;
+        outPresentation->forced = true;
+        return;
+    }
+    outPresentation->klass        = kAudioHubPresent_Physical;
+    outPresentation->transport    = inMsg->transport;
+    if(inMsg->terminal_type != 0)
+    {
+        outPresentation->terminal = inMsg->terminal_type;
+    }
+    outPresentation->icon         = inMsg->icon_kind;
+    outPresentation->relatedGroup = inMsg->related_group;
+}
+
+// gPlugIn_StateMutex held. What the three string getters answer for this record
+// right now (NOT retained).
+static CFStringRef AudioHub_VisibleNameLocked(const AudioHubDevice* inDevice)
+{
+    return ((inDevice->presentClass == kAudioHubPresent_Physical) && (inDevice->presentName != NULL))
+        ? inDevice->presentName : inDevice->deviceName;
+}
+
+static CFStringRef AudioHub_VisibleManufacturerLocked(const AudioHubDevice* inDevice)
+{
+    return ((inDevice->presentClass == kAudioHubPresent_Physical) && (inDevice->presentManufacturer != NULL))
+        ? inDevice->presentManufacturer : CFSTR("AudioHub");
+}
+
+static CFStringRef AudioHub_VisibleModelUIDLocked(const AudioHubDevice* inDevice)
+{
+    return ((inDevice->presentClass == kAudioHubPresent_Physical) && (inDevice->presentModelUID != NULL))
+        ? inDevice->presentModelUID : inDevice->modelUID;
+}
+
+static Boolean AudioHub_SameString(CFStringRef inA, CFStringRef inB)
+{
+    if((inA == NULL) || (inB == NULL))
+    {
+        return inA == inB;
+    }
+    return CFEqual(inA, inB);
+}
+
+static CFStringRef AudioHub_RetainOrNull(CFStringRef inString)
+{
+    return (inString != NULL) ? (CFStringRef)CFRetain(inString) : NULL;
+}
+
+// Service thread, NO lock held. Makes inPresentation (consuming its strings) the
+// endpoint's effective presentation and then tells the host about exactly the
+// properties whose answers changed — the AudioHub_RenameSlot pattern: no IO
+// format changes, so no RequestDeviceConfigurationChange and no IO interruption
+// (measured, spike S3 §2.3). inPostAck: whether the daemon must be told; false
+// only when the session is already gone (detach), where the next replay will.
+static void AudioHub_InstallPresentation(AudioHubSlot* inSlot,
+                                         uint32_t inDir,
+                                         uint32_t inGeneration,
+                                         AudioHubPresentation* inPresentation,
+                                         uint32_t inRequestID,
+                                         Boolean inPostAck)
+{
+    AudioHubDevice* theDevice = &inSlot->dev[inDir];
+    AudioObjectPropertyAddress theChanged[4];
+    UInt32 theChangedCount = 0;
+    Boolean theTerminalChanged = false;
+    Boolean theRelatedChanged = false;
+    AudioObjectID theRelatedIDs[kAudioHubDevsPerSlot];
+    UInt32 theRelatedCount = 0;
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    const Boolean theRelatedBefore = AudioHub_SlotHalvesRelatedLocked(inSlot);
+    CFStringRef theNameBefore  = AudioHub_RetainOrNull(AudioHub_VisibleNameLocked(theDevice));
+    CFStringRef theMakerBefore = AudioHub_RetainOrNull(AudioHub_VisibleManufacturerLocked(theDevice));
+    CFStringRef theModelBefore = AudioHub_RetainOrNull(AudioHub_VisibleModelUIDLocked(theDevice));
+    const uint32_t theTransportBefore = theDevice->presentTransport;
+    const uint32_t theTerminalBefore  = theDevice->presentTerminal;
+
+    if(theDevice->presentName != NULL)         CFRelease(theDevice->presentName);
+    if(theDevice->presentManufacturer != NULL) CFRelease(theDevice->presentManufacturer);
+    if(theDevice->presentModelUID != NULL)     CFRelease(theDevice->presentModelUID);
+    theDevice->presentName         = inPresentation->name;          // the +1 moves here
+    theDevice->presentManufacturer = inPresentation->manufacturer;
+    theDevice->presentModelUID     = inPresentation->modelUID;
+    inPresentation->name = inPresentation->manufacturer = inPresentation->modelUID = NULL;
+    theDevice->presentClass        = inPresentation->klass;
+    theDevice->presentTransport    = inPresentation->transport;
+    theDevice->presentTerminal     = inPresentation->terminal;
+    theDevice->presentIcon         = inPresentation->icon;
+    theDevice->presentRelatedGroup = inPresentation->relatedGroup;
+    theDevice->presentReason       = inPresentation->reason;
+    theDevice->presentForced       = inPresentation->forced;
+    theDevice->presentRequestID    = inRequestID;
+
+    if(!AudioHub_SameString(theNameBefore, AudioHub_VisibleNameLocked(theDevice)))
+    {
+        theChanged[theChangedCount++].mSelector = kAudioObjectPropertyName;
+    }
+    if(!AudioHub_SameString(theMakerBefore, AudioHub_VisibleManufacturerLocked(theDevice)))
+    {
+        theChanged[theChangedCount++].mSelector = kAudioObjectPropertyManufacturer;
+    }
+    if(!AudioHub_SameString(theModelBefore, AudioHub_VisibleModelUIDLocked(theDevice)))
+    {
+        theChanged[theChangedCount++].mSelector = kAudioDevicePropertyModelUID;
+    }
+    if(theTransportBefore != theDevice->presentTransport)
+    {
+        theChanged[theChangedCount++].mSelector = kAudioDevicePropertyTransportType;
+    }
+    theTerminalChanged = (theTerminalBefore != theDevice->presentTerminal);
+    theRelatedChanged = (theRelatedBefore != AudioHub_SlotHalvesRelatedLocked(inSlot));
+    if(theRelatedChanged)
+    {
+        theRelatedCount = AudioHub_CopyListedDeviceIDsLocked(inSlot, theRelatedIDs);
+    }
+    const AudioObjectID theDeviceID = AudioHub_ID(&theDevice->deviceID);
+    const AudioObjectID theStreamID = AudioHub_ID(&theDevice->streamID);
+    const Boolean theListed = theDevice->listed;
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    if(theNameBefore != NULL)  CFRelease(theNameBefore);
+    if(theMakerBefore != NULL) CFRelease(theMakerBefore);
+    if(theModelBefore != NULL) CFRelease(theModelBefore);
+
+    if(inPostAck)
+    {
+        bridge_presentation_state(theDevice);
+    }
+
+    if((gPlugIn_Host == NULL) || (atomic_load(&gHostReady) == 0) ||
+       (inSlot->state != kSlotBound) || (inSlot->generation != inGeneration))
+    {
+        return;
+    }
+    if(theListed && (theChangedCount > 0))
+    {
+        for(UInt32 theIndex = 0; theIndex < theChangedCount; ++theIndex)
+        {
+            theChanged[theIndex].mScope   = kAudioObjectPropertyScopeGlobal;
+            theChanged[theIndex].mElement = kAudioObjectPropertyElementMain;
+        }
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, theDeviceID, theChangedCount, theChanged);
+    }
+    if(theListed && theTerminalChanged)
+    {
+        AudioObjectPropertyAddress theAddress;
+        theAddress.mSelector = kAudioStreamPropertyTerminalType;
+        theAddress.mScope    = kAudioObjectPropertyScopeGlobal;
+        theAddress.mElement  = kAudioObjectPropertyElementMain;
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, theStreamID, 1, &theAddress);
+    }
+    if(theRelatedChanged)
+    {
+        AudioHub_AnnounceRelatedDevices(inSlot, inGeneration, theRelatedIDs, theRelatedCount);
+    }
+}
+
+// Service thread, from the transport, once shape, sender and session have been
+// checked there. Always answers (through InstallPresentation's ack) unless the
+// request names a slot generation that is not current — the daemon's own
+// generation filter would drop that answer anyway.
+static void AudioHub_HandlePresentation(const AudioHubPresentationMsg* inMsg)
+{
+    if(inMsg->endpoint >= kAudioHubMaxEndpoints)
+    {
+        return;
+    }
+    AudioHubSlot* theSlot = &gSlots[AUDIOHUB_ENDPOINT_SLOT(inMsg->endpoint)];
+    const uint32_t theDir = AUDIOHUB_ENDPOINT_DIR(inMsg->endpoint);
+    if((theSlot->state != kSlotBound) || (inMsg->generation != theSlot->generation))
+    {
+        os_log(OS_LOG_DEFAULT, kAudioHubDriverLog "ignored a presentation for endpoint %u at generation %u (now %u)",
+               inMsg->endpoint, inMsg->generation, theSlot->generation);
+        return;
+    }
+    AudioHubDevice* theDevice = &theSlot->dev[theDir];
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    const Boolean theListed = theDevice->listed;
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    AudioHubPresentation thePresentation;
+    AudioHub_EvaluatePresentation(theDevice->isInput, theListed, AudioHubBridge_SessionCallerCheck(), inMsg,
+                                  &thePresentation);
+    if(thePresentation.forced)
+    {
+        os_log(OS_LOG_DEFAULT, kAudioHubDriverLog "endpoint %u presented as virtual: physical presentation refused "
+                                                  "(reason %u)",
+               inMsg->endpoint, thePresentation.reason);
+    }
+    AudioHub_InstallPresentation(theSlot, theDir, theSlot->generation, &thePresentation, inMsg->request_id, true);
+}
+
+// The daemon session ended (exit, crash, supersession). Every bound endpoint
+// goes back to Virtual at once: a Physical presentation is a claim the
+// VERIFIED session made, and whoever attaches next — possibly a process that
+// fails the caller check — must not inherit it. The next session's daemon
+// re-establishes Physical after its re-Bind, which it has to send anyway; the
+// transport flip in between neither interrupts IO nor reselects default
+// devices (spike S3 §2.3).
+static void AudioHub_ResetAllPresentations(void)
+{
+    for(uint32_t theSlotIndex = 0; theSlotIndex < kAudioHubMaxSlots; ++theSlotIndex)
+    {
+        AudioHubSlot* theSlot = &gSlots[theSlotIndex];
+        if(theSlot->state != kSlotBound)
+        {
+            continue;
+        }
+        for(uint32_t theDir = 0; theDir < kAudioHubDevsPerSlot; ++theDir)
+        {
+            AudioHubDevice* theDevice = &theSlot->dev[theDir];
+            pthread_mutex_lock(&gPlugIn_StateMutex);
+            const Boolean theDefault = (theDevice->presentClass == kAudioHubPresent_Virtual) &&
+                                       !theDevice->presentForced && (theDevice->presentRequestID == 0);
+            pthread_mutex_unlock(&gPlugIn_StateMutex);
+            if(theDefault)
+            {
+                continue;
+            }
+            AudioHubPresentation theVirtual;
+            memset(&theVirtual, 0, sizeof(theVirtual));
+            theVirtual.klass     = kAudioHubPresent_Virtual;
+            theVirtual.transport = kAudioDeviceTransportTypeVirtual;
+            theVirtual.terminal  = AudioHub_DefaultTerminal(theDevice);
+            theVirtual.icon      = kAudioHubPresentIcon_None;
+            theVirtual.reason    = kAudioHubPresentReason_None;
+            AudioHub_InstallPresentation(theSlot, theDir, theSlot->generation, &theVirtual, 0, false);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- bridge hooks
 
 static void AudioHub_BridgeAttached(void)
@@ -2237,6 +2822,8 @@ static void AudioHub_BridgeDetached(void)
     pthread_mutex_unlock(&gPlugIn_StateMutex);
     // The transport already unpublished every ring. Bindings and committed HAL
     // layouts survive, but speakers wait for a new-session format transaction.
+    // Presentations do not survive: see AudioHub_ResetAllPresentations.
+    AudioHub_ResetAllPresentations();
 }
 
 static void AudioHub_BridgeTick(void)
@@ -2258,6 +2845,7 @@ static const AudioHubBridgeHooks gBridgeHooks =
     .format          = AudioHub_HandleFormat,
     .notify_volume   = AudioHub_ApplyDaemonVolume,
     .notify_latency  = AudioHub_ApplyDaemonLatency,
+    .presentation    = AudioHub_HandlePresentation,
     .flush           = AudioHub_FlushOutbox,
     .tick            = AudioHub_BridgeTick,
     .io_running_mask = AudioHub_IORunningMask
@@ -3121,7 +3709,7 @@ static OSStatus AudioHub_GetDevicePropertyData(AudioHubDevice* inDevice, const A
         {
             if(inDataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
             pthread_mutex_lock(&gPlugIn_StateMutex);
-            CFStringRef theName = (inDevice->deviceName != NULL) ? CFRetain(inDevice->deviceName) : NULL;
+            CFStringRef theName = AudioHub_RetainOrNull(AudioHub_VisibleNameLocked(inDevice));
             pthread_mutex_unlock(&gPlugIn_StateMutex);
             if(theName == NULL) return kAudioHardwareBadObjectError;
             *((CFStringRef*)outData) = theName;
@@ -3129,10 +3717,16 @@ static OSStatus AudioHub_GetDevicePropertyData(AudioHubDevice* inDevice, const A
             break;
         }
         case kAudioObjectPropertyManufacturer:
+        {
             if(inDataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
-            *((CFStringRef*)outData) = CFRetain(CFSTR("AudioHub"));
+            pthread_mutex_lock(&gPlugIn_StateMutex);
+            CFStringRef theManufacturer = AudioHub_RetainOrNull(AudioHub_VisibleManufacturerLocked(inDevice));
+            pthread_mutex_unlock(&gPlugIn_StateMutex);
+            if(theManufacturer == NULL) return kAudioHardwareBadObjectError;
+            *((CFStringRef*)outData) = theManufacturer;
             *outDataSize = sizeof(CFStringRef);
             break;
+        }
         case kAudioObjectPropertyOwnedObjects:
         {
             UInt32 theNumberItems = AudioHub_ScopeMatchesDevice(inDevice, inAddress->mScope) ? 3 : 0;
@@ -3177,7 +3771,7 @@ static OSStatus AudioHub_GetDevicePropertyData(AudioHubDevice* inDevice, const A
         {
             if(inDataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
             pthread_mutex_lock(&gPlugIn_StateMutex);
-            CFStringRef theModelUID = (inDevice->modelUID != NULL) ? CFRetain(inDevice->modelUID) : NULL;
+            CFStringRef theModelUID = AudioHub_RetainOrNull(AudioHub_VisibleModelUIDLocked(inDevice));
             pthread_mutex_unlock(&gPlugIn_StateMutex);
             if(theModelUID == NULL) return kAudioHardwareBadObjectError;
             *((CFStringRef*)outData) = theModelUID;
@@ -3185,8 +3779,12 @@ static OSStatus AudioHub_GetDevicePropertyData(AudioHubDevice* inDevice, const A
             break;
         }
         case kAudioDevicePropertyTransportType:
+            // Virtual unless a verified daemon presented this endpoint as a
+            // whitelisted physical transport (AudioHub_EvaluatePresentation).
             if(inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
-            *((UInt32*)outData) = kAudioDeviceTransportTypeVirtual;
+            pthread_mutex_lock(&gPlugIn_StateMutex);
+            *((UInt32*)outData) = inDevice->presentTransport;
+            pthread_mutex_unlock(&gPlugIn_StateMutex);
             *outDataSize = sizeof(UInt32);
             break;
         case kAudioDevicePropertyRelatedDevices:
@@ -3567,7 +4165,9 @@ static OSStatus AudioHub_GetStreamPropertyData(AudioHubDevice* inDevice, const A
             break;
         case kAudioStreamPropertyTerminalType:
             if(inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
-            *((UInt32*)outData) = inDevice->isInput ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker;
+            pthread_mutex_lock(&gPlugIn_StateMutex);
+            *((UInt32*)outData) = inDevice->presentTerminal;
+            pthread_mutex_unlock(&gPlugIn_StateMutex);
             *outDataSize = sizeof(UInt32);
             break;
         case kAudioStreamPropertyStartingChannel:

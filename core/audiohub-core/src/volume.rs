@@ -161,6 +161,8 @@ pub fn set_default_input_mute(muted: bool) -> Result<()> {
 /// never land on another peer's endpoint.  Other platforms do not use this
 /// lookup and return an explicit error.
 pub fn get_audiohub_peer_endpoint_volume(peer_key: &str, input: bool) -> Result<VolumeState> {
+    #[cfg(feature = "fake-audio")]
+    crate::audio::fake::refuse_native("volume::get_audiohub_peer_endpoint_volume")?;
     imp::get_audiohub_peer(
         if input {
             EndpointFlow::Input
@@ -183,6 +185,8 @@ pub struct AudioHubEndpointPresence {
 /// the inventory is incomplete, not that the endpoints have disappeared.
 #[cfg(windows)]
 pub fn list_audiohub_peer_endpoints() -> Result<Vec<AudioHubEndpointPresence>> {
+    #[cfg(feature = "fake-audio")]
+    crate::audio::fake::refuse_native("volume::list_audiohub_peer_endpoints")?;
     imp::list_audiohub_peer_endpoints()
 }
 
@@ -224,6 +228,8 @@ pub fn set_audiohub_peer_endpoint_volume(
     muted: bool,
 ) -> Result<VolumeState> {
     let scalar = normalize_scalar(scalar)?;
+    #[cfg(feature = "fake-audio")]
+    crate::audio::fake::refuse_native("volume::set_audiohub_peer_endpoint_volume")?;
     imp::set_audiohub_peer(
         if input {
             EndpointFlow::Input
@@ -253,11 +259,20 @@ pub fn set_output_mute(dev: Option<&str>, muted: bool) -> Result<()> {
 }
 
 fn get_endpoint_volume(flow: EndpointFlow, dev: Option<&str>) -> Result<VolumeState> {
+    #[cfg(feature = "fake-audio")]
+    if let Some(world) = crate::audio::fake::active() {
+        return world.volume_get(flow == EndpointFlow::Input, dev);
+    }
     imp::get(flow, dev)
 }
 
 fn set_endpoint_volume(flow: EndpointFlow, dev: Option<&str>, scalar: f32) -> Result<()> {
-    imp::set_volume(flow, dev, normalize_scalar(scalar)?)
+    let scalar = normalize_scalar(scalar)?;
+    #[cfg(feature = "fake-audio")]
+    if let Some(world) = crate::audio::fake::active() {
+        return world.volume_set(flow == EndpointFlow::Input, dev, Some(scalar), None);
+    }
+    imp::set_volume(flow, dev, scalar)
 }
 
 fn normalize_scalar(scalar: f32) -> Result<f32> {
@@ -268,6 +283,10 @@ fn normalize_scalar(scalar: f32) -> Result<f32> {
 }
 
 fn set_endpoint_mute(flow: EndpointFlow, dev: Option<&str>, muted: bool) -> Result<()> {
+    #[cfg(feature = "fake-audio")]
+    if let Some(world) = crate::audio::fake::active() {
+        return world.volume_set(flow == EndpointFlow::Input, dev, None, Some(muted));
+    }
     imp::set_mute(flow, dev, muted)
 }
 
@@ -392,6 +411,8 @@ impl GainState {
 /// onto a working speaker. `Result` has a place to say "this device cannot
 /// answer"; the `applied` field does not.
 pub fn get_output_gain(dev: Option<&str>) -> Result<GainState> {
+    #[cfg(feature = "fake-audio")]
+    crate::audio::fake::refuse_native("volume::get_output_gain")?;
     imp::get_gain(dev)
 }
 
@@ -413,6 +434,8 @@ pub fn set_output_gain(dev: Option<&str>, gain: f32) -> Result<GainState> {
     if !gain.is_finite() {
         bail!("gain must be finite");
     }
+    #[cfg(feature = "fake-audio")]
+    crate::audio::fake::refuse_native("volume::set_output_gain")?;
     imp::set_gain(dev, gain.clamp(0.0, 1.0))
 }
 

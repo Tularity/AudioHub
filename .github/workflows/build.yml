@@ -64,6 +64,10 @@ env:
   # rather than a confusing mismatch three minutes into the run.
   CARGO_ABOUT_VERSION: 0.9.1
   CARGO_TERM_COLOR: always
+  # Every artifact this workflow builds is shippable (the [release] path only
+  # publishes what the build jobs produced). audiohubd's build.rs refuses the
+  # test-only `facts-injection` feature under this flag.
+  AUDIOHUB_RELEASE_BUILD: '1'
 
 jobs:
   # ---------------------------------------------------------------- gate
@@ -199,6 +203,36 @@ jobs:
           # exists on a runner. The script then signs ad-hoc and says so.
           zsh app/build-app.sh
 
+      # Static, read-only guard. The test-only fake audio backend (feature
+      # `fake-audio`, core/audiohub-core/src/audio_fake.rs) embeds a marker string
+      # and the planned facts-injection feature embeds another; a shipped binary
+      # must contain neither. Nothing is executed — the files are only read.
+      # It scans the cargo outputs that were copied into the bundle as sidecars
+      # AND the bundled copies themselves (the .app is what the dmg is built from;
+      # the dmg and pkg are compressed, so they cannot be grepped directly).
+      - name: Scan shipped binaries for test-only markers
+        run: |
+          set -euo pipefail
+          bundle=app/src-tauri/target/release/bundle/macos/AudioHub.app
+          files=(
+            target/release/audiohubd
+            target/release/audiohub
+            app/src-tauri/target/release/audiohub-app
+            "$bundle"/Contents/MacOS/*
+          )
+          bad=0
+          for f in "${files[@]}"; do
+            [ -f "$f" ] || { echo "missing shipped binary: $f"; exit 1; }
+            for marker in audiohub-fake-audio-v1 AUDIOHUB_FACTS_INJECTION_ENABLED; do
+              if grep -aqF -- "$marker" "$f"; then
+                echo "FORBIDDEN test-only marker '$marker' found in $f"
+                bad=1
+              fi
+            done
+            echo "clean: $f"
+          done
+          [ "$bad" = 0 ]
+
       - name: Locate the dmg
         id: dmg
         run: |
@@ -304,6 +338,42 @@ jobs:
           # so a stock windows-latest runner is enough: MSBuild and vswhere come
           # with the image and signing is off (/p:SignMode=Off).
           ./scripts/build-windows-installer.ps1 -AllowUnsignedDriver -AuthenticodeMode Development
+
+      # Static, read-only guard. The test-only fake audio backend (feature
+      # `fake-audio`, core/audiohub-core/src/audio_fake.rs) embeds a marker string
+      # and the planned facts-injection feature embeds another; a shipped binary
+      # must contain neither. Nothing is executed — the files are only read as
+      # bytes. The NSIS installer payload is compressed, so the scan covers the
+      # executables that go into it: the cargo outputs and the sidecar copies
+      # staged under app/src-tauri/binaries.
+      - name: Scan shipped binaries for test-only markers
+        shell: pwsh
+        run: |
+          $t = 'x86_64-pc-windows-msvc'
+          $files = @(
+            "target/$t/release/audiohubd.exe"
+            "target/$t/release/audiohub.exe"
+            "target/$t/release/audiohub-vad-helper.exe"
+            "app/src-tauri/target/$t/release/audiohub-app.exe"
+            "app/src-tauri/binaries/audiohubd-$t.exe"
+            "app/src-tauri/binaries/audiohub-$t.exe"
+          )
+          $markers = @('audiohub-fake-audio-v1', 'AUDIOHUB_FACTS_INJECTION_ENABLED')
+          $bad = $false
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { throw "missing shipped binary: $f" }
+            # Latin-1 maps every byte to one char, so an ASCII marker is found
+            # byte-for-byte without any text-decoding surprises.
+            $text = [System.Text.Encoding]::Latin1.GetString([System.IO.File]::ReadAllBytes((Resolve-Path $f)))
+            foreach ($m in $markers) {
+              if ($text.Contains($m)) {
+                Write-Host "FORBIDDEN test-only marker '$m' found in $f"
+                $bad = $true
+              }
+            }
+            Write-Host "scanned: $f"
+          }
+          if ($bad) { throw 'test-only markers found in shipped binaries' }
 
       - name: Locate the installer
         id: exe

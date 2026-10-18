@@ -222,6 +222,32 @@ if ($UpdateBranch -lt 0 -or $DriverDecision -lt 0 -or $UpdateBranch -gt $DriverD
     $NsisHooksText.IndexOf('Goto audiohub_preuninstall_done', [StringComparison]::Ordinal) -lt 0) {
     throw 'NSIS `/UPDATE` must bypass the full driver/lifecycle uninstall before any destructive decision'
 }
+# The v11 bus driver can unload without a restart only once no daemon holds its
+# control device. Full uninstall must therefore stop the installed processes
+# before the helper's `uninstall` (which removes the root, then sweeps every
+# AUDIOHUB\PeerEndpoint child devnode including phantoms, then the packages).
+# Upgrades stop the same processes in PREINSTALL; the driver package itself is
+# updated later by the App's explicit helper `install`.
+$HelperUninstall = $NsisHooksText.IndexOf('audiohub-vad-helper.exe" uninstall', [StringComparison]::Ordinal)
+$StopBeforeUninstall = if ($HelperUninstall -ge 0) {
+    $NsisHooksText.LastIndexOf('!insertmacro AudioHubStopInstalledProcesses', $HelperUninstall, [StringComparison]::Ordinal)
+} else {
+    -1
+}
+if ($HelperUninstall -lt 0 -or $StopBeforeUninstall -lt $DriverDecision) {
+    throw 'NSIS uninstall must stop the installed daemon before the helper removes the driver devnodes'
+}
+$PreInstallStart = $NsisHooksText.IndexOf('!macro NSIS_HOOK_PREINSTALL', [StringComparison]::Ordinal)
+$PreInstallEnd = if ($PreInstallStart -ge 0) {
+    $NsisHooksText.IndexOf('!macroend', $PreInstallStart, [StringComparison]::Ordinal)
+} else {
+    -1
+}
+if ($PreInstallStart -lt 0 -or $PreInstallEnd -lt 0 -or
+    $NsisHooksText.IndexOf('!insertmacro AudioHubStopInstalledProcesses', $PreInstallStart, [StringComparison]::Ordinal) -gt $PreInstallEnd -or
+    $NsisHooksText.IndexOf('!insertmacro AudioHubStopInstalledProcesses', $PreInstallStart, [StringComparison]::Ordinal) -lt 0) {
+    throw 'NSIS upgrade must stop the installed daemon before replacing files'
+}
 foreach ($Forbidden in @('CleanupProfiles', 'ProfileList')) {
     if ($NsisHooksText.Contains($Forbidden) -or $LifecycleText.Contains($Forbidden)) {
         throw "installer lifecycle must not traverse user profiles as SYSTEM: $Forbidden"
@@ -380,11 +406,41 @@ foreach ($Name in @('AudioHubVad.inf', 'AudioHubVad.sys', 'AudioHubVad.cat')) {
     $DriverFiles[$Name] = $Path
 }
 $InfText = [IO.File]::ReadAllText($DriverFiles['AudioHubVad.inf'])
-foreach ($Needle in @('ROOT\AudioHubVad', 'AudioHubVad.sys', 'AudioHubVad.cat', 'ServiceBinary')) {
+# Protocol v11: one INF binds ROOT\AudioHubVad to the bus model and
+# AUDIOHUB\PeerEndpoint to the per-peer adapter model. The helper refuses a
+# payload without both (a v10 INF has only the root adapter), so fail here first.
+foreach ($Needle in @(
+    'ROOT\AudioHubVad',
+    'AUDIOHUB\PeerEndpoint',
+    'AudioHub Audio Bus',
+    'AudioHubVad.sys',
+    'AudioHubVad.cat',
+    'ServiceBinary'
+)) {
     if ($InfText.IndexOf($Needle, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
         throw "AudioHubVad.inf does not contain required declaration: $Needle"
     }
 }
+$CompactInf = ($InfText -replace '\s', '').ToLowerInvariant()
+foreach ($Binding in @('=audiohubbus,root\audiohubvad', '=audiohubvad_sa,audiohub\peerendpoint')) {
+    if (-not $CompactInf.Contains($Binding)) {
+        throw "AudioHubVad.inf does not bind the v11 model: $Binding"
+    }
+}
+# DriverVer must carry this product version and a build-derived fourth field
+# (drivers\windows-vad\build.ps1, BUILD.md "DriverVer"). An equal DriverVer on
+# two different packages is a PnP ranking tie that can leave a stale .sys bound,
+# so a hand-stamped or stale package must not be shipped under a new version.
+$ProductVersion = [string]((Get-Content -LiteralPath (Join-Path $TauriDir 'tauri.conf.json') -Raw | ConvertFrom-Json).version)
+$DriverVerMatch = [regex]::Match($InfText, '(?im)^\s*DriverVer\s*=\s*([0-9]{2}/[0-9]{2}/[0-9]{4})\s*,\s*([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)\s*$')
+if (-not $DriverVerMatch.Success) {
+    throw 'AudioHubVad.inf has no four-part DriverVer'
+}
+$DriverVerBase = '{0}.{1}.{2}' -f $DriverVerMatch.Groups[2].Value, $DriverVerMatch.Groups[3].Value, $DriverVerMatch.Groups[4].Value
+if ($DriverVerBase -ne $ProductVersion) {
+    throw "AudioHubVad.inf DriverVer $DriverVerBase.$($DriverVerMatch.Groups[5].Value) does not belong to product version $ProductVersion"
+}
+Write-Host ("[audiohub] AudioHubVad DriverVer {0},{1}.{2}" -f $DriverVerMatch.Groups[1].Value, $DriverVerBase, $DriverVerMatch.Groups[5].Value)
 $Unsigned = @()
 if (-not $AllowUnsignedDriver) {
     foreach ($Name in @('AudioHubVad.sys', 'AudioHubVad.cat')) {
@@ -402,6 +458,11 @@ if ($AllowUnsignedDriver) {
 }
 
 Step 'build CLI and daemon (MSVC x64)'
+# A release build must not contain test-only features: audiohubd's build.rs
+# fails the build if `facts-injection` is enabled under this flag.
+if ($ReleaseSigning) {
+    $env:AUDIOHUB_RELEASE_BUILD = '1'
+}
 Push-Location $Root
 try {
     Invoke-Checked {

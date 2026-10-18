@@ -29,7 +29,11 @@
 
 #include "AudioHubBridge.h"
 
+#include <Security/Security.h> // the strong caller check behind Physical presentation
 #include <bsm/libbsm.h> // audit_token_to_euid / _to_pid: the sender's identity, from the kernel
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <mach/mach_vm.h>
 #include <mach/memory_object_types.h> // MAP_MEM_NAMED_CREATE
 #include <mach/vm_map.h>              // mach_make_memory_entry_64
@@ -115,6 +119,48 @@
 #if kAudioHubPeerCheckLevel >= kAudioHubPeerCheck_Requirement
 #error "kAudioHubPeerCheck_Requirement has no implementation yet; see the comment above"
 #endif
+
+// THE STRONG CHECK (PinnedImage) is NOT a Hello gate. The level above still
+// decides who may hold the rings, unchanged. What PinnedImage decides is
+// narrower and newer: whether this session may present a device as PHYSICAL
+// (kAudioHubMsg_Presentation). Without it, a same-user process that wins a Hello
+// could publish devices that claim to be a USB headset — a capability no
+// process had before 1.0.2. With it, such a process gets Virtual devices only,
+// i.e. exactly the pre-1.0.2 surface (docs/physical-presentation-1.0.2-design.md
+// §2.4 and §6.6, spike S7 in docs/spike-s3-s7-20261017.md).
+//
+// Why each condition, all of which must hold:
+//   - signature valid AND `identifier "com.audiohub.daemon" and certificate
+//     leaf = H"<pin>"`: the installer signs the runtime daemon with a persistent
+//     machine-local identity whose private key is root-only; the certificate
+//     hash is stable across upgrades, so it is pinned rather than a per-build
+//     cdhash (spike S7 §4).
+//   - <pin> comes from a root-owned, not group/world-writable file under the
+//     service versions directory (the installer publishes it next to each
+//     signed daemon). The driver host runs as _coreaudiod, unsandboxed, so it
+//     can read 0444/0555 files under a root 0755 chain and nothing private.
+//   - the executable lives under that same versions directory: the signing
+//     identity's private key is briefly handed to the login user's session
+//     while the installer signs, so "signed by the pin" alone could be a copy
+//     run from anywhere; a path only root can write is what binds the identity
+//     to the installed image.
+//   - CS_VALID and CS_RUNTIME from the kernel: without hardened runtime a
+//     same-user DYLD_INSERT_LIBRARIES injection keeps the process CS_VALID and
+//     satisfying the requirement (measured, spike S7 §3.4). The installer signs
+//     the daemon with --options runtime for exactly this reason.
+// Evaluated ONCE per accepted Hello (~20 ms measured) and cached for the
+// session; a failure of any kind is "not verified", never an error that could
+// affect audio.
+#define kBridgeServiceVersionsDir "/Library/Application Support/AudioHub/service/versions/"
+#define kBridgePinPath            "/Library/Application Support/AudioHub/service/current/certificate.sha1"
+#define kBridgeDaemonExecutable   "audiohubd"
+#define kBridgeDaemonIdentifier   "com.audiohub.daemon"
+// <sys/codesign.h> values; the header is not part of the public SDK.
+#define kBridgeCSOpsStatus        0u
+#define kBridgeCSValid            0x00000001u
+#define kBridgeCSRuntime          0x00010000u
+// Private libsystem_kernel wrapper; the kernel's view of the audit token's process.
+extern int csops_audittoken(pid_t pid, unsigned int ops, void* useraddr, size_t usersize, audit_token_t* token);
 
 // macOS reserves everything below 500 for system and service accounts; a client
 // of this driver is by construction a user-session process (the header explains
@@ -453,6 +499,9 @@ static audit_token_t              gPeerToken;
 // daemon's slot (spec-m5b §4.4/§4.6).
 static uint64_t                  gSessionID   = 0;
 static _Atomic(uint64_t)         gActiveSessionID = 0;
+// The strong caller check of the current session (see the PinnedImage block at
+// the top), a kAudioHubPresentReason_* value. Service thread only.
+static uint32_t                  gPeerCheck   = kAudioHubPresentReason_CallerNoSession;
 
 // Big enough for every inbound message plus the largest trailer the kernel can
 // append. Anything larger is DESTROYED by the kernel and reported as
@@ -479,6 +528,7 @@ typedef union BridgeRcvBuf
     AudioHubControlMsg   ctl;
     AudioHubBindMsg      bind;
     AudioHubFormatMsg    format;
+    AudioHubPresentationMsg presentation;
     uint8_t              raw[768];
 } BridgeRcvBuf;
 
@@ -490,6 +540,8 @@ _Static_assert(sizeof(BridgeRcvBuf) >= sizeof(AudioHubBindMsg) + sizeof(mach_msg
                "receive buffer too small for bind + trailer");
 _Static_assert(sizeof(BridgeRcvBuf) >= sizeof(AudioHubFormatMsg) + sizeof(mach_msg_max_trailer_t),
                "receive buffer too small for format + trailer");
+_Static_assert(sizeof(BridgeRcvBuf) >= sizeof(AudioHubPresentationMsg) + sizeof(mach_msg_max_trailer_t),
+               "receive buffer too small for presentation + trailer");
 
 static uint64_t bridge_now_msec(void)
 {
@@ -552,6 +604,7 @@ static void bridge_disconnect(int inTellSuperseded)
         mach_port_deallocate(mach_task_self(), gDaemonPort);
         gDaemonPort = MACH_PORT_NULL;
         memset(&gPeerToken, 0, sizeof(gPeerToken));
+        gPeerCheck = kAudioHubPresentReason_CallerNoSession;
         if((gHooks != NULL) && (gHooks->detached != NULL))
         {
             gHooks->detached();
@@ -837,6 +890,202 @@ static int bridge_sender_is_session_peer(const mach_msg_audit_trailer_t* inTrail
     return (memcmp(&inTrailer->msgh_audit, &gPeerToken, sizeof(gPeerToken)) == 0);
 }
 
+// ---------------------------------------------------------------- strong caller check
+
+// Every directory from "/" down to (excluding) inPath must be a real
+// directory owned by root and writable by nobody else, and inPath itself a
+// regular file with the same properties. inPath must already be canonical
+// (realpath), so no component is a symlink that could be swapped.
+static int bridge_root_chain_is_safe(const char* inPath)
+{
+    char thePrefix[PATH_MAX];
+    const size_t theLength = strlen(inPath);
+    if((theLength == 0) || (theLength >= sizeof(thePrefix)) || (inPath[0] != '/'))
+    {
+        return 0;
+    }
+    for(size_t theIndex = 1; theIndex <= theLength; ++theIndex)
+    {
+        if((theIndex != theLength) && (inPath[theIndex] != '/'))
+        {
+            continue;
+        }
+        memcpy(thePrefix, inPath, theIndex);
+        thePrefix[theIndex] = '\0';
+        struct stat theStat;
+        if(lstat(thePrefix, &theStat) != 0)
+        {
+            return 0;
+        }
+        const int theLast = (theIndex == theLength);
+        if(theLast ? !S_ISREG(theStat.st_mode) : !S_ISDIR(theStat.st_mode))
+        {
+            return 0;
+        }
+        if((theStat.st_uid != 0) || ((theStat.st_mode & (S_IWGRP | S_IWOTH)) != 0))
+        {
+            return 0;
+        }
+    }
+    struct stat theRoot;
+    return (lstat("/", &theRoot) == 0) && (theRoot.st_uid == 0) && ((theRoot.st_mode & (S_IWGRP | S_IWOTH)) == 0);
+}
+
+// The canonical path must be <versions dir><64 lowercase hex>/<inLeaf> exactly.
+static int bridge_is_version_entry(const char* inCanonical, const char* inLeaf)
+{
+    const size_t thePrefixLength = strlen(kBridgeServiceVersionsDir);
+    if(strncmp(inCanonical, kBridgeServiceVersionsDir, thePrefixLength) != 0)
+    {
+        return 0;
+    }
+    const char* theRest = inCanonical + thePrefixLength;
+    for(size_t theIndex = 0; theIndex < 64; ++theIndex)
+    {
+        const char theChar = theRest[theIndex];
+        if(!(((theChar >= '0') && (theChar <= '9')) || ((theChar >= 'a') && (theChar <= 'f'))))
+        {
+            return 0;
+        }
+    }
+    return (theRest[64] == '/') && (strcmp(theRest + 65, inLeaf) == 0);
+}
+
+// Reads the pinned certificate SHA-1 (40 lowercase hex characters) the installer
+// publishes next to the current runtime daemon. Returns non-zero on success.
+static int bridge_read_pin(char outPin[41])
+{
+    char theCanonical[PATH_MAX];
+    if(realpath(kBridgePinPath, theCanonical) == NULL)
+    {
+        return 0;
+    }
+    if(!bridge_is_version_entry(theCanonical, "certificate.sha1") || !bridge_root_chain_is_safe(theCanonical))
+    {
+        return 0;
+    }
+    const int theFD = open(theCanonical, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if(theFD < 0)
+    {
+        return 0;
+    }
+    struct stat theStat;
+    char theBuffer[64];
+    ssize_t theRead = -1;
+    if((fstat(theFD, &theStat) == 0) && S_ISREG(theStat.st_mode) && (theStat.st_uid == 0) &&
+       ((theStat.st_mode & (S_IWGRP | S_IWOTH)) == 0) && (theStat.st_size >= 40) && (theStat.st_size <= 41))
+    {
+        theRead = read(theFD, theBuffer, sizeof(theBuffer));
+    }
+    close(theFD);
+    if((theRead != 40) && !((theRead == 41) && (theBuffer[40] == '\n')))
+    {
+        return 0;
+    }
+    for(size_t theIndex = 0; theIndex < 40; ++theIndex)
+    {
+        const char theChar = theBuffer[theIndex];
+        if(!(((theChar >= '0') && (theChar <= '9')) || ((theChar >= 'a') && (theChar <= 'f'))))
+        {
+            return 0;
+        }
+        outPin[theIndex] = theChar;
+    }
+    outPin[40] = '\0';
+    return 1;
+}
+
+// The whole PinnedImage verdict for one audit token: kAudioHubPresentReason_None
+// if every condition in the block at the top of this file holds, otherwise the
+// first one that failed. Non-realtime, may take tens of milliseconds.
+static uint32_t bridge_check_caller(const audit_token_t* inToken)
+{
+    char thePin[41];
+    if(!bridge_read_pin(thePin))
+    {
+        return kAudioHubPresentReason_CallerPinUnavailable;
+    }
+
+    uint32_t theReason = kAudioHubPresentReason_None;
+    SecCodeRef theCode = NULL;
+    SecRequirementRef theRequirement = NULL;
+    CFStringRef theRequirementText = NULL;
+    CFURLRef thePathURL = NULL;
+    CFDataRef theTokenData = CFDataCreate(NULL, (const UInt8*)inToken, sizeof(*inToken));
+    const void* theKeys[1] = { kSecGuestAttributeAudit };
+    const void* theValues[1] = { theTokenData };
+    CFDictionaryRef theAttributes = (theTokenData != NULL)
+        ? CFDictionaryCreate(NULL, theKeys, theValues, 1, &kCFTypeDictionaryKeyCallBacks,
+                             &kCFTypeDictionaryValueCallBacks)
+        : NULL;
+
+    // The Security framework reads the caller's executable from disk here, so a
+    // client the driver host cannot read (for instance one in a user's home
+    // directory) fails at this step — which is the safe direction.
+    if((theAttributes == NULL) ||
+       (SecCodeCopyGuestWithAttributes(NULL, theAttributes, kSecCSDefaultFlags, &theCode) != errSecSuccess) ||
+       (theCode == NULL))
+    {
+        theReason = kAudioHubPresentReason_CallerNoCode;
+        goto done;
+    }
+
+    theRequirementText = CFStringCreateWithFormat(NULL, NULL,
+        CFSTR("identifier \"%s\" and certificate leaf = H\"%s\""), kBridgeDaemonIdentifier, thePin);
+    if((theRequirementText == NULL) ||
+       (SecRequirementCreateWithString(theRequirementText, kSecCSDefaultFlags, &theRequirement) != errSecSuccess) ||
+       (SecCodeCheckValidity(theCode, kSecCSStrictValidate, theRequirement) != errSecSuccess))
+    {
+        theReason = kAudioHubPresentReason_CallerRequirement;
+        goto done;
+    }
+
+    {
+        char theRaw[PATH_MAX];
+        char theCanonical[PATH_MAX];
+        if((SecCodeCopyPath(theCode, kSecCSDefaultFlags, &thePathURL) != errSecSuccess) || (thePathURL == NULL) ||
+           !CFURLGetFileSystemRepresentation(thePathURL, true, (UInt8*)theRaw, sizeof(theRaw)) ||
+           (realpath(theRaw, theCanonical) == NULL) ||
+           !bridge_is_version_entry(theCanonical, kBridgeDaemonExecutable) ||
+           !bridge_root_chain_is_safe(theCanonical))
+        {
+            theReason = kAudioHubPresentReason_CallerPath;
+            goto done;
+        }
+    }
+
+    {
+        uint32_t theFlags = 0;
+        audit_token_t theToken = *inToken;
+        if((csops_audittoken(audit_token_to_pid(theToken), kBridgeCSOpsStatus, &theFlags, sizeof(theFlags),
+                             &theToken) != 0) ||
+           ((theFlags & kBridgeCSValid) == 0))
+        {
+            theReason = kAudioHubPresentReason_CallerInvalid;
+            goto done;
+        }
+        if((theFlags & kBridgeCSRuntime) == 0)
+        {
+            theReason = kAudioHubPresentReason_CallerNotRuntime;
+            goto done;
+        }
+    }
+
+done:
+    if(thePathURL != NULL) CFRelease(thePathURL);
+    if(theRequirement != NULL) CFRelease(theRequirement);
+    if(theRequirementText != NULL) CFRelease(theRequirementText);
+    if(theCode != NULL) CFRelease(theCode);
+    if(theAttributes != NULL) CFRelease(theAttributes);
+    if(theTokenData != NULL) CFRelease(theTokenData);
+    return theReason;
+}
+
+uint32_t AudioHubBridge_SessionCallerCheck(void)
+{
+    return (gDaemonPort != MACH_PORT_NULL) ? gPeerCheck : kAudioHubPresentReason_CallerNoSession;
+}
+
 static void bridge_handle_hello(BridgeRcvBuf* inBuf, mach_msg_size_t inSize, const mach_msg_audit_trailer_t* inTrailer)
 {
     AudioHubHelloRequest* theRequest = &inBuf->hello;
@@ -987,6 +1236,10 @@ static void bridge_handle_hello(BridgeRcvBuf* inBuf, mach_msg_size_t inSize, con
     gDaemonPort = theDaemon;
     gPeerToken = inTrailer->msgh_audit;
     gSendTimeouts = 0;
+    // Before `attached`, so every presentation state the driver replays for
+    // this session already carries the right verdict. A failure here costs the
+    // session nothing but Physical presentation.
+    gPeerCheck = bridge_check_caller(&gPeerToken);
     atomic_store(&gActiveSessionID, gSessionID);
     // Only now do the rings go live: the daemon holds every entry and has been
     // told the layout, so anything the IOProc writes from here on is readable.
@@ -996,8 +1249,10 @@ static void bridge_handle_hello(BridgeRcvBuf* inBuf, mach_msg_size_t inSize, con
     {
         gHooks->attached();
     }
-    os_log(OS_LOG_DEFAULT, kBridgeLog "audiohubd attached (uid %u, pid %d, claims pid %u), session %llu, %u slots",
-           thePeerEUID, thePeerPID, theClaimedPID, (unsigned long long)gSessionID, kAudioHubMaxSlots);
+    os_log(OS_LOG_DEFAULT, kBridgeLog "audiohubd attached (uid %u, pid %d, claims pid %u), session %llu, %u slots, "
+                                      "caller check %u (%{public}s)",
+           thePeerEUID, thePeerPID, theClaimedPID, (unsigned long long)gSessionID, kAudioHubMaxSlots,
+           gPeerCheck, (gPeerCheck == kAudioHubPresentReason_None) ? "verified" : "virtual only");
 }
 
 static void bridge_handle_notify(BridgeRcvBuf* inBuf, mach_msg_size_t inSize)
@@ -1066,6 +1321,27 @@ static void bridge_handle_bind(BridgeRcvBuf* inBuf, mach_msg_size_t inSize)
     else if((gHooks != NULL) && (gHooks->bind != NULL))
     {
         gHooks->bind(theMsg);
+    }
+    mach_msg_destroy(&theMsg->header);
+}
+
+// One presentation request. Shape, endpoint range and session are judged here;
+// the class, the descriptor and the slot's generation belong to the driver.
+static void bridge_handle_presentation(BridgeRcvBuf* inBuf, mach_msg_size_t inSize)
+{
+    AudioHubPresentationMsg* theMsg = &inBuf->presentation;
+    if(((theMsg->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) == 0) &&
+       (inSize == sizeof(AudioHubPresentationMsg)) &&
+       (theMsg->endpoint < kAudioHubMaxEndpoints) &&
+       (theMsg->session_id == gSessionID) &&
+       (gHooks != NULL) && (gHooks->presentation != NULL))
+    {
+        gHooks->presentation(theMsg);
+    }
+    else
+    {
+        os_log_error(OS_LOG_DEFAULT, kBridgeLog "refused malformed/stale presentation for endpoint %u session %llu",
+                     theMsg->endpoint, (unsigned long long)theMsg->session_id);
     }
     mach_msg_destroy(&theMsg->header);
 }
@@ -1150,6 +1426,7 @@ static void bridge_serve(void)
             case kAudioHubMsg_Notify:
             case kAudioHubMsg_Bind:
             case kAudioHubMsg_Format:
+            case kAudioHubMsg_Presentation:
                 // Both of these steer devices the user can see and hear, so both
                 // must come from the process that actually completed the current
                 // Hello — not merely from someone with the right euid. Anything
@@ -1172,6 +1449,10 @@ static void bridge_serve(void)
                 else if(theBuf.hdr.msgh_id == kAudioHubMsg_Format)
                 {
                     bridge_handle_format(&theBuf, theBuf.hdr.msgh_size);
+                }
+                else if(theBuf.hdr.msgh_id == kAudioHubMsg_Presentation)
+                {
+                    bridge_handle_presentation(&theBuf, theBuf.hdr.msgh_size);
                 }
                 else
                 {

@@ -386,22 +386,21 @@ Return Value:
     NTSTATUS ntStatus;
 
     //
-    // This sample supports only one instance of this object.
-    // (b/c of CSaveData's static members and Bluetooth HFP logic). 
+    // v11: one adapter per child devnode, so as many instances as children.
+    // The sample allowed exactly one because of CSaveData's driver-global work
+    // items and its Bluetooth HFP logic; neither is used here any more (the
+    // capture-to-file feature is permanently off, see g_DoNotCreateDataFiles).
+    // The count is kept for diagnostics only.
     //
-    if (InterlockedCompareExchange(&CAdapterCommon::m_AdapterInstances, 1, 0) != 0)
-    {
-        ntStatus = STATUS_DEVICE_BUSY;
-        DPF(D_ERROR, ("NewAdapterCommon failed, only one instance is allowed"));
-        goto Done;
-    }
-    
+    InterlockedIncrement(&CAdapterCommon::m_AdapterInstances);
+
     //
     // Allocate an adapter object.
     //
     CAdapterCommon *p = new(PoolFlags, MINADAPTER_POOLTAG) CAdapterCommon(UnknownOuter);
     if (p == NULL)
     {
+        InterlockedDecrement(&CAdapterCommon::m_AdapterInstances);
         ntStatus = STATUS_INSUFFICIENT_RESOURCES;
         DPF(D_ERROR, ("NewAdapterCommon failed, 0x%x", ntStatus));
         goto Done;
@@ -447,7 +446,6 @@ Return Value:
         m_pHW = NULL;
     }
     
-    CSaveData::DestroyWorkItems();
     SAFE_RELEASE(m_pPortClsEtwHelper);
     SAFE_RELEASE(m_pServiceGroupWave);
  
@@ -457,8 +455,9 @@ Return Value:
         m_WdfDevice = NULL;
     }
 
-    InterlockedDecrement(&CAdapterCommon::m_AdapterInstances);
-    ASSERT(CAdapterCommon::m_AdapterInstances == 0);
+    LONG left = InterlockedDecrement(&CAdapterCommon::m_AdapterInstances);
+    ASSERT(left >= 0);
+    UNREFERENCED_PARAMETER(left);
 } // ~CAdapterCommon  
 
 //=============================================================================
@@ -620,11 +619,10 @@ Return Value:
     m_pHW->MixerReset();
 
     //
-    // Initialize SaveData class.
+    // v11: no CSaveData work items. They were driver-global; with one adapter
+    // per child devnode a per-adapter Init/Destroy of them would race, and the
+    // feature that needs them is permanently off.
     //
-    CSaveData::SetDeviceObject(DeviceObject);   //device object is needed by CSaveData
-    ntStatus = CSaveData::InitializeWorkItems(DeviceObject);
-    IF_FAILED_JUMP(ntStatus, Done);
 Done:
 
     return ntStatus;

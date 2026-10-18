@@ -52,16 +52,29 @@ fn main() {
         }
     }
 
+    // Test-feature builds serve a fake audio world (regression suite). The
+    // world is installed before anything can open a device, and such a daemon
+    // never attaches to the HAL driver nor advertises an AirPlay receiver.
+    #[cfg(feature = "fake-audio")]
+    if let Err(e) = audiohubd::install_fake_audio_from_env() {
+        elog!("[audiohubd] fake audio backend failed to start: {e:#}");
+        std::process::exit(1);
+    }
+    #[cfg(feature = "fake-audio")]
+    let (hal_bridge, airplay_advertise) = (Some(audiohubd::halbridge::HalBridgeMode::Off), false);
+    #[cfg(not(feature = "fake-audio"))]
+    let (hal_bridge, airplay_advertise) = (None, true);
+
     let handle = match audiohubd::start_daemon(audiohubd::DaemonCfg {
         control_port: port,
         ipc_port,
         config_dir: None, // env/platform default
         announce,
-        hal_bridge: None,       // production: AUDIOHUB_HAL_BRIDGE decides
+        hal_bridge,             // production: None, so AUDIOHUB_HAL_BRIDGE decides
         tx_throttle_kbps: None, // production: AUDIOHUB_TEST_TX_KBPS decides (normally unlimited)
         block_udp: None,        // production: AUDIOHUB_TEST_BLOCK_UDP decides (normally nothing)
         announce_fault: false,  // test-only knob; there is no production value for it
-        airplay_advertise: true,
+        airplay_advertise,
     }) {
         Ok(h) => Arc::new(h),
         Err(e) => {

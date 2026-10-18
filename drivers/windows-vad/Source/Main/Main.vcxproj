@@ -314,6 +314,7 @@
     <ClCompile Include="adapter.cpp" />
     <ClCompile Include="ahrings.cpp" />
     <ClCompile Include="basetopo.cpp" />
+    <ClCompile Include="bus.cpp" />
     <ClCompile Include="common.cpp" />
     <ClCompile Include="ctldevice.cpp" />
     <ClCompile Include="mintopo.cpp" />
@@ -326,12 +327,12 @@
   <ItemGroup>
     <Inf Exclude="@(Inx)" Include="*.inx">
       <!-- StampInf's TimeStamp is the four-part driver version, despite its
-           name. It must advance whenever the driver protocol changes so a
-           released equal-rank package cannot remain bound during upgrade. -->
-      <TimeStamp>1.0.1.0</TimeStamp>
-      <!-- An empty DateStamp uses the builder's local date, which Inf2Cat can
-           reject as postdated. build.ps1 supplies a UTC-derived date. -->
-      <DateStamp Condition="'$(AudioHubDriverVerDate)' != ''">$(AudioHubDriverVerDate)</DateStamp>
+           name; DateStamp is the DriverVer date. build.ps1 derives BOTH from
+           one UTC instant so every build of different driver sources stamps a
+           strictly larger DriverVer (equal DriverVer packages tie in PnP
+           ranking and can leave stale files bound). See BUILD.md. -->
+      <TimeStamp>$(AudioHubDriverVersion)</TimeStamp>
+      <DateStamp>$(AudioHubDriverVerDate)</DateStamp>
     </Inf>
     <FilesToPackage Include="$(TargetPath)" Condition="'$(ConfigurationType)'=='Driver' or '$(ConfigurationType)'=='DynamicLibrary'" />
   </ItemGroup>
@@ -344,4 +345,10 @@
     <ClInclude Exclude="@(ClInclude)" Include="*.h;*.hpp;*.hxx;*.hm;*.inl;*.xsd" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <!-- DriverVer has no hand-maintained default: an IDE or ad-hoc MSBuild run
+       would otherwise stamp a version that does not order against real
+       builds. Build the driver with build.ps1. -->
+  <Target Name="AudioHubRequireDriverVer" BeforeTargets="PrepareForBuild" Condition="'$(DesignTimeBuild)' != 'true'">
+    <Error Condition="'$(AudioHubDriverVersion)' == '' or '$(AudioHubDriverVerDate)' == ''" Text="AudioHubDriverVersion and AudioHubDriverVerDate are not set. Build AudioHubVad with drivers\windows-vad\build.ps1, which derives DriverVer (see BUILD.md)." />
+  </Target>
 </Project>

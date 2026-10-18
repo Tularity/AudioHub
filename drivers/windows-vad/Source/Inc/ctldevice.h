@@ -18,21 +18,30 @@ Abstract:
 
 //
 // Called from DriverEntry AFTER PcInitializeAdapterDriver (which is what fills
-// the MajorFunction table we hook).
+// the MajorFunction table we hook) and BEFORE AhBusInstallRouter (which saves
+// the table as it stands). Hooks CREATE/CLOSE/CLEANUP/DEVICE_CONTROL; IRPs for
+// anything that is not the control device go straight back to PortCls.
 //
-// A failure here must NOT fail DriverEntry: a driver that loads with no control
-// plane still publishes nothing and hurts nobody, whereas a driver that refuses
-// to load takes the whole devnode out and has to be recovered over SSH.
+VOID AhCtlHookDispatch(_In_ PDRIVER_OBJECT DriverObject);
+
+//
+// v11: the control DEVICE lives exactly as long as the bus FDO: created at its
+// AddDevice, deleted at its REMOVE (spike S4). A creation failure must NOT
+// fail AddDevice: a bus with no control plane publishes nothing and hurts
+// nobody.
 //
 NTSTATUS AhCtlCreateDevice(_In_ PDRIVER_OBJECT DriverObject);
 
 //
-// Called from DriverUnload, before the port-class unload routine.
+// Called from the bus FDO's REMOVE and from DriverUnload. A session still open
+// on the deleted object keeps being served (DEVICE_CONTROL answers
+// STATUS_DELETE_PENDING; CLEANUP unmaps the rings) until it is closed.
 //
 VOID AhCtlDeleteDevice(_In_ PDRIVER_OBJECT DriverObject);
 
 //
-// Called from StartDevice with the devnode's PDO. Reads the expected daemon
+// Called from the bus AddDevice with the ROOT devnode's PDO, before the
+// control device is created. Reads the expected daemon
 // image path out of the device hardware key, which only an administrator can
 // write. Absent value => the check degrades to ACL-only and says so in every
 // AH_HELLO_REPLY, rather than degrading silently.

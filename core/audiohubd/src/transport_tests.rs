@@ -1980,6 +1980,16 @@ fn every_writable_setting_key_is_really_honoured() {
         ("name", json!("ahb-renamed"), &|v: &Value| {
             v.get("name").cloned().unwrap_or(Value::Null)
         }),
+        // Both physical-presentation switches ship ON, so `false` is the
+        // away-from-default value.
+        ("share_device_facts", json!(false), &|v: &Value| {
+            v.get("share_device_facts").cloned().unwrap_or(Value::Null)
+        }),
+        ("present_physical_devices", json!(false), &|v: &Value| {
+            v.get("present_physical_devices")
+                .cloned()
+                .unwrap_or(Value::Null)
+        }),
     ];
     for key in audiohub_ipc::SETTINGS_WRITABLE_KEYS {
         // plan M9「开机自启」是这张表上唯一一个**没有存盘副本**的键：注册项本身

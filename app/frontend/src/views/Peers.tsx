@@ -28,6 +28,8 @@ import { toast } from '../components/Toasts';
 import { bridgeTargets } from '../lib/bridge';
 import { backendParam, normalizeSource, SOURCE_SYSAUDIO } from '../lib/sysaudio';
 import { fmt } from '../lib/fmt';
+import { presentationLabel } from '../lib/presentation';
+import type { PresentationLabel } from '../lib/presentation';
 import { createBusySet, useTick } from '../lib/hooks';
 import { t, joinPhrases } from '../i18n';
 import { actions, getState, useStore } from '../state/store';
@@ -339,6 +341,12 @@ function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
                 )}
                 onRefresh={() => { void refreshPeers(); }}
               />
+              {/* Own line under the row: beside the volume control the text has
+                  ~90px and would be cut to "Shown as a phy…". */}
+              <PresentationBadge
+                label={presentationLabel(output ? peer.presentation?.out : peer.presentation?.in)}
+                testid={`peer-device-presentation-${d.dir}-${fp}`}
+              />
             </div>
           );
         })}
@@ -349,6 +357,27 @@ function PeerDevices({ peer, hidden }: { peer: PeerState; hidden: boolean }) {
         {note}
       </p>
     </div>
+  );
+}
+
+// "Is this device shown to the system as the peer's real hardware, or as an
+// AudioHub virtual one — and if virtual, why." The daemon owns the verdict
+// (lib/presentation.ts only words it); no label means the daemon said nothing.
+function PresentationBadge({ label, testid }: {
+  label: PresentationLabel | null;
+  testid: string;
+}) {
+  if (!label) return null;
+  return (
+    <span
+      className={`dev-presentation ${label.state}`}
+      data-testid={testid}
+      data-state={label.state}
+      data-reason={label.reason ?? undefined}
+    >
+      <span className="dev-presentation-dot" aria-hidden="true" />
+      {label.text}
+    </span>
   );
 }
 

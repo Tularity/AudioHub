@@ -79,6 +79,33 @@ static PDEVICE_OBJECT   g_AhCtlDevice   = NULL;
 static BOOLEAN          g_AhCtlSymlink  = FALSE;
 
 //
+// v11: control devices deleted while the daemon still held its handle. Since
+// the control device lives exactly as long as the bus FDO, the bus can be
+// removed (driver update, uninstall) with a session open. IoDeleteDevice
+// defers the free until that handle is closed, and every IRP that arrives on
+// the deleted object in the meantime -- the daemon's next IOCTL, then its
+// CLEANUP and CLOSE -- must still be handled HERE: PortCls was never told
+// about this object, and handing it one would dereference a device
+// extension it never created.
+//
+#define AH_CTL_RETIRED_MAX  4
+static PDEVICE_OBJECT   g_AhCtlRetired[AH_CTL_RETIRED_MAX];
+
+#pragma code_seg()
+static BOOLEAN
+AhCtlIsRetired(_In_ PDEVICE_OBJECT DeviceObject)
+{
+    for (ULONG i = 0; i < AH_CTL_RETIRED_MAX; i++)
+    {
+        if (DeviceObject != NULL && g_AhCtlRetired[i] == DeviceObject)
+        {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+//
 // The PortCls dispatch entries we displaced. Every IRP for anything that is not
 // the control device goes straight back to them.
 //
@@ -258,6 +285,17 @@ AhCtlLoadPolicy(
     )
 {
     PAGED_CODE();
+
+    //
+    // v11: called once per bus FDO, which can be removed and added again
+    // without the image unloading. Start from the default every time.
+    //
+    if (g_ExpectedImage.Buffer != NULL)
+    {
+        ExFreePoolWithTag(g_ExpectedImage.Buffer, AH_CTL_POOLTAG);
+        RtlZeroMemory(&g_ExpectedImage, sizeof(g_ExpectedImage));
+    }
+    g_ClientCheck = AH_CLIENT_CHECK_ACL_ONLY;
 
     HANDLE hKey = NULL;
     NTSTATUS status = IoOpenDeviceRegistryKey(
@@ -673,6 +711,10 @@ AhCtlCreate(
 {
     PAGED_CODE();
 
+    if (AhCtlIsRetired(DeviceObject))
+    {
+        return AhCompleteIrp(Irp, STATUS_DELETE_PENDING, 0);
+    }
     if (DeviceObject != g_AhCtlDevice)
     {
         return g_PcCreate(DeviceObject, Irp);
@@ -716,6 +758,21 @@ AhCtlClose(
 {
     PAGED_CODE();
 
+    if (AhCtlIsRetired(DeviceObject))
+    {
+        //
+        // The last handle on a deleted control device: IoDeleteDevice frees
+        // it once this completes, so forget the pointer now.
+        //
+        for (ULONG i = 0; i < AH_CTL_RETIRED_MAX; i++)
+        {
+            if (g_AhCtlRetired[i] == DeviceObject)
+            {
+                g_AhCtlRetired[i] = NULL;
+            }
+        }
+        return AhCompleteIrp(Irp, STATUS_SUCCESS, 0);
+    }
     if (DeviceObject != g_AhCtlDevice)
     {
         return g_PcClose(DeviceObject, Irp);
@@ -747,7 +804,7 @@ Routine Description:
 {
     PAGED_CODE();
 
-    if (DeviceObject != g_AhCtlDevice)
+    if (DeviceObject != g_AhCtlDevice && !AhCtlIsRetired(DeviceObject))
     {
         return g_PcCleanup(DeviceObject, Irp);
     }
@@ -797,6 +854,15 @@ AhCtlDeviceControl(
 {
     PAGED_CODE();
 
+    if (AhCtlIsRetired(DeviceObject))
+    {
+        //
+        // The bus went away under an open session. The daemon reads this as
+        // "close the handle and reconnect"; the bindings it made are gone with
+        // the children that hosted them.
+        //
+        return AhCompleteIrp(Irp, STATUS_DELETE_PENDING, 0);
+    }
     if (DeviceObject != g_AhCtlDevice)
     {
         return g_PcDeviceControl(DeviceObject, Irp);
@@ -861,7 +927,8 @@ AhCtlDeviceControl(
         // image is otherwise indistinguishable from this one on the wire.
         //
         rep->caps             = AH_CAP_DATAPLANE | AH_CAP_VOLUME | AH_CAP_LATENCY
-                              | AH_CAP_STREAMSTAT | AH_CAP_VOLUMEEVENT | AH_CAP_OUTPUT_FORMATS;
+                              | AH_CAP_STREAMSTAT | AH_CAP_VOLUMEEVENT | AH_CAP_OUTPUT_FORMATS
+                              | AH_CAP_PRESENTATION | AH_CAP_CHILD_DEVNODES;
         rep->sample_rate      = AUDIOHUB_RING_SAMPLE_RATE;
         rep->out_channels     = AUDIOHUB_SPK_CHANNELS;
         rep->in_channels      = AUDIOHUB_MIC_CHANNELS;
@@ -902,7 +969,18 @@ AhCtlDeviceControl(
         // written into the SAME buffer (METHOD_BUFFERED), so reading the
         // request after starting to build the reply reads the reply back.
         //
-        AH_BIND_REQUEST req = *(AH_BIND_REQUEST *)buffer;
+        // v10: the request is 1680 bytes, too large for a kernel stack frame
+        // that then descends through PcRegisterSubdevice, so the copy lives
+        // in pool for the duration of this call.
+        //
+        AH_BIND_REQUEST *heapReq = (AH_BIND_REQUEST *)
+            ExAllocatePool2(POOL_FLAG_PAGED, sizeof(AH_BIND_REQUEST), AH_CTL_POOLTAG);
+        if (heapReq == NULL)
+        {
+            return AhCompleteIrp(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
+        }
+        RtlCopyMemory(heapReq, buffer, sizeof(AH_BIND_REQUEST));
+        AH_BIND_REQUEST &req = *heapReq;
         AH_BIND_REPLY  *rep = (AH_BIND_REPLY *)buffer;
 
         //
@@ -910,6 +988,13 @@ AhCtlDeviceControl(
         //
         req.peer_key[AH_PEERKEY_BUF - 1] = '\0';
         req.display[AH_DISPLAY_CHARS - 1] = L'\0';
+        for (ULONG d = 0; d < 2; d++)
+        {
+            req.presentation[d].key[AH_PRESKEY_BUF - 1]                = '\0';
+            req.presentation[d].endpoint_desc[AH_DISPLAY_CHARS - 1]    = L'\0';
+            req.presentation[d].adapter_name[AH_DISPLAY_CHARS - 1]     = L'\0';
+            req.presentation[d].manufacturer[AH_MFG_CHARS - 1]         = L'\0';
+        }
 
         RtlZeroMemory(rep, sizeof(*rep));
         rep->slot = req.slot;
@@ -917,7 +1002,35 @@ AhCtlDeviceControl(
         if (req.session_id != g_SessionId)
         {
             rep->status = AH_STATUS_STALE_SESSION;
+            ExFreePoolWithTag(heapReq, AH_CTL_POOLTAG);
             return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
+        }
+
+        //
+        // v10 PRESENTATION CALLER RULE (design 7.6). A physical look is only
+        // ever installed for a session whose opener passed the image-path
+        // check at IRP_MJ_CREATE (AhCheckCallerImage). Under any weaker level
+        // the control device is reachable by every interactive user, so the
+        // request is honoured as VIRTUAL and the reply says so. This adds a
+        // condition; it does not relax or replace any existing check.
+        //
+        ULONG presentationFlags = 0;
+        if (g_ClientCheck < AH_CLIENT_CHECK_IMAGEPATH)
+        {
+            for (ULONG d = 0; d < 2; d++)
+            {
+                if (req.presentation[d].klass != AH_PRES_VIRTUAL)
+                {
+                    RtlZeroMemory(&req.presentation[d], sizeof(req.presentation[d]));
+                    req.presentation[d].klass = AH_PRES_VIRTUAL;
+                    presentationFlags |= AH_BINDREPLY_FLAG_PRESENTATION_FORCED_VIRTUAL;
+                }
+            }
+            if (presentationFlags != 0)
+            {
+                DPF(D_TERSE, ("[AhCtlDeviceControl] slot %u physical presentation forced "
+                              "virtual: client_check %u", req.slot, g_ClientCheck));
+            }
         }
 
         ULONG ahStatus = AH_STATUS_INTERNAL;
@@ -931,16 +1044,18 @@ AhCtlDeviceControl(
             if (req.op != AH_BIND_SET)
             {
                 rep->status = AH_STATUS_BAD_ARGUMENT;
+                ExFreePoolWithTag(heapReq, AH_CTL_POOLTAG);
                 return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
             }
-            (VOID)AhSlotBindSet(req.slot, req.peer_key, req.display, req.flags,
-                                &generation, &state, &ahStatus, &result);
+            (VOID)AhSlotBindSet(req.slot, req.peer_key, req.display, req.presentation,
+                                req.flags, &generation, &state, &ahStatus, &result);
         }
         else
         {
             if (req.op != AH_BIND_CLEAR)
             {
                 rep->status = AH_STATUS_BAD_ARGUMENT;
+                ExFreePoolWithTag(heapReq, AH_CTL_POOLTAG);
                 return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
             }
             (VOID)AhSlotBindClear(req.slot, req.generation, req.flags,
@@ -948,7 +1063,9 @@ AhCtlDeviceControl(
         }
 
         //
-        // Last line of defence for the v6-and-later direction invariant.
+        // Last line of defence for the v6-and-later direction invariant. v11:
+        // AH_STATUS_PENDING (published is a subset, the rest follows through
+        // AH_EVENT_PUBLISHED) is not checked here -- only an OK must be exact.
         // Everything below this point has already been checked inside
         // perpeer.cpp, but the promise is
         // exact equality with the requested render/capture mask -- including
@@ -976,15 +1093,23 @@ AhCtlDeviceControl(
         rep->nt_status  = (UINT32)result.NtStatus;
         rep->published  = result.Published;
         //
-        // Degradations that do not make the call a failure. Today that is only
-        // AH_BINDREPLY_FLAG_NAME_FALLBACK, and it is relayed rather than
+        // Degradations that do not make the call a failure (for example
+        // AH_BINDREPLY_FLAG_NAME_FALLBACK). They are relayed rather than
         // dropped for the same reason `published` exists at all: a driver that
         // answers OK owes the caller everything it knows about how far short of
         // "OK" the result actually fell.
         //
         rep->flags      = result.Flags;
-        AhSpeakerFormatBind(req.slot, generation,
-            (result.Published & AH_PUB_RENDER) != 0 ? TRUE : FALSE);
+        if (code == IOCTL_AUDIOHUB_BIND_SET)
+        {
+            rep->flags |= presentationFlags;
+        }
+        //
+        // v11: the speaker-format state follows the published mask inside
+        // perpeer.cpp, under the slot lock, at every place it can change (a
+        // Set, a Clear, a child starting or going away) -- not only here.
+        //
+        ExFreePoolWithTag(heapReq, AH_CTL_POOLTAG);
         return AhCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*rep));
     }
 
@@ -1303,15 +1428,52 @@ AhCtlDeviceControl(
 //-----------------------------------------------------------------------------
 
 #pragma code_seg("INIT")
+VOID
+AhCtlHookDispatch(
+    _In_ PDRIVER_OBJECT DriverObject
+    )
+{
+    KeInitializeSpinLock(&g_PendLock);
+    g_PendIrp     = NULL;
+    g_SessionFile = NULL;
+    g_SessionId   = 0;
+    RtlZeroMemory(g_AhCtlRetired, sizeof(g_AhCtlRetired));
+
+    //
+    // Hook the four entries we need, keeping PortCls's originals so every IRP
+    // for an audio device object goes straight back to it. Same shape as the
+    // IRP_MJ_PNP hook adapter.cpp already installs. v11: done once, in
+    // DriverEntry, before the bus router saves the table; the control DEVICE
+    // comes and goes with the bus FDO (AhCtlCreateDevice / AhCtlDeleteDevice).
+    //
+    g_PcCreate        = DriverObject->MajorFunction[IRP_MJ_CREATE];
+    g_PcClose         = DriverObject->MajorFunction[IRP_MJ_CLOSE];
+    g_PcCleanup       = DriverObject->MajorFunction[IRP_MJ_CLEANUP];
+    g_PcDeviceControl = DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL];
+
+    DriverObject->MajorFunction[IRP_MJ_CREATE]         = AhCtlCreate;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE]          = AhCtlClose;
+    DriverObject->MajorFunction[IRP_MJ_CLEANUP]        = AhCtlCleanup;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = AhCtlDeviceControl;
+}
+
+#pragma code_seg("PAGE")
 NTSTATUS
 AhCtlCreateDevice(
     _In_ PDRIVER_OBJECT DriverObject
     )
 {
+    PAGED_CODE();
+
     NTSTATUS status;
     UNICODE_STRING deviceName;
     UNICODE_STRING symlinkName;
     UNICODE_STRING sddl;
+
+    if (g_AhCtlDevice != NULL)
+    {
+        return STATUS_SUCCESS;
+    }
 
     RtlInitUnicodeString(&deviceName, AH_CTL_DEVICE_NAME_W);
     RtlInitUnicodeString(&symlinkName, AH_CTL_SYMLINK_W);
@@ -1324,11 +1486,12 @@ AhCtlCreateDevice(
     //
     RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
 
-    KeInitializeSpinLock(&g_PendLock);
-    g_PendIrp     = NULL;
-    g_SessionFile = NULL;
-    g_SessionId   = 0;
-
+    //
+    // NOT resetting g_SessionFile: a session opened on a previous (now
+    // retired) control device stays the session until its CLEANUP, which is
+    // the only place its ring mapping can be torn down. A new daemon is told
+    // the device is busy until then.
+    //
     status = IoCreateDeviceSecure(
         DriverObject,
         0,                          // no device extension: all state is static
@@ -1355,21 +1518,6 @@ AhCtlCreateDevice(
         return status;
     }
     g_AhCtlSymlink = TRUE;
-
-    //
-    // Hook the four entries we need, keeping PortCls's originals so every IRP
-    // for an audio device object goes straight back to it. Same shape as the
-    // IRP_MJ_PNP hook adapter.cpp already installs.
-    //
-    g_PcCreate        = DriverObject->MajorFunction[IRP_MJ_CREATE];
-    g_PcClose         = DriverObject->MajorFunction[IRP_MJ_CLOSE];
-    g_PcCleanup       = DriverObject->MajorFunction[IRP_MJ_CLEANUP];
-    g_PcDeviceControl = DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL];
-
-    DriverObject->MajorFunction[IRP_MJ_CREATE]         = AhCtlCreate;
-    DriverObject->MajorFunction[IRP_MJ_CLOSE]          = AhCtlClose;
-    DriverObject->MajorFunction[IRP_MJ_CLEANUP]        = AhCtlCleanup;
-    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = AhCtlDeviceControl;
 
     g_AhCtlDevice->Flags &= ~DO_DEVICE_INITIALIZING;
 
@@ -1399,6 +1547,23 @@ AhCtlDeleteDevice(
 
     if (g_AhCtlDevice != NULL)
     {
+        if (g_SessionFile != NULL)
+        {
+            //
+            // A session is still open on this object. Remember it so the IRPs
+            // still to come for it stay ours (see g_AhCtlRetired). A full
+            // table only loses that guarantee for a fifth stacked removal
+            // with every earlier handle still open.
+            //
+            for (ULONG i = 0; i < AH_CTL_RETIRED_MAX; i++)
+            {
+                if (g_AhCtlRetired[i] == NULL)
+                {
+                    g_AhCtlRetired[i] = g_AhCtlDevice;
+                    break;
+                }
+            }
+        }
         IoDeleteDevice(g_AhCtlDevice);
         g_AhCtlDevice = NULL;
     }
@@ -1408,4 +1573,5 @@ AhCtlDeleteDevice(
         ExFreePoolWithTag(g_ExpectedImage.Buffer, AH_CTL_POOLTAG);
         RtlZeroMemory(&g_ExpectedImage, sizeof(g_ExpectedImage));
     }
+    g_ClientCheck = AH_CLIENT_CHECK_ACL_ONLY;
 }

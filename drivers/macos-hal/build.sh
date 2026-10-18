@@ -53,7 +53,7 @@ clang -bundle \
     -Wall -Wextra -O2 \
     -arch arm64 -arch x86_64 \
     -mmacosx-version-min="$MACOS_MIN" \
-    -framework CoreAudio -framework CoreFoundation \
+    -framework CoreAudio -framework CoreFoundation -framework Security \
     -lbsm \
     -o "$BIN" \
     src/AudioHubDriver.c src/AudioHubBridge.c

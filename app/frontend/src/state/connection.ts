@@ -450,6 +450,12 @@ export async function applySettings(patch: DaemonSettingsPatch): Promise<DaemonS
   void refreshPeers();   // 模式变了，每个对端的 hal_device 跟着变
   void refreshStatus();
   void refreshAirPlaySessions();
+  // Physical presentation is re-evaluated on the daemon's next device pass, a
+  // moment after this reply. Re-read the peers shortly after so the per-device
+  // indicator follows the switch without waiting for the 10 s poll.
+  if ('present_physical_devices' in patch || 'share_device_facts' in patch) {
+    for (const delay of [700, 2000]) setTimeout(() => void refreshPeers(), delay);
+  }
   return res;
 }
 

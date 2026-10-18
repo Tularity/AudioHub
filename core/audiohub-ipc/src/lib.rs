@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod procid;
 pub mod transport;
 
 pub use transport::{
@@ -96,6 +97,10 @@ pub struct IpcEndpoint {
     pub port: u16,
     pub token: String,
     pub pid: u32,
+    /// Kernel start time of `pid` (see `procid`). Lets readers tell this daemon
+    /// from an unrelated process that inherited the PID after a crash.
+    #[serde(default)]
+    pub started: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +259,12 @@ pub const SETTINGS_WRITABLE_KEYS: &[&str] = &[
     // 它落在 `identity.json` 而不是 `settings.json`：名字与签名密钥是同一份
     // 身份，分开存就会有一份能被单独拷走、单独删掉的半截身份。
     "name",
+    // Physical device presentation (docs/physical-presentation-1.0.2-design.md
+    // §5.3). Provider side: publish this machine's default-device facts to
+    // peers. Consumer side: mirror a peer's physical device in the local
+    // virtual-device list. Both take effect live, without a restart.
+    "share_device_facts",
+    "present_physical_devices",
 ];
 
 /// Daemon-owned settings, `settings.get` / `settings.set` (spec-m5b §6.1).
@@ -384,6 +395,20 @@ pub struct DaemonSettings {
     /// Virtual-device slots the attached driver offers, and how many are bound.
     pub hal_capacity: u8,
     pub hal_used: u8,
+    /// Provider side of physical device presentation (design §3.5, §5.3):
+    /// publish this machine's default-device description (name, kind,
+    /// transport, a salted token; never a hardware id) to paired peers so they
+    /// can present the device the way this machine really has it. Writable.
+    ///
+    /// Absent from an older daemon's reply; `false` is the right reading
+    /// there, since a daemon that predates the field never published anything.
+    #[serde(default)]
+    pub share_device_facts: bool,
+    /// Consumer side (design §5.1, §5.3): mirror a peer's real default device
+    /// in this machine's virtual-device list when the peer shares it and the
+    /// driver supports it. Writable. Same absent-means-`false` reading.
+    #[serde(default)]
+    pub present_physical_devices: bool,
     /// 这台机器**此刻叫什么**（用户 2026-08-10 第 9 条：本机名称可自定义）。
     ///
     /// 写：空串 = 清除覆盖，回到 `local_hostname()`。读：这里报的是**生效值**，
@@ -617,6 +642,49 @@ pub struct HalDeviceInfo {
     pub spk_frames: u64,
     pub mic_frames: u64,
     pub mic_dropped: u64,
+}
+
+/// How one direction of a peer's virtual device looks to this machine's
+/// system right now (design §5.5). Derived by the daemon, never stored.
+///
+/// `class` says what is in force; `reason` says why the target is what it is,
+/// so a `virtual` device always carries its explanation. When `class` and the
+/// target differ (`pending_republish`) the change is queued and the device
+/// still shows its old look.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirectionPresentation {
+    /// `"physical"` | `"virtual"`: the look currently in force.
+    pub class: String,
+    /// Final device name as the system lists it (physical only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// snake_case `PhysicalTransport` of the mirrored device (physical only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// snake_case `FormFactor` of the mirrored device (physical only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_factor: Option<String>,
+    /// Why the target presentation is what it is: `physical` or a stable
+    /// `[a-z0-9_]` code such as `consumer_disabled`, `driver_unsupported`,
+    /// `peer_unsupported`, `provider_opt_out`, `audiohub_own`. Unknown codes
+    /// must be shown generically, never dropped.
+    #[serde(default)]
+    pub reason: String,
+    /// The target differs from what is in force and is not applied yet.
+    #[serde(default)]
+    pub pending_republish: bool,
+}
+
+/// Both directions of [`DirectionPresentation`], `PeerState.presentation`.
+/// Carried beside `hal_device` rather than inside it so the slot record that
+/// owns `PeerHalDevice` does not have to know about presentation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerPresentation {
+    /// The peer's speaker (output) direction.
+    pub out: DirectionPresentation,
+    /// The peer's microphone (input) direction.
+    #[serde(rename = "in")]
+    pub input: DirectionPresentation,
 }
 
 /// A peer's virtual devices, as `PeerState.hal_device`.
@@ -1348,6 +1416,10 @@ pub struct PeerState {
     /// driver, or the slot pool is full — see `hal_reason`).
     #[serde(default)]
     pub hal_device: Option<PeerHalDevice>,
+    /// Physical-vs-virtual look of `hal_device`, both directions. `None` when
+    /// there is no `hal_device` or the daemon predates the feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<PeerPresentation>,
     /// Why this peer has no virtual devices: "mode_a" | "no_driver" |
     /// "capacity" | "removed_while_offline".
     #[serde(default)]
@@ -1527,7 +1599,7 @@ pub struct PeerState {
 ///                        mark_offline_devices?, native_locale?, mode_a_volume_sync?,
 ///                        mode_a_mute_local?, discovery_announce?, autostart?,
 ///                        airplay_enabled?, airplay_name?, airplay_password?,
-///                        name?}
+///                        name?, share_device_facts?, present_physical_devices?}
 ///                                             -> DaemonSettings
 ///       `airplay_password` is write-only. The reply contains only
 ///       `airplay_password_set`; the secret never enters a frontend store or
@@ -1610,6 +1682,13 @@ pub mod methods {
     pub const DAEMON_STATUS: &str = "daemon.status";
     pub const DAEMON_SHUTDOWN: &str = "daemon.shutdown";
     pub const DAEMON_SIMULATE_DEVICE_CHANGE: &str = "daemon.simulate_device_change";
+    /// Test-only (`facts-injection` feature, design §8.2): override the
+    /// provider's device-facts classifier for one direction,
+    /// `{direction: "input"|"output", facts: DirectionFacts | null}`. The
+    /// constant does not exist in a release build, and neither does the
+    /// daemon's handler.
+    #[cfg(feature = "facts-injection")]
+    pub const TEST_FACTS_INJECT: &str = "test.facts.inject";
     pub const DAEMON_PERMISSIONS: &str = "daemon.permissions";
     pub const DAEMON_REQUEST_PERMISSION: &str = "daemon.request_permission";
     pub const DAEMON_RESET_IDENTITY: &str = "daemon.reset_identity";
@@ -1787,5 +1866,43 @@ mod version_contract_tests {
         assert!(current.out_volume_pending);
         assert!(current.out_volume_software_gain);
         assert_eq!(current.device_volume_version, 1);
+    }
+    /// A reply from a daemon that predates physical presentation has neither
+    /// setting and no `presentation`; both read as off/absent. The wire names
+    /// of the new view are part of the contract (the UI reads them by name).
+    #[test]
+    fn presentation_fields_are_additive_and_named_as_documented() {
+        use super::{DirectionPresentation, PeerPresentation, SETTINGS_WRITABLE_KEYS};
+        assert!(SETTINGS_WRITABLE_KEYS.contains(&"share_device_facts"));
+        assert!(SETTINGS_WRITABLE_KEYS.contains(&"present_physical_devices"));
+
+        let p = PeerPresentation {
+            out: DirectionPresentation {
+                class: "physical".into(),
+                name: Some("Speakers (Peer)".into()),
+                transport: Some("usb".into()),
+                form_factor: Some("speakers".into()),
+                reason: "physical".into(),
+                pending_republish: false,
+            },
+            input: DirectionPresentation {
+                class: "virtual".into(),
+                name: None,
+                transport: None,
+                form_factor: None,
+                reason: "consumer_disabled".into(),
+                pending_republish: true,
+            },
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["out"]["class"], "physical");
+        assert_eq!(v["in"]["reason"], "consumer_disabled");
+        assert!(v["in"].get("name").is_none(), "virtual carries no name");
+        assert_eq!(serde_json::from_value::<PeerPresentation>(v).unwrap(), p);
+        // A direction object with only a class still parses.
+        let min: DirectionPresentation =
+            serde_json::from_value(serde_json::json!({"class": "virtual"})).unwrap();
+        assert_eq!(min.reason, "");
+        assert!(!min.pending_republish);
     }
 }

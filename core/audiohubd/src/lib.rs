@@ -18,6 +18,9 @@ mod conn;
 mod devdecl;
 /// 设备固有延迟（规格 §3.2 的级 2 `cap_dev` / 级 9 `play_dev`）接进遥测的地方。
 mod devlats;
+/// docs/physical-presentation-1.0.2-design.md §3.5/§4: DeviceFacts publication
+/// (provider) and per-connection storage (consumer).
+pub(crate) mod device_facts_pub;
 /// plan M3 「同网段互见」：mDNS 广播的开关、持久化与诚实上报。
 #[cfg(test)]
 mod discovery_tests;
@@ -45,6 +48,9 @@ mod mux;
 mod output_caps;
 /// plan §15：每对端 × 每方向的传输档位（持久化 + 失效隔离）。
 mod peer_transport;
+/// docs/physical-presentation-1.0.2-design.md §5: consumer-side presentation
+/// policy (decision, naming, platform targets, mic gate, rebuild scheduling).
+pub(crate) mod presentation;
 mod quality;
 pub mod reconnect;
 /// 截止期线程的延迟落盘日志（阻塞 write + Stderr 全局锁不许上音频线程）。
@@ -62,6 +68,8 @@ mod transport;
 /// 传输档位的接线测试（两台真 daemon，断言执行器而不是设置字段）。
 #[cfg(test)]
 mod transport_tests;
+#[cfg(all(test, feature = "fake-audio"))]
+mod fake_tests;
 mod wsshell;
 
 /// Public for the deviceless test that pins the "one device = one bridge
@@ -470,8 +478,64 @@ pub(crate) fn apply_announce(inner: &Arc<DaemonInner>, want: bool) -> bool {
     }
 }
 
+/// IPC method names of the fake audio backend. Kept in this crate, not in
+/// `audiohub-ipc`, so the shipped IPC surface does not change.
+#[cfg(feature = "fake-audio")]
+pub mod fake_ipc {
+    /// World status: devices, defaults, live streams, `native_touches`.
+    pub const STATUS: &str = "debug.fake.status";
+    /// Apply one `audiohub_core::audio::fake::FakeInject` (the params object).
+    pub const INJECT: &str = "debug.fake.inject";
+    /// What an output device played: `{uid, freq?, window_ms?}`.
+    pub const SINK_STATS: &str = "debug.fake.sink_stats";
+}
+
+#[cfg(feature = "fake-audio")]
+fn fake_audio_active() -> bool {
+    audio::fake::active().is_some()
+}
+
+/// Installs this process's fake audio world. `AUDIOHUB_FAKE_AUDIO` names a
+/// world description file (`ahr.fake.v1` JSON); when it is unset the built-in
+/// default world is used, so a fake build can never fall through to real
+/// devices. A world that is already installed is kept.
+#[cfg(feature = "fake-audio")]
+pub fn install_fake_audio_from_env() -> Result<()> {
+    use audio::fake;
+    if fake::active().is_some() {
+        return Ok(());
+    }
+    let cfg = match std::env::var_os("AUDIOHUB_FAKE_AUDIO").filter(|p| !p.is_empty()) {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("read AUDIOHUB_FAKE_AUDIO={}", Path::new(&path).display()))?;
+            serde_json::from_str::<fake::FakeWorldCfg>(&text).with_context(|| {
+                format!("parse fake audio world {}", Path::new(&path).display())
+            })?
+        }
+        None => {
+            logln(format_args!(
+                "[audiohubd] AUDIOHUB_FAKE_AUDIO is not set; using the built-in fake audio world"
+            ));
+            fake::FakeWorldCfg::default_world()
+        }
+    };
+    fake::install_for_process(cfg)?;
+    logln(format_args!("[audiohubd] fake audio backend active ({})", fake::MARKER));
+    Ok(())
+}
+
 pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     airplay::init_logging();
+    // A test build announces itself loudly (design §8.2 item 3). The banner
+    // also references the link-time marker, so it cannot be stripped from a
+    // test binary; a release build has neither.
+    #[cfg(feature = "facts-injection")]
+    logln(format_args!(
+        "[audiohubd] *** TEST BUILD: device facts injection is compiled in ({}); \
+         never ship this binary ***",
+        device_facts_pub::facts_injection_marker()
+    ));
     let cfg_dir = cfg
         .config_dir
         .clone()
@@ -506,6 +570,12 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     let mut hal_cfg = halbridge::HalBridgeCfg::from_env();
     if let Some(mode) = cfg.hal_bridge {
         hal_cfg.mode = mode;
+    }
+    // A daemon serving a fake audio world must never attach to the real
+    // driver: forced here so no embedding caller can forget it.
+    #[cfg(feature = "fake-audio")]
+    if fake_audio_active() {
+        hal_cfg.mode = halbridge::HalBridgeMode::Off;
     }
     // Named before it is moved: the line used to print the DEFAULT service name
     // whatever `AUDIOHUB_HAL_SERVICE` said, which makes it useless for the one
@@ -552,7 +622,11 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     let (site_build_send, site_build_recv) = mpsc::channel::<engine::SitePlaybackBuildReq>();
     let (site_built_send, site_built_recv) = mpsc::channel::<engine::SitePlaybackBuildDone>();
     let cfg_dir_for_state = cfg_dir.clone();
-    let airplay = airplay::AirPlayController::new(cfg.airplay_advertise, cfg_dir.clone());
+    #[cfg(feature = "fake-audio")]
+    let airplay_advertise = cfg.airplay_advertise && !fake_audio_active();
+    #[cfg(not(feature = "fake-audio"))]
+    let airplay_advertise = cfg.airplay_advertise;
+    let airplay = airplay::AirPlayController::new(airplay_advertise, cfg_dir.clone());
     let inner = Arc::new(DaemonInner {
         id: RwLock::new(id.clone()),
         cfg_dir,
@@ -582,6 +656,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         device_output_volume_io: Mutex::new(0),
         device_input_volume_io: Mutex::new(0),
         native_output: Mutex::new(Default::default()),
+        device_facts: device_facts_pub::LocalFacts::new(),
         shutdown: AtomicBool::new(false),
         cleanup: Once::new(),
         announce_guard: Mutex::new(announce_guard),
@@ -718,6 +793,13 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
     {
         let i = inner.clone();
         threads.push(spawn(
+            "ahb-device-facts",
+            Box::new(move || device_facts_pub::watch_loop(i)),
+        )?);
+    }
+    {
+        let i = inner.clone();
+        threads.push(spawn(
             "ahb-ipc",
             Box::new(move || ipcserv::accept_loop(i, ipc_listener)),
         )?);
@@ -828,6 +910,9 @@ pub(crate) struct DaemonInner {
     pub(crate) device_output_volume_io: Mutex<u64>,
     pub(crate) device_input_volume_io: Mutex<u64>,
     pub(crate) native_output: Mutex<audiohub_core::output_capabilities::NativeOutputObservation>,
+    /// What this machine publishes as `SessionMsg::DeviceFacts`, plus the
+    /// test-only injection override. See `device_facts_pub`.
+    pub(crate) device_facts: device_facts_pub::LocalFacts,
     pub shutdown: AtomicBool,
     cleanup: Once,
     pub announce_guard: Mutex<Option<AnnounceGuard>>,
@@ -1298,7 +1383,7 @@ const fn expected_hal_driver_protocol() -> u32 {
 #[test]
 fn hal_status_uses_the_platform_driver_protocol() {
     #[cfg(windows)]
-    assert_eq!(expected_hal_driver_protocol(), 9);
+    assert_eq!(expected_hal_driver_protocol(), 11);
     #[cfg(target_os = "macos")]
     assert_eq!(expected_hal_driver_protocol(), 4);
 }
@@ -1341,6 +1426,26 @@ pub(crate) fn status_with_hal(
 ) -> Result<serde_json::Value> {
     let mut v = serde_json::to_value(info)?;
     if let Some(obj) = v.as_object_mut() {
+        // Which audio backend this process is serving. Release builds always
+        // say "real"; the regression suite refuses to run fake-layer cases
+        // against anything that does not say "fake".
+        #[cfg(not(feature = "fake-audio"))]
+        obj.insert("audio_backend".to_string(), serde_json::Value::from("real"));
+        #[cfg(feature = "fake-audio")]
+        {
+            let world = audio::fake::active();
+            obj.insert(
+                "audio_backend".to_string(),
+                serde_json::Value::from(if world.is_some() { "fake" } else { "real" }),
+            );
+            obj.insert(
+                "fake".to_string(),
+                match world {
+                    Some(w) => serde_json::to_value(w.status())?,
+                    None => serde_json::Value::Null,
+                },
+            );
+        }
         obj.insert("hal".to_string(), serde_json::to_value(hal_status(inner))?);
         obj.insert("latency_guard".to_string(), latency_guard_status(inner)?);
         obj.insert(
@@ -1348,6 +1453,13 @@ pub(crate) fn status_with_hal(
             serde_json::to_value(lk(&inner.native_output).clone())?,
         );
         obj.insert("spatial_output".to_string(), spatial::status(inner));
+        // Test features compiled in (design §8.2): empty in every shipped build.
+        obj.insert(
+            "build_features".to_string(),
+            serde_json::to_value(device_facts_pub::build_features())?,
+        );
+        obj.insert("device_facts".to_string(), device_facts_pub::status(inner));
+        obj.insert("presentation".to_string(), haldev::presentation_status(inner));
         obj.insert("hal_output_formats".to_string(), inner.hal().map(|hal| hal.output_formats_status()).unwrap_or(serde_json::Value::Null));
     }
     Ok(v)
@@ -1825,6 +1937,9 @@ pub(crate) struct ConnShared {
     pub(crate) peer_native_output:
         Mutex<Option<audiohub_core::output_capabilities::NativeOutputObservation>>,
     pub(crate) peer_spatial_output: Mutex<Option<audiohub_net::secure::SpatialOutputOffer>>,
+    /// The peer's advertised DeviceFacts version and newest accepted
+    /// observation. Connection-scoped for the same reason as the fields above.
+    pub(crate) peer_device_facts: Mutex<device_facts_pub::PeerDeviceFacts>,
 }
 
 /// The peer's advertised mode, with "unknown" and "unrecognised" kept apart.
@@ -5205,11 +5320,23 @@ fn read_ipc_json(dir: &Path) -> Option<IpcEndpoint> {
     serde_json::from_slice::<IpcEndpoint>(&bytes).ok()
 }
 
-/// True if the process that wrote ipc.json is still running.
+/// True if the process that wrote ipc.json is still running *and is the same
+/// process*. A PID is not an identity: after a crash or power loss the OS hands
+/// it to an unrelated process, and a port probe is no better (anything may
+/// listen there by then). The recorded kernel start time settles it; only when
+/// the OS cannot tell do we fall back to a plain liveness probe.
 fn owner_alive(ep: &IpcEndpoint) -> bool {
+    use audiohub_ipc::procid::{owner_proof, OwnerProof};
+    match owner_proof(ep.pid, ep.started) {
+        OwnerProof::Alive => true,
+        OwnerProof::Stale => false,
+        OwnerProof::Unproven => owner_probe_fallback(ep),
+    }
+}
+
+fn owner_probe_fallback(ep: &IpcEndpoint) -> bool {
     #[cfg(unix)]
     {
-        let _ = ep;
         // signal 0 only tests existence + permission; EPERM means the pid is
         // live but owned by another user
         unsafe {
@@ -5221,7 +5348,6 @@ fn owner_alive(ep: &IpcEndpoint) -> bool {
     }
     #[cfg(not(unix))]
     {
-        // no cheap pid probe here: ask the recorded endpoint instead
         std::net::TcpStream::connect_timeout(
             &SocketAddr::from(([127, 0, 0, 1], ep.port)),
             Duration::from_millis(200),
@@ -5272,6 +5398,7 @@ fn write_ipc_json(dir: &Path, port: u16, token: &str) -> Result<()> {
         port,
         token: token.to_string(),
         pid: std::process::id(),
+        started: audiohub_ipc::procid::own_start_id(),
     };
     let path = dir.join("ipc.json");
     // randomized name + create_new: the token must never exist at a guessable
@@ -7923,5 +8050,71 @@ mod fault_injection {
             p.local_ms, None,
             "**绝不用 0 填补**：读不到的那一级若按 0 计入，总数会从 1050 掉回 50，看起来完全健康"
         );
+    }
+}
+
+#[cfg(test)]
+mod ipc_owner_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ahd-ipcowner-{tag}-{}", gen_token()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn put(dir: &Path, pid: u32, started: Option<u64>) {
+        let ep = IpcEndpoint {
+            ipc_version: IPC_VERSION,
+            port: 1, // nothing listens here; liveness must not depend on it
+            token: "t".into(),
+            pid,
+            started,
+        };
+        std::fs::write(dir.join("ipc.json"), serde_json::to_vec(&ep).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn write_records_own_identity() {
+        let d = scratch("write");
+        write_ipc_json(&d, 4242, "tok").unwrap();
+        let ep = read_ipc_json(&d).unwrap();
+        assert_eq!(ep.pid, std::process::id());
+        assert_eq!(ep.started, audiohub_ipc::procid::own_start_id());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn live_owner_is_detected() {
+        let Some(me) = audiohub_ipc::procid::own_start_id() else {
+            return;
+        };
+        let d = scratch("live");
+        put(&d, std::process::id(), Some(me));
+        assert!(ensure_endpoint_unowned(&d).is_err(), "a live daemon owns it");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn reused_pid_with_different_start_is_stale() {
+        let Some(me) = audiohub_ipc::procid::own_start_id() else {
+            return;
+        };
+        let d = scratch("reuse");
+        // Same PID, different image/start: what a power-loss leftover looks like
+        // once the OS hands the PID to an unrelated process.
+        put(&d, std::process::id(), Some(me.wrapping_add(12_345)));
+        ensure_endpoint_unowned(&d).expect("stale file must not block startup");
+        // and the new daemon can take the file over
+        write_ipc_json(&d, 4242, "tok").unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn dead_pid_is_stale() {
+        let d = scratch("dead");
+        put(&d, u32::MAX - 1, Some(1));
+        ensure_endpoint_unowned(&d).expect("nonexistent pid is stale");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

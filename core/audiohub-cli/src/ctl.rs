@@ -257,6 +257,15 @@ pub enum CtlCmd {
         /// while `AUDIOHUB_NAME` is set — that variable outranks it.
         #[arg(long)]
         name: Option<String>,
+        /// publish this machine's default-device description (name, kind,
+        /// transport; never a hardware id) to paired peers so they can
+        /// present it as the same kind of device (design §3.5)
+        #[arg(long)]
+        share_device_facts: Option<bool>,
+        /// mirror a peer's real default device (name, kind, transport) in the
+        /// virtual-device list when the peer shares it (design §5.3)
+        #[arg(long)]
+        present_physical_devices: Option<bool>,
     },
     /// plan §15：某一台对端、某一个方向的延迟与音质档。
     ///
@@ -352,9 +361,76 @@ pub enum CtlCmd {
     },
     /// stop the daemon
     Shutdown,
+    /// inspect and drive the fake audio backend (test-feature builds only)
+    #[cfg(feature = "fake-audio")]
+    Fake {
+        #[command(subcommand)]
+        cmd: FakeCmd,
+    },
+    /// override the daemon's device-facts classifier (test-feature builds only)
+    #[cfg(feature = "facts-injection")]
+    TestFacts {
+        #[command(subcommand)]
+        cmd: TestFactsCmd,
+    },
+}
+
+/// `ctl test-facts ...`: the provider-side injection of design §8.2.
+#[cfg(feature = "facts-injection")]
+#[derive(Subcommand)]
+pub enum TestFactsCmd {
+    /// replace one direction's classification with the given DirectionFacts
+    /// JSON (published with origin=injected), or with --clear go back to the
+    /// real classifier
+    Inject {
+        /// input | output
+        #[arg(long)]
+        direction: String,
+        /// the DirectionFacts object, e.g. '{"class":"physical","reason":"physical",
+        /// "physical":{"transport":"usb","form_factor":"headphones","name":"X",
+        /// "device_token":"0123456789abcdef"}}'
+        #[arg(long, conflicts_with = "clear", required_unless_present = "clear")]
+        facts: Option<String>,
+        /// stop overriding this direction
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
+/// `ctl fake ...`: the regression suite's handle on a fake daemon's devices.
+#[cfg(feature = "fake-audio")]
+#[derive(Subcommand)]
+pub enum FakeCmd {
+    /// world status: backend marker, devices, defaults, streams, native_touches
+    Status,
+    /// apply one injection, given as its JSON object, e.g.
+    /// '{"action":"kill_stream","uid":"fake-mic-1"}'
+    Inject {
+        /// the injection object
+        action: String,
+    },
+    /// what an output device has played (tone analysis over the newest window)
+    SinkStats {
+        /// output device UID
+        #[arg(long)]
+        uid: String,
+        /// fit a tone near this frequency (Hz)
+        #[arg(long)]
+        freq: Option<f64>,
+        /// analysis window in milliseconds
+        #[arg(long, default_value_t = 200)]
+        window_ms: u32,
+    },
 }
 
 pub fn dispatch(cmd: M4Cmd, json: bool) -> Result<i32> {
+    // A test-feature CLI must not reach real devices either: the local paths
+    // (an in-process daemon, the volume command) get the same fake world the
+    // daemon binary would.
+    #[cfg(feature = "fake-audio")]
+    if matches!(cmd, M4Cmd::Daemon { .. } | M4Cmd::Volume { .. }) {
+        audiohubd::install_fake_audio_from_env()?;
+    }
     match cmd {
         M4Cmd::Daemon {
             port,
@@ -456,17 +532,21 @@ fn cmd_daemon(
     secs: f32,
     json: bool,
 ) -> Result<i32> {
+    #[cfg(feature = "fake-audio")]
+    let (hal_bridge, airplay_advertise) = (Some(audiohubd::halbridge::HalBridgeMode::Off), false);
+    #[cfg(not(feature = "fake-audio"))]
+    let (hal_bridge, airplay_advertise) = (None, true);
     #[allow(unused_mut)]
     let mut handle = audiohubd::start_daemon(audiohubd::DaemonCfg {
         control_port: port,
         ipc_port,
         config_dir: None, // resolve via AUDIOHUB_CONFIG_DIR / platform default, same as ctl
         announce,
-        hal_bridge: None,       // production: AUDIOHUB_HAL_BRIDGE decides
+        hal_bridge,             // production: None, so AUDIOHUB_HAL_BRIDGE decides
         tx_throttle_kbps: None, // production: AUDIOHUB_TEST_TX_KBPS decides (normally unlimited)
         block_udp: None,        // production: AUDIOHUB_TEST_BLOCK_UDP decides (normally nothing)
         announce_fault: false,  // test-only knob; there is no production value for it
-        airplay_advertise: true,
+        airplay_advertise,
     })?;
     info(&format!(
         "daemon running: control_port={port} ipc_port={} config_dir={}",
@@ -659,6 +739,54 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             methods::DAEMON_SIMULATE_DEVICE_CHANGE,
             json!({ "kind": kind }),
         ),
+        #[cfg(feature = "facts-injection")]
+        CtlCmd::TestFacts { cmd } => match cmd {
+            TestFactsCmd::Inject {
+                direction,
+                facts,
+                clear,
+            } => {
+                let facts = match (facts, clear) {
+                    (_, true) => Value::Null,
+                    (Some(text), false) => {
+                        let v: Value = serde_json::from_str(text)
+                            .map_err(|e| anyhow!("--facts is not JSON: {e}"))?;
+                        if !v.is_object() {
+                            return Err(anyhow!("--facts must be a JSON object"));
+                        }
+                        v
+                    }
+                    (None, false) => return Err(anyhow!("give --facts or --clear")),
+                };
+                (
+                    methods::TEST_FACTS_INJECT,
+                    json!({ "direction": direction, "facts": facts }),
+                )
+            }
+        },
+        #[cfg(feature = "fake-audio")]
+        CtlCmd::Fake { cmd } => match cmd {
+            FakeCmd::Status => (audiohubd::fake_ipc::STATUS, json!({})),
+            FakeCmd::Inject { action } => {
+                let v: Value = serde_json::from_str(action)
+                    .map_err(|e| anyhow!("the injection is not a JSON object: {e}"))?;
+                if !v.is_object() {
+                    return Err(anyhow!("the injection must be a JSON object"));
+                }
+                (audiohubd::fake_ipc::INJECT, v)
+            }
+            FakeCmd::SinkStats {
+                uid,
+                freq,
+                window_ms,
+            } => {
+                let mut p = json!({ "uid": uid, "window_ms": window_ms });
+                if let Some(f) = freq {
+                    p["freq"] = json!(f);
+                }
+                (audiohubd::fake_ipc::SINK_STATS, p)
+            }
+        },
         // 传输档位（`latency` / `quality`）**必须能从这里写**。
         //
         // 在此之前它们只有 UI 一条写入路径，于是「档位到底有没有被下发」这件事
@@ -686,8 +814,16 @@ fn request_for(cmd: &CtlCmd) -> Result<(&'static str, Value)> {
             airplay_password,
             autostart,
             name,
+            share_device_facts,
+            present_physical_devices,
         } => {
             let mut p = serde_json::Map::new();
+            if let Some(v) = share_device_facts {
+                p.insert("share_device_facts".into(), json!(v));
+            }
+            if let Some(v) = present_physical_devices {
+                p.insert("present_physical_devices".into(), json!(v));
+            }
             if let Some(m) = mode {
                 p.insert("mode".into(), json!(m));
             }
@@ -898,6 +1034,45 @@ fn val_f64(v: &Value, key: &str) -> f64 {
 
 fn val_bool(v: &Value, key: &str) -> bool {
     v.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// One line per `ctl fake` reply. The status line checks the daemon's backend
+/// marker against this binary's, so a CLI and a daemon from different builds
+/// are told apart instead of silently trusted.
+#[cfg(feature = "fake-audio")]
+fn summarize_fake(cmd: &FakeCmd, v: &Value) {
+    match cmd {
+        FakeCmd::Status => {
+            let marker = val_str(v, "marker");
+            let ok = marker == audiohub_core::audio::fake::MARKER;
+            info(&format!(
+                "fake audio backend marker={marker} ({}) native_touches={} devices={} streams={}",
+                if ok { "matches this build" } else { "MISMATCH" },
+                val_u64(v, "native_touches"),
+                v.get("devices").and_then(Value::as_array).map_or(0, Vec::len),
+                v.get("streams").and_then(Value::as_array).map_or(0, Vec::len),
+            ));
+        }
+        FakeCmd::Inject { .. } => info(&format!(
+            "fake injection {} killed_streams={} notified={}",
+            val_str(v, "action"),
+            val_u64(v, "killed_streams"),
+            val_bool(v, "notified"),
+        )),
+        FakeCmd::SinkStats { uid, .. } => {
+            let tone = &v["tone"];
+            info(&format!(
+                "fake sink {uid} gen={} frames_total={} rms={:.4} tone_detected={} snr_db={}",
+                val_u64(v, "gen"),
+                val_u64(v, "frames_total"),
+                v.get("rms").and_then(Value::as_f64).unwrap_or(0.0),
+                tone.get("detected").and_then(Value::as_bool).unwrap_or(false),
+                tone.get("snr_db")
+                    .and_then(Value::as_f64)
+                    .map_or("-".to_string(), |s| format!("{s:.1}")),
+            ));
+        }
+    }
 }
 
 fn summarize(cmd: &CtlCmd, v: &Value) {
@@ -1172,6 +1347,15 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
             "simulated default-{kind} device change (epoch {})",
             v.get("epoch").and_then(|e| e.as_u64()).unwrap_or(0)
         )),
+        #[cfg(feature = "fake-audio")]
+        CtlCmd::Fake { cmd } => summarize_fake(cmd, v),
+        #[cfg(feature = "facts-injection")]
+        CtlCmd::TestFacts { .. } => info(&format!(
+            "TEST facts injection {} {} (generation {})",
+            val_str(v, "direction"),
+            if val_bool(v, "cleared") { "cleared" } else { "set" },
+            val_u64(v, "generation"),
+        )),
         CtlCmd::Settings { .. } => {
             info(&format!(
                 "mode={} effective_mode={} remove_virtual_on_disconnect={} \
@@ -1181,6 +1365,7 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                  airplay_enabled={} airplay_listening={} airplay_name={:?} \
                  airplay_password_set={} \
                  autostart={} \
+                 share_device_facts={} present_physical_devices={} \
                  virtual devices {}/{}",
                 val_str(v, "mode"),
                 val_str(v, "effective_mode"),
@@ -1196,6 +1381,8 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 val_str(v, "airplay_effective_name"),
                 val_bool(v, "airplay_password_set"),
                 val_bool(v, "autostart"),
+                val_bool(v, "share_device_facts"),
+                val_bool(v, "present_physical_devices"),
                 val_u64(v, "hal_used"),
                 val_u64(v, "hal_capacity"),
             ));
@@ -1518,6 +1705,16 @@ mod tests {
             ),
             ("autostart", "--autostart=true", json!(true)),
             ("name", "--name=客厅 Mac", json!("客厅 Mac")),
+            (
+                "share_device_facts",
+                "--share-device-facts=false",
+                json!(false),
+            ),
+            (
+                "present_physical_devices",
+                "--present-physical-devices=false",
+                json!(false),
+            ),
         ];
         for key in audiohub_ipc::SETTINGS_WRITABLE_KEYS {
             let (_, flag, want) = sample.iter().find(|(k, _, _)| k == key).unwrap_or_else(|| {

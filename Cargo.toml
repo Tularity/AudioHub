@@ -16,10 +16,22 @@ exclude = ["test", "vendor/cpal-0.16.0"]
 [patch.crates-io]
 # Keep the pinned CPAL release while carrying the minimal Windows same-stream
 # output timing metadata required by AudioTx. Other hosts retain CPAL's None.
+# It also keeps CPAL's process-wide WASAPI device enumerator in a pinned MTA,
+# so it stays valid after the thread that first used CPAL exits
+# (src/host/wasapi/device.rs, get_enumerator).
 cpal = { path = "vendor/cpal-0.16.0" }
 
 [profile.release]
 opt-level = 3
+
+# Regression-suite builds of the fake audio backend (`--features fake-audio`):
+# release optimisation so real-time timing stays close to the shipped binary,
+# with debug assertions ON, which `fake-audio` requires. The product release
+# profile has none, so a release build with the feature fails to compile.
+[profile.regress]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
 
 [profile.dev]
 # macOS defaults this to "unpacked": each codegen unit's .o stays in

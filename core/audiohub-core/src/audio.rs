@@ -8,6 +8,36 @@ use cpal::{SampleFormat, SupportedStreamConfig};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
+/// Test-only fake audio backend (regression suite, DESIGN §8). A child module
+/// so it can build `LivePlayback`/`LiveCapture`/`AudioTx`/`AudioRx` from the
+/// same private parts the real streams use instead of widening their API.
+/// Never part of a release build: see the `compile_error!` at its top.
+#[cfg(feature = "fake-audio")]
+#[path = "audio_fake.rs"]
+pub mod fake;
+
+/// What keeps a native stream running for as long as its owner lives. Without
+/// the fake backend this is exactly `cpal::Stream`, so the real build is the
+/// same type it always was.
+#[cfg(not(feature = "fake-audio"))]
+type StreamHold = cpal::Stream;
+
+#[cfg(feature = "fake-audio")]
+enum StreamHold {
+    Cpal(#[allow(dead_code)] cpal::Stream),
+    Fake(#[allow(dead_code)] fake::StreamGuard),
+}
+
+#[cfg(not(feature = "fake-audio"))]
+fn hold_native(stream: cpal::Stream) -> StreamHold {
+    stream
+}
+
+#[cfg(feature = "fake-audio")]
+fn hold_native(stream: cpal::Stream) -> StreamHold {
+    StreamHold::Cpal(stream)
+}
+
 #[cfg(target_os = "windows")]
 mod windows_pro_audio {
     use std::ffi::c_void;
@@ -250,6 +280,10 @@ pub struct DefaultDevicePresence {
 }
 
 pub fn default_device_presence() -> DefaultDevicePresence {
+    #[cfg(feature = "fake-audio")]
+    if let Some(world) = fake::active() {
+        return world.default_device_presence();
+    }
     let host = cpal::default_host();
     DefaultDevicePresence {
         input: host.default_input_device().is_some(),
@@ -267,6 +301,10 @@ fn describe(cfg: &SupportedStreamConfig) -> String {
 }
 
 pub fn default_devices_report() -> Result<DevicesReport> {
+    #[cfg(feature = "fake-audio")]
+    if let Some(world) = fake::active() {
+        return Ok(world.devices_report());
+    }
     let host = cpal::default_host();
     let out_dev = host.default_output_device();
     let in_dev = host.default_input_device();
@@ -343,6 +381,10 @@ pub fn list_input_devices() -> Vec<String> {
 /// duplicates kept. Like the name listings this only reads properties, so it
 /// never opens a unit and never trips a permission prompt.
 pub fn list_devices_detailed() -> Vec<DeviceEntry> {
+    #[cfg(feature = "fake-audio")]
+    if let Some(world) = fake::active() {
+        return world.list_detailed();
+    }
     devices::list_detailed()
 }
 
@@ -351,6 +393,10 @@ pub fn list_devices_detailed() -> Vec<DeviceEntry> {
 /// human can check, and with runtime-generated names it is not knowable in
 /// advance.
 pub fn device_name_for_uid(kind: DeviceKind, uid: &str) -> Result<String> {
+    #[cfg(feature = "fake-audio")]
+    if let Some(world) = fake::active() {
+        return world.name_for_uid(kind, uid);
+    }
     devices::name_for_uid(kind, uid)
 }
 
@@ -361,6 +407,10 @@ pub fn device_name_for_uid(kind: DeviceKind, uid: &str) -> Result<String> {
 /// rejected, instead of collapsing into a single entry that would silently
 /// resolve to whichever of them cpal happened to enumerate first.
 fn list_names(kind: DeviceKind) -> Vec<String> {
+    #[cfg(feature = "fake-audio")]
+    if let Some(world) = fake::active() {
+        return dedup_in_order(world.list_names(kind));
+    }
     dedup_in_order(devices::list_all(kind))
 }
 
@@ -425,6 +475,8 @@ fn resolve_name(names: &[String], query: &str, kind: DeviceKind) -> Result<Strin
 /// that quietly played into the speakers instead of the virtual card would be
 /// worse than a failed session.
 fn find_device(kind: DeviceKind, query: &str) -> Result<(cpal::Device, String)> {
+    #[cfg(feature = "fake-audio")]
+    fake::refuse_native("audio::find_device")?;
     let names = devices::list_all(kind);
     let resolved = resolve_name(&names, query, kind)?;
     let dev = devices::find(kind, &resolved)
@@ -438,6 +490,8 @@ fn find_device(kind: DeviceKind, query: &str) -> Result<(cpal::Device, String)> 
 /// invent matches that the system itself would not make. No fallback to the
 /// default device either — a mistyped UID must say so.
 fn find_device_by_uid(kind: DeviceKind, uid: &str) -> Result<(cpal::Device, String)> {
+    #[cfg(feature = "fake-audio")]
+    fake::refuse_native("audio::find_device_by_uid")?;
     devices::find_by_uid(kind, uid)
 }
 
@@ -1675,7 +1729,13 @@ impl StreamHealth {
     /// already finished. The first error is the diagnosis; later ones are
     /// fallout, so they only get logged.
     fn fail(&self, what: &str, e: &cpal::StreamError) {
-        let msg = format!("{what} stream error: {e}");
+        self.fail_message(format!("{what} stream error: {e}"));
+    }
+
+    /// The body of [`StreamHealth::fail`] without the cpal error type, so a
+    /// stream death can be recorded by something other than the cpal error
+    /// callback (the fake backend's injected deaths) with identical semantics.
+    fn fail_message(&self, msg: String) {
         eprintln!("[audiohub] {msg}");
         {
             let mut slot = self.err.lock().unwrap_or_else(|p| p.into_inner());
@@ -1886,6 +1946,8 @@ fn map_interleaved_frame(source: &[f32], device: &mut [f32]) {
 }
 
 pub fn play_samples_blocking(samples: &[f32], src_rate: u32) -> Result<()> {
+    #[cfg(feature = "fake-audio")]
+    fake::refuse_native("audio::play_samples_blocking")?;
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -1961,7 +2023,7 @@ pub struct PlaybackConfigSnapshot {
 }
 
 pub struct LivePlayback {
-    _stream: cpal::Stream,
+    _stream: StreamHold,
     health: Arc<StreamHealth>,
     config: PlaybackConfigSnapshot,
 }
@@ -2764,6 +2826,10 @@ impl LivePlayback {
     }
 
     pub fn start_channels(src_rate: u32, channels: u8) -> Result<(LivePlayback, AudioTx)> {
+        #[cfg(feature = "fake-audio")]
+        if let Some(world) = fake::active() {
+            return world.open_output(fake::Target::Default, src_rate, channels);
+        }
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -2782,6 +2848,10 @@ impl LivePlayback {
         src_rate: u32,
         channels: u8,
     ) -> Result<(LivePlayback, AudioTx)> {
+        #[cfg(feature = "fake-audio")]
+        if let Some(world) = fake::active() {
+            return world.open_output(fake::Target::Name(device_name), src_rate, channels);
+        }
         let (device, resolved) = find_device(DeviceKind::Output, device_name)?;
         LivePlayback::on_device(&device, src_rate, channels)
             .with_context(|| format!("open output device {resolved:?}"))
@@ -2799,6 +2869,10 @@ impl LivePlayback {
         src_rate: u32,
         channels: u8,
     ) -> Result<(LivePlayback, AudioTx)> {
+        #[cfg(feature = "fake-audio")]
+        if let Some(world) = fake::active() {
+            return world.open_output(fake::Target::Uid(uid), src_rate, channels);
+        }
         let (device, resolved) = find_device_by_uid(DeviceKind::Output, uid)?;
         LivePlayback::on_device(&device, src_rate, channels)
             .with_context(|| format!("open output device {resolved:?} (UID {uid:?})"))
@@ -2809,6 +2883,8 @@ impl LivePlayback {
         src_rate: u32,
         channels: u8,
     ) -> Result<(LivePlayback, AudioTx)> {
+        #[cfg(feature = "fake-audio")]
+        fake::refuse_native("LivePlayback::on_device")?;
         let channels = channels.clamp(1, 2);
         let supported = device
             .default_output_config()
@@ -2870,7 +2946,7 @@ impl LivePlayback {
 
         Ok((
             LivePlayback {
-                _stream: stream,
+                _stream: hold_native(stream),
                 health,
                 config: config_snapshot,
             },
@@ -2893,7 +2969,7 @@ impl LivePlayback {
 }
 
 pub struct LiveCapture {
-    _stream: cpal::Stream,
+    _stream: StreamHold,
     health: Arc<StreamHealth>,
 }
 
@@ -3000,6 +3076,10 @@ impl LiveCapture {
     }
 
     pub fn start() -> Result<(LiveCapture, AudioRx, u32)> {
+        #[cfg(feature = "fake-audio")]
+        if let Some(world) = fake::active() {
+            return world.open_input(fake::Target::Default);
+        }
         let host = cpal::default_host();
         let device = host
             .default_input_device()
@@ -3010,6 +3090,10 @@ impl LiveCapture {
     /// Captures from the named input device (e.g. the input side of a virtual
     /// card). Errors rather than falling back to the default microphone.
     pub fn start_on(device_name: &str) -> Result<(LiveCapture, AudioRx, u32)> {
+        #[cfg(feature = "fake-audio")]
+        if let Some(world) = fake::active() {
+            return world.open_input(fake::Target::Name(device_name));
+        }
         let (device, resolved) = find_device(DeviceKind::Input, device_name)?;
         LiveCapture::on_device(&device).with_context(|| format!("open input device {resolved:?}"))
     }
@@ -3018,12 +3102,18 @@ impl LiveCapture {
     /// to name a per-peer virtual microphone, whose display name changes with
     /// the peer it belongs to.
     pub fn start_on_uid(uid: &str) -> Result<(LiveCapture, AudioRx, u32)> {
+        #[cfg(feature = "fake-audio")]
+        if let Some(world) = fake::active() {
+            return world.open_input(fake::Target::Uid(uid));
+        }
         let (device, resolved) = find_device_by_uid(DeviceKind::Input, uid)?;
         LiveCapture::on_device(&device)
             .with_context(|| format!("open input device {resolved:?} (UID {uid:?})"))
     }
 
     fn on_device(device: &cpal::Device) -> Result<(LiveCapture, AudioRx, u32)> {
+        #[cfg(feature = "fake-audio")]
+        fake::refuse_native("LiveCapture::on_device")?;
         let supported = device
             .default_input_config()
             .context("default input config")?;
@@ -3045,11 +3135,7 @@ impl LiveCapture {
             SampleFormat::I16 => device.build_input_stream(
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    mono.clear();
-                    for frame in data.chunks(channels) {
-                        let sum: f32 = frame.iter().map(|&v| v as f32 / 32768.0).sum();
-                        mono.push(sum / channels as f32);
-                    }
+                    fold_to_mono_i16(data, channels, &mut mono);
                     let wrote = prod.push_slice(&mono);
                     if wrote < mono.len() {
                         cb_dropped.fetch_add((mono.len() - wrote) as u64, Ordering::Relaxed);
@@ -3061,11 +3147,7 @@ impl LiveCapture {
             _ => device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    mono.clear();
-                    for frame in data.chunks(channels) {
-                        let sum: f32 = frame.iter().sum();
-                        mono.push(sum / channels as f32);
-                    }
+                    fold_to_mono_f32(data, channels, &mut mono);
                     let wrote = prod.push_slice(&mono);
                     if wrote < mono.len() {
                         cb_dropped.fetch_add((mono.len() - wrote) as u64, Ordering::Relaxed);
@@ -3078,7 +3160,7 @@ impl LiveCapture {
         stream.play()?;
         Ok((
             LiveCapture {
-                _stream: stream,
+                _stream: hold_native(stream),
                 health,
             },
             AudioRx {
@@ -3088,6 +3170,26 @@ impl LiveCapture {
             },
             rate,
         ))
+    }
+}
+
+/// Folds one interleaved capture block to mono by averaging the channels of
+/// each frame. Shared by the real capture callback and the fake backend so the
+/// two cannot drift apart on what reaches the 2 s capture ring.
+fn fold_to_mono_f32(data: &[f32], channels: usize, mono: &mut Vec<f32>) {
+    mono.clear();
+    for frame in data.chunks(channels) {
+        let sum: f32 = frame.iter().sum();
+        mono.push(sum / channels as f32);
+    }
+}
+
+/// [`fold_to_mono_f32`] for a native i16 capture block.
+fn fold_to_mono_i16(data: &[i16], channels: usize, mono: &mut Vec<f32>) {
+    mono.clear();
+    for frame in data.chunks(channels) {
+        let sum: f32 = frame.iter().map(|&v| v as f32 / 32768.0).sum();
+        mono.push(sum / channels as f32);
     }
 }
 
@@ -3212,6 +3314,19 @@ impl DeviceChangeWatcher {
         let worker = std::thread::Builder::new()
             .name("audiohub-devwatch".to_string())
             .spawn(move || {
+                // A fake world replaces the platform listener with its own
+                // notification list; the worker, fan-out and callback below
+                // are the same code path either way.
+                #[cfg(feature = "fake-audio")]
+                if let Some(world) = fake::active() {
+                    let reg = world.register_watcher(kind, Arc::clone(&f));
+                    r.publish(Ok(()));
+                    while f.wait() {
+                        cb();
+                    }
+                    world.unregister_watcher(reg);
+                    return;
+                }
                 let reg = match watch_imp::register(kind, Arc::clone(&f)) {
                     Ok(reg) => {
                         r.publish(Ok(()));
@@ -3817,6 +3932,8 @@ pub fn watch_device_list(
     secs: f32,
     on_event: Box<dyn FnMut(&DeviceEvent) + Send + 'static>,
 ) -> Result<Vec<DeviceEvent>> {
+    #[cfg(feature = "fake-audio")]
+    fake::refuse_native("audio::watch_device_list")?;
     let state = Arc::new(Mutex::new(WatchState {
         known: list_devices_detailed(),
         events: Vec::new(),

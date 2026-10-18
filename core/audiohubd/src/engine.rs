@@ -1537,6 +1537,14 @@ pub(crate) fn source_builder_loop(
 ) {
     // 开着的 cpal 采集流，按「哪一次请求造的」存。**只有这条线程碰它**。
     let mut caps: HashMap<(SourceSpec, u64), LiveCapture> = HashMap::new();
+    // A dead `LiveCapture` never produces samples again, and silence from the
+    // paired `AudioRx` looks identical to a quiet room. This thread is the
+    // only owner that can see the death; bumping `dev_in_epoch` drives the
+    // same rebuild path a default-input change takes. Retry while the corpse
+    // stays in `caps` — a failed reopen deliberately keeps the previous
+    // source, and wireless receivers often take hundreds of ms to reappear.
+    const DEAD_MIC_RETRY: Duration = Duration::from_secs(1);
+    let mut last_dead_mic_bump: Option<Instant> = None;
     loop {
         // 用超时而不是阻塞 `recv`：关机时 `tx_loop` 先退出、通道那头还活着
         // （`DaemonInner` 还被别人持有），死等就永远退不出来。
@@ -1545,6 +1553,31 @@ pub(crate) fn source_builder_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if inner.shutdown.load(Ordering::SeqCst) {
                     return;
+                }
+                let dead_why = caps.iter().find_map(|((spec, _), cap)| {
+                    if matches!(spec, SourceSpec::Mic) && !cap.is_alive() {
+                        Some(
+                            cap.take_error()
+                                .unwrap_or_else(|| "input stream dead".into()),
+                        )
+                    } else {
+                        None
+                    }
+                });
+                if let Some(why) = dead_why {
+                    let due = last_dead_mic_bump
+                        .map(|t| t.elapsed() >= DEAD_MIC_RETRY)
+                        .unwrap_or(true);
+                    if due {
+                        let epoch = inner.dev_in_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+                        last_dead_mic_bump = Some(Instant::now());
+                        dlog!(
+                            "[audiohubd] microphone capture died ({why}); \
+                             requesting rebuild via input epoch {epoch}"
+                        );
+                    }
+                } else {
+                    last_dead_mic_bump = None;
                 }
                 continue;
             }
@@ -2114,7 +2147,10 @@ impl TxState {
             for w in waiters {
                 self.install_stream(&d.spec.clone(), w);
             }
-            dlog!("[audiohubd] {} 已重建（默认设备变化）", d.spec.label());
+            dlog!(
+                "[audiohubd] {} 已重建（默认输入变化或采集流失效）",
+                d.spec.label()
+            );
             return;
         }
         // ② 没人等 ⇒ 等的人在建源期间全撤了。直接收尸，别留一个没人读的设备。
@@ -2774,8 +2810,8 @@ fn drain_skipped_ticks(
     total
 }
 
-/// spec-m4c §D: the default input changed, so a live `MicSource` is now bound
-/// to the wrong device.
+/// spec-m4c §D: the default input changed, or its live capture died. In either
+/// case the current `MicSource` can no longer provide the intended samples.
 ///
 /// 「先造好新的、再丢老的」这条保证**没有变**，只是换了地方兑现：老的
 /// `SourceEnt` 原封不动留在表里，直到 `TxState::on_build_done` 拿到新的那一刻
@@ -2784,16 +2820,22 @@ fn drain_skipped_ticks(
 /// 变的只有一件事：**开设备这件事不再发生在这条线程上**。
 fn request_mic_rebuild(st: &mut TxState) {
     if !st.sources.contains_key(&SourceSpec::Mic) {
-        dlog!("[audiohubd] default input changed; no microphone source to rebuild");
+        dlog!("[audiohubd] input changed or capture died; no microphone source to rebuild");
         return;
     }
     if st.pending.contains_key(&SourceSpec::Mic) {
         // 上一次重建还没回来。再发一次只会白开一次设备，并让两个成品互相覆盖。
-        dlog!("[audiohubd] default input changed; 上一次麦克风重建还在进行中，本次略过");
+        dlog!(
+            "[audiohubd] input changed or capture died; \
+             上一次麦克风重建还在进行中，本次略过"
+        );
         return;
     }
     st.request_build(SourceSpec::Mic);
-    dlog!("[audiohubd] default input changed; 已请求重建麦克风源（设备在建源线程上开）");
+    dlog!(
+        "[audiohubd] input changed or capture died; \
+         已请求重建麦克风源（设备在建源线程上开）"
+    );
 }
 
 /// 把 keepalive 学到的对端端口取过来（规格 spec-m4a §3：只学端口，不学 IP）。
@@ -9121,6 +9163,30 @@ pub(crate) mod deadline_thread_guards {
         assert!(
             fn_body("fn reap_dead_sources(").contains("st.retire("),
             "收尸没有交给建源线程"
+        );
+    }
+
+    /// A fatal capture callback may only request an input rebuild. Endpoint
+    /// lifecycle noise must never restart the output side or named outputs.
+    #[test]
+    fn a_dead_microphone_capture_only_bumps_the_input_epoch() {
+        let builder = fn_body("pub(crate) fn source_builder_loop(");
+        assert!(
+            builder.contains("matches!(spec, SourceSpec::Mic) && !cap.is_alive()"),
+            "建源线程没有识别已经死亡的默认麦克风采集"
+        );
+        assert_eq!(
+            builder.matches("dev_in_epoch.fetch_add(").count(),
+            1,
+            "死亡采集必须且只能通过输入代号请求重建"
+        );
+        assert!(
+            !builder.contains("dev_out_epoch"),
+            "麦克风失效触碰了输出代号，会中断正在播放的声音"
+        );
+        assert!(
+            builder.contains("DEAD_MIC_RETRY"),
+            "死亡采集没有节流重试，设备离线时会形成紧循环"
         );
     }
 

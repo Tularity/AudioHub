@@ -1541,12 +1541,15 @@ pub(crate) fn source_builder_loop(
     let mut caps: HashMap<(SourceSpec, u64), LiveCapture> = HashMap::new();
     // A dead `LiveCapture` never produces samples again, and silence from the
     // paired `AudioRx` looks identical to a quiet room. This thread is the
-    // only owner that can see the death; bumping `dev_in_epoch` drives the
-    // same rebuild path a default-input change takes. Retry while the corpse
-    // stays in `caps` — a failed reopen deliberately keeps the previous
-    // source, and wireless receivers often take hundreds of ms to reappear.
+    // only owner that can see the death, so it asks `tx_loop` for a rebuild
+    // through `mic_rebuild_req`. That request is private to the microphone
+    // source: the default input did not change, so `dev_in_epoch` (and every
+    // capability, facts, inventory and latency consumer keyed on it) is left
+    // alone. Retry while the corpse stays in `caps` — a failed reopen
+    // deliberately keeps the previous source, and wireless receivers often
+    // take hundreds of ms to reappear.
     const DEAD_MIC_RETRY: Duration = Duration::from_secs(1);
-    let mut last_dead_mic_bump: Option<Instant> = None;
+    let mut last_dead_mic_req: Option<Instant> = None;
     loop {
         // 用超时而不是阻塞 `recv`：关机时 `tx_loop` 先退出、通道那头还活着
         // （`DaemonInner` 还被别人持有），死等就永远退不出来。
@@ -1567,19 +1570,19 @@ pub(crate) fn source_builder_loop(
                     }
                 });
                 if let Some(why) = dead_why {
-                    let due = last_dead_mic_bump
+                    let due = last_dead_mic_req
                         .map(|t| t.elapsed() >= DEAD_MIC_RETRY)
                         .unwrap_or(true);
                     if due {
-                        let epoch = inner.dev_in_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-                        last_dead_mic_bump = Some(Instant::now());
+                        let n = inner.mic_rebuild_req.fetch_add(1, Ordering::Release) + 1;
+                        last_dead_mic_req = Some(Instant::now());
                         dlog!(
                             "[audiohubd] microphone capture died ({why}); \
-                             requesting rebuild via input epoch {epoch}"
+                             requesting microphone rebuild #{n}"
                         );
                     }
                 } else {
-                    last_dead_mic_bump = None;
+                    last_dead_mic_req = None;
                 }
                 continue;
             }
@@ -2473,6 +2476,7 @@ mod spatial_lifecycle_integration_tests {
             next_connection_id: AtomicU64::new(42),
             recon: Mutex::new(HashMap::new()),
             dev_in_epoch: AtomicU64::new(0),
+            mic_rebuild_req: AtomicU64::new(0),
             dev_out_epoch: Arc::new(AtomicU64::new(0)),
             devices: crate::DeviceInventory::with_scanner(|| (Vec::new(), Vec::new())),
             dev_lat: crate::devlats::DevLatCache::new(),
@@ -2902,6 +2906,7 @@ pub(crate) fn tx_loop(
     // is never replaced.
     let hal = inner.hal();
     let mut dev_epoch = inner.dev_in_epoch.load(Ordering::Relaxed);
+    let mut mic_req_seen = inner.mic_rebuild_req.load(Ordering::Acquire);
     let _qos_guard = raise_audio_thread_qos("tx_loop");
     // 本线程的 `dlog!` 从此走入队 + 独立线程落盘。**必须在进循环之前**：
     // 之后这条线程上任何一处 `dlog!`（包括 `halbridge` 里那两条欠载段首/段尾）
@@ -2942,8 +2947,10 @@ pub(crate) fn tx_loop(
         }
         {
             let e = inner.dev_in_epoch.load(Ordering::Relaxed);
-            if e != dev_epoch {
+            let r = inner.mic_rebuild_req.load(Ordering::Acquire);
+            if e != dev_epoch || r != mic_req_seen {
                 dev_epoch = e;
+                mic_req_seen = r;
                 request_mic_rebuild(&mut st);
             }
         }
@@ -9203,28 +9210,23 @@ pub(crate) mod deadline_thread_guards {
         );
     }
 
-    /// A fatal capture callback may only request an input rebuild. Endpoint
-    /// lifecycle noise must never restart the output side or named outputs.
+    /// A dead capture asks only for a microphone rebuild. It must not
+    /// pretend the default input changed (`dev_in_epoch` is a broadcast read
+    /// by capability, facts, inventory and latency consumers) and must never
+    /// touch the output side.
     #[test]
-    fn a_dead_microphone_capture_only_bumps_the_input_epoch() {
+    fn a_dead_microphone_capture_requests_only_a_private_mic_rebuild() {
         let builder = fn_body("pub(crate) fn source_builder_loop(");
         assert!(
             builder.contains("matches!(spec, SourceSpec::Mic) && !cap.is_alive()"),
-            "建源线程没有识别已经死亡的默认麦克风采集"
+            "the builder no longer detects a dead default-microphone capture"
         );
-        assert_eq!(
-            builder.matches("dev_in_epoch.fetch_add(").count(),
-            1,
-            "死亡采集必须且只能通过输入代号请求重建"
-        );
-        assert!(
-            !builder.contains("dev_out_epoch"),
-            "麦克风失效触碰了输出代号，会中断正在播放的声音"
-        );
-        assert!(
-            builder.contains("DEAD_MIC_RETRY"),
-            "死亡采集没有节流重试，设备离线时会形成紧循环"
-        );
+        assert_eq!(builder.matches("mic_rebuild_req.fetch_add(").count(), 1);
+        assert!(!builder.contains("dev_in_epoch"), "a capture death is not a default-input change");
+        assert!(!builder.contains("dev_out_epoch"), "a capture death must not touch the output side");
+        assert!(builder.contains("DEAD_MIC_RETRY"), "dead-capture requests must be throttled");
+        let tx = fn_body("pub(crate) fn tx_loop(");
+        assert!(tx.contains("mic_rebuild_req.load("), "tx_loop never consumes the rebuild request");
     }
 
     fn tone() -> Src {

@@ -676,6 +676,7 @@ pub fn start_daemon(cfg: DaemonCfg) -> Result<DaemonHandle> {
         next_connection_id: AtomicU64::new(1),
         recon: Mutex::new(HashMap::new()),
         dev_in_epoch: AtomicU64::new(0),
+        mic_rebuild_req: AtomicU64::new(0),
         dev_out_epoch: Arc::new(AtomicU64::new(0)),
         devices: DeviceInventory::production(),
         dev_lat: devlats::DevLatCache::new(),
@@ -984,6 +985,12 @@ pub(crate) struct DaemonInner {
     /// `daemon.simulate_device_change`; the tx/mixer/ticker loops each compare
     /// against their own last-seen value, so one event drives every rebuild.
     pub dev_in_epoch: AtomicU64,
+    /// Private rebuild request for the microphone source. Bumped only by the
+    /// source builder when it finds its live default-input capture dead; read
+    /// only by `tx_loop`. Unlike `dev_in_epoch` it says nothing about the
+    /// default device, so it must not drive capability announcements, device
+    /// facts, inventory or latency refreshes.
+    pub(crate) mic_rebuild_req: AtomicU64,
     pub dev_out_epoch: Arc<AtomicU64>,
     pub devices: Arc<DeviceInventory>,
     /// 规格 §3.2 的级 2 `cap_dev` 与级 9 `play_dev`：两个**默认设备**的固有延迟。

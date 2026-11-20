@@ -91,6 +91,7 @@ dependencies = [
  "md-5",
  "num-bigint",
  "num-traits",
+ "objc2",
  "plist",
  "rand",
  "rsa",

@@ -354,6 +354,16 @@ pub struct DaemonSettings {
     /// its built-in Receiver, so this is a fact, not a fixed default.
     #[serde(default)]
     pub airplay_airplay2_port: Option<u16>,
+    /// How many AirPlay senders can play at the same time (mixed locally).
+    /// Absent from an older daemon's reply.
+    #[serde(default)]
+    pub airplay_max_senders: Option<u32>,
+    /// PTP backend a new AirPlay 2 sender would get: `instance` | `system` |
+    /// `portable` | `unavailable`. `None` while the receiver is stopped or the
+    /// backend has not been probed yet. With `system` only one AirPlay 2 (PTP)
+    /// sender can play at a time.
+    #[serde(default)]
+    pub airplay_ptp_backend: Option<String>,
     /// plan M9「开机自启」：这台机器此刻**真的**注册着登录项吗。
     ///
     /// 与它的邻居 `discovery_announce` 不同，这一个**不是存盘的愿望**——它是
@@ -459,6 +469,13 @@ pub struct AirPlaySessionInfo {
     pub artwork_content_type: Option<String>,
     /// How long this sender has been connected, in milliseconds.
     pub connected_ms: u64,
+    /// Timing source of this session: `ntp` | `ptp_instance` | `ptp_system` |
+    /// `ptp_portable`. `ptp_system` means the shared system PTP clock fallback.
+    #[serde(default)]
+    pub timing: Option<String>,
+    /// Reverse volume-sync failure for this sender only.
+    #[serde(default)]
+    pub volume_sync_warning: Option<String>,
 }
 
 /// One versioned artwork response returned by `airplay.artwork.get`.

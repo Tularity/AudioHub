@@ -19,7 +19,7 @@
 //!   event channel as an exact `0..=1` slider plus an independent mute flag;
 //!   authenticated DACP remains a compatibility fallback for older senders.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -31,8 +31,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use audiohub_airplay::{
     is_control_port_bind_error, AirPlayConfig, AirPlayEvent, AirPlayRuntime, MdnsService, PcmBus,
-    PcmRead, PcmReader, Protocol, ReceiverVolumeControlSnapshot, RemoteControlInfo,
+    PcmLanes, PcmReader, Protocol, ReceiverVolumeControlSnapshot, RemoteControlInfo,
     RemoteControlSnapshot, RuntimePhase, SenderVolumeSnapshot, SessionInfo as RuntimeSessionInfo,
+    SessionTiming, AUDIOHUB_FRAME_SAMPLES, MAX_AIRPLAY_LANES,
 };
 use audiohub_ipc::{AirPlayArtwork, AirPlaySessionInfo};
 use base64::prelude::*;
@@ -684,14 +685,24 @@ enum DacpTrySendError {
     Disconnected,
 }
 
+impl std::fmt::Debug for DacpWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DacpWorker")
+            .field("current_serial", &self.current_serial.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
 impl DacpWorker {
-    fn new() -> Self {
+    /// One reverse-volume worker per sender lane. Jobs of one sender complete
+    /// in serial order; a slow sender cannot delay another sender's updates.
+    fn new(lane: u8) -> Self {
         let (job_tx, job_rx) = mpsc::sync_channel::<DacpJob>(1);
         let (outcome_tx, outcome_rx) = mpsc::channel();
         let current_serial = Arc::new(AtomicU64::new(0));
         let worker_serial = Arc::clone(&current_serial);
         let thread = thread::Builder::new()
-            .name("ahb-airplay-volume".to_string())
+            .name(format!("ahb-airplay-volume-{lane}"))
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
                     let mut route = if event_job_authority_current(&job, &worker_serial) {
@@ -1024,6 +1035,7 @@ impl VolumeSync {
         replaced_session
     }
 
+    #[cfg(test)]
     fn ended(&mut self, session_id: Option<u64>) -> bool {
         let Some(session_id) = session_id else {
             return false;
@@ -1067,6 +1079,7 @@ impl VolumeSync {
         self.sender_reported != Some(target) || self.sender_revision != Some(revision)
     }
 
+    #[cfg(test)]
     fn reconcile_sender_snapshot(
         &mut self,
         authoritative: Option<(SessionVolume, u64)>,
@@ -1339,6 +1352,24 @@ impl VolumeSync {
             if let Some(flight) = self.remote_inflight.take() {
                 let _ = flight.write_gate.cancel();
             }
+        }
+    }
+
+    /// Another sender's newer command (or the shared value a newcomer must
+    /// adopt) owns the system volume. Accept this sender's command as what its
+    /// UI shows without writing the system volume; the next native poll then
+    /// reverse-synchronizes it to the shared value. `represented` is what the
+    /// sender is known to show: its own command, or the shared state when its
+    /// report confirmed a fan-out within tolerance.
+    fn adopt_superseded(&mut self, target: SessionVolume, represented: SystemVolumeState) {
+        if self.target != Some(target) {
+            return;
+        }
+        self.retry = None;
+        self.remote_retry = None;
+        self.sender_known_system = Some(represented);
+        if let Some(flight) = self.remote_inflight.take() {
+            let _ = flight.write_gate.cancel();
         }
     }
 
@@ -1740,6 +1771,452 @@ fn reverse_outcome_authority_current(outcome: &DacpOutcome) -> bool {
     }
 }
 
+/// A sender report this close to the shared value confirms a fan-out rather
+/// than issuing a new command. Senders round the value they display; without
+/// this tolerance two senders could keep correcting each other.
+const FANOUT_DB_TOLERANCE: f32 = 0.05;
+
+/// How many AirPlay senders can play (and are mixed) at the same time.
+pub(crate) const MAX_SENDERS: u32 = MAX_AIRPLAY_LANES as u32;
+
+/// Who last set the one shared AirPlay volume (the system output volume).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthoritySource {
+    Sender { session_id: u64 },
+    /// A change made on this machine (keyboard, system UI, another app).
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VolumeAuthority {
+    source: AuthoritySource,
+    /// Receiver-wide order of the last accepted sender command. Sender
+    /// commands at or below it lost the "last command wins" race.
+    order: u64,
+    /// AirPlay dB replayed onto a replacement default output.
+    db: f32,
+    /// Last known system state: readback after our write, or the polled
+    /// local change.
+    state: SystemVolumeState,
+}
+
+/// Per-sender volume state. Each sender has its own echo/tombstone state
+/// machine and its own reverse-volume worker.
+#[derive(Debug)]
+struct VolumeLane {
+    lane: u8,
+    /// Join sequence; a lower value joined earlier (decision Q1).
+    joined: u64,
+    sync: VolumeSync,
+    worker: DacpWorker,
+    /// Reverse volume-sync failure of this sender only.
+    warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SenderWinner {
+    target: SessionVolume,
+    /// The winner's first command since it joined.
+    newcomer: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HubPlan {
+    None,
+    /// Write a sender's command (or replay/retry it) through its lane.
+    Apply {
+        target: SessionVolume,
+        reason: VolumeApplyReason,
+    },
+    /// Replay a shared value whose source is no longer a live sender
+    /// command (a local change, or an ended sender).
+    Replay {
+        authority: VolumeAuthority,
+        attempt: Option<u8>,
+    },
+}
+
+/// One shared AirPlay volume across every playing sender (design §2.7).
+///
+/// The system output volume is the only authority. A sender command applies
+/// when it is the newest one (by receiver-wide `order`); every other sender is
+/// reverse-synchronized to the result by the ordinary native poll, because its
+/// `sender_known_system` no longer matches the system volume. The source of a
+/// command already shows that value and is therefore never written back.
+#[derive(Debug, Default)]
+struct VolumeHub {
+    lanes: BTreeMap<u64, VolumeLane>,
+    authority: Option<VolumeAuthority>,
+    /// Bounded retry of a failed `HubPlan::Replay` write.
+    replay_retry: Option<u8>,
+    next_join: u64,
+}
+
+impl VolumeHub {
+    fn is_synced_with(&self, live: &[u64]) -> bool {
+        self.lanes.len() == live.len() && live.iter().all(|id| self.lanes.contains_key(id))
+    }
+
+    /// Follow the runtime's lane-holding sessions. Removed lanes are returned
+    /// so the caller can drop (join) their workers outside the controller lock.
+    fn sync_lanes(&mut self, live: &[(u64, u8)]) -> Vec<VolumeLane> {
+        let ended: Vec<u64> = self
+            .lanes
+            .keys()
+            .copied()
+            .filter(|id| !live.iter().any(|(live_id, _)| live_id == id))
+            .collect();
+        let removed = ended
+            .into_iter()
+            .filter_map(|id| self.remove_lane(id))
+            .collect();
+        for &(session_id, lane) in live {
+            if self.lanes.contains_key(&session_id) {
+                continue;
+            }
+            let joined = self.next_join;
+            self.next_join += 1;
+            self.lanes.insert(
+                session_id,
+                VolumeLane {
+                    lane,
+                    joined,
+                    sync: VolumeSync::default(),
+                    worker: DacpWorker::new(lane),
+                    warning: None,
+                },
+            );
+        }
+        removed
+    }
+
+    /// End one sender: revoke its queued/active reverse write and forget its
+    /// state. Other senders' workers are untouched.
+    fn remove_lane(&mut self, session_id: u64) -> Option<VolumeLane> {
+        let mut lane = self.lanes.remove(&session_id)?;
+        lane.sync.clear();
+        lane.worker.invalidate();
+        if self.lanes.is_empty() {
+            self.authority = None;
+            self.replay_retry = None;
+        }
+        Some(lane)
+    }
+
+    fn clear(&mut self) -> Vec<VolumeLane> {
+        self.authority = None;
+        self.replay_retry = None;
+        std::mem::take(&mut self.lanes)
+            .into_values()
+            .map(|mut lane| {
+                lane.sync.clear();
+                lane.worker.invalidate();
+                lane
+            })
+            .collect()
+    }
+
+    fn authority_source(&self) -> Option<AuthoritySource> {
+        self.authority.map(|authority| authority.source)
+    }
+
+    fn warning_for(&self, session_id: u64) -> Option<String> {
+        self.lanes.get(&session_id)?.warning.clone()
+    }
+
+    /// The first sender's warning, in lane order.
+    fn first_warning(&self) -> Option<String> {
+        self.lanes
+            .values()
+            .filter(|lane| lane.warning.is_some())
+            .min_by_key(|lane| lane.lane)
+            .and_then(|lane| lane.warning.clone())
+    }
+
+    /// Whether any sender has established a value that a native poll can
+    /// compare against.
+    fn wants_native_poll(&self) -> bool {
+        self.lanes.values().any(|lane| {
+            lane.sync.target.is_some() && lane.sync.sender_known_system.is_some()
+        })
+    }
+
+    /// Consume every sender's lossless volume snapshot and arbitrate:
+    /// the newest command (by `order`) wins and is returned for the system
+    /// write; the others adopt it. A newcomer's first command while an
+    /// earlier sender is playing never changes the system volume (Q1).
+    fn reconcile_senders(
+        &mut self,
+        snapshots: &[SenderVolumeSnapshot],
+        now: Instant,
+    ) -> Option<SenderWinner> {
+        struct Candidate {
+            order: u64,
+            target: SessionVolume,
+            newcomer: bool,
+        }
+        let mut candidates = Vec::new();
+        for snapshot in snapshots {
+            if !snapshot.db.is_finite() {
+                continue;
+            }
+            let Some(lane) = self.lanes.get_mut(&snapshot.session_id) else {
+                continue;
+            };
+            let newcomer = lane.sync.sender_revision.is_none();
+            let reported = SessionVolume {
+                session_id: snapshot.session_id,
+                db: snapshot.db,
+            };
+            match lane
+                .sync
+                .reconcile_sender_snapshot_at(Some((reported, snapshot.revision)), now)
+            {
+                SenderSnapshotDecision::Unchanged => {}
+                SenderSnapshotDecision::ReverseEcho { target } => {
+                    // The sender reflected our reverse write. Its revision was
+                    // consumed while preserving the worker flight.
+                    lane.warning = None;
+                    dlog!(
+                        "[audiohubd] AirPlay reverse volume echo confirmed session={} db={:.2}",
+                        target.session_id,
+                        target.db
+                    );
+                }
+                SenderSnapshotDecision::DeferredRemoteOutcome => {
+                    // Left untouched until the worker outcome resolves it.
+                    lane.warning = None;
+                }
+                SenderSnapshotDecision::Apply { target, .. } => {
+                    // A newer sender value revokes this sender's queued
+                    // reverse writes, and its reverse failure is no longer a
+                    // pending user action.
+                    lane.worker.invalidate();
+                    lane.warning = None;
+                    candidates.push(Candidate {
+                        order: snapshot.order,
+                        target,
+                        newcomer,
+                    });
+                }
+            }
+        }
+        candidates.sort_by_key(|candidate| candidate.order);
+        let mut eligible = Vec::new();
+        for candidate in candidates {
+            let joined = self.lanes[&candidate.target.session_id].joined;
+            let earlier_sender_playing = self
+                .lanes
+                .iter()
+                .any(|(id, lane)| *id != candidate.target.session_id && lane.joined < joined);
+            if candidate.newcomer && earlier_sender_playing {
+                self.adopt(candidate.target, None);
+            } else {
+                eligible.push(candidate);
+            }
+        }
+        let winner = eligible.pop()?;
+        for candidate in eligible {
+            self.adopt(candidate.target, None);
+        }
+        if let Some(authority) = self.authority {
+            if winner.order <= authority.order {
+                // A newer command was already applied (event pump and ticker
+                // race); this one only adopts it.
+                self.adopt(winner.target, None);
+                return None;
+            }
+            if self.lanes.len() >= 2
+                && within_fanout_tolerance(winner.target.db, authority.state.airplay_db())
+            {
+                // The sender confirmed the shared value (rounded by its UI).
+                self.adopt(winner.target, Some(authority.state));
+                if let Some(authority) = self.authority.as_mut() {
+                    authority.order = winner.order;
+                }
+                return None;
+            }
+        }
+        for (id, lane) in self.lanes.iter_mut() {
+            if *id != winner.target.session_id {
+                // A pending write of an older command must not override the
+                // new authority.
+                lane.sync.retry = None;
+            }
+        }
+        self.replay_retry = None;
+        self.authority = Some(VolumeAuthority {
+            source: AuthoritySource::Sender {
+                session_id: winner.target.session_id,
+            },
+            order: winner.order,
+            db: winner.target.db,
+            state: SystemVolumeState::from_sender_db(winner.target.db),
+        });
+        Some(SenderWinner {
+            target: winner.target,
+            newcomer: winner.newcomer,
+        })
+    }
+
+    fn adopt(&mut self, target: SessionVolume, represented: Option<SystemVolumeState>) {
+        if let Some(lane) = self.lanes.get_mut(&target.session_id) {
+            lane.sync.adopt_superseded(
+                target,
+                represented.unwrap_or_else(|| SystemVolumeState::from_sender_db(target.db)),
+            );
+        }
+    }
+
+    /// A replacement default output: every sender re-checks its value once.
+    fn observe_output_change(&mut self) {
+        for (&session_id, lane) in self.lanes.iter_mut() {
+            lane.worker.invalidate();
+            lane.sync.observe_output_change(Some(session_id));
+        }
+    }
+
+    /// Output-change replay (exactly once) or a pending bounded retry of the
+    /// shared value. A live sender authority replays through its own lane so
+    /// its echo/retry bookkeeping is the same as with a single sender.
+    fn plan_authority(&mut self, output_changed: bool) -> HubPlan {
+        let Some(authority) = self.authority else {
+            return HubPlan::None;
+        };
+        if let AuthoritySource::Sender { session_id } = authority.source {
+            if let Some(lane) = self
+                .lanes
+                .get_mut(&session_id)
+                .filter(|lane| lane.sync.target.is_some())
+            {
+                return match lane.sync.plan_tick(Some(session_id), output_changed) {
+                    VolumeTickPlan::Apply {
+                        target,
+                        retry_attempt,
+                    } => HubPlan::Apply {
+                        target,
+                        reason: retry_attempt
+                            .map_or(VolumeApplyReason::OutputChanged, VolumeApplyReason::Retry),
+                    },
+                    VolumeTickPlan::None | VolumeTickPlan::ClearedInactive => HubPlan::None,
+                };
+            }
+        }
+        if output_changed {
+            self.replay_retry = None;
+            return HubPlan::Replay {
+                authority,
+                attempt: None,
+            };
+        }
+        let Some(attempts) = self.replay_retry else {
+            return HubPlan::None;
+        };
+        if attempts >= VOLUME_RETRY_LIMIT {
+            self.replay_retry = None;
+            return HubPlan::None;
+        }
+        self.replay_retry = Some(attempts + 1);
+        HubPlan::Replay {
+            authority,
+            attempt: Some(attempts + 1),
+        }
+    }
+
+    fn is_apply_current(&self, target: SessionVolume) -> bool {
+        self.authority_source()
+            == Some(AuthoritySource::Sender {
+                session_id: target.session_id,
+            })
+            && self
+                .lanes
+                .get(&target.session_id)
+                .is_some_and(|lane| lane.sync.is_current(target, Some(target.session_id)))
+    }
+
+    fn applied(&mut self, target: SessionVolume, applied_scalar: f32) {
+        if let Some(lane) = self.lanes.get_mut(&target.session_id) {
+            lane.sync.succeeded(target);
+        }
+        if let Some(authority) = self.authority.as_mut().filter(|authority| {
+            authority.source
+                == AuthoritySource::Sender {
+                    session_id: target.session_id,
+                }
+        }) {
+            authority.state = SystemVolumeState {
+                scalar: applied_scalar,
+                muted: target.db <= AIRPLAY_VOLUME_MUTE_DB,
+            };
+        }
+    }
+
+    fn apply_failed(&mut self, target: SessionVolume, retry_attempt: Option<u8>) {
+        if let Some(lane) = self.lanes.get_mut(&target.session_id) {
+            lane.sync.failed(target, retry_attempt);
+        }
+    }
+
+    fn replay_applied(&mut self, authority: VolumeAuthority, applied_scalar: f32) {
+        if self.authority != Some(authority) {
+            return;
+        }
+        self.replay_retry = None;
+        if let Some(current) = self.authority.as_mut() {
+            current.state = SystemVolumeState {
+                scalar: applied_scalar,
+                muted: authority.db <= AIRPLAY_VOLUME_MUTE_DB,
+            };
+        }
+    }
+
+    fn replay_failed(&mut self, authority: VolumeAuthority, attempt: Option<u8>) {
+        if self.authority != Some(authority) {
+            return;
+        }
+        if attempt.is_some_and(|attempt| attempt >= VOLUME_RETRY_LIMIT) {
+            self.replay_retry = None;
+        } else if self.replay_retry.is_none() {
+            self.replay_retry = Some(attempt.unwrap_or(0));
+        }
+    }
+
+    /// A polled system value that differs from the authority while none of
+    /// our own writes is pending is a local change: it becomes the shared
+    /// value, and the per-sender polls fan it out to every sender.
+    fn observe_native(&mut self, current: SystemVolumeState) -> bool {
+        let Some(authority) = self.authority else {
+            return false;
+        };
+        if same_reverse_volume(authority.state, current, true) || self.replay_retry.is_some() {
+            return false;
+        }
+        if let AuthoritySource::Sender { session_id } = authority.source {
+            if self.lanes.get(&session_id).is_some_and(|lane| {
+                lane.sync.sender_known_system.is_none() || lane.sync.retry.is_some()
+            }) {
+                return false;
+            }
+        }
+        self.authority = Some(VolumeAuthority {
+            source: AuthoritySource::Local,
+            order: authority.order,
+            db: current.airplay_db(),
+            state: current,
+        });
+        true
+    }
+}
+
+fn within_fanout_tolerance(db: f32, shared_db: f32) -> bool {
+    let muted = db <= AIRPLAY_VOLUME_MUTE_DB;
+    let shared_muted = shared_db <= AIRPLAY_VOLUME_MUTE_DB;
+    if muted || shared_muted {
+        return muted == shared_muted;
+    }
+    (db - shared_db).abs() <= FANOUT_DB_TOLERANCE
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Desired {
     effective_enabled: bool,
@@ -1762,13 +2239,12 @@ struct ControllerState {
     desired: Desired,
     generation: u64,
     runtime: Option<AirPlayRuntime>,
-    bus: Option<PcmBus>,
+    lanes: Option<PcmLanes>,
     mdns: Option<AirPlayMdnsGuard>,
     event_thread: Option<JoinHandle<()>>,
     error: Option<String>,
     native_volume_warning: Option<String>,
-    dacp_warning: Option<String>,
-    volume: VolumeSync,
+    volume: VolumeHub,
 }
 
 /// Actual receiver facts used by `settings.get`.
@@ -1778,6 +2254,7 @@ pub(crate) struct LiveStatus {
     pub error: Option<String>,
     pub warning: Option<String>,
     pub airplay2_port: Option<u16>,
+    pub ptp_backend: Option<String>,
 }
 
 /// Owns the currently running receiver. Reconfiguration is serialized because
@@ -1795,16 +2272,51 @@ pub(crate) struct AirPlayController {
     /// discovery caches do not retain a now-dead ephemeral port after a daemon
     /// restart or an in-place app redeploy.
     airplay2_port_path: PathBuf,
-    // Changes whenever `state.bus` is replaced. The 10 ms mixer path checks
+    // Changes whenever `state.lanes` is replaced. The 10 ms mixer path checks
     // this atomic first and only takes the controller mutex on a replacement.
     bus_epoch: AtomicU64,
     // System volume writes can be initiated by the protocol event pump and the
     // ordinary 200 ms ticker. Serialize them without holding `state` across OS IO.
     volume_apply_lock: Mutex<()>,
     dacp_serial: AtomicU64,
-    dacp: DacpWorker,
     reconcile_lock: Mutex<()>,
     state: Mutex<ControllerState>,
+}
+
+/// Follow the runtime's lane-holding sessions in the volume hub. Removed
+/// lanes must be dropped by the caller after releasing the controller lock:
+/// dropping joins the lane's reverse-volume worker.
+fn sync_volume_lanes(state: &mut ControllerState) -> Vec<VolumeLane> {
+    let Some(runtime) = state.runtime.as_ref() else {
+        return state.volume.clear();
+    };
+    if state.volume.is_synced_with(&runtime.live_session_ids()) {
+        return Vec::new();
+    }
+    let live: Vec<(u64, u8)> = runtime
+        .status()
+        .sessions
+        .into_iter()
+        .filter_map(|session| Some((session.id, session.lane?)))
+        .collect();
+    state.volume.sync_lanes(&live)
+}
+
+/// Consume every sender's volume snapshot; returns the command that must be
+/// written to the system volume, if any.
+fn reconcile_sender_volumes(state: &mut ControllerState) -> Option<SessionVolume> {
+    let snapshots = state
+        .runtime
+        .as_ref()
+        .map(AirPlayRuntime::sender_volume_snapshots)
+        .unwrap_or_default();
+    let winner = state.volume.reconcile_senders(&snapshots, Instant::now())?;
+    if winner.newcomer {
+        // A newly joined sender must not inherit a warning produced for the
+        // command of a previous one.
+        state.native_volume_warning = None;
+    }
+    Some(winner.target)
 }
 
 impl AirPlayController {
@@ -1819,7 +2331,6 @@ impl AirPlayController {
             bus_epoch: AtomicU64::new(1),
             volume_apply_lock: Mutex::new(()),
             dacp_serial: AtomicU64::new(1),
-            dacp: DacpWorker::new(),
             reconcile_lock: Mutex::new(()),
             state: Mutex::new(ControllerState {
                 desired: Desired {
@@ -1830,13 +2341,12 @@ impl AirPlayController {
                 },
                 generation: 0,
                 runtime: None,
-                bus: None,
+                lanes: None,
                 mdns: None,
                 event_thread: None,
                 error: None,
                 native_volume_warning: None,
-                dacp_warning: None,
-                volume: VolumeSync::default(),
+                volume: VolumeHub::default(),
             }),
         })
     }
@@ -1883,27 +2393,27 @@ impl AirPlayController {
 
         // Withdraw discovery before stopping the listener. A sender must not
         // discover a port in the interval where it is being torn down.
-        let (old_mdns, old_runtime, old_events, generation) = {
+        let (old_mdns, old_runtime, old_events, old_lanes, generation) = {
             let mut state = lk(&self.state);
             state.generation = state.generation.wrapping_add(1).max(1);
             state.desired = desired.clone();
-            state.bus = None;
+            state.lanes = None;
             self.bus_epoch.fetch_add(1, Ordering::Release);
             state.error = None;
             state.native_volume_warning = None;
-            state.dacp_warning = None;
-            state.volume.clear();
-            // Polling plans and queues DACP work under this same state lock.
-            // Invalidate only after clearing state so every older enqueue is
-            // ordered before (and therefore cancelled by) this store.
-            self.dacp.invalidate();
+            // Polling plans and queues reverse work under this same state
+            // lock. Each lane is invalidated after its state is cleared, so
+            // every older enqueue is ordered before (and cancelled by) it.
+            let old_lanes = state.volume.clear();
             (
                 state.mdns.take(),
                 state.runtime.take(),
                 state.event_thread.take(),
+                old_lanes,
                 state.generation,
             )
         };
+        drop(old_lanes);
         drop(old_mdns);
         if let Some(runtime) = old_runtime {
             if let Err(e) = runtime.stop() {
@@ -1948,7 +2458,7 @@ impl AirPlayController {
             }
         };
         let events = runtime.subscribe_events();
-        let bus = runtime.pcm_bus();
+        let lanes = runtime.pcm_lanes();
 
         let mdns = if self.advertise {
             match AirPlayMdnsGuard::register(runtime.mdns_services()) {
@@ -1974,7 +2484,7 @@ impl AirPlayController {
                 let _ = runtime.stop();
                 return;
             }
-            state.bus = Some(bus);
+            state.lanes = Some(lanes);
             self.bus_epoch.fetch_add(1, Ordering::Release);
             state.runtime = Some(runtime);
             state.mdns = mdns;
@@ -1983,20 +2493,19 @@ impl AirPlayController {
         match self.spawn_event_pump(generation, events) {
             Ok(handle) => lk(&self.state).event_thread = Some(handle),
             Err(e) => {
-                let (mdns, runtime) = {
+                let (mdns, runtime, old_lanes) = {
                     let mut state = lk(&self.state);
-                    state.bus = None;
-                    state.volume.clear();
+                    state.lanes = None;
+                    // A ticker can observe the lanes during the narrow
+                    // interval between installing the runtime and spawning
+                    // this pump. Clearing the hub cancels any job it planned.
+                    let old_lanes = state.volume.clear();
                     state.native_volume_warning = None;
-                    state.dacp_warning = None;
-                    // A ticker can observe the bus during the narrow interval
-                    // between installing the runtime and spawning this pump.
-                    // Cancel any job it planned with that now-defunct token.
-                    self.dacp.invalidate();
                     self.bus_epoch.fetch_add(1, Ordering::Release);
                     state.error = Some(format!("AirPlay 事件线程启动失败：{e}"));
-                    (state.mdns.take(), state.runtime.take())
+                    (state.mdns.take(), state.runtime.take(), old_lanes)
                 };
+                drop(old_lanes);
                 drop(mdns);
                 if let Some(runtime) = runtime {
                     let _ = runtime.stop();
@@ -2032,122 +2541,84 @@ impl AirPlayController {
                             db: event_db,
                             ..
                         } => {
-                            let target = {
+                            // The bounded event is only a wakeup: the runtime
+                            // installs every sender's lossless snapshot before
+                            // publishing it, and all of them are reconciled
+                            // here so the newest command wins.
+                            let (winner, removed) = {
                                 let mut state = lk(&controller.state);
                                 if state.generation != generation {
                                     return;
                                 }
-                                let active_session =
-                                    state.bus.as_ref().and_then(PcmBus::active_session);
-                                let sender_snapshot = state
-                                    .runtime
-                                    .as_ref()
-                                    .and_then(AirPlayRuntime::sender_volume_snapshot);
-                                let authoritative = authoritative_volume_target(
-                                    sender_snapshot,
-                                    active_session,
-                                );
-                                let Some((target, revision)) = authoritative else {
-                                    dlog!(
-                                        "[audiohubd] ignoring AirPlay volume wakeup db={event_db:.2} for session {:?} (active {:?}, no authoritative sender snapshot)",
-                                        event_session_id,
-                                        active_session
-                                    );
-                                    continue;
-                                };
-                                let (target, replaced_session) = match state
-                                    .volume
-                                    .reconcile_sender_snapshot(Some((target, revision)))
+                                let removed = sync_volume_lanes(&mut state);
+                                let winner = reconcile_sender_volumes(&mut state);
+                                if winner.is_none()
+                                    && event_session_id
+                                        .is_none_or(|id| !state.volume.lanes.contains_key(&id))
                                 {
-                                    SenderSnapshotDecision::Unchanged => {
-                                        // The event queue is bounded and asynchronous.
-                                        // Treat its payload only as a wakeup: a delayed
-                                        // event whose lossless revision was already
-                                        // consumed must not roll a newer reverse-volume
-                                        // success back to the old sender value.
-                                        continue;
-                                    }
-                                    SenderSnapshotDecision::ReverseEcho { target } => {
-                                        // The sender reflected our in-flight DACP value
-                                        // before completing the HTTP response. The state
-                                        // machine consumed its revision while preserving
-                                        // the worker flight, so neither native IO nor
-                                        // serial invalidation belongs on this path.
-                                        state.dacp_warning = None;
-                                        dlog!(
-                                            "[audiohubd] AirPlay reverse volume echo confirmed session={} db={:.2}",
-                                            target.session_id,
-                                            target.db
-                                        );
-                                        continue;
-                                    }
-                                    SenderSnapshotDecision::DeferredRemoteOutcome => {
-                                        // The worker has write authorization but
-                                        // has not yet proved a complete request.
-                                        // Leave the lossless snapshot untouched;
-                                        // the next outcome/tick resolves whether
-                                        // this was an echo or a sender command.
-                                        continue;
-                                    }
-                                    SenderSnapshotDecision::Apply {
-                                        target,
-                                        replaced_session,
-                                    } => (target, replaced_session),
-                                };
-                                // Runtime installs the lossless snapshot before
-                                // publishing the event. Adopting that snapshot
-                                // under `state` gives the current command a stable
-                                // identity and keeps the event path low-latency.
-                                // Invalidate every older queued reverse write only
-                                // when a new snapshot revision was actually adopted.
-                                controller.dacp.invalidate();
-                                if replaced_session {
-                                    // A replacement sender must not inherit a
-                                    // warning produced for the previous one.
-                                    state.native_volume_warning = None;
+                                    dlog!(
+                                        "[audiohubd] ignoring AirPlay volume wakeup db={event_db:.2} for session {:?} (not a playing sender)",
+                                        event_session_id
+                                    );
                                 }
-                                // The sender just established a newer value, so
-                                // any reverse-direction failure is no longer a
-                                // pending user action.
-                                state.dacp_warning = None;
-                                target
+                                (winner, removed)
                             };
-                            controller.apply_volume_target(
-                                generation,
-                                target,
-                                VolumeApplyReason::SenderEvent,
-                            );
+                            drop(removed);
+                            if let Some(target) = winner {
+                                controller.apply_volume_target(
+                                    generation,
+                                    target,
+                                    VolumeApplyReason::SenderEvent,
+                                );
+                            }
                         }
                         AirPlayEvent::SessionEnded { session_id, .. } => {
-                            let mut state = lk(&controller.state);
-                            if state.generation != generation {
-                                return;
-                            }
-                            if state.volume.ended(session_id) {
-                                controller.dacp.invalidate();
-                                state.native_volume_warning = None;
-                                state.dacp_warning = None;
-                            }
+                            let removed = {
+                                let mut state = lk(&controller.state);
+                                if state.generation != generation {
+                                    return;
+                                }
+                                let still_live = session_id.is_some_and(|id| {
+                                    state
+                                        .runtime
+                                        .as_ref()
+                                        .is_some_and(|runtime| runtime.live_session_ids().contains(&id))
+                                });
+                                match session_id.filter(|_| !still_live) {
+                                    Some(id) => {
+                                        let was_authority = state.volume.authority_source()
+                                            == Some(AuthoritySource::Sender { session_id: id });
+                                        let removed = state.volume.remove_lane(id);
+                                        if removed.is_some()
+                                            && (was_authority || state.volume.lanes.is_empty())
+                                        {
+                                            state.native_volume_warning = None;
+                                        }
+                                        removed
+                                    }
+                                    None => None,
+                                }
+                            };
+                            drop(removed);
                         }
                         AirPlayEvent::RuntimeFailed { message } => {
-                            let mdns = {
+                            let (mdns, removed) = {
                                 let mut state = lk(&controller.state);
                                 if state.generation != generation {
                                     return;
                                 }
                                 state.error = Some(format!("AirPlay 接收器运行失败：{message}"));
-                                state.bus = None;
-                                state.volume.clear();
-                                state.native_volume_warning = None;
-                                state.dacp_warning = None;
-                                // Runtime failure ends the authority of this
+                                state.lanes = None;
+                                // Runtime failure ends the authority of every
                                 // session and its bearer token. Polling queues
                                 // under the same state lock, so this cancels
                                 // every older job before the lock is released.
-                                controller.dacp.invalidate();
+                                let removed = state.volume.clear();
+                                state.native_volume_warning = None;
                                 controller.bus_epoch.fetch_add(1, Ordering::Release);
-                                state.mdns.take()
+                                (state.mdns.take(), removed)
                             };
+                            drop(removed);
                             // Stop advertising a listener that died.
                             drop(mdns);
                         }
@@ -2166,21 +2637,19 @@ impl AirPlayController {
         let _serial = lk(&self.volume_apply_lock);
         {
             let state = lk(&self.state);
-            let active = state.bus.as_ref().and_then(PcmBus::active_session);
-            if state.generation != generation || !state.volume.is_current(target, active) {
+            if state.generation != generation || !state.volume.is_apply_current(target) {
                 return;
             }
         }
 
         let result = apply_system_volume(target.db);
         let mut state = lk(&self.state);
-        let active = state.bus.as_ref().and_then(PcmBus::active_session);
-        if state.generation != generation || !state.volume.is_current(target, active) {
+        if state.generation != generation || !state.volume.is_apply_current(target) {
             return;
         }
         match result {
             Ok(applied) => {
-                state.volume.succeeded(target);
+                state.volume.applied(target, applied);
                 state.native_volume_warning = None;
                 match reason {
                     VolumeApplyReason::SenderEvent => dlog!(
@@ -2206,7 +2675,7 @@ impl AirPlayController {
                 }
             }
             Err(error) => {
-                state.volume.failed(target, reason.retry_attempt());
+                state.volume.apply_failed(target, reason.retry_attempt());
                 let message = format!("AirPlay 音量同步失败：{error:#}");
                 dlog!(
                     "[audiohubd] {message} (session={} db={:.2} reason={reason:?})",
@@ -2225,26 +2694,62 @@ impl AirPlayController {
         }
     }
 
+    /// Replay a shared value that no live sender command owns (a local change
+    /// or an ended sender) onto the current default output.
+    fn apply_volume_replay(&self, generation: u64, authority: VolumeAuthority, attempt: Option<u8>) {
+        let _serial = lk(&self.volume_apply_lock);
+        {
+            let state = lk(&self.state);
+            if state.generation != generation || state.volume.authority != Some(authority) {
+                return;
+            }
+        }
+        let result = apply_system_volume(authority.db);
+        let mut state = lk(&self.state);
+        if state.generation != generation || state.volume.authority != Some(authority) {
+            return;
+        }
+        match result {
+            Ok(applied) => {
+                state.volume.replay_applied(authority, applied);
+                state.native_volume_warning = None;
+                dlog!(
+                    "[audiohubd] AirPlay shared volume reapplied db={:.2} attempt={attempt:?} applied_scalar={applied:.6}",
+                    authority.db
+                );
+            }
+            Err(error) => {
+                state.volume.replay_failed(authority, attempt);
+                let message = format!("AirPlay 音量同步失败：{error:#}");
+                dlog!(
+                    "[audiohubd] {message} (shared db={:.2} attempt={attempt:?})",
+                    authority.db
+                );
+                state.native_volume_warning = Some(message);
+            }
+        }
+    }
+
     pub(crate) fn stop(&self) {
         let _serial = lk(&self.reconcile_lock);
-        let (mdns, runtime, events) = {
+        let (mdns, runtime, events, old_lanes) = {
             let mut state = lk(&self.state);
             state.generation = state.generation.wrapping_add(1).max(1);
-            state.bus = None;
+            state.lanes = None;
             self.bus_epoch.fetch_add(1, Ordering::Release);
             state.error = None;
             state.native_volume_warning = None;
-            state.dacp_warning = None;
-            state.volume.clear();
             // See `reconcile`: this must be later than every old enqueue under
             // the same state lock, including one racing with shutdown.
-            self.dacp.invalidate();
+            let old_lanes = state.volume.clear();
             (
                 state.mdns.take(),
                 state.runtime.take(),
                 state.event_thread.take(),
+                old_lanes,
             )
         };
+        drop(old_lanes);
         drop(mdns);
         if let Some(runtime) = runtime {
             if let Err(e) = runtime.stop() {
@@ -2271,8 +2776,9 @@ impl AirPlayController {
             warning: state
                 .native_volume_warning
                 .clone()
-                .or_else(|| state.dacp_warning.clone()),
+                .or_else(|| state.volume.first_warning()),
             airplay2_port: runtime_status.as_ref().and_then(|s| s.airplay2_port),
+            ptp_backend: runtime_status.and_then(|s| s.ptp_backend),
         }
     }
 
@@ -2286,7 +2792,10 @@ impl AirPlayController {
             .status()
             .sessions
             .into_iter()
-            .map(|session| session_view(session, now))
+            .map(|session| {
+                let warning = state.volume.warning_for(session.id);
+                session_view(session, now, warning)
+            })
             .collect()
     }
 
@@ -2309,18 +2818,18 @@ impl AirPlayController {
         })
     }
 
+    /// Whether any sender currently owns a PCM lane.
     pub(crate) fn has_active_session(&self) -> bool {
         lk(&self.state)
-            .bus
+            .lanes
             .as_ref()
-            .and_then(PcmBus::active_session)
-            .is_some()
+            .is_some_and(PcmLanes::any_active)
     }
 
     /// Ordinary 200 ms control-ticker hook. Runtime status is authoritative for
-    /// the latest sender volume, so this also repairs a final volume event that
-    /// could not enter the bounded observer queue. A default-output replacement
-    /// reapplies the active sender's last command; otherwise it only performs a
+    /// every sender's latest volume, so this also repairs a final volume event
+    /// that could not enter the bounded observer queue. A default-output
+    /// replacement replays the shared value once; otherwise it only performs a
     /// bounded retry that an earlier native write explicitly left pending.
     pub(crate) fn volume_tick(
         &self,
@@ -2331,86 +2840,37 @@ impl AirPlayController {
         let output_lease = OutputEpochLease::new(expected_output_epoch, output_epoch);
         // The watcher can fire after the ticker sampled `expected_output_epoch`
         // but before control reaches us. Treat that exactly like a change seen
-        // by the ticker: replay sender authority before any reverse read.
+        // by the ticker: replay the shared value before any reverse read.
         let output_changed = output_changed || !output_lease.is_current();
-        self.refresh_dacp_authority();
+        drop(self.refresh_dacp_authority());
         self.finish_dacp_outcomes();
-        let (generation, plan, reconciled) = {
+        let (generation, plan) = {
             let mut state = lk(&self.state);
-            let active = state.bus.as_ref().and_then(PcmBus::active_session);
             if output_changed {
-                self.dacp.invalidate();
-                state.volume.observe_output_change(active);
+                state.volume.observe_output_change();
             }
             let generation = state.generation;
-            let authoritative = authoritative_volume_target(
-                state
-                    .runtime
-                    .as_ref()
-                    .and_then(AirPlayRuntime::sender_volume_snapshot),
-                active,
-            );
-            let decision = state.volume.reconcile_sender_snapshot(authoritative);
-            let (plan, reconciled) = match decision {
-                SenderSnapshotDecision::Apply {
+            let plan = match reconcile_sender_volumes(&mut state) {
+                Some(target) => HubPlan::Apply {
                     target,
-                    replaced_session,
-                } => {
-                    self.dacp.invalidate();
-                    if replaced_session {
-                        state.native_volume_warning = None;
-                    }
-                    state.dacp_warning = None;
-                    (
-                        VolumeTickPlan::Apply {
-                            target,
-                            retry_attempt: None,
-                        },
-                        true,
-                    )
-                }
-                SenderSnapshotDecision::ReverseEcho { .. }
-                | SenderSnapshotDecision::DeferredRemoteOutcome => {
-                    state.dacp_warning = None;
-                    let plan = if output_changed {
-                        // Replay the current target to the replacement endpoint
-                        // before any native read. The echoed/deferred payload may
-                        // be an older value than the authority retained in target.
-                        state.volume.plan_tick(active, true)
-                    } else {
-                        VolumeTickPlan::None
-                    };
-                    (plan, false)
-                }
-                SenderSnapshotDecision::Unchanged => {
-                    (state.volume.plan_tick(active, output_changed), false)
-                }
+                    reason: VolumeApplyReason::StatusReconcile,
+                },
+                // An echoed/deferred payload may be older than the authority,
+                // so a replacement output replays the authority itself.
+                None => state.volume.plan_authority(output_changed),
             };
-            if plan == VolumeTickPlan::ClearedInactive {
-                // SessionEnded is a bounded observer event and can be dropped.
-                // This ticker fallback must revoke queued bearer use as well as
-                // clear logical volume state.
-                self.dacp.invalidate();
-                state.native_volume_warning = None;
-                state.dacp_warning = None;
-            }
-            (generation, plan, reconciled)
+            (generation, plan)
         };
-        if let VolumeTickPlan::Apply {
-            target,
-            retry_attempt,
-        } = plan
-        {
-            let reason = if reconciled {
-                VolumeApplyReason::StatusReconcile
-            } else {
-                retry_attempt.map_or(VolumeApplyReason::OutputChanged, VolumeApplyReason::Retry)
-            };
-            self.apply_volume_target(generation, target, reason);
-            return;
-        }
-        if plan == VolumeTickPlan::ClearedInactive {
-            return;
+        match plan {
+            HubPlan::Apply { target, reason } => {
+                self.apply_volume_target(generation, target, reason);
+                return;
+            }
+            HubPlan::Replay { authority, attempt } => {
+                self.apply_volume_replay(generation, authority, attempt);
+                return;
+            }
+            HubPlan::None => {}
         }
         if let Some(observed_epoch) = self.poll_native_volume_for_sender(output_lease.clone()) {
             // A replacement raced this reverse poll. Re-enter only the normal
@@ -2420,156 +2880,58 @@ impl AirPlayController {
         }
     }
 
-    fn refresh_dacp_authority(&self) {
+    /// Follow lane changes, then observe every sender's reverse-route lease.
+    /// Returns the removed lanes for dropping outside the lock.
+    fn refresh_dacp_authority(&self) -> Vec<VolumeLane> {
         let mut state = lk(&self.state);
-        let active = state.bus.as_ref().and_then(PcmBus::active_session);
-        let remote = state.runtime.as_ref().and_then(|runtime| {
-            runtime
-                .receiver_volume_control_snapshot()
+        let removed = sync_volume_lanes(&mut state);
+        let ControllerState {
+            runtime,
+            mdns,
+            volume,
+            ..
+        } = &mut *state;
+        let Some(runtime) = runtime.as_ref() else {
+            return removed;
+        };
+        for (&session_id, lane) in volume.lanes.iter_mut() {
+            let remote = runtime
+                .receiver_volume_control_snapshot(session_id)
                 .filter(ReceiverVolumeControlSnapshot::is_current)
                 .map(|snapshot| (snapshot.session_id(), snapshot.revision(), u64::MAX))
                 .or_else(|| {
                     let snapshot = runtime
-                        .active_remote_control_snapshot()
+                        .remote_control_snapshot(session_id)
                         .filter(RemoteControlSnapshot::is_current)?;
-                    let endpoint = state.mdns.as_ref()?.dacp_endpoint(snapshot.info())?;
+                    let endpoint = mdns.as_ref()?.dacp_endpoint(snapshot.info())?;
                     Some((
                         snapshot.info().session_id,
                         snapshot.revision(),
                         endpoint.revision,
                     ))
-                })
-        });
-        if state.volume.observe_remote_revision(active, remote) {
-            // Jobs queued under any previous revision must fail their serial
-            // guard even if the secret refresh raced between network return
-            // and outcome consumption. The revision tracker also forces one
-            // current-native reassertion on the fresh lease next tick.
-            self.dacp.invalidate();
-            state.dacp_warning = None;
+                });
+            if lane.sync.observe_remote_revision(Some(session_id), remote) {
+                // Jobs queued under any previous revision must fail their
+                // serial guard even if the secret refresh raced between
+                // network return and outcome consumption. The revision tracker
+                // also forces one current-native reassertion on the fresh
+                // lease next tick.
+                lane.worker.invalidate();
+                lane.warning = None;
+            }
         }
+        removed
     }
 
     fn finish_dacp_outcomes(&self) {
-        for outcome in self.dacp.drain_outcomes() {
-            let mut state = lk(&self.state);
-            let active = state.bus.as_ref().and_then(PcmBus::active_session);
-            if state.generation != outcome.generation || active != Some(outcome.session_id) {
-                // A request from the previous session/generation can finish
-                // after a fast reconnect. If it may have reached the sender,
-                // arm one harmless correction using the current session's
-                // credentials once that sender has established its value.
-                if outcome.result.may_have_written_request(&outcome.write_gate) {
-                    state.volume.stale_remote_may_have_reached_sender();
-                }
-                continue;
-            }
-            if reject_revoked_dacp_outcome(
-                &mut state.volume,
-                outcome.serial,
-                &outcome.result,
-                &outcome.write_gate,
-                reverse_outcome_authority_current(&outcome),
-            ) {
-                continue;
-            }
-            let may_have_written = outcome.result.may_have_written_request(&outcome.write_gate);
-            let result = match outcome.result {
-                DacpOutcomeResult::Superseded => {
-                    state.volume.remote_superseded(outcome.serial);
-                    continue;
-                }
-                DacpOutcomeResult::RevokedAfterPossibleWrite => {
-                    state
-                        .volume
-                        .remote_revoked_after_possible_write(outcome.serial);
-                    continue;
-                }
-                DacpOutcomeResult::Sent(result) => result,
-            };
-            // The runtime installs its lossless sender snapshot before it
-            // publishes the bounded event wakeup. If the matching RTSP echo is
-            // already present, consume it while this exact flight still owns
-            // its serial. `remote_result` clears the flight below; waiting
-            // until the ordinary reconciliation phase would misclassify the
-            // echo as a fresh sender command.
-            let authoritative = authoritative_volume_target(
-                state
-                    .runtime
-                    .as_ref()
-                    .and_then(AirPlayRuntime::sender_volume_snapshot),
-                active,
-            );
-            if may_have_written {
-                if let Some(target) = state
-                    .volume
-                    .confirm_remote_echo(authoritative, Some(outcome.serial))
-                {
-                    state.dacp_warning = None;
-                    dlog!(
-                        "[audiohubd] AirPlay reverse volume echo confirmed before DACP outcome session={} db={:.2}",
-                        target.session_id,
-                        target.db
-                    );
-                }
-            }
-            let http_success = result.is_ok();
-            let Some(completion) = state.volume.remote_result_classified_at(
-                outcome.serial,
-                http_success,
-                may_have_written,
-                Instant::now(),
-            ) else {
-                // The job was already on the wire when a newer sender command
-                // invalidated it. Both an HTTP success and an error after a
-                // possible `write_all` are uncertain stale writes; force one
-                // correction to the current native value after that newer
-                // command finishes applying. `Superseded` was filtered above
-                // and is the only outcome known not to have written bytes.
-                if may_have_written {
-                    state.volume.stale_remote_may_have_reached_sender();
-                } else {
-                    state.volume.remote_superseded(outcome.serial);
-                }
-                continue;
-            };
-            let flight = completion.flight;
-            match result {
-                Ok(()) => {
-                    state.dacp_warning = None;
-                    let route = match outcome.route {
-                        ReverseVolumeRoute::Event => "AP2 event",
-                        ReverseVolumeRoute::Dacp => "DACP",
-                    };
-                    dlog!(
-                        "[audiohubd] AirPlay {route} volume request accepted session={} db={:.2}",
-                        outcome.session_id,
-                        outcome.db
-                    );
-                }
-                Err(error) if completion.delivered => {
-                    // Some DACP receivers reflect the accepted value through
-                    // RTSP before the HTTP response is complete. That echo is
-                    // stronger delivery evidence than a later response-read
-                    // failure, so do not show a false warning or retry it.
-                    state.dacp_warning = None;
-                    dlog!(
-                        "[audiohubd] AirPlay DACP volume confirmed by RTSP echo session={} db={:.2} (HTTP completion failed: {error})",
-                        outcome.session_id,
-                        outcome.db
-                    );
-                }
-                Err(error) => {
-                    let message = format!("AirPlay 反向音量同步失败：{error}");
-                    state.dacp_warning = Some(message.clone());
-                    dlog!(
-                        "[audiohubd] {message} (session={} db={:.2} attempt={}/{})",
-                        outcome.session_id,
-                        outcome.db,
-                        flight.attempt,
-                        DACP_VOLUME_RETRY_LIMIT
-                    );
-                }
+        let mut state = lk(&self.state);
+        let generation = state.generation;
+        let ControllerState {
+            runtime, volume, ..
+        } = &mut *state;
+        for (&session_id, lane) in volume.lanes.iter_mut() {
+            for outcome in lane.worker.drain_outcomes() {
+                finish_lane_outcome(generation, session_id, runtime.as_ref(), lane, outcome);
             }
         }
     }
@@ -2582,16 +2944,7 @@ impl AirPlayController {
         // observing between them would manufacture a local change that never
         // existed and echo it back over DACP.
         let _serial = lk(&self.volume_apply_lock);
-        let should_poll = {
-            let state = lk(&self.state);
-            let active = state.bus.as_ref().and_then(PcmBus::active_session);
-            state
-                .volume
-                .target
-                .is_some_and(|target| active == Some(target.session_id))
-                && state.volume.sender_known_system.is_some()
-        };
-        if !should_poll {
+        if !lk(&self.state).volume.wants_native_poll() {
             return None;
         }
 
@@ -2609,85 +2962,102 @@ impl AirPlayController {
             return Some(output_epoch.observed());
         }
         let generation = state.generation;
-        let active = state.bus.as_ref().and_then(PcmBus::active_session);
-        let event_control = state
-            .runtime
-            .as_ref()
-            .and_then(AirPlayRuntime::receiver_volume_control_snapshot)
-            .filter(|control| active == Some(control.session_id()) && control.is_current());
-        let dacp_route = state
-            .runtime
-            .as_ref()
-            .and_then(AirPlayRuntime::active_remote_control_snapshot)
-            .filter(|remote| active == Some(remote.info().session_id) && remote.is_current())
-            .and_then(|remote| {
-                let endpoint = state
-                    .mdns
-                    .as_ref()
-                    .and_then(|mdns| mdns.dacp_endpoint(remote.info()))?;
-                Some((remote, endpoint))
-            });
-        let (remote_control, endpoint) = match dacp_route {
-            Some((remote, endpoint)) => (Some(remote), Some(endpoint)),
-            None => (None, None),
-        };
-        if event_control.is_none() && remote_control.is_none() {
-            return None;
+        let ControllerState {
+            runtime,
+            mdns,
+            volume,
+            ..
+        } = &mut *state;
+        if volume.observe_native(current) {
+            dlog!(
+                "[audiohubd] AirPlay shared volume changed locally scalar={:.6} muted={}",
+                current.scalar,
+                current.muted
+            );
         }
-        let preserve_muted_scalar = event_control.is_some();
-        if state
-            .volume
-            .settle_remote_if_converged_for_route(active, current, preserve_muted_scalar)
-        {
-            // A failed reverse write is no longer a pending user action once
-            // the native endpoint naturally returns to the value the sender
-            // already represents.
-            state.dacp_warning = None;
-            return None;
-        }
-        let serial = self.dacp_serial.fetch_add(1, Ordering::Relaxed).max(1);
-        let flight =
-            state
-                .volume
-                .plan_remote_for_route(active, current, serial, preserve_muted_scalar)?;
-        if !output_epoch.is_current() {
-            return Some(output_epoch.observed());
-        }
-        let job = DacpJob {
-            serial,
-            generation,
-            session_id: active.expect("reverse volume plan requires an active session"),
-            endpoint,
-            remote_control,
-            event_control,
-            output_epoch,
-            db: flight.db,
-            scalar: current.scalar,
-            muted: current.muted,
-            write_gate: flight.write_gate.clone(),
-        };
-        match self.dacp.try_send(job) {
-            Ok(()) => state.volume.remote_queued(flight),
-            Err(DacpTrySendError::Full) => {
-                // Latest native read wins: leave the state unarmed and retry
-                // after the one in-flight network request has completed.
+        let runtime = runtime.as_ref()?;
+        for (&session_id, lane) in volume.lanes.iter_mut() {
+            let event_control = runtime
+                .receiver_volume_control_snapshot(session_id)
+                .filter(|control| control.session_id() == session_id && control.is_current());
+            let dacp_route = runtime
+                .remote_control_snapshot(session_id)
+                .filter(|remote| remote.info().session_id == session_id && remote.is_current())
+                .and_then(|remote| {
+                    let endpoint = mdns
+                        .as_ref()
+                        .and_then(|mdns| mdns.dacp_endpoint(remote.info()))?;
+                    Some((remote, endpoint))
+                });
+            let (remote_control, endpoint) = match dacp_route {
+                Some((remote, endpoint)) => (Some(remote), Some(endpoint)),
+                None => (None, None),
+            };
+            if event_control.is_none() && remote_control.is_none() {
+                continue;
             }
-            Err(DacpTrySendError::Disconnected) => {
-                state.dacp_warning = Some("AirPlay 反向音量线程已停止".to_string());
+            let preserve_muted_scalar = event_control.is_some();
+            if lane.sync.settle_remote_if_converged_for_route(
+                Some(session_id),
+                current,
+                preserve_muted_scalar,
+            ) {
+                // A failed reverse write is no longer a pending user action
+                // once the native endpoint naturally returns to the value the
+                // sender already represents.
+                lane.warning = None;
+                continue;
+            }
+            let serial = self.dacp_serial.fetch_add(1, Ordering::Relaxed).max(1);
+            let Some(flight) = lane.sync.plan_remote_for_route(
+                Some(session_id),
+                current,
+                serial,
+                preserve_muted_scalar,
+            ) else {
+                continue;
+            };
+            if !output_epoch.is_current() {
+                return Some(output_epoch.observed());
+            }
+            let job = DacpJob {
+                serial,
+                generation,
+                session_id,
+                endpoint,
+                remote_control,
+                event_control,
+                output_epoch: output_epoch.clone(),
+                db: flight.db,
+                scalar: current.scalar,
+                muted: current.muted,
+                write_gate: flight.write_gate.clone(),
+            };
+            match lane.worker.try_send(job) {
+                Ok(()) => lane.sync.remote_queued(flight),
+                Err(DacpTrySendError::Full) => {
+                    // Latest native read wins: leave the state unarmed and
+                    // retry after the one in-flight network request completed.
+                }
+                Err(DacpTrySendError::Disconnected) => {
+                    lane.warning = Some("AirPlay 反向音量线程已停止".to_string());
+                }
             }
         }
         None
     }
 
-    /// A mixer-owned reader that follows runtime replacements. Reusing a raw
-    /// `PcmReader` would leave local playback attached to the old bus forever
-    /// after a name/password change restarted the receiver.
+    /// A mixer-owned reader that follows runtime replacements and lane
+    /// allocations. Reusing raw `PcmReader`s would leave local playback
+    /// attached to old buses forever after a name/password change restarted
+    /// the receiver.
     pub(crate) fn local_reader(self: &Arc<Self>) -> LocalReader {
         LocalReader {
             controller: Arc::clone(self),
             bus_epoch: 0,
-            reader: None,
-            bus: None,
+            lanes: None,
+            lanes_generation: 0,
+            readers: std::array::from_fn(|_| None),
         }
     }
 
@@ -2708,15 +3078,15 @@ impl AirPlayController {
         self.output_device_version.fetch_add(1, Ordering::Release);
     }
 
-    fn bus_snapshot(&self) -> (u64, Option<PcmBus>) {
+    fn lanes_snapshot(&self) -> (u64, Option<PcmLanes>) {
         // The epoch is bumped while holding `state`, so seeing the same value
         // on both sides proves this clone corresponds to that epoch.
         loop {
             let before = self.bus_epoch.load(Ordering::Acquire);
-            let bus = lk(&self.state).bus.clone();
+            let lanes = lk(&self.state).lanes.clone();
             let after = self.bus_epoch.load(Ordering::Acquire);
             if before == after {
-                return (after, bus);
+                return (after, lanes);
             }
         }
     }
@@ -2724,6 +3094,132 @@ impl AirPlayController {
     #[cfg(test)]
     pub(crate) fn event_thread_for_test(&self) -> bool {
         lk(&self.state).event_thread.is_some()
+    }
+}
+
+/// Consume one reverse-volume outcome of one sender's worker.
+fn finish_lane_outcome(
+    generation: u64,
+    session_id: u64,
+    runtime: Option<&AirPlayRuntime>,
+    lane: &mut VolumeLane,
+    outcome: DacpOutcome,
+) {
+    if generation != outcome.generation || outcome.session_id != session_id {
+        // A request from a previous generation can finish after a fast
+        // restart. If it may have reached the sender, arm one harmless
+        // correction once that sender has established its value.
+        if outcome.result.may_have_written_request(&outcome.write_gate) {
+            lane.sync.stale_remote_may_have_reached_sender();
+        }
+        return;
+    }
+    if reject_revoked_dacp_outcome(
+        &mut lane.sync,
+        outcome.serial,
+        &outcome.result,
+        &outcome.write_gate,
+        reverse_outcome_authority_current(&outcome),
+    ) {
+        return;
+    }
+    let may_have_written = outcome.result.may_have_written_request(&outcome.write_gate);
+    let result = match outcome.result {
+        DacpOutcomeResult::Superseded => {
+            lane.sync.remote_superseded(outcome.serial);
+            return;
+        }
+        DacpOutcomeResult::RevokedAfterPossibleWrite => {
+            lane.sync.remote_revoked_after_possible_write(outcome.serial);
+            return;
+        }
+        DacpOutcomeResult::Sent(result) => result,
+    };
+    // The runtime installs its lossless sender snapshot before it publishes
+    // the bounded event wakeup. If the matching RTSP echo is already present,
+    // consume it while this exact flight still owns its serial.
+    // `remote_result` clears the flight below; waiting until the ordinary
+    // reconciliation phase would misclassify the echo as a fresh sender
+    // command.
+    let authoritative = authoritative_volume_target(
+        runtime.and_then(|runtime| {
+            runtime
+                .sender_volume_snapshots()
+                .into_iter()
+                .find(|snapshot| snapshot.session_id == session_id)
+        }),
+        Some(session_id),
+    );
+    if may_have_written {
+        if let Some(target) = lane
+            .sync
+            .confirm_remote_echo(authoritative, Some(outcome.serial))
+        {
+            lane.warning = None;
+            dlog!(
+                "[audiohubd] AirPlay reverse volume echo confirmed before DACP outcome session={} db={:.2}",
+                target.session_id,
+                target.db
+            );
+        }
+    }
+    let http_success = result.is_ok();
+    let Some(completion) = lane.sync.remote_result_classified_at(
+        outcome.serial,
+        http_success,
+        may_have_written,
+        Instant::now(),
+    ) else {
+        // The job was already on the wire when a newer sender command
+        // invalidated it. Both an HTTP success and an error after a possible
+        // `write_all` are uncertain stale writes; force one correction to the
+        // current native value after that newer command finishes applying.
+        // `Superseded` was filtered above and is the only outcome known not
+        // to have written bytes.
+        if may_have_written {
+            lane.sync.stale_remote_may_have_reached_sender();
+        } else {
+            lane.sync.remote_superseded(outcome.serial);
+        }
+        return;
+    };
+    let flight = completion.flight;
+    match result {
+        Ok(()) => {
+            lane.warning = None;
+            let route = match outcome.route {
+                ReverseVolumeRoute::Event => "AP2 event",
+                ReverseVolumeRoute::Dacp => "DACP",
+            };
+            dlog!(
+                "[audiohubd] AirPlay {route} volume request accepted session={} db={:.2}",
+                outcome.session_id,
+                outcome.db
+            );
+        }
+        Err(error) if completion.delivered => {
+            // Some DACP receivers reflect the accepted value through RTSP
+            // before the HTTP response is complete. That echo is stronger
+            // delivery evidence than a later response-read failure, so do not
+            // show a false warning or retry it.
+            lane.warning = None;
+            dlog!(
+                "[audiohubd] AirPlay DACP volume confirmed by RTSP echo session={} db={:.2} (HTTP completion failed: {error})",
+                outcome.session_id,
+                outcome.db
+            );
+        }
+        Err(error) => {
+            let message = format!("AirPlay 反向音量同步失败：{error}");
+            lane.warning = Some(message.clone());
+            dlog!(
+                "[audiohubd] {message} (session={} db={:.2} attempt={}/{})",
+                outcome.session_id,
+                outcome.db,
+                flight.attempt,
+                DACP_VOLUME_RETRY_LIMIT
+            );
+        }
     }
 }
 
@@ -2827,7 +3323,22 @@ fn authoritative_volume_target(
     ))
 }
 
-fn session_view(session: RuntimeSessionInfo, now_unix_ms: u64) -> AirPlaySessionInfo {
+fn session_timing_label(timing: SessionTiming) -> Option<String> {
+    let label = match timing {
+        SessionTiming::Ntp => "ntp",
+        SessionTiming::PtpInstance => "ptp_instance",
+        SessionTiming::PtpSystem => "ptp_system",
+        SessionTiming::PtpPortable => "ptp_portable",
+        SessionTiming::Unknown => return None,
+    };
+    Some(label.to_string())
+}
+
+fn session_view(
+    session: RuntimeSessionInfo,
+    now_unix_ms: u64,
+    volume_sync_warning: Option<String>,
+) -> AirPlaySessionInfo {
     AirPlaySessionInfo {
         id: session.id,
         protocol: match session.protocol {
@@ -2848,59 +3359,170 @@ fn session_view(session: RuntimeSessionInfo, now_unix_ms: u64) -> AirPlaySession
         artwork_revision: session.artwork_revision,
         artwork_content_type: session.artwork_content_type,
         connected_ms: now_unix_ms.saturating_sub(session.started_unix_ms),
+        timing: session_timing_label(session.timing),
+        volume_sync_warning,
     }
 }
 
-/// Reader used by the local mixer. It re-subscribes after every runtime
-/// generation change and otherwise remains an independent bus cursor.
+/// Frames per mixer block of one AirPlay lane (10 ms at 48 kHz).
+pub(crate) const AIRPLAY_LANE_FRAMES: usize = AUDIOHUB_FRAME_SAMPLES;
+const ALL_AIRPLAY_LANES: u8 = ((1u16 << MAX_AIRPLAY_LANES) - 1) as u8;
+
+/// One mixer block of every AirPlay lane. Only lanes in
+/// [`AirPlayLaneRead::active_mask`] hold valid data for the block.
+pub(crate) struct AirPlayLaneFrames {
+    pub frames: [[[f32; 2]; AIRPLAY_LANE_FRAMES]; MAX_AIRPLAY_LANES],
+}
+
+impl AirPlayLaneFrames {
+    pub(crate) fn new() -> Self {
+        Self {
+            frames: [[[0.0; 2]; AIRPLAY_LANE_FRAMES]; MAX_AIRPLAY_LANES],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AirPlayLaneRead {
+    /// Lanes whose block belongs to a playing sender (silent while it primes).
+    /// Each one is a separate mix contributor.
+    pub active_mask: u8,
+    /// Lanes whose read acknowledged the current PCM timeline. Only these may
+    /// publish output timing to their producer.
+    pub epoch_mask: u8,
+    /// Frames skipped while aligning a timed startup/resume, over all lanes.
+    pub late: u64,
+}
+
+struct LaneReader {
+    bus: PcmBus,
+    reader: PcmReader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LaneReadOutcome {
+    active: bool,
+    epoch_current: bool,
+    late: u64,
+}
+
+/// Read one lane's block. An allocated lane without a sender gets a
+/// zero-length read: it keeps the lane's presentation gate in step with the
+/// output timeline without consuming frames or counting silence.
+fn read_lane(
+    lane: &mut LaneReader,
+    out: &mut [[f32; 2]; AIRPLAY_LANE_FRAMES],
+    presentation_epoch: u64,
+    next_output: Option<Instant>,
+) -> LaneReadOutcome {
+    if lane.bus.active_session().is_some() {
+        let read = lane
+            .reader
+            .read_stereo_timed(out, presentation_epoch, next_output);
+        LaneReadOutcome {
+            active: read.session_id.is_some(),
+            epoch_current: read.epoch != 0,
+            late: read.late,
+        }
+    } else {
+        let read = lane
+            .reader
+            .read_stereo_timed(&mut [], presentation_epoch, None);
+        LaneReadOutcome {
+            active: false,
+            epoch_current: read.epoch != 0,
+            late: 0,
+        }
+    }
+}
+
+/// Reader used by the local mixer: one independent cursor per allocated
+/// AirPlay lane. It re-subscribes after every runtime generation change and
+/// subscribes to a lane as soon as the runtime allocates it.
 pub(crate) struct LocalReader {
     controller: Arc<AirPlayController>,
     bus_epoch: u64,
-    reader: Option<PcmReader>,
-    bus: Option<PcmBus>,
+    lanes: Option<PcmLanes>,
+    lanes_generation: u64,
+    readers: [Option<LaneReader>; MAX_AIRPLAY_LANES],
 }
 
 impl LocalReader {
-    fn refresh_bus(&mut self) {
+    fn refresh_lanes(&mut self) {
         let current_epoch = self.controller.bus_epoch.load(Ordering::Acquire);
         if current_epoch != self.bus_epoch {
-            let (bus_epoch, bus) = self.controller.bus_snapshot();
+            let (bus_epoch, lanes) = self.controller.lanes_snapshot();
             self.bus_epoch = bus_epoch;
-            self.reader = bus.as_ref().map(|bus| bus.subscribe());
-            self.bus = bus;
+            self.readers = std::array::from_fn(|_| None);
+            self.lanes = lanes;
+            self.lanes_generation = u64::MAX;
         }
-    }
-
-    pub(crate) fn has_active_session(&mut self) -> bool {
-        self.refresh_bus();
-        self.bus.as_ref().and_then(PcmBus::active_session).is_some()
-    }
-
-    pub(crate) fn read_into(&mut self, out: &mut [[f32; 2]], presentation_epoch: u64, next_output: Option<std::time::Instant>) -> PcmRead {
-        self.refresh_bus();
-        match self.reader.as_mut() {
-            Some(reader) => reader.read_stereo_timed(out, presentation_epoch, next_output),
-            None => {
-                out.fill([0.0; 2]);
-                PcmRead {
-                    copied: 0,
-                    silence: out.len(),
-                    dropped: 0,
-                    late: 0,
-                    session_id: None,
-                    epoch: 0,
+        let Some(lanes) = self.lanes.as_ref() else {
+            return;
+        };
+        // The generation is bumped only after a new lane is visible, so every
+        // lane allocated up to this value is found below.
+        let generation = lanes.generation();
+        if generation == self.lanes_generation {
+            return;
+        }
+        self.lanes_generation = generation;
+        for (index, slot) in self.readers.iter_mut().enumerate() {
+            if slot.is_none() {
+                if let Some(bus) = lanes.lane(index) {
+                    *slot = Some(LaneReader {
+                        bus: bus.clone(),
+                        reader: bus.subscribe(),
+                    });
                 }
             }
         }
     }
 
+    /// Whether any lane currently has a playing sender.
+    pub(crate) fn has_active_session(&mut self) -> bool {
+        self.refresh_lanes();
+        self.lanes.as_ref().is_some_and(PcmLanes::any_active)
+    }
+
+    pub(crate) fn read_lanes(
+        &mut self,
+        out: &mut AirPlayLaneFrames,
+        presentation_epoch: u64,
+        next_output: Option<Instant>,
+    ) -> AirPlayLaneRead {
+        self.refresh_lanes();
+        let mut read = AirPlayLaneRead::default();
+        for (index, (slot, frames)) in self
+            .readers
+            .iter_mut()
+            .zip(out.frames.iter_mut())
+            .enumerate()
+        {
+            let Some(lane) = slot.as_mut() else {
+                continue;
+            };
+            let outcome = read_lane(lane, frames, presentation_epoch, next_output);
+            let bit = 1u8 << index;
+            if outcome.active {
+                read.active_mask |= bit;
+            }
+            if outcome.epoch_current {
+                read.epoch_mask |= bit;
+            }
+            read.late += outcome.late;
+        }
+        read
+    }
+
     pub(crate) fn cancel_output_read(&mut self, presentation_epoch: u64) {
-        if let Some(reader) = self.reader.as_mut() {
+        for lane in self.readers.iter_mut().flatten() {
             // A zero-length waiting read resets the existing timed read gate
             // without subscribing, allocating, or consuming another frame.
-            reader.read_stereo_timed(&mut [], presentation_epoch, None);
+            lane.reader
+                .read_stereo_timed(&mut [], presentation_epoch, None);
         }
-        self.publish_output_timing(presentation_epoch, None);
+        self.publish_output_timing(ALL_AIRPLAY_LANES, presentation_epoch, None);
     }
 
     pub(crate) fn device_tail(&self, epoch: u64) -> Option<(Duration, bool)> {
@@ -2915,11 +3537,21 @@ impl LocalReader {
         Some((Duration::from_micros(timing >> 2), timing & 2 != 0))
     }
 
-    pub(crate) fn publish_output_timing(&self, epoch: u64, downstream: Option<(Duration, bool)>) {
-        if let Some(bus) = &self.bus {
+    /// Publish (or, with `None`, invalidate) the output timing of the lanes in
+    /// `lane_mask`.
+    pub(crate) fn publish_output_timing(
+        &self,
+        lane_mask: u8,
+        epoch: u64,
+        downstream: Option<(Duration, bool)>,
+    ) {
+        for (index, lane) in self.readers.iter().enumerate() {
+            let Some(lane) = lane.as_ref().filter(|_| lane_mask & (1 << index) != 0) else {
+                continue;
+            };
             match downstream {
-                Some((delay, estimated)) => bus.publish_output_timing(epoch, delay, estimated),
-                None => bus.publish_output_timing(0, Duration::ZERO, true),
+                Some((delay, estimated)) => lane.bus.publish_output_timing(epoch, delay, estimated),
+                None => lane.bus.publish_output_timing(0, Duration::ZERO, true),
             }
         }
     }
@@ -4184,6 +4816,7 @@ mod tests {
             session_id: 7,
             db: -6.0,
             revision: 1,
+            order: 1,
         };
         assert!(authoritative_volume_target(Some(snapshot), Some(7)).is_some());
         assert_eq!(authoritative_volume_target(None, Some(7)), None);
@@ -4197,6 +4830,7 @@ mod tests {
             session_id: 7,
             db: -6.0,
             revision: 5,
+            order: 9,
         };
         let (latest, revision) = authoritative_volume_target(Some(snapshot), Some(7)).unwrap();
         assert_eq!(
@@ -4272,6 +4906,291 @@ mod tests {
                 retry_attempt: None,
             }
         );
+    }
+
+    fn hub_snapshot(session_id: u64, db: f32, revision: u64, order: u64) -> SenderVolumeSnapshot {
+        SenderVolumeSnapshot {
+            session_id,
+            db,
+            revision,
+            order,
+        }
+    }
+
+    fn hub_with(lanes: &[(u64, u8)]) -> VolumeHub {
+        let mut hub = VolumeHub::default();
+        assert!(hub.sync_lanes(lanes).is_empty());
+        hub
+    }
+
+    fn system(db: f32) -> SystemVolumeState {
+        SystemVolumeState::from_sender_db(db)
+    }
+
+    fn sv(session_id: u64, db: f32) -> SessionVolume {
+        SessionVolume { session_id, db }
+    }
+
+    /// A wins alone, then B joins and adopts (Q1). Both have established
+    /// values and the system holds A's command.
+    fn hub_two_established_senders() -> VolumeHub {
+        let mut hub = hub_with(&[(1, 0), (2, 1)]);
+        let now = Instant::now();
+        let winner = hub.reconcile_senders(&[hub_snapshot(1, -10.0, 1, 1)], now);
+        assert_eq!(winner.map(|w| w.target), Some(sv(1, -10.0)));
+        hub.applied(sv(1, -10.0), system(-10.0).scalar);
+        assert_eq!(
+            hub.reconcile_senders(
+                &[hub_snapshot(1, -10.0, 1, 1), hub_snapshot(2, -20.0, 1, 2)],
+                now
+            ),
+            None,
+            "a newcomer's first command never changes the shared volume"
+        );
+        hub
+    }
+
+    #[test]
+    fn hub_source_sender_is_not_written_back_and_others_are_fanned_out() {
+        let mut hub = hub_two_established_senders();
+        let current = system(-10.0);
+        let a = hub.lanes.get_mut(&1).unwrap();
+        assert!(
+            a.sync.plan_remote(Some(1), current, 1).is_none(),
+            "the command's source already shows the value"
+        );
+        let b = hub.lanes.get_mut(&2).unwrap();
+        let flight = b
+            .sync
+            .plan_remote(Some(2), current, 2)
+            .expect("the other sender is synchronized to the shared value");
+        assert!((flight.db - -10.0).abs() < 1e-4);
+
+        // B now commands; A is fanned out to B's value, B is not written back.
+        let winner = hub.reconcile_senders(&[hub_snapshot(2, -5.0, 2, 3)], Instant::now());
+        assert_eq!(winner.map(|w| w.target), Some(sv(2, -5.0)));
+        assert!(!winner.unwrap().newcomer);
+        hub.applied(sv(2, -5.0), system(-5.0).scalar);
+        let current = system(-5.0);
+        assert!(hub.lanes.get_mut(&2).unwrap().sync.plan_remote(Some(2), current, 3).is_none());
+        assert!(hub.lanes.get_mut(&1).unwrap().sync.plan_remote(Some(1), current, 4).is_some());
+    }
+
+    #[test]
+    fn hub_last_order_wins_and_a_late_older_command_only_adopts() {
+        let mut hub = hub_two_established_senders();
+        let now = Instant::now();
+        let winner = hub.reconcile_senders(
+            &[hub_snapshot(1, -8.0, 2, 5), hub_snapshot(2, -12.0, 2, 4)],
+            now,
+        );
+        assert_eq!(winner.map(|w| w.target), Some(sv(1, -8.0)));
+        let b = &hub.lanes[&2];
+        assert_eq!(b.sync.sender_known_system, Some(system(-12.0)));
+        assert_eq!(b.sync.retry, None);
+        assert_eq!(hub.authority.unwrap().order, 5);
+
+        // The event pump applied A's order 7 before B's order 6 was consumed.
+        assert!(hub
+            .reconcile_senders(&[hub_snapshot(1, -7.0, 3, 7)], now)
+            .is_some());
+        assert_eq!(
+            hub.reconcile_senders(&[hub_snapshot(2, -2.0, 3, 6)], now),
+            None,
+            "an older command never overrides a newer one"
+        );
+        assert_eq!(
+            hub.authority.unwrap().source,
+            AuthoritySource::Sender { session_id: 1 }
+        );
+        assert_eq!(hub.lanes[&2].sync.sender_known_system, Some(system(-2.0)));
+        assert_eq!(hub.lanes[&2].sync.target, Some(sv(2, -2.0)));
+    }
+
+    #[test]
+    fn hub_local_change_becomes_shared_and_is_fanned_out_to_every_sender() {
+        let mut hub = hub_two_established_senders();
+        let local = system(-3.0);
+        assert!(!hub.observe_native(system(-10.0)), "our own write is not a local change");
+        assert!(hub.observe_native(local));
+        let authority = hub.authority.unwrap();
+        assert_eq!(authority.source, AuthoritySource::Local);
+        assert_eq!(authority.state, local);
+        assert!(hub.lanes.get_mut(&1).unwrap().sync.plan_remote(Some(1), local, 1).is_some());
+        assert!(hub.lanes.get_mut(&2).unwrap().sync.plan_remote(Some(2), local, 2).is_some());
+
+        // A sender write in flight (readback not yet consumed) is not a local
+        // change even though the system value already moved.
+        let winner = hub.reconcile_senders(&[hub_snapshot(2, -15.0, 2, 9)], Instant::now());
+        assert!(winner.is_some());
+        assert!(!hub.observe_native(system(-14.0)));
+        assert_eq!(
+            hub.authority.unwrap().source,
+            AuthoritySource::Sender { session_id: 2 }
+        );
+    }
+
+    #[test]
+    fn hub_newcomer_adopts_while_another_sender_plays_but_a_lone_sender_applies() {
+        let mut hub = hub_with(&[(1, 0)]);
+        let now = Instant::now();
+        assert!(hub.reconcile_senders(&[hub_snapshot(1, -10.0, 1, 1)], now).is_some());
+        hub.applied(sv(1, -10.0), system(-10.0).scalar);
+        assert!(hub.sync_lanes(&[(1, 0), (2, 1)]).is_empty());
+        assert_eq!(hub.reconcile_senders(&[hub_snapshot(2, -25.0, 1, 2)], now), None);
+        assert_eq!(hub.lanes[&2].sync.sender_known_system, Some(system(-25.0)));
+        assert_eq!(hub.authority.unwrap().db, -10.0);
+        // Its next command is an ordinary command.
+        assert!(hub.reconcile_senders(&[hub_snapshot(2, -25.0, 2, 3)], now).is_some());
+
+        // Two senders joining at once: the earlier one applies, the later one adopts.
+        let mut hub = hub_with(&[(5, 0), (6, 1)]);
+        let winner = hub.reconcile_senders(
+            &[hub_snapshot(5, -9.0, 1, 1), hub_snapshot(6, -1.0, 1, 2)],
+            now,
+        );
+        assert_eq!(winner.map(|w| w.target), Some(sv(5, -9.0)));
+        assert!(winner.unwrap().newcomer);
+
+        // The earlier sender left before the newcomer's first command.
+        let mut hub = hub_with(&[(7, 0), (8, 1)]);
+        drop(hub.sync_lanes(&[(8, 1)]));
+        let winner = hub.reconcile_senders(&[hub_snapshot(8, -4.0, 1, 1)], now);
+        assert_eq!(winner.map(|w| w.target), Some(sv(8, -4.0)));
+    }
+
+    #[test]
+    fn hub_ending_a_sender_cancels_only_its_own_worker() {
+        let mut hub = hub_two_established_senders();
+        hub.lanes[&1].worker.current_serial.store(7, Ordering::Release);
+        hub.lanes[&2].worker.current_serial.store(8, Ordering::Release);
+        let removed = hub.sync_lanes(&[(1, 0)]);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].worker.current_serial.load(Ordering::Acquire), 0);
+        assert_eq!(removed[0].sync.target, None);
+        assert_eq!(hub.lanes[&1].worker.current_serial.load(Ordering::Acquire), 7);
+        assert!(hub.authority.is_some(), "the shared value survives");
+        drop(removed);
+
+        let removed = hub.remove_lane(1).unwrap();
+        assert_eq!(removed.worker.current_serial.load(Ordering::Acquire), 0);
+        assert_eq!(hub.authority, None, "no sender left, no shared authority");
+    }
+
+    #[test]
+    fn hub_output_change_replays_the_shared_value_exactly_once() {
+        let mut hub = hub_two_established_senders();
+        hub.observe_output_change();
+        assert_eq!(
+            hub.plan_authority(true),
+            HubPlan::Apply {
+                target: sv(1, -10.0),
+                reason: VolumeApplyReason::OutputChanged,
+            }
+        );
+        assert_eq!(hub.plan_authority(false), HubPlan::None);
+        assert!(hub.lanes[&2].sync.force_remote, "every sender re-checks once");
+
+        // A local value has no sender lane to replay through.
+        assert!(hub.observe_native(system(-3.0)));
+        hub.observe_output_change();
+        let authority = hub.authority.unwrap();
+        assert_eq!(
+            hub.plan_authority(true),
+            HubPlan::Replay {
+                authority,
+                attempt: None,
+            }
+        );
+        assert_eq!(hub.plan_authority(false), HubPlan::None);
+        hub.replay_failed(authority, None);
+        for attempt in 1..=VOLUME_RETRY_LIMIT {
+            assert_eq!(
+                hub.plan_authority(false),
+                HubPlan::Replay {
+                    authority,
+                    attempt: Some(attempt),
+                }
+            );
+            hub.replay_failed(authority, Some(attempt));
+        }
+        assert_eq!(hub.plan_authority(false), HubPlan::None, "bounded retry");
+    }
+
+    #[test]
+    fn hub_reverse_warnings_stay_with_their_sender() {
+        let mut hub = hub_with(&[(1, 0), (2, 1)]);
+        hub.lanes.get_mut(&2).unwrap().warning = Some("b failed".into());
+        assert_eq!(hub.warning_for(1), None);
+        assert_eq!(hub.warning_for(2).as_deref(), Some("b failed"));
+        assert_eq!(hub.first_warning().as_deref(), Some("b failed"));
+        hub.lanes.get_mut(&1).unwrap().warning = Some("a failed".into());
+        assert_eq!(hub.first_warning().as_deref(), Some("a failed"), "lane order");
+        // A new command of B clears only B's warning.
+        let now = Instant::now();
+        hub.reconcile_senders(&[hub_snapshot(1, -10.0, 1, 1)], now);
+        hub.lanes.get_mut(&1).unwrap().warning = Some("a failed".into());
+        hub.reconcile_senders(&[hub_snapshot(2, -10.0, 1, 2)], now);
+        assert_eq!(hub.warning_for(2), None);
+        assert_eq!(hub.warning_for(1).as_deref(), Some("a failed"));
+    }
+
+    #[test]
+    fn hub_fanout_confirmation_within_tolerance_is_not_a_new_command() {
+        let mut hub = hub_two_established_senders();
+        let now = Instant::now();
+        assert_eq!(
+            hub.reconcile_senders(&[hub_snapshot(2, -10.03, 2, 3)], now),
+            None,
+            "B rounded the fanned-out value"
+        );
+        let authority = hub.authority.unwrap();
+        assert_eq!(authority.source, AuthoritySource::Sender { session_id: 1 });
+        assert_eq!(hub.lanes[&2].sync.sender_known_system, Some(authority.state));
+        assert!(hub
+            .lanes
+            .get_mut(&2)
+            .unwrap()
+            .sync
+            .plan_remote(Some(2), authority.state, 1)
+            .is_none());
+        let winner = hub.reconcile_senders(&[hub_snapshot(2, -10.2, 3, 4)], now);
+        assert_eq!(winner.map(|w| w.target), Some(sv(2, -10.2)));
+
+        // A lone sender keeps the single-sender behavior: every command applies.
+        let mut hub = hub_with(&[(1, 0)]);
+        assert!(hub.reconcile_senders(&[hub_snapshot(1, -10.0, 1, 1)], now).is_some());
+        hub.applied(sv(1, -10.0), system(-10.0).scalar);
+        assert!(hub.reconcile_senders(&[hub_snapshot(1, -10.03, 2, 2)], now).is_some());
+    }
+
+    #[test]
+    fn idle_lane_gets_a_zero_length_read_and_a_missing_runtime_reads_nothing() {
+        let bus = PcmBus::new(audiohub_airplay::BusConfig::default());
+        let mut lane = LaneReader {
+            reader: bus.subscribe(),
+            bus,
+        };
+        let mut out = [[0.5f32; 2]; AIRPLAY_LANE_FRAMES];
+        let outcome = read_lane(&mut lane, &mut out, 3, Some(Instant::now()));
+        assert!(!outcome.active);
+        assert_eq!(outcome.late, 0);
+        assert!(
+            out.iter().all(|frame| *frame == [0.5, 0.5]),
+            "an idle lane's block is neither consumed nor silence-filled"
+        );
+
+        let dir = PortTestDir::new("local-reader");
+        let controller = AirPlayController::new(false, dir.0.clone());
+        let mut reader = controller.local_reader();
+        assert!(!reader.has_active_session());
+        let mut frames = AirPlayLaneFrames::new();
+        assert_eq!(
+            reader.read_lanes(&mut frames, 1, None),
+            AirPlayLaneRead::default()
+        );
+        reader.cancel_output_read(1);
+        assert!(!controller.has_active_session());
     }
 
     #[test]
@@ -6424,13 +7343,22 @@ mod tests {
             duration_ms: None,
             started_unix_ms: 1_000,
             selected_for_output: true,
+            lane: Some(0),
+            timing: SessionTiming::PtpSystem,
         };
-        let view = session_view(session.clone(), 4_250);
+        let view = session_view(session.clone(), 4_250, Some("reverse failed".into()));
         assert_eq!(view.connected_ms, 3_250);
         assert_eq!(view.peer, "192.0.2.4");
         assert_eq!(view.artwork_revision, Some(3));
         assert_eq!(view.artwork_content_type.as_deref(), Some("image/jpeg"));
-        assert_eq!(session_view(session, 900).connected_ms, 0);
+        assert_eq!(view.timing.as_deref(), Some("ptp_system"));
+        assert_eq!(view.volume_sync_warning.as_deref(), Some("reverse failed"));
+        let unknown = RuntimeSessionInfo {
+            timing: SessionTiming::Unknown,
+            ..session.clone()
+        };
+        assert_eq!(session_view(unknown, 4_250, None).timing, None);
+        assert_eq!(session_view(session, 900, None).connected_ms, 0);
     }
 
     #[test]

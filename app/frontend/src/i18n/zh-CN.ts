@@ -755,8 +755,13 @@ export const zhCN = {
   'share.proto.airplay.stateWarning': '接收仍在运行，但存在运行警告',
   'share.proto.airplay.stateUnsupported': '当前服务不支持 AirPlay 接收',
   'share.proto.airplay.airplay2Port': 'AirPlay 2 端口 {port}',
+  'share.proto.airplay.multi': '最多 {n} 个发送端可同时播放，声音混合输出，音量为同一个值。',
+  'share.proto.airplay.ptpSingle': '本系统目前只支持一个 AirPlay 2（PTP）发送端。',
 
   'share.proto.active.title': '当前接入',
+  'share.proto.active.titleCount': '当前接入（{count}）',
+  'share.proto.active.sharedClock': '共享时钟',
+  'share.proto.active.sharedClockWhy': '本机在备用时钟下只支持一个 AirPlay 2（PTP）发送端。',
   'share.proto.active.empty': '还没有任何外部来源接入。',
   'share.proto.active.unknownTrack': '未提供曲目信息',
   'share.proto.active.unknownPeer': '未知发送端',

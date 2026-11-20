@@ -1,7 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { isUnknownMethod, sanitizeDaemonSettings } from './airplay';
+import {
+  isUnknownMethod, maxSenders, sanitizeDaemonSettings, singlePtpSender, usesSharedClock,
+} from './airplay';
 
 const SHARE_PROTOCOLS_SRC = readFileSync(
   fileURLToPath(new URL('../views/ShareProtocols.tsx', import.meta.url)),
@@ -70,5 +72,56 @@ describe('AirPlay 设置界面边界', () => {
   it('不再提供 AirPlay 音频去向选择', () => {
     expect(SHARE_PROTOCOLS_SRC).not.toContain('airplay_route');
     expect(SHARE_PROTOCOLS_SRC).not.toContain('share.proto.airplay.route');
+  });
+});
+
+describe('AirPlay 多发送端界面', () => {
+  it('只有 ptp_system 会话显示共享时钟标签', () => {
+    expect(usesSharedClock({ timing: 'ptp_system' })).toBe(true);
+    for (const timing of ['ntp', 'ptp_instance', 'ptp_portable', null, undefined] as const) {
+      expect(usesSharedClock({ timing })).toBe(false);
+    }
+    expect(usesSharedClock({})).toBe(false);
+  });
+
+  it('发送端上限缺省或非法时隐藏提示', () => {
+    expect(maxSenders(null)).toBeNull();
+    expect(maxSenders({})).toBeNull();
+    expect(maxSenders({ airplay_max_senders: null })).toBeNull();
+    expect(maxSenders({ airplay_max_senders: 0 })).toBeNull();
+    expect(maxSenders({ airplay_max_senders: 1.5 })).toBeNull();
+    expect(maxSenders({ airplay_max_senders: 4 })).toBe(4);
+  });
+
+  it('只有 system 后端提示单 PTP 发送端', () => {
+    expect(singlePtpSender({ airplay_ptp_backend: 'system' })).toBe(true);
+    for (const backend of ['instance', 'portable', 'unavailable', null, undefined] as const) {
+      expect(singlePtpSender({ airplay_ptp_backend: backend })).toBe(false);
+    }
+    expect(singlePtpSender(null)).toBe(false);
+  });
+
+  it('界面按数量、标签、告警和提示条件渲染，缺省字段保持原样', () => {
+    const src = SHARE_PROTOCOLS_SRC;
+    expect(src).toContain("sessions.length > 0\n          ? t('share.proto.active.titleCount'");
+    expect(src).toContain("t('share.proto.active.title')");
+    expect(src).toContain('{usesSharedClock(session) ? (');
+    expect(src).toContain('title={t(\'share.proto.active.sharedClockWhy\')}');
+    expect(src).toContain('{session.volume_sync_warning ? (');
+    expect(src).toContain('{senderLimit != null ? (');
+    expect(src).toContain('{singlePtpSender(settings) ? (');
+  });
+
+  it('中英文案同步提供新键', () => {
+    const zh = readFileSync(fileURLToPath(new URL('../i18n/zh-CN.ts', import.meta.url)), 'utf8');
+    const en = readFileSync(fileURLToPath(new URL('../i18n/en-US.ts', import.meta.url)), 'utf8');
+    for (const key of [
+      'share.proto.airplay.multi', 'share.proto.airplay.ptpSingle',
+      'share.proto.active.titleCount', 'share.proto.active.sharedClock',
+      'share.proto.active.sharedClockWhy',
+    ]) {
+      expect(zh).toContain(`'${key}'`);
+      expect(en).toContain(`'${key}'`);
+    }
   });
 });

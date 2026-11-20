@@ -205,7 +205,8 @@ jobs:
 
       # Static, read-only guard. The test-only fake audio backend (feature
       # `fake-audio`, core/audiohub-core/src/audio_fake.rs) embeds a marker string
-      # and the planned facts-injection feature embeds another; a shipped binary
+      # and the planned facts-injection feature embeds another; the AirPlay
+      # `airplay-test-hooks` feature embeds its two environment-variable names; a shipped binary
       # must contain neither. Nothing is executed — the files are only read.
       # It scans the cargo outputs that were copied into the bundle as sidecars
       # AND the bundled copies themselves (the .app is what the dmg is built from;
@@ -223,7 +224,7 @@ jobs:
           bad=0
           for f in "${files[@]}"; do
             [ -f "$f" ] || { echo "missing shipped binary: $f"; exit 1; }
-            for marker in audiohub-fake-audio-v1 AUDIOHUB_FACTS_INJECTION_ENABLED; do
+            for marker in audiohub-fake-audio-v1 AUDIOHUB_FACTS_INJECTION_ENABLED AUDIOHUB_TEST_AIRPLAY_PTP_BACKEND AUDIOHUB_TEST_TIMESYNC_FAULT; do
               if grep -aqF -- "$marker" "$f"; then
                 echo "FORBIDDEN test-only marker '$marker' found in $f"
                 bad=1
@@ -341,7 +342,8 @@ jobs:
 
       # Static, read-only guard. The test-only fake audio backend (feature
       # `fake-audio`, core/audiohub-core/src/audio_fake.rs) embeds a marker string
-      # and the planned facts-injection feature embeds another; a shipped binary
+      # and the planned facts-injection feature embeds another; the AirPlay
+      # `airplay-test-hooks` feature embeds its two environment-variable names; a shipped binary
       # must contain neither. Nothing is executed — the files are only read as
       # bytes. The NSIS installer payload is compressed, so the scan covers the
       # executables that go into it: the cargo outputs and the sidecar copies
@@ -358,7 +360,7 @@ jobs:
             "app/src-tauri/binaries/audiohubd-$t.exe"
             "app/src-tauri/binaries/audiohub-$t.exe"
           )
-          $markers = @('audiohub-fake-audio-v1', 'AUDIOHUB_FACTS_INJECTION_ENABLED')
+          $markers = @('audiohub-fake-audio-v1', 'AUDIOHUB_FACTS_INJECTION_ENABLED', 'AUDIOHUB_TEST_AIRPLAY_PTP_BACKEND', 'AUDIOHUB_TEST_TIMESYNC_FAULT')
           $bad = $false
           foreach ($f in $files) {
             if (-not (Test-Path $f)) { throw "missing shipped binary: $f" }

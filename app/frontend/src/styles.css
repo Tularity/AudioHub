@@ -2349,6 +2349,9 @@ body .sel-pop.up:not(.open) { transform: translateY(4px) scale(.96); }
 }
 .proto-state.listening { color: var(--ok); }
 .proto-state.error { color: var(--danger); }
+.proto-hint { margin-top: 8px; font-size: 12px; line-height: 1.5; color: var(--text-dim); }
+.proto-hint.warn, .proto-session-warn { color: var(--warn); }
+.proto-session-warn { font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 
 /* 「当前接入」的空态：这一行就是投送有没有抵达的落点，空着本身也是答案。 */
 .proto-empty {

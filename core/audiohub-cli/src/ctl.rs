@@ -1363,7 +1363,7 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                  mode_a_volume_sync={} mode_a_mute_local={} \
                  discovery_announce={} discovery_announcing={} \
                  airplay_enabled={} airplay_listening={} airplay_name={:?} \
-                 airplay_password_set={} \
+                 airplay_password_set={} airplay_max_senders={} airplay_ptp_backend={} \
                  autostart={} \
                  share_device_facts={} present_physical_devices={} \
                  virtual devices {}/{}",
@@ -1380,6 +1380,8 @@ fn summarize(cmd: &CtlCmd, v: &Value) {
                 val_bool(v, "airplay_listening"),
                 val_str(v, "airplay_effective_name"),
                 val_bool(v, "airplay_password_set"),
+                val_u64(v, "airplay_max_senders"),
+                v.get("airplay_ptp_backend").and_then(Value::as_str).unwrap_or("-"),
                 val_bool(v, "autostart"),
                 val_bool(v, "share_device_facts"),
                 val_bool(v, "present_physical_devices"),

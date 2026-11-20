@@ -687,6 +687,13 @@ export interface AirPlaySessionInfo {
   /** 当前封面 MIME；null 表示该版本清除了封面。 */
   artwork_content_type?: string | null;
   connected_ms?: number;
+  /**
+   * 该会话的计时来源；旧 daemon 不带。`ptp_system` = 回退到系统共享 PTP 时钟，
+   * 此时本机同一时刻只支持一个 AirPlay 2（PTP）发送端。
+   */
+  timing?: 'ntp' | 'ptp_instance' | 'ptp_system' | 'ptp_portable' | null;
+  /** 该会话的音量同步告警；没有告警或旧 daemon 时为空。 */
+  volume_sync_warning?: string | null;
 }
 
 /** 按版本单独取得的 AirPlay 封面，避免每次会话轮询重复传输图片。 */
@@ -863,6 +870,10 @@ export interface DaemonSettings {
   airplay_warning?: string | null;
   /** 当前 AirPlay 2 接收器实际选择的控制端口。 */
   airplay_airplay2_port?: number | null;
+  /** 可同时播放的 AirPlay 发送端上限；旧 daemon 不带。 */
+  airplay_max_senders?: number | null;
+  /** AirPlay 2 的 PTP 后端；null / 缺省 = 未探测或旧 daemon。 */
+  airplay_ptp_backend?: 'instance' | 'system' | 'portable' | 'unavailable' | null;
   /** 只报告是否设过密码，绝不返回密码本身。 */
   airplay_password_set?: boolean;
   /**

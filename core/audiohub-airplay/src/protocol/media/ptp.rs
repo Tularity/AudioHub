@@ -8,10 +8,14 @@
 use super::buffered_clock::{rtp_delta, PlaybackAnchor};
 #[cfg(target_os = "macos")]
 use super::ptp_macos::{MacPtpClock, MacPtpError, MacPtpPort};
+#[cfg(target_os = "macos")]
+use super::ptp_timesync;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,7 +41,8 @@ const PAIR_LIFETIME: Duration = Duration::from_secs(2);
 const ANNOUNCE_LIFETIME: Duration = Duration::from_secs(5);
 const MAX_PENDING_SYNCS: usize = 128;
 const MAX_CLOCK_SOURCES: usize = 64;
-const SAMPLE_CHANNEL_CAPACITY: usize = 128;
+// Room for several senders' interleaved Sync/Follow_Up pairs (design §2.5).
+const SAMPLE_CHANNEL_CAPACITY: usize = 512;
 const MAPPER_WINDOW: Duration = Duration::from_secs(2);
 /// A frame may wait this long for the mapper's initial three-sample window
 /// before `NotReady` becomes a telemetry failure. Audio behavior remains a
@@ -122,82 +127,293 @@ pub(crate) struct PtpRemoteMatch {
     pub(crate) port_number: u16,
 }
 
+/// Timing backend bound to one PTP control session.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtpBackendKind {
+    /// Process-wide UDP 319/320 observer plus a per-session mapper (Windows,
+    /// and isolated test receivers).
+    Portable,
+    /// macOS: a per-sender TimeSync gPTP instance.
+    MacInstance,
+    /// macOS: the shared CoreMedia system clock behind the one-sender gate.
+    MacSystem,
+}
+
+impl PtpBackendKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Portable => "portable",
+            Self::MacInstance => "instance",
+            Self::MacSystem => "system",
+        }
+    }
+}
+
+/// Process-wide view of the PTP timing backends (design §3 step 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PtpBackendStatus {
+    /// Backend a new PTP sender would get: `instance`, `system`, `portable`
+    /// or `unavailable`; `None` while not yet determined (macOS probes
+    /// TimeSync lazily at the first PTP SETUP).
+    pub kind_available: Option<&'static str>,
+    pub tripped: bool,
+    pub instance_sessions: u64,
+    pub system_sessions: u64,
+    pub instance_create_failures: u64,
+    pub lock_timeouts: u64,
+    pub gm_lost: u64,
+}
+
+const PLATFORM_UNBOUND: u8 = 0;
+const PLATFORM_PORTABLE: u8 = 1;
+const PLATFORM_MAC_WITH_SYSTEM_CLOCK: u8 = 2;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const PLATFORM_MAC_WITHOUT_SYSTEM_CLOCK: u8 = 3;
+static PLATFORM: AtomicU8 = AtomicU8::new(PLATFORM_UNBOUND);
+static INSTANCE_SESSIONS: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_SESSIONS: AtomicU64 = AtomicU64::new(0);
+static INSTANCE_CREATE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn ptp_backend_status() -> PtpBackendStatus {
+    #[cfg(target_os = "macos")]
+    let (lock_timeouts, gm_lost, tripped) = (
+        ptp_timesync::LOCK_TIMEOUTS.load(Ordering::Relaxed),
+        ptp_timesync::GM_LOST.load(Ordering::Relaxed),
+        ptp_timesync::BREAKER.is_tripped(),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (lock_timeouts, gm_lost, tripped) = (0, 0, false);
+    PtpBackendStatus {
+        kind_available: backend_available(tripped),
+        tripped,
+        instance_sessions: INSTANCE_SESSIONS.load(Ordering::Relaxed),
+        system_sessions: SYSTEM_SESSIONS.load(Ordering::Relaxed),
+        instance_create_failures: INSTANCE_CREATE_FAILURES.load(Ordering::Relaxed),
+        lock_timeouts,
+        gm_lost,
+    }
+}
+
+fn backend_available(tripped: bool) -> Option<&'static str> {
+    let platform = PLATFORM.load(Ordering::Relaxed);
+    let system = match platform {
+        PLATFORM_UNBOUND => return None,
+        PLATFORM_PORTABLE => return Some("portable"),
+        PLATFORM_MAC_WITH_SYSTEM_CLOCK => true,
+        _ => false,
+    };
+    let instance = if super::ptp_timesync::test_hooks::forced_system() || tripped {
+        Some(false)
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            ptp_timesync::probed_availability().map(ptp_timesync::Availability::is_available)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Some(false)
+        }
+    };
+    match instance {
+        Some(true) => Some("instance"),
+        Some(false) if system => Some("system"),
+        Some(false) => Some("unavailable"),
+        // Not probed yet: a system clock alone would be the answer only if
+        // the probe fails, so report "not determined".
+        None => None,
+    }
+}
+
+/// Whether `peer` is this host: loopback, the connection's local address or
+/// any address of a local interface (`interfaces`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn is_local_peer(peer: Ipv4Addr, local: Ipv4Addr, interfaces: &[Ipv4Addr]) -> bool {
+    peer.is_loopback() || peer == local || interfaces.contains(&peer)
+}
+
+/// IPv4 addresses of this host's interfaces. An enumeration failure is
+/// logged and yields none; loopback and the connection's local address are
+/// still recognized by [`is_local_peer`].
+#[cfg(target_os = "macos")]
+fn local_interface_ipv4() -> Vec<Ipv4Addr> {
+    match if_addrs::get_if_addrs() {
+        Ok(interfaces) => interfaces
+            .into_iter()
+            .filter_map(|interface| match interface.ip() {
+                IpAddr::V4(address) => Some(address),
+                IpAddr::V6(_) => None,
+            })
+            .collect(),
+        Err(error) => {
+            log::warn!(
+                target: "audiohub_airplay::airplay2",
+                "AirPlay 2 PTP could not enumerate local interfaces: {error}"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Reason a session must skip the per-sender instance backend before any
+/// instance is created, or `None` when the instance may be tried.
+///
+/// A sender on this very host never locks a TimeSync instance (its PTP
+/// packets do not cross an interface), so it goes straight to the system
+/// clock and never counts toward the breaker.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn instance_precheck(
+    breaker: &super::ptp_timesync::Breaker,
+    peer: Ipv4Addr,
+    peer_is_local: bool,
+) -> Option<&'static str> {
+    if peer_is_local {
+        Some("local_peer")
+    } else if breaker.is_tripped() {
+        Some("tripped")
+    } else if breaker.peer_failed(peer) {
+        Some("peer_lock_failed")
+    } else {
+        None
+    }
+}
+
+/// Outcome of the backend fallback chain for one session.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) enum BackendChoice<I, S> {
+    Instance(I),
+    System(S),
+}
+
+/// Design §2.4 fallback chain, independent of the concrete backends so the
+/// state machine is testable with fakes:
+///
+/// 1. `forced_system` (test builds only) skips the instance step;
+/// 2. `instance` is `Err(reason)` when unavailable or tripped, otherwise a
+///    creation future whose failure reason is kept as the fallback reason;
+/// 3. `system` is `None` without a CoreMedia clock, otherwise it may fail
+///    with `WouldBlock` when the one-sender gate is taken (RTSP 453);
+/// 4. neither available is `Unsupported` (RTSP 500).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) async fn select_backend<I, S, F>(
+    forced_system: bool,
+    instance: Result<F, &'static str>,
+    system: Option<impl FnOnce() -> io::Result<S>>,
+) -> io::Result<(BackendChoice<I, S>, Option<&'static str>)>
+where
+    F: Future<Output = Result<I, &'static str>>,
+{
+    let fallback_reason = if forced_system {
+        Some("forced_system")
+    } else {
+        match instance {
+            Ok(create) => match create.await {
+                Ok(port) => return Ok((BackendChoice::Instance(port), None)),
+                Err(reason) => Some(reason),
+            },
+            Err(reason) => Some(reason),
+        }
+    };
+    match system {
+        Some(open) => open().map(|port| (BackendChoice::System(port), fallback_reason)),
+        None => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "no PTP timing backend: {}",
+                fallback_reason.unwrap_or("system clock unavailable")
+            ),
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacRoot {
+    clock: Option<MacPtpClock>,
+    gate: Arc<Semaphore>,
+}
+
+#[cfg(target_os = "macos")]
+enum MacSession {
+    System {
+        port: MacPtpPort,
+        _permit: OwnedSemaphorePermit,
+    },
+    Instance(ptp_timesync::TimeSyncPort),
+}
+
 #[derive(Clone)]
 pub(crate) struct PtpClockSource {
     samples: broadcast::Sender<PtpClockSample>,
+    backend: PtpBackendKind,
+    fallback_reason: Option<&'static str>,
     #[cfg(target_os = "macos")]
-    mac_clock: Option<MacPtpClock>,
+    mac_root: Option<Arc<MacRoot>>,
     #[cfg(target_os = "macos")]
-    mac_port: Option<Arc<MacPtpPort>>,
-    #[cfg(target_os = "macos")]
-    mac_session_gate: Option<Arc<Semaphore>>,
-    #[cfg(target_os = "macos")]
-    _mac_session_permit: Option<Arc<OwnedSemaphorePermit>>,
+    mac_session: Option<Arc<MacSession>>,
 }
 
 impl PtpClockSource {
+    fn portable(samples: broadcast::Sender<PtpClockSample>) -> Self {
+        Self {
+            samples,
+            backend: PtpBackendKind::Portable,
+            fallback_reason: None,
+            #[cfg(target_os = "macos")]
+            mac_root: None,
+            #[cfg(target_os = "macos")]
+            mac_session: None,
+        }
+    }
+
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<PtpClockSample> {
         self.samples.subscribe()
     }
 
+    /// Backend this session maps through.
+    pub(crate) fn backend(&self) -> PtpBackendKind {
+        self.backend
+    }
+
+    /// Why a preferred backend was not used for this session, if any.
+    pub(crate) fn fallback_reason(&self) -> Option<&'static str> {
+        self.fallback_reason
+    }
+
+    /// Becomes true when the session's instance port failed its lock
+    /// watchdog; the control connection should then close. `None` for
+    /// backends without such a signal.
+    pub(crate) fn failed(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        #[cfg(target_os = "macos")]
+        if let Some(MacSession::Instance(port)) = self.mac_session.as_deref() {
+            return Some(port.failed());
+        }
+        None
+    }
+
     /// Install the authenticated AirPlay peer into the platform timing
     /// backend. On Windows the process-wide UDP observer is already ready and
-    /// this is a cheap clone. macOS must register the peer with CoreMedia's
-    /// TimeSync service because the kernel owns UDP 319/320 and does not fan
-    /// those packets out to ordinary application sockets.
-    pub(crate) fn for_session(
+    /// this is a cheap clone. On macOS the kernel owns UDP 319/320, so the
+    /// peer is registered with TimeSync: preferably as its own gPTP instance
+    /// (several senders at once), otherwise on CoreMedia's shared system
+    /// clock, which can follow only one sender (`WouldBlock` -> RTSP 453).
+    pub(crate) async fn for_session(
         &self,
         local_ip: IpAddr,
         peer_ip: IpAddr,
         remote_match: Option<PtpRemoteMatch>,
     ) -> io::Result<Self> {
         #[cfg(target_os = "macos")]
-        if let Some(clock) = self.mac_clock.as_ref() {
+        if let Some(root) = self.mac_root.as_ref() {
             let (IpAddr::V4(local_ip), IpAddr::V4(peer_ip)) = (local_ip, peer_ip) else {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "the macOS AirPlay 2 PTP backend currently requires IPv4",
                 ));
             };
-            let permit = self
-                .mac_session_gate
-                .as_ref()
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "the macOS PTP session gate is unavailable",
-                    )
-                })?
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "macOS currently supports one active AirPlay 2 PTP sender",
-                    )
-                })?;
-            let port = clock
-                .add_ipv4_port(local_ip, peer_ip)
-                .map_err(mac_ptp_io_error)?;
-            // Current Apple senders commonly omit ClockID/ClockPorts from
-            // timingPeerInfo. Keep CoreMedia's default receive matching in
-            // that case; Apple's AirPlaySupport likewise applies an override
-            // only when the sender provides a complete sourcePortIdentity
-            // tuple. A complete tuple lets us narrow matching explicitly.
-            if let Some(remote_match) = remote_match {
-                port.override_receive_matching(
-                    remote_match.clock_identity,
-                    remote_match.port_number,
-                )
-                .map_err(mac_ptp_io_error)?;
-            }
-            return Ok(Self {
-                samples: self.samples.clone(),
-                mac_clock: Some(clock.clone()),
-                mac_port: Some(Arc::new(port)),
-                mac_session_gate: self.mac_session_gate.clone(),
-                _mac_session_permit: Some(Arc::new(permit)),
-            });
+            return self
+                .mac_session_source(root, local_ip, peer_ip, remote_match)
+                .await;
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -206,8 +422,93 @@ impl PtpClockSource {
         Ok(self.clone())
     }
 
-    /// Map a buffered RTP timestamp directly through the macOS system PTP
-    /// clock. `None` means this source uses the portable UDP observer/mapper.
+    #[cfg(target_os = "macos")]
+    async fn mac_session_source(
+        &self,
+        root: &Arc<MacRoot>,
+        local_ip: Ipv4Addr,
+        peer_ip: Ipv4Addr,
+        remote_match: Option<PtpRemoteMatch>,
+    ) -> io::Result<Self> {
+        let forced_system = ptp_timesync::test_hooks::forced_system();
+        let availability = if forced_system {
+            None
+        } else {
+            Some(
+                tokio::task::spawn_blocking(ptp_timesync::availability)
+                    .await
+                    .unwrap_or(ptp_timesync::Availability::Unavailable("probe_panicked")),
+            )
+        };
+        let peer_is_local = is_local_peer(peer_ip, local_ip, &local_interface_ipv4());
+        let precheck = instance_precheck(&ptp_timesync::BREAKER, peer_ip, peer_is_local);
+        let instance = match (availability, precheck) {
+            (None, _) => Err("forced_system"),
+            (_, Some(reason)) => Err(reason),
+            (Some(ptp_timesync::Availability::Available { .. }), None) => {
+                Ok(ptp_timesync::acquire(local_ip, peer_ip, remote_match))
+            }
+            (Some(ptp_timesync::Availability::Unavailable(reason)), None) => Err(reason),
+        };
+        let attempted = instance.is_ok();
+        let system = root.clock.as_ref().map(|clock| {
+            let gate = Arc::clone(&root.gate);
+            move || -> io::Result<MacSession> {
+                let permit = gate.try_acquire_owned().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "macOS system PTP clock already follows another AirPlay 2 sender",
+                    )
+                })?;
+                let port = clock
+                    .add_ipv4_port(local_ip, peer_ip)
+                    .map_err(mac_ptp_io_error)?;
+                // Current Apple senders commonly omit ClockID/ClockPorts from
+                // timingPeerInfo. Keep CoreMedia's default receive matching in
+                // that case; Apple's AirPlaySupport likewise applies an
+                // override only when the sender provides a complete
+                // sourcePortIdentity tuple.
+                if let Some(remote_match) = remote_match {
+                    port.override_receive_matching(
+                        remote_match.clock_identity,
+                        remote_match.port_number,
+                    )
+                    .map_err(mac_ptp_io_error)?;
+                }
+                Ok(MacSession::System {
+                    port,
+                    _permit: permit,
+                })
+            }
+        });
+        let (choice, fallback_reason) = select_backend(forced_system, instance, system).await?;
+        if attempted && fallback_reason.is_some() {
+            INSTANCE_CREATE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            crate::telemetry::record_ptp_instance_create_failure(
+                crate::telemetry::operation_token(),
+            );
+        }
+        let (backend, session) = match choice {
+            BackendChoice::Instance(port) => {
+                INSTANCE_SESSIONS.fetch_add(1, Ordering::Relaxed);
+                (PtpBackendKind::MacInstance, MacSession::Instance(port))
+            }
+            BackendChoice::System(session) => {
+                SYSTEM_SESSIONS.fetch_add(1, Ordering::Relaxed);
+                (PtpBackendKind::MacSystem, session)
+            }
+        };
+        Ok(Self {
+            samples: self.samples.clone(),
+            backend,
+            fallback_reason,
+            mac_root: Some(Arc::clone(root)),
+            mac_session: Some(Arc::new(session)),
+        })
+    }
+
+    /// Map a buffered RTP timestamp directly through the macOS PTP backend.
+    /// `None` means this source uses the portable UDP observer/mapper.
     pub(crate) fn platform_deadline_for_rtp(
         &self,
         anchor: PlaybackAnchor,
@@ -216,19 +517,23 @@ impl PtpClockSource {
         _telemetry_token: crate::telemetry::OperationToken,
     ) -> Option<Result<Instant, PtpClockError>> {
         #[cfg(target_os = "macos")]
-        if let Some(port) = self.mac_port.as_ref() {
+        if let Some(session) = self.mac_session.as_deref() {
             let remote_time_ns = match remote_time_for_rtp(anchor, packet_rtp, sample_rate) {
                 Ok(value) => value,
                 Err(error) => return Some(Err(error)),
             };
-            return Some(
-                port.map_remote_time(remote_time_ns, anchor.timeline_id)
+            return Some(match session {
+                MacSession::System { port, .. } => port
+                    .map_remote_time(remote_time_ns, anchor.timeline_id)
                     .map_err(|error| match error {
                         MacPtpError::NotLocked => PtpClockError::NotReady,
                         MacPtpError::GrandmasterMismatch { .. } => PtpClockError::SourceMismatch,
                         _ => PtpClockError::PlatformClockUnavailable,
                     }),
-            );
+                MacSession::Instance(port) => {
+                    port.map_remote_time(remote_time_ns, anchor.timeline_id)
+                }
+            });
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -240,9 +545,10 @@ impl PtpClockSource {
     pub(crate) fn local_port_identity(&self) -> Option<(u64, u16)> {
         #[cfg(target_os = "macos")]
         {
-            self.mac_port
-                .as_ref()
-                .map(|port| (port.clock_identity(), port.port_number()))
+            self.mac_session.as_deref().map(|session| match session {
+                MacSession::System { port, .. } => (port.clock_identity(), port.port_number()),
+                MacSession::Instance(port) => (port.clock_identity(), port.port_number()),
+            })
         }
         #[cfg(not(target_os = "macos"))]
         None
@@ -251,17 +557,7 @@ impl PtpClockSource {
     #[cfg(test)]
     pub(crate) fn test_source() -> Self {
         let (samples, _) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
-        Self {
-            samples,
-            #[cfg(target_os = "macos")]
-            mac_clock: None,
-            #[cfg(target_os = "macos")]
-            mac_port: None,
-            #[cfg(target_os = "macos")]
-            mac_session_gate: None,
-            #[cfg(target_os = "macos")]
-            _mac_session_permit: None,
-        }
+        Self::portable(samples)
     }
 
     #[cfg(test)]
@@ -287,18 +583,23 @@ impl PtpObserver {
 
     /// Bind the standard AirPlay PTP ports before advertising the receiver.
     /// Failure is fatal: continuing would claim a timing capability that this
-    /// process cannot actually observe.
+    /// process cannot actually observe. On macOS that means neither the
+    /// CoreMedia system clock nor TimeSync instances are usable.
     pub(crate) async fn bind_ipv4() -> io::Result<(Self, PtpClockSource)> {
         #[cfg(target_os = "macos")]
         {
-            Self::bind_macos_system_clock()
+            Self::bind_macos().await
         }
         #[cfg(not(target_os = "macos"))]
-        Self::bind(
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, PTP_EVENT_PORT)),
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, PTP_GENERAL_PORT)),
-        )
-        .await
+        {
+            let bound = Self::bind(
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, PTP_EVENT_PORT)),
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, PTP_GENERAL_PORT)),
+            )
+            .await?;
+            PLATFORM.store(PLATFORM_PORTABLE, Ordering::Relaxed);
+            Ok(bound)
+        }
     }
 
     /// Isolated binding for in-process daemon tests. Real receivers must use
@@ -319,17 +620,7 @@ impl PtpObserver {
         let event_socket = UdpSocket::bind(event_address).await?;
         let general_socket = UdpSocket::bind(general_address).await?;
         let (samples, _) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
-        let source = PtpClockSource {
-            samples: samples.clone(),
-            #[cfg(target_os = "macos")]
-            mac_clock: None,
-            #[cfg(target_os = "macos")]
-            mac_port: None,
-            #[cfg(target_os = "macos")]
-            mac_session_gate: None,
-            #[cfg(target_os = "macos")]
-            _mac_session_permit: None,
-        };
+        let source = PtpClockSource::portable(samples.clone());
         Ok((
             Self {
                 event_socket: Some(event_socket),
@@ -345,16 +636,40 @@ impl PtpObserver {
     }
 
     #[cfg(target_os = "macos")]
-    fn bind_macos_system_clock() -> io::Result<(Self, PtpClockSource)> {
-        let clock = MacPtpClock::new().map_err(mac_ptp_io_error)?;
-        let (samples, _) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
-        let source = PtpClockSource {
-            samples: samples.clone(),
-            mac_clock: Some(clock),
-            mac_port: None,
-            mac_session_gate: Some(Arc::new(Semaphore::new(1))),
-            _mac_session_permit: None,
+    async fn bind_macos() -> io::Result<(Self, PtpClockSource)> {
+        let clock = match MacPtpClock::new() {
+            Ok(clock) => Some(clock),
+            Err(error) => {
+                // The per-sender backend alone is enough to receive PTP
+                // senders; only both missing is fatal.
+                let availability = tokio::task::spawn_blocking(ptp_timesync::availability)
+                    .await
+                    .unwrap_or(ptp_timesync::Availability::Unavailable("probe_panicked"));
+                if !availability.is_available() {
+                    return Err(mac_ptp_io_error(error));
+                }
+                log::warn!(
+                    target: "audiohub_airplay::airplay2",
+                    "CoreMedia PTP clock unavailable ({error}); using TimeSync instances only"
+                );
+                None
+            }
         };
+        PLATFORM.store(
+            if clock.is_some() {
+                PLATFORM_MAC_WITH_SYSTEM_CLOCK
+            } else {
+                PLATFORM_MAC_WITHOUT_SYSTEM_CLOCK
+            },
+            Ordering::Relaxed,
+        );
+        let (samples, _) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
+        let mut source = PtpClockSource::portable(samples.clone());
+        source.backend = PtpBackendKind::MacSystem;
+        source.mac_root = Some(Arc::new(MacRoot {
+            clock,
+            gate: Arc::new(Semaphore::new(1)),
+        }));
         Ok((
             Self {
                 event_socket: None,
@@ -1326,6 +1641,8 @@ mod tests {
 
     #[test]
     fn telemetry_reset_preserves_ptp_announce_and_pending_pair_state() {
+        // Global recorder: serialized against concurrent `telemetry::reset`.
+        let _telemetry = crate::telemetry::test_serial();
         let (samples, mut receiver) = broadcast::channel(8);
         let mut observer = PtpObserver {
             event_socket: None,
@@ -1373,6 +1690,8 @@ mod tests {
 
     #[test]
     fn telemetry_reset_preserves_mapper_samples_and_existing_anchor() {
+        // Global recorder: serialized against concurrent `telemetry::reset`.
+        let _telemetry = crate::telemetry::test_serial();
         let epoch = Instant::now();
         let peer: IpAddr = "192.0.2.10".parse().unwrap();
         let original_token = crate::telemetry::operation_token();
@@ -1481,5 +1800,480 @@ mod tests {
             ),
             Err(PtpClockError::Stale)
         );
+    }
+
+    // ------------------------------------------------- backend fallback chain
+
+    #[derive(Debug)]
+    struct FakeInstance(u8);
+
+    /// System backend fake with the real one-sender gate semantics.
+    fn fake_system(
+        gate: &std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> impl FnOnce() -> io::Result<tokio::sync::OwnedSemaphorePermit> {
+        let gate = std::sync::Arc::clone(gate);
+        move || {
+            gate.try_acquire_owned()
+                .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "gate taken"))
+        }
+    }
+
+    #[tokio::test]
+    async fn create_failure_falls_back_to_system_and_a_second_system_session_would_block() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let (first, reason) = select_backend(
+            false,
+            Ok(async { Err::<FakeInstance, _>("create_failed") }),
+            Some(fake_system(&gate)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first, BackendChoice::System(_)));
+        assert_eq!(reason, Some("create_failed"));
+
+        let second = select_backend(
+            false,
+            Ok(async { Err::<FakeInstance, _>("port_failed") }),
+            Some(fake_system(&gate)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(second.kind(), io::ErrorKind::WouldBlock, "RTSP 453");
+
+        // Instance sessions are not constrained by the system gate.
+        for index in 0..3u8 {
+            let (choice, reason) = select_backend(
+                false,
+                Ok(async move { Ok::<_, &'static str>(FakeInstance(index)) }),
+                Some(fake_system(&gate)),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(choice, BackendChoice::Instance(FakeInstance(i)) if i == index));
+            assert_eq!(reason, None);
+        }
+        drop(first);
+        let (again, _) = select_backend(
+            false,
+            Err::<std::future::Ready<Result<FakeInstance, &'static str>>, _>("tripped"),
+            Some(fake_system(&gate)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(again, BackendChoice::System(_)), "gate released with its session");
+    }
+
+    #[tokio::test]
+    async fn forced_system_unavailable_and_missing_clock_follow_the_chain() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let (choice, reason) = select_backend(
+            true,
+            Ok(async { Ok::<_, &'static str>(FakeInstance(1)) }),
+            Some(fake_system(&gate)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(choice, BackendChoice::System(_)), "forced system skips step 2");
+        assert_eq!(reason, Some("forced_system"));
+        drop(choice);
+
+        let (choice, reason) = select_backend(
+            false,
+            Err::<std::future::Ready<Result<FakeInstance, &'static str>>, _>("missing_class"),
+            Some(fake_system(&gate)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(choice, BackendChoice::System(_)));
+        assert_eq!(reason, Some("missing_class"));
+
+        let none = select_backend(
+            false,
+            Err::<std::future::Ready<Result<FakeInstance, &'static str>>, _>("bad_encoding"),
+            None::<fn() -> io::Result<()>>,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(none.kind(), io::ErrorKind::Unsupported, "RTSP 500");
+
+        let (choice, _) = select_backend(
+            false,
+            Ok(async { Ok::<_, &'static str>(FakeInstance(2)) }),
+            None::<fn() -> io::Result<()>>,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(choice, BackendChoice::Instance(_)), "instance alone suffices");
+    }
+
+    /// The instance argument of [`select_backend`] for a session whose
+    /// precheck gave `precheck` and whose fake creation yields `created`.
+    fn fake_instance(
+        precheck: Option<&'static str>,
+        created: Result<u8, &'static str>,
+    ) -> Result<std::future::Ready<Result<FakeInstance, &'static str>>, &'static str> {
+        match precheck {
+            Some(reason) => Err(reason),
+            None => Ok(std::future::ready(created.map(FakeInstance))),
+        }
+    }
+
+    #[test]
+    fn local_peer_recognizes_loopback_the_local_address_and_interface_addresses() {
+        let local = Ipv4Addr::new(10, 130, 40, 39);
+        let interfaces = [local, Ipv4Addr::new(192, 168, 64, 1)];
+        assert!(is_local_peer(Ipv4Addr::LOCALHOST, local, &[]));
+        assert!(is_local_peer(Ipv4Addr::new(127, 0, 0, 2), local, &[]));
+        assert!(is_local_peer(local, local, &[]));
+        assert!(is_local_peer(
+            Ipv4Addr::new(192, 168, 64, 1),
+            local,
+            &interfaces
+        ));
+        assert!(!is_local_peer(
+            Ipv4Addr::new(10, 130, 40, 41),
+            local,
+            &interfaces
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_peer_uses_the_system_path_and_never_counts_toward_the_breaker() {
+        let breaker = super::super::ptp_timesync::Breaker::new();
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let local = Ipv4Addr::new(10, 130, 40, 39);
+
+        // The same-host sender would get an instance that never locks; it
+        // must not even try.
+        let precheck = instance_precheck(&breaker, local, is_local_peer(local, local, &[]));
+        assert_eq!(precheck, Some("local_peer"));
+        let (choice, reason) = select_backend(
+            false,
+            fake_instance(precheck, Ok(1)),
+            Some(fake_system(&gate)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(choice, BackendChoice::System(_)));
+        assert_eq!(reason, Some("local_peer"));
+        assert!(!breaker.is_tripped());
+        assert!(!breaker.peer_failed(local));
+
+        // A remote sender still gets its own instance while the local one
+        // holds the system gate.
+        let remote = Ipv4Addr::new(10, 130, 40, 41);
+        let precheck = instance_precheck(&breaker, remote, is_local_peer(remote, local, &[local]));
+        assert_eq!(precheck, None);
+        let (remote_choice, reason) = select_backend(
+            false,
+            fake_instance(precheck, Ok(2)),
+            Some(fake_system(&gate)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            remote_choice,
+            BackendChoice::Instance(FakeInstance(2))
+        ));
+        assert_eq!(reason, None);
+
+        // The system clock still follows one sender: a second same-host
+        // session while the first plays is RTSP 453, as in 1.0.2.
+        let error = select_backend(
+            false,
+            fake_instance(instance_precheck(&breaker, local, true), Ok(3)),
+            Some(fake_system(&gate)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(choice);
+    }
+
+    #[tokio::test]
+    async fn one_failing_peer_fails_only_itself_and_two_distinct_peers_trip_the_breaker() {
+        let breaker = super::super::ptp_timesync::Breaker::new();
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let a = Ipv4Addr::new(10, 0, 0, 1);
+        let b = Ipv4Addr::new(10, 0, 0, 2);
+        let c = Ipv4Addr::new(10, 0, 0, 3);
+
+        // Peer A gets an instance that then fails its lock watchdog.
+        let (first_a, _) = select_backend(
+            false,
+            fake_instance(instance_precheck(&breaker, a, false), Ok(1)),
+            Some(fake_system(&gate)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first_a, BackendChoice::Instance(_)));
+        assert!(!breaker.note_watchdog_failure(a), "one peer does not trip");
+        drop(first_a);
+
+        // Peer B is unaffected and still gets an instance.
+        assert_eq!(instance_precheck(&breaker, b, false), None);
+        let (first_b, _) = select_backend(
+            false,
+            fake_instance(instance_precheck(&breaker, b, false), Ok(2)),
+            Some(fake_system(&gate)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first_b, BackendChoice::Instance(FakeInstance(2))));
+
+        // Peer A's next session goes to the system clock instead of failing
+        // again after another ten seconds.
+        let (again_a, reason) = select_backend(
+            false,
+            fake_instance(instance_precheck(&breaker, a, false), Ok(3)),
+            Some(fake_system(&gate)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(again_a, BackendChoice::System(_)));
+        assert_eq!(reason, Some("peer_lock_failed"));
+
+        // B fails too: two distinct peers and no success trip the breaker.
+        assert!(breaker.note_watchdog_failure(b));
+        assert!(breaker.is_tripped());
+        drop(first_b);
+        drop(again_a);
+        let (third, reason) = select_backend(
+            false,
+            fake_instance(instance_precheck(&breaker, c, false), Ok(4)),
+            Some(fake_system(&gate)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(third, BackendChoice::System(_)));
+        assert_eq!(reason, Some("tripped"));
+    }
+
+    #[test]
+    fn backend_kind_names_match_the_ipc_vocabulary() {
+        assert_eq!(PtpBackendKind::Portable.as_str(), "portable");
+        assert_eq!(PtpBackendKind::MacInstance.as_str(), "instance");
+        assert_eq!(PtpBackendKind::MacSystem.as_str(), "system");
+    }
+
+    // ------------------------------------------------- Windows observer
+
+    #[test]
+    fn interleaved_samples_from_two_senders_reach_only_their_own_mapper() {
+        let (samples, mut receiver) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
+        let mut observer = PtpObserver {
+            event_socket: None,
+            general_socket: None,
+            samples,
+            announcements: HashMap::new(),
+            pending_syncs: HashMap::new(),
+            pending_follow_ups: HashMap::new(),
+            completed_pairs: HashMap::new(),
+        };
+        let senders: [(IpAddr, u64, u64); 2] = [
+            ("192.0.2.10".parse().unwrap(), 0xaa00_0000_0000_0a01, 1_000),
+            ("192.0.2.11".parse().unwrap(), 0xbb00_0000_0000_0b02, 49_000),
+        ];
+        let base = Instant::now();
+        for (peer, grandmaster, _) in senders {
+            let mut announce = header(MESSAGE_ANNOUNCE, PTP_ANNOUNCE_BYTES, 1, 0);
+            announce[53..61].copy_from_slice(&grandmaster.to_be_bytes());
+            observer.receive(
+                &announce,
+                SocketAddr::new(peer, PTP_GENERAL_PORT),
+                PTP_GENERAL_PORT,
+                base,
+            );
+        }
+        // Sync from both senders first, then the Follow_Ups in reverse order,
+        // all with the same sequence numbers (each sender counts on its own).
+        for round in 0..4u16 {
+            let at = base + Duration::from_millis(125 * u64::from(round) + 1);
+            for (peer, _, _) in senders {
+                let sync = header(MESSAGE_SYNC, PTP_SYNC_BYTES, round, 0);
+                observer.receive(&sync, SocketAddr::new(peer, PTP_EVENT_PORT), PTP_EVENT_PORT, at);
+            }
+            for (peer, _, seconds) in senders.iter().rev() {
+                let mut follow = header(MESSAGE_FOLLOW_UP, PTP_SYNC_BYTES, round, 0);
+                // Remote time advances with the 125 ms Sync interval.
+                timestamp(&mut follow, *seconds, u32::from(round) * 125_000_000);
+                observer.receive(
+                    &follow,
+                    SocketAddr::new(*peer, PTP_GENERAL_PORT),
+                    PTP_GENERAL_PORT,
+                    at + Duration::from_micros(200),
+                );
+            }
+        }
+        let token = crate::telemetry::operation_token();
+        let mut mappers: Vec<PtpClockMapper> = senders
+            .iter()
+            .map(|(peer, grandmaster, _)| {
+                PtpClockMapper::new(*peer, *grandmaster, base, token, crate::telemetry::MediaKind::Buffered)
+            })
+            .collect();
+        let mut emitted = 0;
+        while let Ok(sample) = receiver.try_recv() {
+            emitted += 1;
+            for (index, mapper) in mappers.iter_mut().enumerate() {
+                let own = sample.peer == senders[index].0;
+                let result = mapper.observe(sample);
+                if own {
+                    assert_eq!(sample.grandmaster, senders[index].1);
+                    assert!(result.is_ok(), "own sample accepted");
+                } else {
+                    assert_eq!(result, Err(PtpClockError::SourceMismatch));
+                }
+            }
+        }
+        assert_eq!(emitted, 8, "every interleaved pair completed exactly once");
+        for (index, mapper) in mappers.iter().enumerate() {
+            let anchor = PlaybackAnchor {
+                timeline_id: senders[index].1,
+                remote_time_ns: senders[index].2 * 1_000_000_000,
+                rtp_time: 0,
+                telemetry_token: token,
+            };
+            let deadline = mapper
+                .deadline_for_rtp(base + Duration::from_millis(400), anchor, 0, 44_100, token)
+                .unwrap();
+            // Round 0 Sync arrived at base+1 ms carrying the anchor time.
+            assert_eq!(deadline, base + Duration::from_millis(1));
+        }
+    }
+}
+
+/// Live fallback-chain checks (design §4.2 M4) on the macOS lab VM. Run one
+/// process per mode, built with `--features airplay-test-hooks`:
+/// `AUDIOHUB_TS_EXPECT=system_gate` with `AUDIOHUB_TEST_AIRPLAY_PTP_BACKEND=system`;
+/// `AUDIOHUB_TS_EXPECT=fallback` with `AUDIOHUB_TEST_TIMESYNC_FAULT=missing_class`
+/// or `create_fail`; `AUDIOHUB_TS_EXPECT=never_lock` with
+/// `AUDIOHUB_TEST_TIMESYNC_FAULT=never_lock` (one failing peer only fails
+/// itself, a second distinct one trips the breaker); `AUDIOHUB_TS_EXPECT=local_peer`
+/// without hooks (the host's own address uses the system clock, a remote
+/// peer still gets an instance). Peers come from
+/// `AUDIOHUB_TS_LOCAL_IPV4` / `AUDIOHUB_TS_PEERS` (two IPv4 addresses).
+#[cfg(all(test, target_os = "macos"))]
+mod mac_live {
+    use super::*;
+
+    fn env(name: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the macOS lab VM, test hooks and live peers"]
+    async fn live_backend_fallback_chain() {
+        let local: IpAddr = env("AUDIOHUB_TS_LOCAL_IPV4").parse().unwrap();
+        let peers: Vec<IpAddr> = env("AUDIOHUB_TS_PEERS")
+            .split(',')
+            .map(|peer| peer.trim().parse().unwrap())
+            .collect();
+        let expect = env("AUDIOHUB_TS_EXPECT");
+        let (_observer, root) = PtpObserver::bind_ipv4().await.expect("macOS PTP root");
+        let describe = |source: &io::Result<PtpClockSource>| match source {
+            Ok(source) => format!(
+                "backend={} reason={:?} identity={:?}",
+                source.backend().as_str(),
+                source.fallback_reason(),
+                source.local_port_identity().map(|(id, port)| format!("{id:016x}/{port}"))
+            ),
+            Err(error) => format!("error kind={:?} {error}", error.kind()),
+        };
+        match expect.as_str() {
+            "system_gate" | "fallback" => {
+                let first = root.for_session(local, peers[0], None).await;
+                println!("M4 {expect} first: {}", describe(&first));
+                let second = root.for_session(local, peers[1], None).await;
+                println!("M4 {expect} second: {}", describe(&second));
+                let first = first.expect("first session uses the system clock");
+                assert_eq!(first.backend(), PtpBackendKind::MacSystem);
+                assert!(first.fallback_reason().is_some());
+                assert_eq!(second.err().map(|error| error.kind()), Some(io::ErrorKind::WouldBlock));
+                drop(first);
+                let third = root.for_session(local, peers[1], None).await;
+                println!("M4 {expect} after release: {}", describe(&third));
+                assert_eq!(third.unwrap().backend(), PtpBackendKind::MacSystem);
+                println!("M4 {expect} status: {:?}", ptp_backend_status());
+            }
+            "never_lock" => {
+                let first = root.for_session(local, peers[0], None).await;
+                println!("M4 never_lock first: {}", describe(&first));
+                let first = first.expect("instance session");
+                assert_eq!(first.backend(), PtpBackendKind::MacInstance);
+                let failed = first.failed().expect("instance failure signal");
+                let started = Instant::now();
+                let Some(MacSession::Instance(port)) = first.mac_session.as_deref() else {
+                    panic!("instance session expected");
+                };
+                let mut last_error = None;
+                while !*failed.borrow() && started.elapsed() < Duration::from_secs(20) {
+                    last_error = port.map_remote_time(1_000_000_000_000, 0xaa).err();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                let elapsed = started.elapsed();
+                println!(
+                    "M4 never_lock failed={} after {:?} last_map_error={last_error:?} status={:?}",
+                    *failed.borrow(),
+                    elapsed,
+                    ptp_backend_status()
+                );
+                assert!(*failed.borrow());
+                assert!(elapsed >= Duration::from_millis(9_900) && elapsed < Duration::from_secs(12));
+                assert!(
+                    !ptp_backend_status().tripped,
+                    "one failing peer does not trip"
+                );
+                drop(first);
+                let retry = root.for_session(local, peers[0], None).await;
+                println!("M4 never_lock same peer again: {}", describe(&retry));
+                let retry = retry.unwrap();
+                assert_eq!(retry.backend(), PtpBackendKind::MacSystem);
+                assert_eq!(retry.fallback_reason(), Some("peer_lock_failed"));
+                drop(retry);
+                let second = root.for_session(local, peers[1], None).await;
+                println!("M4 never_lock second peer: {}", describe(&second));
+                let second = second.expect("instance session");
+                assert_eq!(second.backend(), PtpBackendKind::MacInstance);
+                let failed = second.failed().expect("instance failure signal");
+                let Some(MacSession::Instance(port)) = second.mac_session.as_deref() else {
+                    panic!("instance session expected");
+                };
+                let started = Instant::now();
+                while !*failed.borrow() && started.elapsed() < Duration::from_secs(20) {
+                    let _ = port.map_remote_time(1_000_000_000_000, 0xaa);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                println!(
+                    "M4 never_lock second failed={} status={:?}",
+                    *failed.borrow(),
+                    ptp_backend_status()
+                );
+                assert!(*failed.borrow());
+                assert!(
+                    ptp_backend_status().tripped,
+                    "two distinct failing peers trip"
+                );
+                drop(second);
+                let third = root.for_session(local, peers[1], None).await;
+                println!("M4 never_lock after trip: {}", describe(&third));
+                let third = third.unwrap();
+                assert_eq!(third.backend(), PtpBackendKind::MacSystem);
+                assert_eq!(third.fallback_reason(), Some("tripped"));
+            }
+            "local_peer" => {
+                let own = root.for_session(local, local, None).await;
+                println!("M4 local_peer own address: {}", describe(&own));
+                let own = own.expect("same-host session uses the system clock");
+                assert_eq!(own.backend(), PtpBackendKind::MacSystem);
+                assert_eq!(own.fallback_reason(), Some("local_peer"));
+                let remote = root.for_session(local, peers[0], None).await;
+                println!("M4 local_peer remote: {}", describe(&remote));
+                assert_eq!(remote.unwrap().backend(), PtpBackendKind::MacInstance);
+                println!("M4 local_peer status: {:?}", ptp_backend_status());
+                assert!(!ptp_backend_status().tripped);
+            }
+            other => panic!("unknown AUDIOHUB_TS_EXPECT {other}"),
+        }
     }
 }

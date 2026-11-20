@@ -1220,6 +1220,8 @@ fn settings_view(inner: &Arc<DaemonInner>) -> DaemonSettings {
         airplay_warning: airplay_live.warning,
         airplay_password_set: crate::settings::airplay_password_is_set(&inner.cfg_dir),
         airplay_airplay2_port: airplay_live.airplay2_port,
+        airplay_max_senders: Some(crate::airplay::MAX_SENDERS),
+        airplay_ptp_backend: airplay_live.ptp_backend,
         // plan M9「开机自启」。四个字段全部**探测**出来，一个都不存盘：登录项
         // 活过重启靠的是 plist / 计划任务本身，settings.json 里再放一份就成了
         // 第二个真值源（见 `crate::autostart` 开头）。

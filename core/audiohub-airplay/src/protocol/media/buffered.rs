@@ -2929,6 +2929,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn telemetry_reset_preserves_partial_tcp_frame_anchor_and_decoder() {
+        // Global recorder: serialized against concurrent `telemetry::reset`.
+        let _telemetry = crate::telemetry::test_serial();
         let (ports, handle, state) = harness().await;
         let mut sender = TcpStream::connect((Ipv4Addr::LOCALHOST, ports.data_port))
             .await

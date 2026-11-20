@@ -254,9 +254,9 @@ async fn dispatch_classic(
                 },
                 _ => return DispatchOutcome::reply(response_for(request, 400, "Bad Request")),
             };
-            let permit = match config.media_permits.clone().try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
+            let permit = match MediaPermit::try_acquire(&config.media_permits) {
+                Some(permit) => permit,
+                None => {
                     return DispatchOutcome::reply(response_for(
                         request,
                         453,
@@ -395,8 +395,9 @@ mod tests {
     }
 
     fn state() -> ConnectionState {
-        let (tx, _) = watch::channel(None);
-        ConnectionState::new(Ipv4Addr::LOCALHOST.into(), tx).unwrap()
+        let (remote, _) = watch::channel(RemoteControlMap::new());
+        let (volume, _) = watch::channel(VolumeMap::new());
+        ConnectionState::new(Ipv4Addr::LOCALHOST.into(), remote, volume).unwrap()
     }
 
     fn sdp() -> Vec<u8> {
@@ -528,7 +529,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn classic_setup_respects_the_shared_media_permit_and_state_order() {
+    async fn classic_setup_respects_the_shared_media_limit_and_state_order() {
         let mut config = super::super::tests::config();
         config.classic_key = Arc::new(TestKey(Arc::new(AtomicUsize::new(0))));
         let mut state = state();
@@ -552,7 +553,10 @@ mod tests {
         )
         .await;
         state.classic.announced = announced.install_classic_announcement.take();
-        let _busy = config.media_permits.clone().try_acquire_owned().unwrap();
+        // Classic and AirPlay 2 share the receiver-wide limit of four streams.
+        let _busy: Vec<_> = (0..MAX_ACTIVE_MEDIA_STREAMS)
+            .map(|_| MediaPermit::try_acquire(&config.media_permits).unwrap())
+            .collect();
         assert_eq!(call(&setup, &config, &mut state).await.response.status, 453);
         assert!(state.classic.announced.is_some());
         assert!(state.media.is_none());

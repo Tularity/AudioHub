@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react';
 import { BlockTitle, Help, SettingRow, Switch } from '../components/Controls';
 import { Icon } from '../components/Icon';
 import { Sheet } from '../components/Sheet';
+import { maxSenders, singlePtpSender, usesSharedClock } from '../lib/airplay';
 import { WIKI } from '../lib/external';
 import { fmt } from '../lib/fmt';
 import { joinPhrases, t } from '../i18n';
@@ -210,6 +211,7 @@ function AirPlayCard() {
   }
 
   const effectiveName = settings?.airplay_effective_name || daemonName;
+  const senderLimit = maxSenders(settings);
   const status = stateText(settings, supported);
   const stateTone = settings?.airplay_error || settings?.airplay_warning
     ? ' error'
@@ -285,6 +287,17 @@ function AirPlayCard() {
               </span>
             )}
           />
+
+          {senderLimit != null ? (
+            <p className="proto-hint" data-testid="share-proto-airplay-multi">
+              {t('share.proto.airplay.multi', { n: senderLimit })}
+            </p>
+          ) : null}
+          {singlePtpSender(settings) ? (
+            <p className="proto-hint warn" data-testid="share-proto-airplay-ptp-single">
+              {t('share.proto.airplay.ptpSingle')}
+            </p>
+          ) : null}
         </>
       ) : null}
 
@@ -379,6 +392,15 @@ function ActiveSession({ session, index }: {
         <div className="proto-session-head">
           <strong>{title}</strong>
           <span className="tag">{protocol}</span>
+          {usesSharedClock(session) ? (
+            <span
+              className="tag"
+              title={t('share.proto.active.sharedClockWhy')}
+              data-testid={`share-proto-clock-${session.id ?? index}`}
+            >
+              {t('share.proto.active.sharedClock')}
+            </span>
+          ) : null}
           <span className={`tag ${session.paused ? 'warn' : 'ok'}`}>
             {session.paused
               ? t('share.proto.active.paused')
@@ -386,6 +408,14 @@ function ActiveSession({ session, index }: {
           </span>
         </div>
         {media ? <div className="proto-session-media">{media}</div> : null}
+        {session.volume_sync_warning ? (
+          <div
+            className="proto-session-warn"
+            data-testid={`share-proto-volwarn-${session.id ?? index}`}
+          >
+            {session.volume_sync_warning}
+          </div>
+        ) : null}
         <div className="proto-session-meta">
           <span>{t('share.proto.active.peer', { peer })}</span>
           {format ? <span>{format}</span> : null}
@@ -403,7 +433,11 @@ function ActiveCard() {
 
   return (
     <section className="card block" data-testid="share-proto-active">
-      <h3 className="block-title">{t('share.proto.active.title')}</h3>
+      <h3 className="block-title">
+        {sessions.length > 0
+          ? t('share.proto.active.titleCount', { count: sessions.length })
+          : t('share.proto.active.title')}
+      </h3>
       {sessions.length === 0 ? (
         <div className="proto-empty" data-testid="share-proto-active-empty">
           <Icon name="cable" cls="ico" />

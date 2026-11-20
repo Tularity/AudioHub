@@ -2440,6 +2440,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn telemetry_reset_preserves_realtime_ptp_frame_and_deadline() {
+        // Global recorder: serialized against concurrent `telemetry::reset`.
+        let _telemetry = crate::telemetry::test_serial();
         const TIMELINE: u64 = 0x4142_4344_4546_4748;
         let data = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let control = UdpSocket::bind("127.0.0.1:0").await.unwrap();

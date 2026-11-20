@@ -1,8 +1,78 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
+
+/// Maximum number of concurrently playing AirPlay senders, and therefore of
+/// PCM lanes. Equal to the receiver's media-stream limit.
+pub const MAX_AIRPLAY_LANES: usize = 4;
+
+/// Fixed set of lazily allocated per-sender PCM buses.
+///
+/// Every lane is an ordinary [`PcmBus`]: one writer, one session at a time,
+/// timestamp alignment and its own clock correction. A lane is allocated on
+/// first use (about 4.6 MB with the default config) and then kept for the
+/// lifetime of the runtime. [`Self::generation`] changes whenever a lane is
+/// allocated, so a reader can cheaply notice that it must subscribe to it.
+#[derive(Debug, Clone)]
+pub struct PcmLanes {
+    inner: Arc<LanesInner>,
+}
+
+#[derive(Debug)]
+struct LanesInner {
+    config: BusConfig,
+    lanes: [OnceLock<PcmBus>; MAX_AIRPLAY_LANES],
+    generation: AtomicU64,
+}
+
+impl PcmLanes {
+    pub(crate) fn new(config: BusConfig) -> Self {
+        Self {
+            inner: Arc::new(LanesInner {
+                config,
+                lanes: std::array::from_fn(|_| OnceLock::new()),
+                generation: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// Changes whenever a lane is allocated. Lock-free.
+    pub fn generation(&self) -> u64 {
+        self.inner.generation.load(Ordering::SeqCst)
+    }
+
+    /// The lane's bus, or `None` until the lane has been allocated (or when
+    /// `index` is out of range).
+    pub fn lane(&self, index: usize) -> Option<&PcmBus> {
+        self.inner.lanes.get(index)?.get()
+    }
+
+    /// Whether any allocated lane currently has an owning session.
+    pub fn any_active(&self) -> bool {
+        self.inner
+            .lanes
+            .iter()
+            .filter_map(OnceLock::get)
+            .any(|bus| bus.active_session().is_some())
+    }
+
+    /// Allocate a lane if needed. The generation is bumped only after the lane
+    /// is visible, so a reader that observes the new generation finds it.
+    pub(crate) fn ensure_lane(&self, index: usize) -> &PcmBus {
+        let mut created = false;
+        let bus = self.inner.lanes[index].get_or_init(|| {
+            created = true;
+            PcmBus::new(self.inner.config)
+        });
+        if created {
+            self.inner.generation.fetch_add(1, Ordering::SeqCst);
+            crate::telemetry::record_pcm_lane_allocated(crate::telemetry::operation_token());
+        }
+        bus
+    }
+}
 
 /// A receiver-owned estimate, not a claim of exact acoustic presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -940,6 +1010,8 @@ mod tests {
 
     #[test]
     fn telemetry_reset_preserves_pcm_and_reader_priming() {
+        // Global recorder: serialized against concurrent `telemetry::reset`.
+        let _telemetry = crate::telemetry::test_serial();
         let bus = PcmBus::new(BusConfig {
             capacity_samples: 960,
             prebuffer_samples: 4,
@@ -991,6 +1063,8 @@ mod tests {
 
     #[test]
     fn overflow_is_bounded_and_reported_per_reader() {
+        // Global recorder: serialized against concurrent `telemetry::reset`.
+        let _telemetry = crate::telemetry::test_serial();
         let telemetry_before = crate::telemetry::snapshot().counters;
         let bus = tiny_bus();
         let mut reader = bus.subscribe();
@@ -1024,6 +1098,8 @@ mod tests {
 
     #[test]
     fn writer_lock_does_not_count_as_contention_during_real_underrun() {
+        // Global recorder: serialized against concurrent `telemetry::reset`.
+        let _telemetry = crate::telemetry::test_serial();
         let telemetry_before = crate::telemetry::snapshot().counters;
         let bus = tiny_bus();
         let mut reader = bus.subscribe();
@@ -1054,7 +1130,58 @@ mod tests {
     }
 
     #[test]
+    fn lanes_allocate_lazily_and_bump_generation_once_per_lane() {
+        let lanes = PcmLanes::new(BusConfig {
+            capacity_samples: 960,
+            prebuffer_samples: 0,
+            max_correction_ppm: 500,
+        });
+        assert_eq!(lanes.generation(), 0);
+        assert!(lanes.lane(0).is_none());
+        assert!(lanes.lane(MAX_AIRPLAY_LANES).is_none());
+        assert!(!lanes.any_active());
+        lanes.ensure_lane(1);
+        assert_eq!(lanes.generation(), 1);
+        assert!(lanes.lane(0).is_none());
+        assert!(lanes.lane(1).is_some());
+        lanes.ensure_lane(1);
+        assert_eq!(lanes.generation(), 1, "an existing lane is reused");
+        lanes.ensure_lane(1).activate(5);
+        assert!(lanes.any_active());
+        lanes.lane(1).unwrap().end(5);
+        assert!(!lanes.any_active());
+    }
+
+    #[test]
+    fn lanes_are_independent_buses_with_their_own_owner() {
+        let lanes = PcmLanes::new(BusConfig {
+            capacity_samples: 960,
+            prebuffer_samples: 0,
+            max_correction_ppm: 500,
+        });
+        let first = lanes.ensure_lane(0).clone();
+        let second = lanes.ensure_lane(1).clone();
+        let mut first_reader = first.subscribe();
+        let mut second_reader = second.subscribe();
+        first.activate(1);
+        second.activate(2);
+        assert!(first.push(1, &[[0.25, -0.25]]));
+        assert!(second.push(2, &[[0.5, -0.5]]));
+        assert!(!first.push(2, &[[0.9, 0.9]]), "a session writes only its own lane");
+        let mut out = [[0.0; 2]; 1];
+        assert_eq!(first_reader.read_stereo_into(&mut out).session_id, Some(1));
+        assert_eq!(out, [[0.25, -0.25]]);
+        assert_eq!(second_reader.read_stereo_into(&mut out).session_id, Some(2));
+        assert_eq!(out, [[0.5, -0.5]]);
+        first.end(1);
+        assert_eq!(second.active_session(), Some(2), "ending one lane leaves the other");
+    }
+
+    /// Lane-level replacement: a single lane still has one owner at a time.
+    #[test]
     fn new_session_invalidates_old_sink_and_resets_readers() {
+        // Global recorder: serialized against concurrent `telemetry::reset`.
+        let _telemetry = crate::telemetry::test_serial();
         let mismatches_before = crate::telemetry::snapshot()
             .counters
             .pcm_bus_pushes_owner_mismatch;

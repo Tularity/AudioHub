@@ -28,10 +28,10 @@ use super::metadata::{self, Artwork, MergePolicy, NowPlayingUpdate, PatchField, 
 use super::pairing::PairSetupServer;
 use super::rtsp::{Header, Request, RequestDecoder, RequestLimits, Response};
 use super::tlv8::{self, Tlv8Field, Tlv8Limits};
-use crate::runtime::{Protocol, ReceiverVolumeProvider, ReceiverVolumeSnapshot};
+use crate::runtime::{Protocol, ReceiverVolumeProvider, ReceiverVolumeSnapshot, SessionTiming};
 use plist::{Dictionary, Value};
 use rand::{rngs::OsRng, RngCore};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Cursor};
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -46,10 +46,11 @@ use tokio::time::timeout;
 use zeroize::Zeroizing;
 
 const MAX_CONNECTIONS: usize = 16;
-// AudioHub owns one local output mix. A second AirPlay sender must not reserve
-// another decoder, network buffer, and device writer behind a separate control
-// connection while the first stream is active.
-const MAX_ACTIVE_MEDIA_STREAMS: usize = 1;
+// Concurrent media streams across AirPlay 2 and classic RAOP (design §2.2).
+// Each holds a decoder, network buffers and one PCM lane; the daemon mixes the
+// lanes. Two or three home senders at once is already a lot, and four
+// full-scale sources keep the soft clipper engaged almost permanently.
+pub(crate) const MAX_ACTIVE_MEDIA_STREAMS: usize = crate::bus::MAX_AIRPLAY_LANES;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const EVENT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -247,7 +248,33 @@ pub(crate) struct SetupPhase1Fields {
 /// has reached the encrypted control socket. It cannot make SETUP falsely
 /// succeed: every fallible network/decoder resource is prepared beforehand.
 pub(crate) type PcmOutputFactory =
-    Arc<dyn Fn(u64, SocketAddr, Protocol) -> Box<dyn PcmOutput> + Send + Sync>;
+    Arc<dyn Fn(u64, SocketAddr, Protocol, SessionTiming) -> Box<dyn PcmOutput> + Send + Sync>;
+
+/// One receiver media slot. Held by the control connection while it has a
+/// prepared or active stream; telemetry tracks the number held.
+pub(crate) struct MediaPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl MediaPermit {
+    pub(crate) fn try_acquire(permits: &Arc<Semaphore>) -> Option<Self> {
+        let permit = Arc::clone(permits).try_acquire_owned().ok()?;
+        crate::telemetry::record_media_stream_started(crate::telemetry::operation_token());
+        Some(Self { _permit: permit })
+    }
+}
+
+impl Drop for MediaPermit {
+    fn drop(&mut self) {
+        crate::telemetry::record_media_stream_ended();
+    }
+}
+
+impl std::fmt::Debug for MediaPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MediaPermit")
+    }
+}
 
 struct CompletionOutput {
     inner: Option<Box<dyn PcmOutput>>,
@@ -296,9 +323,21 @@ impl Drop for CompletionOutput {
 pub(crate) struct VolumeUpdate {
     pub(crate) protocol: Protocol,
     pub(crate) stream_id: u64,
+    /// Per-stream command counter: 1, 2, 3, ... for each stream. The daemon's
+    /// echo correlation relies on "the next revision of the same session".
     pub(crate) revision: u64,
+    /// Receiver-wide command order across all streams; only used to decide
+    /// which sender's command was last.
+    pub(crate) order: u64,
     pub(crate) db: f32,
 }
+
+/// Latest volume command per live stream. A stream's entry is removed when
+/// the stream ends.
+pub(crate) type VolumeMap = BTreeMap<u64, VolumeUpdate>;
+/// Remote-control state per live stream. Only active streams are present;
+/// removal means the stream ended.
+pub(crate) type RemoteControlMap = BTreeMap<u64, RemoteControlState>;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RemoteControlCredentials {
@@ -316,18 +355,12 @@ impl std::fmt::Debug for RemoteControlCredentials {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RemoteControlState {
-    Active {
-        protocol: Protocol,
-        stream_id: u64,
-        peer: SocketAddr,
-        credentials: Option<RemoteControlCredentials>,
-        event_commands: Option<EventCommandSender>,
-    },
-    Ended {
-        protocol: Protocol,
-        stream_id: u64,
-    },
+pub(crate) struct RemoteControlState {
+    pub(crate) protocol: Protocol,
+    pub(crate) stream_id: u64,
+    pub(crate) peer: SocketAddr,
+    pub(crate) credentials: Option<RemoteControlCredentials>,
+    pub(crate) event_commands: Option<EventCommandSender>,
 }
 
 /// Synchronous, bounded handle to the encrypted AP2 event-channel actor.
@@ -663,8 +696,8 @@ pub(crate) async fn serve(
     listener: TcpListener,
     config: Arc<ServerConfig>,
     event_tx: mpsc::Sender<ProbeEvent>,
-    latest_volume: watch::Sender<Option<VolumeUpdate>>,
-    latest_remote_control: watch::Sender<Option<RemoteControlState>>,
+    latest_volume: watch::Sender<VolumeMap>,
+    latest_remote_control: watch::Sender<RemoteControlMap>,
     output_factory: PcmOutputFactory,
 ) -> io::Result<()> {
     listener.set_nonblocking(true)?;
@@ -692,7 +725,7 @@ pub(crate) async fn serve(
     let pair_setup_limiter = Arc::new(PairSetupLimiter::new());
     let apple_challenges = Arc::new(AppleChallengeExecutor::new());
     let next_stream_id = Arc::new(AtomicU64::new(1));
-    let volume_revision = Arc::new(AtomicU64::new(0));
+    let volume_order = Arc::new(AtomicU64::new(0));
 
     loop {
         let (socket, peer) = tokio::select! {
@@ -716,7 +749,7 @@ pub(crate) async fn serve(
         let pair_setup_limiter = Arc::clone(&pair_setup_limiter);
         let apple_challenges = Arc::clone(&apple_challenges);
         let next_stream_id = Arc::clone(&next_stream_id);
-        let volume_revision = Arc::clone(&volume_revision);
+        let volume_order = Arc::clone(&volume_order);
         tokio::spawn(async move {
             let _permit = permit;
             log::info!(
@@ -734,7 +767,7 @@ pub(crate) async fn serve(
                 pair_setup_limiter,
                 apple_challenges,
                 next_stream_id,
-                volume_revision,
+                volume_order,
             )
             .await;
             match result {
@@ -949,15 +982,22 @@ struct ConnectionState {
     phase_one: Option<PhaseOneState>,
     media: Option<ActiveMedia>,
     media_completion: Option<watch::Receiver<bool>>,
-    /// One global receiver slot owned by this control connection while it has
+    /// One receiver media slot owned by this control connection while it has
     /// an active or prepared media stream. Keeping the permit outside the
     /// concrete stream lets the same connection replace a stream atomically.
-    media_permit: Option<OwnedSemaphorePermit>,
+    media_permit: Option<MediaPermit>,
     remote_control: RemoteControlAccumulator,
     pending_volume_db: Option<f32>,
+    /// Per-stream volume command counter; reset for every new stream.
+    stream_volume_revision: u64,
+    /// Timing negotiated in SETUP phase one, reported with the PCM sink.
+    session_timing: SessionTiming,
+    /// Becomes true when the session's PTP instance failed its watchdog.
+    ptp_failed: Option<watch::Receiver<bool>>,
     now_playing: ConnectionNowPlaying,
     plaintext_apple_response_sent: bool,
-    latest_remote_control: watch::Sender<Option<RemoteControlState>>,
+    latest_remote_control: watch::Sender<RemoteControlMap>,
+    latest_volume: watch::Sender<VolumeMap>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1001,7 +1041,8 @@ impl ClassicConnection {
 impl ConnectionState {
     fn new(
         peer_ip: IpAddr,
-        latest_remote_control: watch::Sender<Option<RemoteControlState>>,
+        latest_remote_control: watch::Sender<RemoteControlMap>,
+        latest_volume: watch::Sender<VolumeMap>,
     ) -> Result<Self, ConnectionError> {
         // Plaintext pairing/control stays at the small default body budget.
         // `install_control_after_m4` raises it only after authentication.
@@ -1031,9 +1072,13 @@ impl ConnectionState {
             media_permit: None,
             remote_control: RemoteControlAccumulator::default(),
             pending_volume_db: None,
+            stream_volume_revision: 0,
+            session_timing: SessionTiming::Unknown,
+            ptp_failed: None,
             now_playing: ConnectionNowPlaying::default(),
             plaintext_apple_response_sent: false,
             latest_remote_control,
+            latest_volume,
         })
     }
 
@@ -1049,15 +1094,58 @@ impl ConnectionState {
         let Some(stream_id) = self.active_stream_id() else {
             return;
         };
-        let _ = self
-            .latest_remote_control
-            .send(Some(RemoteControlState::Active {
-                protocol: self.media.as_ref().expect("active stream").protocol(),
-                stream_id,
-                peer,
-                credentials: self.remote_control.complete(),
-                event_commands: publishable_event_commands(self.event_commands.as_ref()),
-            }));
+        let state = RemoteControlState {
+            protocol: self.media.as_ref().expect("active stream").protocol(),
+            stream_id,
+            peer,
+            credentials: self.remote_control.complete(),
+            event_commands: publishable_event_commands(self.event_commands.as_ref()),
+        };
+        self.latest_remote_control.send_if_modified(|streams| {
+            if streams.get(&stream_id) == Some(&state) {
+                return false;
+            }
+            streams.insert(stream_id, state);
+            true
+        });
+    }
+
+    /// Publish the next volume command of the active stream.
+    fn publish_volume(&mut self, volume_order: &AtomicU64, db: f32) {
+        let Some(media) = self.media.as_ref() else {
+            return;
+        };
+        let (protocol, stream_id) = (media.protocol(), media.stream_id());
+        self.publish_stream_volume(volume_order, protocol, stream_id, db);
+    }
+
+    fn publish_stream_volume(
+        &mut self,
+        volume_order: &AtomicU64,
+        protocol: Protocol,
+        stream_id: u64,
+        db: f32,
+    ) {
+        self.stream_volume_revision += 1;
+        let update = VolumeUpdate {
+            protocol,
+            stream_id,
+            revision: self.stream_volume_revision,
+            order: volume_order.fetch_add(1, Ordering::AcqRel).wrapping_add(1),
+            db,
+        };
+        self.latest_volume.send_modify(|streams| {
+            streams.insert(stream_id, update);
+        });
+    }
+
+    /// Remove an ended stream from both published maps. Removal from the
+    /// remote-control map is the stream's "ended" notification.
+    fn end_stream_publications(&self, stream_id: u64) {
+        self.latest_volume
+            .send_if_modified(|streams| streams.remove(&stream_id).is_some());
+        self.latest_remote_control
+            .send_if_modified(|streams| streams.remove(&stream_id).is_some());
     }
 }
 
@@ -1082,12 +1170,7 @@ impl Drop for ConnectionState {
             task.abort();
         }
         if let Some(media) = self.media.take() {
-            let _ = self
-                .latest_remote_control
-                .send(Some(RemoteControlState::Ended {
-                    protocol: media.protocol(),
-                    stream_id: media.stream_id(),
-                }));
+            self.end_stream_publications(media.stream_id());
             drop(media);
         }
     }
@@ -1096,6 +1179,19 @@ impl Drop for ConnectionState {
 enum PhaseOneState {
     Ntp(PreparedTiming),
     Ptp(PtpClockSource),
+}
+
+impl PhaseOneState {
+    fn timing(&self) -> SessionTiming {
+        match self {
+            Self::Ntp(_) => SessionTiming::Ntp,
+            Self::Ptp(source) => match source.backend() {
+                super::media::ptp::PtpBackendKind::Portable => SessionTiming::PtpPortable,
+                super::media::ptp::PtpBackendKind::MacInstance => SessionTiming::PtpInstance,
+                super::media::ptp::PtpBackendKind::MacSystem => SessionTiming::PtpSystem,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1332,25 +1428,19 @@ async fn run_connection(
     peer: SocketAddr,
     config: Arc<ServerConfig>,
     event_tx: mpsc::Sender<ProbeEvent>,
-    latest_volume: watch::Sender<Option<VolumeUpdate>>,
-    latest_remote_control: watch::Sender<Option<RemoteControlState>>,
+    latest_volume: watch::Sender<VolumeMap>,
+    latest_remote_control: watch::Sender<RemoteControlMap>,
     output_factory: PcmOutputFactory,
     pair_setup_limiter: Arc<PairSetupLimiter>,
     apple_challenges: Arc<AppleChallengeExecutor>,
     next_stream_id: Arc<AtomicU64>,
-    volume_revision: Arc<AtomicU64>,
+    volume_order: Arc<AtomicU64>,
 ) -> Result<(), ConnectionError> {
-    let mut state = ConnectionState::new(peer.ip(), latest_remote_control)?;
+    let mut state = ConnectionState::new(peer.ip(), latest_remote_control, latest_volume)?;
     loop {
         if state.media.as_ref().is_some_and(ActiveMedia::is_finished) {
             if let Some(media) = state.media.take() {
-                let stream_id = media.stream_id();
-                let _ = state
-                    .latest_remote_control
-                    .send(Some(RemoteControlState::Ended {
-                        protocol: media.protocol(),
-                        stream_id,
-                    }));
+                state.end_stream_publications(media.stream_id());
                 drop(media);
             }
             state.media_permit = None;
@@ -1369,10 +1459,9 @@ async fn run_connection(
                 peer,
                 &config,
                 &event_tx,
-                &latest_volume,
                 &output_factory,
                 &next_stream_id,
-                &volume_revision,
+                &volume_order,
                 &pair_setup_limiter,
                 &apple_challenges,
                 &mut state,
@@ -1392,10 +1481,9 @@ async fn process_one_request(
     peer: SocketAddr,
     config: &ServerConfig,
     event_tx: &mpsc::Sender<ProbeEvent>,
-    latest_volume: &watch::Sender<Option<VolumeUpdate>>,
     output_factory: &PcmOutputFactory,
     next_stream_id: &AtomicU64,
-    volume_revision: &AtomicU64,
+    volume_order: &AtomicU64,
     pair_setup_limiter: &PairSetupLimiter,
     apple_challenges: &AppleChallengeExecutor,
     state: &mut ConnectionState,
@@ -1698,6 +1786,11 @@ async fn process_one_request(
         }
     }
     if let Some(phase_one) = outcome.install_phase_one {
+        state.session_timing = phase_one.timing();
+        state.ptp_failed = match &phase_one {
+            PhaseOneState::Ptp(source) => source.failed(),
+            PhaseOneState::Ntp(_) => None,
+        };
         state.phase_one = Some(phase_one);
     }
     if let Some(permit) = outcome.install_media_permit {
@@ -1705,11 +1798,19 @@ async fn process_one_request(
     }
     if let Some(prepared) = outcome.start_media {
         if let Some(mut previous) = state.media.take() {
+            // Same-connection replacement: the old stream ends, the new one
+            // starts with its own id; the connection keeps its permit.
+            state.end_stream_publications(previous.stream_id());
             previous.abort().await;
         }
         let stream_id = prepared.stream_id();
         let protocol = prepared.protocol();
-        let output = output_factory(stream_id, peer, protocol);
+        let timing = match protocol {
+            Protocol::AirPlay1 => SessionTiming::Ntp,
+            Protocol::AirPlay2 => state.session_timing,
+        };
+        state.stream_volume_revision = 0;
+        let output = output_factory(stream_id, peer, protocol, timing);
         let (finished, completion) = watch::channel(false);
         state.media_completion = Some(completion);
         state.media = Some(prepared.start(Box::new(CompletionOutput {
@@ -1736,7 +1837,7 @@ async fn process_one_request(
         }
         state.publish_remote_control(peer);
         if let Some(db) = state.pending_volume_db {
-            publish_volume(latest_volume, volume_revision, protocol, stream_id, db);
+            state.publish_volume(volume_order, db);
         }
         let _ = event_tx.try_send(ProbeEvent::SessionStarted {
             peer: peer.ip(),
@@ -1758,13 +1859,7 @@ async fn process_one_request(
     if let Some(db) = outcome.volume_db {
         state.pending_volume_db = Some(db);
         if let Some(stream_id) = state.active_stream_id() {
-            publish_volume(
-                latest_volume,
-                volume_revision,
-                state.media.as_ref().expect("active media").protocol(),
-                stream_id,
-                db,
-            );
+            state.publish_volume(volume_order, db);
             let _ = event_tx.try_send(ProbeEvent::Volume {
                 peer: peer.ip(),
                 stream_id,
@@ -1792,12 +1887,7 @@ async fn process_one_request(
 
     if outcome.teardown_media {
         if let Some(mut media) = state.media.take() {
-            let _ = state
-                .latest_remote_control
-                .send(Some(RemoteControlState::Ended {
-                    protocol: media.protocol(),
-                    stream_id: media.stream_id(),
-                }));
+            state.end_stream_publications(media.stream_id());
             media.abort().await;
         }
         state.media_permit = None;
@@ -1824,24 +1914,6 @@ fn media_command_error_response(request: &Request, error: &io::Error) -> Respons
         }
         _ => response_for(request, 500, "Internal Server Error"),
     }
-}
-
-fn publish_volume(
-    latest_volume: &watch::Sender<Option<VolumeUpdate>>,
-    volume_revision: &AtomicU64,
-    protocol: Protocol,
-    stream_id: u64,
-    db: f32,
-) {
-    let revision = volume_revision
-        .fetch_add(1, Ordering::AcqRel)
-        .wrapping_add(1);
-    let _ = latest_volume.send(Some(VolumeUpdate {
-        protocol,
-        stream_id,
-        revision,
-        db,
-    }));
 }
 
 fn install_control_after_m4(
@@ -1894,16 +1966,21 @@ async fn read_next_request(
         }
 
         let mut wire = [0u8; READ_CHUNK_BYTES];
-        let read = if let Some(completion) = state.media_completion.as_mut() {
-            if *completion.borrow() {
+        if state.media_completion.as_ref().is_some_and(|completion| *completion.borrow())
+            || state.ptp_failed.as_ref().is_some_and(|failed| *failed.borrow())
+        {
+            return Ok(None);
+        }
+        let read = tokio::select! {
+            result = socket.read(&mut wire) => result,
+            _ = watch_changed(state.media_completion.as_mut()) => return Ok(None),
+            _ = watch_changed(state.ptp_failed.as_mut()) => {
+                log::warn!(
+                    target: "audiohub_airplay::airplay2",
+                    "AirPlay 2 control connection closing: its PTP instance failed"
+                );
                 return Ok(None);
             }
-            tokio::select! {
-                result = socket.read(&mut wire) => result,
-                _ = completion.changed() => return Ok(None),
-            }
-        } else {
-            socket.read(&mut wire).await
         }
         .map_err(|_| ConnectionError::Io)?;
         if read == 0 {
@@ -1926,6 +2003,16 @@ async fn read_next_request(
                 .feed(&wire[..read])
                 .map_err(|_| ConnectionError::Framing)?;
         }
+    }
+}
+
+/// Resolves when an optional watch changes or closes; never without one.
+async fn watch_changed(receiver: Option<&mut watch::Receiver<bool>>) {
+    match receiver {
+        Some(receiver) => {
+            let _ = receiver.changed().await;
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -2050,7 +2137,7 @@ struct DispatchOutcome {
     install_event_keys: Option<ChannelKeys>,
     install_event_endpoint: Option<PreparedEventEndpoint>,
     install_phase_one: Option<PhaseOneState>,
-    install_media_permit: Option<OwnedSemaphorePermit>,
+    install_media_permit: Option<MediaPermit>,
     start_media: Option<PreparedMedia>,
     volume_db: Option<f32>,
     now_playing: Option<NowPlayingWireUpdate>,
@@ -2641,9 +2728,9 @@ async fn setup_response(
             let new_media_permit = if connection_has_media_permit {
                 None
             } else {
-                let permit = match Arc::clone(media_permits).try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
+                let permit = match MediaPermit::try_acquire(media_permits) {
+                    Some(permit) => permit,
+                    None => {
                         log::info!(
                             target: "audiohub_airplay::airplay2",
                             "AirPlay 2 media SETUP refused: active-stream limit reached"
@@ -2965,7 +3052,7 @@ async fn setup_response(
                         ));
                     };
                     let ptp_clock =
-                        match ptp_clock.for_session(local_addr.ip(), peer.ip(), remote_match) {
+                        match ptp_clock.for_session(local_addr.ip(), peer.ip(), remote_match).await {
                             Ok(clock) => clock,
                             Err(error) => {
                                 log::warn!(
@@ -2984,6 +3071,20 @@ async fn setup_response(
                                 ));
                             }
                         };
+                    crate::telemetry::record_ptp_backend_selected(
+                        telemetry_token,
+                        peer.ip(),
+                        connection_id,
+                        ptp_clock.backend().as_str(),
+                        ptp_clock.fallback_reason().unwrap_or("selected"),
+                    );
+                    log::info!(
+                        target: "audiohub_airplay::airplay2",
+                        "AirPlay 2 PTP backend peer={} backend={} reason={}",
+                        peer.ip(),
+                        ptp_clock.backend().as_str(),
+                        ptp_clock.fallback_reason().unwrap_or("selected"),
+                    );
                     crate::telemetry::record_timing_peer_selection(
                         telemetry_token,
                         peer.ip(),
@@ -4924,8 +5025,9 @@ mod tests {
     }
 
     fn test_state() -> ConnectionState {
-        let (remote_tx, _remote_rx) = watch::channel(None);
-        ConnectionState::new("127.0.0.1".parse().unwrap(), remote_tx).unwrap()
+        let (remote_tx, _remote_rx) = watch::channel(RemoteControlMap::new());
+        let (volume_tx, _volume_rx) = watch::channel(VolumeMap::new());
+        ConnectionState::new("127.0.0.1".parse().unwrap(), remote_tx, volume_tx).unwrap()
     }
 
     fn media_permits() -> Arc<Semaphore> {
@@ -5144,7 +5246,7 @@ mod tests {
             }
             fn flush(&mut self) {}
         }
-        Arc::new(|_, _, _| Box::new(NullOutput))
+        Arc::new(|_, _, _, _| Box::new(NullOutput))
     }
 
     #[test]
@@ -5295,7 +5397,7 @@ mod tests {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut state = test_state();
         let permits = Arc::new(Semaphore::new(1));
-        state.media_permit = Some(permits.clone().try_acquire_owned().unwrap());
+        state.media_permit = Some(MediaPermit::try_acquire(&permits).unwrap());
         let (finished, completion) = watch::channel(false);
         state.media_completion = Some(completion);
         let output = CompletionOutput {
@@ -5303,6 +5405,7 @@ mod tests {
                 1,
                 socket.peer_addr().unwrap(),
                 Protocol::AirPlay1,
+                SessionTiming::Ntp,
             )),
             finished,
         };
@@ -5336,7 +5439,6 @@ mod tests {
         let mut config = config();
         config.password = Some("secret".into());
         let (events, _event_rx) = mpsc::channel(8);
-        let (volume, _volume_rx) = watch::channel(None);
         for (index, (method, extra, expected)) in [
             ("ANNOUNCE", "", "401"),
             ("GET_PARAMETER", "", "200"),
@@ -5358,7 +5460,6 @@ mod tests {
                 peer,
                 &config,
                 &events,
-                &volume,
                 &null_output_factory(),
                 &AtomicU64::new(1),
                 &AtomicU64::new(0),
@@ -5405,19 +5506,17 @@ mod tests {
             let mut state = test_state();
             state.control = Some(keys.into_codec());
             let (event_tx, _event_rx) = mpsc::channel(4);
-            let (volume_tx, _volume_rx) = watch::channel(None);
             let output_factory = null_output_factory();
             let next_stream_id = AtomicU64::new(1);
-            let volume_revision = AtomicU64::new(0);
+            let volume_order = AtomicU64::new(0);
             process_one_request(
                 &mut socket,
                 peer,
                 &config(),
                 &event_tx,
-                &volume_tx,
                 &output_factory,
                 &next_stream_id,
-                &volume_revision,
+                &volume_order,
                 &PairSetupLimiter::new(),
                 &AppleChallengeExecutor::new(),
                 &mut state,
@@ -5471,13 +5570,11 @@ mod tests {
             state.control = Some(control_keys.into_codec());
             state.event_commands = Some(event_commands);
             let (event_tx, _event_rx) = mpsc::channel(4);
-            let (volume_tx, _volume_rx) = watch::channel(None);
             process_one_request(
                 &mut socket,
                 peer,
                 &config(),
                 &event_tx,
-                &volume_tx,
                 &null_output_factory(),
                 &AtomicU64::new(1),
                 &AtomicU64::new(0),
@@ -5542,13 +5639,11 @@ mod tests {
             let (mut socket, peer) = listener.accept().await.unwrap();
             let mut state = test_state();
             let (event_tx, _event_rx) = mpsc::channel(4);
-            let (volume_tx, _volume_rx) = watch::channel(None);
             process_one_request(
                 &mut socket,
                 peer,
                 &config,
                 &event_tx,
-                &volume_tx,
                 &null_output_factory(),
                 &AtomicU64::new(1),
                 &AtomicU64::new(0),
@@ -5672,7 +5767,6 @@ mod tests {
             config.apple_response = signer.clone();
             config.classic_key = Arc::new(TestClassicKey);
             let (events, _event_rx) = mpsc::channel(8);
-            let (volumes, _volume_rx) = watch::channel(None);
             let challenge = STANDARD.encode([0x55; 16]);
             let body = format!("v=0\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\na=rsaaeskey:{}\r\na=aesiv:{}\r\n", STANDARD.encode([0x5a; 256]), STANDARD.encode([2; 16]));
             for step in 0..2 {
@@ -5709,7 +5803,6 @@ mod tests {
                     peer,
                     &config,
                     &events,
-                    &volumes,
                     &null_output_factory(),
                     &AtomicU64::new(1),
                     &AtomicU64::new(0),
@@ -5762,7 +5855,6 @@ mod tests {
             let (mut socket, peer) = listener.accept().await.unwrap();
             let mut state = test_state();
             let (event_tx, _event_rx) = mpsc::channel(4);
-            let (volume_tx, _volume_rx) = watch::channel(None);
             let executor = AppleChallengeExecutor::new();
             for expected in [ConnectionProgress::Continue, ConnectionProgress::Close] {
                 assert_eq!(
@@ -5771,7 +5863,6 @@ mod tests {
                         peer,
                         &config(),
                         &event_tx,
-                        &volume_tx,
                         &null_output_factory(),
                         &AtomicU64::new(1),
                         &AtomicU64::new(0),
@@ -6950,7 +7041,7 @@ mod tests {
         assert_ne!(ports.control_port, 0);
         assert_eq!(ports.audio_buffer_size, 8 * 1024 * 1024);
 
-        let mut active = prepared.start(null_output_factory()(51, peer, Protocol::AirPlay2));
+        let mut active = prepared.start(null_output_factory()(51, peer, Protocol::AirPlay2, SessionTiming::Unknown));
         assert_eq!(active.kind(), MediaKind::Buffered);
         active
             .set_rate(BufferedRateAnchor {
@@ -7021,7 +7112,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_gate_allows_same_connection_replacement_and_rejects_competitors() {
+    async fn media_gate_accepts_four_streams_rejects_the_fifth_and_reuses_a_connection_permit() {
+        // Global recorder: serialized against concurrent `telemetry::reset`.
+        let _telemetry = crate::telemetry::test_serial();
         let telemetry_before = crate::telemetry::snapshot().counters;
         let peer: SocketAddr = "127.0.0.1:6000".parse().unwrap();
         let local: SocketAddr = "127.0.0.1:7000".parse().unwrap();
@@ -7084,8 +7177,8 @@ mod tests {
             .start_media
             .take()
             .unwrap()
-            .start(null_output_factory()(1, peer, Protocol::AirPlay2));
-        assert_eq!(permits.available_permits(), 0);
+            .start(null_output_factory()(1, peer, Protocol::AirPlay2, SessionTiming::Unknown));
+        assert_eq!(permits.available_permits(), MAX_ACTIVE_MEDIA_STREAMS - 1);
 
         // PTP timing and the connection-owned permit survive a stream-only
         // TEARDOWN, so the sender can immediately prepare a replacement media
@@ -7114,9 +7207,39 @@ mod tests {
         assert!(repeated.start_media.take().is_some());
         assert!(matches!(first_phase, Some(PhaseOneState::Ptp(_))));
         assert!(!first.is_finished());
+        assert_eq!(
+            permits.available_permits(),
+            MAX_ACTIVE_MEDIA_STREAMS - 1,
+            "a same-connection replacement does not take another permit"
+        );
+
+        // Three more connections are accepted concurrently.
+        let mut others = Vec::new();
+        for index in 0..(MAX_ACTIVE_MEDIA_STREAMS - 1) {
+            let (_observer, clock) = PtpObserver::bind_ephemeral().await.unwrap();
+            let mut phase = Some(PhaseOneState::Ptp(clock));
+            let mut accepted = setup_response(
+                &request,
+                peer,
+                local,
+                "receiver-peer",
+                None,
+                &permits,
+                &mut event_keys,
+                true,
+                &mut phase,
+                false,
+                &AtomicU64::new(10 + index as u64),
+                crate::telemetry::operation_token(),
+                crate::telemetry::ConnectionId::new(),
+            )
+            .await;
+            assert_eq!(accepted.response.status, 200, "stream {} accepted", index + 2);
+            others.push(accepted.install_media_permit.take().expect("own permit"));
+        }
         assert_eq!(permits.available_permits(), 0);
 
-        // A different connection still cannot exceed the global media limit.
+        // The fifth concurrent stream exceeds the receiver limit.
         let (_observer, clock) = PtpObserver::bind_ephemeral().await.unwrap();
         let mut second_phase = Some(PhaseOneState::Ptp(clock));
         let second_connection_id = crate::telemetry::ConnectionId::new();
@@ -7167,6 +7290,8 @@ mod tests {
         assert_eq!(permits.available_permits(), 0);
         drop(first_permit);
         assert_eq!(permits.available_permits(), 1);
+        let gauge = crate::telemetry::snapshot().counters;
+        assert!(gauge.media_streams_peak >= MAX_ACTIVE_MEDIA_STREAMS as u64);
 
         let retry = setup_response(
             &request,
@@ -7188,6 +7313,85 @@ mod tests {
         assert!(retry.install_media_permit.is_some());
         drop(retry);
         assert_eq!(permits.available_permits(), 1);
+        drop(others);
+        assert_eq!(permits.available_permits(), MAX_ACTIVE_MEDIA_STREAMS);
+    }
+
+    #[tokio::test]
+    async fn failed_ptp_instance_closes_an_idle_control_connection() {
+        let listener = TokioTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut state = test_state();
+        let (failed, receiver) = watch::channel(false);
+        state.ptp_failed = Some(receiver);
+        let fail = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            failed.send(true).unwrap();
+            failed
+        });
+        assert!(timeout(
+            Duration::from_millis(500),
+            read_next_request(&mut socket, &mut state)
+        )
+        .await
+        .expect("a failed PTP instance wakes the idle connection")
+        .unwrap()
+        .is_none());
+        let _failed = fail.await.unwrap();
+    }
+
+    #[test]
+    fn stream_publications_use_per_stream_revisions_and_global_order() {
+        let (remote_tx, mut remote_rx) = watch::channel(RemoteControlMap::new());
+        let (volume_tx, mut volume_rx) = watch::channel(VolumeMap::new());
+        let mut first = ConnectionState::new(
+            "127.0.0.1".parse().unwrap(),
+            remote_tx.clone(),
+            volume_tx.clone(),
+        )
+        .unwrap();
+        let mut second =
+            ConnectionState::new("127.0.0.2".parse().unwrap(), remote_tx, volume_tx).unwrap();
+        let order = AtomicU64::new(0);
+        // Volume without an active stream is not published.
+        first.publish_volume(&order, -3.0);
+        assert!(volume_rx.borrow_and_update().is_empty());
+        first.publish_stream_volume(&order, Protocol::AirPlay2, 1, -10.0);
+        second.publish_stream_volume(&order, Protocol::AirPlay2, 2, -20.0);
+        first.publish_stream_volume(&order, Protocol::AirPlay2, 1, -10.0);
+        let volumes = volume_rx.borrow_and_update().clone();
+        assert_eq!((volumes[&1].revision, volumes[&1].order), (2, 3));
+        assert_eq!((volumes[&2].revision, volumes[&2].order), (1, 2));
+        for stream_id in [1, 2] {
+            first.latest_remote_control.send_modify(|streams| {
+                streams.insert(
+                    stream_id,
+                    RemoteControlState {
+                        protocol: Protocol::AirPlay2,
+                        stream_id,
+                        peer: "127.0.0.1:6000".parse().unwrap(),
+                        credentials: None,
+                        event_commands: None,
+                    },
+                );
+            });
+        }
+        assert_eq!(remote_rx.borrow_and_update().len(), 2);
+
+        // Same-connection replacement: the old stream leaves both maps and the
+        // new one restarts at revision 1 while the order keeps growing.
+        first.end_stream_publications(1);
+        first.stream_volume_revision = 0;
+        first.publish_stream_volume(&order, Protocol::AirPlay2, 3, -5.0);
+        let volumes = volume_rx.borrow_and_update().clone();
+        assert!(!volumes.contains_key(&1));
+        assert_eq!((volumes[&3].revision, volumes[&3].order), (1, 4));
+        assert_eq!(remote_rx.borrow_and_update().keys().copied().collect::<Vec<_>>(), vec![2]);
     }
 
     #[tokio::test]

@@ -33,6 +33,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
 
+[features]
+# Test-only fault injection for the per-sender PTP backend
+# (AUDIOHUB_TEST_AIRPLAY_PTP_BACKEND, AUDIOHUB_TEST_TIMESYNC_FAULT). Never
+# enabled by a normal dependency edge; build.rs refuses it when
+# AUDIOHUB_RELEASE_BUILD=1 and the product CI scans shipped binaries for the
+# variable names.
+airplay-test-hooks = []
+
 [dev-dependencies]
 serde_json = "1"
 
@@ -40,3 +48,6 @@ serde_json = "1"
 core-foundation = "0.10"
 if-addrs = "0.13"
 libc = "0.2"
+# TimeSync.framework per-sender gPTP instances (private ObjC, resolved at
+# runtime). Already in the workspace lock through audiohub-core.
+objc2 = { version = "0.6", default-features = false, features = ["std"] }

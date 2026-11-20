@@ -467,7 +467,7 @@ impl Error for MacPtpError {
     }
 }
 
-fn interface_name_for(local_ip: Ipv4Addr) -> Result<String, MacPtpError> {
+pub(crate) fn interface_name_for(local_ip: Ipv4Addr) -> Result<String, MacPtpError> {
     get_if_addrs()
         .map_err(MacPtpError::InterfaceEnumeration)?
         .into_iter()

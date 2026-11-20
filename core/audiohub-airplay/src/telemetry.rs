@@ -2,11 +2,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Media streams currently holding a receiver media permit. Process-wide and
+/// never reset: it is a point-in-time gauge, not a per-generation counter.
+static MEDIA_ACTIVE_STREAMS: AtomicU64 = AtomicU64::new(0);
+/// Set once the macOS per-sender PTP backend tripped its circuit breaker.
+static PTP_BACKEND_TRIPPED: AtomicBool = AtomicBool::new(false);
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use uuid::Uuid;
 
-const TELEMETRY_SCHEMA_VERSION: u32 = 3;
+const TELEMETRY_SCHEMA_VERSION: u32 = 4;
 const RECENT_EVENT_LIMIT: usize = 128;
 const CONTROL_SESSION_HISTORY_LIMIT: usize = 128;
 
@@ -182,6 +188,38 @@ pub struct AirPlayTelemetryCounters {
     pub pcm_bus_read_calls: u64,
     pub pcm_bus_output_samples: u64,
     pub pcm_bus_silence_samples: u64,
+    /// Schema 4. Point-in-time media streams holding a receiver permit.
+    #[serde(default)]
+    pub media_active_streams_gauge: u64,
+    /// Schema 4. Highest concurrent media-stream count seen in this
+    /// generation (at least the current gauge).
+    #[serde(default)]
+    pub media_streams_peak: u64,
+    /// Schema 4. PCM lanes allocated (first use of a lane) in this generation.
+    #[serde(default)]
+    pub pcm_lane_allocations: u64,
+    /// Schema 4. Sinks that found no free PCM lane and were discarded.
+    #[serde(default)]
+    pub pcm_lane_exhausted: u64,
+    /// Schema 4. PTP sessions bound to a per-sender TimeSync instance (macOS).
+    #[serde(default)]
+    pub ptp_backend_instance_sessions: u64,
+    /// Schema 4. PTP sessions bound to the shared system clock (macOS).
+    #[serde(default)]
+    pub ptp_backend_system_sessions: u64,
+    /// Schema 4. Failed attempts to create or reuse a per-sender instance.
+    #[serde(default)]
+    pub ptp_backend_instance_create_failures: u64,
+    /// Schema 4. Instance ports that never produced a valid lock in time.
+    #[serde(default)]
+    pub ptp_backend_instance_lock_timeouts: u64,
+    /// Schema 4. Instance ports whose grandmaster disappeared.
+    #[serde(default)]
+    pub ptp_backend_instance_gm_lost: u64,
+    /// Schema 4. 1 once the per-sender backend's circuit breaker tripped in
+    /// this process (point-in-time state; it survives a telemetry reset).
+    #[serde(default)]
+    pub ptp_backend_tripped: u64,
 }
 
 /// Bounded, deduplicated observations that retain addresses and rejection reasons.
@@ -271,6 +309,16 @@ pub enum AirPlayTelemetryEvent {
         operation: String,
         reason: String,
         samples: u64,
+    },
+    /// Schema 4. Timing backend chosen for one PTP control session.
+    PtpBackendSelected {
+        sequence: u64,
+        peer: String,
+        connection_id: String,
+        /// `instance`, `system` or `portable`.
+        backend: String,
+        /// `selected`, or why a preferred backend was not used.
+        reason: String,
     },
 }
 
@@ -705,6 +753,10 @@ enum EventCategory {
     PtpMapperMappedTimeOutOfRange,
     PtpMapperPlatformClockUnavailable,
     PtpMapperOther,
+    PtpBackendInstance,
+    PtpBackendSystem,
+    PtpBackendSystemFallback,
+    PtpBackendPortable,
 }
 
 #[derive(Default)]
@@ -782,6 +834,14 @@ struct TelemetrySlot {
     pcm_bus_read_calls: AtomicU64,
     pcm_bus_output_samples: AtomicU64,
     pcm_bus_silence_samples: AtomicU64,
+    media_streams_peak: AtomicU64,
+    pcm_lane_allocations: AtomicU64,
+    pcm_lane_exhausted: AtomicU64,
+    ptp_backend_instance_sessions: AtomicU64,
+    ptp_backend_system_sessions: AtomicU64,
+    ptp_backend_instance_create_failures: AtomicU64,
+    ptp_backend_instance_lock_timeouts: AtomicU64,
+    ptp_backend_instance_gm_lost: AtomicU64,
     // SETPEERS/SETPEERSX are control-plane requests. Their prepare and commit
     // transactions span several reason counters, so snapshot takes this same
     // narrow lock to expose an exact classification rather than a torn sum.
@@ -1021,6 +1081,19 @@ impl TelemetrySlot {
             pcm_bus_read_calls: load(&self.pcm_bus_read_calls),
             pcm_bus_output_samples: load(&self.pcm_bus_output_samples),
             pcm_bus_silence_samples: load(&self.pcm_bus_silence_samples),
+            media_active_streams_gauge: MEDIA_ACTIVE_STREAMS.load(Ordering::Relaxed),
+            media_streams_peak: load(&self.media_streams_peak)
+                .max(MEDIA_ACTIVE_STREAMS.load(Ordering::Relaxed)),
+            pcm_lane_allocations: load(&self.pcm_lane_allocations),
+            pcm_lane_exhausted: load(&self.pcm_lane_exhausted),
+            ptp_backend_instance_sessions: load(&self.ptp_backend_instance_sessions),
+            ptp_backend_system_sessions: load(&self.ptp_backend_system_sessions),
+            ptp_backend_instance_create_failures: load(
+                &self.ptp_backend_instance_create_failures,
+            ),
+            ptp_backend_instance_lock_timeouts: load(&self.ptp_backend_instance_lock_timeouts),
+            ptp_backend_instance_gm_lost: load(&self.ptp_backend_instance_gm_lost),
+            ptp_backend_tripped: u64::from(PTP_BACKEND_TRIPPED.load(Ordering::Relaxed)),
         };
         let control_sessions = self
             .observed_control_sessions
@@ -1123,6 +1196,14 @@ impl TelemetrySlot {
             &self.pcm_bus_read_calls,
             &self.pcm_bus_output_samples,
             &self.pcm_bus_silence_samples,
+            &self.media_streams_peak,
+            &self.pcm_lane_allocations,
+            &self.pcm_lane_exhausted,
+            &self.ptp_backend_instance_sessions,
+            &self.ptp_backend_system_sessions,
+            &self.ptp_backend_instance_create_failures,
+            &self.ptp_backend_instance_lock_timeouts,
+            &self.ptp_backend_instance_gm_lost,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -1487,6 +1568,14 @@ pub fn snapshot() -> AirPlayTelemetrySnapshot {
 }
 
 /// Reset counters and events, then return the new generation's initial snapshot.
+/// Serializes unit tests that reset, or assert deltas of, the process-wide
+/// recorder; without it a concurrent `reset` can erase another test's delta.
+#[cfg(test)]
+pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub fn reset() -> AirPlayTelemetrySnapshot {
     telemetry().reset()
 }
@@ -2410,6 +2499,98 @@ pub(crate) fn record_pcm_bus_read(
     add(&guard.slot.pcm_bus_silence_samples, silence);
 }
 
+/// A media stream acquired a receiver permit.
+pub(crate) fn record_media_stream_started(token: OperationToken) {
+    let active = MEDIA_ACTIVE_STREAMS.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Some(guard) = telemetry().enter_token(token) {
+        guard.slot.media_streams_peak.fetch_max(active, Ordering::Relaxed);
+    }
+}
+
+/// A media stream released its receiver permit.
+pub(crate) fn record_media_stream_ended() {
+    // Balanced with record_media_stream_started by MediaPermit's lifetime.
+    MEDIA_ACTIVE_STREAMS.fetch_sub(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_pcm_lane_allocated(token: OperationToken) {
+    if let Some(guard) = telemetry().enter_token(token) {
+        increment(&guard.slot.pcm_lane_allocations);
+    }
+}
+
+pub(crate) fn record_pcm_lane_exhausted(token: OperationToken) {
+    if let Some(guard) = telemetry().enter_token(token) {
+        increment(&guard.slot.pcm_lane_exhausted);
+    }
+}
+
+/// The timing backend chosen for one PTP control session. `backend` is
+/// `instance`, `system` or `portable`; `reason` is `selected` or the reason a
+/// preferred backend was skipped.
+pub(crate) fn record_ptp_backend_selected(
+    token: OperationToken,
+    peer: IpAddr,
+    connection_id: ConnectionId,
+    backend: &'static str,
+    reason: &'static str,
+) {
+    let Some(guard) = telemetry().enter_token(token) else {
+        return;
+    };
+    let category = match backend {
+        "instance" => {
+            increment(&guard.slot.ptp_backend_instance_sessions);
+            EventCategory::PtpBackendInstance
+        }
+        "system" => {
+            increment(&guard.slot.ptp_backend_system_sessions);
+            if reason == "selected" {
+                EventCategory::PtpBackendSystem
+            } else {
+                EventCategory::PtpBackendSystemFallback
+            }
+        }
+        _ => EventCategory::PtpBackendPortable,
+    };
+    if !guard.slot.claim_event(category) {
+        return;
+    }
+    guard.slot.push_event(AirPlayTelemetryEvent::PtpBackendSelected {
+        sequence: guard.slot.next_sequence(),
+        peer: peer.to_string(),
+        connection_id: connection_id.text(),
+        backend: backend.to_owned(),
+        reason: reason.to_owned(),
+    });
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn record_ptp_instance_create_failure(token: OperationToken) {
+    if let Some(guard) = telemetry().enter_token(token) {
+        increment(&guard.slot.ptp_backend_instance_create_failures);
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn record_ptp_instance_lock_timeout(token: OperationToken) {
+    if let Some(guard) = telemetry().enter_token(token) {
+        increment(&guard.slot.ptp_backend_instance_lock_timeouts);
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn record_ptp_instance_gm_lost(token: OperationToken) {
+    if let Some(guard) = telemetry().enter_token(token) {
+        increment(&guard.slot.ptp_backend_instance_gm_lost);
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn record_ptp_backend_tripped() {
+    PTP_BACKEND_TRIPPED.store(true, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2433,7 +2614,7 @@ mod tests {
             }
         }
         let before = recorder.snapshot();
-        assert_eq!(before.schema_version, 3);
+        assert_eq!(before.schema_version, 4);
         assert!(Uuid::parse_str(&before.generation_marker).is_ok());
         assert_eq!(before.counters.rtsp_phase2_requests, 1);
         assert_eq!(before.recent_events.len(), RECENT_EVENT_LIMIT);
@@ -2454,7 +2635,7 @@ mod tests {
     #[test]
     fn public_snapshot_serializes_with_stable_top_level_fields() {
         let value = serde_json::to_value(Telemetry::default().snapshot()).unwrap();
-        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["schema_version"], 4);
         assert!(value["control_sessions"].is_array());
         assert!(value["control_sessions_truncated"].is_boolean());
         assert!(value["active_control_sessions"].is_array());
@@ -2477,7 +2658,62 @@ mod tests {
         assert!(value["counters"]["pcm_bus_lock_contention_reads"].is_u64());
         assert!(value["counters"]["pcm_bus_underrun_reads"].is_u64());
         assert!(value["counters"]["pcm_bus_overflow_events"].is_u64());
+        for field in [
+            "media_active_streams_gauge",
+            "media_streams_peak",
+            "pcm_lane_allocations",
+            "pcm_lane_exhausted",
+            "ptp_backend_instance_sessions",
+            "ptp_backend_system_sessions",
+            "ptp_backend_instance_create_failures",
+            "ptp_backend_instance_lock_timeouts",
+            "ptp_backend_instance_gm_lost",
+            "ptp_backend_tripped",
+        ] {
+            assert!(value["counters"][field].is_u64(), "{field}");
+        }
         assert!(value["recent_events"].is_array());
+    }
+
+    #[test]
+    fn schema_four_counters_deserialize_from_a_schema_three_document() {
+        let mut value = serde_json::to_value(AirPlayTelemetryCounters::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "media_active_streams_gauge",
+            "media_streams_peak",
+            "pcm_lane_allocations",
+            "pcm_lane_exhausted",
+            "ptp_backend_tripped",
+        ] {
+            assert!(object.remove(field).is_some());
+        }
+        let decoded: AirPlayTelemetryCounters = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, AirPlayTelemetryCounters::default());
+    }
+
+    #[test]
+    fn backend_selection_event_is_emitted_once_per_category() {
+        let token = operation_token();
+        let before = snapshot().counters;
+        let peer: IpAddr = "192.0.2.44".parse().unwrap();
+        let connection = ConnectionId::new();
+        record_ptp_backend_selected(token, peer, connection, "instance", "selected");
+        record_ptp_backend_selected(token, peer, connection, "system", "create_failed");
+        let after = snapshot();
+        assert!(
+            after.counters.ptp_backend_instance_sessions
+                >= before.ptp_backend_instance_sessions.saturating_add(1)
+        );
+        assert!(
+            after.counters.ptp_backend_system_sessions
+                >= before.ptp_backend_system_sessions.saturating_add(1)
+        );
+        assert!(after.recent_events.iter().any(|event| matches!(
+            event,
+            AirPlayTelemetryEvent::PtpBackendSelected { backend, reason, .. }
+                if backend == "system" && reason == "create_failed"
+        )));
     }
 
     #[test]

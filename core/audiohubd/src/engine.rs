@@ -41,6 +41,8 @@ const _: () = assert!(
 
 const F48: usize = 480; // 48k @ 10ms
 const F48_STEREO: usize = F48 * 2;
+// AirPlay lanes deliver exactly one mixer block per read.
+const _: () = assert!(F48 == crate::airplay::AIRPLAY_LANE_FRAMES);
 const RING_CAP: usize = 96000; // 2s @ 48k
 const TONE_AMP: f32 = 0.5;
 
@@ -4718,6 +4720,25 @@ fn add_airplay_to_local_mix(
     }
 }
 
+/// Every playing AirPlay sender is its own contributor at unity gain; the
+/// ordinary single/multi-source protection (`protect_output_sample`) applies
+/// to the sum exactly as for peer streams.
+fn add_airplay_lanes_to_local_mix(
+    lanes: &crate::airplay::AirPlayLaneFrames,
+    active_mask: u8,
+    mix: &mut [f32; F48_STEREO],
+    stereo_scratch: &mut [f32; F48_STEREO],
+    corr_a: &mut [f32; F48_STEREO],
+    contrib: &mut u32,
+    corr: &mut Option<f64>,
+) {
+    for (lane, frame) in lanes.frames.iter().enumerate() {
+        if active_mask & (1 << lane) != 0 {
+            add_airplay_to_local_mix(frame, mix, stereo_scratch, corr_a, contrib, corr);
+        }
+    }
+}
+
 /// Appends post-clip mixer output to the 2s ring used by mix_verdicts.
 fn push_mix(inner: &DaemonInner, samples: &[f32]) {
     let mut r = lk(&inner.mix_ring);
@@ -6118,7 +6139,7 @@ pub(crate) fn mixer_loop(
     let mut mon = [0.0f32; F48_STEREO];
     let mut frame = [0.0f32; F48_STEREO];
     let mut stereo = [0.0f32; F48_STEREO];
-    let mut airplay_frame = [[0.0f32; 2]; F48];
+    let mut airplay_frames = crate::airplay::AirPlayLaneFrames::new();
     let mut airplay = inner.airplay.local_reader();
     // spec-m5b §5.4 microphone direction. Lifted out of the daemon mutex once,
     // here, so the tick itself never touches that lock; the bridge is installed
@@ -6245,14 +6266,18 @@ pub(crate) fn mixer_loop(
         }
         // Invalidate the old PCM timeline before exposing a new epoch to the
         // producer. A contended read did not acknowledge that invalidation.
-        let airplay_read = airplay.read_into(&mut airplay_frame, playback_transitions.presentation_epoch, next_output);
-        if airplay_read.epoch != 0 {
-            airplay.publish_output_timing(playback_transitions.presentation_epoch, output_timing);
+        let airplay_read = airplay.read_lanes(&mut airplay_frames, playback_transitions.presentation_epoch, next_output);
+        if airplay_read.epoch_mask != 0 {
+            airplay.publish_output_timing(
+                airplay_read.epoch_mask,
+                playback_transitions.presentation_epoch,
+                output_timing,
+            );
         }
         if airplay_read.late != 0 {
             dlog!("[audiohubd] AirPlay timed startup skipped {} late frames", airplay_read.late);
         }
-        let airplay_local = airplay_read.session_id.is_some();
+        let airplay_local = airplay_read.active_mask != 0;
         let site_output_requested =
             airplay_local || streams.iter().any(|stream| stream.is_spk || stream.monitor);
         if site_output_requested && playback.is_none() {
@@ -6368,8 +6393,9 @@ pub(crate) fn mixer_loop(
             // AirPlay samples stay full-scale. The sender's dB event is
             // applied to the system output control in `airplay.rs`, never
             // multiplied into this frame.
-            add_airplay_to_local_mix(
-                &airplay_frame,
+            add_airplay_lanes_to_local_mix(
+                &airplay_frames,
+                airplay_read.active_mask,
                 &mut mix,
                 &mut stereo,
                 &mut corr_a,
@@ -6827,6 +6853,87 @@ pub(crate) mod tests {
         assert_eq!(second_contrib, 2);
         assert_eq!(second_corr, Some(1.0));
         assert_eq!(second_mix.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn every_active_airplay_lane_is_a_unity_gain_contributor() {
+        let mut lanes = crate::airplay::AirPlayLaneFrames::new();
+        for (index, frame) in lanes.frames[0].iter_mut().enumerate() {
+            let value = 0.5 * index as f32 / F48 as f32;
+            *frame = [value, -value];
+        }
+        for (index, frame) in lanes.frames[2].iter_mut().enumerate() {
+            let value = 0.25 + 0.5 * index as f32 / F48 as f32;
+            *frame = [value, value];
+        }
+        // Lane 1 holds stale data but is not active: it must not contribute.
+        lanes.frames[1] = [[0.9; 2]; F48];
+
+        let mut mix = [0.0; F48_STEREO];
+        let mut stereo = [0.0; F48_STEREO];
+        let mut corr_a = [0.0; F48_STEREO];
+        let mut contrib = 0;
+        let mut corr = None;
+        add_airplay_lanes_to_local_mix(
+            &lanes,
+            0b101,
+            &mut mix,
+            &mut stereo,
+            &mut corr_a,
+            &mut contrib,
+            &mut corr,
+        );
+        assert_eq!(contrib, 2, "two senders are two contributors");
+        assert!(corr.is_some());
+        for (index, pair) in mix.chunks_exact(2).enumerate() {
+            let a = lanes.frames[0][index];
+            let b = lanes.frames[2][index];
+            assert_eq!(pair, [a[0] + b[0], a[1] + b[1]], "unit gain, no per-stream scaling");
+        }
+        // Two sources: the sum is protected by the soft knee (decision Q2).
+        let loud = mix[F48_STEREO - 2];
+        assert!(loud > 0.8);
+        assert_eq!(protect_output_sample(loud, contrib == 1), soft_clip(loud));
+        assert!(protect_output_sample(loud, contrib == 1) < loud);
+    }
+
+    #[test]
+    fn a_single_airplay_lane_stays_amplitude_transparent() {
+        let mut lanes = crate::airplay::AirPlayLaneFrames::new();
+        lanes.frames[3] = [[0.95, -0.95]; F48];
+        let mut mix = [0.0; F48_STEREO];
+        let mut stereo = [0.0; F48_STEREO];
+        let mut corr_a = [0.0; F48_STEREO];
+        let mut contrib = 0;
+        let mut corr = None;
+        add_airplay_lanes_to_local_mix(
+            &lanes,
+            0b1000,
+            &mut mix,
+            &mut stereo,
+            &mut corr_a,
+            &mut contrib,
+            &mut corr,
+        );
+        assert_eq!(contrib, 1);
+        assert_eq!(corr, None);
+        for sample in mix {
+            assert_eq!(protect_output_sample(sample, contrib == 1), sample);
+        }
+
+        let mut silent_mix = [0.0; F48_STEREO];
+        let mut none = 0;
+        add_airplay_lanes_to_local_mix(
+            &lanes,
+            0,
+            &mut silent_mix,
+            &mut stereo,
+            &mut corr_a,
+            &mut none,
+            &mut corr,
+        );
+        assert_eq!(none, 0, "idle lanes are not contributors");
+        assert!(silent_mix.iter().all(|sample| *sample == 0.0));
     }
 
     #[test]

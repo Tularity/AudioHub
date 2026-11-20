@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use uuid::Uuid;
 
-const TELEMETRY_SCHEMA_VERSION: u32 = 4;
+const TELEMETRY_SCHEMA_VERSION: u32 = 5;
 const RECENT_EVENT_LIMIT: usize = 128;
 const CONTROL_SESSION_HISTORY_LIMIT: usize = 128;
 
@@ -220,6 +220,25 @@ pub struct AirPlayTelemetryCounters {
     /// this process (point-in-time state; it survives a telemetry reset).
     #[serde(default)]
     pub ptp_backend_tripped: u64,
+    /// Schema 5. Grandmaster/source handoffs that carried a session's
+    /// mapping (and its anchor) to a new PTP source.
+    #[serde(default)]
+    pub ptp_gm_handoffs: u64,
+    /// Schema 5. Handoff attempts that could not complete, plus changes that
+    /// ended a stream after the grace period.
+    #[serde(default)]
+    pub ptp_gm_handoff_failures: u64,
+    /// Schema 5. Rate anchors that moved a session to another timeline.
+    #[serde(default)]
+    pub ptp_anchor_timeline_switches: u64,
+    /// Schema 5. SETPEERS timing ports opened/closed/failed on a macOS
+    /// instance or system clock.
+    #[serde(default)]
+    pub ptp_peer_ports_opened: u64,
+    #[serde(default)]
+    pub ptp_peer_ports_closed: u64,
+    #[serde(default)]
+    pub ptp_peer_port_failures: u64,
 }
 
 /// Bounded, deduplicated observations that retain addresses and rejection reasons.
@@ -319,6 +338,20 @@ pub enum AirPlayTelemetryEvent {
         backend: String,
         /// `selected`, or why a preferred backend was not used.
         reason: String,
+    },
+    /// Schema 5. One grandmaster/source handoff or handoff failure.
+    PtpGmHandoff {
+        sequence: u64,
+        control_peer: String,
+        from_grandmaster: String,
+        to_grandmaster: Option<String>,
+        /// `handed_off` or `failed`.
+        outcome: String,
+        /// Handoff kind (`rebased`, `same_grandmaster`, `platform`) or
+        /// failure reason.
+        reason: String,
+        /// New-timeline minus old-timeline time at one instant (saturated).
+        delta_ns: i64,
     },
 }
 
@@ -842,6 +875,12 @@ struct TelemetrySlot {
     ptp_backend_instance_create_failures: AtomicU64,
     ptp_backend_instance_lock_timeouts: AtomicU64,
     ptp_backend_instance_gm_lost: AtomicU64,
+    ptp_gm_handoffs: AtomicU64,
+    ptp_gm_handoff_failures: AtomicU64,
+    ptp_anchor_timeline_switches: AtomicU64,
+    ptp_peer_ports_opened: AtomicU64,
+    ptp_peer_ports_closed: AtomicU64,
+    ptp_peer_port_failures: AtomicU64,
     // SETPEERS/SETPEERSX are control-plane requests. Their prepare and commit
     // transactions span several reason counters, so snapshot takes this same
     // narrow lock to expose an exact classification rather than a torn sum.
@@ -1094,6 +1133,12 @@ impl TelemetrySlot {
             ptp_backend_instance_lock_timeouts: load(&self.ptp_backend_instance_lock_timeouts),
             ptp_backend_instance_gm_lost: load(&self.ptp_backend_instance_gm_lost),
             ptp_backend_tripped: u64::from(PTP_BACKEND_TRIPPED.load(Ordering::Relaxed)),
+            ptp_gm_handoffs: load(&self.ptp_gm_handoffs),
+            ptp_gm_handoff_failures: load(&self.ptp_gm_handoff_failures),
+            ptp_anchor_timeline_switches: load(&self.ptp_anchor_timeline_switches),
+            ptp_peer_ports_opened: load(&self.ptp_peer_ports_opened),
+            ptp_peer_ports_closed: load(&self.ptp_peer_ports_closed),
+            ptp_peer_port_failures: load(&self.ptp_peer_port_failures),
         };
         let control_sessions = self
             .observed_control_sessions
@@ -1204,6 +1249,12 @@ impl TelemetrySlot {
             &self.ptp_backend_instance_create_failures,
             &self.ptp_backend_instance_lock_timeouts,
             &self.ptp_backend_instance_gm_lost,
+            &self.ptp_gm_handoffs,
+            &self.ptp_gm_handoff_failures,
+            &self.ptp_anchor_timeline_switches,
+            &self.ptp_peer_ports_opened,
+            &self.ptp_peer_ports_closed,
+            &self.ptp_peer_port_failures,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -1952,11 +2003,14 @@ pub(crate) fn record_peer_list_update_prepared(
         });
 }
 
+/// `applied` says whether the parsed list reached the session's PTP clock
+/// (accepted timing peers and, on macOS, timing ports).
 pub(crate) fn record_peer_list_update_committed(
     token: OperationToken,
     control_peer: IpAddr,
     connection_id: ConnectionId,
     parsed: bool,
+    applied: bool,
 ) {
     let Some(guard) = telemetry().enter_token(token) else {
         return;
@@ -1971,7 +2025,12 @@ pub(crate) fn record_peer_list_update_committed(
         .slot
         .peer_list_update_response_committed_200
         .fetch_add(1, Ordering::SeqCst);
-    if parsed {
+    if parsed && applied {
+        guard
+            .slot
+            .peer_list_update_applied_to_session_clock
+            .fetch_add(1, Ordering::SeqCst);
+    } else if parsed {
         guard
             .slot
             .peer_list_update_acknowledged_but_ignored
@@ -2586,6 +2645,90 @@ pub(crate) fn record_ptp_instance_gm_lost(token: OperationToken) {
     }
 }
 
+/// Handoff events are rare (a user changing an AirPlay group); keep at most
+/// this many per generation so a flapping grandmaster cannot evict the
+/// other diagnostics from the bounded event queue.
+const GM_HANDOFF_EVENT_LIMIT: u64 = 32;
+
+fn push_gm_handoff_event(
+    slot: &TelemetrySlot,
+    control_peer: IpAddr,
+    from: u64,
+    to: Option<u64>,
+    outcome: &str,
+    reason: &str,
+    delta_ns: i128,
+) {
+    let total = load(&slot.ptp_gm_handoffs).saturating_add(load(&slot.ptp_gm_handoff_failures));
+    if total > GM_HANDOFF_EVENT_LIMIT {
+        return;
+    }
+    slot.push_event(AirPlayTelemetryEvent::PtpGmHandoff {
+        sequence: slot.next_sequence(),
+        control_peer: control_peer.to_string(),
+        from_grandmaster: format!("{from:016x}"),
+        to_grandmaster: to.map(|value| format!("{value:016x}")),
+        outcome: outcome.to_owned(),
+        reason: reason.to_owned(),
+        delta_ns: i64::try_from(delta_ns).unwrap_or(if delta_ns < 0 { i64::MIN } else { i64::MAX }),
+    });
+}
+
+pub(crate) fn record_ptp_gm_handoff(
+    token: OperationToken,
+    control_peer: IpAddr,
+    from: u64,
+    to: u64,
+    kind: &'static str,
+    delta_ns: i128,
+) {
+    if let Some(guard) = telemetry().enter_token(token) {
+        increment(&guard.slot.ptp_gm_handoffs);
+        push_gm_handoff_event(
+            guard.slot,
+            control_peer,
+            from,
+            Some(to),
+            "handed_off",
+            kind,
+            delta_ns,
+        );
+    }
+}
+
+pub(crate) fn record_ptp_gm_handoff_failure(
+    token: OperationToken,
+    control_peer: IpAddr,
+    from: u64,
+    to: Option<u64>,
+    reason: &'static str,
+) {
+    if let Some(guard) = telemetry().enter_token(token) {
+        increment(&guard.slot.ptp_gm_handoff_failures);
+        push_gm_handoff_event(guard.slot, control_peer, from, to, "failed", reason, 0);
+    }
+}
+
+pub(crate) fn record_ptp_anchor_timeline_switch(token: OperationToken) {
+    if let Some(guard) = telemetry().enter_token(token) {
+        increment(&guard.slot.ptp_anchor_timeline_switches);
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn record_ptp_peer_ports(
+    token: OperationToken,
+    opened: usize,
+    closed: usize,
+    failed: usize,
+) {
+    if let Some(guard) = telemetry().enter_token(token) {
+        add(&guard.slot.ptp_peer_ports_opened, opened);
+        add(&guard.slot.ptp_peer_ports_closed, closed);
+        add(&guard.slot.ptp_peer_port_failures, failed);
+    }
+}
+
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn record_ptp_backend_tripped() {
     PTP_BACKEND_TRIPPED.store(true, Ordering::Relaxed);
@@ -2614,7 +2757,7 @@ mod tests {
             }
         }
         let before = recorder.snapshot();
-        assert_eq!(before.schema_version, 4);
+        assert_eq!(before.schema_version, 5);
         assert!(Uuid::parse_str(&before.generation_marker).is_ok());
         assert_eq!(before.counters.rtsp_phase2_requests, 1);
         assert_eq!(before.recent_events.len(), RECENT_EVENT_LIMIT);
@@ -2635,7 +2778,7 @@ mod tests {
     #[test]
     fn public_snapshot_serializes_with_stable_top_level_fields() {
         let value = serde_json::to_value(Telemetry::default().snapshot()).unwrap();
-        assert_eq!(value["schema_version"], 4);
+        assert_eq!(value["schema_version"], 5);
         assert!(value["control_sessions"].is_array());
         assert!(value["control_sessions_truncated"].is_boolean());
         assert!(value["active_control_sessions"].is_array());
@@ -2669,6 +2812,12 @@ mod tests {
             "ptp_backend_instance_lock_timeouts",
             "ptp_backend_instance_gm_lost",
             "ptp_backend_tripped",
+            "ptp_gm_handoffs",
+            "ptp_gm_handoff_failures",
+            "ptp_anchor_timeline_switches",
+            "ptp_peer_ports_opened",
+            "ptp_peer_ports_closed",
+            "ptp_peer_port_failures",
         ] {
             assert!(value["counters"][field].is_u64(), "{field}");
         }
@@ -2690,6 +2839,71 @@ mod tests {
         }
         let decoded: AirPlayTelemetryCounters = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, AirPlayTelemetryCounters::default());
+    }
+
+    #[test]
+    fn schema_five_counters_deserialize_from_a_schema_four_document() {
+        let mut value = serde_json::to_value(AirPlayTelemetryCounters::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "ptp_gm_handoffs",
+            "ptp_gm_handoff_failures",
+            "ptp_anchor_timeline_switches",
+            "ptp_peer_ports_opened",
+            "ptp_peer_ports_closed",
+            "ptp_peer_port_failures",
+        ] {
+            assert!(object.remove(field).is_some());
+        }
+        let decoded: AirPlayTelemetryCounters = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, AirPlayTelemetryCounters::default());
+    }
+
+    #[test]
+    fn peer_list_commits_split_applied_from_ignored_and_handoffs_are_counted() {
+        let _serial = test_serial();
+        let token = operation_token();
+        let before = snapshot().counters;
+        let peer: IpAddr = "192.0.2.45".parse().unwrap();
+        let connection = ConnectionId::new();
+        record_peer_list_update_committed(token, peer, connection, true, true);
+        record_peer_list_update_committed(token, peer, connection, true, false);
+        record_peer_list_update_committed(token, peer, connection, false, false);
+        record_ptp_gm_handoff(token, peer, 1, 2, "rebased", -5);
+        record_ptp_gm_handoff_failure(token, peer, 2, None, "old_mapping_unavailable");
+        record_ptp_anchor_timeline_switch(token);
+        let counters = snapshot().counters;
+        // Media tests record handoffs concurrently without the serial lock.
+        assert!(
+            counters.peer_list_update_applied_to_session_clock
+                >= before.peer_list_update_applied_to_session_clock + 1
+        );
+        assert!(
+            counters.peer_list_update_acknowledged_but_ignored
+                >= before.peer_list_update_acknowledged_but_ignored + 1
+        );
+        assert!(counters.ptp_gm_handoffs >= before.ptp_gm_handoffs + 1);
+        assert!(counters.ptp_gm_handoff_failures >= before.ptp_gm_handoff_failures + 1);
+        assert!(counters.ptp_anchor_timeline_switches >= before.ptp_anchor_timeline_switches + 1);
+
+        let recorder = Telemetry::default();
+        {
+            let guard = recorder.enter();
+            push_gm_handoff_event(guard.slot, peer, 1, Some(2), "handed_off", "rebased", -5);
+            push_gm_handoff_event(guard.slot, peer, 2, None, "failed", "grace_expired", 0);
+        }
+        let events = recorder.snapshot().recent_events;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AirPlayTelemetryEvent::PtpGmHandoff { outcome, reason, delta_ns, to_grandmaster, .. }
+                if outcome == "handed_off" && reason == "rebased" && *delta_ns == -5
+                    && to_grandmaster.as_deref() == Some("0000000000000002")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AirPlayTelemetryEvent::PtpGmHandoff { outcome, to_grandmaster: None, .. }
+                if outcome == "failed"
+        )));
     }
 
     #[test]

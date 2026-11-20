@@ -19,7 +19,8 @@
 
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
-use super::ptp::PtpClockError;
+use super::ptp::{PlatformHandoff, PtpClockError};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -272,6 +273,145 @@ impl TsLine {
         );
         u64::try_from(i128::from(self.mach_anchor) + ticks).map_err(|_| LineRejection::OutOfRange)
     }
+
+    /// Domain (grandmaster) time at `mach` by linear extrapolation.
+    pub(crate) fn domain_at_mach(&self, mach: u64) -> Option<i128> {
+        if self.mach_per_domain_second == 0 {
+            return None;
+        }
+        let ticks = i128::from(mach) - i128::from(self.mach_anchor);
+        Some(
+            i128::from(self.domain_anchor_ns)
+                + div_round(
+                    ticks * NANOS_PER_SECOND,
+                    i128::from(self.mach_per_domain_second),
+                ),
+        )
+    }
+}
+
+/// Handoff from the instance's retired line (last healthy line on `from`)
+/// to its current line, evaluated at one host instant `mach_now`. A planned
+/// grandmaster change keeps the current line healthy, so it never counts as
+/// a lock failure; this only computes how to carry the anchor across.
+pub(crate) fn handoff_between_lines(
+    retired: Option<TsLine>,
+    current: Option<TsLine>,
+    from: u64,
+    now_ns: u64,
+    mach_now: u64,
+) -> Result<PlatformHandoff, &'static str> {
+    let current = current.ok_or("new_grandmaster_not_locked")?;
+    if now_ns.saturating_sub(current.sampled_at_ns) > LINE_MAX_AGE.as_nanos() as u64 {
+        return Err("new_line_stale");
+    }
+    // Never map through the instance's own clock or an unlocked line.
+    current.health().map_err(|_| "new_grandmaster_not_locked")?;
+    if current.grandmaster == from {
+        return Err("no_grandmaster_change");
+    }
+    let retired = retired
+        .filter(|line| line.grandmaster == from)
+        .ok_or("old_mapping_unavailable")?;
+    let max_age = super::ptp_session::HANDOFF_MAX_OLD_AGE.as_nanos() as u64;
+    if now_ns.saturating_sub(retired.sampled_at_ns) > max_age {
+        return Err("old_mapping_too_old");
+    }
+    let old = retired
+        .domain_at_mach(mach_now)
+        .ok_or("old_mapping_unavailable")?;
+    let new = current
+        .domain_at_mach(mach_now)
+        .ok_or("new_mapping_unavailable")?;
+    Ok(PlatformHandoff {
+        grandmaster: current.grandmaster,
+        delta_ns: new - old,
+    })
+}
+
+// ---------------------------------------------------------------- peer ports
+
+/// Reference counts of the extra unicast ports one instance opened for
+/// SETPEERS peers, shared by every session lease on that instance.
+#[derive(Debug, Default)]
+pub(crate) struct ExtraPortLeases {
+    refs: HashMap<Ipv4Addr, usize>,
+    leases: HashMap<u64, Vec<Ipv4Addr>>,
+}
+
+/// Ports to open (first reference) and close (last reference gone).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ExtraPortPlan {
+    pub(crate) open: Vec<Ipv4Addr>,
+    pub(crate) close: Vec<Ipv4Addr>,
+}
+
+impl ExtraPortLeases {
+    /// Replace one lease's peer set.
+    pub(crate) fn replace(&mut self, lease: u64, peers: &[Ipv4Addr]) -> ExtraPortPlan {
+        let mut wanted = peers.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let previous = self.leases.remove(&lease).unwrap_or_default();
+        let mut plan = ExtraPortPlan::default();
+        for peer in previous.iter().filter(|peer| !wanted.contains(peer)) {
+            if self.decrement(*peer) {
+                plan.close.push(*peer);
+            }
+        }
+        for peer in wanted.iter().filter(|peer| !previous.contains(peer)) {
+            let count = self.refs.entry(*peer).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                plan.open.push(*peer);
+            }
+        }
+        if !wanted.is_empty() {
+            self.leases.insert(lease, wanted);
+        }
+        plan
+    }
+
+    /// The lease ended: ports nobody else references.
+    pub(crate) fn release(&mut self, lease: u64) -> Vec<Ipv4Addr> {
+        let peers = self.leases.remove(&lease).unwrap_or_default();
+        peers
+            .into_iter()
+            .filter(|peer| self.decrement(*peer))
+            .collect()
+    }
+
+    /// Opening `peer` failed: forget the lease's reference so a later
+    /// update (from any lease) retries it.
+    pub(crate) fn open_failed(&mut self, lease: u64, peer: Ipv4Addr) {
+        if let Some(peers) = self.leases.get_mut(&lease) {
+            peers.retain(|existing| *existing != peer);
+        }
+        // Every lease that referenced it in the same step expected it open.
+        self.refs.remove(&peer);
+        for peers in self.leases.values_mut() {
+            peers.retain(|existing| *existing != peer);
+        }
+    }
+
+    pub(crate) fn open_ports(&self) -> Vec<Ipv4Addr> {
+        let mut ports: Vec<Ipv4Addr> = self.refs.keys().copied().collect();
+        ports.sort_unstable();
+        ports
+    }
+
+    fn decrement(&mut self, peer: Ipv4Addr) -> bool {
+        let Some(count) = self.refs.get_mut(&peer) else {
+            return false;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.refs.remove(&peer);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Single-writer seqlock holding the latest [`TsLine`].
@@ -506,7 +646,7 @@ pub(crate) use service::{acquire, availability, probed_availability, Availabilit
 #[cfg(target_os = "macos")]
 mod service {
     use super::*;
-    use crate::protocol::media::ptp::PtpRemoteMatch;
+    use crate::protocol::media::ptp::{PeerPortUpdate, PtpRemoteMatch};
     use core_foundation::base::TCFType;
     use core_foundation::string::CFString;
     use objc2::rc::{autoreleasepool, Retained};
@@ -604,6 +744,9 @@ mod service {
         clock_identity: u64,
         port_number: u16,
         line: LineCell,
+        /// Last healthy line on the previous grandmaster, published when the
+        /// instance follows a new one (planned GM change).
+        retired: LineCell,
         demand: Demand,
         failed: watch::Sender<bool>,
         /// Receive-matching override: 0 not requested, 1 accepted, 2 refused.
@@ -615,6 +758,8 @@ mod service {
     /// lease; the instance is removed when the last lease for the peer ends.
     pub(crate) struct TimeSyncPort {
         shared: Arc<PortShared>,
+        /// This session's lease on the instance (keys its SETPEERS ports).
+        lease: u64,
         commands: mpsc::Sender<Command>,
     }
 
@@ -647,6 +792,58 @@ mod service {
                 .ok_or(PtpClockError::MappedTimeOutOfRange)?;
             BREAKER.note_mapped();
             Ok(instant)
+        }
+
+        /// Grandmaster of the instance's latest line, for diagnostics.
+        pub(crate) fn grandmaster(&self) -> Option<u64> {
+            self.shared
+                .line
+                .read()
+                .map(|line| line.grandmaster)
+                .filter(|grandmaster| *grandmaster != 0)
+        }
+
+        /// Carry an anchor on `from` to the grandmaster the instance follows
+        /// now. Lock-free; never sends an ObjC message.
+        pub(crate) fn handoff(&self, from: u64) -> Result<PlatformHandoff, &'static str> {
+            let base = clock_base();
+            let now_ns = base.now_ns();
+            // SAFETY: no arguments; reads the tick counter.
+            let mach_now = unsafe { mach_absolute_time() };
+            handoff_between_lines(
+                self.shared.retired.read(),
+                self.shared.line.read(),
+                from,
+                now_ns,
+                mach_now,
+            )
+        }
+
+        /// Replace this session's SETPEERS timing ports on the instance.
+        pub(crate) async fn set_peers(&self, peers: Vec<Ipv4Addr>) -> PeerPortUpdate {
+            let failed = |peers: &[Ipv4Addr], reason| PeerPortUpdate {
+                failed: peers.iter().map(|peer| (*peer, reason)).collect(),
+                ..PeerPortUpdate::default()
+            };
+            let (reply, result) = oneshot::channel();
+            if self
+                .commands
+                .send(Command::SetPeers {
+                    peer: self.shared.peer,
+                    entry_id: self.shared.entry_id,
+                    lease: self.lease,
+                    peers: peers.clone(),
+                    reply,
+                })
+                .is_err()
+            {
+                return failed(&peers, "service_thread_failed");
+            }
+            match tokio::time::timeout(PROBE_TIMEOUT, result).await {
+                Ok(Ok(update)) => update,
+                Ok(Err(_)) => failed(&peers, "service_thread_failed"),
+                Err(_) => failed(&peers, "service_timeout"),
+            }
         }
 
         /// Whether the sender's sourcePortIdentity override was accepted;
@@ -697,6 +894,7 @@ mod service {
             let _ = self.commands.send(Command::Release {
                 peer: self.shared.peer,
                 entry_id: self.shared.entry_id,
+                lease: self.lease,
             });
         }
     }
@@ -707,11 +905,19 @@ mod service {
             local: Ipv4Addr,
             peer: Ipv4Addr,
             remote: Option<PtpRemoteMatch>,
-            reply: oneshot::Sender<Result<Arc<PortShared>, &'static str>>,
+            reply: oneshot::Sender<Result<(Arc<PortShared>, u64), &'static str>>,
         },
         Release {
             peer: Ipv4Addr,
             entry_id: u64,
+            lease: u64,
+        },
+        SetPeers {
+            peer: Ipv4Addr,
+            entry_id: u64,
+            lease: u64,
+            peers: Vec<Ipv4Addr>,
+            reply: oneshot::Sender<PeerPortUpdate>,
         },
         #[cfg(test)]
         DirectConvert {
@@ -792,12 +998,13 @@ mod service {
                 reply,
             })
             .map_err(|_| "service_thread_failed")?;
-        let shared = tokio::time::timeout(PROBE_TIMEOUT, result)
+        let (shared, lease) = tokio::time::timeout(PROBE_TIMEOUT, result)
             .await
             .map_err(|_| "acquire_timeout")?
             .map_err(|_| "service_thread_failed")??;
         Ok(TimeSyncPort {
             shared,
+            lease,
             commands: commands.clone(),
         })
     }
@@ -818,6 +1025,10 @@ mod service {
         last_valid_ns: Option<u64>,
         healthy: bool,
         failed: bool,
+        /// Last healthy line, to detect a grandmaster change.
+        last_healthy: Option<TsLine>,
+        /// SETPEERS ports opened on this instance, counted per lease.
+        extra: ExtraPortLeases,
     }
 
     struct ServiceThread {
@@ -825,6 +1036,7 @@ mod service {
         probe: Option<Availability>,
         entries: HashMap<Ipv4Addr, PeerEntry>,
         next_entry_id: u64,
+        next_lease: u64,
         poisoned: bool,
     }
 
@@ -861,6 +1073,7 @@ mod service {
                 probe: None,
                 entries: HashMap::new(),
                 next_entry_id: 1,
+                next_lease: 1,
                 poisoned: false,
             }
         }
@@ -930,16 +1143,37 @@ mod service {
                     remote,
                     reply,
                 } => {
-                    let result = self.acquire(local, peer, remote);
-                    let lease = result.as_ref().ok().map(|shared| shared.entry_id);
+                    let result = self.acquire(local, peer, remote).map(|shared| {
+                        let lease = self.next_lease;
+                        self.next_lease += 1;
+                        (shared, lease)
+                    });
+                    let lease = result
+                        .as_ref()
+                        .ok()
+                        .map(|(shared, lease)| (shared.entry_id, *lease));
                     if reply.send(result).is_err() {
                         // The caller timed out; return the lease it never got.
-                        if let Some(entry_id) = lease {
-                            self.release(peer, entry_id);
+                        if let Some((entry_id, lease)) = lease {
+                            self.release(peer, entry_id, lease);
                         }
                     }
                 }
-                Command::Release { peer, entry_id } => self.release(peer, entry_id),
+                Command::Release {
+                    peer,
+                    entry_id,
+                    lease,
+                } => self.release(peer, entry_id, lease),
+                Command::SetPeers {
+                    peer,
+                    entry_id,
+                    lease,
+                    peers,
+                    reply,
+                } => {
+                    let update = self.set_peers(peer, entry_id, lease, peers);
+                    let _ = reply.send(update);
+                }
                 #[cfg(test)]
                 Command::DirectConvert {
                     peer,
@@ -1199,6 +1433,7 @@ mod service {
                 clock_identity,
                 port_number,
                 line: LineCell::default(),
+                retired: LineCell::default(),
                 demand: Demand::default(),
                 failed: watch::channel(false).0,
                 receive_matching: std::sync::atomic::AtomicU8::new(receive_matching),
@@ -1213,6 +1448,8 @@ mod service {
                 last_valid_ns: None,
                 healthy: false,
                 failed: false,
+                last_healthy: None,
+                extra: ExtraPortLeases::default(),
             };
             let reverse = objc.reverse_convert;
             refresh_entry(&mut entry, reverse, clock_base().now_ns());
@@ -1224,12 +1461,15 @@ mod service {
             Ok(shared)
         }
 
-        fn release(&mut self, peer: Ipv4Addr, entry_id: u64) {
+        fn release(&mut self, peer: Ipv4Addr, entry_id: u64, lease: u64) {
             let Some(entry) = self.entries.get_mut(&peer) else {
                 return;
             };
             if entry.shared.entry_id != entry_id {
                 return;
+            }
+            for address in entry.extra.release(lease) {
+                remove_unicast_port(entry, address);
             }
             entry.refs = entry.refs.saturating_sub(1);
             if entry.refs > 0 {
@@ -1257,6 +1497,58 @@ mod service {
                 instance_removed.as_bool(),
                 error_code(error)
             );
+        }
+
+        /// Replace one lease's SETPEERS ports on its peer's instance.
+        fn set_peers(
+            &mut self,
+            peer: Ipv4Addr,
+            entry_id: u64,
+            lease: u64,
+            peers: Vec<Ipv4Addr>,
+        ) -> PeerPortUpdate {
+            let mut update = PeerPortUpdate::default();
+            let Some(entry) = self
+                .entries
+                .get_mut(&peer)
+                .filter(|entry| entry.shared.entry_id == entry_id && !self.poisoned)
+            else {
+                update.failed = peers
+                    .iter()
+                    .map(|address| (*address, "instance_missing"))
+                    .collect();
+                return update;
+            };
+            // The sender itself already has the instance's main port.
+            let wanted: Vec<Ipv4Addr> = peers
+                .into_iter()
+                .filter(|address| *address != peer)
+                .collect();
+            let plan = entry.extra.replace(lease, &wanted);
+            for address in plan.close {
+                remove_unicast_port(entry, address);
+                update.closed.push(address);
+            }
+            for address in plan.open {
+                match add_unicast_port(entry, address) {
+                    Ok(port_number) => {
+                        log::info!(
+                            target: "audiohub_airplay::airplay2",
+                            "TimeSync instance for {peer} added timing peer {address} port={port_number}"
+                        );
+                        update.opened.push(address);
+                    }
+                    Err(code) => {
+                        log::warn!(
+                            target: "audiohub_airplay::airplay2",
+                            "TimeSync instance for {peer} could not add timing peer {address} code={code}"
+                        );
+                        entry.extra.open_failed(lease, address);
+                        update.failed.push((address, "port_failed"));
+                    }
+                }
+            }
+            update
         }
 
         fn tick(&mut self) {
@@ -1294,6 +1586,51 @@ mod service {
                 }
             }
         }
+    }
+
+    /// Open one SETPEERS unicast port on the entry's instance; returns the
+    /// allocated port number or the NSError code.
+    fn add_unicast_port(entry: &PeerEntry, address: Ipv4Addr) -> Result<u16, isize> {
+        let destination = u32::from_be_bytes(address.octets());
+        let mut port_number = 0u16;
+        let mut error: *mut AnyObject = std::ptr::null_mut();
+        // SAFETY: encoding `c@:@I^S^@` verified by the probe; the interface
+        // string outlives the call.
+        let added: Bool = unsafe {
+            msg_send![&*entry.clock, addUnicastUDPv4EtEPortOnInterfaceNamed: ns_string(&entry.interface), withDestinationAddress: destination, allocatedPortNumber: &mut port_number as *mut u16, error: &mut error as *mut *mut AnyObject]
+        };
+        if !added.as_bool() {
+            return Err(error_code(error));
+        }
+        if let Some(port) = find_port(&entry.clock, port_number) {
+            // SAFETY: encoding `c@:` verified by the probe.
+            let enabled: Bool = unsafe { msg_send![&*port, enabled] };
+            if !enabled.as_bool() {
+                let mut error: *mut AnyObject = std::ptr::null_mut();
+                // SAFETY: encoding `c@:^@` verified by the probe; NO is not
+                // fatal (see `acquire`).
+                let _: Bool = unsafe {
+                    msg_send![&*port, enablePortError: &mut error as *mut *mut AnyObject]
+                };
+            }
+        }
+        Ok(port_number)
+    }
+
+    fn remove_unicast_port(entry: &PeerEntry, address: Ipv4Addr) {
+        let destination = u32::from_be_bytes(address.octets());
+        let mut error: *mut AnyObject = std::ptr::null_mut();
+        // SAFETY: encoding `c@:@I^@` verified by the probe.
+        let removed: Bool = unsafe {
+            msg_send![&*entry.clock, removeUnicastUDPv4EtEPortFromInterfaceNamed: ns_string(&entry.interface), withDestinationAddress: destination, error: &mut error as *mut *mut AnyObject]
+        };
+        log::info!(
+            target: "audiohub_airplay::airplay2",
+            "TimeSync instance for {} removed timing peer {address} removed={} code={}",
+            entry.shared.peer,
+            removed.as_bool(),
+            error_code(error)
+        );
     }
 
     fn method_encoding(method: &objc2::runtime::Method) -> Option<String> {
@@ -1351,6 +1688,60 @@ mod service {
         (domain != 0 && domain != u64::MAX).then_some(domain)
     }
 
+    /// Role of the instance's ports: slave (3) when any port follows the
+    /// grandmaster (the main sender port or a SETPEERS peer port, which a
+    /// HomePod-style grandmaster may use directly), otherwise the main
+    /// port's role.
+    fn instance_port_role(clock: &AnyObject, main_port: u16) -> i32 {
+        // SAFETY: encoding `@@:` verified by the probe; NSArray accessors are
+        // public Foundation API.
+        let ports: Option<Retained<AnyObject>> = unsafe { msg_send![clock, ports] };
+        let Some(ports) = ports else {
+            return 0;
+        };
+        // SAFETY: `ports` is an NSArray.
+        let count: usize = unsafe { msg_send![&*ports, count] };
+        let port_sel = sel!(portNumber);
+        let role_sel = sel!(portRole);
+        let mut main_role = 0;
+        for index in 0..count {
+            // SAFETY: index < count.
+            let port: Option<Retained<AnyObject>> =
+                unsafe { msg_send![&*ports, objectAtIndex: index] };
+            let Some(port) = port else { continue };
+            let class = port.class();
+            if !class.responds_to(port_sel) || !class.responds_to(role_sel) {
+                continue;
+            }
+            // SAFETY: responds to `portRole` (encoding `i@:`).
+            let role: i32 = unsafe { msg_send![&*port, portRole] };
+            if role == PORT_ROLE_SLAVE {
+                return role;
+            }
+            // SAFETY: responds to `portNumber` (encoding `S@:`).
+            let number: u16 = unsafe { msg_send![&*port, portNumber] };
+            if number == main_port {
+                main_role = role;
+            }
+        }
+        main_role
+    }
+
+    /// `(domain, mach, slope)` from two conversions one second apart.
+    fn line_at(clock: &AnyObject, domain: u64) -> Option<(u64, u64, u64, u64)> {
+        let (mach0, gm0) = convert_to_mach(clock, domain)?;
+        let (mach1, gm1) = convert_to_mach(clock, domain.saturating_add(1_000_000_000))?;
+        let nominal = clock_base().timebase.ticks_per_second();
+        let slope = i128::from(mach1) - i128::from(mach0);
+        // A real rate differs from nominal by ppm, never by 1 %.
+        (gm0 == gm1 && slope > 0 && (slope - nominal).abs() * 100 < nominal).then_some((
+            domain,
+            mach0,
+            slope as u64,
+            gm0,
+        ))
+    }
+
     /// Read health fields and recompute the line; publish both.
     fn refresh_entry(entry: &mut PeerEntry, reverse_convert: bool, now_ns: u64) {
         let clock = &*entry.clock;
@@ -1358,17 +1749,14 @@ mod service {
         let mut lock_state: i32 = unsafe { msg_send![clock, lockState] };
         let identity_gm: u64 = unsafe { msg_send![clock, grandmasterIdentity] };
         let self_identity: u64 = unsafe { msg_send![clock, clockIdentity] };
-        let port_role = find_port(clock, entry.shared.port_number)
-            // SAFETY: `find_port` only returns ports responding to portRole
-            // (encoding `i@:`).
-            .map(|port| -> i32 { unsafe { msg_send![&*port, portRole] } })
-            .unwrap_or(0);
+        let port_role = instance_port_role(clock, entry.shared.port_number);
         if test_hooks::fault() == Some(Fault::NeverLock) {
             lock_state = 0;
         }
+        // SAFETY: no arguments; reads the tick counter.
+        let mach_now = unsafe { mach_absolute_time() };
         let anchor_domain = if reverse_convert {
-            // SAFETY: no arguments; reads the tick counter.
-            convert_to_domain(clock, unsafe { mach_absolute_time() })
+            convert_to_domain(clock, mach_now)
         } else {
             entry.shared.demand.last_remote_ns()
         };
@@ -1381,25 +1769,59 @@ mod service {
             ..TsLine::default()
         };
         if let Some(domain) = anchor_domain {
-            if let (Some((mach0, gm0)), Some((mach1, gm1))) = (
-                convert_to_mach(clock, domain),
-                convert_to_mach(clock, domain.saturating_add(1_000_000_000)),
-            ) {
-                let nominal = clock_base().timebase.ticks_per_second();
-                let slope = i128::from(mach1) - i128::from(mach0);
-                // A real rate differs from nominal by ppm, never by 1 %.
-                if gm0 == gm1 && slope > 0 && (slope - nominal).abs() * 100 < nominal {
-                    line.domain_anchor_ns = domain;
-                    line.mach_anchor = mach0;
-                    line.mach_per_domain_second = slope as u64;
-                    if gm0 != 0 {
-                        line.grandmaster = gm0;
+            let mut fitted = line_at(clock, domain);
+            // Without the reverse conversion the anchor is the last time
+            // media asked for, which after a grandmaster change belongs to
+            // the old timeline and can be far from now on the new one.
+            // Re-anchor at the extrapolated "now" so the line stays exact
+            // where it is used.
+            if let Some((domain, mach, slope, _)) = fitted {
+                let ticks_per_second = clock_base().timebase.ticks_per_second();
+                if (i128::from(mach) - i128::from(mach_now)).abs() > ticks_per_second {
+                    let probe = TsLine {
+                        domain_anchor_ns: domain,
+                        mach_anchor: mach,
+                        mach_per_domain_second: slope,
+                        ..TsLine::default()
+                    };
+                    if let Some(near) = probe
+                        .domain_at_mach(mach_now)
+                        .and_then(|value| u64::try_from(value).ok())
+                    {
+                        fitted = line_at(clock, near).or(fitted);
                     }
                 }
             }
+            if let Some((domain, mach, slope, gm)) = fitted {
+                line.domain_anchor_ns = domain;
+                line.mach_anchor = mach;
+                line.mach_per_domain_second = slope;
+                if gm != 0 {
+                    line.grandmaster = gm;
+                }
+            }
+        }
+        let healthy = line.health().is_ok();
+        if healthy {
+            if let Some(previous) = entry
+                .last_healthy
+                .filter(|previous| previous.grandmaster != line.grandmaster)
+            {
+                // Planned grandmaster change (e.g. a HomePod joined the
+                // sender's group): keep the old line for the handoff.
+                entry.shared.retired.publish(&previous);
+                log::info!(
+                    target: "audiohub_airplay::airplay2",
+                    "TimeSync instance for {} grandmaster changed old={:016x} new={:016x} ports={:?}",
+                    entry.shared.peer,
+                    previous.grandmaster,
+                    line.grandmaster,
+                    entry.extra.open_ports()
+                );
+            }
+            entry.last_healthy = Some(line);
         }
         entry.shared.line.publish(&line);
-        let healthy = line.health().is_ok();
         if healthy {
             entry.last_valid_ns = Some(now_ns);
         } else if entry.healthy
@@ -1511,6 +1933,150 @@ mod tests {
             port_role: PORT_ROLE_SLAVE,
             sampled_at_ns: 1_000,
         }
+    }
+
+    #[test]
+    fn handoff_between_lines_carries_the_old_timeline_to_the_new_grandmaster() {
+        let now_ns = 10_000_000_000;
+        let old = TsLine {
+            domain_anchor_ns: 1_910_362_000_000_000,
+            mach_anchor: 1_000_000_000,
+            mach_per_domain_second: 1_000_000_000,
+            lock_state: LOCK_STATE_LOCKED,
+            grandmaster: 0x52737efca4c20008,
+            self_identity: 0x11,
+            port_role: PORT_ROLE_SLAVE,
+            sampled_at_ns: now_ns - 300_000_000,
+        };
+        // The HomePod runs 8 ppm fast relative to mach.
+        let new = TsLine {
+            domain_anchor_ns: 49_072_000_000_000,
+            mach_anchor: 1_200_000_000,
+            mach_per_domain_second: 999_992_000,
+            grandmaster: 0xf4cbe772eb370008,
+            sampled_at_ns: now_ns - 50_000_000,
+            ..old
+        };
+        let mach_now = 1_500_000_000;
+        let handoff =
+            handoff_between_lines(Some(old), Some(new), old.grandmaster, now_ns, mach_now).unwrap();
+        assert_eq!(handoff.grandmaster, new.grandmaster);
+        let old_now = old.domain_at_mach(mach_now).unwrap();
+        let new_now = new.domain_at_mach(mach_now).unwrap();
+        assert_eq!(old_now, 1_910_362_500_000_000);
+        assert_eq!(old_now + handoff.delta_ns, new_now);
+        // Mapping the rebased time through the new line lands on mach_now.
+        let rebased = u64::try_from(old_now + handoff.delta_ns).unwrap();
+        let mach = new
+            .map_to_mach(new.sampled_at_ns, rebased, new.grandmaster)
+            .unwrap();
+        assert!((i128::from(mach) - i128::from(mach_now)).abs() <= 1);
+        // And back again (HomePod -> Mac).
+        let back = TsLine {
+            sampled_at_ns: now_ns,
+            ..old
+        };
+        let retired = TsLine {
+            sampled_at_ns: now_ns - 100_000_000,
+            ..new
+        };
+        let handoff =
+            handoff_between_lines(Some(retired), Some(back), new.grandmaster, now_ns, mach_now)
+                .unwrap();
+        assert_eq!(handoff.grandmaster, old.grandmaster);
+        assert_eq!(new_now + handoff.delta_ns, old_now);
+    }
+
+    #[test]
+    fn handoff_between_lines_refuses_self_unlocked_stale_and_unknown_timelines() {
+        let now_ns = 10_000_000_000;
+        let line = TsLine {
+            domain_anchor_ns: 1_000,
+            mach_anchor: 1_000,
+            mach_per_domain_second: 1_000_000_000,
+            lock_state: LOCK_STATE_LOCKED,
+            grandmaster: 0xbb,
+            self_identity: 0x11,
+            port_role: PORT_ROLE_SLAVE,
+            sampled_at_ns: now_ns,
+        };
+        let retired = TsLine {
+            grandmaster: 0xaa,
+            ..line
+        };
+        let own = TsLine {
+            grandmaster: 0x11,
+            ..line
+        };
+        assert_eq!(
+            handoff_between_lines(Some(retired), Some(own), 0xaa, now_ns, 2_000),
+            Err("new_grandmaster_not_locked")
+        );
+        let unlocked = TsLine {
+            lock_state: 1,
+            ..line
+        };
+        assert_eq!(
+            handoff_between_lines(Some(retired), Some(unlocked), 0xaa, now_ns, 2_000),
+            Err("new_grandmaster_not_locked")
+        );
+        assert_eq!(
+            handoff_between_lines(Some(retired), Some(line), 0xbb, now_ns, 2_000),
+            Err("no_grandmaster_change")
+        );
+        assert_eq!(
+            handoff_between_lines(None, Some(line), 0xaa, now_ns, 2_000),
+            Err("old_mapping_unavailable")
+        );
+        let ancient = TsLine {
+            sampled_at_ns: 1,
+            ..retired
+        };
+        assert_eq!(
+            handoff_between_lines(Some(ancient), Some(line), 0xaa, now_ns, 2_000),
+            Err("old_mapping_too_old")
+        );
+        let stale = TsLine {
+            sampled_at_ns: now_ns - 2_000_000_000,
+            ..line
+        };
+        assert_eq!(
+            handoff_between_lines(Some(retired), Some(stale), 0xaa, now_ns, 2_000),
+            Err("new_line_stale")
+        );
+        assert_eq!(
+            handoff_between_lines(Some(retired), None, 0xaa, now_ns, 2_000),
+            Err("new_grandmaster_not_locked")
+        );
+    }
+
+    #[test]
+    fn extra_port_leases_count_references_across_sessions_sharing_an_instance() {
+        let homepod: Ipv4Addr = "10.130.32.243".parse().unwrap();
+        let other: Ipv4Addr = "10.130.32.107".parse().unwrap();
+        let mut leases = ExtraPortLeases::default();
+        let plan = leases.replace(1, &[homepod, homepod]);
+        assert_eq!(plan.open, vec![homepod]);
+        assert!(plan.close.is_empty());
+        // A second session from the same sender shares the port.
+        let plan = leases.replace(2, &[homepod, other]);
+        assert_eq!(plan.open, vec![other]);
+        // Session 1's group drops the HomePod: session 2 still needs it.
+        let plan = leases.replace(1, &[]);
+        assert!(plan.open.is_empty() && plan.close.is_empty());
+        assert_eq!(leases.open_ports(), vec![other, homepod]);
+        // Session 2 ends: both ports go.
+        let mut closed = leases.release(2);
+        closed.sort_unstable();
+        assert_eq!(closed, vec![other, homepod]);
+        assert!(leases.open_ports().is_empty());
+        // A failed open is forgotten so the next update retries it.
+        let plan = leases.replace(3, &[homepod]);
+        assert_eq!(plan.open, vec![homepod]);
+        leases.open_failed(3, homepod);
+        assert!(leases.open_ports().is_empty());
+        assert_eq!(leases.replace(3, &[homepod]).open, vec![homepod]);
+        assert!(leases.release(99).is_empty());
     }
 
     #[test]

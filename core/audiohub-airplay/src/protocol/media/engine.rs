@@ -14,7 +14,8 @@ use super::clock::{
 use super::decode::{Type96AlacDecoder, CHANNELS, FRAMES_PER_PACKET, SAMPLE_RATE};
 use super::jitter::{InsertOutcome, JitterBuffer};
 use super::packet::{RingDisposition, RtpPacket, SequenceExtender16, TimestampExtender32};
-use super::ptp::{PtpClockError, PtpClockMapper, PtpClockSample, PtpClockSource};
+use super::ptp::{PtpClockError, PtpClockSample, PtpClockSource};
+use super::ptp_session::SessionPtpClock;
 use super::setup::Type96Setup;
 use std::collections::{HashSet, VecDeque};
 use std::io;
@@ -40,7 +41,6 @@ const MIN_SYNC_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_RETRANSMIT_ATTEMPTS: u8 = 6;
 const NONCE_HISTORY: usize = 2_048;
 const PTP_SYNC_ANCHOR_BYTES: usize = 28;
-const MAX_PENDING_PTP_SAMPLES: usize = 32;
 const MAX_CLOCKED_SILENCE_PACKETS: usize = 512;
 // In the realtime d7 profile, the timestamp at bytes 4..8 is 11,035 frames
 // ahead of the RTP frame that must reach the DAC at the advertised PTP time.
@@ -451,12 +451,9 @@ struct NtpType96Clock {
 }
 
 struct PtpType96Clock {
-    source: PtpClockSource,
-    epoch: std::time::Instant,
-    mapper: Option<PtpClockMapper>,
+    /// Accepted timing peers, mapping and grandmaster handoff.
+    ptp: SessionPtpClock,
     anchor: Option<PlaybackAnchor>,
-    pending_samples: VecDeque<PtpClockSample>,
-    ready_logged: bool,
     anchor_logged: bool,
 }
 
@@ -564,12 +561,13 @@ impl Type96Engine {
                 epoch,
             } => (
                 Type96Clock::Ptp(PtpType96Clock {
-                    source,
-                    epoch,
-                    mapper: None,
+                    ptp: SessionPtpClock::new(
+                        source,
+                        prepared.peer_ip,
+                        epoch,
+                        crate::telemetry::MediaKind::Realtime,
+                    ),
                     anchor: None,
-                    pending_samples: VecDeque::with_capacity(MAX_PENDING_PTP_SAMPLES),
-                    ready_logged: false,
                     anchor_logged: false,
                 }),
                 Some(samples),
@@ -685,6 +683,9 @@ impl Type96Engine {
                     }
                 }
                 _ = gap_tick.tick() => {
+                    if let Some(error) = self.ptp_fatal() {
+                        return RunExit::Io(error);
+                    }
                     self.service_media_tick().await;
                 }
                 _ = timing_tick.tick() => {
@@ -1079,25 +1080,13 @@ impl Type96Engine {
         anchor: PtpSyncAnchor,
         telemetry_token: crate::telemetry::OperationToken,
     ) {
-        let peer_ip = self.peer_ip;
         let Type96Clock::Ptp(clock) = &mut self.clock else {
             return;
         };
-        let playback_anchor = anchor.playback_anchor(telemetry_token);
-        let reset_mapper = clock
-            .mapper
-            .as_ref()
-            .is_none_or(|mapper| mapper.grandmaster() != playback_anchor.timeline_id);
-        if reset_mapper {
-            clock.mapper = Some(PtpClockMapper::new(
-                peer_ip,
-                playback_anchor.timeline_id,
-                clock.epoch,
-                telemetry_token,
-                crate::telemetry::MediaKind::Realtime,
-            ));
-            clock.ready_logged = false;
-        }
+        let mut playback_anchor = anchor.playback_anchor(telemetry_token);
+        clock
+            .ptp
+            .install_anchor(&mut playback_anchor, std::time::Instant::now());
         clock.anchor = Some(playback_anchor);
         if !clock.anchor_logged {
             clock.anchor_logged = true;
@@ -1109,19 +1098,6 @@ impl Type96Engine {
                 anchor.latency_frames(),
                 anchor.timeline_id
             );
-        }
-
-        let pending = std::mem::take(&mut clock.pending_samples);
-        for sample in pending {
-            if sample.peer == peer_ip && sample.grandmaster == playback_anchor.timeline_id {
-                Self::observe_ptp_sample_value(clock, sample);
-            } else {
-                crate::telemetry::record_ptp_pending_disposition(
-                    sample.telemetry_token,
-                    "mapper_pending_sample_discarded",
-                    1,
-                );
-            }
         }
     }
 
@@ -1141,50 +1117,23 @@ impl Type96Engine {
                 return;
             }
         };
-        if sample.peer != self.peer_ip {
-            return;
-        }
         let Type96Clock::Ptp(clock) = &mut self.clock else {
             return;
         };
-        if clock.mapper.is_none() {
-            if clock.pending_samples.len() == MAX_PENDING_PTP_SAMPLES {
-                if let Some(evicted) = clock.pending_samples.pop_front() {
-                    crate::telemetry::record_ptp_pending_disposition(
-                        evicted.telemetry_token,
-                        "mapper_pending_sample_evicted",
-                        1,
-                    );
-                }
-            }
-            clock.pending_samples.push_back(sample);
-            return;
-        }
-        Self::observe_ptp_sample_value(clock, sample);
+        clock
+            .ptp
+            .observe_sample(sample, std::time::Instant::now(), clock.anchor.as_mut());
     }
 
-    fn observe_ptp_sample_value(clock: &mut PtpType96Clock, sample: PtpClockSample) {
-        let Some(mapper) = clock.mapper.as_mut() else {
-            return;
+    /// A grandmaster change this stream could not follow (see
+    /// `SessionPtpClock::take_fatal`).
+    fn ptp_fatal(&mut self) -> Option<io::Error> {
+        let delivering = self.delivery_started;
+        let Type96Clock::Ptp(clock) = &mut self.clock else {
+            return None;
         };
-        match mapper.observe(sample) {
-            Ok(Some(estimate)) => {
-                if !clock.ready_logged {
-                    clock.ready_logged = true;
-                    log::info!(
-                        target: "audiohub_airplay::airplay2",
-                        "AirPlay 2 realtime PTP clock ready samples={} timeline={:016x}",
-                        estimate.retained_samples,
-                        sample.grandmaster
-                    );
-                }
-            }
-            Ok(None) => {}
-            Err(error) => log::debug!(
-                target: "audiohub_airplay::airplay2",
-                "AirPlay 2 realtime PTP sample rejected: {error}"
-            ),
-        }
+        let playing = delivering && clock.anchor.is_some();
+        clock.ptp.take_fatal(std::time::Instant::now(), playing)
     }
 
     fn drain_ready(&mut self) {
@@ -1282,10 +1231,10 @@ impl Type96Engine {
         else {
             return ClockedSchedule::Wait;
         };
-        let Type96Clock::Ptp(clock) = &self.clock else {
+        let Type96Clock::Ptp(clock) = &mut self.clock else {
             return ClockedSchedule::Wait;
         };
-        let Some(anchor) = clock.anchor else {
+        let Some(anchor) = clock.anchor.as_mut() else {
             crate::telemetry::record_scheduler_wait(
                 telemetry_token,
                 crate::telemetry::MediaKind::Realtime,
@@ -1293,32 +1242,18 @@ impl Type96Engine {
             );
             return ClockedSchedule::Wait;
         };
-        let Some(mapper) = clock.mapper.as_ref() else {
+        let now = std::time::Instant::now();
+        let Ok((deadline_source, deadline)) =
+            clock
+                .ptp
+                .deadline(now, anchor, frame_timestamp, SAMPLE_RATE, telemetry_token)
+        else {
             crate::telemetry::record_scheduler_wait(
                 telemetry_token,
                 crate::telemetry::MediaKind::Realtime,
                 "missing_mapper",
             );
             return ClockedSchedule::Wait;
-        };
-        let now = std::time::Instant::now();
-        let (deadline_source, deadline) = match clock.source.platform_deadline_for_rtp(
-            anchor,
-            frame_timestamp,
-            SAMPLE_RATE,
-            telemetry_token,
-        ) {
-            Some(result) => (crate::telemetry::DeadlineSource::Platform, result),
-            None => (
-                crate::telemetry::DeadlineSource::PortableMapper,
-                mapper.deadline_for_rtp(
-                    now,
-                    anchor,
-                    frame_timestamp,
-                    SAMPLE_RATE,
-                    telemetry_token,
-                ),
-            ),
         };
         match deadline {
             Ok(deadline) => {

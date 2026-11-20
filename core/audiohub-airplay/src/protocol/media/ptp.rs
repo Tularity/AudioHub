@@ -2,12 +2,15 @@
 //!
 //! AirPlay senders act as the timing grandmaster. AudioHub listens for the
 //! sender's two-step Sync / Follow_Up exchange and maps that remote timeline
-//! onto its local monotonic clock. It does not announce itself as a master,
-//! participate in grouping, or implement multiroom topology.
+//! onto its local monotonic clock. It does not announce itself as a master
+//! or implement multiroom topology; it follows the grandmaster the sender's
+//! group elects, including changes announced through SETPEERS
+//! (`ptp_session`).
 
 use super::buffered_clock::{rtp_delta, PlaybackAnchor};
 #[cfg(target_os = "macos")]
 use super::ptp_macos::{MacPtpClock, MacPtpError, MacPtpPort};
+use super::ptp_session::{PeerSetChange, SessionShared};
 #[cfg(target_os = "macos")]
 use super::ptp_timesync;
 use std::collections::{HashMap, VecDeque};
@@ -16,8 +19,7 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-#[cfg(target_os = "macos")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
@@ -51,6 +53,8 @@ pub(crate) const DEADLINE_NOT_READY_WARMUP: Duration = MAPPER_WINDOW;
 const MAPPER_MAX_SAMPLES: usize = 32;
 const MAPPER_MIN_SAMPLES: usize = 3;
 const MAPPER_MAX_OFFSET_STEP_NS: i128 = 250_000_000;
+/// Samples within this distance of an estimate support it for a handoff.
+const HANDOFF_CONSISTENCY_NS: i128 = 20_000_000;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -125,6 +129,111 @@ pub(crate) struct PtpClockSample {
 pub(crate) struct PtpRemoteMatch {
     pub(crate) clock_identity: u64,
     pub(crate) port_number: u16,
+}
+
+/// A platform clock followed a new grandmaster: add `delta_ns` to a time on
+/// the old grandmaster's timeline to get the same instant on the new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlatformHandoff {
+    pub(crate) grandmaster: u64,
+    pub(crate) delta_ns: i128,
+}
+
+/// Extra unicast timing ports a SETPEERS update opened or closed on a
+/// platform clock (macOS). Portable sessions need no ports.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PeerPortUpdate {
+    pub(crate) opened: Vec<Ipv4Addr>,
+    pub(crate) closed: Vec<Ipv4Addr>,
+    pub(crate) failed: Vec<(Ipv4Addr, &'static str)>,
+}
+
+/// Outcome of applying one peer list to a session's clock source.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PeerListApplied {
+    pub(crate) change: PeerSetChange,
+    pub(crate) ports: Option<PeerPortUpdate>,
+}
+
+/// Whether `address` can be one of a session's timing peers: a unicast
+/// remote address other than the control peer and this host.
+pub(crate) fn usable_timing_peer(
+    address: IpAddr,
+    control_peer: IpAddr,
+    local: IpAddr,
+    interfaces: &[IpAddr],
+) -> bool {
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || address == control_peer
+        || address == local
+        || interfaces.contains(&address))
+}
+
+/// Parse one advertised timing address. Senders list IPv4 and IPv6 strings;
+/// an IPv6 zone suffix (`%en0`) is dropped.
+pub(crate) fn parse_timing_address(text: &str) -> Option<IpAddr> {
+    let text = text.trim();
+    let text = text.split('%').next().unwrap_or(text);
+    text.parse().ok()
+}
+
+/// Latest grandmaster each PTP peer announced to the portable observer.
+#[derive(Debug, Clone, Copy)]
+struct ObservedGrandmaster {
+    peer: IpAddr,
+    grandmaster: u64,
+    seen_at: Instant,
+}
+
+static OBSERVED_GRANDMASTERS: Mutex<Vec<ObservedGrandmaster>> = Mutex::new(Vec::new());
+
+fn note_observed_grandmaster(peer: IpAddr, grandmaster: u64, seen_at: Instant) {
+    let mut observed = OBSERVED_GRANDMASTERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(entry) = observed.iter_mut().find(|entry| entry.peer == peer) {
+        entry.grandmaster = grandmaster;
+        entry.seen_at = seen_at;
+        return;
+    }
+    if observed.len() >= MAX_CLOCK_SOURCES {
+        if let Some(oldest) = observed
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.seen_at)
+            .map(|(index, _)| index)
+        {
+            observed.swap_remove(oldest);
+        }
+    }
+    observed.push(ObservedGrandmaster {
+        peer,
+        grandmaster,
+        seen_at,
+    });
+}
+
+/// Grandmasters announced by `peers` to the portable observer, with their
+/// age, for diagnostics (`peer:gm@age_ms`).
+pub(crate) fn describe_observed_grandmasters(peers: &[IpAddr], now: Instant) -> String {
+    let observed = OBSERVED_GRANDMASTERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut text = String::new();
+    for entry in observed.iter().filter(|entry| peers.contains(&entry.peer)) {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&format!(
+            "{}:{:016x}@{}ms",
+            entry.peer,
+            entry.grandmaster,
+            now.saturating_duration_since(entry.seen_at).as_millis()
+        ));
+    }
+    text
 }
 
 /// Timing backend bound to one PTP control session.
@@ -255,6 +364,31 @@ fn local_interface_ipv4() -> Vec<Ipv4Addr> {
     }
 }
 
+/// Every address of this host's interfaces (macOS); elsewhere only the
+/// connection's local address is known and checked by the caller.
+fn local_interface_addresses() -> Vec<IpAddr> {
+    #[cfg(target_os = "macos")]
+    {
+        match if_addrs::get_if_addrs() {
+            Ok(interfaces) => interfaces
+                .into_iter()
+                .map(|interface| interface.ip())
+                .collect(),
+            Err(error) => {
+                log::warn!(
+                    target: "audiohub_airplay::airplay2",
+                    "AirPlay 2 PTP could not enumerate local interfaces: {error}"
+                );
+                Vec::new()
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Reason a session must skip the per-sender instance backend before any
 /// instance is created, or `None` when the instance may be tried.
 ///
@@ -338,6 +472,9 @@ enum MacSession {
     System {
         port: MacPtpPort,
         _permit: OwnedSemaphorePermit,
+        /// Extra ports for the session's SETPEERS peers. Only one session
+        /// holds the system clock (the gate), so no cross-session counts.
+        peer_ports: Mutex<HashMap<Ipv4Addr, MacPtpPort>>,
     },
     Instance(ptp_timesync::TimeSyncPort),
 }
@@ -347,10 +484,15 @@ pub(crate) struct PtpClockSource {
     samples: broadcast::Sender<PtpClockSample>,
     backend: PtpBackendKind,
     fallback_reason: Option<&'static str>,
+    /// Per-session timing peers and handoff state; `None` on the
+    /// process-wide root source.
+    session: Option<Arc<SessionShared>>,
     #[cfg(target_os = "macos")]
     mac_root: Option<Arc<MacRoot>>,
     #[cfg(target_os = "macos")]
     mac_session: Option<Arc<MacSession>>,
+    #[cfg(test)]
+    fake_platform: Option<Arc<FakePlatform>>,
 }
 
 impl PtpClockSource {
@@ -359,11 +501,149 @@ impl PtpClockSource {
             samples,
             backend: PtpBackendKind::Portable,
             fallback_reason: None,
+            session: None,
             #[cfg(target_os = "macos")]
             mac_root: None,
             #[cfg(target_os = "macos")]
             mac_session: None,
+            #[cfg(test)]
+            fake_platform: None,
         }
+    }
+
+    /// Session state shared with the media engine.
+    pub(crate) fn session(&self) -> Option<&Arc<SessionShared>> {
+        self.session.as_ref()
+    }
+
+    /// Whether deadlines come from a platform clock (macOS TimeSync or
+    /// CoreMedia) rather than the portable observer's samples.
+    pub(crate) fn maps_on_platform(&self) -> bool {
+        #[cfg(test)]
+        if self.fake_platform.is_some() {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        if self.mac_session.is_some() {
+            return true;
+        }
+        false
+    }
+
+    /// Grandmaster the platform clock currently follows, for diagnostics.
+    pub(crate) fn platform_grandmaster(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(fake) = self.fake_platform.as_ref() {
+            return fake.grandmaster();
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(session) = self.mac_session.as_deref() {
+            return match session {
+                MacSession::System { port, .. } => port.last_grandmaster(),
+                MacSession::Instance(port) => port.grandmaster(),
+            };
+        }
+        None
+    }
+
+    /// Carry an anchor on `from_grandmaster` over to the grandmaster the
+    /// platform clock now follows. `None` for the portable backend, which
+    /// hands off in `ptp_session` from its own samples.
+    pub(crate) fn platform_handoff(
+        &self,
+        from_grandmaster: u64,
+    ) -> Option<Result<PlatformHandoff, &'static str>> {
+        #[cfg(test)]
+        if let Some(fake) = self.fake_platform.as_ref() {
+            return Some(fake.handoff(from_grandmaster));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(session) = self.mac_session.as_deref() {
+            return Some(match session {
+                MacSession::System { port, .. } => port.handoff(from_grandmaster),
+                MacSession::Instance(port) => port.handoff(from_grandmaster),
+            });
+        }
+        let _ = from_grandmaster;
+        None
+    }
+
+    /// Apply an authenticated peer list (SETUP timing peers, SETPEERS,
+    /// SETPEERSX) to this session: samples from every listed peer become
+    /// acceptable, and on macOS the listed IPv4 peers get unicast timing
+    /// ports on the session's instance or system clock. `None` when this is
+    /// not a session source.
+    pub(crate) async fn apply_peer_list(
+        &self,
+        local_ip: IpAddr,
+        addresses: &[IpAddr],
+    ) -> Option<PeerListApplied> {
+        let session = self.session.as_ref()?;
+        let control = session.control_peer();
+        let interfaces = local_interface_addresses();
+        let peers: Vec<IpAddr> = addresses
+            .iter()
+            .copied()
+            .filter(|address| usable_timing_peer(*address, control, local_ip, &interfaces))
+            .collect();
+        let change = session.replace_peers(peers);
+        let ports = self.apply_platform_ports(&change.peers).await;
+        Some(PeerListApplied { change, ports })
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn apply_platform_ports(&self, peers: &[IpAddr]) -> Option<PeerPortUpdate> {
+        let session = self.mac_session.as_deref()?;
+        let wanted: Vec<Ipv4Addr> = peers
+            .iter()
+            .filter_map(|peer| match peer {
+                IpAddr::V4(address) => Some(*address),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+        Some(match session {
+            MacSession::Instance(port) => port.set_peers(wanted).await,
+            MacSession::System {
+                port, peer_ports, ..
+            } => {
+                let mut update = PeerPortUpdate::default();
+                let mut ports = peer_ports.lock().unwrap_or_else(PoisonError::into_inner);
+                let stale: Vec<Ipv4Addr> = ports
+                    .keys()
+                    .filter(|address| !wanted.contains(address))
+                    .copied()
+                    .collect();
+                for address in stale {
+                    // Dropping the port removes it from the CoreMedia clock.
+                    ports.remove(&address);
+                    update.closed.push(address);
+                }
+                for address in wanted {
+                    if ports.contains_key(&address) || address == port.destination_peer() {
+                        continue;
+                    }
+                    match port.sibling(address) {
+                        Ok(sibling) => {
+                            ports.insert(address, sibling);
+                            update.opened.push(address);
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                target: "audiohub_airplay::airplay2",
+                                "AirPlay 2 PTP system clock could not add timing peer {address}: {error}"
+                            );
+                            update.failed.push((address, "port_failed"));
+                        }
+                    }
+                }
+                update
+            }
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn apply_platform_ports(&self, _peers: &[IpAddr]) -> Option<PeerPortUpdate> {
+        None
     }
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<PtpClockSample> {
@@ -417,9 +697,11 @@ impl PtpClockSource {
         }
 
         #[cfg(not(target_os = "macos"))]
-        let _ = (local_ip, peer_ip, remote_match);
+        let _ = (local_ip, remote_match);
 
-        Ok(self.clone())
+        let mut source = self.clone();
+        source.session = Some(Arc::new(SessionShared::new(peer_ip)));
+        Ok(source)
     }
 
     #[cfg(target_os = "macos")]
@@ -478,6 +760,7 @@ impl PtpClockSource {
                 Ok(MacSession::System {
                     port,
                     _permit: permit,
+                    peer_ports: Mutex::new(HashMap::new()),
                 })
             }
         });
@@ -502,8 +785,11 @@ impl PtpClockSource {
             samples: self.samples.clone(),
             backend,
             fallback_reason,
+            session: Some(Arc::new(SessionShared::new(IpAddr::V4(peer_ip)))),
             mac_root: Some(Arc::clone(root)),
             mac_session: Some(Arc::new(session)),
+            #[cfg(test)]
+            fake_platform: None,
         })
     }
 
@@ -516,6 +802,10 @@ impl PtpClockSource {
         sample_rate: u32,
         _telemetry_token: crate::telemetry::OperationToken,
     ) -> Option<Result<Instant, PtpClockError>> {
+        #[cfg(test)]
+        if let Some(fake) = self.fake_platform.as_ref() {
+            return Some(fake.deadline(anchor, packet_rtp, sample_rate));
+        }
         #[cfg(target_os = "macos")]
         if let Some(session) = self.mac_session.as_deref() {
             let remote_time_ns = match remote_time_for_rtp(anchor, packet_rtp, sample_rate) {
@@ -558,6 +848,25 @@ impl PtpClockSource {
     pub(crate) fn test_source() -> Self {
         let (samples, _) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
         Self::portable(samples)
+    }
+
+    /// Portable session source for `control_peer` (what `for_session`
+    /// returns off macOS).
+    #[cfg(test)]
+    pub(crate) fn test_session_source(control_peer: IpAddr) -> Self {
+        let mut source = Self::test_source();
+        source.session = Some(Arc::new(SessionShared::new(control_peer)));
+        source
+    }
+
+    /// Session source whose deadlines and handoffs come from a fake
+    /// platform clock (the macOS backends' contract).
+    #[cfg(test)]
+    pub(crate) fn test_platform_source(control_peer: IpAddr, fake: Arc<FakePlatform>) -> Self {
+        let mut source = Self::test_session_source(control_peer);
+        source.backend = PtpBackendKind::MacInstance;
+        source.fake_platform = Some(fake);
+        source
     }
 
     #[cfg(test)]
@@ -788,14 +1097,26 @@ impl PtpObserver {
                         }
                     }
                 }
-                self.announcements.insert(
-                    (peer.ip(), header.source),
-                    Announcement {
-                        grandmaster,
-                        received_at,
-                        telemetry_token,
-                    },
-                );
+                let previous = self
+                    .announcements
+                    .insert(
+                        (peer.ip(), header.source),
+                        Announcement {
+                            grandmaster,
+                            received_at,
+                            telemetry_token,
+                        },
+                    )
+                    .map(|announcement| announcement.grandmaster);
+                if previous.is_some_and(|previous| previous != grandmaster) {
+                    log::info!(
+                        target: "audiohub_airplay::airplay2",
+                        "AirPlay 2 PTP peer {} now announces grandmaster {grandmaster:016x} (was {:016x})",
+                        peer.ip(),
+                        previous.unwrap_or_default()
+                    );
+                }
+                note_observed_grandmaster(peer.ip(), grandmaster, received_at);
                 crate::telemetry::record_ptp_datagram(
                     telemetry_token,
                     peer.ip(),
@@ -1187,6 +1508,37 @@ impl PtpClockMapper {
         self.grandmaster
     }
 
+    pub(crate) fn peer(&self) -> IpAddr {
+        self.peer
+    }
+
+    pub(crate) fn last_sample_at(&self) -> Option<Instant> {
+        self.samples.back().map(|sample| sample.received_at)
+    }
+
+    /// Current offset estimate (same rule as deadline mapping).
+    pub(crate) fn estimate(&self, now: Instant) -> Result<PtpClockEstimate, PtpClockError> {
+        self.estimate_at(now)
+    }
+
+    /// The estimate when it is safe to carry an anchor onto this mapping: at
+    /// least three fresh samples agree with it. Guards against the first
+    /// Syncs after a grandmaster change, whose Announce label and timestamp
+    /// can briefly disagree.
+    pub(crate) fn handoff_ready(&self, now: Instant) -> Option<PtpClockEstimate> {
+        let estimate = self.estimate_at(now).ok()?;
+        let supporting = self
+            .samples
+            .iter()
+            .filter(|sample| now.saturating_duration_since(sample.received_at) <= MAPPER_WINDOW)
+            .filter(|sample| {
+                (sample.local_minus_remote_ns - estimate.local_minus_remote_ns).abs()
+                    <= HANDOFF_CONSISTENCY_NS
+            })
+            .count();
+        (supporting >= MAPPER_MIN_SAMPLES).then_some(estimate)
+    }
+
     pub(crate) fn observe(
         &mut self,
         sample: PtpClockSample,
@@ -1394,6 +1746,101 @@ impl PtpClockError {
 }
 
 impl std::error::Error for PtpClockError {}
+
+/// Platform clock fake with the macOS backends' contract: it follows one
+/// grandmaster at a time, maps only anchors on that grandmaster, never maps
+/// through its own identity, and can hand off from the grandmaster it
+/// followed last (TimeSync's retired line / CoreMedia's last mapping).
+#[cfg(test)]
+pub(crate) struct FakePlatform {
+    epoch: Instant,
+    own_identity: u64,
+    state: Mutex<FakePlatformState>,
+}
+
+#[cfg(test)]
+struct FakePlatformState {
+    grandmaster: u64,
+    /// Local ns since `epoch` minus remote ns.
+    offset_ns: i128,
+    retired: Option<(u64, i128)>,
+}
+
+#[cfg(test)]
+impl FakePlatform {
+    pub(crate) fn new(epoch: Instant, grandmaster: u64, own_identity: u64) -> Self {
+        Self {
+            epoch,
+            own_identity,
+            state: Mutex::new(FakePlatformState {
+                grandmaster,
+                offset_ns: 0,
+                retired: None,
+            }),
+        }
+    }
+
+    /// Follow `grandmaster` with `offset_ns` (local - remote).
+    pub(crate) fn lock(&self, grandmaster: u64, offset_ns: i128) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.grandmaster != grandmaster && state.grandmaster != self.own_identity {
+            state.retired = Some((state.grandmaster, state.offset_ns));
+        }
+        state.grandmaster = grandmaster;
+        state.offset_ns = offset_ns;
+    }
+
+    pub(crate) fn forget_retired(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retired = None;
+    }
+
+    fn grandmaster(&self) -> Option<u64> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        (state.grandmaster != self.own_identity).then_some(state.grandmaster)
+    }
+
+    fn deadline(
+        &self,
+        anchor: PlaybackAnchor,
+        packet_rtp: u32,
+        sample_rate: u32,
+    ) -> Result<Instant, PtpClockError> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.grandmaster == self.own_identity {
+            return Err(PtpClockError::NotReady);
+        }
+        if anchor.timeline_id != state.grandmaster {
+            return Err(PtpClockError::SourceMismatch);
+        }
+        let remote = i128::from(remote_time_for_rtp(anchor, packet_rtp, sample_rate)?);
+        let local = u64::try_from(remote + state.offset_ns)
+            .map_err(|_| PtpClockError::MappedTimeOutOfRange)?;
+        self.epoch
+            .checked_add(Duration::from_nanos(local))
+            .ok_or(PtpClockError::MappedTimeOutOfRange)
+    }
+
+    fn handoff(&self, from: u64) -> Result<PlatformHandoff, &'static str> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.grandmaster == self.own_identity {
+            return Err("new_grandmaster_not_locked");
+        }
+        if state.grandmaster == from {
+            return Err("no_grandmaster_change");
+        }
+        let (_, old_offset) = state
+            .retired
+            .filter(|(grandmaster, _)| *grandmaster == from)
+            .ok_or("old_mapping_unavailable")?;
+        Ok(PlatformHandoff {
+            grandmaster: state.grandmaster,
+            delta_ns: old_offset - state.offset_ns,
+        })
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn mac_ptp_io_error(error: MacPtpError) -> io::Error {

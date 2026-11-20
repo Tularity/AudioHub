@@ -22,7 +22,10 @@ use super::media::buffered::{
 use super::media::engine::{
     PcmOutput, PreparedTiming, PreparedType96, Type96MediaHandle, Type96Ports,
 };
-use super::media::ptp::{PtpClockSource, PtpObserver, PtpRemoteMatch};
+use super::media::ptp::{
+    describe_observed_grandmasters, parse_timing_address, PeerListApplied, PtpClockSource,
+    PtpObserver, PtpRemoteMatch,
+};
 use super::media::setup::{self, STREAM_TYPE_REALTIME_AUDIO};
 use super::metadata::{self, Artwork, MergePolicy, NowPlayingUpdate, PatchField, TrackMetadata};
 use super::pairing::PairSetupServer;
@@ -1758,6 +1761,7 @@ async fn process_one_request(
                 peer.ip(),
                 state.connection_id,
                 telemetry.parsed,
+                telemetry.applied,
             );
         } else {
             crate::telemetry::record_peer_list_update_commit_failure(
@@ -2111,6 +2115,9 @@ struct PeerListTelemetryContext {
     address_count: usize,
     peer_ids: Vec<String>,
     addresses: Vec<String>,
+    /// Every listed address that parses as an IP address (not truncated);
+    /// applied to the session's PTP clock.
+    timing_addresses: Vec<IpAddr>,
     clock_identity_count: usize,
     clock_identities: Vec<u64>,
     clock_port_count: usize,
@@ -2124,6 +2131,8 @@ struct PeerListTelemetryOutcome {
     method: PeerListUpdateMethod,
     content_type: Option<String>,
     parsed: bool,
+    /// The parsed list reached the session's PTP clock.
+    applied: bool,
     reason: &'static str,
     context: PeerListTelemetryContext,
 }
@@ -2486,8 +2495,12 @@ async fn dispatch_encrypted(
                 request,
                 PeerListUpdateMethod::SetPeers,
                 &config.identity.public_identifier(),
+                local_addr.ip(),
+                peer.ip(),
+                session_ptp_source(phase_one),
                 telemetry_token,
             )
+            .await
         }
         ("SETPEERSX", _) => {
             let telemetry_token = crate::telemetry::operation_token();
@@ -2495,8 +2508,12 @@ async fn dispatch_encrypted(
                 request,
                 PeerListUpdateMethod::SetPeersX,
                 &config.identity.public_identifier(),
+                local_addr.ip(),
+                peer.ip(),
+                session_ptp_source(phase_one),
                 telemetry_token,
             )
+            .await
         }
         ("SETRATEANCHORTIME", _) => {
             if active_media_kind != Some(MediaKind::Buffered) {
@@ -3102,6 +3119,24 @@ async fn setup_response(
                             .iter()
                             .any(|timing_peer| timing_peer.id == remote_timing_peer.id),
                     );
+                    // SETUP's timing peers are the sender's group as of now;
+                    // later SETPEERS/SETPEERSX replace them.
+                    let advertised: Vec<IpAddr> = remote_timing_peer
+                        .addresses
+                        .iter()
+                        .chain(
+                            timing_peer_list
+                                .iter()
+                                .flat_map(|peer| peer.addresses.iter()),
+                        )
+                        .filter_map(|address| parse_timing_address(address))
+                        .collect();
+                    if let Some(applied) = ptp_clock
+                        .apply_peer_list(local_addr.ip(), &advertised)
+                        .await
+                    {
+                        log_peer_list_applied("SETUP", peer.ip(), &ptp_clock, &applied);
+                    }
                     let body = match setup_ptp_phase_one_body(
                         event_port,
                         local_addr.ip(),
@@ -3469,6 +3504,9 @@ fn parse_peer_list_update(
                     .as_string()
                     .filter(|address| !address.is_empty() && address.len() <= 255)
                     .ok_or("shape")?;
+                context
+                    .timing_addresses
+                    .extend(parse_timing_address(address));
                 context.address_count = context.address_count.saturating_add(1);
                 if context.addresses.len() < PEER_LIST_EVENT_ADDRESS_LIMIT {
                     context.addresses.push(address.to_owned());
@@ -3486,6 +3524,9 @@ fn parse_peer_list_update(
                     context.truncated = true;
                 }
                 for address in &peer.addresses {
+                    context
+                        .timing_addresses
+                        .extend(parse_timing_address(address));
                     context.address_count = context.address_count.saturating_add(1);
                     if context.addresses.len() < PEER_LIST_EVENT_ADDRESS_LIMIT {
                         context.addresses.push(address.clone());
@@ -3675,10 +3716,14 @@ fn encode_binary_dictionary(dictionary: Dictionary) -> io::Result<Vec<u8>> {
     Ok(body)
 }
 
-fn peer_list_update_response(
+#[allow(clippy::too_many_arguments)]
+async fn peer_list_update_response(
     request: &Request,
     method: PeerListUpdateMethod,
     local_timing_peer_id: &str,
+    local_ip: IpAddr,
+    control_peer: IpAddr,
+    ptp_source: Option<PtpClockSource>,
     telemetry_token: crate::telemetry::OperationToken,
 ) -> DispatchOutcome {
     let content_type = unique_content_type_from_headers(request.headers());
@@ -3692,19 +3737,112 @@ fn peer_list_update_response(
         Ok(context) => (true, "parsed", context),
         Err(reason) => (false, reason, PeerListTelemetryContext::default()),
     };
-    // Preserve 1.0 behavior: these requests are acknowledged but not applied
-    // to the active mapper yet. Telemetry states that limitation explicitly so
-    // a dual-target reproduction cannot mistake a 200 for a clock update.
+    // The list names the sender's current group. It becomes the session's
+    // accepted timing peers (and, on macOS, timing ports) so the session
+    // clock can follow a grandmaster the group moves to, e.g. a HomePod.
+    let applied = match ptp_source {
+        Some(source) if parsed => {
+            match source
+                .apply_peer_list(local_ip, &context.timing_addresses)
+                .await
+            {
+                Some(result) => {
+                    log_peer_list_applied(method.as_str(), control_peer, &source, &result);
+                    true
+                }
+                None => false,
+            }
+        }
+        _ if parsed => {
+            log::info!(
+                target: "audiohub_airplay::airplay2",
+                "AirPlay 2 {} from {control_peer} not applied: the connection has no PTP session clock",
+                method.as_str()
+            );
+            false
+        }
+        _ => false,
+    };
     DispatchOutcome::reply(response_for(request, 200, "OK")).with_peer_list_telemetry(
         PeerListTelemetryOutcome {
             token: telemetry_token,
             method,
             content_type,
             parsed,
+            applied,
             reason,
             context,
         },
     )
+}
+
+/// The connection's PTP session clock, if phase one negotiated PTP.
+fn session_ptp_source(phase_one: &Option<PhaseOneState>) -> Option<PtpClockSource> {
+    match phase_one {
+        Some(PhaseOneState::Ptp(source)) => Some(source.clone()),
+        _ => None,
+    }
+}
+
+fn format_addresses<T: std::fmt::Display>(addresses: &[T]) -> String {
+    addresses
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One INFO line per applied peer list: the session's grandmaster against
+/// what the listed peers currently announce, so a group change can be read
+/// from a capture without guessing.
+fn log_peer_list_applied(
+    method: &str,
+    control_peer: IpAddr,
+    source: &PtpClockSource,
+    applied: &PeerListApplied,
+) {
+    let session_gm = source
+        .session()
+        .and_then(|session| session.grandmaster())
+        .map_or_else(|| "none".to_owned(), |gm| format!("{gm:016x}"));
+    let mut watched = applied.change.peers.clone();
+    watched.push(control_peer);
+    let observed = describe_observed_grandmasters(&watched, std::time::Instant::now());
+    let platform_gm = source
+        .platform_grandmaster()
+        .map_or_else(|| "none".to_owned(), |gm| format!("{gm:016x}"));
+    let ports = applied.ports.as_ref().map_or_else(
+        || "n/a".to_owned(),
+        |ports| {
+            format!(
+                "opened=[{}] closed=[{}] failed=[{}]",
+                format_addresses(&ports.opened),
+                format_addresses(&ports.closed),
+                ports
+                    .failed
+                    .iter()
+                    .map(|(address, reason)| format!("{address}:{reason}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        },
+    );
+    if let Some(ports) = applied.ports.as_ref() {
+        crate::telemetry::record_ptp_peer_ports(
+            crate::telemetry::operation_token(),
+            ports.opened.len(),
+            ports.closed.len(),
+            ports.failed.len(),
+        );
+    }
+    log::info!(
+        target: "audiohub_airplay::airplay2",
+        "AirPlay 2 PTP peer list applied method={method} control_peer={control_peer} backend={} peers=[{}] added=[{}] removed=[{}] session_gm={session_gm} platform_gm={platform_gm} observed=[{observed}] ports: {ports}",
+        source.backend().as_str(),
+        format_addresses(&applied.change.peers),
+        format_addresses(&applied.change.added),
+        format_addresses(&applied.change.removed),
+    );
 }
 
 fn record_response(request: &Request) -> DispatchOutcome {
@@ -8056,5 +8194,115 @@ mod tests {
             assert_eq!(outcome.response.status, 200, "{target}");
             assert!(!outcome.close_after, "{target}");
         }
+    }
+
+    #[tokio::test]
+    async fn setpeers_and_setpeersx_are_applied_to_the_session_clock() {
+        let control: IpAddr = "192.0.2.13".parse().unwrap();
+        let local: IpAddr = "192.0.2.30".parse().unwrap();
+        let source = PtpClockSource::test_session_source(control);
+        let legacy = |addresses: &[&str]| {
+            let mut body = Vec::new();
+            Value::Array(
+                addresses
+                    .iter()
+                    .map(|address| Value::String((*address).to_owned()))
+                    .collect(),
+            )
+            .to_writer_binary(&mut body)
+            .unwrap();
+            body
+        };
+        // Apple's legacy list: the sender's own addresses, the new group
+        // member, and (sometimes) the receiver itself.
+        // (fe80::1 would be lo0's own address on macOS; use a remote one.)
+        let body = legacy(&[
+            "192.0.2.13",
+            "fe80::42b:31b2:6f75:762a%en0",
+            "192.0.2.243",
+            "192.0.2.30",
+            "fdf9::2",
+        ]);
+        let request = make_request(
+            "SETPEERS",
+            "rtsp://192.0.2.30/1",
+            Some("/peer-list-changed"),
+            &body,
+        );
+        let outcome = peer_list_update_response(
+            &request,
+            PeerListUpdateMethod::SetPeers,
+            "local-peer-id",
+            local,
+            control,
+            Some(source.clone()),
+            crate::telemetry::operation_token(),
+        )
+        .await;
+        assert_eq!(outcome.response.status, 200);
+        let telemetry = outcome.peer_list_telemetry.as_ref().unwrap();
+        assert!(telemetry.parsed && telemetry.applied);
+        let expected: Vec<IpAddr> = ["192.0.2.243", "fdf9::2", "fe80::42b:31b2:6f75:762a"]
+            .iter()
+            .map(|address| address.parse().unwrap())
+            .collect();
+        assert_eq!(source.session().unwrap().peers().1, expected);
+
+        // SETPEERSX replaces the list (HomePod removed from the group).
+        let mut entry = Dictionary::new();
+        entry.insert("ID".into(), Value::String("sender".into()));
+        entry.insert(
+            "Addresses".into(),
+            Value::Array(vec![
+                Value::String("192.0.2.13".into()),
+                Value::String("192.0.2.14".into()),
+            ]),
+        );
+        let mut body = Vec::new();
+        Value::Array(vec![Value::Dictionary(entry)])
+            .to_writer_binary(&mut body)
+            .unwrap();
+        let request = make_request(
+            "SETPEERSX",
+            "rtsp://192.0.2.30/1",
+            Some("/peer-list-changed-x"),
+            &body,
+        );
+        let outcome = peer_list_update_response(
+            &request,
+            PeerListUpdateMethod::SetPeersX,
+            "local-peer-id",
+            local,
+            control,
+            Some(source.clone()),
+            crate::telemetry::operation_token(),
+        )
+        .await;
+        assert!(outcome.peer_list_telemetry.as_ref().unwrap().applied);
+        assert_eq!(
+            source.session().unwrap().peers().1,
+            vec!["192.0.2.14".parse::<IpAddr>().unwrap()]
+        );
+
+        // Without a PTP session the list is acknowledged but not applied.
+        let request = make_request(
+            "SETPEERS",
+            "rtsp://192.0.2.30/1",
+            Some("/peer-list-changed"),
+            &legacy(&["192.0.2.243"]),
+        );
+        let outcome = peer_list_update_response(
+            &request,
+            PeerListUpdateMethod::SetPeers,
+            "local-peer-id",
+            local,
+            control,
+            None,
+            crate::telemetry::operation_token(),
+        )
+        .await;
+        assert_eq!(outcome.response.status, 200);
+        let telemetry = outcome.peer_list_telemetry.as_ref().unwrap();
+        assert!(telemetry.parsed && !telemetry.applied);
     }
 }

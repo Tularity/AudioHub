@@ -1623,12 +1623,17 @@ pub struct PeerState {
 ///       diagnostic state snapshot. Empty clears it.
 /// - "airplay.sessions.list" {}                -> Vec<AirPlaySessionInfo>
 /// - "airplay.artwork.get" {session_id, revision} -> AirPlayArtwork | null
-/// - "airplay.telemetry.get" {}                -> AirPlay telemetry schema v3 snapshot
-/// - "airplay.telemetry.reset" {}              -> new empty schema v3 generation
+/// - "airplay.telemetry.get" {}                -> AirPlay telemetry schema v5 snapshot
+/// - "airplay.telemetry.reset" {}              -> new empty schema v5 generation
 ///       Numeric leaves are cumulative inside `reset_generation` except fields
 ///       ending in `_gauge`, which are point-in-time values and may decrease.
-///       SETPEERS/SETPEERSX remain ACK-but-ignored; application-to-clock and
-///       terminal response outcomes are reported independently. Each media mode
+///       SETPEERS/SETPEERSX update the session's accepted PTP timing peers
+///       (and macOS timing ports) so the session clock can follow a moved
+///       grandmaster; `peer_list_update_applied_to_session_clock` counts
+///       those, `..._acknowledged_but_ignored` lists without a PTP session.
+///       Schema 5 adds `ptp_gm_handoffs`, `ptp_gm_handoff_failures`,
+///       `ptp_anchor_timeline_switches` and `ptp_peer_ports_*`. Terminal
+///       response outcomes are reported independently. Each media mode
 ///       exposes PTP broadcast lag and cross-generation discard event/sample
 ///       totals; `control_sessions` identifies each observed RTSP connection by
 ///       its unique `(peer_ip, connection_id)` pair for cross-VM evidence

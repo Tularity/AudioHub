@@ -10,7 +10,8 @@
 use super::super::server::{sync_diagnostics_enabled, sync_utc_ns};
 use super::buffered_clock::{network_time_nanos, PlaybackAnchor};
 use super::engine::PcmOutput;
-use super::ptp::{PtpClockError, PtpClockMapper, PtpClockSample, PtpClockSource};
+use super::ptp::{PtpClockError, PtpClockSample, PtpClockSource};
+use super::ptp_session::SessionPtpClock;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use plist::{Dictionary, Value};
@@ -61,7 +62,6 @@ const COMMAND_CAPACITY: usize = 8;
 // without retaining one heap allocation per authenticated block.
 const MAX_AUTHENTICATED_BLOCKS: usize = SEQUENCE_MODULUS as usize;
 const MAX_BLOCKS_PER_PUMP: usize = 64;
-const MAX_PENDING_PTP_SAMPLES: usize = 32;
 const MAX_CLOCKED_FUTURE: Duration = Duration::from_secs(30);
 const MAX_CLOCKED_LATENESS: Duration = Duration::from_millis(500);
 
@@ -583,12 +583,10 @@ struct Type103Engine {
     output_epoch: Option<u64>,
     staging_slack: Duration,
     output_started: bool,
-    ptp_source: PtpClockSource,
     ptp_samples: broadcast::Receiver<PtpClockSample>,
-    pending_ptp_samples: VecDeque<PtpClockSample>,
-    ptp_epoch: std::time::Instant,
-    ptp_clock: Option<PtpClockMapper>,
-    ptp_clock_logged: bool,
+    /// Session PTP clock: accepted timing peers, mapping, and grandmaster
+    /// handoff (SETPEERS) for `playback_anchor`.
+    ptp: SessionPtpClock,
     authenticated_block_seen: bool,
     decoded_block_seen: bool,
     decoder_needs_reset: bool,
@@ -681,12 +679,13 @@ impl Type103Engine {
             output_epoch: None,
             staging_slack: Duration::ZERO,
             output_started: false,
-            ptp_source: prepared.ptp_source,
             ptp_samples: prepared.ptp_samples,
-            pending_ptp_samples: VecDeque::with_capacity(MAX_PENDING_PTP_SAMPLES),
-            ptp_epoch: prepared.ptp_epoch,
-            ptp_clock: None,
-            ptp_clock_logged: false,
+            ptp: SessionPtpClock::new(
+                prepared.ptp_source,
+                prepared.peer_ip,
+                prepared.ptp_epoch,
+                crate::telemetry::MediaKind::Buffered,
+            ),
             authenticated_block_seen: false,
             decoded_block_seen: false,
             decoder_needs_reset: false,
@@ -937,6 +936,12 @@ impl Type103Engine {
                 }
                 _ = housekeeping.tick() => {
                     self.housekeeping_ticks = self.housekeeping_ticks.wrapping_add(1);
+                    if let Some(error) = self
+                        .ptp
+                        .take_fatal(std::time::Instant::now(), self.playing_is_current())
+                    {
+                        return RunExit::Io(error);
+                    }
                     // Every 5 s. `lead_ms` is how far ahead of the speaker the
                     // next frame is — the one number that answers "did the
                     // cushion come back" without relying on how it sounded.
@@ -1185,39 +1190,17 @@ impl Type103Engine {
             self.output_started = false;
         }
         self.refresh_output_lead();
-        self.playback_anchor = Some(PlaybackAnchor {
+        let mut playback_anchor = PlaybackAnchor {
             timeline_id,
             remote_time_ns,
             rtp_time,
             telemetry_token,
-        });
-        let reset_clock = self
-            .ptp_clock
-            .as_ref()
-            .is_none_or(|clock| clock.grandmaster() != timeline_id);
-        if reset_clock {
-            self.ptp_clock = Some(PtpClockMapper::new(
-                self.peer_ip,
-                timeline_id,
-                self.ptp_epoch,
-                telemetry_token,
-                crate::telemetry::MediaKind::Buffered,
-            ));
-            self.ptp_clock_logged = false;
-        }
-
-        let pending = std::mem::take(&mut self.pending_ptp_samples);
-        for sample in pending {
-            if sample.peer == self.peer_ip && sample.grandmaster == timeline_id {
-                self.observe_ptp_sample_value(sample);
-            } else {
-                crate::telemetry::record_ptp_pending_disposition(
-                    sample.telemetry_token,
-                    "mapper_pending_sample_discarded",
-                    1,
-                );
-            }
-        }
+        };
+        // A new timeline promotes a warm mapper; a label from a timeline this
+        // session handed off from is translated to the current one.
+        self.ptp
+            .install_anchor(&mut playback_anchor, std::time::Instant::now());
+        self.playback_anchor = Some(playback_anchor);
         Ok(())
     }
 
@@ -1234,47 +1217,11 @@ impl Type103Engine {
             }
             Err(broadcast::error::RecvError::Closed) => return,
         };
-        if sample.peer != self.peer_ip {
-            return;
-        }
-        if self.ptp_clock.is_none() {
-            if self.pending_ptp_samples.len() == MAX_PENDING_PTP_SAMPLES {
-                if let Some(evicted) = self.pending_ptp_samples.pop_front() {
-                    crate::telemetry::record_ptp_pending_disposition(
-                        evicted.telemetry_token,
-                        "mapper_pending_sample_evicted",
-                        1,
-                    );
-                }
-            }
-            self.pending_ptp_samples.push_back(sample);
-            return;
-        }
-        self.observe_ptp_sample_value(sample);
-    }
-
-    fn observe_ptp_sample_value(&mut self, sample: PtpClockSample) {
-        let Some(clock) = self.ptp_clock.as_mut() else {
-            return;
-        };
-        match clock.observe(sample) {
-            Ok(Some(estimate)) => {
-                if !self.ptp_clock_logged {
-                    self.ptp_clock_logged = true;
-                    log::info!(
-                        target: "audiohub_airplay::airplay2",
-                        "AirPlay 2 PTP clock ready samples={} timeline={:016x}",
-                        estimate.retained_samples,
-                        sample.grandmaster
-                    );
-                }
-            }
-            Ok(None) => {}
-            Err(error) => log::debug!(
-                target: "audiohub_airplay::airplay2",
-                "AirPlay 2 PTP clock sample rejected: {error}"
-            ),
-        }
+        self.ptp.observe_sample(
+            sample,
+            std::time::Instant::now(),
+            self.playback_anchor.as_mut(),
+        );
     }
 
     fn pump_authenticated_blocks(&mut self) -> io::Result<()> {
@@ -1536,7 +1483,7 @@ impl Type103Engine {
         telemetry_token: crate::telemetry::OperationToken,
     ) -> Option<std::time::Instant> {
         self.refresh_output_lead();
-        let Some(anchor) = self.playback_anchor else {
+        let Some(anchor) = self.playback_anchor.as_mut() else {
             crate::telemetry::record_scheduler_wait(
                 telemetry_token,
                 crate::telemetry::MediaKind::Buffered,
@@ -1544,29 +1491,20 @@ impl Type103Engine {
             );
             return None;
         };
-        let Some(clock) = self.ptp_clock.as_ref() else {
+        let now = std::time::Instant::now();
+        let Ok((_, deadline)) = self.ptp.deadline(
+            now,
+            anchor,
+            timestamp,
+            BUFFERED_SAMPLE_RATE as u32,
+            telemetry_token,
+        ) else {
             crate::telemetry::record_scheduler_wait(
                 telemetry_token,
                 crate::telemetry::MediaKind::Buffered,
                 "missing_mapper",
             );
             return None;
-        };
-        let now = std::time::Instant::now();
-        let deadline = match self.ptp_source.platform_deadline_for_rtp(
-            anchor,
-            timestamp,
-            BUFFERED_SAMPLE_RATE as u32,
-            telemetry_token,
-        ) {
-            Some(result) => result,
-            None => clock.deadline_for_rtp(
-                now,
-                anchor,
-                timestamp,
-                BUFFERED_SAMPLE_RATE as u32,
-                telemetry_token,
-            ),
         };
         match deadline {
             Ok(deadline) => Some(deadline.checked_sub(self.output_lead).unwrap_or(now)),
@@ -1617,10 +1555,12 @@ impl Type103Engine {
     /// from a real network gap without guessing from the drop count.
     fn note_clock_unavailable(&mut self, error: &PtpClockError) {
         if self.clock_unavailable_since.is_none() {
-            self.clock_unavailable_since = Some(std::time::Instant::now());
+            let now = std::time::Instant::now();
+            self.clock_unavailable_since = Some(now);
             log::info!(
                 target: "audiohub_airplay::airplay2",
-                "AirPlay 2 media clock unavailable: {error}"
+                "AirPlay 2 media clock unavailable: {error} {}",
+                self.ptp.describe(now)
             );
         }
     }
@@ -1648,7 +1588,7 @@ impl Type103Engine {
         else {
             return ReadySchedule::Wait;
         };
-        let Some(anchor) = self.playback_anchor else {
+        let Some(anchor) = self.playback_anchor.as_mut() else {
             crate::telemetry::record_scheduler_wait(
                 telemetry_token,
                 crate::telemetry::MediaKind::Buffered,
@@ -1656,32 +1596,20 @@ impl Type103Engine {
             );
             return ReadySchedule::Wait;
         };
-        let Some(clock) = self.ptp_clock.as_ref() else {
+        let now = std::time::Instant::now();
+        let Ok((deadline_source, deadline)) = self.ptp.deadline(
+            now,
+            anchor,
+            ready_timestamp,
+            BUFFERED_SAMPLE_RATE as u32,
+            telemetry_token,
+        ) else {
             crate::telemetry::record_scheduler_wait(
                 telemetry_token,
                 crate::telemetry::MediaKind::Buffered,
                 "missing_mapper",
             );
             return ReadySchedule::Wait;
-        };
-        let now = std::time::Instant::now();
-        let (deadline_source, deadline) = match self.ptp_source.platform_deadline_for_rtp(
-            anchor,
-            ready_timestamp,
-            BUFFERED_SAMPLE_RATE as u32,
-            telemetry_token,
-        ) {
-            Some(result) => (crate::telemetry::DeadlineSource::Platform, result),
-            None => (
-                crate::telemetry::DeadlineSource::PortableMapper,
-                clock.deadline_for_rtp(
-                    now,
-                    anchor,
-                    ready_timestamp,
-                    BUFFERED_SAMPLE_RATE as u32,
-                    telemetry_token,
-                ),
-            ),
         };
         match deadline {
             Ok(deadline) => {
@@ -3027,6 +2955,76 @@ mod tests {
             "a late discard must not flush the output bus"
         );
         drop(guard);
+        assert!(!handle.is_finished());
+        handle.abort().await;
+    }
+
+    /// 30-win 2026-11-20 05:34Z: the sender relays a new grandmaster after
+    /// SETPEERS and sends no new anchor. Audio must keep flowing past the
+    /// point where the old grandmaster's samples went stale (2 s).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grandmaster_change_without_a_new_anchor_keeps_audio_flowing() {
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9_000);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9_001);
+        let ptp = PtpClockSource::test_session_source(peer.ip());
+        let prepared = PreparedType103::prepare(local, peer, valid_setup(), ptp.clone())
+            .await
+            .unwrap();
+        let ports = prepared.ports();
+        let state = Arc::new(Mutex::new(OutputState::default()));
+        let handle = prepared.start(Box::new(TestOutput(Arc::clone(&state))));
+        let base = std::time::Instant::now();
+        let mut sender = TcpStream::connect((Ipv4Addr::LOCALHOST, ports.data_port))
+            .await
+            .unwrap();
+        handle.set_rate(test_rate(true)).await.unwrap();
+        publish_ptp_burst(&ptp, peer.ip(), base).await;
+        sender
+            .write_all(&framed(&make_packet(1, 0, OWNED_AAC_FRAME_HEX, [111; 8])))
+            .await
+            .unwrap();
+        wait_for(|| state.lock().unwrap().writes.len() == 1).await;
+
+        // The sender now relays grandmaster 2, whose timeline is far away.
+        let relay = {
+            let ptp = ptp.clone();
+            let peer = peer.ip();
+            tokio::spawn(async move {
+                for _ in 0..700 {
+                    let received_at = std::time::Instant::now();
+                    let elapsed =
+                        u64::try_from(received_at.duration_since(base).as_nanos()).unwrap();
+                    ptp.publish_test_sample(PtpClockSample {
+                        peer,
+                        grandmaster: 2,
+                        remote_time_ns: 7_000_000_000_000 + elapsed,
+                        received_at,
+                        telemetry_token: crate::telemetry::operation_token(),
+                    });
+                    time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+        time::sleep(Duration::from_millis(2_300)).await;
+        let elapsed_ns = std::time::Instant::now().duration_since(base).as_nanos();
+        let current_rtp = u32::try_from(
+            ((elapsed_ns + PCM_OUTPUT_LEAD.as_nanos() + 20_000_000)
+                * u128::from(BUFFERED_SAMPLE_RATE))
+                / 1_000_000_000,
+        )
+        .unwrap();
+        sender
+            .write_all(&framed(&make_packet(
+                2,
+                current_rtp,
+                OWNED_AAC_FRAME_HEX,
+                [112; 8],
+            )))
+            .await
+            .unwrap();
+        wait_for(|| state.lock().unwrap().writes.len() == 2).await;
+        assert_eq!(state.lock().unwrap().flushes, 0);
+        relay.abort();
         assert!(!handle.is_finished());
         handle.abort().await;
     }

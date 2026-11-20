@@ -15,8 +15,11 @@ use std::fmt;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+use super::ptp::PlatformHandoff;
+use super::ptp_session::{converge_clock_handoff, LastMapping};
 
 const CORE_MEDIA_PATH: &[u8] = b"/System/Library/Frameworks/CoreMedia.framework/CoreMedia\0";
 const CM_TIME_VALID: u32 = 1;
@@ -130,6 +133,9 @@ struct MacPtpClockInner {
     clock: NonNull<c_void>,
     instant_epoch: Instant,
     host_epoch_ns: i128,
+    /// Last successful conversion, kept to carry an anchor across a
+    /// grandmaster change (CoreMedia has no domain-time query).
+    last_mapping: Mutex<Option<LastMapping>>,
     // Declared last so the function pointers stay loaded through Inner::drop
     // and through the destruction of every preceding field.
     _library: CoreMediaLibrary,
@@ -186,6 +192,7 @@ impl MacPtpClock {
                 clock,
                 instant_epoch,
                 host_epoch_ns,
+                last_mapping: Mutex::new(None),
                 _library: library,
             }),
         })
@@ -240,17 +247,14 @@ impl MacPtpClockInner {
         unsafe { (self.symbols.is_locked)(self.clock.as_ptr()) != 0 }
     }
 
-    fn map_remote_time(
-        &self,
-        remote_time_ns: u64,
-        expected_grandmaster: u64,
-    ) -> Result<Instant, MacPtpError> {
-        if !self.is_locked() {
-            return Err(MacPtpError::NotLocked);
-        }
-
-        let remote_value = i64::try_from(remote_time_ns)
-            .map_err(|_| MacPtpError::RemoteTimeOutOfRange(remote_time_ns))?;
+    /// Raw conversion: the returned CMTime (unvalidated) and the
+    /// grandmaster CoreMedia used.
+    fn convert_raw(&self, remote_time_ns: i128) -> Result<(CMTime, u64), MacPtpError> {
+        let remote_value = i64::try_from(remote_time_ns).map_err(|_| {
+            MacPtpError::RemoteTimeOutOfRange(
+                u64::try_from(remote_time_ns.max(0)).unwrap_or(u64::MAX),
+            )
+        })?;
         let remote_time = CMTime {
             value: remote_value,
             timescale: 1_000_000_000,
@@ -259,7 +263,7 @@ impl MacPtpClockInner {
         };
         let mut observed_grandmaster = 0u64;
         // SAFETY: the CMTime value and GM output pointer match the verified
-        // by-value ABI. The returned CMTime is validated before use.
+        // by-value ABI. The returned CMTime is validated by the callers.
         let host_time = unsafe {
             (self.symbols.get_host_time)(
                 self.clock.as_ptr(),
@@ -267,6 +271,32 @@ impl MacPtpClockInner {
                 &mut observed_grandmaster,
             )
         };
+        Ok((host_time, observed_grandmaster))
+    }
+
+    /// `(host_ns, grandmaster_used)` for one grandmaster time.
+    fn host_time_for(&self, remote_time_ns: i128) -> Result<(i128, u64), MacPtpError> {
+        let (host_time, observed_grandmaster) = self.convert_raw(remote_time_ns)?;
+        Ok((validated_time_ns(host_time)?, observed_grandmaster))
+    }
+
+    fn map_remote_time(
+        &self,
+        remote_time_ns: u64,
+        expected_grandmaster: u64,
+    ) -> Result<Instant, MacPtpError> {
+        if !self.is_locked() {
+            return Err(MacPtpError::NotLocked);
+        }
+        let remote = i128::from(remote_time_ns);
+        if remote > i128::from(i64::MAX) {
+            return Err(MacPtpError::RemoteTimeOutOfRange(remote_time_ns));
+        }
+        let (host_time, observed_grandmaster) = self.convert_raw(remote)?;
+        // Check the grandmaster before the time: after a change, a time on
+        // the old timeline can lie before boot on the new one, and TimeSync
+        // then returns an invalid time. That is a grandmaster change (the
+        // handoff can follow it), not an unavailable clock.
         if observed_grandmaster != expected_grandmaster {
             return Err(MacPtpError::GrandmasterMismatch {
                 expected: expected_grandmaster,
@@ -274,7 +304,39 @@ impl MacPtpClockInner {
             });
         }
         let host_ns = validated_time_ns(host_time)?;
+        *self
+            .last_mapping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(LastMapping {
+            grandmaster: observed_grandmaster,
+            remote_ns: remote,
+            host_ns,
+        });
         instant_from_delta(self.instant_epoch, host_ns - self.host_epoch_ns)
+    }
+
+    fn host_now_ns(&self) -> Result<i128, MacPtpError> {
+        // SAFETY: public CoreMedia calls on the process-wide host clock.
+        let host_clock = unsafe { (self.symbols.get_host_time_clock)() };
+        if host_clock.is_null() {
+            return Err(MacPtpError::NullHostClock);
+        }
+        // SAFETY: the host clock is a non-null process-wide singleton.
+        validated_time_ns(unsafe { (self.symbols.clock_get_time)(host_clock) })
+    }
+
+    fn handoff(&self, from: u64, own_identity: u64) -> Result<PlatformHandoff, &'static str> {
+        if !self.is_locked() {
+            return Err("new_grandmaster_not_locked");
+        }
+        let last = *self
+            .last_mapping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let host_now = self.host_now_ns().map_err(|_| "host_clock_unavailable")?;
+        converge_clock_handoff(from, own_identity, last, host_now, |remote| {
+            self.host_time_for(remote).map_err(|_| "conversion_failed")
+        })
     }
 }
 
@@ -344,6 +406,57 @@ impl MacPtpPort {
     #[cfg(test)]
     pub(crate) fn is_locked(&self) -> bool {
         self.inner.is_locked()
+    }
+
+    pub(crate) fn destination_peer(&self) -> Ipv4Addr {
+        self.destination_peer
+    }
+
+    /// Register another IPv4 timing peer on the same clock and interface
+    /// (a SETPEERS peer of this session).
+    pub(crate) fn sibling(&self, destination_peer: Ipv4Addr) -> Result<MacPtpPort, MacPtpError> {
+        let destination_numeric = ipv4_network_numeric(destination_peer);
+        let mut clock_identity = 0u64;
+        let mut port_number = 0u16;
+        // SAFETY: as in `MacPtpClock::add_ipv4_port`; the interface string
+        // is the one this port was registered with.
+        let status = unsafe {
+            (self.inner.symbols.add_ipv4_port)(
+                self.inner.clock.as_ptr(),
+                self.interface.as_concrete_TypeRef().cast(),
+                destination_numeric,
+                &mut clock_identity,
+                &mut port_number,
+            )
+        };
+        if status != 0 {
+            return Err(MacPtpError::CoreMedia {
+                operation: "CM8021ASClockAddIPv4PortAndGetIdentity",
+                status,
+            });
+        }
+        Ok(MacPtpPort {
+            inner: Arc::clone(&self.inner),
+            interface: self.interface.clone(),
+            destination_peer,
+            destination_numeric,
+            clock_identity,
+            port_number,
+        })
+    }
+
+    /// Grandmaster of the last successful mapping, for diagnostics.
+    pub(crate) fn last_grandmaster(&self) -> Option<u64> {
+        self.inner
+            .last_mapping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map(|mapping| mapping.grandmaster)
+    }
+
+    /// Carry an anchor on `from` to the grandmaster the clock now follows.
+    pub(crate) fn handoff(&self, from: u64) -> Result<PlatformHandoff, &'static str> {
+        self.inner.handoff(from, self.clock_identity)
     }
 
     pub(crate) fn map_remote_time(

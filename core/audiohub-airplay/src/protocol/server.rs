@@ -23,8 +23,8 @@ use super::media::engine::{
     PcmOutput, PreparedTiming, PreparedType96, Type96MediaHandle, Type96Ports,
 };
 use super::media::ptp::{
-    describe_observed_grandmasters, parse_timing_address, PeerListApplied, PtpClockSource,
-    PtpObserver, PtpRemoteMatch,
+    clock_identity_from_mac, describe_observed_grandmasters, parse_timing_address,
+    PeerListApplied, PtpClockSource, PtpObserver, PtpRemoteMatch,
 };
 use super::media::setup::{self, STREAM_TYPE_REALTIME_AUDIO};
 use super::metadata::{self, Artwork, MergePolicy, NowPlayingUpdate, PatchField, TrackMetadata};
@@ -705,10 +705,11 @@ pub(crate) async fn serve(
 ) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
+    let ptp_identity = clock_identity_from_mac(config.mac);
     let ptp_binding = if config.ptp_test_ephemeral {
-        PtpObserver::bind_ephemeral().await
+        PtpObserver::bind_ephemeral(ptp_identity).await
     } else {
-        PtpObserver::bind_ipv4().await
+        PtpObserver::bind_ipv4(ptp_identity).await
     };
     let (ptp_observer, ptp_clock) = ptp_binding.map_err(|error| {
         io::Error::new(
@@ -5107,6 +5108,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Condvar, Mutex as StdMutex};
 
+    /// PTP clockIdentity of the test receivers' isolated observers.
+    const TEST_PTP_IDENTITY: u64 = 0x02aa_bbff_fecc_ddee;
+
     pub(super) fn config() -> ServerConfig {
         ServerConfig {
             name: "AudioHub Test".into(),
@@ -6765,7 +6769,7 @@ mod tests {
         );
         let mut event_keys = Some(derive_event_keys(&[0x91; 64]).unwrap());
         let mut phase_one = None;
-        let (_ptp_observer, ptp_clock) = PtpObserver::bind_ephemeral().await.unwrap();
+        let (_ptp_observer, ptp_clock) = PtpObserver::bind_ephemeral(TEST_PTP_IDENTITY).await.unwrap();
         let outcome = setup_response(
             &request,
             peer,
@@ -7121,7 +7125,7 @@ mod tests {
     async fn stream_setup_prepares_live_type103_ports_and_buffer_capacity() {
         let peer: SocketAddr = "127.0.0.1:6000".parse().unwrap();
         let local: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-        let (_ptp_observer, ptp_clock) = PtpObserver::bind_ephemeral().await.unwrap();
+        let (_ptp_observer, ptp_clock) = PtpObserver::bind_ephemeral(TEST_PTP_IDENTITY).await.unwrap();
         let mut phase_one = Some(PhaseOneState::Ptp(ptp_clock));
 
         let mut stream = Dictionary::new();
@@ -7284,7 +7288,7 @@ mod tests {
             }),
         );
 
-        let (_observer, clock) = PtpObserver::bind_ephemeral().await.unwrap();
+        let (_observer, clock) = PtpObserver::bind_ephemeral(TEST_PTP_IDENTITY).await.unwrap();
         let mut first_phase = Some(PhaseOneState::Ptp(clock));
         let mut event_keys = None;
         let first_connection_id = crate::telemetry::ConnectionId::new();
@@ -7354,7 +7358,7 @@ mod tests {
         // Three more connections are accepted concurrently.
         let mut others = Vec::new();
         for index in 0..(MAX_ACTIVE_MEDIA_STREAMS - 1) {
-            let (_observer, clock) = PtpObserver::bind_ephemeral().await.unwrap();
+            let (_observer, clock) = PtpObserver::bind_ephemeral(TEST_PTP_IDENTITY).await.unwrap();
             let mut phase = Some(PhaseOneState::Ptp(clock));
             let mut accepted = setup_response(
                 &request,
@@ -7378,7 +7382,7 @@ mod tests {
         assert_eq!(permits.available_permits(), 0);
 
         // The fifth concurrent stream exceeds the receiver limit.
-        let (_observer, clock) = PtpObserver::bind_ephemeral().await.unwrap();
+        let (_observer, clock) = PtpObserver::bind_ephemeral(TEST_PTP_IDENTITY).await.unwrap();
         let mut second_phase = Some(PhaseOneState::Ptp(clock));
         let second_connection_id = crate::telemetry::ConnectionId::new();
         let mut second = setup_response(
@@ -7555,7 +7559,7 @@ mod tests {
             Some(BINARY_PLIST_CONTENT_TYPE),
             &binary_plist(root),
         );
-        let (_ptp_observer, ptp_clock) = PtpObserver::bind_ephemeral().await.unwrap();
+        let (_ptp_observer, ptp_clock) = PtpObserver::bind_ephemeral(TEST_PTP_IDENTITY).await.unwrap();
         let mut phase_one = Some(PhaseOneState::Ptp(ptp_clock));
         let mut event_keys = None;
         let outcome = setup_response(

@@ -36,5 +36,5 @@ pub use runtime::{
 pub use telemetry::{
     reset as reset_telemetry, snapshot as telemetry_snapshot, AirPlayControlSessionIdentity,
     AirPlayTelemetryCounters, AirPlayTelemetryEvent, AirPlayTelemetrySnapshot,
-    MediaTelemetryCounters,
+    MediaTelemetryCounters, PtpSenderTelemetry,
 };

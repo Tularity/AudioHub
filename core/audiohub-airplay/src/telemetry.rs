@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use uuid::Uuid;
 
-const TELEMETRY_SCHEMA_VERSION: u32 = 5;
+const TELEMETRY_SCHEMA_VERSION: u32 = 6;
 const RECENT_EVENT_LIMIT: usize = 128;
 const CONTROL_SESSION_HISTORY_LIMIT: usize = 128;
 
@@ -239,7 +239,48 @@ pub struct AirPlayTelemetryCounters {
     pub ptp_peer_ports_closed: u64,
     #[serde(default)]
     pub ptp_peer_port_failures: u64,
+    /// Schema 6. Apple organization-extension Signaling datagrams observed.
+    #[serde(default)]
+    pub ptp_signaling_observed: u64,
+    /// Schema 6. One-step Sync datagrams accepted as complete samples.
+    #[serde(default)]
+    pub ptp_sync_one_step_observed: u64,
+    /// Schema 6. Wake-up Announce pairs sent to a silent sender clock.
+    #[serde(default)]
+    pub ptp_wake_sequences_sent: u64,
+    /// Schema 6. Wake-up Announce pairs of which a datagram could not be
+    /// sent.
+    #[serde(default)]
+    pub ptp_wake_send_failures: u64,
+    /// Schema 6. Sessions whose sender announced for a while without
+    /// sending any Sync/Follow_Up (one warning per session).
+    #[serde(default)]
+    pub ptp_silent_clock_warnings: u64,
+    /// Schema 6. Portable sessions ended because no PTP sample ever arrived.
+    #[serde(default)]
+    pub ptp_clock_never_ready_failures: u64,
 }
+
+/// Schema 6. PTP datagrams from one sender address, by message type, for
+/// telling a silent clock from a parse problem. Message-type counters count
+/// every parsed datagram, including ones later rejected; rejections are also
+/// counted by reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtpSenderTelemetry {
+    pub peer: String,
+    pub announce: u64,
+    pub sync_two_step: u64,
+    pub sync_one_step: u64,
+    pub follow_up: u64,
+    pub signaling: u64,
+    pub rejected_total: u64,
+    pub rejected_by_reason: std::collections::BTreeMap<String, u64>,
+    pub wake_sequences_sent: u64,
+}
+
+/// Senders kept in [`AirPlayTelemetrySnapshot::ptp_senders`]; the least
+/// recently seen one is dropped first.
+const PTP_SENDER_LIMIT: usize = 16;
 
 /// Bounded, deduplicated observations that retain addresses and rejection reasons.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,6 +429,9 @@ pub struct AirPlayTelemetrySnapshot {
     /// therefore before it appears in `control_sessions`.
     pub active_control_sessions: Vec<AirPlayControlSessionIdentity>,
     pub recent_events: Vec<AirPlayTelemetryEvent>,
+    /// Schema 6. Per-sender PTP datagram counters, most recently seen last.
+    #[serde(default)]
+    pub ptp_senders: Vec<PtpSenderTelemetry>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -881,6 +925,14 @@ struct TelemetrySlot {
     ptp_peer_ports_opened: AtomicU64,
     ptp_peer_ports_closed: AtomicU64,
     ptp_peer_port_failures: AtomicU64,
+    ptp_signaling_observed: AtomicU64,
+    ptp_sync_one_step_observed: AtomicU64,
+    ptp_wake_sequences_sent: AtomicU64,
+    ptp_wake_send_failures: AtomicU64,
+    ptp_silent_clock_warnings: AtomicU64,
+    ptp_clock_never_ready_failures: AtomicU64,
+    /// Updated only on the PTP observer task (never a media or PCM path).
+    ptp_senders: Mutex<Vec<PtpSenderTelemetry>>,
     // SETPEERS/SETPEERSX are control-plane requests. Their prepare and commit
     // transactions span several reason counters, so snapshot takes this same
     // narrow lock to expose an exact classification rather than a torn sum.
@@ -1139,7 +1191,18 @@ impl TelemetrySlot {
             ptp_peer_ports_opened: load(&self.ptp_peer_ports_opened),
             ptp_peer_ports_closed: load(&self.ptp_peer_ports_closed),
             ptp_peer_port_failures: load(&self.ptp_peer_port_failures),
+            ptp_signaling_observed: load(&self.ptp_signaling_observed),
+            ptp_sync_one_step_observed: load(&self.ptp_sync_one_step_observed),
+            ptp_wake_sequences_sent: load(&self.ptp_wake_sequences_sent),
+            ptp_wake_send_failures: load(&self.ptp_wake_send_failures),
+            ptp_silent_clock_warnings: load(&self.ptp_silent_clock_warnings),
+            ptp_clock_never_ready_failures: load(&self.ptp_clock_never_ready_failures),
         };
+        let ptp_senders = self
+            .ptp_senders
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
         let control_sessions = self
             .observed_control_sessions
             .lock()
@@ -1166,6 +1229,7 @@ impl TelemetrySlot {
             control_sessions_truncated,
             active_control_sessions,
             recent_events,
+            ptp_senders,
         }
     }
 
@@ -1255,9 +1319,19 @@ impl TelemetrySlot {
             &self.ptp_peer_ports_opened,
             &self.ptp_peer_ports_closed,
             &self.ptp_peer_port_failures,
+            &self.ptp_signaling_observed,
+            &self.ptp_sync_one_step_observed,
+            &self.ptp_wake_sequences_sent,
+            &self.ptp_wake_send_failures,
+            &self.ptp_silent_clock_warnings,
+            &self.ptp_clock_never_ready_failures,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
+        self.ptp_senders
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         self.realtime.reset();
         self.buffered.reset();
         self.observed_control_sessions
@@ -1574,6 +1648,7 @@ impl Telemetry {
             control_sessions_truncated: false,
             active_control_sessions: Vec::new(),
             recent_events: Vec::new(),
+            ptp_senders: Vec::new(),
         }
     }
 }
@@ -2110,6 +2185,16 @@ pub(crate) fn record_ptp_datagram(
             _ => increment(&guard.slot.ptp_datagrams_rejected_other),
         }
     }
+    match message {
+        Some("signaling") => increment(&guard.slot.ptp_signaling_observed),
+        Some("sync_one_step") if accepted => {
+            increment(&guard.slot.ptp_sync_one_step_observed);
+        }
+        _ => {}
+    }
+    update_ptp_sender(guard.slot, peer, |entry| {
+        count_ptp_datagram(entry, message, accepted, reason);
+    });
     // This runs on the PTP UDP observer task, not a media scheduler or PCM
     // callback. Preserve the first endpoint/reason observation per generation
     // so a failed two-target run can be attributed without putting allocation
@@ -2126,6 +2211,87 @@ pub(crate) fn record_ptp_datagram(
         outcome: (if accepted { "accepted" } else { "rejected" }).to_owned(),
         reason: reason.to_owned(),
     });
+}
+
+/// Per-sender accounting of one datagram (see [`PtpSenderTelemetry`]).
+fn count_ptp_datagram(
+    entry: &mut PtpSenderTelemetry,
+    message: Option<&str>,
+    accepted: bool,
+    reason: &str,
+) {
+    match message {
+        Some("announce") => entry.announce += 1,
+        Some("sync") => entry.sync_two_step += 1,
+        Some("sync_one_step") => entry.sync_one_step += 1,
+        Some("follow_up") => entry.follow_up += 1,
+        Some("signaling") => entry.signaling += 1,
+        _ => {}
+    }
+    if !accepted {
+        entry.rejected_total += 1;
+        match entry.rejected_by_reason.get_mut(reason) {
+            Some(count) => *count += 1,
+            None => {
+                entry.rejected_by_reason.insert(reason.to_owned(), 1);
+            }
+        }
+    }
+}
+
+/// Apply `update` to `peer`'s entry, creating it (and dropping the least
+/// recently seen sender beyond [`PTP_SENDER_LIMIT`]) as needed. The entry
+/// moves to the end, so the list stays ordered by last activity.
+fn update_ptp_sender(
+    slot: &TelemetrySlot,
+    peer: IpAddr,
+    update: impl FnOnce(&mut PtpSenderTelemetry),
+) {
+    let mut senders = slot
+        .ptp_senders
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut entry = match senders
+        .iter()
+        .position(|entry| entry.peer.parse::<IpAddr>().ok() == Some(peer))
+    {
+        Some(index) => senders.remove(index),
+        None => PtpSenderTelemetry {
+            peer: peer.to_string(),
+            ..PtpSenderTelemetry::default()
+        },
+    };
+    update(&mut entry);
+    if senders.len() >= PTP_SENDER_LIMIT {
+        senders.remove(0);
+    }
+    senders.push(entry);
+}
+
+/// One wake-up Announce pair for a silent sender clock: `sent` is false when
+/// the socket refused a datagram of it.
+pub(crate) fn record_ptp_wake_sequence(token: OperationToken, peer: IpAddr, sent: bool) {
+    let Some(guard) = telemetry().enter_token(token) else {
+        return;
+    };
+    if sent {
+        increment(&guard.slot.ptp_wake_sequences_sent);
+        update_ptp_sender(guard.slot, peer, |entry| entry.wake_sequences_sent += 1);
+    } else {
+        increment(&guard.slot.ptp_wake_send_failures);
+    }
+}
+
+pub(crate) fn record_ptp_silent_clock_warning(token: OperationToken) {
+    if let Some(guard) = telemetry().enter_token(token) {
+        increment(&guard.slot.ptp_silent_clock_warnings);
+    }
+}
+
+pub(crate) fn record_ptp_clock_never_ready(token: OperationToken) {
+    if let Some(guard) = telemetry().enter_token(token) {
+        increment(&guard.slot.ptp_clock_never_ready_failures);
+    }
 }
 
 pub(crate) fn record_ptp_sample_emitted(token: OperationToken, delivered: bool) {
@@ -2757,7 +2923,7 @@ mod tests {
             }
         }
         let before = recorder.snapshot();
-        assert_eq!(before.schema_version, 5);
+        assert_eq!(before.schema_version, 6);
         assert!(Uuid::parse_str(&before.generation_marker).is_ok());
         assert_eq!(before.counters.rtsp_phase2_requests, 1);
         assert_eq!(before.recent_events.len(), RECENT_EVENT_LIMIT);
@@ -2778,7 +2944,7 @@ mod tests {
     #[test]
     fn public_snapshot_serializes_with_stable_top_level_fields() {
         let value = serde_json::to_value(Telemetry::default().snapshot()).unwrap();
-        assert_eq!(value["schema_version"], 5);
+        assert_eq!(value["schema_version"], 6);
         assert!(value["control_sessions"].is_array());
         assert!(value["control_sessions_truncated"].is_boolean());
         assert!(value["active_control_sessions"].is_array());
@@ -2818,10 +2984,92 @@ mod tests {
             "ptp_peer_ports_opened",
             "ptp_peer_ports_closed",
             "ptp_peer_port_failures",
+            "ptp_signaling_observed",
+            "ptp_sync_one_step_observed",
+            "ptp_wake_sequences_sent",
+            "ptp_wake_send_failures",
+            "ptp_silent_clock_warnings",
+            "ptp_clock_never_ready_failures",
         ] {
             assert!(value["counters"][field].is_u64(), "{field}");
         }
         assert!(value["recent_events"].is_array());
+        assert!(value["ptp_senders"].is_array());
+    }
+
+    #[test]
+    fn schema_six_fields_deserialize_from_a_schema_five_document() {
+        let mut value = serde_json::to_value(Telemetry::default().snapshot()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        assert!(object.remove("ptp_senders").is_some());
+        let counters = object["counters"].as_object_mut().unwrap();
+        for field in [
+            "ptp_signaling_observed",
+            "ptp_sync_one_step_observed",
+            "ptp_wake_sequences_sent",
+            "ptp_wake_send_failures",
+            "ptp_silent_clock_warnings",
+            "ptp_clock_never_ready_failures",
+        ] {
+            assert!(counters.remove(field).is_some(), "{field}");
+        }
+        let decoded: AirPlayTelemetrySnapshot = serde_json::from_value(value).unwrap();
+        assert!(decoded.ptp_senders.is_empty());
+        assert_eq!(decoded.counters.ptp_wake_sequences_sent, 0);
+    }
+
+    #[test]
+    fn ptp_senders_count_message_types_and_rejections_per_address_and_stay_bounded() {
+        let recorder = Telemetry::default();
+        let ipad: IpAddr = "10.130.32.40".parse().unwrap();
+        let mac: IpAddr = "10.130.32.13".parse().unwrap();
+        {
+            let guard = recorder.enter();
+            let slot = guard.slot;
+            let count = |peer, message: Option<&str>, accepted, reason: &str| {
+                update_ptp_sender(slot, peer, |entry| {
+                    count_ptp_datagram(entry, message, accepted, reason);
+                });
+            };
+            count(ipad, Some("announce"), true, "announcement_observed");
+            count(ipad, Some("signaling"), true, "signaling_observed");
+            count(ipad, None, false, "parse_unsupported_message");
+            count(mac, Some("sync"), true, "sync_observed");
+            count(mac, Some("follow_up"), true, "follow_up_observed");
+            count(mac, Some("sync"), false, "duplicate_completed_pair");
+            update_ptp_sender(slot, ipad, |entry| entry.wake_sequences_sent += 1);
+        }
+        let senders = recorder.snapshot().ptp_senders;
+        assert_eq!(senders.len(), 2);
+        // Most recently updated last.
+        assert_eq!(senders[1].peer, ipad.to_string());
+        let ipad_entry = &senders[1];
+        assert_eq!(
+            (ipad_entry.announce, ipad_entry.signaling, ipad_entry.follow_up),
+            (1, 1, 0)
+        );
+        assert_eq!(ipad_entry.rejected_by_reason["parse_unsupported_message"], 1);
+        assert_eq!(ipad_entry.wake_sequences_sent, 1);
+        let mac_entry = &senders[0];
+        assert_eq!((mac_entry.sync_two_step, mac_entry.follow_up), (2, 1));
+        assert_eq!(mac_entry.rejected_total, 1);
+
+        {
+            let guard = recorder.enter();
+            for index in 0..(PTP_SENDER_LIMIT as u8 + 4) {
+                let peer = IpAddr::from([192, 0, 2, index]);
+                update_ptp_sender(guard.slot, peer, |entry| entry.announce += 1);
+            }
+        }
+        let senders = recorder.snapshot().ptp_senders;
+        assert_eq!(senders.len(), PTP_SENDER_LIMIT);
+        assert!(senders.iter().all(|entry| entry.peer != ipad.to_string()));
+        assert_eq!(
+            senders.last().unwrap().peer,
+            IpAddr::from([192, 0, 2, PTP_SENDER_LIMIT as u8 + 3]).to_string()
+        );
+        recorder.reset();
+        assert!(recorder.snapshot().ptp_senders.is_empty());
     }
 
     #[test]

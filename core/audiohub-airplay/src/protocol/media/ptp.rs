@@ -1,11 +1,19 @@
-//! Minimal, receive-only IEEE 802.1AS clock observer for AirPlay 2.
+//! Minimal IEEE 802.1AS clock observer for AirPlay 2.
 //!
 //! AirPlay senders act as the timing grandmaster. AudioHub listens for the
-//! sender's two-step Sync / Follow_Up exchange and maps that remote timeline
-//! onto its local monotonic clock. It does not announce itself as a master
-//! or implement multiroom topology; it follows the grandmaster the sender's
+//! sender's two-step Sync / Follow_Up exchange (or a one-step Sync) and maps
+//! that remote timeline onto its local monotonic clock. It does not
+//! implement multiroom topology; it follows the grandmaster the sender's
 //! group elects, including changes announced through SETPEERS
 //! (`ptp_session`).
+//!
+//! The observer transmits exactly one kind of PTP message: the wake-up
+//! Announce pair for a "silent" sender clock (see [`WakeRegistry`]). Some
+//! Apple senders (an iPad, 2026-11-28 capture) only Announce and Signal
+//! until a peer takes part at the PTP layer; shairport-sync's nqptp wakes
+//! them by briefly announcing a better clock and at once a worse one. It
+//! never sends Sync or Follow_Up, so it can never actually serve as anyone's
+//! grandmaster.
 
 use super::buffered_clock::{rtp_delta, PlaybackAnchor};
 #[cfg(target_os = "macos")]
@@ -39,6 +47,35 @@ const PTP_TWO_STEP_FLAG: u16 = 0x0200;
 const MESSAGE_SYNC: u8 = 0x0;
 const MESSAGE_FOLLOW_UP: u8 = 0x8;
 const MESSAGE_ANNOUNCE: u8 = 0xb;
+const MESSAGE_SIGNALING: u8 = 0xc;
+/// targetPortIdentity, the fixed part of a Signaling body.
+const PTP_SIGNALING_BYTES: usize = PTP_HEADER_BYTES + 10;
+/// unicastFlag | ptpTimescale, as on Apple's and nqptp's Announce.
+const WAKE_ANNOUNCE_FLAGS: u16 = 0x0408;
+/// sourcePortIdentity.portNumber of the wake-up Announce (nqptp: 32776).
+const WAKE_PORT_NUMBER: u16 = 0x8008;
+/// clockClass 248, clockAccuracy unknown, offsetScaledLogVariance 0x436a
+/// (nqptp `send_awakening_announcement_sequence`).
+const WAKE_CLOCK_QUALITY: u32 = 0xf8fe_436a;
+/// timeSource INTERNAL_OSCILLATOR.
+const WAKE_TIME_SOURCE: u8 = 0xa0;
+const WAKE_UTC_OFFSET: u16 = 37;
+/// logMessageInterval -2 (four Announces a second, as the senders use).
+const WAKE_LOG_INTERVAL: u8 = 0xfe;
+/// controlField "all others".
+const WAKE_CONTROL_FIELD: u8 = 0x05;
+/// Announces from a sender clock without any Sync/Follow_Up before it is
+/// woken (nqptp `broadcasting_task`: `announcements_without_followups == 3`).
+const WAKE_AFTER_ANNOUNCES: u64 = 3;
+/// The worse Announce follows the better one after this (nqptp: 150 ms).
+const WAKE_INFERIOR_DELAY: Duration = Duration::from_millis(150);
+/// A still-silent clock is woken again after this, at most
+/// [`WAKE_MAX_ATTEMPTS`] times per session (UDP may lose the pair).
+const WAKE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const WAKE_MAX_ATTEMPTS: u32 = 3;
+/// A failed send of the retracting (worse) Announce is retried this often.
+const WAKE_RESEND_DELAY: Duration = Duration::from_millis(50);
+const WAKE_MAX_RESENDS: u8 = 3;
 const PAIR_LIFETIME: Duration = Duration::from_secs(2);
 const ANNOUNCE_LIFETIME: Duration = Duration::from_secs(5);
 const MAX_PENDING_SYNCS: usize = 128;
@@ -74,9 +111,23 @@ struct Header {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Message {
-    Announce { header: Header, grandmaster: u64 },
-    Sync { header: Header },
+    Announce {
+        header: Header,
+        grandmaster: u64,
+        priority1: u8,
+        priority2: u8,
+    },
+    /// `one_step_origin_ns` is the origin timestamp of a one-step Sync (the
+    /// two-step flag is clear); `None` for a two-step Sync, whose time comes
+    /// in its Follow_Up.
+    Sync {
+        header: Header,
+        one_step_origin_ns: Option<u64>,
+    },
     FollowUp { header: Header, origin_ns: u64 },
+    /// Counted for diagnostics only (Apple sends an organization-extension
+    /// TLV with every Announce).
+    Signaling { header: Header },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -234,6 +285,265 @@ pub(crate) fn describe_observed_grandmasters(peers: &[IpAddr], now: Instant) -> 
         ));
     }
     text
+}
+
+/// PTP clockIdentity of this receiver: the EUI-48 AirPlay device id
+/// widened to EUI-64 by inserting FF-FE (IEEE 1588 7.5.2.2.2, as nqptp's
+/// `get_self_clock_id` does with an interface MAC).
+pub(crate) fn clock_identity_from_mac(mac: [u8; 6]) -> u64 {
+    u64::from_be_bytes([mac[0], mac[1], mac[2], 0xff, 0xfe, mac[3], mac[4], mac[5]])
+}
+
+/// What one session's sender (its control peer) sent to the portable
+/// observer since the session registered. Read for the silent-clock warning
+/// and the never-ready diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SenderClockStatus {
+    pub(crate) first_announce_at: Option<Instant>,
+    pub(crate) last_announce_at: Option<Instant>,
+    /// Grandmaster named by the latest Announce.
+    pub(crate) grandmaster: Option<u64>,
+    pub(crate) announces: u64,
+    pub(crate) sync_two_step: u64,
+    pub(crate) sync_one_step: u64,
+    pub(crate) follow_ups: u64,
+    pub(crate) signaling: u64,
+    pub(crate) wake_sequences: u32,
+}
+
+impl SenderClockStatus {
+    /// Sync and Follow_Up messages: any of them means the clock is not
+    /// silent.
+    pub(crate) fn timing_messages(&self) -> u64 {
+        self.sync_two_step
+            .saturating_add(self.sync_one_step)
+            .saturating_add(self.follow_ups)
+    }
+}
+
+impl fmt::Display for SenderClockStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "announce={} signaling={} sync_two_step={} sync_one_step={} follow_up={} wake_sequences={}",
+            self.announces,
+            self.signaling,
+            self.sync_two_step,
+            self.sync_one_step,
+            self.follow_ups,
+            self.wake_sequences
+        )
+    }
+}
+
+/// The sender's own clock as its latest Announce described it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnnouncedClock {
+    /// Where the Announce came from; the wake-up goes back there.
+    from: SocketAddr,
+    clock: u64,
+    grandmaster: u64,
+    priority1: u8,
+    priority2: u8,
+}
+
+#[derive(Debug)]
+struct WakeTarget {
+    id: u64,
+    peer: IpAddr,
+    status: SenderClockStatus,
+    announced: Option<AnnouncedClock>,
+    last_attempt: Option<Instant>,
+}
+
+/// Sender clocks of the live portable sessions, shared by the sessions
+/// (register on SETUP, deregister on drop) and the observer task that counts
+/// their datagrams and wakes a silent one.
+///
+/// Wake-up rule, after nqptp (`nqptp.c` `broadcasting_task` and
+/// `send_awakening_announcement_sequence`): when the session's control peer
+/// has sent [`WAKE_AFTER_ANNOUNCES`] Announces as its own grandmaster and no
+/// Sync or Follow_Up at all, unicast two Announces back to the address they
+/// came from: first one priority1 better than the sender's, then
+/// [`WAKE_INFERIOR_DELAY`] later one priority1 worse. Deviations from nqptp:
+/// nqptp also sends the pair on the first Announce of every clock, including
+/// ones already sending Sync; here only a clock with no Sync/Follow_Up is
+/// touched, never one the session already times from. The pair is repeated
+/// at most [`WAKE_MAX_ATTEMPTS`] times, [`WAKE_RETRY_INTERVAL`] apart, while
+/// the clock stays silent (nqptp parks after one), and the two Announces
+/// carry distinct sequence numbers so a receiver cannot discard the
+/// retraction as a duplicate.
+#[derive(Debug, Default)]
+pub(crate) struct WakeRegistry {
+    targets: Mutex<Vec<WakeTarget>>,
+    next_id: AtomicU64,
+}
+
+impl WakeRegistry {
+    fn register(self: &Arc<Self>, peer: IpAddr) -> SenderClockWatch {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(WakeTarget {
+                id,
+                peer,
+                status: SenderClockStatus::default(),
+                announced: None,
+                last_attempt: None,
+            });
+        SenderClockWatch {
+            registry: Arc::clone(self),
+            id,
+        }
+    }
+
+    fn status(&self, id: u64) -> Option<SenderClockStatus> {
+        self.targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|target| target.id == id)
+            .map(|target| target.status)
+    }
+
+    /// Apply `update` to every live session whose control peer is `peer`.
+    fn observe(&self, peer: IpAddr, mut update: impl FnMut(&mut WakeTarget)) {
+        let mut targets = self.targets.lock().unwrap_or_else(PoisonError::into_inner);
+        for target in targets.iter_mut().filter(|target| target.peer == peer) {
+            update(target);
+        }
+    }
+
+    /// The clock to wake for `peer` now, if any (see the type docs). Marks
+    /// the attempt on every session of that peer, so one pair serves all of
+    /// them.
+    fn wake_due(&self, peer: IpAddr, own_identity: u64, now: Instant) -> Option<(AnnouncedClock, u32)> {
+        let mut targets = self.targets.lock().unwrap_or_else(PoisonError::into_inner);
+        let recent_attempt = targets.iter().any(|target| {
+            target.peer == peer
+                && target
+                    .last_attempt
+                    .is_some_and(|at| now.saturating_duration_since(at) < WAKE_RETRY_INTERVAL)
+        });
+        if recent_attempt {
+            return None;
+        }
+        let (clock, attempt) = targets
+            .iter()
+            .filter(|target| target.peer == peer)
+            .find_map(|target| {
+                let clock = target.announced?;
+                let status = target.status;
+                let wanted = status.timing_messages() == 0
+                    && status.announces >= WAKE_AFTER_ANNOUNCES
+                    && status.wake_sequences < WAKE_MAX_ATTEMPTS
+                    && status
+                        .last_announce_at
+                        .is_some_and(|at| now.saturating_duration_since(at) <= ANNOUNCE_LIFETIME)
+                    // Only a sender that is its own grandmaster: never ask a
+                    // clock that follows another one (a grouped HomePod's)
+                    // to renegotiate.
+                    && clock.clock == clock.grandmaster
+                    && clock.grandmaster != own_identity
+                    && wake_priorities(clock.priority1).is_some();
+                wanted.then_some((clock, status.wake_sequences + 1))
+            })?;
+        for target in targets.iter_mut().filter(|target| target.peer == peer) {
+            target.last_attempt = Some(now);
+            target.status.wake_sequences = target.status.wake_sequences.max(attempt);
+        }
+        Some((clock, attempt))
+    }
+
+    /// Record an Announce from `peer` naming `grandmaster`, as the observer
+    /// does for a received datagram.
+    #[cfg(test)]
+    pub(crate) fn test_note_announce(&self, peer: IpAddr, grandmaster: u64, at: Instant) {
+        self.observe(peer, |target| {
+            target.status.announces += 1;
+            target.status.first_announce_at.get_or_insert(at);
+            target.status.last_announce_at = Some(at);
+            target.status.grandmaster = Some(grandmaster);
+        });
+    }
+
+    fn deregister(&self, id: u64) {
+        self.targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|target| target.id != id);
+    }
+}
+
+/// A session's registration in the [`WakeRegistry`]; dropping it (the
+/// session ending) stops any further wake-up for that session.
+#[derive(Debug)]
+pub(crate) struct SenderClockWatch {
+    registry: Arc<WakeRegistry>,
+    id: u64,
+}
+
+impl SenderClockWatch {
+    pub(crate) fn status(&self) -> Option<SenderClockStatus> {
+        self.registry.status(self.id)
+    }
+}
+
+impl Drop for SenderClockWatch {
+    fn drop(&mut self) {
+        self.registry.deregister(self.id);
+    }
+}
+
+/// priority1 values of the better and the worse wake-up Announce, or `None`
+/// when the sender's priority1 leaves no strictly better and strictly worse
+/// value (nqptp falls back to fixed values there; this never risks
+/// announcing a lasting better clock instead).
+fn wake_priorities(sender_priority1: u8) -> Option<(u8, u8)> {
+    Some((
+        sender_priority1.checked_sub(1)?,
+        sender_priority1.checked_add(1)?,
+    ))
+}
+
+/// One wake-up Announce (64 bytes, no TLV), field for field as nqptp's
+/// `send_awakening_announcement_sequence` builds it.
+fn wake_announce(own_identity: u64, sequence: u16, priority1: u8, priority2: u8) -> [u8; PTP_ANNOUNCE_BYTES] {
+    let mut packet = [0u8; PTP_ANNOUNCE_BYTES];
+    packet[0] = (PTP_MAJOR_SDO_ID << 4) | MESSAGE_ANNOUNCE;
+    packet[1] = PTP_VERSION;
+    packet[2..4].copy_from_slice(&(PTP_ANNOUNCE_BYTES as u16).to_be_bytes());
+    packet[4] = PTP_DOMAIN;
+    packet[6..8].copy_from_slice(&WAKE_ANNOUNCE_FLAGS.to_be_bytes());
+    packet[20..28].copy_from_slice(&own_identity.to_be_bytes());
+    packet[28..30].copy_from_slice(&WAKE_PORT_NUMBER.to_be_bytes());
+    packet[30..32].copy_from_slice(&sequence.to_be_bytes());
+    packet[32] = WAKE_CONTROL_FIELD;
+    packet[33] = WAKE_LOG_INTERVAL;
+    // 34..44 originTimestamp stays zero.
+    packet[44..46].copy_from_slice(&WAKE_UTC_OFFSET.to_be_bytes());
+    packet[47] = priority1;
+    packet[48..52].copy_from_slice(&WAKE_CLOCK_QUALITY.to_be_bytes());
+    packet[52] = priority2;
+    packet[53..61].copy_from_slice(&own_identity.to_be_bytes());
+    // 61..63 stepsRemoved stays zero.
+    packet[63] = WAKE_TIME_SOURCE;
+    packet
+}
+
+/// A wake-up Announce waiting for its send time.
+#[derive(Debug, Clone, Copy)]
+struct WakeDatagram {
+    due: Instant,
+    to: SocketAddr,
+    packet: [u8; PTP_ANNOUNCE_BYTES],
+    /// The worse Announce that retracts the better one; it ends the pair.
+    retraction: bool,
+    resends: u8,
+    /// Whether every earlier datagram of this pair was sent.
+    pair_ok: bool,
+    telemetry_token: crate::telemetry::OperationToken,
 }
 
 /// Timing backend bound to one PTP control session.
@@ -482,6 +792,8 @@ enum MacSession {
 #[derive(Clone)]
 pub(crate) struct PtpClockSource {
     samples: broadcast::Sender<PtpClockSample>,
+    /// Sender clocks of the portable sessions, shared with the observer.
+    wake: Arc<WakeRegistry>,
     backend: PtpBackendKind,
     fallback_reason: Option<&'static str>,
     /// Per-session timing peers and handoff state; `None` on the
@@ -496,9 +808,10 @@ pub(crate) struct PtpClockSource {
 }
 
 impl PtpClockSource {
-    fn portable(samples: broadcast::Sender<PtpClockSample>) -> Self {
+    fn portable(samples: broadcast::Sender<PtpClockSample>, wake: Arc<WakeRegistry>) -> Self {
         Self {
             samples,
+            wake,
             backend: PtpBackendKind::Portable,
             fallback_reason: None,
             session: None,
@@ -700,7 +1013,10 @@ impl PtpClockSource {
         let _ = (local_ip, remote_match);
 
         let mut source = self.clone();
-        source.session = Some(Arc::new(SessionShared::new(peer_ip)));
+        source.session = Some(Arc::new(SessionShared::with_clock_watch(
+            peer_ip,
+            self.wake.register(peer_ip),
+        )));
         Ok(source)
     }
 
@@ -783,6 +1099,7 @@ impl PtpClockSource {
         };
         Ok(Self {
             samples: self.samples.clone(),
+            wake: Arc::clone(&self.wake),
             backend,
             fallback_reason,
             session: Some(Arc::new(SessionShared::new(IpAddr::V4(peer_ip)))),
@@ -847,7 +1164,20 @@ impl PtpClockSource {
     #[cfg(test)]
     pub(crate) fn test_source() -> Self {
         let (samples, _) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
-        Self::portable(samples)
+        Self::portable(samples, Arc::default())
+    }
+
+    /// Portable session source registered with `wake` like `for_session`
+    /// registers with its observer's registry.
+    #[cfg(test)]
+    pub(crate) fn test_watched_session_source(control_peer: IpAddr, wake: &Arc<WakeRegistry>) -> Self {
+        let mut source = Self::test_source();
+        source.wake = Arc::clone(wake);
+        source.session = Some(Arc::new(SessionShared::with_clock_watch(
+            control_peer,
+            wake.register(control_peer),
+        )));
+        source
     }
 
     /// Portable session source for `control_peer` (what `for_session`
@@ -883,9 +1213,38 @@ pub(crate) struct PtpObserver {
     pending_syncs: HashMap<SyncKey, PendingSync>,
     pending_follow_ups: HashMap<SyncKey, PendingFollowUp>,
     completed_pairs: HashMap<SyncKey, (Instant, crate::telemetry::OperationToken)>,
+    wake: Arc<WakeRegistry>,
+    /// This receiver's clockIdentity (wake-up Announces; an Announce naming
+    /// it as grandmaster is ignored).
+    own_identity: u64,
+    wake_sequence: u16,
+    /// Wake-up Announces waiting for their send time, in due order.
+    outgoing: VecDeque<WakeDatagram>,
 }
 
 impl PtpObserver {
+    fn new(
+        event_socket: Option<UdpSocket>,
+        general_socket: Option<UdpSocket>,
+        samples: broadcast::Sender<PtpClockSample>,
+        wake: Arc<WakeRegistry>,
+        own_identity: u64,
+    ) -> Self {
+        Self {
+            event_socket,
+            general_socket,
+            samples,
+            announcements: HashMap::with_capacity(8),
+            pending_syncs: HashMap::with_capacity(16),
+            pending_follow_ups: HashMap::with_capacity(16),
+            completed_pairs: HashMap::with_capacity(16),
+            wake,
+            own_identity,
+            wake_sequence: 0,
+            outgoing: VecDeque::new(),
+        }
+    }
+
     fn completed_pair_is_duplicate(&self, key: SyncKey) -> bool {
         self.completed_pairs.contains_key(&key)
     }
@@ -894,9 +1253,10 @@ impl PtpObserver {
     /// Failure is fatal: continuing would claim a timing capability that this
     /// process cannot actually observe. On macOS that means neither the
     /// CoreMedia system clock nor TimeSync instances are usable.
-    pub(crate) async fn bind_ipv4() -> io::Result<(Self, PtpClockSource)> {
+    pub(crate) async fn bind_ipv4(own_identity: u64) -> io::Result<(Self, PtpClockSource)> {
         #[cfg(target_os = "macos")]
         {
+            let _ = own_identity;
             Self::bind_macos().await
         }
         #[cfg(not(target_os = "macos"))]
@@ -904,6 +1264,7 @@ impl PtpObserver {
             let bound = Self::bind(
                 SocketAddr::from((Ipv4Addr::UNSPECIFIED, PTP_EVENT_PORT)),
                 SocketAddr::from((Ipv4Addr::UNSPECIFIED, PTP_GENERAL_PORT)),
+                own_identity,
             )
             .await?;
             PLATFORM.store(PLATFORM_PORTABLE, Ordering::Relaxed);
@@ -914,10 +1275,11 @@ impl PtpObserver {
     /// Isolated binding for in-process daemon tests. Real receivers must use
     /// the well-known ports; this exists because Cargo builds a dependency
     /// without `cfg(test)` even when its caller's tests run in parallel.
-    pub(crate) async fn bind_ephemeral() -> io::Result<(Self, PtpClockSource)> {
+    pub(crate) async fn bind_ephemeral(own_identity: u64) -> io::Result<(Self, PtpClockSource)> {
         Self::bind(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            own_identity,
         )
         .await
     }
@@ -925,21 +1287,21 @@ impl PtpObserver {
     async fn bind(
         event_address: SocketAddr,
         general_address: SocketAddr,
+        own_identity: u64,
     ) -> io::Result<(Self, PtpClockSource)> {
         let event_socket = UdpSocket::bind(event_address).await?;
         let general_socket = UdpSocket::bind(general_address).await?;
         let (samples, _) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
-        let source = PtpClockSource::portable(samples.clone());
+        let wake = Arc::new(WakeRegistry::default());
+        let source = PtpClockSource::portable(samples.clone(), Arc::clone(&wake));
         Ok((
-            Self {
-                event_socket: Some(event_socket),
-                general_socket: Some(general_socket),
+            Self::new(
+                Some(event_socket),
+                Some(general_socket),
                 samples,
-                announcements: HashMap::with_capacity(8),
-                pending_syncs: HashMap::with_capacity(16),
-                pending_follow_ups: HashMap::with_capacity(16),
-                completed_pairs: HashMap::with_capacity(16),
-            },
+                wake,
+                own_identity,
+            ),
             source,
         ))
     }
@@ -973,24 +1335,16 @@ impl PtpObserver {
             Ordering::Relaxed,
         );
         let (samples, _) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
-        let mut source = PtpClockSource::portable(samples.clone());
+        // TimeSync owns UDP 319/320 and takes part in PTP itself: nothing
+        // for this process to count or wake.
+        let wake = Arc::new(WakeRegistry::default());
+        let mut source = PtpClockSource::portable(samples.clone(), Arc::clone(&wake));
         source.backend = PtpBackendKind::MacSystem;
         source.mac_root = Some(Arc::new(MacRoot {
             clock,
             gate: Arc::new(Semaphore::new(1)),
         }));
-        Ok((
-            Self {
-                event_socket: None,
-                general_socket: None,
-                samples,
-                announcements: HashMap::new(),
-                pending_syncs: HashMap::new(),
-                pending_follow_ups: HashMap::new(),
-                completed_pairs: HashMap::new(),
-            },
-            source,
-        ))
+        Ok((Self::new(None, None, samples, wake, 0), source))
     }
 
     pub(crate) async fn run(mut self) -> io::Result<()> {
@@ -1008,20 +1362,155 @@ impl PtpObserver {
         let mut prune_tick = tokio::time::interval(Duration::from_millis(250));
         prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            let next_wake = self.outgoing.front().map(|datagram| datagram.due);
             tokio::select! {
                 received = event_socket.recv_from(&mut event) => {
-                    let (length, peer) = received?;
-                    self.receive(&event[..length], peer, PTP_EVENT_PORT, Instant::now());
+                    if let Some((length, peer)) = tolerate_reset(received)? {
+                        self.receive(&event[..length], peer, PTP_EVENT_PORT, Instant::now());
+                    }
                 }
                 received = general_socket.recv_from(&mut general) => {
-                    let (length, peer) = received?;
-                    self.receive(&general[..length], peer, PTP_GENERAL_PORT, Instant::now());
+                    if let Some((length, peer)) = tolerate_reset(received)? {
+                        self.receive(&general[..length], peer, PTP_GENERAL_PORT, Instant::now());
+                    }
+                }
+                _ = tokio::time::sleep_until(next_wake.unwrap_or_else(Instant::now).into()), if next_wake.is_some() => {
+                    self.send_due_wake(&general_socket, Instant::now());
                 }
                 _ = prune_tick.tick() => {
                     self.prune(Instant::now());
                 }
             }
         }
+    }
+
+    /// Send every wake-up Announce that is due. A refused retraction is
+    /// retried: it must not stay unsent after the better Announce went out.
+    fn send_due_wake(&mut self, socket: &UdpSocket, now: Instant) {
+        while self.outgoing.front().is_some_and(|datagram| datagram.due <= now) {
+            let Some(mut datagram) = self.outgoing.pop_front() else {
+                break;
+            };
+            let sent = match socket.try_send_to(&datagram.packet, datagram.to) {
+                Ok(_) => true,
+                Err(error) => {
+                    log::warn!(
+                        target: "audiohub_airplay::airplay2",
+                        "AirPlay 2 PTP wake-up Announce to {} not sent (retraction={}): {error}",
+                        datagram.to,
+                        datagram.retraction
+                    );
+                    false
+                }
+            };
+            if datagram.retraction {
+                if !sent && datagram.resends < WAKE_MAX_RESENDS {
+                    datagram.resends += 1;
+                    datagram.due = now + WAKE_RESEND_DELAY;
+                    datagram.pair_ok = false;
+                    self.queue_wake(datagram);
+                    continue;
+                }
+                crate::telemetry::record_ptp_wake_sequence(
+                    datagram.telemetry_token,
+                    datagram.to.ip(),
+                    sent && datagram.pair_ok,
+                );
+            } else if !sent {
+                if let Some(retraction) = self
+                    .outgoing
+                    .iter_mut()
+                    .find(|next| next.retraction && next.to == datagram.to)
+                {
+                    retraction.pair_ok = false;
+                }
+            }
+        }
+    }
+
+    fn queue_wake(&mut self, datagram: WakeDatagram) {
+        let index = self
+            .outgoing
+            .iter()
+            .position(|queued| queued.due > datagram.due)
+            .unwrap_or(self.outgoing.len());
+        self.outgoing.insert(index, datagram);
+    }
+
+    /// After an Announce from `peer`: wake its clock if a session waits on
+    /// it in vain (see [`WakeRegistry`]).
+    fn maybe_wake(&mut self, peer: IpAddr, now: Instant) {
+        let Some((clock, attempt)) = self.wake.wake_due(peer, self.own_identity, now) else {
+            return;
+        };
+        let Some((better, worse)) = wake_priorities(clock.priority1) else {
+            return;
+        };
+        let telemetry_token = crate::telemetry::operation_token();
+        let first = self.wake_sequence;
+        self.wake_sequence = self.wake_sequence.wrapping_add(2);
+        log::info!(
+            target: "audiohub_airplay::airplay2",
+            "AirPlay 2 PTP sender {} clock {:016x} announces itself as grandmaster (priority1 {} priority2 {}) but sends no Sync/Follow_Up; sending wake-up Announce pair {attempt}/{WAKE_MAX_ATTEMPTS} to {} (priority1 {better} then {worse}, own clock {:016x})",
+            peer,
+            clock.clock,
+            clock.priority1,
+            clock.priority2,
+            clock.from,
+            self.own_identity
+        );
+        for (offset, priority1, retraction) in [
+            (Duration::ZERO, better, false),
+            (WAKE_INFERIOR_DELAY, worse, true),
+        ] {
+            let sequence = first.wrapping_add(u16::from(retraction));
+            self.queue_wake(WakeDatagram {
+                due: now + offset,
+                to: clock.from,
+                packet: wake_announce(self.own_identity, sequence, priority1, clock.priority2),
+                retraction,
+                resends: 0,
+                pair_ok: true,
+                telemetry_token,
+            });
+        }
+    }
+
+    /// Count one parsed datagram from `peer` for the sessions it serves.
+    fn note_sender_message(&self, peer: SocketAddr, message: Message, received_at: Instant) {
+        self.wake.observe(peer.ip(), |target| {
+            let status = &mut target.status;
+            match message {
+                Message::Announce {
+                    header,
+                    grandmaster,
+                    priority1,
+                    priority2,
+                } => {
+                    status.announces += 1;
+                    status.first_announce_at.get_or_insert(received_at);
+                    status.last_announce_at = Some(received_at);
+                    status.grandmaster = Some(grandmaster);
+                    target.announced = Some(AnnouncedClock {
+                        from: peer,
+                        clock: header.source.clock,
+                        grandmaster,
+                        priority1,
+                        priority2,
+                    });
+                }
+                Message::Sync {
+                    one_step_origin_ns: None,
+                    ..
+                } => status.sync_two_step += 1,
+                Message::Sync {
+                    one_step_origin_ns: Some(_),
+                    ..
+                } => status.sync_one_step += 1,
+                Message::FollowUp { .. } => status.follow_ups += 1,
+                Message::Signaling { .. } => status.signaling += 1,
+            }
+        });
     }
 
     fn receive(&mut self, packet: &[u8], peer: SocketAddr, local_port: u16, received_at: Instant) {
@@ -1058,7 +1547,9 @@ impl PtpObserver {
         let message_name = message.telemetry_name();
         let expected_port = match message {
             Message::Sync { .. } => PTP_EVENT_PORT,
-            Message::Announce { .. } | Message::FollowUp { .. } => PTP_GENERAL_PORT,
+            Message::Announce { .. } | Message::FollowUp { .. } | Message::Signaling { .. } => {
+                PTP_GENERAL_PORT
+            }
         };
         if local_port != expected_port {
             crate::telemetry::record_ptp_datagram(
@@ -1073,11 +1564,41 @@ impl PtpObserver {
             return;
         }
 
+        if let Message::Announce { grandmaster, .. } = message {
+            if grandmaster == self.own_identity {
+                // Only a sender reacting to our wake-up Announce could name
+                // this receiver; it never sends Sync, so never follow that.
+                crate::telemetry::record_ptp_datagram(
+                    telemetry_token,
+                    peer.ip(),
+                    peer.port(),
+                    local_port,
+                    Some(message_name),
+                    false,
+                    "self_grandmaster",
+                );
+                return;
+            }
+        }
+
         self.prune(received_at);
+        self.note_sender_message(peer, message, received_at);
         match message {
+            Message::Signaling { .. } => {
+                crate::telemetry::record_ptp_datagram(
+                    telemetry_token,
+                    peer.ip(),
+                    peer.port(),
+                    local_port,
+                    Some(message_name),
+                    true,
+                    "signaling_observed",
+                );
+            }
             Message::Announce {
                 header,
                 grandmaster,
+                ..
             } => {
                 if self.announcements.len() >= MAX_CLOCK_SOURCES
                     && !self.announcements.contains_key(&(peer.ip(), header.source))
@@ -1126,8 +1647,67 @@ impl PtpObserver {
                     true,
                     "announcement_observed",
                 );
+                self.maybe_wake(peer.ip(), received_at);
             }
-            Message::Sync { header } => {
+            Message::Sync {
+                header,
+                one_step_origin_ns: Some(origin_ns),
+            } => {
+                let key = SyncKey {
+                    peer: peer.ip(),
+                    source: header.source,
+                    sequence: header.sequence,
+                };
+                if self.completed_pair_is_duplicate(key) {
+                    crate::telemetry::record_ptp_datagram(
+                        telemetry_token,
+                        peer.ip(),
+                        peer.port(),
+                        local_port,
+                        Some(message_name),
+                        false,
+                        "duplicate_completed_pair",
+                    );
+                    return;
+                }
+                let Some(announcement) = self.announcements.get(&(peer.ip(), header.source)) else {
+                    crate::telemetry::record_ptp_datagram(
+                        telemetry_token,
+                        peer.ip(),
+                        peer.port(),
+                        local_port,
+                        Some(message_name),
+                        false,
+                        "missing_announcement",
+                    );
+                    return;
+                };
+                let grandmaster = announcement.grandmaster;
+                // A one-step Sync is a complete sample: its own origin
+                // timestamp plus its correctionField.
+                self.emit_sample(
+                    key,
+                    grandmaster,
+                    origin_ns,
+                    i128::from(header.correction_scaled_ns),
+                    received_at,
+                    received_at,
+                    telemetry_token,
+                );
+                crate::telemetry::record_ptp_datagram(
+                    telemetry_token,
+                    peer.ip(),
+                    peer.port(),
+                    local_port,
+                    Some(message_name),
+                    true,
+                    "sync_one_step_observed",
+                );
+            }
+            Message::Sync {
+                header,
+                one_step_origin_ns: None,
+            } => {
                 let key = SyncKey {
                     peer: peer.ip(),
                     source: header.source,
@@ -1271,7 +1851,31 @@ impl PtpObserver {
 
         let correction =
             i128::from(sync.correction_scaled_ns) + i128::from(follow_up.correction_scaled_ns);
-        let corrected_scaled = i128::from(follow_up.origin_ns) * 65_536 + correction;
+        self.emit_sample(
+            key,
+            sync.grandmaster,
+            follow_up.origin_ns,
+            correction,
+            sync.received_at,
+            now,
+            sample_token,
+        );
+    }
+
+    /// Publish one sample: `origin_ns` corrected by `correction_scaled_ns`
+    /// (2^-16 ns), received at `received_at` (the Sync's arrival).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_sample(
+        &mut self,
+        key: SyncKey,
+        grandmaster: u64,
+        origin_ns: u64,
+        correction_scaled_ns: i128,
+        received_at: Instant,
+        now: Instant,
+        sample_token: crate::telemetry::OperationToken,
+    ) {
+        let corrected_scaled = i128::from(origin_ns) * 65_536 + correction_scaled_ns;
         let Ok(remote_time_ns) = u64::try_from(corrected_scaled.div_euclid(65_536)) else {
             crate::telemetry::record_ptp_pending_disposition(
                 sample_token,
@@ -1301,9 +1905,9 @@ impl PtpObserver {
             .samples
             .send(PtpClockSample {
                 peer: key.peer,
-                grandmaster: sync.grandmaster,
+                grandmaster,
                 remote_time_ns,
-                received_at: sync.received_at,
+                received_at,
                 telemetry_token: sample_token,
             })
             .is_ok();
@@ -1398,22 +2002,50 @@ fn parse_message(packet: &[u8]) -> Result<Message, PtpParseError> {
         ),
     };
     match header.message_type {
-        MESSAGE_SYNC if packet.len() >= PTP_SYNC_BYTES && header.flags & PTP_TWO_STEP_FLAG != 0 => {
-            Ok(Message::Sync { header })
-        }
+        MESSAGE_SYNC if packet.len() >= PTP_SYNC_BYTES => Ok(Message::Sync {
+            header,
+            one_step_origin_ns: if header.flags & PTP_TWO_STEP_FLAG != 0 {
+                None
+            } else {
+                Some(parse_timestamp(&packet[PTP_HEADER_BYTES..PTP_SYNC_BYTES])?)
+            },
+        }),
         MESSAGE_FOLLOW_UP if packet.len() >= PTP_SYNC_BYTES => Ok(Message::FollowUp {
             header,
             origin_ns: parse_timestamp(&packet[PTP_HEADER_BYTES..PTP_SYNC_BYTES])?,
         }),
         MESSAGE_ANNOUNCE if packet.len() >= PTP_ANNOUNCE_BYTES => Ok(Message::Announce {
             header,
+            priority1: packet[47],
+            priority2: packet[52],
             grandmaster: u64::from_be_bytes(
                 packet[53..61]
                     .try_into()
                     .expect("announce minimum length checked"),
             ),
         }),
+        MESSAGE_SIGNALING if packet.len() >= PTP_SIGNALING_BYTES => {
+            Ok(Message::Signaling { header })
+        }
         _ => Err(PtpParseError::UnsupportedMessage),
+    }
+}
+
+/// A receive error on an unconnected UDP socket that only reports an ICMP
+/// port-unreachable for an earlier send (Windows `WSAECONNRESET`, e.g.
+/// after a wake-up Announce to a sender that has gone) must not end the
+/// observer.
+fn tolerate_reset<T>(received: io::Result<T>) -> io::Result<Option<T>> {
+    match received {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {
+            log::debug!(
+                target: "audiohub_airplay::airplay2",
+                "AirPlay 2 PTP socket reported an unreachable peer: {error}"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1447,8 +2079,16 @@ impl Message {
     fn telemetry_name(self) -> &'static str {
         match self {
             Self::Announce { .. } => "announce",
-            Self::Sync { .. } => "sync",
+            Self::Sync {
+                one_step_origin_ns: None,
+                ..
+            } => "sync",
+            Self::Sync {
+                one_step_origin_ns: Some(_),
+                ..
+            } => "sync_one_step",
             Self::FollowUp { .. } => "follow_up",
+            Self::Signaling { .. } => "signaling",
         }
     }
 }
@@ -1856,6 +2496,7 @@ mod tests {
 
     const SOURCE_CLOCK: u64 = 0x0102_0304_0506_0708;
     const GRANDMASTER: u64 = 0x1112_1314_1516_1718;
+    const OWN_CLOCK: u64 = 0x02aa_bbff_fecc_ddee;
 
     fn header(message_type: u8, length: usize, sequence: u16, correction: i64) -> Vec<u8> {
         let mut packet = vec![0u8; length];
@@ -1915,8 +2556,25 @@ mod tests {
 
         let mut one_step = header(MESSAGE_SYNC, PTP_SYNC_BYTES, 8, 0);
         one_step[6..8].copy_from_slice(&0x0408u16.to_be_bytes());
-        assert_eq!(
+        timestamp(&mut one_step, 3, 7);
+        assert!(matches!(
             parse_message(&one_step),
+            Ok(Message::Sync {
+                header: Header { sequence: 8, .. },
+                one_step_origin_ns: Some(3_000_000_007),
+            })
+        ));
+        one_step[40..44].copy_from_slice(&1_000_000_000u32.to_be_bytes());
+        assert_eq!(parse_message(&one_step), Err(PtpParseError::InvalidTimestamp));
+
+        let delay_request = header(0x1, PTP_SYNC_BYTES, 9, 0);
+        assert_eq!(
+            parse_message(&delay_request),
+            Err(PtpParseError::UnsupportedMessage)
+        );
+        let short_signaling = header(MESSAGE_SIGNALING, PTP_SIGNALING_BYTES - 1, 1, 0);
+        assert_eq!(
+            parse_message(&short_signaling),
             Err(PtpParseError::UnsupportedMessage)
         );
     }
@@ -1953,6 +2611,8 @@ mod tests {
                     ..
                 },
                 grandmaster: 0x5273_7ec2_e765_0008,
+                priority1: 250,
+                priority2: 239,
             })
         ));
         assert!(matches!(
@@ -1962,7 +2622,8 @@ mod tests {
                     sequence: 1,
                     flags: 0x0608,
                     ..
-                }
+                },
+                one_step_origin_ns: None,
             })
         ));
         assert!(matches!(
@@ -1984,15 +2645,7 @@ mod tests {
         let event_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let general_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let (samples, mut receiver) = broadcast::channel(8);
-        let mut observer = PtpObserver {
-            event_socket: Some(event_socket),
-            general_socket: Some(general_socket),
-            samples,
-            announcements: HashMap::new(),
-            pending_syncs: HashMap::new(),
-            pending_follow_ups: HashMap::new(),
-            completed_pairs: HashMap::new(),
-        };
+        let mut observer = PtpObserver::new(Some(event_socket), Some(general_socket), samples, Arc::default(), OWN_CLOCK);
         let peer: SocketAddr = "192.0.2.10:319".parse().unwrap();
         let received_at = Instant::now();
 
@@ -2027,15 +2680,7 @@ mod tests {
         let event_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let general_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let (samples, mut receiver) = broadcast::channel(8);
-        let mut observer = PtpObserver {
-            event_socket: Some(event_socket),
-            general_socket: Some(general_socket),
-            samples,
-            announcements: HashMap::new(),
-            pending_syncs: HashMap::new(),
-            pending_follow_ups: HashMap::new(),
-            completed_pairs: HashMap::new(),
-        };
+        let mut observer = PtpObserver::new(Some(event_socket), Some(general_socket), samples, Arc::default(), OWN_CLOCK);
         let peer: IpAddr = "192.0.2.10".parse().unwrap();
         let base = Instant::now();
         let mut announce = header(MESSAGE_ANNOUNCE, PTP_ANNOUNCE_BYTES, 1, 0);
@@ -2091,15 +2736,7 @@ mod tests {
         // Global recorder: serialized against concurrent `telemetry::reset`.
         let _telemetry = crate::telemetry::test_serial();
         let (samples, mut receiver) = broadcast::channel(8);
-        let mut observer = PtpObserver {
-            event_socket: None,
-            general_socket: None,
-            samples,
-            announcements: HashMap::new(),
-            pending_syncs: HashMap::new(),
-            pending_follow_ups: HashMap::new(),
-            completed_pairs: HashMap::new(),
-        };
+        let mut observer = PtpObserver::new(None, None, samples, Arc::default(), OWN_CLOCK);
         let peer: IpAddr = "192.0.2.10".parse().unwrap();
         let base = Instant::now();
         let mut announce = header(MESSAGE_ANNOUNCE, PTP_ANNOUNCE_BYTES, 1, 0);
@@ -2508,15 +3145,7 @@ mod tests {
     #[test]
     fn interleaved_samples_from_two_senders_reach_only_their_own_mapper() {
         let (samples, mut receiver) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
-        let mut observer = PtpObserver {
-            event_socket: None,
-            general_socket: None,
-            samples,
-            announcements: HashMap::new(),
-            pending_syncs: HashMap::new(),
-            pending_follow_ups: HashMap::new(),
-            completed_pairs: HashMap::new(),
-        };
+        let mut observer = PtpObserver::new(None, None, samples, Arc::default(), OWN_CLOCK);
         let senders: [(IpAddr, u64, u64); 2] = [
             ("192.0.2.10".parse().unwrap(), 0xaa00_0000_0000_0a01, 1_000),
             ("192.0.2.11".parse().unwrap(), 0xbb00_0000_0000_0b02, 49_000),
@@ -2588,6 +3217,332 @@ mod tests {
             assert_eq!(deadline, base + Duration::from_millis(1));
         }
     }
+
+    // ------------------------------------------------- silent sender clock
+
+    /// The iPad's Announce and Signaling exactly as captured on 2026-11-28
+    /// (30-win pktmon, airplay-ipad-ptp-capture-20261128T055102Z).
+    const IPAD_ANNOUNCE: &str = concat!(
+        "1b02004c00000408000000000000000000000000",
+        "342b6edcbdd200088011000105fe00000000000000000000002500faf821436af6",
+        "342b6edcbdd200080000a000080008342b6edcbdd20008"
+    );
+    const IPAD_SIGNALING: &str = concat!(
+        "1c02006a00000408000000000000000000000000",
+        "342b6edcbdd200088011000005800000000000000000000000030016000d93000001",
+        "0003030100002710000027100000000000030020000d93000005000f0301000000",
+        "00271000002710000027100000271000000000"
+    );
+    const IPAD_CLOCK: u64 = 0x342b_6edc_bdd2_0008;
+
+    fn ipad_announce(sequence: u16) -> Vec<u8> {
+        let mut packet = hex::decode(IPAD_ANNOUNCE).unwrap();
+        packet[30..32].copy_from_slice(&sequence.to_be_bytes());
+        packet
+    }
+
+    fn ipad_follow_up(sequence: u16, seconds: u64) -> Vec<u8> {
+        let mut follow = header(MESSAGE_FOLLOW_UP, PTP_SYNC_BYTES, sequence, 0);
+        follow[20..28].copy_from_slice(&IPAD_CLOCK.to_be_bytes());
+        follow[28..30].copy_from_slice(&0x8011u16.to_be_bytes());
+        timestamp(&mut follow, seconds, 0);
+        follow
+    }
+
+    fn general(peer: IpAddr) -> SocketAddr {
+        SocketAddr::new(peer, PTP_GENERAL_PORT)
+    }
+
+    fn watched_observer(peer: IpAddr) -> (PtpObserver, Arc<WakeRegistry>, SenderClockWatch) {
+        let (samples, _) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
+        let wake = Arc::new(WakeRegistry::default());
+        let watch = wake.register(peer);
+        (
+            PtpObserver::new(None, None, samples, Arc::clone(&wake), OWN_CLOCK),
+            wake,
+            watch,
+        )
+    }
+
+    fn queued(observer: &PtpObserver) -> Vec<(Instant, SocketAddr, u16, u8, bool)> {
+        observer
+            .outgoing
+            .iter()
+            .map(|datagram| {
+                let packet = &datagram.packet;
+                (
+                    datagram.due,
+                    datagram.to,
+                    u16::from_be_bytes([packet[30], packet[31]]),
+                    packet[47],
+                    datagram.retraction,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clock_identity_widens_the_device_mac_to_eui64() {
+        assert_eq!(
+            clock_identity_from_mac([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+            0x02aa_bbff_fecc_ddee
+        );
+    }
+
+    #[test]
+    fn wake_announce_matches_the_nqptp_layout_and_parses_as_announce() {
+        let packet = wake_announce(OWN_CLOCK, 7, 249, 246);
+        assert_eq!(packet.len(), 64);
+        assert_eq!(&packet[..4], &[0x1b, 0x02, 0x00, 0x40]);
+        assert_eq!(&packet[6..8], &[0x04, 0x08]);
+        assert_eq!(&packet[28..30], &0x8008u16.to_be_bytes());
+        assert_eq!(&packet[32..34], &[0x05, 0xfe]);
+        assert_eq!(&packet[44..46], &37u16.to_be_bytes());
+        assert_eq!(&packet[48..52], &0xf8fe_436au32.to_be_bytes());
+        assert_eq!(&packet[61..63], &[0, 0], "stepsRemoved");
+        assert_eq!(packet[63], 0xa0);
+        assert!(matches!(
+            parse_message(&packet),
+            Ok(Message::Announce {
+                header: Header {
+                    sequence: 7,
+                    source: PortIdentity { clock: OWN_CLOCK, port: 0x8008 },
+                    ..
+                },
+                grandmaster: OWN_CLOCK,
+                priority1: 249,
+                priority2: 246,
+            })
+        ));
+        assert_eq!(wake_priorities(250), Some((249, 251)));
+        assert_eq!(wake_priorities(0), None);
+        assert_eq!(wake_priorities(255), None);
+    }
+
+    #[test]
+    fn captured_ipad_announce_and_signaling_parse() {
+        assert!(matches!(
+            parse_message(&hex::decode(IPAD_ANNOUNCE).unwrap()),
+            Ok(Message::Announce {
+                header: Header {
+                    sequence: 1,
+                    source: PortIdentity { clock: IPAD_CLOCK, port: 0x8011 },
+                    ..
+                },
+                grandmaster: IPAD_CLOCK,
+                priority1: 250,
+                priority2: 246,
+            })
+        ));
+        assert!(matches!(
+            parse_message(&hex::decode(IPAD_SIGNALING).unwrap()),
+            Ok(Message::Signaling { header: Header { sequence: 0, .. } })
+        ));
+    }
+
+    #[test]
+    fn silent_sender_clock_gets_a_better_then_worse_announce_and_bounded_retries() {
+        let peer: IpAddr = "192.0.2.40".parse().unwrap();
+        let (mut observer, _wake, watch) = watched_observer(peer);
+        let signaling = hex::decode(IPAD_SIGNALING).unwrap();
+        let base = Instant::now();
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        for index in 0..2u16 {
+            observer.receive(&ipad_announce(index + 1), general(peer), PTP_GENERAL_PORT, at(250 * u64::from(index)));
+            observer.receive(&signaling, general(peer), PTP_GENERAL_PORT, at(250 * u64::from(index)));
+        }
+        assert!(observer.outgoing.is_empty(), "two Announces are not enough");
+        observer.receive(&ipad_announce(3), general(peer), PTP_GENERAL_PORT, at(500));
+        assert_eq!(
+            queued(&observer),
+            vec![
+                (at(500), general(peer), 0, 249, false),
+                (at(650), general(peer), 1, 251, true),
+            ]
+        );
+        let status = watch.status().unwrap();
+        assert_eq!((status.announces, status.signaling, status.wake_sequences), (3, 2, 1));
+        assert_eq!(status.grandmaster, Some(IPAD_CLOCK));
+
+        // Announces inside the retry interval do not repeat the pair.
+        observer.outgoing.clear();
+        for ms in [750, 1_000, 2_250] {
+            observer.receive(&ipad_announce(4), general(peer), PTP_GENERAL_PORT, at(ms));
+        }
+        assert!(observer.outgoing.is_empty());
+        // Retries 2 s apart, three pairs in all.
+        observer.receive(&ipad_announce(5), general(peer), PTP_GENERAL_PORT, at(2_500));
+        assert_eq!(queued(&observer).len(), 2);
+        assert_eq!(queued(&observer)[0].2, 2, "fresh sequence numbers");
+        observer.outgoing.clear();
+        observer.receive(&ipad_announce(6), general(peer), PTP_GENERAL_PORT, at(4_500));
+        assert_eq!(queued(&observer).len(), 2);
+        observer.outgoing.clear();
+        observer.receive(&ipad_announce(7), general(peer), PTP_GENERAL_PORT, at(6_500));
+        observer.receive(&ipad_announce(8), general(peer), PTP_GENERAL_PORT, at(9_000));
+        assert!(observer.outgoing.is_empty(), "at most three pairs per session");
+        assert_eq!(watch.status().unwrap().wake_sequences, WAKE_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn a_clock_that_sends_follow_ups_is_never_woken() {
+        let peer: IpAddr = "192.0.2.41".parse().unwrap();
+        let (mut observer, _wake, watch) = watched_observer(peer);
+        let base = Instant::now();
+        observer.receive(&ipad_announce(1), general(peer), PTP_GENERAL_PORT, base);
+        observer.receive(&ipad_follow_up(1, 10), general(peer), PTP_GENERAL_PORT, base);
+        for index in 2..20u16 {
+            let at = base + Duration::from_millis(250 * u64::from(index));
+            observer.receive(&ipad_announce(index), general(peer), PTP_GENERAL_PORT, at);
+        }
+        assert!(observer.outgoing.is_empty());
+        assert_eq!(watch.status().unwrap().follow_ups, 1);
+
+        // Woken once, then silent no more: no further pair.
+        let peer: IpAddr = "192.0.2.42".parse().unwrap();
+        let (mut observer, _wake, _watch) = watched_observer(peer);
+        for index in 0..3u16 {
+            let at = base + Duration::from_millis(250 * u64::from(index));
+            observer.receive(&ipad_announce(index), general(peer), PTP_GENERAL_PORT, at);
+        }
+        assert_eq!(observer.outgoing.len(), 2);
+        observer.outgoing.clear();
+        observer.receive(&ipad_follow_up(1, 10), general(peer), PTP_GENERAL_PORT, base + Duration::from_secs(1));
+        observer.receive(&ipad_announce(9), general(peer), PTP_GENERAL_PORT, base + Duration::from_secs(5));
+        assert!(observer.outgoing.is_empty());
+    }
+
+    #[test]
+    fn only_a_watched_sender_that_is_its_own_grandmaster_is_woken() {
+        let base = Instant::now();
+        // Not registered by any session.
+        let stranger: IpAddr = "192.0.2.43".parse().unwrap();
+        let (mut observer, _wake, _watch) = watched_observer("192.0.2.44".parse().unwrap());
+        for index in 0..6u16 {
+            let at = base + Duration::from_millis(250 * u64::from(index));
+            observer.receive(&ipad_announce(index), general(stranger), PTP_GENERAL_PORT, at);
+        }
+        assert!(observer.outgoing.is_empty());
+
+        // A boundary clock relaying another grandmaster.
+        let relay: IpAddr = "192.0.2.45".parse().unwrap();
+        let (mut observer, _wake, _watch) = watched_observer(relay);
+        for index in 0..6u16 {
+            let mut announce = ipad_announce(index);
+            announce[53..61].copy_from_slice(&GRANDMASTER.to_be_bytes());
+            let at = base + Duration::from_millis(250 * u64::from(index));
+            observer.receive(&announce, general(relay), PTP_GENERAL_PORT, at);
+        }
+        assert!(observer.outgoing.is_empty());
+
+        // The session ended: its registration is gone.
+        let peer: IpAddr = "192.0.2.46".parse().unwrap();
+        let (mut observer, wake, watch) = watched_observer(peer);
+        drop(watch);
+        assert!(wake.targets.lock().unwrap().is_empty());
+        for index in 0..6u16 {
+            let at = base + Duration::from_millis(250 * u64::from(index));
+            observer.receive(&ipad_announce(index), general(peer), PTP_GENERAL_PORT, at);
+        }
+        assert!(observer.outgoing.is_empty());
+    }
+
+    #[test]
+    fn an_announce_naming_this_receiver_as_grandmaster_is_ignored() {
+        let peer: IpAddr = "192.0.2.47".parse().unwrap();
+        let (samples, mut receiver) = broadcast::channel(8);
+        let mut observer = PtpObserver::new(None, None, samples, Arc::default(), OWN_CLOCK);
+        let base = Instant::now();
+        let mut announce = header(MESSAGE_ANNOUNCE, PTP_ANNOUNCE_BYTES, 1, 0);
+        announce[53..61].copy_from_slice(&OWN_CLOCK.to_be_bytes());
+        observer.receive(&announce, general(peer), PTP_GENERAL_PORT, base);
+        assert!(observer.announcements.is_empty());
+        let sync = header(MESSAGE_SYNC, PTP_SYNC_BYTES, 3, 0);
+        observer.receive(&sync, SocketAddr::new(peer, PTP_EVENT_PORT), PTP_EVENT_PORT, base);
+        let mut follow = header(MESSAGE_FOLLOW_UP, PTP_SYNC_BYTES, 3, 0);
+        timestamp(&mut follow, 1, 0);
+        observer.receive(&follow, general(peer), PTP_GENERAL_PORT, base);
+        assert!(receiver.try_recv().is_err(), "no sample on our own identity");
+    }
+
+    #[test]
+    fn one_step_sync_is_a_complete_sample_with_its_correction() {
+        let peer: IpAddr = "192.0.2.48".parse().unwrap();
+        let (samples, mut receiver) = broadcast::channel(8);
+        let mut observer = PtpObserver::new(None, None, samples, Arc::default(), OWN_CLOCK);
+        let base = Instant::now();
+        let mut one_step = header(MESSAGE_SYNC, PTP_SYNC_BYTES, 5, 3 * 65_536 + 32_768);
+        one_step[6..8].copy_from_slice(&0x0008u16.to_be_bytes());
+        timestamp(&mut one_step, 7, 11);
+        let event = SocketAddr::new(peer, PTP_EVENT_PORT);
+        // Without an Announce the grandmaster is unknown.
+        observer.receive(&one_step, event, PTP_EVENT_PORT, base);
+        assert!(receiver.try_recv().is_err());
+
+        let mut announce = header(MESSAGE_ANNOUNCE, PTP_ANNOUNCE_BYTES, 1, 0);
+        announce[53..61].copy_from_slice(&GRANDMASTER.to_be_bytes());
+        observer.receive(&announce, general(peer), PTP_GENERAL_PORT, base);
+        let at = base + Duration::from_millis(3);
+        observer.receive(&one_step, event, PTP_EVENT_PORT, at);
+        let sample = receiver.try_recv().unwrap();
+        assert_eq!(sample.peer, peer);
+        assert_eq!(sample.grandmaster, GRANDMASTER);
+        // 7 s + 11 ns + 3.5 ns correction, floored.
+        assert_eq!(sample.remote_time_ns, 7_000_000_014);
+        assert_eq!(sample.received_at, at);
+        // A repeated datagram is not a second sample.
+        observer.receive(&one_step, event, PTP_EVENT_PORT, at + Duration::from_millis(1));
+        assert!(receiver.try_recv().is_err());
+        // One-step on the general port is a port mismatch.
+        observer.receive(&one_step, general(peer), PTP_GENERAL_PORT, at);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn due_wake_announces_go_out_in_order_from_the_general_socket() {
+        let general_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let sender_address = sender.local_addr().unwrap();
+        let (samples, _) = broadcast::channel(8);
+        let wake = Arc::new(WakeRegistry::default());
+        let _watch = wake.register(sender_address.ip());
+        let mut observer = PtpObserver::new(None, None, samples, Arc::clone(&wake), OWN_CLOCK);
+        let base = Instant::now();
+        for index in 0..3u16 {
+            observer.receive(&ipad_announce(index), general(sender_address.ip()), PTP_GENERAL_PORT, base);
+        }
+        assert_eq!(observer.outgoing.len(), 2);
+        assert!(observer.outgoing.iter().all(|datagram| datagram.to == general(sender_address.ip())));
+        // Deliver to the test socket instead of the real UDP 320.
+        for datagram in &mut observer.outgoing {
+            datagram.to = sender_address;
+        }
+        observer.send_due_wake(&general_socket, base);
+        assert_eq!(observer.outgoing.len(), 1, "the retraction waits 150 ms");
+        observer.send_due_wake(&general_socket, base + WAKE_INFERIOR_DELAY);
+        assert!(observer.outgoing.is_empty());
+        let mut buffer = [0u8; 128];
+        let mut priorities = Vec::new();
+        for _ in 0..2 {
+            let (length, from) = tokio::time::timeout(Duration::from_secs(2), sender.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(from, general_socket.local_addr().unwrap());
+            assert_eq!(length, PTP_ANNOUNCE_BYTES);
+            priorities.push(buffer[47]);
+        }
+        assert_eq!(priorities, vec![249, 251]);
+    }
+
+    #[test]
+    fn a_connection_reset_does_not_end_the_observer() {
+        let reset: io::Result<u8> = Err(io::Error::from(io::ErrorKind::ConnectionReset));
+        assert!(matches!(tolerate_reset(reset), Ok(None)));
+        let other: io::Result<u8> = Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(tolerate_reset(other).is_err());
+        assert!(matches!(tolerate_reset(Ok(3u8)), Ok(Some(3))));
+    }
 }
 
 /// Live fallback-chain checks (design §4.2 M4) on the macOS lab VM. Run one
@@ -2617,7 +3572,7 @@ mod mac_live {
             .map(|peer| peer.trim().parse().unwrap())
             .collect();
         let expect = env("AUDIOHUB_TS_EXPECT");
-        let (_observer, root) = PtpObserver::bind_ipv4().await.expect("macOS PTP root");
+        let (_observer, root) = PtpObserver::bind_ipv4(0).await.expect("macOS PTP root");
         let describe = |source: &io::Result<PtpClockSource>| match source {
             Ok(source) => format!(
                 "backend={} reason={:?} identity={:?}",

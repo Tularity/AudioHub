@@ -32,7 +32,10 @@
 //! comes from [`PtpClockSource::platform_handoff`].
 
 use super::buffered_clock::PlaybackAnchor;
-use super::ptp::{PlatformHandoff, PtpClockError, PtpClockMapper, PtpClockSample, PtpClockSource};
+use super::ptp::{
+    PlatformHandoff, PtpClockError, PtpClockMapper, PtpClockSample, PtpClockSource,
+    SenderClockStatus, SenderClockWatch,
+};
 use crate::telemetry::{DeadlineSource, MediaKind};
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -54,6 +57,18 @@ pub(crate) const HANDOFF_MAX_OLD_AGE: Duration = Duration::from_secs(5);
 pub(crate) const HANDOFF_FAIL_GRACE: Duration = Duration::from_secs(4);
 /// A per-peer grandmaster observation older than this is not current.
 const OBSERVED_FRESH: Duration = Duration::from_secs(2);
+/// A sender that has announced for this long without a single Sync or
+/// Follow_Up gets one WARN per session: at 4 Announces and 8 Syncs a second
+/// a working clock has long produced samples by then.
+pub(crate) const SILENT_CLOCK_WARN_AFTER: Duration = Duration::from_secs(3);
+/// A portable session that has not received one PTP sample this long after
+/// its media stream was set up (SETUP phase two) ends, so the sender shows a
+/// failure instead of "connected" with no sound. It covers the silent-clock
+/// wake-up (first pair after three Announces, about 0.75 s; retries 2 s
+/// apart, the last near 4.75 s), three samples after a wake (0.4 s) and a
+/// lost-pair margin, and still ends well before a user gives up (the iPad
+/// sessions of 2026-11-28 were torn down by hand after 20-30 s).
+pub(crate) const CLOCK_NEVER_READY_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_CANDIDATES: usize = 4;
 const MAX_PENDING_SAMPLES: usize = 32;
 const MAX_RETIRED_TIMELINES: usize = 4;
@@ -83,6 +98,10 @@ pub(crate) struct SessionShared {
     peers: Mutex<Vec<IpAddr>>,
     /// Grandmaster the media engine currently maps through; 0 = none.
     grandmaster: AtomicU64,
+    /// The control peer's PTP traffic as the portable observer sees it
+    /// (also what lets the observer wake a silent clock). `None` on macOS
+    /// backends, where TimeSync owns the ports.
+    clock_watch: Option<SenderClockWatch>,
 }
 
 /// Result of replacing a session's accepted timing peers.
@@ -100,7 +119,20 @@ impl SessionShared {
             generation: AtomicU64::new(0),
             peers: Mutex::new(Vec::new()),
             grandmaster: AtomicU64::new(0),
+            clock_watch: None,
         }
+    }
+
+    pub(crate) fn with_clock_watch(control_peer: IpAddr, watch: SenderClockWatch) -> Self {
+        Self {
+            clock_watch: Some(watch),
+            ..Self::new(control_peer)
+        }
+    }
+
+    /// What the control peer sent the portable observer so far.
+    pub(crate) fn sender_clock_status(&self) -> Option<SenderClockStatus> {
+        self.clock_watch.as_ref()?.status()
     }
 
     pub(crate) fn control_peer(&self) -> IpAddr {
@@ -200,6 +232,10 @@ pub(crate) struct SessionPtpClock {
     mapped_on_anchor: bool,
     fatal_reported: bool,
     ready_logged: bool,
+    /// Samples from accepted peers since the stream started.
+    accepted_samples: u64,
+    silent_clock_warned: bool,
+    never_ready_reported: bool,
 }
 
 impl SessionPtpClock {
@@ -228,6 +264,9 @@ impl SessionPtpClock {
             mapped_on_anchor: false,
             fatal_reported: false,
             ready_logged: false,
+            accepted_samples: 0,
+            silent_clock_warned: false,
+            never_ready_reported: false,
         }
     }
 
@@ -304,6 +343,7 @@ impl SessionPtpClock {
         if !self.accepts(sample.peer) {
             return;
         }
+        self.accepted_samples = self.accepted_samples.saturating_add(1);
         let now = now.max(sample.received_at);
         self.note_observed(sample.peer, sample.grandmaster, sample.received_at);
         let Some((current_peer, current_gm)) = self
@@ -843,7 +883,16 @@ impl SessionPtpClock {
     /// [`HANDOFF_FAIL_GRACE`] while an anchor that already mapped is
     /// playing. Returned once; the caller ends the stream so the sender sees
     /// the failure instead of silence.
+    ///
+    /// Also, on the portable backend, the stream ends once when no PTP
+    /// sample at all arrived within [`CLOCK_NEVER_READY_TIMEOUT`] of its start,
+    /// playing or not, after one silent-clock WARN at
+    /// [`SILENT_CLOCK_WARN_AFTER`]. A stream that ever received a sample is
+    /// never ended this way (a paused sender keeps its session).
     pub(crate) fn take_fatal(&mut self, now: Instant, playing: bool) -> Option<io::Error> {
+        if let Some(error) = self.check_sender_clock(now) {
+            return Some(error);
+        }
         if self.fatal_reported || !playing || !self.mapped_on_anchor {
             return None;
         }
@@ -871,6 +920,55 @@ impl SessionPtpClock {
         Some(io::Error::new(
             io::ErrorKind::TimedOut,
             "PTP grandmaster changed and the session clock could not follow it",
+        ))
+    }
+
+    fn check_sender_clock(&mut self, now: Instant) -> Option<io::Error> {
+        if self.accepted_samples > 0 || self.never_ready_reported || self.source.maps_on_platform()
+        {
+            return None;
+        }
+        let status = self
+            .source
+            .session()
+            .and_then(|shared| shared.sender_clock_status());
+        if !self.silent_clock_warned {
+            if let Some((status, since)) = status.and_then(|status| {
+                status
+                    .first_announce_at
+                    .map(|at| (status, now.saturating_duration_since(at)))
+            }) {
+                if status.timing_messages() == 0 && since >= SILENT_CLOCK_WARN_AFTER {
+                    self.silent_clock_warned = true;
+                    crate::telemetry::record_ptp_silent_clock_warning(
+                        crate::telemetry::operation_token(),
+                    );
+                    log::warn!(
+                        target: "audiohub_airplay::airplay2",
+                        "AirPlay 2 PTP sender {} has announced grandmaster {} for {} ms but sent no Sync/Follow_Up ({status}) {}",
+                        self.control_peer,
+                        format_grandmaster(status.grandmaster),
+                        since.as_millis(),
+                        self.describe(now)
+                    );
+                }
+            }
+        }
+        if now.saturating_duration_since(self.epoch) < CLOCK_NEVER_READY_TIMEOUT {
+            return None;
+        }
+        self.never_ready_reported = true;
+        crate::telemetry::record_ptp_clock_never_ready(crate::telemetry::operation_token());
+        let sender = status.map_or_else(|| "unknown".to_owned(), |status| status.to_string());
+        log::warn!(
+            target: "audiohub_airplay::airplay2",
+            "AirPlay 2 PTP clock never became ready: no PTP sample from the sender within {:?} of the stream start (sender {sender}); ending the stream so the sender shows the failure {}",
+            CLOCK_NEVER_READY_TIMEOUT,
+            self.describe(now)
+        );
+        Some(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "PTP clock never received a sample from the sender",
         ))
     }
 
@@ -912,6 +1010,13 @@ impl SessionPtpClock {
             let _ = write!(text, "{peer}");
         }
         text.push(']');
+        if let Some(status) = self
+            .source
+            .session()
+            .and_then(|shared| shared.sender_clock_status())
+        {
+            let _ = write!(text, " sender_clock=[{status}]");
+        }
         text
     }
 }
@@ -1279,6 +1384,62 @@ mod tests {
         run.anchor_local = anchor_local;
         let deadline = run.deadline(0).unwrap();
         assert_close(deadline, anchor_local, Duration::from_micros(200));
+    }
+
+    #[test]
+    fn a_portable_stream_without_any_sample_warns_once_then_ends_after_the_timeout() {
+        let wake = Arc::new(crate::protocol::media::ptp::WakeRegistry::default());
+        let source = PtpClockSource::test_watched_session_source(mac(), &wake);
+        let epoch = Instant::now();
+        let mut clock = session(source.clone(), epoch);
+        let at = |ms: u64| epoch + Duration::from_millis(ms);
+        for ms in [0, 250, 500, 750] {
+            wake.test_note_announce(mac(), MAC_GM, at(ms));
+        }
+        assert!(clock.take_fatal(at(2_900), false).is_none());
+        assert!(!clock.silent_clock_warned);
+        assert!(clock.take_fatal(at(3_000), false).is_none());
+        assert!(clock.silent_clock_warned, "warned 3 s after the first Announce");
+        let status = source.session().unwrap().sender_clock_status().unwrap();
+        assert_eq!((status.announces, status.timing_messages()), (4, 0));
+        assert!(clock.describe(at(3_000)).contains("sender_clock=[announce=4 "));
+
+        assert!(clock
+            .take_fatal(epoch + CLOCK_NEVER_READY_TIMEOUT - Duration::from_millis(1), false)
+            .is_none());
+        let fatal = clock
+            .take_fatal(epoch + CLOCK_NEVER_READY_TIMEOUT, false)
+            .expect("never ready ends the stream, playing or not");
+        assert_eq!(fatal.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            clock
+                .take_fatal(epoch + CLOCK_NEVER_READY_TIMEOUT * 2, true)
+                .is_none(),
+            "reported once"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_received_a_sample_is_never_ended_for_a_missing_clock() {
+        let source = PtpClockSource::test_session_source(mac());
+        let epoch = Instant::now();
+        let mut clock = session(source, epoch);
+        clock.observe_sample(sample(mac(), mac_timeline(), epoch, epoch), epoch, None);
+        // Paused for a minute, no anchor, no more samples.
+        assert!(clock.take_fatal(epoch + Duration::from_secs(60), false).is_none());
+        assert!(clock.take_fatal(epoch + Duration::from_secs(60), true).is_none());
+
+        // Samples only from an unlisted peer do not count.
+        let source = PtpClockSource::test_session_source(mac());
+        let mut clock = session(source, epoch);
+        clock.observe_sample(sample(homepod(), homepod_timeline(), epoch, epoch), epoch, None);
+        assert!(clock.take_fatal(epoch + CLOCK_NEVER_READY_TIMEOUT, false).is_some());
+
+        // Platform backends (macOS TimeSync) keep their own lock watchdog.
+        let fake = Arc::new(FakePlatform::new(epoch, MAC_GM, 0x00aa_bbcc_ddee_0001));
+        let source = PtpClockSource::test_platform_source(mac(), fake);
+        let mut clock = session(source, epoch);
+        assert!(clock.take_fatal(epoch + Duration::from_secs(60), false).is_none());
     }
 
     #[test]

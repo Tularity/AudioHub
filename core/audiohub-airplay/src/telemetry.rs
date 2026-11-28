@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use uuid::Uuid;
 
-const TELEMETRY_SCHEMA_VERSION: u32 = 7;
+const TELEMETRY_SCHEMA_VERSION: u32 = 8;
 const RECENT_EVENT_LIMIT: usize = 128;
 const CONTROL_SESSION_HISTORY_LIMIT: usize = 128;
 
@@ -257,9 +257,32 @@ pub struct AirPlayTelemetryCounters {
     /// sending any Sync/Follow_Up (one warning per session).
     #[serde(default)]
     pub ptp_silent_clock_warnings: u64,
-    /// Schema 6. Portable sessions ended because no PTP sample ever arrived.
+    /// Schema 8 (replaces schema 6's `ptp_clock_never_ready_failures`; such
+    /// streams are no longer ended). Portable streams that had not mapped a
+    /// single deadline 12 s after they started, while playing or without any
+    /// PTP sample (one warning per stream).
     #[serde(default)]
-    pub ptp_clock_never_ready_failures: u64,
+    pub ptp_clock_never_ready_warnings: u64,
+    /// Schema 8. Times this receiver became a silent sender's PTP master.
+    #[serde(default)]
+    pub ptp_master_mode_entered: u64,
+    /// Schema 8. Silent senders whose dataset could not be outranked
+    /// (priority1 and priority2 both 0).
+    #[serde(default)]
+    pub ptp_master_mode_refused: u64,
+    /// Schema 8. Master modes left because the sender sent Sync/Follow_Up or
+    /// announced a better grandmaster.
+    #[serde(default)]
+    pub ptp_master_mode_yielded: u64,
+    /// Schema 8. Master Announce (+ Apple Signaling) and Sync (+ Follow_Up)
+    /// pairs sent.
+    #[serde(default)]
+    pub ptp_master_announces_sent: u64,
+    #[serde(default)]
+    pub ptp_master_syncs_sent: u64,
+    /// Schema 8. Master messages the socket refused to send.
+    #[serde(default)]
+    pub ptp_master_send_failures: u64,
 }
 
 /// Schema 6. PTP datagrams from one sender address, by message type, for
@@ -279,6 +302,14 @@ pub struct PtpSenderTelemetry {
     /// Schema 7 (replaces `wake_sequences_sent`).
     #[serde(default)]
     pub interval_requests_sent: u64,
+    /// Schema 8. Master mode entered for this sender, and the master
+    /// Announce and Sync pairs sent to it.
+    #[serde(default)]
+    pub master_mode_entered: u64,
+    #[serde(default)]
+    pub master_announces_sent: u64,
+    #[serde(default)]
+    pub master_syncs_sent: u64,
 }
 
 /// Senders kept in [`AirPlayTelemetrySnapshot::ptp_senders`]; the least
@@ -933,7 +964,13 @@ struct TelemetrySlot {
     ptp_interval_requests_sent: AtomicU64,
     ptp_interval_request_send_failures: AtomicU64,
     ptp_silent_clock_warnings: AtomicU64,
-    ptp_clock_never_ready_failures: AtomicU64,
+    ptp_clock_never_ready_warnings: AtomicU64,
+    ptp_master_mode_entered: AtomicU64,
+    ptp_master_mode_refused: AtomicU64,
+    ptp_master_mode_yielded: AtomicU64,
+    ptp_master_announces_sent: AtomicU64,
+    ptp_master_syncs_sent: AtomicU64,
+    ptp_master_send_failures: AtomicU64,
     /// Updated only on the PTP observer task (never a media or PCM path).
     ptp_senders: Mutex<Vec<PtpSenderTelemetry>>,
     // SETPEERS/SETPEERSX are control-plane requests. Their prepare and commit
@@ -1199,7 +1236,13 @@ impl TelemetrySlot {
             ptp_interval_requests_sent: load(&self.ptp_interval_requests_sent),
             ptp_interval_request_send_failures: load(&self.ptp_interval_request_send_failures),
             ptp_silent_clock_warnings: load(&self.ptp_silent_clock_warnings),
-            ptp_clock_never_ready_failures: load(&self.ptp_clock_never_ready_failures),
+            ptp_clock_never_ready_warnings: load(&self.ptp_clock_never_ready_warnings),
+            ptp_master_mode_entered: load(&self.ptp_master_mode_entered),
+            ptp_master_mode_refused: load(&self.ptp_master_mode_refused),
+            ptp_master_mode_yielded: load(&self.ptp_master_mode_yielded),
+            ptp_master_announces_sent: load(&self.ptp_master_announces_sent),
+            ptp_master_syncs_sent: load(&self.ptp_master_syncs_sent),
+            ptp_master_send_failures: load(&self.ptp_master_send_failures),
         };
         let ptp_senders = self
             .ptp_senders
@@ -1327,7 +1370,13 @@ impl TelemetrySlot {
             &self.ptp_interval_requests_sent,
             &self.ptp_interval_request_send_failures,
             &self.ptp_silent_clock_warnings,
-            &self.ptp_clock_never_ready_failures,
+            &self.ptp_clock_never_ready_warnings,
+            &self.ptp_master_mode_entered,
+            &self.ptp_master_mode_refused,
+            &self.ptp_master_mode_yielded,
+            &self.ptp_master_announces_sent,
+            &self.ptp_master_syncs_sent,
+            &self.ptp_master_send_failures,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -2293,7 +2342,64 @@ pub(crate) fn record_ptp_silent_clock_warning(token: OperationToken) {
 
 pub(crate) fn record_ptp_clock_never_ready(token: OperationToken) {
     if let Some(guard) = telemetry().enter_token(token) {
-        increment(&guard.slot.ptp_clock_never_ready_failures);
+        increment(&guard.slot.ptp_clock_never_ready_warnings);
+    }
+}
+
+/// A master-mode message pair (see `ptp::MasterPort`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtpMasterMessage {
+    /// Announce and the Apple Signaling after it.
+    Announce,
+    /// Sync and its Follow_Up.
+    Sync,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtpMasterTransition {
+    Entered,
+    Refused,
+    Yielded,
+}
+
+pub(crate) fn record_ptp_master_mode(token: OperationToken, peer: IpAddr, transition: PtpMasterTransition) {
+    let Some(guard) = telemetry().enter_token(token) else {
+        return;
+    };
+    match transition {
+        PtpMasterTransition::Entered => {
+            increment(&guard.slot.ptp_master_mode_entered);
+            update_ptp_sender(guard.slot, peer, |entry| entry.master_mode_entered += 1);
+        }
+        PtpMasterTransition::Refused => increment(&guard.slot.ptp_master_mode_refused),
+        PtpMasterTransition::Yielded => increment(&guard.slot.ptp_master_mode_yielded),
+    }
+}
+
+/// One master message pair to `peer`: `sent` is false when the socket
+/// refused either message.
+pub(crate) fn record_ptp_master_send(
+    token: OperationToken,
+    peer: IpAddr,
+    message: PtpMasterMessage,
+    sent: bool,
+) {
+    let Some(guard) = telemetry().enter_token(token) else {
+        return;
+    };
+    if !sent {
+        increment(&guard.slot.ptp_master_send_failures);
+        return;
+    }
+    match message {
+        PtpMasterMessage::Announce => {
+            increment(&guard.slot.ptp_master_announces_sent);
+            update_ptp_sender(guard.slot, peer, |entry| entry.master_announces_sent += 1);
+        }
+        PtpMasterMessage::Sync => {
+            increment(&guard.slot.ptp_master_syncs_sent);
+            update_ptp_sender(guard.slot, peer, |entry| entry.master_syncs_sent += 1);
+        }
     }
 }
 
@@ -2926,7 +3032,7 @@ mod tests {
             }
         }
         let before = recorder.snapshot();
-        assert_eq!(before.schema_version, 7);
+        assert_eq!(before.schema_version, 8);
         assert!(Uuid::parse_str(&before.generation_marker).is_ok());
         assert_eq!(before.counters.rtsp_phase2_requests, 1);
         assert_eq!(before.recent_events.len(), RECENT_EVENT_LIMIT);
@@ -2947,7 +3053,7 @@ mod tests {
     #[test]
     fn public_snapshot_serializes_with_stable_top_level_fields() {
         let value = serde_json::to_value(Telemetry::default().snapshot()).unwrap();
-        assert_eq!(value["schema_version"], 7);
+        assert_eq!(value["schema_version"], 8);
         assert!(value["control_sessions"].is_array());
         assert!(value["control_sessions_truncated"].is_boolean());
         assert!(value["active_control_sessions"].is_array());
@@ -2992,7 +3098,13 @@ mod tests {
             "ptp_interval_requests_sent",
             "ptp_interval_request_send_failures",
             "ptp_silent_clock_warnings",
-            "ptp_clock_never_ready_failures",
+            "ptp_clock_never_ready_warnings",
+            "ptp_master_mode_entered",
+            "ptp_master_mode_refused",
+            "ptp_master_mode_yielded",
+            "ptp_master_announces_sent",
+            "ptp_master_syncs_sent",
+            "ptp_master_send_failures",
         ] {
             assert!(value["counters"][field].is_u64(), "{field}");
         }
@@ -3001,7 +3113,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_six_and_seven_fields_deserialize_from_a_schema_five_document() {
+    fn schema_six_to_eight_fields_deserialize_from_a_schema_five_document() {
         let mut value = serde_json::to_value(Telemetry::default().snapshot()).unwrap();
         let object = value.as_object_mut().unwrap();
         assert!(object.remove("ptp_senders").is_some());
@@ -3012,13 +3124,28 @@ mod tests {
             "ptp_interval_requests_sent",
             "ptp_interval_request_send_failures",
             "ptp_silent_clock_warnings",
-            "ptp_clock_never_ready_failures",
+            "ptp_clock_never_ready_warnings",
+            "ptp_master_mode_entered",
+            "ptp_master_mode_refused",
+            "ptp_master_mode_yielded",
+            "ptp_master_announces_sent",
+            "ptp_master_syncs_sent",
+            "ptp_master_send_failures",
         ] {
             assert!(counters.remove(field).is_some(), "{field}");
         }
         let decoded: AirPlayTelemetrySnapshot = serde_json::from_value(value).unwrap();
         assert!(decoded.ptp_senders.is_empty());
         assert_eq!(decoded.counters.ptp_interval_requests_sent, 0);
+        assert_eq!(decoded.counters.ptp_master_mode_entered, 0);
+        // A schema 7 sender entry has no master fields.
+        let entry: PtpSenderTelemetry = serde_json::from_value(serde_json::json!({
+            "peer": "10.130.32.40", "announce": 1, "sync_two_step": 0, "sync_one_step": 0,
+            "follow_up": 0, "signaling": 1, "rejected_total": 0, "rejected_by_reason": {},
+            "interval_requests_sent": 2
+        }))
+        .unwrap();
+        assert_eq!((entry.master_mode_entered, entry.master_syncs_sent), (0, 0));
     }
 
     #[test]
@@ -3041,6 +3168,7 @@ mod tests {
             count(mac, Some("follow_up"), true, "follow_up_observed");
             count(mac, Some("sync"), false, "duplicate_completed_pair");
             update_ptp_sender(slot, ipad, |entry| entry.interval_requests_sent += 1);
+            update_ptp_sender(slot, ipad, |entry| entry.master_syncs_sent += 2);
         }
         let senders = recorder.snapshot().ptp_senders;
         assert_eq!(senders.len(), 2);
@@ -3053,6 +3181,7 @@ mod tests {
         );
         assert_eq!(ipad_entry.rejected_by_reason["parse_unsupported_message"], 1);
         assert_eq!(ipad_entry.interval_requests_sent, 1);
+        assert_eq!(ipad_entry.master_syncs_sent, 2);
         let mac_entry = &senders[0];
         assert_eq!((mac_entry.sync_two_step, mac_entry.follow_up), (2, 1));
         assert_eq!(mac_entry.rejected_total, 1);

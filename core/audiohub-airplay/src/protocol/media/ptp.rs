@@ -7,14 +7,23 @@
 //! group elects, including changes announced through SETPEERS
 //! (`ptp_session`).
 //!
-//! The observer transmits exactly one kind of PTP message: the IEEE 802.1AS
-//! message interval request (Signaling) that a slave port sends its master
-//! (see [`SenderClockRegistry`]). An iPad that is grandmaster announces but
-//! never sends Sync to AudioHub; to macOS's own AirPlay receiver, where it is
-//! the slave, it sends these requests (2026-11-28 captures). Requesting Sync
-//! is what a slave does, so it is sent to every session's self-announcing
-//! control peer. The observer never sends Announce, Sync or Follow_Up, so it
-//! can never look like or serve as anyone's grandmaster.
+//! As a slave the observer transmits one kind of PTP message: the IEEE
+//! 802.1AS message interval request (Signaling) that a slave port sends its
+//! master (see [`SenderClockRegistry`]).
+//!
+//! Master mode: an iPad sender announces itself as grandmaster but never
+//! sends Sync, neither to AudioHub nor to macOS's own AirPlay receiver. There
+//! the receiver announces a better dataset at once, the iPad yields after a
+//! few Announces and the receiver is the PTP master: Announce + Apple
+//! Signaling 4/s, two-step Sync/Follow_Up 8/s, unicast to the iPad
+//! (`airplay-ipad-applercv-20261128T075756Z`). When a session's control peer
+//! announces itself as grandmaster and has sent no Sync/Follow_Up for
+//! [`MASTER_TRIGGER_AFTER`], the portable observer does the same for that
+//! peer only, on its own timescale ([`OwnTimescale`]), and publishes its own
+//! Syncs as clock samples so the session maps an anchor on this receiver's
+//! timeline exactly. Senders that send Sync (Mac, iPhone) never see it; a
+//! sender that starts Sync, or announces a better grandmaster, makes it
+//! yield for good (see [`MasterPort`]).
 
 use super::buffered_clock::{rtp_delta, PlaybackAnchor};
 #[cfg(target_os = "macos")]
@@ -54,12 +63,13 @@ const PTP_SIGNALING_BYTES: usize = PTP_HEADER_BYTES + 10;
 /// A Signaling message carrying one 802.1AS message interval request TLV.
 const PTP_INTERVAL_REQUEST_BYTES: usize = 60;
 /// unicastFlag | ptpTimescale, as on every Apple PTP message.
-const INTERVAL_REQUEST_FLAGS: u16 = 0x0408;
-/// sourcePortIdentity.portNumber of this receiver's requests. Any value but
-/// 0 and 0xffff is valid; Apple numbers its unicast ports 0x80nn (the iPad
-/// used 0x8011, 0x8014, 0x8015; the Mac 0x8015..0x8017). One fixed value
-/// keeps the identity stable across sessions and restarts.
-const INTERVAL_REQUEST_PORT: u16 = 0x8001;
+const APPLE_UNICAST_FLAGS: u16 = 0x0408;
+/// sourcePortIdentity.portNumber of everything this receiver sends
+/// (interval requests and master mode). Any value but 0 and 0xffff is valid;
+/// Apple numbers its unicast ports 0x80nn (the iPad used 0x8011, 0x8014,
+/// 0x8015; the Mac 0x8015..0x8017). One fixed value keeps the identity
+/// stable across sessions and restarts.
+const OWN_PTP_PORT: u16 = 0x8001;
 /// controlField "all others" and logMessageInterval 0x80, as the iPad sends.
 const INTERVAL_REQUEST_CONTROL_FIELD: u8 = 0x05;
 const INTERVAL_REQUEST_LOG_INTERVAL: u8 = 0x80;
@@ -78,7 +88,67 @@ const INTERVAL_REQUEST_SYNC_8HZ: [u8; 3] = [0x80, 0xfd, 0x80];
 /// (2026-11-28 capture: 36 ms and 30 ms), then about once a second.
 const INTERVAL_REQUEST_FOLLOW_DELAY: Duration = Duration::from_millis(30);
 const INTERVAL_REQUEST_PERIOD: Duration = Duration::from_secs(1);
-const INTERVAL_REQUEST_SEND_TIMEOUT: Duration = Duration::from_millis(50);
+/// Bound on one send (interval request or master message) so a socket that
+/// is not writable cannot stall the receive path.
+const PTP_SEND_TIMEOUT: Duration = Duration::from_millis(50);
+/// A session's control peer that announces itself as grandmaster and has
+/// sent no Sync or Follow_Up this long after its first Announce gets this
+/// receiver as its PTP master. Senders that are clock sources send Sync
+/// within one Sync interval of announcing (macOS: 73 ms; Apple's rate is
+/// 8/s), so at 500 ms a working sender has sent about four. It must also be
+/// short: the iPad's first SETRATEANCHORTIME came 1.7-2.3 s after its first
+/// Announce on 30-win (2026-11-28 10:23Z), and it needs about two of our
+/// Announces (0.3 s at Apple's receiver) to yield and some Syncs to lock
+/// before anchoring on our timeline.
+const MASTER_TRIGGER_AFTER: Duration = Duration::from_millis(500);
+/// logAnnounceInterval -2 and logSyncInterval -3, as Apple's receiver sends.
+const MASTER_ANNOUNCE_INTERVAL: Duration = Duration::from_millis(250);
+const MASTER_SYNC_INTERVAL: Duration = Duration::from_millis(125);
+const MASTER_ANNOUNCE_LOG_INTERVAL: u8 = 0xfe;
+const MASTER_SYNC_LOG_INTERVAL: u8 = 0xfd;
+/// controlField values (IEEE 1588-2008 table 23): Sync 0, Follow_Up 2,
+/// all others 5.
+const CONTROL_SYNC: u8 = 0x00;
+const CONTROL_FOLLOW_UP: u8 = 0x02;
+const CONTROL_OTHER: u8 = 0x05;
+/// unicastFlag | twoStepFlag | ptpTimescale (Apple's Sync).
+const MASTER_SYNC_FLAGS: u16 = APPLE_UNICAST_FLAGS | PTP_TWO_STEP_FLAG;
+/// Announce with the path-trace TLV naming this receiver (Apple's layout).
+const PTP_MASTER_ANNOUNCE_BYTES: usize = 76;
+/// Follow_Up with the 802.1AS information TLV and Apple's subtype-4 TLV.
+const PTP_MASTER_FOLLOW_UP_BYTES: usize = 96;
+/// Signaling with Apple's two organization-extension TLVs.
+const PTP_MASTER_SIGNALING_BYTES: usize = PTP_SIGNALING_BYTES + APPLE_SIGNALING_TLVS.len();
+const CURRENT_UTC_OFFSET: u16 = 37;
+/// timeSource INTERNAL_OSCILLATOR, as Apple's receiver announces.
+const TIME_SOURCE_INTERNAL_OSCILLATOR: u8 = 0xa0;
+/// 802.1AS Follow_Up information TLV (ORGANIZATION_EXTENSION, OUI 00-80-C2,
+/// subtype 1): cumulativeScaledRateOffset, gmTimeBaseIndicator,
+/// lastGmPhaseChange and scaledLastGmFreqChange all zero, i.e. a grandmaster
+/// whose time base never changed. Apple's receiver sends its own non-zero
+/// lastGmPhaseChange/scaledLastGmFreqChange history there; they describe
+/// that Mac's past grandmaster changes, not ours.
+const FOLLOW_UP_INFORMATION_TLV: [u8; 32] = [
+    0x00, 0x03, 0x00, 0x1c, 0x00, 0x80, 0xc2, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+/// Apple organization extension (OUI 00-0D-93) subtype 4 on Follow_Up:
+/// followed by the sender's clockIdentity and two zero bytes.
+const APPLE_FOLLOW_UP_TLV_HEAD: [u8; 10] = [0x00, 0x03, 0x00, 0x10, 0x00, 0x0d, 0x93, 0x00, 0x00, 0x04];
+/// The two Apple organization-extension TLVs (subtypes 1 and 5) Apple's
+/// receiver sends with every Announce while it is grandmaster
+/// (`airplay-ipad-applercv-20261128T075756Z`). Meaning unknown; copied byte
+/// for byte except the trailing three bytes of each, which vary over time
+/// on the Mac (0x34bbdf..0x396763) and are zero on the iPad; zero here.
+const APPLE_SIGNALING_TLVS: [u8; 62] = [
+    // Subtype 1, 22 bytes.
+    0x00, 0x03, 0x00, 0x16, 0x00, 0x0d, 0x93, 0x00, 0x00, 0x01, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00,
+    0x27, 0x10, 0x00, 0x00, 0x27, 0x10, 0x00, 0x00, 0x00, 0x00,
+    // Subtype 5, 32 bytes.
+    0x00, 0x03, 0x00, 0x20, 0x00, 0x0d, 0x93, 0x00, 0x00, 0x05, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x27, 0x10, 0x00, 0x00, 0x27, 0x10, 0x00, 0x00, 0x27, 0x10, 0x00, 0x00, 0x27, 0x10,
+    0x00, 0x00, 0x00, 0x00,
+];
 const PAIR_LIFETIME: Duration = Duration::from_secs(2);
 const ANNOUNCE_LIFETIME: Duration = Duration::from_secs(5);
 const MAX_PENDING_SYNCS: usize = 128;
@@ -119,6 +189,7 @@ enum Message {
         grandmaster: u64,
         priority1: u8,
         priority2: u8,
+        quality: ClockQuality,
     },
     /// `one_step_origin_ns` is the origin timestamp of a one-step Sync (the
     /// two-step flag is clear); `None` for a two-step Sync, whose time comes
@@ -131,6 +202,103 @@ enum Message {
     /// Counted for diagnostics only (Apple sends an organization-extension
     /// TLV with every Announce).
     Signaling { header: Header },
+}
+
+/// grandmasterClockQuality of an Announce (IEEE 1588-2008 5.3.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClockQuality {
+    class: u8,
+    accuracy: u8,
+    variance: u16,
+}
+
+/// The grandmaster an Announce advertises, as the best master clock
+/// algorithm compares it (IEEE 1588-2008 9.3.4, figure 28: priority1,
+/// clockClass, clockAccuracy, offsetScaledLogVariance, priority2, identity;
+/// lower wins). Only different grandmasters are ever compared here, so the
+/// stepsRemoved/topology branch does not apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GrandmasterDataset {
+    priority1: u8,
+    quality: ClockQuality,
+    priority2: u8,
+    identity: u64,
+}
+
+impl GrandmasterDataset {
+    fn rank(self) -> (u8, u8, u8, u16, u8, u64) {
+        (
+            self.priority1,
+            self.quality.class,
+            self.quality.accuracy,
+            self.quality.variance,
+            self.priority2,
+            self.identity,
+        )
+    }
+
+    fn better_than(self, other: Self) -> bool {
+        self.rank() < other.rank()
+    }
+}
+
+/// The dataset this receiver announces as master of a sender that
+/// announced `sender`: the sender's own priority1 and clock quality with
+/// priority2 one lower, which wins on priority2 alone (Apple's receiver beat
+/// the iPad the same way: 250/248/0x21/0x436a with priority2 237 against
+/// 246). With priority2 already 0, priority1 one lower instead. `None` when
+/// both are 0: nothing but a better clock quality could win, and claiming
+/// one would misdescribe this receiver's clock.
+fn master_dataset(sender: GrandmasterDataset, own_identity: u64) -> Option<GrandmasterDataset> {
+    let (priority1, priority2) = match (sender.priority1, sender.priority2) {
+        (priority1, priority2) if priority2 > 0 => (priority1, priority2 - 1),
+        (priority1, priority2) if priority1 > 0 => (priority1 - 1, priority2),
+        _ => return None,
+    };
+    let ours = GrandmasterDataset {
+        priority1,
+        quality: sender.quality,
+        priority2,
+        identity: own_identity,
+    };
+    ours.better_than(sender).then_some(ours)
+}
+
+/// This receiver's PTP time while it is a sender's master: the monotonic
+/// clock the media path uses for host time ([`Instant`]) plus a fixed
+/// offset, so the mapping from this timeline to host time is the identity
+/// and never drifts. The offset is the TAI time (UTC + 37 s) when the
+/// process first needed it, so the values look like PTP time; it is fixed
+/// from then on and wall-clock changes do not affect it. Apple's receiver
+/// uses an uptime-like timescale (about 2.6e6 s), so a sender does not need
+/// real TAI.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OwnTimescale {
+    epoch: Instant,
+    base_ns: u64,
+}
+
+impl OwnTimescale {
+    fn process() -> Self {
+        static PROCESS: std::sync::OnceLock<OwnTimescale> = std::sync::OnceLock::new();
+        *PROCESS.get_or_init(|| {
+            let epoch = Instant::now();
+            let unix_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| u64::try_from(since.as_nanos()).unwrap_or(0));
+            let tai_offset_ns = u64::from(CURRENT_UTC_OFFSET) * NANOS_PER_SECOND as u64;
+            Self {
+                epoch,
+                base_ns: unix_ns.saturating_add(tai_offset_ns),
+            }
+        })
+    }
+
+    pub(crate) fn time_ns(self, at: Instant) -> u64 {
+        let elapsed = u64::try_from(at.saturating_duration_since(self.epoch).as_nanos())
+            .unwrap_or(u64::MAX);
+        self.base_ns.saturating_add(elapsed)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -312,6 +480,8 @@ pub(crate) struct SenderClockStatus {
     pub(crate) signaling: u64,
     /// Interval requests sent to it (shared schedule of its sessions).
     pub(crate) interval_requests: u64,
+    /// This receiver as the peer's PTP master, if it ever was.
+    pub(crate) master: Option<MasterSummary>,
 }
 
 impl SenderClockStatus {
@@ -335,7 +505,42 @@ impl fmt::Display for SenderClockStatus {
             self.sync_one_step,
             self.follow_ups,
             self.interval_requests
-        )
+        )?;
+        if let Some(master) = self.master {
+            write!(f, " master={master}")?;
+        }
+        Ok(())
+    }
+}
+
+/// State of this receiver as one control peer's PTP master.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MasterMode {
+    /// It is the peer's master now.
+    Active,
+    /// It was, until the given reason; not re-entered while the peer has
+    /// sessions.
+    Yielded(&'static str),
+    /// The peer's dataset cannot be outranked (see [`master_dataset`]).
+    Refused,
+}
+
+/// Master mode of a session's control peer, for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MasterSummary {
+    pub(crate) mode: MasterMode,
+    pub(crate) announces: u64,
+    pub(crate) syncs: u64,
+}
+
+impl fmt::Display for MasterSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.mode {
+            MasterMode::Active => f.write_str("active")?,
+            MasterMode::Yielded(reason) => write!(f, "yielded:{reason}")?,
+            MasterMode::Refused => return f.write_str("refused"),
+        }
+        write!(f, "(announces={} syncs={})", self.announces, self.syncs)
     }
 }
 
@@ -346,6 +551,21 @@ struct AnnouncedClock {
     from: SocketAddr,
     clock: u64,
     grandmaster: u64,
+}
+
+/// A session's control peer's latest Announce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LastAnnounce {
+    clock: AnnouncedClock,
+    dataset: GrandmasterDataset,
+    at: Instant,
+}
+
+impl LastAnnounce {
+    /// The announcing clock names itself, not this receiver, as grandmaster.
+    fn names_itself(&self, own_identity: u64) -> bool {
+        self.clock.clock == self.clock.grandmaster && self.clock.grandmaster != own_identity
+    }
 }
 
 /// When a session's next interval request is due, and which one it is.
@@ -363,6 +583,7 @@ struct SenderClockTarget {
     peer: IpAddr,
     status: SenderClockStatus,
     requests: Option<RequestSchedule>,
+    last_announce: Option<LastAnnounce>,
 }
 
 /// One interval request due now.
@@ -372,9 +593,122 @@ struct DueRequest {
     intervals: [u8; 3],
 }
 
+/// This receiver acting as one control peer's PTP master, as Apple's own
+/// receiver is for an iPad (see the module documentation).
+///
+/// Entered once per peer, by [`SenderClockRegistry::evaluate_masters`], when
+/// one of the peer's sessions saw it announce itself as grandmaster (not
+/// this receiver) at least [`MASTER_TRIGGER_AFTER`] before, its latest
+/// Announce still does so and is fresh, and none of its sessions received a
+/// Sync or Follow_Up from it. Sends go to that peer only, from the observer's
+/// 319/320 sockets: Announce + Apple Signaling to its 320 every
+/// [`MASTER_ANNOUNCE_INTERVAL`], two-step Sync to its 319 and Follow_Up to its
+/// 320 every [`MASTER_SYNC_INTERVAL`], both starting at once.
+///
+/// Yields for good (until the peer's last session ends) when the peer sends
+/// any Sync or Follow_Up, i.e. it is a clock source after all, or announces a
+/// grandmaster that beats ours by BMCA (another master appeared). Re-entering
+/// against a better silent grandmaster would only chase it. The interval
+/// request schedule to the peer pauses while active: a master does not ask
+/// its slave for Sync.
+#[derive(Debug)]
+struct MasterPort {
+    peer: IpAddr,
+    /// The peer's 319 (Sync) and 320 (the rest): the latest Announce's
+    /// source address and its event port.
+    event_to: SocketAddr,
+    general_to: SocketAddr,
+    /// Our dataset; `None` when refused.
+    ours: Option<GrandmasterDataset>,
+    mode: MasterMode,
+    entered_at: Instant,
+    next_announce: Instant,
+    next_sync: Instant,
+    announce_sequence: u16,
+    sync_sequence: u16,
+    announces: u64,
+    syncs: u64,
+}
+
+impl MasterPort {
+    fn summary(&self) -> MasterSummary {
+        MasterSummary {
+            mode: self.mode,
+            announces: self.announces,
+            syncs: self.syncs,
+        }
+    }
+}
+
+/// A master-mode transition, for the observer to log and count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterChange {
+    Entered {
+        peer: IpAddr,
+        sender: GrandmasterDataset,
+        ours: GrandmasterDataset,
+        silent_for: Duration,
+    },
+    Refused {
+        peer: IpAddr,
+        sender: GrandmasterDataset,
+    },
+    Yielded {
+        peer: IpAddr,
+        reason: &'static str,
+        after: Duration,
+        summary: MasterSummary,
+    },
+}
+
+/// One master-mode message due now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterSend {
+    /// Announce, then the Apple Signaling.
+    Announce {
+        peer: IpAddr,
+        to: SocketAddr,
+        dataset: GrandmasterDataset,
+        sequence: u16,
+    },
+    /// Sync, then its Follow_Up.
+    Sync {
+        peer: IpAddr,
+        event_to: SocketAddr,
+        general_to: SocketAddr,
+        sequence: u16,
+    },
+}
+
+/// The next due time of a periodic message sent at `due`: one interval
+/// later, or one interval from `now` after a stall (no burst to catch up).
+fn next_period(due: Instant, interval: Duration, now: Instant) -> Instant {
+    let next = due + interval;
+    if next <= now {
+        now + interval
+    } else {
+        next
+    }
+}
+
+#[derive(Debug, Default)]
+struct RegistryState {
+    targets: Vec<SenderClockTarget>,
+    masters: Vec<MasterPort>,
+}
+
+impl RegistryState {
+    fn master_active(&self, peer: IpAddr) -> bool {
+        self.masters
+            .iter()
+            .any(|master| master.peer == peer && master.mode == MasterMode::Active)
+    }
+}
+
 /// Sender clocks of the live portable sessions, shared by the sessions
 /// (register on SETUP, deregister on drop) and the observer task that counts
-/// their datagrams and asks a self-announcing one for Sync.
+/// their datagrams, asks a self-announcing one for Sync and, if it stays
+/// silent, becomes its master ([`MasterPort`]).
 ///
 /// Request rule, copied from what the iPad does as a slave of macOS's
 /// AirPlay receiver (`airplay-ipad-applercv-20261128T075756Z`): once the
@@ -382,29 +716,40 @@ struct DueRequest {
 /// message interval request with "initial" intervals, a second one asking for
 /// 8 Sync a second [`INTERVAL_REQUEST_FOLLOW_DELAY`] later, and that one again
 /// every [`INTERVAL_REQUEST_PERIOD`] for as long as the session lives, Sync
-/// or not (the real slave keeps sending). Unicast to the Announce's source
-/// address. A later Announce for another grandmaster (a sender relaying a
-/// grouped HomePod) does not stop the schedule; the master port is still the
-/// sender's. Sessions sharing a control peer share one schedule (the oldest
-/// registration's).
+/// or not (the real slave keeps sending), except while this receiver is the
+/// peer's master. Unicast to the Announce's source address. A later Announce
+/// for another grandmaster (a sender relaying a grouped HomePod) does not
+/// stop the schedule; the master port is still the sender's. Sessions
+/// sharing a control peer share one schedule (the oldest registration's).
 #[derive(Debug, Default)]
 pub(crate) struct SenderClockRegistry {
-    targets: Mutex<Vec<SenderClockTarget>>,
+    state: Mutex<RegistryState>,
     next_id: AtomicU64,
+    /// This receiver's clockIdentity; 0 where it never sends (macOS, tests).
+    own_identity: u64,
 }
 
 impl SenderClockRegistry {
+    pub(crate) fn new(own_identity: u64) -> Self {
+        Self {
+            own_identity,
+            ..Self::default()
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegistryState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn register(self: &Arc<Self>, peer: IpAddr) -> SenderClockWatch {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.targets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(SenderClockTarget {
-                id,
-                peer,
-                status: SenderClockStatus::default(),
-                requests: None,
-            });
+        self.lock().targets.push(SenderClockTarget {
+            id,
+            peer,
+            status: SenderClockStatus::default(),
+            requests: None,
+            last_announce: None,
+        });
         SenderClockWatch {
             registry: Arc::clone(self),
             id,
@@ -412,18 +757,21 @@ impl SenderClockRegistry {
     }
 
     fn status(&self, id: u64) -> Option<SenderClockStatus> {
-        self.targets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        let state = self.lock();
+        let target = state.targets.iter().find(|target| target.id == id)?;
+        let mut status = target.status;
+        status.master = state
+            .masters
             .iter()
-            .find(|target| target.id == id)
-            .map(|target| target.status)
+            .find(|master| master.peer == target.peer)
+            .map(MasterPort::summary);
+        Some(status)
     }
 
     /// Apply `update` to every live session whose control peer is `peer`.
     fn observe(&self, peer: IpAddr, mut update: impl FnMut(&mut SenderClockTarget)) {
-        let mut targets = self.targets.lock().unwrap_or_else(PoisonError::into_inner);
-        for target in targets.iter_mut().filter(|target| target.peer == peer) {
+        let mut state = self.lock();
+        for target in state.targets.iter_mut().filter(|target| target.peer == peer) {
             update(target);
         }
     }
@@ -436,8 +784,9 @@ impl SenderClockRegistry {
             return false;
         }
         let mut started = false;
-        let mut targets = self.targets.lock().unwrap_or_else(PoisonError::into_inner);
-        for target in targets
+        let mut state = self.lock();
+        for target in state
+            .targets
             .iter_mut()
             .filter(|target| target.peer == peer && target.requests.is_none())
         {
@@ -451,28 +800,43 @@ impl SenderClockRegistry {
         started
     }
 
-    /// The earliest due time of any schedule.
+    /// The earliest due time of any request schedule (paused ones aside) or
+    /// active master's next message.
     fn next_due(&self) -> Option<Instant> {
-        self.targets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        let state = self.lock();
+        let requests = state
+            .targets
             .iter()
-            .filter_map(|target| target.requests.map(|schedule| schedule.due))
-            .min()
+            .filter(|target| !state.master_active(target.peer))
+            .filter_map(|target| target.requests.map(|schedule| schedule.due));
+        let masters = state
+            .masters
+            .iter()
+            .filter(|master| master.mode == MasterMode::Active)
+            .map(|master| master.next_announce.min(master.next_sync));
+        requests.chain(masters).min()
     }
 
     /// Take every request due at `now` and advance its schedule; one per
-    /// control peer (the oldest session's schedule serves the peer).
+    /// control peer (the oldest session's schedule serves the peer). Paused
+    /// while this receiver is the peer's master.
     fn take_due(&self, now: Instant) -> Vec<DueRequest> {
-        let mut targets = self.targets.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.lock();
+        let state = &mut *guard;
         let mut served: Vec<IpAddr> = Vec::new();
         let mut sent: Vec<(IpAddr, u64)> = Vec::new();
         let mut due = Vec::new();
-        for target in targets.iter_mut() {
+        let paused: Vec<IpAddr> = state
+            .masters
+            .iter()
+            .filter(|master| master.mode == MasterMode::Active)
+            .map(|master| master.peer)
+            .collect();
+        for target in state.targets.iter_mut() {
             let Some(schedule) = target.requests.as_mut() else {
                 continue;
             };
-            if served.contains(&target.peer) {
+            if served.contains(&target.peer) || paused.contains(&target.peer) {
                 continue;
             }
             served.push(target.peer);
@@ -497,11 +861,158 @@ impl SenderClockRegistry {
             sent.push((target.peer, schedule.sent));
         }
         for (peer, count) in sent {
-            for target in targets.iter_mut().filter(|target| target.peer == peer) {
+            for target in state.targets.iter_mut().filter(|target| target.peer == peer) {
                 target.status.interval_requests = count;
             }
         }
         due
+    }
+
+    /// Enter master mode for every control peer that qualifies now (see
+    /// [`MasterPort`]).
+    fn evaluate_masters(&self, own_identity: u64, now: Instant) -> Vec<MasterChange> {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        let mut changes = Vec::new();
+        let mut peers: Vec<IpAddr> = Vec::new();
+        for target in &state.targets {
+            if !peers.contains(&target.peer)
+                && !state.masters.iter().any(|master| master.peer == target.peer)
+            {
+                peers.push(target.peer);
+            }
+        }
+        for peer in peers {
+            let mut sessions = state.targets.iter().filter(|target| target.peer == peer);
+            if sessions.clone().any(|target| target.status.timing_messages() > 0) {
+                continue;
+            }
+            let Some((announce, first)) = sessions.find_map(|target| {
+                let announce = target.last_announce?;
+                let first = target.status.first_announce_at?;
+                (announce.names_itself(own_identity)
+                    && now.saturating_duration_since(announce.at) <= ANNOUNCE_LIFETIME
+                    && now.saturating_duration_since(first) >= MASTER_TRIGGER_AFTER)
+                    .then_some((announce, first))
+            }) else {
+                continue;
+            };
+            let sender = announce.dataset;
+            let ours = master_dataset(sender, own_identity);
+            state.masters.push(MasterPort {
+                peer,
+                event_to: SocketAddr::new(announce.clock.from.ip(), PTP_EVENT_PORT),
+                general_to: announce.clock.from,
+                ours,
+                mode: if ours.is_some() {
+                    MasterMode::Active
+                } else {
+                    MasterMode::Refused
+                },
+                entered_at: now,
+                next_announce: now,
+                next_sync: now,
+                // Apple's receiver numbers both from 1.
+                announce_sequence: 1,
+                sync_sequence: 1,
+                announces: 0,
+                syncs: 0,
+            });
+            changes.push(match ours {
+                Some(ours) => MasterChange::Entered {
+                    peer,
+                    sender,
+                    ours,
+                    silent_for: now.saturating_duration_since(first),
+                },
+                None => MasterChange::Refused { peer, sender },
+            });
+        }
+        changes
+    }
+
+    /// Leave master mode for `peer` for good, if active.
+    fn yield_master(&self, peer: IpAddr, reason: &'static str, now: Instant) -> Option<MasterChange> {
+        let mut state = self.lock();
+        let master = state
+            .masters
+            .iter_mut()
+            .find(|master| master.peer == peer && master.mode == MasterMode::Active)?;
+        master.mode = MasterMode::Yielded(reason);
+        Some(MasterChange::Yielded {
+            peer,
+            reason,
+            after: now.saturating_duration_since(master.entered_at),
+            summary: master.summary(),
+        })
+    }
+
+    /// An Announce from `peer` naming `dataset`'s grandmaster: yield when
+    /// that grandmaster beats ours.
+    fn master_sees_announce(
+        &self,
+        peer: IpAddr,
+        dataset: GrandmasterDataset,
+        now: Instant,
+    ) -> Option<MasterChange> {
+        let beaten = self.lock().masters.iter().any(|master| {
+            master.peer == peer
+                && master.mode == MasterMode::Active
+                && master.ours.is_some_and(|ours| dataset.better_than(ours))
+        });
+        if beaten {
+            self.yield_master(peer, "better_grandmaster", now)
+        } else {
+            None
+        }
+    }
+
+    /// Every master message due at `now`, advancing the schedules.
+    fn take_master_due(&self, now: Instant) -> Vec<MasterSend> {
+        let mut state = self.lock();
+        let mut due = Vec::new();
+        for master in state
+            .masters
+            .iter_mut()
+            .filter(|master| master.mode == MasterMode::Active)
+        {
+            let Some(dataset) = master.ours else {
+                continue;
+            };
+            if master.next_announce <= now {
+                due.push(MasterSend::Announce {
+                    peer: master.peer,
+                    to: master.general_to,
+                    dataset,
+                    sequence: master.announce_sequence,
+                });
+                master.announce_sequence = master.announce_sequence.wrapping_add(1);
+                master.announces += 1;
+                master.next_announce = next_period(master.next_announce, MASTER_ANNOUNCE_INTERVAL, now);
+            }
+            if master.next_sync <= now {
+                due.push(MasterSend::Sync {
+                    peer: master.peer,
+                    event_to: master.event_to,
+                    general_to: master.general_to,
+                    sequence: master.sync_sequence,
+                });
+                master.sync_sequence = master.sync_sequence.wrapping_add(1);
+                master.syncs += 1;
+                master.next_sync = next_period(master.next_sync, MASTER_SYNC_INTERVAL, now);
+            }
+        }
+        due
+    }
+
+    /// Send `peer`'s master messages to these addresses instead (tests bind
+    /// ephemeral ports, not 319/320).
+    #[cfg(test)]
+    fn test_redirect_master(&self, peer: IpAddr, event_to: SocketAddr, general_to: SocketAddr) {
+        for master in self.lock().masters.iter_mut().filter(|master| master.peer == peer) {
+            master.event_to = event_to;
+            master.general_to = general_to;
+        }
     }
 
     /// Record an Announce from `peer` naming `grandmaster`, as the observer
@@ -516,15 +1027,29 @@ impl SenderClockRegistry {
     }
 
     fn deregister(&self, id: u64) {
-        self.targets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|target| target.id != id);
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        state.targets.retain(|target| target.id != id);
+        let targets = &state.targets;
+        state.masters.retain(|master| {
+            let keep = targets.iter().any(|target| target.peer == master.peer);
+            if !keep && master.mode == MasterMode::Active {
+                log::info!(
+                    target: "audiohub_airplay::airplay2",
+                    "AirPlay 2 PTP master mode for {} ended with its last session after {} ms ({})",
+                    master.peer,
+                    master.entered_at.elapsed().as_millis(),
+                    master.summary()
+                );
+            }
+            keep
+        });
     }
 }
 
 /// A session's registration in the [`SenderClockRegistry`]; dropping it
-/// (the session ending) stops its interval requests.
+/// (the session ending) stops its interval requests, and master mode for its
+/// control peer once no other session of that peer is left.
 #[derive(Debug)]
 pub(crate) struct SenderClockWatch {
     registry: Arc<SenderClockRegistry>,
@@ -552,9 +1077,9 @@ fn interval_request(own_identity: u64, sequence: u16, intervals: [u8; 3]) -> [u8
     packet[1] = PTP_VERSION;
     packet[2..4].copy_from_slice(&(PTP_INTERVAL_REQUEST_BYTES as u16).to_be_bytes());
     packet[4] = PTP_DOMAIN;
-    packet[6..8].copy_from_slice(&INTERVAL_REQUEST_FLAGS.to_be_bytes());
+    packet[6..8].copy_from_slice(&APPLE_UNICAST_FLAGS.to_be_bytes());
     packet[20..28].copy_from_slice(&own_identity.to_be_bytes());
-    packet[28..30].copy_from_slice(&INTERVAL_REQUEST_PORT.to_be_bytes());
+    packet[28..30].copy_from_slice(&OWN_PTP_PORT.to_be_bytes());
     packet[30..32].copy_from_slice(&sequence.to_be_bytes());
     packet[32] = INTERVAL_REQUEST_CONTROL_FIELD;
     packet[33] = INTERVAL_REQUEST_LOG_INTERVAL;
@@ -563,6 +1088,116 @@ fn interval_request(own_identity: u64, sequence: u16, intervals: [u8; 3]) -> [u8
     packet[54..57].copy_from_slice(&intervals);
     packet[57] = INTERVAL_REQUEST_TLV_FLAGS;
     // 58..60 reserved.
+    packet
+}
+
+/// The PTP header of a message this receiver sends as master: version 2,
+/// domain 0, correctionField 0, sourcePortIdentity `identity`:[`OWN_PTP_PORT`].
+fn write_master_header(
+    packet: &mut [u8],
+    message_type: u8,
+    flags: u16,
+    identity: u64,
+    sequence: u16,
+    (control, log_interval): (u8, u8),
+) {
+    let length = u16::try_from(packet.len()).expect("PTP message length fits 16 bits");
+    packet[0] = (PTP_MAJOR_SDO_ID << 4) | message_type;
+    packet[1] = PTP_VERSION;
+    packet[2..4].copy_from_slice(&length.to_be_bytes());
+    packet[4] = PTP_DOMAIN;
+    packet[6..8].copy_from_slice(&flags.to_be_bytes());
+    // 8..16 correctionField and 16..20 messageTypeSpecific stay zero.
+    packet[20..28].copy_from_slice(&identity.to_be_bytes());
+    packet[28..30].copy_from_slice(&OWN_PTP_PORT.to_be_bytes());
+    packet[30..32].copy_from_slice(&sequence.to_be_bytes());
+    packet[32] = control;
+    packet[33] = log_interval;
+}
+
+/// A PTP Timestamp (48-bit seconds, 32-bit nanoseconds) of `ns`.
+fn write_timestamp(bytes: &mut [u8], ns: u64) {
+    let per_second = NANOS_PER_SECOND as u64;
+    let (seconds, nanos) = (ns / per_second, (ns % per_second) as u32);
+    bytes[0..2].copy_from_slice(&((seconds >> 32) as u16).to_be_bytes());
+    bytes[2..6].copy_from_slice(&(seconds as u32).to_be_bytes());
+    bytes[6..10].copy_from_slice(&nanos.to_be_bytes());
+}
+
+/// Master Announce, byte for byte as Apple's receiver sends it
+/// (`airplay-ipad-applercv-20261128T075756Z`) but for `dataset`: zero
+/// originTimestamp, currentUtcOffset 37, stepsRemoved 0, timeSource
+/// internal oscillator and a PATH_TRACE TLV naming this clock.
+fn master_announce(dataset: GrandmasterDataset, sequence: u16) -> [u8; PTP_MASTER_ANNOUNCE_BYTES] {
+    let mut packet = [0u8; PTP_MASTER_ANNOUNCE_BYTES];
+    write_master_header(
+        &mut packet,
+        MESSAGE_ANNOUNCE,
+        APPLE_UNICAST_FLAGS,
+        dataset.identity,
+        sequence,
+        (CONTROL_OTHER, MASTER_ANNOUNCE_LOG_INTERVAL),
+    );
+    packet[44..46].copy_from_slice(&CURRENT_UTC_OFFSET.to_be_bytes());
+    packet[47] = dataset.priority1;
+    packet[48] = dataset.quality.class;
+    packet[49] = dataset.quality.accuracy;
+    packet[50..52].copy_from_slice(&dataset.quality.variance.to_be_bytes());
+    packet[52] = dataset.priority2;
+    packet[53..61].copy_from_slice(&dataset.identity.to_be_bytes());
+    packet[63] = TIME_SOURCE_INTERNAL_OSCILLATOR;
+    packet[64..68].copy_from_slice(&[0x00, 0x08, 0x00, 0x08]);
+    packet[68..76].copy_from_slice(&dataset.identity.to_be_bytes());
+    packet
+}
+
+/// Master Signaling with Apple's two organization-extension TLVs, sent
+/// after every Announce as Apple's receiver does; targetPortIdentity zero.
+fn master_signaling(identity: u64, sequence: u16) -> [u8; PTP_MASTER_SIGNALING_BYTES] {
+    let mut packet = [0u8; PTP_MASTER_SIGNALING_BYTES];
+    write_master_header(
+        &mut packet,
+        MESSAGE_SIGNALING,
+        APPLE_UNICAST_FLAGS,
+        identity,
+        sequence,
+        (CONTROL_OTHER, INTERVAL_REQUEST_LOG_INTERVAL),
+    );
+    packet[PTP_SIGNALING_BYTES..].copy_from_slice(&APPLE_SIGNALING_TLVS);
+    packet
+}
+
+/// Master two-step Sync: zero originTimestamp, flags 0x0608.
+fn master_sync(identity: u64, sequence: u16) -> [u8; PTP_SYNC_BYTES] {
+    let mut packet = [0u8; PTP_SYNC_BYTES];
+    write_master_header(
+        &mut packet,
+        MESSAGE_SYNC,
+        MASTER_SYNC_FLAGS,
+        identity,
+        sequence,
+        (CONTROL_SYNC, MASTER_SYNC_LOG_INTERVAL),
+    );
+    packet
+}
+
+/// Master Follow_Up for the Sync with `sequence`: preciseOriginTimestamp
+/// `origin_ns` on this receiver's timescale, correctionField 0, the 802.1AS
+/// information TLV and Apple's subtype-4 TLV naming this clock.
+fn master_follow_up(identity: u64, sequence: u16, origin_ns: u64) -> [u8; PTP_MASTER_FOLLOW_UP_BYTES] {
+    let mut packet = [0u8; PTP_MASTER_FOLLOW_UP_BYTES];
+    write_master_header(
+        &mut packet,
+        MESSAGE_FOLLOW_UP,
+        APPLE_UNICAST_FLAGS,
+        identity,
+        sequence,
+        (CONTROL_FOLLOW_UP, MASTER_SYNC_LOG_INTERVAL),
+    );
+    write_timestamp(&mut packet[PTP_HEADER_BYTES..PTP_SYNC_BYTES], origin_ns);
+    packet[44..76].copy_from_slice(&FOLLOW_UP_INFORMATION_TLV);
+    packet[76..86].copy_from_slice(&APPLE_FOLLOW_UP_TLV_HEAD);
+    packet[86..94].copy_from_slice(&identity.to_be_bytes());
     packet
 }
 
@@ -847,6 +1482,13 @@ impl PtpClockSource {
     /// Session state shared with the media engine.
     pub(crate) fn session(&self) -> Option<&Arc<SessionShared>> {
         self.session.as_ref()
+    }
+
+    /// The clockIdentity this receiver uses as a sender's PTP master (its
+    /// samples carry it as grandmaster); `None` where it never is (macOS).
+    pub(crate) fn master_identity(&self) -> Option<u64> {
+        let identity = self.clocks.own_identity;
+        (identity != 0).then_some(identity)
     }
 
     /// Whether deadlines come from a platform clock (macOS TimeSync or
@@ -1234,12 +1876,18 @@ pub(crate) struct PtpObserver {
     pending_follow_ups: HashMap<SyncKey, PendingFollowUp>,
     completed_pairs: HashMap<SyncKey, (Instant, crate::telemetry::OperationToken)>,
     clocks: Arc<SenderClockRegistry>,
-    /// This receiver's clockIdentity (interval requests; an Announce naming
-    /// it as grandmaster is ignored).
+    /// This receiver's clockIdentity (interval requests and master mode; an
+    /// Announce naming it as grandmaster is ignored).
     own_identity: u64,
+    /// Time of this receiver's Syncs in master mode.
+    timescale: OwnTimescale,
+    /// sequenceId of every Signaling this receiver sends (interval requests
+    /// and master Signaling share one port, so one sequence space).
     request_sequence: u16,
     /// A refused request is logged once per observer, then at debug.
     request_failure_logged: bool,
+    /// A refused master message is logged once per master entry.
+    master_failure_logged: bool,
 }
 
 impl PtpObserver {
@@ -1260,8 +1908,10 @@ impl PtpObserver {
             completed_pairs: HashMap::with_capacity(16),
             clocks,
             own_identity,
+            timescale: OwnTimescale::process(),
             request_sequence: 0,
             request_failure_logged: false,
+            master_failure_logged: false,
         }
     }
 
@@ -1312,7 +1962,7 @@ impl PtpObserver {
         let event_socket = UdpSocket::bind(event_address).await?;
         let general_socket = UdpSocket::bind(general_address).await?;
         let (samples, _) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
-        let clocks = Arc::new(SenderClockRegistry::default());
+        let clocks = Arc::new(SenderClockRegistry::new(own_identity));
         let source = PtpClockSource::portable(samples.clone(), Arc::clone(&clocks));
         Ok((
             Self::new(
@@ -1395,10 +2045,14 @@ impl PtpObserver {
                     }
                 }
                 _ = tokio::time::sleep_until(next_request.unwrap_or_else(Instant::now).into()), if next_request.is_some() => {
-                    self.send_due_requests(&general_socket, Instant::now()).await;
+                    let now = Instant::now();
+                    self.send_due_requests(&general_socket, now).await;
+                    self.send_master_due(&event_socket, &general_socket, now).await;
                 }
                 _ = prune_tick.tick() => {
-                    self.prune(Instant::now());
+                    let now = Instant::now();
+                    self.prune(now);
+                    self.evaluate_masters(now);
                 }
             }
         }
@@ -1412,15 +2066,7 @@ impl PtpObserver {
         for request in self.clocks.take_due(now) {
             let packet = interval_request(self.own_identity, self.request_sequence, request.intervals);
             self.request_sequence = self.request_sequence.wrapping_add(1);
-            let result = match tokio::time::timeout(
-                INTERVAL_REQUEST_SEND_TIMEOUT,
-                socket.send_to(&packet, request.to),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "socket not writable")),
-            };
+            let result = send_datagram(socket, &packet, request.to).await;
             let sent = match result {
                 Ok(_) => true,
                 Err(error) => {
@@ -1449,6 +2095,170 @@ impl PtpObserver {
         }
     }
 
+    /// Send every master-mode message that is due (see [`MasterPort`]).
+    /// The Follow_Up's preciseOriginTimestamp is the software time halfway
+    /// through the Sync's send call, and that same instant and time become a
+    /// clock sample of this receiver's own timeline for the peer's sessions:
+    /// the anchor the peer sends on our timeline then maps exactly.
+    async fn send_master_due(&mut self, event_socket: &UdpSocket, general_socket: &UdpSocket, now: Instant) {
+        for send in self.clocks.take_master_due(now) {
+            match send {
+                MasterSend::Announce {
+                    peer,
+                    to,
+                    dataset,
+                    sequence,
+                } => {
+                    let mut result = send_datagram(general_socket, &master_announce(dataset, sequence), to).await;
+                    if result.is_ok() {
+                        let signaling = master_signaling(self.own_identity, self.request_sequence);
+                        self.request_sequence = self.request_sequence.wrapping_add(1);
+                        result = send_datagram(general_socket, &signaling, to).await;
+                    }
+                    self.master_sent(peer, crate::telemetry::PtpMasterMessage::Announce, result);
+                }
+                MasterSend::Sync {
+                    peer,
+                    event_to,
+                    general_to,
+                    sequence,
+                } => {
+                    let before = Instant::now();
+                    let result = send_datagram(event_socket, &master_sync(self.own_identity, sequence), event_to).await;
+                    let sent_at = before + before.elapsed() / 2;
+                    let origin_ns = self.timescale.time_ns(sent_at);
+                    let result = match result {
+                        Ok(()) => {
+                            send_datagram(
+                                general_socket,
+                                &master_follow_up(self.own_identity, sequence, origin_ns),
+                                general_to,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if result.is_ok() {
+                        self.emit_own_sample(peer, origin_ns, sent_at);
+                    }
+                    self.master_sent(peer, crate::telemetry::PtpMasterMessage::Sync, result);
+                }
+            }
+        }
+    }
+
+    /// Publish one of this receiver's own Syncs as a sample of its own
+    /// timeline for `peer`'s sessions: remote time `origin_ns` at local
+    /// `sent_at`, so their mapper's offset is exact and constant.
+    fn emit_own_sample(&self, peer: IpAddr, origin_ns: u64, sent_at: Instant) {
+        let telemetry_token = crate::telemetry::operation_token();
+        let delivered = self
+            .samples
+            .send(PtpClockSample {
+                peer,
+                grandmaster: self.own_identity,
+                remote_time_ns: origin_ns,
+                received_at: sent_at,
+                telemetry_token,
+            })
+            .is_ok();
+        crate::telemetry::record_ptp_sample_emitted(telemetry_token, delivered);
+    }
+
+    fn master_sent(&mut self, peer: IpAddr, message: crate::telemetry::PtpMasterMessage, result: io::Result<()>) {
+        if let Err(error) = &result {
+            if self.master_failure_logged {
+                log::debug!(
+                    target: "audiohub_airplay::airplay2",
+                    "AirPlay 2 PTP master {message:?} to {peer} not sent: {error}"
+                );
+            } else {
+                self.master_failure_logged = true;
+                log::warn!(
+                    target: "audiohub_airplay::airplay2",
+                    "AirPlay 2 PTP master {message:?} to {peer} not sent: {error}"
+                );
+            }
+        }
+        crate::telemetry::record_ptp_master_send(
+            crate::telemetry::operation_token(),
+            peer,
+            message,
+            result.is_ok(),
+        );
+    }
+
+    /// Enter master mode where a session's control peer qualifies.
+    fn evaluate_masters(&mut self, now: Instant) {
+        for change in self.clocks.evaluate_masters(self.own_identity, now) {
+            self.report_master(change);
+        }
+    }
+
+    fn report_master(&mut self, change: MasterChange) {
+        let token = crate::telemetry::operation_token();
+        match change {
+            MasterChange::Entered {
+                peer,
+                sender,
+                ours,
+                silent_for,
+            } => {
+                self.master_failure_logged = false;
+                crate::telemetry::record_ptp_master_mode(
+                    token,
+                    peer,
+                    crate::telemetry::PtpMasterTransition::Entered,
+                );
+                log::info!(
+                    target: "audiohub_airplay::airplay2",
+                    "AirPlay 2 PTP master mode entered for {peer}: it announces itself as grandmaster {:016x} (priority1 {} clockClass {} accuracy 0x{:02x} variance 0x{:04x} priority2 {}) but sent no Sync/Follow_Up in {} ms; announcing {:016x}:{OWN_PTP_PORT:04x} with priority1 {} priority2 {}, Announce 4/s and two-step Sync 8/s unicast to {peer}:319/320",
+                    sender.identity,
+                    sender.priority1,
+                    sender.quality.class,
+                    sender.quality.accuracy,
+                    sender.quality.variance,
+                    sender.priority2,
+                    silent_for.as_millis(),
+                    ours.identity,
+                    ours.priority1,
+                    ours.priority2
+                );
+            }
+            MasterChange::Refused { peer, sender } => {
+                crate::telemetry::record_ptp_master_mode(
+                    token,
+                    peer,
+                    crate::telemetry::PtpMasterTransition::Refused,
+                );
+                log::info!(
+                    target: "audiohub_airplay::airplay2",
+                    "AirPlay 2 PTP master mode refused for {peer}: its grandmaster {:016x} announces priority1 {} priority2 {}, which no honest dataset of this receiver outranks; staying a slave",
+                    sender.identity,
+                    sender.priority1,
+                    sender.priority2
+                );
+            }
+            MasterChange::Yielded {
+                peer,
+                reason,
+                after,
+                summary,
+            } => {
+                crate::telemetry::record_ptp_master_mode(
+                    token,
+                    peer,
+                    crate::telemetry::PtpMasterTransition::Yielded,
+                );
+                log::info!(
+                    target: "audiohub_airplay::airplay2",
+                    "AirPlay 2 PTP master mode yielded for {peer} after {} ms (reason={reason}, {summary}); following the sender's clock again",
+                    after.as_millis()
+                );
+            }
+        }
+    }
+
     /// After an Announce from `peer`: start asking it for Sync if it
     /// announces itself as grandmaster to a session (see
     /// [`SenderClockRegistry`]).
@@ -1468,10 +2278,44 @@ impl PtpObserver {
         if self.clocks.start_requests(peer.ip(), announced, self.own_identity, now) {
             log::info!(
                 target: "audiohub_airplay::airplay2",
-                "AirPlay 2 PTP sender {} clock {clock:016x} announces itself as grandmaster (priority1 {priority1} priority2 {priority2}); sending 802.1AS message interval requests (8 Sync/s) to {peer} as port {:016x}:{INTERVAL_REQUEST_PORT:04x}",
+                "AirPlay 2 PTP sender {} clock {clock:016x} announces itself as grandmaster (priority1 {priority1} priority2 {priority2}); sending 802.1AS message interval requests (8 Sync/s) to {peer} as port {:016x}:{OWN_PTP_PORT:04x}",
                 peer.ip(),
                 self.own_identity
             );
+        }
+    }
+
+    /// Master-mode input from one parsed datagram of `peer`: Sync or
+    /// Follow_Up means it is a clock source (yield); an Announce may name a
+    /// better grandmaster (yield) or complete the trigger (enter).
+    fn update_master(&mut self, peer: IpAddr, message: Message, received_at: Instant) {
+        let change = match message {
+            Message::Sync { .. } | Message::FollowUp { .. } => {
+                self.clocks.yield_master(peer, "sender_sends_sync", received_at)
+            }
+            Message::Announce {
+                grandmaster,
+                priority1,
+                priority2,
+                quality,
+                ..
+            } => self.clocks.master_sees_announce(
+                peer,
+                GrandmasterDataset {
+                    priority1,
+                    quality,
+                    priority2,
+                    identity: grandmaster,
+                },
+                received_at,
+            ),
+            Message::Signaling { .. } => None,
+        };
+        if let Some(change) = change {
+            self.report_master(change);
+        }
+        if matches!(message, Message::Announce { .. }) {
+            self.evaluate_masters(received_at);
         }
     }
 
@@ -1480,10 +2324,30 @@ impl PtpObserver {
         self.clocks.observe(peer.ip(), |target| {
             let status = &mut target.status;
             match message {
-                Message::Announce { grandmaster, .. } => {
+                Message::Announce {
+                    header,
+                    grandmaster,
+                    priority1,
+                    priority2,
+                    quality,
+                } => {
                     status.announces += 1;
                     status.first_announce_at.get_or_insert(received_at);
                     status.grandmaster = Some(grandmaster);
+                    target.last_announce = Some(LastAnnounce {
+                        clock: AnnouncedClock {
+                            from: peer,
+                            clock: header.source.clock,
+                            grandmaster,
+                        },
+                        dataset: GrandmasterDataset {
+                            priority1,
+                            quality,
+                            priority2,
+                            identity: grandmaster,
+                        },
+                        at: received_at,
+                    });
                 }
                 Message::Sync {
                     one_step_origin_ns: None,
@@ -1570,6 +2434,7 @@ impl PtpObserver {
 
         self.prune(received_at);
         self.note_sender_message(peer, message, received_at);
+        self.update_master(peer.ip(), message, received_at);
         match message {
             Message::Signaling { .. } => {
                 crate::telemetry::record_ptp_datagram(
@@ -1587,6 +2452,7 @@ impl PtpObserver {
                 grandmaster,
                 priority1,
                 priority2,
+                ..
             } => {
                 let priorities = (priority1, priority2);
                 if self.announcements.len() >= MAX_CLOCK_SOURCES
@@ -2007,6 +2873,11 @@ fn parse_message(packet: &[u8]) -> Result<Message, PtpParseError> {
             header,
             priority1: packet[47],
             priority2: packet[52],
+            quality: ClockQuality {
+                class: packet[48],
+                accuracy: packet[49],
+                variance: u16::from_be_bytes([packet[50], packet[51]]),
+            },
             grandmaster: u64::from_be_bytes(
                 packet[53..61]
                     .try_into()
@@ -2017,6 +2888,16 @@ fn parse_message(packet: &[u8]) -> Result<Message, PtpParseError> {
             Ok(Message::Signaling { header })
         }
         _ => Err(PtpParseError::UnsupportedMessage),
+    }
+}
+
+/// Send one datagram, waiting for the socket to be writable (a `try_send_to`
+/// on a socket that has only been read can report `WouldBlock`) at most
+/// [`PTP_SEND_TIMEOUT`].
+async fn send_datagram(socket: &UdpSocket, packet: &[u8], to: SocketAddr) -> io::Result<()> {
+    match tokio::time::timeout(PTP_SEND_TIMEOUT, socket.send_to(packet, to)).await {
+        Ok(result) => result.map(|_| ()),
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "socket not writable")),
     }
 }
 
@@ -2602,6 +3483,7 @@ mod tests {
                 grandmaster: 0x5273_7ec2_e765_0008,
                 priority1: 250,
                 priority2: 239,
+                ..
             })
         ));
         assert!(matches!(
@@ -3268,7 +4150,7 @@ mod tests {
     fn expected_request(template: &str, sequence: u16) -> Vec<u8> {
         let mut packet = hex::decode(template).unwrap();
         packet[20..28].copy_from_slice(&OWN_CLOCK.to_be_bytes());
-        packet[28..30].copy_from_slice(&INTERVAL_REQUEST_PORT.to_be_bytes());
+        packet[28..30].copy_from_slice(&OWN_PTP_PORT.to_be_bytes());
         packet[30..32].copy_from_slice(&sequence.to_be_bytes());
         packet
     }
@@ -3301,7 +4183,7 @@ mod tests {
             Ok(Message::Signaling {
                 header: Header {
                     sequence: 0xabcd,
-                    source: PortIdentity { clock: OWN_CLOCK, port: INTERVAL_REQUEST_PORT },
+                    source: PortIdentity { clock: OWN_CLOCK, port: OWN_PTP_PORT },
                     ..
                 }
             })
@@ -3321,6 +4203,7 @@ mod tests {
                 grandmaster: IPAD_CLOCK,
                 priority1: 250,
                 priority2: 246,
+                quality: ClockQuality { class: 248, accuracy: 0x21, variance: 0x436a },
             })
         ));
         for signaling in [IPAD_SIGNALING, IPAD_REQUEST_INITIAL, IPAD_REQUEST_8HZ] {
@@ -3354,11 +4237,13 @@ mod tests {
         assert_eq!(clocks.next_due(), Some(at(1_030)));
         // More Announces do not restart or double the schedule.
         observer.receive(&ipad_announce(2), general(peer), PTP_GENERAL_PORT, at(250));
+        // Sync starting (before the master-mode trigger) does not stop it:
+        // the real slave keeps asking.
+        observer.receive(&ipad_follow_up(1, 10), general(peer), PTP_GENERAL_PORT, at(400));
         observer.receive(&ipad_announce(3), general(peer), PTP_GENERAL_PORT, at(500));
         assert!(clocks.take_due(at(1_000)).is_empty());
         assert_eq!(clocks.take_due(at(1_030)).len(), 1);
-        // Sync starting does not stop it (the real slave keeps asking).
-        observer.receive(&ipad_follow_up(1, 10), general(peer), PTP_GENERAL_PORT, at(1_100));
+        assert_eq!(watch.status().unwrap().master, None, "a clock source never gets a master");
         let due = clocks.take_due(at(2_030));
         assert_eq!(
             due,
@@ -3507,6 +4392,336 @@ mod tests {
         let other: io::Result<u8> = Err(io::Error::from(io::ErrorKind::PermissionDenied));
         assert!(tolerate_reset(other).is_err());
         assert!(matches!(tolerate_reset(Ok(3u8)), Ok(Some(3))));
+    }
+    // ------------------------------------------------- receiver as PTP master
+
+    /// Apple's own AirPlay receiver (macOS, 10.130.32.13) as the iPad's
+    /// master (airplay-ipad-applercv-20261128T075756Z/ipad-ptp.pcap): its
+    /// first Announce, Signaling, Sync and Follow_Up of the session on
+    /// sourcePort 0x8016.
+    const APPLE_RCV_CLOCK: u64 = 0x5273_7efc_a4c2_0008;
+    const APPLE_RCV_ANNOUNCE: &str = concat!(
+        "1b02004c0000040800000000000000000000000052737efca4c200088016000105fe",
+        "00000000000000000000002500faf821436aed52737efca4c200080000a000080008",
+        "52737efca4c20008"
+    );
+    const APPLE_RCV_SIGNALING: &str = concat!(
+        "1c02006a0000040800000000000000000000000052737efca4c20008801600000580",
+        "0000000000000000000000030016000d930000010007000000002710000027100039",
+        "676300030020000d93000005001f00000000000027100000271000002710000027100039",
+        "6763"
+    );
+    const APPLE_RCV_SYNC: &str = concat!(
+        "1002002c0000060800000000000000000000000052737efca4c200088016000100fd",
+        "00000000000000000000"
+    );
+    const APPLE_RCV_FOLLOW_UP: &str = concat!(
+        "180200600000040800000000fafa00000000000052737efca4c200088016000102fd",
+        "00000027d39a180318e60003001c0080c2000001000000000000ffffffff00069cd4",
+        "f1bd68b5fec72af700030010000d9300000452737efca4c200080000"
+    );
+
+    /// A captured Apple receiver message with our port number.
+    fn apple_rcv(text: &str) -> Vec<u8> {
+        let mut packet = hex::decode(text).unwrap();
+        packet[28..30].copy_from_slice(&OWN_PTP_PORT.to_be_bytes());
+        packet
+    }
+
+    fn ipad_dataset() -> GrandmasterDataset {
+        GrandmasterDataset {
+            priority1: 250,
+            quality: ClockQuality {
+                class: 248,
+                accuracy: 0x21,
+                variance: 0x436a,
+            },
+            priority2: 246,
+            identity: IPAD_CLOCK,
+        }
+    }
+
+    #[test]
+    fn master_messages_match_the_apple_receiver_bytes_but_for_documented_fields() {
+        // Announce and Sync: identical, given the Apple receiver's dataset.
+        let apple = GrandmasterDataset {
+            priority2: 237,
+            identity: APPLE_RCV_CLOCK,
+            ..ipad_dataset()
+        };
+        assert_eq!(master_announce(apple, 1).to_vec(), apple_rcv(APPLE_RCV_ANNOUNCE));
+        assert_eq!(master_sync(APPLE_RCV_CLOCK, 1).to_vec(), apple_rcv(APPLE_RCV_SYNC));
+        // Signaling: identical but for the last three (time-varying) bytes
+        // of each Apple TLV, which are zero.
+        let mut expected = apple_rcv(APPLE_RCV_SIGNALING);
+        assert_eq!(expected.len(), PTP_MASTER_SIGNALING_BYTES);
+        for end in [PTP_SIGNALING_BYTES + 26, PTP_MASTER_SIGNALING_BYTES] {
+            assert_ne!(expected[end - 3..end], [0, 0, 0]);
+            expected[end - 3..end].fill(0);
+        }
+        assert_eq!(master_signaling(APPLE_RCV_CLOCK, 0).to_vec(), expected);
+        // Follow_Up: same origin; correctionField (the Mac's egress
+        // correction) and the 802.1AS TLV's grandmaster-change history zero.
+        let mut expected = apple_rcv(APPLE_RCV_FOLLOW_UP);
+        assert_eq!(expected.len(), PTP_MASTER_FOLLOW_UP_BYTES);
+        let origin = parse_timestamp(&expected[PTP_HEADER_BYTES..PTP_SYNC_BYTES]).unwrap();
+        expected[8..16].fill(0);
+        expected[54..76].fill(0);
+        assert_eq!(master_follow_up(APPLE_RCV_CLOCK, 1, origin).to_vec(), expected);
+
+        // Our own parser reads them back.
+        let ours = master_dataset(ipad_dataset(), OWN_CLOCK).unwrap();
+        assert!(matches!(
+            parse_message(&master_announce(ours, 7)),
+            Ok(Message::Announce {
+                header: Header { sequence: 7, source: PortIdentity { clock: OWN_CLOCK, port: OWN_PTP_PORT }, .. },
+                grandmaster: OWN_CLOCK,
+                priority1: 250,
+                priority2: 245,
+                quality: ClockQuality { class: 248, accuracy: 0x21, variance: 0x436a },
+            })
+        ));
+        assert!(matches!(
+            parse_message(&master_sync(OWN_CLOCK, 9)),
+            Ok(Message::Sync { one_step_origin_ns: None, header: Header { sequence: 9, .. } })
+        ));
+        assert!(matches!(
+            parse_message(&master_follow_up(OWN_CLOCK, 9, 1_795_000_000_123_456_789)),
+            Ok(Message::FollowUp { origin_ns: 1_795_000_000_123_456_789, header: Header { sequence: 9, .. } })
+        ));
+        assert!(matches!(
+            parse_message(&master_signaling(OWN_CLOCK, 3)),
+            Ok(Message::Signaling { .. })
+        ));
+    }
+
+    #[test]
+    fn master_dataset_beats_the_sender_by_one_priority_step() {
+        let ipad = ipad_dataset();
+        let ours = master_dataset(ipad, OWN_CLOCK).unwrap();
+        assert_eq!(
+            (ours.priority1, ours.priority2, ours.quality, ours.identity),
+            (250, 245, ipad.quality, OWN_CLOCK)
+        );
+        assert!(ours.better_than(ipad) && !ipad.better_than(ours));
+        // Apple's receiver (priority2 237) beats us: we would yield to it.
+        let apple = GrandmasterDataset {
+            priority2: 237,
+            identity: APPLE_RCV_CLOCK,
+            ..ipad
+        };
+        assert!(apple.better_than(ours));
+        // priority2 0: one priority1 step instead.
+        let zero = GrandmasterDataset { priority2: 0, ..ipad };
+        let ours = master_dataset(zero, OWN_CLOCK).unwrap();
+        assert_eq!((ours.priority1, ours.priority2), (249, 0));
+        assert!(ours.better_than(zero));
+        // Nothing left to step: refuse rather than claim a better clock.
+        let floor = GrandmasterDataset {
+            priority1: 0,
+            priority2: 0,
+            ..ipad
+        };
+        assert_eq!(master_dataset(floor, OWN_CLOCK), None);
+        // BMCA order: clock quality decides before priority2.
+        let gps = GrandmasterDataset {
+            quality: ClockQuality { class: 6, ..ipad.quality },
+            priority2: 255,
+            ..ipad
+        };
+        assert!(gps.better_than(master_dataset(ipad, OWN_CLOCK).unwrap()));
+    }
+
+    fn sync_from(clock: u64, sequence: u16) -> Vec<u8> {
+        let mut sync = header(MESSAGE_SYNC, PTP_SYNC_BYTES, sequence, 0);
+        sync[20..28].copy_from_slice(&clock.to_be_bytes());
+        sync
+    }
+
+    fn event(peer: IpAddr) -> SocketAddr {
+        SocketAddr::new(peer, PTP_EVENT_PORT)
+    }
+
+    fn master_mode(watch: &SenderClockWatch) -> Option<MasterMode> {
+        watch.status().unwrap().master.map(|master| master.mode)
+    }
+
+    #[test]
+    fn a_silent_self_announcing_sender_gets_this_receiver_as_master_after_the_trigger() {
+        let peer: IpAddr = "192.0.2.60".parse().unwrap();
+        let (mut observer, clocks, watch) = watched_observer(peer);
+        let base = Instant::now();
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        observer.receive(&ipad_announce(1), general(peer), PTP_GENERAL_PORT, at(0));
+        observer.receive(&ipad_announce(2), general(peer), PTP_GENERAL_PORT, at(250));
+        observer.evaluate_masters(at(499));
+        assert_eq!(master_mode(&watch), None, "not before the trigger");
+        observer.receive(&ipad_announce(3), general(peer), PTP_GENERAL_PORT, at(500));
+        assert_eq!(master_mode(&watch), Some(MasterMode::Active));
+        // Announce (+ Signaling) and Sync (+ Follow_Up) are due at once, to the
+        // peer's 320 and 319, with our dataset.
+        assert_eq!(clocks.next_due(), Some(at(500)));
+        let ours = master_dataset(ipad_dataset(), OWN_CLOCK).unwrap();
+        assert_eq!(
+            clocks.take_master_due(at(500)),
+            vec![
+                MasterSend::Announce { peer, to: general(peer), dataset: ours, sequence: 1 },
+                MasterSend::Sync { peer, event_to: event(peer), general_to: general(peer), sequence: 1 },
+            ]
+        );
+        // 8 Sync and 4 Announce a second.
+        assert!(clocks.take_master_due(at(624)).is_empty());
+        assert_eq!(
+            clocks.take_master_due(at(625)),
+            vec![MasterSend::Sync { peer, event_to: event(peer), general_to: general(peer), sequence: 2 }]
+        );
+        assert_eq!(clocks.take_master_due(at(750)).len(), 2);
+        // Interval requests (started at the first Announce) pause meanwhile.
+        assert!(clocks.take_due(at(5_000)).is_empty());
+        // More silent Announces (the iPad before it yields) change nothing.
+        observer.receive(&ipad_announce(4), general(peer), PTP_GENERAL_PORT, at(760));
+        assert_eq!(master_mode(&watch), Some(MasterMode::Active));
+        let status = watch.status().unwrap();
+        assert_eq!(status.master.map(|master| (master.announces, master.syncs)), Some((2, 3)));
+        assert!(status.to_string().contains(" master=active(announces=2 syncs=3)"));
+
+        // The sender starts sending Sync after all: yield for good, requests resume.
+        observer.receive(&sync_from(IPAD_CLOCK, 1), event(peer), PTP_EVENT_PORT, at(6_000));
+        assert_eq!(master_mode(&watch), Some(MasterMode::Yielded("sender_sends_sync")));
+        assert!(clocks.take_master_due(at(9_000)).is_empty());
+        assert_eq!(clocks.take_due(at(6_000)).len(), 1);
+        observer.receive(&ipad_announce(5), general(peer), PTP_GENERAL_PORT, at(6_100));
+        observer.evaluate_masters(at(9_000));
+        assert_eq!(master_mode(&watch), Some(MasterMode::Yielded("sender_sends_sync")), "not re-entered");
+        // The last session ends: master state goes with it.
+        drop(watch);
+        assert_eq!(clocks.next_due(), None);
+        assert!(clocks.take_master_due(at(10_000)).is_empty());
+    }
+
+    #[test]
+    fn senders_that_send_sync_or_follow_others_never_get_a_master() {
+        let base = Instant::now();
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        // A Mac: announces itself and sends Sync/Follow_Up at once.
+        let mac: IpAddr = "192.0.2.61".parse().unwrap();
+        let (mut observer, clocks, watch) = watched_observer(mac);
+        for (index, ms) in [0u64, 250, 500, 750, 1_000].into_iter().enumerate() {
+            observer.receive(&ipad_announce(index as u16 + 1), general(mac), PTP_GENERAL_PORT, at(ms));
+            observer.receive(&sync_from(IPAD_CLOCK, index as u16), event(mac), PTP_EVENT_PORT, at(ms + 70));
+        }
+        observer.evaluate_masters(at(5_000));
+        assert_eq!(master_mode(&watch), None);
+        assert!(clocks.take_master_due(at(5_000)).is_empty());
+
+        // A sender relaying another grandmaster (boundary clock).
+        let relay: IpAddr = "192.0.2.62".parse().unwrap();
+        let (mut observer, _clocks, watch) = watched_observer(relay);
+        let mut announce = ipad_announce(1);
+        announce[53..61].copy_from_slice(&GRANDMASTER.to_be_bytes());
+        observer.receive(&announce, general(relay), PTP_GENERAL_PORT, at(0));
+        observer.receive(&announce, general(relay), PTP_GENERAL_PORT, at(600));
+        assert_eq!(master_mode(&watch), None);
+
+        // Not a session's control peer.
+        let stranger: IpAddr = "192.0.2.63".parse().unwrap();
+        let (mut observer, clocks, _watch) = watched_observer("192.0.2.64".parse().unwrap());
+        observer.receive(&ipad_announce(1), general(stranger), PTP_GENERAL_PORT, at(0));
+        observer.receive(&ipad_announce(2), general(stranger), PTP_GENERAL_PORT, at(600));
+        assert!(clocks.take_master_due(at(600)).is_empty());
+
+        // A stale Announce (the sender went quiet) does not start it.
+        let quiet: IpAddr = "192.0.2.65".parse().unwrap();
+        let (mut observer, _clocks, watch) = watched_observer(quiet);
+        observer.receive(&ipad_announce(1), general(quiet), PTP_GENERAL_PORT, at(0));
+        observer.evaluate_masters(at(0) + ANNOUNCE_LIFETIME + Duration::from_millis(1));
+        assert_eq!(master_mode(&watch), None);
+    }
+
+    #[test]
+    fn a_better_grandmaster_makes_master_mode_yield_and_an_unbeatable_one_refuses_it() {
+        let base = Instant::now();
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        let peer: IpAddr = "192.0.2.66".parse().unwrap();
+        let (mut observer, _clocks, watch) = watched_observer(peer);
+        observer.receive(&ipad_announce(1), general(peer), PTP_GENERAL_PORT, at(0));
+        observer.receive(&ipad_announce(2), general(peer), PTP_GENERAL_PORT, at(500));
+        assert_eq!(master_mode(&watch), Some(MasterMode::Active));
+        // Its own worse dataset again: no change.
+        observer.receive(&ipad_announce(3), general(peer), PTP_GENERAL_PORT, at(750));
+        assert_eq!(master_mode(&watch), Some(MasterMode::Active));
+        // It now relays a grandmaster with priority2 237 (better than our 245).
+        let mut announce = ipad_announce(4);
+        announce[52] = 237;
+        announce[53..61].copy_from_slice(&GRANDMASTER.to_be_bytes());
+        observer.receive(&announce, general(peer), PTP_GENERAL_PORT, at(1_000));
+        assert_eq!(master_mode(&watch), Some(MasterMode::Yielded("better_grandmaster")));
+
+        // priority1 and priority2 both 0: refused, nothing sent.
+        let floor: IpAddr = "192.0.2.67".parse().unwrap();
+        let (mut observer, clocks, watch) = watched_observer(floor);
+        let mut announce = ipad_announce(1);
+        announce[47] = 0;
+        announce[52] = 0;
+        observer.receive(&announce, general(floor), PTP_GENERAL_PORT, at(0));
+        observer.receive(&announce, general(floor), PTP_GENERAL_PORT, at(500));
+        assert_eq!(master_mode(&watch), Some(MasterMode::Refused));
+        assert!(clocks.take_master_due(at(500)).is_empty());
+        assert!(watch.status().unwrap().to_string().ends_with(" master=refused"));
+    }
+
+    #[tokio::test]
+    async fn master_messages_go_out_and_each_sync_is_an_exact_sample_of_the_own_timeline() {
+        let event_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let general_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_event = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_general = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer = peer_general.local_addr().unwrap().ip();
+        let (samples, mut receiver) = broadcast::channel(8);
+        let clocks = Arc::new(SenderClockRegistry::new(OWN_CLOCK));
+        let _watch = clocks.register(peer);
+        let mut observer = PtpObserver::new(None, None, samples, Arc::clone(&clocks), OWN_CLOCK);
+        let base = Instant::now();
+        observer.receive(&ipad_announce(1), general(peer), PTP_GENERAL_PORT, base);
+        let entered = base + MASTER_TRIGGER_AFTER;
+        observer.receive(&ipad_announce(2), general(peer), PTP_GENERAL_PORT, entered);
+        clocks.test_redirect_master(peer, peer_event.local_addr().unwrap(), peer_general.local_addr().unwrap());
+        let before = Instant::now();
+        observer.send_master_due(&event_socket, &general_socket, entered).await;
+
+        let mut buffer = [0u8; 256];
+        let mut general_messages = Vec::new();
+        for _ in 0..3 {
+            let (length, from) = tokio::time::timeout(Duration::from_secs(2), peer_general.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(from, general_socket.local_addr().unwrap());
+            general_messages.push(buffer[..length].to_vec());
+        }
+        let (length, from) = tokio::time::timeout(Duration::from_secs(2), peer_event.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(from, event_socket.local_addr().unwrap());
+        let ours = master_dataset(ipad_dataset(), OWN_CLOCK).unwrap();
+        assert_eq!(buffer[..length].to_vec(), master_sync(OWN_CLOCK, 1).to_vec());
+        assert_eq!(general_messages[0], master_announce(ours, 1).to_vec());
+        assert_eq!(general_messages[1], master_signaling(OWN_CLOCK, 0).to_vec());
+        let Ok(Message::FollowUp { origin_ns, header }) = parse_message(&general_messages[2]) else {
+            panic!("third general message is the Follow_Up");
+        };
+        assert_eq!((header.sequence, header.source.clock), (1, OWN_CLOCK));
+
+        let sample = receiver.try_recv().unwrap();
+        assert_eq!((sample.peer, sample.grandmaster), (peer, OWN_CLOCK));
+        assert_eq!(sample.remote_time_ns, origin_ns);
+        assert!(sample.received_at >= before && sample.received_at <= Instant::now());
+        assert_eq!(observer.timescale.time_ns(sample.received_at), origin_ns);
+        // Our timescale is the local clock plus a constant.
+        let later = sample.received_at + Duration::from_millis(1_234);
+        assert_eq!(observer.timescale.time_ns(later) - origin_ns, 1_234_000_000);
+        assert!(receiver.try_recv().is_err(), "one sample per Sync");
     }
 }
 

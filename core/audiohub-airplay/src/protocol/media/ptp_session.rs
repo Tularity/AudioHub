@@ -26,7 +26,12 @@
 //!   which is what CoreMedia's `figTimeSyncClock` resync does on Apple
 //!   receivers;
 //! - fails the stream explicitly when neither is possible, instead of
-//!   holding audio forever.
+//!   holding audio forever;
+//! - maps this receiver's own timeline like any other: in master mode
+//!   (`ptp::MasterPort`) the observer publishes its own Syncs as samples of
+//!   the control peer on this receiver's clockIdentity, so an anchor on that
+//!   timeline maps exactly, and an anchor the sender made on its own silent
+//!   clock before it yielded waits for the sender's next anchor.
 //!
 //! macOS backends map inside TimeSync/CoreMedia; there the handoff delta
 //! comes from [`PtpClockSource::platform_handoff`].
@@ -61,14 +66,14 @@ const OBSERVED_FRESH: Duration = Duration::from_secs(2);
 /// Follow_Up gets one WARN per session: at 4 Announces and 8 Syncs a second
 /// a working clock has long produced samples by then.
 pub(crate) const SILENT_CLOCK_WARN_AFTER: Duration = Duration::from_secs(3);
-/// A portable session that has not received one PTP sample this long after
-/// its media stream was set up (SETUP phase two) ends, so the sender shows a
-/// failure instead of "connected" with no sound. Interval requests start at
-/// the sender's first Announce and repeat every second, so 12 s covers about
-/// ten requests and three samples after the first answer (0.4 s), and still
-/// ends well before a user gives up (the iPad sessions of 2026-11-28 were
-/// torn down by hand after 20-30 s).
-pub(crate) const CLOCK_NEVER_READY_TIMEOUT: Duration = Duration::from_secs(12);
+/// A portable stream that has not mapped one deadline this long after its
+/// media stream was set up (SETUP phase two), while playing or without any
+/// PTP sample at all, gets one WARN. The stream stays connected (user
+/// decision 2026-11-28: a forced end only turned "connected, silent" into
+/// "disconnected"). 12 s leaves room for master mode (entered 0.5 s after the
+/// sender's first Announce, three Syncs 0.25 s later) and a sender anchor
+/// that arrives some seconds after SETUP.
+pub(crate) const CLOCK_NEVER_READY_WARN_AFTER: Duration = Duration::from_secs(12);
 const MAX_CANDIDATES: usize = 4;
 const MAX_PENDING_SAMPLES: usize = 32;
 const MAX_RETIRED_TIMELINES: usize = 4;
@@ -230,6 +235,10 @@ pub(crate) struct SessionPtpClock {
     /// Last `(retired, current)` translation reported at INFO.
     translation_logged: Option<(u64, u64)>,
     mapped_on_anchor: bool,
+    /// Some deadline of this stream ever mapped (any anchor).
+    ever_mapped: bool,
+    /// The wait for an anchor on this receiver's own timeline was logged.
+    own_timeline_wait_logged: bool,
     fatal_reported: bool,
     ready_logged: bool,
     /// Samples from accepted peers since the stream started.
@@ -262,6 +271,8 @@ impl SessionPtpClock {
             change: None,
             translation_logged: None,
             mapped_on_anchor: false,
+            ever_mapped: false,
+            own_timeline_wait_logged: false,
             fatal_reported: false,
             ready_logged: false,
             accepted_samples: 0,
@@ -732,6 +743,21 @@ impl SessionPtpClock {
                         .map(|(_, offset)| offset)
                 });
             let Some(old_offset) = old_offset else {
+                if Some(new_gm) == self.source.master_identity() && current.last_sample_at().is_none() {
+                    // Master mode: the sender anchored on its own clock before
+                    // it yielded to ours, and that clock never sent a sample,
+                    // so there is nothing to carry the anchor across with.
+                    // Not a failed handoff: its next anchor names our timeline.
+                    if !self.own_timeline_wait_logged {
+                        self.own_timeline_wait_logged = true;
+                        log::info!(
+                            target: "audiohub_airplay::airplay2",
+                            "AirPlay 2 PTP anchor timeline {old_gm:016x} never had a sample; this receiver is the sender's master now, waiting for an anchor on {new_gm:016x} {}",
+                            self.describe(now)
+                        );
+                    }
+                    return;
+                }
                 self.fail_change(now, "old_mapping_unavailable");
                 return;
             };
@@ -867,6 +893,7 @@ impl SessionPtpClock {
             }
             if result.is_ok() {
                 self.mapped_on_anchor = true;
+                self.ever_mapped = true;
             }
             return Ok((DeadlineSource::Platform, result));
         }
@@ -875,6 +902,7 @@ impl SessionPtpClock {
         let result = mapper.deadline_for_rtp(now, *anchor, rtp, sample_rate, telemetry_token);
         if result.is_ok() {
             self.mapped_on_anchor = true;
+            self.ever_mapped = true;
         }
         Ok((DeadlineSource::PortableMapper, result))
     }
@@ -884,15 +912,10 @@ impl SessionPtpClock {
     /// playing. Returned once; the caller ends the stream so the sender sees
     /// the failure instead of silence.
     ///
-    /// Also, on the portable backend, the stream ends once when no PTP
-    /// sample at all arrived within [`CLOCK_NEVER_READY_TIMEOUT`] of its start,
-    /// playing or not, after one silent-clock WARN at
-    /// [`SILENT_CLOCK_WARN_AFTER`]. A stream that ever received a sample is
-    /// never ended this way (a paused sender keeps its session).
+    /// A missing clock never ends the stream; on the portable backend it is
+    /// reported by [`Self::warn_sender_clock`].
     pub(crate) fn take_fatal(&mut self, now: Instant, playing: bool) -> Option<io::Error> {
-        if let Some(error) = self.check_sender_clock(now) {
-            return Some(error);
-        }
+        self.warn_sender_clock(now, playing);
         if self.fatal_reported || !playing || !self.mapped_on_anchor {
             return None;
         }
@@ -923,16 +946,24 @@ impl SessionPtpClock {
         ))
     }
 
-    fn check_sender_clock(&mut self, now: Instant) -> Option<io::Error> {
-        if self.accepted_samples > 0 || self.never_ready_reported || self.source.maps_on_platform()
-        {
-            return None;
+    /// Portable backend only, one WARN each per stream:
+    /// - the sender has announced for [`SILENT_CLOCK_WARN_AFTER`] without a
+    ///   single Sync/Follow_Up and no sample arrived (master mode, which
+    ///   starts earlier, supplies samples and so silences this);
+    /// - [`CLOCK_NEVER_READY_WARN_AFTER`] after the stream started no deadline
+    ///   has ever mapped, and either no sample arrived at all or a playing
+    ///   anchor is waiting (e.g. on a timeline nothing serves).
+    ///
+    /// Neither ends the stream.
+    fn warn_sender_clock(&mut self, now: Instant, playing: bool) {
+        if self.never_ready_reported || self.source.maps_on_platform() {
+            return;
         }
         let status = self
             .source
             .session()
             .and_then(|shared| shared.sender_clock_status());
-        if !self.silent_clock_warned {
+        if !self.silent_clock_warned && self.accepted_samples == 0 {
             if let Some((status, since)) = status.and_then(|status| {
                 status
                     .first_announce_at
@@ -954,22 +985,22 @@ impl SessionPtpClock {
                 }
             }
         }
-        if now.saturating_duration_since(self.epoch) < CLOCK_NEVER_READY_TIMEOUT {
-            return None;
+        if self.ever_mapped
+            || (self.accepted_samples > 0 && !playing)
+            || now.saturating_duration_since(self.epoch) < CLOCK_NEVER_READY_WARN_AFTER
+        {
+            return;
         }
         self.never_ready_reported = true;
         crate::telemetry::record_ptp_clock_never_ready(crate::telemetry::operation_token());
         let sender = status.map_or_else(|| "unknown".to_owned(), |status| status.to_string());
         log::warn!(
             target: "audiohub_airplay::airplay2",
-            "AirPlay 2 PTP clock never became ready: no PTP sample from the sender within {:?} of the stream start (sender {sender}); ending the stream so the sender shows the failure {}",
-            CLOCK_NEVER_READY_TIMEOUT,
+            "AirPlay 2 PTP clock not ready {:?} after the stream start: accepted_samples={} playing={playing} (sender {sender}); keeping the stream connected {}",
+            CLOCK_NEVER_READY_WARN_AFTER,
+            self.accepted_samples,
             self.describe(now)
         );
-        Some(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "PTP clock never received a sample from the sender",
-        ))
     }
 
     /// One-line diagnostics: the session's grandmaster against what the
@@ -1387,7 +1418,7 @@ mod tests {
     }
 
     #[test]
-    fn a_portable_stream_without_any_sample_warns_once_then_ends_after_the_timeout() {
+    fn a_portable_stream_without_any_sample_warns_but_is_never_ended() {
         let clocks = Arc::new(crate::protocol::media::ptp::SenderClockRegistry::default());
         let source = PtpClockSource::test_watched_session_source(mac(), &clocks);
         let epoch = Instant::now();
@@ -1405,18 +1436,21 @@ mod tests {
         assert!(clock.describe(at(3_000)).contains("sender_clock=[announce=4 "));
 
         assert!(clock
-            .take_fatal(epoch + CLOCK_NEVER_READY_TIMEOUT - Duration::from_millis(1), false)
+            .take_fatal(epoch + CLOCK_NEVER_READY_WARN_AFTER - Duration::from_millis(1), false)
             .is_none());
-        let fatal = clock
-            .take_fatal(epoch + CLOCK_NEVER_READY_TIMEOUT, false)
-            .expect("never ready ends the stream, playing or not");
-        assert_eq!(fatal.kind(), io::ErrorKind::TimedOut);
+        assert!(!clock.never_ready_reported);
         assert!(
             clock
-                .take_fatal(epoch + CLOCK_NEVER_READY_TIMEOUT * 2, true)
+                .take_fatal(epoch + CLOCK_NEVER_READY_WARN_AFTER, false)
                 .is_none(),
-            "reported once"
+            "never ready only warns; the stream stays connected"
         );
+        assert!(clock.never_ready_reported, "warned once at the deadline");
+        for minutes in 1..5 {
+            assert!(clock
+                .take_fatal(epoch + Duration::from_secs(60 * minutes), true)
+                .is_none());
+        }
     }
 
     #[test]
@@ -1425,21 +1459,155 @@ mod tests {
         let epoch = Instant::now();
         let mut clock = session(source, epoch);
         clock.observe_sample(sample(mac(), mac_timeline(), epoch, epoch), epoch, None);
-        // Paused for a minute, no anchor, no more samples.
+        // Paused for a minute, no anchor, no more samples: not even a warning.
         assert!(clock.take_fatal(epoch + Duration::from_secs(60), false).is_none());
+        assert!(!clock.never_ready_reported);
+        // Playing but never mapped: one warning, still no end.
         assert!(clock.take_fatal(epoch + Duration::from_secs(60), true).is_none());
+        assert!(clock.never_ready_reported);
 
         // Samples only from an unlisted peer do not count.
         let source = PtpClockSource::test_session_source(mac());
         let mut clock = session(source, epoch);
         clock.observe_sample(sample(homepod(), homepod_timeline(), epoch, epoch), epoch, None);
-        assert!(clock.take_fatal(epoch + CLOCK_NEVER_READY_TIMEOUT, false).is_some());
+        assert!(clock.take_fatal(epoch + CLOCK_NEVER_READY_WARN_AFTER, false).is_none());
+        assert!(clock.never_ready_reported);
+
+        // A stream that mapped is never warned about.
+        let source = PtpClockSource::test_session_source(mac());
+        let mut run = Run::start(source, mac_timeline());
+        run.feed(&[(mac(), mac_timeline())], 4);
+        assert!(run.deadline(0).is_ok());
+        run.now += Duration::from_secs(60);
+        assert!(run.clock.take_fatal(run.now, true).is_none());
+        assert!(!run.clock.never_ready_reported);
 
         // Platform backends (macOS TimeSync) keep their own lock watchdog.
         let fake = Arc::new(FakePlatform::new(epoch, MAC_GM, 0x00aa_bbcc_ddee_0001));
         let source = PtpClockSource::test_platform_source(mac(), fake);
         let mut clock = session(source, epoch);
-        assert!(clock.take_fatal(epoch + Duration::from_secs(60), false).is_none());
+        assert!(clock.take_fatal(epoch + Duration::from_secs(60), true).is_none());
+        assert!(!clock.never_ready_reported);
+    }
+
+    /// Master mode: samples of this receiver's own timeline (what the
+    /// observer publishes for its own Syncs) for the control peer.
+    fn own_samples(
+        clock: &mut SessionPtpClock,
+        own: Timeline,
+        epoch: Instant,
+        from: Instant,
+        count: usize,
+        mut anchor: Option<&mut PlaybackAnchor>,
+    ) -> Instant {
+        let mut now = from;
+        for _ in 0..count {
+            clock.observe_sample(sample(mac(), own, epoch, now), now, anchor.as_deref_mut());
+            now += SYNC;
+        }
+        now
+    }
+
+    #[test]
+    fn master_mode_maps_an_anchor_on_the_own_timeline_exactly() {
+        const OWN: u64 = 0x461d_3eff_fe6f_0c5e;
+        let clocks = Arc::new(crate::protocol::media::ptp::SenderClockRegistry::new(OWN));
+        let source = PtpClockSource::test_watched_session_source(mac(), &clocks);
+        assert_eq!(source.master_identity(), Some(OWN));
+        let epoch = Instant::now();
+        let own = Timeline {
+            grandmaster: OWN,
+            base_ns: 1_795_000_000_000_000_000,
+            ppm: 0,
+        };
+        let mut clock = session(source, epoch);
+        let now = own_samples(&mut clock, own, epoch, epoch + Duration::from_millis(5), 3, None);
+        // The sender (now our slave) anchors on our timeline.
+        let anchor_local = now + Duration::from_millis(300);
+        let mut anchor = anchor_at(own, epoch, anchor_local, 1_000);
+        clock.install_anchor(&mut anchor, now);
+        assert_eq!(clock.grandmaster(), Some(OWN));
+        let token = crate::telemetry::operation_token();
+        for frames in [0u32, 44_100, 441_000] {
+            let rtp = anchor.rtp_time.wrapping_add(frames);
+            let (kind, result) = clock.deadline(now, &mut anchor, rtp, RATE, token).unwrap();
+            assert_eq!(kind, DeadlineSource::PortableMapper);
+            // Identity mapping: exact to the nanosecond rounding of RTP.
+            assert_close(result.unwrap(), expected_play(anchor_local, frames), Duration::from_micros(1));
+        }
+        assert!(clock.take_fatal(now + Duration::from_secs(20), true).is_none());
+        assert!(!clock.never_ready_reported);
+    }
+
+    #[test]
+    fn an_anchor_on_the_senders_silent_clock_waits_for_one_on_the_own_timeline() {
+        const OWN: u64 = 0x461d_3eff_fe6f_0c5e;
+        const IPAD_GM: u64 = 0x342b_6edc_bdd2_0008;
+        let clocks = Arc::new(crate::protocol::media::ptp::SenderClockRegistry::new(OWN));
+        let source = PtpClockSource::test_watched_session_source(mac(), &clocks);
+        let epoch = Instant::now();
+        let own = Timeline {
+            grandmaster: OWN,
+            base_ns: 1_795_000_000_000_000_000,
+            ppm: 0,
+        };
+        let ipad = Timeline {
+            grandmaster: IPAD_GM,
+            base_ns: 1_234_567_000_000_000,
+            ppm: 0,
+        };
+        let mut clock = session(source, epoch);
+        // The iPad anchored on its own clock before it yielded.
+        let mut anchor = anchor_at(ipad, epoch, epoch + Duration::from_secs(2), 0);
+        clock.install_anchor(&mut anchor, epoch);
+        let now = own_samples(&mut clock, own, epoch, epoch + Duration::from_millis(5), 12, Some(&mut anchor));
+        assert_eq!(anchor.timeline_id, IPAD_GM, "nothing to rebase with");
+        assert!(clock.own_timeline_wait_logged);
+        let rtp = anchor.rtp_time;
+        assert!(clock.deadline(now, &mut anchor, rtp, RATE, crate::telemetry::operation_token()).unwrap().1.is_err());
+        assert!(clock.take_fatal(now + HANDOFF_FAIL_GRACE * 3, true).is_none(), "never mapped: no fatal");
+        // Its next anchor names our timeline: the warm mapper takes over.
+        let anchor_local = now + Duration::from_millis(400);
+        let mut anchor = anchor_at(own, epoch, anchor_local, 500);
+        clock.install_anchor(&mut anchor, now);
+        assert_eq!(clock.grandmaster(), Some(OWN));
+        let rtp = anchor.rtp_time.wrapping_add(4_410);
+        let (_, result) = clock.deadline(now, &mut anchor, rtp, RATE, crate::telemetry::operation_token()).unwrap();
+        assert_close(result.unwrap(), expected_play(anchor_local, 4_410), Duration::from_micros(1));
+    }
+
+    #[test]
+    fn after_master_mode_yields_the_senders_own_clock_takes_over_continuously() {
+        const OWN: u64 = 0x461d_3eff_fe6f_0c5e;
+        let clocks = Arc::new(crate::protocol::media::ptp::SenderClockRegistry::new(OWN));
+        let source = PtpClockSource::test_watched_session_source(mac(), &clocks);
+        let epoch = Instant::now();
+        let own = Timeline {
+            grandmaster: OWN,
+            base_ns: 1_795_000_000_000_000_000,
+            ppm: 0,
+        };
+        let mut clock = session(source, epoch);
+        let mut now = own_samples(&mut clock, own, epoch, epoch + Duration::from_millis(5), 4, None);
+        let anchor_local = now + Duration::from_millis(500);
+        let mut anchor = anchor_at(own, epoch, anchor_local, 1_000);
+        clock.install_anchor(&mut anchor, now);
+        now = own_samples(&mut clock, own, epoch, now, 4, Some(&mut anchor));
+        let token = crate::telemetry::operation_token();
+        assert!(clock.deadline(now, &mut anchor, 1_000, RATE, token).unwrap().1.is_ok());
+        // We yield (the sender started Sync on its own clock): our samples
+        // stop, the sender's begin. The anchor is rebased through local time.
+        for _ in 0..12 {
+            clock.observe_sample(sample(mac(), mac_timeline(), epoch, now), now, Some(&mut anchor));
+            now += SYNC;
+        }
+        assert_eq!(anchor.timeline_id, MAC_GM);
+        let frames = (now + Duration::from_millis(100)).duration_since(anchor_local).as_nanos()
+            * u128::from(RATE)
+            / 1_000_000_000;
+        let rtp = 1_000u32.wrapping_add(frames as u32);
+        let (_, result) = clock.deadline(now, &mut anchor, rtp, RATE, token).unwrap();
+        assert_close(result.unwrap(), expected_play(anchor_local, frames as u32), Duration::from_micros(200));
     }
 
     #[test]

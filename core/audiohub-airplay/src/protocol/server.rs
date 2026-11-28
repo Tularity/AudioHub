@@ -2535,6 +2535,23 @@ async fn dispatch_encrypted(
                     return DispatchOutcome::reply(response_for(request, 400, "Bad Request"));
                 }
             };
+            // Which PTP timeline the sender anchors on (its own grandmaster,
+            // a relayed one, or this receiver's in master mode).
+            log::info!(
+                target: "audiohub_airplay::airplay2",
+                "AirPlay 2 rate anchor peer={} rate={} networkTimeTimelineID={} networkTimeSecs={} rtpTime={}",
+                peer.ip(),
+                u8::from(anchor.playing),
+                anchor
+                    .timeline_id
+                    .map_or_else(|| "none".to_owned(), |id| format!("{id:016x}")),
+                anchor
+                    .network_time_secs
+                    .map_or_else(|| "none".to_owned(), |secs| secs.to_string()),
+                anchor
+                    .rtp_time
+                    .map_or_else(|| "none".to_owned(), |rtp| rtp.to_string())
+            );
             let mut outcome = DispatchOutcome::reply(response_for(request, 200, "OK"));
             outcome.set_media_rate = Some(anchor);
             outcome

@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use uuid::Uuid;
 
-const TELEMETRY_SCHEMA_VERSION: u32 = 6;
+const TELEMETRY_SCHEMA_VERSION: u32 = 7;
 const RECENT_EVENT_LIMIT: usize = 128;
 const CONTROL_SESSION_HISTORY_LIMIT: usize = 128;
 
@@ -245,13 +245,14 @@ pub struct AirPlayTelemetryCounters {
     /// Schema 6. One-step Sync datagrams accepted as complete samples.
     #[serde(default)]
     pub ptp_sync_one_step_observed: u64,
-    /// Schema 6. Wake-up Announce pairs sent to a silent sender clock.
+    /// Schema 7 (replaces schema 6's `ptp_wake_sequences_sent`). 802.1AS
+    /// message interval requests sent to self-announcing sender clocks.
     #[serde(default)]
-    pub ptp_wake_sequences_sent: u64,
-    /// Schema 6. Wake-up Announce pairs of which a datagram could not be
-    /// sent.
+    pub ptp_interval_requests_sent: u64,
+    /// Schema 7 (replaces `ptp_wake_send_failures`). Interval requests the
+    /// socket refused to send.
     #[serde(default)]
-    pub ptp_wake_send_failures: u64,
+    pub ptp_interval_request_send_failures: u64,
     /// Schema 6. Sessions whose sender announced for a while without
     /// sending any Sync/Follow_Up (one warning per session).
     #[serde(default)]
@@ -275,7 +276,9 @@ pub struct PtpSenderTelemetry {
     pub signaling: u64,
     pub rejected_total: u64,
     pub rejected_by_reason: std::collections::BTreeMap<String, u64>,
-    pub wake_sequences_sent: u64,
+    /// Schema 7 (replaces `wake_sequences_sent`).
+    #[serde(default)]
+    pub interval_requests_sent: u64,
 }
 
 /// Senders kept in [`AirPlayTelemetrySnapshot::ptp_senders`]; the least
@@ -927,8 +930,8 @@ struct TelemetrySlot {
     ptp_peer_port_failures: AtomicU64,
     ptp_signaling_observed: AtomicU64,
     ptp_sync_one_step_observed: AtomicU64,
-    ptp_wake_sequences_sent: AtomicU64,
-    ptp_wake_send_failures: AtomicU64,
+    ptp_interval_requests_sent: AtomicU64,
+    ptp_interval_request_send_failures: AtomicU64,
     ptp_silent_clock_warnings: AtomicU64,
     ptp_clock_never_ready_failures: AtomicU64,
     /// Updated only on the PTP observer task (never a media or PCM path).
@@ -1193,8 +1196,8 @@ impl TelemetrySlot {
             ptp_peer_port_failures: load(&self.ptp_peer_port_failures),
             ptp_signaling_observed: load(&self.ptp_signaling_observed),
             ptp_sync_one_step_observed: load(&self.ptp_sync_one_step_observed),
-            ptp_wake_sequences_sent: load(&self.ptp_wake_sequences_sent),
-            ptp_wake_send_failures: load(&self.ptp_wake_send_failures),
+            ptp_interval_requests_sent: load(&self.ptp_interval_requests_sent),
+            ptp_interval_request_send_failures: load(&self.ptp_interval_request_send_failures),
             ptp_silent_clock_warnings: load(&self.ptp_silent_clock_warnings),
             ptp_clock_never_ready_failures: load(&self.ptp_clock_never_ready_failures),
         };
@@ -1321,8 +1324,8 @@ impl TelemetrySlot {
             &self.ptp_peer_port_failures,
             &self.ptp_signaling_observed,
             &self.ptp_sync_one_step_observed,
-            &self.ptp_wake_sequences_sent,
-            &self.ptp_wake_send_failures,
+            &self.ptp_interval_requests_sent,
+            &self.ptp_interval_request_send_failures,
             &self.ptp_silent_clock_warnings,
             &self.ptp_clock_never_ready_failures,
         ] {
@@ -2268,17 +2271,17 @@ fn update_ptp_sender(
     senders.push(entry);
 }
 
-/// One wake-up Announce pair for a silent sender clock: `sent` is false when
-/// the socket refused a datagram of it.
-pub(crate) fn record_ptp_wake_sequence(token: OperationToken, peer: IpAddr, sent: bool) {
+/// One 802.1AS message interval request to `peer`: `sent` is false when the
+/// socket refused it.
+pub(crate) fn record_ptp_interval_request(token: OperationToken, peer: IpAddr, sent: bool) {
     let Some(guard) = telemetry().enter_token(token) else {
         return;
     };
     if sent {
-        increment(&guard.slot.ptp_wake_sequences_sent);
-        update_ptp_sender(guard.slot, peer, |entry| entry.wake_sequences_sent += 1);
+        increment(&guard.slot.ptp_interval_requests_sent);
+        update_ptp_sender(guard.slot, peer, |entry| entry.interval_requests_sent += 1);
     } else {
-        increment(&guard.slot.ptp_wake_send_failures);
+        increment(&guard.slot.ptp_interval_request_send_failures);
     }
 }
 
@@ -2923,7 +2926,7 @@ mod tests {
             }
         }
         let before = recorder.snapshot();
-        assert_eq!(before.schema_version, 6);
+        assert_eq!(before.schema_version, 7);
         assert!(Uuid::parse_str(&before.generation_marker).is_ok());
         assert_eq!(before.counters.rtsp_phase2_requests, 1);
         assert_eq!(before.recent_events.len(), RECENT_EVENT_LIMIT);
@@ -2944,7 +2947,7 @@ mod tests {
     #[test]
     fn public_snapshot_serializes_with_stable_top_level_fields() {
         let value = serde_json::to_value(Telemetry::default().snapshot()).unwrap();
-        assert_eq!(value["schema_version"], 6);
+        assert_eq!(value["schema_version"], 7);
         assert!(value["control_sessions"].is_array());
         assert!(value["control_sessions_truncated"].is_boolean());
         assert!(value["active_control_sessions"].is_array());
@@ -2986,8 +2989,8 @@ mod tests {
             "ptp_peer_port_failures",
             "ptp_signaling_observed",
             "ptp_sync_one_step_observed",
-            "ptp_wake_sequences_sent",
-            "ptp_wake_send_failures",
+            "ptp_interval_requests_sent",
+            "ptp_interval_request_send_failures",
             "ptp_silent_clock_warnings",
             "ptp_clock_never_ready_failures",
         ] {
@@ -2998,7 +3001,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_six_fields_deserialize_from_a_schema_five_document() {
+    fn schema_six_and_seven_fields_deserialize_from_a_schema_five_document() {
         let mut value = serde_json::to_value(Telemetry::default().snapshot()).unwrap();
         let object = value.as_object_mut().unwrap();
         assert!(object.remove("ptp_senders").is_some());
@@ -3006,8 +3009,8 @@ mod tests {
         for field in [
             "ptp_signaling_observed",
             "ptp_sync_one_step_observed",
-            "ptp_wake_sequences_sent",
-            "ptp_wake_send_failures",
+            "ptp_interval_requests_sent",
+            "ptp_interval_request_send_failures",
             "ptp_silent_clock_warnings",
             "ptp_clock_never_ready_failures",
         ] {
@@ -3015,7 +3018,7 @@ mod tests {
         }
         let decoded: AirPlayTelemetrySnapshot = serde_json::from_value(value).unwrap();
         assert!(decoded.ptp_senders.is_empty());
-        assert_eq!(decoded.counters.ptp_wake_sequences_sent, 0);
+        assert_eq!(decoded.counters.ptp_interval_requests_sent, 0);
     }
 
     #[test]
@@ -3037,7 +3040,7 @@ mod tests {
             count(mac, Some("sync"), true, "sync_observed");
             count(mac, Some("follow_up"), true, "follow_up_observed");
             count(mac, Some("sync"), false, "duplicate_completed_pair");
-            update_ptp_sender(slot, ipad, |entry| entry.wake_sequences_sent += 1);
+            update_ptp_sender(slot, ipad, |entry| entry.interval_requests_sent += 1);
         }
         let senders = recorder.snapshot().ptp_senders;
         assert_eq!(senders.len(), 2);
@@ -3049,7 +3052,7 @@ mod tests {
             (1, 1, 0)
         );
         assert_eq!(ipad_entry.rejected_by_reason["parse_unsupported_message"], 1);
-        assert_eq!(ipad_entry.wake_sequences_sent, 1);
+        assert_eq!(ipad_entry.interval_requests_sent, 1);
         let mac_entry = &senders[0];
         assert_eq!((mac_entry.sync_two_step, mac_entry.follow_up), (2, 1));
         assert_eq!(mac_entry.rejected_total, 1);

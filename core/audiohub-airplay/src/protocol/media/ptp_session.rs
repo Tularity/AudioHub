@@ -63,11 +63,11 @@ const OBSERVED_FRESH: Duration = Duration::from_secs(2);
 pub(crate) const SILENT_CLOCK_WARN_AFTER: Duration = Duration::from_secs(3);
 /// A portable session that has not received one PTP sample this long after
 /// its media stream was set up (SETUP phase two) ends, so the sender shows a
-/// failure instead of "connected" with no sound. It covers the silent-clock
-/// wake-up (first pair after three Announces, about 0.75 s; retries 2 s
-/// apart, the last near 4.75 s), three samples after a wake (0.4 s) and a
-/// lost-pair margin, and still ends well before a user gives up (the iPad
-/// sessions of 2026-11-28 were torn down by hand after 20-30 s).
+/// failure instead of "connected" with no sound. Interval requests start at
+/// the sender's first Announce and repeat every second, so 12 s covers about
+/// ten requests and three samples after the first answer (0.4 s), and still
+/// ends well before a user gives up (the iPad sessions of 2026-11-28 were
+/// torn down by hand after 20-30 s).
 pub(crate) const CLOCK_NEVER_READY_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_CANDIDATES: usize = 4;
 const MAX_PENDING_SAMPLES: usize = 32;
@@ -99,8 +99,8 @@ pub(crate) struct SessionShared {
     /// Grandmaster the media engine currently maps through; 0 = none.
     grandmaster: AtomicU64,
     /// The control peer's PTP traffic as the portable observer sees it
-    /// (also what lets the observer wake a silent clock). `None` on macOS
-    /// backends, where TimeSync owns the ports.
+    /// (also what makes the observer send it interval requests). `None` on
+    /// macOS backends, where TimeSync owns the ports.
     clock_watch: Option<SenderClockWatch>,
 }
 
@@ -1388,13 +1388,13 @@ mod tests {
 
     #[test]
     fn a_portable_stream_without_any_sample_warns_once_then_ends_after_the_timeout() {
-        let wake = Arc::new(crate::protocol::media::ptp::WakeRegistry::default());
-        let source = PtpClockSource::test_watched_session_source(mac(), &wake);
+        let clocks = Arc::new(crate::protocol::media::ptp::SenderClockRegistry::default());
+        let source = PtpClockSource::test_watched_session_source(mac(), &clocks);
         let epoch = Instant::now();
         let mut clock = session(source.clone(), epoch);
         let at = |ms: u64| epoch + Duration::from_millis(ms);
         for ms in [0, 250, 500, 750] {
-            wake.test_note_announce(mac(), MAC_GM, at(ms));
+            clocks.test_note_announce(mac(), MAC_GM, at(ms));
         }
         assert!(clock.take_fatal(at(2_900), false).is_none());
         assert!(!clock.silent_clock_warned);

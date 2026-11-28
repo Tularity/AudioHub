@@ -58,6 +58,12 @@ const MESSAGE_SYNC: u8 = 0x0;
 const MESSAGE_FOLLOW_UP: u8 = 0x8;
 const MESSAGE_ANNOUNCE: u8 = 0xb;
 const MESSAGE_SIGNALING: u8 = 0xc;
+const MESSAGE_DELAY_REQ: u8 = 0x1;
+const MESSAGE_DELAY_RESP: u8 = 0x9;
+/// Delay_Resp: header, receiveTimestamp, requestingPortIdentity.
+const PTP_DELAY_RESP_BYTES: usize = PTP_SYNC_BYTES + 10;
+/// controlField of Delay_Resp (IEEE 1588-2008 table 23).
+const CONTROL_DELAY_RESP: u8 = 0x03;
 /// targetPortIdentity, the fixed part of a Signaling body.
 const PTP_SIGNALING_BYTES: usize = PTP_HEADER_BYTES + 10;
 /// A Signaling message carrying one 802.1AS message interval request TLV.
@@ -135,6 +141,19 @@ const FOLLOW_UP_INFORMATION_TLV: [u8; 32] = [
 /// Apple organization extension (OUI 00-0D-93) subtype 4 on Follow_Up:
 /// followed by the sender's clockIdentity and two zero bytes.
 const APPLE_FOLLOW_UP_TLV_HEAD: [u8; 10] = [0x00, 0x03, 0x00, 0x10, 0x00, 0x0d, 0x93, 0x00, 0x00, 0x04];
+/// Test hook variant V1: median of the trailing three bytes Apple's
+/// receiver sent in both TLVs over 8 Signaling messages (0x34bbdf..0x396763;
+/// sorted median 0x35def8). Probably a scaled link delay: as 2^-16 ns
+/// (802.1AS UScaledNs) it is about 54 ns, a wired neighbour's delay; the
+/// byte before it is always 0. A macOS sender as grandmaster sends flags 0
+/// and zero here, so the value is not required by macOS.
+const APPLE_SIGNALING_TRAILING_MEDIAN: [u8; 3] = [0x35, 0xde, 0xf8];
+/// Test hook variant V3: Apple's receiver's lastGmPhaseChange (12 bytes) and
+/// scaledLastGmFreqChange (4 bytes) from its Follow_Up 802.1AS TLV.
+const APPLE_FOLLOW_UP_GM_CHANGE_FIELDS: [u8; 16] = [
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x06, 0x9c, 0xd4, 0xf1, 0xbd, 0x68, 0xb5, 0xfe, 0xc7, 0x2a, 0xf7,
+];
+const APPLE_LIKE_FOLLOW_UP_CORRECTION_NS: u64 = 80_000;
 /// The two Apple organization-extension TLVs (subtypes 1 and 5) Apple's
 /// receiver sends with every Announce while it is grandmaster
 /// (`airplay-ipad-applercv-20261128T075756Z`). Meaning unknown; copied byte
@@ -202,6 +221,9 @@ enum Message {
     /// Counted for diagnostics only (Apple sends an organization-extension
     /// TLV with every Announce).
     Signaling { header: Header },
+    /// End-to-end delay request of a slave (macOS TimeSync as our slave
+    /// sends one per Sync on 319 and does not lock without the answers).
+    DelayReq { header: Header },
 }
 
 /// grandmasterClockQuality of an Announce (IEEE 1588-2008 5.3.7).
@@ -292,6 +314,24 @@ impl OwnTimescale {
                 base_ns: unix_ns.saturating_add(tai_offset_ns),
             }
         })
+    }
+
+    /// Test hook (variant V3): an uptime-like timescale, as Apple's
+    /// receiver uses (about 2.6e6 s there): seconds since this host booted
+    /// when the process first needed it, then the monotonic clock.
+    fn uptime() -> Self {
+        let epoch = Instant::now();
+        #[cfg(windows)]
+        let base_ns = {
+            extern "system" {
+                fn GetTickCount64() -> u64;
+            }
+            // SAFETY: GetTickCount64 has no preconditions.
+            unsafe { GetTickCount64() }.saturating_mul(1_000_000)
+        };
+        #[cfg(not(windows))]
+        let base_ns = 2_600_000 * NANOS_PER_SECOND as u64;
+        Self { epoch, base_ns }
     }
 
     pub(crate) fn time_ns(self, at: Instant) -> u64 {
@@ -480,6 +520,8 @@ pub(crate) struct SenderClockStatus {
     pub(crate) signaling: u64,
     /// Interval requests sent to it (shared schedule of its sessions).
     pub(crate) interval_requests: u64,
+    /// Delay_Req messages from it (a slave of ours measuring path delay).
+    pub(crate) delay_requests: u64,
     /// This receiver as the peer's PTP master, if it ever was.
     pub(crate) master: Option<MasterSummary>,
 }
@@ -506,6 +548,9 @@ impl fmt::Display for SenderClockStatus {
             self.follow_ups,
             self.interval_requests
         )?;
+        if self.delay_requests > 0 {
+            write!(f, " delay_req={}", self.delay_requests)?;
+        }
         if let Some(master) = self.master {
             write!(f, " master={master}")?;
         }
@@ -727,6 +772,11 @@ pub(crate) struct SenderClockRegistry {
     next_id: AtomicU64,
     /// This receiver's clockIdentity; 0 where it never sends (macOS, tests).
     own_identity: u64,
+    /// Test hook only ([`force_master_test_hook`]): enter master mode even
+    /// toward a sender that sends Sync, and do not yield to its Sync.
+    force_master: bool,
+    /// Test hook only ([`master_variant_test_hook`]); all off by default.
+    variant: MasterVariant,
 }
 
 impl SenderClockRegistry {
@@ -884,7 +934,7 @@ impl SenderClockRegistry {
         }
         for peer in peers {
             let mut sessions = state.targets.iter().filter(|target| target.peer == peer);
-            if sessions.clone().any(|target| target.status.timing_messages() > 0) {
+            if !self.force_master && sessions.clone().any(|target| target.status.timing_messages() > 0) {
                 continue;
             }
             let Some((announce, first)) = sessions.find_map(|target| {
@@ -965,6 +1015,15 @@ impl SenderClockRegistry {
         } else {
             None
         }
+    }
+
+    /// Where an active master for `peer` sends general messages.
+    fn master_general_to(&self, peer: IpAddr) -> Option<SocketAddr> {
+        self.lock()
+            .masters
+            .iter()
+            .find(|master| master.peer == peer && master.mode == MasterMode::Active)
+            .map(|master| master.general_to)
     }
 
     /// Every master message due at `now`, advancing the schedules.
@@ -1164,6 +1223,51 @@ fn master_signaling(identity: u64, sequence: u16) -> [u8; PTP_MASTER_SIGNALING_B
         (CONTROL_OTHER, INTERVAL_REQUEST_LOG_INTERVAL),
     );
     packet[PTP_SIGNALING_BYTES..].copy_from_slice(&APPLE_SIGNALING_TLVS);
+    packet
+}
+
+/// Delay_Resp to a slave's Delay_Req (IEEE 1588-2008 11.3, 13.8): its
+/// sequenceId and correctionField, our receive time of the request
+/// (software, on [`OwnTimescale`]) and its sourcePortIdentity as
+/// requestingPortIdentity; logMessageInterval -3 (logMinDelayReqInterval:
+/// one request per Sync is fine).
+fn delay_resp(identity: u64, request: Header, receive_ns: u64) -> [u8; PTP_DELAY_RESP_BYTES] {
+    let mut packet = [0u8; PTP_DELAY_RESP_BYTES];
+    write_master_header(
+        &mut packet,
+        MESSAGE_DELAY_RESP,
+        APPLE_UNICAST_FLAGS,
+        identity,
+        request.sequence,
+        (CONTROL_DELAY_RESP, MASTER_SYNC_LOG_INTERVAL),
+    );
+    packet[8..16].copy_from_slice(&request.correction_scaled_ns.to_be_bytes());
+    write_timestamp(&mut packet[PTP_HEADER_BYTES..PTP_SYNC_BYTES], receive_ns);
+    packet[44..52].copy_from_slice(&request.source.clock.to_be_bytes());
+    packet[52..54].copy_from_slice(&request.source.port.to_be_bytes());
+    packet
+}
+
+/// [`master_signaling`] with `trailing` as the last three bytes of both
+/// Apple TLVs (test hook variant V1).
+fn master_signaling_with(identity: u64, sequence: u16, trailing: [u8; 3]) -> [u8; PTP_MASTER_SIGNALING_BYTES] {
+    let mut packet = master_signaling(identity, sequence);
+    for end in [PTP_SIGNALING_BYTES + 26, PTP_MASTER_SIGNALING_BYTES] {
+        packet[end - 3..end].copy_from_slice(&trailing);
+    }
+    packet
+}
+
+/// Master Follow_Up shaped like Apple's receiver's (test hook variant V3):
+/// a non-zero correctionField (Apple's 64-123 us egress corrections; 80 us
+/// here) with the origin moved back by the same amount, so origin +
+/// correction is still `corrected_ns`, and Apple's lastGmPhaseChange and
+/// scaledLastGmFreqChange bytes.
+fn master_follow_up_apple_like(identity: u64, sequence: u16, corrected_ns: u64) -> [u8; PTP_MASTER_FOLLOW_UP_BYTES] {
+    let correction_ns = APPLE_LIKE_FOLLOW_UP_CORRECTION_NS.min(corrected_ns);
+    let mut packet = master_follow_up(identity, sequence, corrected_ns - correction_ns);
+    packet[8..16].copy_from_slice(&((correction_ns as i64) << 16).to_be_bytes());
+    packet[60..76].copy_from_slice(&APPLE_FOLLOW_UP_GM_CHANGE_FIELDS);
     packet
 }
 
@@ -1820,7 +1924,12 @@ impl PtpClockSource {
             })
         }
         #[cfg(not(target_os = "macos"))]
-        None
+        {
+            // Test hook (variant V2): advertise this receiver's PTP port in
+            // SETUP timingPeerInfo like the macOS platform backend does.
+            (self.clocks.variant.clock_id && self.clocks.own_identity != 0)
+                .then_some((self.clocks.own_identity, OWN_PTP_PORT))
+        }
     }
 
     #[cfg(test)]
@@ -1888,6 +1997,9 @@ pub(crate) struct PtpObserver {
     request_failure_logged: bool,
     /// A refused master message is logged once per master entry.
     master_failure_logged: bool,
+    /// Delay_Resp messages built on receipt, sent right after (peer, to,
+    /// message).
+    delay_responses: Vec<(IpAddr, SocketAddr, [u8; PTP_DELAY_RESP_BYTES])>,
 }
 
 impl PtpObserver {
@@ -1912,6 +2024,7 @@ impl PtpObserver {
             request_sequence: 0,
             request_failure_logged: false,
             master_failure_logged: false,
+            delay_responses: Vec::new(),
         }
     }
 
@@ -1962,18 +2075,43 @@ impl PtpObserver {
         let event_socket = UdpSocket::bind(event_address).await?;
         let general_socket = UdpSocket::bind(general_address).await?;
         let (samples, _) = broadcast::channel(SAMPLE_CHANNEL_CAPACITY);
-        let clocks = Arc::new(SenderClockRegistry::new(own_identity));
+        let mut registry = SenderClockRegistry::new(own_identity);
+        registry.force_master = force_master_test_hook();
+        registry.variant = master_variant_test_hook();
+        if registry.variant != MasterVariant::default() {
+            log::warn!(
+                target: "audiohub_airplay::airplay2",
+                "AirPlay 2 PTP TEST HOOK active (AUDIOHUB_TEST_AIRPLAY_PTP_MASTER_VARIANT): {:?}",
+                registry.variant
+            );
+        }
+        let outcome = [("event", &event_socket), ("general", &general_socket)]
+            .map(|(name, socket)| format!("{name}:{}", apple_ip_header(socket)))
+            .join(" ");
+        log::info!(
+            target: "audiohub_airplay::airplay2",
+            "AirPlay 2 PTP socket options (Apple's PTP IP header: TTL 255, DF, UDP checksum 0): {outcome}"
+        );
+        if registry.force_master {
+            log::warn!(
+                target: "audiohub_airplay::airplay2",
+                "AirPlay 2 PTP TEST HOOK active (AUDIOHUB_TEST_AIRPLAY_PTP_FORCE_MASTER=1): master mode is forced toward every self-announcing sender, Sync or not"
+            );
+        }
+        let uptime_timescale = registry.variant.apple_follow_up;
+        let clocks = Arc::new(registry);
         let source = PtpClockSource::portable(samples.clone(), Arc::clone(&clocks));
-        Ok((
-            Self::new(
-                Some(event_socket),
-                Some(general_socket),
-                samples,
-                clocks,
-                own_identity,
-            ),
-            source,
-        ))
+        let mut observer = Self::new(
+            Some(event_socket),
+            Some(general_socket),
+            samples,
+            clocks,
+            own_identity,
+        );
+        if uptime_timescale {
+            observer.timescale = OwnTimescale::uptime();
+        }
+        Ok((observer, source))
     }
 
     #[cfg(target_os = "macos")]
@@ -2037,6 +2175,7 @@ impl PtpObserver {
                 received = event_socket.recv_from(&mut event) => {
                     if let Some((length, peer)) = tolerate_reset(received)? {
                         self.receive(&event[..length], peer, PTP_EVENT_PORT, Instant::now());
+                        self.send_delay_responses(&general_socket).await;
                     }
                 }
                 received = general_socket.recv_from(&mut general) => {
@@ -2111,7 +2250,15 @@ impl PtpObserver {
                 } => {
                     let mut result = send_datagram(general_socket, &master_announce(dataset, sequence), to).await;
                     if result.is_ok() {
-                        let signaling = master_signaling(self.own_identity, self.request_sequence);
+                        let signaling = master_signaling_with(
+                            self.own_identity,
+                            self.request_sequence,
+                            if self.clocks.variant.apple_tlv_value {
+                                APPLE_SIGNALING_TRAILING_MEDIAN
+                            } else {
+                                [0; 3]
+                            },
+                        );
                         self.request_sequence = self.request_sequence.wrapping_add(1);
                         result = send_datagram(general_socket, &signaling, to).await;
                     }
@@ -2131,7 +2278,11 @@ impl PtpObserver {
                         Ok(()) => {
                             send_datagram(
                                 general_socket,
-                                &master_follow_up(self.own_identity, sequence, origin_ns),
+                                &if self.clocks.variant.apple_follow_up {
+                                    master_follow_up_apple_like(self.own_identity, sequence, origin_ns)
+                                } else {
+                                    master_follow_up(self.own_identity, sequence, origin_ns)
+                                },
                                 general_to,
                             )
                             .await
@@ -2163,6 +2314,14 @@ impl PtpObserver {
             })
             .is_ok();
         crate::telemetry::record_ptp_sample_emitted(telemetry_token, delivered);
+    }
+
+    /// Send the Delay_Resp messages queued by `receive`.
+    async fn send_delay_responses(&mut self, general_socket: &UdpSocket) {
+        for (peer, to, packet) in std::mem::take(&mut self.delay_responses) {
+            let result = send_datagram(general_socket, &packet, to).await;
+            self.master_sent(peer, crate::telemetry::PtpMasterMessage::DelayResp, result);
+        }
     }
 
     fn master_sent(&mut self, peer: IpAddr, message: crate::telemetry::PtpMasterMessage, result: io::Result<()>) {
@@ -2290,9 +2449,10 @@ impl PtpObserver {
     /// better grandmaster (yield) or complete the trigger (enter).
     fn update_master(&mut self, peer: IpAddr, message: Message, received_at: Instant) {
         let change = match message {
-            Message::Sync { .. } | Message::FollowUp { .. } => {
+            Message::Sync { .. } | Message::FollowUp { .. } if !self.clocks.force_master => {
                 self.clocks.yield_master(peer, "sender_sends_sync", received_at)
             }
+            Message::Sync { .. } | Message::FollowUp { .. } => None,
             Message::Announce {
                 grandmaster,
                 priority1,
@@ -2309,7 +2469,7 @@ impl PtpObserver {
                 },
                 received_at,
             ),
-            Message::Signaling { .. } => None,
+            Message::Signaling { .. } | Message::DelayReq { .. } => None,
         };
         if let Some(change) = change {
             self.report_master(change);
@@ -2359,6 +2519,7 @@ impl PtpObserver {
                 } => status.sync_one_step += 1,
                 Message::FollowUp { .. } => status.follow_ups += 1,
                 Message::Signaling { .. } => status.signaling += 1,
+                Message::DelayReq { .. } => status.delay_requests += 1,
             }
         });
     }
@@ -2396,7 +2557,7 @@ impl PtpObserver {
         };
         let message_name = message.telemetry_name();
         let expected_port = match message {
-            Message::Sync { .. } => PTP_EVENT_PORT,
+            Message::Sync { .. } | Message::DelayReq { .. } => PTP_EVENT_PORT,
             Message::Announce { .. } | Message::FollowUp { .. } | Message::Signaling { .. } => {
                 PTP_GENERAL_PORT
             }
@@ -2436,6 +2597,31 @@ impl PtpObserver {
         self.note_sender_message(peer, message, received_at);
         self.update_master(peer.ip(), message, received_at);
         match message {
+            Message::DelayReq { header } => {
+                // Answered only while this receiver is the peer's master.
+                let to = self.clocks.master_general_to(peer.ip());
+                if let Some(to) = to {
+                    let receive_ns = self.timescale.time_ns(received_at);
+                    self.delay_responses.push((
+                        peer.ip(),
+                        to,
+                        delay_resp(self.own_identity, header, receive_ns),
+                    ));
+                }
+                crate::telemetry::record_ptp_datagram(
+                    telemetry_token,
+                    peer.ip(),
+                    peer.port(),
+                    local_port,
+                    Some(message_name),
+                    to.is_some(),
+                    if to.is_some() {
+                        "delay_req_answered"
+                    } else {
+                        "delay_req_not_master"
+                    },
+                );
+            }
             Message::Signaling { .. } => {
                 crate::telemetry::record_ptp_datagram(
                     telemetry_token,
@@ -2884,11 +3070,124 @@ fn parse_message(packet: &[u8]) -> Result<Message, PtpParseError> {
                     .expect("announce minimum length checked"),
             ),
         }),
+        MESSAGE_DELAY_REQ if packet.len() >= PTP_SYNC_BYTES => Ok(Message::DelayReq { header }),
         MESSAGE_SIGNALING if packet.len() >= PTP_SIGNALING_BYTES => {
             Ok(Message::Signaling { header })
         }
         _ => Err(PtpParseError::UnsupportedMessage),
     }
+}
+
+/// Test-only (`airplay-test-hooks` Cargo feature, refused by build.rs in a
+/// release build): `AUDIOHUB_TEST_AIRPLAY_PTP_FORCE_MASTER=1` makes this
+/// receiver the master of every self-announcing sender after
+/// [`MASTER_TRIGGER_AFTER`], even one that sends Sync, so an Apple sender
+/// (macOS TimeSync) can be made a slave of it the way the iPad is.
+#[cfg(feature = "airplay-test-hooks")]
+fn force_master_test_hook() -> bool {
+    std::env::var("AUDIOHUB_TEST_AIRPLAY_PTP_FORCE_MASTER").as_deref() == Ok("1")
+}
+
+#[cfg(not(feature = "airplay-test-hooks"))]
+fn force_master_test_hook() -> bool {
+    false
+}
+
+/// Master-mode variants for live experiments with a real iPad (test hooks
+/// only): V1 Apple TLV trailing value, V2 ClockID/ClockPorts in SETUP
+/// timingPeerInfo, V3 Apple-like Follow_Up and uptime-like timescale.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+struct MasterVariant {
+    apple_tlv_value: bool,
+    clock_id: bool,
+    apple_follow_up: bool,
+}
+
+impl MasterVariant {
+    fn parse(text: &str) -> Self {
+        let (v1, v2, v3) = match text.trim().to_ascii_lowercase().as_str() {
+            "v1" => (true, false, false),
+            "v2" => (false, true, false),
+            "v3" => (false, false, true),
+            "v4" => (true, true, true),
+            _ => (false, false, false),
+        };
+        Self {
+            apple_tlv_value: v1,
+            clock_id: v2,
+            apple_follow_up: v3,
+        }
+    }
+}
+
+/// Send PTP the way Apple's devices do (every Apple PTP datagram in the
+/// 2026-11-28 captures: IPv4 TTL 255, Don't Fragment, UDP checksum 0). An
+/// iPad followed Apple's receiver as master over IPv4 with such packets but
+/// not ours (TTL 128, DF clear, checksum set). Sets IP_TTL 255 (and the
+/// multicast TTL), and on Windows IP_DONTFRAGMENT and UDP_NOCHECKSUM. A
+/// refused option is reported, never fatal: the socket still works as
+/// before. Returns what each option did, for the log line.
+fn apple_ip_header(socket: &UdpSocket) -> String {
+    let mut done = vec![
+        format!("ttl={}", socket.set_ttl(255).map_or_else(|error| error.to_string(), |()| "ok".to_owned())),
+        format!(
+            "mcast_ttl={}",
+            socket
+                .set_multicast_ttl_v4(255)
+                .map_or_else(|error| error.to_string(), |()| "ok".to_owned())
+        ),
+    ];
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        #[link(name = "ws2_32")]
+        extern "system" {
+            fn setsockopt(socket: usize, level: i32, name: i32, value: *const u8, length: i32) -> i32;
+        }
+        const IPPROTO_IP: i32 = 0;
+        const IP_DONTFRAGMENT: i32 = 14;
+        const IPPROTO_UDP: i32 = 17;
+        const UDP_NOCHECKSUM: i32 = 1;
+        let set = |level: i32, name: i32| -> String {
+            let enabled: u32 = 1;
+            // SAFETY: a valid socket handle owned by `socket`, a 4-byte
+            // DWORD option value and its length.
+            let result = unsafe {
+                setsockopt(
+                    socket.as_raw_socket() as usize,
+                    level,
+                    name,
+                    (&enabled as *const u32).cast(),
+                    4,
+                )
+            };
+            if result == 0 {
+                "ok".to_owned()
+            } else {
+                io::Error::last_os_error().to_string()
+            }
+        };
+        done.push(format!("df={}", set(IPPROTO_IP, IP_DONTFRAGMENT)));
+        done.push(format!("udp_nochecksum={}", set(IPPROTO_UDP, UDP_NOCHECKSUM)));
+    }
+    // The portable backend runs on Windows; elsewhere only TTL is set.
+    #[cfg(not(windows))]
+    done.push("df=not_set,udp_nochecksum=not_set".to_owned());
+    done.join(",")
+}
+
+/// `AUDIOHUB_TEST_AIRPLAY_PTP_MASTER_VARIANT=v0|v1|v2|v3|v4`, read at start.
+#[cfg(feature = "airplay-test-hooks")]
+fn master_variant_test_hook() -> MasterVariant {
+    std::env::var("AUDIOHUB_TEST_AIRPLAY_PTP_MASTER_VARIANT")
+        .map(|value| MasterVariant::parse(&value))
+        .unwrap_or_default()
+}
+
+#[cfg(not(feature = "airplay-test-hooks"))]
+fn master_variant_test_hook() -> MasterVariant {
+    MasterVariant::default()
 }
 
 /// Send one datagram, waiting for the socket to be writable (a `try_send_to`
@@ -2959,6 +3258,7 @@ impl Message {
             } => "sync_one_step",
             Self::FollowUp { .. } => "follow_up",
             Self::Signaling { .. } => "signaling",
+            Self::DelayReq { .. } => "delay_req",
         }
     }
 }
@@ -3437,9 +3737,15 @@ mod tests {
         one_step[40..44].copy_from_slice(&1_000_000_000u32.to_be_bytes());
         assert_eq!(parse_message(&one_step), Err(PtpParseError::InvalidTimestamp));
 
-        let delay_request = header(0x1, PTP_SYNC_BYTES, 9, 0);
-        assert_eq!(
+        // Delay_Req is parsed (master mode answers it); other types are not.
+        let delay_request = header(MESSAGE_DELAY_REQ, PTP_SYNC_BYTES, 9, 0);
+        assert!(matches!(
             parse_message(&delay_request),
+            Ok(Message::DelayReq { header: Header { sequence: 9, .. } })
+        ));
+        let pdelay_request = header(0x2, PTP_SYNC_BYTES, 9, 0);
+        assert_eq!(
+            parse_message(&pdelay_request),
             Err(PtpParseError::UnsupportedMessage)
         );
         let short_signaling = header(MESSAGE_SIGNALING, PTP_SIGNALING_BYTES - 1, 1, 0);
@@ -4668,6 +4974,128 @@ mod tests {
         assert_eq!(master_mode(&watch), Some(MasterMode::Refused));
         assert!(clocks.take_master_due(at(500)).is_empty());
         assert!(watch.status().unwrap().to_string().ends_with(" master=refused"));
+    }
+
+    /// macOS TimeSync's Delay_Req as our slave (mac-audio-lab, 2026-11-28,
+    /// round2/runs/x1-forced-master-mac-music/ptp.pcap, sequenceId 1).
+    const MAC_DELAY_REQ: &str = concat!(
+        "1102002c0000040800000000000000000000000000155ddf2d1700088000000100fd",
+        "00000000000000000000"
+    );
+
+    #[test]
+    fn a_slave_delay_request_gets_a_delay_response_only_in_master_mode() {
+        let peer: IpAddr = "192.0.2.69".parse().unwrap();
+        let (mut observer, _clocks, watch) = watched_observer(peer);
+        let base = Instant::now();
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        let mut request = hex::decode(MAC_DELAY_REQ).unwrap();
+        request[8..16].copy_from_slice(&(5i64 * 65_536).to_be_bytes());
+        // Not master yet: parsed, counted, not answered.
+        observer.receive(&request, event(peer), PTP_EVENT_PORT, at(0));
+        assert!(observer.delay_responses.is_empty());
+        observer.receive(&ipad_announce(1), general(peer), PTP_GENERAL_PORT, at(0));
+        observer.receive(&ipad_announce(2), general(peer), PTP_GENERAL_PORT, at(500));
+        assert_eq!(master_mode(&watch), Some(MasterMode::Active));
+        // Delay_Req on the general port is a port mismatch.
+        observer.receive(&request, general(peer), PTP_GENERAL_PORT, at(600));
+        assert!(observer.delay_responses.is_empty());
+        observer.receive(&request, event(peer), PTP_EVENT_PORT, at(700));
+        let (to_peer, to, response) = observer.delay_responses.pop().expect("answered");
+        assert_eq!((to_peer, to), (peer, general(peer)));
+        let receive_ns = observer.timescale.time_ns(at(700));
+        let mut expected = vec![0u8; PTP_DELAY_RESP_BYTES];
+        expected[..4].copy_from_slice(&[0x19, 0x02, 0x00, 0x36]);
+        expected[6..8].copy_from_slice(&[0x04, 0x08]);
+        expected[8..16].copy_from_slice(&(5i64 * 65_536).to_be_bytes());
+        expected[20..28].copy_from_slice(&OWN_CLOCK.to_be_bytes());
+        expected[28..30].copy_from_slice(&OWN_PTP_PORT.to_be_bytes());
+        expected[30..32].copy_from_slice(&1u16.to_be_bytes());
+        expected[32..34].copy_from_slice(&[0x03, 0xfd]);
+        write_timestamp(&mut expected[34..44], receive_ns);
+        expected[44..54].copy_from_slice(&hex::decode("00155ddf2d1700088000").unwrap());
+        assert_eq!(response.to_vec(), expected);
+        assert_eq!(watch.status().unwrap().delay_requests, 2);
+        assert!(watch.status().unwrap().to_string().contains(" delay_req=2 master=active"));
+    }
+
+    #[test]
+    fn master_variants_parse_and_shape_messages_like_apple() {
+        assert_eq!(MasterVariant::parse("v0"), MasterVariant::default());
+        assert_eq!(MasterVariant::parse("bogus"), MasterVariant::default());
+        assert_eq!(
+            MasterVariant::parse(" V4 "),
+            MasterVariant { apple_tlv_value: true, clock_id: true, apple_follow_up: true }
+        );
+        assert!(MasterVariant::parse("v2").clock_id && !MasterVariant::parse("v2").apple_tlv_value);
+        // V1: the Apple receiver's Signaling but for its median trailing value.
+        let mut expected = apple_rcv(APPLE_RCV_SIGNALING);
+        for end in [PTP_SIGNALING_BYTES + 26, PTP_MASTER_SIGNALING_BYTES] {
+            expected[end - 3..end].copy_from_slice(&APPLE_SIGNALING_TRAILING_MEDIAN);
+        }
+        assert_eq!(
+            master_signaling_with(APPLE_RCV_CLOCK, 0, APPLE_SIGNALING_TRAILING_MEDIAN).to_vec(),
+            expected
+        );
+        // V3: Apple's TLV bytes; origin + correction is the corrected time.
+        let fu = master_follow_up_apple_like(APPLE_RCV_CLOCK, 1, 5_000_000_000);
+        let mut apple = apple_rcv(APPLE_RCV_FOLLOW_UP);
+        assert_eq!(fu[44..96], apple[44..96]);
+        let Ok(Message::FollowUp { origin_ns, header }) = parse_message(&fu) else {
+            panic!("Follow_Up");
+        };
+        assert_eq!(origin_ns + (header.correction_scaled_ns >> 16) as u64, 5_000_000_000);
+        apple[8..16].copy_from_slice(&fu[8..16]);
+        apple[34..44].copy_from_slice(&fu[34..44]);
+        assert_eq!(fu.to_vec(), apple);
+        // V2: ClockID/port only with the variant and an identity.
+        let mut source = PtpClockSource::test_source();
+        assert_eq!(source.local_port_identity(), None);
+        source.clocks = Arc::new(SenderClockRegistry {
+            variant: MasterVariant::parse("v2"),
+            ..SenderClockRegistry::new(OWN_CLOCK)
+        });
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(source.local_port_identity(), Some((OWN_CLOCK, OWN_PTP_PORT)));
+        // The uptime-like timescale is small (seconds since boot).
+        assert!(OwnTimescale::uptime().time_ns(Instant::now()) < 400 * 86_400 * NANOS_PER_SECOND as u64);
+    }
+
+    #[tokio::test]
+    async fn ptp_sockets_get_apple_ttl_255_and_the_windows_options() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let outcome = apple_ip_header(&socket);
+        assert_eq!(socket.ttl().unwrap(), 255, "{outcome}");
+        assert!(outcome.contains("ttl=ok"), "{outcome}");
+        #[cfg(windows)]
+        assert!(outcome.contains("df=ok") && outcome.contains("udp_nochecksum=ok"), "{outcome}");
+    }
+
+    #[test]
+    fn the_force_master_test_hook_masters_a_sender_that_sends_sync_and_ignores_its_sync() {
+        let peer: IpAddr = "192.0.2.68".parse().unwrap();
+        let (samples, _) = broadcast::channel(8);
+        let clocks = Arc::new(SenderClockRegistry {
+            force_master: true,
+            ..SenderClockRegistry::new(OWN_CLOCK)
+        });
+        let watch = clocks.register(peer);
+        let mut observer = PtpObserver::new(None, None, samples, Arc::clone(&clocks), OWN_CLOCK);
+        let base = Instant::now();
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        observer.receive(&ipad_announce(1), general(peer), PTP_GENERAL_PORT, at(0));
+        observer.receive(&sync_from(IPAD_CLOCK, 1), event(peer), PTP_EVENT_PORT, at(70));
+        observer.receive(&ipad_announce(2), general(peer), PTP_GENERAL_PORT, at(500));
+        assert_eq!(master_mode(&watch), Some(MasterMode::Active));
+        observer.receive(&sync_from(IPAD_CLOCK, 2), event(peer), PTP_EVENT_PORT, at(570));
+        assert_eq!(master_mode(&watch), Some(MasterMode::Active), "its Sync is ignored");
+        // A better grandmaster still wins.
+        let mut announce = ipad_announce(3);
+        announce[47] = 1;
+        observer.receive(&announce, general(peer), PTP_GENERAL_PORT, at(750));
+        assert_eq!(master_mode(&watch), Some(MasterMode::Yielded("better_grandmaster")));
+        // Without the hook (the release default) nothing changes.
+        assert!(!force_master_test_hook() || cfg!(feature = "airplay-test-hooks"));
     }
 
     #[tokio::test]

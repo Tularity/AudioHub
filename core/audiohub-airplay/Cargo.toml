@@ -35,7 +35,9 @@ zeroize = "1"
 
 [features]
 # Test-only fault injection for the per-sender PTP backend
-# (AUDIOHUB_TEST_AIRPLAY_PTP_BACKEND, AUDIOHUB_TEST_TIMESYNC_FAULT). Never
+# (AUDIOHUB_TEST_AIRPLAY_PTP_BACKEND, AUDIOHUB_TEST_TIMESYNC_FAULT,
+# AUDIOHUB_TEST_AIRPLAY_PTP_FORCE_MASTER, AUDIOHUB_TEST_AIRPLAY_PTP_MASTER_VARIANT).
+# Never
 # enabled by a normal dependency edge; build.rs refuses it when
 # AUDIOHUB_RELEASE_BUILD=1 and the product CI scans shipped binaries for the
 # variable names.

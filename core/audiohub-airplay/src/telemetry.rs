@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use uuid::Uuid;
 
-const TELEMETRY_SCHEMA_VERSION: u32 = 8;
+const TELEMETRY_SCHEMA_VERSION: u32 = 9;
 const RECENT_EVENT_LIMIT: usize = 128;
 const CONTROL_SESSION_HISTORY_LIMIT: usize = 128;
 
@@ -283,6 +283,10 @@ pub struct AirPlayTelemetryCounters {
     /// Schema 8. Master messages the socket refused to send.
     #[serde(default)]
     pub ptp_master_send_failures: u64,
+    /// Schema 9. Delay_Resp messages sent to a slave's Delay_Req in master
+    /// mode (end-to-end delay measurement; macOS does not lock without).
+    #[serde(default)]
+    pub ptp_master_delay_responses_sent: u64,
 }
 
 /// Schema 6. PTP datagrams from one sender address, by message type, for
@@ -310,6 +314,12 @@ pub struct PtpSenderTelemetry {
     pub master_announces_sent: u64,
     #[serde(default)]
     pub master_syncs_sent: u64,
+    /// Schema 9. Delay_Req datagrams from this sender and Delay_Resp sent
+    /// back to it.
+    #[serde(default)]
+    pub delay_req: u64,
+    #[serde(default)]
+    pub master_delay_responses_sent: u64,
 }
 
 /// Senders kept in [`AirPlayTelemetrySnapshot::ptp_senders`]; the least
@@ -971,6 +981,7 @@ struct TelemetrySlot {
     ptp_master_announces_sent: AtomicU64,
     ptp_master_syncs_sent: AtomicU64,
     ptp_master_send_failures: AtomicU64,
+    ptp_master_delay_responses_sent: AtomicU64,
     /// Updated only on the PTP observer task (never a media or PCM path).
     ptp_senders: Mutex<Vec<PtpSenderTelemetry>>,
     // SETPEERS/SETPEERSX are control-plane requests. Their prepare and commit
@@ -1243,6 +1254,7 @@ impl TelemetrySlot {
             ptp_master_announces_sent: load(&self.ptp_master_announces_sent),
             ptp_master_syncs_sent: load(&self.ptp_master_syncs_sent),
             ptp_master_send_failures: load(&self.ptp_master_send_failures),
+            ptp_master_delay_responses_sent: load(&self.ptp_master_delay_responses_sent),
         };
         let ptp_senders = self
             .ptp_senders
@@ -1377,6 +1389,7 @@ impl TelemetrySlot {
             &self.ptp_master_announces_sent,
             &self.ptp_master_syncs_sent,
             &self.ptp_master_send_failures,
+            &self.ptp_master_delay_responses_sent,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -2278,6 +2291,7 @@ fn count_ptp_datagram(
         Some("sync_one_step") => entry.sync_one_step += 1,
         Some("follow_up") => entry.follow_up += 1,
         Some("signaling") => entry.signaling += 1,
+        Some("delay_req") => entry.delay_req += 1,
         _ => {}
     }
     if !accepted {
@@ -2353,6 +2367,8 @@ pub(crate) enum PtpMasterMessage {
     Announce,
     /// Sync and its Follow_Up.
     Sync,
+    /// Delay_Resp to a slave's Delay_Req.
+    DelayResp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2399,6 +2415,10 @@ pub(crate) fn record_ptp_master_send(
         PtpMasterMessage::Sync => {
             increment(&guard.slot.ptp_master_syncs_sent);
             update_ptp_sender(guard.slot, peer, |entry| entry.master_syncs_sent += 1);
+        }
+        PtpMasterMessage::DelayResp => {
+            increment(&guard.slot.ptp_master_delay_responses_sent);
+            update_ptp_sender(guard.slot, peer, |entry| entry.master_delay_responses_sent += 1);
         }
     }
 }
@@ -3032,7 +3052,7 @@ mod tests {
             }
         }
         let before = recorder.snapshot();
-        assert_eq!(before.schema_version, 8);
+        assert_eq!(before.schema_version, 9);
         assert!(Uuid::parse_str(&before.generation_marker).is_ok());
         assert_eq!(before.counters.rtsp_phase2_requests, 1);
         assert_eq!(before.recent_events.len(), RECENT_EVENT_LIMIT);
@@ -3053,7 +3073,7 @@ mod tests {
     #[test]
     fn public_snapshot_serializes_with_stable_top_level_fields() {
         let value = serde_json::to_value(Telemetry::default().snapshot()).unwrap();
-        assert_eq!(value["schema_version"], 8);
+        assert_eq!(value["schema_version"], 9);
         assert!(value["control_sessions"].is_array());
         assert!(value["control_sessions_truncated"].is_boolean());
         assert!(value["active_control_sessions"].is_array());
@@ -3105,6 +3125,7 @@ mod tests {
             "ptp_master_announces_sent",
             "ptp_master_syncs_sent",
             "ptp_master_send_failures",
+            "ptp_master_delay_responses_sent",
         ] {
             assert!(value["counters"][field].is_u64(), "{field}");
         }
@@ -3113,7 +3134,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_six_to_eight_fields_deserialize_from_a_schema_five_document() {
+    fn schema_six_to_nine_fields_deserialize_from_a_schema_five_document() {
         let mut value = serde_json::to_value(Telemetry::default().snapshot()).unwrap();
         let object = value.as_object_mut().unwrap();
         assert!(object.remove("ptp_senders").is_some());
@@ -3131,6 +3152,7 @@ mod tests {
             "ptp_master_announces_sent",
             "ptp_master_syncs_sent",
             "ptp_master_send_failures",
+            "ptp_master_delay_responses_sent",
         ] {
             assert!(counters.remove(field).is_some(), "{field}");
         }
@@ -3146,6 +3168,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!((entry.master_mode_entered, entry.master_syncs_sent), (0, 0));
+        assert_eq!((entry.delay_req, entry.master_delay_responses_sent), (0, 0));
     }
 
     #[test]
